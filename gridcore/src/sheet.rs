@@ -408,6 +408,13 @@ impl ChartSource {
         format!("{name}${}${}", col_name(col), self.range.0 + 1)
     }
 
+    /// The single label cell left of `row` — a row-oriented series' name ref,
+    /// the transpose of [`header_ref`](Self::header_ref).
+    pub fn label_ref(&self, row: u32) -> String {
+        let name = self.prefix();
+        format!("{name}${}${}", col_name(self.range.1), row + 1)
+    }
+
     /// Parse a `Sheet1!$A$1:$D$5` ref (the sheet part optional).
     pub fn parse_f_ref(s: &str) -> Option<ChartSource> {
         let (sheet, cells) = match s.rsplit_once('!') {
@@ -468,11 +475,35 @@ pub fn range_labels(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<String> {
         .collect()
 }
 
-/// Read a chart's data out of a worksheet range: the first row names the
-/// series, one column of labels becomes the categories, and every column that
-/// holds numbers becomes a series. This is what the Insert button plots and
-/// what re-pointing a chart at a new range replots.
+/// Read a chart's data out of a worksheet range, either way round.
+///
+/// With `by_row` false — Excel's default, and the only thing docxy wrote before
+/// orientation existed — the first row names the series, one column of labels
+/// becomes the categories, and every column that holds numbers becomes a
+/// series. With `by_row` true it is the transpose: the first column names the
+/// series, one row of labels becomes the categories, and every numeric row is a
+/// series.
+///
+/// This is what the Insert button plots, what re-pointing a chart at a new range
+/// replots, and what Switch Row/Column re-derives.
 pub fn chart_from_range(
+    sheet: &Sheet,
+    sheet_name: &str,
+    range: (u32, u32, u32, u32),
+    kind: &str,
+    by_row: bool,
+) -> Option<ChartData> {
+    if by_row {
+        chart_from_rows(sheet, sheet_name, range, kind)
+    } else {
+        chart_from_columns(sheet, sheet_name, range, kind)
+    }
+}
+
+/// The column reading of a range: one series per numeric column. Kept exactly as
+/// it was before orientation existed, so a column chart still comes out
+/// byte-for-byte what it always did.
+fn chart_from_columns(
     sheet: &Sheet,
     sheet_name: &str,
     range: (u32, u32, u32, u32),
@@ -571,6 +602,114 @@ pub fn chart_from_range(
         // Authored here, so it is exactly what the writer emits.
         complex: false,
         by_row: false,
+    })
+}
+
+/// The row reading of a range: one series per numeric row, the transpose of
+/// [`chart_from_columns`]. The first column holds the series names, the first
+/// row that isn't numeric supplies the category labels.
+fn chart_from_rows(
+    sheet: &Sheet,
+    sheet_name: &str,
+    range: (u32, u32, u32, u32),
+    kind: &str,
+) -> Option<ChartData> {
+    let (r0, c0, r1, c1) = range;
+    if c1 <= c0 {
+        return None; // label column only — nothing to plot
+    }
+    let text_of = |r: u32, c: u32| -> String {
+        match sheet.cell(r, c).map(|cl| &cl.value) {
+            Some(CellValue::Text(t)) => t.clone(),
+            Some(CellValue::Number(n)) => {
+                format_with(&Xf::default(), &CellValue::Number(*n), false)
+            }
+            Some(CellValue::Bool(b)) => b.to_string(),
+            Some(CellValue::Error(e)) => e.clone(),
+            _ => String::new(),
+        }
+    };
+    // A row is a series if it is mostly numbers; the first that isn't supplies
+    // the category labels.
+    let (mut cat_row, mut num_rows) = (None, Vec::new());
+    for r in r0..=r1 {
+        let (mut nums, mut txts) = (0u32, 0u32);
+        for c in (c0 + 1)..=c1 {
+            match sheet.cell(r, c).map(|cl| &cl.value) {
+                Some(CellValue::Number(_)) => nums += 1,
+                Some(CellValue::Text(_)) => txts += 1,
+                _ => {}
+            }
+        }
+        if nums > 0 && nums >= txts {
+            num_rows.push(r);
+        } else if cat_row.is_none() {
+            cat_row = Some(r);
+        }
+    }
+    if num_rows.is_empty() {
+        return None;
+    }
+    // Same split as the column branch: "we found a label row" is not "we had to
+    // pick one". Every row being numeric means the fallback row is itself
+    // plotted, and naming it in `<c:cat>` would label the numbers with
+    // themselves — so the categories go out as literals instead.
+    let label_row = cat_row;
+    let cat_row = cat_row.unwrap_or(r0);
+    let cols: Vec<u32> = (c0 + 1..=c1).collect();
+    let title = text_of(cat_row, c0);
+    // `cat_col` names the column the SERIES NAMES come from here, not the
+    // categories: it is a column index and a row chart takes its labels from a
+    // row, which no column index can express. The writer must therefore derive a
+    // row chart's `<c:cat>` from `categories_ref`, never from `cat_col`.
+    let src = |r_a: u32, r_b: u32| ChartSource {
+        sheet: sheet_name.to_string(),
+        range: (r_a, c0 + 1, r_b, c1),
+        cat_col: c0,
+    };
+    let whole = ChartSource {
+        sheet: sheet_name.to_string(),
+        range,
+        cat_col: c0,
+    };
+    let series = num_rows
+        .iter()
+        .map(|&r| ChartSeries {
+            name: text_of(r, c0),
+            // A row series occupies no single column, and `col` feeds two
+            // column-shaped decisions (the writer's fallback ref and
+            // `claimed_col`). A row index here would make both quietly wrong
+            // rather than inapplicable; `values_ref` is always set, so the
+            // fallback is never reached.
+            col: None,
+            values_ref: Some(src(r, r)),
+            name_ref: Some(whole.label_ref(r)),
+            values: cols
+                .iter()
+                .map(|&c| match sheet.cell(r, c).map(|cl| &cl.value) {
+                    Some(CellValue::Number(n)) => *n,
+                    _ => 0.0,
+                })
+                .collect(),
+            color: None,
+        })
+        .collect();
+    Some(ChartData {
+        title: if title.is_empty() {
+            "Chart".into()
+        } else {
+            title
+        },
+        kind: kind.to_string(),
+        categories: cols.iter().map(|&c| text_of(cat_row, c)).collect(),
+        series,
+        source: Some(whole),
+        categories_ref: label_row.map(|r| src(r, r)),
+        part: None,
+        edited: true,
+        // Authored here, so it is exactly what the writer emits.
+        complex: false,
+        by_row: true,
     })
 }
 
@@ -1563,7 +1702,7 @@ mod tests {
             sh.set_cell(r, c, cell);
         }
         // And a chart built from a range is column-oriented too.
-        let cd = chart_from_range(&sh, "Budget", (0, 0, 1, 1), "column").expect("chart");
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 1, 1), "column", false).expect("chart");
         assert!(!cd.by_row);
     }
 
@@ -1588,7 +1727,7 @@ mod tests {
             let (r, c) = parse_cell_name(addr).unwrap();
             sh.set_cell(r, c, cell);
         }
-        let cd = chart_from_range(&sh, "Budget", (0, 0, 2, 2), "column").expect("chart");
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 2, 2), "column", false).expect("chart");
         assert_eq!(cd.title, "Item"); // the label column's header names the chart
         assert_eq!(cd.categories, vec!["Laptop", "Dock"]);
         assert_eq!(cd.series.len(), 2);
@@ -1604,15 +1743,147 @@ mod tests {
         );
 
         // A range with nothing numeric in it can't be plotted.
-        assert!(chart_from_range(&sh, "Budget", (0, 0, 2, 0), "column").is_none());
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 2, 0), "column", false).is_none());
         // Neither can a header row on its own.
-        assert!(chart_from_range(&sh, "Budget", (0, 0, 0, 2), "column").is_none());
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 0, 2), "column", false).is_none());
         // The label column was found, so its cells name the categories.
         assert_eq!(
             cd.categories_ref.map(|s| s.range),
             Some((1, 0, 2, 0)),
             "categories come from the label column"
         );
+    }
+
+    /// The Overview's worked example: one row per item, a header row of column
+    /// headings.
+    fn overview_sheet() -> Sheet {
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Unit price")),
+            ("D1", Cell::text("Total")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(1199.0)),
+            ("D2", Cell::number(2398.0)),
+            ("A3", Cell::text("Monitor")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(249.5)),
+            ("D3", Cell::number(998.0)),
+            ("A4", Cell::text("Keyboard")),
+            ("B4", Cell::number(6.0)),
+            ("C4", Cell::number(39.99)),
+            ("D4", Cell::number(239.94)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        sh
+    }
+
+    #[test]
+    fn chart_from_rows_picks_labels_and_numeric_series() {
+        let sh = overview_sheet();
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true).expect("chart");
+        assert!(cd.by_row);
+        // The label row's first cell names the chart, as the label column's
+        // header does the other way round.
+        assert_eq!(cd.title, "Item");
+        assert_eq!(cd.categories, vec!["Qty", "Unit price", "Total"]);
+        assert_eq!(cd.series.len(), 3);
+        let names: Vec<&str> = cd.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Laptop", "Monitor", "Keyboard"]);
+        assert_eq!(cd.series[0].values, vec![2.0, 1199.0, 2398.0]);
+        assert_eq!(cd.series[2].values, vec![6.0, 39.99, 239.94]);
+        // A row series names no column — `col` feeds column-shaped decisions
+        // only, and a row index there would be silently wrong.
+        assert!(cd.series.iter().all(|s| s.col.is_none()));
+        // Each slot's ref is the row rectangle / the label cell left of it.
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((1, 1, 1, 3))
+        );
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Budget!$A$2"));
+        assert_eq!(cd.series[2].name_ref.as_deref(), Some("Budget!$A$4"));
+        assert_eq!(
+            cd.series[2].values_ref.as_ref().map(|s| s.to_ref()),
+            Some("Budget!$B$4:$D$4".to_string())
+        );
+        // The label row was found, so its cells name the categories.
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|s| s.range),
+            Some((0, 1, 0, 3)),
+            "categories come from the label row"
+        );
+        let src = cd.source.expect("source");
+        assert_eq!(
+            (src.sheet.as_str(), src.range, src.cat_col),
+            ("Budget", (0, 0, 3, 3), 0)
+        );
+
+        // A range with nothing numeric across a row can't be plotted.
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 3, 0), "column", true);
+        assert!(cd.is_none(), "a label column on its own plots nothing");
+        // Nor can a label column plus a row of headings, with no numbers.
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 0, 3), "column", true).is_none());
+    }
+
+    #[test]
+    fn the_two_orientations_of_one_range_are_transposes() {
+        let sh = overview_sheet();
+        let by_col = chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", false).expect("cols");
+        let by_row = chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true).expect("rows");
+
+        // Series and categories swap places.
+        let col_names: Vec<&str> = by_col.series.iter().map(|s| s.name.as_str()).collect();
+        let row_names: Vec<&str> = by_row.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(col_names, by_row.categories.iter().collect::<Vec<_>>());
+        assert_eq!(row_names, by_col.categories.iter().collect::<Vec<_>>());
+
+        // And the numbers are the same grid, read the other way.
+        for (i, s) in by_col.series.iter().enumerate() {
+            for (j, v) in s.values.iter().enumerate() {
+                assert_eq!(*v, by_row.series[j].values[i], "cell ({j},{i})");
+            }
+        }
+        // Both name the same box, and only the flag differs.
+        assert_eq!(
+            by_col.source.as_ref().map(|s| s.range),
+            by_row.source.as_ref().map(|s| s.range)
+        );
+        assert!(!by_col.by_row && by_row.by_row);
+    }
+
+    #[test]
+    fn an_all_numeric_row_table_writes_literal_categories_not_a_plotted_row() {
+        // The row analogue of `Year | Sales`: every row is numeric, so the
+        // fallback category row is itself plotted. Naming it in `<c:cat>` would
+        // label the numbers with themselves.
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Year")),
+            ("B1", Cell::number(2024.0)),
+            ("C1", Cell::number(2025.0)),
+            ("A2", Cell::text("Sales")),
+            ("B2", Cell::number(10.0)),
+            ("C2", Cell::number(20.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let cd = chart_from_range(&sh, "Data", (0, 0, 1, 2), "column", true).expect("chart");
+        assert_eq!(cd.categories_ref, None);
+        // Both rows plot; the first also supplies the labels, as literals.
+        let names: Vec<&str> = cd.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Year", "Sales"]);
+        assert_eq!(cd.categories, vec!["2024", "2025"]);
     }
 
     #[test]
@@ -1635,7 +1906,7 @@ mod tests {
             let (r, c) = parse_cell_name(addr).unwrap();
             sh.set_cell(r, c, cell);
         }
-        let cd = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column").expect("chart");
+        let cd = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column", false).expect("chart");
         assert_eq!(cd.categories_ref, None);
         // The labels are still there, as literals — the writer emits `<c:strLit>`.
         assert_eq!(cd.categories, vec!["2024", "2025"]);

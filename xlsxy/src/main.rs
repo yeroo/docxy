@@ -3663,7 +3663,7 @@ impl App {
         // first non-numeric column supplies the labels.
         let data = {
             let sh = self.sheet();
-            gridcore::sheet::chart_from_range(sh, &sh.name, (r1, c1, r2, c2), kind)
+            gridcore::sheet::chart_from_range(sh, &sh.name, (r1, c1, r2, c2), kind, false)
         };
         let Some(data) = data else {
             // `chart_from_range` refuses both a header-only selection and one

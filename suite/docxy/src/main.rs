@@ -2935,7 +2935,8 @@ impl Docxy {
         // `<c:f>` naming that sheet.
         let Some(mut data) = self.active_sheet().and_then(|v| {
             let sh = v.pkg.workbook.sheets.get(si)?;
-            gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind)
+            // Re-pointing keeps the chart reading the way it already does.
+            gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind, old.by_row)
         }) else {
             let (r1, c1, r2, c2) = range;
             self.ref_msg = Some((
@@ -5905,7 +5906,8 @@ impl Docxy {
                 (0, 0, mr.min(rows), mc)
             };
             let sh = v.sheet();
-            let data = gridcore::sheet::chart_from_range(sh, &sh.name, range, kind)?;
+            // A freshly inserted chart reads columns, as Excel's does.
+            let data = gridcore::sheet::chart_from_range(sh, &sh.name, range, kind, false)?;
             Some((range, data))
         }) else {
             return;

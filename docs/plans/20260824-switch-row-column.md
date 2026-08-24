@@ -187,26 +187,26 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 2: Build a chart from rows
 
-- [ ] add the orientation parameter to `chart_from_range`
+- [x] add the orientation parameter to `chart_from_range`
       (gridcore/src/sheet.rs:464) and implement the row branch: classify **rows**
       as numeric-or-label, the first text row supplies the category labels, each
       numeric row becomes a series named from the first column's cell
-- [ ] set `values_ref` to the row rectangle and `name_ref` to the row's label
+- [x] set `values_ref` to the row rectangle and `name_ref` to the row's label
       cell; leave `col: None` for a row series, since it names a column and the
       writer's fallback and `claimed_col` both read it as one
-- [ ] keep the column branch byte-for-byte as it is — the row branch is added
+- [x] keep the column branch byte-for-byte as it is — the row branch is added
       beside it, not folded into a shared generic path, unless that falls out
       cleanly
-- [ ] update the three callers (suite main.rs:2938, main.rs:5908,
+- [x] update the three callers (suite main.rs:2938, main.rs:5908,
       xlsxy/src/main.rs:3666) to pass the current orientation
-- [ ] write tests for the row branch mirroring
+- [x] write tests for the row branch mirroring
       `chart_from_range_picks_labels_and_numeric_series`: series names, values,
       categories, and the refs each slot holds
-- [ ] write a test that the same range built both ways is a true transpose —
+- [x] write a test that the same range built both ways is a true transpose —
       same numbers, series and categories swapped
-- [ ] write a test for the all-numeric row table, the row analogue of
+- [x] write a test for the all-numeric row table, the row analogue of
       `an_all_numeric_table_writes_literal_categories_not_a_plotted_column`
-- [ ] run tests in BOTH workspaces — must pass before Task 3
+- [x] run tests in BOTH workspaces — must pass before Task 3
 
 ### Task 3: Write a row-oriented chart to OOXML
 
