@@ -1755,6 +1755,52 @@ fn rebuild_source(data: &mut gridcore::sheet::ChartData) {
     }
 }
 
+/// Read a chart's range the other way round: what was a series becomes a
+/// category and back again, which is Excel's `Switch Row/Column`.
+///
+/// This is a RE-DERIVATION, not a rearrangement of the series already there.
+/// Flipping goes back through `chart_from_range` — the same call the DATA RANGE
+/// field and the Insert button make — so exactly one piece of code decides what
+/// a range means, and a flipped chart is indistinguishable from one authored
+/// that way round in the first place.
+///
+/// `sheet` must be the sheet `data.source` NAMES, not whichever is on screen: a
+/// chart floating over one sheet can plot another's numbers, and re-deriving
+/// from the wrong one would quietly replot it against the cells underneath it.
+///
+/// `None` when there is no `source` box to re-derive from (an imported chart
+/// whose refs the model can't hold) or when the range doesn't read the other way
+/// round at all — a single column of numbers has no row of them.
+///
+/// What rides along and what doesn't:
+/// - **Title, part and `complex`** are kept, for the reasons `chart_apply_range`
+///   keeps them: the title may have been typed, and taking `chart_from_range`'s
+///   `complex: false` would let the writer regenerate a stacked or combo plot
+///   area as a plain clustered one.
+/// - **Series colours do not.** The flipped series are different data — after
+///   the Overview's example the series are Laptop/Monitor/Keyboard where they
+///   were Qty/Unit price/Total — so matching colours by position would paint
+///   "Laptop" with the colour the user chose for "Qty". There is usually not
+///   even the same NUMBER of them.
+///
+/// For the same reason, hand edits to the plot (a series removed, one re-pointed
+/// at another column) do not survive a flip: the range is the source of truth
+/// again. Flipping twice therefore returns the chart the range describes, which
+/// IS the original chart for one that was derived from its range and never
+/// hand-edited.
+fn chart_switch_row_column(
+    data: &gridcore::sheet::ChartData,
+    sheet: &gridcore::sheet::Sheet,
+) -> Option<gridcore::sheet::ChartData> {
+    let src = data.source.as_ref()?;
+    let mut out =
+        gridcore::sheet::chart_from_range(sheet, &sheet.name, src.range, &data.kind, !data.by_row)?;
+    out.title = data.title.clone();
+    out.part = data.part.clone();
+    out.complex = data.complex;
+    Some(out)
+}
+
 /// Move series `i` by `delta` places, clamped to the ends. Returns where it
 /// landed, or `None` if it couldn't move. Colours ride along, since they live
 /// on the series rather than on its position.
@@ -2975,6 +3021,43 @@ impl Docxy {
         let said = ref_a1(self.sheet_names().get(si).map(String::as_str), range);
         self.set_status(format!("Chart plots {}", said.trim_start_matches('=')));
         self.ref_msg = Some((RefTarget::ChartRange, true, msg));
+        self.chart_set_data(data, cx);
+    }
+
+    /// The selected chart re-derived from its own range the other way round, or
+    /// `None` when it can't be — which is also what greys the Switch
+    /// Row/Column button out, so the button is enabled exactly when clicking it
+    /// would do something.
+    ///
+    /// The box's sheet name is what gets resolved, not the sheet on screen; an
+    /// EMPTY name is an unqualified box, which means the sheet on screen, so it
+    /// is passed as `None` rather than looked up and missed.
+    fn chart_switched(&self) -> Option<gridcore::sheet::ChartData> {
+        let data = self.chart_data()?;
+        let sheet = data.source.as_ref()?.sheet.clone();
+        let v = self.active_sheet()?;
+        let named = (!sheet.is_empty()).then_some(sheet.as_str());
+        let si = sheet_index_of(&self.sheet_names(), named, v.active).ok()?;
+        chart_switch_row_column(&data, v.pkg.workbook.sheets.get(si)?)
+    }
+
+    /// Excel's `Switch Row/Column`: read the chart's range the other way round,
+    /// so each row becomes a series instead of each column.
+    ///
+    /// The undo snapshot is `chart_set_data`'s — it takes one before writing the
+    /// chart back, and a flip always differs from what is there (the
+    /// orientation, if nothing else), so its "committed nothing" early return
+    /// can't swallow this.
+    fn chart_switch_orientation(&mut self, cx: &mut Context<Self>) {
+        let Some(data) = self.chart_switched() else {
+            return;
+        };
+        self.set_status(format!(
+            "Chart reads each {} as a series \u{2014} {} series over {} categories",
+            if data.by_row { "row" } else { "column" },
+            data.series.len(),
+            data.categories.len()
+        ));
         self.chart_set_data(data, cx);
     }
 
@@ -6188,6 +6271,69 @@ impl Docxy {
             );
         }
 
+        // Excel's Switch Row/Column, which lives in its Select Data Source
+        // dialog — here it sits under the type buttons, since both answer "what
+        // does this range mean".
+        //
+        // It is enabled exactly when clicking it would do something:
+        // `chart_switched` is the same call the click makes, so the button can
+        // never look live and then do nothing. When it isn't, the note under it
+        // says which of the two reasons it is, rather than leaving a dead
+        // button to be clicked at.
+        let switched = self.chart_switched();
+        let can_switch = switched.is_some();
+        let switch_note = match &switched {
+            Some(_) => format!(
+                "Each {} is a series; each {} a category.",
+                if data.by_row { "row" } else { "column" },
+                if data.by_row { "column" } else { "row" },
+            ),
+            None if data.source.is_none() => "No data range to re-read \u{2014} this chart came \
+                 with references the model can't hold."
+                .to_string(),
+            None => format!(
+                "Its range has no {} of numbers to read the other way round.",
+                if data.by_row { "column" } else { "row" },
+            ),
+        };
+        let ent_sw = ent.clone();
+        let switch = v_flex()
+            .gap(px(2.))
+            .pt(px(4.))
+            .child(
+                div()
+                    .id("chart-switch-rowcol")
+                    .px_2()
+                    .py(px(3.))
+                    .rounded(px(4.))
+                    .text_size(px(11.))
+                    .border_1()
+                    .border_color(pal.border)
+                    .text_color(if can_switch { pal.fg } else { pal.dim })
+                    .when(can_switch, |d| {
+                        d.cursor_pointer().hover(|d| d.bg(pal.hover)).on_click(
+                            move |_ev, _w, cx2| {
+                                ent_sw.update(cx2, |this, cx2| this.chart_switch_orientation(cx2));
+                            },
+                        )
+                    })
+                    .tooltip(move |w, cx2| {
+                        gpui_component::tooltip::Tooltip::new(
+                            "Switch Row/Column \u{2014} replot the range with its rows and \
+                             columns swapped",
+                        )
+                        .build(w, cx2)
+                    })
+                    .child("Switch Row/Column"),
+            )
+            .child(
+                div()
+                    .px_1()
+                    .text_size(px(10.))
+                    .text_color(pal.dim)
+                    .child(switch_note),
+            );
+
         // One card per series: what names it, what it plots, and its colour.
         // Everything here is a field, so a series can be pointed at the grid.
         // The two hints are the same on every card and cost a walk of the
@@ -6412,6 +6558,7 @@ impl Docxy {
                     ))
                     .child(heading("TYPE"))
                     .child(types)
+                    .child(switch)
                     // The four buttons above are the only kinds we can WRITE,
                     // and only as a single clustered/standard plot group. A
                     // scatter/area/doughnut/radar chart — or a stacked or combo
@@ -16912,6 +17059,161 @@ mod grid_geom_tests {
         assert_eq!(
             d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
             Some(("Data", (0, 0, 4, 2)))
+        );
+    }
+
+    /// The Overview's worked example, as a sheet: one row per item, a header
+    /// row of column headings. Charted by column it plots Qty/Unit price/Total
+    /// against Laptop/Monitor/Keyboard; switched, it is the transpose.
+    fn overview_sheet() -> gridcore::sheet::Sheet {
+        use gridcore::sheet::{Cell, Sheet};
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        let rows: [(&str, [f64; 3]); 3] = [
+            ("Laptop", [2.0, 1199.0, 2398.0]),
+            ("Monitor", [4.0, 249.5, 998.0]),
+            ("Keyboard", [6.0, 39.99, 239.94]),
+        ];
+        for (c, h) in ["Item", "Qty", "Unit price", "Total"].iter().enumerate() {
+            sh.set_cell(0, c as u32, Cell::text(h));
+        }
+        for (r, (name, nums)) in rows.iter().enumerate() {
+            let r = r as u32 + 1;
+            sh.set_cell(r, 0, Cell::text(name));
+            for (c, n) in nums.iter().enumerate() {
+                sh.set_cell(r, c as u32 + 1, Cell::number(*n));
+            }
+        }
+        sh
+    }
+
+    #[test]
+    fn switch_row_column_replots_the_range_the_other_way_round() {
+        let sh = overview_sheet();
+        let col = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", false)
+            .expect("column chart");
+        // What docxy plots today: a series per numeric column, categories from
+        // the label column.
+        assert!(!col.by_row);
+        let names: Vec<&str> = col.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Qty", "Unit price", "Total"]);
+        assert_eq!(col.categories, vec!["Laptop", "Monitor", "Keyboard"]);
+
+        // Switched, it is the chart the Overview's Excel screenshot shows.
+        let row = super::chart_switch_row_column(&col, &sh).expect("switched");
+        assert!(row.by_row);
+        let names: Vec<&str> = row.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Laptop", "Monitor", "Keyboard"]);
+        assert_eq!(row.categories, vec!["Qty", "Unit price", "Total"]);
+        assert_eq!(row.series[0].values, vec![2.0, 1199.0, 2398.0]);
+        assert_eq!(row.series[2].values, vec![6.0, 39.99, 239.94]);
+        // The refs move with the plot, so a save writes the switched chart
+        // rather than the one it was switched from.
+        assert_eq!(
+            row.series[0].values_ref.as_ref().map(|s| s.to_ref()),
+            Some("Budget!$B$2:$D$2".to_string())
+        );
+        assert_eq!(row.series[0].name_ref.as_deref(), Some("Budget!$A$2"));
+        assert_eq!(
+            row.categories_ref.as_ref().map(|s| s.to_ref()),
+            Some("Budget!$B$1:$D$1".to_string())
+        );
+        // The box it re-reads is the same box, so switching again is possible
+        // and the DATA RANGE field doesn't move.
+        assert_eq!(row.source.as_ref().map(|s| s.range), Some((0, 0, 3, 3)));
+        // The look of the chart is kept: the type, and the plot area a stacked
+        // or combo part held back.
+        assert_eq!(row.kind, "column");
+        assert_eq!(row.title, col.title);
+    }
+
+    #[test]
+    fn switching_twice_returns_the_original_chart() {
+        let sh = overview_sheet();
+        let col = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", false)
+            .expect("column chart");
+        let there = super::chart_switch_row_column(&col, &sh).expect("switched");
+        let back = super::chart_switch_row_column(&there, &sh).expect("switched back");
+        // Whole-value equality, not a field-by-field walk: a flip is a
+        // re-derivation from the range, so a chart that came from that range
+        // must come back byte for byte.
+        assert_eq!(back, col);
+    }
+
+    #[test]
+    fn switching_keeps_the_title_and_the_part_it_cannot_regenerate() {
+        let sh = overview_sheet();
+        let mut col =
+            gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", false)
+                .expect("column chart");
+        col.title = "Q3 spend".into();
+        col.part = Some("<c:chartSpace/>".into());
+        col.complex = true;
+        // Colours are the one thing that does NOT ride along: the switched
+        // series are different data, so matching by position would paint
+        // "Laptop" with the colour chosen for "Qty".
+        col.series[0].color = Some(0xff0000);
+        let row = super::chart_switch_row_column(&col, &sh).expect("switched");
+        assert_eq!(row.title, "Q3 spend");
+        assert_eq!(row.part.as_deref(), Some("<c:chartSpace/>"));
+        assert!(row.complex, "a stacked/combo part must stay held back");
+        assert!(row.series.iter().all(|s| s.color.is_none()));
+    }
+
+    #[test]
+    fn a_chart_with_nothing_to_re_read_cannot_be_switched() {
+        let sh = overview_sheet();
+        let col = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", false)
+            .expect("column chart");
+        // An imported chart whose refs the model couldn't hold has no box to
+        // re-derive from; the panel greys the button out on this answer.
+        let mut orphan = col.clone();
+        orphan.source = None;
+        assert!(super::chart_switch_row_column(&orphan, &sh).is_none());
+
+        // A range that doesn't read the other way round refuses too. One
+        // column wide, there is nothing to read ACROSS — a row of it is a
+        // single cell — so the column chart is the only reading there is.
+        let boxed = |range| {
+            Some(gridcore::sheet::ChartSource {
+                sheet: "Budget".into(),
+                range,
+                cat_col: 0,
+            })
+        };
+        let mut narrow = col.clone();
+        narrow.source = boxed((0, 0, 3, 0));
+        assert!(super::chart_switch_row_column(&narrow, &sh).is_none());
+
+        // And the transpose of that: a row-oriented chart one row deep has no
+        // column to read down.
+        let mut flat =
+            gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true)
+                .expect("row chart");
+        flat.source = boxed((1, 0, 1, 3));
+        assert!(super::chart_switch_row_column(&flat, &sh).is_none());
+    }
+
+    #[test]
+    fn switching_re_reads_the_sheet_the_box_names_not_the_one_on_screen() {
+        // `chart_switch_row_column` is handed the sheet, so the wrong one is a
+        // possible mistake — pin that it plots whatever it is given and stamps
+        // THAT sheet's name on the refs it writes.
+        let mut other = overview_sheet();
+        other.name = "Ledger".into();
+        let col =
+            gridcore::sheet::chart_from_range(&other, "Ledger", (0, 0, 3, 3), "column", false)
+                .expect("column chart");
+        let row = super::chart_switch_row_column(&col, &other).expect("switched");
+        assert_eq!(
+            row.series[0].values_ref.as_ref().map(|s| s.to_ref()),
+            Some("Ledger!$B$2:$D$2".to_string())
+        );
+        assert_eq!(
+            row.source.as_ref().map(|s| s.sheet.clone()),
+            Some("Ledger".to_string())
         );
     }
 

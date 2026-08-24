@@ -255,20 +255,25 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 6: Switch Row/Column in the Chart panel
 
-- [ ] add a `Switch Row/Column` button to the Chart panel in
+- [x] add a `Switch Row/Column` button to the Chart panel in
       `suite/docxy/src/main.rs`, beside the TYPE row where Excel puts it
-- [ ] on click: flip `by_row` and re-derive the chart from its `source` range
+- [x] on click: flip `by_row` and re-derive the chart from its `source` range
       with the new orientation, through the same `chart_from_range` path the
       DATA RANGE field uses, so one code path decides what a range means
-- [ ] take an undo snapshot before applying — this replaces every series, and
-      `chart_set_data` takes no snapshot of its own
-- [ ] disable or hide the button when the chart has no `source` box to
+- [x] take an undo snapshot before applying — ⚠️ the premise was stale:
+      `chart_set_data` DOES take one (`self.sheet_snapshot()`, main.rs), and a
+      flip always differs from what is there, so its "committed nothing" early
+      return can't swallow it. Verified rather than duplicated — a second
+      snapshot would cost two undos per click.
+- [x] disable or hide the button when the chart has no `source` box to
       re-derive from (an imported chart whose refs the model cannot hold), and
-      say why in the panel rather than failing silently on click
-- [ ] write tests for the pure part: given a `ChartData` and its sheet, the
+      say why in the panel rather than failing silently on click — the button is
+      enabled on `chart_switched().is_some()`, the same call the click makes, and
+      the note under it names which of the two reasons it is
+- [x] write tests for the pure part: given a `ChartData` and its sheet, the
       flipped chart's series names, values and categories
-- [ ] write a test that flipping twice returns the original chart
-- [ ] run tests — must pass before Task 7
+- [x] write a test that flipping twice returns the original chart
+- [x] run tests — must pass before Task 7
 
 ### Task 7: Re-pointing a series accepts a row when the chart is row-oriented
 
