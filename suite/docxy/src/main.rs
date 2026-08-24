@@ -1832,10 +1832,36 @@ fn ref_index_at(refs: &[(u32, u32, u32, u32)], r: u32, c: u32) -> Option<usize> 
         .map(|(i, _)| i)
 }
 
-/// A range as the A1 text a field shows.
+/// A range as BARE A1 text — `B2:B5`, no `=`, no anchors, no sheet.
+///
+/// This is the form for the places that are already about the sheet in front of
+/// you and have no room to say so twice: the name box, and the readout while a
+/// drag is in progress. Every range FIELD shows `ref_a1` instead — the
+/// qualified, anchored form Excel writes — so a reference can be copied between
+/// the two apps. When in doubt it's `ref_a1`: this one names no sheet, so a
+/// field holding it would lose a qualifier the moment it was re-shown.
 fn range_a1((r1, c1, r2, c2): (u32, u32, u32, u32)) -> String {
     use gridcore::sheet::cell_name;
     format!("{}:{}", cell_name(r1, c1), cell_name(r2, c2))
+}
+
+/// A reference as a range field shows it, the way Excel writes one:
+/// `=Budget!$A$1:$D$5`, or `=$A$1:$D$5` when it names no sheet.
+///
+/// The quoting rules for the sheet name are the writer's, reached through
+/// `ChartSource::to_ref` so a name needing quotes (`'My Sheet'`, `'Bob''s
+/// Data'`) is spelled here exactly as it is spelled in the saved `<c:f>`. The
+/// only difference between the two is the leading `=`, which the field shows
+/// and the XML doesn't. `parse_ref_text` reads back everything this writes.
+// Wired into every range field in Task 3; until then only the tests call it.
+#[allow(dead_code)]
+fn ref_a1(sheet: Option<&str>, range: (u32, u32, u32, u32)) -> String {
+    let src = gridcore::sheet::ChartSource {
+        sheet: sheet.unwrap_or_default().to_string(),
+        range,
+        cat_col: range.1,
+    };
+    format!("={}", src.to_ref())
 }
 
 /// The rectangle a selection covers, whichever corner it was dragged from.
@@ -16221,9 +16247,9 @@ fn main() {
 mod grid_geom_tests {
     use super::{
         RefText, char_to_byte, chart_range_of, col_at_x, col_px, edit_runs, fill_box,
-        formula_ref_tokens, last_visible_col, parse_ref_text, range_a1, range_text, ref_color,
-        ref_index_at, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
-        series_move, series_remove, shift_col, shift_row,
+        formula_ref_tokens, last_visible_col, parse_ref_text, range_a1, range_text, ref_a1,
+        ref_color, ref_index_at, ref_token_at, replace_ref, resize_axis, row_height_px,
+        scroll_col0_for_sel, series_move, series_remove, shift_col, shift_row,
     };
 
     // A uniform-width sheet: every column is `w` px.
@@ -17018,6 +17044,62 @@ mod grid_geom_tests {
             );
         }
         assert_eq!(range_a1((1, 1, 4, 1)), "B2:B5");
+    }
+
+    #[test]
+    fn ref_a1_round_trips_through_parse_ref_text() {
+        // Whatever a field shows, the field can be committed unchanged and mean
+        // the same cells on the same sheet — including names that need quoting.
+        for sheet in [
+            None,
+            Some("Sheet1"),
+            Some("Budget"),
+            Some("My Sheet"),
+            Some("Bob's Data"),
+            Some("2024"),
+        ] {
+            for range in [(0, 0, 4, 3), (1, 1, 1, 1), (9, 25, 20, 27)] {
+                assert_eq!(
+                    parse_ref_text(&ref_a1(sheet, range)),
+                    Some(RefText {
+                        sheet: sheet.map(str::to_string),
+                        range,
+                    }),
+                    "{sheet:?} {range:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ref_a1_writes_the_form_excel_shows() {
+        // Qualified and anchored, with the leading = a field carries.
+        assert_eq!(ref_a1(Some("Budget"), (0, 0, 4, 3)), "=Budget!$A$1:$D$5");
+        // A one-cell range still names both corners.
+        assert_eq!(ref_a1(Some("Budget"), (2, 2, 2, 2)), "=Budget!$C$3:$C$3");
+        // No sheet means no `!` at all — a bare `!$A$1` isn't a reference.
+        assert_eq!(ref_a1(None, (0, 0, 4, 3)), "=$A$1:$D$5");
+        // A name needing no quotes gets none; one needing them gets the
+        // writer's quoting, apostrophes doubled.
+        assert_eq!(ref_a1(Some("Sheet1"), (1, 1, 4, 1)), "=Sheet1!$B$2:$B$5");
+        assert_eq!(
+            ref_a1(Some("My Sheet"), (1, 1, 4, 1)),
+            "='My Sheet'!$B$2:$B$5"
+        );
+        assert_eq!(
+            ref_a1(Some("Bob's Data"), (0, 0, 0, 0)),
+            "='Bob''s Data'!$A$1:$A$1"
+        );
+        // The same cells as the `<c:f>` the writer saves, bar the `=`.
+        let src = gridcore::sheet::ChartSource {
+            sheet: "My Sheet".into(),
+            range: (1, 1, 4, 1),
+            cat_col: 1,
+        };
+        assert_eq!(
+            ref_a1(Some("My Sheet"), src.range),
+            format!("={}", src.to_ref())
+        );
     }
 
     #[test]

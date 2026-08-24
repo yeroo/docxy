@@ -185,18 +185,18 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 2: Format a reference the way Excel writes it
 
-- [ ] add `fn ref_a1(sheet: Option<&str>, range: (u32, u32, u32, u32)) -> String`
+- [x] add `fn ref_a1(sheet: Option<&str>, range: (u32, u32, u32, u32)) -> String`
       producing `=Budget!$A$1:$D$5`, or `=$A$1:$D$5` when `sheet` is `None`,
       quoting through `gridcore::sheet::quote_sheet_name`
-- [ ] keep `range_a1` (main.rs:1798) as-is for the places that want the bare
+- [x] keep `range_a1` (main.rs:1798) as-is for the places that want the bare
       form — the name box and the drag-in-progress readout — and note in its doc
       comment which form belongs where, so the two don't get confused later
-- [ ] write a round-trip test: for a table of ranges and sheet names (including
+- [x] write a round-trip test: for a table of ranges and sheet names (including
       `My Sheet` and `Bob's Data`), `parse_ref_text(&ref_a1(s, r))` returns
       exactly that sheet and range
-- [ ] write tests for the shapes: a one-cell range renders `$C$3:$C$3`, `None`
+- [x] write tests for the shapes: a one-cell range renders `$C$3:$C$3`, `None`
       renders no `!`, and a name needing no quotes gets none
-- [ ] run tests — must pass before Task 3
+- [x] run tests — must pass before Task 3
 
 ### Task 3: Every range field shows the Excel form
 
