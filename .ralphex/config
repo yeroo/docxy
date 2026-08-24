@@ -1,0 +1,16 @@
+# ralphex — docxy-local overrides.
+#
+# The external review phase runs revmux (a panel of review agents, then a
+# verification pass) instead of a single codex pass.
+#
+# ralphex has no revmux integration of its own — `external_review_tool` only
+# accepts codex/custom/none, so this goes through the generic custom hook.
+# pkg/executor/custom.go runs it as `exec.Command(script, promptFile)`, a direct
+# exec with NO shell, and Windows cannot exec a .sh that way (verified: it fails
+# with "%1 is not a valid Win32 application"). Hence a .cmd that bridges into Git
+# bash, rather than the .sh the upstream scripts/opencode example ships.
+#
+# The path must use backslashes: a forward-slash relative path reaches cmd.exe
+# as a command name and fails with "'scripts' is not recognized".
+external_review_tool = custom
+custom_review_script = scripts\revmux-review.cmd

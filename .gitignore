@@ -28,3 +28,6 @@
 
 # ralphex progress logs
 .ralphex/progress/
+
+# revmux review rounds (agent chatter, prompts, reports) — regenerable
+.revmux/
