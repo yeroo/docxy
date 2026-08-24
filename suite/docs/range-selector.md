@@ -87,9 +87,15 @@ field inside a bar that means routing *past* the bar as well (`to_bar` in
 field declined would otherwise be dropped there rather than reaching the sheet.
 
 Under the field sits whatever the last commit said about it — `"Applies to
-D2:D5"`, or `"\"total\" isn't a range like A1:D5"` — falling back to the field's
+Sheet1!$B$2:$D$5"` (the field's `=` dropped so it reads as a sentence, the
+qualifier kept because it is what says *which sheet* the rule lands on), or
+`"\"total\" isn't a range like =Sheet1!$A$1:$D$5"` — falling back to the field's
 static help line when there's nothing to report (`ref_msg`, keyed by target so
-fields can't show each other's messages).
+fields can't show each other's messages). Every field words the refusal through
+one function (`not_a_range_msg`), so no failure reads as a different *kind* of
+failure depending on which field met it, and the example it holds up is spelled
+with the sheet actually open (`Docxy::ref_example`) rather than a hardcoded
+`Sheet1` the workbook may not have.
 
 ## Which inputs accept a range
 
@@ -99,7 +105,7 @@ One `RefTarget` variant per input, one `ref_commit` arm per variant:
 |--------|-------|-------------|
 | `ChartRange` | Chart panel | replots the chart from the box |
 | `ChartTitle` | Chart panel | plain text — **not** pointable |
-| `SeriesName(i)` | series card | a ref reads that **cell** — the top-left one, since the cache beside it holds a single point — and is kept live; anything else is a literal name, and only if you **changed** the text (`series_name_commit`) |
+| `SeriesName(i)` | series card | the field **shows the reference** (`=Budget!$B$1:$B$1`), not the name it resolved to, as Excel's Series name box does (`series_name_shown`); a series with no ref shows its literal name. A ref reads that **cell** — the top-left one, since the cache beside it holds a single point, and the ref is narrowed to it before anything is read — and is kept live; anything else is a literal name, and only if you **changed** the text, measured against whichever of the two was displayed (`series_name_commit`) |
 | `SeriesValues(i)` | series card | re-reads **only** that series' numbers, from **one column**: Excel splits a two-dimensional pick into a series per column and reads such a ref column-major, while `range_numbers` flattens row-major, so a wider pick is refused rather than written out in the wrong order |
 | `Categories` | Chart panel | the category-axis labels |
 | `CondFormat` | Conditional Formatting bar | the cells the rule applies to |
@@ -132,7 +138,13 @@ combo plot area still round-trips verbatim, and only **picking a type**
 (`chart_set_kind`) says "author this one afresh". Growing the box as a slot moves
 only stretches it over the sheet it already names (`union_source`) —
 `ChartSource::union` keeps the receiver's sheet, so unioning across sheets would
-leave the box naming one and covering the other's cells.
+leave the box naming one and covering the other's cells. A slot re-pointed at
+**another** sheet leaves the box alone rather than replacing it: replacing would
+make the DATA RANGE field describe that one slot instead of the chart, and Enter
+on the field the user never touched would then replot everything from a single
+foreign column. The loader settles the same clash the same way (`parse_chart`
+keeps the box it already has), so a chart reads identically before and after a
+save.
 
 Series can also be added, removed and reordered from the panel. A reorder closes
 the gap behind the series rather than swapping it with its destination — the
@@ -148,9 +160,11 @@ through a reorder.
 Every range field **shows** a reference the way Excel writes one:
 `=Budget!$A$1:$D$5` — a leading `=`, `$` anchors, and the sheet qualifier — so a
 ref can be copied between this app and Excel's own dialogs and mean the same
-thing in both. That is `ref_a1`, and everything a field displays goes through it:
+thing in both. That is `ref_a1`, and every reference a field displays goes through it:
 the chart panel's four slots, the four entry bars' seeds, and the text a drag
-writes while it is in progress (`ref_pick_text`).
+writes while it is in progress (`ref_pick_text`). The one thing a field shows
+that isn't a reference is a series name that came from none — that is a literal,
+and shows as itself (`series_name_shown`).
 
 Input is deliberately **more permissive** than that output, as Excel's is.
 `parse_ref_text` accepts, returning a `RefText { sheet, range }`:
@@ -166,6 +180,11 @@ Input is deliberately **more permissive** than that output, as Excel's is.
 
 The split is on the **last** `!`: a quoted sheet name may contain one and the
 cells never can.
+
+What it refuses, beyond text that isn't cells at all: an **empty** qualifier.
+`!A1:D5` and `''!A1:D5` are typos, not "this sheet" — Excel refuses both, and
+taking them would land a reference on the sheet in front of you that pointedly
+named none.
 
 A qualifier is **kept, never dropped**. Whoever typed `Budget!A1:D5` gets
 Budget's cells or a message saying there is no such sheet — never this sheet's
@@ -234,7 +253,7 @@ is — appear frozen.
 
 ### Which form belongs where
 
-There are three ways to spell a rectangle in this app and exactly one right
+There are four ways to spell a rectangle in this app and exactly one right
 place for each. **A new range field uses `ref_a1`.** Anything else loses a
 qualifier the moment the field is re-shown, which is the bug this syntax exists
 to remove.
@@ -243,7 +262,7 @@ to remove.
 |------|---------|-----------|---------|
 | Qualified, anchored, `=` | `=Budget!$A$1:$D$5` | `ref_a1` | every range **field** |
 | Anchored, no sheet | `=$A$1:$D$5` | `ref_a1` with `sheet: None` | a field on a source that names no sheet (a chart authored before refs carried one) |
-| Bare A1 | `B2:B5` | `range_a1` | the name box, and a pick written into a **cell's formula** (`range_text`), where naming this very sheet is noise Excel doesn't write either |
+| Bare A1 | `B2:B5` | `range_a1` | a pick written into a **cell's formula** (`range_text`), where naming this very sheet is noise Excel doesn't write either. The name box shows the same *form* but builds its own text inline in `sheet_el` |
 | `<c:f>` ref | `Budget!$A$1:$D$5` | `ChartSource::to_ref` | the OOXML writer |
 
 `ref_a1` *is* the `<c:f>` form plus the leading `=`: it builds a `ChartSource`
@@ -443,8 +462,9 @@ cargo test --manifest-path suite/Cargo.toml   # the pure helpers
 cargo test -p gridcore                        # the chart model + xlsx round-trip
 ```
 
-Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `ref_pick_text`,
-`sheet_index_of`, `chart_ref_of`, `target_takes_foreign_sheet`, `bar_ref_text`,
+Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
+`series_name_shown`, `ref_pick_text`, `sheet_index_of`, `ref_source`,
+`chart_ref_of`, `union_source`, `target_takes_foreign_sheet`, `bar_ref_text`,
 `preview_range`, `sel_range`, `col_at_x`, `row_at_index`/`row_index_of`,
 `series_remove`/`series_move`, `ref_token_at`, `replace_ref`,
 `formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,

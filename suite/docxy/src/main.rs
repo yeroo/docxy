@@ -1497,13 +1497,14 @@ enum NameCommit {
     Literal,
 }
 
-/// A series-name field shows the name the series REPORTS, not the reference it
-/// may have come from, so "does this text name cells?" can only be asked of text
-/// the user actually changed. Otherwise focusing the field of a series called
-/// `Q1` (or `H1`, or `FY1` — quarter and half-year headers are the common case)
-/// and pressing Enter would read it as cell Q1: the name becomes that cell's
-/// contents, usually empty, and the series ends up bound to an unrelated cell.
-/// Re-committing a name that came from a reference would likewise sever it.
+/// "Does this text name cells?" can only be asked of text the user actually
+/// changed, so the question is put against `shown` — whatever the field was
+/// displaying (`series_name_shown`: the reference when the name came from one,
+/// the literal name when it didn't). Otherwise focusing the field of a series
+/// called `Q1` (or `H1`, or `FY1` — quarter and half-year headers are the common
+/// case) and pressing Enter would read it as cell Q1: the name becomes that
+/// cell's contents, usually empty, and the series ends up bound to an unrelated
+/// cell.
 fn series_name_commit(text: &str, shown: &str) -> NameCommit {
     if text.trim() == shown.trim() {
         return NameCommit::Unchanged;
@@ -1538,6 +1539,11 @@ fn parse_ref_text(text: &str) -> Option<RefText> {
     let t = text.trim();
     let t = t.strip_prefix('=').unwrap_or(t).trim();
     let (name, cells) = match t.rsplit_once('!') {
+        // A `!` with nothing in front of it names no sheet, and Excel refuses
+        // `!A1:D5` and `''!A1:D5` rather than reading them as this one. Taking
+        // them would act on the sheet in front of you for a reference that
+        // pointedly didn't name it.
+        Some((p, _)) if unquote_sheet_name(p).is_none() => return None,
         Some((p, r)) => (unquote_sheet_name(p), r),
         None => (None, t),
     };
@@ -1549,7 +1555,8 @@ fn parse_ref_text(text: &str) -> Option<RefText> {
 
 /// The sheet name a qualifier carries, undoing `quote_sheet_name`: a
 /// `'...'`-wrapped name loses its quotes and its doubled `''` become one `'`.
-/// An empty qualifier names no sheet, which reads as "the one in front of you".
+/// An empty qualifier names no sheet at all — which `parse_ref_text` reads as a
+/// typo and refuses, rather than as "the one in front of you".
 fn unquote_sheet_name(prefix: &str) -> Option<String> {
     let p = prefix.trim();
     let name = match p.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
@@ -1580,6 +1587,22 @@ fn sheet_index_of(names: &[String], sheet: Option<&str>, active: usize) -> Resul
         .ok_or_else(|| format!("there's no sheet called \"{want}\""))
 }
 
+/// The complaint a range field gives text that isn't a range, held up against
+/// the shape that field wants. Every field words it the same way, so no failure
+/// reads as a different KIND of failure depending on which field met it — and
+/// every one quotes what was typed without the `=` the field seeds itself with,
+/// since that `=` is not part of what the user got wrong.
+fn not_a_range_msg(text: &str, example: &str) -> String {
+    let t = text.trim();
+    format!(
+        "\"{}\" isn't a range like {example}",
+        t.strip_prefix('=').unwrap_or(t).trim()
+    )
+}
+
+/// A resolved reference: which sheet of the workbook, and which of its cells.
+type RefCells = (usize, (u32, u32, u32, u32));
+
 /// The most cells a chart reads from one field. It plots a point per cell AND
 /// renders an element per point, so an unbounded range — `A1:A1048576` parses
 /// perfectly well — would allocate a million strings and ask the renderer for a
@@ -1599,9 +1622,9 @@ fn chart_ref_of(
     example: &str,
     names: &[String],
     active: usize,
-) -> Result<(usize, (u32, u32, u32, u32)), String> {
+) -> Result<RefCells, String> {
     let Some(r) = parse_ref_text(text) else {
-        return Err(format!("\"{}\" isn't a range like {example}", text.trim()));
+        return Err(not_a_range_msg(text, example));
     };
     let (r1, c1, r2, c2) = r.range;
     let cells = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
@@ -1624,20 +1647,50 @@ fn series_remove(list: &mut Vec<gridcore::sheet::ChartSeries>, i: usize) -> bool
     true
 }
 
+/// The sheet a resolved reference reads, and the `ChartSource` a slot pointed
+/// there writes back — stamped with THAT sheet's name rather than the name of
+/// whichever sheet happened to be on screen, which is what makes a cross-sheet
+/// reference survive a save: `chart_space_xml` spells the `<c:f>` from this.
+///
+/// `None` when `si` names no sheet, so a stale index reports rather than
+/// panics. Every chart slot resolves its index through `sheet_index_of` first,
+/// so that is a backstop, not an expected answer.
+fn ref_source(
+    sheets: &[gridcore::sheet::Sheet],
+    si: usize,
+    range: (u32, u32, u32, u32),
+) -> Option<(&gridcore::sheet::Sheet, gridcore::sheet::ChartSource)> {
+    let sh = sheets.get(si)?;
+    Some((
+        sh,
+        gridcore::sheet::ChartSource {
+            sheet: sh.name.clone(),
+            range,
+            cat_col: range.1,
+        },
+    ))
+}
+
 /// Grow a chart's box to also cover a slot just re-pointed at `src`.
 ///
 /// `ChartSource::union` merges rectangles and keeps the receiver's sheet name,
 /// so unioning across sheets would leave the box naming one sheet and covering
 /// the other's cells — and `chart_space_xml` derives a ref-less series' and the
-/// categories' `<c:f>` from that box. A box on another sheet has nothing to say
-/// about these cells, so it is replaced rather than stretched.
+/// categories' `<c:f>` from that box. Replacing it is no better: the box would
+/// then describe the one slot just re-pointed rather than the chart, and the
+/// DATA RANGE field showing it would offer to replot the whole chart from a
+/// single foreign column. A slot on another sheet leaves the box alone — which
+/// is also how the loader resolves the same clash (`parse_chart` in
+/// `gridcore/src/drawing.rs` keeps the box it already has), so a chart reads
+/// the same before and after a save.
 fn union_source(
     box_: &mut Option<gridcore::sheet::ChartSource>,
     src: gridcore::sheet::ChartSource,
 ) {
     match box_ {
         Some(b) if b.sheet.eq_ignore_ascii_case(&src.sheet) => b.union(&src),
-        _ => *box_ = Some(src),
+        Some(_) => {}
+        slot => *slot = Some(src),
     }
 }
 
@@ -1951,10 +2004,7 @@ fn bar_range_text(text: &str, sheet: &str) -> Result<String, String> {
         // Back in the field's own form, qualified with the sheet just checked:
         // what the bar echoes is what the bar would accept again.
         Some(r) => Ok(ref_a1(Some(sheet), r.range)),
-        None => Err(format!(
-            "\"{t}\" isn't a range like {}",
-            ref_a1(Some(sheet), (0, 0, 4, 3))
-        )),
+        None => Err(not_a_range_msg(t, &ref_a1(Some(sheet), (0, 0, 4, 3)))),
     }
 }
 
@@ -2012,14 +2062,8 @@ fn bar_ref_text(
     }
     let Some(r) = parse_ref_text(text) else {
         // The same complaint the refusing bars give, so the two never read as
-        // different kinds of failure: the `=` the field seeds itself with is
-        // not part of what the user typed wrong.
-        let t = text.trim();
-        return Err(format!(
-            "\"{}\" isn't a range like {}",
-            t.strip_prefix('=').unwrap_or(t).trim(),
-            ref_a1(Some(here), (0, 0, 4, 3))
-        ));
+        // different kinds of failure.
+        return Err(not_a_range_msg(text, &ref_a1(Some(here), (0, 0, 4, 3))));
     };
     let i = sheet_index_of(names, r.sheet.as_deref(), active)?;
     Ok((i, ref_a1(names.get(i).map(String::as_str), r.range)))
@@ -2815,8 +2859,8 @@ impl Docxy {
     /// sheet in front of you.
     fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(old) = self.chart_data() else { return };
-        let cells = text.trim();
-        let (si, range) = match self.chart_ref(text, "=Sheet1!$A$1:$D$5") {
+        let example = self.ref_example((0, 0, 4, 3));
+        let (si, range) = match self.chart_ref(text, &example) {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::ChartRange, false, m));
@@ -2828,7 +2872,7 @@ impl Docxy {
         // every ref it builds, so a chart re-pointed at another sheet saves as a
         // `<c:f>` naming that sheet.
         let Some(mut data) = self.active_sheet().and_then(|v| {
-            let sh = &v.pkg.workbook.sheets[si];
+            let sh = v.pkg.workbook.sheets.get(si)?;
             gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind)
         }) else {
             let (r1, c1, r2, c2) = range;
@@ -2860,7 +2904,13 @@ impl Docxy {
             data.series.len(),
             data.categories.len()
         );
-        self.set_status(format!("Chart plots {}", cells.to_uppercase()));
+        // What it plots is the RESOLVED reference, not the text: uppercasing what
+        // was typed would shout a sheet name the workbook hasn't got ("Chart
+        // plots ='MY SHEET'!$A$1:$D$5" for a sheet called `My Sheet`), and a
+        // qualifier resolves case-insensitively, so only the canonical spelling
+        // is true. The `=` comes off because this reads as a sentence.
+        let said = ref_a1(self.sheet_names().get(si).map(String::as_str), range);
+        self.set_status(format!("Chart plots {}", said.trim_start_matches('=')));
         self.ref_msg = Some((RefTarget::ChartRange, true, msg));
         self.chart_set_data(data, cx);
     }
@@ -3057,7 +3107,8 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let (si, range) = match self.chart_ref(text, "=Sheet1!$B$2:$B$5") {
+        let example = self.ref_example((1, 1, 4, 1));
+        let (si, range) = match self.chart_ref(text, &example) {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::SeriesValues(i), false, m));
@@ -3082,14 +3133,10 @@ impl Docxy {
         // The RESOLVED sheet, not the one on screen: its name is what rides on
         // the `ChartSource` written back, and so what makes a cross-sheet
         // reference survive a save.
-        let sh = &v.pkg.workbook.sheets[si];
-        let name = sh.name.clone();
-        let values = gridcore::sheet::range_numbers(sh, range);
-        let src = gridcore::sheet::ChartSource {
-            sheet: name,
-            range,
-            cat_col: range.1,
+        let Some((sh, src)) = ref_source(&v.pkg.workbook.sheets, si, range) else {
+            return;
         };
+        let values = gridcore::sheet::range_numbers(sh, range);
         let Some(s) = data.series.get_mut(i) else {
             return;
         };
@@ -3126,22 +3173,23 @@ impl Docxy {
                         return;
                     }
                 };
+                // A name is ONE cell, so the reference is narrowed to its
+                // top-left corner BEFORE any cells are read: `chart_space_xml`
+                // caches a single point beside the ref, so a wider pick would
+                // write a `<c:f>` its own cache contradicts — and this is the
+                // one chart field that doesn't go through `chart_ref_of`, so
+                // reading the range whole would let `=A1:XFD1048576` build a
+                // string per cell of the sheet for a label taken from one.
                 let range = r.range;
+                let cell = (range.0, range.1, range.0, range.1);
                 let Some(v) = self.active_sheet() else { return };
-                let sh = &v.pkg.workbook.sheets[si];
-                let label = gridcore::sheet::range_labels(sh, range)
+                let Some((sh, src)) = ref_source(&v.pkg.workbook.sheets, si, cell) else {
+                    return;
+                };
+                let label = gridcore::sheet::range_labels(sh, cell)
                     .first()
                     .cloned()
                     .unwrap_or_default();
-                // A name is ONE cell — the label taken above is that cell's, and
-                // `chart_space_xml` caches a single point beside the ref. A
-                // wider pick would write a `<c:f>` its own cache contradicts.
-                let cell = (range.0, range.1, range.0, range.1);
-                let src = gridcore::sheet::ChartSource {
-                    sheet: sh.name.clone(),
-                    range: cell,
-                    cat_col: range.1,
-                };
                 (label, Some(src.to_ref()))
             }
             // Not a reference — Excel takes a typed name as the name.
@@ -3234,7 +3282,8 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let (si, range) = match self.chart_ref(text, "=Sheet1!$A$2:$A$5") {
+        let example = self.ref_example((1, 0, 4, 0));
+        let (si, range) = match self.chart_ref(text, &example) {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::Categories, false, m));
@@ -3244,13 +3293,10 @@ impl Docxy {
         };
         let Some(v) = self.active_sheet() else { return };
         // The resolved sheet: its labels, and its name on the ref written back.
-        let sh = &v.pkg.workbook.sheets[si];
-        data.categories = gridcore::sheet::range_labels(sh, range);
-        let src = gridcore::sheet::ChartSource {
-            sheet: sh.name.clone(),
-            range,
-            cat_col: range.1,
+        let Some((sh, src)) = ref_source(&v.pkg.workbook.sheets, si, range) else {
+            return;
         };
+        data.categories = gridcore::sheet::range_labels(sh, range);
         data.categories_ref = Some(src.clone());
         // The chart's box covers everything it reads, labels included — the same
         // reason `series_apply_values` unions, and the DATA RANGE the panel shows
@@ -4093,15 +4139,22 @@ impl Docxy {
             })
             .unwrap_or_default()
     }
+    /// The `=Sheet1!$A$1:$D$5` a range field holds up as the shape it wants —
+    /// spelled with the sheet IN FRONT OF YOU rather than a name the workbook
+    /// may not have. A hint (or a complaint) naming `Sheet1` in a workbook whose
+    /// sheets are `Budget` and `Ledger` sends whoever follows it straight into
+    /// "there's no sheet called \"Sheet1\"".
+    fn ref_example(&self, range: (u32, u32, u32, u32)) -> String {
+        let names = self.sheet_names();
+        let active = self.active_sheet().map_or(0, |v| v.active);
+        ref_a1(names.get(active).map(String::as_str), range)
+    }
+
     /// What a chart field's text commits to: the sheet index to read and the
     /// cells of it. The `Err` is the message for `ref_msg`, whether the text
     /// isn't a range, asks for more cells than a chart plots, or names a sheet
     /// the workbook hasn't got.
-    fn chart_ref(
-        &self,
-        text: &str,
-        example: &str,
-    ) -> Result<(usize, (u32, u32, u32, u32)), String> {
+    fn chart_ref(&self, text: &str, example: &str) -> Result<RefCells, String> {
         let Some(v) = self.active_sheet() else {
             return Err("there's no workbook open".to_string());
         };
@@ -4745,15 +4798,23 @@ impl Docxy {
                 // validation may not be the one on screen: the list is built
                 // where it is read, and the boxes reading it commonly sit on
                 // another sheet from the one it was typed on.
-                let sheet = self.bar_sheet_index();
-                if let Some((cells, s)) = self.bar_cells().zip(sheet).filter(|_| !items.is_empty())
-                {
-                    let f1 = format!("\"{}\"", items.join(","));
-                    self.sheet_snapshot();
-                    if let Some(v) = self.active_sheet_mut() {
-                        v.pkg.add_data_validation(s, cells, "list", "", &f1, None);
+                let target = self.bar_cells().zip(self.bar_sheet_index());
+                match target {
+                    _ if items.is_empty() => {}
+                    Some((cells, s)) => {
+                        let f1 = format!("\"{}\"", items.join(","));
+                        self.sheet_snapshot();
+                        if let Some(v) = self.active_sheet_mut() {
+                            v.pkg.add_data_validation(s, cells, "list", "", &f1, None);
+                        }
+                        self.mark_sheet_dirty();
                     }
-                    self.mark_sheet_dirty();
+                    // The pinned range no longer resolves — its sheet was
+                    // renamed or removed while this bar sat open. The bar closes
+                    // either way, and `bar_close` takes its `ref_msg` with it, so
+                    // the status line is what's left to say the rule never
+                    // landed rather than let the close look like it applied.
+                    None => self.set_status("That range names a sheet this workbook hasn't got"),
                 }
                 self.sheet_dv_edit = None;
                 self.bar_close();
@@ -5768,7 +5829,7 @@ impl Docxy {
             } else {
                 // Nothing selected: plot the used cells — but a big sheet has
                 // far more of those than a card can draw, and this path doesn't
-                // go through `chart_range_of`'s cap. Columns are capped first,
+                // go through `chart_ref_of`'s cap. Columns are capped first,
                 // at a count a legend can still name; without that a sheet 4096
                 // columns wide leaves room for zero rows and the button does
                 // nothing at all.
@@ -5917,7 +5978,7 @@ impl Docxy {
         id: impl Into<String>,
         target: RefTarget,
         value: String,
-        hint: &'static str,
+        hint: String,
         help: &'static str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -5930,7 +5991,7 @@ impl Docxy {
         };
         let shown = match &editing {
             Some(_) => String::new(),
-            None if value.is_empty() => hint.to_string(),
+            None if value.is_empty() => hint,
             None => value.clone(),
         };
         let idle_text = StyledText::new(SharedString::from(shown));
@@ -6063,6 +6124,10 @@ impl Docxy {
 
         // One card per series: what names it, what it plots, and its colour.
         // Everything here is a field, so a series can be pointed at the grid.
+        // The two hints are the same on every card and cost a walk of the
+        // workbook's sheet names each, so they are spelled once for the lot.
+        let name_hint = format!("e.g. {} or a name", self.ref_example((0, 1, 0, 1)));
+        let vals_hint = format!("e.g. {}", self.ref_example((1, 1, 4, 1)));
         let mut series_list = v_flex().gap(px(6.));
         for (si, sr) in data.series.iter().enumerate() {
             let vals = sr
@@ -6162,7 +6227,7 @@ impl Docxy {
                         format!("series-name-{si}"),
                         RefTarget::SeriesName(si),
                         series_name_shown(&sr.name, sr.name_ref.as_deref()),
-                        "e.g. =Sheet1!$B$1 or a name",
+                        name_hint.clone(),
                         "",
                         cx,
                     ))
@@ -6177,7 +6242,7 @@ impl Docxy {
                         format!("series-vals-{si}"),
                         RefTarget::SeriesValues(si),
                         vals,
-                        "e.g. =Sheet1!$B$2:$B$5",
+                        vals_hint.clone(),
                         "",
                         cx,
                     ))
@@ -6275,7 +6340,7 @@ impl Docxy {
                         "chart-range",
                         RefTarget::ChartRange,
                         range_shown,
-                        "e.g. =Sheet1!$A$1:$D$5",
+                        format!("e.g. {}", self.ref_example((0, 0, 4, 3))),
                         "Include the header row: it names the series. Enter to replot.",
                         cx,
                     ))
@@ -6313,7 +6378,7 @@ impl Docxy {
                         "chart-title",
                         RefTarget::ChartTitle,
                         data.title.clone(),
-                        "Chart title",
+                        "Chart title".to_string(),
                         "",
                         cx,
                     ))
@@ -6347,7 +6412,7 @@ impl Docxy {
                                 .as_ref()
                                 .map(source_ref_text)
                                 .unwrap_or_default(),
-                            "e.g. =Sheet1!$A$2:$A$5",
+                            format!("e.g. {}", self.ref_example((1, 0, 4, 0))),
                             "The cells labelling each point along the axis.",
                             cx,
                         ),
@@ -12216,7 +12281,8 @@ impl Docxy {
             .clone()
             .or_else(|| self.bar_seed().map(|r| ref_a1(Some(&sheet), r)))
             .unwrap_or_default();
-        self.ref_field(id, target, value, "=Sheet1!$A$1:$D$5", "", cx)
+        let hint = self.ref_example((0, 0, 4, 3));
+        self.ref_field(id, target, value, hint, "", cx)
     }
 
     /// The Text-to-Columns delimiter bar.
@@ -16691,16 +16757,51 @@ mod grid_geom_tests {
         });
         // Another sheet: `union` keeps the RECEIVER's name, so stretching would
         // leave the box saying "Data" over cells on "Report" — and
-        // `chart_space_xml` derives refs from that box. Replace it instead.
+        // `chart_space_xml` derives refs from that box. Replacing it would be
+        // just as wrong the other way: the box would describe one re-pointed
+        // slot instead of the chart, and the DATA RANGE field showing it would
+        // offer to replot everything from that one foreign column. It stands,
+        // as it does when the loader meets the same clash.
         let mut b = Some(src("Data", (1, 1, 3, 1)));
         super::union_source(&mut b, src("Report", (9, 9, 9, 9)));
         assert_eq!(b.as_ref().map(|s| (s.sheet.as_str(), s.range)), {
-            Some(("Report", (9, 9, 9, 9)))
+            Some(("Data", (1, 1, 3, 1)))
         });
         // No box yet: the pointed cells become it.
         let mut b = None;
         super::union_source(&mut b, src("Data", (0, 0, 1, 1)));
         assert_eq!(b.map(|s| s.range), Some((0, 0, 1, 1)));
+    }
+
+    #[test]
+    fn a_pointed_slot_reads_the_sheet_its_reference_named() {
+        use gridcore::sheet::{Cell, Sheet};
+        let sheet = |name: &str, n: f64| {
+            let mut sh = Sheet {
+                name: name.to_string(),
+                ..Default::default()
+            };
+            sh.set_cell(0, 0, Cell::number(n));
+            sh
+        };
+        let sheets = vec![sheet("Sheet1", 1.0), sheet("Budget", 42.0)];
+        // The sheet in front of you is 0; the reference named Budget, so 1 is
+        // what `sheet_index_of` resolved and 1 is what gets read — Budget's
+        // numbers, not Sheet1's cells of the same name.
+        let (sh, src) = super::ref_source(&sheets, 1, (0, 0, 0, 0)).unwrap();
+        assert_eq!(gridcore::sheet::range_numbers(sh, (0, 0, 0, 0)), vec![42.0]);
+        // And Budget's NAME on the source written back, which is what carries
+        // the reference across a save.
+        assert_eq!(src.sheet, "Budget");
+        assert_eq!(src.to_ref(), "Budget!$A$1:$A$1");
+        assert_eq!(super::source_ref_text(&src), "=Budget!$A$1:$A$1");
+        // An unqualified reference resolves to the active sheet, and reads it.
+        let (sh, src) = super::ref_source(&sheets, 0, (0, 0, 0, 0)).unwrap();
+        assert_eq!(gridcore::sheet::range_numbers(sh, (0, 0, 0, 0)), vec![1.0]);
+        assert_eq!(src.sheet, "Sheet1");
+        // An index naming no sheet answers `None` rather than panicking.
+        assert!(super::ref_source(&sheets, 2, (0, 0, 0, 0)).is_none());
+        assert!(super::ref_source(&[], 0, (0, 0, 0, 0)).is_none());
     }
 
     #[test]
@@ -16756,6 +16857,13 @@ mod grid_geom_tests {
         assert_eq!(parse_ref_text("Budget!"), None);
         assert_eq!(parse_ref_text("=Budget!"), None);
         assert_eq!(parse_ref_text("'My Sheet'!total"), None);
+        // And cells with an EMPTY qualifier in front of them are refused rather
+        // than read as this sheet's — Excel refuses both spellings too, and
+        // taking them would land a reference on the sheet in front of you that
+        // pointedly named none.
+        assert_eq!(parse_ref_text("!A1:D5"), None);
+        assert_eq!(parse_ref_text("=!A1:D5"), None);
+        assert_eq!(parse_ref_text("''!A1:D5"), None);
     }
 
     #[test]
@@ -16770,7 +16878,8 @@ mod grid_geom_tests {
             super::unquote_sheet_name("'Bob''s Data'"),
             Some("Bob's Data".into())
         );
-        // An empty qualifier names no sheet: `!A1` means the sheet in front of you.
+        // An empty qualifier names no sheet — which is why `parse_ref_text`
+        // refuses `!A1` outright instead of reading it as this sheet's.
         assert_eq!(super::unquote_sheet_name(""), None);
         assert_eq!(super::unquote_sheet_name("''"), None);
     }
@@ -17405,6 +17514,9 @@ mod grid_geom_tests {
             Some("My Sheet"),
             Some("Bob's Data"),
             Some("2024"),
+            // The split is on the LAST `!` precisely so a quoted name may hold
+            // one; nothing else in the round trip may notice.
+            Some("Odd!Name"),
         ] {
             for range in [(0, 0, 4, 3), (1, 1, 1, 1), (9, 25, 20, 27)] {
                 assert_eq!(
