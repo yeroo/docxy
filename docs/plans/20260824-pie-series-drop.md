@@ -7,7 +7,7 @@ from the file. Nothing warns at any point — the panel goes on listing all
 three, each pointed at cells and colourable, and no status line is set.
 
 The loss happens in one place. `chart_space_xml`'s pie arm
-(gridcore/src/xlsx.rs:2355-2361) writes `data.series.first()` and discards the
+(gridcore/src/xlsx.rs) writes `data.series.first()` and discards the
 rest:
 
 ```rust
@@ -26,19 +26,28 @@ Switch Row/Column review, each proposing to refuse the state at the UI doors
 that reach it. This plan does the opposite: the state is legal, so **keep the
 data and stop lying about it**. Nothing is refused; nothing is lost.
 
-### The doors, for completeness
+### The doors, as they stand at HEAD
 
-`chart_kind_series_err` (suite/docxy/src/main.rs:1790) already refuses a second
-series from `series_add`, `chart_apply_range` and `chart_switched`. Two paths
-reach the same state unguarded:
+**All five are shut.** `chart_kind_series_err`
+(suite/docxy/src/main.rs) is called by `chart_apply_range`,
+`chart_switched`, `chart_set_kind` and `sheet_insert_chart`;
+`series_add` applies the same rule in its own words
+(`data.kind == "pie" && n > 0`, asked before the push). The two this plan was
+first drafted against — `chart_set_kind`, the widest door, and
+`sheet_insert_chart` — were closed by commit 02654cd, each with a comment saying
+why, and the guard's own doc comment enumerates all five.
 
-- **`chart_set_kind`** (main.rs:3281-3294) — select a 3-series column chart,
-  click **Pie**. The widest door, and the one reached by clicking the word.
-- **`sheet_insert_chart`** (main.rs:6200) — select `A1:D5`, click **Pie** on the
-  ribbon; `chart_from_range` returns three series.
+So the Overview's scenario **cannot be reached from the panel today**: clicking
+**Pie** on a three-series chart is refused with a message. What can still reach
+it is a FILE — the schema allows a multi-series `<c:pieChart>` even though
+Excel's own UI will not author one, and `parse_chart` therefore marks such a
+chart `complex` (gridcore/src/drawing.rs, the `cd.kind == "pie" &&
+cd.series.len() > 1` term of `cd.complex`) so its part round-trips verbatim rather than being
+regenerated one slice group short.
 
-Once saving preserves every series, those doors stop being holes: reaching the
-state is fine. What must change is that the panel says a pie plots the first
+That is the state this plan changes: once saving preserves every series, the
+refusals stop earning their keep and the `complex` hold-back stops being needed
+for pie. What must change alongside is that the panel says a pie plots the first
 series only, rather than implying all three are drawn.
 
 ### Key benefits
@@ -51,32 +60,38 @@ series only, rather than implying all three are drawn.
 
 - **Doughnut.** Rendering multiple rings is a separate feature; this plan only
   stops discarding the data a doughnut would later need.
-- **Multi-level categories.** A related pre-existing finding
-  (gridcore/src/drawing.rs:693) uses range shape as a proxy for
-  `<c:multiLvlStrRef>`, so a one-line multi-level ref is accepted and flattened
-  on save. Real, unrelated, and wants its own plan.
+- **Doughnut rendering**, again: several rings is a feature, not a fix.
+
+*(The multi-level-category finding this plan originally deferred was FIXED
+before the plan was written: `parse_chart` keys on the `<c:multiLvlStrRef>`
+element rather than the shape of its `<c:f>` — the `multiLvlStrRef` arm of
+`parse_chart`'s `Event::Start`, read at its `let held` filter — and `a_multi_level_category_over_one_category_is_refused_too`
+(drawing.rs) pins the one-line case. Nothing left to plan.)*
 
 ## Context (from discovery)
 
 ### Files and components involved
 
-- `gridcore/src/xlsx.rs:2355-2361` — the pie arm of `chart_space_xml`, where
+- `gridcore/src/xlsx.rs` — the pie arm of `chart_space_xml`, where
   the data is dropped.
 - `gridcore/src/drawing.rs` — `parse_chart`, which must read every `<c:ser>`
   back out of a `<c:pieChart>`.
-- `suite/docxy/src/main.rs` — `chart_kind_series_err` (:1790) and its three
-  callers, `chart_set_kind` (:3281), `sheet_insert_chart` (:6200), the type
-  buttons (:6448-6479) and the series list (:6558).
+- `suite/docxy/src/main.rs` — `chart_kind_series_err` and its four
+  callers `chart_apply_range`, `chart_switched`,
+  `chart_set_kind` and `sheet_insert_chart`; `series_add`,
+  which asks the same question inline; the type buttons and the series
+  list.
 - `xlsxy/src/main.rs` — the TUI's chart insert, same entry point shape.
 - The chart renderer in the suite, which must draw only the first series for a
   pie even though several are now present.
 
 ### Provenance
 
-Every finding below is **pre-existing** — none was introduced by the Switch
-Row/Column branch. They surfaced there because that branch added
-`chart_kind_series_err`, which made the codebase *look* protected where it was
-not.
+The data loss in `chart_space_xml` is **pre-existing** — it was not introduced
+by the Switch Row/Column branch. It surfaced there because that branch added
+`chart_kind_series_err`, whose three original call sites made the codebase
+*look* protected where it was not; the remaining two doors were closed in the
+same branch (02654cd) once the reviewers named them.
 
 | Reviewer | Confidence | Angle |
 |---|---|---|
@@ -163,9 +178,16 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 2: Write every series a pie holds
 
-- [ ] change `chart_space_xml`'s pie arm (gridcore/src/xlsx.rs:2355-2361) to
+- [ ] change `chart_space_xml`'s pie arm (gridcore/src/xlsx.rs) to
       emit a `<c:ser>` for every series, as the bar and line arms do, rather
       than `data.series.first()`
+- [ ] drop the `cd.kind == "pie" && cd.series.len() > 1` term from
+      `parse_chart`'s `cd.complex` (gridcore/src/drawing.rs): it holds an
+      imported multi-series pie's part back from regeneration precisely because
+      the writer would lose series, so it must go in the same task the writer
+      stops losing them — otherwise such a chart stays uneditable
+- [ ] update the tests that pin that hold-back (drawing.rs, the `pie` case
+      around the `complex` assertions) to expect a regenerable chart
 - [ ] replace the "extra series are invalid (that's doughnut)" comment with
       what is actually true: the format allows several, Excel plots the first,
       and we keep them so a save never deletes the user's work
@@ -193,9 +215,9 @@ pure logic, but constructing views or elements blows up the render macro, so
       explicitly and in one place, rather than relying on the writer having
       discarded the others
 - [ ] in the Chart panel, mark the series beyond the first as not plotted —
-      the series cards (main.rs:6558) currently present all of them
+      the series cards (`series_card` in main.rs) currently present all of them
       identically, which is what makes the loss invisible
-- [ ] add a note beside the type buttons (main.rs:6448-6479) saying a pie plots
+- [ ] add a note beside the type buttons (the `CHART TYPE` row in main.rs) saying a pie plots
       the first series only, shown when a pie has more than one
 - [ ] write tests for the pure part: given a kind and a series count, what the
       panel should say
@@ -203,11 +225,16 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 5: Retire the refusal
 
-- [ ] `chart_kind_series_err` (main.rs:1790) refuses a state that is now legal
-      and lossless. Remove it, along with its calls in `series_add` (:3564),
-      `chart_apply_range` (:3152) and `chart_switched` (:3242)
-- [ ] leave `chart_set_kind` (:3281) and `sheet_insert_chart` (:6200) unguarded
-      — that is now correct, and is the point of the change
+- [ ] `chart_kind_series_err` (main.rs) refuses a state that is now legal
+      and lossless. Remove it and **all four** of its call sites:
+      `chart_apply_range`, `chart_switched`, `chart_set_kind`
+      and `sheet_insert_chart`. Deleting the function while any
+      caller stands does not compile
+- [ ] remove `series_add`'s inline equivalent too (`data.kind == "pie"
+      && n > 0`) — it is the same rule in its own words, and leaving it would
+      keep the "+ Series" button refusing what every other door now allows
+- [ ] the guard's doc comment enumerates all five doors;
+      it goes with the function
 - [ ] update or delete the tests that pinned the refusal, and say in the commit
       why a removed guard is the fix rather than a regression
 - [ ] write a test that adding a second series to a pie now succeeds and
@@ -217,7 +244,11 @@ pure logic, but constructing views or elements blows up the render macro, so
 ### Task 6: Verify acceptance criteria
 
 - [ ] verify the Overview's scenario: three series, click Pie, save, reopen —
-      all three series are still there, and only the first is drawn
+      all three series are still there, and only the first is drawn. (This is
+      the step that proves Task 5 landed: before it, the click is REFUSED by
+      `chart_kind_series_err` and the scenario cannot be reached at all)
+- [ ] verify a workbook that arrives holding a multi-series `<c:pieChart>` is
+      now editable rather than held back as `complex`
 - [ ] verify a chart converted to Pie and back to Column keeps all its series
 - [ ] verify the one-series pie is unchanged end to end
 - [ ] run `cargo test --manifest-path suite/Cargo.toml` — all pass
@@ -277,8 +308,5 @@ report that rather than working around it.
 
 **Related, deferred**:
 
-- Multi-level categories: `drawing.rs:693` uses range shape as a proxy for
-  `<c:multiLvlStrRef>`, so a one-line multi-level ref is accepted and flattened
-  on an edited save. Wants its own plan.
 - Doughnut rendering, which would actually draw the extra series this plan
   preserves.

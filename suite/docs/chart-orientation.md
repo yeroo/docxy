@@ -114,6 +114,10 @@ rediscover them:
   along a row are the row reading's, and `categories_shape_err` refuses the
   other line on either orientation, so nothing the panel commits can contradict
   what the loader reads back out of it.
+  "Stacked" is a claim about ONE grid, so the cells must also name the **same
+  sheet** — two single-cell series on different sheets are not above one another
+  however their coordinates line up, and a chart with cross-sheet refs would
+  otherwise flip orientation on a reload.
   The stacked-cell rule then decides only when the categories are **one cell or
   absent**. *One cell* is the genuine row case, whose labels *are* one cell when
   its range is two columns wide. *Absent* is not: `chart_from_columns` leaves
@@ -154,13 +158,21 @@ guarantee, and it is guarded by a column round-trip test as well as the writer's
 byte-for-byte one; treat a failure in either as a blocker rather than an
 expectation to update.
 
-`parse_chart`'s `cat_col` fixup — "whichever `<c:f>` landed in the box first set
-`cat_col`, so correct it from `<c:cat>`" — is **skipped** for a row chart.
-`categories_ref.range.1` is merely the left end of the label row, the first
-*category's* column and never the labels' own, so the fixup would move `cat_col`
-off the series-name column onto a plotted one. Left alone it keeps what the
-first ref gave it, which is the series-name column — exactly what
-`chart_from_rows` puts there.
+`parse_chart` says which column the box calls its label column **outright**,
+rather than letting whichever `<c:f>` seeded the box decide it — the fold order
+is about which *sheet* wins, and leaning on it for `cat_col` too made one answer
+hostage to the other. A **column** chart takes `cat_col` from `<c:cat>`, where
+the labels really live. A **row** chart cannot: `categories_ref.range.1` is
+merely the left end of the label row, the first *category's* column and never
+the labels' own, so it would move `cat_col` off the series-name column onto a
+plotted one. It is taken from the first series' **name cell** instead, which is
+that column — exactly what `chart_from_rows` puts there.
+
+A chart with no `<c:cat>` ref at all has told us nothing, and `cat_col` then
+falls back to a column some series plots. The writer's `claimed_col` guard is
+what stops that being written out as a label ref: labels typed as `<c:strLit>`
+came from nobody's cells, and handing Excel a ref to refresh them from would
+replace them with whatever those cells hold.
 
 ## In the panel
 
@@ -279,7 +291,10 @@ is already showing.
 
 `rebuild_source` needs no orientation of its own: it unions rectangles, so a row
 series' ref grows the box the same way a column's does. A test pins that rather
-than leaving it assumed.
+than leaving it assumed. It does care about ORDER, though — the series' values go
+in before the categories and the name cells, so that one cross-sheet label ref
+cannot take the box off the sheet the chart plots — and `parse_chart` folds in
+that same order, which is what keeps the box identical before and after a save.
 
 ## Testing
 

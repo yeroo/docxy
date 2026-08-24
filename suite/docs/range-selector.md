@@ -135,15 +135,28 @@ A sheet the workbook hasn't got is refused by name under the field instead.
 
 Re-pointing keeps the chart's `complex` flag (`chart_apply_range`): a stacked or
 combo plot area still round-trips verbatim, and only **picking a type**
-(`chart_set_kind`) says "author this one afresh". Growing the box as a slot moves
-only stretches it over the sheet it already names (`union_source`) —
-`ChartSource::union` keeps the receiver's sheet, so unioning across sheets would
-leave the box naming one and covering the other's cells. A slot re-pointed at
-**another** sheet leaves the box alone rather than replacing it: replacing would
-make the DATA RANGE field describe that one slot instead of the chart, and Enter
-on the field the user never touched would then replot everything from a single
-foreign column. The loader settles the same clash the same way (`parse_chart`
-keeps the box it already has), so a chart reads identically before and after a
+(`chart_set_kind`) says "author this one afresh". The box itself is **rebuilt**
+rather than grown (`rebuild_source`): the fold starts empty and walks every slot
+— each series' values, then the categories, then the series' name cells — so the
+box shrinks as readily as it stretches, and once every slot has moved to another
+sheet the box follows them there. Growing the box it already had would strand
+it naming a sheet no slot reads.
+
+Within that fold the **first sheet wins** and a slot naming a different one is
+skipped: `ChartSource::union` keeps the receiver's sheet, so unioning across
+sheets would leave the box naming one and covering the other's cells, and
+replacing would make the DATA RANGE field describe that one slot instead of the
+chart — Enter on the field the user never touched would then replot everything
+from a single foreign column. The **numbers** therefore go in **first**, and the
+categories and the series' NAME cells only after them: both are labels rather
+than data, both may legally sit on another sheet (`target_takes_foreign_sheet`
+says so for CATEGORY LABELS and SERIES NAME alike), and folded first a single
+foreign `<c:cat>` or `<c:tx>` would seed the box and get every local slot after
+it skipped, collapsing a chart over `A1:D5` onto that one line. Folded after,
+they only stretch the box the numbers chose — or seed it when there were no
+numbers to choose it, which is why the categories go in before the names. The
+loader folds in exactly this order and settles the clash the same way
+(`parse_chart`, `fold_source`), so a chart reads identically before and after a
 save.
 
 Series can also be added, removed and reordered from the panel. A reorder closes
@@ -474,11 +487,12 @@ cargo test -p gridcore                        # the chart model + xlsx round-tri
 
 Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
 `series_name_shown`, `ref_pick_text`, `sheet_index_of`, `ref_source`,
-`chart_ref_of`, `union_source`, `target_takes_foreign_sheet`, `bar_ref_text`,
+`chart_ref_of`, `rebuild_source`, `target_takes_foreign_sheet`, `bar_ref_text`,
 `preview_range`, `sel_range`, `col_at_x`, `row_at_index`/`row_index_of`,
 `series_remove`/`series_move`, `ref_token_at`, `replace_ref`,
 `formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,
-`sort_rows_from`, `bar_range_text`.
+`sort_rows_from`, `bar_range_text`, `series_values_shape_err`,
+`categories_shape_err`, `chart_kind_series_err`, `chart_field_examples`.
 
 That list is why every helper here is a **pure free function** taking the
 workbook's sheet names as a `&[String]` rather than reading them off the view:

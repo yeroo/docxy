@@ -480,13 +480,16 @@ pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
 /// (a column chart over a range one data row deep).
 fn infer_by_row(cd: &ChartData) -> bool {
     let (mut rows, mut cols) = (0usize, 0usize);
-    // The single-cell series, in the order they appear.
-    let mut cells: Vec<(u32, u32)> = Vec::new();
+    // The single-cell series, in the order they appear. Each keeps the SHEET it
+    // was read from: "stacked in one column" is a claim about one grid, and two
+    // cells on different sheets are not stacked however their coordinates line
+    // up.
+    let mut cells: Vec<(&str, u32, u32)> = Vec::new();
     for s in &cd.series {
         let Some(v) = &s.values_ref else { continue };
         let (r1, c1, r2, c2) = v.range;
         match (r1 == r2, c1 == c2) {
-            (true, true) => cells.push((r1, c1)),
+            (true, true) => cells.push((v.sheet.as_str(), r1, c1)),
             (true, false) => rows += 1,
             (false, true) => cols += 1,
             _ => {}
@@ -509,10 +512,34 @@ fn infer_by_row(cd: &ChartData) -> bool {
             _ => {}
         }
     }
-    // Still nothing. Stacked single cells are row evidence.
+    // Still nothing. Stacked single cells are row evidence — on ONE sheet,
+    // compared the way a sheet name resolves everywhere else.
     cells.len() > 1
-        && cells.iter().all(|c| c.1 == cells[0].1)
-        && cells.iter().any(|c| c.0 != cells[0].0)
+        && cells
+            .iter()
+            .all(|c| c.0.eq_ignore_ascii_case(cells[0].0) && c.2 == cells[0].2)
+        && cells.iter().any(|c| c.1 != cells[0].1)
+}
+
+/// Fold one reference into the chart's overall box: the first ref seeds it, a
+/// later one on the SAME sheet stretches it, and one naming another sheet is
+/// skipped.
+///
+/// Skipping rather than replacing is what keeps the box describing the CHART:
+/// [`ChartSource::union`](crate::sheet::ChartSource::union) keeps the receiver's
+/// sheet, so unioning across sheets would leave the box naming one sheet and
+/// covering the other's cells. The panel's `rebuild_source` folds the same way
+/// in the same order, which is what makes a chart read identically before and
+/// after a save.
+fn fold_source(box_: &mut Option<crate::sheet::ChartSource>, src: crate::sheet::ChartSource) {
+    match box_ {
+        // Case-insensitively, because that is how a sheet name resolves
+        // everywhere else — `Budget!$B$2` and `budget!$B$3` are one sheet's
+        // cells, and comparing them byte for byte would drop the second.
+        Some(cur) if cur.sheet.eq_ignore_ascii_case(&src.sheet) => cur.union(&src),
+        Some(_) => {}
+        slot => *slot = Some(src),
+    }
 }
 
 fn parse_chart(xml: &str) -> ChartData {
@@ -554,6 +581,12 @@ fn parse_chart(xml: &str) -> ChartData {
     // Inside the point arrays a scatter or bubble chart plots instead of
     // `<c:cat>`/`<c:val>`.
     let mut in_pts = false;
+    // Every series' CATEGORY and NAME ref, folded into the box only once the
+    // loop has ended — see `fold_source` and the two folds after it. What a
+    // chart IS is the numbers it plots, so `<c:val>` (and a scatter's points)
+    // decide which sheet the box names; labels and headers stretch it after.
+    let mut cat_boxes: Vec<crate::sheet::ChartSource> = Vec::new();
+    let mut name_boxes: Vec<crate::sheet::ChartSource> = Vec::new();
     // The `idx` of the open `<c:pt>`. Excel writes SPARSE caches — a blank or
     // non-numeric source cell simply has no `<c:pt>` — so appending in document
     // order shifts everything after a gap one place left, and an edited chart
@@ -777,12 +810,21 @@ fn parse_chart(xml: &str) -> ChartData {
                         // `chart_space_xml` derives a ref-less series' cells
                         // from `source`, so an edited chart would be written
                         // back plotting them.
-                        if mode != 0 || in_pts {
-                            match &mut cd.source {
-                                Some(cur) if cur.sheet == src.sheet => cur.union(&src),
-                                Some(_) => {}
-                                slot => *slot = Some(src),
-                            }
+                        //
+                        // The CATEGORIES and the series' NAME cells wait until
+                        // after the loop (see `cat_boxes`/`name_boxes`). Both
+                        // are labels, not numbers, and Excel is happy for
+                        // either to sit on another sheet than the values — so
+                        // letting one seed the box would hand a single
+                        // cross-sheet `<c:cat>` or `<c:tx>` the whole chart's
+                        // sheet. `<c:val>` and a scatter's points fold here, in
+                        // document order, and decide the sheet between them.
+                        if mode == 1 {
+                            name_boxes.push(src);
+                        } else if mode == 2 {
+                            cat_boxes.push(src);
+                        } else if mode != 0 || in_pts {
+                            fold_source(&mut cd.source, src);
                         }
                     } else if mode != 0 {
                         // A ref this model can't hold: a whole column
@@ -827,6 +869,22 @@ fn parse_chart(xml: &str) -> ChartData {
             Event::Eof => break,
         }
     }
+    // The CATEGORIES, then the series' NAME cells, both held back above. They
+    // belong in the box — leaving the categories out drops the label column and
+    // leaving the names out drops the header row, shrinking a chart's DATA
+    // RANGE from `A1:D5` to `B2:D5` — but neither may DECIDE which sheet the
+    // box names. `<c:cat>` is one line of LABELS and `<c:tx>` one HEADER cell,
+    // and Excel is happy for either to sit on another sheet than the numbers;
+    // folded in document order (the writer emits `{tx}{cat}{val}`) a single
+    // foreign one would seed the box, and every local `<c:val>` after it would
+    // then be skipped for the sheet mismatch, collapsing the whole chart's box
+    // onto that one foreign line. Folded after, they stretch the box the
+    // plotted numbers already decided, or seed it only when nothing else did —
+    // categories before names, so a chart whose series are all literal still
+    // takes its sheet from its labels rather than from a header cell.
+    for src in cat_boxes.into_iter().chain(name_boxes) {
+        fold_source(&mut cd.source, src);
+    }
     // A pie with several `<c:ser>` is the shape the writer cannot reproduce
     // without losing data: `chart_space_xml`'s pie arm emits `series.first()`
     // only. Nothing docxy derives can reach it — four of the five panel doors
@@ -841,23 +899,30 @@ fn parse_chart(xml: &str) -> ChartData {
         || !matches!(grouping.as_str(), "" | "clustered" | "standard")
         || (cd.kind == "pie" && cd.series.len() > 1);
     cd.by_row = infer_by_row(&cd);
-    // `cat_col` is set by whichever `<c:f>` landed in the box FIRST, and inside
-    // a `<c:ser>` that is the series' NAME ref — its header cell, in the column
-    // it plots. Where the labels really live is `<c:cat>`, so say so whenever
-    // the chart told us.
+    // Which column the box calls its LABEL column, said outright rather than
+    // inherited from whichever `<c:f>` happened to seed the box — the fold
+    // order is about which SHEET wins, and leaning on it for `cat_col` too made
+    // one answer hostage to the other.
     //
-    // Not for a row chart, though: there the labels live in a ROW, and
-    // `cat_col` is a column index that cannot say so. `categories_ref.range.1`
-    // is merely the left end of that label row — the first CATEGORY's column,
-    // never the labels' own column — so the fixup would move `cat_col` off the
-    // series-name column onto a plotted one. Left alone, `cat_col` keeps what
-    // the first ref in the box gave it (a series' name cell, in the label
-    // column), which is exactly what `chart_from_rows` puts there.
-    if !cd.by_row {
-        if let (Some(src), Some(cats)) = (cd.source.as_mut(), cd.categories_ref.as_ref()) {
-            if src.sheet == cats.sheet {
-                src.cat_col = cats.range.1;
-            }
+    // A COLUMN chart takes it from `<c:cat>`: that is where the labels really
+    // live, so say so whenever the chart told us.
+    //
+    // A ROW chart cannot. Its labels run along a ROW and `cat_col` is a column
+    // index, so `categories_ref.range.1` would be merely the left end of that
+    // label row — the first CATEGORY's column, never the labels' own. What
+    // `chart_from_rows` puts there is the column the SERIES NAMES come from, so
+    // take it from the first series' name cell, which is that column.
+    let cat_col = if cd.by_row {
+        cd.series
+            .first()
+            .and_then(|s| s.name_ref.as_deref())
+            .and_then(crate::sheet::ChartSource::parse_f_ref)
+    } else {
+        cd.categories_ref.clone()
+    };
+    if let (Some(src), Some(from)) = (cd.source.as_mut(), cat_col) {
+        if src.sheet.eq_ignore_ascii_case(&from.sheet) {
+            src.cat_col = from.range.1;
         }
     }
     cd
@@ -1204,10 +1269,10 @@ mod tests {
 
     #[test]
     fn the_source_box_takes_its_label_column_from_the_category_ref() {
-        // `cat_col` is set by whichever `<c:f>` landed in the box first, and
-        // inside a `<c:ser>` that is the NAME ref — column B here. The labels
-        // are in A, and `chart_space_xml` derives `<c:cat>` from `cat_col` when
-        // a chart has no category ref of its own.
+        // A column chart takes `cat_col` from `<c:cat>` — column A here — not
+        // from whichever `<c:f>` seeded the box, which is the values ref in
+        // column B. `chart_space_xml` derives `<c:cat>` from `cat_col` when a
+        // chart has no category ref of its own, so it must be the LABEL column.
         let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
           <c:ser><c:idx val="0"/>
             <c:tx><c:strRef><c:f>Budget!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>
@@ -1299,9 +1364,9 @@ mod tests {
 
     #[test]
     fn typed_in_categories_are_not_given_a_reference_they_never_had() {
-        // Categories written as `<c:strLit>` came from nobody's cells.
-        // `source.cat_col` is then just whichever `<c:f>` was read first — here
-        // the series' NAME ref, in a column no series plots — so deriving
+        // Categories written as `<c:strLit>` came from nobody's cells, so the
+        // chart never said which column its labels live in and `source.cat_col`
+        // falls back to a column some series plots — so deriving
         // `<c:cat><c:strRef>` from it would hand Excel a ref to refresh the
         // user's typed labels away from.
         let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
@@ -1313,9 +1378,11 @@ mod tests {
         let cd = parse_chart(xml);
         assert_eq!(cd.categories, vec!["North", "South"]);
         assert_eq!(cd.categories_ref, None);
-        // The box spans A..C, and `cat_col` is A — the name cell's column.
+        // The box spans A..C. With no `<c:cat>` ref to take it from, `cat_col`
+        // is C — the column the series plots, which `claimed_col` then refuses
+        // to write out as the labels' own.
         assert_eq!(cd.source.as_ref().map(|s| (s.range, s.cat_col)), {
-            Some(((0, 0, 2, 2), 0))
+            Some(((0, 0, 2, 2), 2))
         });
         let out = crate::xlsx::chart_space_xml(&cd);
         assert!(out.contains("<c:cat><c:strLit>"), "kept literal: {out}");
@@ -1456,10 +1523,10 @@ mod tests {
     #[test]
     fn a_column_a_series_plots_is_never_named_as_the_categories() {
         use crate::sheet::{ChartData, ChartSeries, ChartSource};
-        // `cat_col` comes from whichever ref was read first. For a chart whose
-        // categories are literals, no ref names the label column at all — the
-        // first is a series' own values — so a derived <c:cat> would tell Excel
-        // to label each bar with the number it plots.
+        // For a chart whose categories are literals, no ref names the label
+        // column at all, so `cat_col` falls back to a column some series plots
+        // — and a derived <c:cat> would then tell Excel to label each bar with
+        // the number it plots.
         let col = |c: u32| ChartSource {
             sheet: "Budget".into(),
             range: (1, c, 3, c),
@@ -1851,6 +1918,87 @@ mod tests {
             cd.categories_ref.as_ref().map(|s| s.range),
             Some((1, 0, 1, 1))
         );
+    }
+
+    /// A series' NAME and the CATEGORIES may each sit on another sheet than the
+    /// numbers — Excel writes such a `<c:tx>` or `<c:cat>` happily, and docxy's
+    /// own panel commits both (`target_takes_foreign_sheet`). Folded in document
+    /// order they are the first two refs the chart offers, so either would seed
+    /// the box and every local `<c:val>` after it would be skipped for the sheet
+    /// mismatch: a chart plotting `Sheet1!A1:C5` would come back naming one cell
+    /// of `Budget`. Both are folded after the numbers for exactly this reason.
+    #[test]
+    fn a_cross_sheet_label_ref_does_not_take_the_box_from_the_cells_plotted() {
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Budget!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strRef><c:f>Sheet1!$A$2:$A$3</c:f><c:strCache><c:ptCount val="2"/><c:pt idx="0"><c:v>North</c:v></c:pt><c:pt idx="1"><c:v>South</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        // The plotted cells decide the sheet, and the foreign name is skipped
+        // rather than collapsing the box onto `Budget`.
+        assert_eq!(
+            cd.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Sheet1", (1, 0, 2, 1)))
+        );
+        // The ref itself is kept — it is a legal cross-sheet name, and only its
+        // claim on the BOX was refused.
+        assert_eq!(
+            cd.series[0].name_ref.as_deref(),
+            Some("Budget!$B$1"),
+            "the name ref survives"
+        );
+
+        // A LOCAL name, by contrast, still stretches the box up over the header
+        // row — the reason name cells are folded in at all.
+        let local = xml.replace("Budget!$B$1", "Sheet1!$B$1");
+        assert_eq!(
+            parse_chart(&local).source.as_ref().map(|s| s.range),
+            Some((0, 0, 2, 1))
+        );
+
+        // The mirror case, one slot over: the writer emits `{tx}{cat}{val}`, so
+        // with `<c:tx>` held back a foreign `<c:cat>` would be the first ref
+        // folded and would seize the box the same way. The categories are held
+        // back too, so the numbers still decide — the box keeps `Sheet1`, and
+        // only column A, which now lives elsewhere, is missing from it.
+        let cat = local.replace("Sheet1!$A$2:$A$3", "Budget!$A$2:$A$3");
+        let cd = parse_chart(&cat);
+        assert_eq!(
+            cd.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Sheet1", (0, 1, 2, 1))),
+            "the foreign categories ref is skipped, not made the box"
+        );
+        assert_eq!(
+            cd.categories_ref
+                .as_ref()
+                .map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Budget", (1, 0, 2, 0))),
+            "the categories ref survives"
+        );
+    }
+
+    /// Two single-cell series stacked down one column are read as a row chart
+    /// (`infer_by_row`), because the column derivation emits one series per
+    /// column and so can never produce two sharing one. Cells on DIFFERENT
+    /// sheets are not stacked, however their coordinates line up.
+    #[test]
+    fn single_cells_on_different_sheets_are_not_stacked() {
+        let chart = |a: &str, b: &str| {
+            format!(
+                r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/><c:val><c:numRef><c:f>{a}</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+          <c:ser><c:idx val="1"/><c:val><c:numRef><c:f>{b}</c:f><c:numCache><c:pt idx="0"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>
+          </c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+            )
+        };
+        // One sheet, one column, different rows: stacked, so a row chart.
+        assert!(parse_chart(&chart("Data!$B$2", "Data!$B$3")).by_row);
+        // Same coordinates, two sheets: no stack, so the safe column reading.
+        assert!(!parse_chart(&chart("Data!$B$2", "Budget!$B$3")).by_row);
+        // Case is not a sheet difference — Excel resolves names that way.
+        assert!(parse_chart(&chart("Data!$B$2", "data!$B$3")).by_row);
     }
 
     /// Every shape that fits both readings, or neither, answers "column" — the

@@ -1705,20 +1705,28 @@ fn ref_source(
 /// leaves the box alone, exactly as the loader resolves the same clash
 /// (`parse_chart` in `gridcore/src/drawing.rs`).
 ///
-/// The fold starts EMPTY, not from the box already there, and walks the slots in
-/// the order the writer emits them — each series' name cell, the categories,
-/// then its values. Growing the existing box instead strands it: once every slot
-/// has moved to another sheet, nothing matches it any more, so it would go on
-/// naming a sheet no slot reads. The panel seeds DATA RANGE from that box, and
-/// Enter there replots the whole chart from the cells the user moved away from,
-/// with no undo snapshot. Rebuilding converges the moment the references do,
-/// which is what actually makes a chart read the same before and after a save —
-/// the loader unions from scratch too, so anything less diverges from it.
+/// The fold starts EMPTY, not from the box already there. Growing the existing
+/// box instead strands it: once every slot has moved to another sheet, nothing
+/// matches it any more, so it would go on naming a sheet no slot reads. The
+/// panel seeds DATA RANGE from that box, and Enter there replots the whole
+/// chart from the cells the user moved away from, with no undo snapshot.
+/// Rebuilding converges the moment the references do, which is what actually
+/// makes a chart read the same before and after a save — the loader unions from
+/// scratch too, so anything less diverges from it.
 ///
-/// The name cell is folded in because the loader folds it in (`<c:tx>` carries
-/// mode 1): leaving it out would drop the header row from the box, shrinking
-/// the DATA RANGE the panel shows from `A1:D5` to `A2:D5` the first time a
-/// series was re-pointed.
+/// The NUMBERS go in first — every series' values — and only then the
+/// categories and the series' NAME cells. Those two are folded in at all
+/// because the loader folds them in (`<c:cat>` carries mode 2 and `<c:tx>` mode
+/// 1): leaving them out would drop the label column and the header row from the
+/// box, shrinking the DATA RANGE the panel shows from `A1:D5` to `B2:D5` the
+/// first time a series was re-pointed. They are folded AFTER because a
+/// categories ref is one LINE of labels and a name is one CELL, and each may
+/// legally name another sheet than the numbers (`target_takes_foreign_sheet` is
+/// `true` for both, and `categories_apply`/`series_apply_name` resolve one) —
+/// first, it would seed the box, and every local ref after it would be skipped
+/// for the sheet mismatch, collapsing a chart plotting `A1:D5` onto that single
+/// foreign line. `parse_chart` holds its `<c:cat>` and `<c:tx>` refs back to
+/// the end for the same reason, so the two still agree slot for slot.
 ///
 /// A chart with no parsable reference anywhere keeps the box it had — there is
 /// nothing to rebuild it from, and dropping it would blank DATA RANGE.
@@ -1732,21 +1740,32 @@ fn rebuild_source(data: &mut gridcore::sheet::ChartData) {
         }
     }
     let mut built = None;
+    // The NUMBERS decide which sheet the box names: every series' values, in
+    // series order. That is what the chart IS — the labels and the headers only
+    // annotate it.
     for s in &data.series {
-        if let Some(src) = s.name_ref.as_deref().and_then(ChartSource::parse_f_ref) {
-            fold(&mut built, src);
-        }
-        if let Some(src) = data.categories_ref.clone() {
-            fold(&mut built, src);
-        }
         if let Some(src) = s.values_ref.clone() {
             fold(&mut built, src);
         }
     }
-    // Categories can outlive every series ref — a chart whose series are all
-    // literal still has labels to cover.
-    if built.is_none() {
-        if let Some(src) = data.categories_ref.clone() {
+    // Then the LABEL cells, then the HEADER cells. All four slots belong in the
+    // box — leaving the categories out drops the label column and leaving the
+    // names out drops the header row, shrinking the DATA RANGE the panel shows
+    // from `A1:D5` to `B2:D5` the first time a series is re-pointed — but
+    // neither may DECIDE the sheet. Categories are one LINE of labels and a
+    // name is ONE cell, and each may legally sit on another sheet than the
+    // numbers (`target_takes_foreign_sheet` is `true` for both). Folded first
+    // one would seed the box, and every local ref after it would then be
+    // skipped for the sheet mismatch, collapsing a chart plotting `A1:D5` onto
+    // that one foreign line. Folded after, they stretch the box the numbers
+    // already decided, or seed it only when nothing else did — categories
+    // before names, so a chart whose series are all literal still takes its
+    // sheet from its labels rather than from a header cell.
+    if let Some(src) = data.categories_ref.clone() {
+        fold(&mut built, src);
+    }
+    for s in &data.series {
+        if let Some(src) = s.name_ref.as_deref().and_then(ChartSource::parse_f_ref) {
             fold(&mut built, src);
         }
     }
@@ -2371,19 +2390,24 @@ fn sort_rows_from(
 }
 
 /// The cells a range field's text points at ON THE SHEET IN FRONT OF YOU, or
-/// `None` when it points somewhere else. `here` is the active sheet's name.
+/// `None` when it points somewhere else. `names` are the workbook's sheets and
+/// `active` the one on screen.
 ///
 /// A reference naming another sheet gets no wash: washing this sheet's A1:D5
 /// for a ref that means Budget's A1:D5 would draw the very lie — same-named
 /// cells standing in for the ones actually read — that keeping the qualifier
 /// exists to remove. The field still holds the ref and the grid is still in
 /// point mode, so a drag can re-point it at cells you can see.
-fn preview_range(text: &str, here: &str) -> Option<(u32, u32, u32, u32)> {
+///
+/// The qualifier is RESOLVED (`sheet_index_of`) rather than matched against the
+/// active sheet's name, so the wash answers for the sheet a commit will
+/// actually act on. The two differ only on a workbook Excel forbids and this
+/// code tolerates — two sheets whose names differ in case, where the lookup
+/// takes the first — and there a name test would outline the active sheet's
+/// cells for a ref that reads the other one's.
+fn preview_range(text: &str, names: &[String], active: usize) -> Option<(u32, u32, u32, u32)> {
     let r = parse_ref_text(text)?;
-    match r.sheet {
-        Some(s) if !s.eq_ignore_ascii_case(here) => None,
-        _ => Some(r.range),
-    }
+    (sheet_index_of(names, r.sheet.as_deref(), active).ok()? == active).then_some(r.range)
 }
 
 /// The A1 text for a range dragged from `anchor` to `to`, in either direction.
@@ -3606,6 +3630,11 @@ impl Docxy {
         };
         s.name = name;
         s.name_ref = name_ref;
+        // A name cell is part of the chart's box (`rebuild_source`), so moving
+        // one moves the box — and `parse_chart` would rebuild it from the refs
+        // on the next open whether or not this did. Without this the panel
+        // shows one DATA RANGE before a save and another after it.
+        rebuild_source(&mut data);
         self.chart_set_data(data, cx);
     }
 
@@ -4180,8 +4209,8 @@ impl Docxy {
         if !f.target.is_range() {
             return None;
         }
-        let here = self.active_sheet().map_or("", |v| v.sheet().name.as_str());
-        preview_range(&f.buf, here)
+        let active = self.active_sheet()?.active;
+        preview_range(&f.buf, &self.sheet_names(), active)
     }
 
     /// Everything drawn over the grid that isn't the cells themselves: the fill
@@ -17328,8 +17357,66 @@ mod grid_geom_tests {
             Some(("Data", (0, 0, 4, 1)))
         );
 
+        // A single foreign series NAME must not take the box off the cells the
+        // chart plots. Folded first it would seed the box with `Budget!$B$1`
+        // and every local slot after it would be skipped for the sheet
+        // mismatch, so a chart over `Data!A1:C5` would read as one cell of
+        // Budget — DATA RANGE would show it, and Enter there would refuse the
+        // 1x1 box. Names go in LAST, so the plotted cells decide the sheet.
+        let mut d = chart(
+            vec![
+                ser(Some("Budget!$B$1"), Some(src("Data", (1, 1, 4, 1)))),
+                ser(Some("Data!$C$1"), Some(src("Data", (1, 2, 4, 2)))),
+            ],
+            Some(src("Data", (1, 0, 4, 0))),
+            Some(src("Data", (0, 0, 4, 2))),
+        );
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 0, 4, 2))),
+            "the foreign name is skipped, not made the box"
+        );
+
+        // The same, one slot over: `categories_apply` resolves a foreign sheet
+        // too (`target_takes_foreign_sheet(Categories)` is `true`), so pointing
+        // CATEGORY LABELS at `Budget!$A$2:$A$5` must not take the box off the
+        // numbers either. Folded before the values it would seed the box and
+        // every local slot after it would be skipped, so DATA RANGE would read
+        // `=Budget!$A$2:$A$5` for a chart plotting `Data!B2:C5` — and Switch
+        // Row/Column re-derives the whole chart from it.
+        let mut d = chart(
+            vec![
+                ser(Some("Data!$B$1"), Some(src("Data", (1, 1, 4, 1)))),
+                ser(Some("Data!$C$1"), Some(src("Data", (1, 2, 4, 2)))),
+            ],
+            Some(src("Budget", (1, 0, 4, 0))),
+            Some(src("Data", (0, 0, 4, 2))),
+        );
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 1, 4, 2))),
+            "the foreign categories ref is skipped, not made the box"
+        );
+
+        // With nothing else to go on, though, a name still seeds the box —
+        // otherwise a chart whose slots are all name cells would have none.
+        let mut d = chart(vec![ser(Some("Budget!$B$1"), None)], None, None);
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Budget", (0, 1, 0, 1)))
+        );
+
         // A chart whose series are all literal still has labels to cover.
         let mut d = chart(vec![ser(None, None)], Some(src("Data", (1, 0, 4, 0))), None);
+        super::rebuild_source(&mut d);
+        assert_eq!(d.source.map(|s| s.range), Some((1, 0, 4, 0)));
+
+        // And so does one with no `<c:ser>` at all, whose categories were first
+        // set through `categories_apply`.
+        let mut d = chart(Vec::new(), Some(src("Data", (1, 0, 4, 0))), None);
         super::rebuild_source(&mut d);
         assert_eq!(d.source.map(|s| s.range), Some((1, 0, 4, 0)));
 
@@ -18671,37 +18758,55 @@ mod grid_geom_tests {
             })
         );
         // And the wash follows it back onto the sheet you can see.
-        assert_eq!(preview_range(before, "Sheet1"), None);
-        assert_eq!(preview_range(&after, "Sheet1"), Some((1, 1, 4, 1)));
+        let wb = names(&["Sheet1", "Budget"]);
+        assert_eq!(preview_range(before, &wb, 0), None);
+        assert_eq!(preview_range(&after, &wb, 0), Some((1, 1, 4, 1)));
     }
 
     /// The wash may only cover cells the reference really reads. A ref naming
     /// another sheet washes nothing here, however well its A1 half parses.
     #[test]
     fn the_wash_only_covers_the_sheet_in_front_of_you() {
+        let wb = names(&["Sheet1", "Budget", "My Sheet", "Bob's Data"]);
         // No qualifier means this sheet, whichever it is.
-        assert_eq!(preview_range("A1:D5", "Sheet1"), Some((0, 0, 4, 3)));
-        assert_eq!(preview_range("=$A$1:$D$5", "Budget"), Some((0, 0, 4, 3)));
+        assert_eq!(preview_range("A1:D5", &wb, 0), Some((0, 0, 4, 3)));
+        assert_eq!(preview_range("=$A$1:$D$5", &wb, 1), Some((0, 0, 4, 3)));
         // Naming this sheet is the same thing, in any case and quoted or not.
         assert_eq!(
-            preview_range("=Sheet1!$A$1:$D$5", "Sheet1"),
+            preview_range("=Sheet1!$A$1:$D$5", &wb, 0),
             Some((0, 0, 4, 3))
         );
-        assert_eq!(preview_range("sheet1!a1:d5", "Sheet1"), Some((0, 0, 4, 3)));
+        assert_eq!(preview_range("sheet1!a1:d5", &wb, 0), Some((0, 0, 4, 3)));
         assert_eq!(
-            preview_range("='My Sheet'!$C$3:$C$3", "My Sheet"),
+            preview_range("='My Sheet'!$C$3:$C$3", &wb, 2),
             Some((2, 2, 2, 2))
         );
         // Naming another sheet washes nothing — the whole point.
-        assert_eq!(preview_range("=Budget!$A$1:$D$5", "Sheet1"), None);
-        assert_eq!(preview_range("Budget!A1:D5", "Sheet1"), None);
-        assert_eq!(preview_range("='Bob''s Data'!$A$1", "Sheet1"), None);
+        assert_eq!(preview_range("=Budget!$A$1:$D$5", &wb, 0), None);
+        assert_eq!(preview_range("Budget!A1:D5", &wb, 0), None);
+        assert_eq!(preview_range("='Bob''s Data'!$A$1", &wb, 0), None);
         // Even a sheet the workbook hasn't got: it isn't THIS one either.
-        assert_eq!(preview_range("=Nowhere!$A$1:$B$2", "Sheet1"), None);
+        assert_eq!(preview_range("=Nowhere!$A$1:$B$2", &wb, 0), None);
         // And text that isn't a range at all never washes.
-        assert_eq!(preview_range("total", "Sheet1"), None);
-        assert_eq!(preview_range("", "Sheet1"), None);
-        assert_eq!(preview_range("=Sheet1!", "Sheet1"), None);
+        assert_eq!(preview_range("total", &wb, 0), None);
+        assert_eq!(preview_range("", &wb, 0), None);
+        assert_eq!(preview_range("=Sheet1!", &wb, 0), None);
+    }
+
+    /// The wash must answer for the sheet a COMMIT will act on, and a commit
+    /// resolves the qualifier through `sheet_index_of` — first case-insensitive
+    /// match wins. Excel forbids two sheets differing only in case; this code
+    /// tolerates them, so the two lookups have to agree on which one is meant.
+    #[test]
+    fn the_wash_resolves_a_qualifier_the_way_a_commit_does() {
+        let wb = names(&["Budget", "budget"]);
+        // Sheet 1 is active and the ref says `budget` — but `budget` resolves
+        // to sheet 0, so those are not the cells in front of you.
+        assert_eq!(preview_range("=budget!$A$1", &wb, 1), None);
+        assert_eq!(sheet_index_of(&wb, Some("budget"), 1), Ok(0));
+        // From sheet 0 the same ref does wash, because that is where it reads.
+        assert_eq!(preview_range("=budget!$A$1", &wb, 0), Some((0, 0, 0, 0)));
+        assert_eq!(preview_range("=BUDGET!$A$1", &wb, 0), Some((0, 0, 0, 0)));
     }
 
     #[test]
