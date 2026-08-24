@@ -402,6 +402,44 @@ pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
     parse_chart(xml)
 }
 
+/// Which way round a parsed chart reads its range.
+///
+/// SpreadsheetML has no orientation element, so this asks the question Excel
+/// asks: what SHAPE is each series' `<c:val>`? One row across several columns
+/// (`$B$2:$D$2`) is a row series; one column down several rows (`$B$2:$B$5`) is
+/// a column series.
+///
+/// Every ambiguous case answers "column", because that is what every chart
+/// written before orientation existed is, and what the panel can always show:
+///
+/// - **A single cell** (`$B$2`) is one row AND one column at once — it fits
+///   both readings, so it votes for neither.
+/// - **A series with no readable ref**: `<c:numLit>` values, or a ref this
+///   model cannot hold (`Sheet1!$B:$B`, a defined name). There is no shape to
+///   measure, so no vote.
+/// - **A rectangle** spanning both ways (`$B$2:$D$5`) is a shape neither
+///   reading produces — a hand-authored or foreign chart. No vote.
+/// - **Series that disagree**: a row vote must be UNANIMOUS to win. A chart
+///   mixing the two is one this model cannot re-derive either way round, and
+///   the column reading is the safer of the two to hand the user, since
+///   `ChartSeries::col` and `ChartSource::cat_col` both assume it.
+///
+/// With no votes at all — the chart has no series, or none with a ref — the
+/// answer is the same: column.
+fn infer_by_row(cd: &ChartData) -> bool {
+    let (mut rows, mut cols) = (0usize, 0usize);
+    for s in &cd.series {
+        let Some(v) = &s.values_ref else { continue };
+        let (r1, c1, r2, c2) = v.range;
+        match (r1 == r2, c1 == c2) {
+            (true, false) => rows += 1,
+            (false, true) => cols += 1,
+            _ => {}
+        }
+    }
+    rows > 0 && cols == 0
+}
+
 fn parse_chart(xml: &str) -> ChartData {
     let mut cd = ChartData::default();
     let mut budget = MAX_CACHE_POINTS;
@@ -671,13 +709,24 @@ fn parse_chart(xml: &str) -> ChartData {
     }
     cd.complex =
         groups > 1 || unparsed_ref || !matches!(grouping.as_str(), "" | "clustered" | "standard");
+    cd.by_row = infer_by_row(&cd);
     // `cat_col` is set by whichever `<c:f>` landed in the box FIRST, and inside
     // a `<c:ser>` that is the series' NAME ref — its header cell, in the column
     // it plots. Where the labels really live is `<c:cat>`, so say so whenever
     // the chart told us.
-    if let (Some(src), Some(cats)) = (cd.source.as_mut(), cd.categories_ref.as_ref()) {
-        if src.sheet == cats.sheet {
-            src.cat_col = cats.range.1;
+    //
+    // Not for a row chart, though: there the labels live in a ROW, and
+    // `cat_col` is a column index that cannot say so. `categories_ref.range.1`
+    // is merely the left end of that label row — the first CATEGORY's column,
+    // never the labels' own column — so the fixup would move `cat_col` off the
+    // series-name column onto a plotted one. Left alone, `cat_col` keeps what
+    // the first ref in the box gave it (a series' name cell, in the label
+    // column), which is exactly what `chart_from_rows` puts there.
+    if !cd.by_row {
+        if let (Some(src), Some(cats)) = (cd.source.as_mut(), cd.categories_ref.as_ref()) {
+            if src.sheet == cats.sheet {
+                src.cat_col = cats.range.1;
+            }
         }
     }
     cd
@@ -1508,5 +1557,115 @@ mod tests {
             DrawingKind::Chart(c) => assert_eq!(c.kind, "pie"),
             _ => panic!("expected chart"),
         }
+    }
+
+    /// The Overview's table read the OTHER way round: one series per PRODUCT
+    /// row, the header row as categories. Nothing in the file says so — the
+    /// only evidence is that each `<c:val>` spans one row and three columns —
+    /// so the loader has to work it out, or the panel comes back showing the
+    /// wrong button state for a chart Excel is drawing correctly.
+    #[test]
+    fn a_row_oriented_chart_is_recognised_by_the_shape_of_its_refs() {
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Budget!$A$2</c:f><c:strCache><c:pt idx="0"><c:v>Laptop</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strRef><c:f>Budget!$B$1:$D$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt><c:pt idx="1"><c:v>Unit price</c:v></c:pt><c:pt idx="2"><c:v>Total</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$B$2:$D$2</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>1199</c:v></c:pt><c:pt idx="2"><c:v>2398</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser>
+          <c:ser><c:idx val="1"/>
+            <c:tx><c:strRef><c:f>Budget!$A$3</c:f><c:strCache><c:pt idx="0"><c:v>Monitor</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strRef><c:f>Budget!$B$1:$D$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt><c:pt idx="1"><c:v>Unit price</c:v></c:pt><c:pt idx="2"><c:v>Total</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$B$3:$D$3</c:f><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt><c:pt idx="1"><c:v>249.5</c:v></c:pt><c:pt idx="2"><c:v>998</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert!(cd.by_row, "one row across three columns is a row series");
+        let names: Vec<&str> = cd.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Laptop", "Monitor"]);
+        assert_eq!(cd.series[0].values, vec![2.0, 1199.0, 2398.0]);
+        assert_eq!(cd.series[1].values, vec![4.0, 249.5, 998.0]);
+        assert_eq!(cd.categories, vec!["Qty", "Unit price", "Total"]);
+        // Each series kept its own row rectangle, and the categories their row.
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|v| v.range),
+            Some((1, 1, 1, 3))
+        );
+        assert_eq!(
+            cd.series[1].values_ref.as_ref().map(|v| v.range),
+            Some((2, 1, 2, 3))
+        );
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|v| v.range),
+            Some((0, 1, 0, 3))
+        );
+        // The box is the whole table, and `cat_col` still names the column the
+        // SERIES NAMES come from — the fixup that would have moved it onto the
+        // first category's column (B) does not run for a row chart.
+        assert_eq!(
+            cd.source.as_ref().map(|s| (s.range, s.cat_col)),
+            Some(((0, 0, 2, 3), 0))
+        );
+    }
+
+    /// The regression that matters: every chart written before orientation
+    /// existed is column-oriented, and must still parse as one.
+    #[test]
+    fn a_column_oriented_chart_is_still_column_oriented() {
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Budget!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>Qty</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:cat><c:strRef><c:f>Budget!$A$2:$A$3</c:f><c:strCache><c:pt idx="0"><c:v>Laptop</c:v></c:pt><c:pt idx="1"><c:v>Dock</c:v></c:pt></c:strCache></c:strRef></c:cat>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert!(!cd.by_row, "one column down two rows is a column series");
+        // And the `cat_col` fixup still runs for it: the labels are in A.
+        assert_eq!(cd.source.as_ref().map(|s| s.cat_col), Some(0));
+    }
+
+    /// Every shape that fits both readings, or neither, answers "column" — the
+    /// orientation every pre-existing chart has, and the only one the rest of
+    /// the model (`ChartSeries::col`, `ChartSource::cat_col`) can describe.
+    #[test]
+    fn ambiguous_series_shapes_default_to_column_orientation() {
+        let chart = |sers: &str| {
+            format!(
+                r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>{sers}</c:barChart></c:plotArea></c:chart></c:chartSpace>"#
+            )
+        };
+        let val = |f: &str| {
+            format!(
+                r#"<c:ser><c:idx val="0"/><c:val><c:numRef><c:f>{f}</c:f><c:numCache><c:ptCount val="1"/><c:pt idx="0"><c:v>1</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#
+            )
+        };
+
+        // A single cell is one row AND one column: it fits both readings.
+        assert!(!parse_chart(&chart(&val("Budget!$B$2"))).by_row);
+
+        // A rectangle is a shape neither reading produces.
+        assert!(!parse_chart(&chart(&val("Budget!$B$2:$D$5"))).by_row);
+
+        // Literal values: no ref at all, so nothing to measure.
+        let lit = r#"<c:ser><c:idx val="0"/><c:val><c:numLit><c:ptCount val="2"/><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numLit></c:val></c:ser>"#;
+        let cd = parse_chart(&chart(lit));
+        assert_eq!(cd.series.len(), 1);
+        assert!(!cd.by_row);
+
+        // A ref this model cannot hold — a whole column — is no shape either.
+        let whole = parse_chart(&chart(&val("Budget!$B:$B")));
+        assert!(!whole.by_row);
+        assert!(whole.complex, "an unparsed ref keeps the part verbatim");
+
+        // Series that DISAGREE: one row-shaped, one column-shaped. A row vote
+        // has to be unanimous, so this reads as a column chart.
+        let mixed = parse_chart(&chart(&format!(
+            "{}{}",
+            val("Budget!$B$2:$D$2"),
+            val("Budget!$B$3:$B$5")
+        )));
+        assert_eq!(mixed.series.len(), 2);
+        assert!(!mixed.by_row, "a mixed chart falls back to column");
+
+        // No series at all — nothing votes, and the answer is still column.
+        assert!(!parse_chart(&chart("")).by_row);
     }
 }

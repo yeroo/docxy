@@ -229,18 +229,18 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 4: Infer orientation when loading a chart
 
-- [ ] in `parse_chart` (gridcore/src/drawing.rs), infer `by_row` from the shape
+- [x] in `parse_chart` (gridcore/src/drawing.rs), infer `by_row` from the shape
       of the series' value refs: a `<c:val>` spanning one row and several
       columns is row-oriented; one column and several rows is column-oriented
-- [ ] decide the ambiguous cases explicitly and comment them: a single cell, a
+- [x] decide the ambiguous cases explicitly and comment them: a single cell, a
       series with no ref at all, and a chart whose series disagree. Default to
       column-oriented, which is what every chart written before this plan is
-- [ ] check the `cat_col` fixup (drawing.rs:674-680) still does the right thing
+- [x] check the `cat_col` fixup (drawing.rs:674-680) still does the right thing
       for a row chart, or is skipped
-- [ ] write tests parsing a hand-written row-oriented `chartSpace` and
+- [x] write tests parsing a hand-written row-oriented `chartSpace` and
       asserting `by_row`, the series, and the categories
-- [ ] write tests for each ambiguous case named above
-- [ ] run tests — must pass before Task 5
+- [x] write tests for each ambiguous case named above
+- [x] run tests — must pass before Task 5
 
 ### Task 5: Round-trip a row-oriented chart
 
