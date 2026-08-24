@@ -1490,8 +1490,9 @@ enum NameCommit {
     /// The text is still the name the field was seeded with — leave the series
     /// exactly as it is.
     Unchanged,
-    /// A reference: read the name out of those cells and keep the link.
-    Ref((u32, u32, u32, u32)),
+    /// A reference: read the name out of those cells — on the sheet it names,
+    /// if it named one — and keep the link.
+    Ref(RefText),
     /// Anything else is the name itself.
     Literal,
 }
@@ -1507,9 +1508,8 @@ fn series_name_commit(text: &str, shown: &str) -> NameCommit {
     if text.trim() == shown.trim() {
         return NameCommit::Unchanged;
     }
-    // Task 4 resolves the sheet a ref may name; for now only its cells matter.
     match parse_ref_text(text) {
-        Some(r) => NameCommit::Ref(r.range),
+        Some(r) => NameCommit::Ref(r),
         None => NameCommit::Literal,
     }
 }
@@ -1570,9 +1570,6 @@ fn unquote_sheet_name(prefix: &str) -> Option<String> {
 /// Excel forbids two sheets whose names differ only in case, but a hand-built
 /// file can carry them; the first one wins, as it does everywhere else the app
 /// looks a sheet up by name.
-// Wired into the commit paths in the next task; until then only the tests
-// reach it.
-#[allow(dead_code)]
 fn sheet_index_of(names: &[String], sheet: Option<&str>, active: usize) -> Result<usize, String> {
     let Some(want) = sheet else {
         return Ok(active);
@@ -1589,21 +1586,31 @@ fn sheet_index_of(names: &[String], sheet: Option<&str>, active: usize) -> Resul
 /// million divs, every frame, rather than draw anything anyone wanted.
 const MAX_CHART_CELLS: u64 = 4096;
 
-/// A chart field's range, or what to tell the user. `example` is the shape that
-/// field wants, for the "isn't a range" message.
-fn chart_range_of(text: &str, example: &str) -> Result<(u32, u32, u32, u32), String> {
+/// Which sheet a chart field reads and which of its cells, or what to tell the
+/// user. `example` is the shape that field wants, for the "isn't a range"
+/// message; `names` are the workbook's sheets and `active` the one on screen,
+/// which is what an unqualified reference means.
+///
+/// The cell cap is weighed BEFORE the sheet is looked up, because a range too
+/// big to plot is too big on every sheet — reporting the missing sheet first
+/// would only send the user back to fix the same field twice.
+fn chart_ref_of(
+    text: &str,
+    example: &str,
+    names: &[String],
+    active: usize,
+) -> Result<(usize, (u32, u32, u32, u32)), String> {
     let Some(r) = parse_ref_text(text) else {
         return Err(format!("\"{}\" isn't a range like {example}", text.trim()));
     };
-    let range = r.range;
-    let (r1, c1, r2, c2) = range;
+    let (r1, c1, r2, c2) = r.range;
     let cells = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
     if cells > MAX_CHART_CELLS {
         return Err(format!(
             "that range is {cells} cells; a chart plots at most {MAX_CHART_CELLS}"
         ));
     }
-    Ok(range)
+    Ok((sheet_index_of(names, r.sheet.as_deref(), active)?, r.range))
 }
 
 /// Drop series `i`, unless it is the last one — a chart with no series has
@@ -2720,19 +2727,13 @@ impl Docxy {
 
     /// Re-point the selected chart at another range, replotting its categories
     /// and series from those cells while keeping its type, title and colours.
-    /// A `Sheet!A1:D5` form is accepted; Task 5 resolves the sheet it names,
-    /// until when the cells are read from the sheet in front of you.
+    /// The reference names the sheet it reads — a chart floating over one sheet
+    /// can plot another sheet's numbers — and an unqualified one means the
+    /// sheet in front of you.
     fn chart_apply_range(&mut self, text: &str, cx: &mut Context<Self>) {
         let Some(old) = self.chart_data() else { return };
-        // The field shows the box qualified, but the read below is still the
-        // ACTIVE sheet's, so a chart floating over one sheet and plotting
-        // another would be re-pointed here by committing its own seed text.
-        // Task 5 resolves the qualifier and this guard goes.
-        if self.ref_block_elsewhere(RefTarget::ChartRange, old.source.as_ref(), cx) {
-            return;
-        }
         let cells = text.trim();
-        let range = match chart_range_of(text, "=Sheet1!$A$1:$D$5") {
+        let (si, range) = match self.chart_ref(text, "=Sheet1!$A$1:$D$5") {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::ChartRange, false, m));
@@ -2740,8 +2741,11 @@ impl Docxy {
                 return;
             }
         };
+        // `chart_from_range` is handed the RESOLVED sheet and stamps its name on
+        // every ref it builds, so a chart re-pointed at another sheet saves as a
+        // `<c:f>` naming that sheet.
         let Some(mut data) = self.active_sheet().and_then(|v| {
-            let sh = v.sheet();
+            let sh = &v.pkg.workbook.sheets[si];
             gridcore::sheet::chart_from_range(sh, &sh.name, range, &old.kind)
         }) else {
             let (r1, c1, r2, c2) = range;
@@ -2947,52 +2951,13 @@ impl Docxy {
         self.find_open = false;
     }
 
-    /// The sheet a chart reference reads, when that is NOT the sheet on screen.
-    /// A chart floats over one sheet and may plot another; the fields now SHOW
-    /// which, but the commit paths still read the active sheet, so committing
-    /// one of those slots from the wrong sheet would move it here, onto
-    /// unrelated numbers. Task 5 resolves the qualifier and this guard goes.
-    fn ref_elsewhere(&self, src: Option<&gridcore::sheet::ChartSource>) -> Option<String> {
-        let here = self.active_sheet()?.sheet().name.clone();
-        let src = src?;
-        (!src.sheet.eq_ignore_ascii_case(&here)).then(|| src.sheet.clone())
-    }
-
-    /// Refuse a commit whose slot reads another sheet, saying which. `true` when
-    /// the caller should stop.
-    fn ref_block_elsewhere(
-        &mut self,
-        target: RefTarget,
-        src: Option<&gridcore::sheet::ChartSource>,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let Some(other) = self.ref_elsewhere(src) else {
-            return false;
-        };
-        self.ref_msg = Some((
-            target,
-            false,
-            format!("these cells are on {other}; open that sheet to re-point them"),
-        ));
-        cx.notify();
-        true
-    }
-
     /// Re-point one series at another range, re-reading just its numbers. The
     /// other series and the categories are left exactly as they were.
     fn series_apply_values(&mut self, i: usize, text: &str, cx: &mut Context<Self>) {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        let target = RefTarget::SeriesValues(i);
-        if self.ref_block_elsewhere(
-            target,
-            data.series.get(i).and_then(|s| s.values_ref.as_ref()),
-            cx,
-        ) {
-            return;
-        }
-        let range = match chart_range_of(text, "=Sheet1!$B$2:$B$5") {
+        let (si, range) = match self.chart_ref(text, "=Sheet1!$B$2:$B$5") {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::SeriesValues(i), false, m));
@@ -3014,7 +2979,10 @@ impl Docxy {
             return;
         }
         let Some(v) = self.active_sheet() else { return };
-        let sh = v.sheet();
+        // The RESOLVED sheet, not the one on screen: its name is what rides on
+        // the `ChartSource` written back, and so what makes a cross-sheet
+        // reference survive a save.
+        let sh = &v.pkg.workbook.sheets[si];
         let name = sh.name.clone();
         let values = gridcore::sheet::range_numbers(sh, range);
         let src = gridcore::sheet::ChartSource {
@@ -3047,19 +3015,20 @@ impl Docxy {
             .get(i)
             .map(|s| series_name_shown(&s.name, s.name_ref.as_deref()))
             .unwrap_or_default();
-        let held = data
-            .series
-            .get(i)
-            .and_then(|s| s.name_ref.as_deref())
-            .and_then(gridcore::sheet::ChartSource::parse_f_ref);
-        if self.ref_block_elsewhere(RefTarget::SeriesName(i), held.as_ref(), cx) {
-            return;
-        }
         let (name, name_ref) = match series_name_commit(text, &shown) {
             NameCommit::Unchanged => return,
-            NameCommit::Ref(range) => {
+            NameCommit::Ref(r) => {
+                let si = match self.ref_sheet_index(r.sheet.as_deref()) {
+                    Ok(si) => si,
+                    Err(m) => {
+                        self.ref_msg = Some((RefTarget::SeriesName(i), false, m));
+                        cx.notify();
+                        return;
+                    }
+                };
+                let range = r.range;
                 let Some(v) = self.active_sheet() else { return };
-                let sh = v.sheet();
+                let sh = &v.pkg.workbook.sheets[si];
                 let label = gridcore::sheet::range_labels(sh, range)
                     .first()
                     .cloned()
@@ -3165,10 +3134,7 @@ impl Docxy {
         let Some(mut data) = self.chart_data() else {
             return;
         };
-        if self.ref_block_elsewhere(RefTarget::Categories, data.categories_ref.as_ref(), cx) {
-            return;
-        }
-        let range = match chart_range_of(text, "=Sheet1!$A$2:$A$5") {
+        let (si, range) = match self.chart_ref(text, "=Sheet1!$A$2:$A$5") {
             Ok(r) => r,
             Err(m) => {
                 self.ref_msg = Some((RefTarget::Categories, false, m));
@@ -3177,7 +3143,8 @@ impl Docxy {
             }
         };
         let Some(v) = self.active_sheet() else { return };
-        let sh = v.sheet();
+        // The resolved sheet: its labels, and its name on the ref written back.
+        let sh = &v.pkg.workbook.sheets[si];
         data.categories = gridcore::sheet::range_labels(sh, range);
         let src = gridcore::sheet::ChartSource {
             sheet: sh.name.clone(),
@@ -4002,20 +3969,39 @@ impl Docxy {
     /// The `Err` is worded for the user because that is where it goes: straight
     /// into `ref_msg`, under the field that named a sheet the workbook hasn't
     /// got.
-    // Wired into the chart and validation commit paths in the next task.
-    #[allow(dead_code)]
     fn ref_sheet_index(&self, sheet: Option<&str>) -> Result<usize, String> {
         let Some(v) = self.active_sheet() else {
             return Err("there's no workbook open".to_string());
         };
-        let names: Vec<String> = v
-            .pkg
-            .workbook
-            .sheets
-            .iter()
-            .map(|s| s.name.clone())
-            .collect();
-        sheet_index_of(&names, sheet, v.active)
+        sheet_index_of(&self.sheet_names(), sheet, v.active)
+    }
+    /// The open workbook's sheet names, in order, for the by-name lookups a
+    /// reference's qualifier needs. Empty when no sheet is on screen.
+    fn sheet_names(&self) -> Vec<String> {
+        self.active_sheet()
+            .map(|v| {
+                v.pkg
+                    .workbook
+                    .sheets
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    /// What a chart field's text commits to: the sheet index to read and the
+    /// cells of it. The `Err` is the message for `ref_msg`, whether the text
+    /// isn't a range, asks for more cells than a chart plots, or names a sheet
+    /// the workbook hasn't got.
+    fn chart_ref(
+        &self,
+        text: &str,
+        example: &str,
+    ) -> Result<(usize, (u32, u32, u32, u32)), String> {
+        let Some(v) = self.active_sheet() else {
+            return Err("there's no workbook open".to_string());
+        };
+        chart_ref_of(text, example, &self.sheet_names(), v.active)
     }
     fn active_sheet_mut(&mut self) -> Option<&mut SheetView> {
         match self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
@@ -16340,7 +16326,7 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        RefText, char_to_byte, chart_range_of, col_at_x, col_px, edit_runs, fill_box,
+        RefText, char_to_byte, chart_ref_of, col_at_x, col_px, edit_runs, fill_box,
         formula_ref_tokens, last_visible_col, parse_ref_text, range_a1, range_text, ref_a1,
         ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
         row_height_px, scroll_col0_for_sel, series_move, series_name_shown, series_remove,
@@ -16554,11 +16540,26 @@ mod grid_geom_tests {
         // Actually typing a reference points the name at those cells.
         assert_eq!(
             series_name_commit("B1", "Qty"),
-            NameCommit::Ref((0, 1, 0, 1))
+            NameCommit::Ref(super::RefText {
+                sheet: None,
+                range: (0, 1, 0, 1)
+            })
         );
         assert_eq!(
             series_name_commit("$D$7", "Qty"),
-            NameCommit::Ref((6, 3, 6, 3))
+            NameCommit::Ref(super::RefText {
+                sheet: None,
+                range: (6, 3, 6, 3)
+            })
+        );
+        // A qualifier survives the commit: this is the name of a cell on
+        // ANOTHER sheet, and `series_apply_name` resolves it there.
+        assert_eq!(
+            series_name_commit("=Budget!$B$1", "Qty"),
+            NameCommit::Ref(super::RefText {
+                sheet: Some("Budget".into()),
+                range: (0, 1, 0, 1)
+            })
         );
         // Anything else is the name itself.
         assert_eq!(series_name_commit("Revenue", "Qty"), NameCommit::Literal);
@@ -16782,24 +16783,92 @@ mod grid_geom_tests {
         }
     }
 
+    /// The workbook the chart-reference tests resolve against: the sheet on
+    /// screen is index 1, so reading index 0 or 2 can only have come from a
+    /// qualifier rather than from a fallback to the active sheet.
+    fn book() -> Vec<String> {
+        vec!["Budget".into(), "Sheet2".into(), "My Sheet".into()]
+    }
+
     #[test]
-    fn chart_range_of_bounds_what_a_chart_will_read() {
-        // A range a chart can plot comes back parsed.
-        assert_eq!(chart_range_of("B2:B5", "B2:B5"), Ok((1, 1, 4, 1)));
-        assert_eq!(chart_range_of(" c3 ", "B2:B5"), Ok((2, 2, 2, 2)));
+    fn chart_ref_of_bounds_what_a_chart_will_read() {
+        let b = book();
+        // A range a chart can plot comes back parsed, on the sheet in front of
+        // you when it named none.
+        assert_eq!(chart_ref_of("B2:B5", "B2:B5", &b, 1), Ok((1, (1, 1, 4, 1))));
+        assert_eq!(chart_ref_of(" c3 ", "B2:B5", &b, 1), Ok((1, (2, 2, 2, 2))));
         // Anything that isn't a range says so, quoting the field's own example.
         assert_eq!(
-            chart_range_of("total", "A2:A5"),
+            chart_ref_of("total", "A2:A5", &b, 1),
             Err("\"total\" isn't a range like A2:A5".to_string())
         );
         // A whole column parses fine and would allocate a million cells — the
         // point of the cap is that the field declines instead of hanging.
-        let err = chart_range_of("A1:A1048576", "B2:B5").unwrap_err();
+        let err = chart_ref_of("A1:A1048576", "B2:B5", &b, 1).unwrap_err();
         assert!(err.contains("1048576 cells"), "got {err:?}");
         assert!(err.contains("at most 4096"), "got {err:?}");
         // The cap is inclusive at the boundary.
-        assert!(chart_range_of("A1:A4096", "B2:B5").is_ok());
-        assert!(chart_range_of("A1:A4097", "B2:B5").is_err());
+        assert!(chart_ref_of("A1:A4096", "B2:B5", &b, 1).is_ok());
+        assert!(chart_ref_of("A1:A4097", "B2:B5", &b, 1).is_err());
+    }
+
+    #[test]
+    fn chart_ref_of_reads_the_sheet_the_reference_names() {
+        let b = book();
+        // The bug this whole syntax exists to remove: a qualifier naming
+        // another sheet is HONOURED, so these cells come off Budget rather than
+        // off Sheet2, which is the one on screen.
+        assert_eq!(
+            chart_ref_of("=Budget!$A$1:$D$5", "=Sheet1!$A$1:$D$5", &b, 1),
+            Ok((0, (0, 0, 4, 3)))
+        );
+        // Excel matches sheet names case-insensitively, and so does this.
+        assert_eq!(
+            chart_ref_of("budget!A1:D5", "=Sheet1!$A$1:$D$5", &b, 1),
+            Ok((0, (0, 0, 4, 3)))
+        );
+        // A name needing quotes resolves through the same path.
+        assert_eq!(
+            chart_ref_of("='My Sheet'!$B$2:$B$5", "=Sheet1!$B$2:$B$5", &b, 1),
+            Ok((2, (1, 1, 4, 1)))
+        );
+        // Naming the sheet you are already looking at is just the active one.
+        assert_eq!(
+            chart_ref_of("=Sheet2!$B$2:$B$5", "=Sheet1!$B$2:$B$5", &b, 1),
+            Ok((1, (1, 1, 4, 1)))
+        );
+        // Every field's own seed text — `ref_a1` over the active sheet — must
+        // commit unchanged, or re-pressing Enter on an untouched field would
+        // report an error.
+        let seed = super::ref_a1(Some("Sheet2"), (1, 1, 4, 1));
+        assert_eq!(
+            chart_ref_of(&seed, "=Sheet1!$B$2:$B$5", &b, 1),
+            Ok((1, (1, 1, 4, 1)))
+        );
+    }
+
+    #[test]
+    fn chart_ref_of_refuses_a_sheet_the_workbook_hasnt_got() {
+        let b = book();
+        // Named but absent: refused by name, never redirected to the active
+        // sheet's cells of the same address.
+        assert_eq!(
+            chart_ref_of("=Ledger!$A$1:$D$5", "=Sheet1!$A$1:$D$5", &b, 1),
+            Err("there's no sheet called \"Ledger\"".to_string())
+        );
+        // A foreign sheet does not buy a way past the cell cap: the range is
+        // weighed first, so this reports the size rather than the sheet.
+        let err = chart_ref_of("=Budget!$A$1:$A$100000", "=Sheet1!$B$2:$B$5", &b, 1).unwrap_err();
+        assert!(err.contains("at most 4096"), "got {err:?}");
+        // Both wrong: the cap still speaks first, and the range is still the
+        // thing to fix.
+        let err = chart_ref_of("=Ledger!$A$1:$A$100000", "=Sheet1!$B$2:$B$5", &b, 1).unwrap_err();
+        assert!(err.contains("at most 4096"), "got {err:?}");
+        // A qualifier over text that isn't cells is still not a range.
+        assert_eq!(
+            chart_ref_of("Budget!total", "A2:A5", &b, 1),
+            Err("\"Budget!total\" isn't a range like A2:A5".to_string())
+        );
     }
 
     #[test]

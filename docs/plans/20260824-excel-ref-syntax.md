@@ -251,25 +251,38 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 5: Chart fields read from the sheet their reference names
 
-- [ ] `series_apply_values` (main.rs:2847): resolve the ref's sheet via
+- [x] `series_apply_values` (main.rs:2847): resolve the ref's sheet via
       `ref_sheet_index` instead of the hardcoded `self.active_sheet()`, and read
       the numbers from that sheet; report an unknown sheet through `ref_msg`
-      against `RefTarget::SeriesValues(i)`
-- [ ] `series_apply_name`: same, reading the label through
-      `gridcore::sheet::range_labels` on the resolved sheet
-- [ ] `categories_apply`: same, against `RefTarget::Categories`
-- [ ] the DATA RANGE commit path: same, against `RefTarget::ChartRange`
-- [ ] make sure the `ChartSource` written back carries the **resolved** sheet's
+      against `RefTarget::SeriesValues(i)` — via the new `chart_ref`, which is
+      `chart_range_of` renamed to `chart_ref_of` and grown a sheet lookup, so
+      "isn't a range", "too many cells" and "no such sheet" all arrive as one
+      `Err` the caller drops straight into `ref_msg`
+- [x] `series_apply_name`: same, reading the label through
+      `gridcore::sheet::range_labels` on the resolved sheet — `NameCommit::Ref`
+      now carries the whole `RefText` rather than just its cells, and the sheet
+      is resolved through `ref_sheet_index`
+- [x] `categories_apply`: same, against `RefTarget::Categories`
+- [x] the DATA RANGE commit path: same, against `RefTarget::ChartRange`
+- [x] make sure the `ChartSource` written back carries the **resolved** sheet's
       name, not the active sheet's — this is what makes the ref persist as a
-      real `<c:f>` pointing at the other sheet
-- [ ] keep the existing guards intact: the one-column rule for a series
-      (main.rs:2871) and the `MAX_CHART_CELLS` cap (main.rs:1529)
-- [ ] write tests for the pure decision — given a ref's sheet, the workbook's
+      real `<c:f>` pointing at the other sheet (`chart_from_range` is handed the
+      resolved sheet and stamps its name on every ref it builds)
+- [x] keep the existing guards intact: the one-column rule for a series
+      (main.rs:2871) and the `MAX_CHART_CELLS` cap (main.rs:1529) — the cap is
+      weighed BEFORE the sheet lookup, so a range too big to plot reports its
+      size rather than a missing sheet the user would then fix twice
+- [x] ➕ delete `ref_elsewhere` / `ref_block_elsewhere`: the stopgap that refused
+      to commit a slot already reading another sheet, added in Task 3 when the
+      fields began SHOWING a qualifier the commit paths still ignored. Resolution
+      replaces it — the four paths now honour the qualifier instead of refusing
+      it, which is the whole point of this plan
+- [x] write tests for the pure decision — given a ref's sheet, the workbook's
       sheet names, and the active index, which sheet index is read and what
       message (if any) is produced
-- [ ] write tests for the error cases: unknown sheet, and a foreign sheet
+- [x] write tests for the error cases: unknown sheet, and a foreign sheet
       combined with a too-large range (the cell cap must still fire)
-- [ ] run tests — must pass before Task 6
+- [x] run tests — must pass before Task 6
 
 ### Task 6: Data validation accepts a foreign sheet; sort and text-to-columns refuse one
 
