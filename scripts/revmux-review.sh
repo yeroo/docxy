@@ -1,159 +1,133 @@
 #!/usr/bin/env bash
-# revmux-review.sh — ralphex external-review hook that runs revmux.
+# Bridge: make revmux serve as ralphex's external review tool.
 #
-# ralphex calls this via pkg/executor/custom.go as `exec.Command(script, promptFile)`
-# — a direct exec with NO shell — so on Windows it must be reached through
-# revmux-review.cmd, which bridges into Git bash. See that file.
+# Adapted from the proven winterm-browser hook (tools/ralphex-revmux.sh). Keep
+# the two in step — differences here should be docxy-specific, not accidental.
 #
-# Wiring (.ralphex/config):
-#   external_review_tool = custom
-#   custom_review_script = scripts/revmux-review.cmd
+# ralphex calls this with exec.Command(script, promptFile) — no shell, one
+# argument, stdout and stderr merged and streamed line by line. It watches the
+# stream for <<<RALPHEX:CODEX_REVIEW_DONE>>>, which we MUST emit exactly once
+# when finished; without it ralphex waits out its idle timeout on a review that
+# already completed.
 #
-# Contract: $1 is the rendered prompt file (ralphex has already substituted
-# {{GOAL}}, {{DIFF_INSTRUCTION}}, {{PLAN_FILE}} and friends into it). Whatever we
-# print on stdout becomes the findings ralphex feeds to its evaluation phase.
-
-set -euo pipefail
-
-command -v revmux >/dev/null 2>&1 || { echo "error: revmux not found on PATH" >&2; exit 1; }
-
-prompt_file="${1:-}"
-if [[ -z "$prompt_file" || ! -f "$prompt_file" ]]; then
-    echo "error: prompt file not provided or not found: ${prompt_file:-<none>}" >&2
-    exit 1
-fi
-
-repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
-cd "$repo_root"
-
-# One revmux task per branch, one round per invocation. ralphex's external
-# review is a LOOP — it calls this again after each fix round — so the run name
-# has to be unique or `revmux new` would collide with the previous round.
-branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo detached)
-task="ralphex-${branch//\//-}"
-run="$(date +%Y%m%d-%H%M%S)"
-
-paths=$(revmux new --task "$task" --run "$run")
-pluck() { printf '%s' "$paths" | sed -n "s/.*\"$1\": \"\\(.*\\)\".*/\\1/p" | sed 's/\\\\/\//g'; }
-goal_md=$(pluck goal)
-scope_md=$(pluck scope)
-profile_md=$(pluck profile)
-round_dir=$(pluck round_dir)
-
-# The ralphex prompt already states the goal and the review focus, and carries
-# the diff command for this iteration plus any previous-round context. Hand it
-# over whole rather than paraphrasing it — paraphrase is where review context
+# The prompt file ralphex hands us is its rendered custom_review.txt: it already
+# carries the goal, the git diff command for THIS iteration, the plan path and
+# the progress log. That is very nearly a revmux scope, so it is passed through
+# verbatim rather than reconstructed — paraphrase is where review context
 # silently goes missing between rounds.
-cp "$prompt_file" "$goal_md"
-
-# The default branch ralphex diffs against, as it wrote it into the prompt.
-# ralphex renders the diff command for THIS iteration into the prompt — it is
-# narrower than "branch vs main" once the run is under way, and reviewing the
-# whole branch would drag in every commit that predates the plan. Take its
-# command verbatim rather than reconstructing one.
-diff_cmd=$(grep -m1 -oE '^git diff .*$' "$prompt_file" || true)
-diff_cmd="${diff_cmd:-git diff origin/main...HEAD}"
-
-{
-    echo "# Item under review: the working tree of $(basename "$repo_root"), branch \`$branch\`"
-    echo
-    echo "Review exactly the changes this command prints, and nothing else — the"
-    echo "branch also carries earlier work that is not under review here."
-    echo "Read the full diff before judging any hunk:"
-    echo
-    echo '```'
-    echo "$diff_cmd"
-    echo '```'
-    echo
-    echo "## Files changed"
-    echo
-    echo '```'
-    eval "${diff_cmd/git diff/git diff --stat}" 2>/dev/null || echo "(diff unavailable)"
-    echo '```'
-    echo
-    echo "## Plan being executed"
-    echo
-    echo "The branch is being built task-by-task from a ralphex plan under"
-    echo "\`docs/plans/\`. Read it: it records deliberate scope decisions, and a"
-    echo "finding that argues against a documented decision is not a finding."
-} > "$scope_md"
-
-{
-    cat <<'EOF'
-# Project conventions
-
-## Two cargo workspaces — this is the trap
-
-This repository holds TWO separate cargo workspaces. A green build in one says
-nothing about the other, and this has already broken CI once: growing a shared
-struct compiled fine under `suite/` and broke `xlsxy`, `gridwasm` and the TUI
-`docxy`, which build literals of that type.
-
-```bash
-# the suite (GPUI desktop app) — its own workspace, NOT part of the root one
-cargo build --manifest-path suite/Cargo.toml
-cargo test  --manifest-path suite/Cargo.toml
-
-# the root workspace: gridcore, docxcore, xlsxy, gridwasm, lookxy, TUI docxy
-cargo build --all-targets
-cargo test  -p gridcore
-cargo clippy -p gridcore --all-targets -- -D warnings
-cargo fmt --check
-```
-
-Any change touching `gridcore` types must be checked against BOTH.
-
-## Testing
-
-- Pure free functions in `suite/docxy/src/main.rs` are tested in the
-  `#[cfg(test)]` module at the bottom of that file. gpui `#[test]` works for
-  pure logic; constructing views or elements blows up the render macro, so
-  helpers are deliberately written as pure free functions to stay testable.
-- Model behaviour is tested in `gridcore/src/*.rs` next to the code.
-- There is no browser e2e harness. On-screen behaviour is verified manually
-  against an installer build, not in CI.
-
-## What is worth reporting
-
-- Real defects: wrong behaviour, dropped data, panics, silent fallbacks that
-  hide a user's mistake.
-- OOXML correctness — invalid XML or refs Excel rejects are severe, because the
-  symptom is Excel reporting the workbook as needing repair and dropping
-  content.
-- Missing tests for a code path the change introduced.
-
-## What is not
-
-- Style preferences, naming, comment density — the codebase has settled
-  conventions and matching them beats improving them.
-- Anything the plan file explicitly lists as out of scope or deferred.
-EOF
-} > "$profile_md"
-
-# REVMUX_REVIEW_DRYRUN=1 scaffolds the round and stops, so the wiring can be
-# checked without paying for a panel of agents.
-if [[ -n "${REVMUX_REVIEW_DRYRUN:-}" ]]; then
-    echo "dry run: round scaffolded at $round_dir" >&2
-    for f in "$goal_md" "$scope_md" "$profile_md"; do
-        echo "  $(wc -c <"$f" | tr -d ' ') bytes  $f" >&2
-    done
-    exit 0
-fi
-
-# --no-tui because ralphex captures stdout; --markdown so report.md is written
-# in a form the evaluation phase can read directly. revmux's own progress goes
-# to stderr so it stays out of the findings ralphex reads.
 #
-# revmux exits NON-ZERO when it has findings, the way a linter does. Under
-# `set -e` that killed this script before it could hand the report over, so a
-# review that worked perfectly looked to ralphex like a crashed hook. The report
-# file existing is the real success signal — check that, not the exit code.
-revmux --task "$task" --run "$run" --no-tui --markdown --workdir "$repo_root" >&2 || true
+# Wire it up in .ralphex/config:
+#     external_review_tool = custom
+#     custom_review_script = scripts\revmux-review.cmd
+#
+# Invoked on Windows through the .cmd sibling, because exec.Command cannot run a
+# .sh directly there.
 
-report="$round_dir/report.md"
-if [[ -f "$report" ]]; then
-    cat "$report"
-else
-    echo "error: revmux produced no report at $report" >&2
-    exit 1
+# NOT `set -e`: revmux exits non-zero when it HAS findings, the way a linter
+# does, and every guard below is meant to warn and continue rather than take the
+# whole review phase down.
+set -uo pipefail
+
+PROMPT_FILE="${1:-}"
+DONE_SIGNAL='<<<RALPHEX:CODEX_REVIEW_DONE>>>'
+
+# Emitted on every exit path, including the failures below.
+finish() { printf '%s\n' "$DONE_SIGNAL"; }
+trap finish EXIT
+
+if [ -z "$PROMPT_FILE" ] || [ ! -f "$PROMPT_FILE" ]; then
+  echo "revmux-review: no prompt file passed (got '${PROMPT_FILE}')" >&2
+  exit 0
 fi
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || REPO_ROOT="$PWD"
+cd "$REPO_ROOT" || exit 0
+
+command -v revmux >/dev/null 2>&1 || { echo "revmux-review: revmux not on PATH" >&2; exit 0; }
+
+# comprehensive is the diff-shaped roster: bugs+impl, arch+quality and
+# docs+tests on claude, plus an adversarial codex peer.
+PROFILE="${RALPHEX_REVMUX_PROFILE:-comprehensive}"
+MIN_CONFIDENCE="${RALPHEX_REVMUX_MIN_CONFIDENCE:-60}"
+# revmux's default hard timeout is 20m per agent attempt. The one panel this
+# repo has run took ~15m with agents at 3.7M tokens on a single-file diff, so
+# the default is close enough to bite on a wider one — an agent killed mid-read
+# reports nothing, and a review that silently covered less is worse than one
+# that took longer.
+HARD_TIMEOUT="${RALPHEX_REVMUX_HARD_TIMEOUT:-40m}"
+
+# One revmux task per PLAN, one run per review iteration. Keeping the task
+# stable across iterations is the point: revmux carries earlier rounds into
+# every later prompt, so iteration 2 knows what iteration 1 already reported.
+# Keying on the branch instead would merge unrelated plans into one history.
+PLAN_NAME="$(grep -m1 -oE '[^ /\\]+\.md' "$PROMPT_FILE" 2>/dev/null | head -1 | sed 's/\.md$//')"
+[ -z "$PLAN_NAME" ] && PLAN_NAME="review"
+TASK="ralphex-${PLAN_NAME}"
+RUN="$(date +%Y%m%d-%H%M%S)"
+
+PATHS_JSON="$(revmux new --task "$TASK" --run "$RUN" 2>/dev/null)" || {
+  echo "revmux-review: revmux new failed" >&2; exit 0; }
+
+# Take the scope path out of revmux's own payload rather than joining it by hand.
+SCOPE="$(printf '%s' "$PATHS_JSON" | sed -n 's/.*"scope"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | head -1 | sed 's/\\\\/\//g')"
+[ -z "$SCOPE" ] && { echo "revmux-review: could not read scope path from revmux new" >&2; exit 0; }
+
+{
+  echo "# Review scope (handed over by ralphex)"
+  echo
+  echo "This round was opened automatically by ralphex's external review phase for"
+  echo "the task it just implemented. Everything below the rule is ralphex's own"
+  echo "review prompt, verbatim — it carries the goal, the exact diff command for"
+  echo "this iteration, and the paths to the plan and the progress log."
+  echo
+  echo "Review the diff it names. The plan file states what the task was supposed"
+  echo "to do; a change that works but does not match the plan is a finding worth"
+  echo "reporting, and one that argues against a decision the plan records as"
+  echo "deliberate is not."
+  echo
+  echo "## This repository holds TWO cargo workspaces"
+  echo
+  echo "A green build in one says nothing about the other. Growing a shared"
+  echo "gridcore struct has already compiled clean under \`suite/\` while breaking"
+  echo "\`xlsxy\`, \`gridwasm\` and the TUI \`docxy\`, which build literals of it."
+  echo
+  echo '```bash'
+  echo "cargo build --manifest-path suite/Cargo.toml   # the GPUI desktop suite"
+  echo "cargo test  --manifest-path suite/Cargo.toml"
+  echo "cargo build --all-targets                      # gridcore, xlsxy, gridwasm, lookxy, TUI"
+  echo "cargo test  -p gridcore"
+  echo "cargo clippy -p gridcore --all-targets -- -D warnings"
+  echo '```'
+  echo
+  echo "Invalid XML or refs Excel rejects are severe: the symptom is Excel"
+  echo "reporting the workbook as needing repair and dropping content. Style,"
+  echo "naming and comment density are not findings — the codebase has settled"
+  echo "conventions and matching them beats improving them."
+  echo
+  echo '---'
+  echo
+  cat "$PROMPT_FILE"
+} > "$SCOPE" 2>/dev/null || { echo "revmux-review: could not write scope" >&2; exit 0; }
+
+echo "revmux-review: running revmux (profile=$PROFILE, task=$TASK, run=$RUN)" >&2
+
+# RALPHEX_REVMUX_DRY_RUN=1 proves the wiring without paying for a panel: the
+# argument arrived, the round was created, the scope was written.
+if [ "${RALPHEX_REVMUX_DRY_RUN:-0}" = "1" ]; then
+  echo "revmux-review: DRY RUN — round created, scope written, revmux not invoked" >&2
+  echo "scope: $SCOPE" >&2
+  echo "NO ISSUES FOUND"
+  exit 0
+fi
+
+# revmux exits non-zero when it HAS findings — a normal review outcome, not a
+# failure — so the status is deliberately not propagated. ralphex reads the
+# findings off stdout, so revmux's output is merged there rather than split.
+revmux --task "$TASK" --run "$RUN" \
+       --profile "$PROFILE" \
+       --min-confidence "$MIN_CONFIDENCE" \
+       --hard-timeout "$HARD_TIMEOUT" \
+       --markdown --no-tui \
+       --workdir "$REPO_ROOT" 2>&1 || true
+
+exit 0
