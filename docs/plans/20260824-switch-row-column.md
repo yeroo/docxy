@@ -244,14 +244,14 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 5: Round-trip a row-oriented chart
 
-- [ ] write a test building a row-oriented chart with `chart_from_range`,
+- [x] write a test building a row-oriented chart with `chart_from_range`,
       writing it with `chart_space_xml`, parsing it back with `parse_chart`, and
       asserting the orientation, series names, values and categories all survive
-- [ ] write the same round-trip for a column-oriented chart, asserting it is
+- [x] write the same round-trip for a column-oriented chart, asserting it is
       still column-oriented — orientation inference must not flip existing charts
-- [ ] write a round-trip for the awkward shape: a 2x2 range, where one row and
+- [x] write a round-trip for the awkward shape: a 2x2 range, where one row and
       one column are equally plausible readings
-- [ ] run tests — must pass before Task 6
+- [x] run tests — must pass before Task 6
 
 ### Task 6: Switch Row/Column in the Chart panel
 

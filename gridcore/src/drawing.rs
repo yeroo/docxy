@@ -1668,4 +1668,187 @@ mod tests {
         // No series at all — nothing votes, and the answer is still column.
         assert!(!parse_chart(&chart("")).by_row);
     }
+
+    /// The Overview's table, one row per item — the sheet the round-trips below
+    /// chart both ways round.
+    fn overview_sheet() -> crate::sheet::Sheet {
+        use crate::sheet::{Cell, Sheet, parse_cell_name};
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Unit price")),
+            ("D1", Cell::text("Total")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(1199.0)),
+            ("D2", Cell::number(2398.0)),
+            ("A3", Cell::text("Monitor")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(249.5)),
+            ("D3", Cell::number(998.0)),
+            ("A4", Cell::text("Keyboard")),
+            ("B4", Cell::number(6.0)),
+            ("C4", Cell::number(39.99)),
+            ("D4", Cell::number(239.94)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        sh
+    }
+
+    /// Orientation is the one thing about a chart that no element of
+    /// SpreadsheetML records: it lives only in the SHAPE of the refs the chart
+    /// writes. So the load→save→load path is where it can actually be lost, and
+    /// build → `chart_space_xml` → `parse_chart` is the whole of the evidence.
+    #[test]
+    fn a_row_oriented_chart_survives_a_write_and_reload() {
+        let sh = overview_sheet();
+        let cd = crate::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true)
+            .expect("chart");
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&cd));
+
+        assert!(again.by_row, "row orientation survived the file");
+        let names: Vec<&str> = again.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Laptop", "Monitor", "Keyboard"]);
+        assert_eq!(again.categories, vec!["Qty", "Unit price", "Total"]);
+        assert_eq!(again.series[0].values, vec![2.0, 1199.0, 2398.0]);
+        assert_eq!(again.series[1].values, vec![4.0, 249.5, 998.0]);
+        assert_eq!(again.series[2].values, vec![6.0, 39.99, 239.94]);
+
+        // Every ref came back the rectangle it went out as — which is exactly
+        // why the orientation came back too.
+        for (i, s) in again.series.iter().enumerate() {
+            assert_eq!(
+                s.values_ref.as_ref().map(|v| v.range),
+                cd.series[i].values_ref.as_ref().map(|v| v.range),
+                "series {i} values ref"
+            );
+            assert_eq!(s.name_ref, cd.series[i].name_ref, "series {i} name ref");
+            assert!(s.col.is_none(), "series {i} names no column");
+        }
+        assert_eq!(
+            again.categories_ref.as_ref().map(|v| v.range),
+            Some((0, 1, 0, 3)),
+            "the label ROW"
+        );
+        // The box is the whole table, and `cat_col` still names the column the
+        // SERIES NAMES come from: the fixup that would move it onto the first
+        // category's column is skipped for a row chart.
+        assert_eq!(
+            again.source.as_ref().map(|s| (s.range, s.cat_col)),
+            Some(((0, 0, 3, 3), 0))
+        );
+        // And it is stable: a second trip through the file changes nothing, so
+        // opening and saving repeatedly cannot drift the chart column-wards.
+        let third = parse_chart(&crate::xlsx::chart_space_xml(&again));
+        assert!(third.by_row);
+        assert_eq!(third.categories, again.categories);
+        assert_eq!(
+            third
+                .series
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            names
+        );
+    }
+
+    /// The regression guard: every chart in every file written before
+    /// orientation existed is column-oriented, and inference must not flip one.
+    #[test]
+    fn a_column_oriented_chart_survives_a_write_and_reload() {
+        let sh = overview_sheet();
+        let cd = crate::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", false)
+            .expect("chart");
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&cd));
+
+        assert!(!again.by_row, "still column-oriented");
+        let names: Vec<&str> = again.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Qty", "Unit price", "Total"]);
+        assert_eq!(again.categories, vec!["Laptop", "Monitor", "Keyboard"]);
+        assert_eq!(again.series[0].values, vec![2.0, 4.0, 6.0]);
+        assert_eq!(again.series[1].values, vec![1199.0, 249.5, 39.99]);
+        assert_eq!(again.series[2].values, vec![2398.0, 998.0, 239.94]);
+        for (i, s) in again.series.iter().enumerate() {
+            assert_eq!(
+                s.values_ref.as_ref().map(|v| v.range),
+                cd.series[i].values_ref.as_ref().map(|v| v.range),
+                "series {i} values ref"
+            );
+            assert_eq!(s.name_ref, cd.series[i].name_ref, "series {i} name ref");
+        }
+        assert_eq!(
+            again.categories_ref.as_ref().map(|v| v.range),
+            Some((1, 0, 3, 0)),
+            "the label COLUMN"
+        );
+        // Here the fixup does run, and puts `cat_col` on the label column.
+        assert_eq!(
+            again.source.as_ref().map(|s| (s.range, s.cat_col)),
+            Some(((0, 0, 3, 3), 0))
+        );
+    }
+
+    /// The awkward shape: a 2x2 range, where a series is a SINGLE CELL either
+    /// way round. Both readings plot the same one bar, and the file holds no
+    /// evidence of which was meant — so what must survive is the data, and the
+    /// orientation falls to the documented default.
+    #[test]
+    fn a_two_by_two_range_keeps_its_data_but_not_its_orientation() {
+        use crate::sheet::{Cell, Sheet, chart_from_range, parse_cell_name};
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+
+        // By column: the series is Qty, the category Laptop. It round-trips
+        // whole, orientation included, because column IS the default.
+        let by_col = chart_from_range(&sh, "Budget", (0, 0, 1, 1), "column", false).expect("cols");
+        assert_eq!(by_col.series[0].name, "Qty");
+        assert_eq!(by_col.categories, vec!["Laptop"]);
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&by_col));
+        assert!(!again.by_row);
+        assert_eq!(again.series.len(), 1);
+        assert_eq!(again.series[0].name, "Qty");
+        assert_eq!(again.series[0].values, vec![2.0]);
+        assert_eq!(again.categories, vec!["Laptop"]);
+
+        // By row: the series is Laptop, the category Qty. Everything the chart
+        // DRAWS survives — the name, the number, the label...
+        let by_row = chart_from_range(&sh, "Budget", (0, 0, 1, 1), "column", true).expect("rows");
+        assert!(by_row.by_row);
+        assert_eq!(by_row.series[0].name, "Laptop");
+        assert_eq!(by_row.categories, vec!["Qty"]);
+        assert_eq!(
+            by_row.series[0].values_ref.as_ref().map(|v| v.to_ref()),
+            Some("Budget!$B$2:$B$2".to_string())
+        );
+        let again = parse_chart(&crate::xlsx::chart_space_xml(&by_row));
+        assert_eq!(again.series.len(), 1);
+        assert_eq!(again.series[0].name, "Laptop");
+        assert_eq!(again.series[0].values, vec![2.0]);
+        assert_eq!(again.categories, vec!["Qty"]);
+        assert_eq!(again.source.as_ref().map(|s| s.range), Some((0, 0, 1, 1)));
+
+        // ...but the button state does not, and cannot: `$B$2:$B$2` is one row
+        // and one column at once, so `infer_by_row` has nothing to read and
+        // answers with the default. Excel is in the same position. The picture
+        // on screen is unaffected; only re-deriving from the box would now
+        // choose the column reading, which draws the same single bar.
+        assert!(!again.by_row, "a one-cell series is evidence of neither");
+    }
 }
