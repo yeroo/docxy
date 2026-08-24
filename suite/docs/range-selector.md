@@ -7,7 +7,8 @@ describes that field, the inputs that use it, and the reference syntax it
 accepts.
 
 Implementation: `suite/docxy/src/main.rs` (`RefTarget`, `RangeEdit`, `ref_field`,
-`ref_commit`, `cell_at`, `formula_pick_to`, `formula_ref_tokens`, `edit_runs`).
+`ref_commit`, `cell_at`, `formula_pick_to`, `formula_ref_tokens`, `edit_runs`,
+and for the syntax `RefText`/`parse_ref_text`, `ref_a1`, `sheet_index_of`).
 
 ## Pointing
 
@@ -39,6 +40,13 @@ scrolled off-screen is revealed (`reveal_range`), in either direction: leftwards
 directly, rightwards on the next render, which is the first point that knows how
 wide the grid is. The chart title isn't a range (`RefTarget::is_range`), so its
 text is never parsed as one.
+
+A reference naming **another sheet** gets no wash (`preview_range`): washing
+this sheet's `A1:D5` for a ref that means Budget's `A1:D5` would draw the very
+lie — same-named cells standing in for the ones actually read — that keeping the
+qualifier exists to remove. The grid stays in point mode regardless, because
+`GridOverlay::picking` reads the field's *focus* and never the preview, so a
+drag can always re-point a foreign ref at cells you can see.
 
 A gesture that has already claimed the pointer wins over point mode, and
 `sheet_drag_over` tests for one first. A chart's resize grips straddle the
@@ -111,10 +119,13 @@ first (`RefTarget::is_bar`) — otherwise what you type lands in the bar's own
 buffer.
 
 Every chart slot — `ChartRange` as much as `SeriesName`, `SeriesValues` and
-`Categories` — refuses cells that are on **another sheet** (`ref_elsewhere`): the
-field shows a range with its sheet stripped, so committing one from the wrong
-sheet would silently move it here onto unrelated numbers. `ChartRange` needs this
-most, since it is seeded from the box and re-points *every* series at once.
+`Categories` — **resolves** a reference naming another sheet (`chart_ref` →
+`chart_ref_of` → `sheet_index_of`) and reads that sheet's cells: a chart floats
+over one sheet and plots another's numbers all the time, which is the whole
+point of a `<c:f>` carrying a sheet name. The `ChartSource` written back carries
+the **resolved** sheet's name, so the ref persists into the file as a real
+cross-sheet `<c:f>` rather than a bare box the next open would read as local.
+A sheet the workbook hasn't got is refused by name under the field instead.
 
 Re-pointing keeps the chart's `complex` flag (`chart_apply_range`): a stacked or
 combo plot area still round-trips verbatim, and only **picking a type**
@@ -134,22 +145,68 @@ through a reorder.
 
 ## Reference syntax
 
-Same-sheet rectangles in A1 form. `parse_ref_text` accepts:
+Every range field **shows** a reference the way Excel writes one:
+`=Budget!$A$1:$D$5` — a leading `=`, `$` anchors, and the sheet qualifier — so a
+ref can be copied between this app and Excel's own dialogs and mean the same
+thing in both. That is `ref_a1`, and everything a field displays goes through it:
+the chart panel's four slots, the four entry bars' seeds, and the text a drag
+writes while it is in progress (`ref_pick_text`).
 
-- `A1:D5`, in any case, with surrounding space
+Input is deliberately **more permissive** than that output, as Excel's is.
+`parse_ref_text` accepts, returning a `RefText { sheet, range }`:
+
+- `A1:D5`, in any case, with surrounding space — `sheet: None`
 - `C3` — a single cell is a one-cell range
-- `$A$1:$D$5` — `$` anchors are accepted and ignored
-- `Budget!A1:D5`, `'My Sheet'!A1:D5` — a chart field drops the sheet prefix,
-  since a chart plots the sheet it floats over and pointing can't reach another
-  one. The four **bars** do not: a rule, a split or a sort acts on the sheet in
-  view, so `bar_range_text` rejects a prefix naming any other sheet rather than
-  applying it here under a message that looks right
+- `$A$1:$D$5` — `$` anchors are optional and ignored
+- `=A1:D5` — the leading `=` is optional
+- `Budget!A1:D5`, `'My Sheet'!A1:D5`, `'Bob''s Data'!A1` — the qualifier is
+  optional; quoting is optional when the name doesn't need it, and a `''` inside
+  a quoted name unquotes to one `'`
 - `D5:A1` — corners in either order name the same box
 
-Anything else is rejected with a message quoting what was typed. Cross-sheet,
-multi-area, whole-column (`A:C`), whole-row, 3D and structured references still
-work **in formulas** — they just can't be built by pointing, and the outline
-skips them. Pointing next to one *inserts* rather than replaces
+The split is on the **last** `!`: a quoted sheet name may contain one and the
+cells never can.
+
+A qualifier is **kept, never dropped**. Whoever typed `Budget!A1:D5` gets
+Budget's cells or a message saying there is no such sheet — never this sheet's
+cells of the same name. (The old behaviour was the opposite: the prefix was
+parsed off and discarded, so typing `Budget!A1:D5` while looking at Sheet2
+silently plotted Sheet2's `A1:D5`.) Resolution is `sheet_index_of`, matching
+**case-insensitively** because Excel does; `None` means the sheet in front of
+you. Two sheets differing only in case — which Excel forbids but a hand-built
+file can carry — resolve to the first, as every other by-name lookup in the app
+does.
+
+Whether a foreign sheet is resolved or refused is per target
+(`target_takes_foreign_sheet`), and turns on what the field *feeds*, not on the
+field:
+
+| Target | Foreign sheet | Why |
+|--------|---------------|-----|
+| `ChartRange`, `SeriesName`, `SeriesValues`, `Categories` | resolved | a chart plots numbers that needn't live on the sheet it floats over |
+| `Validation` | resolved | the rule is built while looking at the lookup sheet holding the list, and applies to the entry sheet holding the boxes |
+| `CondFormat`, `Sort`, `TextToColumns` | refused | each acts on the rows in front of you — a rule paints *these* cells, a sort reorders *these* rows, a split rewrites *these* columns |
+| `ChartTitle` | n/a | not a range at all |
+
+The refusal is the pre-existing message, unchanged:
+`"Budget" is another sheet; this acts on Sheet1`. It fires on a foreign name
+whether or not that sheet exists — the objection is *where the bar acts*, not an
+unknown name. A bar that resolves answers instead with the sheet actually found,
+spelled the way the workbook spells it, so `budget!a1:a9` comes back
+`=Budget!$A$1:$A$9` and the field stops disagreeing with the tab it names
+(`bar_ref_text`; the sheet a bar acts on is then derived from its pinned range by
+`bar_sheet_index`, never stored beside it, so the two cannot drift).
+
+⚠️ The Validation bar's range field is the **applies-to** range, not the list
+source — the bar's own text is a literal comma-separated list. What a qualifier
+buys there is building the rule where the boxes are while looking at the sheet
+holding the list. A range-valued list source is separate work.
+
+Anything else is rejected with a message quoting what was typed. Multi-area,
+whole-column (`A:C`), whole-row, 3D and structured references still work **in
+formulas** — they just can't be built by pointing, and the outline skips them.
+Cross-sheet refs join them there: a field takes one typed, but pointing only
+ever writes the sheet you pointed at. Pointing next to one *inserts* rather than replaces
 (`ref_token_at` declines a token preceded by `!`), so a click can never swing
 `=Sheet2!A1` onto this sheet's cell behind your back.
 
@@ -162,15 +219,48 @@ every span the scan reports, the caret-local one claims from its end, and where
 it reports nothing a pick inserts rather than replaces.
 
 A chart field additionally caps what it will read at `MAX_CHART_CELLS`
-(`chart_range_of`). `A1:A1048576` parses perfectly well and would ask the
+(`chart_ref_of`). `A1:A1048576` parses perfectly well and would ask the
 renderer for a million elements every frame, so the field declines it with a
-count instead of hanging the window. The entry bars have no such cap — a
+count instead of hanging the window. The cap is weighed **before** the sheet is
+looked up: a range too big to plot is too big on every sheet, and reporting a
+missing sheet first would only send the user back to fix the same field twice.
+The entry bars have no such cap — a
 conditional format over a whole column is a normal thing to want. What *is*
 capped is where the reveal can leave the grid: `reconcile_sheet_hscroll` clamps
 `col0` to `MAX_VISIBLE_COL`, the same bound `sheet_el` renders to and `cell_at`
 hit-tests to. Past it the grid would draw a window nothing could click, and —
 since the wheel and the thumb move `col0` one column at a time from wherever it
 is — appear frozen.
+
+### Which form belongs where
+
+There are three ways to spell a rectangle in this app and exactly one right
+place for each. **A new range field uses `ref_a1`.** Anything else loses a
+qualifier the moment the field is re-shown, which is the bug this syntax exists
+to remove.
+
+| Form | Example | Written by | Used by |
+|------|---------|-----------|---------|
+| Qualified, anchored, `=` | `=Budget!$A$1:$D$5` | `ref_a1` | every range **field** |
+| Anchored, no sheet | `=$A$1:$D$5` | `ref_a1` with `sheet: None` | a field on a source that names no sheet (a chart authored before refs carried one) |
+| Bare A1 | `B2:B5` | `range_a1` | the name box, and a pick written into a **cell's formula** (`range_text`), where naming this very sheet is noise Excel doesn't write either |
+| `<c:f>` ref | `Budget!$A$1:$D$5` | `ChartSource::to_ref` | the OOXML writer |
+
+`ref_a1` *is* the `<c:f>` form plus the leading `=`: it builds a `ChartSource`
+and calls `to_ref`, so the sheet-name quoting rules live in the writer alone
+rather than being re-implemented in the UI. `parse_ref_text` reads back
+everything `ref_a1` writes, and a round-trip test pins that.
+
+The one place the bare and qualified forms sit side by side is a drag:
+`range_text` (bare, for a formula) and `ref_pick_text` (qualified, for a field)
+normalise the same rectangle through the same `sel_range`, so what a drag shows
+while it is in progress is what the field keeps when the mouse comes up.
+
+Parsing is likewise one function. `parse_ref_text` returns the sheet and the
+cells **separately** (`RefText`) instead of a bare rectangle, so no caller can
+quietly drop half the answer; resolving the sheet half is then `sheet_index_of`
+alone, wrapped as `Docxy::ref_sheet_index` for the view and reached from
+`chart_ref_of`, `bar_ref_text` and `bar_sheet_index`.
 
 ### The entry bars follow the selection until you pin them
 
@@ -353,10 +443,17 @@ cargo test --manifest-path suite/Cargo.toml   # the pure helpers
 cargo test -p gridcore                        # the chart model + xlsx round-trip
 ```
 
-Covered that way: `parse_ref_text`, `range_a1`, `sel_range`, `col_at_x`,
-`row_at_index`/`row_index_of`, `series_remove`/`series_move`, `ref_token_at`,
-`replace_ref`, `formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,
+Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `ref_pick_text`,
+`sheet_index_of`, `chart_ref_of`, `target_takes_foreign_sheet`, `bar_ref_text`,
+`preview_range`, `sel_range`, `col_at_x`, `row_at_index`/`row_index_of`,
+`series_remove`/`series_move`, `ref_token_at`, `replace_ref`,
+`formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,
 `sort_rows_from`, `bar_range_text`.
+
+That list is why every helper here is a **pure free function** taking the
+workbook's sheet names as a `&[String]` rather than reading them off the view:
+`sheet_index_of` is testable, `Docxy::ref_sheet_index` is the one-line wrapper
+that isn't. Keep new ones on the same side of that line.
 
 Everything else — input routing, point mode, the outlines — can only be checked
 by driving the real binary: launch `suite/target/debug/suite.exe`, assert the

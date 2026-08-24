@@ -365,12 +365,29 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 
 ### Task 9: [Final] Update documentation
 
-- [ ] document the reference syntax the fields accept, and which targets take a
+- [x] document the reference syntax the fields accept, and which targets take a
       foreign sheet, wherever the suite's spreadsheet behaviour is already
-      described
-- [ ] if a new pattern was established (the `RefText` split, `ref_a1` vs
+      described — `suite/docs/range-selector.md` is where that already lives, so
+      its "Reference syntax" section was rewritten: the qualified/anchored form
+      every field now shows, the permissive input grammar (optional `=`, `$`,
+      qualifier and quoting; split on the LAST `!`; either corner first), the
+      case-insensitive `sheet_index_of` resolution and its refusal, and a
+      per-target table of resolved-vs-refused with the reason for each. The
+      stale paragraph claiming chart fields drop the prefix and refuse another
+      sheet (`ref_elsewhere`, now deleted) is replaced by what resolution
+      actually does, including that the written-back `ChartSource` carries the
+      RESOLVED sheet's name. `SPREADSHEET.md`'s pointer to that doc gained a
+      two-line summary so the chart section isn't left describing the old form
+- [x] if a new pattern was established (the `RefText` split, `ref_a1` vs
       `range_a1`), record it so the next range field added follows it rather
-      than re-inventing a third form
+      than re-inventing a third form — new "Which form belongs where" section:
+      a table of the four spellings and who writes each, the rule that a new
+      range field uses `ref_a1`, why `ref_a1` goes through `ChartSource::to_ref`
+      rather than re-implementing the quoting, why `range_text` stays bare
+      beside `ref_pick_text`, and why `parse_ref_text` returns sheet and cells
+      separately so no caller can drop half the answer. The Testing section's
+      covered list grew the new helpers plus the reason they're free functions
+      over `&[String]` rather than methods on the view
 
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`*
 

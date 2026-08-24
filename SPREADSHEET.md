@@ -176,7 +176,10 @@ rather than as frozen number caches, which is what lets an editor repoint one.
 
 Both editors use this: xlsxy's Insert ▸ Chart and the desktop suite's Chart
 panel, whose range fields are documented in
-[`suite/docs/range-selector.md`](suite/docs/range-selector.md).
+[`suite/docs/range-selector.md`](suite/docs/range-selector.md). Those fields
+show and accept references the way Excel writes them — `=Budget!$A$1:$D$5`, with
+the `$` anchors and the sheet qualifier — and a qualifier naming another sheet is
+resolved against the workbook, so a chart can plot a sheet it doesn't float over.
 
 ---
 
