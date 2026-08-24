@@ -300,18 +300,42 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 8: Verify acceptance criteria
 
-- [ ] verify the Overview's worked example: `A1:D4` on that table, switched,
+- [x] verify the Overview's worked example: `A1:D4` on that table, switched,
       yields series Laptop/Monitor/Keyboard against categories Qty/Unit
-      price/Total
-- [ ] verify a column-oriented chart is unchanged end to end — built, written,
-      parsed and displayed exactly as before this plan
-- [ ] verify the deferred items are still deferred: no header darkening, no
-      marching ants, no resolved label lists, no chart source outlines
-- [ ] run `cargo test --manifest-path suite/Cargo.toml` — all pass
-- [ ] run `cargo test -p gridcore` — all pass
-- [ ] run `cargo build --all-targets` at the repo root — root workspace builds
-- [ ] run `cargo clippy -p gridcore --all-targets -- -D warnings` and
-      `cargo fmt --check` — all issues fixed
+      price/Total — pinned by
+      `switch_row_column_replots_the_range_the_other_way_round`
+      (suite/docxy/src/main.rs), which builds exactly the Overview's table,
+      charts `(0,0,3,3)` by column, switches it, and asserts both the plot and
+      the refs (`Budget!$B$2:$D$2`, `Budget!$A$2`, cats `Budget!$B$1:$D$1`)
+- [x] verify a column-oriented chart is unchanged end to end — built, written,
+      parsed and displayed exactly as before this plan. ➕ Verified against the
+      PRE-PLAN BUILD, not only against this branch's own tests: a throwaway
+      example built a workbook holding column/bar/line/pie charts over the
+      Overview table plus an all-numeric block, saved it with `save_xlsx`, and
+      ran under a git worktree at `af22bcf` (the last commit before the plan)
+      and at HEAD. Both files are byte-identical
+      (sha256 `dc56be5f…9366bf`, 25470 bytes), and the derived model
+      (series names, `col`, values, every `values_ref`/`name_ref`,
+      `categories`, `categories_ref`, `source`/`cat_col`) matches line for
+      line. Loading that same file on both builds also parses identically. The
+      scratch examples were removed afterwards; the in-repo guards remain
+      `a_column_oriented_chart_writes_exactly_what_it_wrote_before_orientation`
+      (xlsx.rs) and `a_column_oriented_chart_survives_a_write_and_reload`
+      (drawing.rs)
+- [x] verify the deferred items are still deferred: no header darkening, no
+      marching ants, no resolved label lists, no chart source outlines — the
+      branch diff since the plan commit touches only the six expected files
+      (drawing.rs, sheet.rs, xlsx.rs, suite main.rs, xlsxy main.rs, this plan)
+      and contains no `ref_color` / `ref_index_at` / darkening / ants code
+- [x] run `cargo test --manifest-path suite/Cargo.toml` — all pass (70, up
+      from 62 at the branch head)
+- [x] run `cargo test -p gridcore` — all pass (343 + 1 + 4, up from 329)
+- [x] run `cargo build --all-targets` at the repo root — root workspace builds
+      (the only warnings are the pre-existing bin/lib `.pdb` filename
+      collisions in the COM shims, untouched by this plan)
+- [x] run `cargo clippy -p gridcore --all-targets -- -D warnings` and
+      `cargo fmt --check` — clean; both were also run for the `suite/`
+      workspace, since a green root says nothing about it
 
 ### Task 9: [Final] Update documentation
 
