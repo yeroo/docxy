@@ -1857,6 +1857,47 @@ fn chart_kind_series_err(kind: &str, series: usize) -> Option<String> {
     })
 }
 
+/// How many of a chart's series the plot actually DRAWS.
+///
+/// Every kind draws all of them but the pie, which draws the first. That is a
+/// PLOTTING rule, not a format one: `CT_PieChart` takes its `ser` from
+/// `EG_PieChartShared`, which declares it `maxOccurs="unbounded"` (ECMA-376
+/// Part 1, `dml-chart.xsd`), so a pie may HOLD several and the writer keeps
+/// every one of them — see `chart_space_xml`'s pie arm. Excel plots the first.
+///
+/// Said once, here, so the card and the panel answer it the same way. The card
+/// used to draw whatever series it was handed and the panel to list them all,
+/// which was only ever right because the writer had already thrown the extras
+/// away; now that it doesn't, "draw them all" would put slices on screen that
+/// Excel will not.
+fn chart_plotted_series(kind: &str, series: usize) -> usize {
+    if kind == "pie" { series.min(1) } else { series }
+}
+
+/// Whether the series at `si` of a `series`-long chart is one of the drawn ones.
+fn series_is_plotted(kind: &str, si: usize, series: usize) -> bool {
+    si < chart_plotted_series(kind, series)
+}
+
+/// What the Chart panel says beside its type buttons when the chart holds
+/// series it will not draw, or `None` when everything it holds is plotted.
+///
+/// The loss this note replaces was invisible precisely because nothing said
+/// anything: the panel listed every series, each pointed at cells and
+/// colourable, while the save kept one. The data survives now, so the sentence
+/// to write is what actually becomes of the rest — kept, not drawn — rather
+/// than a refusal.
+fn chart_unplotted_note(kind: &str, series: usize) -> Option<String> {
+    let extra = series.saturating_sub(chart_plotted_series(kind, series));
+    (extra > 0).then(|| {
+        format!(
+            "A {kind} plots the first series only \u{2014} the other {extra} {} kept in the \
+             file but not drawn.",
+            if extra == 1 { "is" } else { "are" },
+        )
+    })
+}
+
 /// Why a picked range can't be the category labels, or `None` if it can.
 ///
 /// `<c:cat>` holds ONE line of labels, and `range_labels` flattens whatever it
@@ -7318,7 +7359,31 @@ impl Docxy {
                         h_flex()
                             .items_center()
                             .justify_between()
-                            .child(div().text_size(px(10.)).text_color(pal.dim).child("NAME"))
+                            // "NAME", and beside it whether this series is one
+                            // the chart draws. A card that says nothing is a
+                            // card that implies "plotted", which on the extra
+                            // series of a pie is the very impression that made
+                            // the old save's data loss invisible.
+                            .child(
+                                h_flex()
+                                    .items_center()
+                                    .gap(px(4.))
+                                    .child(
+                                        div().text_size(px(10.)).text_color(pal.dim).child("NAME"),
+                                    )
+                                    .when(!series_is_plotted(&data.kind, si, n_series), |d| {
+                                        d.child(
+                                            div()
+                                                .px(px(3.))
+                                                .rounded(px(3.))
+                                                .border_1()
+                                                .border_color(pal.border)
+                                                .text_size(px(9.))
+                                                .text_color(pal.dim)
+                                                .child("NOT PLOTTED"),
+                                        )
+                                    }),
+                            )
                             .child(
                                 h_flex()
                                     .gap(px(2.))
@@ -7468,6 +7533,25 @@ impl Docxy {
                     ))
                     .child(heading("TYPE"))
                     .child(types)
+                    // What the picked type DRAWS, when that is less than what
+                    // the chart holds. A pie keeps every series it is given —
+                    // the save no longer drops them — and plots the first, so
+                    // the panel says which of the cards below reach the screen.
+                    // Only shown when there is something to say; a single-series
+                    // pie, and every other kind, draw the lot.
+                    .when_some(
+                        chart_unplotted_note(&data.kind, data.series.len()),
+                        |d, note| {
+                            d.child(
+                                div()
+                                    .px_1()
+                                    .pt(px(2.))
+                                    .text_size(px(10.))
+                                    .text_color(pal.dim)
+                                    .child(note),
+                            )
+                        },
+                    )
                     // The four buttons above are the only kinds we can WRITE,
                     // and only as a single clustered/standard plot group. A
                     // scatter/area/doughnut/radar chart — or a stacked or combo
@@ -16624,12 +16708,6 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
             .and_then(|s| s.color)
             .unwrap_or(PALETTE[si % PALETTE.len()])
     };
-    let maxv = data
-        .series
-        .iter()
-        .flat_map(|s| s.values.iter().copied())
-        .fold(0.0f64, f64::max)
-        .max(1.0);
     // One element per point per series, every frame. A chart the UI authored is
     // capped at MAX_CHART_CELLS when it is pointed, but one read from a file can
     // cache as many points as Excel cared to write, and a card a few hundred
@@ -16638,19 +16716,30 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
     // capping only the points still leaves points × series elements per frame.
     const MAX_CARD_POINTS: usize = 512;
     const MAX_CARD_SERIES: usize = 32;
+    // The plot area is drawn differently per chart kind. Column/Bar/Line share a
+    // per-series legend; Pie's slices are per-category, so it builds its own.
+    let kind = data.kind.as_str();
+    // How many series are DRAWN — all of them, except on a pie, where it is the
+    // first (`chart_plotted_series`). Asked here rather than assumed from what
+    // the file will hold: the writer keeps every series a pie carries, so
+    // "whatever is in `data.series`" is no longer the same question. Everything
+    // measured off the series is measured off the drawn ones only — an axis
+    // stretched by a series that isn't plotted, or a slice per category of a
+    // longer one that isn't either, would both be scaled to invisible data.
+    let nser = chart_plotted_series(kind, data.series.len()).min(MAX_CARD_SERIES);
+    // `nser` is bounded by `data.series.len()` on both terms, so this can't
+    // slice past the end.
+    let plotted = &data.series[..nser];
+    let maxv = plotted
+        .iter()
+        .flat_map(|s| s.values.iter().copied())
+        .fold(0.0f64, f64::max)
+        .max(1.0);
     let ncat = data
         .categories
         .len()
-        .max(
-            data.series
-                .iter()
-                .take(MAX_CARD_SERIES)
-                .map(|s| s.values.len())
-                .max()
-                .unwrap_or(0),
-        )
+        .max(plotted.iter().map(|s| s.values.len()).max().unwrap_or(0))
         .min(MAX_CARD_POINTS);
-    let nser = data.series.len().min(MAX_CARD_SERIES);
     // The title strip and the legend take fixed bites out of the card; the plot
     // area gets the rest, and the bars scale to it.
     let area_h = (h - 46.0).max(40.0);
@@ -16665,9 +16754,6 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
             .child(SharedString::from(label))
     };
 
-    // The plot area is drawn differently per chart kind. Column/Bar/Line share a
-    // per-series legend; Pie's slices are per-category, so it builds its own.
-    let kind = data.kind.as_str();
     let mut pie_legend: Option<AnyElement> = None;
     let plot: AnyElement = match kind {
         "bar" => {
@@ -16686,7 +16772,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
                         )),
                 );
                 let mut bars = v_flex().flex_1().gap(px(1.));
-                for (si, s) in data.series.iter().take(nser).enumerate() {
+                for (si, s) in plotted.iter().enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let frac = (val.max(0.0) / maxv) as f32;
                     bars = bars.child(
@@ -16707,7 +16793,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
             let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
             for ci in 0..ncat {
                 let mut stack = div().relative().w(px(14.)).h(px(plot_h));
-                for (si, s) in data.series.iter().take(nser).enumerate() {
+                for (si, s) in plotted.iter().enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
                     stack = stack.child(
@@ -16735,10 +16821,11 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
         }
         "pie" => {
             // Pie preview as a 100%-stacked proportion bar; slices = categories,
-            // proportions from the first series. Legend is per-category.
+            // proportions from the one series a pie plots — `nser` is that one,
+            // and any others the chart holds are kept in the file undrawn.
             let vals: Vec<f64> = (0..ncat)
                 .map(|ci| {
-                    data.series
+                    plotted
                         .first()
                         .and_then(|s| s.values.get(ci))
                         .copied()
@@ -16794,7 +16881,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
             let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
             for ci in 0..ncat {
                 let mut cluster = h_flex().items_end().gap(px(1.));
-                for (si, s) in data.series.iter().take(nser).enumerate() {
+                for (si, s) in plotted.iter().enumerate() {
                     let val = s.values.get(ci).copied().unwrap_or(0.0);
                     let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
                     cluster = cluster.child(
@@ -16822,7 +16909,7 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
 
     let legend: AnyElement = pie_legend.unwrap_or_else(|| {
         let mut legend = h_flex().gap_3().px_2().pb_1().flex_wrap();
-        for (si, s) in data.series.iter().take(nser).enumerate() {
+        for (si, s) in plotted.iter().enumerate() {
             legend = legend.child(
                 h_flex()
                     .items_center()
@@ -18881,6 +18968,66 @@ mod grid_geom_tests {
         );
         let flipped = super::chart_switch_row_column(&col, &sh).expect("switched");
         assert_eq!(flipped.source.as_ref().unwrap().range, (0, 1, 3, 2));
+    }
+
+    /// What the CARD draws, per kind and count. This is the rule the renderer
+    /// used to get for free from the writer having thrown the extra series
+    /// away; now that a pie keeps every series it holds, the card has to know
+    /// that it still plots one of them.
+    #[test]
+    fn a_pie_draws_one_series_however_many_it_holds() {
+        use super::chart_plotted_series as drawn;
+        assert_eq!(drawn("pie", 0), 0);
+        assert_eq!(drawn("pie", 1), 1);
+        assert_eq!(drawn("pie", 2), 1);
+        assert_eq!(drawn("pie", 7), 1);
+        // Every other kind plots the lot, including the empty and the one-series
+        // cases the pie shares with them.
+        for k in ["column", "bar", "line", ""] {
+            for n in [0, 1, 2, 7] {
+                assert_eq!(drawn(k, n), n, "{k} with {n}");
+            }
+        }
+
+        // Per series, which is the question the panel's card asks: on a pie only
+        // the leading card is drawn, on anything else all of them are.
+        use super::series_is_plotted as shown;
+        assert!(shown("pie", 0, 3));
+        assert!(!shown("pie", 1, 3));
+        assert!(!shown("pie", 2, 3));
+        assert!(shown("pie", 0, 1));
+        for si in 0..3 {
+            assert!(shown("column", si, 3));
+        }
+    }
+
+    /// What the PANEL says beside the type buttons, given a kind and a count.
+    ///
+    /// The note exists because the data now survives: the extra series of a pie
+    /// are still in the file and still editable below, so the sentence says
+    /// "kept but not drawn" rather than refusing anything.
+    #[test]
+    fn the_panel_says_a_pie_plots_the_first_series_only() {
+        use super::chart_unplotted_note as note;
+        // Nothing to say when everything the chart holds is drawn.
+        assert_eq!(note("pie", 0), None);
+        assert_eq!(note("pie", 1), None);
+        for k in ["column", "bar", "line", ""] {
+            for n in [0, 1, 2, 7] {
+                assert_eq!(note(k, n), None, "{k} with {n}");
+            }
+        }
+        // Two series: one extra, said in the singular.
+        let two = note("pie", 2).expect("a two-series pie has something to say");
+        assert!(two.contains("A pie plots the first series only"), "{two}");
+        assert!(two.contains("the other 1 is kept in the file"), "{two}");
+        // Three: two extra, in the plural.
+        let three = note("pie", 3).expect("a three-series pie too");
+        assert!(
+            three.contains("the other 2 are kept in the file"),
+            "{three}"
+        );
+        assert!(three.contains("not drawn"), "{three}");
     }
 
     /// `series_add` refuses a pie a second series because the writer would drop

@@ -265,17 +265,27 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 4: Draw and describe only what a pie plots
 
-- [ ] make the suite's chart renderer draw only the first series for a pie,
+- [x] make the suite's chart renderer draw only the first series for a pie,
       explicitly and in one place, rather than relying on the writer having
-      discarded the others
-- [ ] in the Chart panel, mark the series beyond the first as not plotted —
+      discarded the others (`chart_plotted_series` in main.rs is the one place;
+      `chart_card` derives `nser` from it and slices `plotted`, so `maxv`,
+      `ncat`, every per-series loop and the pie arm's proportions all measure
+      the DRAWN series only — an undrawn one can no longer stretch the axis or
+      add an empty slice)
+- [x] in the Chart panel, mark the series beyond the first as not plotted —
       the series cards (`series_card` in main.rs) currently present all of them
-      identically, which is what makes the loss invisible
-- [ ] add a note beside the type buttons (the `CHART TYPE` row in main.rs) saying a pie plots
+      identically, which is what makes the loss invisible (a `NOT PLOTTED` tag
+      beside the card's `NAME` label, asked via `series_is_plotted`)
+- [x] add a note beside the type buttons (the `CHART TYPE` row in main.rs) saying a pie plots
       the first series only, shown when a pie has more than one
-- [ ] write tests for the pure part: given a kind and a series count, what the
-      panel should say
-- [ ] run tests — must pass before Task 5
+      (`chart_unplotted_note`, rendered under `types` in `chart_panel`; it says
+      the others are KEPT in the file, since they now are)
+- [x] write tests for the pure part: given a kind and a series count, what the
+      panel should say (`a_pie_draws_one_series_however_many_it_holds` and
+      `the_panel_says_a_pie_plots_the_first_series_only`, main.rs)
+- [x] run tests — must pass before Task 5 (suite 82; gridcore 366 + 1 + 4; root
+      workspace builds; `cargo clippy -p gridcore --all-targets -- -D warnings`
+      and `cargo fmt --check` clean in both workspaces)
 
 ### Task 5: Retire the refusal
 
