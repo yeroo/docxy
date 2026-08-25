@@ -7030,6 +7030,14 @@ impl Docxy {
         if q.is_empty() {
             return;
         }
+        // A find MOVES the selection, so it is a press on the cells like any
+        // arrow key: take the selection back first. `Ctrl+F` itself is left off
+        // the hand-back list — opening a bar is aimed at the window — but what
+        // the bar then does is not, and the guard cannot live at the keystroke
+        // anyway: `sheet_key` returns into `sheet_find_key` while `find_open`
+        // is set, and the bar's own buttons never reach `sheet_key` at all.
+        // Without this the ring lands on a cell `sel_hidden` is not drawing.
+        self.chart_hand_back(cx);
         if let Some(v) = self.active_sheet_mut() {
             let (mr, mc) = v.extent();
             let ncols = mc as i64 + 1;
@@ -7063,6 +7071,11 @@ impl Docxy {
         if q.is_empty() {
             return;
         }
+        // Replace WRITES the selected cell, so it hands the selection back for
+        // the same reason `Ctrl+X` does: a write to a cell the chart is hiding
+        // is one you cannot see happening. Before `sheet_snapshot`, so the undo
+        // step is taken with the selection already back on the cells.
+        self.chart_hand_back(cx);
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
@@ -16978,7 +16991,8 @@ fn sheet_col_header(
 struct GridOverlay {
     /// Box an in-progress fill drag would cover — outlined, not yet applied.
     fill_preview: Option<(u32, u32, u32, u32)>,
-    /// Cells a focused range field points at, washed so they stand out.
+    /// Cells a focused range field points at, outlined with the dashed brand
+    /// border (`border_range`). No wash of its own — that went with the border.
     range_preview: Option<(u32, u32, u32, u32)>,
     /// A range field has the keyboard: the active cell drops its ring so it
     /// can't be mistaken for the range being picked, and wears a wash instead.
@@ -17955,6 +17969,9 @@ fn sheet_el(
         range_dashed,
         ..ov
     };
+    // Read off before the row-list closure moves `ov`; the DV overlay below is
+    // built after that move but is gated on the same flag.
+    let sel_hidden = ov.sel_hidden;
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
     // over these, so a filtered-out row collapses instead of showing blank.
     let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new(
@@ -18315,8 +18332,12 @@ fn sheet_el(
     };
     // Data-validation list dropdown: an arrow on the selected cell + (when open)
     // a value popup, both cell-anchored in the same layer.
+    // Both go with the selection: while a chart owns it (`sel_hidden`) the
+    // arrow would float over a cell nothing on screen names, and picking a
+    // value from it would write that unmarked cell — the same invisible write
+    // the fill handle drops its own affordance to avoid.
     let mut dv_overlay: Vec<AnyElement> = Vec::new();
-    if let Some(vals) = &dv_values {
+    if let Some(vals) = dv_values.as_ref().filter(|_| !sel_hidden) {
         let (sr, sc) = view.sel;
         if let Some(cx0) = col_x(sc) {
             let cw = col_px(sh.col_width(sc));

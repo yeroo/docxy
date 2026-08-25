@@ -457,9 +457,14 @@ one does, for every press and for the navigation keys alike:
   the chart is hiding is one you cannot watch move, type into or be pasted over
   — the same invisible-motion confusion this rule exists to end. Escape and
   Delete still belong to the chart, and so do the keys aimed at the document or
-  the window rather than the selection: `Ctrl+S`, `Ctrl+F`, `Ctrl+F1`, and undo
-  and redo (which drop the chart selection themselves, because the chart list
-  moves under them).
+  the window rather than the selection: `Ctrl+S`, `Ctrl+F1`, and undo and redo
+  (which drop the chart selection themselves, because the chart list moves under
+  them). `Ctrl+F` only *opens* a bar, so it is off the list too — but Find Next
+  and Replace hand back, because the bar moves and writes the selection. The
+  guard sits in `sheet_find_next` and `sheet_replace` rather than at the
+  keystroke: `sheet_key` returns into `sheet_find_key` while the bar is open,
+  and the bar's own buttons never reach `sheet_key` at all. (`Replace All` is
+  sheet-wide and never reads `sel`, so it does not need one.)
 - While **pointing** — a range field or a half-typed formula has the keyboard —
   a press on a cell writes a reference and changes *nothing* about what is
   selected. That is what lets the Chart panel's own range fields work: the chart
@@ -483,8 +488,12 @@ making it optional would ripple through the whole grid to express something
 nobody asked for. So `cell_selection_shown` → `GridOverlay::sel_hidden` turns
 off every indicator keyed to the selection together — the ring, the
 `range_tint` wash, both headers' highlight, the point-mode wash, the auto-fill
-handle and the selection's own border — and dismissing the chart brings the ring
-back exactly where it was, which is also what Excel does.
+handle, the data-validation dropdown arrow and the selection's own border — and
+dismissing the chart brings the ring back exactly where it was, which is also
+what Excel does. The handle and the DV arrow are on that list for a stronger
+reason than the washes: both are *affordances* that write the cell they sit on,
+so leaving either standing over an unmarked cell would be the same invisible
+write the key hand-back exists to prevent.
 
 The one indicator deliberately still drawn under `sel_hidden` is the **pointed
 range's** border. A selected chart's range fields point at cells; hiding it
