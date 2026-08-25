@@ -5746,6 +5746,14 @@ impl Docxy {
         // panel stays), click a panel range field, then click the fx bar —
         // `chart_hand_back` returns early there, with nothing selected to hand
         // back, so the drop is owed here.
+        //
+        // The bars themselves go with it. `sheet_key` asks every one of them
+        // before the cell editor too, and clearing `range_edit` alone would
+        // hand the keyboard STRAIGHT to the bar the field sat in: `to_bar` is
+        // gated on `bar_field`, which is read off `range_edit`. Ribbon ▸ Data
+        // Validation, click its range field, click the fx bar — Enter would
+        // add a validation rule instead of committing the cell.
+        self.typing_bars_close();
         self.range_edit = None;
         self.range_pick = None;
         self.ref_msg = None;
