@@ -4717,6 +4717,105 @@ mod tests {
         assert!(xml.contains("Budget!$B$2:$B$3"));
     }
 
+    /// The write half of the fix is only half of it: a save that emits three
+    /// `<c:ser>` still loses two series if the loader that reads the file back
+    /// keeps one. `parse_chart` walks `<c:ser>` generically, so this should
+    /// already hold — pinned rather than assumed, because it is the assertion
+    /// that actually says "the user's work survived the save".
+    #[test]
+    fn a_three_series_pie_survives_a_write_and_a_read() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        let ser = |name: &str, col: u32, v: f64| ChartSeries {
+            name: name.into(),
+            values: vec![v, v + 1.0],
+            col: Some(col),
+            values_ref: Some(ChartSource {
+                sheet: "Budget".into(),
+                range: (1, col, 2, col),
+                cat_col: 0,
+            }),
+            ..Default::default()
+        };
+        let data = ChartData {
+            title: "Sales".into(),
+            kind: "pie".into(),
+            categories: vec!["Q1".into(), "Q2".into()],
+            series: vec![
+                ser("East", 1, 1.0),
+                ser("West", 2, 3.0),
+                ser("North", 3, 5.0),
+            ],
+            ..Default::default()
+        };
+        let back = crate::drawing::parse_chart_for_test(&chart_space_xml(&data));
+        assert_eq!(back.kind, "pie");
+        assert_eq!(back.series.len(), 3, "all three came back");
+        // Names, cached values and the cells each series reads — a series that
+        // returns nameless or pointed at another series' column is the same
+        // loss wearing a different shape.
+        for (i, (name, col, v)) in [("East", 1, 1.0), ("West", 2, 3.0), ("North", 3, 5.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let s = &back.series[i];
+            assert_eq!(s.name, name, "series {i} name");
+            assert_eq!(s.values, vec![v, v + 1.0], "series {i} values");
+            assert_eq!(
+                s.values_ref.as_ref().map(ChartSource::to_ref),
+                Some(format!(
+                    "Budget!${}$2:${}$3",
+                    (b'A' + col as u8) as char,
+                    (b'A' + col as u8) as char
+                )),
+                "series {i} values ref"
+            );
+        }
+        assert_eq!(back.categories, vec!["Q1".to_string(), "Q2".to_string()]);
+        // And it stays editable, so the NEXT save regenerates rather than
+        // copying a part the writer was assumed not to understand.
+        assert!(!back.complex, "a multi-series pie is not held back");
+        assert!(chart_is_writable(&back));
+        // Writing what came back reproduces the same part: the round trip is
+        // stable, not merely lossless once.
+        assert_eq!(chart_space_xml(&back), chart_space_xml(&data));
+    }
+
+    /// The common case, end to end. One series in, one series out, unchanged —
+    /// the multi-series arm must not have cost the single-series pie anything.
+    #[test]
+    fn a_one_series_pie_survives_a_write_and_a_read() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        let data = ChartData {
+            title: "Sales".into(),
+            kind: "pie".into(),
+            categories: vec!["Q1".into(), "Q2".into()],
+            series: vec![ChartSeries {
+                name: "East".into(),
+                values: vec![1.0, 2.0],
+                col: Some(1),
+                values_ref: Some(ChartSource {
+                    sheet: "Budget".into(),
+                    range: (1, 1, 2, 1),
+                    cat_col: 0,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let back = crate::drawing::parse_chart_for_test(&chart_space_xml(&data));
+        assert_eq!(back.kind, "pie");
+        assert_eq!(back.series.len(), 1);
+        assert_eq!(back.series[0].name, "East");
+        assert_eq!(back.series[0].values, vec![1.0, 2.0]);
+        assert_eq!(
+            back.series[0].values_ref.as_ref().map(ChartSource::to_ref),
+            Some("Budget!$B$2:$B$3".to_string())
+        );
+        assert_eq!(back.categories, vec!["Q1".to_string(), "Q2".to_string()]);
+        assert!(!back.complex);
+        assert_eq!(chart_space_xml(&back), chart_space_xml(&data));
+    }
+
     #[test]
     fn parse_frozen_pane() {
         let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";

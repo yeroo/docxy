@@ -245,13 +245,23 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 3: Read every series back
 
-- [ ] check `parse_chart` returns all series from a `<c:pieChart>` — it walks
+- [x] check `parse_chart` returns all series from a `<c:pieChart>` — it walks
       `<c:ser>` generically, so this may already hold; pin it with a test rather
-      than assume
-- [ ] write a round-trip test: build a three-series pie, write it, parse it,
+      than assume (CONFIRMED: the `"ser"` Start arm pushes one `ChartSeries` per
+      element in DOCUMENT ORDER and `<c:ser><c:idx>` is never read — the only
+      `idx` the parser touches is `<c:pt idx=…>`. Pinned by
+      `a_pie_whose_series_indices_skip_a_number_still_reads_as_two`
+      (the `tdf111173` idx 0/2 shape from Task 1's ➕ note) and
+      `a_seven_series_pie_reads_back_all_seven` (`complex_29s`), drawing.rs)
+- [x] write a round-trip test: build a three-series pie, write it, parse it,
       and assert all three survive with their names, values and refs
-- [ ] write a round-trip test for the one-series pie
-- [ ] run tests — must pass before Task 4
+      (`a_three_series_pie_survives_a_write_and_a_read`, xlsx.rs — also asserts
+      the chart comes back non-`complex` and writable, and that rewriting what
+      was read reproduces the same part)
+- [x] write a round-trip test for the one-series pie
+      (`a_one_series_pie_survives_a_write_and_a_read`, xlsx.rs)
+- [x] run tests — must pass before Task 4 (gridcore 366, suite 80; root
+      workspace builds; clippy and `cargo fmt --check` clean)
 
 ### Task 4: Draw and describe only what a pie plots
 

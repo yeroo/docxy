@@ -1401,6 +1401,68 @@ mod tests {
         assert!(!cd.complex);
     }
 
+    /// `<c:idx>`/`<c:order>` need not be contiguous. The writer emits 0,1,2,
+    /// but Excel does not have to: `tdf111173.xlsx` in the corpus writes a
+    /// two-series pie as idx 0 and idx **2**. A reader that sized or keyed a
+    /// `Vec` by `idx` would come back with a phantom empty series between
+    /// them — `parse_chart` takes `<c:ser>` in DOCUMENT ORDER instead, and
+    /// this pins that it stays that way.
+    #[test]
+    fn a_pie_whose_series_indices_skip_a_number_still_reads_as_two() {
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:pieChart>
+          <c:ser><c:idx val="0"/><c:order val="0"/>
+            <c:tx><c:v>East</c:v></c:tx>
+            <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>3</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser>
+          <c:ser><c:idx val="2"/><c:order val="2"/>
+            <c:tx><c:v>West</c:v></c:tx>
+            <c:val><c:numRef><c:f>Budget!$D$2:$D$3</c:f><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.kind, "pie");
+        assert_eq!(cd.series.len(), 2, "two `<c:ser>`, two series — no gap");
+        assert_eq!(cd.series[0].name, "East");
+        assert_eq!(cd.series[1].name, "West");
+        assert_eq!(cd.series[0].values, vec![2.0, 3.0]);
+        assert_eq!(cd.series[1].values, vec![4.0, 5.0]);
+        // Each keeps ITS OWN cells: sharing one ref across both would be the
+        // silent re-point rather than the silent drop.
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|r| r.to_ref()),
+            Some("Budget!$B$2:$B$3".to_string())
+        );
+        assert_eq!(
+            cd.series[1].values_ref.as_ref().map(|r| r.to_ref()),
+            Some("Budget!$D$2:$D$3".to_string())
+        );
+        assert!(!cd.complex);
+    }
+
+    /// A pie with SEVEN series — `complex_29s.xlsx` in the corpus, written by
+    /// real Excel — comes back whole rather than truncated at some cap.
+    #[test]
+    fn a_seven_series_pie_reads_back_all_seven() {
+        let sers: String = (0..7)
+            .map(|i| {
+                format!(
+                    r#"<c:ser><c:idx val="{i}"/><c:order val="{i}"/><c:tx><c:v>S{i}</c:v></c:tx>
+                    <c:val><c:numRef><c:f>Budget!${}$2:${}$3</c:f><c:numCache><c:pt idx="0"><c:v>{i}</c:v></c:pt></c:numCache></c:numRef></c:val></c:ser>"#,
+                    (b'B' + i as u8) as char,
+                    (b'B' + i as u8) as char
+                )
+            })
+            .collect();
+        let cd = parse_chart(&format!(
+            r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:pieChart>{sers}</c:pieChart></c:plotArea></c:chart></c:chartSpace>"#
+        ));
+        assert_eq!(cd.series.len(), 7);
+        for i in 0..7 {
+            assert_eq!(cd.series[i].name, format!("S{i}"));
+            assert_eq!(cd.series[i].values, vec![i as f64]);
+        }
+        assert!(!cd.complex);
+    }
+
     #[test]
     fn the_source_box_takes_its_label_column_from_the_category_ref() {
         // A column chart takes `cat_col` from `<c:cat>` — column A here — not
