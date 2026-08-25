@@ -337,22 +337,75 @@ backstop working as specified, not a defect — the tested guarantee is that the
 
 ### Task 3: A selected chart outlines the cells it reads
 
-- [ ] add the chart's source areas to `GridOverlay` — one entry per slot with
+- [x] add the chart's source areas to `GridOverlay` — one entry per slot with
       its role (values / categories / name), derived from the selected chart's
       `values_ref`, `categories_ref`, `name_ref` and `point_refs`
-- [ ] colour by role in **Excel's mapping**: values blue, categories purple,
+      → `GridOverlay::chart_refs: Rc<Vec<ChartSourceArea>>`, filled by
+      `Docxy::chart_refs()` from the pure `chart_source_areas`. Empty when no
+      chart is selected, which IS the "is this drawn?" question — no extra flag
+- [x] colour by role in **Excel's mapping**: values blue, categories purple,
       names green. Define them as named constants beside `ref_color` with a
       comment saying they are deliberately Excel's and not the `ref_color`
       palette, so a later reader does not "unify" them
-- [ ] resolve overlap the way `ref_index_at` already does — smallest area wins,
+      → `CHART_VALUES_COLOR` `0x4472c4`, `CHART_CATEGORIES_COLOR` `0x7030a0`,
+      `CHART_NAME_COLOR` `0x00b050`, with `chart_slot_color` and that comment
+- [x] resolve overlap the way `ref_index_at` already does — smallest area wins,
       earliest on a tie — so a name cell inside the values box still reads as a
-      name
-- [ ] draw only the areas on the sheet in front of you: a ref naming another
+      name → the rule is now SHARED rather than copied; see below
+- [x] draw only the areas on the sheet in front of you: a ref naming another
       sheet gets nothing, exactly as `preview_range` already refuses the wash
-- [ ] write tests for the pure part: given a `ChartData` and the active sheet
+      → `chart_source_areas` takes the active sheet's name and drops any ref
+      naming another; an unqualified ref is the chart's own sheet, matching
+      `sheet_index_of(None)`
+- [x] write tests for the pure part: given a `ChartData` and the active sheet
       name, the areas and their roles; the overlap rule; and the foreign-sheet
-      case
-- [ ] run tests — must pass before Task 4
+      case → 8 tests in `grid_geom_tests` (`chart_source_areas_*`,
+      `chart_area_at_*`, `chart_slot_colors_are_excels_and_not_the_ref_palette`)
+- [x] run tests — must pass before Task 4 → suite 104 pass, gridcore 370+1+4,
+      both workspaces clippy clean and `cargo fmt --check` clean
+
+#### Slots, not the box
+
+`ChartData::source` — the union the panel's DATA RANGE shows — is deliberately
+NOT outlined. It is one rectangle around everything, and it answers none of what
+selecting a chart asks: *which cells are the numbers, which are the labels*. So
+`chart_source_areas` walks the four slots the panel edits instead:
+`values_ref`, `point_refs`, `categories_ref`, `name_ref`. A cell inside the box
+but in no slot (`A1` of an `A1:C5` chart) is drawn nothing at all.
+
+`point_refs` is in that list because a scatter's and a bubble's numbers live
+there and never in `values_ref` — reading only the latter would outline nothing
+for the one chart kind whose plot IS its refs.
+
+The order is `rebuild_source`'s: every series' numbers first, then the
+categories, then the name cells. That order is the tie-break for two areas of
+equal size, and the model's own fold order is the one already justified.
+
+#### The overlap rule is shared, not copied
+
+`ref_index_at` was refactored onto a new `smallest_ref_at(ranges, r, c)`, and
+`chart_area_at` calls the same function over the areas' ranges. Two lists asking
+"who owns this cell" have to answer the same way, and a shared rule cannot drift
+apart the way two copies would. It takes an iterator rather than a slice, so
+neither caller allocates per cell.
+
+The rule earns its keep here more than it does for formulas: the slots nest **by
+construction** — a series' name cell is the header of the column its values read
+— so without smallest-wins every green name cell would be swallowed by the blue
+box it heads, and the name colour would never appear at all.
+
+➕ **Duplicate areas are folded.** Two series pointed at one cell, or a re-point
+that left a duplicate, would otherwise draw the same box twice for no visible
+difference. Same cells in a DIFFERENT slot is not a duplicate — both claims are
+real, and the overlap rule picks between them.
+
+#### Outline only, no wash
+
+The formula's references wash their cells (`a: 0.14`) as well as outlining them.
+The chart's source areas outline only. Three washes over a selection that may
+also carry `range_tint` is the doubled-up indicator this plan set out to remove,
+and unlike a formula's references — which are read while typing, off the grid —
+these are read while looking straight at the cells.
 
 ### Task 4: One selection at a time
 

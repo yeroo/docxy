@@ -2669,6 +2669,27 @@ fn ref_color(i: usize) -> u32 {
     REF_COLORS[i % REF_COLORS.len()]
 }
 
+/// Which of a list of ranges owns cell `(r, c)` when they overlap: the SMALLEST
+/// one covering it, earliest index on a tie.
+///
+/// The rule is shared rather than copied, because the two lists that ask it —
+/// a formula's references and a selected chart's source areas — have to answer
+/// the same way. A cell claimed twice belongs to the tighter claim.
+fn smallest_ref_at(
+    ranges: impl Iterator<Item = (u32, u32, u32, u32)>,
+    r: u32,
+    c: u32,
+) -> Option<usize> {
+    ranges
+        .enumerate()
+        .filter(|&(_, (r0, c0, r1, c1))| r >= r0 && r <= r1 && c >= c0 && c <= c1)
+        .min_by_key(|&(i, (r0, c0, r1, c1))| {
+            let cells = (r1 as u64 - r0 as u64 + 1) * (c1 as u64 - c0 as u64 + 1);
+            (cells, i)
+        })
+        .map(|(i, _)| i)
+}
+
 /// Which of a formula's references owns cell `(r, c)` for colouring: the
 /// SMALLEST one covering it, earliest index on a tie.
 ///
@@ -2676,18 +2697,119 @@ fn ref_color(i: usize) -> u32 {
 /// the token it sits in (the inner one), so the grid has to agree or the second
 /// reference would have no cell drawn in its colour at all.
 fn ref_index_at(refs: &[(u32, u32, u32, u32)], r: u32, c: u32) -> Option<usize> {
-    refs.iter()
-        .enumerate()
-        .filter(|(_, r0c0)| {
-            let (r0, c0, r1, c1) = **r0c0;
-            r >= r0 && r <= r1 && c >= c0 && c <= c1
-        })
-        .min_by_key(|(i, rng)| {
-            let (r0, c0, r1, c1) = **rng;
-            let cells = (r1 as u64 - r0 as u64 + 1) * (c1 as u64 - c0 as u64 + 1);
-            (cells, *i)
-        })
-        .map(|(i, _)| i)
+    smallest_ref_at(refs.iter().copied(), r, c)
+}
+
+/// Which slot of a chart a source area fills — what those cells MEAN to the
+/// chart, rather than which reference they happen to be.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ChartSlot {
+    /// A series' numbers: its `<c:val>`, or a scatter's/bubble's point refs.
+    Values,
+    /// The category labels: `<c:cat>`.
+    Categories,
+    /// A series' name cell: its `<c:tx>`, usually the column header.
+    Name,
+}
+
+/// The colours a selected chart's source areas are outlined in — **Excel's own
+/// mapping**, deliberately, and NOT the `ref_color` palette above.
+///
+/// The two answer different questions. `ref_color` says "the Nth reference of
+/// the formula you are typing": its colours mean an ORDER, and cycle once they
+/// run out. These three say what the cells ARE to the chart, and anyone
+/// arriving from Excel already knows them by sight — blue values, purple
+/// categories, green series names. Matching Excel beats matching docxy for
+/// exactly that reason, so please don't "unify" these with the palette.
+const CHART_VALUES_COLOR: u32 = 0x4472c4; // blue
+const CHART_CATEGORIES_COLOR: u32 = 0x7030a0; // purple
+const CHART_NAME_COLOR: u32 = 0x00b050; // green
+
+/// The colour a source area is outlined in, by what it feeds the chart.
+fn chart_slot_color(slot: ChartSlot) -> u32 {
+    match slot {
+        ChartSlot::Values => CHART_VALUES_COLOR,
+        ChartSlot::Categories => CHART_CATEGORIES_COLOR,
+        ChartSlot::Name => CHART_NAME_COLOR,
+    }
+}
+
+/// One area of the sheet a selected chart reads, and what it reads it as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ChartSourceArea {
+    range: (u32, u32, u32, u32),
+    slot: ChartSlot,
+}
+
+/// The areas the chart reads on the sheet called `sheet`, one per reference it
+/// holds — for the grid to outline while the chart is selected.
+///
+/// SLOTS, not the box. `ChartData::source` is the union the panel's DATA RANGE
+/// shows, and outlining it would draw one rectangle around everything and say
+/// nothing about what any part of it does. What the user is asking when they
+/// select a chart is *which cells are the numbers, which are the labels* — so
+/// this walks `values_ref`, `point_refs`, `categories_ref` and `name_ref`
+/// instead, exactly the four slots the panel edits.
+///
+/// The ORDER is `rebuild_source`'s: every series' numbers first, then the
+/// categories, then the name cells. It matters because it is the tie-break for
+/// two areas of equal size (`chart_area_at`), and the model's own fold order is
+/// the one already justified.
+///
+/// Only THIS sheet's cells. A ref naming another sheet gets nothing at all,
+/// exactly as `preview_range` refuses the pointed-range wash for one — the
+/// cells it names are real, but they are not the cells in front of you, and
+/// drawing this sheet's cells of the same address would be a lie. A ref naming
+/// NO sheet is the chart's own, which is this one (a chart is only selectable
+/// on the sheet it floats over).
+fn chart_source_areas(cd: &gridcore::sheet::ChartData, sheet: &str) -> Vec<ChartSourceArea> {
+    use gridcore::sheet::ChartSource;
+    let mut out: Vec<ChartSourceArea> = Vec::new();
+    let mut push = |src: &ChartSource, slot: ChartSlot| {
+        if !(src.sheet.is_empty() || src.sheet.eq_ignore_ascii_case(sheet)) {
+            return; // another sheet's cells; nothing to draw here
+        }
+        let area = ChartSourceArea {
+            range: src.range,
+            slot,
+        };
+        // Two series pointed at one cell, or a re-point that left a duplicate,
+        // would otherwise draw the same box twice for no difference on screen.
+        if !out.contains(&area) {
+            out.push(area);
+        }
+    };
+    for s in &cd.series {
+        if let Some(src) = &s.values_ref {
+            push(src, ChartSlot::Values);
+        }
+        // A scatter's and a bubble's numbers live here instead of in
+        // `values_ref`, so leaving them out would outline nothing at all for
+        // the one chart kind whose plot IS its refs.
+        for src in &s.point_refs {
+            push(src, ChartSlot::Values);
+        }
+    }
+    if let Some(src) = &cd.categories_ref {
+        push(src, ChartSlot::Categories);
+    }
+    for s in &cd.series {
+        if let Some(src) = s.name_ref.as_deref().and_then(ChartSource::parse_f_ref) {
+            push(&src, ChartSlot::Name);
+        }
+    }
+    out
+}
+
+/// Which source area owns cell `(r, c)`, by the same rule the formula's
+/// references use: smallest area wins, earliest on a tie.
+///
+/// The slots nest by construction — a series' NAME cell is the header of the
+/// column its VALUES read, and a row chart's categories sit inside its box — so
+/// without the rule every name would be swallowed by the values box it heads
+/// and the green would never appear.
+fn chart_area_at(areas: &[ChartSourceArea], r: u32, c: u32) -> Option<usize> {
+    smallest_ref_at(areas.iter().map(|a| a.range), r, c)
 }
 
 /// A range as BARE A1 text — `B2:B5`, no `=`, no anchors, no sheet.
@@ -4753,8 +4875,25 @@ impl Docxy {
         preview_range(&f.buf, &self.sheet_names(), active)
     }
 
+    /// The cells the selected chart reads, for the grid to outline in the
+    /// colour of the slot each one feeds. Nothing at all when no chart is
+    /// selected, so deselecting a chart drops the outlines with its handles.
+    ///
+    /// The active sheet's name is what decides whose cells these are: a chart
+    /// may legally read another sheet, and `chart_source_areas` draws nothing
+    /// for such a ref rather than pointing at this sheet's cells of the same
+    /// address.
+    fn chart_refs(&self) -> std::rc::Rc<Vec<ChartSourceArea>> {
+        let areas = match (self.active_sheet(), self.chart_data()) {
+            (Some(v), Some(cd)) => chart_source_areas(&cd, &v.sheet().name),
+            _ => Vec::new(),
+        };
+        std::rc::Rc::new(areas)
+    }
+
     /// Everything drawn over the grid that isn't the cells themselves: the fill
-    /// and range previews, point mode, and the formula's coloured references.
+    /// and range previews, point mode, the formula's coloured references and a
+    /// selected chart's source areas.
     /// One bundle, so the render pass doesn't thread four more arguments through
     /// `sheet_el`. `handle_hidden` is filled in there, where the chart cards'
     /// boxes are known.
@@ -4768,6 +4907,7 @@ impl Docxy {
             // let you drag a new range out of the sheet you can see.
             picking: self.range_field_active(),
             formula_refs: self.formula_refs(),
+            chart_refs: self.chart_refs(),
             // In point mode a drag off the selection's corner means "sweep a
             // range", not "auto-fill". The handle's own guard only covers an
             // in-cell edit, so without this a drag that starts on those few
@@ -16365,6 +16505,11 @@ struct GridOverlay {
     /// The ranges the formula being typed mentions, in writing order — each
     /// outlined in its own colour so you can see what it reads.
     formula_refs: std::rc::Rc<Vec<(u32, u32, u32, u32)>>,
+    /// The cells the SELECTED chart reads, one entry per slot with its role,
+    /// each outlined in Excel's own colour for that role. Empty when no chart
+    /// is selected — which is the whole of the "is this drawn?" question, so
+    /// there is no separate flag.
+    chart_refs: std::rc::Rc<Vec<ChartSourceArea>>,
     /// The selection's corner is under a chart card, which owns those pixels.
     handle_hidden: bool,
     /// The pointed range's border dashes. False past `RANGE_BORDER_CELL_CAP`
@@ -16479,6 +16624,10 @@ fn sheet_row(
         // Cells the formula being typed reads: the innermost reference covering
         // this cell gives it its colour, which is the one the TEXT draws too.
         let formula_ref = ref_index_at(&ov.formula_refs, r, c).map(|i| (i, ov.formula_refs[i]));
+        // Cells the SELECTED chart reads: the tightest slot covering this one
+        // gives it its colour, so a series' name cell still reads as a name
+        // inside the values box it heads.
+        let chart_ref = chart_area_at(&ov.chart_refs, r, c).map(|i| ov.chart_refs[i]);
         let cell_editing = selected && editing.is_some();
         let on_freeze = fc > 0 && c + 1 == fc;
         let (text, xf, is_num) = match sh.cell(r, c) {
@@ -16683,6 +16832,28 @@ fn sheet_row(
                         .when(bot, |d| d.border_b(px(2.)))
                         .when(lft, |d| d.border_l(px(2.)))
                         .when(rgt, |d| d.border_r(px(2.))),
+                ));
+            }
+        }
+        // The selected chart's source areas, each outlined in the colour of the
+        // slot it feeds — blue values, purple categories, green series names,
+        // which is Excel's own mapping and deliberately not `ref_color`'s.
+        // Drawn per edge cell, `deferred`, exactly like the references above.
+        if let Some(a) = chart_ref {
+            let e = range_edges_at(a.range, r, c);
+            if !e.is_empty() {
+                cell = cell.relative().child(deferred(
+                    div()
+                        .absolute()
+                        .left(px(-1.))
+                        .top(px(-1.))
+                        .right(px(-1.))
+                        .bottom(px(-1.))
+                        .border_color(hsla_u(chart_slot_color(a.slot)))
+                        .when(e.top, |d| d.border_t(px(2.)))
+                        .when(e.bottom, |d| d.border_b(px(2.)))
+                        .when(e.left, |d| d.border_l(px(2.)))
+                        .when(e.right, |d| d.border_r(px(2.))),
                 ));
             }
         }
@@ -17934,13 +18105,15 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
+        CHART_CATEGORIES_COLOR, CHART_NAME_COLOR, CHART_VALUES_COLOR, ChartSlot, ChartSourceArea,
         EdgeMask, GRID_MAX_VISIBLE_ROWS, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan,
-        RefText, SHEET_ROW_H, border_range, char_to_byte, chart_ref_of, col_at_x, col_px, dash_fit,
-        edit_runs, fill_box, formula_ref_tokens, last_visible_col, parse_ref_text, preview_range,
-        range_a1, range_border_dashed, range_border_plan, range_edges_at, range_text, ref_a1,
-        ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
-        row_height_px, scroll_col0_for_sel, series_move, series_name_shown, series_remove,
-        sheet_index_of, shift_col, shift_row, source_ref_text,
+        RefText, SHEET_ROW_H, border_range, char_to_byte, chart_area_at, chart_ref_of,
+        chart_slot_color, chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box,
+        formula_ref_tokens, last_visible_col, parse_ref_text, preview_range, range_a1,
+        range_border_dashed, range_border_plan, range_edges_at, range_text, ref_a1, ref_color,
+        ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px,
+        scroll_col0_for_sel, series_move, series_name_shown, series_remove, sheet_index_of,
+        shift_col, shift_row, source_ref_text,
     };
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -21219,6 +21392,290 @@ mod grid_geom_tests {
         // the deferred element entirely.
         assert!(range_edges_at((1, 1, 5, 5), 3, 3).is_empty());
         assert!(range_edges_at(row, 5, 3).is_empty());
+    }
+
+    // ---- a selected chart's source areas --------------------------------
+
+    fn chart_src(sheet: &str, range: (u32, u32, u32, u32)) -> gridcore::sheet::ChartSource {
+        gridcore::sheet::ChartSource {
+            sheet: sheet.into(),
+            range,
+            cat_col: range.1,
+        }
+    }
+
+    fn chart_series(
+        name_ref: Option<&str>,
+        values_ref: Option<gridcore::sheet::ChartSource>,
+    ) -> gridcore::sheet::ChartSeries {
+        gridcore::sheet::ChartSeries {
+            name_ref: name_ref.map(str::to_string),
+            values_ref,
+            ..Default::default()
+        }
+    }
+
+    /// A two-series chart over `Data!A1:C5`: a header cell naming each series
+    /// in row 1, labels down column A, numbers in B and C.
+    fn data_chart() -> gridcore::sheet::ChartData {
+        gridcore::sheet::ChartData {
+            series: vec![
+                chart_series(Some("Data!$B$1"), Some(chart_src("Data", (1, 1, 4, 1)))),
+                chart_series(Some("Data!$C$1"), Some(chart_src("Data", (1, 2, 4, 2)))),
+            ],
+            categories_ref: Some(chart_src("Data", (1, 0, 4, 0))),
+            source: Some(chart_src("Data", (0, 0, 4, 2))),
+            ..Default::default()
+        }
+    }
+
+    /// `(range, slot)` as a test reads it, so a failure names the slot rather
+    /// than an enum buried in a tuple.
+    fn areas(cd: &gridcore::sheet::ChartData, sheet: &str) -> Vec<((u32, u32, u32, u32), char)> {
+        chart_source_areas(cd, sheet)
+            .into_iter()
+            .map(|a| {
+                (
+                    a.range,
+                    match a.slot {
+                        ChartSlot::Values => 'v',
+                        ChartSlot::Categories => 'c',
+                        ChartSlot::Name => 'n',
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Every slot the chart holds a reference for becomes an area, in the
+    /// model's own fold order: the numbers, then the labels, then the names.
+    /// The chart's BOX is not among them — it is their union, and outlining it
+    /// would say nothing about what any part of it does.
+    #[test]
+    fn chart_source_areas_lists_one_area_per_slot() {
+        let listed = areas(&data_chart(), "Data");
+        assert_eq!(
+            listed,
+            vec![
+                ((1, 1, 4, 1), 'v'), // B2:B5
+                ((1, 2, 4, 2), 'v'), // C2:C5
+                ((1, 0, 4, 0), 'c'), // A2:A5
+                ((0, 1, 0, 1), 'n'), // B1
+                ((0, 2, 0, 2), 'n'), // C1
+            ]
+        );
+        // The box `A1:C5` is not drawn, though the chart holds it.
+        assert!(!listed.iter().any(|a| a.0 == (0, 0, 4, 2)));
+
+        // A chart holding no references outlines nothing rather than falling
+        // back to its box.
+        let bare = gridcore::sheet::ChartData {
+            source: Some(chart_src("Data", (0, 0, 4, 2))),
+            series: vec![chart_series(None, None)],
+            ..Default::default()
+        };
+        assert!(areas(&bare, "Data").is_empty());
+        assert!(areas(&Default::default(), "Data").is_empty());
+    }
+
+    /// A scatter's and a bubble's numbers live in `point_refs`, not in
+    /// `values_ref`. Reading only the latter would outline nothing at all for
+    /// the one chart kind whose plot IS its refs.
+    #[test]
+    fn chart_source_areas_reads_a_scatters_points() {
+        let mut s = chart_series(Some("Data!$B$1"), None);
+        s.point_refs = vec![
+            chart_src("Data", (1, 0, 3, 0)), // xVal A2:A4
+            chart_src("Data", (1, 1, 3, 1)), // yVal B2:B4
+        ];
+        let cd = gridcore::sheet::ChartData {
+            series: vec![s],
+            ..Default::default()
+        };
+        assert_eq!(
+            areas(&cd, "Data"),
+            vec![
+                ((1, 0, 3, 0), 'v'),
+                ((1, 1, 3, 1), 'v'),
+                ((0, 1, 0, 1), 'n'),
+            ]
+        );
+    }
+
+    /// A reference naming another sheet draws NOTHING — not this sheet's cells
+    /// of the same address, which is the lie `preview_range` refuses for the
+    /// pointed range too. A reference naming NO sheet is the chart's own.
+    #[test]
+    fn chart_source_areas_draws_only_the_sheet_in_front_of_you() {
+        let cd = data_chart();
+        // Seen from another sheet, a chart reading `Data` outlines nothing.
+        assert!(areas(&cd, "Sheet2").is_empty());
+        // Excel matches sheet names case-insensitively, and so does this.
+        assert_eq!(areas(&cd, "data").len(), 5);
+
+        // Mixed: the numbers are here, the labels and the name on `Ref`. Only
+        // the numbers are drawn.
+        let mixed = gridcore::sheet::ChartData {
+            series: vec![chart_series(
+                Some("Ref!$B$1"),
+                Some(chart_src("Data", (1, 1, 4, 1))),
+            )],
+            categories_ref: Some(chart_src("Ref", (1, 0, 4, 0))),
+            ..Default::default()
+        };
+        assert_eq!(areas(&mixed, "Data"), vec![((1, 1, 4, 1), 'v')]);
+
+        // An unqualified ref — a chart authored before its refs carried a
+        // sheet — belongs to the sheet it floats over, which is this one.
+        let unqualified = gridcore::sheet::ChartData {
+            series: vec![chart_series(
+                Some("$B$1"),
+                Some(chart_src("", (1, 1, 4, 1))),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            areas(&unqualified, "Data"),
+            vec![((1, 1, 4, 1), 'v'), ((0, 1, 0, 1), 'n')]
+        );
+
+        // A `name_ref` that is not a reference at all (a typed name) is not an
+        // area, and does not stop the slots after it being read.
+        let typed = gridcore::sheet::ChartData {
+            series: vec![chart_series(
+                Some("not a ref"),
+                Some(chart_src("Data", (1, 1, 4, 1))),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(areas(&typed, "Data"), vec![((1, 1, 4, 1), 'v')]);
+    }
+
+    /// Two series pointed at one cell draw one box — not the same box twice
+    /// for no visible difference.
+    #[test]
+    fn chart_source_areas_folds_a_duplicated_reference() {
+        let cd = gridcore::sheet::ChartData {
+            series: vec![
+                chart_series(Some("Data!$B$1"), Some(chart_src("Data", (1, 1, 4, 1)))),
+                chart_series(Some("Data!$B$1"), Some(chart_src("Data", (1, 1, 4, 1)))),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            areas(&cd, "Data"),
+            vec![((1, 1, 4, 1), 'v'), ((0, 1, 0, 1), 'n')]
+        );
+        // Same cells, different slot, is NOT a duplicate: both claims are real,
+        // and the overlap rule below is what picks between them.
+        let both = gridcore::sheet::ChartData {
+            series: vec![chart_series(
+                Some("Data!$B$1"),
+                Some(chart_src("Data", (0, 1, 0, 1))),
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            areas(&both, "Data"),
+            vec![((0, 1, 0, 1), 'v'), ((0, 1, 0, 1), 'n')]
+        );
+    }
+
+    /// The overlap rule, shared with `ref_index_at`: the SMALLEST area covering
+    /// a cell owns it, earliest on a tie. Without it a series' name cell would
+    /// be swallowed by the values box it heads.
+    #[test]
+    fn chart_area_at_gives_a_cell_to_the_tightest_slot() {
+        let cd = gridcore::sheet::ChartData {
+            series: vec![chart_series(
+                Some("Data!$B$1"),
+                // The values ref covers its own header cell, as a chart
+                // re-pointed at a whole column does.
+                Some(chart_src("Data", (0, 1, 4, 1))),
+            )],
+            ..Default::default()
+        };
+        let a = chart_source_areas(&cd, "Data");
+        let slot = |r, c| chart_area_at(&a, r, c).map(|i| a[i].slot);
+        assert_eq!(slot(0, 1), Some(ChartSlot::Name)); // B1 → the one cell
+        assert_eq!(slot(2, 1), Some(ChartSlot::Values)); // B3 → only the values
+        assert_eq!(slot(0, 0), None); // A1 → neither
+        assert_eq!(slot(5, 1), None); // B6 → below both
+
+        // Earliest wins a tie of equal size: the values ref is folded first, so
+        // a name cell that IS the whole values ref reads as values.
+        let tie = gridcore::sheet::ChartData {
+            series: vec![chart_series(
+                Some("Data!$B$1"),
+                Some(chart_src("Data", (0, 1, 0, 1))),
+            )],
+            ..Default::default()
+        };
+        let a = chart_source_areas(&tie, "Data");
+        assert_eq!(
+            chart_area_at(&a, 0, 1).map(|i| a[i].slot),
+            Some(ChartSlot::Values)
+        );
+        // Nothing to own a cell, and nothing to panic on.
+        assert_eq!(chart_area_at(&[], 0, 0), None);
+    }
+
+    /// The labels stay apart from the numbers, and the box owns nothing.
+    #[test]
+    fn chart_area_at_keeps_the_labels_apart_from_the_numbers() {
+        let a = chart_source_areas(&data_chart(), "Data");
+        let slot = |r, c| chart_area_at(&a, r, c).map(|i| a[i].slot);
+        assert_eq!(slot(1, 0), Some(ChartSlot::Categories)); // A2, a label
+        assert_eq!(slot(1, 1), Some(ChartSlot::Values)); // B2, a number
+        assert_eq!(slot(0, 1), Some(ChartSlot::Name)); // B1, a header
+        assert_eq!(slot(0, 2), Some(ChartSlot::Name)); // C1, a header
+        // A1 is inside the chart's BOX but in none of its slots, and the box is
+        // not drawn — so nothing owns it.
+        assert_eq!(slot(0, 0), None);
+    }
+
+    /// The three role colours are Excel's: distinct from each other, and from
+    /// every colour `ref_color` hands a formula reference — a source outline
+    /// must never be mistaken for "the Nth reference of what you are typing".
+    #[test]
+    fn chart_slot_colors_are_excels_and_not_the_ref_palette() {
+        assert_eq!(chart_slot_color(ChartSlot::Values), CHART_VALUES_COLOR);
+        assert_eq!(
+            chart_slot_color(ChartSlot::Categories),
+            CHART_CATEGORIES_COLOR
+        );
+        assert_eq!(chart_slot_color(ChartSlot::Name), CHART_NAME_COLOR);
+
+        let roles = [CHART_VALUES_COLOR, CHART_CATEGORIES_COLOR, CHART_NAME_COLOR];
+        for (i, a) in roles.iter().enumerate() {
+            for b in &roles[i + 1..] {
+                assert_ne!(a, b);
+            }
+            // `ref_color` cycles through six; none of them may collide.
+            for j in 0..6 {
+                assert_ne!(*a, ref_color(j), "role {a:#08x} collides with ref {j}");
+            }
+        }
+    }
+
+    /// An area becomes SIDES through `range_edges_at` — the same geometry the
+    /// pointed range's border uses, so a one-cell name owns all four and a
+    /// column of values owns three at each end and two down the middle.
+    #[test]
+    fn chart_source_areas_feed_the_same_edge_geometry_as_the_range_border() {
+        let a = chart_source_areas(&data_chart(), "Data");
+        let one = ChartSourceArea {
+            range: (0, 1, 0, 1),
+            slot: ChartSlot::Name,
+        };
+        assert!(a.contains(&one));
+        assert_eq!(mask(range_edges_at(one.range, 0, 1)), "trbl"); // B1
+
+        let vals = a[0].range; // B2:B5
+        assert_eq!(mask(range_edges_at(vals, 1, 1)), "tr.l"); // B2, the top
+        assert_eq!(mask(range_edges_at(vals, 2, 1)), ".r.l"); // B3, the middle
+        assert_eq!(mask(range_edges_at(vals, 4, 1)), ".rbl"); // B5, the bottom
+        assert!(range_edges_at(vals, 1, 2).is_empty()); // C2 is another slot's
     }
 }
 
