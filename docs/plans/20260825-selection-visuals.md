@@ -335,6 +335,43 @@ reachable, and a select-all there falls back to a solid border. That is the
 backstop working as specified, not a defect — the tested guarantee is that the
 **same edges** are still drawn, just solid.
 
+➕ **Hidden rows would leave the rectangle open** (review). Drawing per cell has
+one consequence this task did not chase down: `range_edges_at` gives the top
+edge to `r == r0`, and if row `r0` is hidden or filtered out, no rendered cell
+owns it. The preview had drawn that way all along; the change spread the rule to
+the selection border and to the chart's source areas, where an open rectangle is
+exactly what Task 3's paint order exists to prevent. `sheet_el` now snaps every
+outlined range onto the visible-row list it already builds
+(`snap_range_rows`) — the border, the formula's references and the chart's
+areas alike — before any of them reach `range_edges_at`. Snapping there rather
+than inside `range_edges_at` keeps that function, `range_border_plan` and
+`range_border_cell_count` agreeing on the same total arithmetic. It also moved
+`border_range` itself into `sheet_el`, as `GridOverlay::border_rg`: the drawn
+border and the range the cap is costed against are now one answer, asked once.
+
+➕ **Snapping has to happen before `border_range` decides** (review). The
+single-cell guard there — a lone cell already wears the ring, so drawing a box
+round it too is the doubled indicator this plan removes — has to see the range
+that will actually be *drawn*. Composed the other way round, a two-row selection
+with one row hidden passed the guard, snapped down to one cell, and wore both.
+`sheet_el` now snaps the preview and the shown selection on the way in.
+
+➕ **Past the end of the grid is not "hidden"** (review). `visible` is
+`0..total_rows` minus the hidden rows, and `total_rows` is the used extent plus
+headroom — so "not in `visible`" also caught every row past the drawing.
+`=SUM(A1:A800)` on a 500-row grid had its bottom edge pulled back to row 500 and
+drawn *closed* there, saying the reference ended where the grid did (same for a
+chart whose `values_ref` is a padded `$B$2:$B$1000`, a common shape in files
+Excel and LibreOffice write). `snap_range_rows` now takes the rendered row count
+and leaves `r1` alone past it, so the rectangle stays open where the range
+really carries on.
+
+➕ **The comment note goes with the selection too** (review). The yellow note on
+a commented cell is anchored on the selection and names it, so under
+`sel_hidden` it would hang over a cell the grid marks in no other way — and
+paint over the chart layer. It is now gated with the rest of the set, and the
+set's enumeration in `suite/docs/range-selector.md` names it.
+
 ### Task 3: A selected chart outlines the cells it reads
 
 - [x] add the chart's source areas to `GridOverlay` — one entry per slot with
@@ -381,12 +418,22 @@ The order is `rebuild_source`'s: every series' numbers first, then the
 categories, then the name cells. That order is the tie-break for two areas of
 equal size, and the model's own fold order is the one already justified.
 
-#### The overlap rule is shared, not copied
+#### The overlap rule is stated once, mirrored once
 
 `ref_index_at` was refactored onto a new `smallest_ref_at(ranges, r, c)`. Two
 lists asking "who owns this cell" have to answer the same way, and a shared rule
 cannot drift apart the way two copies would. It takes an iterator rather than a
 slice, so neither caller allocates per cell.
+
+➕ **What is shared turned out to be the arithmetic, not the function**
+(review). The ➕ below is why: an outline needs every covering area, not the
+single winner, so `chart_areas_at` cannot call `smallest_ref_at` — it
+expresses the same rule as a paint order instead. `range_covers` and
+`range_cells` are extracted and called from both, so "covers" and "smaller"
+cannot drift; only the order differs, and the reversed sort is documented as
+this `min_by_key` read backwards. `smallest_ref_at` therefore has ONE caller
+(`ref_index_at`), and its `impl Iterator` generality is a small piece of
+speculative reach the second caller never took up.
 
 The rule earns its keep here more than it does for formulas: the slots nest **by
 construction** — a series' name cell is the header of the column its values read
@@ -492,6 +539,35 @@ press with `pointing` passed through properly rather than hard-coded `false`.
 Escape and Delete still belong to the chart; so do `Ctrl+S`, `Ctrl+F`, `Ctrl+F1`
 (aimed at the document or the window) and undo/redo (which drop the chart
 selection themselves, because the chart list moves under them).
+
+➕ **Tab needs the rule stated a third time** (review). Reading the rule off
+`sheet_key` misses it: gpui swallows Tab for focus traversal, so it never
+arrives as a key event at all — it is action-bound, and `tab_key` /
+`shift_tab_key` call `sheet_commit` directly. That commits and advances the
+selection exactly as the arrows do, so with a chart selected it was moving a
+selection `sel_hidden` was not drawing, and dismissing the chart revealed the
+ring somewhere else. Both now hand back first. The comment in `sheet_key` that
+listed Tab among the keys "that change nothing about the selection" said so
+because Tab does nothing *there*; it now says why.
+
+➕ **...but a live range field still comes first** (review). Bypassing
+`sheet_key` bypasses more than the hand-back arm: the routing that gives a
+focused Chart-panel field the keyboard (`range_edit.is_some()` →
+`range_edit_key`) sits above it, which is why the arrows *don't* hand back while
+one is open. Handing back from `tab_key` unconditionally made Tab the one
+navigation key that pulled the chart out from under a live field, and
+`drop_field` took the half-typed reference and its error message with it. Both
+`tab_key` and `shift_tab_key` now return early on `range_edit.is_some()`, so the
+field swallows Tab exactly as it swallows every other key.
+
+➕ **So is the ribbon, and so is the fx bar** (review, commit `162abab`).
+`run_sheet_act` asks the new `act_targets_cells` before anything reads the
+selection — Ribbon ▸ Bold is the same `sheet_toggle_bold` as `Ctrl+B`, and
+Delete Row is the case that matters. It is a `!matches!` over three whole-sheet
+exceptions (`ProtectSheet`, `Outline`, `Todo`), so a new `SheetAct` defaults to
+handing back. A click on the formula bar opens an editor on the selected cell
+and hands back for the same reason `F2` does. Both are recorded in
+`suite/docs/range-selector.md`'s "One selection at a time".
 
 ### Task 5: The Chart panel is sticky
 
@@ -610,7 +686,7 @@ underneath it. That is the whole line between sticky and stale.
 | Complaint | Answered by |
 |---|---|
 | 1. A pointed range is a flat wash | `sheet_row` draws `range_edges_at`'s sides with `border_dashed()` at `RANGE_BORDER_W` in `hsla_u(BRAND)`; the pointed range's own `a: 0.18` wash is gone |
-| 2. A selected chart says nothing about its sources | `GridOverlay::chart_refs` ← `chart_source_areas`, coloured by `chart_slot_color` (`CHART_VALUES_COLOR` blue / `CHART_CATEGORIES_COLOR` purple / `CHART_NAME_COLOR` green) and resolved by the shared `smallest_ref_at` |
+| 2. A selected chart says nothing about its sources | `GridOverlay::chart_refs` ← `chart_source_areas`, coloured by `chart_slot_color` (`CHART_VALUES_COLOR` blue / `CHART_CATEGORIES_COLOR` purple / `CHART_NAME_COLOR` green) and resolved by `chart_areas_at`, which mirrors `smallest_ref_at`'s rule as a paint order (they share `range_covers` / `range_cells`, not the function — see the ➕ below) |
 | 3. A chart and a cell are selected at once | `press_selection` over `SelectTarget::{Cell, Chart, NavKey}`, with `cell_selection_shown` → `GridOverlay::sel_hidden` darkening the ring, the wash, both headers and the handle together |
 | 4. The Chart panel vanishes on a cell click | `Docxy::panel_chart` moved only through `chart_panel_after`; the render gate and the grid-width reservation both ask `panel_chart_shown()`, and `chart_panel_shown(idx, count)` bounds-checks it |
 

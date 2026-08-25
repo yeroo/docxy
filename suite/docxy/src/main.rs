@@ -2695,12 +2695,31 @@ fn ref_color(i: usize) -> u32 {
     REF_COLORS[i % REF_COLORS.len()]
 }
 
+/// How many cells a range covers — the size the overlap rule ranks by.
+fn range_cells(range: (u32, u32, u32, u32)) -> u64 {
+    let (r0, c0, r1, c1) = range;
+    (r1 as u64 - r0 as u64 + 1) * (c1 as u64 - c0 as u64 + 1)
+}
+
+/// Whether `range` covers cell `(r, c)`.
+fn range_covers(range: (u32, u32, u32, u32), r: u32, c: u32) -> bool {
+    let (r0, c0, r1, c1) = range;
+    r >= r0 && r <= r1 && c >= c0 && c <= c1
+}
+
 /// Which of a list of ranges owns cell `(r, c)` when they overlap: the SMALLEST
-/// one covering it, earliest index on a tie.
+/// one covering it, earliest index on a tie. A cell claimed twice belongs to
+/// the tighter claim.
 ///
-/// The rule is shared rather than copied, because the two lists that ask it —
-/// a formula's references and a selected chart's source areas — have to answer
-/// the same way. A cell claimed twice belongs to the tighter claim.
+/// Two lists ask that question — a formula's references and a selected chart's
+/// source areas — and they have to answer it the same way. They do NOT share
+/// this function, though: `chart_areas_at` needs every covering area in paint
+/// order rather than the single winner, because an outline's loser is a
+/// rectangle whose side ran through the cell (see its own doc). What is shared
+/// is the arithmetic underneath — `range_cells` and `range_covers` — so the
+/// two cannot drift on what "smaller" and "covers" mean; the ORDER each wants
+/// is stated once in each place, and `chart_areas_at`'s reversed sort is
+/// deliberately this `min_by_key` read backwards.
 fn smallest_ref_at(
     ranges: impl Iterator<Item = (u32, u32, u32, u32)>,
     r: u32,
@@ -2708,11 +2727,8 @@ fn smallest_ref_at(
 ) -> Option<usize> {
     ranges
         .enumerate()
-        .filter(|&(_, (r0, c0, r1, c1))| r >= r0 && r <= r1 && c >= c0 && c <= c1)
-        .min_by_key(|&(i, (r0, c0, r1, c1))| {
-            let cells = (r1 as u64 - r0 as u64 + 1) * (c1 as u64 - c0 as u64 + 1);
-            (cells, i)
-        })
+        .filter(|&(_, rg)| range_covers(rg, r, c))
+        .min_by_key(|&(i, rg)| (range_cells(rg), i))
         .map(|(i, _)| i)
 }
 
@@ -2843,19 +2859,20 @@ fn chart_source_areas(cd: &gridcore::sheet::ChartData, sheet: &str) -> Vec<Chart
 /// largest first means the tightest claim paints LAST and wins any edge two
 /// areas share, which is the same cell going to the same slot as before.
 fn chart_areas_at(areas: &[ChartSourceArea], r: u32, c: u32) -> Vec<usize> {
-    let cells = |i: usize| {
-        let (r0, c0, r1, c1) = areas[i].range;
-        (r1 as u64 - r0 as u64 + 1) * (c1 as u64 - c0 as u64 + 1)
-    };
+    // `range_covers` and `range_cells` are `smallest_ref_at`'s own, so "covers"
+    // and "smaller" cannot come to mean two different things here; only the
+    // order differs, and deliberately.
     let mut hit: Vec<usize> = (0..areas.len())
-        .filter(|&i| {
-            let (r0, c0, r1, c1) = areas[i].range;
-            r >= r0 && r <= r1 && c >= c0 && c <= c1
-        })
+        .filter(|&i| range_covers(areas[i].range, r, c))
         .collect();
     // Reversed on both keys: the last painted is the smallest, and the earliest
     // index among equals — `smallest_ref_at`'s winner, expressed as paint order.
-    hit.sort_by_key(|&i| (std::cmp::Reverse(cells(i)), std::cmp::Reverse(i)));
+    hit.sort_by_key(|&i| {
+        (
+            std::cmp::Reverse(range_cells(areas[i].range)),
+            std::cmp::Reverse(i),
+        )
+    });
     hit
 }
 
@@ -2869,8 +2886,13 @@ enum SelectTarget {
     /// of its resize grips alike, because a resize is still a press on the
     /// chart it grips, and Excel selects a chart on mouse-DOWN.
     Chart(usize),
-    /// A key the grid navigates with (the arrows, and Enter). It moves the cell
-    /// selection, so it is aimed at the cells even though nothing was clicked.
+    /// Anything that reads or writes the cell selection without being a press
+    /// on a grid object: the navigation keys and Tab, `F2` and any printable
+    /// character, the `Ctrl` commands that act on cells, Find Next / Replace,
+    /// every ribbon command `act_targets_cells` accepts, and a click on the
+    /// formula bar. It moves or acts on the cell selection, so it is aimed at
+    /// the cells even though nothing on the GRID was clicked — which is what
+    /// separates it from `Cell` and `Chart` above.
     NavKey,
 }
 
@@ -4085,8 +4107,10 @@ impl Docxy {
         cx.notify();
     }
 
-    /// Re-point the selected chart at another range, replotting its categories
-    /// and series from those cells while keeping its type, title and colours.
+    /// Re-point the panel's chart — the one it SHOWS, `chart_data`'s, which is
+    /// not always the selected one — at another range, replotting its
+    /// categories and series from those cells while keeping its type, title and
+    /// colours.
     /// The reference names the sheet it reads — a chart floating over one sheet
     /// can plot another sheet's numbers — and an unqualified one means the
     /// sheet in front of you.
@@ -4208,8 +4232,8 @@ impl Docxy {
             })
     }
 
-    /// The selected chart re-derived from its own range the other way round, or
-    /// WHY it can't be — which is both what greys the Switch Row/Column button
+    /// The panel's chart (`chart_data`'s, not `chart_sel`'s) re-derived from its
+    /// own range the other way round, or WHY it can't be — which is both what greys the Switch Row/Column button
     /// out and the note printed under it, so the button is enabled exactly when
     /// clicking it would do something and the reason given is the real one. The
     /// two used to be worked out separately, and the note then blamed the range
@@ -4262,7 +4286,8 @@ impl Docxy {
         self.chart_set_data(data, cx);
     }
 
-    /// Switch the selected chart between column / bar / line / pie.
+    /// Switch the panel's chart (`chart_data`'s) between column / bar / line /
+    /// pie.
     fn chart_set_kind(&mut self, kind: &str, cx: &mut Context<Self>) {
         let Some(data) = self.chart_data() else {
             return;
@@ -4352,7 +4377,7 @@ impl Docxy {
         }
     }
 
-    /// Colour one series of the selected chart.
+    /// Colour one series of the panel's chart (`chart_data`'s).
     fn chart_set_color(&mut self, series: usize, rgb: u32, cx: &mut Context<Self>) {
         let Some(mut data) = self.chart_data() else {
             return;
@@ -5252,7 +5277,10 @@ impl Docxy {
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
             handle_hidden: self.range_field_active() || self.formula_pick_active(),
-            // The cap needs the column window, which only `sheet_el` has.
+            // The border's range and the cap on its dashes both need the
+            // visible-row list and the column window, which only `sheet_el`
+            // has.
+            border_rg: None,
             range_dashed: true,
             // One selection at a time: a selected chart owns it, and the grid
             // shows nothing of its own until that chart is dismissed.
@@ -7581,9 +7609,12 @@ impl Docxy {
             .into_any_element()
     }
 
-    /// The "Chart" side panel, shown while a chart is selected: what it plots,
-    /// how it is drawn, its title, and a colour per series. Every control acts
-    /// on the selection immediately.
+    /// The "Chart" side panel, shown while `panel_chart_shown()` is `Some` —
+    /// from the press on a card until Escape, the close box or an `Invalidate`,
+    /// which under the sticky rule outlives the chart's SELECTION: what it
+    /// plots, how it is drawn, its title, and a colour per series. Every
+    /// control acts immediately on the chart the panel SHOWS (`chart_data` /
+    /// `chart_set_data`), not on whatever is selected.
     fn chart_panel(&self, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let Some(data) = self.chart_data() else {
             return div().into_any_element();
@@ -8374,9 +8405,12 @@ impl Docxy {
                 "left" | "right" | "up" | "down" | "enter" | "f2" => self.chart_hand_back(cx),
                 // A printable character starts a fresh edit in the selected
                 // cell, so it is as much a press on the cells as F2 is. Every
-                // other key — a lone modifier, Tab, a function key the grid
-                // ignores — leaves the chart selected, because it changes
-                // nothing about the selection either way.
+                // other key — a lone modifier, a function key the grid ignores
+                // — leaves the chart selected, because it changes nothing about
+                // the selection either way. Tab is NOT in that set: gpui
+                // swallows it for focus traversal, so it arrives as an action
+                // (`tab_key` / `shift_tab_key`) and never reaches here, and it
+                // states the hand-back for itself.
                 _ if ev
                     .keystroke
                     .key_char
@@ -10916,6 +10950,22 @@ impl Docxy {
         self.context_menu = None;
         // On a sheet, Tab commits the edit and advances one cell to the right.
         if self.active_is_sheet() {
+            // A Chart-panel range field swallows Tab the same way it swallows
+            // every other key, and for the same reason: it has the keyboard.
+            // `sheet_key` states that first (`range_edit.is_some()` routes to
+            // `range_edit_key` BEFORE the hand-back arm), and Tab is
+            // action-bound, so it has to be stated again here — otherwise Tab
+            // would be the one navigation key that hands the chart back out
+            // from under a live field, discarding the half-typed reference and
+            // its error message with `drop_field`.
+            if self.range_edit.is_some() {
+                return;
+            }
+            // Tab is action-bound, so it never reaches `sheet_key`'s hand-back
+            // arm — the rule has to be stated again here. It moves the cell
+            // selection exactly as the arrows do, and a selection the chart is
+            // hiding is one you cannot watch move.
+            self.chart_hand_back(cx);
             return self.sheet_commit(0, 1, cx);
         }
         self.with_editor(window, cx, |e| e.insert_tab());
@@ -10931,6 +10981,12 @@ impl Docxy {
         self.context_menu = None;
         // On a sheet, Shift+Tab commits and moves one cell to the left.
         if self.active_is_sheet() {
+            // Same as Tab above: the field has the keyboard first, then
+            // action-bound, moves the selection, hands back.
+            if self.range_edit.is_some() {
+                return;
+            }
+            self.chart_hand_back(cx);
             return self.sheet_commit(0, -1, cx);
         }
         self.with_editor(window, cx, |e| e.change_indent(-720));
@@ -16678,6 +16734,47 @@ fn range_edges_at(range: (u32, u32, u32, u32), r: u32, c: u32) -> EdgeMask {
     }
 }
 
+/// `range` with its row span pulled onto rows the grid actually DRAWS:
+/// `visible` is the sorted list of unhidden rows the renderer walks, so a range
+/// whose first or last row is hidden or filtered out has no rendered cell to
+/// own that edge and `range_edges_at` would leave the rectangle open on that
+/// side. Snapping `r0` up to the first visible row at or after it, and `r1`
+/// down to the last visible row at or before it, hands the edge to the cell
+/// that is actually against the gap — which is where the eye puts it anyway,
+/// since a hidden row collapses to zero height and its neighbours sit flush.
+///
+/// A range with no visible row at all comes back unchanged: nothing of it is
+/// drawn either way, and leaving the value alone keeps this a total function,
+/// so a caller mapping over a list (a formula's references, a chart's source
+/// areas) keeps its INDICES — which are what pick the colour.
+///
+/// `rendered` is the number of rows the grid virtualizes over, and it is what
+/// tells a HIDDEN row apart from one that is merely past the end of the drawing.
+/// `visible` is that span with the hidden rows taken out, so "not in `visible`"
+/// alone would also catch every row past it — and a `=SUM(A1:A800)` on a
+/// 500-row grid would have its bottom edge pulled back and drawn CLOSED across
+/// the last row, saying the reference ends there. A range that runs off the
+/// bottom keeps its `r1`: the edge belongs to a row nothing draws, so the
+/// rectangle stays open, which is the truthful picture.
+fn snap_range_rows(
+    range: (u32, u32, u32, u32),
+    visible: &[u32],
+    rendered: u32,
+) -> (u32, u32, u32, u32) {
+    let (r0, c0, r1, c1) = range;
+    let first = visible.partition_point(|&v| v < r0);
+    let past_last = visible.partition_point(|&v| v <= r1);
+    if first >= past_last {
+        return range;
+    }
+    let last = if r1 >= rendered {
+        r1
+    } else {
+        visible[past_last - 1]
+    };
+    (visible[first], c0, last, c1)
+}
+
 /// How the pointed range's border is drawn over one viewport: the boundary
 /// cells that are actually on screen with the edges each owns, and whether
 /// those edges are dashed or (past the cap) solid.
@@ -16856,9 +16953,17 @@ struct DashFit {
 /// column reads as a solid tick rather than a lone half-dash.
 // Deliberately uncalled: Task 2 took gpui's native `border_dashed()` rather
 // than laying the dashes itself, so nothing draws from this. It stays because
-// it is the executable half of the note above `RANGE_BORDER_W` — the tests
-// below pin what the shader will do at our width, so a gpui bump that changes
-// the pattern fails here instead of quietly changing how a range looks.
+// it is the executable half of the note above `RANGE_BORDER_W`: the written
+// form of what we read out of the shader, worked through to the numbers it
+// produces at our column widths, so "what will a pointed range look like"
+// has an answer that can be run.
+//
+// It is NOT a regression guard, and must not be read as one. Every input is
+// ours — `DASH_LEN_PER_W`, `DASH_GAP_PER_W`, `RANGE_BORDER_W` — so a gpui bump
+// that changes the shader's pattern leaves these tests green while the dashes
+// on screen change. Nothing here can see that happen. After a `cargo update`
+// that moves gpui, the only check is re-reading `shaders.hlsl` by hand and
+// editing the two `*_PER_W` constants if it has moved.
 #[allow(dead_code)]
 fn dash_fit(edge_px: f32, border_w: f32) -> Option<DashFit> {
     if edge_px <= 0.0 || border_w <= 0.0 {
@@ -16993,6 +17098,8 @@ struct GridOverlay {
     fill_preview: Option<(u32, u32, u32, u32)>,
     /// Cells a focused range field points at, outlined with the dashed brand
     /// border (`border_range`). No wash of its own — that went with the border.
+    /// An INPUT to `border_rg` below, which `sheet_el` resolves; the row
+    /// renderer reads that rather than this.
     range_preview: Option<(u32, u32, u32, u32)>,
     /// A range field has the keyboard: the active cell drops its ring so it
     /// can't be mistaken for the range being picked, and wears a wash instead.
@@ -17007,12 +17114,21 @@ struct GridOverlay {
     chart_refs: std::rc::Rc<Vec<ChartSourceArea>>,
     /// The selection's corner is under a chart card, which owns those pixels.
     handle_hidden: bool,
+    /// What the dashed brand border outlines this frame: the pointed range,
+    /// else a selection spanning more than one cell (`border_range`), with its
+    /// rows snapped onto the ones the grid draws (`snap_range_rows`).
+    ///
+    /// Resolved in `sheet_el` and not by the row renderer, because it needs the
+    /// visible-row list, and because the cap below has to be costed against the
+    /// same range the rows will draw — one answer, asked once.
+    border_rg: Option<(u32, u32, u32, u32)>,
     /// The pointed range's border dashes. False past `RANGE_BORDER_CELL_CAP`
     /// visible boundary cells, where the same edges are drawn solid instead.
     /// Only `sheet_el` knows the column window, so it fills this in.
     range_dashed: bool,
     /// A chart is selected, and one selection at a time means the grid's own is
-    /// not shown: no ring, no range wash, no header highlight, no fill handle.
+    /// not shown: no ring, no range wash, no header highlight, no fill handle,
+    /// no data-validation arrow, no comment note.
     /// The cells KEEP their selection -- it simply stops being drawn until the
     /// chart is dismissed (a click on the grid, Escape, or the panel's close
     /// button), at which point it reappears exactly where it was.
@@ -17055,9 +17171,10 @@ fn sheet_row(
     // The row-number gutter highlights the selection's rows — unless a chart
     // owns the selection, in which case the grid shows none of it.
     let hl_row = !ov.sel_hidden && r >= r0 && r <= r1;
-    // What the dashed border outlines this frame: the cells a focused range
-    // field points at, else a selection spanning more than one cell.
-    let border_rg = border_range(ov.range_preview, shown_sel(&ov, (r0, c0, r1, c1)));
+    // What the dashed border outlines this frame — the cells a focused range
+    // field points at, else a selection spanning more than one cell — resolved
+    // once for the whole grid in `sheet_el`, where the visible rows are known.
+    let border_rg = ov.border_rg;
     // Variable row height: an explicit <row ht> sets a floor (points → px at the
     // app's 15pt≈21px scale); wrapped cells grow the row past it via their
     // natural (min-content) height. items_stretch makes every cell fill it.
@@ -17329,9 +17446,9 @@ fn sheet_row(
         });
         // A formula's references, each in its own colour — drawn per edge cell
         // for the same reason as the range outline below.
-        if let Some((i, (fr0, fc0, fr1, fc1))) = formula_ref {
-            let (top, bot, lft, rgt) = (r == fr0, r == fr1, c == fc0, c == fc1);
-            if top || bot || lft || rgt {
+        if let Some((i, rg)) = formula_ref {
+            let e = range_edges_at(rg, r, c);
+            if !e.is_empty() {
                 cell = cell.relative().child(deferred(
                     div()
                         .absolute()
@@ -17340,10 +17457,10 @@ fn sheet_row(
                         .right(px(-1.))
                         .bottom(px(-1.))
                         .border_color(hsla_u(ref_color(i)))
-                        .when(top, |d| d.border_t(px(2.)))
-                        .when(bot, |d| d.border_b(px(2.)))
-                        .when(lft, |d| d.border_l(px(2.)))
-                        .when(rgt, |d| d.border_r(px(2.))),
+                        .when(e.top, |d| d.border_t(px(2.)))
+                        .when(e.bottom, |d| d.border_b(px(2.)))
+                        .when(e.left, |d| d.border_l(px(2.)))
+                        .when(e.right, |d| d.border_r(px(2.))),
                 ));
             }
         }
@@ -17951,6 +18068,15 @@ fn sheet_el(
             br < rr && bc < cc
         })
     };
+    // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
+    // over these, so a filtered-out row collapses instead of showing blank.
+    // Built before the overlay is finished because every outline is snapped
+    // onto it below.
+    let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new(
+        (0..total_rows as u32)
+            .filter(|r| !sh.row_hidden(*r))
+            .collect(),
+    );
     // The cards' boxes are only known here, so the fill handle's visibility is
     // the one overlay field the render pass can't fill in.
     //
@@ -17959,26 +18085,63 @@ fn sheet_el(
     // then `col0..=cend`) is only settled here. The frozen band and the scrolled
     // window are counted as one span `0..=cend`, which over-counts the columns
     // scrolled between them — the same safe direction as everything else here.
-    let range_dashed =
-        border_range(ov.range_preview, shown_sel(&ov, (r0, c0, r1, c1))).is_none_or(|rg| {
-            let cols = (if fc > 0 { 0 } else { col0 }, cend);
-            range_border_dashed(rg, cols, GRID_MAX_VISIBLE_ROWS)
-        });
+    //
+    // And every outlined range is snapped onto the rows above first: an edge
+    // belongs to a row that is drawn, or it is not drawn at all and the
+    // rectangle opens up (`snap_range_rows`). That is the border, the formula's
+    // references and the chart's source areas alike — the three lists
+    // `range_edges_at` answers for.
+    //
+    // The border snaps BEFORE `border_range` decides, not after: the
+    // single-cell guard there ("a lone cell already wears the ring") has to see
+    // the range that will actually be DRAWN, or a two-row selection with one of
+    // its rows hidden collapses to one cell and wears both the ring and a full
+    // dashed box — the doubled indicator the guard exists to remove.
+    let border_rg = border_range(
+        ov.range_preview
+            .map(|p| snap_range_rows(p, &visible, total_rows as u32)),
+        shown_sel(&ov, (r0, c0, r1, c1)).map(|s| snap_range_rows(s, &visible, total_rows as u32)),
+    );
+    let range_dashed = border_rg.is_none_or(|rg| {
+        let cols = (if fc > 0 { 0 } else { col0 }, cend);
+        range_border_dashed(rg, cols, GRID_MAX_VISIBLE_ROWS)
+    });
+    // Re-wrapped only when there is something to snap: the common frame has no
+    // formula open and no chart selected, and pays nothing.
+    let formula_refs = if ov.formula_refs.is_empty() {
+        ov.formula_refs.clone()
+    } else {
+        std::rc::Rc::new(
+            ov.formula_refs
+                .iter()
+                .map(|&rg| snap_range_rows(rg, &visible, total_rows as u32))
+                .collect(),
+        )
+    };
+    let chart_refs = if ov.chart_refs.is_empty() {
+        ov.chart_refs.clone()
+    } else {
+        std::rc::Rc::new(
+            ov.chart_refs
+                .iter()
+                .map(|a| ChartSourceArea {
+                    range: snap_range_rows(a.range, &visible, total_rows as u32),
+                    ..*a
+                })
+                .collect(),
+        )
+    };
     let ov = GridOverlay {
         handle_hidden: ov.handle_hidden || corner_under_chart,
+        border_rg,
         range_dashed,
+        formula_refs,
+        chart_refs,
         ..ov
     };
     // Read off before the row-list closure moves `ov`; the DV overlay below is
     // built after that move but is gated on the same flag.
     let sel_hidden = ov.sel_hidden;
-    // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
-    // over these, so a filtered-out row collapses instead of showing blank.
-    let visible: std::rc::Rc<Vec<u32>> = std::rc::Rc::new(
-        (0..total_rows as u32)
-            .filter(|r| !sh.row_hidden(*r))
-            .collect(),
-    );
     // Frozen top rows (Excel freeze panes, rows axis): pinned below the header,
     // outside the virtualized list, so they stay put while the rest scrolls.
     let fr = (frz_r as usize).min(visible.len()).min(30);
@@ -18285,7 +18448,13 @@ fn sheet_el(
         .collect();
     // A yellow note box for the selected commented cell (hidden while its entry
     // bar is open), anchored just off the cell's top-right like Excel.
-    let note: Option<AnyElement> = if comment_editing {
+    //
+    // It goes with the selection for the same reason the DV arrow below does:
+    // it is anchored on the selected cell and names it, so while a chart owns
+    // the selection (`sel_hidden`) it would hang over a cell the grid is
+    // drawing no ring, no wash and no header mark for — and paint over the
+    // chart layer while it did.
+    let note: Option<AnyElement> = if comment_editing || sel_hidden {
         None
     } else {
         let (sr, sc) = view.sel;
@@ -18642,7 +18811,7 @@ mod grid_geom_tests {
         range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
         ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
         series_move, series_name_shown, series_remove, sheet_index_of, shift_col, shift_row,
-        shown_sel, source_ref_text,
+        shown_sel, snap_range_rows, source_ref_text,
     };
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -19925,7 +20094,8 @@ mod grid_geom_tests {
     ///
     /// **What this test can and cannot reach.** Five of the six sites sit in
     /// `Docxy` methods that a unit test cannot call, for want of a constructed
-    /// view holding a selected chart: `chart_apply_range`, `chart_set_kind`,
+    /// view whose Chart panel holds a chart (`panel_chart`, not `chart_sel` —
+    /// the two came apart when the panel went sticky): `chart_apply_range`, `chart_set_kind`,
     /// `sheet_insert_chart` and `series_add` take `&mut self` and a
     /// `Context<Self>`, and `chart_switched` is `&self` (the render path calls
     /// it each frame to decide whether the Switch Row/Column button greys out)
@@ -21677,6 +21847,57 @@ mod grid_geom_tests {
         assert!(range_edges_at(rg, 2, 2).is_empty()); // the middle
     }
 
+    /// A hidden first or last row has no cell on screen to draw that edge, so
+    /// the range is snapped onto the rows the grid really walks — otherwise the
+    /// rectangle is drawn with one side missing, over neighbours that a
+    /// collapsed row has left sitting flush.
+    #[test]
+    fn snap_range_rows_pulls_a_range_onto_the_rows_that_are_drawn() {
+        // Rows 2 and 5 are hidden (an autofilter, say); the grid renders 8.
+        let vis: Vec<u32> = vec![0, 1, 3, 4, 6, 7];
+        let snap = |rg| snap_range_rows(rg, &vis, 8);
+
+        // Both ends hidden: the outline moves in to the first and last row that
+        // is actually drawn.
+        assert_eq!(snap((2, 1, 5, 3)), (3, 1, 4, 3));
+        // One end hidden.
+        assert_eq!(snap((2, 1, 4, 3)), (3, 1, 4, 3));
+        assert_eq!(snap((1, 1, 5, 3)), (1, 1, 4, 3));
+        // Nothing hidden at the ends: unchanged, columns untouched throughout.
+        assert_eq!(snap((1, 1, 4, 3)), (1, 1, 4, 3));
+        assert_eq!(snap((0, 0, 7, 9)), (0, 0, 7, 9));
+
+        // A range that is ENTIRELY hidden comes back as it went in: no cell of
+        // it is rendered either way, and a total function keeps a caller's
+        // indices — which are what pick a reference's colour.
+        assert_eq!(
+            snap_range_rows((5, 1, 5, 3), &vec![0, 1, 3, 4, 6][..], 8),
+            (5, 1, 5, 3)
+        );
+        assert_eq!(snap_range_rows((2, 1, 2, 3), &[][..], 8), (2, 1, 2, 3));
+
+        // Past the END of the rendered grid is not hidden: `=SUM(A1:A800)` on a
+        // 500-row grid keeps its `r1`, so the rectangle stays open where the
+        // reference really carries on. Only the top is pulled in.
+        assert_eq!(snap_range_rows((2, 1, 40, 3), &vis, 8), (3, 1, 40, 3));
+        assert_eq!(snap_range_rows((0, 0, 8, 0), &vis, 8), (0, 0, 8, 0));
+        // Row 7 is the last one drawn, and it owns no bottom edge.
+        assert_eq!(mask(range_edges_at((3, 1, 40, 3), 7, 2)), "....");
+
+        // Snapping can collapse a multi-row selection to one visible row, and
+        // then `border_range` drops the border for the ring to carry alone —
+        // which is what the user sees: one cell. `sheet_el` composes the two in
+        // exactly this order, snap first, so the guard sees what gets drawn.
+        let snapped = snap_range_rows((2, 1, 3, 1), &vec![3][..], 8);
+        assert_eq!(snapped, (3, 1, 3, 1));
+        assert_eq!(border_range(None, Some(snapped)), None);
+
+        // And the edges then land on the rows that ARE drawn.
+        let rg = snap((2, 1, 5, 3));
+        assert_eq!(mask(range_edges_at(rg, 3, 1)), "t..l");
+        assert_eq!(mask(range_edges_at(rg, 4, 3)), ".rb.");
+    }
+
     /// One cell, every side, one entry — and the plan says dashed, because one
     /// cell is nowhere near the cap.
     #[test]
@@ -21856,10 +22077,11 @@ mod grid_geom_tests {
 
     // ---- Task 2: what the renderer outlines, and whether it dashes ----
 
-    /// `shown_sel` is what pairs the two call sites: the row renderer asks it
-    /// for the border it DRAWS, and `sheet_el` asks it for the range it costs
-    /// the dash cap against. They have to agree, so both go through here rather
-    /// than each remembering to check `sel_hidden`.
+    /// `shown_sel` is the one gate the border goes through: `sheet_el` resolves
+    /// the border's range once (`GridOverlay::border_rg`) and both users read
+    /// that — the rows draw it, and the dash cap is costed against it — so the
+    /// drawn border and the costed one cannot disagree, and neither call site
+    /// has to remember `sel_hidden` for itself.
     #[test]
     fn shown_sel_withholds_the_selection_while_a_chart_owns_it() {
         let sel = (2, 2, 6, 6);

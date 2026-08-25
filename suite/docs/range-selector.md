@@ -45,6 +45,17 @@ than one cell — one code path, one look (`border_range`); a lone selected cell
 already wears its ring, and the `range_tint` wash stays under it because a
 multi-cell selection with nothing but one cell's ring says too little.
 
+An outline whose first or last row is **hidden** — an autofilter, a manually
+hidden row — is pulled in onto the rows the grid actually walks
+(`snap_range_rows`, applied once per frame in `sheet_el`). The renderer draws
+the border cell by cell, so an edge belonging to a row that is never rendered is
+an edge nobody draws, and the rectangle would be left open on that side while
+the collapsed row's neighbours sat flush. The same snap covers all three lists
+that outline: the border, a formula's coloured references, and the selected
+chart's source areas. A range hidden from end to end is left alone — none of it
+is drawn either way, and leaving it keeps the list indices, which are what pick
+each reference's colour.
+
 A pointed range that is scrolled off-screen is revealed (`reveal_range`), in
 either direction: leftwards directly, rightwards on the next render, which is
 the first point that knows how wide the grid is. The chart title isn't a range
@@ -428,10 +439,10 @@ The grid answers *what is selected right now* in one voice: exactly one thing
 looks selected at a time, and a selected chart says which cells it reads.
 
 Implementation: `press_selection`, `SelectTarget`, `SelectionAfter`,
-`cell_selection_shown`, `chart_source_areas`, `chart_slot_color`,
-`chart_areas_at`, `border_range`, `shown_sel`, `range_edges_at`,
-`chart_panel_after`, `chart_panel_shown` — all pure free functions, all beside
-the grid geometry.
+`cell_selection_shown`, `act_targets_cells`, `chart_source_areas`,
+`chart_slot_color`, `chart_areas_at`, `border_range`, `shown_sel`,
+`range_edges_at`, `snap_range_rows`, `chart_panel_after`, `chart_panel_shown` —
+all pure free functions, all beside the grid geometry.
 
 ### One selection at a time
 
@@ -450,9 +461,9 @@ one does, for every press and for the navigation keys alike:
   in Excel. A cell edit in progress is committed in place first, the way a press
   on another cell commits it — otherwise the caret keeps blinking in a cell
   whose ring the chart has just hidden.
-- **Any key the grid acts on** is a press on the cells: the arrows and Enter
-  move the selection, `F2` and any printable character open an edit in it, and
-  `Ctrl+C/X/V/A/B/I` and the two insert shortcuts read or write it. All of them
+- **Any key the grid acts on** is a press on the cells: the arrows, Enter and
+  Tab move the selection, `F2` and any printable character open an edit in it,
+  and `Ctrl+C/X/V/A/B/I` and the two insert shortcuts read or write it. All of them
   hand the selection back first (`Docxy::chart_hand_back`), because a selection
   the chart is hiding is one you cannot watch move, type into or be pasted over
   — the same invisible-motion confusion this rule exists to end. Escape and
@@ -464,7 +475,22 @@ one does, for every press and for the navigation keys alike:
   guard sits in `sheet_find_next` and `sheet_replace` rather than at the
   keystroke: `sheet_key` returns into `sheet_find_key` while the bar is open,
   and the bar's own buttons never reach `sheet_key` at all. (`Replace All` is
-  sheet-wide and never reads `sel`, so it does not need one.)
+  sheet-wide and never reads `sel`, so it does not need one.) Tab and Shift+Tab
+  need the guard stated a third time, in `tab_key` / `shift_tab_key`: gpui
+  swallows Tab for focus traversal, so it arrives as an ACTION and never reaches
+  `sheet_key` — but it commits and advances the selection exactly as the arrows
+  do, so it hands back exactly as they do.
+- **The ribbon is a press on the cells too**, for every command that touches
+  them. `run_sheet_act` asks `act_targets_cells` before anything reads the
+  selection — Ribbon ▸ Bold and `Ctrl+B` are one `sheet_toggle_bold`, and Delete
+  Row is the case that matters, because with a chart selected the rows would go
+  from cells nothing on screen named. The rule is a `!matches!` over the three
+  whole-sheet exceptions (`ProtectSheet`, `Outline`, `Todo`), so a new
+  `SheetAct` variant defaults to handing back rather than to acting on a hidden
+  selection. Clicking the **fx bar** hands back as well: it opens an editor on
+  the selected cell, so it is as much a press on the cells as `F2` is, and
+  without it the caret and the white edit box would be drawn over a cell
+  `sel_hidden` was leaving unmarked while the chart still wore its grips.
 - While **pointing** — a range field or a half-typed formula has the keyboard —
   a press on a cell writes a reference and changes *nothing* about what is
   selected. That is what lets the Chart panel's own range fields work: the chart
@@ -488,12 +514,15 @@ making it optional would ripple through the whole grid to express something
 nobody asked for. So `cell_selection_shown` → `GridOverlay::sel_hidden` turns
 off every indicator keyed to the selection together — the ring, the
 `range_tint` wash, both headers' highlight, the point-mode wash, the auto-fill
-handle, the data-validation dropdown arrow and the selection's own border — and
-dismissing the chart brings the ring back exactly where it was, which is also
-what Excel does. The handle and the DV arrow are on that list for a stronger
-reason than the washes: both are *affordances* that write the cell they sit on,
-so leaving either standing over an unmarked cell would be the same invisible
-write the key hand-back exists to prevent.
+handle, the data-validation dropdown arrow, the selected cell's yellow comment
+note and the selection's own border — and dismissing the chart brings the ring
+back exactly where it was, which is also what Excel does. The handle and the DV
+arrow are on that list for a stronger reason than the washes: both are
+*affordances* that write the cell they sit on, so leaving either standing over
+an unmarked cell would be the same invisible write the key hand-back exists to
+prevent. The comment note is there for the third reason: it is anchored on the
+selected cell and *names* it, so it would hang over a cell the grid is marking
+in no other way — and paint over the chart layer while it did.
 
 The one indicator deliberately still drawn under `sel_hidden` is the **pointed
 range's** border. A selected chart's range fields point at cells; hiding it
@@ -759,17 +788,23 @@ Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
 `sort_rows_from`, `bar_range_text`, `series_values_shape_err`,
 `categories_shape_err`, `chart_field_examples`, `chart_plotted_series`,
 `series_is_plotted`, `chart_unplotted_note`, `smallest_ref_at`,
-`range_edges_at`, `range_border_plan`, `range_border_cell_count`,
-`range_border_dashed`, `dash_fit`, `border_range`, `shown_sel`,
-`chart_source_areas`, `chart_areas_at`, `chart_slot_color`, `press_selection`,
-`cell_selection_shown`, `chart_panel_after`, `chart_panel_shown`.
+`range_edges_at`, `snap_range_rows`, `range_border_plan`,
+`range_border_cell_count`, `range_border_dashed`, `dash_fit`, `border_range`,
+`shown_sel`, `chart_source_areas`, `chart_areas_at`, `chart_slot_color`,
+`press_selection`, `cell_selection_shown`, `act_targets_cells`,
+`chart_panel_after`, `chart_panel_shown`.
 
 Two of those are not on the render path at all. `range_border_plan` builds every
 visible boundary cell, and `dash_fit` lays out the dashes along one edge; the
 app draws from neither (`range_edges_at` and gpui's own `border_dashed()` do
-that). They are kept as the slow, obvious models the fast answers are checked
-against — `range_border_cell_count` must agree with the plan it replaced, and
-`dash_fit` fails if a gpui bump changes the shader's pattern under us.
+that). `range_border_plan` is kept as the slow, obvious model the fast answer is
+checked against: `range_border_cell_count` — which `range_border_dashed` calls
+on the render path, every frame — must agree with the plan it replaced.
+`dash_fit` is kept for a weaker reason — it is our hand-transcription of the shader's arithmetic, so
+the dash geometry at our widths can be run rather than reasoned about. It is not
+a guard: every constant it reads is ours, so a gpui bump that changes the
+shader's pattern leaves its tests green and the screen different. Re-read
+`shaders.hlsl` by hand after a `cargo update -p gpui`.
 
 That list is why every helper here is a **pure free function** taking the
 workbook's sheet names as a `&[String]` rather than reading them off the view:
