@@ -4885,6 +4885,259 @@ mod tests {
         assert_eq!(again.series[1].values, vec![3.0, 4.0]);
     }
 
+    /// The Overview's scenario, end to end through a real file: three series,
+    /// pick **Pie**, save, reopen. Before this plan the click was refused; with
+    /// the refusal gone the click lands, and this is the assertion that the
+    /// save it leads to no longer eats two thirds of the chart.
+    ///
+    /// Deliberately at PACKAGE level rather than through `chart_space_xml`
+    /// alone: the regeneration is gated on `edited && chart_is_writable &&
+    /// part`, the part is rewritten inside the zip, and the reopen goes back
+    /// through `load_xlsx`. A test that stopped at the XML string would pass
+    /// while any one of those three dropped the chart on the floor.
+    #[test]
+    fn three_series_clicked_to_pie_survive_a_save_and_a_reopen() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
+        let src = |range| ChartSource {
+            sheet: "Sheet1".into(),
+            range,
+            cat_col: 0,
+        };
+        let ser = |name: &str, col: u32, v: f64| ChartSeries {
+            name: name.into(),
+            values: vec![v, v + 1.0],
+            col: Some(col),
+            values_ref: Some(src((1, col, 2, col))),
+            name_ref: Some(format!("Sheet1!${}$1", (b'A' + col as u8) as char)),
+            ..Default::default()
+        };
+        let chart = |p: &SheetPackage| match &p.workbook.sheets[0]
+            .drawings
+            .first()
+            .expect("chart drawing")
+            .kind
+        {
+            DrawingKind::Chart(c) => c.clone(),
+            other => panic!("expected a chart drawing, got {other:?}"),
+        };
+        let mut pkg = new_xlsx();
+        // What the user has on screen before the click: an ordinary column
+        // chart over three columns, each series pointed at its own cells.
+        pkg.add_chart(
+            0,
+            (5, 0),
+            (20, 8),
+            &ChartData {
+                title: "Sales".into(),
+                kind: "column".into(),
+                categories: vec!["Q1".into(), "Q2".into()],
+                series: vec![
+                    ser("East", 1, 1.0),
+                    ser("West", 2, 3.0),
+                    ser("North", 3, 5.0),
+                ],
+                source: Some(src((0, 0, 2, 3))),
+                categories_ref: Some(src((1, 0, 2, 0))),
+                ..Default::default()
+            },
+        );
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).expect("the column chart reopens");
+        assert_eq!(chart(&pkg).series.len(), 3);
+
+        // The click: `chart_take_kind` (suite) relabels the chart and clears
+        // nothing else, and committing it marks the chart edited.
+        let mut cd = chart(&pkg);
+        cd.kind = "pie".into();
+        cd.complex = false;
+        cd.edited = true;
+        pkg.workbook.sheets[0].drawings[0].kind = DrawingKind::Chart(cd);
+
+        // Save…
+        let bytes = save_xlsx(&pkg);
+        // …and the part that went to disk really is a pie holding all three,
+        // not a pie holding one. Asserted on the saved bytes because that is
+        // what Excel would be handed.
+        let reopened = load_xlsx(&bytes).expect("the pie reopens");
+        let part = String::from_utf8(
+            reopened
+                .part("xl/charts/chart1.xml")
+                .expect("the chart part")
+                .to_vec(),
+        )
+        .expect("utf-8");
+        let plot = &part[part.find("<c:pieChart>").expect("a pie was written")
+            ..part.find("</c:pieChart>").expect("closed")];
+        assert_eq!(plot.matches("<c:ser>").count(), 3, "three slice groups");
+
+        // …reopen.
+        let back = chart(&reopened);
+        assert_eq!(back.kind, "pie");
+        assert_eq!(back.series.len(), 3, "all three series are still there");
+        for (i, (name, col, v)) in [("East", 1, 1.0), ("West", 2, 3.0), ("North", 3, 5.0)]
+            .into_iter()
+            .enumerate()
+        {
+            let s = &back.series[i];
+            assert_eq!(s.name, name, "series {i} name");
+            assert_eq!(s.values, vec![v, v + 1.0], "series {i} values");
+            assert_eq!(
+                s.values_ref.as_ref().map(|r| r.range),
+                Some((1, col, 2, col)),
+                "series {i} still reads its own cells"
+            );
+        }
+        assert_eq!(back.categories, vec!["Q1".to_string(), "Q2".to_string()]);
+        // Reopened editable rather than held back, so the next save regenerates
+        // — the `complex` hold-back Task 2 removed does not creep back in by
+        // way of the file.
+        assert!(!back.complex, "editable on reopen");
+        assert!(chart_is_writable(&back));
+        // Only the first is DRAWN. The suite says that in its own crate
+        // (`chart_plotted_series`, `chart_unplotted_note`); what the file half
+        // owes is that the other two are present to be listed at all.
+    }
+
+    /// Pie → Column → Pie is lossless. The conversion is why the model must not
+    /// cap a pie at one series (see "Why not enforce it in the model" in the
+    /// plan): a cap would make picking Pie destroy the very data that picking
+    /// Column back is supposed to return.
+    #[test]
+    fn a_pie_converted_to_column_and_back_keeps_every_series() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
+        let src = |range| ChartSource {
+            sheet: "Sheet1".into(),
+            range,
+            cat_col: 0,
+        };
+        let ser = |name: &str, col: u32, v: f64| ChartSeries {
+            name: name.into(),
+            values: vec![v, v + 1.0],
+            col: Some(col),
+            values_ref: Some(src((1, col, 2, col))),
+            ..Default::default()
+        };
+        let chart = |p: &SheetPackage| match &p.workbook.sheets[0]
+            .drawings
+            .first()
+            .expect("chart drawing")
+            .kind
+        {
+            DrawingKind::Chart(c) => c.clone(),
+            other => panic!("expected a chart drawing, got {other:?}"),
+        };
+        let mut pkg = new_xlsx();
+        pkg.add_chart(
+            0,
+            (5, 0),
+            (20, 8),
+            &ChartData {
+                title: "Sales".into(),
+                kind: "pie".into(),
+                categories: vec!["Q1".into(), "Q2".into()],
+                series: vec![
+                    ser("East", 1, 1.0),
+                    ser("West", 2, 3.0),
+                    ser("North", 3, 5.0),
+                ],
+                source: Some(src((0, 0, 2, 3))),
+                categories_ref: Some(src((1, 0, 2, 0))),
+                ..Default::default()
+            },
+        );
+        // Round-trip once as a pie, then relabel to column, save, reopen.
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).expect("the pie reopens");
+        assert_eq!(chart(&pkg).series.len(), 3);
+        let mut cd = chart(&pkg);
+        cd.kind = "column".into();
+        cd.edited = true;
+        pkg.workbook.sheets[0].drawings[0].kind = DrawingKind::Chart(cd);
+        let mut pkg = load_xlsx(&save_xlsx(&pkg)).expect("the column chart reopens");
+        let col = chart(&pkg);
+        assert_eq!(col.kind, "column");
+        assert_eq!(col.series.len(), 3, "converting back keeps all three");
+        assert_eq!(col.series[2].name, "North");
+        assert_eq!(col.series[2].values, vec![5.0, 6.0]);
+
+        // And back to pie again: three trips through the writer, still three.
+        let mut cd = col;
+        cd.kind = "pie".into();
+        cd.edited = true;
+        pkg.workbook.sheets[0].drawings[0].kind = DrawingKind::Chart(cd);
+        let again = chart(&load_xlsx(&save_xlsx(&pkg)).expect("the pie reopens again"));
+        assert_eq!(again.kind, "pie");
+        assert_eq!(again.series.len(), 3);
+        let names: Vec<&str> = again.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["East", "West", "North"]);
+        assert_eq!(
+            again.series[1].values_ref.as_ref().map(|r| r.range),
+            Some((1, 2, 2, 2))
+        );
+    }
+
+    /// The common case, through the same file path: one series in, one series
+    /// out, and the part is unchanged when it is written again. Whatever the
+    /// multi-series arm changed, it did not move the pie everybody has.
+    #[test]
+    fn a_one_series_pie_reopens_unchanged() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, DrawingKind};
+        let src = |range| ChartSource {
+            sheet: "Sheet1".into(),
+            range,
+            cat_col: 0,
+        };
+        let chart = |p: &SheetPackage| match &p.workbook.sheets[0]
+            .drawings
+            .first()
+            .expect("chart drawing")
+            .kind
+        {
+            DrawingKind::Chart(c) => c.clone(),
+            other => panic!("expected a chart drawing, got {other:?}"),
+        };
+        let part_of = |p: &SheetPackage| {
+            String::from_utf8(p.part("xl/charts/chart1.xml").expect("chart part").to_vec())
+                .expect("utf-8")
+        };
+        let mut pkg = new_xlsx();
+        pkg.add_chart(
+            0,
+            (5, 0),
+            (20, 8),
+            &ChartData {
+                title: "Sales".into(),
+                kind: "pie".into(),
+                categories: vec!["Q1".into(), "Q2".into()],
+                series: vec![ChartSeries {
+                    name: "East".into(),
+                    values: vec![1.0, 2.0],
+                    col: Some(1),
+                    values_ref: Some(src((1, 1, 2, 1))),
+                    ..Default::default()
+                }],
+                source: Some(src((0, 0, 2, 1))),
+                categories_ref: Some(src((1, 0, 2, 0))),
+                ..Default::default()
+            },
+        );
+        let re = load_xlsx(&save_xlsx(&pkg)).expect("reopen");
+        let back = chart(&re);
+        assert_eq!(back.kind, "pie");
+        assert_eq!(back.series.len(), 1);
+        assert_eq!(back.series[0].name, "East");
+        assert_eq!(back.series[0].values, vec![1.0, 2.0]);
+        assert!(!back.complex);
+        // Edited and saved again, the part is unchanged — one `<c:ser>`, no
+        // stray empty slice group from the loop that now writes several.
+        let before = part_of(&re);
+        let mut edited = re;
+        let mut cd = back;
+        cd.edited = true;
+        edited.workbook.sheets[0].drawings[0].kind = DrawingKind::Chart(cd);
+        let re2 = load_xlsx(&save_xlsx(&edited)).expect("reopen after the edit");
+        assert_eq!(part_of(&re2), before, "the one-series part did not move");
+        assert_eq!(part_of(&re2).matches("<c:ser>").count(), 1);
+    }
+
     #[test]
     fn parse_frozen_pane() {
         let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";

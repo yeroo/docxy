@@ -323,19 +323,54 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] verify the Overview's scenario: three series, click Pie, save, reopen —
+- [x] verify the Overview's scenario: three series, click Pie, save, reopen —
       all three series are still there, and only the first is drawn. (This is
       the step that proves Task 5 landed: before it, the click is REFUSED by
       `chart_kind_series_err` and the scenario cannot be reached at all)
-- [ ] verify a workbook that arrives holding a multi-series `<c:pieChart>` is
-      now editable rather than held back as `complex`
-- [ ] verify a chart converted to Pie and back to Column keeps all its series
-- [ ] verify the one-series pie is unchanged end to end
-- [ ] run `cargo test --manifest-path suite/Cargo.toml` — all pass
-- [ ] run `cargo test -p gridcore` — all pass
-- [ ] run `cargo build --all-targets` — root workspace builds
-- [ ] run `cargo clippy -p gridcore --all-targets -- -D warnings` and
-      `cargo fmt --check` — clean
+      (`three_series_clicked_to_pie_survive_a_save_and_a_reopen`, xlsx.rs —
+      at PACKAGE level, not through `chart_space_xml` alone: it goes through
+      `add_chart`, the `edited && writable && part` regeneration gate, the zip,
+      and `load_xlsx`. Asserts the saved part holds three `<c:ser>` inside one
+      `<c:pieChart>`, that all three come back with their names, values and
+      their OWN refs, and that the chart reopens non-`complex` and writable.
+      The "only the first is drawn" half is the suite's, pinned there by
+      `a_pie_draws_one_series_however_many_it_holds` and
+      `the_panel_says_a_pie_plots_the_first_series_only`)
+- [x] verify a workbook that arrives holding a multi-series `<c:pieChart>` is
+      now editable rather than held back as `complex` (checked against the REAL
+      corpus files from Task 1 with a one-off test — `corpus/xlsx-ext/` is
+      gitignored so it cannot be committed: `complex_29s.xlsx` chart3 reads back
+      as a 7-series pie, `chart-hatch-fill.xlsx` and `strict_chart.xlsx` as
+      2-series pies, all three `complex=false` and `chart_is_writable`, and each
+      workbook still round-trips. The committed equivalents are the synthetic
+      `a_pie_that_arrives_with_two_series_stays_editable` and
+      `a_seven_series_pie_reads_back_all_seven`, drawing.rs)
+- [x] verify a chart converted to Pie and back to Column keeps all its series
+      (`a_pie_converted_to_column_and_back_keeps_every_series`, xlsx.rs —
+      pie → column → pie through three saves and reopens, three series and
+      their refs intact at every step)
+- [x] verify the one-series pie is unchanged end to end
+      (`a_one_series_pie_reopens_unchanged`, xlsx.rs — the part is identical
+      after a re-save and still holds exactly one `<c:ser>`, so the loop that
+      now writes several adds no empty slice group to the common case)
+- [x] run `cargo test --manifest-path suite/Cargo.toml` — all pass (82)
+- [x] run `cargo test -p gridcore` — all pass (370 + 1 + 4)
+- [x] run `cargo build --all-targets` — root workspace builds
+- [x] run `cargo clippy -p gridcore --all-targets -- -D warnings` and
+      `cargo fmt --check` — clean (clippy and fmt also clean in the suite
+      workspace. ⚠️ as in Task 5, `cargo build --manifest-path suite/Cargo.toml`
+      cannot relink `suite.exe` while a suite window is open — "Access is
+      denied"; `cargo test` and `cargo clippy --all-targets` compile the same
+      code and pass)
+
+➕ Correction to Task 1's corpus table: `tdf111173.xlsx` is a COMBO part —
+`<c:doughnutChart>` **and** `<c:pieChart>` in one `<c:plotArea>`. Its pieChart
+does hold two `<c:ser>` as the table says, but the part reads back as
+`kind=doughnut`, 3 series, `complex=true`, held by the unrelated `groups > 1`
+term. That hold-back is correct and out of scope (doughnut rendering is
+explicitly deferred). So THREE corpus workbooks, not four, are freed by this
+plan; the idx-0/idx-2 shape the file taught us is still pinned by
+`a_pie_whose_series_indices_skip_a_number_still_reads_as_two`.
 
 ### Task 7: [Final] Update documentation
 
