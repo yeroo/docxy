@@ -3809,10 +3809,25 @@ impl Docxy {
             self.chart_sel,
             self.formula_pick_active() || self.range_field_active(),
         );
-        if after.drop_field {
+        // Asked of the PANEL's chart, not of `chart_sel`. Under the sticky rule
+        // those two diverge: click a cell and the chart is deselected while its
+        // panel stays open, so pressing that same card again is `chart_sel ==
+        // None` and misses `press_selection`'s same-chart no-op. The field being
+        // typed in belongs to the chart the panel SHOWS, and re-selecting that
+        // chart is not a change of chart — throwing the edit away there is the
+        // mid-edit loss the sticky panel was added to stop.
+        if after.drop_field && self.panel_chart != Some(idx) {
             self.range_edit = None;
             self.ref_msg = None;
             self.range_pick = None;
+        }
+        // A half-typed cell would otherwise keep its caret and its white box
+        // while the card draws its handles — two things selected, and the
+        // keyboard going to the one the chart is hiding. `select_cell` commits
+        // in place for the same reason; a press on a card is as much a press
+        // away from the cell as a press on another cell is.
+        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            self.sheet_commit(0, 0, cx);
         }
         self.chart_sel = after.chart;
         // The panel swaps to it, opening if it was shut.
@@ -3892,23 +3907,34 @@ impl Docxy {
     /// arrow keys. The chart's own keys (Escape, Delete) are the exceptions and
     /// never call this; so are the ones aimed at the document or the window
     /// rather than the selection (Ctrl+S, Ctrl+F, Ctrl+F1).
-    fn chart_hand_back(&mut self) {
+    fn chart_hand_back(&mut self, cx: &mut Context<Self>) {
         if self.chart_sel.is_none() {
             return;
         }
-        // Pointing is passed through rather than assumed, as at every other
-        // call site: a focused range field keeps both the chart and the field,
-        // because the cells it points at are drawn even under `sel_hidden`.
-        let after = press_selection(
-            SelectTarget::NavKey,
-            self.chart_sel,
-            self.formula_pick_active() || self.range_field_active(),
-        );
+        // `pointing` is false here, unlike at the press sites. Point mode is a
+        // property of a POINTER gesture — a click on a cell writes a reference
+        // into the focused field instead of moving the selection — and no key
+        // that reaches this function is one. A Ctrl+X arriving while a range
+        // field has focus is still a cut, and if the chart kept the selection
+        // it would be a cut of cells `sel_hidden` is not drawing: the exact
+        // invisible write this function exists to prevent.
+        let after = press_selection(SelectTarget::NavKey, self.chart_sel, false);
         self.chart_sel = after.chart;
         self.chart_panel_event(PanelEvent::Deselect);
         if after.drop_field {
+            // The grid has the keyboard now, so a panel field cannot keep it —
+            // the whole of `drop_field`, not just the message. Leaving
+            // `range_edit` standing would hand the ring back to the cells and
+            // then feed every following keystroke to the field anyway.
+            self.range_edit = None;
+            self.range_pick = None;
             self.ref_msg = None;
         }
+        // The handles and the source outlines have just gone and the ring has
+        // just come back. Several callers return without repainting — a paste
+        // into a protected sheet, a copy with nothing to copy — so the repaint
+        // is owed here rather than to whatever runs next.
+        cx.notify();
     }
 
     /// How many charts the active sheet has, in `chart_locate`'s order. The
@@ -8243,7 +8269,7 @@ impl Docxy {
             if matches!(key, "c" | "x" | "v" | "a" | "b" | "i")
                 || (shift && matches!(key, "p" | "k"))
             {
-                self.chart_hand_back();
+                self.chart_hand_back(cx);
             }
             match key {
                 "s" => self.save_active(window, cx),
@@ -8304,7 +8330,7 @@ impl Docxy {
                 // keyboard" confusion this rule exists to end. The key then
                 // falls through to the grid, which acts on the selection it has
                 // just been given.
-                "left" | "right" | "up" | "down" | "enter" | "f2" => self.chart_hand_back(),
+                "left" | "right" | "up" | "down" | "enter" | "f2" => self.chart_hand_back(cx),
                 // A printable character starts a fresh edit in the selected
                 // cell, so it is as much a press on the cells as F2 is. Every
                 // other key — a lone modifier, Tab, a function key the grid
@@ -8317,7 +8343,7 @@ impl Docxy {
                     .and_then(|c| c.chars().next())
                     .is_some_and(|ch| !ch.is_control()) =>
                 {
-                    self.chart_hand_back()
+                    self.chart_hand_back(cx)
                 }
                 _ => {}
             }

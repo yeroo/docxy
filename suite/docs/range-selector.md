@@ -442,8 +442,14 @@ one does, for every press and for the navigation keys alike:
   and its source outlines go, and the cell ring returns.
 - A press on a **chart** takes it the other way. Pressing the *same* chart again
   is a no-op rather than a re-selection, or every press on a selected card would
-  drop the panel field you were about to type in. A resize grip counts as a
-  press on its chart, and the selection moves on mouse-**down**, as in Excel.
+  drop the panel field you were about to type in. "Same" is asked of the chart
+  the **panel** shows, not of `chart_sel`: the sticky rule makes those two
+  diverge, and a card pressed while its own panel is open and its own field is
+  half-typed is a re-selection whichever of the two is `None`. A resize grip
+  counts as a press on its chart, and the selection moves on mouse-**down**, as
+  in Excel. A cell edit in progress is committed in place first, the way a press
+  on another cell commits it — otherwise the caret keeps blinking in a cell
+  whose ring the chart has just hidden.
 - **Any key the grid acts on** is a press on the cells: the arrows and Enter
   move the selection, `F2` and any printable character open an edit in it, and
   `Ctrl+C/X/V/A/B/I` and the two insert shortcuts read or write it. All of them
@@ -460,6 +466,15 @@ one does, for every press and for the navigation keys alike:
   being edited survives the clicks that edit it. Pressing another chart still
   swaps, pointing or not, because the focused field belongs to the chart being
   left (`drop_field`).
+- Pointing is a property of the **pointer**, not of the keyboard, so the
+  hand-back above is unconditional: `chart_hand_back` passes `pointing: false`.
+  A `Ctrl+X` that arrives while a range field has focus is still a cut, and a
+  cut of cells the chart is hiding is precisely the invisible write the rule
+  forbids — so the chart lets go, the ring comes back, and the cut happens where
+  you can watch it. The field goes with it, all of `drop_field` (`range_edit`,
+  `range_pick`, `ref_msg`) and not just the message, because the grid now has
+  the keyboard and a field that kept `range_edit` would go on swallowing every
+  keystroke behind a ring that says otherwise.
 
 "Selecting a chart clears the cell selection" is implemented as *stops drawing
 it*, not as clearing it. `SheetView::sel` is a `(row, col)` rather than an
