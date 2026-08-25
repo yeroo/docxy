@@ -902,6 +902,11 @@ struct Docxy {
     // The selected chart on the active sheet, as an index into that sheet's
     // chart list (UI-authored charts first, then the ones loaded from the file).
     chart_sel: Option<usize>,
+    // The chart the Chart panel SHOWS, which outlives `chart_sel`: deselecting
+    // a chart drops its handles and its source outlines but leaves the panel
+    // open on it, so a range edit survives the click on the grid that was
+    // pointing it. Moved only by `chart_panel_after`; see `PanelEvent`.
+    panel_chart: Option<usize>,
     // An in-progress chart move: which chart, and how far the pointer has
     // travelled since the press. The anchor only moves on release.
     chart_drag: Option<ChartDrag>,
@@ -2859,6 +2864,57 @@ fn cell_selection_shown(chart: Option<usize>) -> bool {
     chart.is_none()
 }
 
+/// What just happened to the Chart panel, as the panel itself sees it.
+///
+/// The panel used to be gated straight on `chart_sel`, so a click anywhere on
+/// the grid closed it — including the click that was meant to point one of its
+/// own range fields at a cell. Under the sticky rule the panel has its own
+/// state, and these are the only four things that move it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PanelEvent {
+    /// A chart card was pressed: the panel shows that chart, swapping off
+    /// whichever one it was showing.
+    Select(usize),
+    /// The chart lost the selection to the grid (a click on a cell, a
+    /// navigation key). The panel is STICKY: it keeps showing that chart, so a
+    /// range edit survives a click on the cells it is being pointed at.
+    Deselect,
+    /// The panel's `\u{00d7}`, or Escape. The two deliberate ways out, and the
+    /// only ones that a user performs on purpose.
+    Dismiss,
+    /// The chart list underneath changed — a delete, a sheet switch, a tab
+    /// switch, an undo. Every chart-keyed index now means something else, so
+    /// the panel cannot keep showing "chart 2" and must close outright.
+    Invalidate,
+}
+
+/// Which chart the Chart panel shows after `ev`, given the one it shows now.
+/// `None` is the panel closed; there is no separate open flag, because "open"
+/// and "has a chart to show" are the same question and two fields could
+/// disagree about it.
+fn chart_panel_after(shown: Option<usize>, ev: PanelEvent) -> Option<usize> {
+    match ev {
+        PanelEvent::Select(i) => Some(i),
+        // The whole point: deselection does NOT close it.
+        PanelEvent::Deselect => shown,
+        PanelEvent::Dismiss | PanelEvent::Invalidate => None,
+    }
+}
+
+/// The chart the panel actually renders, filtered against the sheet in front of
+/// you: an index past the end of that sheet's chart list names nothing, so the
+/// panel closes rather than rendering an empty shell that still eats
+/// `SIDE_PANEL_W` of grid.
+///
+/// `Invalidate` is supposed to have caught every way the list can change, and
+/// this is the second line of defence for when it hasn't — the checkbox asks
+/// that the panel "must not display a chart that no longer exists", and a rule
+/// that holds by construction beats one that holds if every mutation site
+/// remembered to fire an event.
+fn chart_panel_shown(shown: Option<usize>, n_charts: usize) -> Option<usize> {
+    shown.filter(|&i| i < n_charts)
+}
+
 /// Which of the two selections a press or navigation key leaves selected.
 ///
 /// - A press on a **cell** takes the selection back from any chart: its handles
@@ -3495,6 +3551,7 @@ impl Docxy {
             sheet_dragging: false,
             sheet_fill: None,
             chart_sel: None,
+            panel_chart: None,
             chart_drag: None,
             range_edit: None,
             ref_msg: None,
@@ -3653,8 +3710,10 @@ impl Docxy {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
         }
         // The chart drops its handles and its source outlines; the cell ring
-        // comes back out.
+        // comes back out. The PANEL stays open on it — that is the sticky rule,
+        // and the reason this click cannot interrupt a range edit.
         self.chart_sel = after.chart;
+        self.chart_panel_event(PanelEvent::Deselect);
         if after.drop_field {
             self.range_edit = None;
             self.ref_msg = None;
@@ -3735,6 +3794,8 @@ impl Docxy {
             self.range_pick = None;
         }
         self.chart_sel = after.chart;
+        // The panel swaps to it, opening if it was shut.
+        self.chart_panel_event(PanelEvent::Select(idx));
         self.chart_drag = Some(ChartDrag {
             idx,
             edge,
@@ -3781,10 +3842,47 @@ impl Docxy {
     /// that list changes underneath them (a sheet switch, a tab switch, an undo).
     fn chart_drop_selection(&mut self) {
         self.chart_sel = None;
+        // The panel is sticky against DESELECTION, not against the list moving
+        // under it: an index into a list that just changed names a different
+        // chart, so the panel closes here rather than silently swapping to
+        // whichever one slid into the gap.
+        self.chart_panel_event(PanelEvent::Invalidate);
         self.chart_drag = None;
         self.range_edit = None;
         self.ref_msg = None;
         self.range_pick = None;
+    }
+
+    /// Move the Chart panel's state. The decision is `chart_panel_after`; this
+    /// is only the field it is written to, so every caller expresses what
+    /// happened rather than what the panel should now be.
+    fn chart_panel_event(&mut self, ev: PanelEvent) {
+        self.panel_chart = chart_panel_after(self.panel_chart, ev);
+    }
+
+    /// How many charts the active sheet has, in `chart_locate`'s order. The
+    /// panel's index is checked against this, so it can never render a chart
+    /// that has gone.
+    fn chart_count(&self) -> usize {
+        let Some(v) = self.active_sheet() else {
+            return 0;
+        };
+        let sidx = v.active;
+        let ui = v.charts.iter().filter(|c| c.sheet == sidx).count();
+        let dw = v.pkg.workbook.sheets[sidx]
+            .drawings
+            .iter()
+            .filter(|dw| matches!(dw.kind, gridcore::sheet::DrawingKind::Chart(_)))
+            .count();
+        ui + dw
+    }
+
+    /// The chart the Chart panel renders, or `None` when the panel is shut.
+    /// This is the ONE answer both the render gate and the grid-width
+    /// reservation ask, so the panel can never be drawn in a slot the grid also
+    /// laid itself out over.
+    fn panel_chart_shown(&self) -> Option<usize> {
+        chart_panel_shown(self.panel_chart, self.chart_count())
     }
 
     /// Everything the UI holds that points INTO one grid: the chart selection
@@ -3824,10 +3922,10 @@ impl Docxy {
             .map(ChartRef::Drawing)
     }
 
-    /// The selected chart's data.
-    fn chart_data(&self) -> Option<gridcore::sheet::ChartData> {
+    /// The idx-th chart's data, in `chart_locate`'s order.
+    fn chart_data_at(&self, idx: usize) -> Option<gridcore::sheet::ChartData> {
         let v = self.active_sheet()?;
-        match self.chart_locate(self.chart_sel?)? {
+        match self.chart_locate(idx)? {
             ChartRef::Ui(i) => Some(v.charts[i].data.clone()),
             ChartRef::Drawing(i) => match &v.pkg.workbook.sheets[v.active].drawings[i].kind {
                 gridcore::sheet::DrawingKind::Chart(cd) => Some(cd.clone()),
@@ -3836,10 +3934,26 @@ impl Docxy {
         }
     }
 
-    /// Write the selected chart's data back, marking it edited so a save
-    /// regenerates its chart part.
+    /// The data the Chart panel is editing — the chart it SHOWS, not the one
+    /// selected. Under the sticky rule those differ: a click on a cell drops
+    /// the selection and leaves the panel open, and every field in it must go
+    /// on reading and writing the chart whose name is at the top of it.
+    ///
+    /// The grid's source outlines ask `chart_sel` instead (`chart_refs`), which
+    /// is the whole distinction: what is SELECTED is drawn on the cells, what
+    /// is SHOWN is edited in the panel.
+    fn chart_data(&self) -> Option<gridcore::sheet::ChartData> {
+        self.chart_data_at(self.panel_chart_shown()?)
+    }
+
+    /// Write the panel's chart data back, marking it edited so a save
+    /// regenerates its chart part. The panel's chart for the same reason
+    /// `chart_data` reads it: a commit from a field has to land on the chart
+    /// that field belongs to, selected or not.
     fn chart_set_data(&mut self, mut data: gridcore::sheet::ChartData, cx: &mut Context<Self>) {
-        let Some(sel) = self.chart_sel else { return };
+        let Some(sel) = self.panel_chart_shown() else {
+            return;
+        };
         let Some(loc) = self.chart_locate(sel) else {
             return;
         };
@@ -4294,8 +4408,9 @@ impl Docxy {
 
     /// Every bar that swallows typing. `sheet_key` asks them BEFORE it asks a
     /// range field that isn't one of theirs, so a field outside them taking
-    /// focus has to close them: the Chart panel renders off `chart_sel` alone,
-    /// so its fields stay clickable while a bar is open, and clicking one would
+    /// focus has to close them: the Chart panel renders off its own state and
+    /// not the bars', so its fields stay clickable while a bar is open — more
+    /// so now that it is sticky — and clicking one would
     /// draw a focused border and a caret while every keystroke went to the bar
     /// — and a drag on the grid rewrote (and committed) the CHART's range.
     fn typing_bars_close(&mut self) {
@@ -4999,7 +5114,14 @@ impl Docxy {
     /// for such a ref rather than pointing at this sheet's cells of the same
     /// address.
     fn chart_refs(&self) -> std::rc::Rc<Vec<ChartSourceArea>> {
-        let areas = match (self.active_sheet(), self.chart_data()) {
+        // `chart_sel`, deliberately, NOT the panel's chart: these outlines are
+        // the selection made visible on the cells, so they go with the handles
+        // the moment the chart is deselected — even though the panel stays open
+        // on it.
+        let areas = match (
+            self.active_sheet(),
+            self.chart_sel.and_then(|i| self.chart_data_at(i)),
+        ) {
             (Some(v), Some(cd)) => chart_source_areas(&cd, &v.sheet().name),
             _ => Vec::new(),
         };
@@ -5142,6 +5264,7 @@ impl Docxy {
             self.sheet_commit(0, 0, cx);
         }
         self.chart_sel = after.chart;
+        self.chart_panel_event(PanelEvent::Deselect);
         if after.drop_field {
             self.range_edit = None;
             self.ref_msg = None;
@@ -7701,6 +7824,9 @@ impl Docxy {
                             .on_click(move |_ev, _w, cx2| {
                                 ent_x.update(cx2, |this, cx2| {
                                     this.chart_sel = None;
+                                    // One of the two deliberate ways out: the
+                                    // panel closes here rather than sticking.
+                                    this.chart_panel_event(PanelEvent::Dismiss);
                                     this.range_edit = None;
                                     this.ref_msg = None;
                                     this.range_pick = None;
@@ -8090,6 +8216,7 @@ impl Docxy {
             match key {
                 "escape" => {
                     self.chart_sel = None;
+                    self.chart_panel_event(PanelEvent::Dismiss);
                     cx.notify();
                     return;
                 }
@@ -8104,6 +8231,7 @@ impl Docxy {
                 "left" | "right" | "up" | "down" | "enter" => {
                     let after = press_selection(SelectTarget::NavKey, self.chart_sel, false);
                     self.chart_sel = after.chart;
+                    self.chart_panel_event(PanelEvent::Deselect);
                     if after.drop_field {
                         self.ref_msg = None;
                     }
@@ -8115,6 +8243,10 @@ impl Docxy {
             "escape" => {
                 self.sheet_pick = None;
                 self.chart_sel = None;
+                // Escape reaches here when the chart is already deselected and
+                // only the sticky panel is left, and it is the keyboard's way
+                // of shutting that panel — the same dismissal as its close box.
+                self.chart_panel_event(PanelEvent::Dismiss);
                 if let Some(v) = self.active_sheet_mut() {
                     v.editing = None;
                 }
@@ -15486,7 +15618,7 @@ impl Render for Docxy {
             if self.active_pivot().is_some() {
                 panel += SIDE_PANEL_W;
             }
-            if self.chart_sel.is_some() {
+            if self.panel_chart_shown().is_some() {
                 panel += SIDE_PANEL_W;
             }
             let w = f32::from(window.viewport_size().width) - panel;
@@ -16172,8 +16304,11 @@ impl Render for Docxy {
         let notes_panel = (is_doc && self.show_notes).then(|| self.notes_panel(pal, cx));
         // The PivotTable Fields panel, shown when a pivot output sheet is active.
         let pivot_panel = self.active_pivot().map(|i| self.pivot_panel(i, pal, cx));
-        // The Chart panel takes the same slot while a chart is selected.
-        let chart_panel = (!is_doc && self.chart_sel.is_some()).then(|| self.chart_panel(pal, cx));
+        // The Chart panel takes the same slot. It is gated on the chart it
+        // SHOWS, not the one selected: deselecting leaves it open (see
+        // `PanelEvent`), so a click on the grid can no longer close it mid-edit.
+        let chart_panel =
+            (!is_doc && self.panel_chart_shown().is_some()).then(|| self.chart_panel(pal, cx));
         let body = h_flex()
             .flex_1()
             .min_h(px(0.))
@@ -18280,15 +18415,15 @@ fn main() {
 mod grid_geom_tests {
     use super::{
         CHART_CATEGORIES_COLOR, CHART_NAME_COLOR, CHART_VALUES_COLOR, ChartSlot, ChartSourceArea,
-        EdgeMask, GRID_MAX_VISIBLE_ROWS, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan,
-        RefText, SHEET_ROW_H, SelectTarget, SelectionAfter, border_range, cell_selection_shown,
-        char_to_byte, chart_area_at, chart_ref_of, chart_slot_color, chart_source_areas, col_at_x,
-        col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens, last_visible_col,
-        parse_ref_text, press_selection, preview_range, range_a1, range_border_dashed,
-        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
-        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
-        series_move, series_name_shown, series_remove, sheet_index_of, shift_col, shift_row,
-        source_ref_text,
+        EdgeMask, GRID_MAX_VISIBLE_ROWS, PanelEvent, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W,
+        RangeBorderPlan, RefText, SHEET_ROW_H, SelectTarget, SelectionAfter, border_range,
+        cell_selection_shown, char_to_byte, chart_area_at, chart_panel_after, chart_panel_shown,
+        chart_ref_of, chart_slot_color, chart_source_areas, col_at_x, col_px, dash_fit, edit_runs,
+        fill_box, formula_ref_tokens, last_visible_col, parse_ref_text, press_selection,
+        preview_range, range_a1, range_border_dashed, range_border_plan, range_edges_at,
+        range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref,
+        resize_axis, row_height_px, scroll_col0_for_sel, series_move, series_name_shown,
+        series_remove, sheet_index_of, shift_col, shift_row, source_ref_text,
     };
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -22015,6 +22150,122 @@ mod grid_geom_tests {
         assert_eq!(mask(range_edges_at(vals, 2, 1)), ".r.l"); // B3, the middle
         assert_eq!(mask(range_edges_at(vals, 4, 1)), ".rbl"); // B5, the bottom
         assert!(range_edges_at(vals, 1, 2).is_empty()); // C2 is another slot's
+    }
+    /// The sticky rule itself: a chart losing the selection does NOT close the
+    /// panel showing it. This is the whole of complaint 4 — the panel used to be
+    /// gated on `chart_sel`, so any click on the grid shut it mid-edit.
+    #[test]
+    fn the_panel_stays_open_when_its_chart_is_deselected() {
+        let shut = None;
+        let open = chart_panel_after(shut, PanelEvent::Select(2));
+        assert_eq!(open, Some(2), "pressing a card opens the panel on it");
+        let after_click = chart_panel_after(open, PanelEvent::Deselect);
+        assert_eq!(after_click, Some(2), "a click on a cell must not close it");
+        // Repeated deselection (a sweep across cells, then an arrow key) is
+        // idempotent — nothing about it counts down towards a close.
+        let mut s = after_click;
+        for _ in 0..5 {
+            s = chart_panel_after(s, PanelEvent::Deselect);
+        }
+        assert_eq!(s, Some(2));
+    }
+
+    /// Selecting another chart swaps the panel rather than stacking; selecting
+    /// the same one again is the same answer, so a press on a card is safe to
+    /// fire unconditionally from `chart_press`.
+    #[test]
+    fn selecting_another_chart_swaps_the_panel() {
+        let open = chart_panel_after(None, PanelEvent::Select(0));
+        assert_eq!(chart_panel_after(open, PanelEvent::Select(3)), Some(3));
+        assert_eq!(chart_panel_after(open, PanelEvent::Select(0)), Some(0));
+        // And it reopens a panel that was dismissed, from either state.
+        assert_eq!(chart_panel_after(None, PanelEvent::Select(1)), Some(1));
+    }
+
+    /// The two deliberate ways out — the panel's `×` and Escape — both fully
+    /// dismiss, and a later deselection does not resurrect it.
+    #[test]
+    fn dismissing_closes_the_panel_for_good() {
+        let open = chart_panel_after(None, PanelEvent::Select(1));
+        let shut = chart_panel_after(open, PanelEvent::Dismiss);
+        assert_eq!(shut, None);
+        assert_eq!(chart_panel_after(shut, PanelEvent::Deselect), None);
+        assert_eq!(chart_panel_after(shut, PanelEvent::Dismiss), None);
+        // A press on a card is still the way back in.
+        assert_eq!(chart_panel_after(shut, PanelEvent::Select(1)), Some(1));
+    }
+
+    /// A delete, a sheet switch, a tab switch or an undo all reach
+    /// `chart_drop_selection`, and all mean the same thing to the panel: the
+    /// index it holds names a different chart now, so it closes outright. This
+    /// is the difference between sticky and stale.
+    #[test]
+    fn the_chart_list_changing_closes_the_panel() {
+        let open = chart_panel_after(None, PanelEvent::Select(2));
+        assert_eq!(chart_panel_after(open, PanelEvent::Invalidate), None);
+        assert_eq!(chart_panel_after(None, PanelEvent::Invalidate), None);
+    }
+
+    /// Second line of defence for "it must not display a chart that no longer
+    /// exists": whatever the events did, the index is checked against the sheet
+    /// in front of you before anything is rendered.
+    #[test]
+    fn the_panel_never_shows_a_chart_that_is_gone() {
+        assert_eq!(chart_panel_shown(Some(0), 3), Some(0));
+        assert_eq!(chart_panel_shown(Some(2), 3), Some(2));
+        // Deleted the last of three, panel was on it.
+        assert_eq!(chart_panel_shown(Some(2), 2), None);
+        // Switched to a sheet with no charts at all.
+        assert_eq!(chart_panel_shown(Some(0), 0), None);
+        // Shut stays shut however many charts there are.
+        assert_eq!(chart_panel_shown(None, 5), None);
+    }
+
+    /// The flow the sticky rule exists for, start to finish: select a chart,
+    /// click a cell mid-edit, point a field at the grid, then dismiss. The
+    /// panel is open for every step in between and shut only at the end.
+    #[test]
+    fn a_range_edit_survives_a_click_on_the_grid() {
+        let n = 2; // the sheet has two charts throughout
+        let mut panel = None;
+        let open = |p: Option<usize>| chart_panel_shown(p, n).is_some();
+
+        panel = chart_panel_after(panel, PanelEvent::Select(1));
+        assert!(open(panel));
+        // A click on a cell while a range field has the keyboard POINTS: the
+        // chart is not even deselected (`press_selection` leaves it alone), so
+        // the panel is untouched.
+        let after = press_selection(SelectTarget::Cell, Some(1), true);
+        assert_eq!(after.chart, Some(1));
+        assert!(!after.cell_moves && !after.drop_field);
+        assert!(open(panel));
+        // A click with NO field focused deselects — and the panel stays, which
+        // is what lets the next click land in one of its fields.
+        let after = press_selection(SelectTarget::Cell, Some(1), false);
+        assert_eq!(after.chart, None);
+        panel = chart_panel_after(panel, PanelEvent::Deselect);
+        assert_eq!(chart_panel_shown(panel, n), Some(1), "still on that chart");
+        // Now point that field from a deselected panel: still nothing moves.
+        let after = press_selection(SelectTarget::Cell, None, true);
+        assert_eq!(after.chart, None);
+        assert!(!after.cell_moves && !after.drop_field);
+        assert!(open(panel));
+        // Escape (or the `×`) is the only thing that shuts it.
+        panel = chart_panel_after(panel, PanelEvent::Dismiss);
+        assert!(!open(panel));
+    }
+
+    /// Deleting the chart the panel shows closes it by both routes at once:
+    /// `chart_delete_selected` fires `Invalidate` through
+    /// `chart_drop_selection`, and the index would fail the bounds check even
+    /// if it hadn't.
+    #[test]
+    fn deleting_the_shown_chart_closes_the_panel_either_way() {
+        let panel = chart_panel_after(None, PanelEvent::Select(1)); // of two
+        let by_event = chart_panel_after(panel, PanelEvent::Invalidate);
+        assert_eq!(chart_panel_shown(by_event, 1), None);
+        // Suppose the event were ever missed: one chart left, index 1 is gone.
+        assert_eq!(chart_panel_shown(panel, 1), None);
     }
 }
 

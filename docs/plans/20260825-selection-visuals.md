@@ -472,20 +472,82 @@ tested rows rather than an accident of where the check sits.
 
 ### Task 5: The Chart panel is sticky
 
-- [ ] replace the panel's gate (main.rs:15889) with state that outlives
+- [x] replace the panel's gate (main.rs:15889) with state that outlives
       `chart_sel`: the panel shows the last chart selected and stays open after
       deselection
-- [ ] close it on the `×` (main.rs:7430) and on `Escape`, and swap it when a
+      -> `Docxy::panel_chart`, moved only through `chart_panel_after`; both the
+      render gate and the grid-width reservation now ask `panel_chart_shown()`
+- [x] close it on the `X` (main.rs:7430) and on `Escape`, and swap it when a
       different chart is selected
-- [ ] decide and record what the panel does when the chart it shows is deleted,
-      or its sheet is left — it must not display a chart that no longer exists
-- [ ] make sure a range field inside a sticky panel still points at the grid:
+      -> `PanelEvent::Dismiss` at the close box and at BOTH escape paths (the
+      chart-selected one and the grid's own, which is where Escape lands once
+      the chart is already deselected); `Select(idx)` swaps
+- [x] decide and record what the panel does when the chart it shows is deleted,
+      or its sheet is left - it must not display a chart that no longer exists
+      -> it closes, by two independent routes; see "Gone means shut" below
+- [x] make sure a range field inside a sticky panel still points at the grid:
       that is the whole reason for stickiness, so a field focused while the
       chart is deselected must still work
-- [ ] write tests for the pure decision: given chart selection events, deletes,
+      -> `chart_data`/`chart_set_data` re-keyed onto the panel's chart; see
+      "Shown, versus selected" below
+- [x] write tests for the pure decision: given chart selection events, deletes,
       sheet switches and dismissals, whether the panel is open and which chart
-      it shows
-- [ ] run tests — must pass before Task 6
+      it shows -> 7 tests in `grid_geom_tests`
+      (`the_panel_stays_open_when_its_chart_is_deselected`,
+      `selecting_another_chart_swaps_the_panel`,
+      `dismissing_closes_the_panel_for_good`,
+      `the_chart_list_changing_closes_the_panel`,
+      `the_panel_never_shows_a_chart_that_is_gone`,
+      `a_range_edit_survives_a_click_on_the_grid`,
+      `deleting_the_shown_chart_closes_the_panel_either_way`)
+- [x] run tests - must pass before Task 6 -> suite 117 pass, gridcore 370+1+4,
+      both workspaces clippy clean and `cargo fmt --check` clean
+
+#### Shown, versus selected
+
+The panel outliving the selection splits one question into two, and every site
+that used to read `chart_sel` had to be sorted into one of them:
+
+- **Selected** - what is drawn ON the cells: the card's handles and Task 3's
+  source outlines (`chart_refs`, still `chart_sel`), the cell selection being
+  hidden (`sel_hidden`), and what Delete removes.
+- **Shown** - what the panel EDITS: `chart_data` and `chart_set_data`, and
+  through them every field commit, the type buttons and Switch Row/Column.
+
+Getting this wrong in the other direction is what would break the checkbox
+about pointing: a field committed while the chart is deselected would find no
+chart to write to and silently drop the edit. So `chart_data` reads the panel's
+chart and `chart_data_at(idx)` is the by-index accessor both share.
+
+Worth recording, because it was the surprise: a click on the grid **while a
+range field has the keyboard never deselected the chart in the first place** -
+`press_selection`'s `pointing` arm leaves the selection exactly as it was
+(Task 4). So stickiness is not what makes *that* click work. What it fixes is
+the click with **no field focused**: you glance at a cell, the chart deselects,
+and before this task the panel went with it - taking away the very fields you
+were about to click into. Stickiness is what puts the field back within reach.
+
+#### Gone means shut
+
+Two independent routes, because "the panel must never show a chart that no
+longer exists" is worth more than one:
+
+1. **`PanelEvent::Invalidate`**, fired from `chart_drop_selection` - the
+   existing choke point every list change already goes through (delete, sheet
+   switch, tab switch, undo, redo, chart insert). The panel closes rather than
+   sliding onto whichever chart took the index.
+2. **A bounds check at render**, `chart_panel_shown(panel_chart, chart_count())`.
+   Even if a future mutation forgot to fire the event, an index past the end of
+   the active sheet's chart list shuts the panel. Both the render gate and the
+   `sheet_grid_w` reservation call it, so the panel can never be drawn in a slot
+   the grid also laid itself out over - or reserve a slot it doesn't fill.
+
+Closing rather than clamping is deliberate: clamping to the nearest surviving
+chart would leave the panel open on a chart the user never selected, with a
+focused field about to repoint it.
+
+The panel is sticky against **deselection**, never against the list moving
+underneath it. That is the whole line between sticky and stale.
 
 ### Task 6: Verify acceptance criteria
 
