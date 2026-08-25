@@ -1806,57 +1806,6 @@ fn series_values_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<
     }
 }
 
-/// Why a plot can't be handed to a chart of this kind, or `None` if it can.
-///
-/// A pie plots ONE series: `chart_space_xml` writes only the first and the
-/// preview draws only the first, so a second would be listed in the panel,
-/// pointed at cells, coloured, and then dropped on save without a word.
-///
-/// There are five ways a pie can come to hold a second series through the
-/// panel. This is the question four of them ask — one of them twice;
-/// `series_add` asks the same question in its own words:
-///
-/// - `series_add` — the explicit "+ Series" button, which does NOT call this.
-///   It refuses at `n > 0` BEFORE pushing, which is this rule on the count the
-///   push would leave (`n + 1 > 1`), and keeps its own wording because "+
-///   Series" is about to add one rather than commit a plot. Equivalent today,
-///   but a kind rule changed here has to be changed there too.
-/// - `chart_apply_range` — a wider DATA RANGE. Every re-derivation keeps the
-///   chart's KIND and takes the series count from the cells.
-/// - `chart_switch_row_column` — a flip turns N categories into N one-point
-///   series, so it reaches the state in ONE click.
-/// - `chart_set_kind` — picking **Pie** on a chart that already has N series.
-///   It USUALLY does not re-derive: it keeps `data.series` and rewrites `kind`,
-///   which is why "guard every re-derivation" is not enough. It is also the
-///   widest door of the five, since it is what a user reaches by clicking the
-///   word *Pie*. It asks TWICE, because the one chart it does re-derive — a
-///   scatter or bubble the writer would save empty (`chart_would_lose_points`)
-///   — comes back from `chart_reauthored` with a series per numeric column of
-///   its box rather than the ones on screen, so the count that walked past the
-///   first check is not the count the user would get. The second ask is inside
-///   `chart_reauthored`, on the re-derived plot, and its refusal can therefore
-///   name a count the panel is not showing.
-/// - `sheet_insert_chart` — Insert ▸ Pie over a range with several numeric
-///   columns, which `chart_from_range` reads as a series each.
-///
-/// Those are the five doors the PANEL has. A file can arrive already holding a
-/// multi-series `<c:pieChart>` — the schema allows it even though Excel's own
-/// UI won't author it — and `parse_chart` calls such a chart one this model
-/// cannot reproduce, so it round-trips as Excel wrote it rather than losing its
-/// extra series on the next edit.
-///
-/// Refusing (rather than silently keeping the first) is the same answer
-/// `series_add` has always given, and it is the one that cannot lose work the
-/// user can see in the panel.
-fn chart_kind_series_err(kind: &str, series: usize) -> Option<String> {
-    (kind == "pie" && series > 1).then(|| {
-        format!(
-            "A pie plots one series and this reads as {series} \u{2014} pick \
-             column, bar or line, or a range with one line of numbers"
-        )
-    })
-}
-
 /// How many of a chart's series the plot actually DRAWS.
 ///
 /// Every kind draws all of them but the pie, which draws the first. That is a
@@ -2355,13 +2304,11 @@ fn chart_reauthored(
                  \u{2014} point DATA RANGE at the cells it should read first."
         )
     })?;
-    // The re-derivation takes its series count from the CELLS, so a box two
-    // numeric columns wide reads as two series however many the scatter had.
-    // That is the same question `chart_set_kind` asked of the chart on screen,
-    // asked again of the plot the user is actually about to get.
-    if let Some(m) = chart_kind_series_err(kind, out.series.len()) {
-        return Err(m);
-    }
+    // Nothing is asked about the series COUNT any more. A box two numeric
+    // columns wide re-derives as two series whatever the kind, pie included:
+    // `chart_space_xml` writes every one of them, so the second is kept in the
+    // file rather than dropped on save, and the panel says which of them the
+    // plot draws (`chart_plotted_series`, `chart_unplotted_note`).
     out.title = data.title.clone();
     out.part = data.part.clone();
     Ok(out)
@@ -3722,11 +3669,6 @@ impl Docxy {
             cx.notify();
             return;
         };
-        if let Some(m) = chart_kind_series_err(&old.kind, data.series.len()) {
-            self.ref_msg = Some((RefTarget::ChartRange, false, m));
-            cx.notify();
-            return;
-        }
         // The new plot keeps the look of the old one.
         data.title = old.title.clone();
         data.part = old.part.clone();
@@ -3813,27 +3755,12 @@ impl Docxy {
             return Err("No chart selected.".to_string());
         };
         let sh = self.chart_range_sheet(&data)?;
-        let out = chart_switch_row_column(&data, sh)?;
         // The flip keeps `kind`, and a pie read the other way round is usually
-        // one one-point series per category. Caught here rather than at the
-        // click so the button greys out with the reason under it, the way every
-        // other "can't switch this one" does.
-        //
-        // The rule is the shared one; the SENTENCE is not. Every other door
-        // asks about the plot the user is committing, so "this reads as N"
-        // names what they are about to get. Here N is the FLIP's count and the
-        // note sits under a button nobody pressed — the chart on screen still
-        // reads as one series over a range that already holds one line of
-        // numbers, so the shared wording would name a shape that is not the
-        // problem and offer a remedy already in place. The siblings in this
-        // slot are statements about the chart as it stands; so is this.
-        if chart_kind_series_err(&out.kind, out.series.len()).is_some() {
-            return Err(format!(
-                "Read the other way round its range is {} series, and a pie plots one.",
-                out.series.len(),
-            ));
-        }
-        Ok(out)
+        // one one-point series per category — which used to be refused here,
+        // because the writer then dropped all but the first on save. It writes
+        // every one of them now, so the flip is allowed and the panel says
+        // which of the series the plot draws (`chart_unplotted_note`).
+        chart_switch_row_column(&data, sh)
     }
 
     /// Excel's `Switch Row/Column`: read the chart's range the other way round,
@@ -3876,18 +3803,13 @@ impl Docxy {
         if data.kind == kind && !data.complex {
             return;
         }
-        // Asked of the chart ON SCREEN, because picking Pie usually keeps the
-        // series it finds: this is the one door to a multi-series pie that
-        // "guard every re-derivation" misses, and the one that reaches it in a
-        // single click on a chart whose series the user has already pointed and
-        // coloured. The re-authoring branch below asks it a SECOND time, of the
-        // count its own re-derivation reads out of the box, since the two can
-        // differ — see `chart_reauthored`.
-        if let Some(m) = chart_kind_series_err(kind, data.series.len()) {
-            self.set_status(m);
-            cx.notify();
-            return;
-        }
+        // Picking **Pie** on a chart that already has several series used to be
+        // refused right here, this being the widest door to a multi-series pie:
+        // one click on a chart whose series the user has already pointed and
+        // coloured. It is allowed now — `chart_space_xml` keeps every series a
+        // pie holds, so the click loses nothing, and picking the old kind back
+        // returns the chart intact.
+        //
         // Picking a WRITABLE type hands the part to `chart_space_xml` on the
         // next save, and it writes each series from the numbers the model holds
         // — a `values_ref`, a `col` inside the box, or a cached snapshot. A
@@ -4233,18 +4155,11 @@ impl Docxy {
             return;
         };
         let n = data.series.len();
-        // A pie plots one series and `chart_space_xml` writes only the first —
-        // a second would be listed in the panel, pointed at cells, and then
-        // dropped on save without a word.
-        if data.kind == "pie" && n > 0 {
-            self.ref_msg = Some((
-                RefTarget::SeriesValues(n - 1),
-                false,
-                "A pie plots one series — switch to column, bar or line to add another".into(),
-            ));
-            cx.notify();
-            return;
-        }
+        // A pie used to refuse a second series here, because `chart_space_xml`
+        // wrote only the first and the rest were dropped on save without a
+        // word. It writes every one of them now, so "+ Series" adds one to a
+        // pie like any other kind — the card says `NOT PLOTTED` and the note
+        // under CHART TYPE says the file keeps it (`chart_unplotted_note`).
         data.series.push(gridcore::sheet::ChartSeries {
             name: format!("Series {}", n + 1),
             values: vec![0.0; data.categories.len()],
@@ -6900,15 +6815,10 @@ impl Docxy {
         }) else {
             return;
         };
-        // Asked before the snapshot, for the same reason the plot is derived
-        // first: a range the chart can't hold pushes no undo entry. Insert ▸ Pie
-        // over several numeric columns reads as a series each, and the writer
-        // would keep only the first.
-        if let Some(m) = chart_kind_series_err(kind, data.series.len()) {
-            self.set_status(m);
-            cx.notify();
-            return;
-        }
+        // Insert ▸ Pie over several numeric columns reads as a series each, and
+        // that is inserted as-is: the writer keeps every one of them, and the
+        // panel says the pie draws the first (`chart_unplotted_note`).
+        //
         // UI-authored charts live in the snapshot alongside the workbook, so
         // without this Ctrl+Z would undo the edit BEFORE the insert and leave
         // the chart standing.
@@ -7222,11 +7132,9 @@ impl Docxy {
         // the `CHART_NO_BOX` case was already fixed for.
         //
         // `"column"` stands for all four buttons: they are all writable kinds,
-        // and the only refusal that turns on WHICH is `chart_kind_series_err`,
-        // which is a pie-only count and never fires for a column. So a Pie
-        // click on a multi-series box can still be refused after this says the
-        // re-read is on — with the count named, which is a different sentence
-        // about a different problem.
+        // and no refusal left in `chart_set_kind` turns on WHICH one is picked.
+        // (One did — a pie-only series count — until the writer stopped losing
+        // a pie's extra series and the refusal stopped being a fix.)
         //
         // Cheap enough for a render path for `chart_switched`'s reason: the
         // same `chart_range_sheet` cap bounds both, and the flip above already
@@ -18465,10 +18373,12 @@ mod grid_geom_tests {
         super::rebuild_source(&mut after);
         assert_eq!(after.source, out.source);
 
-        // A pie is refused on the count the RE-DERIVATION reads — two numeric
-        // columns are two series however many `<c:ser>` the scatter had.
-        let err = super::chart_reauthored(&scatter, "pie", &sh).expect_err("two series");
-        assert!(err.contains("reads as 2"), "{err}");
+        // A pie re-derives the same way and is no longer refused for its count:
+        // two numeric columns are two series, both kept, the first drawn.
+        let pie = super::chart_reauthored(&scatter, "pie", &sh).expect("two series");
+        assert_eq!(pie.kind, "pie");
+        assert_eq!(pie.series.len(), 2);
+        assert_eq!(super::chart_plotted_series(&pie.kind, pie.series.len()), 1);
 
         // And a box with no numbers under its header is refused with the shape
         // this chart reads, not with a silent empty chart.
@@ -19030,22 +18940,21 @@ mod grid_geom_tests {
         assert!(three.contains("not drawn"), "{three}");
     }
 
-    /// `series_add` refuses a pie a second series because the writer would drop
-    /// it, with its own inline `n > 0` test. There are four other ways to reach
-    /// the same state — the DATA RANGE commit and the switch both re-derive
-    /// while keeping the old kind, and picking **Pie** or inserting one skip the
-    /// derivation question entirely — and those four ask `chart_kind_series_err`,
-    /// which is `series_add`'s rule stated on the count AFTER the push.
+    /// Every door to a multi-series pie is OPEN now, and each one describes
+    /// what it hands over rather than refusing it.
+    ///
+    /// There were five: `series_add`'s inline `n > 0`, and `chart_reauthored`,
+    /// `chart_switched`, `chart_set_kind` and `sheet_insert_chart`, which all
+    /// asked one shared `chart_kind_series_err`. Every one of them existed
+    /// because `chart_space_xml` wrote a pie's FIRST series and dropped the
+    /// rest, so a second could be pointed at cells and coloured and then lost
+    /// on save without a word. The writer keeps them all now
+    /// (`a_pie_writes_every_series_it_holds`, gridcore), so the refusals guard
+    /// nothing — what is left to say is which of the series the plot draws, and
+    /// that is `chart_plotted_series` and `chart_unplotted_note`.
     #[test]
-    fn a_pie_is_refused_a_re_derived_plot_with_more_than_one_series() {
-        use super::chart_kind_series_err as err;
-        assert!(err("pie", 1).is_none());
-        assert!(err("pie", 0).is_none());
-        assert!(err("pie", 2).is_some_and(|m| m.contains("A pie plots one series")));
-        // Every other kind plots as many as the cells give.
-        for k in ["column", "bar", "line"] {
-            assert_eq!(err(k, 5), None);
-        }
+    fn every_door_to_a_multi_series_pie_is_open_and_says_what_it_draws() {
+        use super::{chart_plotted_series as drawn, chart_unplotted_note as note};
 
         // The switch is the route that reaches it in one click: a pie over a
         // label column plus one numeric column reads, the other way round, as
@@ -19073,12 +18982,17 @@ mod grid_geom_tests {
         let flipped = super::chart_switch_row_column(&pie, &sh).expect("flip");
         assert_eq!(flipped.kind, "pie");
         assert_eq!(flipped.series.len(), 3);
-        assert!(err(&flipped.kind, flipped.series.len()).is_some());
+        // All three are kept; one is drawn, and the panel says so.
+        assert_eq!(drawn(&flipped.kind, flipped.series.len()), 1);
+        assert!(
+            note(&flipped.kind, flipped.series.len())
+                .is_some_and(|m| m.contains("kept in the file"))
+        );
 
         // The doors that do NOT re-derive. `chart_set_kind` keeps the series it
         // finds and rewrites the kind, so a column chart over a range with two
-        // numeric columns becomes a pie holding both — the widest route to the
-        // silent drop, since it is one click on the word "Pie".
+        // numeric columns becomes a pie holding both — the widest route, since
+        // it is one click on the word "Pie", and now a lossless one.
         for (addr, cell) in [
             ("C1", gridcore::sheet::Cell::text("Price")),
             ("C2", gridcore::sheet::Cell::number(900.0)),
@@ -19091,14 +19005,41 @@ mod grid_geom_tests {
         let cols = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 2), "column", false)
             .expect("cols");
         assert_eq!(cols.series.len(), 2);
-        // What `chart_set_kind("pie", …)` would be committing: the SAME series,
-        // under a kind that writes one.
-        assert!(err("pie", cols.series.len()).is_some());
-        // And what `sheet_insert_chart("pie", …)` derives over the same range.
+        // What `chart_set_kind("pie", …)` commits: the SAME series, under a
+        // kind that draws the first and keeps the second. Nothing is dropped,
+        // so picking "column" straight back returns the chart it started as.
+        assert_eq!(drawn("pie", cols.series.len()), 1);
+        assert_eq!(drawn("column", cols.series.len()), 2);
+        assert!(note("pie", cols.series.len()).is_some());
+        assert_eq!(note("column", cols.series.len()), None);
+
+        // And what `sheet_insert_chart("pie", …)` derives over the same range:
+        // a series per numeric column, inserted as-is.
         let inserted = gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 2), "pie", false)
             .expect("pie");
         assert_eq!(inserted.series.len(), 2);
-        assert!(err(&inserted.kind, inserted.series.len()).is_some());
+        assert_eq!(drawn(&inserted.kind, inserted.series.len()), 1);
+        assert!(note(&inserted.kind, inserted.series.len()).is_some());
+
+        // `series_add`'s push, which used to be refused at `n > 0`: a pie with
+        // one series gets a second, and the panel marks it not plotted rather
+        // than the button turning it away. (That it then SURVIVES the save is
+        // `a_series_added_to_a_pie_survives_a_save`, gridcore — this side of
+        // the wall cannot reach the writer.)
+        let mut grown = pie.clone();
+        grown.series.push(gridcore::sheet::ChartSeries {
+            name: "Series 2".into(),
+            values: vec![0.0; grown.categories.len()],
+            ..Default::default()
+        });
+        assert_eq!(grown.series.len(), 2);
+        assert_eq!(drawn(&grown.kind, grown.series.len()), 1);
+        assert!(!super::series_is_plotted(
+            &grown.kind,
+            1,
+            grown.series.len()
+        ));
+        assert!(super::series_is_plotted(&grown.kind, 0, grown.series.len()));
     }
 
     #[test]

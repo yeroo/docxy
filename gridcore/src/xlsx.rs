@@ -4816,6 +4816,75 @@ mod tests {
         assert_eq!(chart_space_xml(&back), chart_space_xml(&data));
     }
 
+    /// What the suite's "+ Series" button now does to a pie, and what used to
+    /// be refused at that button because the save undid it.
+    ///
+    /// `series_add` (suite/docxy/src/main.rs) pushes a series with a default
+    /// name, one zero per category, and no `values_ref` yet — the user points
+    /// it at cells next. The refusal was there because `chart_space_xml` wrote
+    /// only `series.first()`, so the pushed series was listed in the panel,
+    /// pointed at cells, coloured, and then gone from the file. The button is
+    /// open now; this is the assertion that says opening it costs nothing.
+    #[test]
+    fn a_series_added_to_a_pie_survives_a_save() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        let mut data = ChartData {
+            title: "Sales".into(),
+            kind: "pie".into(),
+            categories: vec!["Q1".into(), "Q2".into()],
+            series: vec![ChartSeries {
+                name: "East".into(),
+                values: vec![1.0, 2.0],
+                col: Some(1),
+                values_ref: Some(ChartSource {
+                    sheet: "Budget".into(),
+                    range: (1, 1, 2, 1),
+                    cat_col: 0,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // The push, exactly as the button makes it.
+        data.series.push(ChartSeries {
+            name: "Series 2".into(),
+            values: vec![0.0; data.categories.len()],
+            ..Default::default()
+        });
+
+        let xml = chart_space_xml(&data);
+        assert_eq!(xml.matches("<c:ser>").count(), 2, "both series written");
+        let back = crate::drawing::parse_chart_for_test(&xml);
+        assert_eq!(back.kind, "pie");
+        assert_eq!(back.series.len(), 2, "the added series came back");
+        assert_eq!(back.series[0].name, "East");
+        assert_eq!(back.series[0].values, vec![1.0, 2.0]);
+        // The fresh one keeps its name and its (empty) numbers, so the user can
+        // go on pointing it at cells after a save and a reload.
+        assert_eq!(back.series[1].name, "Series 2");
+        assert_eq!(back.series[1].values, vec![0.0, 0.0]);
+        assert!(!back.complex, "still editable");
+        assert!(chart_is_writable(&back));
+
+        // Pointing it at cells afterwards is the other half of the same story:
+        // the ref rides the next save out and back too.
+        let mut pointed = back.clone();
+        pointed.series[1].values = vec![3.0, 4.0];
+        pointed.series[1].col = Some(2);
+        pointed.series[1].values_ref = Some(ChartSource {
+            sheet: "Budget".into(),
+            range: (1, 2, 2, 2),
+            cat_col: 0,
+        });
+        let again = crate::drawing::parse_chart_for_test(&chart_space_xml(&pointed));
+        assert_eq!(again.series.len(), 2);
+        assert_eq!(
+            again.series[1].values_ref.as_ref().map(ChartSource::to_ref),
+            Some("Budget!$C$2:$C$3".to_string())
+        );
+        assert_eq!(again.series[1].values, vec![3.0, 4.0]);
+    }
+
     #[test]
     fn parse_frozen_pane() {
         let ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";

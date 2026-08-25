@@ -289,21 +289,37 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 5: Retire the refusal
 
-- [ ] `chart_kind_series_err` (main.rs) refuses a state that is now legal
+- [x] `chart_kind_series_err` (main.rs) refuses a state that is now legal
       and lossless. Remove it and **all four** of its call sites:
       `chart_apply_range`, `chart_switched`, `chart_set_kind`
       and `sheet_insert_chart`. Deleting the function while any
-      caller stands does not compile
-- [ ] remove `series_add`'s inline equivalent too (`data.kind == "pie"
+      caller stands does not compile (all four gone; the door the plan calls
+      `chart_apply_range` is `chart_reauthored`, which is what that commit path
+      actually asks — the range commit in `chart_apply_range` asked it too, so
+      five sites in all, each replaced by a comment saying what it used to buy)
+- [x] remove `series_add`'s inline equivalent too (`data.kind == "pie"
       && n > 0`) — it is the same rule in its own words, and leaving it would
       keep the "+ Series" button refusing what every other door now allows
-- [ ] the guard's doc comment enumerates all five doors;
-      it goes with the function
-- [ ] update or delete the tests that pinned the refusal, and say in the commit
+- [x] the guard's doc comment enumerates all five doors;
+      it goes with the function (deleted with it)
+- [x] update or delete the tests that pinned the refusal, and say in the commit
       why a removed guard is the fix rather than a regression
-- [ ] write a test that adding a second series to a pie now succeeds and
-      survives a save
-- [ ] run tests — must pass before Task 6
+      (`a_pie_is_refused_a_re_derived_plot_with_more_than_one_series` inverted
+      into `every_door_to_a_multi_series_pie_is_open_and_says_what_it_draws`,
+      which walks the same four doors and asserts each yields the multi-series
+      pie and describes it via `chart_plotted_series`/`chart_unplotted_note`;
+      `picking_a_writable_type_authors_a_valueless_scatter_afresh`'s pie arm
+      inverted from `expect_err("two series")` to a two-series pie)
+- [x] write a test that adding a second series to a pie now succeeds and
+      survives a save (`a_series_added_to_a_pie_survives_a_save`, xlsx.rs —
+      `series_add`'s exact push, written, read back, then pointed at cells and
+      round-tripped again; the panel half is in the suite test above, which
+      cannot reach the writer across the crate wall)
+- [x] run tests — must pass before Task 6 (suite 82, gridcore 367 + 1 + 4; root
+      workspace builds; `cargo clippy` clean in both and `cargo fmt --check`
+      clean in both. ⚠️ `cargo build --manifest-path suite/Cargo.toml` cannot
+      relink `suite.exe` while a suite window is open — "Access is denied";
+      `cargo test`/`cargo clippy --all-targets` compile the same code and pass)
 
 ### Task 6: Verify acceptance criteria
 
