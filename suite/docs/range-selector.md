@@ -2,7 +2,7 @@
 
 Every input in the suite that asks for cells is the same input. Focus it and it
 takes the keyboard; click or drag on the grid and it writes what you pointed at;
-the cells it names are washed and outlined while you work. This document
+the cells it names are outlined while you work. This document
 describes that field, the inputs that use it, and the reference syntax it
 accepts.
 
@@ -33,16 +33,26 @@ starts pointing:
   in-cell editor and a hyperlinked cell isn't followed, both of which would act
   on a selection the click deliberately didn't move.
 
-Every field that names cells **washes and outlines** them while you type
-(`range_preview`) — a series' values and the category labels above all, since
-that is where you most need to see what you picked. A pointed range that is
-scrolled off-screen is revealed (`reveal_range`), in either direction: leftwards
-directly, rightwards on the next render, which is the first point that knows how
-wide the grid is. The chart title isn't a range (`RefTarget::is_range`), so its
-text is never parsed as one.
+Every field that names cells **outlines** them while you type
+(`range_preview`) — a dashed border in the brand teal, at Excel's border width
+and in Excel's shape, drawn by the edge cells themselves (`range_edges_at`,
+below). A series' values and the category labels need that most, since that is
+where you can least afford to be wrong about what you picked. The pointed range
+has no wash of its own: the dashed outline is unmistakable alone, and two
+indicators for one thing is exactly the doubling this grid tries to avoid. The
+same border draws the **selection** when no field is pointing and it spans more
+than one cell — one code path, one look (`border_range`); a lone selected cell
+already wears its ring, and the `range_tint` wash stays under it because a
+multi-cell selection with nothing but one cell's ring says too little.
 
-A reference naming **another sheet** gets no wash (`preview_range`): washing
-this sheet's `A1:D5` for a ref that means Budget's `A1:D5` would draw the very
+A pointed range that is scrolled off-screen is revealed (`reveal_range`), in
+either direction: leftwards directly, rightwards on the next render, which is
+the first point that knows how wide the grid is. The chart title isn't a range
+(`RefTarget::is_range`), so its text is never parsed as one.
+
+A reference naming **another sheet** gets no outline (`preview_range`):
+bordering this sheet's `A1:D5` for a ref that means Budget's `A1:D5` would draw
+the very
 lie — same-named cells standing in for the ones actually read — that keeping the
 qualifier exists to remove. The grid stays in point mode regardless, because
 `GridOverlay::picking` reads the field's *focus* and never the preview, so a
@@ -229,9 +239,9 @@ silently plotted Sheet2's `A1:D5`.) Resolution is `sheet_index_of`, matching
 sheet in front of you. The fold is `eq_ignore_ascii_case`, so a name outside
 ASCII matches only at its own case: `бюджет!A1` does not find `Бюджет`. The
 same fold decides `preview_range` (which delegates to `sheet_index_of`), the
-sheet-name uniqueness check, and `bar_range_text` — the **wash** that spells a
-reference back out — so changing it here alone would let resolution and the
-wash disagree about one reference. It is not, however, universal: the
+sheet-name uniqueness check, and `bar_range_text` — the **preview** that spells
+a reference back out — so changing it here alone would let resolution and the
+preview disagree about one reference. It is not, however, universal: the
 in-workbook hyperlink jump (`sheet_follow_hyperlink`) and a validation list's
 range source (`dv_list_values`) still match a sheet name byte for byte, so
 `=Budget!A1:A9` as a DV source finds nothing if the sheet is spelt `budget`.
@@ -397,7 +407,8 @@ literal.
 
 Each reference gets a colour by index from a six-entry palette (`ref_color`,
 wrapping past the end). On the grid its cells are outlined and lightly tinted in
-that colour — kept distinguishable from the picked-range wash. In the text,
+that colour — kept distinguishable from the pointed range's dashed border. In
+the text,
 `edit_runs` splits the buffer at the caret *and* at every token boundary, each
 run carrying its reference index, so a caret standing inside a reference splits
 it without either half losing its colour, and clicking any run still places the
@@ -410,6 +421,136 @@ sits in, the inner one. So the grid asks `ref_index_at`, which picks the
 **smallest** covering reference (earliest index on a tie). Taking the first
 covering one instead left the second reference with no cell anywhere in its
 colour.
+
+## What is selected, and what it reads
+
+The grid answers *what is selected right now* in one voice: exactly one thing
+looks selected at a time, and a selected chart says which cells it reads.
+
+Implementation: `press_selection`, `SelectTarget`, `SelectionAfter`,
+`cell_selection_shown`, `chart_source_areas`, `chart_slot_color`,
+`chart_area_at`, `border_range`, `range_edges_at`, `chart_panel_after`,
+`chart_panel_shown` — all pure free functions, all beside the grid geometry.
+
+### One selection at a time
+
+A chart card and a cell could both claim it, so `press_selection` decides which
+one does, for every press and for the navigation keys alike:
+
+- A press on a **cell** takes the selection back from any chart — its handles
+  and its source outlines go, and the cell ring returns.
+- A press on a **chart** takes it the other way. Pressing the *same* chart again
+  is a no-op rather than a re-selection, or every press on a selected card would
+  drop the panel field you were about to type in. A resize grip counts as a
+  press on its chart, and the selection moves on mouse-**down**, as in Excel.
+- **Navigation keys** (the arrows, Enter) are a press on the cells: they move
+  the cell selection, so they hand it back first. Escape and Delete still belong
+  to the chart.
+- While **pointing** — a range field or a half-typed formula has the keyboard —
+  a press on a cell writes a reference and changes *nothing* about what is
+  selected. That is what lets the Chart panel's own range fields work: the chart
+  being edited survives the clicks that edit it. Pressing another chart still
+  swaps, pointing or not, because the focused field belongs to the chart being
+  left (`drop_field`).
+
+"Selecting a chart clears the cell selection" is implemented as *stops drawing
+it*, not as clearing it. `SheetView::sel` is a `(row, col)` rather than an
+`Option`, and every keyboard path, the Name Box and the formula bar read it;
+making it optional would ripple through the whole grid to express something
+nobody asked for. So `cell_selection_shown` → `GridOverlay::sel_hidden` turns
+off every indicator keyed to the selection together — the ring, the
+`range_tint` wash, both headers' highlight, the point-mode wash, the auto-fill
+handle and the selection's own border — and dismissing the chart brings the ring
+back exactly where it was, which is also what Excel does.
+
+The one indicator deliberately still drawn under `sel_hidden` is the **pointed
+range's** border. A selected chart's range fields point at cells; hiding it
+would blind the very interaction the panel exists for. `border_range` therefore
+takes the selection as an `Option`, so "the pointed range" and "the selection"
+are told apart at the type rather than by a flag at each call site.
+
+### What a selected chart's outlines mean
+
+Selecting a chart outlines the cells it reads, each slot in its own colour:
+
+| Outline | Colour | The cells are |
+|---|---|---|
+| `CHART_VALUES_COLOR` | blue `0x4472c4` | the numbers plotted (`values_ref`, and a scatter's or bubble's `point_refs`) |
+| `CHART_CATEGORIES_COLOR` | purple `0x7030a0` | the category labels (`categories_ref`) |
+| `CHART_NAME_COLOR` | green `0x00b050` | a series' name (`name_ref`) |
+
+These are **Excel's mapping, deliberately**, and not the `ref_color` palette
+above them. The two answer different questions: `ref_color` says "the Nth
+reference of the formula you are typing", so its colours mean an *order* and
+cycle once they run out; these three say what the cells *are* to the chart, and
+anyone arriving from Excel knows them by sight. Matching Excel beats matching
+docxy for exactly that reason — please don't unify them with the palette.
+
+**Slots, not the box.** `ChartData::source` — the union the panel's DATA RANGE
+shows — is *not* outlined. It is one rectangle around everything and answers
+none of what selecting a chart asks: which cells are the numbers, which are the
+labels. `chart_source_areas` walks the four slots the panel edits instead, so a
+cell inside the box but in no slot (`A1` of an `A1:C5` chart) is drawn nothing.
+`point_refs` is in that list because a scatter's and a bubble's numbers live
+there and never in `values_ref`.
+
+**Smallest wins**, the same rule the formula colours use, and now literally the
+same function: `ref_index_at` and `chart_area_at` both call `smallest_ref_at`.
+Two lists asking "who owns this cell" have to answer the same way, and a shared
+rule cannot drift apart the way two copies would. It earns its keep here more
+than for formulas, because the slots nest *by construction* — a series' name
+cell is the header of the column its values read — so without it every green
+name cell would be swallowed by the blue box it heads.
+
+**Outline only, no wash.** A formula's references tint their cells as well;
+these do not. A chart's sources are read while looking straight at the grid, and
+a third wash over cells that may also carry `range_tint` is the doubled-up
+indicator this work set out to remove. **Only the sheet in front of you** is
+outlined, too: a ref naming another sheet gets nothing, exactly as
+`preview_range` already refuses the wash. An unqualified ref means the chart's
+own sheet.
+
+Duplicate areas are folded — two series pointed at one cell would otherwise draw
+the same box twice. The same cells in a *different* slot is not a duplicate:
+both claims are real, and smallest-wins picks between them.
+
+### The Chart panel is sticky
+
+The panel used to be gated straight on `chart_sel`, so any click on the grid
+closed it mid-edit. It now has its own state (`Docxy::panel_chart`), moved only
+through `chart_panel_after`, and only four things move it:
+
+- `Select(idx)` — a chart card was pressed; the panel swaps to it.
+- `Deselect` — the chart lost the selection to the grid. The panel **keeps
+  showing that chart**. This is the whole point: you glance at a cell, the chart
+  deselects, and the fields you were about to click into are still there.
+- `Dismiss` — the panel's `×`, or Escape. The two deliberate ways out.
+- `Invalidate` — the chart list underneath changed. The panel **closes**.
+
+That splits one question into two, and every site that read `chart_sel` belongs
+to one of them:
+
+- **Selected** — what is drawn on the cells: the card's handles, the source
+  outlines (`chart_refs`), `sel_hidden`, and what Delete removes.
+- **Shown** — what the panel *edits*: `chart_data`/`chart_set_data`, and through
+  them every field commit, the type buttons and Switch Row/Column.
+
+Getting that backwards is what would break the stickiness it exists for: a field
+committed while the chart is deselected would find no chart to write to and
+silently drop the edit.
+
+**Gone means shut.** The panel must never show a chart that no longer exists, so
+there are two independent routes to closing it. `Invalidate` fires from
+`chart_drop_selection` — the choke point every list change already goes through
+(delete, sheet switch, tab switch, undo, redo, insert) — and, as a second line
+of defence, `chart_panel_shown(panel_chart, chart_count())` bounds-checks the
+index at render. Both the render gate and the `sheet_grid_w` reservation ask it,
+so the panel can never be drawn in a slot the grid also laid itself out over, or
+reserve a slot it doesn't fill. Closing rather than clamping is deliberate:
+clamping to the nearest surviving chart would leave the panel open on a chart
+the user never selected, with a focused field about to re-point it. The panel is
+sticky against **deselection**, never against the list moving underneath it —
+that is the whole line between sticky and stale.
 
 ## Traps this rests on
 
@@ -432,6 +573,59 @@ cell's overflow clip. The chart overlay's approach (reconstructing row positions
 from a uniform row height) drifts on rows whose height comes from their content,
 which is already visible on the sample sheet. Any new overlay that has to line
 up with cells must use the per-cell technique.
+
+**GPUI draws dashed borders, in the quad shader.** `grep -c dash` in
+`gpui/src/style.rs` is 0, which is how this got recorded as impossible once
+already — the wrong file. The setter is `Styled::border_dashed()`
+(`crates/gpui/src/styled.rs:500`, on the `Styled` trait, so plain `div()` has
+it), the enum is `BorderStyle::{Solid, Dashed}` (`crates/gpui/src/scene.rs:597`),
+and the dashes are drawn in the quad shader on all three backends we ship
+(`gpui_windows/src/shaders.hlsl:664`, `gpui_wgpu/src/shaders.wgsl:693`,
+`gpui_macos/src/shaders.metal`). `PathBuilder::dash_array()`
+(`path_builder.rs:108`) exists too, for stroked paths — not needed here, since a
+quad border is cheaper and lays out with the cell. Line numbers are at the gpui
+rev this workspace pins (zed `8276687`, per `suite/Cargo.lock`).
+
+So **a dash is not an element**: a dashed border costs exactly what a solid one
+costs, and there is nothing to trade for hand-rolling one. What the shader gives
+us is not chosen, though, and `dash_fit` mirrors its arithmetic so the numbers
+are derived rather than eyeballed:
+
+- the pattern is dash `2W`, gap `1W` — pitch `3W`, derived from the border
+  width, with no separate dash-length knob;
+- dashes are laid out **per straight side, not around the perimeter**, and the
+  side is made to start *and* end with a dash by reserving one dash's length and
+  stretching the gap so the rest divides evenly;
+- an edge of `4W` or less is painted **solid** — the shader's `dash_gap > 0.0`
+  test fails and it silently skips dashing. At `RANGE_BORDER_W = 2` that is 8px,
+  which only a clipped sliver of a column can be.
+
+Because the layout is per quad, the dash phase restarts at every column
+boundary: a long horizontal edge is a run of per-cell dash groups rather than
+one continuous rhythm. Each group starts and ends flush with its cell, so the
+seam falls on the gridline where the eye already expects one. That is the price
+of per-cell rendering, and it is worth paying — see the drift trap above.
+
+**The dashed border's cost is bounded by the viewport, not by the range.** The
+grid only renders visible cells, so a range's border costs one quad per *visible*
+boundary cell however large the range is: at the narrowest column (28px) and
+shortest row (21px) a 1920×1200 grid shows ≈69 × ≈55 cells, so a full-row
+selection is ≈69 quads, a full-column one ≈55, and select-all
+(`A1:XFD1048576`) ≈123 — its perimeter is mostly off screen.
+`RANGE_BORDER_CELL_CAP = 512` is the backstop: past it `range_border_plan`
+reports `dashed: false` and **the same edges are drawn solid**. Degrading to
+solid rather than to stuttering is the tested guarantee; on a hypothetical
+ultrawide showing ~180 minimum-width columns the cap genuinely is reachable and
+select-all there goes solid, which is the backstop working.
+
+Only `sheet_el` knows the visible column window, so it decides the cap once per
+frame (`range_border_dashed` → `GridOverlay::range_dashed`) and `sheet_row`
+reads it. Two deliberate over-counts, both in the direction where the cap fires
+*sooner*, never later: the frozen band and the scrolled window are counted as
+one span, and the row side is bounded by `GRID_MAX_VISIBLE_ROWS = 128` rather
+than measured, because `sheet_el` is handed the grid's width but not its height.
+Don't raise that constant to be safe — two full columns at 256 would clear the
+cap between them and drop an ordinary tall selection to solid.
 
 **A drag can be released anywhere, so it must be ended everywhere.**
 `sheet_dragging`, `drag_anchor`, `sheet_fill`, `chart_drag`, `formula_pick` and
@@ -521,7 +715,11 @@ Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
 `formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,
 `sort_rows_from`, `bar_range_text`, `series_values_shape_err`,
 `categories_shape_err`, `chart_field_examples`, `chart_plotted_series`,
-`series_is_plotted`, `chart_unplotted_note`.
+`series_is_plotted`, `chart_unplotted_note`, `smallest_ref_at`,
+`range_edges_at`, `range_border_plan`, `range_border_dashed`, `dash_fit`,
+`border_range`, `chart_source_areas`, `chart_area_at`, `chart_slot_color`,
+`press_selection`, `cell_selection_shown`, `chart_panel_after`,
+`chart_panel_shown`.
 
 That list is why every helper here is a **pure free function** taking the
 workbook's sheet names as a `&[String]` rather than reading them off the view:

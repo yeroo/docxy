@@ -597,10 +597,28 @@ would blind the very interaction the panel exists for.
 
 ### Task 7: [Final] Update documentation
 
-- [ ] document the selection rules in `suite/docs/range-selector.md`: one
+- [x] document the selection rules in `suite/docs/range-selector.md`: one
       selection at a time, the sticky panel, and what each source colour means
-- [ ] record the dashed-border technique and its cost bound, so the next person
+      → new section "What is selected, and what it reads", with a subsection
+      each for the press rule (`press_selection`, `sel_hidden`, the pointing
+      arm, the pointed-range exception), the source colours (the table, slots
+      not the box, smallest-wins, outline-only, foreign sheets) and the sticky
+      panel (the four `PanelEvent`s, selected-vs-shown, "gone means shut")
+- [x] record the dashed-border technique and its cost bound, so the next person
       wanting a dashed anything does not re-derive that gpui has no such style
+      → two new traps in "Traps this rests on": **GPUI draws dashed borders,
+      in the quad shader** (the `styled.rs`/`scene.rs`/shader citations at the
+      pinned rev, why `style.rs` is the wrong file to grep, the `2W`/`1W`
+      geometry, the `4W` solid floor, the per-quad phase restart) and **the
+      cost is bounded by the viewport, not by the range**
+      (`RANGE_BORDER_CELL_CAP`, the solid fallback, and why
+      `GRID_MAX_VISIBLE_ROWS` is 128 and not higher)
+
+➕ The wash wording elsewhere in the doc was corrected in the same pass: the
+pointed range no longer has a wash of its own, so "washes and outlines" became
+"outlines", and `border_range` outlining a multi-cell selection is recorded
+beside it. The tested-helper list at the bottom gained this plan's thirteen new
+pure functions.
 
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`*
 
