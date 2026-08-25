@@ -551,15 +551,49 @@ underneath it. That is the whole line between sticky and stale.
 
 ### Task 6: Verify acceptance criteria
 
-- [ ] verify each of the four numbered complaints in the Overview is addressed
-- [ ] verify the deliberate non-goals are still absent: no animation on the
+- [x] verify each of the four numbered complaints in the Overview is addressed
+      → all four traced to code; see "What answers each complaint" below
+- [x] verify the deliberate non-goals are still absent: no animation on the
       dashes, no Excel green, no header-darkening work, no chart axis work
-- [ ] verify edge cases: a one-cell range, a range scrolled out of view, a chart
+      → the plan's own diff (`87455c3..HEAD`, 1782 lines of `main.rs`) contains
+      no `animation`/`with_animation`, no Excel green (`0x00b04f`, `0x21a366`,
+      `0x107c41`) — the only green is `CHART_NAME_COLOR`, which is Excel's
+      *chart-source* mapping and deliberate — and no axis or gridline work. The
+      header lines it touches only pass `sel_hidden` in to turn the EXISTING
+      highlight off; no darkening style was added
+- [x] verify edge cases: a one-cell range, a range scrolled out of view, a chart
       whose refs name another sheet, a chart deleted while its panel is sticky
-- [ ] run `cargo test --manifest-path suite/Cargo.toml` — all pass
-- [ ] run `cargo test -p gridcore` — all pass
-- [ ] run `cargo build --all-targets` — root workspace builds
-- [ ] run clippy on both workspaces and `cargo fmt --check` — clean
+      → one test each and all passing: `border_plan_one_cell_range_owns_all_four_edges`,
+      `border_plan_clips_to_the_visible_window` (which also covers scrolled
+      *clean* past — empty, not dashed, no panic on the empty box, and off in
+      one axis only), `chart_source_areas_draws_only_the_sheet_in_front_of_you`,
+      and `deleting_the_shown_chart_closes_the_panel_either_way` (with
+      `the_panel_never_shows_a_chart_that_is_gone` and
+      `the_chart_list_changing_closes_the_panel` covering the other route)
+- [x] run `cargo test --manifest-path suite/Cargo.toml` — all pass
+      → 117 passed, 0 failed
+- [x] run `cargo test -p gridcore` — all pass
+      → 370 + 1 conformance + 4 roundtrip passed, 0 failed
+- [x] run `cargo build --all-targets` — root workspace builds
+      → builds. The only warnings are the pre-existing `.pdb` output-filename
+      collisions in the two comshim crates, untouched by this plan
+- [x] run clippy on both workspaces and `cargo fmt --check` — clean
+      → `cargo clippy -p gridcore --all-targets -- -D warnings` and
+      `cargo clippy --manifest-path suite/Cargo.toml --all-targets -- -D warnings`
+      both silent; `cargo fmt --check` clean on both workspaces
+
+#### What answers each complaint
+
+| Complaint | Answered by |
+|---|---|
+| 1. A pointed range is a flat wash | `sheet_row` draws `range_edges_at`'s sides with `border_dashed()` at `RANGE_BORDER_W` in `hsla_u(BRAND)`; the pointed range's own `a: 0.18` wash is gone |
+| 2. A selected chart says nothing about its sources | `GridOverlay::chart_refs` ← `chart_source_areas`, coloured by `chart_slot_color` (`CHART_VALUES_COLOR` blue / `CHART_CATEGORIES_COLOR` purple / `CHART_NAME_COLOR` green) and resolved by the shared `smallest_ref_at` |
+| 3. A chart and a cell are selected at once | `press_selection` over `SelectTarget::{Cell, Chart, NavKey}`, with `cell_selection_shown` → `GridOverlay::sel_hidden` darkening the ring, the wash, both headers and the handle together |
+| 4. The Chart panel vanishes on a cell click | `Docxy::panel_chart` moved only through `chart_panel_after`; the render gate and the grid-width reservation both ask `panel_chart_shown()`, and `chart_panel_shown(idx, count)` bounds-checks it |
+
+The one thing deliberately still drawn under `sel_hidden` is the **pointed
+range's** border — a selected chart's range fields point at cells, so hiding it
+would blind the very interaction the panel exists for.
 
 ### Task 7: [Final] Update documentation
 
