@@ -2363,6 +2363,16 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
             AXES,
         ),
         "pie" => {
+            // ECMA-376 Part 1, DrawingML Charts (dml-chart.xsd): CT_PieChart's
+            // content comes from EG_PieChartShared, which declares
+            //   <xsd:element name="ser" type="CT_PieSer" minOccurs="0" maxOccurs="unbounded"/>
+            // — so SEVERAL `<c:ser>` in one `<c:pieChart>` is schema-valid, and
+            // real Excel-authored files do it (corpus: openoffice/.../pvt/
+            // complex_29s.xlsx chart3.xml holds seven, libreoffice/.../
+            // tdf111173.xlsx two). Excel plots the FIRST series only; that is a
+            // plotting rule, not a format rule.
+            // TODO(pie-series-drop Task 2): the line below acts on the format
+            // rule that does not exist and drops the rest of the user's data.
             // Pie takes a single series; extra series are invalid (that's doughnut).
             let pie_ser = data
                 .series

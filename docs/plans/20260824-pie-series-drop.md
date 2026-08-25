@@ -98,6 +98,41 @@ same branch (02654cd) once the reviewers named them.
 | arch+quality | 85 | `chart_set_kind` is the fourth and widest door |
 | adversarial | 94 | pie insertion bypasses the guard entirely |
 
+### Task 1 finding — the format does permit it (2026-08-25)
+
+**Schema.** ECMA-376 Part 1, DrawingML Charts (`dml-chart.xsd`): `CT_PieChart`
+takes its content from the group `EG_PieChartShared`, which declares
+
+```xsd
+<xsd:element name="ser" type="CT_PieSer" minOccurs="0" maxOccurs="unbounded"/>
+```
+
+so more than one `<c:ser>` inside one `<c:pieChart>` is schema-valid. The
+citation now sits beside the pie arm in `chart_space_xml`
+(gridcore/src/xlsx.rs). Excel plotting only the first series is a *plotting*
+rule, not a format rule — the plan's premise holds and Tasks 2–7 stand.
+
+**Corpus.** Scanned all 555 workbooks under `corpus/` (192 chart parts,
+29 `<c:pieChart>` elements). **Four** hold more than one `<c:ser>`, and every
+one of them was written by real Excel (`docProps/app.xml` says
+`Microsoft Excel`):
+
+| File | Part | `<c:ser>` |
+|---|---|---|
+| `corpus/xlsx-ext/openoffice/test/testgui/data/pvt/complex_29s.xlsx` | `xl/charts/chart3.xml` | 7 |
+| `corpus/xlsx-ext/libreoffice/chart2/qa/extras/data/xlsx/chart-hatch-fill.xlsx` | `xl/charts/chart1.xml` | 2 |
+| `corpus/xlsx-ext/libreoffice/chart2/qa/extras/data/xlsx/strict_chart.xlsx` | `xl/charts/chart1.xml` | 2 |
+| `corpus/xlsx-ext/libreoffice/chart2/qa/extras/data/xlsx/tdf111173.xlsx` | `xl/charts/chart1.xml` | 2 |
+
+So multi-series pies are not merely legal but present in the wild — today each
+of these four is held back as `complex` by `parse_chart`, which is exactly the
+hold-back Task 2 removes.
+
+➕ Noted for Task 2: `<c:idx>`/`<c:order>` need NOT be contiguous. `complex_29s`
+runs 0–6 sequentially, but `tdf111173` uses idx 0 and idx **2**. The writer
+emitting sequential indices is fine; the READER (Task 3) must not assume they
+are.
+
 ### Dependencies
 
 None outside the repo. Both workspaces build clean at the branch head;
@@ -163,17 +198,21 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 1: Confirm the format actually permits it
 
-- [ ] verify against ECMA-376 that `CT_PieChart` declares `ser` with
+- [x] verify against ECMA-376 that `CT_PieChart` declares `ser` with
       `maxOccurs="unbounded"`, and record the citation in a comment beside the
       pie arm — the whole plan rests on this, and the code currently carries the
-      opposite claim as a comment
-- [ ] check what the OOXML corpus holds: search the sample workbooks for a
+      opposite claim as a comment (CONFIRMED: `EG_PieChartShared`,
+      `dml-chart.xsd`; citation now in the pie arm)
+- [x] check what the OOXML corpus holds: search the sample workbooks for a
       `<c:pieChart>` containing more than one `<c:ser>`, and note whether real
-      files in the wild do this
-- [ ] ⚠️ if the format does NOT permit it, STOP and update this plan: the
+      files in the wild do this (4 of 29 pie charts, all Excel-authored —
+      table in Context)
+- [x] ⚠️ if the format does NOT permit it, STOP and update this plan: the
       approach changes to guarding the doors instead, and the remaining tasks
-      are wrong. Do not proceed on the assumption
-- [ ] no code change in this task; record the finding in the plan
+      are wrong. Do not proceed on the assumption (not triggered — the format
+      permits it)
+- [x] no code change in this task; record the finding in the plan (only the
+      citation comment beside the pie arm; no behaviour change)
 
 ### Task 2: Write every series a pie holds
 
