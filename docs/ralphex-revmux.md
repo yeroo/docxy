@@ -33,6 +33,13 @@ external command` and takes the whole review phase down.
 Keep this file minimal. Local config *shadows* the global one, so a key copied
 in that you never meant to pin will silently override `~/.config/ralphex/`.
 
+⚠️ **Check that these two keys are actually uncommented.** `ralphex --init`
+writes the full template with everything commented out, which looks like a
+configured project but is not: the hook sits there and is never invoked, and
+the external review phase quietly runs codex instead. That was the state of one
+repo here for weeks. `grep -vE '^\s*#|^\s*$' .ralphex/config` should print
+exactly the two lines above.
+
 ### 2. `scripts/revmux-review.cmd`
 
 The Windows bridge. `exec.Command` cannot run a `.sh` on Windows — it fails
@@ -58,8 +65,23 @@ the wrong one and the script dies on `date: command not found` while `git` and
 `revmux` resolve fine from the system `PATH` — a baffling failure until you
 know.
 
-Add `*.cmd text eol=crlf` to `.gitattributes` if the repo normalises to LF.
-`cmd.exe` mis-parses a multi-line `if (` block in an LF-only batch file.
+### Line endings — three files that fail in different directions
+
+Get this wrong and the setup breaks on a fresh clone rather than on your
+machine, which makes it hard to spot. Put all three rules in `.gitattributes`:
+
+```
+*.sh              text eol=lf     # bash: a CR gives "$'\r': command not found"
+.ralphex/config   text eol=lf     # a CR joins the value: a path ending in \r
+*.cmd             text eol=crlf   # cmd.exe mis-parses a multi-line if-block in LF
+*.bat             text eol=crlf
+```
+
+A repo with no `.gitattributes` at all is the dangerous case: everything falls
+through to the user's `core.autocrlf`, so on Windows the `.sh` and the config
+are the ones that get mangled. Adding a rule for `*.cmd` alone makes it worse,
+not better — it fixes the file that was already fine and leaves the other two
+to chance. `git check-attr eol -- <file>` tells you what will actually happen.
 
 ### 3. `scripts/revmux-review.sh`
 
