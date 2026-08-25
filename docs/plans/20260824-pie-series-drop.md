@@ -30,7 +30,9 @@ data and stop lying about it**. Nothing is refused; nothing is lost.
 
 **All five are shut.** `chart_kind_series_err`
 (suite/docxy/src/main.rs) is called by `chart_apply_range`,
-`chart_switched`, `chart_set_kind` and `sheet_insert_chart`;
+`chart_switched`, `chart_set_kind` and `sheet_insert_chart` — and once more by
+`chart_reauthored`, which is `chart_set_kind`'s second ask rather than a door
+of its own;
 `series_add` applies the same rule in its own words
 (`data.kind == "pie" && n > 0`, asked before the push). The two this plan was
 first drafted against — `chart_set_kind`, the widest door, and
@@ -75,9 +77,10 @@ element rather than the shape of its `<c:f>` — the `multiLvlStrRef` arm of
   the data is dropped.
 - `gridcore/src/drawing.rs` — `parse_chart`, which must read every `<c:ser>`
   back out of a `<c:pieChart>`.
-- `suite/docxy/src/main.rs` — `chart_kind_series_err` and its four
+- `suite/docxy/src/main.rs` — `chart_kind_series_err` and its five
   callers `chart_apply_range`, `chart_switched`,
-  `chart_set_kind` and `sheet_insert_chart`; `series_add`,
+  `chart_set_kind`, `sheet_insert_chart` and `chart_reauthored`
+  (`chart_set_kind`'s second ask, on the re-derived plot); `series_add`,
   which asks the same question inline; the type buttons and the series
   list.
 - `xlsxy/src/main.rs` — the TUI's chart insert, same entry point shape.
@@ -273,7 +276,8 @@ pure logic, but constructing views or elements blows up the render macro, so
       the DRAWN series only — an undrawn one can no longer stretch the axis or
       add an empty slice)
 - [x] in the Chart panel, mark the series beyond the first as not plotted —
-      the series cards (`series_card` in main.rs) currently present all of them
+      the series cards (built inline in `chart_panel`'s series loop in
+      main.rs) currently present all of them
       identically, which is what makes the loss invisible (a `NOT PLOTTED` tag
       beside the card's `NAME` label, asked via `series_is_plotted`)
 - [x] add a note beside the type buttons (the `CHART TYPE` row in main.rs) saying a pie plots
@@ -293,10 +297,10 @@ pure logic, but constructing views or elements blows up the render macro, so
       and lossless. Remove it and **all four** of its call sites:
       `chart_apply_range`, `chart_switched`, `chart_set_kind`
       and `sheet_insert_chart`. Deleting the function while any
-      caller stands does not compile (all four gone; the door the plan calls
-      `chart_apply_range` is `chart_reauthored`, which is what that commit path
-      actually asks — the range commit in `chart_apply_range` asked it too, so
-      five sites in all, each replaced by a comment saying what it used to buy)
+      caller stands does not compile (all four gone; the list above missed a
+      fifth site — `chart_reauthored`, which asked it on the RE-DERIVED plot,
+      the second of the two asks `chart_set_kind` made — so five call sites in
+      all, each replaced by a comment saying what it used to buy)
 - [x] remove `series_add`'s inline equivalent too (`data.kind == "pie"
       && n > 0`) — it is the same rule in its own words, and leaving it would
       keep the "+ Series" button refusing what every other door now allows
@@ -305,9 +309,17 @@ pure logic, but constructing views or elements blows up the render macro, so
 - [x] update or delete the tests that pinned the refusal, and say in the commit
       why a removed guard is the fix rather than a regression
       (`a_pie_is_refused_a_re_derived_plot_with_more_than_one_series` inverted
-      into `every_door_to_a_multi_series_pie_is_open_and_says_what_it_draws`,
-      which walks the same four doors and asserts each yields the multi-series
-      pie and describes it via `chart_plotted_series`/`chart_unplotted_note`;
+      into `the_multi_series_pie_each_door_hands_over_is_described_not_refused`
+      — renamed from the drafted
+      `every_door_to_a_multi_series_pie_is_open_and_says_what_it_draws`, since
+      what it pins is the shape each door hands over, not that the doors are
+      unguarded — which covers the same four doors and asserts each yields
+      the multi-series pie and describes it via
+      `chart_plotted_series`/`chart_unplotted_note`. It reaches the PURE half of
+      each door only — all four are `Docxy` methods needing a constructed view;
+      three take `&mut self` and a `Context<Self>`, while `chart_switched` is
+      `&self`, called from the render path to grey the button — as
+      its own doc comment and `suite/docs/pie-series.md` both spell out;
       `picking_a_writable_type_authors_a_valueless_scatter_afresh`'s pie arm
       inverted from `expect_err("two series")` to a two-series pie)
 - [x] write a test that adding a second series to a pie now succeeds and

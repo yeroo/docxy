@@ -12,8 +12,8 @@ them now, so there is nothing to refuse and the doors are open.
 Implementation: `chart_space_xml`'s pie arm (`gridcore/src/xlsx.rs`),
 `parse_chart` (`gridcore/src/drawing.rs`), and in the panel
 `chart_plotted_series`, `series_is_plotted`, `chart_unplotted_note`,
-`chart_card`, `series_card` and `chart_panel`'s `CHART TYPE` row
-(`suite/docxy/src/main.rs`).
+`chart_card`, and in `chart_panel` both the series list and the `CHART TYPE`
+row (`suite/docxy/src/main.rs`).
 
 ## Several `<c:ser>` in one `<c:pieChart>` is legal
 
@@ -112,9 +112,11 @@ else derives from it, so the card and the panel can never disagree.
   slice proportions therefore measure the **drawn** series only — an undrawn one
   can no longer stretch the axis or add an empty slice. Before, that was true by
   accident, because the writer had already thrown the extras away.
-- **The series cards** (`series_card`) tag every unplotted one `NOT PLOTTED`
-  beside its `NAME` label, asked via `series_is_plotted`. Presenting all of them
-  identically is exactly what made the old loss invisible.
+- **The series cards** — built inline in `chart_panel`'s series loop, at the
+  card's `NAME` row — tag every unplotted one `NOT PLOTTED` beside that label,
+  asked via `series_is_plotted`. Grep for `series_is_plotted` to find the site;
+  there is no `series_card` function. Presenting all of them identically is
+  exactly what made the old loss invisible.
 - **The type row** (`chart_panel`) shows `chart_unplotted_note` under the
   buttons when a chart holds more than it draws: *"A pie plots the first series
   only — the other 2 are kept in the file but not drawn."* The sentence says
@@ -132,9 +134,9 @@ something the format and the file both allow. All five doors now go through:
 
 | Door | What it does now |
 |---|---|
-| `chart_set_kind` — clicking **Pie** | keeps the series, rewrites the kind; picking the old kind back returns the chart intact |
+| `chart_set_kind` — clicking **Pie** | keeps the series, rewrites the kind; picking the old kind back returns the chart intact. On a chart the writer would save empty it re-derives instead, through `chart_reauthored` — `chart_set_kind`'s second ask rather than a door of its own |
 | `sheet_insert_chart` — Insert ▸ Pie | inserts over a range with several numeric columns |
-| `chart_reauthored` / `chart_apply_range` — a wide DATA RANGE | re-derives a series per numeric column, pie included |
+| `chart_apply_range` — a wide DATA RANGE | re-derives a series per numeric column, pie included |
 | `chart_switched` — the flip | allowed even though a flipped pie is usually one one-point series per category ([`chart-orientation.md`](chart-orientation.md)) |
 | `series_add` — **+ Series** | pushes onto a pie like any other kind |
 
@@ -143,8 +145,11 @@ buying it. `the_multi_series_pie_each_door_hands_over_is_described_not_refused`
 covers four of them — the flip, `chart_set_kind`, `sheet_insert_chart` and
 `series_add`'s push — asserting each yields the multi-series pie *and* that
 `chart_plotted_series` / `chart_unplotted_note` describe it. Be precise about
-what that pins: those four doors are `&mut self` methods taking a
-`Context<Self>`, so the test reaches only the PURE half each delegates to
+what that pins: all four are `Docxy` methods, so a unit test cannot call them
+for want of a constructed view holding a selected chart — `chart_set_kind`,
+`sheet_insert_chart` and `series_add` take `&mut self` and a `Context<Self>`,
+and `chart_switched` is `&self` because the render path calls it each frame to
+grey the button. The test reaches only the PURE half each delegates to
 (`chart_switch_row_column`, `chart_from_range`, and `series_add`'s push written
 out). It pins the shape they produce and the words said about it — **not** that
 they are unguarded; a refusal re-added inside one of those bodies would leave it

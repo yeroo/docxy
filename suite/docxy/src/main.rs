@@ -3677,6 +3677,12 @@ impl Docxy {
             cx.notify();
             return;
         };
+        // Nothing is asked about the series COUNT. Re-pointing a pie at a box
+        // several numeric columns wide used to be refused right here, because
+        // `chart_space_xml` then wrote the first series and dropped the rest on
+        // save; it writes every one of them now, so the widened plot is kept
+        // whole and the panel says which of it the pie draws
+        // (`chart_plotted_series`, `chart_unplotted_note`).
         // The new plot keeps the look of the old one.
         data.title = old.title.clone();
         data.part = old.part.clone();
@@ -18964,9 +18970,10 @@ mod grid_geom_tests {
     /// The multi-series pie each door now hands over, and what the panel says
     /// about it.
     ///
-    /// There were five refusals: `series_add`'s inline `n > 0`, and
-    /// `chart_reauthored`, `chart_switched`, `chart_set_kind` and
-    /// `sheet_insert_chart`, which all asked one shared `chart_kind_series_err`.
+    /// There were six refusals: `series_add`'s inline `n > 0`, and
+    /// `chart_reauthored`, `chart_apply_range`, `chart_switched`,
+    /// `chart_set_kind` and `sheet_insert_chart`, which all asked one shared
+    /// `chart_kind_series_err`.
     /// Every one of them existed because `chart_space_xml` wrote a pie's FIRST
     /// series and dropped the rest, so a second could be pointed at cells and
     /// coloured and then lost on save without a word. The writer keeps them all
@@ -18974,18 +18981,33 @@ mod grid_geom_tests {
     /// guard nothing — what is left to say is which of the series the plot
     /// draws, and that is `chart_plotted_series` and `chart_unplotted_note`.
     ///
-    /// **What this test can and cannot reach.** Four of the five doors are
-    /// `&mut self` methods taking a `Context<Self>`, so a unit test cannot call
-    /// them; what it calls is the pure half each one delegates to —
-    /// `chart_switch_row_column` under `chart_switched`, `chart_from_range`
-    /// under `chart_set_kind`'s and `sheet_insert_chart`'s re-derivation, and
-    /// `series_add`'s push written out — and then asks
-    /// `chart_plotted_series` / `chart_unplotted_note` what the panel makes of
-    /// the result. So it pins the SHAPE each door produces and how it is
+    /// **What this test can and cannot reach.** Five of the six sites sit in
+    /// `Docxy` methods that a unit test cannot call, for want of a constructed
+    /// view holding a selected chart: `chart_apply_range`, `chart_set_kind`,
+    /// `sheet_insert_chart` and `series_add` take `&mut self` and a
+    /// `Context<Self>`, and `chart_switched` is `&self` (the render path calls
+    /// it each frame to decide whether the Switch Row/Column button greys out)
+    /// but needs that same view. What this test calls is the pure half each one
+    /// delegates to — `chart_switch_row_column` under `chart_switched`,
+    /// `chart_from_range` under `sheet_insert_chart`'s derivation, and
+    /// `series_add`'s push written out, while `chart_set_kind`'s arm models its
+    /// RELABEL path, where `chart_take_kind` keeps the series it finds and only
+    /// rewrites the kind (its re-deriving branch runs through
+    /// `chart_reauthored`, main.rs:3859, and is not what this arm walks) — and
+    /// then asks `chart_plotted_series` / `chart_unplotted_note` what the panel
+    /// makes of the result. So it pins the SHAPE each door produces and how it is
     /// described; it does not pin that the doors are unguarded. Re-adding a
-    /// refusal inside one of those `&mut self` bodies would leave this green.
-    /// `chart_reauthored`, the one door that IS a free function, is genuinely
-    /// walked by `picking_a_writable_type_authors_a_valueless_scatter_afresh`.
+    /// refusal inside one of those five `Docxy` bodies would leave this green.
+    /// Four arms are written below; the fifth `Docxy` site, `chart_apply_range`,
+    /// has no arm of its own, but its whole re-derivation is the same
+    /// `chart_from_range` call these arms make (main.rs:3657), so the shape it
+    /// hands over is the one pinned here. The sixth site, `chart_reauthored`, is
+    /// the one that is a free function rather than a `Docxy` method, so it is
+    /// the only one a unit test can call as ITSELF — and one does:
+    /// `picking_a_writable_type_authors_a_valueless_scatter_afresh` walks it
+    /// (main.rs:18392) and expects the two-series pie where it used to expect
+    /// this very refusal. That one site is pinned against a re-added guard; the
+    /// five `Docxy` ones are not.
     #[test]
     fn the_multi_series_pie_each_door_hands_over_is_described_not_refused() {
         use super::{chart_plotted_series as drawn, chart_unplotted_note as note};

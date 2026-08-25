@@ -4944,8 +4944,11 @@ mod tests {
         let mut pkg = load_xlsx(&save_xlsx(&pkg)).expect("the column chart reopens");
         assert_eq!(chart(&pkg).series.len(), 3);
 
-        // The click: `chart_take_kind` (suite) relabels the chart and clears
-        // nothing else, and committing it marks the chart edited.
+        // The click: `chart_take_kind` (suite) relabels the chart, clears
+        // `complex` and — the kind being writable — the per-series point slots,
+        // and committing it marks the chart edited. The point slots are empty
+        // on a chart the writer itself produced, so the two lines below are the
+        // whole of what that call does here.
         let mut cd = chart(&pkg);
         cd.kind = "pie".into();
         cd.complex = false;
