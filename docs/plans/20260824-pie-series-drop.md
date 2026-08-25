@@ -60,7 +60,6 @@ series only, rather than implying all three are drawn.
 
 - **Doughnut.** Rendering multiple rings is a separate feature; this plan only
   stops discarding the data a doughnut would later need.
-- **Doughnut rendering**, again: several rings is a feature, not a fix.
 
 *(The multi-level-category finding this plan originally deferred was FIXED
 before the plan was written: `parse_chart` keys on the `<c:multiLvlStrRef>`

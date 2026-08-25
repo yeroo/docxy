@@ -823,7 +823,20 @@ fn parse_chart(xml: &str) -> ChartData {
                             name_boxes.push(src);
                         } else if mode == 2 {
                             cat_boxes.push(src);
-                        } else if mode != 0 || in_pts {
+                        } else if mode != 0 {
+                            fold_source(&mut cd.source, src);
+                        } else if in_pts {
+                            // A scatter's/bubble's points are its numbers, but
+                            // they arrive in their own elements rather than in
+                            // `<c:val>`, so `values_ref` stays empty for them.
+                            // Keep them on the series as well as in the box:
+                            // the panel rebuilds the box from the slots it can
+                            // see, and a scatter whose points were only ever
+                            // folded here would rebuild out of its label cells
+                            // alone.
+                            if let Some(sr) = cd.series.last_mut() {
+                                sr.point_refs.push(src.clone());
+                            }
                             fold_source(&mut cd.source, src);
                         }
                     } else if mode != 0 {
@@ -1826,9 +1839,11 @@ mod tests {
             cd.categories_ref.as_ref().map(|v| v.range),
             Some((0, 1, 0, 3))
         );
-        // The box is the whole table, and `cat_col` still names the column the
-        // SERIES NAMES come from — the fixup that would have moved it onto the
-        // first category's column (B) does not run for a row chart.
+        // The box is the whole table, and `cat_col` names the column the SERIES
+        // NAMES come from — column A, taken outright from the first series'
+        // name cell (`Budget!$A$2`), which is where `chart_from_rows` puts
+        // them. A row chart's labels run along a ROW, so `<c:cat>` cannot
+        // supply a column index at all.
         assert_eq!(
             cd.source.as_ref().map(|s| (s.range, s.cat_col)),
             Some(((0, 0, 2, 3), 0))
@@ -1979,6 +1994,52 @@ mod tests {
         );
     }
 
+    /// A scatter plots from `<c:xVal>`/`<c:yVal>` rather than `<c:val>`, so
+    /// `values_ref` is empty for it however live the series is. Those refs are
+    /// still the chart's NUMBERS: they fold into the box here, and they are
+    /// kept on the series as `point_refs` so the panel's `rebuild_source` can
+    /// see the same cells. Blind to them it would rebuild a scatter's box out
+    /// of its lone `<c:tx>` cell and collapse the DATA RANGE it shows.
+    #[test]
+    fn a_scatters_point_refs_are_kept_on_its_series() {
+        let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:scatterChart><c:scatterStyle val="lineMarker"/>
+          <c:ser><c:idx val="0"/>
+            <c:tx><c:strRef><c:f>Sheet1!$B$1</c:f><c:strCache><c:pt idx="0"><c:v>S</c:v></c:pt></c:strCache></c:strRef></c:tx>
+            <c:xVal><c:numRef><c:f>Sheet1!$A$2:$A$3</c:f><c:numCache><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:xVal>
+            <c:yVal><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt><c:pt idx="1"><c:v>9</c:v></c:pt></c:numCache></c:numRef></c:yVal>
+          </c:ser></c:scatterChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(xml);
+        assert_eq!(cd.kind, "scatter");
+        // No `<c:val>` anywhere, so the values slot stays empty — that is the
+        // blindness `point_refs` exists to close, not a parse failure.
+        assert!(
+            cd.series[0].values_ref.is_none(),
+            "a scatter has no <c:val>"
+        );
+        assert_eq!(
+            cd.series[0]
+                .point_refs
+                .iter()
+                .map(|s| (s.sheet.as_str(), s.range))
+                .collect::<Vec<_>>(),
+            vec![("Sheet1", (1, 0, 2, 0)), ("Sheet1", (1, 1, 2, 1))],
+            "both point arrays, in document order"
+        );
+        // And they are still the box, header cell included.
+        assert_eq!(
+            cd.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Sheet1", (0, 0, 2, 1)))
+        );
+
+        // A chart that plots from `<c:val>` carries none — every kind the
+        // writer authors takes that path, so the new slot stays empty there.
+        let bar = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:barChart><c:barDir val="col"/>
+          <c:ser><c:idx val="0"/>
+            <c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
+          </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
+        assert!(parse_chart(bar).series[0].point_refs.is_empty());
+    }
+
     /// Two single-cell series stacked down one column are read as a row chart
     /// (`infer_by_row`), because the column derivation emits one series per
     /// column and so can never produce two sharing one. Cells on DIFFERENT
@@ -2115,9 +2176,10 @@ mod tests {
             Some((0, 1, 0, 3)),
             "the label ROW"
         );
-        // The box is the whole table, and `cat_col` still names the column the
-        // SERIES NAMES come from: the fixup that would move it onto the first
-        // category's column is skipped for a row chart.
+        // The box is the whole table, and `cat_col` names the column the SERIES
+        // NAMES come from — taken outright from the first series' name cell,
+        // not from `<c:cat>`, which for a row chart is a ROW of labels and so
+        // names no column. This is the row branch's only round-trip guard.
         assert_eq!(
             again.source.as_ref().map(|s| (s.range, s.cat_col)),
             Some(((0, 0, 3, 3), 0))
@@ -2166,7 +2228,8 @@ mod tests {
             Some((1, 0, 3, 0)),
             "the label COLUMN"
         );
-        // Here the fixup does run, and puts `cat_col` on the label column.
+        // A COLUMN chart takes `cat_col` from `<c:cat>` instead, which here is
+        // the label column.
         assert_eq!(
             again.source.as_ref().map(|s| (s.range, s.cat_col)),
             Some(((0, 0, 3, 3), 0))

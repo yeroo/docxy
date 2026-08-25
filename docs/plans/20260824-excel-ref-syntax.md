@@ -62,7 +62,11 @@ a prerequisite for this one):
   "route through what the writer already does" rather than new formatting.
 - **The formula engine already parses `Sheet!A1`** — `Parser::sheet_ref`
   (gridcore/src/formula.rs:850), reached from formula.rs:795 and :807. Cross-sheet
-  is a UI-layer gap only. Nothing in `gridcore` needs to learn a new syntax.
+  is a UI-layer gap only as far as SYNTAX goes: nothing in `gridcore` needs to
+  learn a new one. ⚠️ It did need to learn the new POLICY — see the ➕ task
+  below; `parse_chart` decides which sheet a chart's box names, and the panel's
+  `rebuild_source` has to fold the same refs in the same order or a chart reads
+  one way before a save and another after it.
 - **Sheet-by-name lookup has precedent** in this file —
   `v.pkg.workbook.sheets.iter().position(|s| s.name == sn)` at main.rs:4972 and
   main.rs:5018.
@@ -317,8 +321,14 @@ behaviour is tested in `gridcore/src/sheet.rs`.
 - [x] `range_preview` (main.rs:3507): return `None` when the parsed ref names a
       sheet other than the active one — drawing the wash over the visible sheet's
       A1:D5 for a ref that means Budget's A1:D5 is exactly the lie this plan
-      removes — the decision itself is the new pure `preview_range(text, here)`,
-      compared case-insensitively as `sheet_index_of` compares
+      removes — the decision itself is the new pure function — ⚠️ deviation:
+      it is `preview_range(text, names, active)`, not `preview_range(text,
+      here)`. It RESOLVES the qualifier through `sheet_index_of` and asks
+      whether the sheet found is the active one, rather than comparing the
+      qualifier against the active sheet's NAME. On a workbook holding both
+      `Budget` and `budget` the two answers differ, and the resolving one is the
+      sheet a commit will act on — which is the whole point of the plan.
+      `the_wash_resolves_a_qualifier_the_way_a_commit_does` pins it
 - [x] `range_pick_end`: write the picked range through `ref_a1` with the active
       sheet's name, so a mouse pick replaces a foreign qualifier with the sheet
       actually picked from — already so since Task 3: `range_pick_to` REPLACES
@@ -344,9 +354,13 @@ behaviour is tested in `gridcore/src/sheet.rs`.
       (main.rs:12217); every commit path resolves via `sheet_index_of`, and the
       `let cells = t.rsplit_once('!')…` line that dropped a qualifier is gone
 - [x] verify the out-of-scope list is still out of scope — no Switch
-      Row/Column, no header restyle, no marching ants, no chart-source outlines:
-      the whole plan's diff is `suite/docxy/src/main.rs` plus this file, and its
-      only added `ref_color`/`ref_index_at` mention is a test-module `use`
+      Row/Column, no header restyle, no marching ants, no chart-source outlines;
+      its only added `ref_color`/`ref_index_at` mention is a test-module `use`.
+      ⚠️ deviation: the diff is NOT `suite/docxy/src/main.rs` plus this file. It
+      also touches `gridcore/src/drawing.rs` and `gridcore/src/sheet.rs` (the
+      ➕ task below), `suite/docs/range-selector.md`,
+      `suite/docs/chart-orientation.md`, `scripts/revmux-review.sh` and
+      `docs/plans/20260824-pie-series-drop.md`
 - [x] verify edge cases: sheet names needing quotes, an apostrophe in a name, a
       one-cell range, a reversed range (`D5:A1`), an unknown sheet, and the
       concatenation `A1:B5A1:D5` — each is pinned by a test:
@@ -362,6 +376,45 @@ behaviour is tested in `gridcore/src/sheet.rs`.
       (xlsxy, gridwasm, lookxy, TUI docxy) still builds — clean
 - [x] run `cargo clippy -p gridcore --all-targets -- -D warnings` and
       `cargo fmt --check` — both clean, nothing to fix
+
+### ➕ Task 8b: The loader had to learn the same policy (out of the original scope)
+
+Discovered during review of Task 5's `rebuild_source`. Not in the Overview and
+not in the "Files and components involved" list, which named `gridcore` as
+reference-only — recorded here because the diff is real and behavioural, and
+because `gridcore` is the SHARED crate: `xlsxy`, `gridwasm`, `lookxy` and the
+TUI `docxy` all read charts through `parse_chart`, so a green `suite/` build
+says nothing about them.
+
+- [x] `gridcore/src/drawing.rs` — `fold_source`: the fold `parse_chart` shares
+      with the panel, comparing sheet names case-insensitively as
+      `sheet_index_of` does, so `Budget!$B$2` and `budget!$B$3` are one sheet
+- [x] `parse_chart` holds its `<c:cat>` (mode 2) and `<c:tx>` (mode 1) refs back
+      in `cat_boxes`/`name_boxes` and folds them AFTER the loop — values, then
+      categories, then names. Folded in document order (`{tx}{cat}{val}`) a
+      single cross-sheet label ref seeded the box and every local `<c:val>`
+      after it was skipped for the sheet mismatch, collapsing a chart plotting
+      `A1:D5` onto one foreign cell. The panel's `rebuild_source` folds the same
+      four slot kinds in the same order, which is what makes a chart read the
+      same before and after a save
+- [x] `infer_by_row` compares the SHEET as well as the coordinates, so two
+      single cells that merely line up across sheets are not read as a stack
+- [x] `cat_col` is assigned outright rather than inherited from whichever
+      `<c:f>` seeded the box: from `<c:cat>` for a column chart, and from the
+      first series' NAME cell for a row chart, whose labels run along a row and
+      so name no column
+- [x] `gridcore/src/sheet.rs` — `ChartSeries::point_refs`, holding a
+      scatter's/bubble's `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` refs. Those
+      kinds carry no `<c:val>`, so `rebuild_source` was blind to their numbers
+      and rebuilt their box from label cells alone
+- [x] tests: `a_cross_sheet_label_ref_does_not_take_the_box_from_the_cells_plotted`,
+      `single_cells_on_different_sheets_are_not_stacked`,
+      `a_scatters_point_refs_are_kept_on_its_series`,
+      `the_source_box_takes_its_label_column_from_the_category_ref`, and the two
+      row-chart round-trip guards, mirrored in the suite by
+      `a_charts_box_is_rebuilt_from_the_references_its_slots_hold`
+- [x] documented in `suite/docs/chart-orientation.md` and
+      `suite/docs/range-selector.md`
 
 ### Task 9: [Final] Update documentation
 

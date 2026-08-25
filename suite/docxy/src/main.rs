@@ -1714,8 +1714,9 @@ fn ref_source(
 /// makes a chart read the same before and after a save — the loader unions from
 /// scratch too, so anything less diverges from it.
 ///
-/// The NUMBERS go in first — every series' values — and only then the
-/// categories and the series' NAME cells. Those two are folded in at all
+/// The NUMBERS go in first — every series' values, and a scatter's or bubble's
+/// points beside them — and only then the categories and the series' NAME
+/// cells. Those two are folded in at all
 /// because the loader folds them in (`<c:cat>` carries mode 2 and `<c:tx>` mode
 /// 1): leaving them out would drop the label column and the header row from the
 /// box, shrinking the DATA RANGE the panel shows from `A1:D5` to `B2:D5` the
@@ -1743,9 +1744,18 @@ fn rebuild_source(data: &mut gridcore::sheet::ChartData) {
     // The NUMBERS decide which sheet the box names: every series' values, in
     // series order. That is what the chart IS — the labels and the headers only
     // annotate it.
+    //
+    // `point_refs` belongs here too, folded with its own series: a scatter or a
+    // bubble plots from `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` and so carries no
+    // `values_ref` at all, and rebuilding such a chart's box from its label
+    // cells alone would collapse the DATA RANGE the panel shows onto one header
+    // cell. `parse_chart` folds the two in the same document order.
     for s in &data.series {
         if let Some(src) = s.values_ref.clone() {
             fold(&mut built, src);
+        }
+        for src in &s.point_refs {
+            fold(&mut built, src.clone());
         }
     }
     // Then the LABEL cells, then the HEADER cells. All four slots belong in the
@@ -3696,6 +3706,15 @@ impl Docxy {
         // `ref_msg` is keyed by series index, and every index past `i` just
         // shifted — the old message would surface under a different series.
         self.ref_msg = None;
+        // A series takes its slots with it, so deleting one SHRINKS the box —
+        // the same rule the other commit paths follow. Without this the box
+        // goes on covering the deleted column: DATA RANGE keeps offering it,
+        // and Enter on that untouched field hands `chart_from_range` a range
+        // two columns wide, which re-derives the deleted series and undoes the
+        // delete. `parse_chart` shrinks the box on the next open regardless, so
+        // leaving it also made the panel read one way before a save and another
+        // after it.
+        rebuild_source(&mut data);
         self.chart_set_data(data, cx);
     }
 
@@ -3709,6 +3728,15 @@ impl Docxy {
         }
         self.range_edit = None;
         self.ref_msg = None; // same index-keying as `series_delete`
+        // Reordering changes no reference, but it changes the ORDER they fold
+        // in — and the first values ref decides which sheet the box names.
+        // Moving a series that reads `Budget` ahead of ones that read `Data`
+        // therefore moves the box, and `parse_chart` rebuilds it in the new
+        // document order on the next open whether or not this does. Pointing a
+        // series at another sheet is a supported commit
+        // (`target_takes_foreign_sheet(SeriesValues)`), so such a chart is
+        // reachable.
+        rebuild_source(&mut data);
         self.chart_set_data(data, cx);
     }
 
@@ -17413,6 +17441,85 @@ mod grid_geom_tests {
         let mut d = chart(vec![ser(None, None)], Some(src("Data", (1, 0, 4, 0))), None);
         super::rebuild_source(&mut d);
         assert_eq!(d.source.map(|s| s.range), Some((1, 0, 4, 0)));
+
+        // And the labels, not the header, are what it takes its SHEET from —
+        // the categories-before-names half of the order, which the cases above
+        // cannot show because each of them has numbers to seed the box. Fold
+        // the name first and `Budget!$B$1` seeds it, the local categories ref
+        // is skipped for the sheet mismatch, and DATA RANGE reads a 1x1 box on
+        // a sheet the chart takes no label from.
+        let mut d = chart(
+            vec![ser(Some("Budget!$B$1"), None)],
+            Some(src("Data", (1, 0, 4, 0))),
+            None,
+        );
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (1, 0, 4, 0))),
+            "the labels decide the sheet when there are no numbers, not the header"
+        );
+
+        // A SCATTER plots from `<c:xVal>`/`<c:yVal>`, so `values_ref` is empty
+        // however live it is. Its points are carried in `point_refs` and folded
+        // with the numbers — otherwise the lone name cell would be the only
+        // slot here, and committing a series name would collapse the box of a
+        // chart plotting `A2:B3` onto `B1`.
+        let mut d = chart(
+            vec![ChartSeries {
+                name_ref: Some("Data!$B$1".into()),
+                point_refs: vec![src("Data", (1, 0, 2, 0)), src("Data", (1, 1, 2, 1))],
+                ..ChartSeries::default()
+            }],
+            None,
+            Some(src("Data", (0, 0, 2, 1))),
+        );
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 0, 2, 1))),
+            "a scatter's points are numbers and hold its box open"
+        );
+
+        // Deleting a series takes its slots with it, so the box SHRINKS —
+        // `series_delete` rebuilds for this. Left alone the box would go on
+        // covering column C, DATA RANGE would keep offering `A1:C5`, and Enter
+        // on that untouched field would re-derive the deleted series.
+        let mut d = chart(
+            vec![
+                ser(Some("Data!$B$1"), Some(src("Data", (1, 1, 4, 1)))),
+                ser(Some("Data!$C$1"), Some(src("Data", (1, 2, 4, 2)))),
+            ],
+            Some(src("Data", (1, 0, 4, 0))),
+            Some(src("Data", (0, 0, 4, 2))),
+        );
+        assert!(super::series_remove(&mut d.series, 1));
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 0, 4, 1))),
+            "the deleted series' column is out of the box"
+        );
+
+        // Reordering changes no reference, but it changes which one seeds the
+        // box — the first values ref decides the sheet, and pointing a series
+        // at another sheet is a supported commit. `series_reorder` rebuilds so
+        // the panel agrees with the document order `parse_chart` will read back.
+        let mut d = chart(
+            vec![
+                ser(Some("Data!$B$1"), Some(src("Data", (1, 1, 4, 1)))),
+                ser(Some("Budget!$C$1"), Some(src("Budget", (1, 2, 4, 2)))),
+            ],
+            None,
+            Some(src("Data", (0, 0, 4, 2))),
+        );
+        assert!(super::series_move(&mut d.series, 1, -1).is_some());
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Budget", (0, 2, 4, 2))),
+            "the series now drawn first decides the sheet"
+        );
 
         // And so does one with no `<c:ser>` at all, whose categories were first
         // set through `categories_apply`.

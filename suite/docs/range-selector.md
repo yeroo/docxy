@@ -137,10 +137,12 @@ Re-pointing keeps the chart's `complex` flag (`chart_apply_range`): a stacked or
 combo plot area still round-trips verbatim, and only **picking a type**
 (`chart_set_kind`) says "author this one afresh". The box itself is **rebuilt**
 rather than grown (`rebuild_source`): the fold starts empty and walks every slot
-— each series' values, then the categories, then the series' name cells — so the
-box shrinks as readily as it stretches, and once every slot has moved to another
-sheet the box follows them there. Growing the box it already had would strand
-it naming a sheet no slot reads.
+— each series' values (and, for a scatter or bubble, its `point_refs`, since
+those kinds plot from `<c:xVal>`/`<c:yVal>` and carry no `<c:val>` at all), then
+the categories, then the series' name cells — so the box shrinks as readily as
+it stretches, and once every slot has moved to another sheet the box follows
+them there. Growing the box it already had would strand it naming a sheet no
+slot reads.
 
 Within that fold the **first sheet wins** and a slot naming a different one is
 skipped: `ChartSource::union` keeps the receiver's sheet, so unioning across
@@ -162,7 +164,13 @@ save.
 Series can also be added, removed and reordered from the panel. A reorder closes
 the gap behind the series rather than swapping it with its destination — the
 arrows only ever send ±1, where the two agree, but the helper is written for what
-it says. A pie takes one series and `chart_space_xml` writes only the first, so
+it says. Both **rebuild the box**, like every other slot-mutating path: a
+deleted series takes its slots with it, so the box must shrink or DATA RANGE
+goes on offering the deleted column and Enter there re-derives it; and a reorder
+changes which values ref folds FIRST, which is what decides the sheet the box
+names. `parse_chart` rebuilds from the surviving refs in document order on the
+next open either way, so skipping it would only make the panel read one way
+before a save and another after it. A pie takes one series and `chart_space_xml` writes only the first, so
 `+ Add series` refuses there rather than listing one the save would drop. The
 last series can't be removed (a chart with none is not renderable, and Excel won't let you
 get there either), and a series' colour lives on the series, so it travels

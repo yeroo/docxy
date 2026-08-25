@@ -600,6 +600,9 @@ fn chart_from_columns(
                 })
                 .collect(),
             color: None,
+            // Authored from a range, so it plots through `<c:val>`; only a
+            // scatter or bubble read from a file carries point refs.
+            point_refs: Vec::new(),
         })
         .collect();
     Some(ChartData {
@@ -702,6 +705,9 @@ fn chart_from_rows(
                 })
                 .collect(),
             color: None,
+            // Authored from a range, so it plots through `<c:val>`; only a
+            // scatter or bubble read from a file carries point refs.
+            point_refs: Vec::new(),
         })
         .collect();
     Some(ChartData {
@@ -744,6 +750,18 @@ pub struct ChartSeries {
     pub values_ref: Option<ChartSource>,
     /// The `<c:f>` ref naming this series (usually its header cell), verbatim.
     pub name_ref: Option<String>,
+    /// The cells a SCATTER's or BUBBLE's points come from: its `<c:xVal>`,
+    /// `<c:yVal>` and `<c:bubbleSize>` refs, in document order.
+    ///
+    /// Those kinds plot from their own elements rather than from `<c:val>`, so
+    /// `values_ref` is `None` for them however live the series is. They are
+    /// still NUMBERS, and the chart's box is built from the numbers — keeping
+    /// them here is what lets the panel's `rebuild_source` see the same cells
+    /// the loader folded, instead of rebuilding a scatter's box out of its
+    /// label cells alone and collapsing the DATA RANGE it shows.
+    ///
+    /// Empty for every kind the writer authors; those carry `values_ref`.
+    pub point_refs: Vec<ChartSource>,
 }
 
 /// One data-validation rule over a set of cell ranges.
