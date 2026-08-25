@@ -177,11 +177,20 @@ exactly when you need it. Two things a monitor must get right:
   success marker stays silent through a crash, and silence looks identical to
   still-running.
 
-**Commit before each round.** ralphex reviews `base...HEAD`, so anything left
-uncommitted is *absent from the review scope*. This bit three times: work that
-was finished and verified sat in the working tree while the next panel
-re-reported defects that were already fixed. When a run dies mid-round, verify
-and commit what it left behind before restarting.
+**Commit before RESTARTING a run** — not before every round. The diff
+instruction changes between iterations:
+
+| Iteration | Diff |
+|---|---|
+| the first of a run | `git diff <base-ref>...HEAD` — committed work only |
+| every later one | plain `git diff` — the uncommitted working tree |
+
+So a running loop reviews its own uncommitted fixes and needs no help. But a
+**restart** begins again at `base...HEAD` and is blind to the working tree —
+which is exactly how a rate limit costs you work: ralphex finishes and verifies
+a fix, dies before committing it, and the restart's panel re-reports defects
+that are already fixed. When a run dies mid-round, verify and commit what it
+left behind before restarting.
 
 **On a rate limit**, pass `--wait 2h`. ralphex detects the limit, sleeps and
 resumes by itself. Check for orphaned work first — it may have finished and
@@ -206,6 +215,17 @@ That can oscillate indefinitely.
 - **Watch severity, not count.** Counts bounce around — 8 → 2 → 7 → 4 → 8 is a
   healthy run. Major → all-Minor-docs is convergence. A Major every round means
   each fix is introducing the next defect, which is a different problem.
+- **The clearest stop signal is a round whose findings are all about the
+  previous round's own fix.** The pie run ended 7 → 2 → 0 → 3, and all three of
+  the last round's findings were about a sentence the round before had
+  rewritten. At that point the loop is reviewing itself, not the work.
+- **Verify the premise in Task 1 and let the plan say STOP.** The one run that
+  never raised a single Major was the one whose plan opened by proving its own
+  central claim — against the schema *and* a corpus of real files — before any
+  behaviour changed, with instructions to halt and rewrite the plan if the
+  claim failed. That task also turned up a detail nobody had considered
+  (`<c:idx>` need not be contiguous), which the later tasks were then written
+  to handle rather than trip over.
 - **Adjacent pre-existing issues are a stopping signal.** When the panel starts
   reaching into problems the plan does not cover, file them as their own plan.
   Do not let them be smuggled into the branch.
