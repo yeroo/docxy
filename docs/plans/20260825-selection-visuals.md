@@ -360,7 +360,7 @@ backstop working as specified, not a defect — the tested guarantee is that the
 - [x] write tests for the pure part: given a `ChartData` and the active sheet
       name, the areas and their roles; the overlap rule; and the foreign-sheet
       case → 8 tests in `grid_geom_tests` (`chart_source_areas_*`,
-      `chart_area_at_*`, `chart_slot_colors_are_excels_and_not_the_ref_palette`)
+      `chart_areas_at_*`, `chart_slot_colors_are_excels_and_not_the_ref_palette`)
 - [x] run tests — must pass before Task 4 → suite 104 pass, gridcore 370+1+4,
       both workspaces clippy clean and `cargo fmt --check` clean
 
@@ -383,16 +383,28 @@ equal size, and the model's own fold order is the one already justified.
 
 #### The overlap rule is shared, not copied
 
-`ref_index_at` was refactored onto a new `smallest_ref_at(ranges, r, c)`, and
-`chart_area_at` calls the same function over the areas' ranges. Two lists asking
-"who owns this cell" have to answer the same way, and a shared rule cannot drift
-apart the way two copies would. It takes an iterator rather than a slice, so
-neither caller allocates per cell.
+`ref_index_at` was refactored onto a new `smallest_ref_at(ranges, r, c)`. Two
+lists asking "who owns this cell" have to answer the same way, and a shared rule
+cannot drift apart the way two copies would. It takes an iterator rather than a
+slice, so neither caller allocates per cell.
 
 The rule earns its keep here more than it does for formulas: the slots nest **by
 construction** — a series' name cell is the header of the column its values read
 — so without smallest-wins every green name cell would be swallowed by the blue
 box it heads, and the name colour would never appear at all.
+
+➕ **But an outline's loser still has to be drawn** (review). Smallest-wins is a
+rule about which *colour* a cell takes, and that is all a formula's tint needs.
+An outline is different: the area that loses a cell is a rectangle whose SIDE
+ran through it, and dropping that side leaves the rectangle open. A `values_ref`
+of `B1:B5` headed by a `name_ref` of `B1` — what SERIES VALUES writes when you
+include the header, and what the overlap test itself constructs — drew with no
+top edge at all, because `B1` is the whole of its top row.
+
+So the renderer asks `chart_areas_at` for **every** area covering the cell,
+largest first, and draws them in that order. The tightest claim paints last and
+wins any shared edge, which is smallest-wins expressed as paint order instead of
+as a lookup: same cell, same slot, and the outer box keeps its sides.
 
 ➕ **Duplicate areas are folded.** Two series pointed at one cell, or a re-point
 that left a duplicate, would otherwise draw the same box twice for no visible
@@ -469,6 +481,17 @@ belong to the chart, as they did.
 The decision function is deliberately given `pointing` for every target, so
 "clicking another chart while a field is focused still swaps" is one of the
 tested rows rather than an accident of where the check sits.
+
+➕ **And so is every other key the grid acts on** (review). The arrows were the
+case that made the rule necessary, but they are not the only one: `F2` and any
+printable character open an edit in the selected cell, and `Ctrl+C/X/V/A/B/I`
+and the two insert shortcuts read or write it. All of them were reaching the
+grid past the chart block — the Ctrl ones because that block sits above it and
+returns. Each now goes through `Docxy::chart_hand_back`, which is the NavKey
+press with `pointing` passed through properly rather than hard-coded `false`.
+Escape and Delete still belong to the chart; so do `Ctrl+S`, `Ctrl+F`, `Ctrl+F1`
+(aimed at the document or the window) and undo/redo (which drop the chart
+selection themselves, because the chart list moves under them).
 
 ### Task 5: The Chart panel is sticky
 
@@ -590,6 +613,14 @@ underneath it. That is the whole line between sticky and stale.
 | 2. A selected chart says nothing about its sources | `GridOverlay::chart_refs` ← `chart_source_areas`, coloured by `chart_slot_color` (`CHART_VALUES_COLOR` blue / `CHART_CATEGORIES_COLOR` purple / `CHART_NAME_COLOR` green) and resolved by the shared `smallest_ref_at` |
 | 3. A chart and a cell are selected at once | `press_selection` over `SelectTarget::{Cell, Chart, NavKey}`, with `cell_selection_shown` → `GridOverlay::sel_hidden` darkening the ring, the wash, both headers and the handle together |
 | 4. The Chart panel vanishes on a cell click | `Docxy::panel_chart` moved only through `chart_panel_after`; the render gate and the grid-width reservation both ask `panel_chart_shown()`, and `chart_panel_shown(idx, count)` bounds-checks it |
+
+➕ **A sticky panel needed one more drop site** (review). `sheet_follow_hyperlink`
+switched sheets with a bare `v.active = idx`, alone among the sheet switches in
+not calling `drop_grid_state`. That was harmless while the panel was gated on
+`chart_sel` — the click that followed the link had already closed it — and is
+not harmless now: the panel outlives the click, and "chart 2" on the sheet you
+land on is a chart nobody picked, which the bounds check cannot catch because it
+is in range. It now drops grid state whenever the jump actually changes sheet.
 
 The one thing deliberately still drawn under `sel_hidden` is the **pointed
 range's** border — a selected chart's range fields point at cells, so hiding it

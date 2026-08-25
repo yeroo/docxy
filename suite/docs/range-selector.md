@@ -429,8 +429,9 @@ looks selected at a time, and a selected chart says which cells it reads.
 
 Implementation: `press_selection`, `SelectTarget`, `SelectionAfter`,
 `cell_selection_shown`, `chart_source_areas`, `chart_slot_color`,
-`chart_area_at`, `border_range`, `range_edges_at`, `chart_panel_after`,
-`chart_panel_shown` — all pure free functions, all beside the grid geometry.
+`chart_areas_at`, `border_range`, `shown_sel`, `range_edges_at`,
+`chart_panel_after`, `chart_panel_shown` — all pure free functions, all beside
+the grid geometry.
 
 ### One selection at a time
 
@@ -443,9 +444,16 @@ one does, for every press and for the navigation keys alike:
   is a no-op rather than a re-selection, or every press on a selected card would
   drop the panel field you were about to type in. A resize grip counts as a
   press on its chart, and the selection moves on mouse-**down**, as in Excel.
-- **Navigation keys** (the arrows, Enter) are a press on the cells: they move
-  the cell selection, so they hand it back first. Escape and Delete still belong
-  to the chart.
+- **Any key the grid acts on** is a press on the cells: the arrows and Enter
+  move the selection, `F2` and any printable character open an edit in it, and
+  `Ctrl+C/X/V/A/B/I` and the two insert shortcuts read or write it. All of them
+  hand the selection back first (`Docxy::chart_hand_back`), because a selection
+  the chart is hiding is one you cannot watch move, type into or be pasted over
+  — the same invisible-motion confusion this rule exists to end. Escape and
+  Delete still belong to the chart, and so do the keys aimed at the document or
+  the window rather than the selection: `Ctrl+S`, `Ctrl+F`, `Ctrl+F1`, and undo
+  and redo (which drop the chart selection themselves, because the chart list
+  moves under them).
 - While **pointing** — a range field or a half-typed formula has the keyboard —
   a press on a cell writes a reference and changes *nothing* about what is
   selected. That is what lets the Chart panel's own range fields work: the chart
@@ -494,13 +502,24 @@ cell inside the box but in no slot (`A1` of an `A1:C5` chart) is drawn nothing.
 `point_refs` is in that list because a scatter's and a bubble's numbers live
 there and never in `values_ref`.
 
-**Smallest wins**, the same rule the formula colours use, and now literally the
-same function: `ref_index_at` and `chart_area_at` both call `smallest_ref_at`.
-Two lists asking "who owns this cell" have to answer the same way, and a shared
-rule cannot drift apart the way two copies would. It earns its keep here more
-than for formulas, because the slots nest *by construction* — a series' name
-cell is the header of the column its values read — so without it every green
-name cell would be swallowed by the blue box it heads.
+**Smallest wins — but everything is still drawn.** The slots nest *by
+construction*: a series' name cell is the header of the column its values read,
+so a cell is regularly claimed twice, and without a rule every green name cell
+would be swallowed by the blue box it heads. A formula's colours settle that
+with `smallest_ref_at`: one cell, one colour, tightest claim wins.
+
+That is right for a **fill** and wrong for an **outline**. The loser of a fill
+is a colour nobody misses; the loser of an outline is a rectangle whose side ran
+through that cell, and dropping it leaves the rectangle *open*. A `values_ref`
+of `B1:B5` headed by a `name_ref` of `B1` — what the SERIES VALUES field writes
+when you include the header — would draw with no top edge at all, because `B1`
+is the whole of its top row.
+
+So `chart_areas_at` returns **every** area covering the cell, largest first, and
+the renderer draws them in that order. The tightest claim paints last and wins
+any edge two areas share, which is `smallest_ref_at`'s answer expressed as paint
+order rather than as a lookup — same cell, same slot, and the outer box keeps
+its sides.
 
 **Outline only, no wash.** A formula's references tint their cells as well;
 these do not. A chart's sources are read while looking straight at the grid, and
@@ -716,10 +735,17 @@ Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
 `sort_rows_from`, `bar_range_text`, `series_values_shape_err`,
 `categories_shape_err`, `chart_field_examples`, `chart_plotted_series`,
 `series_is_plotted`, `chart_unplotted_note`, `smallest_ref_at`,
-`range_edges_at`, `range_border_plan`, `range_border_dashed`, `dash_fit`,
-`border_range`, `chart_source_areas`, `chart_area_at`, `chart_slot_color`,
-`press_selection`, `cell_selection_shown`, `chart_panel_after`,
-`chart_panel_shown`.
+`range_edges_at`, `range_border_plan`, `range_border_cell_count`,
+`range_border_dashed`, `dash_fit`, `border_range`, `shown_sel`,
+`chart_source_areas`, `chart_areas_at`, `chart_slot_color`, `press_selection`,
+`cell_selection_shown`, `chart_panel_after`, `chart_panel_shown`.
+
+Two of those are not on the render path at all. `range_border_plan` builds every
+visible boundary cell, and `dash_fit` lays out the dashes along one edge; the
+app draws from neither (`range_edges_at` and gpui's own `border_dashed()` do
+that). They are kept as the slow, obvious models the fast answers are checked
+against — `range_border_cell_count` must agree with the plan it replaced, and
+`dash_fit` fails if a gpui bump changes the shader's pattern under us.
 
 That list is why every helper here is a **pure free function** taking the
 workbook's sheet names as a `&[String]` rather than reading them off the view:

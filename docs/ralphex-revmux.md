@@ -6,10 +6,14 @@ first's external review phase gives you an autonomous loop: implement, review,
 fix, re-review, until it converges.
 
 This document is what that cost to get working, so the next repo does not pay
-it again. It is portable — only the profile text in the hook is repo-specific.
+it again. It is portable; the repo-specific parts are the profile names in the
+hook and the round at which the roster narrows.
 
 **Status**: proven. A 14-round loop on `docxy` converged 8 → … → 3 → 1 findings
-over 4h14m, fixing two Major defects that three earlier reviews had missed.
+over 4h14m, fixing two Major defects that three earlier reviews had missed. That
+run is also what motivated the convergence caps in [Bounding the
+cost](#bounding-the-cost): every Major it found arrived in the first two rounds,
+and the other twelve were the loop reviewing its own documentation fixes.
 Before this, the same wiring had failed at the review phase in two repositories
 for four different reasons, all listed below.
 
@@ -22,7 +26,13 @@ Three files. Copy them, change the profile text, done.
 ```
 external_review_tool = custom
 custom_review_script = scripts\revmux-review.cmd
+max_external_iterations = 3
+review_patience = 2
 ```
+
+The first two are the wiring. The last two are the convergence caps — see
+[Bounding the cost](#bounding-the-cost) for why they are pinned here rather
+than left to the global default.
 
 **The path must use backslashes.** ralphex runs it via
 `exec.Command(script, promptFile)` with no shell; a `.cmd` reached that way
@@ -33,12 +43,12 @@ external command` and takes the whole review phase down.
 Keep this file minimal. Local config *shadows* the global one, so a key copied
 in that you never meant to pin will silently override `~/.config/ralphex/`.
 
-⚠️ **Check that these two keys are actually uncommented.** `ralphex --init`
+⚠️ **Check that these keys are actually uncommented.** `ralphex --init`
 writes the full template with everything commented out, which looks like a
 configured project but is not: the hook sits there and is never invoked, and
 the external review phase quietly runs codex instead. That was the state of one
 repo here for weeks. `grep -vE '^\s*#|^\s*$' .ralphex/config` should print
-exactly the two lines above.
+exactly the four lines above — the two wiring keys and the two caps.
 
 ### 2. `scripts/revmux-review.cmd`
 
@@ -97,13 +107,29 @@ trap finish EXIT                      # every exit path — see trap 5
 # One revmux task per PLAN, one run per iteration.
 PLAN_NAME="$(grep -m1 -oE '[^ /\\]+\.md' "$PROMPT_FILE" | head -1 | sed 's/\.md$//')"
 TASK="ralphex-${PLAN_NAME}"
-RUN="$(date +%Y%m%d-%H%M%S)"
+
+# Which round this is — the rounds already on disk, +1. Works only because
+# the task is keyed on the PLAN and so stays stable across iterations.
+ROUNDS_DONE=$(find ".revmux/tasks/$TASK" -mindepth 1 -maxdepth 1 -type d | wc -l)
+ROUND=$((ROUNDS_DONE + 1))
+
+# The round number LEADS the run name, and not just for sorting: a bare
+# timestamp is second-resolution, so two rounds landing in the same second
+# would silently share a directory — one round reusing the other's inputs,
+# corrupting the history revmux carries forward.
+RUN="$(printf '%02d' "$ROUND")-$(date +%Y%m%d-%H%M%S)"
+
+# The roster narrows by round — the convergence control. See below.
+if   [ -n "${RALPHEX_REVMUX_PROFILE:-}" ]; then PROFILE="$RALPHEX_REVMUX_PROFILE"
+elif [ "$ROUND" -le 2 ]; then                   PROFILE="comprehensive"
+else                                            PROFILE="final"
+fi
 
 PATHS_JSON="$(revmux new --task "$TASK" --run "$RUN")"
 # write BOTH the scope and the profile revmux allocates
 
 revmux --task "$TASK" --run "$RUN" \
-       --profile comprehensive --min-confidence 60 \
+       --profile "$PROFILE" --min-confidence 60 \
        --hard-timeout 40m --markdown --no-tui \
        --workdir "$REPO_ROOT" 2>&1 || true
 exit 0                                # always — see trap 4
@@ -164,6 +190,14 @@ RALPHEX_REVMUX_DRY_RUN=1 cmd //c "scripts\revmux-review.cmd" "$PROMPT_FILE"
 
 `cmd //c` from Git bash reproduces ralphex's exec closely enough. Expect exit 0
 and the `DONE` signal.
+
+**The three escape hatches**, all read from the environment:
+
+| Variable | Effect |
+|---|---|
+| `RALPHEX_REVMUX_PROFILE` | pins one profile for **every** round — which turns the round ladder off, and with it the thing that ends the Minor-docs tail. Set it to debug a roster, not to run a loop. |
+| `RALPHEX_REVMUX_MIN_CONFIDENCE` | the panel's reporting threshold (default 60) |
+| `RALPHEX_REVMUX_HARD_TIMEOUT` | the per-round wall clock (default 40m) |
 
 **Run it in a split pane**, not a new session — easier to watch beside the work.
 
@@ -234,8 +268,33 @@ That can oscillate indefinitely.
   two Majors of its own, including a regression that could write a `<c:f>`
   naming a sheet the workbook no longer had. A review round is the wrong place
   to add a field.
-- `review_patience = N` in the config terminates the loop after N rounds with
-  no commits. It is `0` (disabled) by default.
+### Bounding the cost
+
+Left alone the external loop runs `max(3, max_iterations/5)` = **10** rounds,
+each a full panel. That is the token sink, and the shape above is why: across
+four plans here, every Major finding arrived in round 1 or 2, and every round
+after that was Minor documentation seeding the next round's Minor documentation.
+
+Three layers, cheapest first:
+
+1. **The roster narrows by round** (`scripts/revmux-review.sh`). Rounds 1–2 get
+   `comprehensive` — four agents, where the real findings come from. Round 3 on
+   gets `final`: two agents, and nothing below Major reported. This is what
+   actually ends the tail, and it ends it *by construction* — no Majors means no
+   findings, and ralphex stops. It is also the layer that costs least when it is
+   wrong, because a real Major is still reported.
+2. **`review_patience = 2`** stops the loop after two rounds with no commits,
+   which is what a standing disagreement between the panel and ralphex looks
+   like. It is `0` (disabled) by default; this repo pins it.
+3. **`max_external_iterations = 3`** is the hard ceiling, for when the first two
+   are wrong about something.
+
+The layers bound different things, which is easy to misread. The hard ceiling
+bounds **one run**, so within a single run the roster narrows for at most its
+last permitted round. The round counter is derived from the directories under
+`.revmux/tasks/$TASK`, which persist — so the ladder also carries across
+**re-runs of the same plan**: resume a plan that has had three rounds and the
+next one is already `final`.
 
 ## Writing plans for this loop
 

@@ -146,7 +146,9 @@ covers four of them — the flip, `chart_set_kind`, `sheet_insert_chart` and
 `series_add`'s push — asserting each yields the multi-series pie *and* that
 `chart_plotted_series` / `chart_unplotted_note` describe it. Be precise about
 what that pins: all four are `Docxy` methods, so a unit test cannot call them
-for want of a constructed view holding a selected chart — `chart_set_kind`,
+for want of a constructed view whose Chart panel holds a chart (`panel_chart`,
+not `chart_sel` — the two came apart when the panel went sticky, see
+[`range-selector.md`](range-selector.md)) — `chart_set_kind`,
 `sheet_insert_chart` and `series_add` take `&mut self` and a `Context<Self>`,
 and `chart_switched` is `&self` because the render path calls it each frame to
 grey the button. The test reaches only the PURE half each delegates to
