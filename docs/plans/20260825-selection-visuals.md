@@ -409,20 +409,66 @@ these are read while looking straight at the cells.
 
 ### Task 4: One selection at a time
 
-- [ ] selecting a chart clears the cell selection, so the cell ring does not
+- [x] selecting a chart clears the cell selection, so the cell ring does not
       compete with the chart's handles
-- [ ] clicking a cell deselects the chart (drops its handles and its source
-      outlines) and selects that cell
-- [ ] preserve what already works: `Escape` and the panel's `×` still fully
+      → the cells KEEP their selection and stop DRAWING it; see "Cleared, or
+      merely not shown" below. `GridOverlay::sel_hidden` darkens the ring, the
+      `range_tint` wash, both headers' highlight, the point-mode wash, the
+      auto-fill handle and the selection's own dashed border together
+- [x] clicking a cell deselects the chart (drops its handles and its source
+      outlines) and selects that cell → `select_cell` and `extend_to` both route
+      through `press_selection`; `chart_refs` is already keyed on `chart_sel`,
+      so the Task 3 outlines go with the handles
+- [x] preserve what already works: `Escape` and the panel's `×` still fully
       dismiss, and a drag that starts on a chart's resize grip is still a resize
-      rather than a cell selection
-- [ ] check the range-picking path is unaffected — while a range field has the
+      rather than a cell selection → both dismissals untouched; a grip's press
+      goes through `chart_press` (chart→same chart, a no-op on the selection)
+      and `sheet_drag_over` returns early while `chart_drag` is in flight
+- [x] check the range-picking path is unaffected — while a range field has the
       keyboard the grid is in point mode, and a click there points rather than
       selecting, which must not now also deselect the chart being edited
-- [ ] write tests for the pure decision: given a click target and the current
+      → `pointing` is an input to `press_selection`, which then changes nothing
+      at all; a pointed range is the one thing still bordered under `sel_hidden`
+- [x] write tests for the pure decision: given a click target and the current
       selection state, what is selected afterwards — covering chart→cell,
       cell→chart, chart→same chart, and a click while point mode is active
-- [ ] run tests — must pass before Task 5
+      → 6 tests in `grid_geom_tests` (`a_press_on_a_cell_…`,
+      `a_press_on_a_chart_…`, `a_press_on_the_selected_chart_keeps_its_panel_field`,
+      `a_click_while_pointing_points_instead_of_selecting`,
+      `navigation_keys_take_the_selection_back_from_a_chart`,
+      `exactly_one_thing_is_selected_after_any_press`), plus the two new
+      `border_range` cases for a selection a chart owns
+- [x] run tests — must pass before Task 5 → suite 110 pass, gridcore 370+1+4,
+      both workspaces clippy clean and `cargo fmt --check` clean
+
+#### Cleared, or merely not shown
+
+"Clears the cell selection" cannot be taken literally: `SheetView::sel` is a
+`(row, col)`, not an `Option`, and every keyboard path, the Name Box and the
+formula bar read it. Making it optional would ripple through the whole grid to
+express something the user never asked for — they asked that **two things stop
+looking selected at once**.
+
+So the chart takes the selection's *visibility*, not its value. `sel_hidden`
+turns off every indicator keyed to it, and dismissing the chart — a click on the
+grid, `Escape`, the panel's `×` — brings the ring back exactly where it was,
+which is also what Excel does. The one indicator deliberately left ON is the
+**pointed range's** border: pointing at cells is what a selected chart's range
+fields do, and `border_range` now takes `Option<sel>` so the two cases are told
+apart at the type rather than by a flag at each call site (`shown_sel`).
+
+#### ➕ Navigation keys are a press on the cells
+
+Not in the checkboxes, but hiding the selection made it necessary: with a chart
+selected, an arrow key would otherwise move a cell selection nothing is drawing
+— invisible motion, which is a worse version of the confusion this task exists
+to end. So `SelectTarget::NavKey` joins `Cell` and `Chart`, and the arrows and
+Enter hand the selection back before the grid moves it. Escape and Delete still
+belong to the chart, as they did.
+
+The decision function is deliberately given `pointing` for every target, so
+"clicking another chart while a field is focused still swaps" is one of the
+tested rows rather than an accident of where the check sits.
 
 ### Task 5: The Chart panel is sticky
 

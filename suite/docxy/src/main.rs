@@ -2812,6 +2812,92 @@ fn chart_area_at(areas: &[ChartSourceArea], r: u32, c: u32) -> Option<usize> {
     smallest_ref_at(areas.iter().map(|a| a.range), r, c)
 }
 
+/// What a press — or a grid navigation key — is aimed at, for the "one
+/// selection at a time" rule.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SelectTarget {
+    /// A press on a grid cell.
+    Cell,
+    /// A press on the idx-th chart card of the active sheet — its body or one
+    /// of its resize grips alike, because a resize is still a press on the
+    /// chart it grips, and Excel selects a chart on mouse-DOWN.
+    Chart(usize),
+    /// A key the grid navigates with (the arrows, and Enter). It moves the cell
+    /// selection, so it is aimed at the cells even though nothing was clicked.
+    NavKey,
+}
+
+/// What is selected once that press or key has been handled.
+///
+/// Two things could claim to be selected — a chart card and a cell — and the
+/// whole point of this rule is that only ever one does, so that "what will the
+/// keyboard act on" has a visible answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SelectionAfter {
+    /// The chart selected afterwards; `None` means the grid has it.
+    chart: Option<usize>,
+    /// The cell selection moves to what was pressed. False while pointing (the
+    /// click writes a reference into a field and the selection stays put) and
+    /// false for a press on a chart.
+    cell_moves: bool,
+    /// Drop the panel's focused field, its message and any pick in flight. They
+    /// are all keyed by series position within the SELECTED chart, so they mean
+    /// something else — or nothing — the moment that chart changes.
+    drop_field: bool,
+}
+
+/// Whether the grid draws its cell selection at all: the ring, the range wash,
+/// the headers' highlight and the auto-fill handle.
+///
+/// It is deliberately NOT a field of `SelectionAfter`, because it is not a
+/// fourth decision — a chart being selected IS the cell selection being hidden,
+/// whether the chart was just pressed or has been selected all along. The
+/// render pass asks this every frame with no press in sight, and the answer has
+/// to be the same one a press produced. The cells keep their selection; they
+/// merely stop showing it until the chart is dismissed.
+fn cell_selection_shown(chart: Option<usize>) -> bool {
+    chart.is_none()
+}
+
+/// Which of the two selections a press or navigation key leaves selected.
+///
+/// - A press on a **cell** takes the selection back from any chart: its handles
+///   and its source outlines go, and the cell ring returns.
+/// - A press on a **chart** takes it the other way, and the same chart again is
+///   a no-op rather than a re-selection — otherwise every press on a selected
+///   card would drop the panel field you were about to type in.
+/// - While **pointing** (a range field or a half-typed formula has the
+///   keyboard) a press on a cell writes a reference and changes nothing about
+///   what is selected. That is the whole reason the chart panel's range fields
+///   work: the chart being edited must survive the clicks that edit it.
+///   Pressing another CHART still swaps, pointing or not — the field belongs
+///   to the chart being left.
+fn press_selection(target: SelectTarget, chart: Option<usize>, pointing: bool) -> SelectionAfter {
+    match target {
+        SelectTarget::Chart(idx) if chart == Some(idx) => SelectionAfter {
+            chart,
+            cell_moves: false,
+            drop_field: false,
+        },
+        SelectTarget::Chart(idx) => SelectionAfter {
+            chart: Some(idx),
+            cell_moves: false,
+            drop_field: true,
+        },
+        _ if pointing => SelectionAfter {
+            chart,
+            cell_moves: false,
+            drop_field: false,
+        },
+        SelectTarget::Cell | SelectTarget::NavKey => SelectionAfter {
+            chart: None,
+            cell_moves: true,
+            // The grid has the keyboard now, so a panel field cannot keep it.
+            drop_field: true,
+        },
+    }
+}
+
 /// A range as BARE A1 text — `B2:B5`, no `=`, no anchors, no sheet.
 ///
 /// This is the form for a reference written into a CELL, where naming the sheet
@@ -3535,12 +3621,22 @@ impl Docxy {
     /// Move the spreadsheet selection to a cell (from a grid click), collapsing
     /// the range and committing any in-progress edit first.
     fn select_cell(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
-        // Typing a formula: a click writes the cell in rather than committing
-        // the edit and moving away.
-        if self.formula_pick_active() {
-            return self.formula_pick_to(row, col, true, cx);
-        }
-        if self.range_field_active() {
+        // One selection at a time, decided in one place: while a range field or
+        // a half-typed formula is POINTING, this click writes a reference and
+        // nothing is selected or deselected — which is exactly why a chart
+        // panel's range fields can be pointed at the grid at all. Otherwise the
+        // grid takes the selection back from whatever chart was holding it.
+        let after = press_selection(
+            SelectTarget::Cell,
+            self.chart_sel,
+            self.formula_pick_active() || self.range_field_active(),
+        );
+        if !after.cell_moves {
+            // Typing a formula: a click writes the cell in rather than
+            // committing the edit and moving away.
+            if self.formula_pick_active() {
+                return self.formula_pick_to(row, col, true, cx);
+            }
             // Mid-drag: the pick already has this cell, and its release applies.
             if matches!(self.range_pick, Some((_, true))) {
                 return;
@@ -3556,9 +3652,13 @@ impl Docxy {
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx); // commit in place before moving away
         }
-        self.chart_sel = None; // going back to the grid drops any chart selection
-        self.range_edit = None;
-        self.ref_msg = None;
+        // The chart drops its handles and its source outlines; the cell ring
+        // comes back out.
+        self.chart_sel = after.chart;
+        if after.drop_field {
+            self.range_edit = None;
+            self.ref_msg = None;
+        }
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
@@ -3608,18 +3708,33 @@ impl Docxy {
 
     /// Press on a chart card: select it (Excel selects on mouse-down, not on
     /// click) and arm a drag from where the pointer went down. `edge` is
-    /// `(0, 0)` for the card itself (a move) or the side a resize grip owns.
+    /// `(0, 0)` for the card itself (a move) or the side a resize grip owns —
+    /// a grip's press comes through here too, so a resize selects the chart it
+    /// grips rather than the cells underneath.
+    ///
+    /// Selecting the chart takes the selection AWAY from the grid: the cell
+    /// ring, the range wash and the headers' highlight are not drawn while a
+    /// chart owns it (`GridOverlay::sel_hidden`), so the two never compete over
+    /// which one the keyboard will act on.
     fn chart_press(&mut self, idx: usize, edge: (i8, i8), at: (f32, f32), cx: &mut Context<Self>) {
         // The panel's focused field is keyed by series position within the
         // SELECTED chart, so it means something else on another one: it would
         // point the new chart's series at the old one's buffer, or stay focused
         // (and swallow the keyboard) on a series the new chart doesn't have.
-        if self.chart_sel != Some(idx) {
+        // Pointing is passed through rather than assumed: a press on a chart
+        // selects it whether or not a field has the keyboard, and `press_selection`
+        // is where that is written down once.
+        let after = press_selection(
+            SelectTarget::Chart(idx),
+            self.chart_sel,
+            self.formula_pick_active() || self.range_field_active(),
+        );
+        if after.drop_field {
             self.range_edit = None;
             self.ref_msg = None;
             self.range_pick = None;
         }
-        self.chart_sel = Some(idx);
+        self.chart_sel = after.chart;
         self.chart_drag = Some(ChartDrag {
             idx,
             edge,
@@ -4915,6 +5030,9 @@ impl Docxy {
             handle_hidden: self.range_field_active() || self.formula_pick_active(),
             // The cap needs the column window, which only `sheet_el` has.
             range_dashed: true,
+            // One selection at a time: a selected chart owns it, and the grid
+            // shows nothing of its own until that chart is dismissed.
+            sel_hidden: !cell_selection_shown(self.chart_sel),
         }
     }
 
@@ -5006,14 +5124,27 @@ impl Docxy {
 
     /// Extend the selection to a cell (Shift+click), keeping the anchor.
     fn extend_to(&mut self, row: u32, col: u32, cx: &mut Context<Self>) {
-        if self.formula_pick_active() {
-            return self.formula_pick_to(row, col, false, cx);
-        }
-        if self.range_field_active() {
+        // A shift-click, or a sweep across cells, is a press on the CELLS: it
+        // takes the selection back from a chart exactly as a plain click does,
+        // or the range would grow behind a selection nothing is drawing.
+        let after = press_selection(
+            SelectTarget::Cell,
+            self.chart_sel,
+            self.formula_pick_active() || self.range_field_active(),
+        );
+        if !after.cell_moves {
+            if self.formula_pick_active() {
+                return self.formula_pick_to(row, col, false, cx);
+            }
             return self.range_pick_to(row, col, false, cx);
         }
         if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
             self.sheet_commit(0, 0, cx);
+        }
+        self.chart_sel = after.chart;
+        if after.drop_field {
+            self.range_edit = None;
+            self.ref_msg = None;
         }
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
@@ -7963,6 +8094,20 @@ impl Docxy {
                     return;
                 }
                 "delete" | "backspace" => return self.chart_delete_selected(cx),
+                // The grid's own navigation keys take the selection BACK, the
+                // same way a click on a cell does. Without this an arrow would
+                // move a cell selection that is hidden while the chart owns it
+                // -- something you cannot see moving, which is exactly the "who
+                // has the keyboard" confusion this rule exists to end. The key
+                // then falls through to the grid, which moves the selection it
+                // has just been given.
+                "left" | "right" | "up" | "down" | "enter" => {
+                    let after = press_selection(SelectTarget::NavKey, self.chart_sel, false);
+                    self.chart_sel = after.chart;
+                    if after.drop_field {
+                        self.ref_msg = None;
+                    }
+                }
                 _ => {}
             }
         }
@@ -16317,15 +16462,28 @@ const GRID_MAX_VISIBLE_ROWS: u32 = 128;
 /// Otherwise it outlines the selection, but only when that spans more than one
 /// cell — a single cell already wears the active ring, and drawing both would
 /// be the doubled-up indicator this plan is trying to remove.
+///
+/// `sel` is an Option because the selection can be there and not shown: while a
+/// chart owns the selection the grid draws none of its own (`sel_hidden`), and
+/// a range it does not outline is a range it must not border either. A POINTED
+/// range still wins in that state — that is a chart's own field pointing.
 fn border_range(
     preview: Option<(u32, u32, u32, u32)>,
-    sel: (u32, u32, u32, u32),
+    sel: Option<(u32, u32, u32, u32)>,
 ) -> Option<(u32, u32, u32, u32)> {
     if preview.is_some() {
         return preview;
     }
-    let (r0, c0, r1, c1) = sel;
-    ((r0, c0) != (r1, c1)).then_some(sel)
+    let (r0, c0, r1, c1) = sel?;
+    ((r0, c0) != (r1, c1)).then_some((r0, c0, r1, c1))
+}
+
+/// The selection as the grid is currently WILLING to draw it: `None` while a
+/// chart owns the selection, so every indicator keyed to it — the ring, the
+/// wash, the header highlight, the border — goes dark together rather than one
+/// call site at a time remembering to check.
+fn shown_sel(ov: &GridOverlay, sel: (u32, u32, u32, u32)) -> Option<(u32, u32, u32, u32)> {
+    (!ov.sel_hidden).then_some(sel)
 }
 
 /// Whether `range`'s border is drawn dashed, or falls back to solid because it
@@ -16434,6 +16592,7 @@ fn sheet_col_header(
     fc: u32,
     col0: u32,
     cend: u32,
+    sel_hidden: bool,
 ) -> AnyElement {
     use gridcore::sheet::col_name;
     let sh = view.sheet();
@@ -16455,7 +16614,8 @@ fn sheet_col_header(
     );
     // Frozen columns 0..fc pinned, then the scrollable window col0..=cend.
     for c in (0..fc).chain(col0..=cend) {
-        let hl = c >= c0 && c <= c1;
+        // Dark while a chart owns the selection, for the same reason the ring is.
+        let hl = !sel_hidden && c >= c0 && c <= c1;
         let on_freeze = fc > 0 && c + 1 == fc;
         let ent_h = ent.clone();
         let handle = div()
@@ -16516,6 +16676,15 @@ struct GridOverlay {
     /// visible boundary cells, where the same edges are drawn solid instead.
     /// Only `sheet_el` knows the column window, so it fills this in.
     range_dashed: bool,
+    /// A chart is selected, and one selection at a time means the grid's own is
+    /// not shown: no ring, no range wash, no header highlight, no fill handle.
+    /// The cells KEEP their selection -- it simply stops being drawn until the
+    /// chart is dismissed (a click on the grid, Escape, or the panel's close
+    /// button), at which point it reappears exactly where it was.
+    ///
+    /// A pointed range is deliberately still drawn: pointing at cells is what a
+    /// selected chart's range fields do, and the border is what shows where.
+    sel_hidden: bool,
 }
 
 /// One data row: the row-number gutter cell plus the visible cells (frozen
@@ -16548,10 +16717,12 @@ fn sheet_row(
     let head_fg = hsla_u(0x5a5a5a);
     let brand = hsla_u(BRAND);
     let range_tint = Hsla { a: 0.14, ..brand };
-    let hl_row = r >= r0 && r <= r1;
+    // The row-number gutter highlights the selection's rows — unless a chart
+    // owns the selection, in which case the grid shows none of it.
+    let hl_row = !ov.sel_hidden && r >= r0 && r <= r1;
     // What the dashed border outlines this frame: the cells a focused range
     // field points at, else a selection spanning more than one cell.
-    let border_rg = border_range(ov.range_preview, (r0, c0, r1, c1));
+    let border_rg = border_range(ov.range_preview, shown_sel(&ov, (r0, c0, r1, c1)));
     // Variable row height: an explicit <row ht> sets a floor (points → px at the
     // app's 15pt≈21px scale); wrapped cells grow the row past it via their
     // natural (min-content) height. items_stretch makes every cell fill it.
@@ -16613,8 +16784,8 @@ fn sheet_row(
         let selected = (r, c) == (sr, sc);
         // While a range is being picked the active cell keeps its place with a
         // wash instead of the ring, so only the picked range reads as an outline.
-        let ring = selected && !ov.picking;
-        let in_range = r >= r0 && r <= r1 && c >= c0 && c <= c1;
+        let ring = selected && !ov.picking && !ov.sel_hidden;
+        let in_range = !ov.sel_hidden && r >= r0 && r <= r1 && c >= c0 && c <= c1;
         // Cells the fill drag would reach: shaded while the button is down, so
         // the drag reads as a preview and nothing has actually moved yet.
         let in_preview = !in_range
@@ -16731,7 +16902,9 @@ fn sheet_row(
                     ..hsla_u(ref_color(i))
                 })
             })
-            .when(selected && ov.picking, |d| d.bg(Hsla { a: 0.38, ..brand }))
+            .when(selected && ov.picking && !ov.sel_hidden, |d| {
+                d.bg(Hsla { a: 0.38, ..brand })
+            })
             .when(ring, |d| d.border_2().border_color(brand));
         if cell_editing {
             cell = cell.justify_start().child(edit_caret_row(
@@ -16889,7 +17062,7 @@ fn sheet_row(
         // scroll/row-height math to drift); it is absolutely positioned, so it adds
         // nothing to the cell's size; and it is `deferred`, so it paints after the
         // neighbouring cells that would otherwise clip its outer half.
-        if editing.is_none() && !ov.handle_hidden && r == r1 && c == c1 {
+        if editing.is_none() && !ov.handle_hidden && !ov.sel_hidden && r == r1 && c == c1 {
             let ent_fill = ent.clone();
             let ent_fill_dn = ent.clone();
             // Insets are measured from the PADDING box, so back out the cell's
@@ -17388,7 +17561,7 @@ fn sheet_el(
     // wrapping it in `overflow_x` steals the wheel and breaks vertical scrolling).
     // Columns are rendered to fill the viewport; a horizontal scroller can't be
     // layered on without losing virtualization on raw gpui.
-    let header = sheet_col_header(view, ent, fc, col0, cend);
+    let header = sheet_col_header(view, ent, fc, col0, cend, ov.sel_hidden);
     let cc_frozen = comment_cells.clone();
     let cc_list = comment_cells.clone();
     // A chart card floating over the selection's corner owns those pixels, so
@@ -17440,10 +17613,11 @@ fn sheet_el(
     // then `col0..=cend`) is only settled here. The frozen band and the scrolled
     // window are counted as one span `0..=cend`, which over-counts the columns
     // scrolled between them — the same safe direction as everything else here.
-    let range_dashed = border_range(ov.range_preview, (r0, c0, r1, c1)).is_none_or(|rg| {
-        let cols = (if fc > 0 { 0 } else { col0 }, cend);
-        range_border_dashed(rg, cols, GRID_MAX_VISIBLE_ROWS)
-    });
+    let range_dashed =
+        border_range(ov.range_preview, shown_sel(&ov, (r0, c0, r1, c1))).is_none_or(|rg| {
+            let cols = (if fc > 0 { 0 } else { col0 }, cend);
+            range_border_dashed(rg, cols, GRID_MAX_VISIBLE_ROWS)
+        });
     let ov = GridOverlay {
         handle_hidden: ov.handle_hidden || corner_under_chart,
         range_dashed,
@@ -18107,13 +18281,14 @@ mod grid_geom_tests {
     use super::{
         CHART_CATEGORIES_COLOR, CHART_NAME_COLOR, CHART_VALUES_COLOR, ChartSlot, ChartSourceArea,
         EdgeMask, GRID_MAX_VISIBLE_ROWS, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan,
-        RefText, SHEET_ROW_H, border_range, char_to_byte, chart_area_at, chart_ref_of,
-        chart_slot_color, chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box,
-        formula_ref_tokens, last_visible_col, parse_ref_text, preview_range, range_a1,
-        range_border_dashed, range_border_plan, range_edges_at, range_text, ref_a1, ref_color,
-        ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px,
-        scroll_col0_for_sel, series_move, series_name_shown, series_remove, sheet_index_of,
-        shift_col, shift_row, source_ref_text,
+        RefText, SHEET_ROW_H, SelectTarget, SelectionAfter, border_range, cell_selection_shown,
+        char_to_byte, chart_area_at, chart_ref_of, chart_slot_color, chart_source_areas, col_at_x,
+        col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens, last_visible_col,
+        parse_ref_text, press_selection, preview_range, range_a1, range_border_dashed,
+        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
+        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
+        series_move, series_name_shown, series_remove, sheet_index_of, shift_col, shift_row,
+        source_ref_text,
     };
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -21281,18 +21456,182 @@ mod grid_geom_tests {
     /// a lone cell already wears the active ring.
     #[test]
     fn border_range_prefers_the_pointed_range_over_the_selection() {
-        let sel = (2, 2, 6, 6);
+        let sel = Some((2, 2, 6, 6));
         // A field is pointing: its range wins even though the selection is wide.
         assert_eq!(border_range(Some((0, 0, 1, 1)), sel), Some((0, 0, 1, 1)));
         // Nothing pointing: the selection, because it spans more than one cell.
-        assert_eq!(border_range(None, sel), Some(sel));
+        assert_eq!(border_range(None, sel), sel);
         // A one-cell selection draws no border — the ring is the indicator.
-        assert_eq!(border_range(None, (3, 4, 3, 4)), None);
+        assert_eq!(border_range(None, Some((3, 4, 3, 4))), None);
         // A one-cell POINTED range still does: nothing else marks it.
         assert_eq!(border_range(Some((3, 4, 3, 4)), sel), Some((3, 4, 3, 4)));
         // A single row and a single column both span more than one cell.
-        assert_eq!(border_range(None, (3, 4, 3, 9)), Some((3, 4, 3, 9)));
-        assert_eq!(border_range(None, (3, 4, 8, 4)), Some((3, 4, 8, 4)));
+        assert_eq!(border_range(None, Some((3, 4, 3, 9))), Some((3, 4, 3, 9)));
+        assert_eq!(border_range(None, Some((3, 4, 8, 4))), Some((3, 4, 8, 4)));
+        // A chart owns the selection, so the grid is showing none of it: there
+        // is no selection to outline, and the border goes with the ring.
+        assert_eq!(border_range(None, None), None);
+        // A POINTED range still outlines in that state — it is the selected
+        // chart's own field pointing, and showing where is its whole job.
+        assert_eq!(border_range(Some((0, 0, 1, 1)), None), Some((0, 0, 1, 1)));
+    }
+
+    /// One selection at a time, from the cells' side: a press on a cell takes
+    /// the selection back from whatever chart was holding it, and the panel
+    /// field that belonged to that chart goes with it.
+    #[test]
+    fn a_press_on_a_cell_takes_the_selection_back_from_a_chart() {
+        let after = press_selection(SelectTarget::Cell, Some(3), false);
+        assert_eq!(
+            after,
+            SelectionAfter {
+                chart: None,
+                cell_moves: true,
+                drop_field: true,
+            }
+        );
+        // The grid has the selection, so it draws it again.
+        assert!(cell_selection_shown(after.chart));
+
+        // Nothing was selected either: the cell still moves, and the field is
+        // still dropped, because the grid has taken the keyboard regardless.
+        let after = press_selection(SelectTarget::Cell, None, false);
+        assert_eq!(
+            after,
+            SelectionAfter {
+                chart: None,
+                cell_moves: true,
+                drop_field: true,
+            }
+        );
+    }
+
+    /// And from the chart's side: selecting a chart takes the selection away
+    /// from the cells, so the ring cannot compete with the chart's handles.
+    #[test]
+    fn a_press_on_a_chart_takes_the_selection_from_the_cells() {
+        let after = press_selection(SelectTarget::Chart(2), None, false);
+        assert_eq!(
+            after,
+            SelectionAfter {
+                chart: Some(2),
+                // The cell selection does NOT move — it stays where it was and
+                // stops being drawn, so dismissing the chart puts it back.
+                cell_moves: false,
+                drop_field: true,
+            }
+        );
+        assert!(!cell_selection_shown(after.chart));
+
+        // Swapping charts drops the field too: it is keyed by series position
+        // within the chart being left, so it means something else on this one.
+        let after = press_selection(SelectTarget::Chart(2), Some(5), false);
+        assert_eq!(after.chart, Some(5 - 3)); // == Some(2), the pressed chart
+        assert!(after.drop_field);
+    }
+
+    /// Pressing the chart that is ALREADY selected is a no-op on the selection.
+    /// It has to be: every press on a selected card starts a move drag, and
+    /// dropping the field on each of them would close the panel entry you were
+    /// halfway through typing.
+    #[test]
+    fn a_press_on_the_selected_chart_keeps_its_panel_field() {
+        let after = press_selection(SelectTarget::Chart(4), Some(4), false);
+        assert_eq!(
+            after,
+            SelectionAfter {
+                chart: Some(4),
+                cell_moves: false,
+                drop_field: false,
+            }
+        );
+        // A resize grip presses the same chart it grips, so a resize is this
+        // case, not a cell selection.
+        assert_eq!(
+            press_selection(SelectTarget::Chart(4), Some(4), true),
+            after
+        );
+    }
+
+    /// Point mode: while a range field or a half-typed formula has the
+    /// keyboard, a click on the grid POINTS. Nothing is selected or deselected
+    /// — the chart being edited must survive the clicks that edit it, which is
+    /// the entire reason its range fields are pointable.
+    #[test]
+    fn a_click_while_pointing_points_instead_of_selecting() {
+        for chart in [None, Some(0), Some(7)] {
+            let after = press_selection(SelectTarget::Cell, chart, true);
+            assert_eq!(
+                after,
+                SelectionAfter {
+                    chart,
+                    cell_moves: false,
+                    drop_field: false,
+                },
+                "pointing must not disturb {chart:?}"
+            );
+        }
+        // Pressing another CHART still swaps while pointing: the field belongs
+        // to the chart being left, so it cannot survive the move.
+        let after = press_selection(SelectTarget::Chart(1), Some(0), true);
+        assert_eq!(after.chart, Some(1));
+        assert!(after.drop_field);
+    }
+
+    /// A grid navigation key is aimed at the cells, so it takes the selection
+    /// back the way a click does. Without that an arrow would move a selection
+    /// hidden behind the chart that owns it.
+    #[test]
+    fn navigation_keys_take_the_selection_back_from_a_chart() {
+        let after = press_selection(SelectTarget::NavKey, Some(1), false);
+        assert_eq!(
+            after,
+            SelectionAfter {
+                chart: None,
+                cell_moves: true,
+                drop_field: true,
+            }
+        );
+        assert!(cell_selection_shown(after.chart));
+        // While pointing, the same key is the FIELD's, not the grid's.
+        let after = press_selection(SelectTarget::NavKey, Some(1), true);
+        assert_eq!(after.chart, Some(1));
+        assert!(!after.cell_moves);
+    }
+
+    /// The invariant the whole task exists for, over every combination: the
+    /// cell selection is shown exactly when no chart is selected, and no
+    /// outcome ever both selects a chart and moves the cells.
+    #[test]
+    fn exactly_one_thing_is_selected_after_any_press() {
+        let targets = [
+            SelectTarget::Cell,
+            SelectTarget::NavKey,
+            SelectTarget::Chart(0),
+            SelectTarget::Chart(1),
+        ];
+        for target in targets {
+            for chart in [None, Some(0), Some(1)] {
+                for pointing in [false, true] {
+                    let after = press_selection(target, chart, pointing);
+                    assert_eq!(
+                        cell_selection_shown(after.chart),
+                        after.chart.is_none(),
+                        "{target:?} {chart:?} {pointing}"
+                    );
+                    assert!(
+                        !(after.chart.is_some() && after.cell_moves),
+                        "{target:?} {chart:?} {pointing}: both selected"
+                    );
+                    // A press on a chart always ends with THAT chart selected,
+                    // pointing or not — there is no state in which clicking a
+                    // card fails to select it.
+                    if let SelectTarget::Chart(i) = target {
+                        assert_eq!(after.chart, Some(i));
+                    }
+                }
+            }
+        }
     }
 
     /// The cap is bounded by the VIEWPORT, not the range: the widths and row
