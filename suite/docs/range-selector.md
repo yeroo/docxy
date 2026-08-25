@@ -487,10 +487,25 @@ one does, for every press and for the navigation keys alike:
   from cells nothing on screen named. The rule is a `!matches!` over the three
   whole-sheet exceptions (`ProtectSheet`, `Outline`, `Todo`), so a new
   `SheetAct` variant defaults to handing back rather than to acting on a hidden
-  selection. Clicking the **fx bar** hands back as well: it opens an editor on
+  selection. Not every writer arrives through `run_sheet_act`, though: the
+  Number dropdown flips its own flag and its strip calls `sheet_apply_numfmt`
+  directly, and the colour swatches call `sheet_apply_color` directly. Those
+  all end at `sheet_format`, so the hand-back is asked there too — it returns
+  immediately with nothing selected, so the common path pays nothing, and a
+  future direct caller is covered without having to remember this rule.
+  Clicking the **fx bar** hands back as well: it opens an editor on
   the selected cell, so it is as much a press on the cells as `F2` is, and
   without it the caret and the white edit box would be drawn over a cell
   `sel_hidden` was leaving unmarked while the chart still wore its grips.
+- **A cell editor and a range field cannot both hold the keyboard.** `sheet_key`
+  asks `range_edit` before the cell editor, so a field left standing while an
+  editor opened would take every keystroke — and the Enter that commits — for
+  itself, with the caret and the white box drawn over the cell. `F2` and the
+  double-click are already behind that check (the first never gets past it, the
+  second treats a live field as *pointing* and only writes a reference), but the
+  fx bar is not: `chart_hand_back` returns early there, because the sticky panel
+  means a field can have focus with no chart selected. So the drop lives in
+  `sheet_begin_edit`, the one door every editor opens through.
 - While **pointing** — a range field or a half-typed formula has the keyboard —
   a press on a cell writes a reference and changes *nothing* about what is
   selected. That is what lets the Chart panel's own range fields work: the chart

@@ -5737,6 +5737,18 @@ impl Docxy {
         if self.sheet_protected() {
             return;
         }
+        // A cell editor and a range field cannot both hold the keyboard. The
+        // key router asks `range_edit` BEFORE the cell editor, so leaving a
+        // field standing here would draw the caret and the white box over a
+        // cell while every keystroke — and the Enter that commits — went to the
+        // field instead. Reachable since the Chart panel became sticky: select
+        // a chart, click a cell (the chart hands the selection back but the
+        // panel stays), click a panel range field, then click the fx bar —
+        // `chart_hand_back` returns early there, with nothing selected to hand
+        // back, so the drop is owed here.
+        self.range_edit = None;
+        self.range_pick = None;
+        self.ref_msg = None;
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
             v.editing = Some(initial.unwrap_or_else(|| v.edit_string(r, c)));
@@ -5994,6 +6006,14 @@ impl Docxy {
     /// each cell's `Xf`, intern it (dedup), and re-point the cell's style. Values
     /// and formulas are untouched, so no recalc is needed.
     fn sheet_format(&mut self, apply: impl Fn(&mut gridcore::sheet::Xf), cx: &mut Context<Self>) {
+        // This writes to `v.range()`, so the selection it acts on has to be the
+        // one the grid is DRAWING. `run_sheet_act` hands the selection back for
+        // the ribbon commands, but not every formatting writer arrives that way
+        // — the Number dropdown flips its own flag and its strip calls
+        // `sheet_apply_numfmt` directly, and the colour swatches call
+        // `sheet_apply_color` directly. Asking here covers the lot: it returns
+        // immediately when no chart is selected, so the common path is free.
+        self.chart_hand_back(cx);
         self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
             let (r0, c0, r1, c1) = v.range();
