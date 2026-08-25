@@ -2169,12 +2169,22 @@ pub(crate) fn esc_raw_attr(s: &str) -> String {
 
 /// The chart kinds [`chart_space_xml`] can author. Everything else — scatter,
 /// area, doughnut, radar, bubble, surface — falls into its `_` arm and would be
-/// written back out as a clustered COLUMN chart. Worse, `parse_chart` reads data
-/// from `<c:cat>`/`<c:val>` only, never `<c:xVal>`/`<c:yVal>`, so a scatter or
-/// bubble chart's series carry no values at all: regenerating one turns it into
-/// an empty column chart, irreversibly. Those parts round-trip verbatim instead,
+/// written back out as a clustered COLUMN chart. Worse, `parse_chart` reads
+/// point DATA from `<c:cat>`/`<c:val>` only: a scatter's or bubble's
+/// `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` contribute their REFS (the box, and
+/// `ChartSeries::point_refs`) but no cached numbers, so such a series carries
+/// no values at all and regenerating one turns it into an empty column chart,
+/// irreversibly. Those parts round-trip verbatim instead,
 /// which is what they did before charts became editable — a stale ref beats a
 /// destroyed chart.
+///
+/// This is a question about a chart's KIND, so the panel's type buttons could
+/// walk straight through it — picking `column` for a scatter makes
+/// [`chart_is_writable`] true and hands the writer exactly the series with no
+/// values described above. They don't: `chart_set_kind` sends any chart holding
+/// such a series through `chart_reauthored`, which re-derives it from its own
+/// box first, so every series that reaches this gate as `column` really does
+/// carry values.
 pub fn chart_kind_is_writable(kind: &str) -> bool {
     matches!(kind, "bar" | "column" | "line" | "pie")
 }
@@ -5940,9 +5950,14 @@ mod tests {
     fn an_edited_scatter_chart_is_kept_verbatim_rather_than_flattened() {
         use crate::sheet::DrawingKind;
         // `chart_space_xml` can only author bar/column/line/pie. A scatter chart
-        // regenerated through it becomes a clustered COLUMN chart — and, since
-        // `parse_chart` never reads `<c:xVal>`/`<c:yVal>`, one with no data at
-        // all. Round-tripping the part beats destroying it.
+        // regenerated through it becomes a clustered COLUMN chart — and an EMPTY
+        // one: `parse_chart` reads a scatter's `<c:xVal>`/`<c:yVal>` REFS (the
+        // box, and `ChartSeries::point_refs`) but caches no numbers from them, so
+        // every one of its series reaches the writer with nothing in any of the
+        // three slots `<c:val>` comes from. Round-tripping the part beats
+        // destroying it. (Converting such a chart deliberately is a different
+        // door, and it re-derives rather than relabels — see the panel's
+        // `chart_reauthored`.)
         assert!(!chart_kind_is_writable("scatter"));
         assert!(!chart_kind_is_writable("doughnut"));
         assert!(chart_kind_is_writable("column"));

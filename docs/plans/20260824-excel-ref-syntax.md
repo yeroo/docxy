@@ -416,6 +416,254 @@ says nothing about them.
 - [x] documented in `suite/docs/chart-orientation.md` and
       `suite/docs/range-selector.md`
 
+### ➕ Task 8c: `point_refs` had to obey the rules every other `ChartSource` does
+
+Raised by the review round after 8b landed, and recorded here because 8b's
+checklist closed without them: the new slot was folded by the panel but was the
+one `ChartSource` nothing re-based, and nothing cleared.
+
+- [x] `gridcore/src/edit.rs` — `rename_sheet_in_chart` and `shift_chart_refs`
+      walk `ser.point_refs` too. A scatter's points are the only refs its series
+      has, and `rebuild_source` folds them FIRST, so a stale one seeded the box
+      with the old sheet and got every correctly-renamed slot after it skipped
+      for the mismatch — DATA RANGE naming a sheet the workbook no longer has.
+      A wholly-deleted range drops its point ref rather than dangling, the same
+      rule `values_ref` follows. This is what SPREADSHEET.md's "structural edits
+      re-base **every** `ChartSource`" always claimed
+- [x] `suite/docxy/src/main.rs` — `chart_take_kind` (extracted out of
+      `chart_set_kind`, and testable) clears `point_refs` when the picked kind
+      is one `chart_kind_is_writable` accepts: the writer's bar/column/line/pie
+      arms emit no `<c:xVal>`, so carried across a conversion they left
+      `rebuild_source` stretching the box back over the obsolete X column the
+      next time any field committed. NOT the writer's `<c:cat>` fallback, which
+      reads `data.source`'s `cat_col` and never these — the first draft of this
+      comment claimed it did. A scatter that stays a scatter keeps them — its
+      part round-trips verbatim, so the next `parse_chart` reads those very
+      refs back
+- [x] `chart_set_kind` AUTHORS AFRESH rather than relabels, when the chart it is
+      converting has nothing the writer could plot (`chart_has_plottable_values`
+      — no `values_ref`, no `col`, no cached numbers, which is every imported
+      scatter and bubble). Relabelling one `column` made
+      `chart_is_writable` true, and the next save then overwrote its part with
+      `<c:val><c:numLit><c:ptCount val="0"/>` per series: a 50-point scatter
+      destroyed in one click, the outcome `chart_kind_is_writable`'s own comment
+      calls irreversible. `chart_reauthored` runs the box back through
+      `chart_from_range` — the same call DATA RANGE and Insert make — keeping
+      the title and the part (the writer only overwrites a part it knows) and
+      refusing with the chart's own shape when the box holds no numbers to
+      plot. It also settles the box: a relabelled scatter's only foldable slot
+      was its `<c:tx>` name cell, so the next `series_apply_name` /
+      `series_delete` / `series_reorder` / `categories_apply` collapsed a box
+      over `A1:B4` onto `B1` and DATA RANGE stopped re-deriving. Re-derived,
+      every series carries a `values_ref` for `rebuild_source` to fold
+- [x] `chart_range_sheet` extracted out of `chart_switched`: resolving the sheet
+      a chart's BOX names (not the one on screen), under `chart_ref_of`'s cell
+      cap, is now asked by both doors that re-derive a chart from its own box,
+      with the same three sentences when it can't be
+- [x] `fold_source` is `pub` and the suite's `rebuild_source` CALLS it rather
+      than keeping a byte-for-byte copy. The two deciding a cross-sheet ref
+      identically is what makes a chart read the same before and after a save,
+      which is not an invariant to hand-maintain in two crates
+- [x] Switch Row/Column moved BELOW the not-writable note: the flip carries
+      `complex` and `part`, so on a stacked or scatter chart it shows and isn't
+      saved — exactly what the note's "edits below" says, and above it the
+      button was the one control the wording excluded
+- [x] the delete-shrinks-the-box claim narrowed, in the `series_delete` comment
+      and in `range-selector.md`: the box is a rectangle, so it only shrinks off
+      a column at its ENDS. A middle delete leaves it as wide, and the rebuild's
+      real justification is that the panel must show the box `parse_chart` will
+      rebuild on the next open
+- [x] the "every by-name lookup folds case" claim narrowed in
+      `range-selector.md` and in `sheet_index_of`'s own doc comment:
+      `sheet_follow_hyperlink` and `dv_list_values` still match byte for byte.
+      The load-bearing half — resolution and the wash (`bar_range_text`) must
+      not disagree — stands
+- [x] `SPREADSHEET.md` and `chart_kind_is_writable`'s doc comment no longer say
+      `parse_chart` doesn't read `<c:xVal>`/`<c:yVal>`. It reads their REFS (the
+      box, and `point_refs`); what it never reads is their cached numbers, which
+      is the reason the kind isn't writable
+- [x] tests: `a_rename_follows_a_scatters_point_refs`,
+      `a_row_insert_moves_a_scatters_point_refs`,
+      `deleting_a_scatters_x_cells_drops_that_point_ref_instead_of_dangling`,
+      `a_scatter_on_another_sheet_keeps_its_point_refs`,
+      `picking_a_writable_type_clears_a_scatters_point_refs`,
+      `picking_a_writable_type_authors_a_valueless_scatter_afresh`, and a
+      middle-delete case in
+      `a_charts_box_is_rebuilt_from_the_references_its_slots_hold`
+
+### ➕ Task 8d: the re-author door asked its question of the wrong thing
+
+Raised by the review round after 8c landed. The door 8c opened in
+`chart_set_kind` was right about WHAT to do and wrong about WHEN and about what
+else moves when it does.
+
+- [x] the gate is asked per SERIES, not per chart:
+      `chart_has_plottable_values` (chart-wide `any`) became
+      `chart_would_lose_points` — does any series hold `point_refs` the writer
+      could not emit (`values_ref`, `col` and `values` all absent). The `any`
+      let a HALF re-pointed scatter relabel: ser0 given a `values_ref` through
+      SERIES VALUES made the whole chart look plottable, and the save then
+      wrote `<c:val><c:numLit><c:ptCount val="0"/>` over ser1 — the series
+      nobody touched, lost with no `complex` to hold the part back. Asking
+      about points-to-lose rather than values-to-emit is also what keeps
+      `series_add`'s empty new series (no refs, and no `values` until the chart
+      has categories) from forcing a re-derivation that would discard the hand
+      edits on every other series
+- [x] `chart_set_kind` clears `range_edit` / `ref_msg` / `range_pick` on the
+      branch that took `chart_reauthored`'s output. A re-derivation REPLACES the
+      series (a scatter's one X/Y pair comes back as a series per numeric
+      column), and both are keyed by bare series index, so the panel's own
+      "type below, then pick a type above" left an open field to commit its
+      buffer onto whichever series inherited the number — or to go on taking
+      keystrokes while no longer drawn, when the count shrank. The same three
+      lines `chart_press` clears for that hazard, and the two of them
+      `chart_switch_orientation` and `series_delete` clear: `range_pick` is the
+      one of the three not keyed by series index, so those two leave it to
+      `range_pick_end`, which returns early once `range_edit` is `None`
+- [x] the comments that said this door "does not re-derive" — in
+      `chart_set_kind`, in `chart_kind_series_err`'s list of the five doors to a
+      multi-series pie, and in `chart-orientation.md` — now say that it usually
+      doesn't, and that it therefore asks `chart_kind_series_err` TWICE: once on
+      the count on screen, once on the count `chart_reauthored` reads out of the
+      box, whose refusal can name a count the panel is not showing
+- [x] `chart_take_kind`'s doc, `chart_kind_is_writable`'s doc,
+      `chart-orientation.md` and `SPREADSHEET.md` no longer state the guarantee
+      per series while the gate was per chart. With the gate per series the
+      claim is simply true, and each says so in one place rather than three
+- [x] tests: the mixed case (`chart_would_lose_points` on a two-series scatter
+      with only one re-pointed) and the `series_add` case (an empty series is
+      not a loss) in
+      `picking_a_writable_type_clears_a_scatters_point_refs`. Clearing the
+      panel's per-series state is view code, which the render macro forbids
+      constructing in a `#[test]`, so it is covered by the comment naming the
+      two siblings that do the same thing rather than by an assertion
+
+### ➕ Task 8e: what the re-author door hands `chart_from_range`
+
+Raised by the review round after 8d landed. 8c/8d settled WHEN the door
+re-derives; this settles what it re-derives FROM, and what the panel says about
+it.
+
+- [x] `chart_box_with_header`: the box an imported scatter arrives with sits ON
+      its points. `parse_chart` folds it out of the `<c:xVal>`/`<c:yVal>` refs
+      and only then lets `<c:cat>`/`<c:tx>` stretch it, so a series whose name
+      came as a literal `<c:v>Speed` (which is how Excel writes a typed one, and
+      what the `an_edited_scatter_chart_is_kept_verbatim_rather_than_flattened`
+      fixture has) leaves nothing to stretch it upward and the box is `A2:B4`
+      where an authored chart's would be `A1:B4`. `chart_from_range` reads every
+      box the other way — `chart_from_columns` names the series from row `r0`
+      and plots `r0 + 1..=r1` — so re-deriving that one unchanged ate row 2 as
+      headings: a three-point scatter came back TWO points named `1` and `10`,
+      the numbers it consumed, and the next save wrote that over the part. The
+      box is now widened one line when any series' `point_refs`/`values_ref`
+      reaches its leading edge, and refused (naming the edge) when there is no
+      line to widen into. Switch Row/Column re-derives from the same box and so
+      asks the same question, for the orientation the FLIP is about to read it
+      as — only for a chart whose box came out of point refs at all
+      (`chart_box_from_points`, asked of the refs rather than of what a relabel
+      would cost, so a half re-pointed scatter is still one), since every other
+      box is one the user set in DATA RANGE and widening it would break the
+      double flip. Widening happens after `chart_range_sheet`'s cell cap, so
+      both doors re-count (`chart_cells_within_cap`)
+- [x] `infer_by_row` reads `point_refs` shapes alongside `values_ref`. It had
+      only `<c:val>` to measure, which a scatter has none of, so EVERY scatter
+      answered "column" — no longer just the panel's reading, since 8c made
+      `by_row` decide how the re-derivation reads the box. A scatter laid out
+      along rows (`$B$2:$F$2` / `$B$3:$F$3`) came back as five one-point series,
+      and then as a pie refused on a count of five. Only multi-cell point refs
+      vote; a one-point scatter is two single cells side by side and must not
+      reach the stacked-cell fallback
+- [x] `ChartSeries::points_unheld`, and `chart_would_lose_points` asking it as
+      well as `point_refs`. That vec is filled only when the loader could parse
+      an `<c:f>` out of the point elements — a `<c:numLit>` scatter has no
+      `<c:f>` to fail on, and one naming `Sheet1!$A:$A` fails `parse_f_ref` under
+      a `mode` of 0, so the `unparsed_ref` arm never sees it either. Both
+      arrived with all four slots empty, indistinguishable from the empty series
+      `series_add` pushes, walked past 8d's gate and were relabelled — the
+      silent `<c:ptCount val="0"/>` this whole change exists to prevent, and the
+      one shape it had left open. Marked at the CLOSE of each point element (the
+      only place that knows the element yielded nothing), cleared by
+      `chart_take_kind` with the refs beside it. Per ELEMENT, so a series with
+      one readable half carries the mark AND a ref — and only when the element
+      held points at all, so a schema-legal empty one
+      (`<c:numLit><c:ptCount val="0"/>`) is left alone rather than sent down the
+      re-author door to be refused for a box it never needed
+- [x] the not-writable note says what picking a type does to the edits below it,
+      because for these charts it does not save them: a re-read replaces the
+      series wholesale, keeping only the title. Which of the two a click takes
+      turns on per-series state the panel doesn't draw, so the note names the
+      re-read outright and `chart_set_kind` sets a status line saying it
+      happened, with how many series and the kind the chart HAD (a bubble chart
+      reaches the same branch, so the sentence cannot say "scatter"). The
+      "Switch Row/Column sits below the note" comment now cites the note's
+      second half too — the flip is the one edit below it that DOES survive the
+      click, because it re-derives there and then and so leaves the points-only
+      class entirely, not because the later re-read honours `data.by_row`
+- [x] the note asks the click's own question by MAKING the call (`reread` =
+      `chart_range_sheet` + `chart_reauthored("column", …)`, the way the switch
+      button already derives its flip every frame) rather than by the proxy
+      `data.source.is_some()`. That proxy was unsound in both directions: it
+      promised a re-read for every refusal `chart_reauthored` can return with
+      the box still in place (a plot half the box misses, a points-leading box
+      with no line above it, a widened box past the cap, a box with no line of
+      numbers, a box naming a missing sheet), and with no box at all it fell
+      back to the bare first half — which claims the edits get saved once a type
+      is picked, on the one chart where picking a type can only say
+      `CHART_NO_BOX`. So there are three sentences now, not two, and the third
+      names the remedy the five refusals share (point DATA RANGE at cells).
+      `"column"` answers for all four buttons: the only kind-dependent refusal
+      is `chart_kind_series_err`, which is a pie-only count
+- [x] `chart_reauthored` refuses a series that NAMES point cells the fold took
+      none of (`chart_points_off_box`, asked with the box in hand). Two shapes
+      reach it, and both leave the box provably short of the plot:
+      - an `<c:f>` `parse_f_ref` refused (`<c:xVal>` naming a whole column beside
+        a held `<c:yVal>`). The marks are per point ELEMENT, so one series
+        carries both, and `rebuild_source` folds only the half it holds
+      - a HELD ref naming ANOTHER SHEET than the box. `fold_source` SKIPS it
+        rather than unioning across sheets, and nothing else records the skip —
+        `unparsed_ref` is only set for `mode != 0`, never under a point element —
+        so the sheets are compared at the door. `chart_from_range` reads ONE
+        sheet, so re-deriving would drop the foreign half outright
+
+      Either way the re-derivation plots one coordinate and drops the other,
+      which the status line's "the series below are the range's" does not say.
+      LITERAL points are deliberately let through: they are in no cells at all,
+      so no box could have covered them and the chart's own is the best that
+      exists. That exemption is per ELEMENT, which is why the loader keeps
+      `ChartSeries::points_ref_unheld` beside the wider `points_unheld` — asking
+      the wider mark here would refuse an ordinary bubble whose
+      `<c:bubbleSize>` is a `<c:numLit>` beside held X/Y refs, a chart whose box
+      covers every cell its plot names
+
+      Both doors that re-derive from the box ask it: `chart_reauthored`, where
+      the loss reaches the FILE (the re-derived chart is a writable kind and the
+      next save regenerates the part), and `chart_switch_row_column`, where it
+      reaches the screen and then the file two clicks later — the flip leaves
+      every series carrying a `values_ref`, so the type click after it is a plain
+      relabel with the missing half already gone
+- [x] the stale "`parse_chart` never reads `<c:xVal>`/`<c:yVal>`" in
+      `an_edited_scatter_chart_is_kept_verbatim_rather_than_flattened` and in
+      `range-selector.md`'s "Only four chart kinds can be written back" — the
+      two sites 8c's sweep missed, both now saying what the other three say (the
+      refs are read, the numbers are not). `SPREADSHEET.md`'s `complex` sentence
+      says which slots it covers, now that the points have a mark of their own
+- [x] tests: `re_authoring_a_scatter_whose_box_sits_on_its_points_keeps_every_point`
+      (widen / no room / by-row / already-headed). The by-row case drives the
+      whole of `chart_reauthored`, not the widening helper alone: both halves of
+      the orientation fix are on that one path — the box widens LEFT and
+      `chart_from_range` reads a series per numeric ROW — and pinning only the
+      helper leaves a `false` in either call green,
+      `switching_a_scatter_whose_box_sits_on_its_points_does_not_eat_a_line`
+      (widen sideways / no room / a `<c:val>` chart's box left alone),
+      `a_scatter_whose_points_cannot_be_held_says_so_on_the_series`,
+      `a_row_laid_scatter_is_inferred_by_row_from_its_point_refs`, and the
+      unheld/cleared cases in
+      `picking_a_writable_type_clears_a_scatters_point_refs`,
+      `re_authoring_refuses_a_scatter_whose_box_covers_only_the_held_half`
+      (a refused ref refused / a held ref on another sheet refused, case-folded
+      / literal points still go through, beside a held ref or not / a re-point
+      puts the series beyond the question)
+
 ### Task 9: [Final] Update documentation
 
 - [x] document the reference syntax the fields accept, and which targets take a

@@ -407,18 +407,28 @@ pub(crate) fn parse_chart_for_test(xml: &str) -> ChartData {
 /// SpreadsheetML has no orientation element, so this asks the question Excel
 /// asks: what SHAPE is each series' `<c:val>`? One row across several columns
 /// (`$B$2:$D$2`) is a row series; one column down several rows (`$B$2:$B$5`) is
-/// a column series.
+/// a column series. A SCATTER's and a BUBBLE's numbers live in `<c:xVal>` /
+/// `<c:yVal>` / `<c:bubbleSize>` instead, so their `ChartSeries::point_refs`
+/// are measured the same way and vote alongside — without them those kinds have
+/// no `<c:val>` at all and every one of them would answer "column" by default,
+/// which `chart_set_kind`'s re-derivation now acts on. Only a MULTI-cell point
+/// ref votes, and unlike a `<c:val>` cell a single-cell one is not kept as
+/// stacked-cell evidence either: a one-point scatter is two single cells, and
+/// stacked down one column they would otherwise satisfy every clause of the
+/// stacked-cell rule below and answer `by_row` for a chart that says nothing
+/// about orientation.
 ///
 /// Ambiguity falls back to "column", because that is what every chart written
 /// before orientation existed is, and what the panel can always show. What
 /// counts as ambiguous:
 ///
 /// - **A single cell** (`$B$2`) is one row AND one column at once — it fits
-///   both readings, so it votes for neither. Several of them can still settle
-///   it between them; see below.
+///   both readings, so it votes for neither. Several `<c:val>` cells can still
+///   settle it between them; see below — point-ref cells cannot, per above.
 /// - **A series with no readable ref**: `<c:numLit>` values, or a ref this
-///   model cannot hold (`Sheet1!$B:$B`, a defined name). There is no shape to
-///   measure, so no vote — though such a chart's `<c:cat>` may still settle it
+///   model cannot hold (`Sheet1!$B:$B`, a defined name) — in either slot, so a
+///   scatter's unheld points (`ChartSeries::points_unheld`) are silent here too.
+///   There is no shape to measure, so no vote — though such a chart's `<c:cat>` may still settle it
 ///   below, since the categories are read whatever the series are made of.
 /// - **A rectangle** spanning both ways (`$B$2:$D$5`) is a shape neither
 ///   reading produces — a hand-authored or foreign chart. No vote.
@@ -486,6 +496,29 @@ fn infer_by_row(cd: &ChartData) -> bool {
     // up.
     let mut cells: Vec<(&str, u32, u32)> = Vec::new();
     for s in &cd.series {
+        // A scatter's and a bubble's numbers arrive under `<c:xVal>`/`<c:yVal>`
+        // rather than `<c:val>`, so `values_ref` is `None` for every series they
+        // have and the tally would otherwise see NOTHING — dropping through to
+        // the empty-`cells` fallback and answering `false` for every one of
+        // them, whichever way round it was laid out. That answer is no longer
+        // just the panel's reading: `chart_set_kind` re-derives such a chart
+        // through `chart_from_range`, so a row-laid scatter read column-wise
+        // comes back as N one-point series.
+        //
+        // The point refs have a shape to read like any other, and both of a
+        // series' refs run the same way — an X row is paired with a Y row — so
+        // they vote together. Only MULTI-cell ones are counted: a one-point
+        // scatter's X and Y are two single cells side by side, which says
+        // nothing about orientation and would be read as un-stacked evidence by
+        // the fallback below.
+        for v in &s.point_refs {
+            let (r1, c1, r2, c2) = v.range;
+            match (r1 == r2, c1 == c2) {
+                (true, false) => rows += 1,
+                (false, true) => cols += 1,
+                _ => {}
+            }
+        }
         let Some(v) = &s.values_ref else { continue };
         let (r1, c1, r2, c2) = v.range;
         match (r1 == r2, c1 == c2) {
@@ -531,7 +564,14 @@ fn infer_by_row(cd: &ChartData) -> bool {
 /// covering the other's cells. The panel's `rebuild_source` folds the same way
 /// in the same order, which is what makes a chart read identically before and
 /// after a save.
-fn fold_source(box_: &mut Option<crate::sheet::ChartSource>, src: crate::sheet::ChartSource) {
+///
+/// `pub` for exactly that reason: the suite's `rebuild_source` CALLS this
+/// rather than keeping its own copy. The two must decide a cross-sheet ref
+/// identically or a chart reads one way before a save and another after it,
+/// and an invariant two crates have to satisfy byte for byte is not one to
+/// maintain by hand in two places. The slot ORDER stays with each caller;
+/// only the one-ref-into-the-box decision is shared.
+pub fn fold_source(box_: &mut Option<crate::sheet::ChartSource>, src: crate::sheet::ChartSource) {
     match box_ {
         // Case-insensitively, because that is how a sheet name resolves
         // everywhere else — `Budget!$B$2` and `budget!$B$3` are one sheet's
@@ -581,6 +621,28 @@ fn parse_chart(xml: &str) -> ChartData {
     // Inside the point arrays a scatter or bubble chart plots instead of
     // `<c:cat>`/`<c:val>`.
     let mut in_pts = false;
+    // Whether the OPEN `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` yielded a ref we
+    // could hold. Its close is the only place that knows the element carried
+    // points nothing on the series records — a `<c:numLit>` has no `<c:f>` to
+    // fail on, so there is no per-ref moment to catch it at.
+    let mut pts_held = false;
+    // Whether the OPEN point element carried any points AT ALL — an `<c:f>`
+    // (held or refused), a `<c:pt>`, or a positive `<c:ptCount>`. A
+    // schema-legal EMPTY source (`<c:numLit><c:ptCount val="0"/></c:numLit>`,
+    // which is what a series added with no data looks like) holds nothing to
+    // lose, so it must not be marked `points_unheld` alongside the literal
+    // scatter that does: the mark sends `chart_set_kind` down the re-author
+    // door, and a chart that plots nothing would be refused there for a box it
+    // has no reason to need.
+    let mut pts_seen = false;
+    // Whether the OPEN point element named CELLS this model could not hold — an
+    // `<c:f>` with text in it that `parse_f_ref` refused. That is the half of
+    // `points_unheld` which says the chart's box is short of its plot: the ref
+    // names cells and the fold skipped every one of them. A `<c:numLit>` names
+    // no cells and leaves this false, which is what lets the panel's re-author
+    // door tell "no box could have covered these" from "the box misses half the
+    // plot". See `ChartSeries::points_ref_unheld`.
+    let mut pts_ref_bad = false;
     // Every series' CATEGORY and NAME ref, folded into the box only once the
     // loop has ended — see `fold_source` and the two folds after it. What a
     // chart IS is the numbers it plots, so `<c:val>` (and a scatter's points)
@@ -660,10 +722,22 @@ fn parse_chart(xml: &str) -> ChartData {
                     "val" if plotted => mode = 3,
                     // A scatter's/bubble's points: plotted cells, but under
                     // names `mode` doesn't cover.
-                    "xVal" | "yVal" | "bubbleSize" if plotted => in_pts = true,
+                    "xVal" | "yVal" | "bubbleSize" if plotted => {
+                        in_pts = true;
+                        pts_held = false;
+                        pts_seen = false;
+                        pts_ref_bad = false;
+                    }
+                    // A cache or literal that says how many points it holds.
+                    // Read only to tell an EMPTY point element from one whose
+                    // points went unheld; `<c:pt>` is what actually carries them.
+                    "ptCount" if in_pts => {
+                        pts_seen |= p.attr("val").trim().parse::<u64>().is_ok_and(|n| n > 0)
+                    }
                     // Capped: `idx` is an untrusted attribute, and it sizes a
                     // Vec. No cache can outgrow the sheet it reads.
                     "pt" => {
+                        pts_seen |= in_pts;
                         pt_idx = p
                             .attr("idx")
                             .trim()
@@ -672,6 +746,10 @@ fn parse_chart(xml: &str) -> ChartData {
                             .filter(|&i| i < crate::sheet::MAX_ROWS as usize)
                     }
                     "v" => in_v = true,
+                    // Whether it holds a POINT is a question about its text, so
+                    // `pts_seen` waits for the `Event::Text` arm below: `<c:f/>`
+                    // and `<c:f></c:f>` open and close here naming no cells at
+                    // all, and neither has a plot to lose.
                     "f" => in_f = true,
                     "t" if in_title => in_title_text = true,
                     // The series' OWN fill, which is the one `chart_space_xml`
@@ -746,6 +824,13 @@ fn parse_chart(xml: &str) -> ChartData {
                 // name and widen the chart's box to cover the title cell.
                 } else if in_f && ser_depth == 1 {
                     let raw = decoded(p.text()).trim().to_string();
+                    // A NON-EMPTY formula under `<c:xVal>`/`<c:yVal>`/
+                    // `<c:bubbleSize>` is point content whether or not
+                    // `parse_f_ref` can hold it: held, it fills `point_refs`
+                    // below; unheld, it is exactly the plot the close arm marks
+                    // `points_unheld` for. An empty one names nothing and must
+                    // leave the element as blank as `<c:ptCount val="0"/>` does.
+                    pts_seen |= in_pts && !raw.is_empty();
                     // Excel's MULTI-LEVEL category (`<c:multiLvlStrRef>`, one
                     // `<c:lvl>` per level) names every level's cells in one
                     // `<c:f>`, where this model holds a single line of labels.
@@ -837,6 +922,7 @@ fn parse_chart(xml: &str) -> ChartData {
                             if let Some(sr) = cd.series.last_mut() {
                                 sr.point_refs.push(src.clone());
                             }
+                            pts_held = true;
                             fold_source(&mut cd.source, src);
                         }
                     } else if mode != 0 {
@@ -850,6 +936,18 @@ fn parse_chart(xml: &str) -> ChartData {
                         // type in the panel is still the way to author it
                         // afresh, exactly as for a stacked or combo chart.
                         unparsed_ref = true;
+                    } else if in_pts && !raw.is_empty() {
+                        // The same refusal under a point element, where there is
+                        // no `mode` for the arm above to catch it by. It names
+                        // cells the fold could not take, so the box comes out
+                        // short of the plot — the one thing that separates this
+                        // from a `<c:numLit>`, and what the re-author door
+                        // refuses on. `complex` is deliberately NOT set here:
+                        // unlike a `<c:cat>`/`<c:val>` the writer would flatten
+                        // to literals, a scatter's points are already held back
+                        // by `chart_would_lose_points`, which reads the mark
+                        // this sets on the close.
+                        pts_ref_bad = true;
                     }
                 } else if in_title_text {
                     cd.title.push_str(&decoded(p.text()));
@@ -874,7 +972,35 @@ fn parse_chart(xml: &str) -> ChartData {
                         mode = 0;
                         multi_lvl = false;
                     }
-                    "xVal" | "yVal" | "bubbleSize" => in_pts = false,
+                    // Points this model could not hold — literal `<c:numLit>`
+                    // ones, or an `<c:f>` `parse_f_ref` refused. Nothing else on
+                    // the series would remember them (a scatter has no
+                    // `values_ref`, no `col` and no cached numbers either way),
+                    // so say so here: an unmarked one is indistinguishable from
+                    // the empty series "+ Series" pushes, and picking a writable
+                    // type would then relabel it and let the next save write
+                    // `<c:ptCount val="0"/>` over a plot it can never re-read.
+                    //
+                    // `pts_seen` keeps an EMPTY point element out of that: one
+                    // holding no `<c:f>`, no `<c:pt>` and `<c:ptCount val="0"/>`
+                    // has no plot to destroy, and marking it would send a chart
+                    // that draws nothing down the re-author door to be refused
+                    // for a box it never needed.
+                    "xVal" | "yVal" | "bubbleSize" => {
+                        if in_pts {
+                            if let Some(sr) = cd.series.last_mut() {
+                                if pts_seen && !pts_held {
+                                    sr.points_unheld = true;
+                                }
+                                // The narrower mark, which only a refused `<c:f>`
+                                // sets: it says the plot reaches cells the box
+                                // does not, where the wider one also covers
+                                // literals that reach no cells at all.
+                                sr.points_ref_unheld |= pts_ref_bad;
+                            }
+                        }
+                        in_pts = false;
+                    }
                     _ => {}
                 }
                 depth -= 1;
@@ -2038,6 +2164,140 @@ mod tests {
             <c:val><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt><c:pt idx="1"><c:v>5</c:v></c:pt></c:numCache></c:numRef></c:val>
           </c:ser></c:barChart></c:plotArea></c:chart></c:chartSpace>"#;
         assert!(parse_chart(bar).series[0].point_refs.is_empty());
+        assert!(!parse_chart(bar).series[0].points_unheld);
+    }
+
+    /// The points this model cannot turn into a ref — literal `<c:numLit>` ones,
+    /// or an `<c:f>` `parse_f_ref` refuses. They leave `point_refs` EMPTY, which
+    /// from the panel is indistinguishable from the empty series "+ Series"
+    /// pushes: no refs, no `col`, no cached numbers either way. So the loader
+    /// says outright that the series held points, and `chart_would_lose_points`
+    /// reads it — without which picking a writable type relabels such a chart
+    /// and the next save writes `<c:ptCount val="0"/>` over a plot that can
+    /// never be read back.
+    #[test]
+    fn a_scatter_whose_points_cannot_be_held_says_so_on_the_series() {
+        // Literal points: no `<c:f>` at all, so there is no ref to fail on.
+        let lit = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:scatterChart><c:scatterStyle val="lineMarker"/>
+          <c:ser><c:idx val="0"/><c:tx><c:v>Speed</c:v></c:tx>
+            <c:xVal><c:numLit><c:pt idx="0"><c:v>1</c:v></c:pt><c:pt idx="1"><c:v>2</c:v></c:pt></c:numLit></c:xVal>
+            <c:yVal><c:numLit><c:pt idx="0"><c:v>4</c:v></c:pt><c:pt idx="1"><c:v>9</c:v></c:pt></c:numLit></c:yVal>
+          </c:ser></c:scatterChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(lit);
+        assert!(cd.series[0].point_refs.is_empty());
+        assert!(cd.series[0].points_unheld);
+        // Literal points name NO cells, so nothing here says the chart's box is
+        // short of its plot — only the wider mark is set.
+        assert!(!cd.series[0].points_ref_unheld);
+        // Nothing folded a box either, so the panel's re-author door has the
+        // clean "no data range" answer to give rather than a silent empty plot.
+        assert!(cd.source.is_none());
+
+        // A whole-column ref: `parse_f_ref` refuses it, and under `<c:xVal>`
+        // there is no `mode` for the `unparsed_ref` arm to catch it by.
+        let col = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:scatterChart><c:scatterStyle val="lineMarker"/>
+          <c:ser><c:idx val="0"/>
+            <c:xVal><c:numRef><c:f>Sheet1!$A:$A</c:f></c:numRef></c:xVal>
+            <c:yVal><c:numRef><c:f>Sheet1!$B$2:$B$3</c:f></c:numRef></c:yVal>
+          </c:ser></c:scatterChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(col);
+        // The half it COULD hold is still held — the mark is per element, and
+        // one unheld half is enough to make the series a loss.
+        assert_eq!(cd.series[0].point_refs.len(), 1);
+        assert!(cd.series[0].points_unheld);
+        // And the NARROWER mark with it: this element named cells, so the box
+        // the fold came out with is short of the plot. That is what the panel's
+        // re-author door refuses on, where the literal above goes through.
+        assert!(cd.series[0].points_ref_unheld);
+
+        // An EMPTY point element is not the same thing. A series added with no
+        // data is schema-legal (`<c:ptCount val="0"/>`, or nothing at all) and
+        // holds no plot to destroy, so it must arrive unmarked — marked, it
+        // would send a chart that draws nothing down the re-author door and be
+        // refused there for a box it never needed.
+        let none = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:scatterChart><c:scatterStyle val="lineMarker"/>
+          <c:ser><c:idx val="0"/><c:tx><c:v>Speed</c:v></c:tx>
+            <c:xVal><c:numLit><c:ptCount val="0"/></c:numLit></c:xVal>
+            <c:yVal/>
+          </c:ser></c:scatterChart></c:plotArea></c:chart></c:chartSpace>"#;
+        let cd = parse_chart(none);
+        assert!(cd.series[0].point_refs.is_empty());
+        assert!(!cd.series[0].points_unheld);
+        assert!(!cd.series[0].points_ref_unheld);
+
+        // Nor is an EMPTY `<c:f>`, which is the same empty element written the
+        // other legal way round: a `<c:numRef>` whose formula names no cells
+        // holds no plot either, and the open tag alone must not stand in for
+        // one. Marked, this chart would be refused a writable type for a box it
+        // never needed.
+        let empty_f = none
+            .replace(
+                r#"<c:numLit><c:ptCount val="0"/></c:numLit>"#,
+                "<c:numRef><c:f/></c:numRef>",
+            )
+            .replace(
+                "<c:yVal/>",
+                "<c:yVal><c:numRef><c:f>  </c:f></c:numRef></c:yVal>",
+            );
+        let cd = parse_chart(&empty_f);
+        assert!(cd.series[0].point_refs.is_empty());
+        assert!(!cd.series[0].points_unheld);
+        // An empty `<c:f>` names no cells either, so it must not claim the box
+        // misses any: marked, every such chart would be refused a writable type
+        // for a plot it hasn't got.
+        assert!(!cd.series[0].points_ref_unheld);
+        assert!(cd.source.is_none());
+
+        // One that names cells it cannot hold still marks, text or no cache:
+        // that is the plot the mark exists for.
+        let unheld = empty_f.replace("<c:f/>", "<c:f>Sheet1!$A:$A</c:f>");
+        assert!(parse_chart(&unheld).series[0].points_unheld);
+        assert!(parse_chart(&unheld).series[0].points_ref_unheld);
+        // A whole-column `<c:f>` under a POINT element is not `complex`: the
+        // series is already held back from the writer by its points, and marking
+        // the chart complex would shut the re-author door that is the way out.
+        assert!(!parse_chart(&unheld).complex);
+    }
+
+    /// A scatter has no `<c:val>` for `infer_by_row` to measure, so without its
+    /// point refs every one of them reads "column" whichever way it was laid
+    /// out — and `chart_set_kind` now re-derives on that answer, turning a
+    /// row-laid scatter into N one-point series.
+    #[test]
+    fn a_row_laid_scatter_is_inferred_by_row_from_its_point_refs() {
+        let rows = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:scatterChart><c:scatterStyle val="lineMarker"/>
+          <c:ser><c:idx val="0"/>
+            <c:xVal><c:numRef><c:f>Sheet1!$B$2:$F$2</c:f></c:numRef></c:xVal>
+            <c:yVal><c:numRef><c:f>Sheet1!$B$3:$F$3</c:f></c:numRef></c:yVal>
+          </c:ser></c:scatterChart></c:plotArea></c:chart></c:chartSpace>"#;
+        assert!(parse_chart(rows).by_row);
+
+        // The column layout is the same evidence the other way up.
+        let cols = rows
+            .replace("$B$2:$F$2", "$A$2:$A$6")
+            .replace("$B$3:$F$3", "$B$2:$B$6");
+        assert!(!parse_chart(&cols).by_row);
+
+        // A ONE-point scatter is two single cells, and one legal way to lay a
+        // single coordinate out is stacked down a column (X above Y). That says
+        // nothing about orientation, and must not be read as the stacked-cell
+        // evidence the fallback looks for — which is exactly what it would be
+        // without the multi-cell guard on the `point_refs` tally above: two
+        // single cells in one column with different rows satisfies every clause
+        // of it, and this chart would come back `by_row`, to be re-derived the
+        // wrong way round on a type click.
+        let one = rows
+            .replace("$B$2:$F$2", "$A$2")
+            .replace("$B$3:$F$3", "$A$3");
+        assert!(!parse_chart(&one).by_row);
+
+        // Side by side is the other layout, and the fallback answers it `false`
+        // on its own account (different columns are not stacked) rather than the
+        // guard doing so. Kept because both layouts must come out the same way.
+        let side = rows
+            .replace("$B$2:$F$2", "$A$2")
+            .replace("$B$3:$F$3", "$B$2");
+        assert!(!parse_chart(&side).by_row);
     }
 
     /// Two single-cell series stacked down one column are read as a row chart

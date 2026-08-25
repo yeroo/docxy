@@ -135,7 +135,10 @@ A sheet the workbook hasn't got is refused by name under the field instead.
 
 Re-pointing keeps the chart's `complex` flag (`chart_apply_range`): a stacked or
 combo plot area still round-trips verbatim, and only **picking a type**
-(`chart_set_kind`) says "author this one afresh". The box itself is **rebuilt**
+(`chart_set_kind`) says "author this one afresh" — which for a chart carrying no
+numbers the writer could plot, an imported scatter or bubble, means exactly that:
+the box goes back through `chart_from_range` (`chart_reauthored`) instead of the
+chart being relabelled into one the save would empty. The box itself is **rebuilt**
 rather than grown (`rebuild_source`): the fold starts empty and walks every slot
 — each series' values (and, for a scatter or bubble, its `point_refs`, since
 those kinds plot from `<c:xVal>`/`<c:yVal>` and carry no `<c:val>` at all), then
@@ -165,10 +168,11 @@ Series can also be added, removed and reordered from the panel. A reorder closes
 the gap behind the series rather than swapping it with its destination — the
 arrows only ever send ±1, where the two agree, but the helper is written for what
 it says. Both **rebuild the box**, like every other slot-mutating path: a
-deleted series takes its slots with it, so the box must shrink or DATA RANGE
-goes on offering the deleted column and Enter there re-derives it; and a reorder
-changes which values ref folds FIRST, which is what decides the sheet the box
-names. `parse_chart` rebuilds from the surviving refs in document order on the
+deleted series takes its slots with it, so the box shrinks off its column when
+that column is at an EDGE of the box (the box is a rectangle, so deleting a
+MIDDLE series leaves it exactly as wide — DATA RANGE goes on offering the
+deleted column, and Enter there re-derives it); and a reorder changes which
+values ref folds FIRST, which is what decides the sheet the box names. `parse_chart` rebuilds from the surviving refs in document order on the
 next open either way, so skipping it would only make the panel read one way
 before a save and another after it. A pie takes one series and `chart_space_xml` writes only the first, so
 `+ Add series` refuses there rather than listing one the save would drop. The
@@ -221,11 +225,18 @@ parsed off and discarded, so typing `Budget!A1:D5` while looking at Sheet2
 silently plotted Sheet2's `A1:D5`.) Resolution is `sheet_index_of`, matching
 **case-insensitively for ASCII names** because Excel does; `None` means the
 sheet in front of you. The fold is `eq_ignore_ascii_case`, so a name outside
-ASCII matches only at its own case: `бюджет!A1` does not find `Бюджет`. That is
-the convention every by-name lookup in the app shares, and changing it here
-alone would let resolution and the wash disagree about one reference. Two
-sheets differing only in case — which Excel forbids but a hand-built file can
-carry — resolve to the first, as every other by-name lookup does.
+ASCII matches only at its own case: `бюджет!A1` does not find `Бюджет`. The
+same fold decides `preview_range` (which delegates to `sheet_index_of`), the
+sheet-name uniqueness check, and `bar_range_text` — the **wash** that spells a
+reference back out — so changing it here alone would let resolution and the
+wash disagree about one reference. It is not, however, universal: the
+in-workbook hyperlink jump (`sheet_follow_hyperlink`) and a validation list's
+range source (`dv_list_values`) still match a sheet name byte for byte, so
+`=Budget!A1:A9` as a DV source finds nothing if the sheet is spelt `budget`.
+That is a separate, older inconsistency this reference syntax didn't reach, not
+a counter-rule. Two sheets differing only in case — which Excel forbids but a
+hand-built file can carry — resolve to the first, in each of the folding
+lookups above.
 
 Whether a foreign sheet is resolved or refused is per target
 (`target_takes_foreign_sheet`), and turns on what the field *feeds*, not on the
@@ -453,9 +464,11 @@ panel's focused field when the selection moves to a *different* chart, since
 chart `edited`, and an edited chart's part is *regenerated* from our model on
 save — which is how a new `<c:f>` reaches the file at all. `chart_space_xml`
 authors bar, column, line and pie; a scatter, area, doughnut, radar or bubble
-chart run through it would come back as a clustered column chart, and (since
-`parse_chart` reads `<c:cat>`/`<c:val>` but never `<c:xVal>`/`<c:yVal>`) an
-empty one. The *plot area* has the same limit: `chart_space_xml` writes one
+chart run through it would come back as a clustered column chart, and an empty
+one: `parse_chart` reads a scatter's and a bubble's
+`<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` *refs* (they fold into the box and stay
+on the series as `ChartSeries::point_refs`) but caches no numbers from them, so
+the writer finds nothing to put in a `<c:val>`. The *plot area* has the same limit: `chart_space_xml` writes one
 group, clustered (bar/column) or standard (line), so a stacked chart would come
 back clustered and a combo chart — bars and a line sharing a plot area — would
 fold every series onto the bar axis. `parse_chart` records that as
@@ -463,7 +476,12 @@ fold every series onto the bar axis. `parse_chart` records that as
 those parts round-trip verbatim instead, and the panel says so under the type
 buttons. The cost is that a rename or a row insert can't follow their refs
 either — a stale ref beats a destroyed chart, and picking a type we can author
-(which clears `complex`) fixes both.
+fixes both. Picking one is not always a relabel: a chart whose series still hold
+nothing but points is *re-read* from its data range instead (`chart_reauthored`),
+because relabelling that one would hand the writer the empty `<c:val>` above.
+The note under the type buttons says which of the three the click will do —
+relabel, re-read, or refuse — by making the re-read call itself rather than
+guessing from whether the chart has a box.
 
 Chart refs are now real refs in the file, so **they have to follow the grid**:
 `structural_edit` runs every `ChartSource` through the same `span`/`point`

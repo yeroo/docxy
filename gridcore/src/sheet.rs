@@ -603,6 +603,8 @@ fn chart_from_columns(
             // Authored from a range, so it plots through `<c:val>`; only a
             // scatter or bubble read from a file carries point refs.
             point_refs: Vec::new(),
+            points_unheld: false,
+            points_ref_unheld: false,
         })
         .collect();
     Some(ChartData {
@@ -708,6 +710,8 @@ fn chart_from_rows(
             // Authored from a range, so it plots through `<c:val>`; only a
             // scatter or bubble read from a file carries point refs.
             point_refs: Vec::new(),
+            points_unheld: false,
+            points_ref_unheld: false,
         })
         .collect();
     Some(ChartData {
@@ -754,14 +758,68 @@ pub struct ChartSeries {
     /// `<c:yVal>` and `<c:bubbleSize>` refs, in document order.
     ///
     /// Those kinds plot from their own elements rather than from `<c:val>`, so
-    /// `values_ref` is `None` for them however live the series is. They are
-    /// still NUMBERS, and the chart's box is built from the numbers — keeping
-    /// them here is what lets the panel's `rebuild_source` see the same cells
-    /// the loader folded, instead of rebuilding a scatter's box out of its
-    /// label cells alone and collapsing the DATA RANGE it shows.
+    /// the loader leaves `values_ref` `None` for them. They are still NUMBERS,
+    /// and the chart's box is built from the numbers — keeping them here is
+    /// what lets the panel's `rebuild_source` see the same cells the loader
+    /// folded, instead of rebuilding a scatter's box out of its label cells
+    /// alone and collapsing the DATA RANGE it shows.
     ///
-    /// Empty for every kind the writer authors; those carry `values_ref`.
+    /// The two slots CAN coexist: the panel's SERIES VALUES field is offered
+    /// for every kind, so re-pointing a scatter's series installs a
+    /// `values_ref` beside these. That is deliberate — the part still
+    /// round-trips verbatim, so the next `parse_chart` reads these refs back
+    /// out of it, and clearing them on a re-point would collapse the box the
+    /// reload rebuilds. `rebuild_source` folds both, in that order.
+    ///
+    /// Empty for every kind the writer authors: nothing here derives them for
+    /// one, and `chart_set_kind` — the one door that converts an imported chart
+    /// into a writable kind — leaves none behind, because the writer regenerates
+    /// such a part from `values_ref`, `categories_ref` and the box alone. It
+    /// gets there two ways: a series that gained a `values_ref` from a re-point
+    /// simply has these cleared (`chart_take_kind`), while one still carrying
+    /// nothing but points would regenerate as an EMPTY chart, so that chart is
+    /// re-derived from its box instead (`chart_reauthored`) and comes back with
+    /// real `values_ref`s and no points at all.
+    ///
+    /// Re-based by `edit::rename_sheet_in_chart` and `edit::shift_chart_refs`
+    /// like every other [`ChartSource`] a chart holds.
     pub point_refs: Vec<ChartSource>,
+    /// This series had `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` points the model
+    /// could not turn into a ref: a `<c:numLit>` (literal points, no `<c:f>` at
+    /// all) or an `<c:f>` [`ChartSource::parse_f_ref`] refuses — a whole column,
+    /// a defined name, a multi-area ref.
+    ///
+    /// Set per point ELEMENT, not per series: whenever ANY ONE of the series'
+    /// `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` held points it yielded no ref for.
+    /// So it can sit beside a NON-EMPTY `point_refs` when only one half was
+    /// readable — a `<c:xVal>` naming `Sheet1!$A:$A` next to a `<c:yVal>` naming
+    /// `Sheet1!$B$2:$B$3` leaves one ref and this mark.
+    ///
+    /// It has to be recorded separately because nothing else on the series
+    /// remembers the unreadable half: `values_ref` and `col` are `None` and
+    /// `values` empty for a scatter either way, so a series whose points were ALL
+    /// unreadable is indistinguishable from the empty one "+ Series" pushes.
+    /// `chart_would_lose_points` asks both slots, which is what
+    /// keeps picking a writable type from relabelling this chart and letting the
+    /// next save write `<c:ptCount val="0"/>` over a plot it could never re-read.
+    ///
+    /// Never set by anything docxy authors — like `point_refs`, it only ever
+    /// arrives from a file, and `chart_take_kind` clears it with them.
+    pub points_unheld: bool,
+    /// The narrower half of [`Self::points_unheld`]: one of those point elements
+    /// held an `<c:f>` NAMING cells that [`ChartSource::parse_f_ref`] refused —
+    /// a whole column, a defined name, a multi-area ref.
+    ///
+    /// The two are worth telling apart because they answer different questions
+    /// about the chart's BOX. Literal points (`<c:numLit>`) live in no cells at
+    /// all, so no box could have covered them and the one the chart has is the
+    /// best that exists. A refused REF names cells the fold then skipped, so the
+    /// box is provably short of the plot and re-deriving from it would drop the
+    /// half that is off it. Only this mark says the second thing; `points_unheld`
+    /// says either, which is all `chart_would_lose_points` needs to know.
+    ///
+    /// Set per point ELEMENT like its wider half, and cleared with it.
+    pub points_ref_unheld: bool,
 }
 
 /// One data-validation rule over a set of cell ranges.

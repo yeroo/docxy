@@ -1587,18 +1587,21 @@ fn unquote_sheet_name(prefix: &str) -> Option<String> {
 /// Matching is case-insensitive for ASCII names, because Excel's is:
 /// `budget!A1` finds the `Budget` sheet. The fold is `eq_ignore_ascii_case`, so
 /// a name outside ASCII matches only at its own case — `бюджет!A1` does NOT
-/// find `Бюджет`. That is the settled convention everywhere this app looks a
-/// sheet up by name (`preview_range`, and the rename uniqueness check), and
-/// folding here alone would let resolution and the wash disagree about the same
-/// reference — so the limit is stated rather than fixed in one place.
+/// find `Бюджет`. The same fold decides `preview_range` (which delegates here),
+/// the rename uniqueness check, and `bar_range_text` — the wash that spells a
+/// reference back out — so folding HERE alone would let resolution and the wash
+/// disagree about the same reference. The limit is stated rather than fixed in
+/// one place for that reason. (It is not universal: `sheet_follow_hyperlink`
+/// and `dv_list_values` still match a sheet name byte for byte, a separate and
+/// older inconsistency this reference syntax didn't reach.)
 ///
 /// A name matching nothing is REFUSED rather than falling back to `active`:
 /// silently redirecting a qualifier someone typed is the bug this reference
 /// syntax exists to remove.
 ///
 /// Excel forbids two sheets whose names differ only in case, but a hand-built
-/// file can carry them; the first one wins, as it does everywhere else the app
-/// looks a sheet up by name.
+/// file can carry them; the first one wins, as it does in each of the lookups
+/// above.
 fn sheet_index_of(names: &[String], sheet: Option<&str>, active: usize) -> Result<usize, String> {
     let Some(want) = sheet else {
         return Ok(active);
@@ -1733,13 +1736,11 @@ fn ref_source(
 /// nothing to rebuild it from, and dropping it would blank DATA RANGE.
 fn rebuild_source(data: &mut gridcore::sheet::ChartData) {
     use gridcore::sheet::ChartSource;
-    fn fold(box_: &mut Option<ChartSource>, src: ChartSource) {
-        match box_ {
-            Some(b) if b.sheet.eq_ignore_ascii_case(&src.sheet) => b.union(&src),
-            Some(_) => {}
-            slot => *slot = Some(src),
-        }
-    }
+    // The loader's own fold, called rather than copied: the two have to settle
+    // a cross-sheet ref identically or a chart reads one way before a save and
+    // another after it. The ORDER below is this function's; the decision it
+    // makes per ref is `parse_chart`'s.
+    let fold = gridcore::drawing::fold_source;
     let mut built = None;
     // The NUMBERS decide which sheet the box names: every series' values, in
     // series order. That is what the chart IS — the labels and the headers only
@@ -1812,8 +1813,8 @@ fn series_values_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<
 /// pointed at cells, coloured, and then dropped on save without a word.
 ///
 /// There are five ways a pie can come to hold a second series through the
-/// panel. This is the question four of them ask; `series_add` asks the same
-/// question in its own words:
+/// panel. This is the question four of them ask — one of them twice;
+/// `series_add` asks the same question in its own words:
 ///
 /// - `series_add` — the explicit "+ Series" button, which does NOT call this.
 ///   It refuses at `n > 0` BEFORE pushing, which is this rule on the count the
@@ -1825,10 +1826,16 @@ fn series_values_shape_err(by_row: bool, range: (u32, u32, u32, u32)) -> Option<
 /// - `chart_switch_row_column` — a flip turns N categories into N one-point
 ///   series, so it reaches the state in ONE click.
 /// - `chart_set_kind` — picking **Pie** on a chart that already has N series.
-///   This one does not re-derive: it keeps `data.series` and rewrites `kind`,
+///   It USUALLY does not re-derive: it keeps `data.series` and rewrites `kind`,
 ///   which is why "guard every re-derivation" is not enough. It is also the
 ///   widest door of the five, since it is what a user reaches by clicking the
-///   word *Pie*.
+///   word *Pie*. It asks TWICE, because the one chart it does re-derive — a
+///   scatter or bubble the writer would save empty (`chart_would_lose_points`)
+///   — comes back from `chart_reauthored` with a series per numeric column of
+///   its box rather than the ones on screen, so the count that walked past the
+///   first check is not the count the user would get. The second ask is inside
+///   `chart_reauthored`, on the re-derived plot, and its refusal can therefore
+///   name a count the panel is not showing.
 /// - `sheet_insert_chart` — Insert ▸ Pie over a range with several numeric
 ///   columns, which `chart_from_range` reads as a series each.
 ///
@@ -1934,6 +1941,402 @@ fn chart_range_help(by_row: bool) -> &'static str {
     }
 }
 
+/// Give a chart the type the panel's buttons picked, in place.
+///
+/// Picking a type is the explicit "author this one afresh" the panel's note
+/// asks for, so `complex` is cleared with it: a stacked or combo plot area held
+/// the part back, and the user has now said what to replace it with.
+///
+/// `point_refs` go too, when the new kind is one the WRITER authors. They are a
+/// scatter's and a bubble's `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>`, and
+/// `chart_space_xml`'s bar/column/line/pie arms emit none of those elements:
+/// such a part is regenerated from `values_ref`, `categories_ref` and the box
+/// alone. Carried across the conversion they would leave `rebuild_source`
+/// folding cells the converted chart no longer plots, stretching the box back
+/// over the obsolete X column the next time any field commits.
+///
+/// (Not the writer's `<c:cat>` fallback, which is a question about the BOX:
+/// that reads `data.source`'s `cat_col`, never these, so clearing them is not
+/// what keeps an obsolete category ref out of the file. Re-deriving the chart
+/// is — see [`chart_reauthored`].)
+///
+/// The series that reach here still HOLDING points are the ones a re-point gave
+/// a `values_ref` beside them; `ChartSeries::point_refs` records that the two
+/// slots coexist. A series carrying nothing but points never gets this far,
+/// whichever OTHER series the same chart has: `chart_would_lose_points` asks per
+/// series, so `chart_set_kind` authors that whole chart afresh from its box
+/// instead of converting it into one the writer would save with an empty
+/// `<c:val>` where those points were. So the BOX is left as it stands — it is
+/// what DATA RANGE offers — and what the next `rebuild_source` folds is the
+/// `values_ref` beside the cleared points, not a lone name cell.
+///
+/// Cleared here rather than in `series_set_values`, because a scatter that
+/// STAYS a scatter still needs them to match what the next `parse_chart` reads
+/// back out of its round-tripped part.
+fn chart_take_kind(data: &mut gridcore::sheet::ChartData, kind: &str) {
+    data.kind = kind.to_string();
+    data.complex = false;
+    if gridcore::xlsx::chart_kind_is_writable(kind) {
+        for s in &mut data.series {
+            s.point_refs.clear();
+            // The same slot, for the points the LOADER could not hold. A series
+            // reaching here still marked was re-pointed by hand (a series with
+            // nothing but unheld points goes through `chart_reauthored`
+            // instead), so it plots from `values_ref` now and the mark is as
+            // obsolete as the refs beside it.
+            s.points_unheld = false;
+            s.points_ref_unheld = false;
+        }
+    }
+}
+
+/// Whether relabelling this chart a writable kind would hand `chart_space_xml`
+/// a series holding points it cannot write — the question that decides whether
+/// picking such a type may simply RELABEL the chart or has to author it afresh.
+///
+/// The writer takes a series' `<c:val>` from one of three places: its own
+/// `values_ref`, the chart's box plus the series' `col`, or — for a snapshot
+/// chart — the cached `values` written back as a `<c:numLit>`. A scatter's and
+/// a bubble's points come from none of the three. `parse_chart` keeps their
+/// `<c:xVal>`/`<c:yVal>` REFS (`ChartSeries::point_refs`) but caches no numbers
+/// from them, and never sets `col`, which is exactly why
+/// `chart_kind_is_writable` refuses those kinds. Relabel such a series `column`
+/// and every one of the three lookups comes back empty: the save writes
+/// `<c:val><c:numLit><c:ptCount val="0"/></c:numLit></c:val>` over the part,
+/// and its 50 points are gone.
+///
+/// Asked per SERIES, because `chart_space_xml` writes each one independently.
+/// A scatter whose first series a re-point gave a `values_ref` and whose second
+/// still carries nothing but points is not half safe: relabel it and the file
+/// keeps the half the user touched and loses the half nobody did, silently and
+/// with no `complex` to hold the part back. One such series is enough to send
+/// the whole chart through [`chart_reauthored`], which reads every numeric
+/// column of the box and so brings both back carrying refs the writer can emit.
+///
+/// "It holds points" is what makes it a LOSS rather than an empty series the
+/// user built themselves: "+ Series" pushes one with no refs and no numbers
+/// (`series_add` — `values` is empty whenever the chart has no categories yet),
+/// and that one has nothing to destroy, while re-deriving the chart over it
+/// would throw away the hand edits on every OTHER series. So the question is
+/// not "can the writer emit this series" but "does it hold points the writer
+/// cannot emit". A chart with no series at all is already the empty chart, so
+/// it relabels too — there is no plot to destroy.
+///
+/// Which is why it takes TWO slots to ask, not just `point_refs`. That vec is
+/// filled only when the loader could parse a `<c:f>` out of the point elements;
+/// a scatter whose points are literal (`<c:xVal><c:numLit>`) or name a whole
+/// column has just as much to lose and would arrive here indistinguishable from
+/// the freshly-added empty series above. `parse_chart` marks that case
+/// `ChartSeries::points_unheld` for exactly this question. Such a chart usually
+/// has no box worth re-deriving either, and that is the point: it gets
+/// `chart_reauthored`'s refusal — `CHART_NO_BOX`, or the shape its range fails
+/// to plot — where before it got a silent `<c:ptCount val="0"/>`.
+fn chart_would_lose_points(data: &gridcore::sheet::ChartData) -> bool {
+    data.series.iter().any(series_loses_points)
+}
+
+/// [`chart_would_lose_points`] asked of ONE series, so the two questions that
+/// need it — "is this chart's plot at risk" and "which half of it is off the
+/// box" ([`chart_points_off_box`]) — cannot drift apart.
+fn series_loses_points(s: &gridcore::sheet::ChartSeries) -> bool {
+    (!s.point_refs.is_empty() || s.points_unheld)
+        && s.values_ref.is_none()
+        && s.col.is_none()
+        && s.values.is_empty()
+}
+
+/// Whether a series the re-author is about to rescue plots cells the box `src`
+/// provably does NOT cover.
+///
+/// Two shapes answer yes, and both are the same defect: the series names cells
+/// and `rebuild_source` folded none of them, so the box describes part of the
+/// plot and re-deriving from it would drop the rest.
+///
+/// - **A ref the loader could not hold** (`ChartSeries::points_ref_unheld`).
+///   The marks are per point ELEMENT, so one series can carry both: an
+///   `<c:xVal>` naming `Sheet1!$A:$A` (which `parse_f_ref` refuses) beside a
+///   `<c:yVal>` the loader held gives `point_refs.len() == 1` AND the mark.
+/// - **A held ref naming ANOTHER SHEET than the box.** Excel is happy for a
+///   scatter's X to sit on `Data` and its Y on `Other`, and
+///   [`gridcore::drawing::fold_source`] SKIPS the second rather than unioning
+///   across sheets (which would leave the box naming one sheet and covering the
+///   other's cells). Nothing else marks that skip — `complex` is not set for it,
+///   because a point element carries no `mode` — so the sheets have to be
+///   compared here. `chart_from_range` reads ONE sheet, so a re-derivation would
+///   plot the half on the box's sheet and silently lose the half that is not.
+///
+/// Either way the box comes out over one coordinate alone — and
+/// [`chart_reauthored`] would widen THAT and plot it, converting the scatter to
+/// a chart of one coordinate with the other silently outside the range it
+/// re-read. The status line's "the series below are the range's" is true and
+/// still says nothing about the half that was never in the range.
+///
+/// LITERAL points (`<c:numLit>`, marked `points_unheld` but not
+/// `points_ref_unheld`) are a different shape and deliberately not caught, even
+/// when they sit beside a held ref on the same series: they are in no cells at
+/// all, so there is no box that could have covered them and re-deriving from
+/// the one the chart has is the best that exists. Asking `points_unheld` here
+/// instead would refuse an ordinary bubble whose `<c:bubbleSize>` is a literal
+/// beside held X/Y refs — a chart whose box covers every cell its plot names.
+///
+/// Asked of the series [`chart_would_lose_points`] answers for, not of every
+/// series: one whose `values_ref` a re-point already filled is saved by the
+/// writer as it stands, its ref is in the fold, and the unheld element beside
+/// it is what `chart_take_kind` clears on any relabel anyway.
+fn chart_points_off_box(
+    data: &gridcore::sheet::ChartData,
+    src: &gridcore::sheet::ChartSource,
+) -> bool {
+    data.series
+        .iter()
+        .filter(|s| series_loses_points(s))
+        .any(|s| {
+            s.points_ref_unheld
+                // Case-insensitively, the way a sheet name resolves everywhere
+                // else and the way `fold_source` itself decided to skip the ref.
+                || s.point_refs
+                    .iter()
+                    .any(|p| !p.sheet.eq_ignore_ascii_case(&src.sheet))
+        })
+}
+
+/// Whether the chart's box was folded out of POINT refs, and so need not lead
+/// with a header line at all.
+///
+/// The provenance question, asked of the slots that answer it: `<c:xVal>`,
+/// `<c:yVal>` and `<c:bubbleSize>` are the only things `parse_chart` folds into
+/// a box that `chart_from_range` would go on to read as a header — everything
+/// else in the fold is either a `<c:val>` (which starts a line BELOW the header
+/// row, because that is where the derivation put it) or a label slot that
+/// stretches the box up over one. A chart with no point refs anywhere therefore
+/// has the box the user can see in DATA RANGE, shaped the way
+/// [`gridcore::sheet::chart_from_range`] shapes one.
+///
+/// Deliberately NOT [`chart_would_lose_points`], which is the narrower question
+/// "would a relabel throw points away" and goes false the moment a series is
+/// re-pointed. `series_set_values` fills `values_ref` and leaves `point_refs`
+/// alone — `rebuild_source` still folds them, so the box still sits on the
+/// points — and gating the widening on the narrow question would hand the
+/// re-pointed scatter's unwidened box to `chart_from_range` to eat a line of.
+/// Asked of the whole CHART rather than per series, because it is one box.
+fn chart_box_from_points(data: &gridcore::sheet::ChartData) -> bool {
+    data.series
+        .iter()
+        .any(|s| !s.point_refs.is_empty() || s.points_unheld)
+}
+
+/// The chart's box, widened by one line if its leading one is PLOTTED rather
+/// than a header — or `None` when there is no line to widen into.
+///
+/// [`chart_from_range`](gridcore::sheet::chart_from_range) reads every box the
+/// same way: with `by_row` false the box's first ROW names the series and the
+/// data starts one row below it (`chart_from_columns` plots `r0 + 1..=r1`),
+/// transposed for `by_row`. Every box docxy itself derives has that shape,
+/// because that derivation is where it came from.
+///
+/// An imported SCATTER's does not. `parse_chart` folds a scatter's box out of
+/// the `<c:xVal>`/`<c:yVal>` refs — its NUMBERS — and only then lets `<c:cat>`
+/// and `<c:tx>` stretch it. A series whose `<c:tx>` is a literal (`<c:v>Speed`,
+/// no `<c:f>`, which is how Excel writes a typed series name) leaves nothing to
+/// stretch it upward, so the box arrives sitting exactly on the points: `A2:B4`
+/// for points in rows 2-4, where the equivalent authored chart's box is `A1:B4`.
+/// Handed to `chart_from_range` unchanged, row 2 is eaten as the header row and
+/// a three-point scatter comes back a TWO-point column chart named after the
+/// numbers it just consumed — silently, and then saved over the original part.
+///
+/// So the leading line is measured against the cells the chart says it PLOTS:
+/// every series' `point_refs` and `values_ref`, on the box's own sheet (a
+/// foreign ref was never folded into the box, so its rows say nothing about it).
+/// If ANY of them reaches the box's first line, that line holds plotted numbers
+/// and is not a header — `any`, not `all`, because one series starting there is
+/// enough for the header reading to eat its first point.
+///
+/// Widening rather than refusing keeps this the SAME question DATA RANGE and
+/// Insert answer: the chart wanted is the one the user would have got by
+/// selecting those cells, and they would have selected the header line too. The
+/// line above may be blank, and that is fine — the series come back unnamed,
+/// which is what the scatter's literal `<c:tx>` names amount to here anyway.
+/// What cannot be fixed is a box already against the sheet's edge, and
+/// [`chart_reauthored`] says so rather than quietly eating a row of the plot.
+///
+/// `by_row` is the orientation the box is ABOUT to be read as, which is not
+/// always the chart's own: [`chart_reauthored`] keeps `data.by_row`, and Switch
+/// Row/Column asks for the flipped one, since which line is the header is a
+/// question about the READING and a box that leads with a header row need not
+/// lead with a label column.
+fn chart_box_with_header(
+    data: &gridcore::sheet::ChartData,
+    src: &gridcore::sheet::ChartSource,
+    by_row: bool,
+) -> Option<(u32, u32, u32, u32)> {
+    let (r0, c0, r1, c1) = src.range;
+    let leads = data
+        .series
+        .iter()
+        .flat_map(|s| s.point_refs.iter().chain(s.values_ref.iter()))
+        .filter(|p| p.sheet.eq_ignore_ascii_case(&src.sheet))
+        .any(|p| {
+            if by_row {
+                p.range.1 == c0
+            } else {
+                p.range.0 == r0
+            }
+        });
+    if !leads {
+        return Some(src.range);
+    }
+    if by_row {
+        c0.checked_sub(1).map(|c| (r0, c, r1, c1))
+    } else {
+        r0.checked_sub(1).map(|r| (r, c0, r1, c1))
+    }
+}
+
+/// How to NAME the box's leading line to a user whose chart has no room to
+/// widen into: where its points start, the line that isn't there, and the fix.
+/// Shared so the two doors that widen a box — [`chart_reauthored`] and Switch
+/// Row/Column — refuse in the same words, each for the orientation IT is about
+/// to read the box as.
+fn chart_header_edge(by_row: bool) -> (&'static str, &'static str, &'static str) {
+    if by_row {
+        ("column A", "label column beside", "a column before")
+    } else {
+        ("row 1", "header row above", "a row above")
+    }
+}
+
+/// [`MAX_CHART_CELLS`] asked of a box, in the sentence
+/// [`Docxy::chart_range_sheet`] has always printed.
+///
+/// Asked in two places for one reason: the box that reaches
+/// [`gridcore::sheet::chart_from_range`] is not always the box that was
+/// counted. [`chart_box_with_header`] adds a LINE to it, and a range that only
+/// just fitted would otherwise walk past the cap on the strength of a header
+/// row nobody counted.
+fn chart_cells_within_cap(range: (u32, u32, u32, u32)) -> Result<(), String> {
+    let (r0, c0, r1, c1) = range;
+    let cells = u64::from(r1 - r0 + 1) * u64::from(c1 - c0 + 1);
+    if cells > MAX_CHART_CELLS {
+        return Err(format!(
+            "Its range is {cells} cells; a chart plots at most {MAX_CHART_CELLS}."
+        ));
+    }
+    Ok(())
+}
+
+/// Author a chart of `kind` afresh from the box it is already showing, or WHY
+/// its box can't be read that way.
+///
+/// This is what "picking a type is the explicit *author this one afresh*" means
+/// for a chart the writer cannot otherwise save — a scatter or bubble, any of
+/// whose series carry refs but no numbers ([`chart_would_lose_points`]). Going
+/// through `chart_from_range` is the same call DATA RANGE and the Insert button
+/// make, so a converted chart is indistinguishable from one authored that way
+/// round in the first place, and it comes out with real `values_ref`s instead
+/// of series the save would empty.
+///
+/// It is also what keeps the box honest. `chart_take_kind` leaves `data.source`
+/// alone, and for a scatter stripped of its `point_refs` the only foldable slot
+/// left would be the `<c:tx>` name cell — so the next `rebuild_source`, which
+/// `series_apply_name`, `series_delete`, `series_reorder` and
+/// `categories_apply` all call, would collapse a box over `A1:B4` onto `B1`,
+/// and Enter on that DATA RANGE would be refused for having no column of
+/// numbers under a header row. Re-deriving here means there is never such a
+/// chart: every series has a `values_ref` the rebuild can fold.
+///
+/// Two things about the box are NOT taken on trust, because `chart_from_range`
+/// assumes both of a box IT derived and an imported scatter's satisfies neither
+/// by construction:
+/// - Its leading line is a HEADER. See [`chart_box_with_header`], which widens
+///   the box by one line when the plotted refs reach its edge, and whose refusal
+///   is the first this function can return.
+/// - Its ORIENTATION. `data.by_row` decides whether the box reads as a series
+///   per numeric column or per numeric row, and `infer_by_row` has no `<c:val>`
+///   to read it off for these kinds — so it reads their `point_refs` too, and a
+///   scatter laid out along ROWS comes back one series per row instead of as N
+///   one-point series. Switch Row/Column remains the remedy for a chart whose
+///   shape says nothing either way.
+///
+/// What rides along and what doesn't, for `chart_switch_row_column`'s reasons:
+/// - **The title** is kept — it may have been typed.
+/// - **`part`** is kept, and it must be: the writer only overwrites a chart
+///   whose part it knows (`cd.part`), so dropping it would leave the ORIGINAL
+///   scatter part on disk and the conversion invisible in the saved file.
+/// - **`complex`** is NOT kept: picking a type is the user saying what to
+///   replace the plot area with, which is the same thing `chart_take_kind`
+///   clears it for. `chart_from_range` says `false`.
+/// - **Series colours** do not: the series are different data now — a scatter's
+///   one X/Y pair becomes a series per numeric column — so matching by position
+///   would paint the wrong one.
+fn chart_reauthored(
+    data: &gridcore::sheet::ChartData,
+    kind: &str,
+    sheet: &gridcore::sheet::Sheet,
+) -> Result<gridcore::sheet::ChartData, String> {
+    let src = data
+        .source
+        .as_ref()
+        .ok_or_else(|| CHART_NO_BOX.to_string())?;
+    // A series naming point cells the fold took none of — a ref the loader could
+    // not hold, or one on a sheet other than the box's — is the shape where the
+    // box is KNOWN to be short of the plot: `rebuild_source` folded the rest and
+    // nothing at all of that half. Re-deriving from it would plot one coordinate
+    // and drop the one that is off the box — the same silent loss this whole
+    // door exists to prevent, arriving by the door itself. See
+    // [`chart_points_off_box`].
+    if chart_points_off_box(data, src) {
+        return Err(CHART_POINTS_OFF_BOX.to_string());
+    }
+    // The box a scatter arrives with sits on its POINTS, with no header line for
+    // `chart_from_range` to name the series from; see [`chart_box_with_header`].
+    let range = chart_box_with_header(data, src, data.by_row).ok_or_else(|| {
+        let (start, edge, insert) = chart_header_edge(data.by_row);
+        format!(
+            "Its points start at {start}, so there is no {edge} them for a {kind} chart to name its series from \u{2014} insert {insert}, or point DATA RANGE at the cells it should read."
+        )
+    })?;
+    // The cap `chart_range_sheet` applied was the box's; this is a line wider,
+    // and a box that only just fitted must not walk past it because the header
+    // line was added after the counting.
+    chart_cells_within_cap(range)?;
+    let mut out = gridcore::sheet::chart_from_range(sheet, &sheet.name, range, kind, data.by_row)
+        .ok_or_else(|| {
+        // Said the way round THIS chart reads, as every other range
+        // refusal is: telling a row chart's user to go and find a column
+        // sends them after the wrong shape.
+        let (line, edge) = if data.by_row {
+            ("row", "beside a label column")
+        } else {
+            ("column", "under a header row")
+        };
+        format!(
+            "Its range has no {line} of numbers {edge} to plot as a {kind} chart \
+                 \u{2014} point DATA RANGE at the cells it should read first."
+        )
+    })?;
+    // The re-derivation takes its series count from the CELLS, so a box two
+    // numeric columns wide reads as two series however many the scatter had.
+    // That is the same question `chart_set_kind` asked of the chart on screen,
+    // asked again of the plot the user is actually about to get.
+    if let Some(m) = chart_kind_series_err(kind, out.series.len()) {
+        return Err(m);
+    }
+    out.title = data.title.clone();
+    out.part = data.part.clone();
+    Ok(out)
+}
+
+/// A box KNOWN to be short of its chart's plot cannot be re-derived from either,
+/// and for the same reason at both doors: `chart_from_range` reads the box, so
+/// whatever the fold skipped comes back missing. See [`chart_points_off_box`].
+const CHART_POINTS_OFF_BOX: &str = "Part of its plot is outside its data range, which covers only the rest \u{2014} point DATA RANGE at the cells the whole plot lives in first.";
+
+/// A chart whose references this model can't hold has no box to re-derive from,
+/// which is the same answer for every door that asks — Switch Row/Column and
+/// picking a type alike.
+const CHART_NO_BOX: &str =
+    "No data range to re-read \u{2014} this chart came with references the model can't hold.";
+
 /// Re-point series `i` at `src`, plotting `values`. Reports how many points it
 /// took, or `None` when there is no series `i`.
 ///
@@ -1978,9 +2381,37 @@ fn series_set_values(
 /// chart floating over one sheet can plot another's numbers, and re-deriving
 /// from the wrong one would quietly replot it against the cells underneath it.
 ///
-/// `None` when there is no `source` box to re-derive from (an imported chart
-/// whose refs the model can't hold) or when the range doesn't read the other way
-/// round at all — a single column of numbers has no row of them.
+/// The refusals, which are what greys the button out and what the note under it
+/// prints: there is no `source` box to re-derive from (an imported chart whose
+/// refs the model can't hold), the box's leading line the OTHER way round is
+/// plotted and there is nowhere to widen into, or the range doesn't read the
+/// other way round at all — a single column of numbers has no row of them.
+///
+/// The middle one is [`chart_box_with_header`]'s, asked for the orientation the
+/// flip is ABOUT to read the box as rather than the one it has: a scatter whose
+/// box `parse_chart` folded out of its points sits ON them, so read the other
+/// way round its first column is data and `chart_from_rows` would consume it as
+/// the series names — a three-point scatter back as three one-point series
+/// named after the X values it just ate, and every one of them carrying a
+/// `values_ref` the writer will happily save over the original part.
+///
+/// Only a chart [`chart_box_from_points`] accepts is widened — the set whose
+/// box came out of point refs, asked of the refs rather than of what a relabel
+/// would cost, so a scatter half re-pointed by hand is still one. Every other
+/// box is the one the user can see in DATA RANGE, derived by `chart_from_range`
+/// from a line the reading already treats as a header, and widening THAT would
+/// silently pull in a column they never selected and move the field under their
+/// hands: a `Year | Sales` box is all numbers, so its first series starts in the
+/// box's own leading column and the plotted-line test alone would fire on it.
+/// Flipping twice must return the chart the range describes.
+///
+/// What the widening does NOT promise is a way back to the imported scatter. The
+/// flip re-derives, so the chart that comes out is one `chart_from_range` made
+/// from the widened box and has left the points-only class for good; flipping IT
+/// twice returns it, but the box it now carries leads with the line the FIRST
+/// flip needed and not with one the other reading can use. That is the same
+/// answer any hand edit gets here — the range is the source of truth again — and
+/// undo, not a second flip, is what puts the scatter back.
 ///
 /// What rides along and what doesn't:
 /// - **Title, part and `complex`** are kept, for the reasons `chart_apply_range`
@@ -2001,14 +2432,44 @@ fn series_set_values(
 fn chart_switch_row_column(
     data: &gridcore::sheet::ChartData,
     sheet: &gridcore::sheet::Sheet,
-) -> Option<gridcore::sheet::ChartData> {
-    let src = data.source.as_ref()?;
-    let mut out =
-        gridcore::sheet::chart_from_range(sheet, &sheet.name, src.range, &data.kind, !data.by_row)?;
+) -> Result<gridcore::sheet::ChartData, String> {
+    let src = data
+        .source
+        .as_ref()
+        .ok_or_else(|| CHART_NO_BOX.to_string())?;
+    // The flip re-derives through `chart_from_range` exactly as the re-author
+    // door does, so a box the fold left short of the plot loses the same half
+    // here — silently, and on screen rather than only on disk. Refused in the
+    // same words, which also greys the button out with the reason under it.
+    if chart_points_off_box(data, src) {
+        return Err(CHART_POINTS_OFF_BOX.to_string());
+    }
+    let to_row = !data.by_row;
+    let range = if chart_box_from_points(data) {
+        let range = chart_box_with_header(data, src, to_row).ok_or_else(|| {
+            let (start, edge, insert) = chart_header_edge(to_row);
+            format!(
+                "Read the other way round its points start at {start}, so there is no {edge} them to name the series from \u{2014} insert {insert}, or point DATA RANGE at the cells it should read."
+            )
+        })?;
+        // A line wider than the box `chart_range_sheet` counted; see
+        // `chart_cells_within_cap`.
+        chart_cells_within_cap(range)?;
+        range
+    } else {
+        src.range
+    };
+    let mut out = gridcore::sheet::chart_from_range(sheet, &sheet.name, range, &data.kind, to_row)
+        .ok_or_else(|| {
+            format!(
+                "Its range has no {} of numbers to read the other way round.",
+                if data.by_row { "column" } else { "row" },
+            )
+        })?;
     out.title = data.title.clone();
     out.part = data.part.clone();
     out.complex = data.complex;
-    Some(out)
+    Ok(out)
 }
 
 /// Move series `i` by `delta` places, clamped to the ends. Returns where it
@@ -3252,6 +3713,51 @@ impl Docxy {
         self.chart_set_data(data, cx);
     }
 
+    /// The sheet a chart's own box NAMES, resolved — the sheet to re-derive
+    /// that chart from — or WHY it can't be re-derived at all.
+    ///
+    /// The box's sheet name is what gets resolved, not the sheet on screen: a
+    /// chart floating over one sheet can plot another's numbers, and re-deriving
+    /// from the wrong one would quietly replot it against the cells underneath
+    /// it. An EMPTY name is an unqualified box, which means the sheet on screen,
+    /// so it is passed as `None` rather than looked up and missed.
+    ///
+    /// The cell cap is `chart_ref_of`'s, for `chart_ref_of`'s reason and then
+    /// some: this range did not come from a field, it came from the FILE, so it
+    /// is the one chart range nothing has ever bounded — a `<c:f>` may legally
+    /// name `$A$1:$A$1048576`. Re-deriving that would walk a million cells and
+    /// build a series per row, and `chart_switched` asks it on every frame the
+    /// panel draws, not once per click.
+    ///
+    /// The three sentences are the ones the Switch Row/Column note has always
+    /// printed, kept word for word: each names the CHART's problem rather than
+    /// that of whichever door asked, so `chart_set_kind` prints them too.
+    ///
+    /// The one-line wrapper `range-selector.md` asks for: the decision it
+    /// delegates to (`sheet_index_of`) is the pure, tested part.
+    fn chart_range_sheet(
+        &self,
+        data: &gridcore::sheet::ChartData,
+    ) -> Result<&gridcore::sheet::Sheet, String> {
+        let Some(src) = data.source.as_ref() else {
+            return Err(CHART_NO_BOX.to_string());
+        };
+        chart_cells_within_cap(src.range)?;
+        let Some(v) = self.active_sheet() else {
+            return Err("No workbook open.".to_string());
+        };
+        let named = (!src.sheet.is_empty()).then_some(src.sheet.as_str());
+        sheet_index_of(&self.sheet_names(), named, v.active)
+            .ok()
+            .and_then(|si| v.pkg.workbook.sheets.get(si))
+            .ok_or_else(|| {
+                format!(
+                    "Its range names a sheet this workbook hasn't got ({}).",
+                    src.sheet
+                )
+            })
+    }
+
     /// The selected chart re-derived from its own range the other way round, or
     /// WHY it can't be — which is both what greys the Switch Row/Column button
     /// out and the note printed under it, so the button is enabled exactly when
@@ -3259,53 +3765,14 @@ impl Docxy {
     /// two used to be worked out separately, and the note then blamed the range
     /// for a sheet name the workbook had lost.
     ///
-    /// The box's sheet name is what gets resolved, not the sheet on screen; an
-    /// EMPTY name is an unqualified box, which means the sheet on screen, so it
-    /// is passed as `None` rather than looked up and missed.
-    ///
-    /// The cell cap is `chart_ref_of`'s, for `chart_ref_of`'s reason and then
-    /// some: this range did not come from a field, it came from the FILE, so it
-    /// is the one chart range nothing has ever bounded — a `<c:f>` may legally
-    /// name `$A$1:$A$1048576`. Re-deriving that would walk a million cells and
-    /// build a series per row, and this runs on every frame the panel draws,
-    /// not once per click.
+    /// The sheet resolution and the cell cap are [`Self::chart_range_sheet`]'s,
+    /// shared with the other door that re-derives a chart from its own box.
     fn chart_switched(&self) -> Result<gridcore::sheet::ChartData, String> {
         let Some(data) = self.chart_data() else {
             return Err("No chart selected.".to_string());
         };
-        let Some(src) = data.source.as_ref() else {
-            return Err(
-                "No data range to re-read \u{2014} this chart came with references the \
-                        model can't hold."
-                    .to_string(),
-            );
-        };
-        let (r1, c1, r2, c2) = src.range;
-        let cells = u64::from(r2 - r1 + 1) * u64::from(c2 - c1 + 1);
-        if cells > MAX_CHART_CELLS {
-            return Err(format!(
-                "Its range is {cells} cells; a chart plots at most {MAX_CHART_CELLS}."
-            ));
-        }
-        let sheet = src.sheet.clone();
-        let Some(v) = self.active_sheet() else {
-            return Err("No workbook open.".to_string());
-        };
-        let named = (!sheet.is_empty()).then_some(sheet.as_str());
-        let found = sheet_index_of(&self.sheet_names(), named, v.active)
-            .ok()
-            .and_then(|si| v.pkg.workbook.sheets.get(si));
-        let Some(sh) = found else {
-            return Err(format!(
-                "Its range names a sheet this workbook hasn't got ({sheet})."
-            ));
-        };
-        let out = chart_switch_row_column(&data, sh).ok_or_else(|| {
-            format!(
-                "Its range has no {} of numbers to read the other way round.",
-                if data.by_row { "column" } else { "row" },
-            )
-        })?;
+        let sh = self.chart_range_sheet(&data)?;
+        let out = chart_switch_row_column(&data, sh)?;
         // The flip keeps `kind`, and a pie read the other way round is usually
         // one one-point series per category. Caught here rather than at the
         // click so the button greys out with the reason under it, the way every
@@ -3362,27 +3829,97 @@ impl Docxy {
 
     /// Switch the selected chart between column / bar / line / pie.
     fn chart_set_kind(&mut self, kind: &str, cx: &mut Context<Self>) {
-        let Some(mut data) = self.chart_data() else {
+        let Some(data) = self.chart_data() else {
             return;
         };
         if data.kind == kind && !data.complex {
             return;
         }
-        // Picking Pie does not re-derive — it keeps the series it finds — so it
-        // is the one door to a multi-series pie that "guard every re-derivation"
-        // misses, and the one that reaches it in a single click on a chart whose
-        // series the user has already pointed and coloured.
+        // Asked of the chart ON SCREEN, because picking Pie usually keeps the
+        // series it finds: this is the one door to a multi-series pie that
+        // "guard every re-derivation" misses, and the one that reaches it in a
+        // single click on a chart whose series the user has already pointed and
+        // coloured. The re-authoring branch below asks it a SECOND time, of the
+        // count its own re-derivation reads out of the box, since the two can
+        // differ — see `chart_reauthored`.
         if let Some(m) = chart_kind_series_err(kind, data.series.len()) {
             self.set_status(m);
             cx.notify();
             return;
         }
-        data.kind = kind.to_string();
-        // Picking a type is the explicit "author this one afresh" the panel's
-        // note asks for: a stacked or combo plot area held the part back, and
-        // the user has now said what to replace it with.
-        data.complex = false;
+        // Picking a WRITABLE type hands the part to `chart_space_xml` on the
+        // next save, and it writes each series from the numbers the model holds
+        // — a `values_ref`, a `col` inside the box, or a cached snapshot. A
+        // scatter's or bubble's series has none of the three
+        // (`chart_would_lose_points`), so relabelling one `column` would
+        // overwrite its part with a series of no points: the plot the user was
+        // looking at, gone in one click and not recoverable by undoing the type.
+        // `chart_kind_is_writable`'s own comment calls that outcome
+        // irreversible; this is the door that would reach it.
+        //
+        // So such a chart is AUTHORED AFRESH from the box it is showing, which
+        // is what the panel's note already promises picking a type does, and
+        // what `chart_take_kind` leaving the box alone assumes the user goes on
+        // to do by hand. Done here, at the click, the conversion cannot be saved
+        // half-finished — and no chart is ever left with its points cleared and
+        // nothing but a name cell for `rebuild_source` to fold.
+        // The kind the chart HAD, for the status line below: `chart_take_kind`
+        // is about to overwrite it, and the sentence names the plot the user is
+        // losing. Not always "scatter" — `chart_would_lose_points` reads
+        // `<c:bubbleSize>` too, so a `<c:bubbleChart>` reaches the same branch.
+        let was = data.kind.clone();
+        // Whether the click RE-READ the chart rather than relabelling it, so the
+        // status line can say so afterwards. Which branch a click takes turns on
+        // per-series state the panel doesn't draw, and the two do very different
+        // things to the cards below — the note above the type buttons warns that
+        // a re-read replaces them, but only the click knows it happened.
+        let mut reauthored = false;
+        let mut data =
+            if gridcore::xlsx::chart_kind_is_writable(kind) && chart_would_lose_points(&data) {
+                // Bound the borrow of `self` before `set_status` needs it back.
+                let out = self
+                    .chart_range_sheet(&data)
+                    .and_then(|sh| chart_reauthored(&data, kind, sh));
+                match out {
+                    Ok(d) => {
+                        // Re-deriving REPLACES the series rather than relabelling
+                        // them: a scatter's one X/Y pair comes back as a series per
+                        // numeric column of the box, and three series over a
+                        // one-column box come back as one. Card `i` is different
+                        // data under the same number, and both of these are keyed
+                        // by bare series index — the hazard
+                        // `chart_switch_orientation` and `series_delete` clear them
+                        // for, reached here by the panel's own "type below, then
+                        // pick a type above": an open field would commit its buffer
+                        // onto whichever series inherited the number, and when the
+                        // count SHRINKS it would go on taking keystrokes while no
+                        // longer drawn.
+                        self.range_edit = None;
+                        self.ref_msg = None;
+                        self.range_pick = None;
+                        reauthored = true;
+                        d
+                    }
+                    Err(m) => {
+                        self.set_status(m);
+                        cx.notify();
+                        return;
+                    }
+                }
+            } else {
+                data
+            };
+        // Still called on a re-derived chart, so exactly one place decides what
+        // picking a type does to `kind`, `complex` and `point_refs`. It is a
+        // no-op there — `chart_from_range` already said all three.
+        chart_take_kind(&mut data, kind);
+        let n = data.series.len();
         self.chart_set_data(data, cx);
+        if reauthored {
+            self.set_status(format!(
+                "Re-read this chart from its data range as {n} series \u{2014} the series below are the range's, not the ones the {was} chart carried."
+            ));
+        }
     }
 
     /// Colour one series of the selected chart.
@@ -3706,14 +4243,19 @@ impl Docxy {
         // `ref_msg` is keyed by series index, and every index past `i` just
         // shifted — the old message would surface under a different series.
         self.ref_msg = None;
-        // A series takes its slots with it, so deleting one SHRINKS the box —
-        // the same rule the other commit paths follow. Without this the box
-        // goes on covering the deleted column: DATA RANGE keeps offering it,
-        // and Enter on that untouched field hands `chart_from_range` a range
-        // two columns wide, which re-derives the deleted series and undoes the
-        // delete. `parse_chart` shrinks the box on the next open regardless, so
-        // leaving it also made the panel read one way before a save and another
-        // after it.
+        // Rebuilt for the reason that always holds: the panel must show the box
+        // `parse_chart` will rebuild on the next open, or it reads one way
+        // before a save and another after it.
+        //
+        // It also shrinks the box off the deleted column — but only when that
+        // column is at an EDGE of it. The box is a rectangle, so deleting the
+        // middle series of `A1:D5` (labels in A, series in B, C, D) leaves the
+        // survivors' refs spanning B..D again and the box unchanged: DATA RANGE
+        // still offers `A1:D5`, and Enter on that untouched field hands
+        // `chart_from_range` all three numeric columns, which re-derives the
+        // deleted series. That is what the loader does on reload too, so the
+        // panel is honest either way; undoing the delete through a field nobody
+        // typed in is the rectangle's doing, not this call's.
         rebuild_source(&mut data);
         self.chart_set_data(data, cx);
     }
@@ -6623,6 +7165,36 @@ impl Docxy {
             Err(why) => why.clone(),
         };
         let flip = switched.ok();
+        // What picking a type would actually DO to this chart, for the
+        // not-writable note below — `None` when a click just relabels it,
+        // `Some(Ok)` when it re-reads the box, `Some(Err)` when it can only
+        // refuse.
+        //
+        // Asked by TRYING it, the way `switched` above asks its own question,
+        // rather than by a proxy. `data.source.is_some()` was one, and not a
+        // sound one: `chart_reauthored` refuses on four further counts that all
+        // leave the box in place — a plot half the box doesn't cover, no line
+        // to widen a points-leading box into, a widened box past the cell cap,
+        // and a box with no line of numbers under a header — plus
+        // `chart_range_sheet`'s missing sheet. Each of those had the note
+        // promising a re-read that the click then declined, which is the shape
+        // the `CHART_NO_BOX` case was already fixed for.
+        //
+        // `"column"` stands for all four buttons: they are all writable kinds,
+        // and the only refusal that turns on WHICH is `chart_kind_series_err`,
+        // which is a pie-only count and never fires for a column. So a Pie
+        // click on a multi-series box can still be refused after this says the
+        // re-read is on — with the count named, which is a different sentence
+        // about a different problem.
+        //
+        // Cheap enough for a render path for `chart_switched`'s reason: the
+        // same `chart_range_sheet` cap bounds both, and the flip above already
+        // re-derives a whole chart every frame.
+        let reread = chart_would_lose_points(&data).then(|| {
+            self.chart_range_sheet(&data)
+                .and_then(|sh| chart_reauthored(&data, "column", sh))
+                .map(|_| ())
+        });
         let ent_sw = ent.clone();
         let switch = v_flex()
             .gap(px(2.))
@@ -6896,13 +7468,28 @@ impl Docxy {
                     ))
                     .child(heading("TYPE"))
                     .child(types)
-                    .child(switch)
                     // The four buttons above are the only kinds we can WRITE,
                     // and only as a single clustered/standard plot group. A
                     // scatter/area/doughnut/radar chart — or a stacked or combo
                     // one — round-trips as its original part rather than being
                     // flattened on save, so edits here show on screen but don't
                     // reach the file until a type is picked. Say so.
+                    //
+                    // And say what picking one DOES to those edits, because for
+                    // one class of chart it does not save them. A scatter or
+                    // bubble whose series still hold nothing but points goes
+                    // through `chart_reauthored`, which re-reads the chart from
+                    // its DATA RANGE and REPLACES the series below — names,
+                    // colours, re-points, additions and all — keeping only the
+                    // title. (Relabelling it instead is what
+                    // `chart_would_lose_points` exists to prevent: the save would
+                    // write `<c:ptCount val="0"/>` over the plot.) Which of the
+                    // three a click takes is invisible from here — re-point
+                    // EVERY series of a scatter and it relabels, re-point only
+                    // some and the whole chart is re-derived, and a box the
+                    // re-derivation can't read refuses it outright — so the note
+                    // asks `reread` and says which, rather than promising the
+                    // edits below are what gets saved.
                     .when(!gridcore::xlsx::chart_is_writable(&data), |d| {
                         d.child(
                             div()
@@ -6912,7 +7499,7 @@ impl Docxy {
                                 .text_color(pal.dim)
                                 .child(format!(
                                     "This {}chart is kept as Excel wrote it. Edits below show \
-                                     here but are not saved until you pick a type above.",
+                                     here but {}",
                                     // Name the kind only when the KIND is what
                                     // holds it back; "This stacked chart" would
                                     // read as a kind we don't have a word for.
@@ -6920,10 +7507,58 @@ impl Docxy {
                                         String::new()
                                     } else {
                                         format!("{} ", data.kind)
+                                    },
+                                    // The answer `chart_set_kind` will give,
+                                    // not a proxy for it — see `reread`, which
+                                    // is the very call the click makes.
+                                    match &reread {
+                                        // A relabel: the type button makes the
+                                        // chart writable and the next save
+                                        // writes the cards below as they stand.
+                                        // True of every chart the writer won't
+                                        // save for a reason other than its
+                                        // points.
+                                        None => "are not saved until you pick a type above.",
+                                        // A re-read: the cards below are
+                                        // replaced wholesale by the box's, so
+                                        // the note says so rather than
+                                        // promising they get saved.
+                                        Some(Ok(())) =>
+                                            "are not saved until you pick a type above, which \
+                                             re-reads it from its data range and replaces the \
+                                             series below.",
+                                        // A refusal. The click's own status
+                                        // line names WHICH of the five it is;
+                                        // the note names the remedy they share,
+                                        // because sending the user to a button
+                                        // that can only refuse is what the
+                                        // `data.source.is_some()` proxy did.
+                                        Some(Err(_)) =>
+                                            "are not saved, and picking a type above can't save \
+                                             them either until DATA RANGE names cells this chart \
+                                             can be re-read from.",
                                     }
                                 )),
                         )
                     })
+                    // BELOW the note deliberately. Switch Row/Column is an edit
+                    // like any other: `chart_switch_row_column` carries
+                    // `complex` and `part` across the flip, so on a stacked bar
+                    // or an area/scatter/doughnut chart the plot visibly
+                    // transposes on screen and the original part still
+                    // round-trips on save. That is exactly what the note's first
+                    // half says ("Edits below show here but are not saved until
+                    // you pick a type above"), and above the note it would be the
+                    // one control the wording excluded. The note's second half —
+                    // that picking a type RE-READS a points-only chart from its
+                    // range — is the one thing a flip is exempt from, and not
+                    // because the re-read honours it: `chart_switch_row_column`
+                    // re-derives THERE AND THEN, so every series comes back
+                    // carrying a `values_ref` and the chart has left the
+                    // points-only class `chart_would_lose_points` asks about.
+                    // The later click merely relabels it, which is also why the
+                    // second half stops being printed once the flip has landed.
+                    .child(switch)
                     .child(heading("TITLE"))
                     .child(self.ref_field(
                         "chart-title",
@@ -17501,6 +18136,31 @@ mod grid_geom_tests {
             "the deleted series' column is out of the box"
         );
 
+        // The LIMIT of that, pinned so it is recorded rather than implied away:
+        // the box is a rectangle, so it can only shrink off a column at its
+        // ENDS. Delete the MIDDLE series of `A1:D5` and the survivors' refs
+        // still span B..D — DATA RANGE goes on offering `A1:D5`, and Enter on
+        // that untouched field re-derives the deleted series. `parse_chart`
+        // computes the same unshrunk box on the next open, so the panel is
+        // honest either way; `series_delete` rebuilds for that agreement, not
+        // for a shrink it cannot always deliver.
+        let mut d = chart(
+            vec![
+                ser(Some("Data!$B$1"), Some(src("Data", (1, 1, 4, 1)))),
+                ser(Some("Data!$C$1"), Some(src("Data", (1, 2, 4, 2)))),
+                ser(Some("Data!$D$1"), Some(src("Data", (1, 3, 4, 3)))),
+            ],
+            Some(src("Data", (1, 0, 4, 0))),
+            Some(src("Data", (0, 0, 4, 3))),
+        );
+        assert!(super::series_remove(&mut d.series, 1));
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 0, 4, 3))),
+            "a middle delete leaves the box exactly as wide"
+        );
+
         // Reordering changes no reference, but it changes which one seeds the
         // box — the first values ref decides the sheet, and pointing a series
         // at another sheet is a supported commit. `series_reorder` rebuilds so
@@ -17535,6 +18195,465 @@ mod grid_geom_tests {
             d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
             Some(("Data", (0, 0, 4, 2)))
         );
+    }
+
+    /// Converting a scatter to a kind the writer authors drops the scatter-only
+    /// refs, so the box the panel rebuilds afterwards describes what the
+    /// converted chart actually plots.
+    #[test]
+    fn picking_a_writable_type_clears_a_scatters_point_refs() {
+        use gridcore::sheet::{ChartData, ChartSeries, ChartSource};
+        let src = |range| ChartSource {
+            sheet: "Data".into(),
+            range,
+            cat_col: 0,
+        };
+        // A scatter named from `B1`, X in `A2:A3`, Y in `B2:B3`.
+        let scatter = || ChartData {
+            kind: "scatter".into(),
+            source: Some(src((0, 0, 2, 1))),
+            series: vec![ChartSeries {
+                name_ref: Some("Data!$B$1".into()),
+                point_refs: vec![src((1, 0, 2, 0)), src((1, 1, 2, 1))],
+                ..ChartSeries::default()
+            }],
+            ..ChartData::default()
+        };
+
+        // The shape that actually reaches `chart_take_kind` with points still
+        // on it: a scatter whose series was RE-POINTED through SERIES VALUES,
+        // which the field offers for every kind, so a `values_ref` now sits
+        // beside the `<c:xVal>`/`<c:yVal>` refs (`ChartSeries::point_refs`).
+        // One with no values at all never gets here — `chart_set_kind` sends
+        // that one through `chart_reauthored` instead.
+        let mut d = scatter();
+        d.series[0].values_ref = Some(src((1, 1, 2, 1)));
+        d.series[0].col = Some(1);
+        super::chart_take_kind(&mut d, "column");
+        assert_eq!(d.kind, "column");
+        assert!(!d.complex);
+        assert!(
+            d.series[0].point_refs.is_empty(),
+            "a column chart has no `<c:xVal>` for them to describe"
+        );
+        // The box is left alone by the conversion itself: it is what DATA RANGE
+        // offers, and the panel may be about to re-derive from it.
+        assert_eq!(d.source.as_ref().map(|s| s.range), Some((0, 0, 2, 1)));
+
+        // And the next rebuild — a series name, a delete, a reorder — folds the
+        // `values_ref` that is still there, so the box describes what the
+        // converted chart plots instead of being stretched back over the
+        // obsolete X column. That it does not collapse onto the lone `B1` name
+        // cell is what the `values_ref` guarantees.
+        super::rebuild_source(&mut d);
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 1, 2, 1))),
+        );
+
+        // Re-pointing after the conversion agrees with it.
+        let n = super::series_set_values(&mut d, 0, vec![1.0, 2.0], src((1, 1, 2, 1)));
+        assert_eq!(n, Some(2));
+        assert_eq!(
+            d.source.as_ref().map(|s| (s.sheet.as_str(), s.range)),
+            Some(("Data", (0, 1, 2, 1))),
+        );
+
+        // A scatter that STAYS a scatter keeps them: its part round-trips
+        // verbatim, so the next `parse_chart` reads those very refs back, and
+        // dropping them here would collapse the box the panel shows.
+        let mut d = scatter();
+        super::chart_take_kind(&mut d, "scatter");
+        assert_eq!(d.series[0].point_refs.len(), 2);
+
+        // The unconverted scatter is the one holding points the writer cannot
+        // emit, which is what routes it away from a bare relabel.
+        assert!(super::chart_would_lose_points(&scatter()));
+        let mut live = scatter();
+        live.series[0].values_ref = Some(src((1, 1, 2, 1)));
+        assert!(!super::chart_would_lose_points(&live));
+        // A snapshot series holds no refs at all and still plots: the writer
+        // writes its cached numbers back as a `<c:numLit>`.
+        let mut snap = scatter();
+        snap.series[0].values = vec![1.0, 2.0];
+        assert!(!super::chart_would_lose_points(&snap));
+        // Asked per SERIES: re-pointing ONE series of a two-series scatter does
+        // not make the other one safe to relabel. `chart_space_xml` writes each
+        // series from its own slots, so a relabel here would keep the half the
+        // user touched and write `<c:ptCount val="0"/>` over the half nobody
+        // did — a partial loss no `complex` holds the part back for.
+        let mut mixed = scatter();
+        mixed.series.push(mixed.series[0].clone());
+        mixed.series[0].values_ref = Some(src((1, 1, 2, 1)));
+        mixed.series[0].col = Some(1);
+        assert!(super::chart_would_lose_points(&mixed));
+        // But an empty series the USER built is not a loss: "+ Series" pushes
+        // one with no refs and no numbers (`values` is empty until the chart has
+        // categories), and re-deriving the chart over it would throw away the
+        // hand edits on every other series instead.
+        let mut added = live.clone();
+        added.series.push(ChartSeries {
+            name: "Series 2".into(),
+            ..ChartSeries::default()
+        });
+        assert!(!super::chart_would_lose_points(&added));
+        // Points the LOADER could not hold look exactly like that empty series
+        // from here — no refs, no `col`, no numbers — so they are marked, and
+        // the mark is the other half of the question. A `<c:xVal><c:numLit>`
+        // scatter, or one naming a whole column, has just as much to destroy.
+        let mut unheld = scatter();
+        unheld.series[0].point_refs.clear();
+        assert!(!super::chart_would_lose_points(&unheld));
+        unheld.series[0].points_unheld = true;
+        assert!(super::chart_would_lose_points(&unheld));
+        // And it is cleared with the refs once the chart is converted, so the
+        // relabel a later click makes is not re-derived all over again.
+        let mut took = unheld.clone();
+        took.series[0].points_ref_unheld = true;
+        took.series[0].values_ref = Some(src((1, 1, 2, 1)));
+        super::chart_take_kind(&mut took, "column");
+        assert!(!took.series[0].points_unheld);
+        assert!(!took.series[0].points_ref_unheld);
+        // No series is not a plot to destroy.
+        assert!(!super::chart_would_lose_points(&ChartData::default()));
+    }
+
+    /// Picking a writable type on a chart the writer would save EMPTY authors it
+    /// afresh from its own box, rather than relabelling it and letting the next
+    /// save overwrite the part with series of nothing.
+    #[test]
+    fn picking_a_writable_type_authors_a_valueless_scatter_afresh() {
+        use gridcore::sheet::{Cell, ChartData, ChartSeries, ChartSource, Sheet};
+        // `Data`: X down column A, Y down column B under a header.
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        sh.set_cell(0, 1, Cell::text("Speed"));
+        for (i, (x, y)) in [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)].iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set_cell(r, 0, Cell::number(*x));
+            sh.set_cell(r, 1, Cell::number(*y));
+        }
+        let src = |range| ChartSource {
+            sheet: "Data".into(),
+            range,
+            cat_col: 0,
+        };
+        // As `parse_chart` hands a scatter over: refs, no numbers, no `col`.
+        let scatter = ChartData {
+            kind: "scatter".into(),
+            title: "Trial 1".into(),
+            source: Some(src((0, 0, 3, 1))),
+            part: Some("xl/charts/chart1.xml".into()),
+            series: vec![ChartSeries {
+                name: "Speed".into(),
+                name_ref: Some("Data!$B$1".into()),
+                point_refs: vec![src((1, 0, 3, 0)), src((1, 1, 3, 1))],
+                ..ChartSeries::default()
+            }],
+            ..ChartData::default()
+        };
+
+        let out = super::chart_reauthored(&scatter, "column", &sh).expect("re-derived");
+        assert_eq!(out.kind, "column");
+        assert!(!out.complex);
+        // Every column of the box is numbers, so both become series — the same
+        // reading Excel gives a scatter converted to a column chart, and the
+        // point of re-deriving: each one now carries a `values_ref` the writer
+        // can emit, where the relabelled chart had none.
+        assert_eq!(out.series.len(), 2);
+        assert!(out.series.iter().all(|s| s.values_ref.is_some()));
+        assert!(out.series.iter().all(|s| s.point_refs.is_empty()));
+        assert!(!super::chart_would_lose_points(&out));
+        // The typed title rides along; so does the part, and it must — the
+        // writer only overwrites a chart part it knows, so dropping it would
+        // leave the original scatter on disk and the conversion invisible.
+        assert_eq!(out.title, "Trial 1");
+        assert_eq!(out.part.as_deref(), Some("xl/charts/chart1.xml"));
+
+        // The box is now the plot's own union rather than an inherited one, so
+        // the rebuild the next panel commit runs leaves it alone.
+        let mut after = out.clone();
+        super::rebuild_source(&mut after);
+        assert_eq!(after.source, out.source);
+
+        // A pie is refused on the count the RE-DERIVATION reads — two numeric
+        // columns are two series however many `<c:ser>` the scatter had.
+        let err = super::chart_reauthored(&scatter, "pie", &sh).expect_err("two series");
+        assert!(err.contains("reads as 2"), "{err}");
+
+        // And a box with no numbers under its header is refused with the shape
+        // this chart reads, not with a silent empty chart.
+        let mut blank = scatter.clone();
+        blank.source = Some(src((0, 0, 0, 1)));
+        let err = super::chart_reauthored(&blank, "column", &sh).expect_err("header row only");
+        assert!(
+            err.contains("no column of numbers under a header row"),
+            "{err}"
+        );
+
+        // Nothing to re-derive from at all: the message every door prints for a
+        // chart whose references the model can't hold.
+        let mut boxless = scatter.clone();
+        boxless.source = None;
+        assert_eq!(
+            super::chart_reauthored(&boxless, "column", &sh).unwrap_err(),
+            super::CHART_NO_BOX
+        );
+    }
+
+    /// The box an imported scatter actually loads with sits ON its points —
+    /// `parse_chart` folds it out of the `<c:xVal>`/`<c:yVal>` refs, and a
+    /// literal `<c:tx>` name leaves nothing to stretch it up over a header row.
+    /// `chart_from_range` reads every box the other way, so re-deriving that one
+    /// unchanged would eat the first data row as headings.
+    #[test]
+    fn re_authoring_a_scatter_whose_box_sits_on_its_points_keeps_every_point() {
+        use gridcore::sheet::{Cell, ChartData, ChartSeries, ChartSource, Sheet};
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        sh.set_cell(0, 1, Cell::text("Speed"));
+        for (i, (x, y)) in [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)].iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set_cell(r, 0, Cell::number(*x));
+            sh.set_cell(r, 1, Cell::number(*y));
+        }
+        // The same trial laid out SIDEWAYS, well clear of the block above so the
+        // column cases read the cells they always did: names down column A, the
+        // five X's along row 7 and the five Y's along row 8.
+        sh.set_cell(6, 0, Cell::text("Run A"));
+        sh.set_cell(7, 0, Cell::text("Run B"));
+        for c in 1..=5u32 {
+            sh.set_cell(6, c, Cell::number(f64::from(c)));
+            sh.set_cell(7, c, Cell::number(f64::from(c) * 10.0));
+        }
+        let src = |range| ChartSource {
+            sheet: "Data".into(),
+            range,
+            cat_col: 0,
+        };
+        // No `name_ref`: the series name came as a literal `<c:v>Speed`, which
+        // is what Excel writes for a typed one. So the box is A2:B4, the points
+        // and nothing else.
+        let scatter = ChartData {
+            kind: "scatter".into(),
+            title: "Trial 1".into(),
+            source: Some(src((1, 0, 3, 1))),
+            part: Some("xl/charts/chart1.xml".into()),
+            series: vec![ChartSeries {
+                name: "Speed".into(),
+                point_refs: vec![src((1, 0, 3, 0)), src((1, 1, 3, 1))],
+                ..ChartSeries::default()
+            }],
+            ..ChartData::default()
+        };
+
+        let out = super::chart_reauthored(&scatter, "column", &sh).expect("re-derived");
+        // Widened up over row 1 — which does hold the header — so both columns
+        // come back whole. Read as-is it would have been two series of TWO
+        // points named `1` and `10`, the numbers it ate.
+        assert_eq!(out.source.as_ref().unwrap().range, (0, 0, 3, 1));
+        assert_eq!(out.series.len(), 2);
+        assert!(out.series.iter().all(|s| s.values.len() == 3));
+        assert_eq!(out.series[1].name, "Speed");
+        assert_eq!(out.series[0].values, vec![1.0, 2.0, 3.0]);
+
+        // A blank line above is still the right answer — the series come back
+        // unnamed, which is all a literal `<c:tx>` amounts to here anyway — but
+        // no line at all cannot be fixed, and is refused rather than eating a
+        // row of the plot.
+        let mut at_edge = scatter.clone();
+        at_edge.source = Some(src((0, 0, 2, 1)));
+        at_edge.series[0].point_refs = vec![src((0, 0, 2, 0)), src((0, 1, 2, 1))];
+        let err = super::chart_reauthored(&at_edge, "column", &sh).expect_err("no room above");
+        assert!(err.contains("Its points start at row 1"), "{err}");
+
+        // Sideways, for a row-laid chart: the leading COLUMN is the label one.
+        // This is the shape `infer_by_row` now answers `true` for off a scatter's
+        // `point_refs` — points along `$B$7:$F$7`/`$B$8:$F$8` — and the whole
+        // point of carrying `data.by_row` through this door, so it is driven end
+        // to end rather than through the widening helper alone.
+        let mut rows = scatter.clone();
+        rows.by_row = true;
+        rows.source = Some(src((6, 1, 7, 5)));
+        rows.series[0].point_refs = vec![src((6, 1, 6, 5)), src((7, 1, 7, 5))];
+        let range = super::chart_box_with_header(&rows, rows.source.as_ref().unwrap(), rows.by_row);
+        assert_eq!(range, Some((6, 0, 7, 5)));
+        let out = super::chart_reauthored(&rows, "column", &sh).expect("re-derived");
+        // Widened LEFT over column A, not up over row 6: the orientation decides
+        // which line is the header, and a box at row 0 would otherwise be refused
+        // for "Its points start at row 1" on a chart whose problem is column A.
+        assert_eq!(out.source.as_ref().unwrap().range, (6, 0, 7, 5));
+        assert!(out.by_row);
+        // One series per numeric ROW, five points each. Read the column way this
+        // is the 8e defect exactly: five one-point series, saved over the part.
+        assert_eq!(out.series.len(), 2);
+        assert!(out.series.iter().all(|s| s.values.len() == 5));
+        assert_eq!(out.series[0].name, "Run A");
+        assert_eq!(out.series[1].name, "Run B");
+        assert_eq!(out.series[1].values, vec![10.0, 20.0, 30.0, 40.0, 50.0]);
+
+        // A box that DOES lead with a header — one a `<c:tx>` ref stretched up
+        // over, or any box docxy derived — is left exactly as it stands.
+        let mut headed = scatter.clone();
+        headed.source = Some(src((0, 0, 3, 1)));
+        assert_eq!(
+            super::chart_box_with_header(&headed, headed.source.as_ref().unwrap(), headed.by_row),
+            Some((0, 0, 3, 1))
+        );
+
+        // The added line is counted. `chart_range_sheet` applied the cap to the
+        // box the chart arrived with, and this one is exactly at it: widened it
+        // is a line over, so a box that only just fitted must not walk past the
+        // cap on the strength of a header row nobody counted. Refused before
+        // any cell is read, which is why the fixture needs none.
+        let mut brim = scatter.clone();
+        let rows = super::MAX_CHART_CELLS as u32 / 2;
+        brim.source = Some(src((1, 0, rows, 1)));
+        brim.series[0].point_refs = vec![src((1, 0, rows, 0)), src((1, 1, rows, 1))];
+        let err = super::chart_reauthored(&brim, "column", &sh).expect_err("over the cap");
+        assert!(
+            err.contains(&format!(
+                "Its range is {} cells",
+                super::MAX_CHART_CELLS + 2
+            )),
+            "{err}"
+        );
+
+        // The flip door counts its own widening too, and widens sideways: a
+        // column each row deep, so the box grows by a whole COLUMN.
+        let mut wide = brim.clone();
+        wide.source = Some(src((0, 1, rows - 1, 2)));
+        wide.series[0].point_refs = vec![src((0, 1, rows - 1, 1)), src((0, 2, rows - 1, 2))];
+        let err = super::chart_switch_row_column(&wide, &sh).expect_err("over the cap");
+        assert!(err.contains("a chart plots at most"), "{err}");
+    }
+
+    /// The two ways a scatter's box can be short of its plot, both refused, and
+    /// the two neighbouring shapes that are not.
+    ///
+    /// Short: `<c:xVal>` naming a whole column `parse_f_ref` refuses beside a
+    /// `<c:yVal>` the loader held, and a held `<c:xVal>` on ANOTHER SHEET than
+    /// the box (`fold_source` skips it rather than unioning across sheets).
+    /// Either way `rebuild_source` folds one half only, so re-deriving would come
+    /// back plotting one coordinate with the other outside the range it just
+    /// re-read. Refused, with DATA RANGE named, which re-derives over whatever
+    /// the user points at.
+    #[test]
+    fn re_authoring_refuses_a_scatter_whose_box_covers_only_the_held_half() {
+        use gridcore::sheet::{Cell, ChartData, ChartSeries, ChartSource, Sheet};
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        sh.set_cell(0, 1, Cell::text("Speed"));
+        for (i, (x, y)) in [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)].iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set_cell(r, 0, Cell::number(*x));
+            sh.set_cell(r, 1, Cell::number(*y));
+        }
+        let src = |range| ChartSource {
+            sheet: "Data".into(),
+            range,
+            cat_col: 0,
+        };
+        let partial = ChartData {
+            kind: "scatter".into(),
+            // The Y column alone, which is all there was to fold.
+            source: Some(src((1, 1, 3, 1))),
+            part: Some("xl/charts/chart1.xml".into()),
+            series: vec![ChartSeries {
+                name: "Speed".into(),
+                point_refs: vec![src((1, 1, 3, 1))],
+                points_unheld: true,
+                points_ref_unheld: true,
+                ..ChartSeries::default()
+            }],
+            ..ChartData::default()
+        };
+        let box_of = |d: &ChartData| d.source.clone().unwrap();
+        assert!(super::chart_would_lose_points(&partial));
+        assert!(super::chart_points_off_box(&partial, &box_of(&partial)));
+        let err = super::chart_reauthored(&partial, "column", &sh).expect_err("box is short");
+        assert!(err.contains("DATA RANGE"), "{err}");
+        assert!(err.contains("covers only the rest"), "{err}");
+
+        // A HELD ref on another sheet is the same defect by the other route:
+        // both halves parsed, so nothing is marked unheld at all, but
+        // `fold_source` skipped the foreign one and `chart_from_range` reads the
+        // box's sheet only — so a re-derivation would lose the X column outright.
+        let mut foreign = partial.clone();
+        foreign.series[0].points_unheld = false;
+        foreign.series[0].points_ref_unheld = false;
+        foreign.series[0].point_refs.push(ChartSource {
+            sheet: "Other".into(),
+            range: (1, 0, 3, 0),
+            cat_col: 0,
+        });
+        assert!(super::chart_would_lose_points(&foreign));
+        assert!(super::chart_points_off_box(&foreign, &box_of(&foreign)));
+        let err = super::chart_reauthored(&foreign, "column", &sh).expect_err("box is short");
+        assert!(err.contains("covers only the rest"), "{err}");
+        // Case is not what makes a sheet foreign, here or anywhere else a name
+        // resolves.
+        let mut same = foreign.clone();
+        same.series[0].point_refs[1].sheet = "dATA".into();
+        assert!(!super::chart_points_off_box(&same, &box_of(&same)));
+
+        // The wider mark WITHOUT the narrower is the literal-points shape, and a
+        // different one: those points live in no cells at all, so no box could
+        // have covered them and the chart's own is the best that exists. Its box
+        // is whatever the LABEL slots folded — a `<c:tx>` ref stretches up over
+        // the header row, so it already leads with one — and it goes through.
+        let mut literal = partial.clone();
+        literal.source = Some(src((0, 0, 3, 1)));
+        literal.series[0].point_refs.clear();
+        literal.series[0].points_ref_unheld = false;
+        assert!(!super::chart_points_off_box(&literal, &box_of(&literal)));
+        let out = super::chart_reauthored(&literal, "column", &sh).expect("re-derived");
+        assert_eq!(out.source.as_ref().unwrap().range, (0, 0, 3, 1));
+        assert_eq!(out.series.len(), 2);
+
+        // And a literal point element BESIDE a held ref is that same shape, not
+        // the short-box one: the bubble whose `<c:bubbleSize>` is a `<c:numLit>`
+        // has a box covering every cell its X and Y name. Asking `points_unheld`
+        // here would refuse it for a reference it hasn't got.
+        let mut lit_beside = literal.clone();
+        lit_beside.series[0].point_refs = vec![src((1, 0, 3, 1))];
+        assert!(super::chart_would_lose_points(&lit_beside));
+        assert!(!super::chart_points_off_box(
+            &lit_beside,
+            &box_of(&lit_beside)
+        ));
+        super::chart_reauthored(&lit_beside, "column", &sh).expect("re-derived");
+
+        // Switch Row/Column re-derives through the same `chart_from_range`, so
+        // it loses the same half and is refused in the same words — which is
+        // what greys the button out with the reason under it. The literal case
+        // still flips, for the reason it still converts.
+        for short in [&partial, &foreign] {
+            let err = super::chart_switch_row_column(short, &sh).expect_err("box is short");
+            assert!(err.contains("covers only the rest"), "{err}");
+        }
+        // Whatever the literal case's flip answers, it is never THIS refusal:
+        // its box covers every cell its plot names.
+        if let Err(e) = super::chart_switch_row_column(&lit_beside, &sh) {
+            assert!(!e.contains("covers only the rest"), "{e}");
+        }
+
+        // A re-point puts the series beyond the question: the writer emits its
+        // `values_ref` as it stands, the fold has that ref, and the unheld
+        // element beside it is what any relabel clears anyway.
+        let mut repointed = partial.clone();
+        repointed.series[0].values_ref = Some(src((1, 1, 3, 1)));
+        assert!(!super::chart_would_lose_points(&repointed));
+        assert!(!super::chart_points_off_box(
+            &repointed,
+            &box_of(&repointed)
+        ));
     }
 
     /// The Overview's worked example, as a sheet: one row per item, a header
@@ -17646,7 +18765,7 @@ mod grid_geom_tests {
         // re-derive from; the panel greys the button out on this answer.
         let mut orphan = col.clone();
         orphan.source = None;
-        assert!(super::chart_switch_row_column(&orphan, &sh).is_none());
+        assert!(super::chart_switch_row_column(&orphan, &sh).is_err());
 
         // A range that doesn't read the other way round refuses too. One
         // column wide, there is nothing to read ACROSS — a row of it is a
@@ -17660,7 +18779,7 @@ mod grid_geom_tests {
         };
         let mut narrow = col.clone();
         narrow.source = boxed((0, 0, 3, 0));
-        assert!(super::chart_switch_row_column(&narrow, &sh).is_none());
+        assert!(super::chart_switch_row_column(&narrow, &sh).is_err());
 
         // And the transpose of that: a row-oriented chart one row deep has no
         // column to read down.
@@ -17668,7 +18787,100 @@ mod grid_geom_tests {
             gridcore::sheet::chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true)
                 .expect("row chart");
         flat.source = boxed((1, 0, 1, 3));
-        assert!(super::chart_switch_row_column(&flat, &sh).is_none());
+        assert!(super::chart_switch_row_column(&flat, &sh).is_err());
+    }
+
+    /// The flip re-derives from the chart's own box, which for an imported
+    /// scatter sits ON its points — the shape `chart_box_with_header` exists
+    /// for, asked here for the orientation the flip is ABOUT to read the box as
+    /// rather than the one it has.
+    #[test]
+    fn switching_a_scatter_whose_box_sits_on_its_points_does_not_eat_a_line() {
+        use gridcore::sheet::{Cell, ChartData, ChartSeries, ChartSource, Sheet};
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        // A label column, then a header row over two columns of points.
+        for (r, label) in [(1, "First"), (2, "Second"), (3, "Third")] {
+            sh.set_cell(r, 0, Cell::text(label));
+        }
+        sh.set_cell(0, 1, Cell::text("X"));
+        sh.set_cell(0, 2, Cell::text("Speed"));
+        for (i, (x, y)) in [(1.0, 10.0), (2.0, 20.0), (3.0, 30.0)].iter().enumerate() {
+            let r = i as u32 + 1;
+            sh.set_cell(r, 1, Cell::number(*x));
+            sh.set_cell(r, 2, Cell::number(*y));
+        }
+        let src = |range| ChartSource {
+            sheet: "Data".into(),
+            range,
+            cat_col: 0,
+        };
+        // Points in B2:C4, and a literal `<c:tx>` name that left nothing to
+        // stretch the box over them: it is B2:C4 too.
+        let scatter = ChartData {
+            kind: "scatter".into(),
+            source: Some(src((1, 1, 3, 2))),
+            series: vec![ChartSeries {
+                name: "Speed".into(),
+                point_refs: vec![src((1, 1, 3, 1)), src((1, 2, 3, 2))],
+                ..ChartSeries::default()
+            }],
+            ..ChartData::default()
+        };
+        let row = super::chart_switch_row_column(&scatter, &sh).expect("switched");
+        // Widened LEFT, not up: the flip reads the box by row, so the line it
+        // needs is the label column. Read as-is, column B would have been eaten
+        // as the series names and the plot would be one point short.
+        assert_eq!(row.source.as_ref().unwrap().range, (1, 0, 3, 2));
+        assert!(row.by_row);
+        let names: Vec<&str> = row.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["First", "Second", "Third"]);
+        assert_eq!(row.series[0].values, vec![1.0, 10.0]);
+
+        // With no line to widen into it is refused, in the same words the
+        // re-author door uses — not flipped onto a mangled plot whose every
+        // series carries a `values_ref` the next save would write out.
+        let mut at_edge = scatter.clone();
+        at_edge.source = Some(src((1, 0, 3, 1)));
+        at_edge.series[0].point_refs = vec![src((1, 0, 3, 0)), src((1, 1, 3, 1))];
+        let err = super::chart_switch_row_column(&at_edge, &sh).expect_err("no room beside");
+        assert!(err.contains("its points start at column A"), "{err}");
+
+        // Re-pointing a series does not close the door behind it. The pick
+        // fills `values_ref`, so the chart no longer has points to LOSE, but
+        // `point_refs` stay on the series and `rebuild_source` still folds them
+        // — the box sits on the points exactly as before, and asking the
+        // narrower "would a relabel cost points" question here would hand that
+        // box to `chart_from_rows` to eat column B as the series names.
+        let mut repointed = scatter.clone();
+        super::series_set_values(&mut repointed, 0, vec![10.0, 20.0, 30.0], src((1, 2, 3, 2)))
+            .expect("re-pointed");
+        assert!(!super::chart_would_lose_points(&repointed));
+        assert_eq!(repointed.source.as_ref().unwrap().range, (1, 1, 3, 2));
+        let row = super::chart_switch_row_column(&repointed, &sh).expect("switched");
+        assert_eq!(row.source.as_ref().unwrap().range, (1, 0, 3, 2));
+        let names: Vec<&str> = row.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["First", "Second", "Third"]);
+
+        // A chart that plots through `<c:val>` is NOT widened: its box is the
+        // one the user set in DATA RANGE, and pulling a column in beside it
+        // would move the field under their hands and break the round trip.
+        //
+        // The box is B1:C4 — two numeric columns under a header row, so
+        // `chart_from_columns` falls back to the FIRST as its category column
+        // and the leading series' `values_ref` starts in the box's own leading
+        // column. The plotted-line test therefore says "widen" here; only the
+        // provenance gate keeps column A out, which is what this case pins.
+        let col = gridcore::sheet::chart_from_range(&sh, "Data", (0, 1, 3, 2), "column", false)
+            .expect("column chart");
+        assert_eq!(
+            super::chart_box_with_header(&col, col.source.as_ref().unwrap(), true),
+            Some((0, 0, 3, 2)),
+        );
+        let flipped = super::chart_switch_row_column(&col, &sh).expect("switched");
+        assert_eq!(flipped.source.as_ref().unwrap().range, (0, 1, 3, 2));
     }
 
     /// `series_add` refuses a pie a second series because the writer would drop

@@ -725,6 +725,14 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
         if let Some(s) = ser.values_ref.as_mut() {
             changed |= retarget(s, old, new_name);
         }
+        // A scatter's or bubble's points are the only numbers such a series
+        // has, and the panel's `rebuild_source` folds them FIRST — leaving them
+        // behind would seed the box with the old name and then skip the
+        // correctly-renamed slots after it for the sheet mismatch, so DATA
+        // RANGE would name a sheet the workbook no longer has.
+        for s in &mut ser.point_refs {
+            changed |= retarget(s, old, new_name);
+        }
         // The name ref is kept verbatim as its `<c:f>` text, so it has to go
         // back through the same spelling rules (quoting included). A single cell
         // stays a single cell rather than becoming `$B$1:$B$1`.
@@ -746,6 +754,15 @@ pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_na
     }
     // Only a chart whose refs actually moved is regenerated on save; the rest
     // round-trip verbatim, formatting and all.
+    //
+    // `edited` is a REQUEST to regenerate, not a promise: `save_xlsx` also asks
+    // `chart_is_writable`, and a scatter, bubble, stacked or combo chart fails
+    // it, so its part is copied byte for byte and the `<c:f>` on disk keeps the
+    // old sheet name until something makes the chart writable. That is the same
+    // trade-off `chart_kind_is_writable`'s own comment records for every other
+    // slot on such a chart — a stale ref beats a destroyed chart — and it is
+    // why re-basing them here is still worth doing: the panel, `rebuild_source`
+    // and the next re-derivation all read the model, not the part.
     cd.edited |= changed;
 }
 
@@ -817,6 +834,28 @@ pub fn shift_chart_refs(
             // back exactly the dangling ref the drop above is for.
             ser.col = None;
         }
+        // A scatter's/bubble's points follow the grid like any other ref, and
+        // are dropped rather than left dangling when their cells are wholly
+        // deleted — the same rule `shift_slot` applies to `values_ref`, and for
+        // the same reason: these ARE the series' numbers, and `rebuild_source`
+        // folds them first, so a stale one drags the panel's box back onto the
+        // pre-edit rectangle.
+        ser.point_refs.retain_mut(|s| {
+            if !mine(s) {
+                return true;
+            }
+            match moved(s, shift) {
+                Some(next) => {
+                    changed |= next != *s;
+                    *s = next;
+                    true
+                }
+                None => {
+                    changed = true;
+                    false
+                }
+            }
+        });
         // The column a series plots is an index into the grid like any other —
         // but only into the grid it actually reads. Shifting it for a column
         // inserted on some OTHER sheet would leave `col` contradicting
@@ -854,7 +893,8 @@ pub fn shift_chart_refs(
             }
         }
     }
-    // Only a chart whose refs actually moved is regenerated on save.
+    // Only a chart whose refs actually moved is regenerated on save — and only
+    // if `chart_is_writable` also says yes; see `rename_sheet_in_chart`.
     cd.edited |= changed;
     changed
 }
@@ -1634,6 +1674,113 @@ mod tests {
         let cd = chart_of(&w);
         assert_eq!(cd.series[0].values_ref, None);
         assert_eq!(cd.series[0].col, None, "or the writer re-derives the ref");
+    }
+
+    /// A scatter on "Data": no `<c:val>` at all, its numbers in `<c:xVal>`
+    /// (A2:A4) and `<c:yVal>` (B2:B4), named from B1.
+    fn scatter_wb() -> Workbook {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, Drawing, DrawingKind};
+        let src = |r: (u32, u32, u32, u32)| ChartSource {
+            sheet: "Data".into(),
+            range: r,
+            cat_col: 0,
+        };
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].name = "Data".into();
+        w.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (0, 0),
+            to: (5, 5),
+            kind: DrawingKind::Chart(ChartData {
+                kind: "scatter".into(),
+                source: Some(src((0, 0, 3, 1))),
+                series: vec![ChartSeries {
+                    name: "Qty".into(),
+                    point_refs: vec![src((1, 0, 3, 0)), src((1, 1, 3, 1))],
+                    name_ref: Some("Data!$B$1".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        });
+        w
+    }
+
+    #[test]
+    fn a_rename_follows_a_scatters_point_refs() {
+        // `point_refs` are the only ref a scatter's series has, and the panel's
+        // `rebuild_source` folds them FIRST. Left on the old name they seed the
+        // box with a sheet the workbook hasn't got, and every correctly-renamed
+        // slot after them is skipped for the mismatch.
+        let mut w = scatter_wb();
+        rename_sheet(&mut w, 0, "Numbers");
+        let cd = chart_of(&w);
+        assert!(
+            cd.series[0].point_refs.iter().all(|p| p.sheet == "Numbers"),
+            "got {:?}",
+            cd.series[0].point_refs
+        );
+        assert_eq!(
+            cd.source.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers")
+        );
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn a_row_insert_moves_a_scatters_point_refs() {
+        let mut w = scatter_wb();
+        insert_rows(&mut w, 0, 0, 2); // two rows above the data body
+        let cd = chart_of(&w);
+        assert_eq!(
+            cd.series[0]
+                .point_refs
+                .iter()
+                .map(|p| p.range)
+                .collect::<Vec<_>>(),
+            vec![(3, 0, 5, 0), (3, 1, 5, 1)],
+        );
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((2, 0, 5, 1)));
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn deleting_a_scatters_x_cells_drops_that_point_ref_instead_of_dangling() {
+        // Same rule as `values_ref`: a wholly-deleted range loses its ref rather
+        // than plotting whatever moved into those cells.
+        let mut w = scatter_wb();
+        delete_cols(&mut w, 0, 0, 1); // column A, the X values
+        let cd = chart_of(&w);
+        assert_eq!(
+            cd.series[0]
+                .point_refs
+                .iter()
+                .map(|p| p.range)
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 3, 0)],
+            "the X ref should be gone and Y should have moved left",
+        );
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn a_scatter_on_another_sheet_keeps_its_point_refs() {
+        let mut w = scatter_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Other".into(),
+            ..Default::default()
+        });
+        insert_rows(&mut w, 1, 0, 5); // edit the OTHER sheet
+        let cd = chart_of(&w);
+        assert_eq!(
+            cd.series[0]
+                .point_refs
+                .iter()
+                .map(|p| p.range)
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 3, 0), (1, 1, 3, 1)],
+        );
+        assert!(!cd.edited);
     }
 
     #[test]

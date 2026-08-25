@@ -171,30 +171,50 @@ rather than as frozen number caches, which is what lets an editor repoint one.
   would drop the rest without a word (`a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it`).
   The schema permits such a chart even though Excel's own UI won't author one,
   and no panel door builds one (`chart_kind_series_err`, and `series_add`'s own
-  `n > 0`), so it only ever arrives from a foreign file. Which is also why
-  `parse_chart` reads `<c:cat>`/`<c:val>` but not `<c:xVal>`/`<c:yVal>`. A
+  `n > 0`), so it only ever arrives from a foreign file. A scatter's and a bubble's
+  `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` ARE read — each folds into
+  `ChartData::source` and is kept on the series as `ChartSeries::point_refs`,
+  so the panel's `rebuild_source` sees the same cells the loader did instead of
+  rebuilding such a chart's box out of its label cells alone. What the LOADER
+  never gives those kinds is a `values_ref` or a cached point: the numbers under
+  `<c:xVal>` are not read, so regenerating one would write an EMPTY column
+  chart, which is why the kind isn't writable and the part round-trips verbatim.
+  (Live, the two slots can coexist — the panel's SERIES VALUES field is offered
+  for every kind, so re-pointing a scatter's series installs a `values_ref`
+  beside its `point_refs`, and `rebuild_source` folds both. Picking a writable
+  TYPE doesn't relabel such a chart into that empty chart either: if ANY of its
+  series still carries nothing but points, `chart_set_kind` authors the whole
+  chart afresh from its own box, so a half-re-pointed scatter can't keep the
+  series the user touched and lose the one nobody did. Points the loader could
+  not turn into a ref at all — a literal `<c:numLit>`, or an `<c:f>` too big to
+  hold — add nothing to `point_refs` and are recorded as
+  `ChartSeries::points_unheld` instead, so that door is shut on them too rather
+  than left open by the empty vec. The mark is per point ELEMENT, so a series
+  with one readable half and one unreadable one carries both it and a ref.) A
   series `<c:f>` this model can't hold (a whole column, a defined name, a
-  multi-area ref) sets `complex` for the same reason: the slot stays empty, and
-  regenerating would write the cached numbers back as `<c:numLit>`, freezing a
-  live chart. A **`<c:multiLvlStrRef>` category** is refused alongside them, for
-  a reason of its own: that is Excel's MULTI-LEVEL category (one `<c:lvl>` per
-  level) where this model holds a single line of labels, so regenerating would
-  write a one-level `<c:strRef>` naming *every* level's cells beside a cache
-  holding one level's — the ref and its cache in different orders. It is the
-  import-side twin of the panel's `categories_shape_err`. The **element** is
-  what decides, not the shape of its `<c:f>`: the usual multi-level ref is a
-  rectangle, but two levels over one category name the *line* `$A$2:$B$2`,
-  which nothing in the range tells from an ordinary row of labels. A `<c:cat>`
-  rectangle stays refused on its own account whoever wrote it, being a shape
-  neither reading produces. Such a chart comes back with `categories_ref = None`,
-  a narrower `source` box and its part kept verbatim (`parse_chart`,
+  multi-area ref) — under `<c:tx>`, `<c:val>` or `<c:cat>`, where `complex` is
+  the only place to say it — sets `complex` for the same reason: the slot
+  stays empty, and regenerating would write the cached numbers back as
+  `<c:numLit>`, freezing a live chart. A **`<c:multiLvlStrRef>` category** is
+  refused alongside them, for a reason of its own: that is Excel's MULTI-LEVEL
+  category (one `<c:lvl>` per level) where this model holds a single line of
+  labels, so regenerating would write a one-level `<c:strRef>` naming *every*
+  level's cells beside a cache holding one level's — the ref and its cache in
+  different orders. It is the import-side twin of the panel's
+  `categories_shape_err`. The **element** is what decides, not the shape of
+  its `<c:f>`: the usual multi-level ref is a rectangle, but two levels over
+  one category name the *line* `$A$2:$B$2`, which nothing in the range tells
+  from an ordinary row of labels. A `<c:cat>` rectangle stays refused on its
+  own account whoever wrote it, being a shape neither reading produces. Such a
+  chart comes back with `categories_ref = None`, a narrower `source` box and
+  its part kept verbatim (`parse_chart`,
   `a_multi_level_category_ref_is_one_this_model_cannot_hold`,
   `a_multi_level_category_over_one_category_is_refused_too`) — so unlike the
-  orientation cases the rest of this section describes, the symptom is a frozen,
-  shrunk-box chart rather than one that reads the wrong way round. (Every kind
-  above fires on a column-oriented chart too: a `<c:val>` of `Sheet1!$B:$B` is
-  the commonest of the lot, and it is a column chart's ref far more often than
-  a row chart's.)
+  orientation cases the rest of this section describes, the symptom is a
+  frozen, shrunk-box chart rather than one that reads the wrong way round.
+  (Every kind above fires on a column-oriented chart too: a `<c:val>` of
+  `Sheet1!$B:$B` is the commonest of the lot, and it is a column chart's ref
+  far more often than a row chart's.)
 - **Sparse caches**: Excel omits the `<c:pt>` for a blank or non-numeric source
   cell, so the parse places each point at its `idx` rather than appending.
   Appending would shift everything after a gap one place left, and an edited

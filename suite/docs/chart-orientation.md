@@ -95,6 +95,23 @@ several rows votes **column**. A row reading wins only if it is **unanimous** �
 `rows > 0 && cols == 0`. Only when *nothing* had a shape of its own does the
 arrangement of the single-cell series get a say (see below).
 
+A scatter and a bubble have no `<c:val>` at all — their numbers arrive under
+`<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` — so their `ChartSeries::point_refs` are
+measured the same way and vote alongside. Without that every one of those charts
+answered "column" by default however it was laid out, which stopped being just
+the panel's reading once picking a type began *re-deriving* them
+(`chart_reauthored`, below): a scatter along rows came back as N one-point
+series. Only **multi-cell** point refs vote — a one-point scatter is two single
+cells, laid out side by side or stacked down one column, and neither says
+anything about orientation. The stacked layout is why the guard is needed rather
+than merely tidy: without it those two cells satisfy every clause of the
+stacked-cell rule below and the chart comes back `by_row`, to be re-derived the
+wrong way round on a type click. Points the loader could not hold at all (a
+`<c:numLit>`, a whole-column `<c:f>`) leave no shape to measure and are silent
+here, like any other unreadable ref; `ChartSeries::points_unheld` records them
+for the separate question of whether the chart can be relabelled, and its
+narrower half `points_ref_unheld` for whether the box is short of the plot.
+
 The ambiguous cases, decided explicitly so the next reader doesn't have to
 rediscover them:
 
@@ -188,9 +205,24 @@ those are:
   hold);
 - a box over the cell cap — this is the one chart range nothing has ever
   bounded, because it came from the FILE rather than from a field, and a
-  `<c:f>` may legally name a whole column;
+  `<c:f>` may legally name a whole column. The count is taken TWICE, and the
+  second one is of the WIDENED box (`chart_cells_within_cap` again, after
+  `chart_box_with_header` below), so a box that fits by a line still refuses
+  here and the number in the message can be a line more than the cell count
+  DATA RANGE shows;
 - a box naming a sheet the workbook hasn't got (one the user has since
   deleted or renamed);
+- a box KNOWN to be short of the plot — a scatter or bubble naming point cells
+  the fold took none of, either an `<c:f>` the loader refused or a held ref on
+  another sheet. `chart_from_range` reads the box, so flipping would come back
+  plotting one coordinate with the other silently gone; the re-author door
+  refuses the same shape in the same words (`chart_points_off_box`);
+- a points-leading box with no line to widen into — the same class of chart
+  read the other way round: a box folded out of the points whose plot then
+  starts at column A (or row 1), so there is no label column beside (or header
+  row above) it for the flipped reading to name the series from
+  (`chart_box_with_header`). The note says which line is missing and that
+  inserting one, or pointing DATA RANGE at the cells to read, is the way out;
 - a range with no line of numbers the other way round;
 - a **pie** whose flipped range would read as more than one series, which is
   the usual case — see below.
@@ -221,6 +253,94 @@ untouched, because `chart_is_writable` vetoes regenerating the part. Picking a
 type (`chart_set_kind`) is what clears `complex`, and that is the documented
 "author this one afresh" escape hatch: after it the incomplete plot is what gets
 written.
+
+There is one chart that pick cannot merely relabel. A scatter's and a bubble's
+points arrive as `<c:xVal>`/`<c:yVal>` REFS with no cached numbers, so such a
+series has nothing `chart_space_xml` could write a `<c:val>` from —
+relabelling it `column` would make `chart_is_writable` true and the next save
+would overwrite its part with a series of zero points. `chart_would_lose_points`
+asks that per SERIES, because the writer writes each one independently: a
+scatter whose first series a re-point gave a `values_ref` and whose second still
+carries nothing but points would otherwise keep the half the user touched and
+lose the half nobody did. One such series sends the whole chart through
+`chart_reauthored`, which re-derives it from its own box through
+`chart_from_range` — literally the "author this one afresh" the note promises —
+or refuses, naming the shape this chart reads, when that box holds no numbers to
+plot. A series with no points and no numbers is not that case: "+ Series" pushes
+one, and it has nothing to lose, while re-deriving over it would discard the
+hand edits on every other series — which is why the loader marks the series it
+*could not read points for* (`points_unheld`), so a literal or whole-column
+scatter is told apart from that empty one rather than relabelled.
+
+The box handed to `chart_from_range` there is not taken on trust, because an
+imported scatter's satisfies neither thing that call assumes of a box **it**
+derived. Its leading line may not be a HEADER: `parse_chart` folds a scatter's
+box out of the point refs — its numbers — and a series named by a literal
+`<c:v>` (no `<c:f>`) leaves nothing to stretch the box up over a header row, so
+it arrives as `A2:B4` where the authored equivalent is `A1:B4`.
+`chart_from_columns` would then eat row 2 as headings and hand back a plot one
+point short of the one on screen, so `chart_box_with_header` widens the box by a
+line whenever a plotted ref reaches its edge, and refuses when there is no line
+to widen into. And its ORIENTATION is `data.by_row`, which is why `infer_by_row`
+reads point refs at all — the paragraph above.
+
+Switch Row/Column re-derives from that same box, so it asks the same question —
+for the orientation the FLIP is about to read it as, not the one the chart has:
+a box that leads with a header row need not lead with a label column, and read
+by row the scatter's `A2:B4` would have column A eaten as the series names.
+Only a chart `chart_box_from_points` accepts is widened, which is the set whose
+box was folded out of point refs, asked of the refs themselves rather than of
+what a relabel would cost: re-pointing a series fills `values_ref` and leaves
+`point_refs` where they are, so a half re-pointed scatter still has its box
+sitting on its points and `chart_would_lose_points` would already have gone
+false for it. Every other box is the one the user can see in DATA RANGE, and
+pulling a line in beside it would move the field under their hands and stop a
+double flip returning the chart the range describes — a `Year | Sales` box is
+all numbers, so its first series starts in the box's own leading column and the
+plotted-line test alone would fire on it. What the widening does not promise is
+a way back to the imported scatter: the flip re-derives, and the chart that
+comes out carries the box the FIRST flip needed rather than one the other
+reading can use, which is the answer every hand edit gets here. Undo, not a
+second flip, is what puts the scatter back. A flip made before the click
+therefore survives it — but not because the re-read honours `data.by_row`. The
+flip re-derives there and then, so every series comes back carrying a
+`values_ref` and the chart has left the points-only class altogether; the later
+click finds nothing to lose and merely relabels, which is also why the note's
+second half stops being shown once a flip has landed.
+
+Because the rest do not, the not-writable note says so: picking a type on a
+chart that still holds nothing but points *re-reads* it from its DATA RANGE and
+replaces the series below — names, colours, re-points, additions — keeping only
+the title. Which of the THREE things a click can do turns on per-series state
+the panel doesn't draw, so `chart_set_kind` also sets a status line saying the
+re-read happened and with how many series.
+
+The note picks between the three by MAKING the call the click would make
+(`chart_range_sheet` + `chart_reauthored(…, "column", …)`, the way the Switch
+Row/Column button already derives its flip every frame) rather than by a proxy:
+
+- **A relabel** — re-point *every* series and the chart has left the points-only
+  class, so the note stops after its first half ("are not saved until you pick a
+  type above").
+- **A re-read** — `chart_reauthored` comes back `Ok`, so the note adds that the
+  click re-reads the chart from its data range and replaces the series below.
+- **A refusal** — `chart_reauthored` comes back `Err`, so the note says the
+  edits are not saved and that picking a type can't save them either until DATA
+  RANGE names cells the chart can be re-read from. That is the branch a chart
+  with no box at all takes: a scatter whose points and whose name are both
+  literals folds nothing into `source`, and `chart_range_sheet`'s first line
+  refuses without one (`CHART_NO_BOX`). It is also the branch for the four
+  refusals that leave the box in PLACE — a plot half the box doesn't cover, a
+  points-leading box with no line to widen into, a widened box past the cell
+  cap, a box with no line of numbers — and for a box naming a sheet the workbook
+  hasn't got.
+
+`data.source.is_some()` used to stand in for that call, and was unsound in both
+directions: it promised a re-read for every one of those five refusals, and with
+no box at all it fell back to the bare first half — which claims the edits get
+saved once a type is picked, on the one chart where picking a type can only
+refuse. `"column"` answers for all four buttons, because the only kind-dependent
+refusal is `chart_kind_series_err`, a pie-only count.
 
 **Re-pointing a series** (`SeriesValues(i)`) checks the shape the *chart* wants,
 not a constant: `series_values_shape_err` refuses `range.1 != range.3` on a
@@ -273,10 +393,13 @@ doors to that state apply:
   the count belongs to the flip, not to the chart on screen.
 - `chart_apply_range` — a wide DATA RANGE on a pie is the same hole by another
   door.
-- `chart_set_kind` — picking **Pie** on a chart that already has N series. This
-  one does not re-derive; it keeps the series and rewrites the kind, which is
-  why guarding the re-derivations alone left it open. It is also the widest
-  door, being what a user reaches by clicking the word *Pie*.
+- `chart_set_kind` — picking **Pie** on a chart that already has N series. It
+  usually does not re-derive; it keeps the series and rewrites the kind, which
+  is why guarding the re-derivations alone left it open. It is also the widest
+  door, being what a user reaches by clicking the word *Pie*. It asks twice: the
+  one chart it does re-derive (the paragraph above) comes back with a series per
+  numeric column of its box, so `chart_reauthored` re-checks the rule on that
+  count — and its refusal can then name a count the panel is not showing.
 - `sheet_insert_chart` — Insert ▸ Pie over a range with several numeric columns.
 
 (A file that arrives already holding a multi-series `<c:pieChart>` is not
