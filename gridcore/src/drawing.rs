@@ -1024,19 +1024,13 @@ fn parse_chart(xml: &str) -> ChartData {
     for src in cat_boxes.into_iter().chain(name_boxes) {
         fold_source(&mut cd.source, src);
     }
-    // A pie with several `<c:ser>` is the shape the writer cannot reproduce
-    // without losing data: `chart_space_xml`'s pie arm emits `series.first()`
-    // only. Nothing docxy derives can reach it — four of the five panel doors
-    // ask `chart_kind_series_err` first, and `series_add` applies the same rule
-    // in its own words (`n > 0` before the push) — but a foreign file may
-    // already be there,
-    // so hold it back rather than let the next edit regenerate it one slice
-    // group short. Picking a type in the panel is still the way out, and that
-    // door is guarded too.
-    cd.complex = groups > 1
-        || unparsed_ref
-        || !matches!(grouping.as_str(), "" | "clustered" | "standard")
-        || (cd.kind == "pie" && cd.series.len() > 1);
+    // A pie with several `<c:ser>` is NOT held back. It used to be, because
+    // `chart_space_xml`'s pie arm emitted `series.first()` only and
+    // regenerating such a part came back one slice group short; that arm now
+    // writes every series, so the shape round-trips and the chart stays
+    // editable. Excel plots the first series either way.
+    cd.complex =
+        groups > 1 || unparsed_ref || !matches!(grouping.as_str(), "" | "clustered" | "standard");
     cd.by_row = infer_by_row(&cd);
     // Which column the box calls its LABEL column, said outright rather than
     // inherited from whichever `<c:f>` happened to seed the box — the fold
@@ -1376,12 +1370,13 @@ mod tests {
     }
 
     #[test]
-    fn a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it() {
-        // The writer's pie arm emits `series.first()` only, so regenerating
-        // this part would drop the second series without a word. No panel door
-        // can build one — four ask `chart_kind_series_err`, and `series_add`
-        // asks the same question inline — but the schema permits it, so a
-        // foreign file can arrive already there.
+    fn a_pie_that_arrives_with_two_series_stays_editable() {
+        // The schema permits several `<c:ser>` in one `<c:pieChart>` and real
+        // Excel files do it, so a foreign workbook can arrive already there.
+        // This used to be held back as `complex`, because regenerating the part
+        // would have dropped the second series: the writer's pie arm emitted
+        // `series.first()` only. It writes every series now, so the shape
+        // round-trips and the chart is editable like any other.
         let xml = r#"<c:chartSpace xmlns:c="c" xmlns:a="a"><c:chart><c:plotArea><c:pieChart>
           <c:ser><c:idx val="0"/>
             <c:val><c:numRef><c:f>Budget!$B$2:$B$3</c:f><c:numCache><c:pt idx="0"><c:v>2</c:v></c:pt></c:numCache></c:numRef></c:val>
@@ -1391,10 +1386,10 @@ mod tests {
           </c:ser></c:pieChart></c:plotArea></c:chart></c:chartSpace>"#;
         let cd = parse_chart(xml);
         assert_eq!(cd.kind, "pie");
-        assert_eq!(cd.series.len(), 2, "both are loaded and both are drawn");
-        assert!(cd.complex, "so the part is not regenerated");
-        assert!(!crate::xlsx::chart_is_writable(&cd));
-        // One series is the ordinary pie, and stays editable.
+        assert_eq!(cd.series.len(), 2, "both are loaded");
+        assert!(!cd.complex, "the writer can reproduce it now");
+        assert!(crate::xlsx::chart_is_writable(&cd));
+        // And the one-series pie, the common case, is unmoved.
         let one = xml.replace(
             r#"<c:ser><c:idx val="1"/>
             <c:val><c:numRef><c:f>Budget!$C$2:$C$3</c:f><c:numCache><c:pt idx="0"><c:v>4</c:v></c:pt></c:numCache></c:numRef></c:val>

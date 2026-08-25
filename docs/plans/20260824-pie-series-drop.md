@@ -216,26 +216,32 @@ pure logic, but constructing views or elements blows up the render macro, so
 
 ### Task 2: Write every series a pie holds
 
-- [ ] change `chart_space_xml`'s pie arm (gridcore/src/xlsx.rs) to
+- [x] change `chart_space_xml`'s pie arm (gridcore/src/xlsx.rs) to
       emit a `<c:ser>` for every series, as the bar and line arms do, rather
-      than `data.series.first()`
-- [ ] drop the `cd.kind == "pie" && cd.series.len() > 1` term from
+      than `data.series.first()` (the arm now interpolates the shared `{sers}`)
+- [x] drop the `cd.kind == "pie" && cd.series.len() > 1` term from
       `parse_chart`'s `cd.complex` (gridcore/src/drawing.rs): it holds an
       imported multi-series pie's part back from regeneration precisely because
       the writer would lose series, so it must go in the same task the writer
       stops losing them — otherwise such a chart stays uneditable
-- [ ] update the tests that pin that hold-back (drawing.rs, the `pie` case
+- [x] update the tests that pin that hold-back (drawing.rs, the `pie` case
       around the `complex` assertions) to expect a regenerable chart
-- [ ] replace the "extra series are invalid (that's doughnut)" comment with
+      (`a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it` renamed
+      to `…_stays_editable` and inverted; `chart_space_xml_per_kind`'s
+      "pie takes a single series" assertion folded into the shared
+      both-series-expected one)
+- [x] replace the "extra series are invalid (that's doughnut)" comment with
       what is actually true: the format allows several, Excel plots the first,
       and we keep them so a save never deletes the user's work
-- [ ] check the `<c:idx>`/`<c:order>` each series gets are sequential, the way
-      the multi-series arms already produce them
-- [ ] write a test asserting a three-series pie writes three `<c:ser>` blocks
-      with distinct refs
-- [ ] write a test that a one-series pie's output is UNCHANGED — the common
-      case must not move
-- [ ] run tests in both workspaces — must pass before Task 3
+- [x] check the `<c:idx>`/`<c:order>` each series gets are sequential, the way
+      the multi-series arms already produce them (`ser_xml`'s `si` comes from
+      `enumerate`, so 0,1,2 — pinned by the new test)
+- [x] write a test asserting a three-series pie writes three `<c:ser>` blocks
+      with distinct refs (`a_pie_writes_every_series_it_holds`)
+- [x] write a test that a one-series pie's output is UNCHANGED — the common
+      case must not move (`a_one_series_pie_is_written_exactly_as_before`)
+- [x] run tests in both workspaces — must pass before Task 3 (gridcore 362 +
+      1 + 4, suite 80; clippy and `cargo fmt --check` clean)
 
 ### Task 3: Read every series back
 

@@ -2371,17 +2371,15 @@ pub(crate) fn chart_space_xml(data: &crate::sheet::ChartData) -> String {
             // complex_29s.xlsx chart3.xml holds seven, libreoffice/.../
             // tdf111173.xlsx two). Excel plots the FIRST series only; that is a
             // plotting rule, not a format rule.
-            // TODO(pie-series-drop Task 2): the line below acts on the format
-            // rule that does not exist and drops the rest of the user's data.
-            // Pie takes a single series; extra series are invalid (that's doughnut).
-            let pie_ser = data
-                .series
-                .first()
-                .map(|s| ser_xml(0, s))
-                .unwrap_or_default();
+            // So EVERY series is written, the same `{sers}` the axed arms use.
+            // This arm used to emit `series.first()` alone, on the claim that
+            // "extra series are invalid (that's doughnut)" — the schema above
+            // says otherwise, and dropping them deleted the user's work on
+            // save. Keeping them costs nothing: Excel still plots the first,
+            // and a chart converted to Pie and back keeps what it had.
             (
                 format!(
-                    "<c:pieChart><c:varyColors val=\"1\"/>{pie_ser}<c:firstSliceAng val=\"0\"/></c:pieChart>"
+                    "<c:pieChart><c:varyColors val=\"1\"/>{sers}<c:firstSliceAng val=\"0\"/></c:pieChart>"
                 ),
                 "",
             )
@@ -4620,22 +4618,103 @@ mod tests {
                 "{kind}: chartSpace not closed"
             );
             // Pie carries no axes; the axed kinds must include the shared catAx.
+            // Every kind writes every series, pie included.
             if kind == "pie" {
                 assert!(!xml.contains(forbidden), "pie must not emit axes");
-                assert_eq!(
-                    xml.matches("<c:ser>").count(),
-                    1,
-                    "pie takes a single series"
-                );
             } else {
                 assert!(xml.contains(forbidden), "{kind}: missing axes");
-                assert_eq!(
-                    xml.matches("<c:ser>").count(),
-                    2,
-                    "{kind}: both series expected"
-                );
             }
+            assert_eq!(
+                xml.matches("<c:ser>").count(),
+                2,
+                "{kind}: both series expected"
+            );
         }
+    }
+
+    #[test]
+    fn a_pie_writes_every_series_it_holds() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        // ECMA-376 lets a `<c:pieChart>` hold several `<c:ser>`; Excel plots
+        // the first. The writer used to emit only that one, which DELETED the
+        // rest of the user's data on save.
+        let ser = |name: &str, col: u32, v: f64| ChartSeries {
+            name: name.into(),
+            values: vec![v, v + 1.0],
+            col: Some(col),
+            values_ref: Some(ChartSource {
+                sheet: "Budget".into(),
+                range: (1, col, 2, col),
+                cat_col: 0,
+            }),
+            ..Default::default()
+        };
+        let data = ChartData {
+            title: "Sales".into(),
+            kind: "pie".into(),
+            categories: vec!["Q1".into(), "Q2".into()],
+            series: vec![
+                ser("East", 1, 1.0),
+                ser("West", 2, 3.0),
+                ser("North", 3, 5.0),
+            ],
+            ..Default::default()
+        };
+        let xml = chart_space_xml(&data);
+        assert_eq!(xml.matches("<c:ser>").count(), 3, "all three are written");
+        // Each names its own cells — three copies of one ref would be a
+        // different kind of loss.
+        for f in ["Budget!$B$2:$B$3", "Budget!$C$2:$C$3", "Budget!$D$2:$D$3"] {
+            assert!(xml.contains(f), "missing values ref {f}");
+        }
+        for n in ["East", "West", "North"] {
+            assert!(xml.contains(n), "missing series name {n}");
+        }
+        // `<c:idx>`/`<c:order>` run 0,1,2 the way the axed arms produce them.
+        for i in 0..3 {
+            assert!(
+                xml.contains(&format!("<c:idx val=\"{i}\"/><c:order val=\"{i}\"/>")),
+                "series {i} is not indexed sequentially"
+            );
+        }
+        assert!(!xml.contains("<c:catAx"), "a pie still carries no axes");
+        assert_eq!(xml.matches('<').count(), xml.matches('>').count());
+    }
+
+    #[test]
+    fn a_one_series_pie_is_written_exactly_as_before() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource};
+        // The common case must not move: one series in, one `<c:ser>` out,
+        // wrapped in the same `<c:pieChart>` with the same varyColors and
+        // firstSliceAng and no axes.
+        let data = ChartData {
+            title: "Sales".into(),
+            kind: "pie".into(),
+            categories: vec!["Q1".into(), "Q2".into()],
+            series: vec![ChartSeries {
+                name: "East".into(),
+                values: vec![1.0, 2.0],
+                col: Some(1),
+                values_ref: Some(ChartSource {
+                    sheet: "Budget".into(),
+                    range: (1, 1, 2, 1),
+                    cat_col: 0,
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let xml = chart_space_xml(&data);
+        assert_eq!(xml.matches("<c:ser>").count(), 1);
+        let plot = &xml[xml.find("<c:pieChart>").unwrap()..xml.find("</c:pieChart>").unwrap()];
+        assert!(plot.starts_with("<c:pieChart><c:varyColors val=\"1\"/><c:ser>"));
+        assert!(plot.ends_with("</c:ser><c:firstSliceAng val=\"0\"/>"));
+        assert!(!xml.contains("<c:catAx") && !xml.contains("<c:valAx"));
+        // And it is byte-identical to what the same series produced when the
+        // arm wrote `series.first()`: that is exactly `ser_xml(0, s)`, which is
+        // what a one-element `{sers}` still is.
+        assert!(xml.contains("<c:idx val=\"0\"/><c:order val=\"0\"/>"));
+        assert!(xml.contains("Budget!$B$2:$B$3"));
     }
 
     #[test]
