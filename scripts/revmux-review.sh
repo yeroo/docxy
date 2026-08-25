@@ -45,9 +45,6 @@ cd "$REPO_ROOT" || exit 0
 
 command -v revmux >/dev/null 2>&1 || { echo "revmux-review: revmux not on PATH" >&2; exit 0; }
 
-# comprehensive is the diff-shaped roster: bugs+impl, arch+quality and
-# docs+tests on claude, plus an adversarial codex peer.
-PROFILE="${RALPHEX_REVMUX_PROFILE:-comprehensive}"
 MIN_CONFIDENCE="${RALPHEX_REVMUX_MIN_CONFIDENCE:-60}"
 # revmux's default hard timeout is 20m per agent attempt. The one panel this
 # repo has run took ~15m with agents at 3.7M tokens on a single-file diff, so
@@ -63,7 +60,40 @@ HARD_TIMEOUT="${RALPHEX_REVMUX_HARD_TIMEOUT:-40m}"
 PLAN_NAME="$(grep -m1 -oE '[^ /\\]+\.md' "$PROMPT_FILE" 2>/dev/null | head -1 | sed 's/\.md$//')"
 [ -z "$PLAN_NAME" ] && PLAN_NAME="review"
 TASK="ralphex-${PLAN_NAME}"
-RUN="$(date +%Y%m%d-%H%M%S)"
+
+# Which round this is, counted from the rounds already in the task's directory.
+# Works only because the task is keyed on the PLAN and stays stable across
+# iterations.
+ROUNDS_DONE=$(find ".revmux/tasks/$TASK" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+ROUND=$((${ROUNDS_DONE:-0} + 1))
+
+# The round number leads the run name so the directory sorts and reads in
+# order. A bare timestamp is second-resolution, and two rounds landing in the
+# same second would silently share a directory — reusing one round's inputs for
+# the next and corrupting the history revmux carries forward.
+RUN="$(printf '%02d' "$ROUND")-$(date +%Y%m%d-%H%M%S)"
+
+# The roster narrows by round, which is the convergence control.
+#
+# Rounds 1-2 get `comprehensive`: four agents — bugs+impl, arch+quality and
+# docs+tests on claude, plus an adversarial codex peer. That is where the real
+# findings come from.
+#
+# Every later round gets `final`: two agents, and nothing below Major is
+# reported. This is the whole cost story. Across four plans every Major arrived
+# in round 1 or 2, and every round after that was Minor documentation — each
+# round's own doc fix seeding the next round's findings, a loop reviewing
+# itself rather than the work, which does not terminate on its own. Reporting
+# only Majors after round 2 ends that tail by construction: no Majors means no
+# findings, and ralphex stops.
+#
+if [ -n "${RALPHEX_REVMUX_PROFILE:-}" ]; then
+  PROFILE="$RALPHEX_REVMUX_PROFILE"
+elif [ "$ROUND" -le 2 ]; then
+  PROFILE="comprehensive"
+else
+  PROFILE="final"
+fi
 
 PATHS_JSON="$(revmux new --task "$TASK" --run "$RUN" 2>/dev/null)" || {
   echo "revmux-review: revmux new failed" >&2; exit 0; }
