@@ -174,7 +174,12 @@ rather than as frozen number caches, which is what lets an editor repoint one.
   to build one; the writer stopped losing series, so both went
   (`a_pie_that_arrives_with_two_series_stays_editable`,
   `three_series_clicked_to_pie_survive_a_save_and_a_reopen`, and
-  [`suite/docs/pie-series.md`](suite/docs/pie-series.md)). A scatter's and a bubble's
+  [`suite/docs/pie-series.md`](suite/docs/pie-series.md)). The trade is the
+  usual one, said here because this change moved a class of chart across it: an
+  imported multi-series pie is now REGENERATED on edit rather than copied, so
+  its per-slice `<c:dPt>` fills, `<c:dLbls>`, legend placement and
+  `<c:firstSliceAng>` go the way they do on every other writable chart, where
+  before they round-tripped verbatim. A scatter's and a bubble's
   `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` ARE read — each folds into
   `ChartData::source` and is kept on the series as `ChartSeries::point_refs`,
   so the panel's `rebuild_source` sees the same cells the loader did instead of

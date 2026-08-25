@@ -1403,7 +1403,11 @@ mod tests {
 
     /// `<c:idx>`/`<c:order>` need not be contiguous. The writer emits 0,1,2,
     /// but Excel does not have to: `tdf111173.xlsx` in the corpus writes a
-    /// two-series pie as idx 0 and idx **2**. A reader that sized or keyed a
+    /// two-series pie as idx 0 and idx **2**. (That part is a combo — a
+    /// `<c:doughnutChart>` beside the `<c:pieChart>` — so it loads as a
+    /// doughnut and stays `complex` for the unrelated `groups > 1` reason. It
+    /// is cited for the GAP its pie group's indices show, not as a file this
+    /// reader path frees.) A reader that sized or keyed a
     /// `Vec` by `idx` would come back with a phantom empty series between
     /// them — `parse_chart` takes `<c:ser>` in DOCUMENT ORDER instead, and
     /// this pins that it stays that way.

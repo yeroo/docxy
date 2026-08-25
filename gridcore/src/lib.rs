@@ -21,7 +21,7 @@
 //!   with workbook-wide reference rewriting.
 //! - [`numfmt`] — the number-format runtime: real rendering of format codes
 //!   (powers `TEXT()` and cell display).
-//! - [`format`] — `cell.format` patch parsing/application and its `Xf`
+//! - [`mod@format`] — `cell.format` patch parsing/application and its `Xf`
 //!   read-back mapping, shared by every host's agent-facing format verb.
 //! - [`xlsx`] — `.xlsx` bytes ⇄ [`sheet::Workbook`] with part preservation.
 

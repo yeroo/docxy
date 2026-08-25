@@ -2167,7 +2167,7 @@ pub(crate) fn esc_raw_attr(s: &str) -> String {
     out
 }
 
-/// The chart kinds [`chart_space_xml`] can author. Everything else — scatter,
+/// The chart kinds `chart_space_xml` can author. Everything else — scatter,
 /// area, doughnut, radar, bubble, surface — falls into its `_` arm and would be
 /// written back out as a clustered COLUMN chart. Worse, `parse_chart` reads
 /// point DATA from `<c:cat>`/`<c:val>` only: a scatter's or bubble's

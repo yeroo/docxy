@@ -311,12 +311,16 @@ pub struct ChartData {
     /// of a combo onto one axis pair as bars. Those parts round-trip verbatim
     /// instead, the same escape hatch scatter and area use.
     ///
-    /// A `<c:pieChart>` holding several `<c:ser>` is the third shape: the
-    /// schema permits it (Excel's own UI won't author one, but a third-party
-    /// writer can) and the writer emits only the first, so regenerating such a
-    /// part would drop the rest without a word. The panel's five doors to that
-    /// state all refuse it; this is the sixth, and it takes the same escape
-    /// hatch.
+    /// A `<c:pieChart>` holding several `<c:ser>` is NOT one of those shapes,
+    /// though it used to be. `CT_PieChart` declares `ser` with
+    /// `maxOccurs="unbounded"`, so the file is valid and Excel merely plots the
+    /// first; the hold-back existed only because `chart_space_xml`'s pie arm
+    /// wrote `series.first()` and regenerating such a part came back short. The
+    /// arm writes every series now, so the shape round-trips and the chart
+    /// stays editable — see `suite/docs/pie-series.md`, which also records
+    /// what an imported pie trades for that: like every other writable chart,
+    /// its part is regenerated on edit, so per-slice `<c:dPt>` fills, data
+    /// labels and legend placement go the way they do everywhere else.
     pub complex: bool,
     /// Which way round the chart reads its range: `false` (the default) is
     /// Excel's column orientation — each column of `source` is a series, the

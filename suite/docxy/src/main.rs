@@ -1839,10 +1839,18 @@ fn series_is_plotted(kind: &str, si: usize, series: usize) -> bool {
 fn chart_unplotted_note(kind: &str, series: usize) -> Option<String> {
     let extra = series.saturating_sub(chart_plotted_series(kind, series));
     (extra > 0).then(|| {
+        // The two-series pie is the COMMON case (a "+ Series" push, a
+        // two-column Insert ▸ Pie), so its sentence has to read as
+        // English rather than as a count: "the other one is", not "the other 1
+        // is". Past one, the numeral is what the reader wants.
+        let rest = if extra == 1 {
+            "one is".to_string()
+        } else {
+            format!("{extra} are")
+        };
         format!(
-            "A {kind} plots the first series only \u{2014} the other {extra} {} kept in the \
-             file but not drawn.",
-            if extra == 1 { "is" } else { "are" },
+            "A {kind} plots the first series only \u{2014} the other {rest} kept in the \
+             file but not drawn."
         )
     })
 }
@@ -18898,6 +18906,16 @@ mod grid_geom_tests {
                 assert_eq!(drawn(k, n), n, "{k} with {n}");
             }
         }
+        // And the invariant `chart_card` actually leans on: whatever the kind,
+        // the drawn count never exceeds the held one, so `&data.series[..nser]`
+        // cannot slice past the end. Said as an assertion rather than left in
+        // the comment beside that slice, since it is the comment that would go
+        // stale first if a future kind plotted something derived instead.
+        for k in ["pie", "column", "bar", "line", "scatter", "doughnut", ""] {
+            for n in [0, 1, 2, 3, 7, 64] {
+                assert!(drawn(k, n) <= n, "{k} with {n} draws {}", drawn(k, n));
+            }
+        }
 
         // Per series, which is the question the panel's card asks: on a pie only
         // the leading card is drawn, on anything else all of them are.
@@ -18927,10 +18945,13 @@ mod grid_geom_tests {
                 assert_eq!(note(k, n), None, "{k} with {n}");
             }
         }
-        // Two series: one extra, said in the singular.
+        // Two series: one extra, said in the singular — and as a WORD, since
+        // this is the case the user meets most and "the other 1 is" reads as a
+        // tally rather than a sentence.
         let two = note("pie", 2).expect("a two-series pie has something to say");
         assert!(two.contains("A pie plots the first series only"), "{two}");
-        assert!(two.contains("the other 1 is kept in the file"), "{two}");
+        assert!(two.contains("the other one is kept in the file"), "{two}");
+        assert!(!two.contains("the other 1 "), "{two}");
         // Three: two extra, in the plural.
         let three = note("pie", 3).expect("a three-series pie too");
         assert!(
@@ -18940,20 +18961,33 @@ mod grid_geom_tests {
         assert!(three.contains("not drawn"), "{three}");
     }
 
-    /// Every door to a multi-series pie is OPEN now, and each one describes
-    /// what it hands over rather than refusing it.
+    /// The multi-series pie each door now hands over, and what the panel says
+    /// about it.
     ///
-    /// There were five: `series_add`'s inline `n > 0`, and `chart_reauthored`,
-    /// `chart_switched`, `chart_set_kind` and `sheet_insert_chart`, which all
-    /// asked one shared `chart_kind_series_err`. Every one of them existed
-    /// because `chart_space_xml` wrote a pie's FIRST series and dropped the
-    /// rest, so a second could be pointed at cells and coloured and then lost
-    /// on save without a word. The writer keeps them all now
-    /// (`a_pie_writes_every_series_it_holds`, gridcore), so the refusals guard
-    /// nothing — what is left to say is which of the series the plot draws, and
-    /// that is `chart_plotted_series` and `chart_unplotted_note`.
+    /// There were five refusals: `series_add`'s inline `n > 0`, and
+    /// `chart_reauthored`, `chart_switched`, `chart_set_kind` and
+    /// `sheet_insert_chart`, which all asked one shared `chart_kind_series_err`.
+    /// Every one of them existed because `chart_space_xml` wrote a pie's FIRST
+    /// series and dropped the rest, so a second could be pointed at cells and
+    /// coloured and then lost on save without a word. The writer keeps them all
+    /// now (`a_pie_writes_every_series_it_holds`, gridcore), so the refusals
+    /// guard nothing — what is left to say is which of the series the plot
+    /// draws, and that is `chart_plotted_series` and `chart_unplotted_note`.
+    ///
+    /// **What this test can and cannot reach.** Four of the five doors are
+    /// `&mut self` methods taking a `Context<Self>`, so a unit test cannot call
+    /// them; what it calls is the pure half each one delegates to —
+    /// `chart_switch_row_column` under `chart_switched`, `chart_from_range`
+    /// under `chart_set_kind`'s and `sheet_insert_chart`'s re-derivation, and
+    /// `series_add`'s push written out — and then asks
+    /// `chart_plotted_series` / `chart_unplotted_note` what the panel makes of
+    /// the result. So it pins the SHAPE each door produces and how it is
+    /// described; it does not pin that the doors are unguarded. Re-adding a
+    /// refusal inside one of those `&mut self` bodies would leave this green.
+    /// `chart_reauthored`, the one door that IS a free function, is genuinely
+    /// walked by `picking_a_writable_type_authors_a_valueless_scatter_afresh`.
     #[test]
-    fn every_door_to_a_multi_series_pie_is_open_and_says_what_it_draws() {
+    fn the_multi_series_pie_each_door_hands_over_is_described_not_refused() {
         use super::{chart_plotted_series as drawn, chart_unplotted_note as note};
 
         // The switch is the route that reaches it in one click: a pie over a

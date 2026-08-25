@@ -75,6 +75,32 @@ The tests that matter here are round-trips, not writer-output assertions — the
 defect was a save that lost data, and a test reading only the emitted string
 would have passed while the loader still dropped series. See *Testing* below.
 
+## What an imported pie trades for that
+
+`chart_is_writable` is `chart_kind_is_writable && !complex`, so dropping the
+term does not only make such a chart editable — it makes its part
+**regenerable**, and `chart_space_xml` writes far less than Excel does. A series
+carries `<c:idx>`/`<c:order>`/`<c:tx>`/`<c:spPr>`/`<c:cat>`/`<c:val>` and
+nothing else, wrapped in a fixed `<c:varyColors val="1"/>` …
+`<c:firstSliceAng val="0"/>`. Per-slice `<c:dPt>` fills, `<c:dLbls>`, the
+legend's position, `explosion`, a non-zero start angle and any `<c:extLst>` are
+gone the first time the chart is regenerated; before, that part was copied
+byte-for-byte.
+
+`chart-hatch-fill.xlsx` in the table above is the sharp case — the hatch fills
+it is named for live in `<c:dPt><c:spPr>` and do not survive an edit. Nor does
+it take a Chart-panel edit to trigger: `shift_chart_refs` and
+`rename_sheet_in_chart` both set `edited` when a row insert or a sheet rename
+moves a ref, so an edit elsewhere in the workbook is enough.
+
+This is the ordinary trade every writable chart already makes (`SPREADSHEET.md`
+§4a) — single-series pies included — and it is recorded here because this change
+moved a class of chart from one side of it to the other. It is the right side:
+the old behaviour did not preserve that formatting so much as freeze the chart,
+and the moment the user did reach it through the panel the SERIES went, which is
+the user's own work rather than the writer's. But "editable like any other" cuts
+both ways, and the next reader should not have to discover which.
+
 ## What the panel says
 
 `chart_plotted_series(kind, series)` is the single answer to "how many of these
@@ -113,14 +139,19 @@ something the format and the file both allow. All five doors now go through:
 | `series_add` — **+ Series** | pushes onto a pie like any other kind |
 
 Each site carries a comment saying what the guard used to buy and why it stopped
-buying it. `every_door_to_a_multi_series_pie_is_open_and_says_what_it_draws`
-walks four of them — the flip, `chart_set_kind`, `sheet_insert_chart` and
-`series_add`'s push — and asserts each yields the multi-series pie *and*
-describes it through `chart_plotted_series` / `chart_unplotted_note`. The
-re-derivation door is pinned by
+buying it. `the_multi_series_pie_each_door_hands_over_is_described_not_refused`
+covers four of them — the flip, `chart_set_kind`, `sheet_insert_chart` and
+`series_add`'s push — asserting each yields the multi-series pie *and* that
+`chart_plotted_series` / `chart_unplotted_note` describe it. Be precise about
+what that pins: those four doors are `&mut self` methods taking a
+`Context<Self>`, so the test reaches only the PURE half each delegates to
+(`chart_switch_row_column`, `chart_from_range`, and `series_add`'s push written
+out). It pins the shape they produce and the words said about it — **not** that
+they are unguarded; a refusal re-added inside one of those bodies would leave it
+green. The one door that is a free function, `chart_reauthored`, IS walked, by
 `picking_a_writable_type_authors_a_valueless_scatter_afresh`, whose pie arm now
-expects a two-series pie where it expected an error, and the save half of
-`series_add` by `a_series_added_to_a_pie_survives_a_save` across the crate
+expects a two-series pie where it expected an error. The save half of
+`series_add` is `a_series_added_to_a_pie_survives_a_save`, across the crate
 wall — the suite's tests cannot reach the writer.
 
 **Why not guard the doors instead.** It is the smaller change, and it was
@@ -158,7 +189,7 @@ cargo test -p gridcore                        # the writer, the loader, the roun
   `a_seven_series_pie_reads_back_all_seven`.
 - `suite/docxy/src/main.rs` — `a_pie_draws_one_series_however_many_it_holds`,
   `the_panel_says_a_pie_plots_the_first_series_only`,
-  `every_door_to_a_multi_series_pie_is_open_and_says_what_it_draws`.
+  `the_multi_series_pie_each_door_hands_over_is_described_not_refused`.
 
 The one check that is **not** here is real Excel: build a 3-series pie, save,
 and open it in Excel. It should open with no repair prompt, plot the first
