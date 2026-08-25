@@ -16030,6 +16030,188 @@ fn scroll_col0_for_sel(
     start.max(fc)
 }
 
+// ---- the pointed range's dashed border (pure; unit-tested below) ---------
+//
+// ⚠️ Correction to this feature's discovery notes: gpui CAN draw a dashed
+// border natively, so a dash is NOT a per-dash element. Citations, all at the
+// gpui rev this workspace pins (zed 8276687, `suite/Cargo.lock`):
+//
+//   * `Styled::border_dashed()` — `crates/gpui/src/styled.rs:500`, sets
+//     `style.border_style = Some(BorderStyle::Dashed)`.
+//   * `BorderStyle::{Solid, Dashed}` — `crates/gpui/src/scene.rs:597`.
+//   * The dashes are drawn by the quad shader, on every backend we ship:
+//     `crates/gpui_windows/src/shaders.hlsl:664`,
+//     `crates/gpui_wgpu/src/shaders.wgsl:693`, and
+//     `crates/gpui_macos/src/shaders.metal` (83 `dash` hits).
+//   * `PathBuilder::dash_array()` — `crates/gpui/src/path_builder.rs:108` —
+//     also exists, for stroked paths. We don't need it: a quad border is
+//     cheaper and lays out with the cell.
+//
+// What is still ours to compute is WHICH edges of the range a given cell owns,
+// because the grid renders cell by cell — which is also the approach that
+// avoids reconstructing row positions from a scroll offset (they drift; row
+// heights are content-driven).
+
+/// The pointed range's border width in px. The dash pitch follows from it:
+/// gpui's shader lays a dash of `2 × width` and a gap of `1 × width`, so the
+/// pitch is `3 × width` and 2px gives Excel's ~4px dash on a 100% display.
+#[allow(dead_code)] // wired into the renderer in the next task
+const RANGE_BORDER_W: f32 = 2.0;
+
+/// gpui's dash pattern, from the shader cited above: dash `2 × border width`,
+/// gap `1 × border width`. Kept as constants because every number below —
+/// pitch, the solid-fallback threshold, the dash count — is derived from them,
+/// and if gpui ever changes the pattern these are the two values to edit.
+const DASH_LEN_PER_W: f32 = 2.0;
+const DASH_GAP_PER_W: f32 = 1.0;
+
+/// Past this many *visible* boundary cells the border is drawn solid instead of
+/// dashed. Because the border is rendered per cell, the count is bounded by the
+/// viewport rather than by the range: selecting whole columns costs the same as
+/// selecting the screen. At the narrowest column (28px) and shortest row (21px)
+/// a 1920×1200 grid shows ~69 × ~55 cells, so the perimeter of even a
+/// select-all tops out near 250. The cap is a backstop against a future
+/// viewport nobody has, not an operating limit.
+const RANGE_BORDER_CELL_CAP: usize = 512;
+
+/// Which sides of the pointed range's border a single cell draws. A cell can
+/// own more than one (a corner owns two; a one-cell range owns all four).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct EdgeMask {
+    top: bool,
+    right: bool,
+    bottom: bool,
+    left: bool,
+}
+
+impl EdgeMask {
+    /// Nothing to draw — the cell is inside the range, or outside it.
+    #[allow(dead_code)] // wired into the renderer in the next task
+    fn is_empty(self) -> bool {
+        !(self.top || self.right || self.bottom || self.left)
+    }
+}
+
+/// The sides of `range`'s border that cell `(r, c)` owns. Cells off the range,
+/// and cells strictly inside it, own nothing. This is the per-cell question the
+/// row renderer asks; `range_border_plan` answers it for a whole viewport.
+#[allow(dead_code)] // wired into the renderer in the next task
+fn range_edges_at(range: (u32, u32, u32, u32), r: u32, c: u32) -> EdgeMask {
+    let (r0, c0, r1, c1) = range;
+    if r < r0 || r > r1 || c < c0 || c > c1 {
+        return EdgeMask::default();
+    }
+    EdgeMask {
+        top: r == r0,
+        right: c == c1,
+        bottom: r == r1,
+        left: c == c0,
+    }
+}
+
+/// How the pointed range's border is drawn over one viewport: the boundary
+/// cells that are actually on screen with the edges each owns, and whether
+/// those edges are dashed or (past the cap) solid.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+struct RangeBorderPlan {
+    /// Boundary cells in row-major order, each with the edges it draws.
+    cells: Vec<(u32, u32, EdgeMask)>,
+    /// False past `RANGE_BORDER_CELL_CAP` — draw the same edges solid.
+    dashed: bool,
+}
+
+/// The border for `range` clipped to the visible window `view` (both inclusive
+/// `(r0, c0, r1, c1)` boxes). Only the perimeter is walked, never the area, so
+/// a selection of a million rows costs the rows you can see. An edge that falls
+/// outside the window is simply not drawn — Excel clips the same way.
+#[allow(dead_code)] // wired into the renderer in the next task
+fn range_border_plan(range: (u32, u32, u32, u32), view: (u32, u32, u32, u32)) -> RangeBorderPlan {
+    let (r0, c0, r1, c1) = range;
+    let (vr0, vc0, vr1, vc1) = view;
+    let (cr0, cr1) = (r0.max(vr0), r1.min(vr1));
+    let (cc0, cc1) = (c0.max(vc0), c1.min(vc1));
+    if cr0 > cr1 || cc0 > cc1 {
+        return RangeBorderPlan::default(); // scrolled entirely out of view
+    }
+    // A BTreeMap both merges the corners (where two edge runs meet on one cell)
+    // and hands the cells back in row-major order, which is the order the rows
+    // render in and the order the tests read in.
+    let mut cells: std::collections::BTreeMap<(u32, u32), EdgeMask> = Default::default();
+    if r0 >= vr0 && r0 <= vr1 {
+        for c in cc0..=cc1 {
+            cells.entry((r0, c)).or_default().top = true;
+        }
+    }
+    if r1 >= vr0 && r1 <= vr1 {
+        for c in cc0..=cc1 {
+            cells.entry((r1, c)).or_default().bottom = true;
+        }
+    }
+    if c0 >= vc0 && c0 <= vc1 {
+        for r in cr0..=cr1 {
+            cells.entry((r, c0)).or_default().left = true;
+        }
+    }
+    if c1 >= vc0 && c1 <= vc1 {
+        for r in cr0..=cr1 {
+            cells.entry((r, c1)).or_default().right = true;
+        }
+    }
+    let cells: Vec<_> = cells.into_iter().map(|((r, c), e)| (r, c, e)).collect();
+    let dashed = cells.len() <= RANGE_BORDER_CELL_CAP;
+    RangeBorderPlan { cells, dashed }
+}
+
+/// Where gpui's shader will put the dashes along one straight edge, so we can
+/// answer "how many, and does this edge dash at all" without a window. It is a
+/// model of the shader, not a substitute for it — nothing here is drawn.
+#[derive(Clone, PartialEq, Debug)]
+struct DashFit {
+    /// Dashes along the edge; the first starts at 0 and the last ends flush
+    /// with the far end, which is why a straight edge reads as deliberate.
+    count: u32,
+    /// Each dash's length in px (`2 × border width`).
+    dash_px: f32,
+    /// Distance between dash starts in px — stretched from the nominal
+    /// `3 × width` so the dashes divide the edge evenly.
+    pitch_px: f32,
+    /// Each dash's start offset from the edge's near end, in px.
+    offsets: Vec<f32>,
+}
+
+/// Fit dashes to an edge of `edge_px` at `border_w`, mirroring the shader's own
+/// arithmetic (`shaders.hlsl:811`): lay a `2W` dash and a `1W` gap, reserve a
+/// dash's length at the far end so the edge both starts and ends with one, then
+/// stretch the gap to divide what's left evenly.
+///
+/// `None` means the edge is too short to dash — at or under `4 × border width`
+/// the shader gives up and paints it solid, so a 5px sliver of a scrolled-off
+/// column reads as a solid tick rather than a lone half-dash.
+#[allow(dead_code)] // wired into the renderer in the next task
+fn dash_fit(edge_px: f32, border_w: f32) -> Option<DashFit> {
+    if edge_px <= 0.0 || border_w <= 0.0 {
+        return None;
+    }
+    let period_per_w = DASH_LEN_PER_W + DASH_GAP_PER_W;
+    let px_per_t = border_w * period_per_w; // one dash period, in px
+    let dash_t = DASH_LEN_PER_W / period_per_w; // a dash, in dash-space
+    // The shader's `max_t`: the edge in dash-space, less the dash it reserves
+    // for the far end.
+    let max_t = edge_px / px_per_t - dash_t;
+    if max_t <= dash_t {
+        return None; // `dash_gap > 0.0` fails in the shader → drawn solid
+    }
+    let gaps = max_t.floor().max(1.0);
+    let pitch_px = (max_t / gaps) * px_per_t;
+    let count = gaps as u32 + 1;
+    Some(DashFit {
+        count,
+        dash_px: dash_t * px_per_t,
+        pitch_px,
+        offsets: (0..count).map(|k| k as f32 * pitch_px).collect(),
+    })
+}
+
 /// A row's pixel height: an explicit `<row ht>` (points) scaled at the app's
 /// 15pt≈`base`px, else `base`. Wrapped cells grow the row beyond this at layout
 /// time; this is the min-height floor.
@@ -17696,11 +17878,13 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        RefText, char_to_byte, chart_ref_of, col_at_x, col_px, edit_runs, fill_box,
-        formula_ref_tokens, last_visible_col, parse_ref_text, preview_range, range_a1, range_text,
-        ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
-        row_height_px, scroll_col0_for_sel, series_move, series_name_shown, series_remove,
-        sheet_index_of, shift_col, shift_row, source_ref_text,
+        EdgeMask, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_ROW_H,
+        char_to_byte, chart_ref_of, col_at_x, col_px, dash_fit, edit_runs, fill_box,
+        formula_ref_tokens, last_visible_col, parse_ref_text, preview_range, range_a1,
+        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
+        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
+        series_move, series_name_shown, series_remove, sheet_index_of, shift_col, shift_row,
+        source_ref_text,
     };
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -20642,6 +20826,223 @@ mod grid_geom_tests {
         assert_eq!(row_height_px(None, 21.0), 21.0); // default
         assert_eq!(row_height_px(Some(15.0), 21.0), 21.0); // 15pt == the base
         assert_eq!(row_height_px(Some(30.0), 21.0), 42.0); // double height
+    }
+
+    // ---- the pointed range's dashed border ------------------------------
+
+    /// The mask a cell would draw, spelled out as `"trbl"` so a test reads like
+    /// the picture it describes.
+    fn mask(m: EdgeMask) -> String {
+        let f = |on: bool, ch: char| if on { ch } else { '.' };
+        [
+            f(m.top, 't'),
+            f(m.right, 'r'),
+            f(m.bottom, 'b'),
+            f(m.left, 'l'),
+        ]
+        .iter()
+        .collect()
+    }
+
+    fn masks(plan: &RangeBorderPlan) -> Vec<(u32, u32, String)> {
+        plan.cells
+            .iter()
+            .map(|&(r, c, m)| (r, c, mask(m)))
+            .collect()
+    }
+
+    /// A one-cell range is its own border: that single cell draws all four
+    /// sides. Its neighbours, and the cells inside a bigger range, draw none.
+    #[test]
+    fn range_edges_at_gives_a_cell_the_sides_it_owns() {
+        assert_eq!(mask(range_edges_at((3, 3, 3, 3), 3, 3)), "trbl");
+        assert!(range_edges_at((3, 3, 3, 3), 3, 4).is_empty()); // just outside
+        assert!(range_edges_at((3, 3, 3, 3), 2, 3).is_empty());
+
+        // A 3×3 range: corners own two sides, edges one, the middle none.
+        let rg = (1, 1, 3, 3);
+        assert_eq!(mask(range_edges_at(rg, 1, 1)), "t..l"); // top-left
+        assert_eq!(mask(range_edges_at(rg, 1, 3)), "tr.."); // top-right
+        assert_eq!(mask(range_edges_at(rg, 3, 3)), ".rb."); // bottom-right
+        assert_eq!(mask(range_edges_at(rg, 3, 1)), "..bl"); // bottom-left
+        assert_eq!(mask(range_edges_at(rg, 1, 2)), "t..."); // top run
+        assert_eq!(mask(range_edges_at(rg, 2, 1)), "...l"); // left run
+        assert!(range_edges_at(rg, 2, 2).is_empty()); // the middle
+    }
+
+    /// One cell, every side, one entry — and the plan says dashed, because one
+    /// cell is nowhere near the cap.
+    #[test]
+    fn border_plan_one_cell_range_owns_all_four_edges() {
+        let plan = range_border_plan((5, 5, 5, 5), (0, 0, 20, 20));
+        assert_eq!(masks(&plan), vec![(5, 5, "trbl".into())]);
+        assert!(plan.dashed);
+    }
+
+    /// A single row: every cell carries top AND bottom, and the two ends add
+    /// their left/right. Nothing is drawn twice — the corners merge.
+    #[test]
+    fn border_plan_single_row_merges_top_and_bottom_on_every_cell() {
+        let plan = range_border_plan((2, 1, 2, 4), (0, 0, 10, 10));
+        assert_eq!(
+            masks(&plan),
+            vec![
+                (2, 1, "t.bl".into()),
+                (2, 2, "t.b.".into()),
+                (2, 3, "t.b.".into()),
+                (2, 4, "trb.".into()),
+            ]
+        );
+    }
+
+    /// A single column is the same picture turned ninety degrees.
+    #[test]
+    fn border_plan_single_column_merges_left_and_right() {
+        let plan = range_border_plan((1, 3, 4, 3), (0, 0, 10, 10));
+        assert_eq!(
+            masks(&plan),
+            vec![
+                (1, 3, "tr.l".into()),
+                (2, 3, ".r.l".into()),
+                (3, 3, ".r.l".into()),
+                (4, 3, ".rbl".into()),
+            ]
+        );
+    }
+
+    /// Scrolled so the top and the left edge are off screen: those runs are not
+    /// drawn at all, and the cells that remain are only the visible parts of the
+    /// bottom and right. Cells off screen never appear — the row renderer never
+    /// asks about them.
+    #[test]
+    fn border_plan_clips_to_the_visible_window() {
+        // Range B2:F6 (rows 1..=5, cols 1..=5), viewport shows rows 3..=9 and
+        // cols 3..=9: the top row and the left column are scrolled away.
+        let plan = range_border_plan((1, 1, 5, 5), (3, 3, 9, 9));
+        assert_eq!(
+            masks(&plan),
+            vec![
+                (3, 5, ".r..".into()),
+                (4, 5, ".r..".into()),
+                (5, 3, "..b.".into()),
+                (5, 4, "..b.".into()),
+                (5, 5, ".rb.".into()),
+            ]
+        );
+        assert!(plan.dashed);
+
+        // Scrolled clean past it: nothing to draw, and no panic on the empty box.
+        let gone = range_border_plan((1, 1, 5, 5), (40, 40, 60, 60));
+        assert!(gone.cells.is_empty());
+        assert!(!gone.dashed); // nothing is drawn, so nothing is dashed
+
+        // Off in one axis only is still off.
+        assert!(
+            range_border_plan((1, 1, 5, 5), (0, 40, 9, 60))
+                .cells
+                .is_empty()
+        );
+    }
+
+    /// A range far wider than the cap still costs only its perimeter — but past
+    /// `RANGE_BORDER_CELL_CAP` visible cells it drops to a solid border. The
+    /// cells are the same either way; only `dashed` changes.
+    #[test]
+    fn border_plan_falls_back_to_solid_past_the_cap() {
+        let wide = RANGE_BORDER_CELL_CAP as u32 + 10;
+
+        // One row, `wide` columns, all visible: one cell per column, over cap.
+        let plan = range_border_plan((0, 0, 0, wide - 1), (0, 0, 50, wide));
+        assert_eq!(plan.cells.len(), wide as usize);
+        assert!(!plan.dashed);
+
+        // The same enormous range, scrolled so only a handful is on screen:
+        // back under the cap, so back to dashes. Cost follows the viewport.
+        let narrow = range_border_plan((0, 0, 0, wide - 1), (0, 0, 50, 9));
+        assert_eq!(narrow.cells.len(), 10);
+        assert!(narrow.dashed);
+
+        // Exactly at the cap is still dashed — the cap is inclusive.
+        let at_cap = range_border_plan(
+            (0, 0, 0, RANGE_BORDER_CELL_CAP as u32 - 1),
+            (0, 0, 50, 100_000),
+        );
+        assert_eq!(at_cap.cells.len(), RANGE_BORDER_CELL_CAP);
+        assert!(at_cap.dashed);
+    }
+
+    /// A whole-sheet selection is bounded by what is on screen, not by the
+    /// 1,048,576 rows it names — this is the property the cap relies on.
+    #[test]
+    fn border_plan_cost_is_bounded_by_the_viewport() {
+        // The densest realistic viewport: 28px columns and 21px rows on a
+        // 1920×1200 grid ≈ 69 columns × 55 rows.
+        let plan = range_border_plan((0, 0, 1_048_575, 16_383), (0, 0, 54, 68));
+        // Only the visible top-left corner of the range is on screen, so only
+        // its top and left runs are drawn: 55 + 69 − 1 shared corner.
+        assert_eq!(plan.cells.len(), 55 + 69 - 1);
+        assert!(plan.cells.len() < RANGE_BORDER_CELL_CAP);
+        assert!(plan.dashed);
+    }
+
+    /// The dash arithmetic at the widths the app actually uses. The first dash
+    /// starts flush at 0 and the last ends flush at the far end, which is what
+    /// makes a run of cells read as one border.
+    #[test]
+    fn dash_fit_matches_the_shader_at_real_grid_widths() {
+        // A default column: 8.43 char units → 65px.
+        let w = col_px(gridcore::sheet::DEFAULT_COL_WIDTH);
+        assert!((w - 65.01).abs() < 1e-3, "default column is {w}px");
+        let f = dash_fit(w, RANGE_BORDER_W).expect("a default column dashes");
+        assert_eq!(f.count, 11);
+        assert_eq!(f.dash_px, 4.0); // 2 × border width
+        assert_eq!(f.offsets[0], 0.0);
+        assert!((f.offsets.last().unwrap() + f.dash_px - w).abs() < 1e-3);
+        assert_eq!(f.offsets.len(), f.count as usize);
+        // The pitch is stretched from the nominal 6px so the dashes divide evenly.
+        assert!(f.pitch_px > 6.0 && f.pitch_px < 6.2, "pitch {}", f.pitch_px);
+
+        // The narrowest column `col_px` allows still dashes: 28px sits exactly
+        // on a dash-count boundary (4.0 periods), so which side of it f32
+        // rounding lands on is not worth asserting — what matters is that it
+        // dashes, at close to the nominal 6px pitch, and still ends flush.
+        let n = dash_fit(28.0, RANGE_BORDER_W).expect("the narrowest column dashes");
+        assert!((4..=5).contains(&n.count), "count {}", n.count);
+        assert!(
+            n.pitch_px >= 6.0 && n.pitch_px <= 8.1,
+            "pitch {}",
+            n.pitch_px
+        );
+        assert!((n.offsets.last().unwrap() + n.dash_px - 28.0).abs() < 1e-3);
+
+        // A row's vertical edge: 21px.
+        let v = dash_fit(SHEET_ROW_H, RANGE_BORDER_W).expect("a default row dashes");
+        assert_eq!(v.count, 3);
+        assert!((v.offsets.last().unwrap() + v.dash_px - SHEET_ROW_H).abs() < 1e-3);
+    }
+
+    /// Too short to dash: the shader paints those edges solid, so `dash_fit`
+    /// says so rather than inventing a fit nobody will see.
+    #[test]
+    fn dash_fit_gives_up_on_an_edge_shorter_than_a_dash_pitch() {
+        // Shorter than one 6px pitch.
+        assert_eq!(dash_fit(5.0, RANGE_BORDER_W), None);
+        // The threshold is 4 × border width: at it, solid; just past it, two
+        // dashes with the gap squeezed.
+        assert_eq!(dash_fit(8.0, RANGE_BORDER_W), None);
+        let f = dash_fit(9.0, RANGE_BORDER_W).expect("just past the threshold");
+        assert_eq!(f.count, 2);
+        assert_eq!(f.offsets[0], 0.0);
+        assert!((f.offsets[1] + f.dash_px - 9.0).abs() < 1e-3);
+
+        // Degenerate inputs are solid too, not a panic or an empty dash list.
+        assert_eq!(dash_fit(0.0, RANGE_BORDER_W), None);
+        assert_eq!(dash_fit(-3.0, RANGE_BORDER_W), None);
+        assert_eq!(dash_fit(65.0, 0.0), None);
+
+        // The threshold scales with the width, as the shader's does.
+        assert_eq!(dash_fit(16.0, 4.0), None); // 4 × 4px
+        assert!(dash_fit(20.0, 4.0).is_some());
     }
 }
 

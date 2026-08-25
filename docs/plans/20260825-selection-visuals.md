@@ -44,18 +44,54 @@ apart would produce four unrelated answers.
 
 ## Context (from discovery)
 
-### GPUI cannot draw a dashed border
+### ⚠️ CORRECTED in Task 1: GPUI *can* draw a dashed border
 
-Established before writing this plan, not assumed:
+The claim below was wrong, and Task 1's first checkbox — "confirm from the gpui
+source" — is why. It is kept because every later task was written against it.
 
-- `grep -c dash` in `gpui/src/style.rs` is **0**. There is no dashed border
-  style, and `div()` exposes no dash option.
-- `gpui::linear_gradient(angle, from, to)` exists (`color.rs:865`) but takes
-  **two stops**, so it cannot express a repeating dash pattern either.
+> ~~`grep -c dash` in `gpui/src/style.rs` is **0**. There is no dashed border
+> style, and `div()` exposes no dash option.~~
+> ~~`gpui::linear_gradient(angle, from, to)` exists (`color.rs:865`) but takes
+> two stops, so it cannot express a repeating dash pattern either.~~
 
-So a dash has to be a discrete element, and "how many elements does a wide
-selection cost" is the central design question of Task 2 rather than a detail.
-The plan does not pre-decide it; it requires a bound and a fallback.
+`style.rs` is the wrong file to grep — the setter lives in `styled.rs` and the
+enum in `scene.rs`. At the gpui rev this workspace pins (zed `8276687`, per
+`suite/Cargo.lock`):
+
+- **`Styled::border_dashed()`** — `crates/gpui/src/styled.rs:500` — sets
+  `style.border_style = Some(BorderStyle::Dashed)`. It is on the `Styled`
+  trait, so plain `div()` has it.
+- **`BorderStyle::{Solid, Dashed}`** — `crates/gpui/src/scene.rs:597`.
+- The dashes are drawn **in the quad shader**, on all three backends we ship:
+  `gpui_windows/src/shaders.hlsl:664`, `gpui_wgpu/src/shaders.wgsl:693`, and
+  `gpui_macos/src/shaders.metal`.
+- `PathBuilder::dash_array()` — `crates/gpui/src/path_builder.rs:108` — exists
+  too, for stroked paths. Not needed: a quad border is cheaper and lays out
+  with the cell.
+
+So **a dash is not an element**. "How many elements does a wide selection cost"
+is no longer the central design question — a dashed border costs exactly what a
+solid one costs. The bound and the fallback are still recorded below, because
+the plan asked for them and they are still the honest answer to "what is the
+worst case", but they are a backstop rather than a constraint.
+
+The `linear_gradient` two-stop observation is correct and now moot.
+
+#### The shader's dash geometry (what we get, not what we choose)
+
+From `shaders.hlsl:664-831`, for an unrounded quad, with `W` = border width:
+
+- Pattern is **dash `2W`, gap `1W`** — pitch `3W`. The size is derived from the
+  border width; there is no separate dash-length knob.
+- Dashes are laid out **per straight side, not around the perimeter**, and the
+  side is made to **start and end with a dash** by reserving one dash's length
+  and then stretching the gap so the rest divides evenly.
+- An edge of **`4W` or less is painted solid** — the shader's `dash_gap > 0.0`
+  test fails and it silently skips dashing. At `W = 2` that is 8px.
+
+`dash_fit` (main.rs) mirrors this arithmetic exactly so the numbers below are
+derived rather than eyeballed, and so "does this edge dash at all" is a
+question a unit test can ask.
 
 ⚠️ **The relevant hard-won lesson**: overlay geometry that reconstructs row
 positions from `logical_scroll_top` × a uniform row height **drifts**, because
@@ -144,27 +180,88 @@ cargo fmt --check
 
 ### Task 1: Decide how a dashed edge is drawn, and bound its cost
 
-- [ ] confirm from the gpui source that no dashed border or repeating gradient
+- [x] confirm from the gpui source that no dashed border or repeating gradient
       exists, and record the citation — every later task depends on it
-- [ ] choose between per-cell edge segments (each boundary cell renders the
+      → ⚠️ **the premise was false**; gpui draws dashed borders natively. The
+      citations and the shader's dash geometry are in Context above.
+- [x] choose between per-cell edge segments (each boundary cell renders the
       dashes along the edges it owns) and one `deferred` overlay sized from
       `bounds_for_item`/`col_at_x`, and write the reasoning into this plan.
       Weigh it against the drift lesson above, which favours per-cell
-- [ ] establish the cost bound: dashes per cell edge at the app's column widths,
+      → **per-cell**; reasoning in "The decision" below
+- [x] establish the cost bound: dashes per cell edge at the app's column widths,
       worst-case element count for a full-width selection, and the cap beyond
-      which the border falls back to solid
-- [ ] write the pure geometry as free functions — given a range and the visible
+      which the border falls back to solid → "The cost bound" below
+- [x] write the pure geometry as free functions — given a range and the visible
       window, which cells are on the boundary and which edges each owns; given
       an edge length and a dash pitch, how many dashes and their offsets
-- [ ] write tests for the boundary function: a one-cell range (all four edges on
+      → `range_edges_at`, `range_border_plan`, `dash_fit` in
+      `suite/docxy/src/main.rs`, beside the existing pure grid geometry
+- [x] write tests for the boundary function: a one-cell range (all four edges on
       one cell), a single row, a single column, a range partly scrolled out of
-      view, and a range wider than the cap
-- [ ] write tests for the dash-fitting function, including an edge shorter than
-      one dash pitch
-- [ ] ⚠️ no rendering change lands in this task — it is the decision and its
+      view, and a range wider than the cap → 6 tests in `grid_geom_tests`
+- [x] write tests for the dash-fitting function, including an edge shorter than
+      one dash pitch → 2 tests, incl. the `4W` solid threshold from both sides
+- [x] ⚠️ no rendering change lands in this task — it is the decision and its
       arithmetic. If the cost bound turns out unacceptable at realistic widths,
       STOP and record that here before writing Task 2
-- [ ] run tests in both workspaces — must pass before Task 2
+      → nothing rendering-side changed; the cost bound is fine, see below
+- [x] run tests in both workspaces — must pass before Task 2
+      → suite 91 pass, gridcore 370+1+4 pass, both clippy clean, both fmt clean
+
+#### The decision: per-cell edge segments
+
+Each boundary cell draws the sides of the range's border that it owns, using
+gpui's own `border_dashed()`. Reasons, in order of weight:
+
+1. **It cannot drift.** A `deferred` overlay would have to know where row *N*
+   is in window coordinates. `bounds_for_item` can answer that, but the moment
+   anything reconstructs a row position from `logical_scroll_top` × a uniform
+   height it is wrong, because row heights are content-driven. A per-cell
+   border is positioned by the cell it is on, so it is right by construction.
+2. **The element cost that made the overlay tempting no longer exists.** With
+   the dashes in the shader, per-cell costs one quad per boundary cell — the
+   same as a solid border would, and the same as the overlay's own quad ×
+   perimeter. There is nothing left to trade for the geometry risk.
+3. **It reuses `GridOverlay`**, the channel that already carries `range_preview`
+   into `sheet_row`, rather than opening a parallel path into the render pass.
+
+The one thing per-cell gives up: because the shader lays dashes out **per
+quad**, the dash phase restarts at every column boundary. A long horizontal
+edge is therefore a run of per-cell dash groups rather than one continuous
+rhythm. Each group starts and ends flush with its cell (the shader reserves a
+dash for the far end), so the seam falls exactly on the gridline where the eye
+already expects one. Judged acceptable; it is on the Post-Completion list to
+confirm against Excel by eye.
+
+#### The cost bound
+
+Dashes per edge, from `dash_fit` at `RANGE_BORDER_W = 2px` (pitch `3W` = 6px):
+
+| Edge | Length | Dashes | Pitch |
+|---|---|---|---|
+| Default column (8.43 units) | 65.01px | 11 | 6.10px |
+| Narrowest column (`col_px` clamp) | 28px | 4–5 | 6.0–8.0px |
+| Widest column (`col_px` clamp) | 320px | 54 | 6.02px |
+| Default row (`SHEET_ROW_H`) | 21px | 3 | 8.5px |
+
+None of these are elements — they are shader output, so the count is free.
+
+Worst-case **element** count: one quad per visible boundary cell. Crucially
+that is bounded by the **viewport, not the range**, because the grid only
+renders visible cells. At the narrowest column (28px) and shortest row (21px) a
+1920×1200 grid shows ≈69 × ≈55 cells, so:
+
+- a full-row selection ≈ **69** quads,
+- a full-column selection ≈ **55**,
+- select-all (A1:XFD1048576) ≈ **123** — its perimeter is mostly off screen.
+
+`RANGE_BORDER_CELL_CAP = 512`, past which `range_border_plan` reports
+`dashed: false` and the same edges are drawn solid. At realistic viewport sizes
+it cannot be reached; it is a backstop against a display nobody has, and the
+tested guarantee is that exceeding it degrades to solid rather than to
+stuttering. Separately and unavoidably, the shader draws any edge of `≤ 4W`
+(8px) solid on its own — which only a clipped sliver of a column can be.
 
 ### Task 2: Draw the pointed range with a dashed brand border
 
