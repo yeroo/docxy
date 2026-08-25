@@ -373,6 +373,27 @@ fn bar_target(act: SheetAct) -> Option<RefTarget> {
     }
 }
 
+/// Whether a ribbon command reads or writes the cell selection.
+///
+/// The same rule `chart_hand_back` states for keys, asked of the ribbon: a
+/// command that acts on the selected cells has to be given a selection that is
+/// on screen. Ribbon ▸ Copy and Ctrl+C are the same `sheet_copy`, so they take
+/// the selection the same way, and Delete Row is the case that matters — with a
+/// chart selected `sel_hidden` leaves no ring, no wash and no header mark, so
+/// the rows would go from cells nothing on screen named.
+///
+/// Almost everything here targets cells, including the ones that only look
+/// sheet-wide: Freeze Panes freezes AT the selected cell, the comment steps
+/// move the selection, and the colour pickers paint it. The exceptions are the
+/// three that never touch it — protection and outlining are properties of the
+/// whole sheet, and `Todo` does nothing at all.
+fn act_targets_cells(act: SheetAct) -> bool {
+    !matches!(
+        act,
+        SheetAct::ProtectSheet | SheetAct::Outline | SheetAct::Todo
+    )
+}
+
 /// A live text field: which target it edits, its buffer, the caret and the
 /// selection anchor (equal to the caret when nothing is selected).
 #[derive(Clone)]
@@ -8106,6 +8127,13 @@ impl Docxy {
     /// Dispatch a spreadsheet ribbon command.
     fn run_sheet_act(&mut self, act: SheetAct, window: &mut Window, cx: &mut Context<Self>) {
         use gridcore::sheet::Align;
+        // Before anything reads the selection — including the bar seeding below
+        // — the grid takes it back, so a command that acts on cells acts on
+        // cells the user can see. `chart_hand_back` returns at once when no
+        // chart is selected, so this costs nothing in the ordinary case.
+        if act_targets_cells(act) {
+            self.chart_hand_back(cx);
+        }
         // An action that opens a bar with a range field seeds that field from
         // the selection first, so the bar starts on the cells it always used.
         if let Some(target) = bar_target(act) {
@@ -17846,6 +17874,13 @@ fn sheet_el(
                 .child(SharedString::from(sel_content))
                 .on_click(move |_ev, window, cx| {
                     ent_fx.update(cx, |this, cx| {
+                        // Clicking the bar opens an editor on the selected
+                        // cell, so it is a press on the cells and takes the
+                        // selection like one. Without this the caret and the
+                        // white edit box would be drawn while the chart still
+                        // drew its frame and grips — two things selected — and
+                        // over a cell `sel_hidden` was leaving unmarked.
+                        this.chart_hand_back(cx);
                         this.sheet_begin_edit(None, cx);
                         this.focus.focus(window, cx);
                     });
@@ -21248,6 +21283,55 @@ mod grid_geom_tests {
         assert_eq!(bar_target(SheetAct::Filter), None);
         assert_eq!(bar_target(SheetAct::RowHeight), None);
         assert_eq!(bar_target(SheetAct::Bold), None);
+    }
+
+    #[test]
+    fn every_ribbon_command_that_touches_cells_takes_the_selection() {
+        use super::{SheetAct, act_targets_cells};
+        // The plain writers, and the destructive one the rule exists for.
+        for act in [
+            SheetAct::Copy,
+            SheetAct::Cut,
+            SheetAct::Paste,
+            SheetAct::Bold,
+            SheetAct::DeleteRow,
+            SheetAct::DeleteCol,
+            SheetAct::Merge,
+            SheetAct::AutoSum,
+            SheetAct::SortAsc,
+            SheetAct::RemoveDuplicates,
+            SheetAct::Subtotal,
+        ] {
+            assert!(act_targets_cells(act));
+        }
+        // The ones that read the selection without looking like it: the freeze
+        // splits AT the selected cell, the comment steps MOVE the selection,
+        // the pickers paint it, and a new chart plots it.
+        for act in [
+            SheetAct::FreezePanes,
+            SheetAct::NextComment,
+            SheetAct::PrevComment,
+            SheetAct::FillColor,
+            SheetAct::FontColor,
+            SheetAct::InsertChart("bar"),
+            SheetAct::InsertPivot,
+        ] {
+            assert!(act_targets_cells(act));
+        }
+        // Every command that opens a bar seeded from the selection is one, or
+        // the bar would open on cells nothing on screen marked.
+        for act in [
+            SheetAct::CondFormat,
+            SheetAct::DataValidation,
+            SheetAct::CustomSort,
+            SheetAct::TextToColumns,
+        ] {
+            assert!(super::bar_target(act).is_some() && act_targets_cells(act));
+        }
+        // The three exceptions: two whole-sheet properties and the inert stub.
+        assert!(!act_targets_cells(SheetAct::ProtectSheet));
+        assert!(!act_targets_cells(SheetAct::Outline));
+        assert!(!act_targets_cells(SheetAct::Todo));
     }
 
     #[test]
