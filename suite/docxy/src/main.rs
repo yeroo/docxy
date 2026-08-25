@@ -2979,6 +2979,26 @@ fn chart_panel_shown(shown: Option<usize>, n_charts: usize) -> Option<usize> {
     shown.filter(|&i| i < n_charts)
 }
 
+/// Does the live range field survive a press on chart `pressed`?
+///
+/// `press_selection` says a press on a chart that is not the selected one drops
+/// the field, because the field belongs to the chart being left. Under the
+/// sticky-panel rule that question has to be asked of the PANEL's chart instead:
+/// click a cell and the chart deselects while its panel stays open, so pressing
+/// that same card is `chart_sel == None` and would drop a field that never
+/// changed owner.
+///
+/// The panel is not the only thing that can hold a live field, though.
+/// `run_sheet_act` hands the chart back WITHOUT shutting the panel, so a bar
+/// field — Data Validation, Sort, Text to Columns — can be pointing at the grid
+/// with a chart panel open behind it. That field belongs to the sheet. Letting
+/// it keep the keyboard while the card takes the selection is exactly the
+/// two-things-selected split this plan set out to remove, so only the panel's
+/// own field is kept.
+fn keeps_panel_field(panel_chart: Option<usize>, pressed: usize, field: Option<RefTarget>) -> bool {
+    panel_chart == Some(pressed) && !field.is_some_and(RefTarget::is_bar)
+}
+
 /// Which of the two selections a press or navigation key leaves selected.
 ///
 /// - A press on a **cell** takes the selection back from any chart: its handles
@@ -3858,8 +3878,15 @@ impl Docxy {
         // None` and misses `press_selection`'s same-chart no-op. The field being
         // typed in belongs to the chart the panel SHOWS, and re-selecting that
         // chart is not a change of chart — throwing the edit away there is the
-        // mid-edit loss the sticky panel was added to stop.
-        if after.drop_field && self.panel_chart != Some(idx) {
+        // mid-edit loss the sticky panel was added to stop. `keeps_panel_field`
+        // states the whole rule, including the bar fields that are not the
+        // panel's to keep.
+        let keep = keeps_panel_field(
+            self.panel_chart,
+            idx,
+            self.range_edit.as_ref().map(|f| f.target),
+        );
+        if after.drop_field && !keep {
             self.range_edit = None;
             self.ref_msg = None;
             self.range_pick = None;
@@ -10959,6 +10986,10 @@ impl Docxy {
             // from under a live field, discarding the half-typed reference and
             // its error message with `drop_field`.
             if self.range_edit.is_some() {
+                // The dismissals above are the only state this arm changes, and
+                // nothing further repaints — say so, or a menu cleared here
+                // stays on screen until the next unrelated frame.
+                cx.notify();
                 return;
             }
             // Tab is action-bound, so it never reaches `sheet_key`'s hand-back
@@ -10984,6 +11015,8 @@ impl Docxy {
             // Same as Tab above: the field has the keyboard first, then
             // action-bound, moves the selection, hands back.
             if self.range_edit.is_some() {
+                // Same as Tab: the dismissals above need a frame.
+                cx.notify();
                 return;
             }
             self.chart_hand_back(cx);
@@ -22201,6 +22234,49 @@ mod grid_geom_tests {
             press_selection(SelectTarget::Chart(4), Some(4), true),
             after
         );
+    }
+
+    /// Only the PANEL's own field survives a press on the card it belongs to.
+    /// A bar field — Data Validation, Sort — belongs to the sheet, and
+    /// `run_sheet_act` opens one while leaving the panel up, so the two really
+    /// do coexist. Keeping it would hand the chart the selection and the bar
+    /// the keyboard: two things selected, which is what the rule forbids.
+    #[test]
+    fn only_the_panels_own_field_survives_a_press_on_its_chart() {
+        use super::{RefTarget, keeps_panel_field};
+
+        // The panel's own fields, on the chart the panel shows: kept.
+        for f in [
+            RefTarget::ChartRange,
+            RefTarget::ChartTitle,
+            RefTarget::SeriesName(0),
+            RefTarget::SeriesValues(2),
+            RefTarget::Categories,
+        ] {
+            assert!(
+                keeps_panel_field(Some(3), 3, Some(f)),
+                "{f:?} is the panel's"
+            );
+        }
+        // No field at all is still "nothing of the panel's to lose".
+        assert!(keeps_panel_field(Some(3), 3, None));
+
+        // A sheet bar pointing at the grid over an open panel: dropped.
+        for f in [
+            RefTarget::CondFormat,
+            RefTarget::Validation,
+            RefTarget::Sort,
+            RefTarget::TextToColumns,
+        ] {
+            assert!(
+                !keeps_panel_field(Some(3), 3, Some(f)),
+                "{f:?} is the sheet's"
+            );
+        }
+
+        // A different chart, or no panel: the field belongs to what is left.
+        assert!(!keeps_panel_field(Some(3), 4, Some(RefTarget::ChartRange)));
+        assert!(!keeps_panel_field(None, 3, Some(RefTarget::ChartRange)));
     }
 
     /// Point mode: while a range field or a half-typed formula has the
