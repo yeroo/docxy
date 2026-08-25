@@ -164,14 +164,17 @@ rather than as frozen number caches, which is what lets an editor repoint one.
   `ChartData::complex` (set by `parse_chart` when the plot area holds more than
   one `*Chart` group, or a `<c:grouping>` that isn't `clustered`/`standard`)
   vetoes the rest. A scatter, doughnut, radar, bubble, stacked or combo chart
-  round-trips **verbatim** even when marked edited — as does a **multi-series
-  pie**, which is a writable KIND and so on none of those lists: a
-  `<c:pieChart>` holding several `<c:ser>` also sets `complex`, because
-  `chart_space_xml`'s pie arm emits `series.first()` only and regenerating
-  would drop the rest without a word (`a_pie_that_arrives_with_two_series_is_kept_as_excel_wrote_it`).
-  The schema permits such a chart even though Excel's own UI won't author one,
-  and no panel door builds one (`chart_kind_series_err`, and `series_add`'s own
-  `n > 0`), so it only ever arrives from a foreign file. A scatter's and a bubble's
+  round-trips **verbatim** even when marked edited. A **multi-series pie** does
+  NOT, any more: `CT_PieChart` declares `ser` with `maxOccurs="unbounded"`
+  (`EG_PieChartShared`, ECMA-376 Part 1 `dml-chart.xsd`), so a `<c:pieChart>`
+  holding several `<c:ser>` is schema-valid — Excel merely plots the first — and
+  `chart_space_xml`'s pie arm writes every one of them, the same `{sers}` the
+  bar and line arms use. It used to emit `series.first()` alone, which is why
+  `parse_chart` marked such a chart `complex` and why every panel door refused
+  to build one; the writer stopped losing series, so both went
+  (`a_pie_that_arrives_with_two_series_stays_editable`,
+  `three_series_clicked_to_pie_survive_a_save_and_a_reopen`, and
+  [`suite/docs/pie-series.md`](suite/docs/pie-series.md)). A scatter's and a bubble's
   `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` ARE read — each folds into
   `ChartData::source` and is kept on the series as `ChartSeries::point_refs`,
   so the panel's `rebuild_source` sees the same cells the loader did instead of

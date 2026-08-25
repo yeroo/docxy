@@ -374,10 +374,26 @@ plan; the idx-0/idx-2 shape the file taught us is still pinned by
 
 ### Task 7: [Final] Update documentation
 
-- [ ] document that a pie keeps every series and plots the first, wherever the
-      suite's chart behaviour is described (`suite/docs/`)
-- [ ] record the ECMA-376 citation from Task 1 so the next reader does not
-      reinstate the drop
+- [x] document that a pie keeps every series and plots the first, wherever the
+      suite's chart behaviour is described (`suite/docs/`) — new
+      `suite/docs/pie-series.md` is the canonical write-up (what the writer and
+      loader do, what the panel says, the retired guard and why removing it is
+      the fix, the deferred doughnut, the test index). The three places that
+      described the OLD behaviour are corrected and point at it:
+      `suite/docs/chart-orientation.md` (the "no pie the panel builds holds
+      more than one series" section, the Switch Row/Column refusal bullet, the
+      `"column"`-answers-for-all-four paragraph and the implementation list),
+      `suite/docs/range-selector.md` ("+ Add series refuses there", and the
+      tested-helper list, which gains `chart_plotted_series`,
+      `series_is_plotted` and `chart_unplotted_note`), and `SPREADSHEET.md`
+      §4a (a multi-series pie is no longer held back as `complex`).
+      `CONTRIBUTING.md` links the new doc beside the other two suite docs
+- [x] record the ECMA-376 citation from Task 1 so the next reader does not
+      reinstate the drop — quoted in full (`CT_PieChart` ← `EG_PieChartShared`,
+      `dml-chart.xsd`, `maxOccurs="unbounded"`) in `pie-series.md` under
+      "Several `<c:ser>` in one `<c:pieChart>` is legal", with the corpus table
+      and an explicit "do not reinstate the drop"; restated in `SPREADSHEET.md`
+      §4a, and already sitting beside the pie arm in `chart_space_xml`
 
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`*
 

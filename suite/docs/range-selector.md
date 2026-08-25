@@ -174,8 +174,10 @@ MIDDLE series leaves it exactly as wide — DATA RANGE goes on offering the
 deleted column, and Enter there re-derives it); and a reorder changes which
 values ref folds FIRST, which is what decides the sheet the box names. `parse_chart` rebuilds from the surviving refs in document order on the
 next open either way, so skipping it would only make the panel read one way
-before a save and another after it. A pie takes one series and `chart_space_xml` writes only the first, so
-`+ Add series` refuses there rather than listing one the save would drop. The
+before a save and another after it. A pie is no exception: it may hold
+several series, `chart_space_xml` writes every one, and the panel says only the
+first is drawn ([`pie-series.md`](pie-series.md)) — `+ Add series` used to
+refuse there, back when the save dropped the extras. The
 last series can't be removed (a chart with none is not renderable, and Excel won't let you
 get there either), and a series' colour lives on the series, so it travels
 through a reorder.
@@ -518,7 +520,8 @@ Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
 `series_remove`/`series_move`, `ref_token_at`, `replace_ref`,
 `formula_ref_tokens`, `edit_runs`, `ref_color`, `ref_index_at`,
 `sort_rows_from`, `bar_range_text`, `series_values_shape_err`,
-`categories_shape_err`, `chart_kind_series_err`, `chart_field_examples`.
+`categories_shape_err`, `chart_field_examples`, `chart_plotted_series`,
+`series_is_plotted`, `chart_unplotted_note`.
 
 That list is why every helper here is a **pure free function** taking the
 workbook's sheet names as a `&[String]` rather than reading them off the view:

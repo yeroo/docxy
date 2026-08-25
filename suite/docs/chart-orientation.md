@@ -21,7 +21,7 @@ Implementation: `ChartData::by_row` and `chart_from_range` /
 `chart_space_xml` (`gridcore/src/xlsx.rs`), `infer_by_row` and `parse_chart`
 (`gridcore/src/drawing.rs`), and in the panel `chart_switch_row_column`,
 `chart_switched`, `chart_switch_orientation`, `series_values_shape_err`,
-`categories_shape_err`, `chart_kind_series_err`, `chart_field_examples`,
+`categories_shape_err`, `chart_field_examples`,
 `series_set_values` (`suite/docxy/src/main.rs`).
 
 ## What each orientation means
@@ -223,9 +223,11 @@ those are:
   row above) it for the flipped reading to name the series from
   (`chart_box_with_header`). The note says which line is missing and that
   inserting one, or pointing DATA RANGE at the cells to read, is the way out;
-- a range with no line of numbers the other way round;
-- a **pie** whose flipped range would read as more than one series, which is
-  the usual case — see below.
+- a range with no line of numbers the other way round.
+
+A **pie** whose flipped range reads as several series — the usual case — used to
+be refused here as well. It no longer is: the flip keeps every series and the
+panel says the plot draws the first, see below.
 
 Undo is `chart_set_data`'s existing snapshot. A flip always differs from what is
 there (the orientation, if nothing else), so that call's "committed nothing"
@@ -339,8 +341,11 @@ Row/Column button already derives its flip every frame) rather than by a proxy:
 directions: it promised a re-read for every one of those five refusals, and with
 no box at all it fell back to the bare first half — which claims the edits get
 saved once a type is picked, on the one chart where picking a type can only
-refuse. `"column"` answers for all four buttons, because the only kind-dependent
-refusal is `chart_kind_series_err`, a pie-only count.
+refuse. `"column"` answers for all four buttons, because no refusal left in
+`chart_set_kind` turns on WHICH one is picked. (One did — `chart_kind_series_err`,
+a pie-only series count — until the writer stopped losing a pie's extra series
+and the refusal stopped being a fix; see
+[`pie-series.md`](pie-series.md).)
 
 **Re-pointing a series** (`SeriesValues(i)`) checks the shape the *chart* wants,
 not a constant: `series_values_shape_err` refuses `range.1 != range.3` on a
@@ -377,40 +382,32 @@ reachable through the panel and can still land there. Its label field then
 refuses its own ref — the same asymmetry `series_values_shape_err` has always
 had for a foreign chart mixing the two series shapes.)
 
-**No pie the panel builds holds more than one series**, because
-`chart_space_xml` writes only the first and the preview draws only the first, so
-a second would be listed in the panel, pointed at cells, coloured, and then
-dropped on save without a word. `chart_kind_series_err` is the rule all five
-doors to that state apply:
+**A pie holds every series it is given and plots the first.** All five doors to
+a multi-series pie are open — `series_add`, the Switch Row/Column flip,
+`chart_apply_range`/`chart_reauthored`, `chart_set_kind` and
+`sheet_insert_chart` — and none of them refuses on a series count any more.
 
-- `series_add` — the "+ Series" button, which has always refused. It is the one
-  door that does not call the helper: it tests `n > 0` before pushing, which is
-  the same rule on the count the push would leave, and keeps its own wording
-  because it is about to add a series rather than commit a whole plot.
-- **Switching** a pie — the flip usually reads N categories as N one-point
-  series. Asked of the DERIVED plot, so the button greys out with the reason
-  under it rather than failing at the click. Its note is worded for that door —
-  the count belongs to the flip, not to the chart on screen.
-- `chart_apply_range` — a wide DATA RANGE on a pie is the same hole by another
-  door.
-- `chart_set_kind` — picking **Pie** on a chart that already has N series. It
-  usually does not re-derive; it keeps the series and rewrites the kind, which
-  is why guarding the re-derivations alone left it open. It is also the widest
-  door, being what a user reaches by clicking the word *Pie*. It asks twice: the
-  one chart it does re-derive (the paragraph above) comes back with a series per
-  numeric column of its box, so `chart_reauthored` re-checks the rule on that
-  count — and its refusal can then name a count the panel is not showing.
-- `sheet_insert_chart` — Insert ▸ Pie over a range with several numeric columns.
+They used to, through `chart_kind_series_err` and `series_add`'s inline
+equivalent, because `chart_space_xml` wrote `series.first()` and dropped the
+rest on save: a second series would be listed in the panel, pointed at cells,
+coloured, and then deleted without a word. The writer keeps them all now, so
+the refusals stopped being a fix and went with the loss. `parse_chart`'s
+matching hold-back went too — a file that arrives holding a multi-series
+`<c:pieChart>` (schema-valid, and Excel-authored files in the corpus do it) is
+no longer marked `complex`, so it is editable like any other chart instead of
+round-tripping verbatim as a stacked or combo plot area still does.
 
-(A file that arrives already holding a multi-series `<c:pieChart>` is not
-reachable through the panel — the schema permits one even though Excel's own UI
-will not author it. `parse_chart` marks such a chart `complex`, so it round-trips
-as Excel wrote it instead of losing its extra series on the next edit, the same
-escape hatch a stacked or combo plot area takes.)
+What replaces the refusal is the panel SAYING what it draws: `NOT PLOTTED` on
+every series card past the first, and `chart_unplotted_note` under the type
+buttons — *"A pie plots the first series only — the other 2 are kept in the file
+but not drawn."* The whole subject, with the ECMA-376 citation that makes it
+legal, is written up in [`pie-series.md`](pie-series.md).
 
-All five refuse rather than silently keeping the first, which is the answer
-`series_add` has always given and the only one that cannot lose work the panel
-is already showing.
+Two things follow for orientation specifically. **Switching** a pie is allowed
+even though the flip usually reads N categories as N one-point series — the
+button no longer greys out for that, and the flipped chart keeps every one of
+them. And **`chart_reauthored`** asks nothing about the count: a box two numeric
+columns wide re-derives as two series whatever the kind, pie included.
 
 `rebuild_source` needs no orientation of its own: it unions rectangles, so a row
 series' ref grows the box the same way a column's does. A test pins that rather

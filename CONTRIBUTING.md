@@ -38,7 +38,9 @@ The desktop suite's grid, its range-selector fields and the two GPUI traps they
 rest on are written up in
 [`suite/docs/range-selector.md`](suite/docs/range-selector.md); how a chart
 reads its range — each column a series, or each row — is in
-[`suite/docs/chart-orientation.md`](suite/docs/chart-orientation.md).
+[`suite/docs/chart-orientation.md`](suite/docs/chart-orientation.md), and why a
+pie keeps every series it holds while plotting the first is in
+[`suite/docs/pie-series.md`](suite/docs/pie-series.md).
 
 The root workspace is twenty crates. Layered bottom-up, at its core:
 
