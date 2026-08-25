@@ -4773,6 +4773,8 @@ impl Docxy {
             // in-cell edit, so without this a drag that starts on those few
             // pixels writes cells instead of picking them.
             handle_hidden: self.range_field_active() || self.formula_pick_active(),
+            // The cap needs the column window, which only `sheet_el` has.
+            range_dashed: true,
         }
     }
 
@@ -16055,7 +16057,6 @@ fn scroll_col0_for_sel(
 /// The pointed range's border width in px. The dash pitch follows from it:
 /// gpui's shader lays a dash of `2 × width` and a gap of `1 × width`, so the
 /// pitch is `3 × width` and 2px gives Excel's ~4px dash on a 100% display.
-#[allow(dead_code)] // wired into the renderer in the next task
 const RANGE_BORDER_W: f32 = 2.0;
 
 /// gpui's dash pattern, from the shader cited above: dash `2 × border width`,
@@ -16086,7 +16087,6 @@ struct EdgeMask {
 
 impl EdgeMask {
     /// Nothing to draw — the cell is inside the range, or outside it.
-    #[allow(dead_code)] // wired into the renderer in the next task
     fn is_empty(self) -> bool {
         !(self.top || self.right || self.bottom || self.left)
     }
@@ -16095,7 +16095,6 @@ impl EdgeMask {
 /// The sides of `range`'s border that cell `(r, c)` owns. Cells off the range,
 /// and cells strictly inside it, own nothing. This is the per-cell question the
 /// row renderer asks; `range_border_plan` answers it for a whole viewport.
-#[allow(dead_code)] // wired into the renderer in the next task
 fn range_edges_at(range: (u32, u32, u32, u32), r: u32, c: u32) -> EdgeMask {
     let (r0, c0, r1, c1) = range;
     if r < r0 || r > r1 || c < c0 || c > c1 {
@@ -16124,7 +16123,6 @@ struct RangeBorderPlan {
 /// `(r0, c0, r1, c1)` boxes). Only the perimeter is walked, never the area, so
 /// a selection of a million rows costs the rows you can see. An edge that falls
 /// outside the window is simply not drawn — Excel clips the same way.
-#[allow(dead_code)] // wired into the renderer in the next task
 fn range_border_plan(range: (u32, u32, u32, u32), view: (u32, u32, u32, u32)) -> RangeBorderPlan {
     let (r0, c0, r1, c1) = range;
     let (vr0, vc0, vr1, vc1) = view;
@@ -16160,6 +16158,48 @@ fn range_border_plan(range: (u32, u32, u32, u32), view: (u32, u32, u32, u32)) ->
     let cells: Vec<_> = cells.into_iter().map(|((r, c), e)| (r, c, e)).collect();
     let dashed = cells.len() <= RANGE_BORDER_CELL_CAP;
     RangeBorderPlan { cells, dashed }
+}
+
+/// The most rows the grid can have on screen at once, for the cap decision
+/// only. `sheet_el` is handed the grid's WIDTH but not its height, so the row
+/// side of the viewport has to be bounded by a number rather than measured.
+///
+/// 128 rows at the 21px row-height floor is a 2688px-tall grid — taller than
+/// any display in landscape, so it over-counts every real viewport, which is
+/// the safe direction: the cap can only fire sooner, never later. It is not
+/// set higher because over-counting is not free — two full columns of 256
+/// would clear `RANGE_BORDER_CELL_CAP` on their own and drop a perfectly
+/// ordinary tall selection to a solid border.
+const GRID_MAX_VISIBLE_ROWS: u32 = 128;
+
+/// Which range the dashed border outlines. A focused range field wins: while
+/// one has the keyboard the border's whole job is to show what it points at.
+/// Otherwise it outlines the selection, but only when that spans more than one
+/// cell — a single cell already wears the active ring, and drawing both would
+/// be the doubled-up indicator this plan is trying to remove.
+fn border_range(
+    preview: Option<(u32, u32, u32, u32)>,
+    sel: (u32, u32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    if preview.is_some() {
+        return preview;
+    }
+    let (r0, c0, r1, c1) = sel;
+    ((r0, c0) != (r1, c1)).then_some(sel)
+}
+
+/// Whether `range`'s border is drawn dashed, or falls back to solid because it
+/// would cost more than `RANGE_BORDER_CELL_CAP` boundary cells.
+///
+/// The renderer draws the border cell by cell, so the cost is bounded by the
+/// viewport, not by the range: `cols` is the visible column window and
+/// `max_rows` the row bound above. The window is anchored on the range's own
+/// first row, which over-counts whenever the range starts above the fold — the
+/// same safe direction as `GRID_MAX_VISIBLE_ROWS`.
+fn range_border_dashed(range: (u32, u32, u32, u32), cols: (u32, u32), max_rows: u32) -> bool {
+    let (r0, _, _, _) = range;
+    let vr1 = r0.saturating_add(max_rows.saturating_sub(1));
+    range_border_plan(range, (r0, cols.0, vr1, cols.1)).dashed
 }
 
 /// Where gpui's shader will put the dashes along one straight edge, so we can
@@ -16327,6 +16367,10 @@ struct GridOverlay {
     formula_refs: std::rc::Rc<Vec<(u32, u32, u32, u32)>>,
     /// The selection's corner is under a chart card, which owns those pixels.
     handle_hidden: bool,
+    /// The pointed range's border dashes. False past `RANGE_BORDER_CELL_CAP`
+    /// visible boundary cells, where the same edges are drawn solid instead.
+    /// Only `sheet_el` knows the column window, so it fills this in.
+    range_dashed: bool,
 }
 
 /// One data row: the row-number gutter cell plus the visible cells (frozen
@@ -16360,6 +16404,9 @@ fn sheet_row(
     let brand = hsla_u(BRAND);
     let range_tint = Hsla { a: 0.14, ..brand };
     let hl_row = r >= r0 && r <= r1;
+    // What the dashed border outlines this frame: the cells a focused range
+    // field points at, else a selection spanning more than one cell.
+    let border_rg = border_range(ov.range_preview, (r0, c0, r1, c1));
     // Variable row height: an explicit <row ht> sets a floor (points → px at the
     // app's 15pt≈21px scale); wrapped cells grow the row past it via their
     // natural (min-content) height. items_stretch makes every cell fill it.
@@ -16429,10 +16476,6 @@ fn sheet_row(
             && ov
                 .fill_preview
                 .is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
-        // Cells the focused range field names.
-        let in_ref = ov
-            .range_preview
-            .is_some_and(|(pr0, pc0, pr1, pc1)| r >= pr0 && r <= pr1 && c >= pc0 && c <= pc1);
         // Cells the formula being typed reads: the innermost reference covering
         // this cell gives it its colour, which is the one the TEXT draws too.
         let formula_ref = ref_index_at(&ov.formula_refs, r, c).map(|i| (i, ov.formula_refs[i]));
@@ -16533,7 +16576,6 @@ fn sheet_row(
                     a: 0.16,
                 })
             })
-            .when(in_ref, |d| d.bg(Hsla { a: 0.18, ..brand }))
             .when_some(formula_ref, |d, (i, _)| {
                 d.bg(Hsla {
                     a: 0.14,
@@ -16644,28 +16686,31 @@ fn sheet_row(
                 ));
             }
         }
-        // The referenced range's border: each edge cell draws its own outer side,
-        // which the cell's own layout places exactly (the overlay's uniform-row
-        // arithmetic drifts on content-tall rows). `deferred` keeps the cell's
-        // overflow clip from eating the line.
-        if in_ref {
-            if let Some((pr0, pc0, pr1, pc1)) = ov.range_preview {
-                let (top, bot, lft, rgt) = (r == pr0, r == pr1, c == pc0, c == pc1);
-                if top || bot || lft || rgt {
-                    cell = cell.relative().child(deferred(
-                        div()
-                            .absolute()
-                            .left(px(-1.))
-                            .top(px(-1.))
-                            .right(px(-1.))
-                            .bottom(px(-1.))
-                            .border_color(hsla_u(BRAND))
-                            .when(top, |d| d.border_t(px(2.)))
-                            .when(bot, |d| d.border_b(px(2.)))
-                            .when(lft, |d| d.border_l(px(2.)))
-                            .when(rgt, |d| d.border_r(px(2.))),
-                    ));
-                }
+        // The pointed range's border: dashed, in the brand teal, at Excel's
+        // border width. Each edge cell draws only the sides it owns
+        // (`range_edges_at`), positioned by the cell's own layout — the overlay
+        // alternative reconstructs row positions from the scroll offset and
+        // drifts on content-tall rows. `deferred` keeps the cell's overflow clip
+        // from eating the line. The dashes themselves come from gpui's quad
+        // shader via `border_dashed`, so they cost exactly what a solid border
+        // costs; past `RANGE_BORDER_CELL_CAP` boundary cells `range_dashed` is
+        // false and the same edges are drawn solid.
+        if let Some(e) = border_rg.map(|rg| range_edges_at(rg, r, c)) {
+            if !e.is_empty() {
+                cell = cell.relative().child(deferred(
+                    div()
+                        .absolute()
+                        .left(px(-1.))
+                        .top(px(-1.))
+                        .right(px(-1.))
+                        .bottom(px(-1.))
+                        .border_color(brand)
+                        .when(ov.range_dashed, |d| d.border_dashed())
+                        .when(e.top, |d| d.border_t(px(RANGE_BORDER_W)))
+                        .when(e.bottom, |d| d.border_b(px(RANGE_BORDER_W)))
+                        .when(e.left, |d| d.border_l(px(RANGE_BORDER_W)))
+                        .when(e.right, |d| d.border_r(px(RANGE_BORDER_W))),
+                ));
             }
         }
         // Auto-fill handle: a small square centred ON the selection's bottom-right
@@ -17218,8 +17263,19 @@ fn sheet_el(
     };
     // The cards' boxes are only known here, so the fill handle's visibility is
     // the one overlay field the render pass can't fill in.
+    //
+    // Neither is the dash cap: the border is drawn cell by cell, so its cost is
+    // the visible boundary cells, and the column window (`fc` frozen columns
+    // then `col0..=cend`) is only settled here. The frozen band and the scrolled
+    // window are counted as one span `0..=cend`, which over-counts the columns
+    // scrolled between them — the same safe direction as everything else here.
+    let range_dashed = border_range(ov.range_preview, (r0, c0, r1, c1)).is_none_or(|rg| {
+        let cols = (if fc > 0 { 0 } else { col0 }, cend);
+        range_border_dashed(rg, cols, GRID_MAX_VISIBLE_ROWS)
+    });
     let ov = GridOverlay {
         handle_hidden: ov.handle_hidden || corner_under_chart,
+        range_dashed,
         ..ov
     };
     // Visible rows (filter/hide skips `hidden="1"` rows) — the list virtualizes
@@ -17878,13 +17934,13 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        EdgeMask, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_ROW_H,
-        char_to_byte, chart_ref_of, col_at_x, col_px, dash_fit, edit_runs, fill_box,
-        formula_ref_tokens, last_visible_col, parse_ref_text, preview_range, range_a1,
-        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
-        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
-        series_move, series_name_shown, series_remove, sheet_index_of, shift_col, shift_row,
-        source_ref_text,
+        EdgeMask, GRID_MAX_VISIBLE_ROWS, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan,
+        RefText, SHEET_ROW_H, border_range, char_to_byte, chart_ref_of, col_at_x, col_px, dash_fit,
+        edit_runs, fill_box, formula_ref_tokens, last_visible_col, parse_ref_text, preview_range,
+        range_a1, range_border_dashed, range_border_plan, range_edges_at, range_text, ref_a1,
+        ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis,
+        row_height_px, scroll_col0_for_sel, series_move, series_name_shown, series_remove,
+        sheet_index_of, shift_col, shift_row, source_ref_text,
     };
 
     fn names(list: &[&str]) -> Vec<String> {
@@ -21043,6 +21099,126 @@ mod grid_geom_tests {
         // The threshold scales with the width, as the shader's does.
         assert_eq!(dash_fit(16.0, 4.0), None); // 4 × 4px
         assert!(dash_fit(20.0, 4.0).is_some());
+    }
+
+    // ---- Task 2: what the renderer outlines, and whether it dashes ----
+
+    /// A focused range field owns the border while it has the keyboard; without
+    /// one the selection gets it, but only when it spans more than one cell —
+    /// a lone cell already wears the active ring.
+    #[test]
+    fn border_range_prefers_the_pointed_range_over_the_selection() {
+        let sel = (2, 2, 6, 6);
+        // A field is pointing: its range wins even though the selection is wide.
+        assert_eq!(border_range(Some((0, 0, 1, 1)), sel), Some((0, 0, 1, 1)));
+        // Nothing pointing: the selection, because it spans more than one cell.
+        assert_eq!(border_range(None, sel), Some(sel));
+        // A one-cell selection draws no border — the ring is the indicator.
+        assert_eq!(border_range(None, (3, 4, 3, 4)), None);
+        // A one-cell POINTED range still does: nothing else marks it.
+        assert_eq!(border_range(Some((3, 4, 3, 4)), sel), Some((3, 4, 3, 4)));
+        // A single row and a single column both span more than one cell.
+        assert_eq!(border_range(None, (3, 4, 3, 9)), Some((3, 4, 3, 9)));
+        assert_eq!(border_range(None, (3, 4, 8, 4)), Some((3, 4, 8, 4)));
+    }
+
+    /// The cap is bounded by the VIEWPORT, not the range: the widths and row
+    /// counts the app actually reaches all dash, and only a window nobody has
+    /// falls back to solid.
+    #[test]
+    fn range_border_dashes_at_every_realistic_viewport() {
+        // A 1920px grid at the narrowest column shows ~69 columns; the row bound
+        // is `GRID_MAX_VISIBLE_ROWS`. Even select-all stays far under the cap.
+        let cols = (0, 68);
+        assert!(range_border_dashed(
+            (0, 0, 0, 16_383),
+            cols,
+            GRID_MAX_VISIBLE_ROWS
+        )); // a full row
+        assert!(range_border_dashed(
+            (0, 0, 1_048_575, 0),
+            cols,
+            GRID_MAX_VISIBLE_ROWS
+        )); // a column
+        assert!(range_border_dashed(
+            (0, 0, 1_048_575, 16_383),
+            cols,
+            GRID_MAX_VISIBLE_ROWS
+        )); // select-all
+        assert!(range_border_dashed(
+            (5, 5, 5, 5),
+            cols,
+            GRID_MAX_VISIBLE_ROWS
+        )); // one cell
+
+        // A range scrolled entirely right of the window plans no cells at all,
+        // so the flag is moot — it reads as "solid", and nothing is drawn to be
+        // solid. Scrolling it into view recomputes against the new window.
+        assert!(!range_border_dashed(
+            (0, 900, 4, 910),
+            cols,
+            GRID_MAX_VISIBLE_ROWS
+        ));
+        assert!(
+            range_border_plan((0, 900, 4, 910), (0, 0, 127, 68))
+                .cells
+                .is_empty()
+        );
+    }
+
+    /// Past the cap the SAME edges are still planned — they just stop dashing.
+    /// That is the guarantee: degrade to solid, never to a partial border.
+    #[test]
+    fn range_border_falls_back_to_solid_past_the_cap() {
+        let wide = RANGE_BORDER_CELL_CAP as u32 + 10;
+        let cols = (0, wide);
+        assert!(!range_border_dashed((0, 0, 0, wide - 1), cols, 1));
+        // The edges themselves are unchanged — a boundary cell still owns its
+        // sides, so the border is drawn either way.
+        let plan = range_border_plan((0, 0, 0, wide - 1), (0, 0, 0, wide));
+        assert!(!plan.dashed);
+        assert_eq!(plan.cells.len(), wide as usize);
+        assert_eq!(mask(plan.cells[0].2), "t.bl");
+
+        // Narrow the column window and the very same range dashes again: the
+        // cost is the viewport's, not the range's.
+        assert!(range_border_dashed((0, 0, 0, wide - 1), (0, 40), 1));
+    }
+
+    /// The row bound is what keeps a tall selection under the cap, and it is
+    /// applied from the range's own first row.
+    #[test]
+    fn range_border_cap_counts_only_the_rows_a_viewport_can_show() {
+        let cols = (0, 3);
+        // 4 columns × a million rows: unbounded this is 2M cells, but only
+        // `GRID_MAX_VISIBLE_ROWS` of them can ever be on screen.
+        assert!(range_border_dashed(
+            (0, 0, 1_048_575, 3),
+            cols,
+            GRID_MAX_VISIBLE_ROWS
+        ));
+        // Lift the bound past the cap and it gives up, as designed.
+        assert!(!range_border_dashed(
+            (0, 0, 1_048_575, 3),
+            cols,
+            RANGE_BORDER_CELL_CAP as u32
+        ));
+        // A degenerate bound of zero rows must not underflow.
+        assert!(range_border_dashed((7, 0, 9, 3), cols, 0));
+    }
+
+    /// The edges a row renderer asks for, for the shapes Task 2 draws: the two
+    /// ends of a single row own three sides each, and the middle owns one.
+    #[test]
+    fn border_edges_cover_the_shapes_the_renderer_draws() {
+        let row = (4, 2, 4, 5);
+        assert_eq!(mask(range_edges_at(row, 4, 2)), "t.bl");
+        assert_eq!(mask(range_edges_at(row, 4, 3)), "t.b.");
+        assert_eq!(mask(range_edges_at(row, 4, 5)), "trb.");
+        // A cell the border does not reach draws nothing, so the renderer skips
+        // the deferred element entirely.
+        assert!(range_edges_at((1, 1, 5, 5), 3, 3).is_empty());
+        assert!(range_edges_at(row, 5, 3).is_empty());
     }
 }
 

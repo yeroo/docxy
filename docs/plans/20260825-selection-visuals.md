@@ -265,18 +265,75 @@ stuttering. Separately and unavoidably, the shader draws any edge of `≤ 4W`
 
 ### Task 2: Draw the pointed range with a dashed brand border
 
-- [ ] render the dashed border for `GridOverlay::range_preview` using Task 1's
+- [x] render the dashed border for `GridOverlay::range_preview` using Task 1's
       geometry, in `BRAND` (`0x2AA79B`) at Excel's border width
-- [ ] decide and record whether the existing `range_tint` wash stays under the
+      → `sheet_row` now asks `range_edges_at` which sides the cell owns and
+      draws them with gpui's `border_dashed()` at `RANGE_BORDER_W`, replacing
+      the hand-rolled solid 2px edge
+- [x] decide and record whether the existing `range_tint` wash stays under the
       dashes or is replaced by them — Excel shows the border alone, and two
       indicators for one thing is what this plan is trying to stop
-- [ ] apply the cap from Task 1: past it, draw a solid border rather than
-      thousands of elements
-- [ ] keep `handle_hidden` behaviour intact — the auto-fill handle is still
-      hidden while a range field is pointable
-- [ ] write tests for the pure part: given a preview range and a viewport, the
+      → the two washes are told apart; see "The two washes" below
+- [x] apply the cap from Task 1: past it, draw a solid border rather than
+      thousands of elements → `range_border_dashed` in `sheet_el` →
+      `GridOverlay::range_dashed`; see "Where the cap is decided" below
+- [x] keep `handle_hidden` behaviour intact — the auto-fill handle is still
+      hidden while a range field is pointable → untouched; the handle's cell
+      may now also draw a border side, which is additive
+- [x] write tests for the pure part: given a preview range and a viewport, the
       list of edge segments to draw, and that the capped case yields solid
-- [ ] run tests — must pass before Task 3
+      → 4 tests in `grid_geom_tests` (`border_range_prefers_…`,
+      `range_border_dashes_at_every_realistic_viewport`,
+      `range_border_falls_back_to_solid_past_the_cap`,
+      `range_border_cap_counts_only_the_rows_a_viewport_can_show`,
+      plus `border_edges_cover_the_shapes_the_renderer_draws`)
+- [x] run tests — must pass before Task 3 → suite 96 pass, gridcore 370+1+4,
+      both workspaces clippy clean and `cargo fmt --check` clean
+
+#### The two washes
+
+The Overview's complaint 1 cites `range_tint`, but `range_tint` is not the
+pointed range's wash — it is the **selection's** (`in_range`, `BRAND` at
+`a: 0.14`). The pointed range had its own, separate, at `a: 0.18`. So the
+question the checkbox asks has two answers, one per wash:
+
+- **The pointed range's wash is gone.** Excel shows the border alone, the
+  dashed teal outline is unmistakable on its own, and keeping both is exactly
+  the doubled-up indicator this plan set out to remove.
+- **`range_tint` stays.** It marks a different thing — what the keyboard will
+  act on — and every spreadsheet including Excel fills its selection as well as
+  outlining it. Removing it would leave a multi-cell selection with nothing but
+  one cell's ring.
+
+➕ **The border now outlines the selection too**, not only `range_preview`.
+Complaint 1 is written against `range_tint`, and read literally it says the
+thing `range_tint` covers "draws no edge at all" — which was true. So
+`border_range` returns the pointed range if a field has the keyboard, else the
+selection **when it spans more than one cell** (a lone cell already wears the
+ring; drawing both would be the same doubling again). One code path, one look,
+and complaint 1 is answered under either reading of which range it meant.
+
+#### Where the cap is decided
+
+The border is drawn per cell, so its cost is the visible boundary cells — and
+only `sheet_el` knows the visible column window (`fc` frozen columns, then
+`col0..=cend`). It computes `range_border_dashed` once per frame into the new
+`GridOverlay::range_dashed`, and `sheet_row` reads it. Two deliberate
+over-counts, both in the safe direction — the cap can fire sooner, never later:
+
+- The frozen band and the scrolled window are counted as one span `0..=cend`,
+  which includes the columns scrolled between them.
+- `sheet_el` is handed the grid's **width but not its height**, so the row side
+  is bounded by `GRID_MAX_VISIBLE_ROWS = 128` rather than measured — a
+  2688px-tall grid at the 21px row floor, taller than any display in landscape.
+  It is not set higher on purpose: two full columns at 256 would clear
+  `RANGE_BORDER_CELL_CAP` between them and drop an ordinary tall selection to
+  solid. At 128 even select-all on a 1920px grid plans ~323 cells.
+
+⚠️ On a hypothetical ultrawide showing ~180 minimum-width columns the cap *is*
+reachable, and a select-all there falls back to a solid border. That is the
+backstop working as specified, not a defect — the tested guarantee is that the
+**same edges** are still drawn, just solid.
 
 ### Task 3: A selected chart outlines the cells it reads
 
