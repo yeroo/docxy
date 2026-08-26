@@ -37,4 +37,16 @@ external_review_tool = custom
 #      wrong about something.
 max_external_iterations = 3
 review_patience = 2
+
+# Task iterations for one plan. The default 50 is a runaway guard, not a budget:
+# the plans here run 7-9 task iterations, and one that cannot be done in 15 has
+# a planning problem that 35 more iterations will not find.
+max_iterations = 15
+
+# Kill a TASK or REVIEW executor that has produced nothing for this long — the
+# guard against a wedged run sitting silent rather than failing. Note its limit:
+# in default Claude mode this does NOT cover the external review phase, so it is
+# no help against a stuck revmux. That one is bounded by its own --idle-timeout
+# (2m per agent) and --hard-timeout (40m, set in the hook).
+idle_timeout = 10m
 custom_review_script = scripts\revmux-review.cmd
