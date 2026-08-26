@@ -57,7 +57,7 @@ Useful flags on `run`:
 
 | Flag | Effect |
 |---|---|
-| `--suite EXE` | drive this binary. Otherwise `$UIHARNESS_SUITE` if it is set (an error if it does not name a file), otherwise the first build found — release before debug, under `suite/target/` then `target/`, relative to the repository this crate was built from and then the working directory |
+| `--suite EXE` | drive this binary. Otherwise `$UIHARNESS_SUITE` if it is set (an error if it does not name a file), otherwise the first build found — release before debug, under `suite/target/` then `target/`, relative to the repository this crate was built from and then the working directory. Release wins over debug whatever their dates, so every run prints the binary it drove as its first line — that is what makes a stale release build answering for a fresh debug one visible |
 | `--run DIR` | where evidence is filed (default `./uiharness-runs`, which is git-ignored) |
 | `--sandbox DIR` | the throwaway config root (default `<run>/sandbox`, **erased before each run**; a directory you name yourself is yours to manage, and is kept) |
 | `--keep` | leave the instance up after the script ends, to poke at the window a case failed on |
@@ -118,7 +118,7 @@ cold start, and every accepted and rejected form is a unit test.
 | `open <path>` | the file, resolved **against the script's own directory** — never the working directory |
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
 | `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
-| `type <text>` | one key event per character, text taken verbatim |
+| `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
 | `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `f2`, `ctrl+c`, `shift+down`, … |
 | `select chart <n>` | the press on a chart card, counting from 0 |
 | `focus <field>` | the click on a reference field |
@@ -134,9 +134,12 @@ Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
 instance — a process per case would multiply a two-second launch by however
 many cases there are — so `open` is the only setup a case has, and it has to
 mean the same thing on case 5 as it did on case 1. In a harness instance it
-therefore reloads even a tab with unsaved edits, silently: those edits belong to
-the case before it and nothing is meant to survive one. (A normal instance still
-asks first, and still keeps your work if you say no.)
+therefore replaces the tab whether or not it has unsaved edits, silently. Not
+everything a case leaves behind sets the dirty flag — an uncommitted in-cell
+edit, the selection, the scroll position — so reloading only the dirty ones
+would carry the rest into the next case, and a case would pass or fail on the
+order it ran in. (A normal instance still asks before discarding unsaved work,
+and still keeps it if you say no.)
 
 ⚠️ **No modal dialog may sit on a path a verb can reach.** `rfd` runs its own
 message loop on the app thread, which stops the control pump dead — the window
@@ -213,6 +216,21 @@ Geometry and pixels are read from a **settled** frame. A verb only marks the
 view dirty, so when its reply goes out the frame that shows what it did has not
 been laid out yet; the driver reads the frame counter, sends its verbs, then
 waits for `rect` to report a higher one before capturing.
+
+**A region that is only partly on screen is refused, not guessed at.** Both
+sides of the crop enforce this, because a half-visible edge is the one failure
+mode a pixel assertion cannot notice by itself: the picture is a perfectly good
+picture, the probe reads a perfectly good line, and the verdict is about the
+wrong pixels.
+
+- The app refuses `rect` for a range whose row or column is cut by the edge of
+  the grid — `column C is only partly in the grid's view; scroll it fully into
+  view first`. Its border is not drawn where a probe would look for it, so
+  there is no honest answer to give.
+- The harness clamps a crop that runs off the *window* (there are still pixels
+  worth filing as evidence) but records which edges it moved, and a border
+  assertion then refuses those edges rather than reading the window's frame as
+  if it were the region's.
 
 ### Colours
 

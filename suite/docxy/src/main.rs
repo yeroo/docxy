@@ -1613,6 +1613,30 @@ fn col_off_right(list: Bounds<Pixels>, x: f32) -> bool {
     list.left() + px(x) >= list.right()
 }
 
+/// How much slack a "is this fully inside the grid?" test allows, in pixels.
+/// Layout arithmetic is `f32`, and refusing a rectangle because an edge landed
+/// a thousandth of a pixel over would be a mystery to whoever wrote the case.
+const EDGE_SLACK: f32 = 0.5;
+
+/// Whether a column that opens `x` and is `w` wide is CUT by the list's right
+/// edge — its left is on screen and its right is not.
+///
+/// ⚠️ [`col_off_right`] only asks about the left edge, so the last column in
+/// view passes it while half of the column, and all of a selection's right-hand
+/// border, is outside the grid. Probing that edge reads the scrollbar or the
+/// Chart panel and returns a confident verdict about it — the same
+/// silently-wrong-pixels trap `col_span_x` exists to close on the other side.
+fn col_cut_right(list: Bounds<Pixels>, x: f32, w: f32) -> bool {
+    list.left() + px(x + w) > list.right() + px(EDGE_SLACK)
+}
+
+/// Whether a row band is cut by the top or bottom of the list it is in — the
+/// row is on screen, but not all of it is. See [`col_cut_right`]: a border
+/// along a cut edge is not drawn where a probe would look for it.
+fn row_cut(list: Bounds<Pixels>, band: Bounds<Pixels>) -> bool {
+    band.top() < list.top() - px(EDGE_SLACK) || band.bottom() > list.bottom() + px(EDGE_SLACK)
+}
+
 /// The rectangle two cells span, from what the layout measured for them: the
 /// row list's own bounds, the top and bottom of the two rows' bands, and the
 /// left and right edges of the two columns' spans.
@@ -5273,6 +5297,13 @@ impl Docxy {
             if band.bottom() <= list.top() || band.top() >= list.bottom() {
                 return Err(format!("row {} is scrolled out of the grid's view", r + 1));
             }
+            if row_cut(list, band) {
+                return Err(format!(
+                    "row {} is only partly in the grid's view; scroll it fully \
+                     into view first",
+                    r + 1
+                ));
+            }
             Ok(band)
         };
         let fc = sh.freeze.1.min(64);
@@ -5293,6 +5324,13 @@ impl Docxy {
             if col_off_right(list, x) {
                 return Err(format!(
                     "column {} is scrolled off to the right of the grid's view",
+                    gridcore::sheet::col_name(c)
+                ));
+            }
+            if col_cut_right(list, x, w) {
+                return Err(format!(
+                    "column {} is only partly in the grid's view; scroll it \
+                     fully into view first",
                     gridcore::sheet::col_name(c)
                 ));
             }
@@ -9484,27 +9522,35 @@ impl Docxy {
                 .position(|t| t.path.as_deref().map(canon) == Some(key.clone()))
             {
                 Some(i) => {
-                    if self.tabs[i].dirty {
-                        // ⚠️ A harness instance never asks, and always reloads.
-                        //
-                        // Never asks because `rfd`'s dialog runs its own modal
-                        // message loop on this thread, so it stops the control
-                        // pump dead: the window still answers Windows messages,
-                        // so it LOOKS alive, while every verb after it times out
-                        // with nothing on stderr to say why. Found by running
-                        // `uiharness/cases/sheet-selection.uit` — case 3 points
-                        // a chart field at some cells, which dirties the tab,
-                        // and case 4's `open` of the same fixture hung the run.
-                        //
-                        // Always reloads because the cases in a script share one
-                        // instance, and `open` is the only setup a case has. If
-                        // it meant "make this the active tab" a case would
-                        // inherit whatever an earlier one typed into the
-                        // fixture, and would pass or fail on the order it ran
-                        // in. Discarding the edits is the point: they are the
-                        // previous case's, and nothing is meant to survive it.
-                        let reload = self.harness.is_some()
-                            || matches!(
+                    // ⚠️ A harness instance never asks, and always reloads —
+                    // whether or not the tab is dirty.
+                    //
+                    // Never asks because `rfd`'s dialog runs its own modal
+                    // message loop on this thread, so it stops the control
+                    // pump dead: the window still answers Windows messages,
+                    // so it LOOKS alive, while every verb after it times out
+                    // with nothing on stderr to say why. Found by running
+                    // `uiharness/cases/sheet-selection.uit` — case 3 points
+                    // a chart field at some cells, which dirties the tab,
+                    // and case 4's `open` of the same fixture hung the run.
+                    //
+                    // Always reloads because the cases in a script share one
+                    // instance, and `open` is the only setup a case has. If it
+                    // meant "make this the active tab" a case would inherit
+                    // whatever an earlier one left behind, and would pass or
+                    // fail on the order it ran in. Plenty of what a case leaves
+                    // behind never sets `dirty`: an uncommitted in-cell edit
+                    // sits in `SheetView::editing` until `sheet_commit` writes
+                    // it into the workbook, and the selection and the scroll
+                    // position are not document state at all. Asking `dirty`
+                    // first would reload for the committed edits and keep the
+                    // rest — the worst of both. Discarding is the point: it is
+                    // the previous case's, and nothing is meant to survive it.
+                    let reload = if self.harness.is_some() {
+                        true
+                    } else {
+                        self.tabs[i].dirty
+                            && matches!(
                             rfd::MessageDialog::new()
                                 .set_title("docxy")
                                 .set_description(format!(
@@ -9514,10 +9560,10 @@ impl Docxy {
                                 .set_buttons(rfd::MessageButtons::YesNo)
                                 .show(),
                             rfd::MessageDialogResult::Yes
-                        );
-                        if reload {
-                            self.tabs[i] = tab_from_path(&path);
-                        }
+                        )
+                    };
+                    if reload {
+                        self.tabs[i] = tab_from_path(&path);
                     }
                     self.active = i;
                 }
@@ -19611,6 +19657,47 @@ mod grid_geom_tests {
         assert!(!col_off_right(list, 899.0));
         assert!(col_off_right(list, 900.0), "exactly at the right edge");
         assert!(col_off_right(list, 1200.0));
+    }
+
+    /// The half-visible cases, which `col_off_right` alone lets through: the
+    /// column STARTS on screen and ends past the edge, so the crop would run
+    /// off the grid and the right-hand border would be probed against whatever
+    /// is beside it.
+    #[test]
+    fn a_partly_visible_row_or_column_is_refused_rather_than_cropped() {
+        use super::{col_cut_right, col_off_right, row_cut};
+        use gpui::{Bounds, Pixels, point, px, size};
+        let list: Bounds<Pixels> = Bounds {
+            origin: point(px(48.), px(160.)),
+            size: size(px(900.), px(400.)),
+        };
+
+        // Wholly inside: both edges on the grid.
+        assert!(
+            !col_cut_right(list, 800.0, 100.0),
+            "ends exactly at the edge"
+        );
+        assert!(!col_cut_right(list, 0.0, 120.0));
+        // Starts on screen, ends past it — the case `col_off_right` misses.
+        assert!(!col_off_right(list, 850.0), "its left edge IS on screen");
+        assert!(
+            col_cut_right(list, 850.0, 100.0),
+            "but its right edge is not"
+        );
+        // Float slack: a fraction of a pixel over is not a refusal.
+        assert!(!col_cut_right(list, 800.0, 100.2));
+
+        let band = |top: f32, bottom: f32| {
+            Bounds::from_corners(point(list.left(), px(top)), point(list.right(), px(bottom)))
+        };
+        assert!(!row_cut(list, band(160.0, 180.0)), "flush with the top");
+        assert!(!row_cut(list, band(540.0, 560.0)), "flush with the bottom");
+        assert!(row_cut(list, band(150.0, 180.0)), "half under the header");
+        assert!(row_cut(list, band(550.0, 570.0)), "half past the bottom");
+        assert!(
+            !row_cut(list, band(160.0, 560.2)),
+            "a fraction over is fine"
+        );
     }
 
     #[test]

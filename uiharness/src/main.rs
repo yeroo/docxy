@@ -28,7 +28,7 @@ use ctlcore::json::Json;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use uiharness::probe::ProbeOpts;
-use uiharness::{Driver, Run, check_border, control_dir, parse_border};
+use uiharness::{Driver, Run, check_border_clipped, control_dir, parse_border};
 
 const USAGE: &str = "\
 uiharness — drive a suite instance started with --harness
@@ -57,8 +57,8 @@ options for shot/window:
   --out FILE                    write here instead of under the run directory
 
 options for run:
-  --suite EXE                   the built suite to drive (default: the newest
-                                target/{release,debug} build; $UIHARNESS_SUITE)
+  --suite EXE                   the built suite to drive (default: $UIHARNESS_SUITE,
+                                else target/release then target/debug)
   --sandbox DIR                 the throwaway config root (default: <run>/sandbox)
   --keep                        leave the instance running after the script ends
 
@@ -193,14 +193,19 @@ fn run() -> Result<String, String> {
                     .ok_or_else(|| format!("shot needs a region\n\n{USAGE}"))?
                     .clone()
             };
-            let (img, cap) = d.shot(&region)?;
-            let path = save(&a, &region, &img)?;
+            let s = d.shot(&region)?;
+            let path = save(&a, &region, &s.image)?;
             Ok(format!(
-                "{region}: {}x{} -> {}  (via {})",
-                img.w,
-                img.h,
+                "{region}: {}x{} -> {}  (via {}){}",
+                s.image.w,
+                s.image.h,
                 path.display(),
-                cap.how
+                s.capture.how,
+                if s.clipped.any() {
+                    "  [clipped: the region runs off the window]"
+                } else {
+                    ""
+                }
             ))
         }
 
@@ -210,13 +215,13 @@ fn run() -> Result<String, String> {
         "assert" => {
             let text = a.rest[1..].join(" ");
             let exp = parse_border(&text)?;
-            let (img, cap) = d.shot(&exp.region)?;
-            let path = save(&a, &exp.region, &img)?;
-            let check = check_border(&exp, &img, ProbeOpts::default());
+            let s = d.shot(&exp.region)?;
+            let path = save(&a, &exp.region, &s.image)?;
+            let check = check_border_clipped(&exp, &s.image, ProbeOpts::default(), s.clipped);
             let mut report = check.report(Some(&path));
             report.push_str(&format!(
                 "  capture:  {}x{} via {}\n",
-                img.w, img.h, cap.how
+                s.image.w, s.image.h, s.capture.how
             ));
             // A failed expectation is a failed process: `Err` here is what puts
             // the report on stderr and a non-zero code on the exit.
@@ -295,7 +300,12 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         }
     };
 
-    let mut out = String::new();
+    // ⚠️ Which binary was driven, first line of every run. `find_suite` prefers
+    // release over debug and does not compare dates, so a stale
+    // `target/release/suite.exe` can quietly answer for the debug build someone
+    // just made — a green run about code that was never built. Naming the file
+    // is what makes that visible instead of mystifying.
+    let mut out = format!("suite:    {}\n", exe.display());
     let mut all_passed = true;
     for (path, base, script) in &scripts {
         out.push_str(&format!("{}\n", path.display()));

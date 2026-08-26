@@ -48,7 +48,7 @@
 //! The nameless form still earns its keep for a region that should be blank —
 //! a fill preview that must not have been drawn, say.
 
-use crate::image::Image;
+use crate::image::{Clip, Image};
 use crate::probe::{
     DEFAULT_DEPTH, LineKind, LineProbe, ProbeOpts, Rgba, Side, Target, background_color, hex,
     probe_edge,
@@ -410,13 +410,41 @@ impl BorderCheck {
     }
 }
 
-/// Check an expectation against the region's pixels.
+/// Was this side of the crop clamped away?
+fn clipped_side(clip: Clip, side: Side) -> bool {
+    match side {
+        Side::Top => clip.top,
+        Side::Right => clip.right,
+        Side::Bottom => clip.bottom,
+        Side::Left => clip.left,
+    }
+}
+
+/// Check an expectation against the region's pixels, where the crop covered the
+/// whole region.
 ///
 /// Pure: the picture has already been taken and cropped. `img` must be the crop
 /// of the region the expectation names — [`crate::Driver::shot`] produces
 /// exactly that, and pairing the two is the caller's job (see
 /// `main.rs`'s `assert`).
 pub fn check_border(exp: &BorderExpect, img: &Image, opts: ProbeOpts) -> BorderCheck {
+    check_border_clipped(exp, img, opts, Clip::default())
+}
+
+/// The same check, told which of the crop's edges are the CAPTURE's rather than
+/// the region's.
+///
+/// ⚠️ A region that runs off the window is cropped to what exists, and the
+/// resulting image's right column is then the window's right column. Probing it
+/// would return a confident verdict — pass or fail — about the window frame
+/// instead of about the border the test named. So a clipped side is not probed
+/// at all: it becomes an error, which fails the check and says why.
+pub fn check_border_clipped(
+    exp: &BorderExpect,
+    img: &Image,
+    opts: ProbeOpts,
+    clip: Clip,
+) -> BorderCheck {
     let background = background_color(img, DEFAULT_DEPTH);
     let target = match exp.color {
         Some(c) => Target::Color(c),
@@ -425,6 +453,16 @@ pub fn check_border(exp: &BorderExpect, img: &Image, opts: ProbeOpts) -> BorderC
     let mut sides = Vec::new();
     let mut errors = Vec::new();
     for side in &exp.sides {
+        if clipped_side(clip, *side) {
+            errors.push(format!(
+                "{:<7}the region runs off the capture on this side, so the edge \
+                 in the picture is the window's, not the region's; \
+                 move or resize the window so '{}' is fully visible",
+                side.name(),
+                exp.region
+            ));
+            continue;
+        }
         match probe_edge(img, *side, target, opts) {
             Ok(probe) => {
                 let pass = exp.kind.satisfied_by(probe.reading.kind);
@@ -774,6 +812,43 @@ mod tests {
         assert!(r.contains("expected:"), "{r}");
         assert!(r.contains("observed:"), "{r}");
         assert!(r.contains("region:   cell:A1:C5"), "{r}");
+    }
+
+    /// The trap a clamped crop sets: the picture is a perfectly good box, so
+    /// every probe reads a line and the check would pass — while the edge the
+    /// test asked about is off the capture entirely and those pixels belong to
+    /// the window, not to the region.
+    #[test]
+    fn a_clipped_edge_is_refused_rather_than_read() {
+        let img = boxed(60, 40, TEAL, 1, 0);
+        let exp = parse_border("border A1:C5 solid teal").unwrap();
+        let clip = Clip {
+            right: true,
+            ..Clip::default()
+        };
+
+        let c = check_border_clipped(&exp, &img, ProbeOpts::default(), clip);
+        assert!(
+            !c.passed(),
+            "a clipped edge cannot be a pass
+{}",
+            c.report(None)
+        );
+        assert_eq!(c.sides.len(), 3, "the other three are still read");
+        assert!(c.sides.iter().all(|s| s.pass));
+        assert_eq!(c.errors.len(), 1);
+        let r = c.report(None);
+        assert!(r.contains("right"), "{r}");
+        assert!(r.contains("runs off the capture"), "{r}");
+
+        // A side the test never named is not an error just because it was cut.
+        let top_only = parse_border("border A1:C5 top solid teal").unwrap();
+        let c = check_border_clipped(&top_only, &img, ProbeOpts::default(), clip);
+        assert!(c.passed(), "{}", c.report(None));
+
+        // And with nothing clipped, this is the plain check.
+        let c = check_border_clipped(&exp, &img, ProbeOpts::default(), Clip::default());
+        assert!(c.passed(), "{}", c.report(None));
     }
 
     #[test]

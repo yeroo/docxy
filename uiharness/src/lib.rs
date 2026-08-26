@@ -48,9 +48,11 @@ pub mod run;
 pub mod runner;
 pub mod script;
 
-pub use driver::{Driver, RegionRect, control_dir};
-pub use expect::{BorderCheck, BorderExpect, ExpectKind, check_border, parse_border};
-pub use image::{Image, RectPx};
+pub use driver::{Driver, RegionRect, Shot, control_dir};
+pub use expect::{
+    BorderCheck, BorderExpect, ExpectKind, check_border, check_border_clipped, parse_border,
+};
+pub use image::{Clip, Image, RectPx};
 pub use probe::{LineKind, LineProbe, ProbeOpts, Side, probe_edge};
 pub use run::Run;
 pub use runner::{CaseOutcome, Runner, ScriptOutcome, Status, StepOutcome};

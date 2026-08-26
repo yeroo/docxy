@@ -30,7 +30,7 @@
 //! window can exercise.
 
 use crate::driver::Driver;
-use crate::expect::{BorderExpect, check_border};
+use crate::expect::{BorderExpect, check_border_clipped};
 use crate::image::Image;
 use crate::probe::ProbeOpts;
 use crate::run::Run;
@@ -290,9 +290,9 @@ impl<'a> Runner<'a> {
             }
 
             Action::Shot(region) => match self.driver.shot(region) {
-                Ok((img, cap)) => match self.save(case, out.line, region, &img) {
+                Ok(s) => match self.save(case, out.line, region, &s.image) {
                     Ok(p) => {
-                        out.detail = format!("{}x{} via {}", img.w, img.h, cap.how);
+                        out.detail = format!("{}x{} via {}", s.image.w, s.image.h, s.capture.how);
                         out.evidence = Some(p);
                         out
                     }
@@ -427,19 +427,20 @@ impl<'a> Runner<'a> {
     }
 
     fn assert_border(&mut self, case: &str, out: StepOutcome, exp: &BorderExpect) -> StepOutcome {
-        let (img, cap) = match self.driver.shot(&exp.region) {
+        let shot = match self.driver.shot(&exp.region) {
             Ok(v) => v,
             Err(e) => return err(out, e),
         };
-        let path = match self.save(case, out.line, &exp.region, &img) {
+        let path = match self.save(case, out.line, &exp.region, &shot.image) {
             Ok(p) => p,
             Err(e) => return err(out, e),
         };
-        let check = check_border(exp, &img, self.opts);
+        let check = check_border_clipped(exp, &shot.image, self.opts, shot.clipped);
+        let how = format!("{}x{} via {}", shot.image.w, shot.image.h, shot.capture.how);
         let mut out = out;
         out.evidence = Some(path);
         if check.passed() {
-            out.detail = format!("{} ({}x{} via {})", exp.describe(), img.w, img.h, cap.how);
+            out.detail = format!("{} ({how})", exp.describe());
             out
         } else {
             // The whole report, indented under the step: what was expected,
@@ -447,7 +448,11 @@ impl<'a> Runner<'a> {
             let body = check.report(None);
             let body = body.lines().skip(1).collect::<Vec<_>>().join("\n");
             out.status = Status::Failed;
-            out.detail = body;
+            // ⚠️ How the picture was taken belongs on the FAILING branch above
+            // all: a screen-copy fallback can have another window over the
+            // region, and "the border is absent" then has an explanation that
+            // the reader would otherwise go hunting in the PNG for.
+            out.detail = format!("{body}\n  capture:  {how}");
             out
         }
     }

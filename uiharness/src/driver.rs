@@ -2,7 +2,7 @@
 //! its picture.
 
 use crate::capture::{Capture, capture_pid};
-use crate::image::{Image, RectPx};
+use crate::image::{Clip, Image, RectPx, clipped};
 use ctlcore::client::{Client, Instance, discover_live};
 use ctlcore::json::Json;
 use std::path::{Path, PathBuf};
@@ -197,16 +197,31 @@ impl Driver {
     /// A capture cropped to `region`: settle first, then photograph, then cut.
     ///
     /// The rect is read BEFORE the capture and both come after the same
-    /// settle, so a window that moved between the two would be caught by the
-    /// crop landing outside the image rather than by silently cropping the
-    /// wrong place — `Image::crop` reports that with both rectangles in the
-    /// message.
-    pub fn shot(&self, region: &str) -> Result<(Image, Capture), String> {
+    /// settle, so a window that moved between the two is caught here rather
+    /// than silently cropping the wrong place: a rect wholly outside the image
+    /// is an error naming both rectangles, and one that only overlaps comes
+    /// back with [`Shot::clipped`] saying which edges are the capture's rather
+    /// than the region's.
+    pub fn shot(&self, region: &str) -> Result<Shot, String> {
         let r = self.settle(region)?;
         let cap = self.capture()?;
-        let img = cap.image.crop(r.rect.relative_to(cap.origin))?;
-        Ok((img, cap))
+        let want = r.rect.relative_to(cap.origin);
+        let clipped = clipped(want, cap.image.w, cap.image.h);
+        let image = cap.image.crop(want)?;
+        Ok(Shot {
+            image,
+            capture: cap,
+            clipped,
+        })
     }
+}
+
+/// One region's pixels: the crop, the capture it came out of, and which of the
+/// crop's edges are the capture's own because the region ran off it.
+pub struct Shot {
+    pub image: Image,
+    pub capture: Capture,
+    pub clipped: Clip,
 }
 
 #[cfg(test)]

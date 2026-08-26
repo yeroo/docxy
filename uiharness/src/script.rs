@@ -311,12 +311,19 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
             })
         }
 
-        // Verbatim: leading spaces are already gone, everything else is typed.
+        // Verbatim between the ends: the line is trimmed on the right before it
+        // gets here, so trimming the left too keeps the two symmetric.
+        //
+        // ⚠️ `split_word` takes off exactly ONE separator, so `type   =SUM(`
+        // would otherwise type two leading spaces into the cell — which makes
+        // it text rather than a formula, and the case then fails several steps
+        // later for a reason that has nothing to do with the app.
         "type" => {
-            if rest.is_empty() {
+            let text = rest.trim_start();
+            if text.is_empty() {
                 return Err(err(line, "'type' needs something to type"));
             }
-            Ok(Action::Type(rest.to_string()))
+            Ok(Action::Type(text.to_string()))
         }
 
         "key" => {

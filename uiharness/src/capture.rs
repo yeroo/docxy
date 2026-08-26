@@ -71,7 +71,8 @@ mod win {
     use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, RECT, TRUE};
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GetDC, HBITMAP, HDC, ReleaseDC, SRCCOPY, SelectObject, StretchBlt,
+        DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HDC, ReleaseDC, SRCCOPY, SelectObject,
+        StretchBlt,
     };
     use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
     use windows::Win32::UI::HiDpi::{
@@ -235,6 +236,13 @@ mod win {
 
             let printed = PrintWindow(hwnd, mem.0, PW_RENDERFULLCONTENT).as_bool();
             let mut how = How::PrintWindow;
+            // ⚠️ GDI batches drawing into a DIB section, and reading the bits
+            // through the pointer goes behind the batch's back. Without the
+            // flush the buffer can still be its initial zeros, `is_blank` fires
+            // on a capture that did work, and the run silently falls through to
+            // the screen copy — which shows whatever window is in front. Machine
+            // -dependent and intermittent, the worst shape for a test harness.
+            let _ = GdiFlush();
             let mut image = read_bgra(bits, w, h);
             if !printed || is_blank(&image) {
                 // The GPU-rendered fallback: copy the same rectangle off the
@@ -244,6 +252,7 @@ mod win {
                 )
                 .as_bool();
                 if ok {
+                    let _ = GdiFlush();
                     let from_screen = read_bgra(bits, w, h);
                     if !is_blank(&from_screen) {
                         image = from_screen;

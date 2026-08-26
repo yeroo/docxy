@@ -45,6 +45,39 @@ impl RectPx {
     }
 }
 
+/// Which of a rectangle's edges a crop had to clamp away.
+///
+/// ⚠️ A clamped crop is the right SIZE for the pixels that exist and the WRONG
+/// answer to "where is this region's right edge?": the crop's right column is
+/// the capture's, not the region's. Anything that probes an edge has to know
+/// which edges are its own, so [`clipped`] reports them and the caller refuses
+/// to read those sides instead of reporting a verdict about the window frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Clip {
+    pub left: bool,
+    pub right: bool,
+    pub top: bool,
+    pub bottom: bool,
+}
+
+impl Clip {
+    /// Was anything trimmed at all?
+    pub fn any(&self) -> bool {
+        self.left || self.right || self.top || self.bottom
+    }
+}
+
+/// Which edges of `r` fall outside a `w` x `h` image — the edges [`clamp_rect`]
+/// moves. All four are `false` for a rectangle wholly inside.
+pub fn clipped(r: RectPx, w: u32, h: u32) -> Clip {
+    Clip {
+        left: r.x < 0,
+        top: r.y < 0,
+        right: r.right() > w as i64,
+        bottom: r.bottom() > h as i64,
+    }
+}
+
 /// A rectangle clipped to a `w` x `h` image, or `None` when it lies entirely
 /// outside one.
 ///
@@ -54,6 +87,9 @@ impl RectPx {
 /// the harness is that a failing test leaves evidence. Wholly outside is a
 /// different thing — there is nothing to look at — so that one is `None` and
 /// the caller reports it.
+///
+/// What clamping must NOT do is let an edge probe read the clamped edge as if
+/// it were the region's; [`clipped`] is how a caller tells the two apart.
 pub fn clamp_rect(r: RectPx, w: u32, h: u32) -> Option<RectPx> {
     let (iw, ih) = (w as i64, h as i64);
     let left = (r.x as i64).max(0);
@@ -196,6 +232,45 @@ mod tests {
         // Wider and taller than the image on every side.
         let c = img.crop(RectPx::new(-100, -100, 1000, 1000)).unwrap();
         assert_eq!((c.w, c.h), (20, 10));
+    }
+
+    /// And the clamp says which edges it moved, so nothing downstream mistakes
+    /// the capture's edge for the region's.
+    #[test]
+    fn a_clamped_crop_reports_the_edges_it_moved() {
+        let inside = clipped(RectPx::new(4, 3, 5, 2), 20, 10);
+        assert!(!inside.any(), "{inside:?}");
+        assert_eq!(clipped(RectPx::new(0, 0, 20, 10), 20, 10), Clip::default());
+
+        // Exactly the bottom-right corner: touching the edge is not past it.
+        assert_eq!(clipped(RectPx::new(16, 8, 4, 2), 20, 10), Clip::default());
+        assert_eq!(
+            clipped(RectPx::new(16, 8, 10, 10), 20, 10),
+            Clip {
+                right: true,
+                bottom: true,
+                ..Clip::default()
+            }
+        );
+        assert_eq!(
+            clipped(RectPx::new(-3, -4, 10, 10), 20, 10),
+            Clip {
+                left: true,
+                top: true,
+                ..Clip::default()
+            }
+        );
+        let all = clipped(RectPx::new(-100, -100, 1000, 1000), 20, 10);
+        assert_eq!(
+            all,
+            Clip {
+                left: true,
+                right: true,
+                top: true,
+                bottom: true
+            }
+        );
+        assert!(all.any());
     }
 
     #[test]
