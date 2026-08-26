@@ -117,8 +117,19 @@ const SOLID_MIN: f32 = 0.90;
 
 /// The band a dashed line's coverage falls in. A `2W`/`1W` pattern covers two
 /// thirds of its edge; the lower bound allows for an edge short enough to hold
-/// only a dash or two, the upper is [`SOLID_MIN`].
+/// only a dash or two, and for the anti-aliased ends of each dash falling
+/// outside the colour tolerance (the grid's own dashed border measures 52-60%).
 const DASH_MIN: f32 = 0.25;
+
+/// The most of its edge a dashed reading may cover.
+///
+/// Not [`SOLID_MIN`], and the difference is the whole reason [`LineKind::Broken`]
+/// exists. gpui's dash pattern is fixed — `2 x width` on, `1 x width` off — so a
+/// duty cycle of two thirds is the *ceiling* for this shader's dashes, and 0.80
+/// is that with headroom. A run covering 85% of its edge in eight pieces is a
+/// line with holes in it, and calling it dashed would pass a test whose whole
+/// subject is whether the app drew dashes.
+const DASH_MAX: f32 = 0.80;
 
 /// How many pieces a run must be in before it can be called dashed.
 ///
@@ -128,19 +139,51 @@ const DASH_MIN: f32 = 0.25;
 /// or four dashes.
 const DASH_MIN_SEGS: usize = 3;
 
-/// How much the dashes (and the gaps) along one run may vary and still count as
-/// a pattern. Generous, because the run is trimmed at both ends by
+/// How far a dash (or a gap) may sit from the typical one and still count as
+/// part of a pattern. Generous, because the run is trimmed at both ends by
 /// [`DEFAULT_MARGIN`] and so may start or finish mid-dash; far tighter than the
 /// spread of a line that is simply drawn in pieces.
 const DASH_SPREAD: usize = 3;
 
+/// How many values at each end of a sorted run of dashes (or gaps) are set
+/// aside before its spread is measured: one in six, rounded down.
+///
+/// ⚠️ This exists because of something the grid does that no synthetic test
+/// predicted. The pointed range's border is rendered **cell by cell**, so the
+/// dash phase restarts at every cell boundary: the last dash before a boundary
+/// is cut short and the first two after it can abut. Against the real thing
+/// that reads as dashes of 2 to 7px on perfectly even 3px gaps — a plain
+/// shortest-to-longest rule called the whole border `Broken`, which is the
+/// harness saying "not dashed" about a border that is visibly dashed, the worst
+/// answer it can give.
+///
+/// A fraction rather than a fixed count, and rounded DOWN, so that it is zero
+/// for the small counts the rule was written for: three fragments are still
+/// measured end to end and still read as fragments. The twenty pieces a real
+/// cell-by-cell border produces can spare the three at its joins.
+const TRIM_FRACTION: usize = 6;
+
+/// The shortest and longest of `v` with [`TRIM_FRACTION`] set aside at each end.
+fn trimmed_range(v: &[usize]) -> Option<(usize, usize)> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    let trim = s.len() / TRIM_FRACTION;
+    let lo = trim;
+    let hi = s.len() - trim - 1;
+    Some((s[lo], s[hi]))
+}
+
 /// Whether the segments repeat evenly enough to be dashes rather than
 /// fragments: no dash more than [`DASH_SPREAD`] times the shortest, and the
-/// same of the gaps between them.
+/// same of the gaps between them — both measured over the middle of the
+/// distribution, with [`TRIM_FRACTION`] of the outliers set aside.
 fn is_regular(segments: &[Segment]) -> bool {
-    let even = |v: &[usize]| match (v.iter().min(), v.iter().max()) {
-        (Some(lo), Some(hi)) => *hi <= lo.max(&1) * DASH_SPREAD,
-        _ => true,
+    let even = |v: &[usize]| match trimmed_range(v) {
+        Some((lo, hi)) => hi <= lo.max(1) * DASH_SPREAD,
+        None => true,
     };
     let dashes: Vec<usize> = segments.iter().map(|s| s.len).collect();
     let gaps: Vec<usize> = segments
@@ -269,12 +312,38 @@ impl LineReading {
         if self.segments.len() < 2 {
             return 0.0;
         }
-        let gaps: usize = self
-            .segments
+        let gaps: usize = self.gaps().iter().sum();
+        gaps as f32 / (self.segments.len() - 1) as f32
+    }
+
+    /// The shortest and longest run, and the shortest and longest gap between
+    /// runs, in pixels: `(dash_min, dash_max, gap_min, gap_max)`.
+    ///
+    /// This is what a `broken` reading was rejected on and the one thing the
+    /// count and the coverage cannot tell you — "20 runs covering 52%" reads
+    /// exactly like a dashed line to anyone holding the message rather than the
+    /// pixels. Reported for `Broken` so the reader can see whether they are
+    /// looking at a pattern with one bad joint or at a line in pieces.
+    pub fn spread(&self) -> (usize, usize, usize, usize) {
+        let dashes: Vec<usize> = self.segments.iter().map(|s| s.len).collect();
+        let gaps: Vec<usize> = self.gaps();
+        let range = |v: &[usize]| {
+            (
+                v.iter().copied().min().unwrap_or(0),
+                v.iter().copied().max().unwrap_or(0),
+            )
+        };
+        let (dlo, dhi) = range(&dashes);
+        let (glo, ghi) = range(&gaps);
+        (dlo, dhi, glo, ghi)
+    }
+
+    /// The gaps between consecutive runs, in pixels.
+    pub fn gaps(&self) -> Vec<usize> {
+        self.segments
             .windows(2)
             .map(|w| w[1].start.saturating_sub(w[0].start + w[0].len))
-            .sum();
-        gaps as f32 / (self.segments.len() - 1) as f32
+            .collect()
     }
 
     /// The reading in one line, as a failure message prints it.
@@ -290,12 +359,16 @@ impl LineReading {
                 self.coverage() * 100.0,
                 self.len
             ),
-            LineKind::Broken => format!(
-                "broken ({} runs covering {:.0}% of {}px)",
-                self.segments.len(),
-                self.coverage() * 100.0,
-                self.len
-            ),
+            LineKind::Broken => {
+                let (dlo, dhi, glo, ghi) = self.spread();
+                format!(
+                    "broken ({} runs of {dlo}-{dhi}px with gaps of {glo}-{ghi}px, \
+                     covering {:.0}% of {}px)",
+                    self.segments.len(),
+                    self.coverage() * 100.0,
+                    self.len
+                )
+            }
         }
     }
 }
@@ -344,7 +417,7 @@ pub fn classify(hits: &[bool]) -> LineReading {
     } else if closed.len() == 1 && coverage >= SOLID_MIN {
         LineKind::Solid
     } else if closed.len() >= DASH_MIN_SEGS
-        && (DASH_MIN..SOLID_MIN).contains(&coverage)
+        && (DASH_MIN..DASH_MAX).contains(&coverage)
         && is_regular(&closed)
     {
         LineKind::Dashed
@@ -637,6 +710,57 @@ mod tests {
         let r = classify(&hits);
         assert_eq!(r.segments.len(), 3);
         assert_eq!(r.kind, LineKind::Broken, "{}", r.describe());
+    }
+
+    /// The grid draws a pointed range's border cell by cell, so the dash phase
+    /// restarts at every cell boundary: a truncated dash before the join and
+    /// two abutting ones after it. This is a transcription of what the real
+    /// thing measures — 20 runs of 2 to 7px on even 3px gaps, 52% of 126px —
+    /// and it must read as dashed. It did not before [`TRIM_FRACTION`].
+    #[test]
+    fn a_border_drawn_cell_by_cell_reads_as_dashed_despite_its_joins() {
+        // Three dashes per stretch, then a join: a 2px stub and a 7px pair.
+        let mut hits = Vec::new();
+        for cell in 0..2 {
+            for _ in 0..8 {
+                hits.extend([true, true, true, false, false, false]);
+            }
+            if cell == 0 {
+                hits.extend([true, true, false, false, false]); // the truncated dash
+                hits.extend([true; 7]); // the two that abut across the join
+                hits.extend([false, false, false]);
+            }
+        }
+        let r = classify(&hits);
+        assert_eq!(r.kind, LineKind::Dashed, "{}", r.describe());
+        let (dlo, dhi, glo, ghi) = r.spread();
+        assert!(
+            dhi >= 7 && dlo <= 2,
+            "the joins are in there: {dlo}-{dhi}px"
+        );
+        assert_eq!((glo, ghi), (3, 3), "the shader's own gaps are even");
+    }
+
+    /// A line with a handful of holes in it covers far more of its edge than
+    /// gpui's `2W`/`1W` shader ever can, and must not be rounded to "dashed"
+    /// just because it is in several pieces on even gaps. Found by running the
+    /// harness: the diagnostic probe of a real dashed border against the
+    /// BACKGROUND picks up the cell text too and reads 87% in 8 runs.
+    #[test]
+    fn a_line_with_holes_covers_too_much_of_its_edge_to_be_dashed() {
+        // Eight runs of 13px on 2px gaps: 87% of the run, evenly spaced.
+        let mut hits = Vec::new();
+        for _ in 0..8 {
+            hits.extend(std::iter::repeat_n(true, 13));
+            hits.extend([false, false]);
+        }
+        let r = classify(&hits);
+        assert!(r.coverage() > DASH_MAX, "{}", r.describe());
+        assert!(r.coverage() < SOLID_MIN, "{}", r.describe());
+        assert_eq!(r.kind, LineKind::Broken, "{}", r.describe());
+        // And the report says what it was rejected on, not just "broken".
+        assert!(r.describe().contains("runs of 13-13px"), "{}", r.describe());
+        assert!(r.describe().contains("gaps of 2-2px"), "{}", r.describe());
     }
 
     #[test]

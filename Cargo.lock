@@ -1643,6 +1643,7 @@ name = "uiharness"
 version = "0.4.0"
 dependencies = [
  "ctlcore",
+ "gridcore",
  "opccore",
  "windows",
 ]

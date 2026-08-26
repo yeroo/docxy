@@ -9444,7 +9444,23 @@ impl Docxy {
             {
                 Some(i) => {
                     if self.tabs[i].dirty {
-                        let reload = matches!(
+                        // ⚠️ Not in a harness instance. `rfd`'s dialog runs its
+                        // own modal message loop on this thread, so it stops the
+                        // control pump dead: the window still answers Windows
+                        // messages, so it LOOKS alive, while every verb after it
+                        // times out with nothing on stderr to say why. Found by
+                        // running `uiharness/cases/sheet-selection.uit` — case 3
+                        // points a chart field at some cells, which dirties the
+                        // tab, and case 4's `open` of the same fixture hung the
+                        // whole run.
+                        //
+                        // `&&` short-circuits, so the dialog is never even
+                        // built. Answering "no" for it is the conservative half
+                        // of the prompt — keep what is open, lose nothing — and
+                        // it makes `open` mean "make this file the active tab",
+                        // which is what a test's setup line wants.
+                        let reload = self.harness.is_none()
+                            && matches!(
                             rfd::MessageDialog::new()
                                 .set_title("docxy")
                                 .set_description(format!(

@@ -31,6 +31,9 @@
 //!   what colour.
 //! - [`expect`] — the vocabulary a test states that in, and what a failure in
 //!   it reads like.
+//! - [`script`] — the format a test is written in, and its parser.
+//! - [`launch`] — starting a sandboxed instance and stopping it again.
+//! - [`runner`] — running a parsed script against one.
 //! - [`run`] — where a run's evidence is filed.
 
 pub mod capture;
@@ -38,12 +41,17 @@ pub mod deflate;
 pub mod driver;
 pub mod expect;
 pub mod image;
+pub mod launch;
 pub mod png;
 pub mod probe;
 pub mod run;
+pub mod runner;
+pub mod script;
 
 pub use driver::{Driver, RegionRect, control_dir};
 pub use expect::{BorderCheck, BorderExpect, ExpectKind, check_border, parse_border};
 pub use image::{Image, RectPx};
 pub use probe::{LineKind, LineProbe, ProbeOpts, Side, probe_edge};
 pub use run::Run;
+pub use runner::{CaseOutcome, Runner, ScriptOutcome, Status, StepOutcome};
+pub use script::{Action, Assertion, Case, Script, ScriptError, Step, parse_script};

@@ -10,7 +10,14 @@
 //! uiharness --config <sandbox> rect cell:A1:C5
 //! uiharness --config <sandbox> shot grid --run out/runs/1 --test drag-select
 //! uiharness --config <sandbox> assert border A1:C5 solid
+//! uiharness run cases/drag-select.uit
 //! ```
+//!
+//! `run` is the one command that does not need an instance already up: it
+//! starts its own in a throwaway config root, runs the script against it, and
+//! stops it again. Every other command attaches to one that is already there,
+//! which is what makes them useful for working a case out by hand before
+//! writing it down.
 //!
 //! `--config` is the sandbox the instance was started with
 //! (`DOCXY_CONFIG_DIR`); the control directory is derived from it exactly as
@@ -18,7 +25,7 @@
 //! It defaults to `DOCXY_CONFIG_DIR` in this process's own environment.
 
 use ctlcore::json::Json;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use uiharness::probe::ProbeOpts;
 use uiharness::{Driver, Run, check_border, control_dir, parse_border};
@@ -30,6 +37,7 @@ usage:
   uiharness [--config DIR | --ctl DIR] [--instance NAME] <command>
 
 commands:
+  run SCRIPT...                 launch a sandboxed instance and run a test script
   ping                          check the connection and print the instance
   call VERB [JSON]              send any verb, print its reply
   rect REGION                   print a region's desktop rectangle
@@ -47,6 +55,12 @@ options for shot/window:
   --run DIR                     the run's output directory (default: ./uiharness-runs)
   --test NAME                   the test the capture belongs to (default: adhoc)
   --out FILE                    write here instead of under the run directory
+
+options for run:
+  --suite EXE                   the built suite to drive (default: the newest
+                                target/{release,debug} build; $UIHARNESS_SUITE)
+  --sandbox DIR                 the throwaway config root (default: <run>/sandbox)
+  --keep                        leave the instance running after the script ends
 
 regions:
   window  grid  chart-panel  cell:B3  cell:A1:C5  chart:0
@@ -73,6 +87,9 @@ struct Args {
     run_dir: PathBuf,
     test: String,
     out: Option<PathBuf>,
+    suite: Option<PathBuf>,
+    sandbox: Option<PathBuf>,
+    keep: bool,
     rest: Vec<String>,
 }
 
@@ -84,6 +101,9 @@ fn parse() -> Result<Args, String> {
         run_dir: PathBuf::from("uiharness-runs"),
         test: "adhoc".to_string(),
         out: None,
+        suite: None,
+        sandbox: None,
+        keep: false,
         rest: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
@@ -99,6 +119,9 @@ fn parse() -> Result<Args, String> {
             "--run" => a.run_dir = PathBuf::from(value("--run")?),
             "--test" => a.test = value("--test")?,
             "--out" => a.out = Some(PathBuf::from(value("--out")?)),
+            "--suite" => a.suite = Some(PathBuf::from(value("--suite")?)),
+            "--sandbox" => a.sandbox = Some(PathBuf::from(value("--sandbox")?)),
+            "--keep" => a.keep = true,
             "-h" | "--help" => return Err(USAGE.to_string()),
             other if other.starts_with("--") => {
                 return Err(format!("unknown option '{other}'\n\n{USAGE}"));
@@ -111,6 +134,11 @@ fn parse() -> Result<Args, String> {
 
 fn run() -> Result<String, String> {
     let a = parse()?;
+    // `run` starts its own instance, so it is answered before the code that
+    // insists on being told where an existing one is.
+    if a.rest.first().map(String::as_str) == Some("run") {
+        return run_scripts(&a);
+    }
     let ctl = match (&a.ctl, &a.config) {
         (Some(d), _) => d.clone(),
         (None, Some(c)) => control_dir(c),
@@ -201,6 +229,78 @@ fn run() -> Result<String, String> {
 
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
     }
+}
+
+/// Run one or more script files against an instance this process starts and
+/// stops.
+///
+/// The script is parsed — all of them, in fact — before the app is launched, so
+/// a typo costs milliseconds rather than a cold start. That ordering is the
+/// point of [`uiharness::script`] being pure.
+fn run_scripts(a: &Args) -> Result<String, String> {
+    let paths = &a.rest[1..];
+    if paths.is_empty() {
+        return Err(format!("run needs a script file\n\n{USAGE}"));
+    }
+    let mut scripts = Vec::new();
+    for p in paths {
+        let path = PathBuf::from(p);
+        let text =
+            std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let script =
+            uiharness::parse_script(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let base = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        scripts.push((path, base, script));
+    }
+
+    let exe = uiharness::launch::find_suite(a.suite.as_deref())?;
+    let run = Run::create(&a.run_dir).map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
+    let sandbox = a
+        .sandbox
+        .clone()
+        .unwrap_or_else(|| run.dir().join("sandbox"));
+    let mut app = uiharness::launch::launch(&exe, &sandbox)?;
+    let ctl = app.ctl_dir();
+
+    let driver = match Driver::connect(&ctl, a.instance.as_deref()) {
+        Ok(d) => d,
+        // A refusal from the isolation gate exits before it ever publishes a
+        // socket, so the connect timing out is the symptom and the exit is the
+        // cause. Say both.
+        Err(e) => {
+            return Err(match app.exited() {
+                Some(why) => format!("{e}\n{why}"),
+                None => e,
+            });
+        }
+    };
+
+    let mut out = String::new();
+    let mut all_passed = true;
+    for (path, base, script) in &scripts {
+        out.push_str(&format!("{}\n", path.display()));
+        let outcome = uiharness::Runner::new(&driver, &run, base).run_script(script);
+        all_passed &= outcome.passed();
+        out.push_str(&outcome.report());
+    }
+    out.push_str(&format!("evidence: {}\n", run.dir().display()));
+    out.push_str(&format!("sandbox:  {}\n", sandbox.display()));
+
+    if a.keep {
+        out.push_str(&format!(
+            "the instance is still running (pid {}); --keep was given\n",
+            driver.pid()
+        ));
+        app.detach();
+    } else {
+        app.shutdown(Some(&driver));
+    }
+
+    if all_passed { Ok(out) } else { Err(out) }
 }
 
 /// File a capture: `--out` if the caller named a file, otherwise under the
