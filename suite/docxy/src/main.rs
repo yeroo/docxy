@@ -2804,6 +2804,18 @@ struct ChartSourceArea {
 /// drawing this sheet's cells of the same address would be a lie. A ref naming
 /// NO sheet is the chart's own, which is this one (a chart is only selectable
 /// on the sheet it floats over).
+/// Whether a selected chart's source outlines belong on the grid right now.
+///
+/// Two conditions, and the second is the one that is easy to miss: picking a
+/// range is the ONE time a chart stays selected while the grid is being used
+/// for something else. The panel's field holds the keyboard, the chart keeps
+/// its handles so the panel stays live, and without this the three source
+/// colours sit under the dashed preview being dragged across them — three
+/// answers to "which cells matter" at the moment exactly one of them does.
+fn chart_outlines_shown(chart_selected: bool, picking_a_range: bool) -> bool {
+    chart_selected && !picking_a_range
+}
+
 fn chart_source_areas(cd: &gridcore::sheet::ChartData, sheet: &str) -> Vec<ChartSourceArea> {
     use gridcore::sheet::ChartSource;
     let mut out: Vec<ChartSourceArea> = Vec::new();
@@ -5267,6 +5279,13 @@ impl Docxy {
     /// may legally read another sheet, and `chart_source_areas` draws nothing
     /// for such a ref rather than pointing at this sheet's cells of the same
     /// address.
+    ///
+    /// **Nothing while a range field is pointing either.** Picking a range is
+    /// the one time the chart stays selected while the grid is being used for
+    /// something else, so the three source colours would sit under the dashed
+    /// preview being dragged over them — three answers to "which cells matter"
+    /// at the moment only one of them does. The outlines come back when the
+    /// field gives the keyboard up.
     fn chart_refs(&self) -> std::rc::Rc<Vec<ChartSourceArea>> {
         // `chart_sel`, deliberately, NOT the panel's chart: these outlines are
         // the selection made visible on the cells, so they go with the handles
@@ -5276,7 +5295,9 @@ impl Docxy {
             self.active_sheet(),
             self.chart_sel.and_then(|i| self.chart_data_at(i)),
         ) {
-            (Some(v), Some(cd)) => chart_source_areas(&cd, &v.sheet().name),
+            (Some(v), Some(cd)) if chart_outlines_shown(true, self.range_field_active()) => {
+                chart_source_areas(&cd, &v.sheet().name)
+            }
             _ => Vec::new(),
         };
         std::rc::Rc::new(areas)
@@ -22621,6 +22642,27 @@ mod grid_geom_tests {
                 ((0, 1, 0, 1), 'n'),
             ]
         );
+    }
+
+    /// The outlines answer "what does this chart read", and they are worth
+    /// drawing only while that is the question being asked.
+    #[test]
+    fn chart_outlines_stand_down_while_a_range_is_being_pointed() {
+        use super::chart_outlines_shown as shown;
+        // Selected and idle: the whole point of the feature.
+        assert!(shown(true, false));
+        // Selected, but a range field has the keyboard. The chart is still
+        // selected — that is what keeps the panel live — so gating on the
+        // selection alone leaves three coloured boxes under the dashed preview
+        // being dragged over them. This is the case that made the grid feel
+        // busy while picking.
+        assert!(
+            !shown(true, true),
+            "picking a range must stand the source outlines down"
+        );
+        // No chart, nothing to outline, pointing or not.
+        assert!(!shown(false, false));
+        assert!(!shown(false, true));
     }
 
     /// A reference naming another sheet draws NOTHING — not this sheet's cells
