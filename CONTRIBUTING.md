@@ -43,6 +43,23 @@ reads its range — each column a series, or each row — is in
 pie keeps every series it holds while plotting the first is in
 [`suite/docs/pie-series.md`](suite/docs/pie-series.md).
 
+The suite's UI itself is covered by a **scripted harness** that drives a
+sandboxed instance by verbs, screenshots it and asserts on the pixels — the one
+way to catch a regression that lives in event handling or rendering, where gpui
+`#[test]` cannot go:
+
+```
+cargo build --release --manifest-path suite/Cargo.toml
+cargo run -p uiharness -- run uiharness/cases/sheet-selection.uit
+cargo test -p uiharness
+```
+
+It needs a desktop session (Windows `PrintWindow`), so it is local and
+on-demand rather than a CI step. How to write a case, the verbs, regions and
+assertions available, and how the isolation from your own installed app's
+documents is enforced, are in
+[`docs/ui-test-harness.md`](docs/ui-test-harness.md).
+
 The root workspace is twenty crates. Layered bottom-up, at its core:
 
 - **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,

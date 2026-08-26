@@ -850,9 +850,9 @@ real profile is still byte-identical to the hash taken before any of this ran.
 
 ### Task 8: [Final] Document it
 
-- [ ] document how to write and run a harness test, the verbs and regions
+- [x] document how to write and run a harness test, the verbs and regions
       available, and the isolation guarantee and how it is enforced
-- [ ] record the gpui-has-no-readback finding so the next person does not go
+- [x] record the gpui-has-no-readback finding so the next person does not go
       looking for a screenshot API
 
 *Note: ralphex automatically moves completed plans to `docs/plans/completed/`*
