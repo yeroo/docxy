@@ -181,9 +181,21 @@ impl Drop for Launched {
 /// setup would live in the runner and half in the script.
 pub fn launch(exe: &Path, sandbox: &Path) -> Result<Launched, String> {
     std::fs::create_dir_all(sandbox).map_err(|e| format!("{}: {e}", sandbox.display()))?;
+    // ⚠️ Absolute before it is handed over. The app resolves a relative
+    // `DOCXY_CONFIG_DIR` against its own working directory, which is the
+    // sandbox itself — so a relative `--run target/…` would send the child
+    // looking for its config root *inside* the config root, and the control
+    // socket would be published somewhere this side never looks. `absolute`
+    // rather than `canonicalize`, which returns a `\\?\` verbatim path.
+    let sandbox =
+        std::path::absolute(sandbox).map_err(|e| format!("{}: {e}", sandbox.display()))?;
     let child = Command::new(exe)
         .arg(HARNESS_FLAG)
-        .env(CONFIG_DIR_ENV, sandbox)
+        .env(CONFIG_DIR_ENV, &sandbox)
+        // The sandbox is also the child's working directory, so the one save
+        // path that falls back to `current_dir()` (an untitled document) writes
+        // there rather than into the repository the harness was run from.
+        .current_dir(&sandbox)
         // Inherited, so a refusal from the isolation gate is visible rather
         // than swallowed — it is written to stderr and is the one message a
         // caller most needs to see.
@@ -193,7 +205,7 @@ pub fn launch(exe: &Path, sandbox: &Path) -> Result<Launched, String> {
         .map_err(|e| format!("{}: {e}", exe.display()))?;
     Ok(Launched {
         child,
-        sandbox: sandbox.to_path_buf(),
+        sandbox,
         exe: exe.to_path_buf(),
         detached: false,
     })

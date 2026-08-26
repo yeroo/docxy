@@ -23,6 +23,11 @@
 # GPUI UI suite build output (separate workspace)
 /suite/target/
 
+# UI test harness output: the captures a run files, plus the throwaway config
+# root the sandboxed instance writes its session and hot sidecars into. All
+# regenerable by re-running `cargo run -p uiharness -- run <case>`.
+/uiharness-runs/
+
 .idea/
 ~$*
 

@@ -57,9 +57,9 @@ Useful flags on `run`:
 
 | Flag | Effect |
 |---|---|
-| `--suite EXE` | drive this binary (default: newest `suite/target/{release,debug}`, or `$UIHARNESS_SUITE`) |
-| `--run DIR` | where evidence is filed (default `./uiharness-runs`) |
-| `--sandbox DIR` | the throwaway config root (default `<run>/sandbox`) |
+| `--suite EXE` | drive this binary. Otherwise `$UIHARNESS_SUITE` if it is set (an error if it does not name a file), otherwise the first build found — release before debug, under `suite/target/` then `target/`, relative to the repository this crate was built from and then the working directory |
+| `--run DIR` | where evidence is filed (default `./uiharness-runs`, which is git-ignored) |
+| `--sandbox DIR` | the throwaway config root (default `<run>/sandbox`, **erased before each run**; a directory you name yourself is yours to manage, and is kept) |
 | `--keep` | leave the instance up after the script ends, to poke at the window a case failed on |
 
 ### Evidence
@@ -68,12 +68,14 @@ Every capture lands under the run directory in a folder named for the test that
 took it, so a failing case can be looked at afterwards:
 
 ```text
-uiharness-runs/drag-to-select-does-not-fill/cell-a1-c5.png
+uiharness-runs/drag-to-select-does-not-fill/007-cell-a1-c5.png
 ```
 
 Names are slugged (`cell:A1:C5` → `cell-a1-c5`) — a colon in a Windows path is a
 stream separator, and a capture named straight from a region would silently
-write somewhere else.
+write somewhere else. The number is the step's line in the script: two steps may
+look at the same region, and without it the later capture would overwrite the
+one the failure above it points at.
 
 ## Driving one by hand
 
@@ -127,6 +129,39 @@ cold start, and every accepted and rejected form is a unit test.
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
 `series-name:N`, `series-values:N`, `cond-format`, `validation`, `sort`,
 `text-to-columns`.
+
+**`open` always loads the file from disk.** The cases in a script share one
+instance — a process per case would multiply a two-second launch by however
+many cases there are — so `open` is the only setup a case has, and it has to
+mean the same thing on case 5 as it did on case 1. In a harness instance it
+therefore reloads even a tab with unsaved edits, silently: those edits belong to
+the case before it and nothing is meant to survive one. (A normal instance still
+asks first, and still keeps your work if you say no.)
+
+⚠️ **No modal dialog may sit on a path a verb can reach.** `rfd` runs its own
+message loop on the app thread, which stops the control pump dead — the window
+keeps answering Windows messages so it *looks* alive, while every verb after it
+times out with nothing on stderr to say why. The reload prompt, the Save As
+dialog a `key ctrl+s` on a never-saved workbook would raise, and the
+unsaved-changes prompt on close are each gated on `harness.is_none()`; anything
+new in that family needs the same guard, and should refuse in words instead
+(`tab.status`), which a case can read.
+
+### The fixture
+
+Cases run against `uiharness/fixtures/basic.xlsx`: one sheet, a `Region/Q1/Q2`
+header and four rows in `A1:C5`, and one bar chart anchored below and right of
+`A1:D5` so it never sits under a drag. It is committed — a UI test must not
+depend on a build step running first — but generated from literals in
+`uiharness/tests/fixture.rs`. Change `build()` there and regenerate, or the
+drift check fails:
+
+```bash
+UIHARNESS_REGEN_FIXTURE=1 cargo test -p uiharness --test fixture
+```
+
+Nothing in the harness reads a user document, which is the point of the fixture
+living under the harness's own directory.
 
 Every verb goes in through **the same entry point the pointer or keyboard
 would**. A verb that reached past a handler into the state it maintains could
@@ -322,7 +357,7 @@ human looking at the whole picture.
 ```bash
 cargo test -p uiharness
 cargo clippy -p uiharness --all-targets -- -D warnings
-cargo test --manifest-path suite/Cargo.toml     # the app side: gate, verbs, regions, keys
+cargo test --manifest-path suite/Cargo.toml     # the app side: the gate, region and key parsing, the config root
 ```
 
 The decisions live in pure free functions — parsing a script, resolving a region

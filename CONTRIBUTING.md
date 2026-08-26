@@ -60,7 +60,7 @@ assertions available, and how the isolation from your own installed app's
 documents is enforced, are in
 [`docs/ui-test-harness.md`](docs/ui-test-harness.md).
 
-The root workspace is twenty crates. Layered bottom-up, at its core:
+The root workspace is twenty-one crates. Layered bottom-up, at its core:
 
 - **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
   DEFLATE, XML pull parser) shared by both document formats.
@@ -75,8 +75,11 @@ The rest follow the same shape — a pure core plus its front end: `projcore` /
 `yppxy` / `mppread` (project schedules), `mailcore` / `lookxy` (mail and
 calendar), `editcore`, `ribboncore` / `ribbonspec` / `backstagecore` and
 `ctlcore` (shared UI and the agent control surface), `docxwasm` / `gridwasm`
-(the browser builds), and `comshimcore` / `xlcomshim` / `wordcomshim` (the COM
-shims). The desktop GPUI suite lives in its own workspace under `suite/`.
+(the browser builds), `comshimcore` / `xlcomshim` / `wordcomshim` (the COM
+shims), and `uiharness` (the driver side of the UI test harness above —
+`publish = false`, and the one root crate with a third-party dependency outside
+`mailcore`: `windows`, for the Win32 window capture). The desktop GPUI suite
+lives in its own workspace under `suite/`.
 
 The three `*core` crates above must stay **dependency-free** (`std` only), as
 must `projcore` and `editcore`; `mailcore` is the exception, since IMAP and a

@@ -20,6 +20,7 @@
 use gridcore::sheet::{Cell, CellValue, ChartData, ChartSeries, DrawingKind};
 use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 /// Where the fixture lives, relative to this crate.
 fn fixture_path() -> PathBuf {
@@ -138,43 +139,67 @@ fn check(bytes: &[u8]) {
     );
 }
 
+/// The committed fixture's bytes, written first if the file is not there (or if
+/// the caller asked for a regeneration).
+///
+/// ⚠️ Shared through a `OnceLock` because both tests below need it and they run
+/// on different threads of one binary: two `fs::write`s racing a `fs::read`
+/// would let a test see a half-written zip and blame the generator for it.
+fn fixture_bytes() -> &'static [u8] {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        let path = fixture_path();
+        if std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some() || !path.is_file() {
+            let bytes = build();
+            check(&bytes);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            eprintln!("wrote {}", path.display());
+        }
+        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    })
+}
+
 #[test]
 fn the_fixture_workbook_is_what_the_cases_are_written_against() {
-    let path = fixture_path();
-    if std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some() || !path.is_file() {
-        let bytes = build();
-        check(&bytes);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, &bytes).unwrap();
-        eprintln!("wrote {}", path.display());
-    }
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    check(&bytes);
+    check(fixture_bytes());
 }
 
 /// The generator and the committed file must not have drifted apart: a change
 /// to `build()` that nobody regenerated would leave the recipe lying.
+///
+/// ⚠️ Compared by content, not by counting. Swapping two cell values, renaming
+/// the chart or moving its anchor leaves every count identical, and those are
+/// precisely the edits a case would then be asserting against a workbook nobody
+/// can reproduce.
 #[test]
 fn the_committed_fixture_matches_the_generator() {
-    let path = fixture_path();
-    if !path.is_file() {
-        return; // the test above writes it; ordering between the two is not fixed
-    }
-    let fresh = build();
-    let on_disk = std::fs::read(&path).unwrap();
     // Compared through the loader rather than byte-wise: a zip's stored order
     // and timestamps are not the fixture's content, and a byte compare would
-    // fail for reasons no reader could act on.
-    let a = load_xlsx(&fresh).unwrap();
-    let b = load_xlsx(&on_disk).unwrap();
-    assert_eq!(
-        a.workbook.sheets[0].cells.len(),
-        b.workbook.sheets[0].cells.len(),
-        "regenerate with UIHARNESS_REGEN_FIXTURE=1"
-    );
-    assert_eq!(
-        a.workbook.sheets[0].drawings.len(),
-        b.workbook.sheets[0].drawings.len(),
-        "regenerate with UIHARNESS_REGEN_FIXTURE=1"
-    );
+    // fail for reasons no reader could act on. Both sides are loaded, so the
+    // fields the loader fills in (chart part paths and the like) match too.
+    let a = load_xlsx(&build()).unwrap();
+    let b = load_xlsx(fixture_bytes()).unwrap();
+    let why = "regenerate with UIHARNESS_REGEN_FIXTURE=1 cargo test -p uiharness --test fixture";
+    let (sa, sb) = (&a.workbook.sheets[0], &b.workbook.sheets[0]);
+    assert_eq!(sa.name, sb.name, "{why}");
+    let cells = |s: &gridcore::sheet::Sheet| {
+        let mut v: Vec<((u32, u32), Cell)> = s.cells.iter().map(|(k, c)| (*k, c.clone())).collect();
+        v.sort_by_key(|(k, _)| *k);
+        v
+    };
+    assert_eq!(cells(sa), cells(sb), "{why}");
+    assert_eq!(sa.drawings.len(), sb.drawings.len(), "{why}");
+    for (x, y) in sa.drawings.iter().zip(&sb.drawings) {
+        assert_eq!((x.from, x.to), (y.from, y.to), "the chart moved — {why}");
+        match (&x.kind, &y.kind) {
+            (DrawingKind::Chart(u), DrawingKind::Chart(v)) => {
+                assert_eq!(u.title, v.title, "{why}");
+                assert_eq!(u.kind, v.kind, "{why}");
+                assert_eq!(u.categories, v.categories, "{why}");
+                assert_eq!(u.series, v.series, "{why}");
+            }
+            (u, v) => panic!("the fixture's drawing changed kind: {u:?} vs {v:?} — {why}"),
+        }
+    }
 }

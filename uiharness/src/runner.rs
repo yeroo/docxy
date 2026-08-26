@@ -290,7 +290,7 @@ impl<'a> Runner<'a> {
             }
 
             Action::Shot(region) => match self.driver.shot(region) {
-                Ok((img, cap)) => match self.save(case, region, &img) {
+                Ok((img, cap)) => match self.save(case, out.line, region, &img) {
                     Ok(p) => {
                         out.detail = format!("{}x{} via {}", img.w, img.h, cap.how);
                         out.evidence = Some(p);
@@ -431,7 +431,7 @@ impl<'a> Runner<'a> {
             Ok(v) => v,
             Err(e) => return err(out, e),
         };
-        let path = match self.save(case, &exp.region, &img) {
+        let path = match self.save(case, out.line, &exp.region, &img) {
             Ok(p) => p,
             Err(e) => return err(out, e),
         };
@@ -466,9 +466,17 @@ impl<'a> Runner<'a> {
         Ok(j.get("text").map(scalar_text).unwrap_or_default())
     }
 
-    fn save(&self, case: &str, region: &str, img: &Image) -> Result<PathBuf, String> {
+    /// File a capture under the case that took it, named for the step as well
+    /// as the region.
+    ///
+    /// ⚠️ The line number is not decoration. Two steps in a case may shoot or
+    /// assert the same region — a `shot` after the assertion that failed is the
+    /// obvious pair — and without it the second write lands on the first's
+    /// file, so the `evidence:` line under the failure points at a picture
+    /// taken later, of a window that had moved on.
+    fn save(&self, case: &str, line: usize, region: &str, img: &Image) -> Result<PathBuf, String> {
         self.run
-            .save(case, region, img)
+            .save(case, &format!("{line:03}-{region}"), img)
             .map_err(|e| format!("saving the capture: {e}"))
     }
 }

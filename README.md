@@ -347,7 +347,8 @@ cargo build --release
 cargo test
 ```
 
-The workspace has ten crates:
+The workspace has twenty-one crates; these are the ones a reader of this
+README will meet (`CONTRIBUTING.md` lists the rest):
 
 - **`opccore`** — pure, `std`-only OPC container plumbing (ZIP read/write,
   DEFLATE, XML pull parser) shared by every engine.

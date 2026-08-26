@@ -259,10 +259,26 @@ fn run_scripts(a: &Args) -> Result<String, String> {
 
     let exe = uiharness::launch::find_suite(a.suite.as_deref())?;
     let run = Run::create(&a.run_dir).map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
-    let sandbox = a
-        .sandbox
-        .clone()
-        .unwrap_or_else(|| run.dir().join("sandbox"));
+    // ⚠️ The default sandbox is a fixed path under a fixed run directory, so it
+    // is the SAME directory on every invocation — and the app persists into it:
+    // `quit` writes `session.json` plus a hot sidecar holding each tab's live
+    // content, and the next launch restores those in preference to the file on
+    // disk. Left alone, run N+1 would start with run N's tabs and their unsaved
+    // edits, which is exactly the "testing that instance's history" the harness
+    // starts its own instance to avoid. A sandbox the caller named is theirs to
+    // manage (that is what `--sandbox` is for: keeping one across runs).
+    let sandbox = match &a.sandbox {
+        Some(p) => p.clone(),
+        None => {
+            let p = run.dir().join("sandbox");
+            if let Err(e) = std::fs::remove_dir_all(&p) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!("clearing the sandbox {}: {e}", p.display()));
+                }
+            }
+            p
+        }
+    };
     let mut app = uiharness::launch::launch(&exe, &sandbox)?;
     let ctl = app.ctl_dir();
 

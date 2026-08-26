@@ -1603,6 +1603,40 @@ fn col_at_x(
     None
 }
 
+/// Whether a column that opens `x` from the list's left edge is off the right
+/// of it. `col_span_x` walks as far right as it is asked to, so a column past
+/// the edge still has a position — one that is not on screen.
+///
+/// Reporting it would hand back a rectangle outside the window, and the crop
+/// would fail later with a message about pixels rather than about the column.
+fn col_off_right(list: Bounds<Pixels>, x: f32) -> bool {
+    list.left() + px(x) >= list.right()
+}
+
+/// The rectangle two cells span, from what the layout measured for them: the
+/// row list's own bounds, the top and bottom of the two rows' bands, and the
+/// left and right edges of the two columns' spans.
+///
+/// ⚠️ The two axes are in DIFFERENT frames and that is not a mistake: a row
+/// band comes from the list and is already in window coordinates, while a
+/// column span is measured from the list's left edge exactly as `cell_at`
+/// measures a press. Adding `list.left()` to the rows, or forgetting it on the
+/// columns, moves the crop by the width of the row-header gutter — a whole
+/// column's worth of pixels, and an assertion that quietly reads the neighbour.
+/// Pure, so that is a unit test rather than something only a window can catch.
+fn cells_rect(
+    list: Bounds<Pixels>,
+    top: Pixels,
+    bottom: Pixels,
+    left_x: f32,
+    right_x: f32,
+) -> Bounds<Pixels> {
+    Bounds::from_corners(
+        point(list.left() + px(left_x), top),
+        point(list.left() + px(right_x), bottom),
+    )
+}
+
 /// The horizontal span of column `c` — its left edge and width, in pixels from
 /// the grid's left edge — or `None` when the column is not in the drawn window
 /// (scrolled off to the left of `col0`, or past `max_col`).
@@ -5256,7 +5290,7 @@ impl Docxy {
             // screen. Reporting it would hand back a rectangle outside the
             // window, and the crop would fail later with a message about
             // pixels rather than about the column.
-            if list.left() + px(x) >= list.right() {
+            if col_off_right(list, x) {
                 return Err(format!(
                     "column {} is scrolled off to the right of the grid's view",
                     gridcore::sheet::col_name(c)
@@ -5267,12 +5301,7 @@ impl Docxy {
         let (top, bottom) = (row_band(r0)?.top(), row_band(r1)?.bottom());
         let (lx, _) = col_span(c0)?;
         let (rx, rw) = col_span(c1)?;
-        // Columns are measured from the list's left edge, exactly as `cell_at`
-        // measures a press; rows are already in window coordinates.
-        Ok(Bounds::from_corners(
-            point(list.left() + px(lx), top),
-            point(list.left() + px(rx + rw), bottom),
-        ))
+        Ok(cells_rect(list, top, bottom, lx, rx + rw))
     }
 
     /// The ranges the formula being typed mentions, for the grid to outline.
@@ -9355,6 +9384,18 @@ impl Docxy {
         // silently dumping into the working directory.
         let path = match existing_path {
             Some(p) => p,
+            // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
+            // this thread and stops the control pump dead (see `open_args`),
+            // and `key ctrl+s` on the untitled workbook reaches here. Refusing
+            // in words is the only answer a test can read.
+            None if self.harness.is_some() => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    tab.status = "this workbook has never been saved, and a \
+                                  harness instance cannot open the Save As dialog"
+                        .into();
+                }
+                return self.refocus(window, cx);
+            }
             None => match rfd::FileDialog::new()
                 .add_filter("Excel workbook", &["xlsx"])
                 .set_file_name(title)
@@ -9444,23 +9485,26 @@ impl Docxy {
             {
                 Some(i) => {
                     if self.tabs[i].dirty {
-                        // ⚠️ Not in a harness instance. `rfd`'s dialog runs its
-                        // own modal message loop on this thread, so it stops the
-                        // control pump dead: the window still answers Windows
-                        // messages, so it LOOKS alive, while every verb after it
-                        // times out with nothing on stderr to say why. Found by
-                        // running `uiharness/cases/sheet-selection.uit` — case 3
-                        // points a chart field at some cells, which dirties the
-                        // tab, and case 4's `open` of the same fixture hung the
-                        // whole run.
+                        // ⚠️ A harness instance never asks, and always reloads.
                         //
-                        // `&&` short-circuits, so the dialog is never even
-                        // built. Answering "no" for it is the conservative half
-                        // of the prompt — keep what is open, lose nothing — and
-                        // it makes `open` mean "make this file the active tab",
-                        // which is what a test's setup line wants.
-                        let reload = self.harness.is_none()
-                            && matches!(
+                        // Never asks because `rfd`'s dialog runs its own modal
+                        // message loop on this thread, so it stops the control
+                        // pump dead: the window still answers Windows messages,
+                        // so it LOOKS alive, while every verb after it times out
+                        // with nothing on stderr to say why. Found by running
+                        // `uiharness/cases/sheet-selection.uit` — case 3 points
+                        // a chart field at some cells, which dirties the tab,
+                        // and case 4's `open` of the same fixture hung the run.
+                        //
+                        // Always reloads because the cases in a script share one
+                        // instance, and `open` is the only setup a case has. If
+                        // it meant "make this the active tab" a case would
+                        // inherit whatever an earlier one typed into the
+                        // fixture, and would pass or fail on the order it ran
+                        // in. Discarding the edits is the point: they are the
+                        // previous case's, and nothing is meant to survive it.
+                        let reload = self.harness.is_some()
+                            || matches!(
                             rfd::MessageDialog::new()
                                 .set_title("docxy")
                                 .set_description(format!(
@@ -19304,7 +19348,13 @@ fn main() {
             window.on_window_should_close(cx, move |_window, cx| {
                 on_close.update(cx, |this, _| {
                     this.persist();
-                    if this.ask_on_close && this.tabs.iter().any(|t| t.dirty) {
+                    // ⚠️ Not in a harness instance — the same modal-loop trap as
+                    // `open_args`, and here it would wedge the shutdown the
+                    // runner waits on after the `quit` verb.
+                    if this.harness.is_none()
+                        && this.ask_on_close
+                        && this.tabs.iter().any(|t| t.dirty)
+                    {
                         matches!(
                             rfd::MessageDialog::new()
                                 .set_title("docxy")
@@ -19527,6 +19577,40 @@ mod grid_geom_tests {
         );
         // Past the last column there is no cell.
         assert_eq!(col_at_x(w, 100_000.0, 0, 0, 255), None);
+    }
+
+    /// The crop every pixel assertion is taken from. `cells_rect` is the last
+    /// step of `cells_bounds`, and the one that can be wrong without anything
+    /// failing: a rectangle off by the gutter's width still crops, still
+    /// probes, and still passes — about the neighbouring column.
+    #[test]
+    fn cells_rect_puts_the_crop_where_the_layout_measured_it() {
+        use super::{cells_rect, col_off_right};
+        use gpui::{Bounds, Pixels, point, px, size};
+        // A row list that does not start at the window's origin, which is the
+        // only way a missing (or doubled) `list.left()` shows up at all.
+        let list: Bounds<Pixels> = Bounds {
+            origin: point(px(48.), px(160.)),
+            size: size(px(900.), px(400.)),
+        };
+        // Columns are measured from the list's left edge; rows are already in
+        // window coordinates.
+        let r = cells_rect(list, px(200.), px(260.), 30.0, 130.0);
+        assert_eq!(r.origin, point(px(78.), px(200.)), "left = list.left + x");
+        assert_eq!(r.size, size(px(100.), px(60.)));
+        assert_eq!(r.bottom(), px(260.), "the bottom row's band ends it");
+        assert_eq!(r.right(), px(178.));
+
+        // One cell twice is that cell, not an empty rectangle.
+        let one = cells_rect(list, px(200.), px(220.), 30.0, 90.0);
+        assert_eq!(one.size, size(px(60.), px(20.)));
+
+        // A column at the list's right edge, or past it, has no pixels to read
+        // and is refused rather than cropped from outside the window.
+        assert!(!col_off_right(list, 0.0));
+        assert!(!col_off_right(list, 899.0));
+        assert!(col_off_right(list, 900.0), "exactly at the right edge");
+        assert!(col_off_right(list, 1200.0));
     }
 
     #[test]
@@ -23599,7 +23683,22 @@ mod config_root_tests {
     /// sibling test running on another thread.
     #[test]
     fn session_and_hot_both_follow_the_override() {
-        let saved = std::env::var_os(CONFIG_DIR_ENV);
+        /// Puts `DOCXY_CONFIG_DIR` back however this test ends.
+        ///
+        /// ⚠️ On drop, not at the end of the body: a failed assertion here would
+        /// otherwise leave the variable removed for the rest of the process, and
+        /// the next test to read it would fail for a reason that has nothing to
+        /// do with what it is testing.
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => unsafe { std::env::set_var(CONFIG_DIR_ENV, v) },
+                    None => unsafe { std::env::remove_var(CONFIG_DIR_ENV) },
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(CONFIG_DIR_ENV));
 
         // Under an override: both land inside it, and neither is the real profile.
         let over = Path::new(r"D:\runs\harness-42");
@@ -23619,9 +23718,5 @@ mod config_root_tests {
         assert_eq!(hot_dir(), real.join("docxy").join("hot"));
         assert!(!session_path().starts_with(over));
         assert!(!hot_dir().starts_with(over));
-
-        if let Some(v) = saved {
-            unsafe { std::env::set_var(CONFIG_DIR_ENV, v) };
-        }
     }
 }

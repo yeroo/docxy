@@ -182,7 +182,8 @@ impl Driver {
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "the app drew no new frame within {FRAME_TIMEOUT:?}                      (still frame {now}, waiting for {target}); is it hung?"
+                    "the app drew no new frame within {FRAME_TIMEOUT:?} \
+                     (still frame {now}, waiting for {target}); is it hung?"
                 ));
             }
         }

@@ -587,14 +587,41 @@ mod tests {
 
     /// The named colours must be the ones the grid actually draws, or a test
     /// that passes is testing the wrong thing.
+    ///
+    /// ⚠️ Read out of the app's own source rather than written down here twice.
+    /// The two crates are in different workspaces so the constants cannot be
+    /// shared, and a test that compares this list against literals in this file
+    /// passes no matter what the app was changed to — which is the one failure
+    /// this test exists to catch.
     #[test]
     fn the_named_colours_are_the_grids_own() {
+        let src = suite_main_rs();
+        let app = |name: &str| -> u32 {
+            let decl = format!("const {name}: u32 = 0x");
+            let at = src
+                .find(&decl)
+                .unwrap_or_else(|| panic!("{name} is gone from suite/docxy/src/main.rs"));
+            let rest = &src[at + decl.len()..];
+            let digits: String = rest.chars().take_while(char::is_ascii_hexdigit).collect();
+            assert_eq!(digits.len(), 6, "{name} is not an 0xRRGGBB literal");
+            u32::from_str_radix(&digits, 16).unwrap()
+        };
         let by = |n: &str| NAMED_COLORS.iter().find(|(k, _)| *k == n).unwrap().1;
-        assert_eq!(by("teal"), 0x2AA79B, "main.rs BRAND");
+        assert_eq!(by("teal"), app("BRAND"));
         assert_eq!(by("brand"), by("teal"));
-        assert_eq!(by("blue"), 0x4472C4, "main.rs CHART_VALUES_COLOR");
-        assert_eq!(by("purple"), 0x7030A0, "main.rs CHART_CATEGORIES_COLOR");
-        assert_eq!(by("green"), 0x00B050, "main.rs CHART_NAME_COLOR");
+        assert_eq!(by("blue"), app("CHART_VALUES_COLOR"));
+        assert_eq!(by("purple"), app("CHART_CATEGORIES_COLOR"));
+        assert_eq!(by("green"), app("CHART_NAME_COLOR"));
+    }
+
+    /// The app's source, as text. Not `include_str!`: a missing file must fail
+    /// the test rather than the build, and it is only read to check a constant.
+    fn suite_main_rs() -> String {
+        let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("suite/docxy/src/main.rs");
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
     }
 
     #[test]

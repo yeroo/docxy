@@ -28,9 +28,11 @@ external_review_tool = custom
 custom_review_script = scripts\revmux-review.cmd
 max_external_iterations = 3
 review_patience = 2
+max_iterations = 15
+idle_timeout = 10m
 ```
 
-The first two are the wiring. The last two are the convergence caps — see
+The first two are the wiring. The rest are the convergence caps — see
 [Bounding the cost](#bounding-the-cost) for why they are pinned here rather
 than left to the global default.
 
@@ -270,12 +272,14 @@ That can oscillate indefinitely.
   to add a field.
 ### Bounding the cost
 
-Left alone the external loop runs `max(3, max_iterations/5)` = **10** rounds,
-each a full panel. That is the token sink, and the shape above is why: across
+With the stock `max_iterations = 50` the external loop would run
+`max(3, max_iterations/5)` = **10** rounds, each a full panel. (This repo
+pins `max_iterations = 15`, which by that formula alone already caps the
+loop at 3.) That is the token sink, and the shape above is why: across
 four plans here, every Major finding arrived in round 1 or 2, and every round
 after that was Minor documentation seeding the next round's Minor documentation.
 
-Three layers, cheapest first:
+Five layers, cheapest first:
 
 1. **The roster narrows by round** (`scripts/revmux-review.sh`). Rounds 1–2 get
    `comprehensive` — four agents, where the real findings come from. Round 3 on
@@ -288,6 +292,15 @@ Three layers, cheapest first:
    like. It is `0` (disabled) by default; this repo pins it.
 3. **`max_external_iterations = 3`** is the hard ceiling, for when the first two
    are wrong about something.
+4. **`max_iterations = 15`** bounds the *task* loop rather than the review
+   loop. The plans here run 7-9 task iterations; the 50 default is a runaway
+   guard, not a budget, and a plan that cannot be done in 15 has a planning
+   problem that 35 more iterations will not find.
+5. **`idle_timeout = 10m`** kills a TASK or REVIEW executor that has gone
+   silent. Note its limit: in default Claude mode it does **not** cover the
+   external review phase, so it is no help against a stuck revmux — that one
+   is bounded by revmux's own `--idle-timeout` and `--hard-timeout` in the
+   hook.
 
 The layers bound different things, which is easy to misread. The hard ceiling
 bounds **one run**, so within a single run the roster narrows for at most its

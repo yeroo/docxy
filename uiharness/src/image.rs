@@ -33,10 +33,6 @@ impl RectPx {
         self.y as i64 + self.h as i64
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.w == 0 || self.h == 0
-    }
-
     /// The same rectangle measured from `origin` instead of from the desktop —
     /// what a screen rectangle becomes once the capture it will be cut out of
     /// is known.

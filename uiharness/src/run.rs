@@ -5,9 +5,13 @@
 //! folder named for the test that took it:
 //!
 //! ```text
-//! <root>/<run>/drag-select-does-not-fill/grid.png
-//!                                       /cell-A1C5.png
+//! <root>/<run>/drag-select-does-not-fill/007-cell-a1-c5.png
+//!                                       /012-grid.png
 //! ```
+//!
+//! A capture taken by a script is named for its step's line as well as its
+//! region, so two steps that look at the same region — an assertion and the
+//! `shot` after it — leave two pictures rather than one overwriting the other.
 //!
 //! The run directory is also the isolation boundary's other half: a harness
 //! instance writes its `session.json` and hot sidecars under `DOCXY_CONFIG_DIR`,

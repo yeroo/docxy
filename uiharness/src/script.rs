@@ -619,8 +619,14 @@ pub fn cells_in_range(text: &str) -> Result<Vec<String>, String> {
 /// the untrimmed tail is what lets `type` take its text verbatim.
 fn split_word(s: &str) -> (&str, &str) {
     let s = s.trim_start();
-    match s.find(char::is_whitespace) {
-        Some(i) => (&s[..i], &s[i + 1..]),
+    // ⚠️ Split by the separator's own length, not by 1. `char::is_whitespace` is
+    // true for U+00A0 and U+3000 as well as for a space, and those are two and
+    // three bytes in UTF-8 — slicing at `i + 1` lands inside the character and
+    // panics. A non-breaking space is what pasting a step out of a document or
+    // a browser leaves behind, and the parser's whole contract is that a bad
+    // line comes back as a message with a line number on it.
+    match s.char_indices().find(|(_, c)| c.is_whitespace()) {
+        Some((i, c)) => (&s[..i], &s[i + c.len_utf8()..]),
         None => (s, ""),
     }
 }
@@ -834,6 +840,33 @@ test a pointed range dashes
         assert!(e.message.contains("no cases"), "{e}");
         let e = parse_script("test one\n  click A1\ntest one\n  click A1\n").unwrap_err();
         assert!(e.message.contains("also called"), "{e}");
+    }
+
+    /// A non-breaking space is what pasting a step out of a document, a chat
+    /// window or a browser leaves behind, and it is invisible in an editor. The
+    /// parser used to slice one byte past the separator, which lands inside a
+    /// multi-byte space and panics — so a typo took the process down instead of
+    /// coming back with a line number on it.
+    #[test]
+    fn a_non_ascii_space_separates_words_like_any_other_and_never_panics() {
+        for gap in ["\u{a0}", "\u{3000}", "\u{2009}"] {
+            let s = parse_script(&format!("test t\n  click{gap}A1\n")).unwrap();
+            assert_eq!(
+                s.cases[0].steps[0].action,
+                Action::Click {
+                    cell: "A1".to_string(),
+                    shift: false,
+                    double: false
+                },
+                "{gap:?}"
+            );
+        }
+        // The same character inside a word is reported, not panicked on.
+        let e = parse_script("test t\n  cli\u{a0}ck A1\n").unwrap_err();
+        assert!(e.message.contains("cli"), "{e}");
+        // A step that is nothing but one is an empty line, not a step.
+        let e = parse_script("test t\n  \u{a0}\n").unwrap_err();
+        assert!(e.message.contains("no steps"), "{e}");
     }
 
     #[test]
