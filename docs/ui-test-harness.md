@@ -171,6 +171,23 @@ would**. A verb that reached past a handler into the state it maintains could
 pass while the handler under test was broken — the one way this harness could be
 worse than nothing.
 
+⚠️ **"The same entry point" means the handler, not the hitbox.** A verb calls
+the method a handler calls; it does not synthesize a pointer at a coordinate and
+let gpui hit-test the element tree. So the harness sees what a handler *does*,
+and cannot see **which elements carry handlers at all**. `drag A1 -> C5` runs
+`grid_press_cell` → `grid_drag_over` → `grid_release`; it never touches the
+deferred fill-handle hitbox that sits over the cells, so a case's `assert cells
+unchanged` would stay green if someone put a second handler back on that handle.
+
+That is exactly how the auto-fill-on-sweep regression arrived, so it is not a
+hypothetical gap. It is closed **in the app, not in a case**:
+`sheet_fill_start` refuses while a grid gesture is in flight
+(`grid_gesture_in_flight`), which makes any mid-sweep handler on that element
+inert whatever fires it. The rule to take from this: when a regression is *an
+element wired wrongly* rather than *a handler behaving wrongly*, a case cannot
+be the whole guard — put the invariant where the state changes and let the case
+cover the behaviour around it.
+
 ### Assertions
 
 | Assertion | Reads |

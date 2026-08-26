@@ -824,7 +824,7 @@ Three of those runs failed **only** the case they were aimed at; `sweep-fills`
 also took case 2 down, because a fill leaves the selection `A1:A5` and case 2's
 border is asked of `A1:C5`.
 
-**Two findings worth more than the four ticks.**
+**Three findings worth more than the four ticks.**
 
 1. **Case 1 survives its own regression only because of `cells unchanged`.**
    Under `sweep-fills`, `assert no fill preview` and `assert dragging is false`
@@ -840,6 +840,44 @@ border is asked of `A1:C5`.
    multi-cell selection or a range-field preview, and a half-typed `=SUM(` in
    E2 has neither, so no dashed border is ever drawn to be seen. The case bites
    through the pair, not through the picture.
+
+3. **`sweep-fills` proves case 1 against the mechanism, not against the
+   original bug** — found in review, after the table above. The mutation arms
+   the fill inside `grid_drag_over`, which is on the verb's path. The
+   regression that actually shipped was not there: it was a second handler
+   (`on_mouse_move`) on the **fill handle's element**, which the pointer
+   crosses during a sweep and a verb never does — `drag` calls
+   `grid_press_cell`/`grid_drag_over`/`grid_release` and hit-tests nothing. So
+   re-adding that handler would leave case 1 fully green.
+
+   This is a limit of *any* handler-driving harness, not a gap in case 1: a
+   verb can see what a handler does, never which elements carry handlers.
+   Closing it inside the harness would mean a second driving layer —
+   synthesized `PlatformInput` at real coordinates through
+   `Window::dispatch_event`, with a painted frame between moves so the handle
+   is where the sweep has just put it — which is a plan of its own, not a line
+   in this one.
+
+   Closed instead **where the state changes**: `sheet_fill_start` now refuses
+   while `grid_gesture_in_flight()` — a press that landed on a cell, i.e. a
+   sweep, a range pick or a formula pick, with the button still down. A press
+   that reached the handle is dispatched first (it is `deferred`, and gpui runs
+   bubble-phase listeners in reverse paint order) and stops propagation, so a
+   legitimate fill still finds nothing in flight and arms as before. Any
+   handler added to that element that fires mid-sweep is now inert.
+
+   Verified from both sides, the same way the table above was. A temporary
+   `self.sheet_fill_start(cx)` at the top of `grid_drag_over` stands in for a
+   handler on the fill handle, since the guard does not care where the call
+   comes from: **with** the guard all five cases pass and the fill never arms;
+   **without** it, case 1 fails with `range is A1:C5` observing `A1:A5` and
+   `cells unchanged` reporting *A2 was 'North' and is now 'Region'*, …A5 —
+   byte for byte the `sweep-fills` failure. Both patches reverted and rebuilt;
+   the clean binary is 5 of 5 again.
+
+   The general rule, recorded in `docs/ui-test-harness.md`: when the regression
+   is *an element wired wrongly* rather than *a handler behaving wrongly*, the
+   case is not the guard — the invariant belongs next to the state.
 
 #### Green in both workspaces
 

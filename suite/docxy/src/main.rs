@@ -4012,10 +4012,44 @@ impl Docxy {
         cx.notify();
     }
 
+    /// Is a grid gesture already in flight — a sweep, a range pick, a formula
+    /// pick? All three are armed by [`grid_press_cell`] and cleared by
+    /// [`grid_release`], so this is true exactly between a press that landed on
+    /// a CELL and the button coming up again.
+    ///
+    /// It exists to answer one question: may this arm an auto-fill? See
+    /// [`sheet_fill_start`](Self::sheet_fill_start).
+    fn grid_gesture_in_flight(&self) -> bool {
+        self.drag_anchor.is_some()
+            || self.sheet_dragging
+            || self.range_pick.is_some()
+            || self.formula_pick.is_some()
+    }
+
     /// Begin an auto-fill drag from the selection's fill handle (the small
     /// square at the range's bottom-right). Captures the source range.
+    ///
+    /// **Only a press that reached the handle itself may arm a fill.** The
+    /// auto-fill-on-sweep regression came in through a second handler on that
+    /// handle (an `on_mouse_move` fallback — see the element in `render`): the
+    /// handle is pinned to the selection's bottom-right corner, so while you
+    /// sweep a range it is re-rendered under your own moving cursor, and its
+    /// move handler fired with the button already down. The guard below is
+    /// what makes that class of mistake inert rather than merely absent: any
+    /// handler on that element that fires mid-gesture finds a press already in
+    /// flight and does nothing.
+    ///
+    /// It cannot refuse a legitimate fill. The handle's `on_mouse_down` is on a
+    /// `deferred` element, so it is dispatched BEFORE the grid's own
+    /// mouse-down (gpui runs bubble-phase listeners in reverse paint order) and
+    /// stops propagation — `grid_press` never runs, and nothing is in flight.
+    ///
+    /// The UI test harness drives `grid_press_cell`/`grid_drag_over` directly
+    /// and so never goes through the element tree's hitboxes; a case's `assert
+    /// cells unchanged` therefore cannot see a handler added here. This guard
+    /// can. See `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
-        if self.sheet_fill.is_some() {
+        if self.sheet_fill.is_some() || self.grid_gesture_in_flight() {
             return;
         }
         if let Some(v) = self.active_sheet() {
@@ -18111,6 +18145,13 @@ fn sheet_row(
                     // that corner IS your pointer — so the handle was re-rendered
                     // under the moving cursor, its move handler fired with the
                     // button down, and selecting cells wrote to them instead.
+                    //
+                    // Adding one back would now be inert rather than harmful:
+                    // `sheet_fill_start` refuses while a grid gesture is in
+                    // flight. Nothing here may rely on that — the press is
+                    // still the only signal — but no UI test can catch a new
+                    // handler on this element (the harness drives the grid's
+                    // methods, not its hitboxes), so the app has to.
                     .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
                         ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start(cx2));

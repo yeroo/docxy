@@ -145,7 +145,7 @@ pub fn gate(over: Option<&OsStr>, os_config: Option<&Path>) -> Result<PathBuf, S
         }
     };
     if let Some(os) = os_config
-        && same_dir(&root, os)
+        && (same_dir(&root, os) || resolves_same(&root, os))
     {
         return Err(format!(
             "{CONFIG_DIR_ENV} points at the real config directory ({}); \
@@ -159,14 +159,37 @@ pub fn gate(over: Option<&OsStr>, os_config: Option<&Path>) -> Result<PathBuf, S
 /// Whether two paths name the same directory, textually: separators and a
 /// trailing one are noise, and Windows paths are case-insensitive. Deliberately
 /// not `canonicalize` — the sandbox root usually does not exist yet when the
-/// gate runs, and a comparison that fails open would defeat the check.
+/// gate runs, and a comparison that fails open would defeat the check. See
+/// [`resolves_same`] for the half that does ask the filesystem.
 pub fn same_dir(a: &Path, b: &Path) -> bool {
-    fn norm(p: &Path) -> String {
-        let s = p.to_string_lossy().replace('\\', "/");
-        let s = s.trim_end_matches('/').to_string();
-        if cfg!(windows) { s.to_lowercase() } else { s }
-    }
     norm(a) == norm(b)
+}
+
+/// Whether two paths that BOTH exist resolve to the same directory.
+///
+/// [`same_dir`] compares spellings, so `%APPDATA%\..\Roaming`, an 8.3 short
+/// name, and a junction laid over the profile all read as "not the real config
+/// directory" and would be accepted as a sandbox — after which `session_path`
+/// and `hot_dir` write over the user's own open documents, which is the single
+/// thing the gate exists to stop.
+///
+/// This can only ever ADD a refusal: it answers false whenever either side
+/// fails to resolve, and a sandbox that does not exist yet cannot be the real
+/// config directory, which does. So the textual check remains the one that has
+/// to hold, and nothing here can make the gate fail open.
+pub fn resolves_same(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => norm(&ca) == norm(&cb),
+        _ => false,
+    }
+}
+
+/// A path reduced to what a comparison should care about: forward separators,
+/// no trailing one, and folded case on Windows.
+fn norm(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/').to_string();
+    if cfg!(windows) { s.to_lowercase() } else { s }
 }
 
 // ---------------------------------------------------------------------------
@@ -1184,6 +1207,35 @@ mod tests {
                 Path::new(r"c:\users\a\appdata\roaming")
             ));
         }
+    }
+
+    /// The half `same_dir` cannot do: a spelling that walks out and back in
+    /// names the same directory, and the gate has to see through it or a
+    /// hand-typed override lands on the real profile.
+    #[test]
+    fn resolves_same_sees_through_a_dot_dot_spelling() {
+        let real = std::env::temp_dir();
+        let Some(leaf) = real.file_name().map(std::ffi::OsString::from) else {
+            return; // a root directory; there is nothing to walk out of
+        };
+        let round_trip = real.join("..").join(leaf);
+        assert!(!same_dir(&round_trip, &real), "the spellings differ");
+        assert!(resolves_same(&round_trip, &real));
+    }
+
+    /// It must never answer true for paths it cannot resolve — that is what
+    /// keeps it purely additive to the textual check.
+    #[test]
+    fn resolves_same_is_false_when_a_path_does_not_exist() {
+        let real = std::env::temp_dir();
+        assert!(!resolves_same(
+            &real.join("no-such-harness-dir-9f3a"),
+            &real
+        ));
+        assert!(!resolves_same(
+            Path::new("/no-such-harness-dir-9f3a"),
+            Path::new("/no-such-harness-dir-9f3b")
+        ));
     }
 
     // ---- discovery placement ----
