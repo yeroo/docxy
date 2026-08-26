@@ -208,10 +208,13 @@ That is exactly how the auto-fill-on-sweep regression arrived, so it is not a
 hypothetical gap. It is closed **in the app, not in a case**:
 `sheet_fill_start` refuses while a grid gesture is in flight
 (`grid_gesture_in_flight`), which makes any mid-sweep handler on that element
-inert whatever fires it. The rule to take from this: when a regression is *an
-element wired wrongly* rather than *a handler behaving wrongly*, a case cannot
-be the whole guard — put the invariant where the state changes and let the case
-cover the behaviour around it.
+inert whatever fires it. The guard's truth table is a unit test in the suite
+(`a_press_that_landed_on_the_grid_cannot_arm_a_fill`) — a guard the harness
+cannot reach still has to be something a test can, or nothing notices when it
+stops guarding. The rule to take from this: when a regression is *an element
+wired wrongly* rather than *a handler behaving wrongly*, a case cannot be the
+whole guard — put the invariant where the state changes, test it there, and let
+the case cover the behaviour around it.
 
 ### Assertions
 

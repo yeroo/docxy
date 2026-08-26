@@ -95,12 +95,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: suite
       - name: Format
         run: cargo fmt --all --check --manifest-path suite/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --manifest-path suite/Cargo.toml --locked
 

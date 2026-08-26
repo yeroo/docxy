@@ -137,7 +137,7 @@ revmux --task "$TASK" --run "$RUN" \
 exit 0                                # always — see trap 4
 ```
 
-## The five traps
+## The six traps
 
 Each of these cost real debugging time. Two of them killed runs in a second
 repository as well, independently.
@@ -160,6 +160,21 @@ repository as well, independently.
    behind trap 4: while the hook is crashing, ralphex bails on the error and
    never reaches the wait — fix the crash without adding the signal and the
    next run hangs instead.
+6. **The rate-limit detector reads the agent's prose.** `claude_limit_patterns`
+   is matched against the executor's whole output, so an agent that *reports* a
+   rate limit trips it. This is not hypothetical: a review round genuinely died
+   on a session limit; the retry ran fine, wrote up what had happened —
+   quoting `You've hit your session limit` in its summary, correctly — and
+   ralphex read its own pattern back out of that summary and slept another two
+   hours. The retry then re-enters the same phase, produces the same write-up
+   and sleeps again: a loop that never converges and never fails, only waits.
+   ralphex 0.20.0 tightened the *codex* defaults for exactly this reason ("so
+   that review findings that talk about rate limiting do not trip a false
+   positive"); the claude patterns still carry the bare phrase. **Watch for a
+   backoff whose log shows the executor doing real work right up to the
+   "detected" line** — that is this, not a limit. There is no config-level fix:
+   any pattern that matches the real message matches an agent quoting it. Kill
+   the run and finish by hand.
 
 ## Design choices that matter
 

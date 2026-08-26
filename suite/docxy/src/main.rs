@@ -586,6 +586,31 @@ fn shift_row(sh: &gridcore::sheet::Sheet, ar: u32, dy: f32) -> u32 {
     rr.max(0) as u32
 }
 
+/// Is a grid gesture in flight, given the four states a press on a CELL can
+/// arm? All four are set by `grid_press_cell` and cleared by `grid_release`,
+/// so any of them being live means the button is still down from a press that
+/// landed on the grid rather than on the fill handle.
+///
+/// Free-standing so the truth table can be tested without a window: the guard
+/// it feeds is the whole reason the auto-fill-on-sweep regression cannot come
+/// back, and a guard nothing tests is a guard that quietly stops guarding. Add
+/// a new grid gesture and it belongs in this list.
+fn gesture_in_flight(
+    drag_anchor: bool,
+    sheet_dragging: bool,
+    range_pick: bool,
+    formula_pick: bool,
+) -> bool {
+    drag_anchor || sheet_dragging || range_pick || formula_pick
+}
+
+/// Whether [`Docxy::sheet_fill_start`] may arm an auto-fill. Only a press that
+/// reached the fill handle itself may, so a gesture already in flight refuses —
+/// see that method for why a legitimate fill never trips this.
+fn may_arm_fill(already_filling: bool, gesture_in_flight: bool) -> bool {
+    !already_filling && !gesture_in_flight
+}
+
 /// The dominant-axis fill box for `src` dragged to `to`: extend rows (down) or
 /// columns (right), whichever the handle was pulled furthest along. Returns the
 /// full box (source + filled cells), 0-based inclusive.
@@ -4020,10 +4045,12 @@ impl Docxy {
     /// It exists to answer one question: may this arm an auto-fill? See
     /// [`sheet_fill_start`](Self::sheet_fill_start).
     fn grid_gesture_in_flight(&self) -> bool {
-        self.drag_anchor.is_some()
-            || self.sheet_dragging
-            || self.range_pick.is_some()
-            || self.formula_pick.is_some()
+        gesture_in_flight(
+            self.drag_anchor.is_some(),
+            self.sheet_dragging,
+            self.range_pick.is_some(),
+            self.formula_pick.is_some(),
+        )
     }
 
     /// Begin an auto-fill drag from the selection's fill handle (the small
@@ -4049,7 +4076,7 @@ impl Docxy {
     /// cells unchanged` therefore cannot see a handler added here. This guard
     /// can. See `docs/ui-test-harness.md`.
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
-        if self.sheet_fill.is_some() || self.grid_gesture_in_flight() {
+        if !may_arm_fill(self.sheet_fill.is_some(), self.grid_gesture_in_flight()) {
             return;
         }
         if let Some(v) = self.active_sheet() {
@@ -19481,13 +19508,51 @@ mod grid_geom_tests {
         RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_ROW_H, SelectTarget, SelectionAfter,
         border_range, cell_selection_shown, char_to_byte, chart_areas_at, chart_panel_after,
         chart_panel_shown, chart_ref_of, chart_slot_color, chart_source_areas, col_at_x, col_px,
-        dash_fit, edit_runs, fill_box, formula_ref_tokens, last_visible_col, parse_ref_text,
-        press_selection, preview_range, range_a1, range_border_cell_count, range_border_dashed,
-        range_border_plan, range_edges_at, range_text, ref_a1, ref_color, ref_index_at,
-        ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px, scroll_col0_for_sel,
-        series_move, series_name_shown, series_remove, sheet_index_of, shift_col, shift_row,
-        shown_sel, snap_range_rows, source_ref_text,
+        dash_fit, edit_runs, fill_box, formula_ref_tokens, gesture_in_flight, last_visible_col,
+        may_arm_fill, parse_ref_text, press_selection, preview_range, range_a1,
+        range_border_cell_count, range_border_dashed, range_border_plan, range_edges_at,
+        range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref,
+        resize_axis, row_height_px, scroll_col0_for_sel, series_move, series_name_shown,
+        series_remove, sheet_index_of, shift_col, shift_row, shown_sel, snap_range_rows,
+        source_ref_text,
     };
+
+    /// ⚠️ The auto-fill-on-sweep regression came in through a second handler on
+    /// the fill handle: the handle is pinned to the selection's bottom-right
+    /// corner, so sweeping a range re-renders it under the moving cursor and
+    /// its move handler fires with the button already down. The guard is what
+    /// makes that class of mistake inert rather than merely absent — and the UI
+    /// harness cannot see it, because it drives handlers directly and so never
+    /// touches a hitbox. This is where it is checked.
+    #[test]
+    fn a_press_that_landed_on_the_grid_cannot_arm_a_fill() {
+        // Nothing in flight: the handle's own press, which is the only one
+        // that may arm a fill.
+        assert!(!gesture_in_flight(false, false, false, false));
+        assert!(may_arm_fill(false, false));
+
+        // Each gesture alone refuses. A sweep is the regression's own path;
+        // the two picks are the same press wearing a different hat.
+        for (drag, dragging, range, formula) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            assert!(
+                gesture_in_flight(drag, dragging, range, formula),
+                "{drag} {dragging} {range} {formula} should be in flight"
+            );
+            assert!(
+                !may_arm_fill(false, gesture_in_flight(drag, dragging, range, formula)),
+                "{drag} {dragging} {range} {formula} should refuse a fill"
+            );
+        }
+
+        // And a fill already under way is not re-armed by a second press.
+        assert!(!may_arm_fill(true, false));
+        assert!(!may_arm_fill(true, true));
+    }
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|n| n.to_string()).collect()
