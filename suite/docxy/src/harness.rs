@@ -26,9 +26,10 @@
 //! Without the flag none of this runs: no listener, no discovery file, and the
 //! real config root, exactly as before.
 
-use crate::CONFIG_DIR_ENV;
+use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
-use gpui::{App, AsyncWindowContext, Context, Entity, Task, Window};
+use gpui::{App, AsyncWindowContext, Context, Entity, KeyDownEvent, Keystroke, Task, Window};
+use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
@@ -51,6 +52,11 @@ const CTL_APP: &str = "suite";
 /// polls rather than blocks. 8ms is under a frame at 60Hz — invisible to a test
 /// — and only runs at all in harness mode.
 const POLL: Duration = Duration::from_millis(8);
+
+/// How long `quit` waits after its reply before stopping the app, so the reply
+/// is on the wire first. Long enough for a loopback write, short enough that a
+/// test never notices.
+const QUIT_GRACE: Duration = Duration::from_millis(120);
 
 // ---------------------------------------------------------------------------
 // Command line
@@ -211,7 +217,20 @@ pub fn attach(
                     match target.update_in(cx, |this, window, cx| {
                         dispatch(this, &verb, &args, window, cx)
                     }) {
-                        Ok(Ok(result)) => req.reply_ok(result),
+                        Ok(Ok(done)) => {
+                            let quit = done.quit;
+                            req.reply_ok(done.result);
+                            if quit {
+                                // Answer first, then go. The reply is handed to
+                                // ctlcore's connection thread to write, so
+                                // quitting in the same breath would race that
+                                // write and the driver would see a closed
+                                // socket instead of the ok it asked for.
+                                cx.background_executor().timer(QUIT_GRACE).await;
+                                let _ = cx.update(|_, cx| cx.quit());
+                                break;
+                            }
+                        }
                         Ok(Err(e)) => req.reply_err(e),
                         // The window closed between the request arriving and it
                         // being applied; answer rather than leave a client hung.
@@ -232,21 +251,434 @@ pub fn attach(
     });
 }
 
+// ---------------------------------------------------------------------------
+// Verbs
+// ---------------------------------------------------------------------------
+
+/// What a verb did: the reply, and whether the app should stop afterwards.
+///
+/// `quit` is the one verb that outlives its own reply, so it cannot simply
+/// return a `Json` — the pump has to answer the client BEFORE the process goes.
+pub struct Done {
+    pub result: Json,
+    pub quit: bool,
+}
+
+impl Done {
+    fn ok(result: Json) -> Result<Done, String> {
+        Ok(Done {
+            result,
+            quit: false,
+        })
+    }
+}
+
+/// The most cells a `drag` verb walks through. A pointer crosses every cell on
+/// its way, and so does the verb — but a drag across a thousand rows would run
+/// a thousand `sheet_drag_over` calls for a selection its last one decides.
+/// Beyond this the path is sampled; the ends are always kept, so the selection
+/// is the same and only the cells swept in between are fewer.
+const MAX_DRAG_STEPS: usize = 256;
+
+// ---- argument parsing (pure) ----------------------------------------------
+
+/// A required string argument.
+pub fn arg_str<'a>(args: &'a Json, key: &str) -> Result<&'a str, String> {
+    match args.get(key) {
+        Some(Json::Str(s)) => Ok(s),
+        Some(_) => Err(format!("'{key}' must be a string")),
+        None => Err(format!("missing argument '{key}'")),
+    }
+}
+
+/// A required non-negative integer argument.
+pub fn arg_usize(args: &Json, key: &str) -> Result<usize, String> {
+    match args.get(key) {
+        Some(v) => v
+            .as_usize()
+            .ok_or_else(|| format!("'{key}' must be a whole number, not below zero")),
+        None => Err(format!("missing argument '{key}'")),
+    }
+}
+
+/// An optional boolean argument, defaulting to `false`.
+pub fn arg_flag(args: &Json, key: &str) -> Result<bool, String> {
+    match args.get(key) {
+        None | Some(Json::Null) => Ok(false),
+        Some(Json::Bool(b)) => Ok(*b),
+        Some(_) => Err(format!("'{key}' must be true or false")),
+    }
+}
+
+/// One A1 cell reference. Deliberately strict: `A0`, `A1:B2` and `banana` are
+/// all refusals rather than a silent clamp to a cell that exists, because a
+/// test that drove the wrong cell would still pass.
+pub fn parse_cell(text: &str) -> Result<(u32, u32), String> {
+    parse_cell_name(text.trim())
+        .ok_or_else(|| format!("'{text}' is not a cell reference (expected something like B3)"))
+}
+
+/// A required A1 cell argument.
+pub fn cell_arg(args: &Json, key: &str) -> Result<(u32, u32), String> {
+    parse_cell(arg_str(args, key)?)
+}
+
+/// The two ends of a drag: the cell it starts on and the cell it ends on.
+pub type DragEnds = ((u32, u32), (u32, u32));
+
+/// The two ends of a `drag`, given either as `from`/`to` cells or as one
+/// `range`. Both spellings resolve to the same press-and-sweep.
+pub fn drag_args(args: &Json) -> Result<DragEnds, String> {
+    if let Some(v) = args.get("range") {
+        let text = v
+            .as_str()
+            .ok_or_else(|| "'range' must be a string".to_string())?;
+        let (r0, c0, r1, c1) = parse_range_name(text.trim())
+            .ok_or_else(|| format!("'{text}' is not a range (expected something like A1:C5)"))?;
+        return Ok(((r0, c0), (r1, c1)));
+    }
+    Ok((cell_arg(args, "from")?, cell_arg(args, "to")?))
+}
+
+/// The cells a pointer dragged from `from` to `to` would cross, in order,
+/// starting with `from` itself — a real drag always moves inside its origin
+/// cell before it crosses a boundary, and that first move is what plants the
+/// selection.
+///
+/// The path is the straight line between the two, sampled once per cell of the
+/// longer axis (and no more than [`MAX_DRAG_STEPS`] times), with consecutive
+/// repeats collapsed. `to` is always the last cell.
+pub fn drag_path(from: (u32, u32), to: (u32, u32)) -> Vec<(u32, u32)> {
+    let (r0, c0) = (from.0 as i64, from.1 as i64);
+    let (r1, c1) = (to.0 as i64, to.1 as i64);
+    let span = (r1 - r0).abs().max((c1 - c0).abs()) as usize;
+    let steps = span.min(MAX_DRAG_STEPS);
+    let mut path = vec![from];
+    for i in 1..=steps {
+        let f = i as f64 / steps as f64;
+        let r = r0 + ((r1 - r0) as f64 * f).round() as i64;
+        let c = c0 + ((c1 - c0) as f64 * f).round() as i64;
+        let cell = (r as u32, c as u32);
+        if path.last() != Some(&cell) {
+            path.push(cell);
+        }
+    }
+    if path.last() != Some(&to) {
+        path.push(to);
+    }
+    path
+}
+
+/// The keys a `key` verb accepts by name — gpui's own spelling, so a test says
+/// what the platform would deliver. Single characters are keys too and are not
+/// in this list.
+const NAMED_KEYS: &[&str] = &[
+    "enter",
+    "escape",
+    "tab",
+    "backspace",
+    "delete",
+    "insert",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "up",
+    "down",
+    "left",
+    "right",
+    "space",
+    "menu",
+];
+
+/// Parse a key spec — `enter`, `ctrl+c`, `shift+down`, `ctrl+shift+z`, `A` —
+/// into the keystroke the platform would have delivered.
+///
+/// Shaped to match gpui's Windows key handling, because the app reads both
+/// halves: `key` is the character printed on the key (a letter stays lower
+/// case, with `shift` set beside it), and `key_char` is what would have been
+/// typed — `None` under Ctrl/Alt/Win, since those produce control characters
+/// the platform filters out, and `None` for the named keys for the same reason.
+/// Getting this wrong would make `ctrl+c` type a "c" into a cell.
+pub fn parse_key(spec: &str) -> Result<Keystroke, String> {
+    let s = spec.trim();
+    if s.is_empty() {
+        return Err("expected a key like 'enter', 'ctrl+c' or 'shift+down'".to_string());
+    }
+    // A trailing '+' is the plus KEY, not an empty one ("+", "ctrl++").
+    let (mods, key) = match s.strip_suffix('+') {
+        Some(rest) => (rest, "+"),
+        None => match s.rsplit_once('+') {
+            Some((m, k)) => (m, k),
+            None => ("", s),
+        },
+    };
+    let mut modifiers = gpui::Modifiers::default();
+    for m in mods.split('+').filter(|p| !p.is_empty()) {
+        match m.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => modifiers.control = true,
+            "shift" => modifiers.shift = true,
+            "alt" | "option" => modifiers.alt = true,
+            "cmd" | "win" | "super" | "meta" | "platform" => modifiers.platform = true,
+            other => return Err(format!("unknown modifier '{other}' in key '{spec}'")),
+        }
+    }
+    if key.is_empty() {
+        return Err(format!("'{spec}' names modifiers but no key"));
+    }
+    let mut chars = key.chars();
+    let (key, key_char) = match (chars.next(), chars.next()) {
+        // A single character: the key itself. An upper-case letter is that key
+        // WITH shift, which is how the platform reports it.
+        (Some(ch), None) => {
+            if ch.is_uppercase() {
+                modifiers.shift = true;
+            }
+            (
+                ch.to_lowercase().to_string(),
+                Some(if modifiers.shift {
+                    ch.to_uppercase().to_string()
+                } else {
+                    ch.to_string()
+                }),
+            )
+        }
+        _ => {
+            let name = key.trim().to_ascii_lowercase();
+            let known = NAMED_KEYS.contains(&name.as_str())
+                || (name.starts_with('f')
+                    && name[1..]
+                        .parse::<u32>()
+                        .is_ok_and(|n| (1..=24).contains(&n)));
+            if !known {
+                return Err(format!(
+                    "unknown key '{key}' (a single character, or one of: {}, f1..f24)",
+                    NAMED_KEYS.join(", ")
+                ));
+            }
+            // Space is the one named key that types something.
+            let ch = (name == "space").then(|| " ".to_string());
+            (name, ch)
+        }
+    };
+    // Ctrl/Alt/Win turn what would have been typed into a control character,
+    // which the platform drops — so a chord carries no `key_char` at all.
+    let typed = !(modifiers.control || modifiers.alt || modifiers.platform);
+    Ok(Keystroke {
+        modifiers,
+        key,
+        key_char: key_char.filter(|_| typed),
+    })
+}
+
+/// The keystrokes that typing `text` would deliver, one per character.
+pub fn typed_keys(text: &str) -> Result<Vec<Keystroke>, String> {
+    if text.is_empty() {
+        return Err("'text' is empty; there is nothing to type".to_string());
+    }
+    let mut out = Vec::new();
+    for ch in text.chars() {
+        let stroke = match ch {
+            '\r' => continue, // a CRLF types one Enter, not two
+            '\n' => Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: "enter".into(),
+                key_char: None,
+            },
+            '\t' => Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: "tab".into(),
+                key_char: None,
+            },
+            ' ' => Keystroke {
+                modifiers: gpui::Modifiers::default(),
+                key: "space".into(),
+                key_char: Some(" ".into()),
+            },
+            c if c.is_control() => {
+                return Err(format!(
+                    "'text' contains the control character U+{:04X}; use the 'key' verb for those",
+                    c as u32
+                ));
+            }
+            c => Keystroke {
+                modifiers: gpui::Modifiers {
+                    shift: c.is_uppercase(),
+                    ..Default::default()
+                },
+                key: c.to_lowercase().to_string(),
+                key_char: Some(c.to_string()),
+            },
+        };
+        out.push(stroke);
+    }
+    if out.is_empty() {
+        return Err("'text' is empty; there is nothing to type".to_string());
+    }
+    Ok(out)
+}
+
+/// The reference fields a test can name, and the target each one is.
+pub fn parse_field(name: &str) -> Result<RefTarget, String> {
+    let name = name.trim();
+    let (head, index) = match name.split_once(':') {
+        Some((h, i)) => {
+            let n: usize = i.trim().parse().map_err(|_| {
+                format!("'{name}': '{i}' is not a series number (they count from 0)")
+            })?;
+            (h.trim(), Some(n))
+        }
+        None => (name, None),
+    };
+    let indexed = |t: fn(usize) -> RefTarget| match index {
+        Some(i) => Ok(t(i)),
+        None => Err(format!("'{head}' needs a series number, e.g. {head}:0")),
+    };
+    match head.to_ascii_lowercase().as_str() {
+        "chart-range" => Ok(RefTarget::ChartRange),
+        "chart-title" => Ok(RefTarget::ChartTitle),
+        "categories" => Ok(RefTarget::Categories),
+        "series-name" => indexed(RefTarget::SeriesName),
+        "series-values" => indexed(RefTarget::SeriesValues),
+        "cond-format" => Ok(RefTarget::CondFormat),
+        "validation" => Ok(RefTarget::Validation),
+        "sort" => Ok(RefTarget::Sort),
+        "text-to-columns" => Ok(RefTarget::TextToColumns),
+        other => Err(format!(
+            "unknown field '{other}' (chart-range, chart-title, categories, \
+             series-name:N, series-values:N, cond-format, validation, sort, text-to-columns)"
+        )),
+    }
+}
+
+/// The name a field reports itself under — [`parse_field`]'s inverse, so a
+/// reply can be fed straight back into the next verb.
+pub fn field_name(target: RefTarget) -> String {
+    match target {
+        RefTarget::ChartRange => "chart-range".into(),
+        RefTarget::ChartTitle => "chart-title".into(),
+        RefTarget::Categories => "categories".into(),
+        RefTarget::SeriesName(i) => format!("series-name:{i}"),
+        RefTarget::SeriesValues(i) => format!("series-values:{i}"),
+        RefTarget::CondFormat => "cond-format".into(),
+        RefTarget::Validation => "validation".into(),
+        RefTarget::Sort => "sort".into(),
+        RefTarget::TextToColumns => "text-to-columns".into(),
+    }
+}
+
+/// `A1` for a cell.
+fn a1(cell: (u32, u32)) -> String {
+    cell_name(cell.0, cell.1)
+}
+
+/// `A1:C5` for a range (`A1` when it is one cell).
+fn a1_range((r0, c0, r1, c1): (u32, u32, u32, u32)) -> String {
+    if (r0, c0) == (r1, c1) {
+        a1((r0, c0))
+    } else {
+        format!("{}:{}", a1((r0, c0)), a1((r1, c1)))
+    }
+}
+
+fn str_or_null(v: Option<String>) -> Json {
+    v.map(Json::Str).unwrap_or(Json::Null)
+}
+
+fn num_or_null(v: Option<usize>) -> Json {
+    v.map(|n| Json::Num(n as f64)).unwrap_or(Json::Null)
+}
+
+// ---- reading the app ------------------------------------------------------
+
+/// The active spreadsheet, or the refusal every cell verb needs.
+fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
+    app.active_sheet()
+        .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
+}
+
+/// Everything a cell verb's caller might assert on, in one reply: what is
+/// selected, what is being edited, which chart owns the selection, which field
+/// has the keyboard, and the previews the grid would be drawing.
+///
+/// One shape for every driving verb, so a test reads the same keys whichever
+/// one it just sent. The sheet half is absent when the active tab is not a
+/// spreadsheet (`type` and `key` reach the document surface too).
+fn state(app: &crate::Docxy) -> Json {
+    let mut out = vec![
+        ("tab", Json::Num(app.active as f64)),
+        (
+            "title",
+            Json::Str(
+                app.tabs
+                    .get(app.active)
+                    .map(|t| t.title.to_string())
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "dirty",
+            Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.dirty)),
+        ),
+        ("sheet_tab", Json::Bool(app.active_is_sheet())),
+    ];
+    if let Some(v) = app.active_sheet() {
+        out.extend([
+            ("sheet", Json::Str(v.sheet().name.clone())),
+            ("sel", Json::Str(a1(v.sel))),
+            ("anchor", Json::Str(a1(v.anchor))),
+            ("range", Json::Str(a1_range(v.range()))),
+            ("editing", Json::Bool(v.editing.is_some())),
+            ("edit", str_or_null(v.editing.clone())),
+        ]);
+    }
+    let ov = app.grid_overlay();
+    out.extend([
+        ("chart_sel", num_or_null(app.chart_sel)),
+        ("panel_chart", num_or_null(app.panel_chart_shown())),
+        ("charts", Json::Num(app.chart_count() as f64)),
+        (
+            "field",
+            str_or_null(app.range_edit.as_ref().map(|f| field_name(f.target))),
+        ),
+        (
+            "field_text",
+            str_or_null(app.range_edit.as_ref().map(|f| f.buf.clone())),
+        ),
+        // The two the auto-fill regression is about: whether a sweep armed the
+        // fill handle, and the box it would write.
+        ("filling", Json::Bool(app.sheet_fill.is_some())),
+        ("fill_preview", str_or_null(ov.fill_preview.map(a1_range))),
+        ("dragging", Json::Bool(app.sheet_dragging)),
+        // Point mode: the grid is picking cells into a field, which is what
+        // makes the selection border dashed rather than solid.
+        ("picking", Json::Bool(ov.picking)),
+        ("range_preview", str_or_null(ov.range_preview.map(a1_range))),
+        ("sel_hidden", Json::Bool(ov.sel_hidden)),
+    ]);
+    Json::Obj(out.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
+// ---- the verb table -------------------------------------------------------
+
 /// Route one harness verb against the live app.
 ///
-/// Task 3 grows this into the verbs that drive the grid, each going through the
-/// same entry point the real UI uses. Today there is only `ping`, which proves
-/// the channel end to end — including that the reply was produced on the app
-/// thread, since it reports the app's own state.
+/// Every driving verb goes through the same entry point the pointer or the
+/// keyboard would: `click-cell` is the cell's own click handler, `drag` is a
+/// press plus one move per cell crossed plus the release, `key`/`type` are
+/// [`crate::Docxy::on_key`], and `select-chart` is the press on a chart card.
+/// A verb that reached past those into the state they maintain could pass while
+/// the handler under test was broken — the one way this harness could be worse
+/// than nothing.
 pub fn dispatch(
     app: &mut crate::Docxy,
     verb: &str,
-    _args: &Json,
-    _window: &mut Window,
-    _cx: &mut Context<crate::Docxy>,
-) -> Result<Json, String> {
+    args: &Json,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<Done, String> {
     match verb {
-        "ping" => Ok(Json::obj(vec![
+        "ping" => Done::ok(Json::obj(vec![
             ("instance", Json::Str(instance_name())),
             ("pid", Json::Num(std::process::id() as f64)),
             (
@@ -255,7 +687,158 @@ pub fn dispatch(
             ),
             ("tabs", Json::Num(app.tabs.len() as f64)),
         ])),
+
+        // Open a file, exactly as a path on the command line does.
+        "open" => {
+            let raw = arg_str(args, "path")?;
+            let path = PathBuf::from(raw);
+            if !path.is_file() {
+                return Err(format!("no such file: {raw}"));
+            }
+            app.open_args(vec![path], cx);
+            Done::ok(state(app))
+        }
+
+        // A click on a cell: press, click, release — the three events the
+        // pointer delivers, in that order.
+        "click-cell" => {
+            let cell = cell_arg(args, "cell")?;
+            let (shift, dbl) = (arg_flag(args, "shift")?, arg_flag(args, "double")?);
+            sheet(app)?;
+            app.grid_press_cell(cell, cx);
+            app.cell_click(cell.0, cell.1, shift, dbl, window, cx);
+            app.grid_release(cx);
+            Done::ok(state(app))
+        }
+
+        // A drag: the press plants the anchor, each cell crossed is a move, the
+        // release commits whatever the moves armed.
+        "drag" => {
+            let (from, to) = drag_args(args)?;
+            sheet(app)?;
+            app.grid_press_cell(from, cx);
+            for (r, c) in drag_path(from, to) {
+                app.grid_drag_over(r, c, cx);
+            }
+            app.grid_release(cx);
+            Done::ok(state(app))
+        }
+
+        // Type text, one key event per character.
+        "type" => {
+            for stroke in typed_keys(arg_str(args, "text")?)? {
+                app.on_key(&key_event(stroke), window, cx);
+            }
+            Done::ok(state(app))
+        }
+
+        // One key, or a list of them ("keys": ["ctrl+c", "down", "ctrl+v"]).
+        "key" => {
+            let specs: Vec<String> = match args.get("keys") {
+                Some(Json::Arr(items)) => items
+                    .iter()
+                    .map(|v| {
+                        v.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| "'keys' must be an array of strings".to_string())
+                    })
+                    .collect::<Result<_, _>>()?,
+                Some(_) => return Err("'keys' must be an array of strings".to_string()),
+                None => vec![arg_str(args, "key")?.to_string()],
+            };
+            if specs.is_empty() {
+                return Err("'keys' is empty; there is nothing to press".to_string());
+            }
+            // Parse them all before pressing any, so a typo in the third key
+            // does not leave the app half way through the sequence.
+            let strokes = specs
+                .iter()
+                .map(|s| parse_key(s))
+                .collect::<Result<Vec<_>, _>>()?;
+            for stroke in strokes {
+                app.on_key(&key_event(stroke), window, cx);
+            }
+            Done::ok(state(app))
+        }
+
+        // Select a chart, as pressing its card does (press then release, with
+        // no travel in between — the release ends the move the press armed).
+        "select-chart" => {
+            let idx = arg_usize(args, "index")?;
+            sheet(app)?;
+            let n = app.chart_count();
+            if idx >= n {
+                return Err(match n {
+                    0 => "this sheet has no charts".to_string(),
+                    _ => format!("no chart {idx}; this sheet has {n} (0..{})", n - 1),
+                });
+            }
+            app.chart_press(idx, (0, 0), (0.0, 0.0), cx);
+            app.grid_release(cx);
+            Done::ok(state(app))
+        }
+
+        // Give a reference field the keyboard, as clicking it does.
+        "focus-field" => {
+            let target = parse_field(arg_str(args, "field")?)?;
+            if target.is_bar() && app.bar_field != Some(target) {
+                return Err(format!(
+                    "'{}' belongs to an entry bar that is not open; \
+                     open it from the ribbon first",
+                    field_name(target)
+                ));
+            }
+            let seed = app.ref_field_seed(target).ok_or_else(|| {
+                format!(
+                    "'{}' is not on screen (no chart is in the panel, or it has no such series)",
+                    field_name(target)
+                )
+            })?;
+            app.ref_field_focus(target, seed, cx);
+            Done::ok(state(app))
+        }
+
+        // Read one cell: what it shows, and what re-editing it would put in the
+        // editor (the formula, or the unformatted literal).
+        "cell" => {
+            let (r, c) = cell_arg(args, "cell")?;
+            let v = sheet(app)?;
+            let raw = v.edit_string(r, c);
+            Done::ok(Json::obj(vec![
+                ("cell", Json::Str(a1((r, c)))),
+                ("row", Json::Num(r as f64)),
+                ("col", Json::Num(c as f64)),
+                ("text", Json::Str(v.cell_text(r, c))),
+                ("value", Json::Str(raw.clone())),
+                ("empty", Json::Bool(raw.is_empty())),
+            ]))
+        }
+
+        // Read the selection and everything keyed to it, changing nothing.
+        "selection" => {
+            sheet(app)?;
+            Done::ok(state(app))
+        }
+
+        // Persist and go. The reply is written first (see the pump).
+        "quit" => {
+            app.persist();
+            Ok(Done {
+                result: Json::obj(vec![("quitting", Json::Bool(true))]),
+                quit: true,
+            })
+        }
+
         other => Err(format!("unknown verb '{other}'")),
+    }
+}
+
+/// A keystroke as the platform would hand it to the window.
+fn key_event(keystroke: Keystroke) -> KeyDownEvent {
+    KeyDownEvent {
+        keystroke,
+        is_held: false,
+        prefer_character_input: false,
     }
 }
 
@@ -430,5 +1013,309 @@ mod tests {
         let dir = control_dir(root);
         assert_eq!(dir, root.join("suite").join("ctl"));
         assert!(dir.starts_with(root));
+    }
+
+    // ---- verb arguments (pure) ----
+
+    fn obj(pairs: &[(&str, Json)]) -> Json {
+        Json::Obj(
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        )
+    }
+
+    fn s(v: &str) -> Json {
+        Json::Str(v.to_string())
+    }
+
+    /// A cell reference names one cell, in any of the spellings a user types.
+    #[test]
+    fn parse_cell_takes_the_spellings_a1_notation_has() {
+        assert_eq!(parse_cell("A1"), Ok((0, 0)));
+        assert_eq!(parse_cell("b3"), Ok((2, 1)));
+        assert_eq!(parse_cell(" $C$4 "), Ok((3, 2)));
+        assert_eq!(parse_cell("AA100"), Ok((99, 26)));
+    }
+
+    /// A cell that does not exist is a refusal, not a clamp: a test driven at
+    /// the wrong cell would still pass, which is worse than not running at all.
+    #[test]
+    fn parse_cell_refuses_what_is_not_a_cell() {
+        for bad in ["A0", "0", "banana", "", "A1:B2", "1A", "XFE1", "A1048577"] {
+            let err = parse_cell(bad).expect_err(&format!("{bad:?} must be refused"));
+            assert!(
+                err.contains("not a cell reference"),
+                "message says what is wrong: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn cell_arg_reports_a_missing_or_mistyped_argument() {
+        let args = obj(&[("cell", s("B2"))]);
+        assert_eq!(cell_arg(&args, "cell"), Ok((1, 1)));
+        assert_eq!(
+            cell_arg(&Json::Null, "cell"),
+            Err("missing argument 'cell'".to_string())
+        );
+        assert_eq!(
+            cell_arg(&obj(&[("cell", Json::Num(3.0))]), "cell"),
+            Err("'cell' must be a string".to_string())
+        );
+    }
+
+    #[test]
+    fn arg_usize_and_flag_report_their_own_shapes() {
+        let args = obj(&[
+            ("index", Json::Num(2.0)),
+            ("shift", Json::Bool(true)),
+            ("bad", Json::Num(-1.0)),
+        ]);
+        assert_eq!(arg_usize(&args, "index"), Ok(2));
+        assert!(arg_usize(&args, "bad").is_err());
+        assert!(arg_usize(&args, "nope").is_err());
+        assert_eq!(arg_flag(&args, "shift"), Ok(true));
+        assert_eq!(arg_flag(&args, "absent"), Ok(false)); // an omitted flag is off
+        assert!(arg_flag(&obj(&[("shift", s("yes"))]), "shift").is_err());
+    }
+
+    /// Both spellings of a drag reach the same pair of cells.
+    #[test]
+    fn drag_args_accepts_from_to_and_a_range() {
+        assert_eq!(
+            drag_args(&obj(&[("from", s("A1")), ("to", s("C5"))])),
+            Ok(((0, 0), (4, 2)))
+        );
+        assert_eq!(
+            drag_args(&obj(&[("range", s("A1:C5"))])),
+            Ok(((0, 0), (4, 2)))
+        );
+        // A one-cell range is a drag that goes nowhere, not an error.
+        assert_eq!(drag_args(&obj(&[("range", s("B2"))])), Ok(((1, 1), (1, 1))));
+    }
+
+    /// A malformed range, and a half-given pair.
+    #[test]
+    fn drag_args_refuses_a_malformed_range() {
+        for bad in ["A1:", ":C5", "A1:C0", "A1-C5", "everything"] {
+            let err = drag_args(&obj(&[("range", s(bad))]))
+                .expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.contains("is not a range"), "{err}");
+        }
+        assert_eq!(
+            drag_args(&obj(&[("range", Json::Num(1.0))])),
+            Err("'range' must be a string".to_string())
+        );
+        // `to` without `from`, and a `from` that is not a cell.
+        assert_eq!(
+            drag_args(&obj(&[("to", s("C5"))])),
+            Err("missing argument 'from'".to_string())
+        );
+        assert!(drag_args(&obj(&[("from", s("A0")), ("to", s("C5"))])).is_err());
+    }
+
+    // ---- the drag path ----
+
+    /// A drag that never leaves its cell still delivers the one move that
+    /// plants the selection.
+    #[test]
+    fn drag_path_of_a_still_drag_is_its_own_cell() {
+        assert_eq!(drag_path((2, 2), (2, 2)), vec![(2, 2)]);
+    }
+
+    /// Straight drags cross every cell on the way, starting where they began.
+    #[test]
+    fn drag_path_crosses_every_cell_in_a_straight_run() {
+        assert_eq!(
+            drag_path((0, 0), (0, 3)),
+            vec![(0, 0), (0, 1), (0, 2), (0, 3)]
+        );
+        assert_eq!(
+            drag_path((5, 1), (2, 1)),
+            vec![(5, 1), (4, 1), (3, 1), (2, 1)]
+        );
+    }
+
+    /// A diagonal moves both ways at once and lands exactly on its target.
+    #[test]
+    fn drag_path_runs_the_diagonal_to_its_end() {
+        let path = drag_path((0, 0), (4, 2));
+        assert_eq!(path.first(), Some(&(0, 0)));
+        assert_eq!(path.last(), Some(&(4, 2)));
+        assert_eq!(path.len(), 5); // one step per row, the longer axis
+        // Monotone in both axes: a pointer never doubles back.
+        for w in path.windows(2) {
+            assert!(w[1].0 >= w[0].0 && w[1].1 >= w[0].1, "{path:?}");
+        }
+    }
+
+    /// A drag down a thousand rows is sampled rather than walked cell by cell,
+    /// but still starts and ends where it was told to.
+    #[test]
+    fn drag_path_is_capped_but_keeps_both_ends() {
+        let path = drag_path((0, 0), (5000, 0));
+        assert_eq!(path.first(), Some(&(0, 0)));
+        assert_eq!(path.last(), Some(&(5000, 0)));
+        assert!(path.len() <= MAX_DRAG_STEPS + 1, "{} cells", path.len());
+    }
+
+    // ---- keys ----
+
+    fn stroke(spec: &str) -> Keystroke {
+        parse_key(spec).unwrap_or_else(|e| panic!("{spec}: {e}"))
+    }
+
+    /// A named key carries no character: the platform filters the control
+    /// character it would have produced, and the grid's handlers rely on that.
+    #[test]
+    fn parse_key_reads_the_named_keys() {
+        let k = stroke("enter");
+        assert_eq!(k.key, "enter");
+        assert_eq!(k.key_char, None);
+        assert!(!k.modifiers.modified());
+        assert_eq!(stroke("Escape").key, "escape"); // case is not significant
+        assert_eq!(stroke("f2").key, "f2");
+        assert_eq!(stroke("pagedown").key, "pagedown");
+        // Space is the named key that does type something.
+        assert_eq!(stroke("space").key_char.as_deref(), Some(" "));
+    }
+
+    #[test]
+    fn parse_key_reads_modifiers() {
+        let k = stroke("ctrl+c");
+        assert!(k.modifiers.control && !k.modifiers.shift);
+        assert_eq!(k.key, "c");
+        // A chord types nothing — or ctrl+c would put a "c" in the cell.
+        assert_eq!(k.key_char, None);
+
+        let k = stroke("shift+down");
+        assert!(k.modifiers.shift);
+        assert_eq!(k.key, "down");
+
+        let k = stroke("ctrl+shift+z");
+        assert!(k.modifiers.control && k.modifiers.shift);
+        assert_eq!(k.key, "z");
+
+        assert!(stroke("cmd+s").modifiers.platform);
+        assert!(stroke("alt+f4").modifiers.alt);
+    }
+
+    /// An upper-case letter is the same key with shift held, which is how the
+    /// platform reports it — `key` stays lower case, `key_char` is the capital.
+    #[test]
+    fn parse_key_reads_a_capital_as_shift_plus_the_key() {
+        let k = stroke("A");
+        assert_eq!(k.key, "a");
+        assert!(k.modifiers.shift);
+        assert_eq!(k.key_char.as_deref(), Some("A"));
+
+        let k = stroke("a");
+        assert_eq!(k.key_char.as_deref(), Some("a"));
+        assert!(!k.modifiers.shift);
+    }
+
+    /// The separator is also a key.
+    #[test]
+    fn parse_key_reads_a_trailing_plus_as_the_plus_key() {
+        assert_eq!(stroke("+").key, "+");
+        let k = stroke("ctrl++");
+        assert_eq!(k.key, "+");
+        assert!(k.modifiers.control);
+    }
+
+    #[test]
+    fn parse_key_refuses_what_it_cannot_press() {
+        assert!(parse_key("").is_err());
+        assert!(parse_key("   ").is_err());
+        let err = parse_key("hyper+a").expect_err("unknown modifier");
+        assert!(err.contains("unknown modifier"), "{err}");
+        let err = parse_key("banana").expect_err("unknown key");
+        assert!(err.contains("unknown key"), "{err}");
+        assert!(parse_key("f25").is_err()); // there is no F25
+    }
+
+    /// Typing is one keystroke per character, with capitals shifted.
+    #[test]
+    fn typed_keys_delivers_one_keystroke_per_character() {
+        let keys = typed_keys("Hi!").expect("typable");
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].key, "h");
+        assert!(keys[0].modifiers.shift);
+        assert_eq!(keys[0].key_char.as_deref(), Some("H"));
+        assert_eq!(keys[1].key_char.as_deref(), Some("i"));
+        assert_eq!(keys[2].key, "!");
+        assert_eq!(keys[2].key_char.as_deref(), Some("!"));
+    }
+
+    /// The whitespace a script is likely to hold.
+    #[test]
+    fn typed_keys_maps_whitespace_to_its_keys() {
+        let keys = typed_keys("a b\tc\r\n").expect("typable");
+        let names: Vec<&str> = keys.iter().map(|k| k.key.as_str()).collect();
+        // The \r of a CRLF is dropped: it types one Enter, not two.
+        assert_eq!(names, ["a", "space", "b", "tab", "c", "enter"]);
+        assert_eq!(keys[5].key_char, None);
+    }
+
+    #[test]
+    fn typed_keys_refuses_empty_text_and_control_characters() {
+        assert!(typed_keys("").is_err());
+        let err = typed_keys("a\u{7}b").expect_err("a bell is not typing");
+        assert!(err.contains("control character"), "{err}");
+    }
+
+    // ---- fields ----
+
+    #[test]
+    fn parse_field_names_every_reference_field() {
+        assert_eq!(parse_field("chart-range"), Ok(RefTarget::ChartRange));
+        assert_eq!(parse_field("Chart-Title"), Ok(RefTarget::ChartTitle));
+        assert_eq!(parse_field("categories"), Ok(RefTarget::Categories));
+        assert_eq!(parse_field("series-name:0"), Ok(RefTarget::SeriesName(0)));
+        assert_eq!(
+            parse_field(" series-values:2 "),
+            Ok(RefTarget::SeriesValues(2))
+        );
+        assert_eq!(parse_field("sort"), Ok(RefTarget::Sort));
+    }
+
+    #[test]
+    fn parse_field_refuses_unknown_and_unnumbered_fields() {
+        let err = parse_field("chart-colour").expect_err("no such field");
+        assert!(err.contains("unknown field"), "{err}");
+        let err = parse_field("series-name").expect_err("which series?");
+        assert!(err.contains("series number"), "{err}");
+        let err = parse_field("series-values:last").expect_err("not a number");
+        assert!(err.contains("not a series number"), "{err}");
+    }
+
+    /// Every name a reply can print is a name the next verb accepts.
+    #[test]
+    fn field_names_round_trip() {
+        for t in [
+            RefTarget::ChartRange,
+            RefTarget::ChartTitle,
+            RefTarget::Categories,
+            RefTarget::SeriesName(0),
+            RefTarget::SeriesValues(3),
+            RefTarget::CondFormat,
+            RefTarget::Validation,
+            RefTarget::Sort,
+            RefTarget::TextToColumns,
+        ] {
+            assert_eq!(parse_field(&field_name(t)), Ok(t));
+        }
+    }
+
+    // ---- reply shapes ----
+
+    #[test]
+    fn a1_names_cells_and_ranges_the_way_a_test_writes_them() {
+        assert_eq!(a1((0, 0)), "A1");
+        assert_eq!(a1_range((0, 0, 4, 2)), "A1:C5");
+        // A one-cell range prints as the cell, not as "B2:B2".
+        assert_eq!(a1_range((1, 1, 1, 1)), "B2");
     }
 }

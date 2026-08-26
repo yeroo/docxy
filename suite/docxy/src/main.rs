@@ -4569,6 +4569,77 @@ impl Docxy {
         self.ref_msg = None;
     }
 
+    /// Give a reference field the keyboard, seeded with `seed` and with all of
+    /// it selected — the body of the field's own mouse-down, so the harness's
+    /// `focus-field` verb takes the keyboard the same way a click does.
+    ///
+    /// Selecting all of it is what makes typing a new value REPLACE the old one
+    /// rather than append to it (the caret-at-click behaviour turned every
+    /// retyped range into "A1:B5A1:D5"). Clicks once focused place the caret
+    /// normally.
+    fn ref_field_focus(&mut self, target: RefTarget, seed: String, cx: &mut Context<Self>) {
+        // A bar's own field is routed to first and must leave its bar standing;
+        // anything else has to take the keyboard away from whatever bar is open.
+        if !target.is_bar() {
+            self.typing_bars_close();
+        }
+        let n = seed.chars().count();
+        self.range_edit = Some(RangeEdit {
+            target,
+            buf: seed,
+            caret: n,
+            anchor: 0,
+            dragging: false,
+        });
+        cx.notify();
+    }
+
+    /// What an unfocused reference field is showing — the value a click on it
+    /// would seed the edit with. The panel and the entry bars each compute this
+    /// inline as they render; this is the same derivation for a caller that has
+    /// no element in hand, which is the harness naming a field by name.
+    fn ref_field_seed(&self, target: RefTarget) -> Option<String> {
+        if target.is_bar() {
+            // Unpinned, a bar's field shows the live selection (`bar_range_field`).
+            let sheet = self
+                .active_sheet()
+                .map(|v| v.sheet().name.clone())
+                .unwrap_or_default();
+            return Some(
+                self.bar_range
+                    .clone()
+                    .or_else(|| self.bar_seed().map(|r| ref_a1(Some(&sheet), r)))
+                    .unwrap_or_default(),
+            );
+        }
+        let data = self.chart_data()?;
+        Some(match target {
+            RefTarget::ChartRange => data
+                .source
+                .as_ref()
+                .map(source_ref_text)
+                .unwrap_or_default(),
+            RefTarget::ChartTitle => data.title.clone(),
+            RefTarget::Categories => data
+                .categories_ref
+                .as_ref()
+                .map(source_ref_text)
+                .unwrap_or_default(),
+            RefTarget::SeriesName(i) => {
+                let s = data.series.get(i)?;
+                series_name_shown(&s.name, s.name_ref.as_deref())
+            }
+            RefTarget::SeriesValues(i) => data
+                .series
+                .get(i)?
+                .values_ref
+                .as_ref()
+                .map(source_ref_text)
+                .unwrap_or_default(),
+            _ => return None,
+        })
+    }
+
     /// Commit whatever is typed in a focused bar range field, for the commit
     /// paths that don't come through the field's own Enter (the Apply button).
     /// `false` means the text isn't a range: the field keeps its old cells, so
@@ -4847,10 +4918,19 @@ impl Docxy {
     /// A press landed on the grid: remember which cell, so the drag that may
     /// follow extends from there rather than from wherever the pointer first
     /// crossed a boundary.
-    fn grid_press(&mut self, pos: Point<Pixels>, _cx: &mut Context<Self>) {
+    fn grid_press(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
         let Some(cell) = self.cell_at(pos) else {
             return;
         };
+        self.grid_press_cell(cell, cx);
+    }
+
+    /// The press, once it has been located. Split out of [`grid_press`] so the
+    /// UI test harness can plant the same anchor from a cell reference: the
+    /// pixel hit-test is not what a test asserts on, and a harness that
+    /// reproduced this body instead of calling it would keep passing after this
+    /// one changed.
+    fn grid_press_cell(&mut self, cell: (u32, u32), _cx: &mut Context<Self>) {
         if self.formula_pick_active() {
             // Anchor the reference on the pressed cell, with the buffer as it
             // stands, so the drag rewrites from there.
@@ -4862,6 +4942,61 @@ impl Docxy {
             self.range_pick = Some((cell, false));
         } else {
             self.drag_anchor = Some(cell);
+        }
+    }
+
+    /// A click landed on cell `(r, c)`: Shift extends, a plain click selects (or
+    /// points, while a formula or a range field has the keyboard), a double
+    /// click opens the in-cell editor and a click on a hyperlinked cell follows
+    /// it. The body of the cell's own `on_click`, lifted to a method so the UI
+    /// test harness's `click-cell` verb drives the same code the pointer does
+    /// rather than a second copy of these rules.
+    fn cell_click(
+        &mut self,
+        r: u32,
+        c: u32,
+        shift: bool,
+        dbl: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if shift {
+            self.extend_to(r, c, cx)
+        } else {
+            // While a formula is being typed — or a range field has the
+            // keyboard — a click POINTS at this cell: the selection never
+            // moves, so neither opening an editor on it (which would replace
+            // the half-typed formula with this cell's contents, or edit a cell
+            // nobody selected) nor following its link is what was asked for.
+            let pointing = self.formula_pick_active() || self.range_field_active();
+            let has_link = self
+                .active_sheet()
+                .is_some_and(|v| v.sheet().hyperlinks.contains_key(&(r, c)));
+            self.select_cell(r, c, cx);
+            if pointing {
+                // the reference is written; nothing else to do
+            } else if dbl {
+                // Double-click enters inline edit mode (Excel-style).
+                self.sheet_begin_edit(None, cx);
+            } else if has_link {
+                self.sheet_follow_hyperlink(r, c, cx);
+            }
+        }
+        // Keep keyboard focus on the grid after a click inside the virtualized
+        // list (which would otherwise capture it).
+        self.focus.focus(window, cx);
+    }
+
+    /// The pointer moved over cell `(r, c)` with the left button down: the
+    /// fill handle's drag if one is armed, a drag-select otherwise. Which of
+    /// the two a sweep means is exactly what the auto-fill regression got
+    /// wrong, so the harness's `drag` verb has to ask it here, not decide for
+    /// itself.
+    fn grid_drag_over(&mut self, r: u32, c: u32, cx: &mut Context<Self>) {
+        if self.sheet_fill.is_some() {
+            self.sheet_fill_over(r, c, cx);
+        } else {
+            self.sheet_drag_over(r, c, cx);
         }
     }
 
@@ -7681,23 +7816,7 @@ impl Docxy {
                 d.on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
                     cx2.stop_propagation();
                     let seed = seed.clone();
-                    ent_c.update(cx2, |this, cx2| {
-                        // A bar's own field is routed to first and must leave
-                        // its bar standing; anything else has to take the
-                        // keyboard away from whatever bar is open.
-                        if !target.is_bar() {
-                            this.typing_bars_close();
-                        }
-                        let n = seed.chars().count();
-                        this.range_edit = Some(RangeEdit {
-                            target,
-                            buf: seed,
-                            caret: n,
-                            anchor: 0,
-                            dragging: false,
-                        });
-                        cx2.notify();
-                    });
+                    ent_c.update(cx2, |this, cx2| this.ref_field_focus(target, seed, cx2));
                 })
             });
         v_flex()
@@ -17533,36 +17652,11 @@ fn sheet_row(
                 );
             }
         }
-        let has_link = sh.hyperlinks.contains_key(&(r, c));
         let ent2 = ent.clone();
         cell = cell.on_click(move |ev, window, cx| {
             let shift = ev.modifiers().shift;
             let dbl = ev.click_count() >= 2;
-            ent2.update(cx, |this, cx| {
-                if shift {
-                    this.extend_to(r, c, cx)
-                } else {
-                    // While a formula is being typed — or a range field has the
-                    // keyboard — a click POINTS at this cell: the selection
-                    // never moves, so neither opening an editor on it (which
-                    // would replace the half-typed formula with this cell's
-                    // contents, or edit a cell nobody selected) nor following
-                    // its link is what was asked for.
-                    let pointing = this.formula_pick_active() || this.range_field_active();
-                    this.select_cell(r, c, cx);
-                    if pointing {
-                        // the reference is written; nothing else to do
-                    } else if dbl {
-                        // Double-click enters inline edit mode (Excel-style).
-                        this.sheet_begin_edit(None, cx);
-                    } else if has_link {
-                        this.sheet_follow_hyperlink(r, c, cx);
-                    }
-                }
-                // Keep keyboard focus on the grid after a click inside the
-                // virtualized list (which would otherwise capture it).
-                this.focus.focus(window, cx);
-            });
+            ent2.update(cx, |this, cx| this.cell_click(r, c, shift, dbl, window, cx));
         });
         // Drag-select: while the left button is held, extend the selection to
         // whatever cell the pointer is over (on_mouse_move is hitbox-scoped, so
@@ -17570,13 +17664,7 @@ fn sheet_row(
         let ent_drag = ent.clone();
         cell = cell.on_mouse_move(move |ev, _window, cx| {
             if ev.pressed_button == Some(MouseButton::Left) {
-                ent_drag.update(cx, |this, cx| {
-                    if this.sheet_fill.is_some() {
-                        this.sheet_fill_over(r, c, cx);
-                    } else {
-                        this.sheet_drag_over(r, c, cx);
-                    }
-                });
+                ent_drag.update(cx, |this, cx| this.grid_drag_over(r, c, cx));
             }
         });
         // A formula's references, each in its own colour — drawn per edge cell

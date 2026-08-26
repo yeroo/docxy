@@ -274,17 +274,75 @@ clippy `-D warnings` and `cargo fmt --check` clean, root workspace `ctlcore`
 
 ### Task 3: Verbs that drive the grid and the panel
 
-- [ ] implement the verbs a UI test needs, each replying with enough state to
+- [x] implement the verbs a UI test needs, each replying with enough state to
       assert on: `open` (a fixture path), `click-cell`, `drag` (from → to),
       `type`, `key`, `select-chart`, `focus-field`, `cell` (read a cell's value),
       `selection` (read the current selection), `quit`
-- [ ] route each verb through the SAME entry point the real UI uses, not a
+- [x] route each verb through the SAME entry point the real UI uses, not a
       parallel path — a verb that bypasses the handler under test would pass
       while the app is broken, which is the one way this harness could be worse
       than useless
-- [ ] write tests for verb parsing and argument validation, including a verb
+- [x] write tests for verb parsing and argument validation, including a verb
       naming a cell that does not exist and a drag with a malformed range
-- [ ] run tests — must pass before Task 4
+- [x] run tests — must pass before Task 4
+
+#### The verbs, and the entry point each one drives
+
+| Verb | Args | Goes through |
+|---|---|---|
+| `ping` | — | (the channel itself) |
+| `open` | `path` | `open_args` — the command-line path |
+| `click-cell` | `cell`, `shift?`, `double?` | `grid_press_cell` → `cell_click` → `grid_release` |
+| `drag` | `from`+`to`, or `range` | `grid_press_cell` → `grid_drag_over` per cell crossed → `grid_release` |
+| `type` | `text` | `on_key`, one event per character |
+| `key` | `key`, or `keys: []` | `on_key` |
+| `select-chart` | `index` | `chart_press` → `grid_release` |
+| `focus-field` | `field` | `ref_field_focus` |
+| `cell` | `cell` | reads `cell_text` / `edit_string` |
+| `selection` | — | reads |
+| `quit` | — | `persist`, then the app stops |
+
+Four handler bodies were **lifted out of their closures into methods** so a verb
+calls the code the pointer calls rather than a second copy of the same rules:
+`grid_press_cell` (out of `grid_press`, past the pixel hit-test), `cell_click`
+(the cell's own `on_click`), `grid_drag_over` (the cell's `on_mouse_move` —
+which is where "is this sweep a fill or a selection?" is decided, i.e. the
+regression itself), and `ref_field_focus` (a reference field's mouse-down). The
+render sites now call those methods, so there is one body each.
+
+Every driving verb replies with the same state object — `sel`, `anchor`,
+`range`, `editing`/`edit`, `dirty`, `chart_sel`, `panel_chart`, `charts`,
+`field`/`field_text`, and the four the regressions are about: `filling`,
+`fill_preview`, `picking`, `sel_hidden`. So `drag A1:C5` already answers "did it
+select without filling" without a screenshot; Task 5 adds the pixels for
+"solid, not dashed".
+
+Verified against the built `suite.exe` driven over the socket, not only in unit
+tests: `open`, `click-cell` (incl. double-click opening the editor), `drag`
+(A1→C5 selected `A1:C5` with `filling:false`, `fill_preview:null` and A1/A2
+unchanged), `type`+`enter` (committed 42 into C5, tab went `dirty`), `key` with
+a list (`down,down,shift+right` → `A4:B4`), `selection`, `cell`, and `quit`
+(replied, then the process went and its discovery file with it). Refusals
+checked live too: `A0`, `nonsense`, `A1:`, a missing `from`, a missing `cell`,
+`banana` as a key, empty `text`, an out-of-range chart, an unknown field, an
+unknown verb, a missing file.
+
+**Two scope notes, so they are a record rather than a surprise in Task 6.**
+
+1. `select-chart` and the Chart-panel `focus-field`s have no *success* path to
+   drive yet: no fixture in the repo carries a chart, and a sheet's Insert ▸
+   Chart is a mouse-only ribbon button (the KeyTip ribbon is the document one),
+   so nothing reachable by verb can author one. Their refusals are exercised;
+   the success paths need the chart-bearing fixture Task 6 adds.
+2. `focus-field` on an entry-bar field (`cond-format`, `validation`, `sort`,
+   `text-to-columns`) refuses unless that bar is already open, because a field
+   focused while its bar is shut is a state the UI cannot reach. Opening one
+   needs a ribbon-command verb, which this plan does not have; Task 6 will say
+   so if a case wants it.
+
+22 new unit tests (165 total in the suite crate), clippy `-D warnings` and
+`cargo fmt --check` clean in both workspaces; root workspace `gridcore` 370 and
+`ctlcore` 30 still pass.
 
 ### Task 4: The app reports geometry; the harness takes pixels
 
