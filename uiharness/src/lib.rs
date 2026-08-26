@@ -27,15 +27,23 @@
 //! - [`deflate`] / [`png`] — writing a real PNG with no image crate.
 //! - [`capture`] — HWND from PID, and the window capture itself.
 //! - [`driver`] — the control client, `rect`, and `shot`.
+//! - [`probe`] — reading a captured region: solid, dashed or absent, and in
+//!   what colour.
+//! - [`expect`] — the vocabulary a test states that in, and what a failure in
+//!   it reads like.
 //! - [`run`] — where a run's evidence is filed.
 
 pub mod capture;
 pub mod deflate;
 pub mod driver;
+pub mod expect;
 pub mod image;
 pub mod png;
+pub mod probe;
 pub mod run;
 
 pub use driver::{Driver, RegionRect, control_dir};
+pub use expect::{BorderCheck, BorderExpect, ExpectKind, check_border, parse_border};
 pub use image::{Image, RectPx};
+pub use probe::{LineKind, LineProbe, ProbeOpts, Side, probe_edge};
 pub use run::Run;

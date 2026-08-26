@@ -516,19 +516,111 @@ and `cargo fmt --check` clean in both workspaces.
 
 ### Task 5: Assertions about what was drawn
 
-- [ ] implement the pixel probes the first tests need: sample a straight run of
+- [x] implement the pixel probes the first tests need: sample a straight run of
       pixels along an edge and decide **solid vs dashed vs absent**, and match a
       colour within a tolerance so anti-aliasing does not fail a true result
-- [ ] express expectations in the test's own vocabulary — `border A1:C5 solid`,
+- [x] express expectations in the test's own vocabulary — `border A1:C5 solid`,
       `border A1:D5 dashed teal` — resolving to a rect via Task 4 and a probe
       via this task
-- [ ] on failure, report what was expected, what was observed, and the path to
+- [x] on failure, report what was expected, what was observed, and the path to
       the PNG. A failure that only says "assertion failed" would send the reader
       back to installing a build, which is what this plan exists to avoid
-- [ ] write tests for the probes over synthetic images: a solid line, a dashed
+- [x] write tests for the probes over synthetic images: a solid line, a dashed
       line at the shader's `2W` dash / `1W` gap pitch, an empty edge, and an
       anti-aliased edge that must still read as its nominal colour
-- [ ] run tests — must pass before Task 6
+- [x] run tests — must pass before Task 6
+
+#### The probe: a band, not a row
+
+`uiharness/src/probe.rs`. A region's rectangle is the region's own box, and the
+app draws its border straddling that box — inset `-1px`, `2px` wide — so of the
+two pixel rows the top border covers, exactly one is inside the crop. Rather
+than have every caller know that inset, `probe_edge` scans a **band** four
+pixels inward and keeps the line that best matches what was asked for. A crop
+one pixel off still reads the right line; an edge with nothing on it still reads
+absent, because nothing in the band matches.
+
+That band is also what makes the anti-aliasing requirement fall out rather than
+need handling. A 2px line that does not sit on a pixel boundary lands as a
+half-covered row, two full ones, and another half-covered row. The half rows are
+further from the nominal colour than any sane tolerance, the full ones are it
+exactly — so keeping the *best* line keeps the core, and the colour reported is
+the one the renderer asked for rather than a blend of it with the paper.
+
+`classify` is the pure core and takes a hit mask, not pixels:
+
+| Reading | When |
+|---|---|
+| `Absent` | ≤10% of the run |
+| `Solid` | one piece, ≥90% |
+| `Dashed` | ≥3 pieces, 25–90%, dashes and gaps each within 3× of each other |
+| `Broken` | anything else |
+
+One pixel of drop-out is closed before counting (anti-aliasing, not a dash — the
+shader's own gap is `1 × width` = 2px, so closing 1px cannot flatten a real
+dashed line), and pieces under 2px are dropped as speckle.
+
+**`Broken` is the fourth answer, and it is why the thresholds are what they
+are.** The plan asked for three; a line with a hole in it is none of them, and
+the first cut of `classify` called it dashed — two pieces covering 75% of the
+run looks exactly like a dash pattern to a rule that only counts pieces. It
+passed a test that ought to have failed, which is the worst thing a harness can
+do. Hence `DASH_MIN_SEGS` (a pattern needs at least two gaps to repeat; the
+shortest edge the grid draws is a 21px row, which still shows three or four
+dashes) and `DASH_SPREAD` (three unequal fragments are fragments). A reading
+nobody predicted is now reported as itself rather than rounded to the nearest
+thing the test was hoping for.
+
+#### The vocabulary
+
+`uiharness/src/expect.rs`, and `uiharness --config <sandbox> assert <expectation>`.
+
+```text
+border <region> [<side>…] <solid|dashed|absent> [<colour>]
+no border <region> [<colour>]
+```
+
+The region is Task 4's — plus writing `A1:C5` for `cell:A1:C5`, because a test
+about a selection should read like the selection. Only a real A1-style reference
+is rewritten: a bare word wrongly turned into `cell:` would quietly ask about
+the wrong thing, whereas a typo left alone comes back from the app as an error.
+Sides are optional and default to all four; the style words may come in either
+order after the region. Colours are named (`teal` = `BRAND`, `blue`/`purple`/
+`green` = the chart slot colours) or `#rrggbb`, and the names are pinned to
+`main.rs`'s own constants by a test — a test that passes against the wrong
+colour is testing nothing.
+
+`absent` **with** a colour is a real expectation and the useful one: "no teal
+line here", which leaves any other line on the edge alone. See the run below.
+
+#### Verified against the built `suite.exe`
+
+A sandboxed instance on `assets/sample.xlsx`, `drag A1 -> C5`, then asserted.
+This is the plan's own regression case: a swept range wears a **solid** border.
+
+| Asked | Answered |
+|---|---|
+| `border A1:C5 solid teal` | ok — all four edges `#2aa79b`, 98–100% of 248/116px |
+| `border A1:C5 dashed` | FAILED, each edge `solid (100% of 248px) #2aa79b` |
+| `border A1:C5 solid blue` | FAILED, `absent` — and under each, `what is drawn there: solid … #2aa79b` |
+| `no border H20 teal` | ok — an unselected cell |
+
+The colour miss is the one worth reading twice. Asking for blue and finding
+nothing is true but useless on its own, so a side that fails a *coloured*
+expectation is probed a second time against the background and the report says
+what is actually drawn there. Without that, a wrong-colour border and an absent
+one produce the same message.
+
+**And one finding that changes how a test should be written.** `no border H20`
+— no colour — FAILS on a perfectly ordinary cell, with `solid (100% of 61px)
+#d9d9d9` on its right and bottom. Those are the sheet's own gridlines. The
+nameless form asks "is there **any** line here", which is a real question for a
+region that should be blank, but it is not the question "is this cell
+unselected". That one is `no border H20 teal`. Recorded in `expect.rs`'s module
+note, because it is the kind of thing that is obvious once and never again.
+
+69 tests in `uiharness` (36 new), suite 178, clippy `-D warnings` and
+`cargo fmt --check` clean.
 
 ### Task 6: The script format, and the first real cases
 

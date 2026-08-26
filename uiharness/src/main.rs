@@ -9,6 +9,7 @@
 //! uiharness --config <sandbox> call drag '{"from":"A1","to":"C5"}'
 //! uiharness --config <sandbox> rect cell:A1:C5
 //! uiharness --config <sandbox> shot grid --run out/runs/1 --test drag-select
+//! uiharness --config <sandbox> assert border A1:C5 solid
 //! ```
 //!
 //! `--config` is the sandbox the instance was started with
@@ -19,7 +20,8 @@
 use ctlcore::json::Json;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use uiharness::{Driver, Run, control_dir};
+use uiharness::probe::ProbeOpts;
+use uiharness::{Driver, Run, check_border, control_dir, parse_border};
 
 const USAGE: &str = "\
 uiharness — drive a suite instance started with --harness
@@ -33,6 +35,13 @@ commands:
   rect REGION                   print a region's desktop rectangle
   shot REGION                   capture a region to a PNG
   window                        capture the whole window to a PNG
+  assert EXPECTATION...         capture a region and check what was drawn
+
+expectations:
+  border A1:C5 solid            every edge of the range, unbroken
+  border A1:D5 dashed teal      every edge dashed, in the brand teal
+  border A1 top solid teal      one named edge
+  no border B7                  nothing along any edge
 
 options for shot/window:
   --run DIR                     the run's output directory (default: ./uiharness-runs)
@@ -157,18 +166,7 @@ fn run() -> Result<String, String> {
                     .clone()
             };
             let (img, cap) = d.shot(&region)?;
-            let path = match &a.out {
-                Some(p) => {
-                    uiharness::png::write(p, &img).map_err(|e| format!("{}: {e}", p.display()))?;
-                    p.clone()
-                }
-                None => {
-                    let run = Run::create(&a.run_dir)
-                        .map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
-                    run.save(&a.test, &region, &img)
-                        .map_err(|e| format!("saving the capture: {e}"))?
-                }
-            };
+            let path = save(&a, &region, &img)?;
             Ok(format!(
                 "{region}: {}x{} -> {}  (via {})",
                 img.w,
@@ -178,6 +176,46 @@ fn run() -> Result<String, String> {
             ))
         }
 
+        // Take the picture and read it. The expectation names the region, so
+        // the crop that is checked and the PNG that is filed are the same
+        // pixels, from the same settled frame.
+        "assert" => {
+            let text = a.rest[1..].join(" ");
+            let exp = parse_border(&text)?;
+            let (img, cap) = d.shot(&exp.region)?;
+            let path = save(&a, &exp.region, &img)?;
+            let check = check_border(&exp, &img, ProbeOpts::default());
+            let mut report = check.report(Some(&path));
+            report.push_str(&format!(
+                "  capture:  {}x{} via {}\n",
+                img.w, img.h, cap.how
+            ));
+            // A failed expectation is a failed process: `Err` here is what puts
+            // the report on stderr and a non-zero code on the exit.
+            if check.passed() {
+                Ok(report)
+            } else {
+                Err(report)
+            }
+        }
+
         other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
+    }
+}
+
+/// File a capture: `--out` if the caller named a file, otherwise under the
+/// run's own directory in the folder named for the test that took it.
+fn save(a: &Args, region: &str, img: &uiharness::Image) -> Result<PathBuf, String> {
+    match &a.out {
+        Some(p) => {
+            uiharness::png::write(p, img).map_err(|e| format!("{}: {e}", p.display()))?;
+            Ok(p.clone())
+        }
+        None => {
+            let run =
+                Run::create(&a.run_dir).map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
+            run.save(&a.test, region, img)
+                .map_err(|e| format!("saving the capture: {e}"))
+        }
     }
 }
