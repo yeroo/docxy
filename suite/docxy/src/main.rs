@@ -1033,6 +1033,63 @@ struct Docxy {
     // they live as long as the window. `None` on every normal launch — the
     // harness is opt-in per process (`--harness`) and starts nothing otherwise.
     harness: Option<harness::Harness>,
+    // Measured bounds of the regions the harness's `rect` verb can name, written
+    // by `probe` elements during layout. Costs one out-of-flow zero-paint element
+    // per probed region per frame, harness or not — the alternative, gating them
+    // on harness mode, would mean the geometry a test asserts on came from a
+    // layout no ordinary run performs.
+    probes: std::rc::Rc<std::cell::RefCell<Probes>>,
+    // Frames rendered. The harness reports it with every rect so a driver can
+    // tell whether the geometry it just read is from a frame drawn AFTER the
+    // verbs it sent — a verb only marks the view dirty, so the frame that shows
+    // its effect has not been laid out by the time the reply goes out.
+    frame: u64,
+}
+
+/// Where the regions a harness test can name actually landed, as gpui measured
+/// them: window-relative, logical pixels.
+///
+/// Two lists because a probe records during the layout of the frame it belongs
+/// to, so the one being built is always incomplete. `render` moves `next` into
+/// `last` as each frame starts, and `rect` answers from `last` — the most recent
+/// frame that finished. Reading `next` instead would intermittently report a
+/// region as missing while its element was still queued.
+#[derive(Default)]
+struct Probes {
+    /// The frame currently being laid out.
+    next: Vec<(String, Bounds<Pixels>)>,
+    /// The last frame that finished — what `rect` answers from.
+    last: Vec<(String, Bounds<Pixels>)>,
+}
+
+impl Probes {
+    fn get(&self, name: &str) -> Option<Bounds<Pixels>> {
+        self.last.iter().find(|(n, _)| n == name).map(|(_, b)| *b)
+    }
+}
+
+/// A zero-paint element that records where it was laid out, under `name`.
+///
+/// Positioned absolutely and inset to zero, so it takes the whole of whatever
+/// it is a child of without joining that parent's flow: the probe measures the
+/// region rather than moving it. Charts and the Chart panel need this because
+/// their geometry is decided by the layout engine, and a harness that
+/// recomputed it would be asserting against a second copy of the layout instead
+/// of the one on screen.
+fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>) -> AnyElement {
+    let (cell, name) = (cell.clone(), name.into());
+    canvas(
+        move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| {
+            cell.borrow_mut().next.push((name, b));
+        },
+        |_b, _s, _w, _a| {},
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .right_0()
+    .bottom_0()
+    .into_any_element()
 }
 
 /// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
@@ -1544,6 +1601,45 @@ fn col_at_x(
         at += w;
     }
     None
+}
+
+/// The horizontal span of column `c` — its left edge and width, in pixels from
+/// the grid's left edge — or `None` when the column is not in the drawn window
+/// (scrolled off to the left of `col0`, or past `max_col`).
+///
+/// The exact inverse of [`col_at_x`], and deliberately the same walk: gutter,
+/// then the frozen columns, then the scrolled window from `col0`. Every `x`
+/// that `col_at_x` answers `c` for falls inside this span, which is the
+/// property `col_span_x_inverts_col_at_x` pins down — a harness that cropped a
+/// screenshot to a cell one column off would assert on the wrong pixels and
+/// still pass.
+fn col_span_x(
+    col_w_px: impl Fn(u32) -> f32,
+    c: u32,
+    fc: u32,
+    col0: u32,
+    max_col: u32,
+) -> Option<(f32, f32)> {
+    if c > max_col {
+        return None;
+    }
+    let mut at = SHEET_GUT;
+    if c < fc {
+        for k in 0..c {
+            at += col_w_px(k);
+        }
+        return Some((at, col_w_px(c)));
+    }
+    for k in 0..fc {
+        at += col_w_px(k);
+    }
+    if c < col0 {
+        return None;
+    }
+    for k in col0..c {
+        at += col_w_px(k);
+    }
+    Some((at, col_w_px(c)))
 }
 
 /// What committing a series-NAME field should do with the text in it.
@@ -3709,6 +3805,8 @@ impl Docxy {
             bar_field: None,
             bar_range: None,
             harness: None,
+            probes: Default::default(),
+            frame: 0,
         }
     }
 
@@ -5050,6 +5148,131 @@ impl Docxy {
             }
         }
         None
+    }
+
+    /// Where a harness region is, relative to the window's client area, in
+    /// logical pixels — or why it has no rectangle right now.
+    ///
+    /// Every answer comes from what the layout engine actually measured: the
+    /// list's own viewport bounds, its per-row bounds, the same column widths
+    /// the renderer walks, and the `probe` elements the Chart panel and the
+    /// chart cards carry. Nothing here recomputes a position the renderer
+    /// already decided, so a region cannot drift from the pixels it names.
+    fn region_bounds(
+        &self,
+        region: harness::Region,
+        window: &Window,
+    ) -> Result<Bounds<Pixels>, String> {
+        use harness::Region;
+        match region {
+            Region::Window => Ok(Bounds {
+                origin: point(px(0.), px(0.)),
+                size: window.viewport_size(),
+            }),
+            Region::Grid => self.grid_bounds(),
+            Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
+            Region::ChartPanel => self
+                .probes
+                .borrow()
+                .get("chart-panel")
+                .ok_or_else(|| "the Chart panel is not open".to_string()),
+            Region::Chart(i) => {
+                let n = self.chart_count();
+                if i >= n {
+                    return Err(match n {
+                        0 => "this sheet has no charts".to_string(),
+                        _ => format!("no chart {i}; this sheet has {n} (0..{})", n - 1),
+                    });
+                }
+                self.probes
+                    .borrow()
+                    .get(&format!("chart:{i}"))
+                    .ok_or_else(|| {
+                        format!(
+                            "chart {i} is scrolled out of the grid's view, so it has no rectangle"
+                        )
+                    })
+            }
+        }
+    }
+
+    /// The grid's scrolling cell area: the virtualized row list's own measured
+    /// bounds, which is the band a cell can be in.
+    fn grid_bounds(&self) -> Result<Bounds<Pixels>, String> {
+        let v = self
+            .active_sheet()
+            .ok_or_else(|| "the active tab is not a spreadsheet".to_string())?;
+        let b = v.vlist.viewport_bounds();
+        if b.size.width <= px(0.) || b.size.height <= px(0.) {
+            return Err("the grid has not been laid out yet".to_string());
+        }
+        Ok(b)
+    }
+
+    /// The box two cells span, corner to corner. One cell twice is that cell.
+    fn cells_bounds(&self, a: (u32, u32), b: (u32, u32)) -> Result<Bounds<Pixels>, String> {
+        let list = self.grid_bounds()?;
+        let v = self
+            .active_sheet()
+            .ok_or_else(|| "the active tab is not a spreadsheet".to_string())?;
+        let sh = v.sheet();
+        // Frozen rows render OUTSIDE the list, so the list cannot locate them —
+        // the same limit `cell_at` has. Refusing is the honest answer; guessing
+        // would put a crop over the wrong band.
+        if sh.freeze.0 > 0 {
+            return Err(
+                "this sheet has frozen rows, which render outside the row list; \
+                 cell rectangles are not available on it"
+                    .to_string(),
+            );
+        }
+        let (r0, r1) = (a.0.min(b.0), a.0.max(b.0));
+        let (c0, c1) = (a.1.min(b.1), a.1.max(b.1));
+        let row_band = |r: u32| -> Result<Bounds<Pixels>, String> {
+            if sh.row_hidden(r) {
+                return Err(format!("row {} is hidden", r + 1));
+            }
+            let band = v
+                .vlist
+                .bounds_for_item(v.row_list_index(r))
+                .ok_or_else(|| format!("row {} is not on screen; scroll to it first", r + 1))?;
+            if band.bottom() <= list.top() || band.top() >= list.bottom() {
+                return Err(format!("row {} is scrolled out of the grid's view", r + 1));
+            }
+            Ok(band)
+        };
+        let fc = sh.freeze.1.min(64);
+        let col0 = v.col0.max(fc).min(MAX_VISIBLE_COL);
+        let col_span = |c: u32| -> Result<(f32, f32), String> {
+            let (x, w) = col_span_x(|k| col_px(sh.col_width(k)), c, fc, col0, MAX_VISIBLE_COL)
+                .ok_or_else(|| {
+                    format!(
+                        "column {} is scrolled off to the left of the grid's view",
+                        gridcore::sheet::col_name(c)
+                    )
+                })?;
+            // `col_span_x` walks as far right as it is asked to, so a column
+            // past the right edge still has a position — one that is not on
+            // screen. Reporting it would hand back a rectangle outside the
+            // window, and the crop would fail later with a message about
+            // pixels rather than about the column.
+            if list.left() + px(x) >= list.right() {
+                return Err(format!(
+                    "column {} is scrolled off to the right of the grid's view",
+                    gridcore::sheet::col_name(c)
+                ));
+            }
+            Ok((x, w))
+        };
+        let (top, bottom) = (row_band(r0)?.top(), row_band(r1)?.bottom());
+        let (lx, _) = col_span(c0)?;
+        let (rx, rw) = col_span(c1)?;
+        // Columns are measured from the list's left edge, exactly as `cell_at`
+        // measures a press; rows are already in window coordinates.
+        Ok(Bounds::from_corners(
+            point(list.left() + px(lx), top),
+            point(list.left() + px(rx + rw), bottom),
+        ))
     }
 
     /// The ranges the formula being typed mentions, for the grid to outline.
@@ -8153,6 +8376,9 @@ impl Docxy {
             .bg(pal.panel)
             .border_l_1()
             .border_color(pal.border)
+            // Where the harness's `chart-panel` region is measured. Out of flow,
+            // so it cannot shift a control.
+            .child(probe(&self.probes, "chart-panel"))
             // The panel is opaque to the mouse: a press that lands on it (or on
             // the gaps between its controls) must not reach the grid behind and
             // move the cell selection out from under the chart being edited.
@@ -16035,6 +16261,15 @@ impl Docxy {
 
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A new frame: what the probes recorded during the last one is now the
+        // complete answer, and they start collecting this one afresh. Stale
+        // entries cannot survive — a chart that was deleted simply does not
+        // record itself again.
+        self.frame = self.frame.wrapping_add(1);
+        {
+            let mut p = self.probes.borrow_mut();
+            p.last = std::mem::take(&mut p.next);
+        }
         // Apply the theme choice (Auto follows the OS appearance).
         let desired = match self.theme_pref {
             ThemePref::Auto => ThemeMode::from(window.appearance()),
@@ -16634,6 +16869,7 @@ impl Render for Docxy {
                     sheet_grid_w,
                     self.grid_overlay(),
                     self.chart_ui(),
+                    &self.probes,
                     cx,
                 )
                 .into_any_element(),
@@ -18135,6 +18371,7 @@ fn sheet_el(
     grid_w: f32,
     ov: GridOverlay,
     chart_ui: ChartUi,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> AnyElement {
     use gridcore::sheet::cell_name;
@@ -18661,6 +18898,9 @@ fn sheet_el(
                         }
                     })
                     .child(chart_card(data, cw, ch))
+                    // Where the harness's `chart:N` region is measured — the card
+                    // as laid out, including a move or resize still in progress.
+                    .child(probe(probes, format!("chart:{i}")))
                     // The selection frame sits just outside the card, like Excel's,
                     // with a grip on each corner and edge.
                     .when(selected, |d| {
@@ -19271,6 +19511,47 @@ mod grid_geom_tests {
         );
         // Past the last column there is no cell.
         assert_eq!(col_at_x(w, 100_000.0, 0, 0, 255), None);
+    }
+
+    #[test]
+    fn col_span_x_inverts_col_at_x() {
+        use super::col_span_x;
+        // Uneven widths, so a bug that assumed one width for all would show.
+        let w = |c: u32| 40.0 + (c % 5) as f32 * 23.0;
+        let g = super::SHEET_GUT;
+        for &(fc, col0) in &[(0u32, 0u32), (0, 7), (2, 9), (3, 3)] {
+            // Every x the hit-test resolves to a column must fall inside that
+            // column's reported span, and the span must be the one the crop
+            // uses. Off by one column and a screenshot assertion would be
+            // looking at the neighbour.
+            let mut x = 0.0f32;
+            while x < g + 900.0 {
+                // `None` is the gutter or past the last column: no span
+                // either way, so there is nothing to check.
+                if let Some(c) = col_at_x(w, x, fc, col0, 255) {
+                    let (left, width) =
+                        col_span_x(w, c, fc, col0, 255).expect("a hit column has a span");
+                    assert!(
+                        x >= left && x < left + width,
+                        "x={x} hit col {c} but its span is {left}..{}",
+                        left + width
+                    );
+                    assert_eq!(width, w(c), "the span's width is the column's width");
+                }
+                x += 1.0;
+            }
+        }
+        // Spans are contiguous: one column ends exactly where the next starts.
+        let (l5, w5) = col_span_x(w, 5, 0, 5, 255).unwrap();
+        let (l6, _) = col_span_x(w, 6, 0, 5, 255).unwrap();
+        assert_eq!(l5, g, "the leftmost scrolled column opens at the gutter");
+        assert_eq!(l5 + w5, l6);
+        // A frozen column keeps its fixed x however far the sheet is scrolled.
+        assert_eq!(col_span_x(w, 0, 2, 40, 255), Some((g, w(0))));
+        assert_eq!(col_span_x(w, 1, 2, 40, 255), Some((g + w(0), w(1))));
+        // Scrolled off to the left, or past the last column: no rectangle.
+        assert_eq!(col_span_x(w, 4, 0, 5, 255), None);
+        assert_eq!(col_span_x(w, 256, 0, 0, 255), None);
     }
 
     #[test]

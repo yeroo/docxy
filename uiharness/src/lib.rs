@@ -1,0 +1,41 @@
+//! `uiharness` — the driver side of the suite's scripted UI test harness.
+//!
+//! The suite starts a [`ctlcore`] control server when launched with `--harness`
+//! and an isolated `DOCXY_CONFIG_DIR` (see `suite/docxy/src/harness.rs`). This
+//! crate is what sits on the other end of that socket: it sends the verbs a
+//! test is written in, asks the app where a named region ended up, photographs
+//! the window, and cuts the region out of the picture.
+//!
+//! ## Who knows what
+//!
+//! The split is deliberate and is what keeps a region assertion from drifting
+//! when a panel moves:
+//!
+//! - **The app supplies the geometry.** Only the layout knows where the grid
+//!   starts, where `A1` is at this scroll position, or how big a chart card
+//!   became. It answers the `rect` verb in physical desktop pixels.
+//! - **The harness supplies the pixels.** gpui has no window readback in a
+//!   shipping build, so [`capture`] uses Win32 `PrintWindow` against the test
+//!   window's HWND — which captures that window alone even when it is partly
+//!   occluded, so a test does not have to own the desktop.
+//!
+//! Neither side has to guess at the other's layout.
+//!
+//! ## Modules
+//!
+//! - [`image`] — an RGBA buffer, and the arithmetic of cropping one.
+//! - [`deflate`] / [`png`] — writing a real PNG with no image crate.
+//! - [`capture`] — HWND from PID, and the window capture itself.
+//! - [`driver`] — the control client, `rect`, and `shot`.
+//! - [`run`] — where a run's evidence is filed.
+
+pub mod capture;
+pub mod deflate;
+pub mod driver;
+pub mod image;
+pub mod png;
+pub mod run;
+
+pub use driver::{Driver, RegionRect, control_dir};
+pub use image::{Image, RectPx};
+pub use run::Run;

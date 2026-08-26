@@ -94,6 +94,9 @@ because a panel moved.
   the event handlers the verbs will drive.
 - `suite/docxy/Cargo.toml` — the `suite` binary; `ctlcore` is not yet a
   dependency of it.
+- `uiharness/` — added in Task 4, in the ROOT workspace: the driver side (the
+  `ctlcore` client, `PrintWindow` capture, a from-scratch PNG encoder, the run
+  output directory). Depends on `ctlcore` and `opccore` only.
 
 ### What must NOT change
 
@@ -132,7 +135,9 @@ cargo build  --manifest-path suite/Cargo.toml
 cargo test   --manifest-path suite/Cargo.toml
 cargo build --all-targets
 cargo test  -p gridcore
+cargo test  -p uiharness          # the harness driver (Task 4 on)
 cargo clippy -p gridcore --all-targets -- -D warnings
+cargo clippy -p uiharness --all-targets -- -D warnings
 cargo fmt --check
 ```
 
@@ -346,17 +351,168 @@ unknown verb, a missing file.
 
 ### Task 4: The app reports geometry; the harness takes pixels
 
-- [ ] add a `rect` verb: given a region name (`window`, `grid`, `chart-panel`,
+- [x] add a `rect` verb: given a region name (`window`, `grid`, `chart-panel`,
       `cell:A1`, `chart:1`), reply with its on-screen rectangle in physical
       pixels, or an error naming the unknown region
-- [ ] write the harness-side capture: find the test instance's HWND from its
+- [x] write the harness-side capture: find the test instance's HWND from its
       PID, `PrintWindow` it to a bitmap, save as PNG, and crop to a rect
-- [ ] make every capture land in the run's own output directory alongside the
+- [x] make every capture land in the run's own output directory alongside the
       test that took it, so a failing test's evidence is findable
-- [ ] write tests for the pure parts: region-name parsing, and cropping a rect
+- [x] write tests for the pure parts: region-name parsing, and cropping a rect
       to an image's bounds (including a rect partly outside the image, which
       must clamp rather than panic)
-- [ ] run tests — must pass before Task 5
+- [x] run tests — must pass before Task 5
+
+#### The regions, and where each answer comes from
+
+| Region | Answered from |
+|---|---|
+| `window` | `window.viewport_size()` — the client area |
+| `grid` | `ListState::viewport_bounds()`, the row list's own measured band |
+| `cell:B3`, `cell:A1:C5` | `bounds_for_item` per row + `col_span_x` per column |
+| `chart-panel` | a `probe` element on the panel |
+| `chart:N` | a `probe` element on the card |
+
+`cell:` takes a range as readily as a single cell, so Task 5's `border A1:C5
+solid` names the selection rather than its two corners. That is beyond the
+plan's list; `cells:` is a synonym that reads better for one.
+
+**Nothing here recomputes a position the renderer already decided.** Rows come
+from the list's per-item bounds and columns from `col_span_x` — a new pure
+function that is the exact inverse of the existing `col_at_x` hit-test, walking
+gutter, then frozen columns, then the scrolled window, the same way.
+`col_span_x_inverts_col_at_x` pins that down over uneven widths and four
+freeze/scroll combinations: every x the hit-test resolves to a column falls
+inside that column's reported span. A crop one column off would assert on the
+neighbour's pixels and still pass.
+
+The Chart panel and the chart cards could not work that way — their geometry is
+decided by the layout engine, and a card's position folds in the scroll offset,
+hidden rows, frozen panes and a drag in progress. So they carry a **probe**: a
+zero-paint `canvas`, positioned `absolute` and inset to zero, which records
+where it was laid out. `Probes` keeps two lists and `render` moves `next` into
+`last` as each frame starts, so `rect` always answers from a frame that
+finished. (The same pattern as the existing `ruler_x0` cell, which a canvas
+already writes each paint.)
+
+Refusals name the thing: an unknown region lists the ones there are, `cell:A0`
+is not a cell, `chart:last` is not an index, a hidden row says so, and a column
+scrolled off says which side it went off. A cell rectangle is refused outright
+on a sheet with frozen ROWS — they render outside the list, so the list cannot
+locate them, which is the same limit `cell_at` has; guessing would put a crop
+over the wrong band.
+
+#### The staleness trap, and the `frame` verb
+
+Found by running it, not by reading it. Opening a chart workbook and asking for
+`chart:0` straight afterwards answered **"scrolled out of the grid's view"**
+while the chart was plainly on screen. Two lags compose:
+
+1. A verb only marks the view dirty. When its reply goes out, the frame that
+   shows what it did may not have been laid out.
+2. A probe records during the layout of its own frame, so the newest *complete*
+   set is always one frame behind.
+
+So `rect` alone cannot be trusted straight after a verb — and the failure mode
+is the bad one: it silently reports the picture from before the change.
+
+The fix is a `frame` verb, which returns the frame count and asks for a repaint.
+`Driver::settle` reads it as `f0` and waits for **`f0 + 2`** before measuring.
+Not `f0 + 1` — that frame may have begun before the verb landed. At `f0 + 2` the
+frame in between began after the read, hence after the verb, and its probes are
+what `rect` now answers from. `shot` settles once and then both measures and
+photographs, so the rect and the pixels come from the same state.
+
+#### The harness side: a new `uiharness` crate
+
+In the ROOT workspace (`uiharness/`), not the suite one: it needs Win32 and
+nothing from gpui, and the suite workspace stays as lean as it is deliberately.
+
+- `image.rs` — an RGBA buffer, `clamp_rect`, `crop`. A rect partly outside the
+  image clamps (a chart half out of view still has pixels worth looking at);
+  wholly outside is an `Err` naming both rectangles. Edges are computed in
+  `i64`, so `i32::MIN` plus `u32::MAX` cannot wrap into a bogus rectangle.
+- `deflate.rs` + `png.rs` — a real PNG with **no image or compression crate**:
+  fixed-Huffman DEFLATE with greedy LZ77 over a hash chain, the zlib wrapper,
+  PNG chunks with `opccore::zipwrite::crc32`, and per-row filtering
+  (None/Sub/Up/Paeth by the usual heuristic). Hand-rolling this is only
+  reasonable because the repo already owns an inflater: every deflate test
+  round-trips through `opccore::inflate::inflate_raw`, including **every one of
+  the 29 length and 30 distance codes**, and the PNG tests decode the file back
+  with a reader written straight from RFC 2083. A 1180x800 window capture comes
+  out at 68 KB from 3.7 MB of pixels.
+- `capture.rs` — `EnumWindows` to the visible top-level window of the PID (owned
+  windows skipped, so a tooltip is not mistaken for the app), then `PrintWindow`
+  with `PW_RENDERFULLCONTENT` into a top-down 32-bit DIB.
+  `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` first — without it
+  `GetWindowRect` reports a 96-DPI fiction and every crop on a scaled display is
+  off by that ratio.
+- `driver.rs` — `Driver::connect` / `call` / `rect` / `frame` / `settle` /
+  `shot`, over `ctlcore::client`. `control_dir` is derived from the sandbox root
+  exactly as the app derives it, so the two cannot look in different places.
+- `run.rs` — `<run>/<test>/<region>.png`, via a `slug` that strips what a
+  Windows path would swallow. `cell:A1:C5` must not keep its colons: on Windows
+  that names an alternate data stream, so the PNG would vanish rather than fail.
+- `main.rs` — `uiharness --config <sandbox> {ping|call|rect|shot|window}`.
+
+**One addition the plan did not call for, and why.** `PrintWindow` only reaches
+DWM-redirected content, and gpui draws with DirectX, so a GPU-composed window
+can come back blank. `capture_window` detects that (`is_blank` — a real window
+is never one flat colour) and falls back to copying the same rectangle off the
+screen, which needs the window unobstructed but always shows what is there.
+Which route a capture took is reported on the `Capture`, so a test can say so.
+In practice `PrintWindow` worked on every capture taken below.
+
+#### Verified against the built `suite.exe`
+
+Two sandboxed instances driven over the socket: `assets/sample.xlsx`, and a
+chart-bearing corpus workbook.
+
+| Asked | Answered |
+|---|---|
+| `window` | `1180x800 at (370,136)` — the client area |
+| `grid` | `1180x534 at (370,350)` |
+| `cell:A1` | `104x24 at (416,350)` — `370 + SHEET_GUT`, on the nose |
+| `cell:B3` | `65x24 at (520,398)` — one column right, two rows down |
+| `cell:A1:C5` | `252x120` — three columns by five rows |
+| `chart:0` | `1170x506 at (481,416)` |
+| `chart-panel` | `231x607 at (1319,303)` |
+| `chart-panel`, none open | "the Chart panel is not open" |
+| `chart:0`, no charts | "this sheet has no charts" |
+| `chart:5` of one | "no chart 5; this sheet has 1 (0..0)" |
+| `nope` | "unknown region 'nope' (window, grid, chart-panel, ...)" |
+| `cell:A0`, `cell:`, `chart:x` | each refused by name |
+| `cell:BB2` | "column BB is scrolled off to the right of the grid's view" |
+
+The PNGs were **opened and looked at**, not just measured: the `window` capture
+is the app pixel for pixel; `cell:A1:C5` is exactly the Item/Qty/Unit-price
+block and nothing else; `chart-panel` is the panel from its "Chart" heading down
+to the second series' colour swatches. `chart:0` came back `1077x506` rather
+than `1170` with the panel open — the card runs past the window edge, so the
+crop clamped, which is the partly-outside path working on a real region.
+
+That last table row is a change made *because* of what a run showed:
+`col_span_x` walks as far right as it is asked, so a column past the viewport
+had a position that was not on screen. Reporting it handed back a rectangle
+outside the window, and the crop then failed with a message about pixels
+instead of about the column.
+
+**A correction to Task 3's scope note.** It recorded that no fixture in the repo
+carries a chart. That is true of `assets/` and `corpus/xlsx/`, but *not* of
+`corpus/xlsx-ext/libreoffice/chart2/` — which is where the chart workbook used
+above came from, and which is how `chart:0`, `chart-panel` and `select-chart`
+all got a success path here. Task 6 can draw its chart fixture from there.
+
+**A footnote on the gpui finding, for Task 8.** `Window::render_to_image` exists
+and sounds like the readback this plan says is absent. It is behind
+`cfg(any(test, feature = "test-support"))` and re-renders the scene to an
+offscreen texture rather than reading what the compositor put on screen, so it
+is not available in a shipping build and would not show what a user sees. The
+plan's conclusion stands; the reason is narrower than "there is no such API".
+
+68 new unit tests (35 in the suite crate, 33 in `uiharness`); suite 178 passed,
+`uiharness` 33, `gridcore` 370, `ctlcore` 30, `opccore` 27; clippy `-D warnings`
+and `cargo fmt --check` clean in both workspaces.
 
 ### Task 5: Assertions about what was drawn
 

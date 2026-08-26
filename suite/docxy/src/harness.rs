@@ -518,6 +518,140 @@ pub fn typed_keys(text: &str) -> Result<Vec<Keystroke>, String> {
     Ok(out)
 }
 
+// ---- regions and their geometry (pure) ------------------------------------
+
+/// A named piece of the window a test can ask for the rectangle of.
+///
+/// The app answers these because the layout is the only thing that knows where
+/// they are. A harness that worked out "the grid starts 120px down" would be
+/// asserting against its own copy of the layout: it would break on a ribbon
+/// change, need correcting for DPI, and could not name `cell:A1` at all, since
+/// where that lands depends on the scroll position, the row heights and the
+/// frozen panes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    /// The window's whole client area — everything a capture contains except
+    /// the frame the OS draws.
+    Window,
+    /// The scrolling cell area of the grid: below the column header, above the
+    /// sheet-tab row.
+    Grid,
+    /// The Chart panel down the right-hand side, when one is open.
+    ChartPanel,
+    /// One cell, or the box a range of them covers.
+    Cells(u32, u32, u32, u32),
+    /// A chart card on the sheet, by index — the same index `select-chart` uses.
+    Chart(usize),
+}
+
+/// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
+/// `cell:A1:C5`, `chart:0`.
+///
+/// `cell:` takes a range as readily as a single cell, so an assertion about a
+/// selection border names the selection rather than its two corners.
+pub fn parse_region(name: &str) -> Result<Region, String> {
+    let name = name.trim();
+    let (head, arg) = match name.split_once(':') {
+        Some((h, a)) => (h.trim(), Some(a.trim())),
+        None => (name, None),
+    };
+    match head.to_ascii_lowercase().as_str() {
+        "window" => Ok(Region::Window),
+        "grid" => Ok(Region::Grid),
+        "chart-panel" => Ok(Region::ChartPanel),
+        "cell" | "cells" => {
+            let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
+                format!("'{head}' needs a cell or a range, e.g. {head}:B3 or {head}:A1:C5")
+            })?;
+            if let Some((r0, c0, r1, c1)) = parse_range_name(a) {
+                return Ok(Region::Cells(r0, c0, r1, c1));
+            }
+            let (r, c) = parse_cell(a)?;
+            Ok(Region::Cells(r, c, r, c))
+        }
+        "chart" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| "'chart' needs an index, e.g. chart:0".to_string())?;
+            let i: usize = a
+                .parse()
+                .map_err(|_| format!("'{a}' is not a chart index (they count from 0)"))?;
+            Ok(Region::Chart(i))
+        }
+        other => Err(format!(
+            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0)"
+        )),
+    }
+}
+
+/// The name a region reports itself under — [`parse_region`]'s inverse, so a
+/// reply names the same thing the request did.
+pub fn region_name(region: Region) -> String {
+    match region {
+        Region::Window => "window".into(),
+        Region::Grid => "grid".into(),
+        Region::ChartPanel => "chart-panel".into(),
+        Region::Cells(r0, c0, r1, c1) => format!("cell:{}", a1_range((r0, c0, r1, c1))),
+        Region::Chart(i) => format!("chart:{i}"),
+    }
+}
+
+/// A rectangle in physical screen pixels: what a harness crops a window capture
+/// to. `x`/`y` are signed because a window on a monitor to the left of the
+/// primary one has negative screen coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScreenRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+}
+
+impl ScreenRect {
+    /// As the `rect` verb reports it.
+    pub fn json(&self) -> Vec<(&'static str, Json)> {
+        vec![
+            ("x", Json::Num(self.x as f64)),
+            ("y", Json::Num(self.y as f64)),
+            ("w", Json::Num(self.w as f64)),
+            ("h", Json::Num(self.h as f64)),
+        ]
+    }
+}
+
+/// Turn a window-relative logical rectangle into physical screen pixels.
+///
+/// `rect` is `(x, y, w, h)` from the client area's top-left; `origin` is where
+/// that corner sits on the desktop, in the same logical units; `scale` is the
+/// display's scale factor.
+///
+/// Both EDGES are rounded, rather than the origin being rounded and the size
+/// scaled separately. Adjacent regions therefore keep sharing an edge in the
+/// result exactly as they do on screen: rounding each size independently would
+/// leave a one-pixel seam between two cells at some scroll positions and an
+/// overlap at others, and a probe that samples a border would read the wrong
+/// side of it.
+pub fn screen_rect(rect: (f32, f32, f32, f32), origin: (f32, f32), scale: f32) -> ScreenRect {
+    // A scale factor of zero or worse would collapse every rect onto a point;
+    // 1.0 is the only sane fallback and matches an unscaled display.
+    let s = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    let (x, y, w, h) = rect;
+    let left = ((origin.0 + x) * s).round();
+    let top = ((origin.1 + y) * s).round();
+    let right = ((origin.0 + x + w.max(0.0)) * s).round();
+    let bottom = ((origin.1 + y + h.max(0.0)) * s).round();
+    ScreenRect {
+        x: left as i32,
+        y: top as i32,
+        w: (right - left).max(0.0) as u32,
+        h: (bottom - top).max(0.0) as u32,
+    }
+}
+
 /// The reference fields a test can name, and the target each one is.
 pub fn parse_field(name: &str) -> Result<RefTarget, String> {
     let name = name.trim();
@@ -812,6 +946,56 @@ pub fn dispatch(
                 ("value", Json::Str(raw.clone())),
                 ("empty", Json::Bool(raw.is_empty())),
             ]))
+        }
+
+        // How many frames the app has drawn, and a request for one more.
+        //
+        // The primitive a driver waits on before it measures or photographs
+        // anything: a verb only marks the view dirty, so when its reply goes
+        // out the frame that shows what it did has not been laid out, and the
+        // probe geometry `rect` answers from is a frame older still. Asking
+        // for a region straight after a verb would report — or refuse — from
+        // before the change. See `Driver::settle`.
+        "frame" => {
+            cx.notify();
+            Done::ok(Json::obj(vec![("frame", Json::Num(app.frame as f64))]))
+        }
+
+        // Where a named region is, on the desktop, in physical pixels — so the
+        // harness can crop a window capture to it. The app answers because the
+        // layout is the only thing that knows; see [`Region`].
+        //
+        // `frame` comes back with it, and it is not decoration: a verb only
+        // marks the view dirty, so the frame that SHOWS what it did has not
+        // been laid out when the reply goes out. A driver reads `frame`, sends
+        // its verbs, then waits for `rect` to report a higher one before
+        // capturing — otherwise it would measure and photograph the frame
+        // before the change.
+        "rect" => {
+            let region = parse_region(arg_str(args, "region")?)?;
+            let b = app.region_bounds(region, window)?;
+            let win = window.bounds();
+            let r = screen_rect(
+                (
+                    f32::from(b.origin.x),
+                    f32::from(b.origin.y),
+                    f32::from(b.size.width),
+                    f32::from(b.size.height),
+                ),
+                (f32::from(win.origin.x), f32::from(win.origin.y)),
+                window.scale_factor(),
+            );
+            // Ask for a frame, so a driver that only ever calls `rect` still
+            // makes progress: an idle app draws nothing, and the count it is
+            // waiting on would never move.
+            cx.notify();
+            let mut out = vec![("region", Json::Str(region_name(region)))];
+            out.extend(r.json());
+            out.extend([
+                ("scale", Json::Num(window.scale_factor() as f64)),
+                ("frame", Json::Num(app.frame as f64)),
+            ]);
+            Done::ok(Json::obj(out))
         }
 
         // Read the selection and everything keyed to it, changing nothing.
@@ -1317,5 +1501,168 @@ mod tests {
         assert_eq!(a1_range((0, 0, 4, 2)), "A1:C5");
         // A one-cell range prints as the cell, not as "B2:B2".
         assert_eq!(a1_range((1, 1, 1, 1)), "B2");
+    }
+
+    // ---- region names ----
+
+    #[test]
+    fn the_plain_regions_parse() {
+        assert_eq!(parse_region("window"), Ok(Region::Window));
+        assert_eq!(parse_region("grid"), Ok(Region::Grid));
+        assert_eq!(parse_region("chart-panel"), Ok(Region::ChartPanel));
+        // Case and surrounding space are noise, as everywhere else here.
+        assert_eq!(parse_region("  Chart-Panel "), Ok(Region::ChartPanel));
+    }
+
+    #[test]
+    fn a_cell_region_takes_one_cell_or_a_range() {
+        assert_eq!(parse_region("cell:B3"), Ok(Region::Cells(2, 1, 2, 1)));
+        assert_eq!(parse_region("cell:A1:C5"), Ok(Region::Cells(0, 0, 4, 2)));
+        // `cells:` reads better for a range and means the same thing.
+        assert_eq!(parse_region("cells:A1:C5"), Ok(Region::Cells(0, 0, 4, 2)));
+        assert_eq!(parse_region("cell:b3"), Ok(Region::Cells(2, 1, 2, 1)));
+    }
+
+    #[test]
+    fn a_chart_region_takes_an_index() {
+        assert_eq!(parse_region("chart:0"), Ok(Region::Chart(0)));
+        assert_eq!(parse_region("chart:12"), Ok(Region::Chart(12)));
+    }
+
+    /// An unknown region must name itself in the refusal and list the ones
+    /// there are. A test that mistyped `chart_panel` would otherwise get a
+    /// rectangle-shaped silence and no idea why.
+    #[test]
+    fn an_unknown_region_is_refused_by_name() {
+        let e = parse_region("chart_panel").unwrap_err();
+        assert!(e.contains("chart_panel"), "{e}");
+        assert!(e.contains("chart-panel"), "{e}");
+        assert!(parse_region("").is_err());
+    }
+
+    #[test]
+    fn a_region_argument_that_names_nothing_is_refused() {
+        // A prefix with nothing after it.
+        let e = parse_region("cell:").unwrap_err();
+        assert!(e.contains("cell:B3"), "{e}");
+        assert!(parse_region("cell").unwrap_err().contains("needs a cell"));
+        // Not a cell, and not a range either.
+        assert!(parse_region("cell:banana").is_err());
+        // Rows count from 1, so there is no row 0 — the same strictness
+        // `parse_cell` has, for the same reason.
+        assert!(parse_region("cell:A0").is_err());
+        assert!(parse_region("cell:A1:").is_err());
+        // A chart index has to be one.
+        let e = parse_region("chart:last").unwrap_err();
+        assert!(e.contains("last"), "{e}");
+        assert!(parse_region("chart:-1").is_err());
+        assert!(parse_region("chart").unwrap_err().contains("chart:0"));
+    }
+
+    /// Every name a reply prints is a name the next request accepts.
+    #[test]
+    fn region_names_round_trip() {
+        for r in [
+            Region::Window,
+            Region::Grid,
+            Region::ChartPanel,
+            Region::Cells(2, 1, 2, 1),
+            Region::Cells(0, 0, 4, 2),
+            Region::Chart(3),
+        ] {
+            assert_eq!(parse_region(&region_name(r)), Ok(r));
+        }
+        // A one-cell region prints as the cell, not as a degenerate range.
+        assert_eq!(region_name(Region::Cells(2, 1, 2, 1)), "cell:B3");
+        assert_eq!(region_name(Region::Cells(0, 0, 4, 2)), "cell:A1:C5");
+    }
+
+    // ---- logical rect -> physical screen pixels ----
+
+    #[test]
+    fn an_unscaled_rect_is_offset_by_the_window_origin() {
+        let r = screen_rect((10.0, 20.0, 100.0, 50.0), (300.0, 200.0), 1.0);
+        assert_eq!(
+            r,
+            ScreenRect {
+                x: 310,
+                y: 220,
+                w: 100,
+                h: 50
+            }
+        );
+    }
+
+    #[test]
+    fn a_scaled_rect_scales_both_the_offset_and_the_size() {
+        let r = screen_rect((10.0, 20.0, 100.0, 50.0), (300.0, 200.0), 2.0);
+        assert_eq!(
+            r,
+            ScreenRect {
+                x: 620,
+                y: 440,
+                w: 200,
+                h: 100
+            }
+        );
+    }
+
+    /// Adjacent regions must still be adjacent after conversion. Rounding the
+    /// origin and scaling the size separately leaves a seam at some scroll
+    /// positions and an overlap at others, and a border probe would then sample
+    /// the wrong side of the line.
+    #[test]
+    fn adjacent_rects_stay_adjacent_at_a_fractional_scale() {
+        let scale = 1.5;
+        let mut x = 0.0f32;
+        let mut prev_right: Option<i32> = None;
+        // Widths that do not land on whole physical pixels at 1.5x.
+        for w in [37.0f32, 51.0, 40.0, 63.0, 19.0] {
+            let r = screen_rect((x, 0.0, w, 10.0), (0.5, 0.25), scale);
+            if let Some(p) = prev_right {
+                assert_eq!(r.x, p, "a gap or an overlap opened at x={x}");
+            }
+            prev_right = Some(r.x + r.w as i32);
+            x += w;
+        }
+    }
+
+    /// A window on a monitor left of the primary one has a negative origin, and
+    /// the rect has to survive it rather than wrapping through zero.
+    #[test]
+    fn a_negative_window_origin_is_kept() {
+        let r = screen_rect((10.0, 10.0, 20.0, 20.0), (-1920.0, -100.0), 1.0);
+        assert_eq!(r.x, -1910);
+        assert_eq!(r.y, -90);
+        assert_eq!((r.w, r.h), (20, 20));
+    }
+
+    /// A zero-size region is a legitimate answer (a collapsed panel); a
+    /// negative one is not, and must not wrap round to an enormous width.
+    #[test]
+    fn degenerate_sizes_clamp_to_zero() {
+        let r = screen_rect((10.0, 10.0, 0.0, 0.0), (0.0, 0.0), 1.0);
+        assert_eq!((r.w, r.h), (0, 0));
+        let r = screen_rect((10.0, 10.0, -50.0, -50.0), (0.0, 0.0), 1.0);
+        assert_eq!((r.w, r.h), (0, 0));
+    }
+
+    /// A scale factor of zero would collapse every region onto a point, and a
+    /// harness would crop nothing at all rather than fail loudly.
+    #[test]
+    fn a_nonsense_scale_falls_back_to_unscaled() {
+        for bad in [0.0, -2.0, f32::NAN] {
+            let r = screen_rect((10.0, 20.0, 30.0, 40.0), (0.0, 0.0), bad);
+            assert_eq!(
+                r,
+                ScreenRect {
+                    x: 10,
+                    y: 20,
+                    w: 30,
+                    h: 40
+                },
+                "scale {bad}"
+            );
+        }
     }
 }
