@@ -9,6 +9,8 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod harness;
+
 use std::path::PathBuf;
 
 use docxcore::comments::Comment;
@@ -1027,6 +1029,10 @@ struct Docxy {
     // While this is None the bar keeps following the selection, which is what
     // these bars did before they grew a range field.
     bar_range: Option<String>,
+    // The UI test harness's control server and its request pump, parked here so
+    // they live as long as the window. `None` on every normal launch — the
+    // harness is opt-in per process (`--harness`) and starts nothing otherwise.
+    harness: Option<harness::Harness>,
 }
 
 /// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
@@ -3702,6 +3708,7 @@ impl Docxy {
             sheet_rowh_edit: None,
             bar_field: None,
             bar_range: None,
+            harness: None,
         }
     }
 
@@ -18880,13 +18887,43 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
 }
 
 fn main() {
-    // Files passed on the command line (e.g. double-clicking a document in
-    // Explorer) — opened on top of the restored hot-exit session.
-    let cli_files: Vec<PathBuf> = std::env::args_os()
-        .skip(1)
-        .map(PathBuf::from)
-        .filter(|p| p.is_file())
-        .collect();
+    // The command line: files to open (e.g. double-clicking a document in
+    // Explorer, opened on top of the restored hot-exit session), plus the
+    // opt-in `--harness` flag.
+    let cli = harness::parse_args(std::env::args_os().skip(1));
+    for flag in &cli.unknown_flags {
+        eprintln!("docxy: ignoring unknown option {flag}");
+    }
+    let cli_files: Vec<PathBuf> = cli.files.into_iter().filter(|p| p.is_file()).collect();
+
+    // The harness control surface: started only when asked for, and only into
+    // an isolated config root. `gate` refuses to run against the installed
+    // app's own config, so a mistyped invocation cannot drive — and overwrite —
+    // the user's live instance. Both refusals are fatal rather than a silent
+    // downgrade: a harness that came up without its socket would leave its
+    // driver waiting on a discovery file that is never written.
+    let want_harness = cli.harness || harness::env_flag(std::env::var_os(harness::HARNESS_ENV));
+    let ctl = if want_harness {
+        let root = match harness::gate(
+            std::env::var_os(CONFIG_DIR_ENV).as_deref(),
+            dirs::config_dir().as_deref(),
+        ) {
+            Ok(root) => root,
+            Err(e) => {
+                eprintln!("docxy: {e}");
+                std::process::exit(2);
+            }
+        };
+        match harness::start(&root) {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                eprintln!("docxy: the harness could not start its control server: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
     gpui_platform::application().with_assets(DocxyAssets).run(move |cx: &mut App| {
         gpui_component::init(cx);
         // Tab / Shift-Tab are reserved by gpui's focus system; bind them to
@@ -18906,6 +18943,11 @@ fn main() {
         let startup_files = cli_files.clone();
         cx.open_window(options, move |window, cx| {
             let view = cx.new(Docxy::new);
+            // In harness mode, start draining control requests as soon as the
+            // view exists, so a driver can connect the moment the window is up.
+            if let Some((server, rx)) = ctl {
+                harness::attach(&view, server, rx, window, cx);
+            }
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {
                 view.update(cx, move |this, cx| this.open_args(startup_files, cx));

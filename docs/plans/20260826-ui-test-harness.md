@@ -213,18 +213,64 @@ author name), and the only two `dirs::` calls are the ones now behind
 
 ### Task 2: An opt-in harness mode that starts a control server
 
-- [ ] add `ctlcore` as a path dependency of the suite crate
-- [ ] add a `--harness` flag (or `DOCXY_HARNESS=1`): with it the suite starts a
+- [x] add `ctlcore` as a path dependency of the suite crate
+- [x] add a `--harness` flag (or `DOCXY_HARNESS=1`): with it the suite starts a
       `ctlcore::serve` listener and writes its discovery file under
       `config_root()`; without it, nothing changes and no listener is started
-- [ ] follow `docxy/src/control.rs` for the wiring — request pump, token check,
+- [x] follow `docxy/src/control.rs` for the wiring — request pump, token check,
       `reply_ok`/`reply_err` shapes — rather than inventing a second style
-- [ ] make the flag imply the isolated config root is REQUIRED: refuse to start
+- [x] make the flag imply the isolated config root is REQUIRED: refuse to start
       the harness against the real config directory, so a mistyped invocation
       cannot drive the user's own instance
-- [ ] write tests for the pure parts: flag parsing, and the refusal when the
+- [x] write tests for the pure parts: flag parsing, and the refusal when the
       config root is not an override
-- [ ] run tests — must pass before Task 3
+- [x] run tests — must pass before Task 3
+
+#### What was built
+
+`suite/docxy/src/harness.rs` — the whole surface, so `main.rs` gains only the
+call sites. The decisions are free functions with tests: `parse_args`,
+`env_flag`, `gate`, `same_dir`, `control_dir`.
+
+- **Enabling it.** `--harness` or `DOCXY_HARNESS=1`. `parse_args` keeps
+  unrecognized `--` arguments instead of dropping them, because the old
+  `filter(is_file)` would have swallowed a mistyped `--harnes` and the app would
+  have come up looking normal while the driver waited forever for a socket.
+- **The gate.** `gate(DOCXY_CONFIG_DIR, dirs::config_dir())` returns the sandbox
+  root, or refuses: no override, a blank override, or an override naming the
+  real config directory (compared textually, ignoring separator style, a
+  trailing slash and — on Windows — case; `canonicalize` is wrong here since the
+  sandbox usually does not exist yet, and it would fail open). Refusal exits 2
+  rather than starting degraded: a harness up without its socket hangs its
+  driver.
+- **Where the socket is published.** `<config_root>/suite/ctl`, derived from the
+  gated root — *not* `ctlcore::config_ctl_dir`, which does its own `APPDATA`
+  lookup and could put the socket in a different sandbox from `session.json`
+  (the Task 1 trap).
+- **The pump.** The one place this could not follow `docxy/src/control.rs`: the
+  terminal editor owns its event loop and selects over requests, while here the
+  thread belongs to gpui. So `attach` spawns a `window.spawn` foreground task
+  that `try_recv`s and applies each request through `update_in` — on the app's
+  own thread, no locking — sleeping 8ms when idle. The `Server` and the `Task`
+  are parked on `Docxy::harness`, so the discovery file is removed and the pump
+  cancelled when the window goes. Token checking and the `reply_ok`/`reply_err`
+  shapes are ctlcore's, unchanged.
+- **The verb table** has only `ping` (instance, pid, config_root, tab count) —
+  Task 3 fills it in. It is enough to prove the reply is produced on the app
+  thread, since it reports the app's own state.
+
+Verified against the real built `suite.exe`, not just in unit tests:
+
+| Run | Result |
+|---|---|
+| `--harness` + sandbox `DOCXY_CONFIG_DIR` | discovery file written under the sandbox; `ping` → `{"ok":true,…,"tabs":1}`; `nope` → `unknown verb 'nope'`; wrong token → `unauthorized`; the real `%APPDATA%\docxy` byte-identical before/after; `session.json` + `hot/tab-0.docx` landed in the sandbox |
+| `--harness`, no `DOCXY_CONFIG_DIR` | exit 2, message naming the variable |
+| `--harness`, `DOCXY_CONFIG_DIR=%APPDATA%` | exit 2, "will not drive the installed app's own state" |
+| no flag, sandbox root | app runs; `suite/ctl` never created — nothing listens |
+
+19 new unit tests; `cargo test --manifest-path suite/Cargo.toml` 143 passed,
+clippy `-D warnings` and `cargo fmt --check` clean, root workspace `ctlcore`
+30 passed.
 
 ### Task 3: Verbs that drive the grid and the panel
 
