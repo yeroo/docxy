@@ -652,6 +652,74 @@ mod tests {
         assert_eq!(by("green"), app("CHART_NAME_COLOR"));
     }
 
+    /// No two colours the grid actually draws may both match one pixel.
+    ///
+    /// `DEFAULT_TOL` is a radius, so colours `d` apart are separable only when
+    /// `2 * tol < d`. `NAMED_COLORS` alone is not the set to check: the grid
+    /// also draws a formula's references in `ref_color`'s palette, and the
+    /// closest pair in the union crosses the two palettes (chart blue vs the
+    /// first reference blue, 23 apart) — which is how a tolerance of 28 once
+    /// let `assert border … blue` pass on a reference border.
+    ///
+    /// The brand teal is deliberately both the selection ring and
+    /// `ref_color(3)`, so an exact-equal pair is allowed; anything strictly
+    /// between that and the separability floor is not.
+    #[test]
+    fn no_two_drawn_colours_can_both_match() {
+        use crate::probe::{DEFAULT_TOL, color_dist};
+
+        let src = suite_main_rs();
+        let decl = "const REF_COLORS: [u32; 6] = [";
+        let at = src
+            .find(decl)
+            .expect("REF_COLORS is gone from suite/docxy/src/main.rs");
+        let (list, _) = src[at + decl.len()..]
+            .split_once(']')
+            .expect("REF_COLORS closes");
+        let refs: Vec<u32> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| {
+                u32::from_str_radix(t.trim_start_matches("0x"), 16)
+                    .unwrap_or_else(|_| panic!("REF_COLORS holds a non-literal: {t}"))
+            })
+            .collect();
+        assert_eq!(refs.len(), 6, "REF_COLORS changed length");
+
+        let mut drawn: Vec<(String, u32)> = NAMED_COLORS
+            .iter()
+            // White and black are paper and text, not border colours; the
+            // borders are what this separability rule protects.
+            .filter(|(n, _)| *n != "white" && *n != "black")
+            .map(|(n, v)| ((*n).to_string(), *v))
+            .collect();
+        drawn.extend(
+            refs.iter()
+                .enumerate()
+                .map(|(i, v)| (format!("ref_color({i})"), *v)),
+        );
+
+        for i in 0..drawn.len() {
+            for j in (i + 1)..drawn.len() {
+                let (an, av) = &drawn[i];
+                let (bn, bv) = &drawn[j];
+                let d = color_dist(rgb(*av), rgb(*bv));
+                if d == 0 {
+                    continue; // the same colour under two names, on purpose
+                }
+                assert!(
+                    u32::from(d) > 2 * u32::from(DEFAULT_TOL),
+                    "{an} ({}) and {bn} ({}) are {d} apart, but DEFAULT_TOL is {}:                      one pixel can match both, so a colour assertion naming either                      would pass on the other. Lower DEFAULT_TOL below {}.",
+                    hex(rgb(*av)),
+                    hex(rgb(*bv)),
+                    DEFAULT_TOL,
+                    d.div_ceil(2),
+                );
+            }
+        }
+    }
+
     /// The app's source, as text. Not `include_str!`: a missing file must fail
     /// the test rather than the build, and it is only read to check a constant.
     fn suite_main_rs() -> String {

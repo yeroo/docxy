@@ -23807,8 +23807,15 @@ mod config_root_tests {
 
     /// The isolation guarantee itself: BOTH persisted locations sit under
     /// whatever `config_root` returns, and both move when the override moves.
-    /// Every env-touching assertion lives in this one test so it cannot race a
-    /// sibling test running on another thread.
+    /// Every env-touching assertion lives in this one test, because a getenv
+    /// concurrent with the setenv below is the undefined behaviour those calls
+    /// are `unsafe` for — and cargo runs this binary's tests on several
+    /// threads.
+    ///
+    /// ⚠️ That makes this a whole-binary invariant, not a local one: no other
+    /// test here may read the environment, however innocently. `harness.rs`'s
+    /// `an_existing_dir` exists for that reason — it replaced a
+    /// `std::env::temp_dir()` (which reads TMP/TEMP) that did race this.
     #[test]
     fn session_and_hot_both_follow_the_override() {
         /// Puts `DOCXY_CONFIG_DIR` back however this test ends.

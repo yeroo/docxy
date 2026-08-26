@@ -82,12 +82,37 @@ impl std::fmt::Display for Side {
     }
 }
 
-/// How far apart two colours may be, per channel, and still count as the same
-/// one. Wide enough to absorb anti-aliasing against a light background and the
-/// odd rounding in the compositor; far narrower than the gap between any two
-/// colours the grid draws (the closest pair in the reference palette is ~60
-/// apart), so it cannot make one border read as another.
-pub const DEFAULT_TOL: u8 = 28;
+/// How far a pixel may be, per channel, from a colour a test NAMED and still
+/// count as that colour ([`Target::Color`]).
+///
+/// ⚠️ This is what keeps a colour assertion honest, and its ceiling is set by
+/// the palette, not by how noisy captures are. A tolerance is a radius, so two
+/// colours the grid draws that are `d` apart can BOTH match one pixel unless
+/// it is under `d / 2` — and then `assert border … blue` passes on a border
+/// the app drew in a different blue, which is the one failure a colour
+/// assertion exists to rule out. The closest distinct pair the grid draws is
+/// the chart values blue `#4472c4` and the first formula-reference blue
+/// `#2f6fdb`, 23 apart; the two live in different palettes in main.rs and were
+/// never compared across them, which is how this once sat at 28.
+/// `no_two_drawn_colours_can_both_match` in `expect.rs` fails if a palette
+/// change narrows the gap again.
+///
+/// It can afford to be this tight because the band scan keeps the BEST line,
+/// whose core is the nominal colour exactly — the tolerance only has to cover
+/// compositor rounding, not a blended edge.
+pub const DEFAULT_TOL: u8 = 11;
+
+/// How far a pixel may be from the background and still count AS the
+/// background ([`Target::NotColor`]).
+///
+/// ⚠️ Deliberately not [`DEFAULT_TOL`]: the two targets want opposite things
+/// from a tolerance. "Is this pixel the blue I named" needs it tight enough to
+/// separate two blues. "Is this pixel not paper" needs it WIDE, because every
+/// near-paper pixel it fails to absorb — a blend against a soft shadow, the
+/// compositor's rounding on a flat fill — reads as a line, and `no border …`
+/// with no colour named starts failing on a blank region. Narrowing the one
+/// constant to fix the first question would have quietly broken the second.
+pub const BACKGROUND_TOL: u8 = 28;
 
 /// How deep into the region to look for the edge's line. Four pixels covers a
 /// 2px border straddling the boundary at any of the insets the grid uses, and
@@ -222,10 +247,12 @@ pub enum Target {
 }
 
 impl Target {
+    /// `tol` is the NAMED-colour tolerance; the background question uses
+    /// [`BACKGROUND_TOL`] instead, for the reason on that constant.
     fn hit(self, px: Rgba, tol: u8) -> bool {
         match self {
             Target::Color(c) => color_matches(px, c, tol),
-            Target::NotColor(bg) => !color_matches(px, bg, tol),
+            Target::NotColor(bg) => !color_matches(px, bg, BACKGROUND_TOL),
         }
     }
 }
@@ -436,7 +463,8 @@ pub fn classify(hits: &[bool]) -> LineReading {
 pub struct ProbeOpts {
     /// How many pixels inward from the edge to search for the line.
     pub depth: u32,
-    /// The per-channel colour tolerance.
+    /// The per-channel tolerance for a colour the test named. The background
+    /// question does not use it (see [`BACKGROUND_TOL`]).
     pub tol: u8,
     /// How many pixels to skip at each end of the run.
     pub margin: u32,
@@ -787,6 +815,37 @@ mod tests {
             "the tolerance must not blur two colours the grid draws"
         );
         assert_eq!(hex(TEAL), "#2aa79b");
+    }
+
+    /// The two tolerances answer opposite questions, so the named-colour one
+    /// must stay under half the closest gap in the palette while the
+    /// background one stays wide. Pinned here because a future "unify these"
+    /// would re-open exactly the hole this pair was split to close.
+    #[test]
+    fn the_named_colour_tolerance_separates_the_two_blues() {
+        let chart_blue: Rgba = [0x44, 0x72, 0xc4, 0xff];
+        let ref_blue: Rgba = [0x2f, 0x6f, 0xdb, 0xff];
+        assert_eq!(color_dist(chart_blue, ref_blue), 23);
+        assert!(
+            !color_matches(chart_blue, ref_blue, DEFAULT_TOL),
+            "a pixel cannot be allowed to match both blues"
+        );
+        // The property `2 * tol < dist` buys, which `tol < dist` does not: NO
+        // pixel matches both. `tol = 23` would also pass the assertion above
+        // and still let every pixel between the two blues answer to either
+        // name — which is the failure mode, not the distance itself.
+        for r in 0..=0xffu16 {
+            let px: Rgba = [r as u8, 0x70, 0xd0, 0xff];
+            assert!(
+                !(color_matches(px, chart_blue, DEFAULT_TOL)
+                    && color_matches(px, ref_blue, DEFAULT_TOL)),
+                "{} answers to both blues",
+                hex(px)
+            );
+        }
+
+        // A compile-time check: the background question must stay the wide one.
+        const _: () = assert!(BACKGROUND_TOL > DEFAULT_TOL);
     }
 
     #[test]

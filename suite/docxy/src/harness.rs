@@ -884,7 +884,7 @@ pub fn dispatch(
         // Type text, one key event per character.
         "type" => {
             for stroke in typed_keys(arg_str(args, "text")?)? {
-                app.on_key(&key_event(stroke), window, cx);
+                press(app, stroke, window, cx);
             }
             Done::ok(state(app))
         }
@@ -913,7 +913,7 @@ pub fn dispatch(
                 .map(|s| parse_key(s))
                 .collect::<Result<Vec<_>, _>>()?;
             for stroke in strokes {
-                app.on_key(&key_event(stroke), window, cx);
+                press(app, stroke, window, cx);
             }
             Done::ok(state(app))
         }
@@ -1047,6 +1047,55 @@ fn key_event(keystroke: Keystroke) -> KeyDownEvent {
         is_held: false,
         prefer_character_input: false,
     }
+}
+
+/// The keys the app binds to actions rather than reading in `on_key`, and the
+/// modifiers each binding carries.
+///
+/// gpui reserves Tab and Shift-Tab for focus traversal: it matches key
+/// BINDINGS before it delivers a key-down event, so these two never reach
+/// `on_key_down` and the app binds them as actions instead (the `cx.bind_keys`
+/// call in `main`). A harness that pushed them into
+/// `on_key` anyway would exercise a path the platform never takes — on a sheet
+/// it is a silent no-op, where a real Tab commits the edit and advances a
+/// cell. That is the "verb bypasses the handler under test" failure this
+/// harness exists to prevent, so [`press`] re-routes them.
+///
+/// ⚠️ This must list exactly what `cx.bind_keys` registers; `action_bound_keys_match_the_bindings`
+/// fails if the two drift.
+const ACTION_KEYS: &[(&str, bool)] = &[("tab", false), ("tab", true)];
+
+/// Whether `stroke` is one of [`ACTION_KEYS`] — i.e. gpui would dispatch it as
+/// an action instead of delivering it to `on_key`.
+fn is_action_key(stroke: &Keystroke) -> bool {
+    let m = &stroke.modifiers;
+    !m.control
+        && !m.alt
+        && !m.platform
+        && ACTION_KEYS
+            .iter()
+            .any(|(key, shift)| *key == stroke.key && *shift == m.shift)
+}
+
+/// Deliver one keystroke the way the platform would: through the bound action
+/// if gpui would match a binding first, otherwise through `on_key`.
+fn press(
+    app: &mut crate::Docxy,
+    stroke: Keystroke,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) {
+    if is_action_key(&stroke) {
+        // The only bindings are Tab and Shift-Tab; `is_action_key` has already
+        // ruled out every other modifier combination.
+        if stroke.modifiers.shift {
+            app.shift_tab_key(window, cx);
+        } else {
+            app.tab_key(window, cx);
+        }
+        return;
+    }
+    app.on_key(&key_event(stroke), window, cx);
 }
 
 #[cfg(test)]
@@ -1209,12 +1258,25 @@ mod tests {
         }
     }
 
+    /// A directory that is certainly there, for the tests that need to
+    /// canonicalize something real.
+    ///
+    /// ⚠️ Not `std::env::temp_dir()`, which reads TMP/TEMP. Reading the
+    /// environment here would race `session_and_hot_both_follow_the_override`
+    /// in main.rs — same test binary, and cargo runs tests on several threads
+    /// — and a getenv concurrent with that test's setenv is the undefined
+    /// behaviour those calls are `unsafe` for. `CARGO_MANIFEST_DIR` is
+    /// substituted at compile time, so nothing is read at run time at all.
+    fn an_existing_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    }
+
     /// The half `same_dir` cannot do: a spelling that walks out and back in
     /// names the same directory, and the gate has to see through it or a
     /// hand-typed override lands on the real profile.
     #[test]
     fn resolves_same_sees_through_a_dot_dot_spelling() {
-        let real = std::env::temp_dir();
+        let real = an_existing_dir();
         let Some(leaf) = real.file_name().map(std::ffi::OsString::from) else {
             return; // a root directory; there is nothing to walk out of
         };
@@ -1227,7 +1289,7 @@ mod tests {
     /// keeps it purely additive to the textual check.
     #[test]
     fn resolves_same_is_false_when_a_path_does_not_exist() {
-        let real = std::env::temp_dir();
+        let real = an_existing_dir();
         assert!(!resolves_same(
             &real.join("no-such-harness-dir-9f3a"),
             &real
@@ -1450,6 +1512,76 @@ mod tests {
         let k = stroke("a");
         assert_eq!(k.key_char.as_deref(), Some("a"));
         assert!(!k.modifiers.shift);
+    }
+
+    // ---- action-bound keys ----
+
+    /// The list the harness re-routes must be exactly what `cx.bind_keys`
+    /// registers. If a third binding is ever added and this list is not
+    /// updated, the harness would push that key into `on_key` — where the app,
+    /// by construction, does not read it — and every case using it would
+    /// silently assert nothing. Reading main.rs's source is the only way to
+    /// check a `cx.bind_keys` call from a test, and it is worth it here.
+    #[test]
+    fn action_bound_keys_match_the_bindings() {
+        let src = include_str!("main.rs");
+        let (_, after) = src
+            .split_once("cx.bind_keys([")
+            .expect("main.rs binds keys exactly once");
+        let (block, _) = after.split_once("]);").expect("the bind_keys call closes");
+        let bound: Vec<String> = block
+            .lines()
+            .filter_map(|l| l.split_once("KeyBinding::new(\""))
+            .filter_map(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_ascii_lowercase())
+            .collect();
+        assert!(!bound.is_empty(), "found no bindings to compare against");
+
+        let routed: Vec<String> = ACTION_KEYS
+            .iter()
+            .map(|(key, shift)| {
+                if *shift {
+                    format!("shift-{key}")
+                } else {
+                    key.to_string()
+                }
+            })
+            .collect();
+        assert_eq!(
+            bound, routed,
+            "the keys main.rs binds as actions and the keys `press` re-routes have drifted"
+        );
+        // `split_once` reads the FIRST call; a second one elsewhere would bind
+        // keys this test never sees. main.rs is the only file that binds any.
+        assert_eq!(
+            src.matches("cx.bind_keys([").count(),
+            1,
+            "main.rs binds keys in more than one place; this test reads only the first"
+        );
+    }
+
+    /// The routing decision itself: Tab and Shift-Tab go to the action, and a
+    /// chord on the same key does not (gpui matches no binding for it, so the
+    /// platform would deliver it as an ordinary key-down).
+    #[test]
+    fn only_the_bare_tab_chords_route_to_an_action() {
+        assert!(is_action_key(&stroke("tab")));
+        assert!(is_action_key(&stroke("shift+tab")));
+
+        assert!(!is_action_key(&stroke("ctrl+tab")));
+        assert!(!is_action_key(&stroke("ctrl+shift+tab")));
+        assert!(!is_action_key(&stroke("alt+tab")));
+        assert!(!is_action_key(&stroke("enter")));
+        assert!(!is_action_key(&stroke("a")));
+    }
+
+    /// Typing a literal tab is the same press, so it must route the same way —
+    /// `typed_keys` produces the very keystroke `parse_key("tab")` does.
+    #[test]
+    fn a_typed_tab_routes_to_the_action_too() {
+        let keys = typed_keys("	").expect("a tab is typable");
+        assert_eq!(keys.len(), 1);
+        assert!(is_action_key(&keys[0]));
     }
 
     /// The separator is also a key.

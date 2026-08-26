@@ -119,12 +119,28 @@ cold start, and every accepted and rejected form is a unit test.
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
 | `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
-| `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `f2`, `ctrl+c`, `shift+down`, … |
+| `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `f2`, `ctrl+c`, `shift+down`, … (`tab` and `shift+tab` go through the app's bound *action*, which is where gpui sends them — see below) |
 | `select chart <n>` | the press on a chart card, counting from 0 |
 | `focus <field>` | the click on a reference field |
 | `snapshot <range>` | remembers those cells, for a later `assert cells unchanged` |
 | `shot <region>` | files a PNG of the region |
 | `assert …` | see below |
+
+### Tab is the one key that is not a key press
+
+gpui reserves Tab and Shift-Tab for focus traversal: it matches key *bindings*
+before it delivers a key-down event, so those two never reach the app's
+`on_key`. The app binds them as actions instead (`InsertTabAction` /
+`OutdentAction`), which is where its Tab behaviour lives — on a sheet, commit
+the open edit and move one cell right or left.
+
+The harness routes them the same way, so `key tab` and a literal tab inside
+`type` both reach the real handler. This is worth stating because the obvious
+implementation — push every keystroke into `on_key` — makes `key tab` a silent
+no-op on a sheet, and a case asserting the selection *did not* move would then
+pass against a perfectly correct app. `ACTION_KEYS` in `harness.rs` lists what
+gets re-routed, and a test fails if it drifts from what `cx.bind_keys`
+registers.
 
 Reference fields, for `focus`: `chart-range`, `chart-title`, `categories`,
 `series-name:N`, `series-values:N`, `cond-format`, `validation`, `sort`,
