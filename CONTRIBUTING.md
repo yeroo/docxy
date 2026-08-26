@@ -77,9 +77,9 @@ calendar), `editcore`, `ribboncore` / `ribbonspec` / `backstagecore` and
 `ctlcore` (shared UI and the agent control surface), `docxwasm` / `gridwasm`
 (the browser builds), `comshimcore` / `xlcomshim` / `wordcomshim` (the COM
 shims), and `uiharness` (the driver side of the UI test harness above —
-`publish = false`, and the one root crate with a third-party dependency outside
-`mailcore`: `windows`, for the Win32 window capture). The desktop GPUI suite
-lives in its own workspace under `suite/`.
+`publish = false`, and dependent only on in-repo crates plus `windows`, for the
+Win32 window capture). The desktop GPUI suite lives in its own workspace under
+`suite/`.
 
 The three `*core` crates above must stay **dependency-free** (`std` only), as
 must `projcore` and `editcore`; `mailcore` is the exception, since IMAP and a

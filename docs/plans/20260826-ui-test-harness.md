@@ -553,7 +553,7 @@ the one the renderer asked for rather than a blend of it with the paper.
 |---|---|
 | `Absent` | ≤10% of the run |
 | `Solid` | one piece, ≥90% |
-| `Dashed` | ≥3 pieces, 25–90%, dashes and gaps each within 3× of each other |
+| `Dashed` | ≥3 pieces, 25–80%, dashes and gaps each within 3× of each other over the trimmed middle of the distribution (both revised in Task 6 §3 — `DASH_MAX = 0.80`, `TRIM_FRACTION`) |
 | `Broken` | anything else |
 
 One pixel of drop-out is closed before counting (anti-aliasing, not a dash — the
@@ -719,7 +719,9 @@ wrong about the thing the case was written for** — which is its own result:
    thing than the case said. Found by reading the transcript of a case that
    passed, which is the argument for the runner printing every step and not only
    the failures. `#` now only starts a comment when it is not the head of a
-   six-digit hex colour.
+   six-digit hex colour — and only on an `assert`, the one step that can name a
+   colour, so that ordinary six-hex-digit words (`decade`, `beefed`, `deface`)
+   still comment out a line anywhere else.
 
 **And one case that could not be expressed as written.** The plan's second
 regression case says "a pointed range that must dash". The first draft pointed
@@ -929,3 +931,40 @@ nothing stops a human looking at the whole picture.
   local-and-on-demand tool until that is solved.
 - Any verb for the Doc or Mail tabs; this plan covers the sheet UI, which is
   where the regressions have been.
+
+### Last review round
+
+The external review's second round crashed on an Anthropic session limit —
+three of its four lenses were cut off mid-investigation and synthesis exited 1,
+so nothing was surfaced to the loop. The adversarial lens had finished, and its
+four findings were recovered from the run directory
+(`.revmux/tasks/ralphex-20260826-ui-test-harness/02-20260826-183142/stages/1-found.json`)
+rather than re-run. All four are fixed here; three of them are the same bug the
+round before had *narrowed* rather than closed, which is the useful half of
+reviewing a fix rather than the original code.
+
+- **`slug` let a name out of its own directory.** `.` and `..` are made of
+  characters the filter accepts, so `slug("..")` was `".."` — one path
+  component that means the parent. `test ..` resolved a capture to
+  `<run>/../<region>.png`, and `png::write` creates the parent and calls
+  `fs::write`, so it could truncate a same-named PNG outside the evidence
+  directory. Only-dots now returns `unnamed`; a dot inside a name is untouched.
+- **The colour exception applied to every assertion.** It had been narrowed
+  from "any step" to "any `assert`", but only a *border* assertion names a
+  colour. `assert range is A1:C5 #decade later` kept `#decade`, and `parse_is`
+  stored `A1:C5 #decade later` as the expected value — a false failure on a
+  line its author had commented out, which is worse than the unknown-argument
+  error the first narrowing fixed. Now gated on `border` / `no border`.
+- **The new duplicate-case guard compared spellings, not directories.**
+  Evidence is filed under `slug(case.name)`, so `smoke case` and `Smoke-Case`
+  both passed the guard and both wrote to `smoke-case`. Compared as slugs now,
+  which also closes the same collision *within* one file — the class the
+  parser's own equal-name check cannot see.
+- **The unique sandbox was keyed on a reusable id.** Naming it for the process
+  fixed the fixed-path collision, but `--keep` detaches the suite and lets the
+  launcher exit, freeing the id while that instance is still running. A later
+  run handed the same id would have recursively deleted a live instance's
+  control directory, and the PID check downstream could not catch it — the
+  discovery record it would have compared against was the thing just deleted.
+  The name now carries a timestamp, and because no earlier run can have chosen
+  it, the recursive delete is gone entirely rather than made safer.

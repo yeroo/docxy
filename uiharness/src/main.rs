@@ -59,7 +59,7 @@ options for shot/window:
 options for run:
   --suite EXE                   the built suite to drive (default: $UIHARNESS_SUITE,
                                 else target/release then target/debug)
-  --sandbox DIR                 the throwaway config root (default: <run>/sandbox)
+  --sandbox DIR                 the throwaway config root (default: <run>/sandbox-<pid>)
   --keep                        leave the instance running after the script ends
 
 regions:
@@ -262,26 +262,41 @@ fn run_scripts(a: &Args) -> Result<String, String> {
         scripts.push((path, base, script));
     }
 
+    if let Some(clash) = uiharness::script::duplicate_case(
+        &scripts
+            .iter()
+            .map(|(p, _, s)| (p.display().to_string(), s))
+            .collect::<Vec<_>>(),
+    ) {
+        return Err(clash);
+    }
+
     let exe = uiharness::launch::find_suite(a.suite.as_deref())?;
     let run = Run::create(&a.run_dir).map_err(|e| format!("{}: {e}", a.run_dir.display()))?;
-    // ⚠️ The default sandbox is a fixed path under a fixed run directory, so it
-    // is the SAME directory on every invocation — and the app persists into it:
-    // `quit` writes `session.json` plus a hot sidecar holding each tab's live
-    // content, and the next launch restores those in preference to the file on
-    // disk. Left alone, run N+1 would start with run N's tabs and their unsaved
-    // edits, which is exactly the "testing that instance's history" the harness
-    // starts its own instance to avoid. A sandbox the caller named is theirs to
-    // manage (that is what `--sandbox` is for: keeping one across runs).
+    // ⚠️ The default sandbox must be one no other run can name, because the app
+    // persists into it: `quit` writes `session.json` plus a hot sidecar holding
+    // each tab's live content, and the next launch restores those in preference
+    // to the file on disk — a shared path would start run N+1 with run N's tabs
+    // and their unsaved edits, exactly the "testing that instance's history"
+    // the harness starts its own instance to avoid.
+    //
+    // The process id is not enough on its own. `--keep` detaches the suite and
+    // lets THIS process exit, which frees the id while that instance is still
+    // up; a later run handed the same id would land on the same path. So the
+    // name carries a timestamp too, and because no earlier run can have chosen
+    // it, there is nothing here to clear. That matters more than the tidiness:
+    // a recursive delete on a path someone else might hold is how a live
+    // instance loses its discovery file and two runs end up driving one window.
+    // A sandbox the caller named is theirs to manage (that is what `--sandbox`
+    // is for: keeping one across runs).
     let sandbox = match &a.sandbox {
         Some(p) => p.clone(),
         None => {
-            let p = run.dir().join("sandbox");
-            if let Err(e) = std::fs::remove_dir_all(&p) {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(format!("clearing the sandbox {}: {e}", p.display()));
-                }
-            }
-            p
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            run.dir()
+                .join(format!("sandbox-{}-{stamp}", std::process::id()))
         }
     };
     let mut app = uiharness::launch::launch(&exe, &sandbox)?;
@@ -299,6 +314,20 @@ fn run_scripts(a: &Args) -> Result<String, String> {
             });
         }
     };
+
+    // The instance that answered must be the one this process started. It is
+    // the same check the unique sandbox above makes unnecessary — and exactly
+    // the reason to keep it: if the two ever disagree, a run would be driving
+    // somebody else's window and reporting on it as if it were its own.
+    if driver.pid() != app.pid() {
+        let (found, ours) = (driver.pid(), app.pid());
+        app.shutdown(None);
+        return Err(format!(
+            "the instance publishing itself in {} is pid {found}, but the one this run \
+             started is pid {ours}; another harness instance is using this sandbox",
+            ctl.display()
+        ));
+    }
 
     // ⚠️ Which binary was driven, first line of every run. `find_suite` prefers
     // release over debug and does not compare dates, so a stale

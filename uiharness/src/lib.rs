@@ -49,11 +49,11 @@ pub mod runner;
 pub mod script;
 
 pub use driver::{Driver, RegionRect, Shot, control_dir};
-pub use expect::{
-    BorderCheck, BorderExpect, ExpectKind, check_border, check_border_clipped, parse_border,
-};
+pub use expect::{BorderCheck, BorderExpect, ExpectKind, check_border_clipped, parse_border};
 pub use image::{Clip, Image, RectPx};
 pub use probe::{LineKind, LineProbe, ProbeOpts, Side, probe_edge};
 pub use run::Run;
 pub use runner::{CaseOutcome, Runner, ScriptOutcome, Status, StepOutcome};
-pub use script::{Action, Assertion, Case, Script, ScriptError, Step, parse_script};
+pub use script::{
+    Action, Assertion, Case, Script, ScriptError, Step, duplicate_case, parse_script,
+};

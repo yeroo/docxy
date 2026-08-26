@@ -754,6 +754,25 @@ fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
         .ok_or_else(|| "the active tab is not a spreadsheet".to_string())
 }
 
+/// Whether a tab's status line says the load did not happen.
+///
+/// The loaders answer `loaded`, `loaded (markdown)` or `loaded — N sheets` when
+/// they read the file, and `read error: …` / `load error: …` / `xlsx load
+/// error: …` when they did not — and the failing branches hand back a real tab
+/// either way (an empty document, or a placeholder surface). So "it starts with
+/// `loaded`" is the whole test, and anything else is the app saying it did not
+/// open the file.
+fn load_failed(status: &str) -> bool {
+    !status.starts_with("loaded")
+}
+
+/// The active tab's reason for not being the file that was asked for, if it is
+/// not.
+fn load_failure(app: &crate::Docxy) -> Option<String> {
+    let t = app.tabs.get(app.active)?;
+    load_failed(&t.status).then(|| t.status.to_string())
+}
+
 /// Everything a cell verb's caller might assert on, in one reply: what is
 /// selected, what is being edited, which chart owns the selection, which field
 /// has the keyboard, and the previews the grid would be drawing.
@@ -776,6 +795,20 @@ fn state(app: &crate::Docxy) -> Json {
         (
             "dirty",
             Json::Bool(app.tabs.get(app.active).is_some_and(|t| t.dirty)),
+        ),
+        // What the tab's status line says. Reported because a refusal a modal
+        // dialog would otherwise have made is written here (that is what the
+        // `harness.is_none()` gates leave behind), and because a document that
+        // failed to load is still a tab with a title — the status is the only
+        // place the failure shows.
+        (
+            "status",
+            Json::Str(
+                app.tabs
+                    .get(app.active)
+                    .map(|t| t.status.to_string())
+                    .unwrap_or_default(),
+            ),
         ),
         ("sheet_tab", Json::Bool(app.active_is_sheet())),
     ];
@@ -853,7 +886,17 @@ pub fn dispatch(
                 return Err(format!("no such file: {raw}"));
             }
             app.open_args(vec![path], cx);
-            Done::ok(state(app))
+            // ⚠️ A load that failed still produces a tab. `doc_from_path`
+            // substitutes an empty document and records the reason in the
+            // tab's status, so the title is still the fixture's file name and
+            // nothing else in the reply tells the two apart — the step would
+            // be green and every assertion after it would be about a document
+            // that was never read. The status is the app's own word for how
+            // the load went, so it is what decides.
+            match load_failure(app) {
+                Some(why) => Err(format!("{raw}: {why}")),
+                None => Done::ok(state(app)),
+            }
         }
 
         // A click on a cell: press, click, release — the three events the
@@ -1347,6 +1390,31 @@ mod tests {
                 err.contains("not a cell reference"),
                 "message says what is wrong: {err}"
             );
+        }
+    }
+
+    /// The `open` verb's whole guard against a green step about a document
+    /// that never loaded. The loaders' success and failure wordings are the
+    /// contract, so they are pinned here rather than left to a reader to
+    /// notice: `Loaded::empty` hands back a real, editable tab titled with the
+    /// file's own name, and the status is the only place the failure shows.
+    #[test]
+    fn a_status_that_does_not_start_with_loaded_is_a_failed_open() {
+        for ok in [
+            "loaded",
+            "loaded (markdown)",
+            "loaded \u{2014} 1 sheet",
+            "loaded \u{2014} 3 sheets",
+        ] {
+            assert!(!load_failed(ok), "{ok}");
+        }
+        for bad in [
+            "read error: The system cannot find the file specified. (os error 2)",
+            "load error: NotZip",
+            "xlsx load error: NotZip",
+            "new",
+        ] {
+            assert!(load_failed(bad), "{bad}");
         }
     }
 

@@ -39,7 +39,12 @@ pub fn slug(name: &str) -> String {
     let s = out.trim_matches('-');
     let s: String = s.chars().take(80).collect();
     let s = s.trim_end_matches('-').to_string();
-    if s.is_empty() {
+    // `.` and `..` survive the filter above, and a slug is joined beneath the
+    // run directory as one path component — so `test ..` would resolve a
+    // capture to `<run>/../002-grid.png` and truncate a same-named PNG outside
+    // the evidence directory. Nothing else is only dots, so refusing the whole
+    // class costs no legitimate name.
+    if s.is_empty() || s.chars().all(|c| c == '.') {
         "unnamed".to_string()
     } else {
         s
@@ -109,6 +114,16 @@ mod tests {
     fn slug_never_returns_an_empty_or_edge_dashed_name() {
         assert_eq!(slug(""), "unnamed");
         assert_eq!(slug(":::"), "unnamed");
+        // A slug is joined beneath the run directory as one component, so a
+        // name that is only dots would step out of it: `test ..` would resolve
+        // its capture to `<run>/../<region>.png` and truncate a same-named PNG
+        // outside the evidence directory.
+        assert_eq!(slug(".."), "unnamed");
+        assert_eq!(slug("."), "unnamed");
+        assert_eq!(slug("..."), "unnamed");
+        assert_eq!(slug(" .. "), "unnamed");
+        // A dot that is part of a name is still a dot.
+        assert_eq!(slug("a..b"), "a..b");
         assert_eq!(slug("  spaced  "), "spaced");
         assert_eq!(slug("--x--"), "x");
     }

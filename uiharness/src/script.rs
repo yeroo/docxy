@@ -176,6 +176,45 @@ fn err(line: usize, message: impl Into<String>) -> ScriptError {
 const STEP_WORDS: &str =
     "open, click, drag, type, key, select chart, focus, snapshot, shot, assert";
 
+/// The first case name two of `scripts` share, as a message naming both files.
+///
+/// ⚠️ [`parse_script`] refuses a repeated `test` name, but only within the file
+/// it is parsing — and a run's evidence is filed under `<case>/<line>-<region>`
+/// with no room for which file the case came from. So `uiharness run a.uit
+/// b.uit`, where both hold a case called `smoke`, would have b's captures land
+/// on a's, and a's failing step would point at a picture of the other case's
+/// window. Checked over the whole run, before anything is launched, for the
+/// same reason parsing is: a name clash costs milliseconds rather than a cold
+/// start.
+pub fn duplicate_case(scripts: &[(String, &Script)]) -> Option<String> {
+    // Compared as slugs, not as written: the evidence directory is
+    // `slug(case.name)`, so `smoke case` and `smoke-case` are two accepted
+    // names that file their captures in one place. Comparing the spellings
+    // would wave them through.
+    let mut seen: Vec<(String, &str, &str)> = Vec::new();
+    for (file, script) in scripts {
+        for case in &script.cases {
+            let key = crate::run::slug(&case.name);
+            match seen.iter().find(|(slug, _, _)| *slug == key) {
+                Some((_, first_name, first_file)) if *first_name == case.name => {
+                    return Some(format!(
+                        "both {first_file} and {file} have a case called '{}'; their captures                          would land on top of each other",
+                        case.name
+                    ));
+                }
+                Some((_, first_name, first_file)) => {
+                    return Some(format!(
+                        "'{first_name}' in {first_file} and '{}' in {file} both file their                          evidence under '{key}'; their captures would land on top of each other",
+                        case.name
+                    ));
+                }
+                None => seen.push((key, &case.name, file)),
+            }
+        }
+    }
+    None
+}
+
 /// Parse a whole script.
 ///
 /// Pure. Blank lines are skipped and a `#` starts a comment to end of line —
@@ -189,10 +228,16 @@ pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
         // `type` keeps its comment; everything else loses it. Decided from the
         // first word, before trimming, so the rule is one place.
         let verbatim = head.eq_ignore_ascii_case("type");
+        // A colour can only appear in a *border* assertion, so that is the only
+        // place `#rrggbb` outranks a comment. Narrower than "any assert": the
+        // other forms take a value that is prose, so `assert range is A1:C5
+        // #decade later` would otherwise keep `#decade` and fail on a line its
+        // author believes they commented out.
+        let colors = head.eq_ignore_ascii_case("assert") && names_a_border(rest);
         let stripped = if verbatim {
             raw.trim().to_string()
         } else {
-            strip_comment(raw).trim().to_string()
+            strip_comment(raw, colors).trim().to_string()
         };
         if stripped.is_empty() {
             continue;
@@ -638,23 +683,44 @@ fn split_word(s: &str) -> (&str, &str) {
     }
 }
 
-/// Everything before an unquoted `#` that is not the start of a colour.
+/// Everything before an unquoted `#`, with `#rrggbb` kept where a colour can
+/// appear.
 ///
 /// ⚠️ `#rrggbb` is a colour, and `assert border A1:B4 solid #2f6fdb` was
 /// silently becoming `assert border A1:B4 solid` — an assertion that still
 /// passed, about a weaker thing than the case said. Caught by reading the
 /// runner's transcript of a case that passed, which is the argument for
 /// printing every step rather than only the failures.
-fn strip_comment(line: &str) -> &str {
+///
+/// `colors` is why the exception does not apply everywhere: only an assertion
+/// names a colour, and plenty of ordinary English words are six hex digits
+/// (`beefed`, `decade`, `deface`), so `click A1 #decade later` on any other
+/// step would keep a "colour" nothing can parse and fail on a line its author
+/// believes they commented out.
+fn strip_comment(line: &str, colors: bool) -> &str {
     let mut in_quote = false;
     for (i, ch) in line.char_indices() {
         match ch {
             '"' => in_quote = !in_quote,
-            '#' if !in_quote && !starts_hex_color(&line[i + 1..]) => return &line[..i],
+            '#' if !in_quote => {
+                // A colour only outranks a comment where a colour can appear.
+                if colors && starts_hex_color(&line[i + 1..]) {
+                    continue;
+                }
+                return &line[..i];
+            }
             _ => {}
         }
     }
     line
+}
+
+/// Whether an `assert`'s remainder is the one expectation that names a colour.
+/// Kept beside [`parse_assertion`]'s own test of the same two words so the pair
+/// cannot drift apart.
+fn names_a_border(rest: &str) -> bool {
+    let t = rest.trim_start().to_ascii_lowercase();
+    t.starts_with("border ") || t.starts_with("no border ")
 }
 
 /// Whether `rest` opens with exactly six hex digits followed by a word break —
@@ -684,6 +750,7 @@ fn unquote(s: &str) -> &str {
 mod tests {
     use super::*;
     use crate::expect::ExpectKind;
+    use crate::run::slug;
 
     const VALID: &str = "\
 # the drag-to-select regressions
@@ -788,12 +855,64 @@ test a pointed range dashes
         );
         // A word that merely starts with a `#` is still a comment.
         assert!(
-            strip_comment("shot grid #2f6fdbish")
+            strip_comment("assert border A1 solid #2f6fdbish", true)
+                .trim()
+                .ends_with("solid")
+        );
+        assert!(
+            strip_comment("shot grid # note", false)
                 .trim()
                 .ends_with("grid")
         );
-        assert!(strip_comment("shot grid # note").trim().ends_with("grid"));
-        assert!(strip_comment("shot grid #notes").trim().ends_with("grid"));
+        assert!(
+            strip_comment("shot grid #notes", false)
+                .trim()
+                .ends_with("grid")
+        );
+        // ⚠️ And on a step that has no colour to name, a hex-looking word is a
+        // comment like any other: `decade`, `beefed` and `deface` are all six
+        // hex digits, and keeping them would fail the line as an unknown
+        // argument instead of ignoring it as its author meant.
+        let s = parse_script(
+            "test t
+  click A1 #decade later
+",
+        )
+        .unwrap();
+        assert_eq!(s.cases[0].steps[0].source, "click A1");
+        // ⚠️ And the same on an `assert` that is not about a border. Only a
+        // border assertion names a colour; the others take a value that is
+        // prose, so `#decade` there is a comment too. Getting this wrong is
+        // worse than an unknown argument: `parse_is` would have stored
+        // `A1:C5 #decade later` as the expected value and reported a failure
+        // against a line the author had commented out.
+        let s = parse_script(
+            "test t
+  assert range is A1:C5 #decade later
+",
+        )
+        .unwrap();
+        assert_eq!(s.cases[0].steps[0].source, "assert range is A1:C5");
+        let s = parse_script(
+            "test t
+  assert cells unchanged #decade
+",
+        )
+        .unwrap();
+        assert_eq!(s.cases[0].steps[0].source, "assert cells unchanged");
+        // But a border assertion still outranks the comment, both spellings.
+        for src in [
+            "assert border H20 solid #4472c4",
+            "assert no border H20 #4472c4",
+        ] {
+            let s = parse_script(&format!(
+                "test t
+  {src}
+"
+            ))
+            .unwrap();
+            assert_eq!(s.cases[0].steps[0].source, src);
+        }
     }
 
     #[test]
@@ -847,6 +966,79 @@ test a pointed range dashes
         assert!(e.message.contains("no cases"), "{e}");
         let e = parse_script("test one\n  click A1\ntest one\n  click A1\n").unwrap_err();
         assert!(e.message.contains("also called"), "{e}");
+    }
+
+    /// The per-file rule is not enough: two files run together share one
+    /// evidence tree, so the same case name in both would still overwrite.
+    #[test]
+    fn two_files_in_one_run_may_not_share_a_case_name() {
+        let a = parse_script(
+            "test smoke
+  click A1
+",
+        )
+        .unwrap();
+        let b = parse_script(
+            "test smoke
+  click B2
+",
+        )
+        .unwrap();
+        let c = parse_script(
+            "test other
+  click C3
+",
+        )
+        .unwrap();
+        assert_eq!(
+            duplicate_case(&[("a.uit".to_string(), &a), ("c.uit".to_string(), &c)]),
+            None
+        );
+        let clash = duplicate_case(&[("a.uit".to_string(), &a), ("b.uit".to_string(), &b)])
+            .expect("the shared name is refused");
+        assert!(clash.contains("a.uit"), "{clash}");
+        assert!(clash.contains("b.uit"), "{clash}");
+        assert!(clash.contains("smoke"), "{clash}");
+        // The degenerate spelling of the same mistake.
+        assert!(duplicate_case(&[("a.uit".to_string(), &a), ("a.uit".to_string(), &a)]).is_some());
+    }
+
+    /// ⚠️ Two names that are not equal can still be one directory: evidence is
+    /// filed under `slug(case.name)`, which lowercases and folds punctuation to
+    /// dashes. Comparing the names as written would let `smoke case` and
+    /// `smoke-case` both through, and the later capture would overwrite the
+    /// earlier one — the same silent swap the equal-name check exists to stop.
+    #[test]
+    fn cases_that_differ_only_below_the_slug_are_refused_too() {
+        let a = parse_script(
+            "test smoke case
+  click A1
+",
+        )
+        .unwrap();
+        let b = parse_script(
+            "test Smoke-Case
+  click B2
+",
+        )
+        .unwrap();
+        assert_eq!(slug(&a.cases[0].name), slug(&b.cases[0].name));
+        let clash = duplicate_case(&[("a.uit".to_string(), &a), ("b.uit".to_string(), &b)])
+            .expect("one evidence directory for two cases is refused");
+        assert!(clash.contains("smoke case"), "{clash}");
+        assert!(clash.contains("Smoke-Case"), "{clash}");
+        assert!(clash.contains("smoke-case"), "{clash}");
+        // Within one file as well, which is the collision the parser's own
+        // equal-name check cannot see.
+        let both = parse_script(
+            "test smoke case
+  click A1
+test Smoke-Case
+  click B2
+",
+        )
+        .unwrap();
+        assert!(duplicate_case(&[("a.uit".to_string(), &both)]).is_some());
     }
 
     /// A non-breaking space is what pasting a step out of a document, a chat

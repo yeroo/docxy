@@ -447,7 +447,18 @@ impl<'a> Runner<'a> {
             // what each edge actually read, and in what colour.
             let body = check.report(None);
             let body = body.lines().skip(1).collect::<Vec<_>>().join("\n");
-            out.status = Status::Failed;
+            // A side that could not be read at all — clipped away by the crop,
+            // or a region too small to hold a run — lands in `errors` rather
+            // than in a reading, and that is `Error`'s definition above: the
+            // step says nothing about the thing under test. Labelling it
+            // `Failed` would also let the case carry on asserting against a
+            // window it cannot read, piling on failures whose real cause is
+            // geometry.
+            out.status = if check.errors.is_empty() {
+                Status::Failed
+            } else {
+                Status::Error
+            };
             // ⚠️ How the picture was taken belongs on the FAILING branch above
             // all: a screen-copy fallback can have another window over the
             // region, and "the border is absent" then has an explanation that

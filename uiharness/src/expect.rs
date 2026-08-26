@@ -16,7 +16,7 @@
 //! writing `A1:C5` for `cell:A1:C5`, because a test that is about a selection
 //! should read like the selection.
 //!
-//! [`check_border`] then reads the region's picture with the probes in
+//! [`check_border_clipped`] then reads the region's picture with the probes in
 //! [`crate::probe`] and produces a [`BorderCheck`], whose `report` is the whole
 //! point of this module:
 //!
@@ -57,8 +57,13 @@ use std::path::Path;
 
 /// The colours the grid draws its outlines in, by the name a test would use.
 ///
-/// These mirror constants in `suite/docxy/src/main.rs` — `BRAND` (:1283) and
-/// the chart slot colours (:2898) — and are duplicated rather than shared
+/// These mirror constants in `suite/docxy/src/main.rs` — `BRAND`, and the chart
+/// slot colours `CHART_VALUES_COLOR` / `CHART_CATEGORIES_COLOR` /
+/// `CHART_NAME_COLOR` — named rather than cited by line, because the names are
+/// what `the_named_colours_are_the_grids_own` looks up and a line number here
+/// has no way of staying true. Note that `REF_COLORS`, the formula-reference
+/// palette, is a different list and is deliberately not on this one; see
+/// `no_two_drawn_colours_can_both_match`. They are duplicated rather than shared
 /// because the two crates are in different workspaces. A test may always write
 /// `#rrggbb` instead, which is what to do for a colour that is not on this
 /// list; the list exists so the common cases read as English.
@@ -420,19 +425,13 @@ fn clipped_side(clip: Clip, side: Side) -> bool {
     }
 }
 
-/// Check an expectation against the region's pixels, where the crop covered the
-/// whole region.
+/// Check an expectation against the region's pixels, told which of the crop's
+/// edges are the CAPTURE's rather than the region's.
 ///
 /// Pure: the picture has already been taken and cropped. `img` must be the crop
 /// of the region the expectation names — [`crate::Driver::shot`] produces
 /// exactly that, and pairing the two is the caller's job (see
 /// `main.rs`'s `assert`).
-pub fn check_border(exp: &BorderExpect, img: &Image, opts: ProbeOpts) -> BorderCheck {
-    check_border_clipped(exp, img, opts, Clip::default())
-}
-
-/// The same check, told which of the crop's edges are the CAPTURE's rather than
-/// the region's.
 ///
 /// ⚠️ A region that runs off the window is cropped to what exists, and the
 /// resulting image's right column is then the window's right column. Probing it
@@ -491,6 +490,15 @@ pub fn check_border_clipped(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The check on a crop that IS the whole region — every image built here
+    /// is one, so there is no clip to pass. Deliberately not part of the
+    /// crate's surface: the two real callers both have a [`Clip`] and must
+    /// pass it, and an unclipped check on a clipped crop reads the window's
+    /// own edge as if it were the region's.
+    fn check_border(exp: &BorderExpect, img: &Image, opts: ProbeOpts) -> BorderCheck {
+        check_border_clipped(exp, img, opts, Clip::default())
+    }
 
     const TEAL: Rgba = [0x2a, 0xa7, 0x9b, 0xff];
     const BLUE: Rgba = [0x44, 0x72, 0xc4, 0xff];

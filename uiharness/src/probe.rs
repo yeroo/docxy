@@ -484,8 +484,9 @@ impl Default for ProbeOpts {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LineProbe {
     pub side: Side,
-    /// How many pixels inward from the edge the line was found. Reported
-    /// because a border at an unexpected inset is worth seeing in a failure.
+    /// How many pixels inward from the edge the line was found. Named by
+    /// [`LineProbe::describe`] when it is not zero, because a border at an
+    /// unexpected inset is worth seeing in a failure.
     pub offset: u32,
     pub reading: LineReading,
     /// The commonest colour among the matched pixels — the line's nominal
@@ -495,10 +496,20 @@ pub struct LineProbe {
 
 impl LineProbe {
     /// The probe in one line, as a failure message prints it.
+    ///
+    /// The inset is named only when it is not zero: a border a pixel or two in
+    /// from where the crop put the edge is what a rectangle that is slightly
+    /// off looks like, and that is worth reading in the failure rather than
+    /// going to the PNG for. A line flush against the edge is the ordinary
+    /// case and says nothing.
     pub fn describe(&self) -> String {
+        let inset = match self.offset {
+            0 => String::new(),
+            n => format!(" at +{n}px"),
+        };
         match self.color {
-            Some(c) => format!("{} {}", self.reading.describe(), hex(c)),
-            None => self.reading.describe(),
+            Some(c) => format!("{} {}{inset}", self.reading.describe(), hex(c)),
+            None => format!("{}{inset}", self.reading.describe()),
         }
     }
 }
@@ -546,10 +557,11 @@ fn modal(px: &[Rgba]) -> Option<Rgba> {
 /// That is what lets a caller name a region without knowing how far the
 /// renderer inset its border.
 ///
-/// `Err` when the crop is too small to hold a run: an image narrower than the
-/// margins, or shallower than the offset asked for. Reporting that is the
-/// point — a zero-pixel run would otherwise classify as `Absent` and a test
-/// would read "no border" when the truth is "no picture".
+/// `Err` when the crop is too small to hold a run a segment could survive in —
+/// an image whose edge, once the margins are skipped, is shorter than
+/// [`MIN_SEG`] — or one with no pixels across that edge at all. Reporting that
+/// is the point — such a run classifies as `Absent`, and a test would read "no
+/// border" when the truth is "no picture".
 pub fn probe_edge(
     img: &Image,
     side: Side,
@@ -564,11 +576,18 @@ pub fn probe_edge(
         Side::Top | Side::Bottom => img.h,
         Side::Left | Side::Right => img.w,
     };
-    if along <= opts.margin * 2 {
+    // ⚠️ Not `along <= margin * 2`. The run that is classified is
+    // `along - 2 * margin` long, and `classify` drops any segment shorter than
+    // `MIN_SEG` — so a run of one pixel is not "a very short reading", it is a
+    // coverage of 0.0 and a confident `Absent`, which is the exact answer this
+    // guard exists to stop. The threshold is the shortest run a segment can
+    // survive in.
+    let run = along.saturating_sub(opts.margin.saturating_mul(2));
+    if run < MIN_SEG as u32 {
         return Err(format!(
-            "the {}x{} region is too small to read its {side} edge: {along}px along it, \
-             with {}px skipped at each end",
-            img.w, img.h, opts.margin
+            "the {}x{} region is too small to read its {side} edge: {along}px along it \
+             leaves {run}px once {}px is skipped at each end, and a line needs {}px",
+            img.w, img.h, opts.margin, MIN_SEG
         ));
     }
     if across == 0 {
@@ -919,6 +938,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p.reading.kind, LineKind::Solid);
+    }
+
+    /// ⚠️ The guard is about what survives `classify`, not about what
+    /// `run_at` can slice. With the default 2px margins a 5px edge leaves one
+    /// pixel, `MIN_SEG` drops the one-pixel segment, and the reading would be
+    /// a confident `absent` on a region nobody could see — `no border` would
+    /// PASS there. So 5px is an error and 6px, which leaves a segment that can
+    /// live, is a reading.
+    #[test]
+    fn an_edge_too_short_to_hold_a_segment_is_an_error_not_an_absence() {
+        let opts = ProbeOpts::default();
+        let shortest = 2 * opts.margin + MIN_SEG as u32;
+        for w in 0..shortest {
+            let img = blank(w, 8);
+            let e = probe_edge(&img, Side::Top, Target::Color(TEAL), opts).unwrap_err();
+            assert!(e.contains("too small"), "{w}px: {e}");
+        }
+        let mut img = blank(shortest, 8);
+        hline(&mut img, 0, 1, TEAL, 1, 0);
+        let p = probe_edge(&img, Side::Top, Target::Color(TEAL), opts).unwrap();
+        assert_eq!(p.reading.kind, LineKind::Solid, "{}", p.describe());
+    }
+
+    /// The inset is measured on every probe, so a failure says it rather than
+    /// sending the reader to the PNG for something already known.
+    #[test]
+    fn an_inset_border_says_where_it_was_found() {
+        let mut img = blank(60, 30);
+        hline(&mut img, 2, 2, TEAL, 1, 0);
+        let p = probe_edge(&img, Side::Top, Target::Color(TEAL), ProbeOpts::default()).unwrap();
+        assert!(p.describe().contains("at +2px"), "{}", p.describe());
+        // The ordinary case says nothing: a line flush against the edge is
+        // where a border belongs.
+        let mut flush = blank(60, 30);
+        hline(&mut flush, 0, 2, TEAL, 1, 0);
+        let p = probe_edge(&flush, Side::Top, Target::Color(TEAL), ProbeOpts::default()).unwrap();
+        assert!(!p.describe().contains("at +"), "{}", p.describe());
     }
 
     /// The reason for the band: the app insets its border by 1px, so the line

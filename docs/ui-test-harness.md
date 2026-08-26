@@ -58,8 +58,8 @@ Useful flags on `run`:
 | Flag | Effect |
 |---|---|
 | `--suite EXE` | drive this binary. Otherwise `$UIHARNESS_SUITE` if it is set (an error if it does not name a file), otherwise the first build found — release before debug, under `suite/target/` then `target/`, relative to the repository this crate was built from and then the working directory. Release wins over debug whatever their dates, so every run prints the binary it drove as its first line — that is what makes a stale release build answering for a fresh debug one visible |
-| `--run DIR` | where evidence is filed (default `./uiharness-runs`, which is git-ignored) |
-| `--sandbox DIR` | the throwaway config root (default `<run>/sandbox`, **erased before each run**; a directory you name yourself is yours to manage, and is kept) |
+| `--run DIR` | where evidence is filed (default `./uiharness-runs`, which is git-ignored). The path a capture lands on is `<case>/<line>-<region>.png`, so two runs sharing this directory *at the same time* would file over each other's pictures — give them different `--run` directories if you run them in parallel. The instances themselves never share anything: each gets its own sandbox |
+| `--sandbox DIR` | the throwaway config root (default `<run>/sandbox-<pid>`, **erased before the launch**; named for the running process so two overlapping runs — or a run started while a `--keep` instance is still up — cannot delete each other's live control directory. A directory you name yourself is yours to manage, and is kept) |
 | `--keep` | leave the instance up after the script ends, to poke at the window a case failed on |
 
 ### Evidence
@@ -101,11 +101,20 @@ an argument.
 
 ## Writing a case
 
-A script (`*.uit`) is plain text. `#` starts a comment — except inside `type`,
-whose text is taken verbatim, because `#` is a character a spreadsheet test has
-every reason to type. A `test <name>` line starts a case and everything under it
-belongs to that case. Two cases may not share a name; their captures would land
-on top of each other.
+A script (`*.uit`) is plain text. `#` starts a comment, with two exceptions:
+inside `type`, whose text is taken verbatim, because `#` is a character a
+spreadsheet test has every reason to type; and inside a **border** assertion
+(`assert border …` / `assert no border …`), where a `#` followed by exactly six
+hex digits is a colour (see [Colours](#colours)) rather than a comment — so
+there, a comment after the colour needs a space or a non-hex word first. The
+exception is that narrow on purpose: a border assertion is the only step that
+names a colour, and plenty of ordinary words are six hex digits (`decade`,
+`beefed`, `deface`), so `assert range is A1:C5 #decade later` comments cleanly.
+A `test <name>` line starts a case and everything under it belongs to that case.
+Two cases may not share a name — not in one file and not across the files of one
+run; their captures would land on top of each other, and the run refuses before
+it launches anything. "Share a name" is judged after the name is folded to its
+evidence directory, so `smoke case` and `Smoke-Case` count as the same name.
 
 `parse_script` is a **pure function over the text**, and the runner parses every
 file before it launches anything — so a typo costs milliseconds rather than a
@@ -115,7 +124,7 @@ cold start, and every accepted and rejected form is a unit test.
 
 | Step | Drives |
 |---|---|
-| `open <path>` | the file, resolved **against the script's own directory** — never the working directory |
+| `open <path>` | the file, resolved **against the script's own directory** — never the working directory. A file the app could not read is an ERROR, not a silent green step: the loaders substitute an empty document and record the reason in `status`, so the step reads the status back and stops the case there |
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
 | `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
@@ -220,7 +229,7 @@ State keys, as the app reports them after every driving verb:
 
 | Key | |
 |---|---|
-| `tab`, `title`, `dirty`, `sheet_tab` | the active tab |
+| `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
@@ -263,7 +272,10 @@ wrong pixels.
 - The harness clamps a crop that runs off the *window* (there are still pixels
   worth filing as evidence) but records which edges it moved, and a border
   assertion then refuses those edges rather than reading the window's frame as
-  if it were the region's.
+  if it were the region's. That refusal is an **ERROR**, not a FAIL: nothing was
+  learned about the app, so the case stops there instead of carrying on and
+  reporting the same geometry as half a dozen more failures. The same goes for a
+  region too small to read an edge of at all.
 
 ### Colours
 
@@ -338,9 +350,9 @@ documents. The full case file was then run. Afterwards the real directory was
 made had landed in the sandbox instead:
 
 ```text
-target/uiharness-runs/sandbox/docxy/session.json
-target/uiharness-runs/sandbox/docxy/hot/tab-0.docx
-target/uiharness-runs/sandbox/docxy/hot/tab-1.xlsx
+target/uiharness-runs/sandbox-<pid>/docxy/session.json
+target/uiharness-runs/sandbox-<pid>/docxy/hot/tab-0.docx
+target/uiharness-runs/sandbox-<pid>/docxy/hot/tab-1.xlsx
 ```
 
 That pair is the whole proof: the run *did* persist, and it persisted somewhere

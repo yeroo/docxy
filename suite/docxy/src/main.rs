@@ -5343,6 +5343,18 @@ impl Docxy {
         let fc = sh.freeze.1.min(64);
         let col0 = v.col0.max(fc).min(MAX_VISIBLE_COL);
         let col_span = |c: u32| -> Result<(f32, f32), String> {
+            // `col_span_x` says `None` for two different reasons, and only one
+            // of them is about scrolling: a column past `MAX_VISIBLE_COL` is
+            // not drawn at all, so telling its author to scroll would send
+            // them the wrong way after a rectangle that does not exist.
+            if c > MAX_VISIBLE_COL {
+                return Err(format!(
+                    "column {} is past {}, the last column the grid \
+                     draws; no scroll position brings it into view",
+                    gridcore::sheet::col_name(c),
+                    gridcore::sheet::col_name(MAX_VISIBLE_COL)
+                ));
+            }
             let (x, w) = col_span_x(|k| col_px(sh.col_width(k)), c, fc, col0, MAX_VISIBLE_COL)
                 .ok_or_else(|| {
                     format!(
