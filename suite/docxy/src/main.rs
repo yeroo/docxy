@@ -16937,16 +16937,35 @@ fn range_border_plan(range: (u32, u32, u32, u32), view: (u32, u32, u32, u32)) ->
 /// ordinary tall selection to a solid border.
 const GRID_MAX_VISIBLE_ROWS: u32 = 128;
 
-/// Which range the dashed border outlines. A focused range field wins: while
-/// one has the keyboard the border's whole job is to show what it points at.
-/// Otherwise it outlines the selection, but only when that spans more than one
-/// cell — a single cell already wears the active ring, and drawing both would
-/// be the doubled-up indicator this plan is trying to remove.
+/// Which range wears a border. A focused range field wins: while one has the
+/// keyboard the border's whole job is to show what it points at. Otherwise it
+/// outlines the selection, but only when that spans more than one cell — a
+/// single cell already wears the active ring, and drawing both would be the
+/// doubled-up indicator this plan is trying to remove.
+///
+/// Whether that border is DASHED is a separate question, decided at the call
+/// site: only a pointed range dashes. A range swept with the mouse gets the
+/// same box, solid.
 ///
 /// `sel` is an Option because the selection can be there and not shown: while a
 /// chart owns the selection the grid draws none of its own (`sel_hidden`), and
 /// a range it does not outline is a range it must not border either. A POINTED
 /// range still wins in that state — that is a chart's own field pointing.
+/// Whether the range's border is drawn dashed rather than solid.
+///
+/// Dashes mean "a field is POINTING at these cells" — they are not decoration
+/// for a wide selection. Excel reserves its marching ants the same way, for a
+/// copy or a dialog's range picker, and a range swept with the mouse wears a
+/// solid border there. Dashing an ordinary selection made a plain drag look
+/// like a formula was reading it.
+///
+/// `within_cap` is the separate cost question (`range_border_dashed`): a border
+/// spanning more boundary cells than the cap falls back to solid even while
+/// pointing, because the renderer draws it cell by cell.
+fn border_is_dashed(pointing: bool, within_cap: bool) -> bool {
+    pointing && within_cap
+}
+
 fn border_range(
     preview: Option<(u32, u32, u32, u32)>,
     sel: Option<(u32, u32, u32, u32)>,
@@ -17601,7 +17620,6 @@ fn sheet_row(
         // nothing to the cell's size; and it is `deferred`, so it paints after the
         // neighbouring cells that would otherwise clip its outer half.
         if editing.is_none() && !ov.handle_hidden && !ov.sel_hidden && r == r1 && c == c1 {
-            let ent_fill = ent.clone();
             let ent_fill_dn = ent.clone();
             // Insets are measured from the PADDING box, so back out the cell's
             // border to reach the corner point, then half the box to centre on it.
@@ -17618,17 +17636,20 @@ fn sheet_row(
                     .items_center()
                     .justify_center()
                     .cursor(CursorStyle::Crosshair)
-                    // The press arms the fill (the deferred hitbox sits above the
-                    // list, so unlike a cell it does see mouse-down); the move is a
-                    // fallback for a drag that leaves the grip before it fires.
+                    // ONLY the press arms the fill. The deferred hitbox sits above
+                    // the list, so unlike a cell it does see mouse-down, and that
+                    // is the whole signal needed.
+                    //
+                    // There used to be an `on_mouse_move` fallback here for "a drag
+                    // that leaves the grip before the press fires", and it turned
+                    // every drag-to-select into a fill. The handle is pinned to the
+                    // selection's bottom-right corner, and while you sweep a range
+                    // that corner IS your pointer — so the handle was re-rendered
+                    // under the moving cursor, its move handler fired with the
+                    // button down, and selecting cells wrote to them instead.
                     .on_mouse_down(MouseButton::Left, move |_ev, _w, cx2| {
                         cx2.stop_propagation();
                         ent_fill_dn.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
-                    })
-                    .on_mouse_move(move |ev, _w, cx2| {
-                        if ev.pressed_button == Some(MouseButton::Left) {
-                            ent_fill.update(cx2, |this, cx2| this.sheet_fill_start(cx2));
-                        }
                     })
                     .child(
                         // A 6px square in a 1px white surround, so it reads against
@@ -18179,15 +18200,25 @@ fn sheet_el(
     // the range that will actually be DRAWN, or a two-row selection with one of
     // its rows hidden collapses to one cell and wears both the ring and a full
     // dashed box — the doubled indicator the guard exists to remove.
+    let preview_rg = ov
+        .range_preview
+        .map(|p| snap_range_rows(p, &visible, total_rows as u32));
     let border_rg = border_range(
-        ov.range_preview
-            .map(|p| snap_range_rows(p, &visible, total_rows as u32)),
+        preview_rg,
         shown_sel(&ov, (r0, c0, r1, c1)).map(|s| snap_range_rows(s, &visible, total_rows as u32)),
     );
-    let range_dashed = border_rg.is_none_or(|rg| {
-        let cols = (if fc > 0 { 0 } else { col0 }, cend);
-        range_border_dashed(rg, cols, GRID_MAX_VISIBLE_ROWS)
-    });
+    // Dashes mean "a field is POINTING at these cells", never merely "these
+    // cells are selected". Excel reserves its marching ants the same way — for
+    // a copy, or a dialog's range picker — and a range you swept with the mouse
+    // wears a solid border there. Dashing an ordinary selection made the two
+    // indistinguishable, so a plain drag looked like a formula was reading it.
+    let range_dashed = border_is_dashed(
+        preview_rg.is_some(),
+        border_rg.is_none_or(|rg| {
+            let cols = (if fc > 0 { 0 } else { col0 }, cend);
+            range_border_dashed(rg, cols, GRID_MAX_VISIBLE_ROWS)
+        }),
+    );
     // Re-wrapped only when there is something to snap: the common frame has no
     // formula open and no chart selected, and pays nothing.
     let formula_refs = if ov.formula_refs.is_empty() {
@@ -22186,6 +22217,27 @@ mod grid_geom_tests {
     /// A focused range field owns the border while it has the keyboard; without
     /// one the selection gets it, but only when it spans more than one cell —
     /// a lone cell already wears the active ring.
+    /// Dashes say a field is POINTING, not that a range is big. Excel reserves
+    /// marching ants for a copy or a dialog picker; a range swept with the
+    /// mouse gets a solid box. Dashing both made a plain drag look like a
+    /// formula was reading the cells.
+    #[test]
+    fn only_a_pointed_range_is_dashed() {
+        use super::border_is_dashed as dashed;
+        // A field is pointing and the range is small enough to draw: dashed.
+        assert!(dashed(true, true));
+        // The regression: an ordinary mouse selection must NOT dash, however
+        // wide it is.
+        assert!(
+            !dashed(false, true),
+            "a range swept with the mouse wears a solid border"
+        );
+        // Pointing, but past the boundary-cell cap — solid, because the border
+        // is drawn cell by cell and the cap is what bounds that.
+        assert!(!dashed(true, false));
+        assert!(!dashed(false, false));
+    }
+
     #[test]
     fn border_range_prefers_the_pointed_range_over_the_selection() {
         let sel = Some((2, 2, 6, 6));
