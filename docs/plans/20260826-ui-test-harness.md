@@ -28,9 +28,9 @@ A test instance must not touch the installed app's settings, workspace, or open
 documents. Today the suite writes two things, both under
 `dirs::config_dir()/docxy`:
 
-- `session.json` — open tabs, files, theme (`session_path`, main.rs:156)
+- `session.json` — open tabs, files, theme (`session_path`, main.rs:189)
 - `hot/` — one `.docx` sidecar per open Doc tab, rewritten on every persist
-  (`hot_dir`, main.rs:3467)
+  (`hot_dir`, main.rs:3497)
 
 Work is hot-persisted and restored *regardless of whether it was saved*, so a
 test instance sharing that directory would overwrite the user's open documents.
@@ -89,9 +89,9 @@ because a panel moved.
 - `ctlcore/` — `serve` (lib.rs:150), `config_ctl_dir` (:406), `instance_name`,
   `Request::arg`/`reply_ok`/`reply_err`, the `Json` type. Reused as-is.
 - `docxy/src/control.rs` — the reference wiring for a ctlcore server in an app.
-- `suite/docxy/src/main.rs` — `session_path` (:156), `hot_dir` (:3467), the CLI
-  file arguments (`std::env::args_os`, ~:18858), and the event handlers the
-  verbs will drive.
+- `suite/docxy/src/main.rs` — `config_root` (:173), `session_path` (:189),
+  `hot_dir` (:3497), the CLI file arguments (`std::env::args_os`, ~:18885), and
+  the event handlers the verbs will drive.
 - `suite/docxy/Cargo.toml` — the `suite` binary; `ctlcore` is not yet a
   dependency of it.
 
@@ -140,24 +140,76 @@ cargo fmt --check
 
 ### Task 1: Prove isolation, before anything can rely on it
 
-- [ ] verify the claim in Context: does `dirs::config_dir()` on Windows read the
+- [x] verify the claim in Context: does `dirs::config_dir()` on Windows read the
       `APPDATA` environment variable, or the known-folder API? Write a tiny
       program that sets `APPDATA` and prints both `dirs::config_dir()` and
       `ctlcore::config_ctl_dir("docxy")`, and record the result in this plan
-- [ ] ⚠️ if they disagree — the expectation — an `APPDATA` override alone is NOT
+- [x] ⚠️ if they disagree — the expectation — an `APPDATA` override alone is NOT
       isolation, and every later task depends on knowing that. If they agree,
       say so here and simplify Task 2 accordingly
-- [ ] add a single `config_root()` helper in the suite that returns the override
+- [x] add a single `config_root()` helper in the suite that returns the override
       when `DOCXY_CONFIG_DIR` is set and `dirs::config_dir()` otherwise, and
       route `session_path()` and `hot_dir()` through it
-- [ ] audit for any other write path — recent files, logs, caches, crash dumps,
+- [x] audit for any other write path — recent files, logs, caches, crash dumps,
       temp sidecars — and route or document each. Grep for `dirs::`, `AppData`,
       `temp_dir`, `File::create`, `write` in the suite and list what was found
       in this plan, so "we checked" is a record rather than a claim
-- [ ] write tests for `config_root()`: override set, override unset, override
+- [x] write tests for `config_root()`: override set, override unset, override
       set to a relative path, and that `session_path`/`hot_dir` both sit under
       whatever it returns
-- [ ] run tests in both workspaces — must pass before Task 2
+- [x] run tests in both workspaces — must pass before Task 2
+
+#### Result: measured, and they disagree
+
+A throwaway crate depending on `dirs = "5"` and path-depending on `ctlcore`
+printed both paths — once with the real environment, then twice with `APPDATA`
+pointed at `target\harness-appdata`: set in-process via `set_var`, and again as
+the environment of a child process, since that is how the harness would do it.
+Windows 11, `dirs` 5.x. Identical results both ways:
+
+```
+APPDATA env                      = ...\docxy\target\harness-appdata
+dirs::config_dir()               = C:\Users\boris\AppData\Roaming        <-- IGNORED it
+ctlcore::config_ctl_dir("docxy") = ...\target\harness-appdata\docxy\ctl  <-- followed it
+```
+
+**They disagree, as expected.** `dirs::config_dir()` goes to the known-folder
+API and never reads `APPDATA`; `ctlcore::config_ctl_dir` reads the variable
+directly. So an `APPDATA` override moves the control socket into the sandbox
+while `session.json` and every hot sidecar keep landing in the user's real
+profile — precisely the "looks isolated, isn't" failure the Overview warns of.
+
+Task 2 is therefore **not** simplified. Two consequences it must honour:
+
+1. `--harness` must *require* `DOCXY_CONFIG_DIR`; an `APPDATA` override alone
+   must not be accepted as isolation.
+2. The discovery file must be written under `config_root()` explicitly, rather
+   than left to `ctlcore::config_ctl_dir`'s own `APPDATA` lookup — otherwise the
+   socket and the session state can end up in two different sandboxes.
+
+#### The write-path audit
+
+Greps over `suite/` (the crate is one file, `suite/docxy/src/main.rs`, plus
+`build.rs`) for `dirs::`, `AppData`/`APPDATA`, `temp_dir`/`tempfile`,
+`File::create`, `fs::write`, `fs::create_dir`, `fs::remove`, `fs::copy`,
+`fs::rename`, `OpenOptions`, `current_dir`, `home_dir`, `data_dir`, `cache_dir`
+and `data_local_dir`. Everything found:
+
+| Site | What it writes | Disposition |
+|---|---|---|
+| `session_path()` (main.rs:189) | `session.json` | **routed** through `config_root()` |
+| `hot_dir()` (main.rs:3497) | the `hot/` directory | **routed** through `config_root()` |
+| `persist()` (:3722, :3728, :3755) | `hot/tab-N.docx`, `hot/tab-N.xlsx`, `session.json` | **routed** — all three derive from the two helpers above |
+| `persist()` (:3710, :3753) | `create_dir_all` for those two directories | **routed** — same derivation |
+| `save_doc` (:8973) | the document the user chose | **documented, not routed** — an explicit save to an explicit path; a harness test reaches it only by issuing a save verb at a path it picked itself |
+| `save_sheet` (:9020) | the workbook the user chose (`rfd` Save-As when new) | **documented, not routed** — same |
+| `save_doc` fallback (:8969) | `current_dir()/<title>` for a never-saved doc | **documented** — the harness gives the child its own working directory, so this stays inside the run too |
+
+Nothing else writes. There are **no** logs, caches, crash dumps, recent-file
+lists, temp files, or `data_dir`/`cache_dir` uses in the suite: the only
+`std::env::var` in the crate is `USERNAME` (:6114, read-only, for the comment
+author name), and the only two `dirs::` calls are the ones now behind
+`config_root()`. `build.rs` writes only into `OUT_DIR`.
 
 ### Task 2: An opt-in harness mode that starts a control server
 

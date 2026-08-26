@@ -153,11 +153,41 @@ struct Session {
     ask_on_close: bool,
 }
 
+/// Environment variable that redirects every file the app persists — the
+/// session, the hot sidecars, and (later) the harness discovery file — to a
+/// directory of the caller's choosing. Set by the UI test harness so a test
+/// instance cannot touch the installed app's state.
+const CONFIG_DIR_ENV: &str = "DOCXY_CONFIG_DIR";
+
+/// Root under which everything this app persists lives. Normally the OS config
+/// directory; a `DOCXY_CONFIG_DIR` override redirects all of it at once.
+///
+/// ⚠️ The override has to be its own variable rather than `APPDATA`. Measured on
+/// Windows 11 with `APPDATA` pointed elsewhere: `ctlcore::config_ctl_dir` reads
+/// `APPDATA` and follows the override, while `dirs::config_dir()` asks the
+/// known-folder API and keeps returning the real `…\AppData\Roaming`. So an
+/// `APPDATA` override moves the control socket but leaves `session.json` and
+/// the hot sidecars in the user's own profile — isolation that looks complete
+/// and is not. One explicit variable that BOTH path mechanisms go through is
+/// the only thing that actually isolates.
+fn config_root() -> PathBuf {
+    config_root_from(std::env::var_os(CONFIG_DIR_ENV), dirs::config_dir())
+}
+
+/// The decision behind [`config_root`], separated from the environment so it
+/// can be tested. An override that is set but empty counts as unset — an
+/// exported-but-blank variable is a shell accident, not a request to write into
+/// the current directory. A relative override is honoured verbatim (resolved
+/// against the working directory), because that is what typing one means.
+fn config_root_from(over: Option<std::ffi::OsString>, os_config: Option<PathBuf>) -> PathBuf {
+    match over {
+        Some(v) if !v.is_empty() => PathBuf::from(v),
+        _ => os_config.unwrap_or_else(|| PathBuf::from(".")),
+    }
+}
+
 fn session_path() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("docxy")
-        .join("session.json")
+    config_root().join("docxy").join("session.json")
 }
 
 // ---- ribbon tabs -----------------------------------------------------------
@@ -3465,10 +3495,7 @@ fn file_name(path: &std::path::Path) -> String {
 /// Directory holding the hot-exit sidecars — one `.docx` per open Doc tab, kept in
 /// sync on each persist so unsaved edits survive a restart.
 fn hot_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("docxy")
-        .join("hot")
+    config_root().join("docxy").join("hot")
 }
 
 /// Serialize a document to `.docx` bytes, adding a numbering part when it uses
@@ -23082,5 +23109,92 @@ mod edit_caret_tests {
         let mut c = 4usize;
         buf_insert(&mut t, &mut c, "!");
         assert_eq!(t, "café!");
+    }
+}
+
+#[cfg(test)]
+mod config_root_tests {
+    use super::{CONFIG_DIR_ENV, config_root, config_root_from, hot_dir, session_path};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    /// With no override, the app writes where the OS says config lives.
+    #[test]
+    fn no_override_uses_the_os_config_dir() {
+        let os = PathBuf::from(r"C:\Users\someone\AppData\Roaming");
+        assert_eq!(config_root_from(None, Some(os.clone())), os);
+    }
+
+    /// The override wins outright — that is the whole point of it existing.
+    #[test]
+    fn override_replaces_the_os_config_dir() {
+        let os = PathBuf::from(r"C:\Users\someone\AppData\Roaming");
+        let over = OsString::from(r"D:\runs\harness-42");
+        assert_eq!(
+            config_root_from(Some(over), Some(os)),
+            PathBuf::from(r"D:\runs\harness-42")
+        );
+    }
+
+    /// An exported-but-blank variable is a shell accident (`export VAR=`), not a
+    /// request to scatter session.json into the working directory.
+    #[test]
+    fn empty_override_counts_as_unset() {
+        let os = PathBuf::from(r"C:\Users\someone\AppData\Roaming");
+        assert_eq!(
+            config_root_from(Some(OsString::new()), Some(os.clone())),
+            os
+        );
+    }
+
+    /// A relative override is honoured verbatim, resolved against the working
+    /// directory like any other relative path a caller types.
+    #[test]
+    fn relative_override_is_honoured_verbatim() {
+        let root = config_root_from(
+            Some(OsString::from("target/harness-cfg")),
+            Some(PathBuf::from(r"C:\Users\someone\AppData\Roaming")),
+        );
+        assert_eq!(root, PathBuf::from("target/harness-cfg"));
+        assert!(root.is_relative());
+    }
+
+    /// Both the OS lookup and the override can be absent (a headless/odd
+    /// profile); fall back to the working directory rather than panicking.
+    #[test]
+    fn no_override_and_no_os_config_falls_back_to_cwd() {
+        assert_eq!(config_root_from(None, None), PathBuf::from("."));
+    }
+
+    /// The isolation guarantee itself: BOTH persisted locations sit under
+    /// whatever `config_root` returns, and both move when the override moves.
+    /// Every env-touching assertion lives in this one test so it cannot race a
+    /// sibling test running on another thread.
+    #[test]
+    fn session_and_hot_both_follow_the_override() {
+        let saved = std::env::var_os(CONFIG_DIR_ENV);
+
+        // Under an override: both land inside it, and neither is the real profile.
+        let over = Path::new(r"D:\runs\harness-42");
+        unsafe { std::env::set_var(CONFIG_DIR_ENV, over) };
+        assert_eq!(config_root(), over);
+        assert_eq!(session_path(), over.join("docxy").join("session.json"));
+        assert_eq!(hot_dir(), over.join("docxy").join("hot"));
+        assert!(session_path().starts_with(over));
+        assert!(hot_dir().starts_with(over));
+
+        // Unset again: back to the OS config dir, which is what a normal launch
+        // must keep doing — the harness is opt-in, never a mode you fall into.
+        unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
+        let real = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+        assert_eq!(config_root(), real);
+        assert_eq!(session_path(), real.join("docxy").join("session.json"));
+        assert_eq!(hot_dir(), real.join("docxy").join("hot"));
+        assert!(!session_path().starts_with(over));
+        assert!(!hot_dir().starts_with(over));
+
+        if let Some(v) = saved {
+            unsafe { std::env::set_var(CONFIG_DIR_ENV, v) };
+        }
     }
 }
