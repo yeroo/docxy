@@ -755,13 +755,98 @@ and committed-case checks); suite 178, `gridcore` 370. Clippy `-D warnings` and
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] verify a harness run cannot touch the real config: run it, then confirm
+- [x] verify a harness run cannot touch the real config: run it, then confirm
       the real `session.json` and `hot/` are byte-identical to before
-- [ ] verify the suite with no harness flag is unchanged — real config root, no
+- [x] verify the suite with no harness flag is unchanged — real config root, no
       listener, no discovery file
-- [ ] verify each test case from Task 6 fails when its fix is reverted, which is
+- [x] verify each test case from Task 6 fails when its fix is reverted, which is
       the only proof a test tests anything
-- [ ] run all tests in both workspaces, clippy and fmt clean
+- [x] run all tests in both workspaces, clippy and fmt clean
+
+#### Isolation, measured against the real profile
+
+`%APPDATA%\docxy` was hashed (SHA-256 per file) and its mtimes recorded before
+anything ran: nine files, including four `hot/tab-N.{docx,xlsx}` sidecars of the
+user's own open documents. Then the full case file was run
+(`uiharness run uiharness/cases/sheet-selection.uit`), which starts a sandboxed
+instance, opens the fixture, edits cells and quits it.
+
+Afterwards the real directory was **byte-identical and mtime-identical** — not
+one file touched. The same writes the app would have made landed in the sandbox
+instead:
+
+```
+target/uiharness-runs/sandbox/docxy/session.json
+target/uiharness-runs/sandbox/docxy/hot/tab-0.docx
+target/uiharness-runs/sandbox/docxy/hot/tab-1.xlsx
+```
+
+That pair is the whole proof: the run *did* persist, and it persisted somewhere
+else. A run that simply never wrote would show the same untouched profile and
+would prove nothing.
+
+#### The no-flag build, checked against the same directory
+
+Reading a config root off a process that has no control surface means watching
+what it writes, so this one is destructive by nature: the real directory was
+copied out, hashed, and the copy verified identical first. `suite.exe` was then
+started with **no `--harness` and `DOCXY_CONFIG_DIR` explicitly removed from its
+environment**, left up for 12s, and killed.
+
+| Asked | Answered |
+|---|---|
+| does it use the real config root? | yes — `session.json` and all four `hot/tab-N` sidecars rewritten in `%APPDATA%\docxy`, mtimes moved |
+| does it start a listener? | no — `%APPDATA%\suite\ctl` was never created (that is `control_dir(config_root)`, and also where `ctlcore::config_ctl_dir("suite")` would land) |
+| does it write a discovery file? | no — the after-hash listing has the same nine files as the before one, so nothing new appeared anywhere under the root |
+
+The contents were unchanged as well (only the mtimes moved — the app rewrote the
+sidecars to the same bytes), and the backup was restored and re-verified
+identical in both hashes and mtimes, before and after every later step.
+
+#### Every case fails when the thing it guards is put back
+
+A case that passes proves nothing until it has been made to fail. Five fixes
+were reverted behind one `UIHARNESS_BREAK=<name>` switch — a temporary patch,
+built once, run five times, then reverted and rebuilt — so each mutation is the
+only difference between a red run and a green one. A control run of the mutated
+binary with the variable unset passed all five, which is what makes the switch
+itself trustworthy.
+
+| Mutation | Reverts | Case | What failed |
+|---|---|---|---|
+| `sweep-fills` | a sweep arms the auto-fill instead of selecting | 1 | `cells unchanged`: *A2 was 'North' and is now 'Region'*, …A5 — and `range is A1:C5` observed `A1:A5` |
+| `dash-always` | `border_is_dashed` ignores `pointing` | 2 | `border A1:C5 solid teal`: *top dashed (30 dashes of ~3.3px, gaps ~3.0px, 52% of 191px)* |
+| `dash-never` | it never dashes | 3 | `border A1:B4 dashed teal`: *top solid (100% of 126px)* |
+| `formula-dashes` | a formula pick counts as pointing | 4 | `picking is false`: observed true |
+| `keep-edit` | a chart press leaves the cell edit open | 5 | `editing is false`: observed true |
+
+Three of those runs failed **only** the case they were aimed at; `sweep-fills`
+also took case 2 down, because a fill leaves the selection `A1:A5` and case 2's
+border is asked of `A1:C5`.
+
+**Two findings worth more than the four ticks.**
+
+1. **Case 1 survives its own regression only because of `cells unchanged`.**
+   Under `sweep-fills`, `assert no fill preview` and `assert dragging is false`
+   both **passed** — by the time the case asks, the fill has committed and
+   cleared `fill_preview` again. Exactly the split Task 6 predicted: an armed
+   fill shows in `fill_preview`, a fill that *ran* shows only in the cells. Drop
+   `snapshot`/`cells unchanged` from that case and it goes green on the very bug
+   it was written for.
+
+2. **Case 4's pixels are not what catches `formula-dashes`; its state
+   assertion is.** With a formula pick counted as pointing, `picking` flips but
+   `border A1:B4 solid #2f6fdb` still **passes** — `border_range` needs a
+   multi-cell selection or a range-field preview, and a half-typed `=SUM(` in
+   E2 has neither, so no dashed border is ever drawn to be seen. The case bites
+   through the pair, not through the picture.
+
+#### Green in both workspaces
+
+`suite` 178 tests, `uiharness` 104, `gridcore` 370 + its integration tests, all
+passing; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
+clean in both. The five cases pass against the rebuilt clean binary, and the
+real profile is still byte-identical to the hash taken before any of this ran.
 
 ### Task 8: [Final] Document it
 
