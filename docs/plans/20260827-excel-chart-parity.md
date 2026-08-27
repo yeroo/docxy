@@ -129,15 +129,41 @@ separate `SheetSnapshot`/`pkg.parts` audit remains a follow-on plan.
 
 ### Task 5: Verify the live user-visible result
 
-- [ ] add only the minimal harness probe/state needed for deterministic checks;
+- [x] add only the minimal harness probe/state needed for deterministic checks;
       do not add OCR or a golden-image subsystem
-- [ ] run the existing five-case selection script and confirm it remains 5/5
-- [ ] run a sandboxed chart fixture, capture the grid, chart card and Chart
+- [x] run the existing five-case selection script and confirm it remains 5/5
+- [x] run a sandboxed chart fixture, capture the grid, chart card and Chart
       panel, and record the evidence path in this plan
-- [ ] verify grey full-range headers, preview-driven headers, resolved panel
+- [x] verify grey full-range headers, preview-driven headers, resolved panel
       values, axes/gridlines, label spacing and non-thin bars in the captures
-- [ ] run all root and suite tests, both clippy commands with `-D warnings`, both
+- [x] run all root and suite tests, both clippy commands with `-D warnings`, both
       format checks and `git diff --check`
+
+Live evidence, 2026-08-27:
+
+- No new harness protocol was needed. Existing state keys (`range`,
+  `range_preview`, `sel_hidden`, `chart_sel`, `panel_chart`) and the existing
+  `window`, `grid`, `chart:0` and `chart-panel` regions cover the checks. The
+  focused `uiharness/cases/excel-chart-parity.uit` case remains screenshot-only
+  for text layout; the harness still has no OCR or golden-image machinery.
+- The unchanged five cases in `uiharness/cases/sheet-selection.uit` passed 5/5.
+  Evidence: `uiharness-runs/20260827-excel-chart-parity-selection-final/`.
+- The range-backed chart fixture case passed 2/2. Evidence:
+  `uiharness-runs/20260827-excel-chart-parity/`; the ordinary-selection window
+  is `a-selected-range-darkens-every-affected-header/012-window.png`, and the
+  pointed grid, card and panel are under
+  `a-pointed-range-owns-headers-while-a-chart-is-selected/` as
+  `028-window.png`, `029-grid.png`, `030-chart-0.png` and
+  `031-chart-panel.png`.
+- Inspection confirmed neutral grey B:D and 2:5 headers for `B2:D5`; while the
+  chart hid that selection, only preview-driven A and 2:5 headers darkened for
+  `A2:A5`. The card showed 0/20/40 scale ticks and gridlines, retained spaced
+  first/last category context, readable-width bars and a separate legend. The
+  panel kept `=Sheet1!$B$1` and `=Sheet1!$A$2:$A$5` editable while showing
+  resolved `Q1` and `North · South · East · West` values.
+- `cargo test`, `cargo test --manifest-path suite/Cargo.toml` (199 passed), both
+  root/suite `cargo clippy --all-targets -- -D warnings`, both root/suite
+  `cargo fmt --check`, and `git diff --check` passed.
 
 ### Task 6: [Final] Document the finished behavior
 

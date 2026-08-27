@@ -17,7 +17,7 @@
 //! literals in this file, which is the whole point of a fixture living under
 //! the harness's own directory.
 
-use gridcore::sheet::{Cell, CellValue, ChartData, ChartSeries, DrawingKind};
+use gridcore::sheet::{Cell, CellValue, ChartData, ChartSeries, ChartSource, DrawingKind};
 use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -59,22 +59,26 @@ fn build() -> Vec<u8> {
     // Anchored well below and right of A1:D5: every case that drags over cells
     // uses that corner, and a card sitting on top of it would put a chart press
     // where a cell press was meant.
+    let source = |range| ChartSource {
+        sheet: "Sheet1".to_string(),
+        range,
+        cat_col: 0,
+    };
     let data = ChartData {
         title: "Quarters".to_string(),
         kind: "bar".to_string(),
         categories: ROWS.iter().map(|(n, _, _)| n.to_string()).collect(),
-        series: vec![
-            ChartSeries {
-                name: "Q1".to_string(),
-                values: ROWS.iter().map(|(_, q, _)| *q).collect(),
-                ..ChartSeries::default()
-            },
-            ChartSeries {
-                name: "Q2".to_string(),
-                values: ROWS.iter().map(|(_, _, q)| *q).collect(),
-                ..ChartSeries::default()
-            },
-        ],
+        series: vec![ChartSeries {
+            name: "Q1".to_string(),
+            values: ROWS.iter().map(|(_, q, _)| *q).collect(),
+            col: Some(1),
+            values_ref: Some(source((1, 1, 4, 1))),
+            name_ref: Some("Sheet1!$B$1".to_string()),
+            ..ChartSeries::default()
+        }],
+        source: Some(source((0, 0, 4, 1))),
+        categories_ref: Some(source((1, 0, 4, 0))),
+        edited: true,
         ..ChartData::default()
     };
     pkg.add_chart(0, (8, 1), (20, 7), &data);
@@ -132,6 +136,22 @@ fn check(bytes: &[u8]) {
         .iter()
         .find(|d| matches!(d.kind, DrawingKind::Chart(_)))
         .unwrap();
+    let DrawingKind::Chart(data) = &chart.kind else {
+        unreachable!("the drawing was filtered to a chart")
+    };
+    assert_eq!(data.source.as_ref().map(|s| s.range), Some((0, 0, 4, 1)));
+    assert_eq!(
+        data.categories_ref.as_ref().map(|s| s.range),
+        Some((1, 0, 4, 0))
+    );
+    assert_eq!(data.categories, ["North", "South", "East", "West"]);
+    assert_eq!(data.series.len(), 1);
+    assert_eq!(data.series[0].name, "Q1");
+    assert_eq!(data.series[0].name_ref.as_deref(), Some("Sheet1!$B$1"));
+    assert_eq!(
+        data.series[0].values_ref.as_ref().map(|s| s.range),
+        Some((1, 1, 4, 1))
+    );
     assert!(
         chart.from.0 >= 6 && chart.from.1 >= 1,
         "the card must not sit over A1:D5, which the drag cases sweep: {:?}",
