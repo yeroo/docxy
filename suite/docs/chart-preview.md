@@ -49,11 +49,13 @@ at 18 characters, and shortened labels expose the full text in a tooltip.
 
 Clustered columns are also sized from the plot width rather than a fixed bar
 width. Each category owns one slot; within it, the target bar width is 2–24 px,
-the target gap between series is 1–4 px, and the category gap is bounded to
-4–24 px and at most 40% of its slot. Extremely dense charts may compress below
-the 2 px target instead of overflowing their plot. The renderer bounds an
-imported card to 512 points and 32 plotted series so malformed caches cannot
-produce an unbounded element tree.
+the target gap between series is 1–4 px, and the target gap between categories
+is 4–24 px and at most 40% of its slot. Once bars reach their 24 px maximum,
+any remaining slot width stays as unused space between clusters, so the actual
+space can exceed that target gap on wide charts. Extremely dense charts may
+compress below the 2 px target instead of overflowing their plot. The renderer
+bounds an imported card to 512 points and 32 plotted series so malformed caches
+cannot produce an unbounded element tree.
 
 ## Intentional limits
 
@@ -68,4 +70,4 @@ The pure helper tests in `suite/docxy/src/main.rs` cover empty, zero,
 fractional and large scales; tiny, normal and wide cards; one and many
 categories and series; category thinning/truncation; column geometry; and all
 four kind paths. Live evidence and the full validation record are kept in
-`docs/plans/20260827-excel-chart-parity.md`.
+`docs/plans/completed/20260827-excel-chart-parity.md`.

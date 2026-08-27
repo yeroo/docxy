@@ -171,15 +171,15 @@ A sheet the workbook hasn't got is refused by name under the field instead.
 
 The Chart panel keeps those references editable while also explaining what
 they currently resolve to. A referenced SERIES NAME field continues to show
-text such as `=Budget!$B$1`; a compact `Resolved: Q1` row beneath it comes from
-the current `ChartSeries::name` cache. A literal series name has no `name_ref`,
-so it remains one editable row and gets no misleading duplicate. CATEGORY
-LABELS likewise keeps its `=Budget!$A$2:$A$5` field and shows a bounded summary
-from `ChartData::categories`: at most four labels, at most 24 Unicode scalar
-values per label, `(blank)` for a blank item, `+N more` for omitted items, and
-`No labels` for an empty cache. Re-pointing, switching orientation and loading
-a chart replace those caches before the next render; the panel never re-reads
-cells merely to draw a preview (`series_resolved_preview`,
+text such as `=Budget!$B$1:$B$1`; a compact `Resolved: Q1` row beneath it comes
+from the current `ChartSeries::name` cache. A literal series name has no
+`name_ref`, so it remains one editable row and gets no misleading duplicate.
+CATEGORY LABELS likewise keeps its `=Budget!$A$2:$A$5` field and shows a bounded
+summary from `ChartData::categories`: at most four labels, at most 24 Unicode
+scalar values per label, `(blank)` for a blank item, `+N more` for omitted
+items, and `No labels` for an empty cache. Re-pointing, switching orientation
+and loading a chart replace those caches before the next render; the panel
+never re-reads cells merely to draw a preview (`series_resolved_preview`,
 `bounded_label_preview`).
 
 These rows are display-only. They neither replace the editable references nor

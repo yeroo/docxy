@@ -159,8 +159,8 @@ Live evidence, 2026-08-27:
   chart hid that selection, only preview-driven A and 2:5 headers darkened for
   `A2:A5`. The card showed 0/20/40 scale ticks and gridlines, retained spaced
   first/last category context, readable-width bars and a separate legend. The
-  panel kept `=Sheet1!$B$1` and `=Sheet1!$A$2:$A$5` editable while showing
-  resolved `Q1` and `North · South · East · West` values.
+  panel kept `=Sheet1!$B$1:$B$1` and `=Sheet1!$A$2:$A$5` editable while
+  showing resolved `Q1` and `North · South · East · West` values.
 - `cargo test`, `cargo test --manifest-path suite/Cargo.toml` (199 passed), both
   root/suite `cargo clippy --all-targets -- -D warnings`, both root/suite
   `cargo fmt --check`, and `git diff --check` passed.

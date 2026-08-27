@@ -64,15 +64,15 @@ documentation with the shipped implementation and archived plan location.
 
 ### Task 3: Correct the reviewed documentation contracts
 
-- [ ] change the validation-record link to
+- [x] change the validation-record link to
       `docs/plans/completed/20260827-excel-chart-parity.md` and sweep for other
       live references to the moved plan
-- [ ] describe the column-layout target gaps separately from unused space that
+- [x] describe the column-layout target gaps separately from unused space that
       remains when bars hit their maximum width
-- [ ] update referenced single-cell series-name examples to the formatter's
+- [x] update referenced single-cell series-name examples to the formatter's
       inclusive `:$B$1` endpoint form in both suite documentation and the
       completed plan, sweeping for equivalent shortened examples
-- [ ] run focused documentation/search checks before Task 4
+- [x] run focused documentation/search checks before Task 4
 
 ### Task 4: [Final] Verify and record the review fixes
 
