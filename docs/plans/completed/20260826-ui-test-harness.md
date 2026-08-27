@@ -886,7 +886,7 @@ border is asked of `A1:C5`.
 
 #### Green in both workspaces
 
-`suite` 178 tests, `uiharness` 104, `gridcore` 370 + its integration tests, all
+`suite` 189 tests, `uiharness` 122, `gridcore` 370 + its integration tests, all
 passing; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`
 clean in both. The five cases pass against the rebuilt clean binary, and the
 real profile is still byte-identical to the hash taken before any of this ran.
@@ -935,9 +935,9 @@ nothing stops a human looking at the whole picture.
 - Any verb for the Doc or Mail tabs; this plan covers the sheet UI, which is
   where the regressions have been.
 
-### Last review round
+### Review closure
 
-The external review's second round crashed on an Anthropic session limit —
+The initial external review's second round crashed on an Anthropic session limit —
 three of its four lenses were cut off mid-investigation and synthesis exited 1,
 so nothing was surfaced to the loop. The adversarial lens had finished, and its
 four findings were recovered from the run directory
@@ -971,3 +971,12 @@ reviewing a fix rather than the original code.
   discovery record it would have compared against was the thing just deleted.
   The name now carries a timestamp, and because no earlier run can have chosen
   it, the recursive delete is gone entirely rather than made safer.
+
+The interrupted review was then completed with native `revmux.exe` and the
+Codex-only profile. Round 03 reviewed the full harness change, rounds 04 and 05
+reviewed the successive repairs, and all confirmed findings were fixed. Round
+06 (`06-20260827-152201`) was restricted to the final two comment corrections
+and to major/critical correctness risks. All four sources completed without
+degradation on the requested model and reported no findings. The final live
+five-case run, 122 `uiharness` tests, 189 suite tests, both clippy passes with
+`-D warnings`, both format checks, and `git diff --check` were green.
