@@ -18595,7 +18595,7 @@ fn chart_card_layout(
     let plot = ChartRect {
         x: body.x + left_axis_w,
         y: body.y,
-        w: (body.w - left_axis_w).max(0.0),
+        w: (body.right() - (body.x + left_axis_w)).max(0.0),
         h: (body.h - horizontal_axis_h).max(0.0),
     };
     layout.plot = plot;
@@ -18828,235 +18828,294 @@ fn chart_grips(idx: usize, w: f32, h: f32, ent: &Entity<Docxy>) -> Vec<AnyElemen
         .collect()
 }
 
-/// A floating chart card drawn at `w` × `h` (its anchor's cell extent).
-fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChartRenderPath {
+    Bar,
+    Line,
+    Pie,
+    Column,
+}
+
+impl ChartRenderPath {
+    fn layout_kind(self) -> &'static str {
+        match self {
+            Self::Bar => "bar",
+            Self::Line => "line",
+            Self::Pie => "pie",
+            Self::Column => "column",
+        }
+    }
+
+    fn has_numeric_axes(self) -> bool {
+        self != Self::Pie
+    }
+
+    fn has_horizontal_value_axis(self) -> bool {
+        self == Self::Bar
+    }
+
+    fn legend_uses_categories(self) -> bool {
+        self == Self::Pie
+    }
+
+    fn uses_column_geometry(self) -> bool {
+        self == Self::Column
+    }
+}
+
+fn chart_render_path(kind: &str) -> ChartRenderPath {
+    match kind {
+        "bar" => ChartRenderPath::Bar,
+        "line" => ChartRenderPath::Line,
+        "pie" => ChartRenderPath::Pie,
+        _ => ChartRenderPath::Column,
+    }
+}
+
+/// A floating chart card drawn at `w` × `h` (its anchor's cell extent). The
+/// model helpers above own every measurement; this renderer only places marks
+/// inside those reserved rectangles, so axes, labels and legends cannot claim
+/// the same pixels.
+fn chart_card(data: &gridcore::sheet::ChartData, chart_id: usize, w: f32, h: f32) -> AnyElement {
     const PALETTE: [u32; 6] = [0x2AA79B, 0x2F6FDB, 0xC0705A, 0xD8A44A, 0x7A5EA8, 0x5A9E5A];
-    // A series' own colour wins over its slot in the palette.
+    const MAX_CARD_POINTS: usize = 512;
+    const MAX_CARD_SERIES: usize = 32;
+    const GRIDLINE: u32 = 0xe3e3e3;
+    const AXIS: u32 = 0xaaaaaa;
+    const LABEL: u32 = 0x666666;
+
+    let path = chart_render_path(&data.kind);
     let ser_color = |si: usize| {
         data.series
             .get(si)
             .and_then(|s| s.color)
             .unwrap_or(PALETTE[si % PALETTE.len()])
     };
-    // One element per point per series, every frame. A chart the UI authored is
-    // capped at MAX_CHART_CELLS when it is pointed, but one read from a file can
-    // cache as many points as Excel cared to write, and a card a few hundred
-    // pixels wide can't show them anyway. BOTH axes need the cap: `parse_chart`
-    // pushes one `ChartSeries` per `<c:ser>` with no bound of its own, so
-    // capping only the points still leaves points × series elements per frame.
-    const MAX_CARD_POINTS: usize = 512;
-    const MAX_CARD_SERIES: usize = 32;
-    // The plot area is drawn differently per chart kind. Column/Bar/Line share a
-    // per-series legend; Pie's slices are per-category, so it builds its own.
-    let kind = data.kind.as_str();
-    // How many series are DRAWN — all of them, except on a pie, where it is the
-    // first (`chart_plotted_series`). Asked here rather than assumed from what
-    // the file will hold: the writer keeps every series a pie carries, so
-    // "whatever is in `data.series`" is no longer the same question. Everything
-    // measured off the series is measured off the drawn ones only — an axis
-    // stretched by a series that isn't plotted, or a slice per category of a
-    // longer one that isn't either, would both be scaled to invisible data.
-    let nser = chart_plotted_series(kind, data.series.len()).min(MAX_CARD_SERIES);
-    // `nser` is bounded by `data.series.len()` on both terms, so this can't
-    // slice past the end.
+    // Bound both imported-cache dimensions so a malformed file cannot create
+    // points × series elements without limit.
+    let nser = chart_plotted_series(path.layout_kind(), data.series.len()).min(MAX_CARD_SERIES);
     let plotted = &data.series[..nser];
+    let ncat = data
+        .categories
+        .len()
+        .max(
+            plotted
+                .iter()
+                .map(|series| series.values.len())
+                .max()
+                .unwrap_or(0),
+        )
+        .min(MAX_CARD_POINTS);
     let scale = chart_scale(
         plotted
             .iter()
             .flat_map(|series| series.values.iter().copied()),
     );
-    let maxv = scale.max;
-    let ncat = data
-        .categories
-        .len()
-        .max(plotted.iter().map(|s| s.values.len()).max().unwrap_or(0))
-        .min(MAX_CARD_POINTS);
-    // The title strip and the legend take fixed bites out of the card; the plot
-    // area gets the rest, and the bars scale to it.
-    let area_h = (h - 46.0).max(40.0);
-    let plot_h = (area_h - 20.0).max(20.0);
-    let cat_label = |ci: usize| {
-        let label = data.categories.get(ci).cloned().unwrap_or_default();
-        div()
-            .text_size(px(8.))
-            .text_color(hsla_u(0x666666))
-            .max_w(px(52.))
-            .overflow_hidden()
-            .child(SharedString::from(label))
+    let legend_labels = if path.legend_uses_categories() {
+        (0..ncat)
+            .map(|index| {
+                let label = data.categories.get(index).cloned().unwrap_or_default();
+                if label.trim().is_empty() {
+                    format!("Category {}", index + 1)
+                } else {
+                    label
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        plotted
+            .iter()
+            .enumerate()
+            .map(|(index, series)| {
+                if series.name.trim().is_empty() {
+                    format!("Series {}", index + 1)
+                } else {
+                    series.name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
     };
+    let layout = chart_card_layout(w, h, path.layout_kind(), &legend_labels);
 
-    let mut pie_legend: Option<AnyElement> = None;
-    let plot: AnyElement = match kind {
-        "bar" => {
-            // Horizontal bars: one row per category, width proportional to value.
-            let mut col = v_flex().flex_1().gap(px(3.)).px_2().py_2().justify_center();
-            for ci in 0..ncat {
-                let mut row = h_flex().items_center().gap(px(4.)).h(px(16.));
-                row = row.child(
+    let mut plot = div()
+        .absolute()
+        .left(px(layout.plot.x))
+        .top(px(layout.plot.y))
+        .w(px(layout.plot.w))
+        .h(px(layout.plot.h))
+        .overflow_hidden();
+
+    // Gridlines are the first children of the plot and therefore stay behind
+    // every mark. Column/line values rise vertically; bar values grow rightward.
+    if path.has_numeric_axes() {
+        for tick in &scale.ticks {
+            if path.has_horizontal_value_axis() {
+                let x = (layout.plot.w * scale.fraction(tick.value))
+                    .clamp(0.0, (layout.plot.w - 1.0).max(0.0));
+                plot = plot.child(
                     div()
-                        .w(px(46.))
-                        .text_size(px(8.))
-                        .text_color(hsla_u(0x666666))
-                        .overflow_hidden()
-                        .child(SharedString::from(
-                            data.categories.get(ci).cloned().unwrap_or_default(),
-                        )),
+                        .absolute()
+                        .left(px(x))
+                        .top_0()
+                        .w(px(1.))
+                        .h_full()
+                        .bg(hsla_u(GRIDLINE)),
                 );
-                let mut bars = v_flex().flex_1().gap(px(1.));
-                for (si, s) in plotted.iter().enumerate() {
-                    let val = s.values.get(ci).copied().unwrap_or(0.0);
-                    let frac = (val.max(0.0) / maxv) as f32;
+            } else {
+                let y = (layout.plot.h * (1.0 - scale.fraction(tick.value)))
+                    .clamp(0.0, (layout.plot.h - 1.0).max(0.0));
+                plot = plot.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top(px(y))
+                        .w_full()
+                        .h(px(1.))
+                        .bg(hsla_u(GRIDLINE)),
+                );
+            }
+        }
+    }
+
+    match path {
+        ChartRenderPath::Bar => {
+            // All category text stays in the left axis gutter. The same label
+            // planner used horizontally by columns is applied to plot height so
+            // dense bars retain first/last context without stacked text.
+            let row_h = if ncat == 0 {
+                0.0
+            } else {
+                layout.plot.h / ncat as f32
+            };
+            let bar_gap = if nser <= 1 {
+                0.0
+            } else {
+                (row_h * 0.08).min(1.0)
+            };
+            let bar_h = if nser == 0 {
+                0.0
+            } else {
+                ((row_h - bar_gap * nser.saturating_sub(1) as f32).max(0.0) / nser as f32).min(6.0)
+            };
+            let mut marks = v_flex().absolute().size_full();
+            for ci in 0..ncat {
+                let mut bars = v_flex()
+                    .h(px(row_h))
+                    .flex_none()
+                    .justify_center()
+                    .gap(px(bar_gap));
+                for (si, series) in plotted.iter().enumerate() {
+                    let value = series.values.get(ci).copied().unwrap_or(0.0);
                     bars = bars.child(
                         div()
-                            .h(px(6.))
-                            .w(relative(frac.clamp(0.02, 1.0)))
+                            .h(px(bar_h))
+                            .w(relative(scale.fraction(value)))
                             .rounded_r(px(1.))
                             .bg(rgb(ser_color(si))),
                     );
                 }
-                row = row.child(bars);
-                col = col.child(row);
+                marks = marks.child(bars);
             }
-            col.h(px(area_h)).into_any_element()
+            plot = plot.child(marks);
         }
-        "line" => {
-            // Point/line preview: each series' value plotted as a dot at its height.
-            let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
+        ChartRenderPath::Line => {
+            // The lightweight line preview retains its existing point marks;
+            // their centres now share the scale and bounded plot rectangle.
+            let category_slot = if ncat == 0 {
+                0.0
+            } else {
+                layout.plot.w / ncat as f32
+            };
+            let mut marks = div().absolute().size_full();
             for ci in 0..ncat {
-                let mut stack = div().relative().w(px(14.)).h(px(plot_h));
-                for (si, s) in plotted.iter().enumerate() {
-                    let val = s.values.get(ci).copied().unwrap_or(0.0);
-                    let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
-                    stack = stack.child(
+                let centre_x = category_slot * (ci as f32 + 0.5);
+                for (si, series) in plotted.iter().enumerate() {
+                    let value = series.values.get(ci).copied().unwrap_or(0.0);
+                    let left = (centre_x - 3.5).clamp(0.0, (layout.plot.w - 7.0).max(0.0));
+                    let bottom = (layout.plot.h * scale.fraction(value) - 3.5)
+                        .clamp(0.0, (layout.plot.h - 7.0).max(0.0));
+                    marks = marks.child(
                         div()
                             .absolute()
-                            .bottom(px(h - 3.5))
-                            .left(px(3.5))
+                            .left(px(left))
+                            .bottom(px(bottom))
                             .size(px(7.))
                             .rounded(px(4.))
                             .bg(rgb(ser_color(si))),
                     );
                 }
-                plot = plot.child(
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_end()
-                        .gap(px(2.))
-                        .h(px(area_h - 2.))
-                        .child(stack)
-                        .child(cat_label(ci)),
-                );
             }
-            plot.into_any_element()
+            plot = plot.child(marks);
         }
-        "pie" => {
-            // Pie preview as a 100%-stacked proportion bar; slices = categories,
-            // proportions from the one series a pie plots — `nser` is that one,
-            // and any others the chart holds are kept in the file undrawn.
-            let vals: Vec<f64> = (0..ncat)
+        ChartRenderPath::Pie => {
+            // Pie remains deliberately axis-free. Its compact preview is a
+            // 100%-stacked proportion bar; its per-category legend is below.
+            let values = (0..ncat)
                 .map(|ci| {
                     plotted
                         .first()
-                        .and_then(|s| s.values.get(ci))
+                        .and_then(|series| series.values.get(ci))
                         .copied()
                         .unwrap_or(0.0)
                         .max(0.0)
                 })
-                .collect();
-            let total = vals.iter().sum::<f64>().max(1.0);
-            let mut bar = h_flex()
+                .collect::<Vec<_>>();
+            let total = values.iter().sum::<f64>().max(1.0);
+            let mut slices = h_flex()
                 .w_full()
-                .h(px(30.))
+                .h(px(30.0f32.min(layout.plot.h)))
                 .rounded(px(4.))
                 .overflow_hidden();
-            let mut leg = h_flex().gap_3().px_2().pb_1().flex_wrap();
-            for ci in 0..ncat {
-                let frac = (vals[ci] / total) as f32;
-                bar = bar.child(
+            for (ci, value) in values.iter().enumerate() {
+                slices = slices.child(
                     div()
                         .h_full()
-                        .w(relative(frac.max(0.0)))
+                        .w(relative((*value / total) as f32))
                         .bg(rgb(PALETTE[ci % PALETTE.len()])),
                 );
-                leg = leg.child(
-                    h_flex()
-                        .items_center()
-                        .gap_1()
-                        .child(
-                            div()
-                                .size(px(9.))
-                                .rounded(px(2.))
-                                .bg(rgb(PALETTE[ci % PALETTE.len()])),
-                        )
-                        .child(div().text_size(px(9.)).text_color(hsla_u(0x333333)).child(
-                            SharedString::from(
-                                data.categories.get(ci).cloned().unwrap_or_default(),
-                            ),
-                        )),
-                );
             }
-            pie_legend = Some(leg.into_any_element());
-            v_flex()
-                .flex_1()
-                .justify_center()
-                .gap(px(6.))
-                .px_3()
-                .py_2()
-                .h(px(area_h))
-                .child(bar)
-                .into_any_element()
+            plot = plot.child(
+                v_flex()
+                    .absolute()
+                    .size_full()
+                    .justify_center()
+                    .px_3()
+                    .child(slices),
+            );
         }
-        _ => {
-            // Column (default): vertical clustered bars.
-            let mut plot = h_flex().h(px(area_h)).items_end().gap(px(6.)).px_2().pt_2();
+        ChartRenderPath::Column => {
+            debug_assert!(path.uses_column_geometry());
+            let columns = chart_column_layout(layout.plot.w, ncat, nser);
+            let mut marks = div().absolute().size_full();
             for ci in 0..ncat {
-                let mut cluster = h_flex().items_end().gap(px(1.));
-                for (si, s) in plotted.iter().enumerate() {
-                    let val = s.values.get(ci).copied().unwrap_or(0.0);
-                    let h = ((val.max(0.0) / maxv) as f32 * plot_h).clamp(1.0, plot_h);
+                let cluster_left = columns.category_slot * ci as f32 + columns.category_gap / 2.0;
+                let mut cluster = h_flex()
+                    .absolute()
+                    .left(px(cluster_left))
+                    .bottom_0()
+                    .w(px(columns.cluster_width))
+                    .h_full()
+                    .items_end()
+                    .gap(px(columns.bar_gap));
+                for (si, series) in plotted.iter().enumerate() {
+                    let value = series.values.get(ci).copied().unwrap_or(0.0);
+                    let bar_h = layout.plot.h * scale.fraction(value);
                     cluster = cluster.child(
                         div()
-                            .w(px(11.))
-                            .h(px(h))
+                            .w(px(columns.bar_width))
+                            .h(px(bar_h))
                             .rounded_t(px(1.))
                             .bg(rgb(ser_color(si))),
                     );
                 }
-                plot = plot.child(
-                    v_flex()
-                        .flex_1()
-                        .items_center()
-                        .justify_end()
-                        .gap(px(2.))
-                        .h(px(area_h - 2.))
-                        .child(cluster)
-                        .child(cat_label(ci)),
-                );
+                marks = marks.child(cluster);
             }
-            plot.into_any_element()
+            plot = plot.child(marks);
         }
-    };
+    }
 
-    let legend: AnyElement = pie_legend.unwrap_or_else(|| {
-        let mut legend = h_flex().gap_3().px_2().pb_1().flex_wrap();
-        for (si, s) in plotted.iter().enumerate() {
-            legend = legend.child(
-                h_flex()
-                    .items_center()
-                    .gap_1()
-                    .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(ser_color(si))))
-                    .child(
-                        div()
-                            .text_size(px(9.))
-                            .text_color(hsla_u(0x333333))
-                            .child(SharedString::from(s.name.clone())),
-                    ),
-            );
-        }
-        legend.into_any_element()
-    });
-    v_flex()
+    let mut root = div()
+        .relative()
         .w(px(w))
         .h(px(h))
         .overflow_hidden()
@@ -19066,17 +19125,233 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
         .rounded(px(4.))
         .child(
             div()
-                .w_full()
+                .absolute()
+                .left(px(layout.title.x))
+                .top(px(layout.title.y))
+                .w(px(layout.title.w))
+                .h(px(layout.title.h))
+                .flex()
+                .items_center()
+                .justify_center()
+                .overflow_hidden()
                 .text_center()
-                .py_1()
                 .text_size(px(12.))
                 .font_weight(FontWeight::BOLD)
                 .text_color(hsla_u(0x222222))
                 .child(SharedString::from(data.title.clone())),
         )
-        .child(plot)
-        .child(legend)
-        .into_any_element()
+        .child(plot);
+
+    if path.has_numeric_axes() {
+        if path.has_horizontal_value_axis() {
+            let mut category_axis = div()
+                .absolute()
+                .left(px(layout.category_axis.x))
+                .top(px(layout.category_axis.y))
+                .w(px(layout.category_axis.w))
+                .h(px(layout.category_axis.h))
+                .border_r_1()
+                .border_color(hsla_u(AXIS));
+            let label_plan = chart_category_label_plan(&data.categories, ncat, layout.plot.h);
+            let width_chars =
+                (((layout.category_axis.w - 6.0).max(0.0) / 5.5).floor() as usize).clamp(1, 18);
+            let max_chars = label_plan.max_chars.min(width_chars);
+            for label in label_plan.labels {
+                let full = data
+                    .categories
+                    .get(label.index)
+                    .cloned()
+                    .unwrap_or_default();
+                let text = bounded_label(&full, max_chars);
+                let shortened = !full.trim().is_empty() && text != full;
+                let centre_y = layout.category_axis.h * (label.index as f32 + 0.5) / ncat as f32;
+                let top = (centre_y - 6.0).clamp(0.0, (layout.category_axis.h - 12.0).max(0.0));
+                let mut element = h_flex()
+                    .id(ElementId::Name(
+                        format!("chart-{chart_id}-bar-category-{}", label.index).into(),
+                    ))
+                    .absolute()
+                    .left_0()
+                    .top(px(top))
+                    .w_full()
+                    .h(px(12.))
+                    .justify_end()
+                    .items_center()
+                    .pr_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(8.))
+                    .text_color(hsla_u(LABEL))
+                    .child(SharedString::from(text));
+                if shortened {
+                    element = element
+                        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx));
+                }
+                category_axis = category_axis.child(element);
+            }
+            root = root.child(category_axis);
+
+            let mut value_axis = div()
+                .absolute()
+                .left(px(layout.value_axis.x))
+                .top(px(layout.value_axis.y))
+                .w(px(layout.value_axis.w))
+                .h(px(layout.value_axis.h))
+                .border_t_1()
+                .border_color(hsla_u(AXIS));
+            for tick in &scale.ticks {
+                let centre_x = layout.value_axis.w * scale.fraction(tick.value);
+                let left = (centre_x - 18.0).clamp(0.0, (layout.value_axis.w - 36.0).max(0.0));
+                value_axis = value_axis.child(
+                    h_flex()
+                        .absolute()
+                        .left(px(left))
+                        .top_0()
+                        .w(px(36.))
+                        .h_full()
+                        .justify_center()
+                        .items_center()
+                        .overflow_hidden()
+                        .text_size(px(8.))
+                        .text_color(hsla_u(LABEL))
+                        .child(SharedString::from(tick.label.clone())),
+                );
+            }
+            root = root.child(value_axis);
+        } else {
+            let mut value_axis = div()
+                .absolute()
+                .left(px(layout.value_axis.x))
+                .top(px(layout.value_axis.y))
+                .w(px(layout.value_axis.w))
+                .h(px(layout.value_axis.h))
+                .border_r_1()
+                .border_color(hsla_u(AXIS));
+            for tick in &scale.ticks {
+                let centre_y = layout.value_axis.h * (1.0 - scale.fraction(tick.value));
+                let top = (centre_y - 5.0).clamp(0.0, (layout.value_axis.h - 10.0).max(0.0));
+                value_axis = value_axis.child(
+                    h_flex()
+                        .absolute()
+                        .left_0()
+                        .top(px(top))
+                        .w_full()
+                        .h(px(10.))
+                        .justify_end()
+                        .items_center()
+                        .pr_1()
+                        .overflow_hidden()
+                        .text_size(px(8.))
+                        .text_color(hsla_u(LABEL))
+                        .child(SharedString::from(tick.label.clone())),
+                );
+            }
+            root = root.child(value_axis);
+
+            let mut category_axis = div()
+                .absolute()
+                .left(px(layout.category_axis.x))
+                .top(px(layout.category_axis.y))
+                .w(px(layout.category_axis.w))
+                .h(px(layout.category_axis.h))
+                .border_t_1()
+                .border_color(hsla_u(AXIS));
+            let label_plan = chart_category_label_plan(&data.categories, ncat, layout.plot.w);
+            let category_slot = if ncat == 0 {
+                0.0
+            } else {
+                layout.category_axis.w / ncat as f32
+            };
+            let visible_slot = if label_plan.labels.is_empty() {
+                layout.category_axis.w
+            } else {
+                layout.category_axis.w / label_plan.labels.len() as f32
+            };
+            for label in label_plan.labels {
+                let full = data
+                    .categories
+                    .get(label.index)
+                    .cloned()
+                    .unwrap_or_default();
+                let centre_x = category_slot * (label.index as f32 + 0.5);
+                let label_w = visible_slot.min(layout.category_axis.w);
+                let left = (centre_x - label_w / 2.0)
+                    .clamp(0.0, (layout.category_axis.w - label_w).max(0.0));
+                let mut element = div()
+                    .id(ElementId::Name(
+                        format!("chart-{chart_id}-category-{}", label.index).into(),
+                    ))
+                    .absolute()
+                    .left(px(left))
+                    .top_0()
+                    .w(px(label_w))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_center()
+                    .text_size(px(8.))
+                    .text_color(hsla_u(LABEL))
+                    .child(SharedString::from(label.text));
+                if label.shortened {
+                    element = element
+                        .tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx));
+                }
+                category_axis = category_axis.child(element);
+            }
+            root = root.child(category_axis);
+        }
+    }
+
+    // The legend is a separate reserved rectangle. It may scroll vertically on
+    // a very small card, which keeps every plotted series/category reachable
+    // without ever laying legend items over the plot.
+    let mut legend_items = h_flex().gap_2().px_1().py_1().flex_wrap();
+    for (index, full) in legend_labels.into_iter().enumerate() {
+        let text = bounded_label(&full, 24);
+        let shortened = text != full;
+        let color = if path.legend_uses_categories() {
+            PALETTE[index % PALETTE.len()]
+        } else {
+            ser_color(index)
+        };
+        let mut item = h_flex()
+            .id(ElementId::Name(
+                format!("chart-{chart_id}-legend-{index}").into(),
+            ))
+            .items_center()
+            .gap_1()
+            .max_w(px(154.))
+            .child(div().size(px(9.)).rounded(px(2.)).bg(rgb(color)))
+            .child(
+                div()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_size(px(9.))
+                    .text_color(hsla_u(0x333333))
+                    .child(SharedString::from(text)),
+            );
+        if shortened {
+            item = item.tooltip(move |window, cx| Tooltip::new(full.clone()).build(window, cx));
+        }
+        legend_items = legend_items.child(item);
+    }
+    root.child(
+        div()
+            .id(ElementId::Name(
+                format!("chart-{chart_id}-legend-scroll").into(),
+            ))
+            .absolute()
+            .left(px(layout.legend.x))
+            .top(px(layout.legend.y))
+            .w(px(layout.legend.w))
+            .h(px(layout.legend.h))
+            .overflow_y_scroll()
+            .child(legend_items),
+    )
+    .into_any_element()
 }
 
 /// Render a spreadsheet tab: a formula/reference bar; a horizontally-scrolling
@@ -19619,7 +19894,7 @@ fn sheet_el(
                             ent_m.update(cx2, |this, cx2| this.chart_drag_move(at, cx2));
                         }
                     })
-                    .child(chart_card(data, cw, ch))
+                    .child(chart_card(data, i, cw, ch))
                     // Where the harness's `chart:N` region is measured — the card
                     // as laid out, including a move or resize still in progress.
                     .child(probe(probes, format!("chart:{i}")))
@@ -20046,14 +20321,14 @@ mod grid_geom_tests {
         SHEET_HEADER_SELECTED_FG, SHEET_ROW_H, SelectTarget, SelectionAfter, arm_fill,
         border_range, bounded_label_preview, cell_selection_shown, char_to_byte, chart_areas_at,
         chart_card_layout, chart_category_label_plan, chart_column_layout, chart_panel_after,
-        chart_panel_shown, chart_ref_of, chart_scale, chart_slot_color, chart_source_areas,
-        col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens, gesture_in_flight,
-        last_visible_col, may_arm_fill, parse_ref_text, press_selection, preview_range, range_a1,
-        range_border_cell_count, range_border_dashed, range_border_plan, range_edges_at,
-        range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref,
-        resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range, series_move,
-        series_name_shown, series_remove, series_resolved_preview, sheet_index_of, shift_col,
-        shift_row, shown_sel, snap_range_rows, source_ref_text,
+        chart_panel_shown, chart_ref_of, chart_render_path, chart_scale, chart_slot_color,
+        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens,
+        gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text, press_selection,
+        preview_range, range_a1, range_border_cell_count, range_border_dashed, range_border_plan,
+        range_edges_at, range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at,
+        replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range,
+        series_move, series_name_shown, series_remove, series_resolved_preview, sheet_index_of,
+        shift_col, shift_row, shown_sel, snap_range_rows, source_ref_text,
     };
 
     #[test]
@@ -23162,6 +23437,41 @@ mod grid_geom_tests {
         let zero_width = chart_column_layout(0.0, 10, 4);
         assert_eq!(zero_width.cluster_width, 0.0);
         assert!(zero_width.compressed);
+    }
+
+    #[test]
+    fn chart_render_paths_keep_kind_specific_axis_and_legend_invariants() {
+        use super::ChartRenderPath;
+
+        let bar = chart_render_path("bar");
+        assert_eq!(bar, ChartRenderPath::Bar);
+        assert!(bar.has_numeric_axes());
+        assert!(bar.has_horizontal_value_axis());
+        assert!(!bar.legend_uses_categories());
+        assert!(!bar.uses_column_geometry());
+
+        let line = chart_render_path("line");
+        assert_eq!(line, ChartRenderPath::Line);
+        assert!(line.has_numeric_axes());
+        assert!(!line.has_horizontal_value_axis());
+        assert!(!line.legend_uses_categories());
+        assert!(!line.uses_column_geometry());
+
+        let pie = chart_render_path("pie");
+        assert_eq!(pie, ChartRenderPath::Pie);
+        assert!(!pie.has_numeric_axes(), "pie must not acquire fake axes");
+        assert!(!pie.has_horizontal_value_axis());
+        assert!(pie.legend_uses_categories());
+        assert!(!pie.uses_column_geometry());
+
+        for fallback in ["column", "area", "scatter", "", "unknown"] {
+            let column = chart_render_path(fallback);
+            assert_eq!(column, ChartRenderPath::Column, "fallback {fallback:?}");
+            assert!(column.has_numeric_axes());
+            assert!(!column.has_horizontal_value_axis());
+            assert!(!column.legend_uses_categories());
+            assert!(column.uses_column_geometry());
+        }
     }
 
     #[test]

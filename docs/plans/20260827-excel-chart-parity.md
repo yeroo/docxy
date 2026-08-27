@@ -114,18 +114,18 @@ separate `SheetSnapshot`/`pkg.parts` audit remains a follow-on plan.
 
 ### Task 4: Render axes, gridlines and collision-resistant plots
 
-- [ ] render a left value-axis gutter and horizontal gridlines behind column
+- [x] render a left value-axis gutter and horizontal gridlines behind column
       and line marks, using the Task 3 scale
-- [ ] render the bar chart's horizontal value scale/gridlines without moving
+- [x] render the bar chart's horizontal value scale/gridlines without moving
       category labels into the plot
-- [ ] keep pie free of numeric axes and preserve its per-category legend
-- [ ] apply calculated column width/gaps and category-label thinning/truncation;
+- [x] keep pie free of numeric axes and preserve its per-category legend
+- [x] apply calculated column width/gaps and category-label thinning/truncation;
       add tooltips where visible text is shortened
-- [ ] constrain/reserve legend layout so it cannot cover the plot on small
+- [x] constrain/reserve legend layout so it cannot cover the plot on small
       cards, while keeping every plotted series identifiable
-- [ ] add helper/invariant tests that distinguish all four rendered kind paths
+- [x] add helper/invariant tests that distinguish all four rendered kind paths
       (`bar`, `line`, `pie`, column/default)
-- [ ] run suite tests before Task 5
+- [x] run suite tests before Task 5
 
 ### Task 5: Verify the live user-visible result
 
