@@ -40,16 +40,16 @@ documentation with the shipped implementation and archived plan location.
 
 ### Task 1: Make category-label geometry orientation-aware
 
-- [ ] sweep every use of `chart_category_label_plan` and identify horizontal
+- [x] sweep every use of `chart_category_label_plan` and identify horizontal
       versus vertical capacity rules before changing the helper contract
-- [ ] keep horizontal first/last retention while sizing each visible label box
+- [x] keep horizontal first/last retention while sizing each visible label box
       from adjacent retained-category centres so the shortened final stride
       cannot overlap its neighbour
-- [ ] give bar category labels a vertical plan based on the rendered 12-pixel
+- [x] give bar category labels a vertical plan based on the rendered 12-pixel
       row height rather than the horizontal 56-pixel width heuristic
-- [ ] test the 11-category/224-pixel `[0, 4, 8, 10]` case for non-overlap, the
+- [x] test the 11-category/224-pixel `[0, 4, 8, 10]` case for non-overlap, the
       four-category bar fixture for full retention, plus zero/one/tiny inputs
-- [ ] run the suite tests before Task 2
+- [x] run the suite tests before Task 2
 
 ### Task 2: Strengthen fixture drift comparison
 
