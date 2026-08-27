@@ -100,17 +100,17 @@ separate `SheetSnapshot`/`pkg.parts` audit remains a follow-on plan.
 
 ### Task 3: Model chart-card scale and available space
 
-- [ ] extract pure chart-scale helpers for the current non-negative preview
+- [x] extract pure chart-scale helpers for the current non-negative preview
       semantics, including stable zero/mid/max ticks and compact tick labels
-- [ ] extract a layout calculation for title, plot, axes and legend that clamps
+- [x] extract a layout calculation for title, plot, axes and legend that clamps
       safely for tiny cards and reserves rather than overlaps those regions
-- [ ] calculate deterministic category-label stride/truncation while retaining
+- [x] calculate deterministic category-label stride/truncation while retaining
       first and last context
-- [ ] calculate clustered column-bar width/gap from plot width, category count
+- [x] calculate clustered column-bar width/gap from plot width, category count
       and plotted series count with explicit usable minimum/maximum bounds
-- [ ] test zero/empty data, fractional and large values, one/many categories,
+- [x] test zero/empty data, fractional and large values, one/many categories,
       one/many series, and tiny/normal/wide cards
-- [ ] run suite tests before Task 4
+- [x] run suite tests before Task 4
 
 ### Task 4: Render axes, gridlines and collision-resistant plots
 

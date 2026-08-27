@@ -18374,6 +18374,400 @@ fn sheet_row(
     row.into_any_element()
 }
 
+/// The lightweight card deliberately keeps the preview's existing
+/// non-negative semantics: negative and non-finite values draw at zero, and a
+/// data set whose positive maximum is below one still uses one as its top.
+/// Three stable ticks are enough for this preview without pretending to pick
+/// Excel's full set of "nice" axis intervals.
+#[derive(Clone, Debug, PartialEq)]
+struct ChartTick {
+    value: f64,
+    label: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ChartScale {
+    max: f64,
+    ticks: [ChartTick; 3],
+}
+
+impl ChartScale {
+    fn fraction(&self, value: f64) -> f32 {
+        if !value.is_finite() {
+            return 0.0;
+        }
+        (value.max(0.0) / self.max).clamp(0.0, 1.0) as f32
+    }
+}
+
+fn trim_fixed(mut value: String) -> String {
+    if value.contains('.') {
+        while value.ends_with('0') {
+            value.pop();
+        }
+        if value.ends_with('.') {
+            value.pop();
+        }
+    }
+    value
+}
+
+/// A compact, deterministic tick label. The card has a narrow value-axis
+/// gutter, so common thousands/millions/billions use suffixes while small
+/// fractions retain enough precision to keep zero, midpoint and maximum
+/// distinct.
+fn compact_chart_tick(value: f64) -> String {
+    if !value.is_finite() || value <= 0.0 {
+        return "0".to_string();
+    }
+    if value >= 1.0e15 {
+        return format!("{value:.1e}");
+    }
+
+    let (scaled, suffix) = if value >= 1.0e12 {
+        (value / 1.0e12, "T")
+    } else if value >= 1.0e9 {
+        (value / 1.0e9, "B")
+    } else if value >= 1.0e6 {
+        (value / 1.0e6, "M")
+    } else if value >= 1.0e3 {
+        (value / 1.0e3, "K")
+    } else {
+        (value, "")
+    };
+
+    let decimals = if !suffix.is_empty() {
+        usize::from(scaled < 100.0)
+    } else if scaled >= 100.0 {
+        0
+    } else if scaled >= 10.0 {
+        1
+    } else if scaled >= 0.1 {
+        2
+    } else if scaled >= 0.01 {
+        3
+    } else if scaled >= 0.001 {
+        4
+    } else {
+        return format!("{scaled:.1e}");
+    };
+    let factor = 10f64.powi(decimals as i32);
+    let rounded = (scaled * factor).round() / factor;
+    format!("{}{}", trim_fixed(format!("{rounded:.decimals$}")), suffix)
+}
+
+fn chart_scale(values: impl IntoIterator<Item = f64>) -> ChartScale {
+    let max = values
+        .into_iter()
+        .filter(|value| value.is_finite())
+        .map(|value| value.max(0.0))
+        .fold(0.0f64, f64::max)
+        .max(1.0);
+    let tick_values = [0.0, max / 2.0, max];
+    ChartScale {
+        max,
+        ticks: tick_values.map(|value| ChartTick {
+            value,
+            label: compact_chart_tick(value),
+        }),
+    }
+}
+
+/// Pixel rectangles used by the card renderer. Every rectangle is relative to
+/// the card and is kept non-negative even when a malformed anchor or a pure
+/// helper test supplies dimensions smaller than the UI's minimum chart size.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ChartRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl ChartRect {
+    fn right(self) -> f32 {
+        self.x + self.w
+    }
+
+    fn bottom(self) -> f32 {
+        self.y + self.h
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ChartCardLayout {
+    title: ChartRect,
+    plot: ChartRect,
+    value_axis: ChartRect,
+    category_axis: ChartRect,
+    legend: ChartRect,
+}
+
+fn chart_dimension(value: f32) -> f32 {
+    if value.is_finite() {
+        value.max(0.0)
+    } else {
+        0.0
+    }
+}
+
+fn chart_legend_rows(labels: &[String], available_width: f32) -> usize {
+    if labels.is_empty() {
+        return 0;
+    }
+
+    let available_width = chart_dimension(available_width);
+    let mut rows = 1usize;
+    let mut used = 0.0f32;
+    for label in labels {
+        // Swatch + gap + a bounded name estimate. Very long imported names
+        // must not claim an unbounded legend row.
+        let item_w = (label.chars().count().min(24) as f32 * 5.5 + 22.0)
+            .clamp(42.0, 154.0)
+            .min(available_width);
+        let gap = if used > 0.0 { 10.0 } else { 0.0 };
+        if used > 0.0 && used + gap + item_w > available_width {
+            rows += 1;
+            used = item_w;
+        } else {
+            used += gap + item_w;
+        }
+    }
+    rows
+}
+
+/// Reserve the title, plot, both axes and legend as disjoint regions. Column
+/// and line charts put the value axis at left; horizontal bars swap those axis
+/// directions; pies get neither numeric nor category axes.
+fn chart_card_layout(
+    width: f32,
+    height: f32,
+    kind: &str,
+    legend_labels: &[String],
+) -> ChartCardLayout {
+    let width = chart_dimension(width);
+    let height = chart_dimension(height);
+    let inset = 6.0f32.min(width / 8.0).min(height / 8.0);
+    let content_w = (width - inset * 2.0).max(0.0);
+    let content_h = (height - inset * 2.0).max(0.0);
+
+    let title_h = 22.0f32.min(content_h * 0.20);
+    let after_title = (content_h - title_h).max(0.0);
+    let legend_rows = chart_legend_rows(legend_labels, content_w);
+    let wanted_legend_h = if legend_rows == 0 {
+        0.0
+    } else {
+        legend_rows as f32 * 14.0 + 4.0
+    };
+    let legend_h = wanted_legend_h.min(after_title * 0.35);
+    let body_h = (after_title - legend_h).max(0.0);
+    let body = ChartRect {
+        x: inset,
+        y: inset + title_h,
+        w: content_w,
+        h: body_h,
+    };
+    let title = ChartRect {
+        x: inset,
+        y: inset,
+        w: content_w,
+        h: title_h,
+    };
+    let legend = ChartRect {
+        x: inset,
+        y: body.bottom(),
+        w: content_w,
+        h: legend_h,
+    };
+
+    let mut layout = ChartCardLayout {
+        title,
+        legend,
+        ..ChartCardLayout::default()
+    };
+    if kind == "pie" {
+        layout.plot = body;
+        return layout;
+    }
+
+    let horizontal_axis_h = 18.0f32.min(body.h * 0.25);
+    let left_axis_w = if kind == "bar" { 54.0f32 } else { 38.0f32 }.min(body.w * 0.30);
+    let plot = ChartRect {
+        x: body.x + left_axis_w,
+        y: body.y,
+        w: (body.w - left_axis_w).max(0.0),
+        h: (body.h - horizontal_axis_h).max(0.0),
+    };
+    layout.plot = plot;
+    if kind == "bar" {
+        layout.category_axis = ChartRect {
+            x: body.x,
+            y: body.y,
+            w: left_axis_w,
+            h: plot.h,
+        };
+        layout.value_axis = ChartRect {
+            x: plot.x,
+            y: plot.bottom(),
+            w: plot.w,
+            h: horizontal_axis_h,
+        };
+    } else {
+        layout.value_axis = ChartRect {
+            x: body.x,
+            y: body.y,
+            w: left_axis_w,
+            h: plot.h,
+        };
+        layout.category_axis = ChartRect {
+            x: plot.x,
+            y: plot.bottom(),
+            w: plot.w,
+            h: horizontal_axis_h,
+        };
+    }
+    layout
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChartCategoryLabel {
+    index: usize,
+    text: String,
+    shortened: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ChartCategoryLabelPlan {
+    stride: usize,
+    max_chars: usize,
+    labels: Vec<ChartCategoryLabel>,
+}
+
+/// Thin labels to the space the plot can plausibly give them. Dense charts
+/// always retain category zero and the last category, and every visible label
+/// is shortened by Unicode scalar values through `bounded_label`.
+fn chart_category_label_plan(
+    labels: &[String],
+    category_count: usize,
+    plot_width: f32,
+) -> ChartCategoryLabelPlan {
+    if category_count == 0 {
+        return ChartCategoryLabelPlan::default();
+    }
+
+    let plot_width = chart_dimension(plot_width);
+    let visible_capacity = if category_count == 1 {
+        1
+    } else {
+        ((plot_width / 56.0).floor() as usize)
+            .max(2)
+            .min(category_count)
+    };
+    let stride = if visible_capacity <= 1 {
+        1
+    } else {
+        (category_count - 1).div_ceil(visible_capacity - 1)
+    };
+
+    let mut indices = Vec::with_capacity(visible_capacity);
+    let mut index = 0usize;
+    while index < category_count {
+        indices.push(index);
+        index = match index.checked_add(stride) {
+            Some(next) => next,
+            None => break,
+        };
+    }
+    if indices.last().copied() != Some(category_count - 1) {
+        indices.push(category_count - 1);
+    }
+
+    let slot_width = plot_width / indices.len().max(1) as f32;
+    let max_chars = ((slot_width / 6.0).floor() as usize).clamp(1, 18);
+    let labels = indices
+        .into_iter()
+        .map(|index| {
+            let full = labels.get(index).map(String::as_str).unwrap_or("");
+            ChartCategoryLabel {
+                index,
+                text: bounded_label(full, max_chars),
+                shortened: !full.trim().is_empty() && full.chars().count() > max_chars,
+            }
+        })
+        .collect();
+    ChartCategoryLabelPlan {
+        stride,
+        max_chars,
+        labels,
+    }
+}
+
+const MIN_COLUMN_BAR_W: f32 = 2.0;
+const MAX_COLUMN_BAR_W: f32 = 24.0;
+const MIN_COLUMN_BAR_GAP: f32 = 1.0;
+const MAX_COLUMN_BAR_GAP: f32 = 4.0;
+const MIN_COLUMN_CATEGORY_GAP: f32 = 4.0;
+const MAX_COLUMN_CATEGORY_GAP: f32 = 24.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ChartColumnLayout {
+    category_slot: f32,
+    cluster_width: f32,
+    bar_width: f32,
+    bar_gap: f32,
+    category_gap: f32,
+    compressed: bool,
+}
+
+/// Size a clustered column group from the space it actually owns. The target
+/// 2..=24px bar bounds and 1..=4px intra-series gap are used whenever the slot
+/// can fit them. Extremely dense data compresses below the target minimum
+/// instead of overflowing the plot, which `compressed` makes explicit.
+fn chart_column_layout(
+    plot_width: f32,
+    category_count: usize,
+    series_count: usize,
+) -> ChartColumnLayout {
+    if category_count == 0 || series_count == 0 {
+        return ChartColumnLayout::default();
+    }
+
+    let plot_width = chart_dimension(plot_width);
+    let category_slot = plot_width / category_count as f32;
+    let target_category_gap = if category_count == 1 {
+        0.0
+    } else {
+        (category_slot * 0.18)
+            .clamp(MIN_COLUMN_CATEGORY_GAP, MAX_COLUMN_CATEGORY_GAP)
+            .min(category_slot * 0.40)
+    };
+    let cluster_budget = (category_slot - target_category_gap).max(0.0);
+    let bar_gap = if series_count <= 1 {
+        0.0
+    } else {
+        let gaps = (series_count - 1) as f32;
+        let preferred = (cluster_budget * 0.04).clamp(MIN_COLUMN_BAR_GAP, MAX_COLUMN_BAR_GAP);
+        let preserves_minimum = (cluster_budget - MIN_COLUMN_BAR_W * series_count as f32) / gaps;
+        if preserves_minimum >= MIN_COLUMN_BAR_GAP {
+            preferred.min(preserves_minimum)
+        } else {
+            preserves_minimum.max(0.0).min(preferred)
+        }
+    };
+    let gap_total = bar_gap * series_count.saturating_sub(1) as f32;
+    let bar_width =
+        ((cluster_budget - gap_total).max(0.0) / series_count as f32).min(MAX_COLUMN_BAR_W);
+    let cluster_width = bar_width * series_count as f32 + gap_total;
+    ChartColumnLayout {
+        category_slot,
+        cluster_width,
+        bar_width,
+        bar_gap,
+        category_gap: (category_slot - cluster_width).max(0.0),
+        compressed: bar_width < MIN_COLUMN_BAR_W,
+    }
+}
+
 /// A floating chart card: a clustered column chart drawn with div bars, plus a
 /// title and legend. Handles bar/column data (the common case) for any kind.
 /// The eight resize grips of a selected chart: one per corner and edge, each
@@ -18466,11 +18860,12 @@ fn chart_card(data: &gridcore::sheet::ChartData, w: f32, h: f32) -> AnyElement {
     // `nser` is bounded by `data.series.len()` on both terms, so this can't
     // slice past the end.
     let plotted = &data.series[..nser];
-    let maxv = plotted
-        .iter()
-        .flat_map(|s| s.values.iter().copied())
-        .fold(0.0f64, f64::max)
-        .max(1.0);
+    let scale = chart_scale(
+        plotted
+            .iter()
+            .flat_map(|series| series.values.iter().copied()),
+    );
+    let maxv = scale.max;
     let ncat = data
         .categories
         .len()
@@ -19645,11 +20040,13 @@ fn main() {
 mod grid_geom_tests {
     use super::{
         BRAND, CHART_CATEGORIES_COLOR, CHART_NAME_COLOR, CHART_VALUES_COLOR, ChartSlot,
-        ChartSourceArea, EdgeMask, GRID_MAX_VISIBLE_ROWS, GridOverlay, PanelEvent,
-        RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_HEADER_SELECTED_BG,
+        ChartSourceArea, EdgeMask, GRID_MAX_VISIBLE_ROWS, GridOverlay, MAX_COLUMN_BAR_GAP,
+        MAX_COLUMN_BAR_W, MIN_COLUMN_BAR_GAP, MIN_COLUMN_BAR_W, PanelEvent, RANGE_BORDER_CELL_CAP,
+        RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_HEADER_SELECTED_BG,
         SHEET_HEADER_SELECTED_FG, SHEET_ROW_H, SelectTarget, SelectionAfter, arm_fill,
         border_range, bounded_label_preview, cell_selection_shown, char_to_byte, chart_areas_at,
-        chart_panel_after, chart_panel_shown, chart_ref_of, chart_slot_color, chart_source_areas,
+        chart_card_layout, chart_category_label_plan, chart_column_layout, chart_panel_after,
+        chart_panel_shown, chart_ref_of, chart_scale, chart_slot_color, chart_source_areas,
         col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens, gesture_in_flight,
         last_visible_col, may_arm_fill, parse_ref_text, press_selection, preview_range, range_a1,
         range_border_cell_count, range_border_dashed, range_border_plan, range_edges_at,
@@ -22574,6 +22971,197 @@ mod grid_geom_tests {
             "\u{1f642}\u{6771}\u{4eac}\u{2026}",
             "UTF-8 labels are truncated by characters, not bytes"
         );
+    }
+
+    #[test]
+    fn chart_scale_handles_empty_zero_fractional_and_large_data() {
+        let empty = chart_scale([]);
+        assert_eq!(empty.max, 1.0);
+        assert_eq!(empty.ticks[0].value, 0.0);
+        assert_eq!(empty.ticks[1].value, 0.5);
+        assert_eq!(empty.ticks[2].value, 1.0);
+        assert_eq!(
+            empty.ticks.each_ref().map(|tick| tick.label.as_str()),
+            ["0", "0.5", "1"]
+        );
+
+        // Zero, negative, NaN and infinity do not distort the non-negative
+        // preview. Fractional-only input retains the existing one-unit floor.
+        let zero = chart_scale([0.0, -4.0, f64::NAN, f64::INFINITY]);
+        assert_eq!(zero, empty);
+        let fractional = chart_scale([0.125, 0.75]);
+        assert_eq!(fractional.max, 1.0);
+        assert_eq!(fractional.fraction(0.75), 0.75);
+        assert_eq!(fractional.fraction(-2.0), 0.0);
+        assert_eq!(fractional.fraction(f64::NAN), 0.0);
+
+        let decimal = chart_scale([2.5]);
+        assert_eq!(decimal.max, 2.5);
+        assert_eq!(
+            decimal.ticks.each_ref().map(|tick| tick.label.as_str()),
+            ["0", "1.25", "2.5"]
+        );
+        assert_eq!(decimal.fraction(5.0), 1.0, "marks clamp at the top");
+
+        let large = chart_scale([2_500_000.0]);
+        assert_eq!(
+            large.ticks.each_ref().map(|tick| tick.label.as_str()),
+            ["0", "1.3M", "2.5M"]
+        );
+    }
+
+    fn assert_chart_rect_inside(rect: super::ChartRect, width: f32, height: f32) {
+        assert!(rect.x >= 0.0 && rect.y >= 0.0);
+        assert!(rect.w >= 0.0 && rect.h >= 0.0);
+        assert!(rect.right() <= width + f32::EPSILON);
+        assert!(rect.bottom() <= height + f32::EPSILON);
+    }
+
+    #[test]
+    fn chart_card_layout_reserves_disjoint_kind_specific_regions() {
+        let legend = names(&["North", "South"]);
+        let column = chart_card_layout(360.0, 220.0, "column", &legend);
+        for rect in [
+            column.title,
+            column.value_axis,
+            column.plot,
+            column.category_axis,
+            column.legend,
+        ] {
+            assert_chart_rect_inside(rect, 360.0, 220.0);
+        }
+        assert!(column.title.bottom() <= column.plot.y);
+        assert!(column.value_axis.right() <= column.plot.x);
+        assert!(column.plot.bottom() <= column.category_axis.y);
+        assert!(column.category_axis.bottom() <= column.legend.y);
+
+        let bar = chart_card_layout(360.0, 220.0, "bar", &legend);
+        assert!(bar.category_axis.right() <= bar.plot.x);
+        assert!(bar.plot.bottom() <= bar.value_axis.y);
+        assert!(bar.value_axis.bottom() <= bar.legend.y);
+
+        let pie = chart_card_layout(360.0, 220.0, "pie", &legend);
+        assert!(pie.plot.w > column.plot.w && pie.plot.h > column.plot.h);
+        assert_eq!(pie.value_axis.w * pie.value_axis.h, 0.0);
+        assert_eq!(pie.category_axis.w * pie.category_axis.h, 0.0);
+    }
+
+    #[test]
+    fn chart_card_layout_clamps_tiny_cards_and_uses_wide_legend_space() {
+        let many = names(&[
+            "Series one",
+            "Series two",
+            "Series three",
+            "Series four",
+            "Series five",
+            "Series six",
+            "Series seven",
+            "Series eight",
+        ]);
+        let normal = chart_card_layout(180.0, 220.0, "line", &many);
+        let wide = chart_card_layout(800.0, 220.0, "line", &many);
+        assert!(wide.legend.h < normal.legend.h);
+        assert!(wide.plot.w > normal.plot.w);
+
+        // The live UI never allows a chart this small; the helper still has to
+        // be total because imported geometry and resize intermediates are data.
+        let tiny = chart_card_layout(20.0, 14.0, "column", &many);
+        for rect in [
+            tiny.title,
+            tiny.value_axis,
+            tiny.plot,
+            tiny.category_axis,
+            tiny.legend,
+        ] {
+            assert_chart_rect_inside(rect, 20.0, 14.0);
+        }
+        assert!(tiny.category_axis.bottom() <= tiny.legend.y + f32::EPSILON);
+
+        let invalid = chart_card_layout(f32::NAN, f32::INFINITY, "bar", &many);
+        assert_eq!(invalid, super::ChartCardLayout::default());
+    }
+
+    #[test]
+    fn category_label_plan_thins_deterministically_and_keeps_end_context() {
+        assert_eq!(
+            chart_category_label_plan(&[], 0, 300.0),
+            super::ChartCategoryLabelPlan::default()
+        );
+
+        let one = names(&["January"]);
+        let one_plan = chart_category_label_plan(&one, 1, 300.0);
+        assert_eq!(one_plan.stride, 1);
+        assert_eq!(one_plan.labels.len(), 1);
+        assert_eq!(one_plan.labels[0].index, 0);
+        assert_eq!(one_plan.labels[0].text, "January");
+        assert!(!one_plan.labels[0].shortened);
+
+        let categories = (0..10)
+            .map(|index| format!("Category {index}"))
+            .collect::<Vec<_>>();
+        let dense = chart_category_label_plan(&categories, categories.len(), 112.0);
+        assert_eq!(dense.stride, 9);
+        assert_eq!(
+            dense
+                .labels
+                .iter()
+                .map(|label| label.index)
+                .collect::<Vec<_>>(),
+            [0, 9]
+        );
+        assert!(dense.labels.iter().all(|label| label.shortened));
+        assert!(dense.max_chars < categories[0].chars().count());
+
+        let wide = chart_category_label_plan(&categories, categories.len(), 700.0);
+        assert_eq!(wide.stride, 1);
+        assert_eq!(wide.labels.len(), categories.len());
+        assert_eq!(wide.labels.first().map(|label| label.index), Some(0));
+        assert_eq!(wide.labels.last().map(|label| label.index), Some(9));
+
+        let unicode = names(&["\u{6771}\u{4eac}\u{5e02}\u{5834}\u{1f642}"]);
+        let shortened = chart_category_label_plan(&unicode, 1, 18.0);
+        assert_eq!(shortened.max_chars, 3);
+        assert_eq!(shortened.labels[0].text, "\u{6771}\u{4eac}\u{2026}");
+        assert!(shortened.labels[0].shortened);
+    }
+
+    #[test]
+    fn column_layout_sizes_one_or_many_series_from_the_plot_width() {
+        assert_eq!(
+            chart_column_layout(300.0, 0, 2),
+            super::ChartColumnLayout::default()
+        );
+        assert_eq!(
+            chart_column_layout(300.0, 4, 0),
+            super::ChartColumnLayout::default()
+        );
+
+        let one = chart_column_layout(600.0, 1, 1);
+        assert_eq!(one.category_slot, 600.0);
+        assert_eq!(one.bar_width, MAX_COLUMN_BAR_W);
+        assert_eq!(one.bar_gap, 0.0);
+        assert!(!one.compressed);
+
+        let normal = chart_column_layout(300.0, 5, 2);
+        assert!((MIN_COLUMN_BAR_W..=MAX_COLUMN_BAR_W).contains(&normal.bar_width));
+        assert!((MIN_COLUMN_BAR_GAP..=MAX_COLUMN_BAR_GAP).contains(&normal.bar_gap));
+        assert!(normal.cluster_width <= normal.category_slot + f32::EPSILON);
+        assert!(normal.category_gap >= 0.0);
+
+        let many = chart_column_layout(300.0, 5, 8);
+        assert!((MIN_COLUMN_BAR_W..=MAX_COLUMN_BAR_W).contains(&many.bar_width));
+        assert!(many.bar_width < normal.bar_width);
+        assert!(many.cluster_width <= many.category_slot + f32::EPSILON);
+
+        // When even the explicit minimum cannot fit, compress safely rather
+        // than spilling a cluster into its neighbour or outside a tiny plot.
+        let dense = chart_column_layout(12.0, 10, 4);
+        assert!(dense.compressed);
+        assert!(dense.bar_width < MIN_COLUMN_BAR_W);
+        assert!(dense.cluster_width <= dense.category_slot + f32::EPSILON);
+        let zero_width = chart_column_layout(0.0, 10, 4);
+        assert_eq!(zero_width.cluster_width, 0.0);
+        assert!(zero_width.compressed);
     }
 
     #[test]
