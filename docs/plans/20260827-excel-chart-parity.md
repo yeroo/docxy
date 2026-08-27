@@ -71,16 +71,16 @@ separate `SheetSnapshot`/`pkg.parts` audit remains a follow-on plan.
 
 ### Task 1: Define neutral header-selection state
 
-- [ ] extract a pure helper that chooses the header range from ordinary
+- [x] extract a pure helper that chooses the header range from ordinary
       selection, active range preview and `sel_hidden`; preview wins, a hidden
       ordinary selection contributes no range
-- [ ] define neutral selected-header background/foreground constants with
+- [x] define neutral selected-header background/foreground constants with
       enough contrast and no reuse of `BRAND`
-- [ ] update column and row header rendering to consume the same chosen range
+- [x] update column and row header rendering to consume the same chosen range
       so their behavior cannot drift
-- [ ] test ordinary selection, pointed preview, chart-hidden selection, and the
+- [x] test ordinary selection, pointed preview, chart-hidden selection, and the
       pointed-preview-while-chart-selected combination
-- [ ] run suite tests before Task 2
+- [x] run suite tests before Task 2
 
 ### Task 2: Show resolved values in the Chart panel
 

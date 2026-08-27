@@ -5863,6 +5863,7 @@ impl Docxy {
         GridOverlay {
             fill_preview: self.sheet_fill_preview(),
             range_preview: self.range_preview(),
+            selected_headers: None,
             // Point mode asks only whether a range field has focus — NOT
             // whether it currently washes anything. A field holding another
             // sheet's reference draws no wash (`preview_range`) and must still
@@ -17571,6 +17572,17 @@ fn shown_sel(ov: &GridOverlay, sel: (u32, u32, u32, u32)) -> Option<(u32, u32, u
     (!ov.sel_hidden).then_some(sel)
 }
 
+/// The one range whose row and column headers are highlighted this frame.
+/// A focused range field points more specifically than the ordinary selection,
+/// so its preview wins even while a selected chart hides the cell selection.
+fn selected_header_range(
+    sel: (u32, u32, u32, u32),
+    preview: Option<(u32, u32, u32, u32)>,
+    sel_hidden: bool,
+) -> Option<(u32, u32, u32, u32)> {
+    preview.or_else(|| (!sel_hidden).then_some(sel))
+}
+
 /// Whether `range`'s border is drawn dashed, or falls back to solid because it
 /// would cost more than `RANGE_BORDER_CELL_CAP` boundary cells.
 ///
@@ -17709,6 +17721,11 @@ fn label_lines(label: &str) -> Vec<String> {
 const MAX_VISIBLE_COL: u32 = 255;
 const SHEET_ROW_H: f32 = 21.0;
 const SHEET_GUT: f32 = 46.0;
+/// Excel-like neutral emphasis for selected row and column headers. These stay
+/// separate from `BRAND`: reference outlines keep their semantic colours while
+/// header selection remains a quiet, high-contrast grey state.
+const SHEET_HEADER_SELECTED_BG: u32 = 0xc9c9c9;
+const SHEET_HEADER_SELECTED_FG: u32 = 0x262626;
 
 /// The frozen column-letter header row (with drag-to-resize handles). Rendered
 /// once above the virtualized rows so it stays put while they scroll vertically.
@@ -17718,7 +17735,7 @@ fn sheet_col_header(
     fc: u32,
     col0: u32,
     cend: u32,
-    sel_hidden: bool,
+    selected_headers: Option<(u32, u32, u32, u32)>,
 ) -> AnyElement {
     use gridcore::sheet::col_name;
     let sh = view.sheet();
@@ -17726,8 +17743,8 @@ fn sheet_col_header(
     let freeze_line = hsla_u(0x8a8a8a);
     let head_bg = hsla_u(0xf1f1f1);
     let head_fg = hsla_u(0x5a5a5a);
-    let brand = hsla_u(BRAND);
-    let (_, c0, _, c1) = view.range();
+    let selected_bg = hsla_u(SHEET_HEADER_SELECTED_BG);
+    let selected_fg = hsla_u(SHEET_HEADER_SELECTED_FG);
     let mut header = h_flex().child(
         div()
             .w(px(SHEET_GUT))
@@ -17740,8 +17757,7 @@ fn sheet_col_header(
     );
     // Frozen columns 0..fc pinned, then the scrollable window col0..=cend.
     for c in (0..fc).chain(col0..=cend) {
-        // Dark while a chart owns the selection, for the same reason the ring is.
-        let hl = !sel_hidden && c >= c0 && c <= c1;
+        let hl = selected_headers.is_some_and(|(_, c0, _, c1)| c >= c0 && c <= c1);
         let on_freeze = fc > 0 && c + 1 == fc;
         let ent_h = ent.clone();
         let handle = div()
@@ -17764,12 +17780,12 @@ fn sheet_col_header(
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(if hl { brand } else { head_bg })
+                .bg(if hl { selected_bg } else { head_bg })
                 .border_r_1()
                 .border_b_1()
                 .border_color(if on_freeze { freeze_line } else { gridline })
                 .text_size(px(11.))
-                .text_color(if hl { hsla_u(0xffffff) } else { head_fg })
+                .text_color(if hl { selected_fg } else { head_fg })
                 .child(SharedString::from(col_name(c)))
                 .child(handle),
         );
@@ -17788,6 +17804,9 @@ struct GridOverlay {
     /// An INPUT to `border_rg` below, which `sheet_el` resolves; the row
     /// renderer reads that rather than this.
     range_preview: Option<(u32, u32, u32, u32)>,
+    /// The range selected once for both header axes by `selected_header_range`.
+    /// Filled by `sheet_el`, alongside the other render-derived overlay state.
+    selected_headers: Option<(u32, u32, u32, u32)>,
     /// A range field has the keyboard: the active cell drops its ring so it
     /// can't be mistaken for the range being picked, and wears a wash instead.
     picking: bool,
@@ -17854,10 +17873,14 @@ fn sheet_row(
     let head_bg = hsla_u(0xf1f1f1);
     let head_fg = hsla_u(0x5a5a5a);
     let brand = hsla_u(BRAND);
+    let selected_header_bg = hsla_u(SHEET_HEADER_SELECTED_BG);
+    let selected_header_fg = hsla_u(SHEET_HEADER_SELECTED_FG);
     let range_tint = Hsla { a: 0.14, ..brand };
-    // The row-number gutter highlights the selection's rows — unless a chart
-    // owns the selection, in which case the grid shows none of it.
-    let hl_row = !ov.sel_hidden && r >= r0 && r <= r1;
+    // The row and column axes consume the same range selected by `sheet_el`, so
+    // a pointed preview cannot highlight one axis without the other.
+    let hl_row = ov
+        .selected_headers
+        .is_some_and(|(hr0, _, hr1, _)| r >= hr0 && r <= hr1);
     // What the dashed border outlines this frame — the cells a focused range
     // field points at, else a selection spanning more than one cell — resolved
     // once for the whole grid in `sheet_el`, where the visible rows are known.
@@ -17873,12 +17896,12 @@ fn sheet_row(
             .flex()
             .items_center()
             .justify_center()
-            .bg(if hl_row { brand } else { head_bg })
+            .bg(if hl_row { selected_header_bg } else { head_bg })
             .border_r_1()
             .border_b_1()
             .border_color(gridline)
             .text_size(px(11.))
-            .text_color(if hl_row { hsla_u(0xffffff) } else { head_fg })
+            .text_color(if hl_row { selected_header_fg } else { head_fg })
             .child(SharedString::from((r + 1).to_string())),
     );
     // Merged regions: the top-left cell spans its columns' combined width; cells
@@ -18573,7 +18596,7 @@ fn sheet_el(
     dv_values: Option<Vec<String>>,
     dv_open: bool,
     grid_w: f32,
-    ov: GridOverlay,
+    mut ov: GridOverlay,
     chart_ui: ChartUi,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
@@ -18605,6 +18628,7 @@ fn sheet_el(
     let total_rows = ((max_r + 100).max(500)) as usize;
     let gridline = hsla_u(0xd9d9d9);
     let (r0, c0, r1, c1) = view.range();
+    ov.selected_headers = selected_header_range((r0, c0, r1, c1), ov.range_preview, ov.sel_hidden);
 
     let editing = view.editing.clone();
     // ---- formula / reference bar ----
@@ -18690,7 +18714,7 @@ fn sheet_el(
     // wrapping it in `overflow_x` steals the wheel and breaks vertical scrolling).
     // Columns are rendered to fill the viewport; a horizontal scroller can't be
     // layered on without losing virtualization on raw gpui.
-    let header = sheet_col_header(view, ent, fc, col0, cend, ov.sel_hidden);
+    let header = sheet_col_header(view, ent, fc, col0, cend, ov.selected_headers);
     let cc_frozen = comment_cells.clone();
     let cc_list = comment_cells.clone();
     // A chart card floating over the selection's corner owns those pixels, so
@@ -19521,19 +19545,58 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        CHART_CATEGORIES_COLOR, CHART_NAME_COLOR, CHART_VALUES_COLOR, ChartSlot, ChartSourceArea,
-        EdgeMask, GRID_MAX_VISIBLE_ROWS, GridOverlay, PanelEvent, RANGE_BORDER_CELL_CAP,
-        RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_ROW_H, SelectTarget, SelectionAfter,
-        arm_fill, border_range, cell_selection_shown, char_to_byte, chart_areas_at,
-        chart_panel_after, chart_panel_shown, chart_ref_of, chart_slot_color, chart_source_areas,
-        col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens, gesture_in_flight,
-        last_visible_col, may_arm_fill, parse_ref_text, press_selection, preview_range, range_a1,
+        BRAND, CHART_CATEGORIES_COLOR, CHART_NAME_COLOR, CHART_VALUES_COLOR, ChartSlot,
+        ChartSourceArea, EdgeMask, GRID_MAX_VISIBLE_ROWS, GridOverlay, PanelEvent,
+        RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_HEADER_SELECTED_BG,
+        SHEET_HEADER_SELECTED_FG, SHEET_ROW_H, SelectTarget, SelectionAfter, arm_fill,
+        border_range, cell_selection_shown, char_to_byte, chart_areas_at, chart_panel_after,
+        chart_panel_shown, chart_ref_of, chart_slot_color, chart_source_areas, col_at_x, col_px,
+        dash_fit, edit_runs, fill_box, formula_ref_tokens, gesture_in_flight, last_visible_col,
+        may_arm_fill, parse_ref_text, press_selection, preview_range, range_a1,
         range_border_cell_count, range_border_dashed, range_border_plan, range_edges_at,
         range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref,
-        resize_axis, row_height_px, scroll_col0_for_sel, series_move, series_name_shown,
-        series_remove, sheet_index_of, shift_col, shift_row, shown_sel, snap_range_rows,
-        source_ref_text,
+        resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range, series_move,
+        series_name_shown, series_remove, sheet_index_of, shift_col, shift_row, shown_sel,
+        snap_range_rows, source_ref_text,
     };
+
+    #[test]
+    fn selected_header_range_follows_selection_and_pointing_precedence() {
+        let selection = (1, 1, 4, 3);
+        let preview = (6, 5, 8, 7);
+
+        // An ordinary visible selection highlights all of its row and column
+        // headers. A pointed range is more specific and replaces that answer.
+        assert_eq!(
+            selected_header_range(selection, None, false),
+            Some(selection)
+        );
+        assert_eq!(
+            selected_header_range(selection, Some(preview), false),
+            Some(preview)
+        );
+
+        // A chart owns and hides the ordinary cell selection, but a range field
+        // in that chart may still point at cells and therefore highlight them.
+        assert_eq!(selected_header_range(selection, None, true), None);
+        assert_eq!(
+            selected_header_range(selection, Some(preview), true),
+            Some(preview)
+        );
+    }
+
+    #[test]
+    fn selected_header_colours_are_neutral_contrasting_greys() {
+        let channels = |rgb: u32| ((rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff);
+        let (br, bg, bb) = channels(SHEET_HEADER_SELECTED_BG);
+        let (fr, fg, fb) = channels(SHEET_HEADER_SELECTED_FG);
+
+        assert_eq!((br, bg), (bg, bb), "background must be neutral grey");
+        assert_eq!((fr, fg), (fg, fb), "foreground must be neutral grey");
+        assert!(br.abs_diff(fr) >= 128, "header text needs strong contrast");
+        assert_ne!(SHEET_HEADER_SELECTED_BG, BRAND);
+        assert_ne!(SHEET_HEADER_SELECTED_FG, BRAND);
+    }
 
     /// ⚠️ The auto-fill-on-sweep regression came in through a second handler on
     /// the fill handle: the handle is pinned to the selection's bottom-right
