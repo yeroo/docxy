@@ -45,6 +45,21 @@ than one cell — one code path, one look (`border_range`); a lone selected cell
 already wears its ring, and the `range_tint` wash stays under it because a
 multi-cell selection with nothing but one cell's ring says too little.
 
+### Header feedback while selecting or pointing
+
+Row and column headers use one shared range (`selected_header_range`) so the
+two axes cannot disagree. An active `range_preview` wins; otherwise the visible,
+normalized cell selection supplies the range; when a selected chart hides that
+ordinary selection (`sel_hidden`), no ordinary headers are marked. The preview
+still wins in that state because a Chart-panel field must show which rows and
+columns it is pointing at even while the chart owns the selection.
+
+Every affected row number and column letter uses the neutral selected-header
+grey (`SHEET_HEADER_SELECTED_BG`/`SHEET_HEADER_SELECTED_FG`), with unaffected
+headers retaining the ordinary header style. This state deliberately does not
+reuse `BRAND`: the dashed pointing border, formula-reference colours and
+selected-chart source colours keep their separate semantic meanings.
+
 An outline whose first or last row is **hidden** — an autofilter, a manually
 hidden row — is pulled in onto the rows the grid actually walks
 (`snap_range_rows`, applied once per frame in `sheet_el`). The renderer draws
@@ -153,6 +168,23 @@ point of a `<c:f>` carrying a sheet name. The `ChartSource` written back carries
 the **resolved** sheet's name, so the ref persists into the file as a real
 cross-sheet `<c:f>` rather than a bare box the next open would read as local.
 A sheet the workbook hasn't got is refused by name under the field instead.
+
+The Chart panel keeps those references editable while also explaining what
+they currently resolve to. A referenced SERIES NAME field continues to show
+text such as `=Budget!$B$1`; a compact `Resolved: Q1` row beneath it comes from
+the current `ChartSeries::name` cache. A literal series name has no `name_ref`,
+so it remains one editable row and gets no misleading duplicate. CATEGORY
+LABELS likewise keeps its `=Budget!$A$2:$A$5` field and shows a bounded summary
+from `ChartData::categories`: at most four labels, at most 24 Unicode scalar
+values per label, `(blank)` for a blank item, `+N more` for omitted items, and
+`No labels` for an empty cache. Re-pointing, switching orientation and loading
+a chart replace those caches before the next render; the panel never re-reads
+cells merely to draw a preview (`series_resolved_preview`,
+`bounded_label_preview`).
+
+These rows are display-only. They neither replace the editable references nor
+change chart serialization. The chart card's separate display limits are
+documented in [`chart-preview.md`](chart-preview.md).
 
 Re-pointing keeps the chart's `complex` flag (`chart_apply_range`): a stacked or
 combo plot area still round-trips verbatim, and only **picking a type**
@@ -805,7 +837,10 @@ Covered that way: `parse_ref_text`, `range_a1`, `ref_a1`, `source_ref_text`,
 `series_is_plotted`, `chart_unplotted_note`, `smallest_ref_at`,
 `range_edges_at`, `snap_range_rows`, `range_border_plan`,
 `range_border_cell_count`, `range_border_dashed`, `dash_fit`, `border_range`,
-`shown_sel`, `chart_source_areas`, `chart_areas_at`, `chart_slot_color`,
+`shown_sel`, `selected_header_range`, `bounded_label`,
+`bounded_label_preview`, `series_resolved_preview`, `chart_scale`,
+`chart_card_layout`, `chart_category_label_plan`, `chart_column_layout`,
+`chart_render_path`, `chart_source_areas`, `chart_areas_at`, `chart_slot_color`,
 `press_selection`, `cell_selection_shown`, `act_targets_cells`,
 `chart_panel_after`, `chart_panel_shown`.
 

@@ -167,12 +167,35 @@ Live evidence, 2026-08-27:
 
 ### Task 6: [Final] Document the finished behavior
 
-- [ ] update `suite/docs/range-selector.md` with the neutral header rule and the
+- [x] update `suite/docs/range-selector.md` with the neutral header rule and the
       resolved-name/category previews
-- [ ] document chart-card layout/scale limits and the deliberate non-negative
+- [x] document chart-card layout/scale limits and the deliberate non-negative
       preview semantics near the renderer or in a focused suite document
-- [ ] record the final test counts, live evidence and any intentional deferrals
+- [x] record the final test counts, live evidence and any intentional deferrals
       in this plan
+
+Final documentation and validation, 2026-08-27:
+
+- `suite/docs/range-selector.md` now records the shared preview-first header
+  range, neutral header colours and cache-only resolved series/category rows.
+  `suite/docs/chart-preview.md` records the kind-specific axes, three-tick
+  non-negative scale, reserved layout, label/column sizing and display-only
+  limits.
+- Final automated counts: root `cargo test` passed 2,323 tests with one existing
+  ignored test; `cargo test --manifest-path suite/Cargo.toml` passed 199/199.
+  Both root/suite `cargo clippy --all-targets -- -D warnings`, both root/suite
+  `cargo fmt --check`, and `git diff --check` passed.
+- Final live evidence remains the Task 5 run: the unchanged selection script
+  passed 5/5 under
+  `uiharness-runs/20260827-excel-chart-parity-selection-final/`, and the chart
+  fixture passed 2/2 under `uiharness-runs/20260827-excel-chart-parity/` with
+  the window/grid/card/panel captures listed above. Task 6 changed
+  documentation only, so no replacement capture was needed.
+- Intentional deferrals remain: side-by-side Excel and resize/long-Unicode
+  manual checks; negative and mixed-sign, secondary/log and exact Excel axes;
+  golden-image/OCR infrastructure; and the separate `SheetSnapshot`/
+  `SheetPackage::parts` undo/redo audit. Chart references, model caches and
+  OOXML/package behavior were not changed by this display work.
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*
 
