@@ -18668,9 +18668,10 @@ struct ChartCategoryLabelPlan {
 /// meet at the midpoint between adjacent retained-category centres, so a
 /// forced final label cannot overlap its neighbour when the final stride is
 /// shorter. Vertical plans centre fixed-height rows on category centres and
-/// clamp them to the axis edges. When at least two rows fit, they discard a
-/// colliding row before forcing the last category into view; a one-row plan
-/// retains category zero.
+/// clamp them to the axis edges. A plan has no labels when a full row cannot
+/// fit and retains category zero when exactly one row fits. When at least two
+/// rows fit, it discards a colliding row before forcing the last category into
+/// view.
 fn chart_category_label_plan(
     labels: &[String],
     category_count: usize,
