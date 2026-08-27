@@ -84,19 +84,19 @@ separate `SheetSnapshot`/`pkg.parts` audit remains a follow-on plan.
 
 ### Task 2: Show resolved values in the Chart panel
 
-- [ ] extract a Unicode-safe bounded label-preview helper that handles empty
+- [x] extract a Unicode-safe bounded label-preview helper that handles empty
       labels, truncation, omitted counts and a small configurable limit
-- [ ] show a referenced series name as a compact resolved value beneath its
+- [x] show a referenced series name as a compact resolved value beneath its
       reference field; keep literal names single and editable without a
       duplicate row
-- [ ] show the chart's resolved category labels beneath the CATEGORY LABELS
+- [x] show the chart's resolved category labels beneath the CATEGORY LABELS
       reference field, using the bounded preview and an explicit empty state
-- [ ] ensure previews are derived only from the current `ChartData` caches and
+- [x] ensure previews are derived only from the current `ChartData` caches and
       update immediately after re-pointing, switching orientation or re-reading
       a chart
-- [ ] test referenced/literal series names plus empty, short, long and Unicode
+- [x] test referenced/literal series names plus empty, short, long and Unicode
       category lists
-- [ ] run suite tests before Task 3
+- [x] run suite tests before Task 3
 
 ### Task 3: Model chart-card scale and available space
 

@@ -478,6 +478,13 @@ const CHART_COLORS: [u32; 8] = [
     0x2AA79B, 0x2F6FDB, 0xC0705A, 0xD8A44A, 0x7A5EA8, 0x5A9E5A, 0xD06C9E, 0x707880,
 ];
 
+/// Keep resolved Chart-panel values useful without letting them make a narrow
+/// side panel arbitrarily tall or wide. These affect display only: the fields
+/// and chart caches retain every character and item.
+const CHART_PANEL_PREVIEW_ITEMS: usize = 4;
+const CHART_PANEL_PREVIEW_LABEL_CHARS: usize = 24;
+const CHART_PANEL_SERIES_NAME_CHARS: usize = 40;
+
 /// Width of a right-hand side panel (PivotTable Fields, Chart). The grid
 /// subtracts each visible one when it works out how many columns fit.
 const SIDE_PANEL_W: f32 = 232.0;
@@ -3341,6 +3348,61 @@ fn series_name_shown(name: &str, name_ref: Option<&str>) -> String {
         Some(src) => source_ref_text(&src),
         None => name.to_string(),
     }
+}
+
+/// One cached chart label made compact for the Chart panel. Character limits
+/// are counted as Unicode scalar values, never byte offsets, so shortening a
+/// non-ASCII label cannot split its UTF-8 representation. Blank cache entries
+/// remain visible as data rather than disappearing into the surrounding row.
+fn bounded_label(label: &str, max_chars: usize) -> String {
+    if label.trim().is_empty() {
+        return "(blank)".to_string();
+    }
+
+    let max_chars = max_chars.max(1);
+    let mut chars = label.chars();
+    let shown: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_none() {
+        return shown;
+    }
+
+    if max_chars == 1 {
+        return "\u{2026}".to_string();
+    }
+    let mut shown: String = label.chars().take(max_chars - 1).collect();
+    shown.push('\u{2026}');
+    shown
+}
+
+/// A bounded, deterministic summary of cached category labels. `max_items` is
+/// deliberately a caller choice so the narrow live panel can use a small cap
+/// while pure tests can exercise every boundary. Labels beyond the cap are
+/// represented by an explicit omitted count; individual long labels are
+/// shortened independently by `max_label_chars`.
+fn bounded_label_preview(labels: &[String], max_items: usize, max_label_chars: usize) -> String {
+    if labels.is_empty() {
+        return "No labels".to_string();
+    }
+
+    let shown = labels.len().min(max_items);
+    let mut parts: Vec<String> = labels[..shown]
+        .iter()
+        .map(|label| bounded_label(label, max_label_chars))
+        .collect();
+    if shown < labels.len() {
+        parts.push(format!("+{} more", labels.len() - shown));
+    }
+    parts.join(" \u{00b7} ")
+}
+
+/// The compact row shown below a series NAME field, or no row for a literal
+/// name. Parsing the cached `name_ref` uses the same test as
+/// `series_name_shown`, so an unreadable legacy ref cannot make a duplicate
+/// row appear beneath the literal name the field falls back to showing.
+fn series_resolved_preview(name: &str, name_ref: Option<&str>, max_chars: usize) -> Option<String> {
+    name_ref
+        .and_then(gridcore::sheet::ChartSource::parse_f_ref)
+        .map(|_| bounded_label(name, max_chars))
 }
 
 /// The rectangle a selection covers, whichever corner it was dragged from.
@@ -8383,6 +8445,15 @@ impl Docxy {
                 .as_ref()
                 .map(source_ref_text)
                 .unwrap_or_default();
+            // Both values come from this frame's ChartData clone. In
+            // particular, resolving a name here never re-reads the sheet: the
+            // series cache is replaced by every re-point/re-read/orientation
+            // path before that path notifies and causes another frame.
+            let resolved_name = series_resolved_preview(
+                &sr.name,
+                sr.name_ref.as_deref(),
+                CHART_PANEL_SERIES_NAME_CHARS,
+            );
             let mut swatches = h_flex().gap(px(3.));
             for swatch in CHART_COLORS {
                 let on = sr.color == Some(swatch);
@@ -8503,6 +8574,16 @@ impl Docxy {
                         "",
                         cx,
                     ))
+                    .when_some(resolved_name, |d, resolved| {
+                        d.child(
+                            div()
+                                .id(ElementId::Name(format!("series-name-resolved-{si}").into()))
+                                .px_1()
+                                .text_size(px(10.))
+                                .text_color(pal.dim)
+                                .child(format!("Resolved: {resolved}")),
+                        )
+                    })
                     .child(
                         div()
                             .pt(px(2.))
@@ -8527,6 +8608,15 @@ impl Docxy {
             .as_ref()
             .map(source_ref_text)
             .unwrap_or_default();
+        // Categories are the other cache the panel explains. This is computed
+        // from `data.categories` only, so a changed reference, orientation or
+        // freshly parsed chart is reflected on the next notified frame without
+        // doing workbook I/O in the renderer.
+        let categories_preview = bounded_label_preview(
+            &data.categories,
+            CHART_PANEL_PREVIEW_ITEMS,
+            CHART_PANEL_PREVIEW_LABEL_CHARS,
+        );
         v_flex()
             .id("chart-panel")
             .w(px(SIDE_PANEL_W))
@@ -8777,6 +8867,15 @@ impl Docxy {
                             "The cells labelling each point along the axis.",
                             cx,
                         ),
+                    )
+                    .child(
+                        div()
+                            .id("chart-cats-resolved")
+                            .px_1()
+                            .pt(px(2.))
+                            .text_size(px(10.))
+                            .text_color(pal.dim)
+                            .child(format!("Resolved: {categories_preview}")),
                     ),
             )
             .into_any_element()
@@ -19549,15 +19648,15 @@ mod grid_geom_tests {
         ChartSourceArea, EdgeMask, GRID_MAX_VISIBLE_ROWS, GridOverlay, PanelEvent,
         RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan, RefText, SHEET_HEADER_SELECTED_BG,
         SHEET_HEADER_SELECTED_FG, SHEET_ROW_H, SelectTarget, SelectionAfter, arm_fill,
-        border_range, cell_selection_shown, char_to_byte, chart_areas_at, chart_panel_after,
-        chart_panel_shown, chart_ref_of, chart_slot_color, chart_source_areas, col_at_x, col_px,
-        dash_fit, edit_runs, fill_box, formula_ref_tokens, gesture_in_flight, last_visible_col,
-        may_arm_fill, parse_ref_text, press_selection, preview_range, range_a1,
+        border_range, bounded_label_preview, cell_selection_shown, char_to_byte, chart_areas_at,
+        chart_panel_after, chart_panel_shown, chart_ref_of, chart_slot_color, chart_source_areas,
+        col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens, gesture_in_flight,
+        last_visible_col, may_arm_fill, parse_ref_text, press_selection, preview_range, range_a1,
         range_border_cell_count, range_border_dashed, range_border_plan, range_edges_at,
         range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at, replace_ref,
         resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range, series_move,
-        series_name_shown, series_remove, sheet_index_of, shift_col, shift_row, shown_sel,
-        snap_range_rows, source_ref_text,
+        series_name_shown, series_remove, series_resolved_preview, sheet_index_of, shift_col,
+        shift_row, shown_sel, snap_range_rows, source_ref_text,
     };
 
     #[test]
@@ -22405,6 +22504,75 @@ mod grid_geom_tests {
             ),
             "the literal name held against its own shown reference must read as \
              a reference — nothing else catches the panel rendering `sr.name`"
+        );
+    }
+
+    #[test]
+    fn resolved_series_name_preview_appears_only_for_a_reference() {
+        assert_eq!(
+            series_resolved_preview("Q1", Some("Budget!$B$1"), 40),
+            Some("Q1".to_string())
+        );
+        assert_eq!(
+            series_resolved_preview("\u{6771}\u{4eac}\u{5e02}\u{5834}", Some("Data!$B$1"), 3),
+            Some("\u{6771}\u{4eac}\u{2026}".to_string()),
+            "a cached Unicode name is shortened at character boundaries"
+        );
+        assert_eq!(
+            series_resolved_preview("", Some("Data!$B$1"), 40),
+            Some("(blank)".to_string())
+        );
+
+        // Literal names stay single and editable: their field already shows
+        // this value, so there is no second resolved row. An unreadable legacy
+        // ref follows the same fallback as `series_name_shown`.
+        assert_eq!(series_resolved_preview("Q1", None, 40), None);
+        assert_eq!(series_resolved_preview("Q1", Some("total"), 40), None);
+    }
+
+    #[test]
+    fn bounded_category_preview_handles_empty_short_long_and_unicode_labels() {
+        let strings = |items: &[&str]| {
+            items
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(bounded_label_preview(&[], 4, 24), "No labels");
+        assert_eq!(
+            bounded_label_preview(&strings(&["", "  "]), 4, 24),
+            "(blank) \u{00b7} (blank)"
+        );
+        assert_eq!(
+            bounded_label_preview(&strings(&["Jan", "Feb", "Mar"]), 4, 24),
+            "Jan \u{00b7} Feb \u{00b7} Mar"
+        );
+        assert_eq!(
+            bounded_label_preview(
+                &strings(&["January", "February", "March", "April", "May"]),
+                3,
+                24,
+            ),
+            "January \u{00b7} February \u{00b7} March \u{00b7} +2 more"
+        );
+        assert_eq!(
+            bounded_label_preview(
+                &strings(&["January", "February", "March", "April", "May"]),
+                1,
+                24,
+            ),
+            "January \u{00b7} +4 more",
+            "the item limit is caller-configurable and preserves an omitted count"
+        );
+        assert_eq!(
+            bounded_label_preview(
+                &strings(&["\u{1f642}\u{6771}\u{4eac}\u{5e02}\u{5834}"]),
+                4,
+                4
+            ),
+            "\u{1f642}\u{6771}\u{4eac}\u{2026}",
+            "UTF-8 labels are truncated by characters, not bytes"
         );
     }
 
