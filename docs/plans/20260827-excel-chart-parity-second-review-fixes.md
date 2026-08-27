@@ -54,13 +54,13 @@ orientation-aware implementation and its conditional gap floor.
 
 ### Task 2: Include parsed complexity in fixture parity
 
-- [ ] re-enumerate every stable field in `StableFixtureChart` and confirm which
+- [x] re-enumerate every stable field in `StableFixtureChart` and confirm which
       loaded fields affect chart editing or saving
-- [ ] include `ChartData::complex` in the stable projection while continuing to
+- [x] include `ChartData::complex` in the stable projection while continuing to
       exclude runtime-only `edited`
-- [ ] add a focused regression that distinguishes otherwise-identical simple
+- [x] add a focused regression that distinguishes otherwise-identical simple
       and complex chart data
-- [ ] run the UI harness fixture tests before Task 3
+- [x] run the UI harness fixture tests before Task 3
 
 ### Task 3: Correct the remaining chart-preview contracts
 

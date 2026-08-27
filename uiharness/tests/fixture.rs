@@ -210,17 +210,23 @@ fn the_fixture_workbook_is_what_the_cases_are_written_against() {
 
 /// The stable chart content this fixture generator deliberately authors.
 ///
-/// `title`, `kind`, `categories`, and `series` are serialized directly into
-/// the chart part. `categories_ref` is serialized there too and must be kept
-/// separate from the cached category text: the cache can stay unchanged while
-/// the cells supplying it move. `source` is included as the loader reconstructs
-/// it from those serialized references, even though the box is not an
-/// independent chart element.
+/// `title`, `kind`, cached `categories`, and every `series` are serialized
+/// directly into the chart part. `categories_ref` is serialized there too and
+/// must be kept separate from the cached category text: the cache can stay
+/// unchanged while the cells supplying it move. `source` is included as the
+/// loader reconstructs it from those serialized references, even though the box
+/// is not an independent chart element. `complex` is parsed from serialized
+/// grouping and plot structure; it decides whether editing can regenerate the
+/// chart part, so a change to it is observable fixture drift.
 ///
-/// `ChartData::edited` is intentionally absent. It is a runtime instruction to
-/// regenerate the chart part, not workbook content, and both sides reset it
-/// when `load_xlsx` reads them. Comparing it would therefore prove nothing
-/// about generator drift.
+/// The remaining loaded fields are not independent stable content. `part` tells
+/// save which package part to rewrite, but is a loader-assigned location;
+/// `by_row` guides later range editing, but is inferred from the series and
+/// category reference shapes already compared above. `ChartData::edited` is
+/// intentionally absent too: it is a runtime instruction to regenerate the
+/// chart part, not workbook content, and both sides reset it when `load_xlsx`
+/// reads them. Comparing it would therefore prove nothing about generator
+/// drift.
 #[derive(Debug, PartialEq)]
 struct StableFixtureChart<'a> {
     title: &'a str,
@@ -229,6 +235,7 @@ struct StableFixtureChart<'a> {
     series: &'a [ChartSeries],
     source: Option<&'a ChartSource>,
     categories_ref: Option<&'a ChartSource>,
+    complex: bool,
 }
 
 fn stable_fixture_chart(data: &ChartData) -> StableFixtureChart<'_> {
@@ -239,6 +246,7 @@ fn stable_fixture_chart(data: &ChartData) -> StableFixtureChart<'_> {
         series: &data.series,
         source: data.source.as_ref(),
         categories_ref: data.categories_ref.as_ref(),
+        complex: data.complex,
     }
 }
 
@@ -303,5 +311,34 @@ fn fixture_drift_detects_a_category_reference_change_with_the_same_cache() {
         stable_fixture_chart(&expected),
         stable_fixture_chart(&drifted),
         "a category-reference-only change must fail fixture parity"
+    );
+}
+
+#[test]
+fn fixture_drift_detects_a_complexity_only_change() {
+    let simple = ChartData {
+        title: "Quarterly sales".into(),
+        kind: "column".into(),
+        categories: vec!["Q1".into(), "Q2".into()],
+        series: vec![ChartSeries {
+            name: "North".into(),
+            values: vec![10.0, 20.0],
+            ..ChartSeries::default()
+        }],
+        ..ChartData::default()
+    };
+    let mut complex = simple.clone();
+    complex.complex = true;
+
+    assert_eq!(simple.title, complex.title);
+    assert_eq!(simple.kind, complex.kind);
+    assert_eq!(simple.categories, complex.categories);
+    assert_eq!(simple.series, complex.series);
+    assert_eq!(simple.source, complex.source);
+    assert_eq!(simple.categories_ref, complex.categories_ref);
+    assert_ne!(
+        stable_fixture_chart(&simple),
+        stable_fixture_chart(&complex),
+        "a grouping-only change must fail fixture parity"
     );
 }
