@@ -208,6 +208,40 @@ fn the_fixture_workbook_is_what_the_cases_are_written_against() {
     check(fixture_bytes());
 }
 
+/// The stable chart content this fixture generator deliberately authors.
+///
+/// `title`, `kind`, `categories`, and `series` are serialized directly into
+/// the chart part. `categories_ref` is serialized there too and must be kept
+/// separate from the cached category text: the cache can stay unchanged while
+/// the cells supplying it move. `source` is included as the loader reconstructs
+/// it from those serialized references, even though the box is not an
+/// independent chart element.
+///
+/// `ChartData::edited` is intentionally absent. It is a runtime instruction to
+/// regenerate the chart part, not workbook content, and both sides reset it
+/// when `load_xlsx` reads them. Comparing it would therefore prove nothing
+/// about generator drift.
+#[derive(Debug, PartialEq)]
+struct StableFixtureChart<'a> {
+    title: &'a str,
+    kind: &'a str,
+    categories: &'a [String],
+    series: &'a [ChartSeries],
+    source: Option<&'a ChartSource>,
+    categories_ref: Option<&'a ChartSource>,
+}
+
+fn stable_fixture_chart(data: &ChartData) -> StableFixtureChart<'_> {
+    StableFixtureChart {
+        title: &data.title,
+        kind: &data.kind,
+        categories: &data.categories,
+        series: &data.series,
+        source: data.source.as_ref(),
+        categories_ref: data.categories_ref.as_ref(),
+    }
+}
+
 /// The generator and the committed file must not have drifted apart: a change
 /// to `build()` that nobody regenerated would leave the recipe lying.
 ///
@@ -237,12 +271,37 @@ fn the_committed_fixture_matches_the_generator() {
         assert_eq!((x.from, x.to), (y.from, y.to), "the chart moved — {why}");
         match (&x.kind, &y.kind) {
             (DrawingKind::Chart(u), DrawingKind::Chart(v)) => {
-                assert_eq!(u.title, v.title, "{why}");
-                assert_eq!(u.kind, v.kind, "{why}");
-                assert_eq!(u.categories, v.categories, "{why}");
-                assert_eq!(u.series, v.series, "{why}");
+                assert_eq!(stable_fixture_chart(u), stable_fixture_chart(v), "{why}");
             }
             (u, v) => panic!("the fixture's drawing changed kind: {u:?} vs {v:?} — {why}"),
         }
     }
+}
+
+#[test]
+fn fixture_drift_detects_a_category_reference_change_with_the_same_cache() {
+    let expected = ChartData {
+        categories: vec!["North".into(), "South".into()],
+        series: vec![ChartSeries {
+            name: "Q1".into(),
+            values: vec![10.0, 20.0],
+            ..ChartSeries::default()
+        }],
+        categories_ref: Some(ChartSource {
+            sheet: "Sheet1".into(),
+            range: (1, 0, 2, 0),
+            cat_col: 0,
+        }),
+        ..ChartData::default()
+    };
+    let mut drifted = expected.clone();
+    drifted.categories_ref.as_mut().unwrap().range = (1, 2, 2, 2);
+
+    assert_eq!(expected.categories, drifted.categories);
+    assert_eq!(expected.series, drifted.series);
+    assert_ne!(
+        stable_fixture_chart(&expected),
+        stable_fixture_chart(&drifted),
+        "a category-reference-only change must fail fixture parity"
+    );
 }

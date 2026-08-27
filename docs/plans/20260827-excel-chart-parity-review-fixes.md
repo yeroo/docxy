@@ -53,14 +53,14 @@ documentation with the shipped implementation and archived plan location.
 
 ### Task 2: Strengthen fixture drift comparison
 
-- [ ] enumerate stable serialized `ChartData` fields used by the generated and
+- [x] enumerate stable serialized `ChartData` fields used by the generated and
       committed fixture and document why runtime-only `edited` is excluded
-- [ ] compare loaded `categories_ref` content in
+- [x] compare loaded `categories_ref` content in
       `the_committed_fixture_matches_the_generator` without relying on the
       non-serialized runtime `edited` flag
-- [ ] add or refine a test that fails when the category reference changes while
+- [x] add or refine a test that fails when the category reference changes while
       cached labels and series stay the same
-- [ ] run the UI harness fixture tests before Task 3
+- [x] run the UI harness fixture tests before Task 3
 
 ### Task 3: Correct the reviewed documentation contracts
 
