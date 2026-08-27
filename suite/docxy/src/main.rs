@@ -18667,8 +18667,9 @@ struct ChartCategoryLabelPlan {
 /// plans always retain category zero and the last category. Their label boxes
 /// meet at the midpoint between adjacent retained-category centres, so a
 /// forced final label cannot overlap its neighbour when the final stride is
-/// shorter. Vertical plans use the rendered label-row height as their capacity
-/// rule instead of treating plot height as horizontal text width.
+/// shorter. Vertical plans centre fixed-height rows on category centres, clamp
+/// them to the axis edges, and discard a colliding row before forcing the last
+/// category into view.
 fn chart_category_label_plan(
     labels: &[String],
     category_count: usize,
@@ -18680,17 +18681,19 @@ fn chart_category_label_plan(
     }
 
     let axis_extent = chart_dimension(axis_extent);
-    let minimum_capacity = match orientation {
-        ChartCategoryLabelOrientation::Horizontal if category_count > 1 => 2,
-        _ => 1,
+    let visible_capacity = match orientation {
+        ChartCategoryLabelOrientation::Horizontal if category_count == 1 => 1,
+        ChartCategoryLabelOrientation::Horizontal => ((axis_extent / orientation.minimum_extent())
+            .floor() as usize)
+            .max(2)
+            .min(category_count),
+        ChartCategoryLabelOrientation::Vertical => {
+            ((axis_extent / orientation.minimum_extent()).floor() as usize).min(category_count)
+        }
     };
-    let visible_capacity = if category_count == 1 {
-        1
-    } else {
-        ((axis_extent / orientation.minimum_extent()).floor() as usize)
-            .max(minimum_capacity)
-            .min(category_count)
-    };
+    if visible_capacity == 0 {
+        return ChartCategoryLabelPlan::default();
+    }
     let stride = if visible_capacity <= 1 {
         1
     } else {
@@ -18715,6 +18718,31 @@ fn chart_category_label_plan(
     }
 
     let category_extent = axis_extent / category_count as f32;
+    if orientation == ChartCategoryLabelOrientation::Vertical {
+        let row_start = |index: usize| {
+            let centre = category_extent * (index as f32 + 0.5);
+            (centre - VERTICAL_CATEGORY_LABEL_ROW_HEIGHT / 2.0)
+                .clamp(0.0, axis_extent - VERTICAL_CATEGORY_LABEL_ROW_HEIGHT)
+        };
+        let mut retained = Vec::with_capacity(indices.len());
+        for index in indices {
+            let start = row_start(index);
+            let overlaps_previous = retained.last().is_some_and(|previous| {
+                row_start(*previous) + VERTICAL_CATEGORY_LABEL_ROW_HEIGHT > start
+            });
+            if !overlaps_previous {
+                retained.push(index);
+            } else if index + 1 == category_count {
+                while retained.last().is_some_and(|previous| {
+                    row_start(*previous) + VERTICAL_CATEGORY_LABEL_ROW_HEIGHT > start
+                }) {
+                    retained.pop();
+                }
+                retained.push(index);
+            }
+        }
+        indices = retained;
+    }
     let centres = indices
         .iter()
         .map(|index| category_extent * (*index as f32 + 0.5))
@@ -18723,22 +18751,28 @@ fn chart_category_label_plan(
         .into_iter()
         .enumerate()
         .map(|(position, index)| {
-            let axis_start = if position == 0 {
-                0.0
-            } else {
-                (centres[position - 1] + centres[position]) / 2.0
-            };
-            let axis_end = if position + 1 == centres.len() {
-                axis_extent
-            } else {
-                (centres[position] + centres[position + 1]) / 2.0
-            };
-            let label_extent = (axis_end - axis_start).max(0.0);
-            let max_chars = match orientation {
+            let (axis_start, label_extent, max_chars) = match orientation {
                 ChartCategoryLabelOrientation::Horizontal => {
-                    ((label_extent / 6.0).floor() as usize).clamp(1, 18)
+                    let axis_start = if position == 0 {
+                        0.0
+                    } else {
+                        (centres[position - 1] + centres[position]) / 2.0
+                    };
+                    let axis_end = if position + 1 == centres.len() {
+                        axis_extent
+                    } else {
+                        (centres[position] + centres[position + 1]) / 2.0
+                    };
+                    let label_extent = (axis_end - axis_start).max(0.0);
+                    let max_chars = ((label_extent / 6.0).floor() as usize).clamp(1, 18);
+                    (axis_start, label_extent, max_chars)
                 }
-                ChartCategoryLabelOrientation::Vertical => 18,
+                ChartCategoryLabelOrientation::Vertical => (
+                    (centres[position] - VERTICAL_CATEGORY_LABEL_ROW_HEIGHT / 2.0)
+                        .clamp(0.0, axis_extent - VERTICAL_CATEGORY_LABEL_ROW_HEIGHT),
+                    VERTICAL_CATEGORY_LABEL_ROW_HEIGHT,
+                    18,
+                ),
             };
             let full = labels.get(index).map(String::as_str).unwrap_or("");
             ChartCategoryLabel {
@@ -19221,22 +19255,15 @@ fn chart_card(data: &gridcore::sheet::ChartData, chart_id: usize, w: f32, h: f32
                     .unwrap_or_default();
                 let text = bounded_label(&full, max_chars);
                 let shortened = !full.trim().is_empty() && text != full;
-                let centre_y = layout.category_axis.h * (label.index as f32 + 0.5) / ncat as f32;
-                let label_h = VERTICAL_CATEGORY_LABEL_ROW_HEIGHT.min(label.axis_extent);
-                let label_bottom = label.axis_start + label.axis_extent;
-                let top = (centre_y - label_h / 2.0).clamp(
-                    label.axis_start,
-                    (label_bottom - label_h).max(label.axis_start),
-                );
                 let mut element = h_flex()
                     .id(ElementId::Name(
                         format!("chart-{chart_id}-bar-category-{}", label.index).into(),
                     ))
                     .absolute()
                     .left_0()
-                    .top(px(top))
+                    .top(px(label.axis_start))
                     .w_full()
-                    .h(px(label_h))
+                    .h(px(VERTICAL_CATEGORY_LABEL_ROW_HEIGHT))
                     .justify_end()
                     .items_center()
                     .pr_1()
@@ -20376,17 +20403,17 @@ mod grid_geom_tests {
         GridOverlay, MAX_COLUMN_BAR_GAP, MAX_COLUMN_BAR_W, MIN_COLUMN_BAR_GAP, MIN_COLUMN_BAR_W,
         PanelEvent, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan, RefText,
         SHEET_HEADER_SELECTED_BG, SHEET_HEADER_SELECTED_FG, SHEET_ROW_H, SelectTarget,
-        SelectionAfter, arm_fill, border_range, bounded_label_preview, cell_selection_shown,
-        char_to_byte, chart_areas_at, chart_card_layout, chart_category_label_plan,
-        chart_column_layout, chart_panel_after, chart_panel_shown, chart_ref_of, chart_render_path,
-        chart_scale, chart_slot_color, chart_source_areas, col_at_x, col_px, dash_fit, edit_runs,
-        fill_box, formula_ref_tokens, gesture_in_flight, last_visible_col, may_arm_fill,
-        parse_ref_text, press_selection, preview_range, range_a1, range_border_cell_count,
-        range_border_dashed, range_border_plan, range_edges_at, range_text, ref_a1, ref_color,
-        ref_index_at, ref_pick_text, ref_token_at, replace_ref, resize_axis, row_height_px,
-        scroll_col0_for_sel, selected_header_range, series_move, series_name_shown, series_remove,
-        series_resolved_preview, sheet_index_of, shift_col, shift_row, shown_sel, snap_range_rows,
-        source_ref_text,
+        SelectionAfter, VERTICAL_CATEGORY_LABEL_ROW_HEIGHT, arm_fill, border_range,
+        bounded_label_preview, cell_selection_shown, char_to_byte, chart_areas_at,
+        chart_card_layout, chart_category_label_plan, chart_column_layout, chart_panel_after,
+        chart_panel_shown, chart_ref_of, chart_render_path, chart_scale, chart_slot_color,
+        chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens,
+        gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text, press_selection,
+        preview_range, range_a1, range_border_cell_count, range_border_dashed, range_border_plan,
+        range_edges_at, range_text, ref_a1, ref_color, ref_index_at, ref_pick_text, ref_token_at,
+        replace_ref, resize_axis, row_height_px, scroll_col0_for_sel, selected_header_range,
+        series_move, series_name_shown, series_remove, series_resolved_preview, sheet_index_of,
+        shift_col, shift_row, shown_sel, snap_range_rows, source_ref_text,
     };
 
     #[test]
@@ -23497,13 +23524,54 @@ mod grid_geom_tests {
         );
     }
 
+    fn assert_vertical_category_rows(plan: &super::ChartCategoryLabelPlan, axis_extent: f32) {
+        for label in &plan.labels {
+            assert_eq!(label.axis_extent, VERTICAL_CATEGORY_LABEL_ROW_HEIGHT);
+            assert!(label.axis_start >= 0.0);
+            assert!(
+                label.axis_start + label.axis_extent <= axis_extent + f32::EPSILON,
+                "row for category {} exceeds {axis_extent}: {label:?}",
+                label.index
+            );
+        }
+        for pair in plan.labels.windows(2) {
+            assert!(pair[0].index < pair[1].index);
+            assert!(pair[0].axis_start <= pair[1].axis_start);
+            assert!(pair[0].axis_start + pair[0].axis_extent <= pair[1].axis_start);
+        }
+    }
+
     #[test]
-    fn vertical_category_label_plan_uses_row_capacity_and_handles_tiny_extents() {
+    fn vertical_category_label_plan_keeps_fixed_rows_in_range_and_disjoint() {
+        let legend = names(&["A", "B", "C", "D"]);
+        let compact_bar = chart_card_layout(150.0, 132.0, "bar", &legend);
+        assert_eq!(compact_bar.plot.h, 49.5);
+
+        let dense_categories = (0..11)
+            .map(|index| format!("Category {index}"))
+            .collect::<Vec<_>>();
+        let dense_plan = chart_category_label_plan(
+            &dense_categories,
+            dense_categories.len(),
+            compact_bar.plot.h,
+            ChartCategoryLabelOrientation::Vertical,
+        );
+        assert_eq!(dense_plan.stride, 4);
+        assert_eq!(
+            dense_plan
+                .labels
+                .iter()
+                .map(|label| label.index)
+                .collect::<Vec<_>>(),
+            [0, 4, 10]
+        );
+        assert_vertical_category_rows(&dense_plan, compact_bar.plot.h);
+
         let fixture_categories = names(&["North", "South", "East", "West"]);
         let fixture_plan = chart_category_label_plan(
             &fixture_categories,
             fixture_categories.len(),
-            194.0,
+            compact_bar.plot.h,
             ChartCategoryLabelOrientation::Vertical,
         );
         assert_eq!(
@@ -23515,26 +23583,48 @@ mod grid_geom_tests {
             [0, 1, 2, 3]
         );
         assert!(fixture_plan.labels.iter().all(|label| !label.shortened));
+        assert_vertical_category_rows(&fixture_plan, compact_bar.plot.h);
 
-        let tiny = chart_category_label_plan(
+        assert_eq!(
+            chart_category_label_plan(
+                &[],
+                0,
+                compact_bar.plot.h,
+                ChartCategoryLabelOrientation::Vertical,
+            ),
+            super::ChartCategoryLabelPlan::default()
+        );
+        for tiny_extent in [0.0, VERTICAL_CATEGORY_LABEL_ROW_HEIGHT - 0.01] {
+            let tiny = chart_category_label_plan(
+                &fixture_categories,
+                fixture_categories.len(),
+                tiny_extent,
+                ChartCategoryLabelOrientation::Vertical,
+            );
+            assert!(tiny.labels.is_empty());
+        }
+
+        let exact_row = chart_category_label_plan(
             &fixture_categories,
             fixture_categories.len(),
-            6.0,
+            VERTICAL_CATEGORY_LABEL_ROW_HEIGHT,
             ChartCategoryLabelOrientation::Vertical,
         );
-        assert_eq!(tiny.labels.len(), 1);
-        assert_eq!(tiny.labels[0].index, 0);
-        assert_eq!(tiny.labels[0].axis_start, 0.0);
-        assert_eq!(tiny.labels[0].axis_extent, 6.0);
+        assert_eq!(exact_row.labels.len(), 1);
+        assert_eq!(exact_row.labels[0].index, 0);
+        assert_eq!(exact_row.labels[0].axis_start, 0.0);
+        assert_vertical_category_rows(&exact_row, VERTICAL_CATEGORY_LABEL_ROW_HEIGHT);
 
-        let zero_extent = chart_category_label_plan(
-            &fixture_categories,
-            fixture_categories.len(),
-            0.0,
+        let one_category = names(&["Only"]);
+        let one_plan = chart_category_label_plan(
+            &one_category,
+            one_category.len(),
+            compact_bar.plot.h,
             ChartCategoryLabelOrientation::Vertical,
         );
-        assert_eq!(zero_extent.labels.len(), 1);
-        assert_eq!(zero_extent.labels[0].axis_extent, 0.0);
+        assert_eq!(one_plan.labels.len(), 1);
+        assert_eq!(one_plan.labels[0].index, 0);
+        assert_vertical_category_rows(&one_plan, compact_bar.plot.h);
     }
 
     #[test]

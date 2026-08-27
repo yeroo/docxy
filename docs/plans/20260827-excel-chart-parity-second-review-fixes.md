@@ -40,17 +40,17 @@ orientation-aware implementation and its conditional gap floor.
 
 ### Task 1: Keep vertical category rows fixed and disjoint
 
-- [ ] sweep the vertical planner and renderer together, including every use of
+- [x] sweep the vertical planner and renderer together, including every use of
       `axis_start`, `axis_extent`, and the 12-pixel row-height constant
-- [ ] choose retained vertical indices only when their edge-clamped fixed
+- [x] choose retained vertical indices only when their edge-clamped fixed
       12-pixel rows fit without overlap; do not reuse horizontal midpoint box
       extents as rendered vertical row heights
-- [ ] render every retained vertical row at 12 pixels while keeping horizontal
+- [x] render every retained vertical row at 12 pixels while keeping horizontal
       midpoint partitions and truncation unchanged
-- [ ] test the 150×132 card's approximately 49.5-pixel plot with 11 categories,
+- [x] test the 150×132 card's approximately 49.5-pixel plot with 11 categories,
       the four-label fixture, and zero/tiny/one-category boundaries; assert
       retained row bounds are fixed-height, in-range, ordered and disjoint
-- [ ] run suite tests before Task 2
+- [x] run suite tests before Task 2
 
 ### Task 2: Include parsed complexity in fixture parity
 
