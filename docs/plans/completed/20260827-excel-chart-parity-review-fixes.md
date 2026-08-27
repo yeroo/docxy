@@ -76,12 +76,12 @@ documentation with the shipped implementation and archived plan location.
 
 ### Task 4: [Final] Verify and record the review fixes
 
-- [ ] re-read all six Revmux findings against the resulting diff and confirm
+- [x] re-read all six Revmux findings against the resulting diff and confirm
       the mechanisms, not only the examples, are fixed
-- [ ] run `cargo test` and `cargo test --manifest-path suite/Cargo.toml`
-- [ ] run root and suite `cargo clippy --all-targets -- -D warnings`
-- [ ] run root and suite `cargo fmt --check` and `git diff --check`
-- [ ] record final counts and any deliberate limits in this plan, then move it
+- [x] run `cargo test` and `cargo test --manifest-path suite/Cargo.toml`
+- [x] run root and suite `cargo clippy --all-targets -- -D warnings`
+- [x] run root and suite `cargo fmt --check` and `git diff --check`
+- [x] record final counts and any deliberate limits in this plan, then move it
       to `docs/plans/completed/`
 
 ## Review record
@@ -92,3 +92,23 @@ documentation with the shipped implementation and archived plan location.
   corrections, and one fixture drift comparison correction.
 - Excluded findings: all entries classified by Revmux as `pre_existing` or
   `immaterial`.
+
+## Final verification
+
+Completed 2026-08-27:
+
+- Re-read all six in-scope findings against the three implementation commits.
+  Horizontal labels use adjacent-centre partitions for their rendered boxes
+  and truncation budgets, bar labels use 12-pixel vertical row capacity, and
+  fixture parity compares the serialized category reference. The three
+  documentation corrections match the implemented formatter and layout
+  behavior.
+- `cargo test`: 2,324 passed, 0 failed, 1 ignored.
+- `cargo test --manifest-path suite/Cargo.toml`: 200 passed, 0 failed,
+  0 ignored.
+- Root and suite `cargo clippy --all-targets -- -D warnings` passed.
+- Root and suite `cargo fmt --check` and `git diff --check` passed.
+- Deliberate limits remain unchanged: this work does not address the
+  pre-existing pie/non-finite defect, the 512-point scale/render-cap mismatch,
+  or the stale `chart_grips` comment, and it does not add OCR or golden-image
+  infrastructure for the immaterial screenshot-assertion finding.
