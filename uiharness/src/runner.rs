@@ -509,9 +509,11 @@ fn fail(mut out: StepOutcome, detail: impl Into<String>) -> StepOutcome {
     out
 }
 
-/// A path as the `open` verb wants it: a plain string. Windows' extended-length
-/// prefix, which `canonicalize` adds, is stripped — the app does open it, but
-/// it turns up in the tab title and in every message about the file.
+/// A path as the `open` verb wants it: a plain string. For the verbatim paths
+/// Windows `canonicalize` returns, UNC is converted to its ordinary `\\server`
+/// form and a drive-letter prefix is stripped so it does not leak into titles
+/// and messages. Other namespaces such as `\\?\Volume{GUID}` have no equivalent
+/// ordinary spelling and must remain verbatim.
 fn path_arg(p: &Path) -> String {
     let s = p.display().to_string();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
@@ -734,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn a_canonicalized_windows_path_loses_its_extended_length_prefix() {
+    fn canonicalized_windows_paths_keep_the_namespace_they_need() {
         assert_eq!(
             path_arg(Path::new(r"\\?\C:\x\basic.xlsx")),
             r"C:\x\basic.xlsx"

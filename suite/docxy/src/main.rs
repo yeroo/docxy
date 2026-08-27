@@ -589,8 +589,9 @@ fn shift_row(sh: &gridcore::sheet::Sheet, ar: u32, dy: f32) -> u32 {
 /// Is a grid gesture in flight, given the four states a press on a cell can
 /// produce? A press arms the anchor or one pick state; sweeping subsequently
 /// sets `sheet_dragging`. [`Docxy::grid_release`] clears all four, so any one
-/// being live means the button is still down from the grid rather than the fill
-/// handle.
+/// being live means the grid is handling a left-button gesture rather than the
+/// fill handle. `sheet_dragging` also covers the intentional fallback where a
+/// held pointer enters the grid after the press began outside it.
 ///
 /// Free-standing so the truth table can be tested without a window: the guard
 /// it feeds is the whole reason the auto-fill-on-sweep regression cannot come
@@ -4060,8 +4061,10 @@ impl Docxy {
 
     /// Is a grid gesture already in flight — a sweep, a range pick, a formula
     /// pick? A press arms an anchor or pick state, a sweep later sets
-    /// `sheet_dragging`, and [`grid_release`] clears them all. This is therefore
-    /// true exactly between a press that landed on a cell and button-up.
+    /// `sheet_dragging`, and [`grid_release`] clears them all. The dragging flag
+    /// also covers a held pointer that enters the grid after pressing outside
+    /// it, so this describes the gesture being handled rather than where its
+    /// original press landed.
     ///
     /// It exists to answer one question: may this arm an auto-fill? See
     /// [`sheet_fill_start`](Self::sheet_fill_start).
