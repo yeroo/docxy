@@ -19,7 +19,7 @@
 
 use gridcore::sheet::{Cell, CellValue, ChartData, ChartSeries, DrawingKind};
 use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Where the fixture lives, relative to this crate.
@@ -139,8 +139,8 @@ fn check(bytes: &[u8]) {
     );
 }
 
-/// The committed fixture's bytes, written first if the file is not there (or if
-/// the caller asked for a regeneration).
+/// The committed fixture's bytes. It is written only when the caller explicitly
+/// asks for regeneration; a missing committed asset is a test failure.
 ///
 /// ⚠️ Shared through a `OnceLock` because both tests below need it and they run
 /// on different threads of one binary: two `fs::write`s racing a `fs::read`
@@ -149,15 +149,38 @@ fn fixture_bytes() -> &'static [u8] {
     static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
     BYTES.get_or_init(|| {
         let path = fixture_path();
-        if std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some() || !path.is_file() {
-            let bytes = build();
-            check(&bytes);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, &bytes).unwrap();
-            eprintln!("wrote {}", path.display());
-        }
-        std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        read_fixture(&path, std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some())
+            .unwrap_or_else(|e| panic!("{e}"))
     })
+}
+
+fn read_fixture(path: &Path, regenerate: bool) -> Result<Vec<u8>, String> {
+    if regenerate {
+        let bytes = build();
+        check(&bytes);
+        std::fs::create_dir_all(path.parent().expect("the fixture has a parent"))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        std::fs::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
+        eprintln!("wrote {}", path.display());
+    }
+    std::fs::read(path).map_err(|e| {
+        format!(
+            "{}: {e}; restore the committed fixture or regenerate it with \
+             UIHARNESS_REGEN_FIXTURE=1 cargo test -p uiharness --test fixture",
+            path.display()
+        )
+    })
+}
+
+#[test]
+fn a_missing_fixture_fails_without_recreating_the_source_tree() {
+    let dir =
+        std::env::temp_dir().join(format!("uiharness-missing-fixture-{}", std::process::id()));
+    let path = dir.join("basic.xlsx");
+    let _ = std::fs::remove_file(&path);
+    let err = read_fixture(&path, false).expect_err("a missing committed fixture must fail");
+    assert!(err.contains("restore the committed fixture"), "{err}");
+    assert!(!path.exists(), "the fixture check must not write {path:?}");
 }
 
 #[test]

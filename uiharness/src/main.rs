@@ -28,7 +28,7 @@ use ctlcore::json::Json;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use uiharness::probe::ProbeOpts;
-use uiharness::{Driver, Run, check_border_clipped, control_dir, parse_border};
+use uiharness::{BorderExpect, Driver, Run, check_border_clipped, control_dir, parse_border};
 
 const USAGE: &str = "\
 uiharness — drive a suite instance started with --harness
@@ -59,7 +59,8 @@ options for shot/window:
 options for run:
   --suite EXE                   the built suite to drive (default: $UIHARNESS_SUITE,
                                 else target/release then target/debug)
-  --sandbox DIR                 the throwaway config root (default: <run>/sandbox-<pid>)
+  --sandbox DIR                 the throwaway config root
+                                (default: <run>/sandbox-<pid>-<timestamp>, retained)
   --keep                        leave the instance running after the script ends
 
 regions:
@@ -67,7 +68,18 @@ regions:
 ";
 
 fn main() -> ExitCode {
-    match run() {
+    let a = match parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("uiharness: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if a.help {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    match run(a) {
         Ok(out) => {
             println!("{out}");
             ExitCode::SUCCESS
@@ -90,10 +102,18 @@ struct Args {
     suite: Option<PathBuf>,
     sandbox: Option<PathBuf>,
     keep: bool,
+    help: bool,
     rest: Vec<String>,
 }
 
 fn parse() -> Result<Args, String> {
+    parse_from(std::env::args().skip(1))
+}
+
+fn parse_from<I>(args: I) -> Result<Args, String>
+where
+    I: IntoIterator<Item = String>,
+{
     let mut a = Args {
         config: std::env::var_os("DOCXY_CONFIG_DIR").map(PathBuf::from),
         ctl: None,
@@ -104,9 +124,10 @@ fn parse() -> Result<Args, String> {
         suite: None,
         sandbox: None,
         keep: false,
+        help: false,
         rest: Vec::new(),
     };
-    let mut it = std::env::args().skip(1);
+    let mut it = args.into_iter();
     while let Some(arg) = it.next() {
         let mut value = |flag: &str| -> Result<String, String> {
             it.next()
@@ -122,7 +143,7 @@ fn parse() -> Result<Args, String> {
             "--suite" => a.suite = Some(PathBuf::from(value("--suite")?)),
             "--sandbox" => a.sandbox = Some(PathBuf::from(value("--sandbox")?)),
             "--keep" => a.keep = true,
-            "-h" | "--help" => return Err(USAGE.to_string()),
+            "-h" | "--help" => a.help = true,
             other if other.starts_with("--") => {
                 return Err(format!("unknown option '{other}'\n\n{USAGE}"));
             }
@@ -132,13 +153,65 @@ fn parse() -> Result<Args, String> {
     Ok(a)
 }
 
-fn run() -> Result<String, String> {
-    let a = parse()?;
+#[derive(Debug)]
+enum Command {
+    Ping,
+    Call { verb: String, args: Json },
+    Rect(String),
+    Shot(String),
+    Assert(BorderExpect),
+}
+
+fn command(a: &Args) -> Result<Command, String> {
+    let cmd = a.rest.first().map(String::as_str).unwrap_or("");
+    match cmd {
+        "" => Err(USAGE.to_string()),
+        "ping" if a.rest.len() == 1 => Ok(Command::Ping),
+        "ping" => Err(format!("ping takes no arguments\n\n{USAGE}")),
+        "call" => {
+            let verb = a
+                .rest
+                .get(1)
+                .ok_or_else(|| format!("call needs a verb\n\n{USAGE}"))?
+                .clone();
+            if a.rest.len() > 3 {
+                return Err(format!("call takes one JSON argument at most\n\n{USAGE}"));
+            }
+            let args = match a.rest.get(2) {
+                Some(text) => {
+                    Json::parse(text).map_err(|e| format!("'{text}' is not JSON: {e}"))?
+                }
+                None => Json::Obj(Vec::new()),
+            };
+            Ok(Command::Call { verb, args })
+        }
+        "rect" => match a.rest.as_slice() {
+            [_, region] => Ok(Command::Rect(region.clone())),
+            [_] => Err(format!("rect needs a region\n\n{USAGE}")),
+            _ => Err(format!("rect takes exactly one region\n\n{USAGE}")),
+        },
+        "shot" => match a.rest.as_slice() {
+            [_, region] => Ok(Command::Shot(region.clone())),
+            [_] => Err(format!("shot needs a region\n\n{USAGE}")),
+            _ => Err(format!("shot takes exactly one region\n\n{USAGE}")),
+        },
+        "window" if a.rest.len() == 1 => Ok(Command::Shot("window".to_string())),
+        "window" => Err(format!("window takes no arguments\n\n{USAGE}")),
+        "assert" => Ok(Command::Assert(parse_border(&a.rest[1..].join(" "))?)),
+        other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
+    }
+}
+
+fn run(a: Args) -> Result<String, String> {
     // `run` starts its own instance, so it is answered before the code that
     // insists on being told where an existing one is.
     if a.rest.first().map(String::as_str) == Some("run") {
         return run_scripts(&a);
     }
+    // Reject typos and missing arguments before a connection attempt. With no
+    // live instance the latter may legitimately wait 20 seconds, but a command
+    // that cannot be executed should fail locally and immediately.
+    let command = command(&a)?;
     let ctl = match (&a.ctl, &a.config) {
         (Some(d), _) => d.clone(),
         (None, Some(c)) => control_dir(c),
@@ -149,50 +222,22 @@ fn run() -> Result<String, String> {
             ));
         }
     };
-    let cmd = a.rest.first().map(String::as_str).unwrap_or("");
-    if cmd.is_empty() {
-        return Err(USAGE.to_string());
-    }
     let d = Driver::connect(&ctl, a.instance.as_deref())?;
 
-    match cmd {
-        "ping" => Ok(d.call("ping", Json::Obj(Vec::new()))?.to_string()),
+    match command {
+        Command::Ping => Ok(d.call("ping", Json::Obj(Vec::new()))?.to_string()),
 
-        "call" => {
-            let verb = a
-                .rest
-                .get(1)
-                .ok_or_else(|| format!("call needs a verb\n\n{USAGE}"))?;
-            let args = match a.rest.get(2) {
-                Some(text) => {
-                    Json::parse(text).map_err(|e| format!("'{text}' is not JSON: {e}"))?
-                }
-                None => Json::Obj(Vec::new()),
-            };
-            Ok(d.call(verb, args)?.to_string())
-        }
+        Command::Call { verb, args } => Ok(d.call(&verb, args)?.to_string()),
 
-        "rect" => {
-            let region = a
-                .rest
-                .get(1)
-                .ok_or_else(|| format!("rect needs a region\n\n{USAGE}"))?;
-            let r = d.settle(region)?;
+        Command::Rect(region) => {
+            let r = d.settle(&region)?;
             Ok(format!(
                 "{region}: {}x{} at ({},{})  scale {}  frame {}",
                 r.rect.w, r.rect.h, r.rect.x, r.rect.y, r.scale, r.frame
             ))
         }
 
-        "shot" | "window" => {
-            let region = if cmd == "window" {
-                "window".to_string()
-            } else {
-                a.rest
-                    .get(1)
-                    .ok_or_else(|| format!("shot needs a region\n\n{USAGE}"))?
-                    .clone()
-            };
+        Command::Shot(region) => {
             let s = d.shot(&region)?;
             let path = save(&a, &region, &s.image)?;
             Ok(format!(
@@ -212,9 +257,7 @@ fn run() -> Result<String, String> {
         // Take the picture and read it. The expectation names the region, so
         // the crop that is checked and the PNG that is filed are the same
         // pixels, from the same settled frame.
-        "assert" => {
-            let text = a.rest[1..].join(" ");
-            let exp = parse_border(&text)?;
+        Command::Assert(exp) => {
             let s = d.shot(&exp.region)?;
             let path = save(&a, &exp.region, &s.image)?;
             let check = check_border_clipped(&exp, &s.image, ProbeOpts::default(), s.clipped);
@@ -231,8 +274,6 @@ fn run() -> Result<String, String> {
                 Err(report)
             }
         }
-
-        other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
     }
 }
 
@@ -372,5 +413,44 @@ fn save(a: &Args, region: &str, img: &uiharness::Image) -> Result<PathBuf, Strin
             run.save(&a.test, region, img)
                 .map_err(|e| format!("saving the capture: {e}"))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parsed(words: &[&str]) -> Args {
+        parse_from(words.iter().map(|word| (*word).to_string())).unwrap()
+    }
+
+    #[test]
+    fn help_is_a_successful_parse_outcome() {
+        let a = parsed(&["--help"]);
+        assert!(a.help);
+    }
+
+    #[test]
+    fn invalid_commands_and_arities_are_rejected_before_connecting() {
+        assert!(
+            command(&parsed(&["frobnicate"]))
+                .unwrap_err()
+                .contains("unknown command")
+        );
+        assert!(
+            command(&parsed(&["rect"]))
+                .unwrap_err()
+                .contains("needs a region")
+        );
+        assert!(
+            command(&parsed(&["ping", "extra"]))
+                .unwrap_err()
+                .contains("no arguments")
+        );
+        assert!(
+            command(&parsed(&["call", "ping", "not-json"]))
+                .unwrap_err()
+                .contains("not JSON")
+        );
     }
 }

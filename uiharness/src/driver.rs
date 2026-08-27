@@ -26,6 +26,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long [`Driver::settle`] waits for a frame to be drawn.
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A moved window should cost one extra capture, not make a test flaky. Three
+/// attempts cover an ordinary drag while still refusing a window that will not
+/// stay put.
+const CAPTURE_ATTEMPTS: usize = 3;
+
 /// What the `rect` verb answered.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RegionRect {
@@ -36,6 +41,44 @@ pub struct RegionRect {
     pub scale: f32,
     /// Which frame the app had finished when it answered. See [`Driver::settle`].
     pub frame: u64,
+}
+
+fn same_geometry(a: RegionRect, b: RegionRect) -> bool {
+    a.rect == b.rect && a.scale == b.scale
+}
+
+fn stable_shot<S, C>(region: &str, mut settle: S, mut capture: C) -> Result<Shot, String>
+where
+    S: FnMut() -> Result<RegionRect, String>,
+    C: FnMut() -> Result<Capture, String>,
+{
+    let mut changed = None;
+    for _ in 0..CAPTURE_ATTEMPTS {
+        let before = settle()?;
+        let cap = capture()?;
+        // Settle again rather than merely asking for a rect. Cell and panel
+        // geometry comes from layout probes, and an immediate rect after a
+        // resize may still describe the pre-resize frame.
+        let after = settle()?;
+        if !same_geometry(before, after) {
+            changed = Some((before, after));
+            continue;
+        }
+        let want = before.rect.relative_to(cap.origin);
+        let clipped = clipped(want, cap.image.w, cap.image.h);
+        let image = cap.image.crop(want)?;
+        return Ok(Shot {
+            image,
+            capture: cap,
+            clipped,
+        });
+    }
+    let (before, after) = changed.expect("capture attempts always record changed geometry");
+    Err(format!(
+        "region '{region}' moved or rescaled during {CAPTURE_ATTEMPTS} captures \
+         (before: {:?}, frame {}; after: {:?}, frame {}); keep the window still and retry",
+        before.rect, before.frame, after.rect, after.frame
+    ))
 }
 
 /// A connection to one harness instance.
@@ -196,23 +239,13 @@ impl Driver {
 
     /// A capture cropped to `region`: settle first, then photograph, then cut.
     ///
-    /// The rect is read BEFORE the capture and both come after the same
-    /// settle, so a window that moved between the two is caught here rather
-    /// than silently cropping the wrong place: a rect wholly outside the image
-    /// is an error naming both rectangles, and one that only overlaps comes
-    /// back with [`Shot::clipped`] saying which edges are the capture's rather
-    /// than the region's.
+    /// The rect is read before and after the capture. If its desktop position,
+    /// size or scale changed in between, the capture is retried: combining
+    /// geometry from one window position with pixels from another can yield a
+    /// valid but shifted crop that clipping alone cannot detect. The frame may
+    /// advance — asking for the second rect itself causes a normal redraw.
     pub fn shot(&self, region: &str) -> Result<Shot, String> {
-        let r = self.settle(region)?;
-        let cap = self.capture()?;
-        let want = r.rect.relative_to(cap.origin);
-        let clipped = clipped(want, cap.image.w, cap.image.h);
-        let image = cap.image.crop(want)?;
-        Ok(Shot {
-            image,
-            capture: cap,
-            clipped,
-        })
+        stable_shot(region, || self.settle(region), || self.capture())
     }
 }
 
@@ -237,6 +270,92 @@ mod tests {
             "must match the app's harness::control_dir, or the two look in \
              different places"
         );
+    }
+
+    #[test]
+    fn a_capture_snapshot_requires_stable_geometry_but_allows_a_new_frame() {
+        let a = RegionRect {
+            rect: RectPx::new(10, 20, 30, 40),
+            scale: 1.0,
+            frame: 7,
+        };
+        let mut b = a;
+        assert!(same_geometry(a, b));
+        b.rect.x += 1;
+        assert!(!same_geometry(a, b), "a move must invalidate the capture");
+        b = a;
+        b.frame += 1;
+        assert!(
+            same_geometry(a, b),
+            "a normal redraw does not move the crop"
+        );
+        b = a;
+        b.scale = 1.25;
+        assert!(
+            !same_geometry(a, b),
+            "a DPI change must invalidate the capture"
+        );
+    }
+
+    fn capture() -> Capture {
+        Capture {
+            image: Image::new(100, 100),
+            origin: (0, 0),
+            how: crate::capture::How::PrintWindow,
+        }
+    }
+
+    #[test]
+    fn shot_retries_changed_geometry_and_uses_the_stable_capture() {
+        let a = RegionRect {
+            rect: RectPx::new(10, 10, 20, 20),
+            scale: 1.0,
+            frame: 1,
+        };
+        let b = RegionRect {
+            rect: RectPx::new(20, 10, 20, 20),
+            scale: 1.0,
+            frame: 2,
+        };
+        let mut rects = [a, b, b, b].into_iter();
+        let mut captures = 0;
+        let shot = stable_shot(
+            "grid",
+            || Ok(rects.next().expect("two attempts need four settled rects")),
+            || {
+                captures += 1;
+                Ok(capture())
+            },
+        )
+        .expect("the second stable attempt succeeds");
+        assert_eq!(captures, 2);
+        assert_eq!(shot.image.w, 20);
+        assert_eq!(shot.image.h, 20);
+    }
+
+    #[test]
+    fn shot_refuses_three_changed_attempts() {
+        let mut frame = 0;
+        let mut captures = 0;
+        let err = stable_shot(
+            "grid",
+            || {
+                frame += 1;
+                Ok(RegionRect {
+                    rect: RectPx::new(frame, 10, 20, 20),
+                    scale: 1.0,
+                    frame: frame as u64,
+                })
+            },
+            || {
+                captures += 1;
+                Ok(capture())
+            },
+        )
+        .err()
+        .expect("geometry that never stabilizes must be refused");
+        assert_eq!(captures, CAPTURE_ATTEMPTS);
+        assert!(err.contains("moved or rescaled"), "{err}");
     }
 
     /// A connect against a directory with nothing in it must fail with a

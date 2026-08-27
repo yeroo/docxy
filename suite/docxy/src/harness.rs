@@ -156,32 +156,90 @@ pub fn gate(over: Option<&OsStr>, os_config: Option<&Path>) -> Result<PathBuf, S
     Ok(root)
 }
 
-/// Whether two paths name the same directory, textually: separators and a
-/// trailing one are noise, and Windows paths are case-insensitive. Deliberately
-/// not `canonicalize` — the sandbox root usually does not exist yet when the
-/// gate runs, and a comparison that fails open would defeat the check. See
-/// [`resolves_same`] for the half that does ask the filesystem.
+/// Whether two paths name the same directory textually: separators, `.`/`..`,
+/// and a trailing separator are noise, and Windows paths are case-insensitive.
+/// This check does not require the proposed sandbox to exist.
 pub fn same_dir(a: &Path, b: &Path) -> bool {
-    norm(a) == norm(b)
+    norm(&lexical_normalize(a)) == norm(&lexical_normalize(b))
 }
 
-/// Whether two paths that BOTH exist resolve to the same directory.
+/// Whether two paths resolve to the same directory through their nearest
+/// existing ancestors.
 ///
-/// [`same_dir`] compares spellings, so `%APPDATA%\..\Roaming`, an 8.3 short
-/// name, and a junction laid over the profile all read as "not the real config
-/// directory" and would be accepted as a sandbox — after which `session_path`
-/// and `hot_dir` write over the user's own open documents, which is the single
-/// thing the gate exists to stop.
+/// [`same_dir`] handles lexical `.`/`..` aliases, but filesystem aliases such as
+/// an 8.3 short name or a junction laid over the profile need canonicalization.
+/// Accepting one as a sandbox would make `session_path` and `hot_dir` write over
+/// the user's own open documents, which is the single thing the gate exists to
+/// stop.
 ///
-/// This can only ever ADD a refusal: it answers false whenever either side
-/// fails to resolve, and a sandbox that does not exist yet cannot be the real
-/// config directory, which does. So the textual check remains the one that has
-/// to hold, and nothing here can make the gate fail open.
+/// Resolving the nearest existing ancestor matters for a new sandbox below a
+/// junction as well as for an existing path. The remaining tail is appended and
+/// normalized without creating anything on disk.
 pub fn resolves_same(a: &Path, b: &Path) -> bool {
-    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+    let mut canonicalize = |path: &Path| std::fs::canonicalize(path);
+    resolves_same_with(a, b, &mut canonicalize)
+}
+
+fn resolves_same_with<F>(a: &Path, b: &Path, resolve: &mut F) -> bool
+where
+    F: FnMut(&Path) -> std::io::Result<PathBuf>,
+{
+    match (
+        resolve_for_compare_with(a, resolve),
+        resolve_for_compare_with(b, resolve),
+    ) {
         (Ok(ca), Ok(cb)) => norm(&ca) == norm(&cb),
         _ => false,
     }
+}
+
+fn resolve_for_compare_with<F>(path: &Path, resolve: &mut F) -> std::io::Result<PathBuf>
+where
+    F: FnMut(&Path) -> std::io::Result<PathBuf>,
+{
+    for ancestor in path.ancestors() {
+        let candidate = if ancestor.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            ancestor
+        };
+        if let Ok(mut base) = resolve(candidate) {
+            let tail = path.strip_prefix(ancestor).unwrap_or(path);
+            base.push(tail);
+            return Ok(lexical_normalize(&base));
+        }
+    }
+    resolve(path)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut base = PathBuf::new();
+    let mut rooted = false;
+    let mut tail: Vec<OsString> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) => base.push(component.as_os_str()),
+            Component::RootDir => {
+                base.push(component.as_os_str());
+                rooted = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => match tail.last() {
+                Some(last) if last != ".." => {
+                    tail.pop();
+                }
+                _ if !rooted => tail.push(OsString::from("..")),
+                _ => {}
+            },
+            Component::Normal(name) => tail.push(name.to_os_string()),
+        }
+    }
+    for component in tail {
+        base.push(component);
+    }
+    base
 }
 
 /// A path reduced to what a comparison should care about: forward separators,
@@ -579,9 +637,12 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         None => (name, None),
     };
     match head.to_ascii_lowercase().as_str() {
-        "window" => Ok(Region::Window),
-        "grid" => Ok(Region::Grid),
-        "chart-panel" => Ok(Region::ChartPanel),
+        "window" if arg.is_none() => Ok(Region::Window),
+        "grid" if arg.is_none() => Ok(Region::Grid),
+        "chart-panel" if arg.is_none() => Ok(Region::ChartPanel),
+        "window" | "grid" | "chart-panel" => {
+            Err(format!("'{head}' does not take an argument; use '{head}'"))
+        }
         "cell" | "cells" => {
             let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
                 format!("'{head}' needs a cell or a range, e.g. {head}:B3 or {head}:A1:C5")
@@ -855,8 +916,10 @@ fn state(app: &crate::Docxy) -> Json {
 ///
 /// Every driving verb goes through the same entry point the pointer or the
 /// keyboard would: `click-cell` is the cell's own click handler, `drag` is a
-/// press plus one move per cell crossed plus the release, `key`/`type` are
-/// [`crate::Docxy::on_key`], and `select-chart` is the press on a chart card.
+/// press plus one move per cell crossed plus the release, ordinary `key`/`type`
+/// input uses [`crate::Docxy::on_key`], action-bound Tab variants use their
+/// `tab_key`/`shift_tab_key` handlers, and `select-chart` is the press on a chart
+/// card.
 /// A verb that reached past those into the state they maintain could pass while
 /// the handler under test was broken — the one way this harness could be worse
 /// than nothing.
@@ -1314,9 +1377,8 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// The half `same_dir` cannot do: a spelling that walks out and back in
-    /// names the same directory, and the gate has to see through it or a
-    /// hand-typed override lands on the real profile.
+    /// Both the lexical and filesystem-aware comparisons see through a spelling
+    /// that walks out and back in.
     #[test]
     fn resolves_same_sees_through_a_dot_dot_spelling() {
         let real = an_existing_dir();
@@ -1324,14 +1386,51 @@ mod tests {
             return; // a root directory; there is nothing to walk out of
         };
         let round_trip = real.join("..").join(leaf);
-        assert!(!same_dir(&round_trip, &real), "the spellings differ");
+        assert!(same_dir(&round_trip, &real), "dot-dot is normalized");
         assert!(resolves_same(&round_trip, &real));
     }
 
-    /// It must never answer true for paths it cannot resolve — that is what
-    /// keeps it purely additive to the textual check.
     #[test]
-    fn resolves_same_is_false_when_a_path_does_not_exist() {
+    fn gate_refuses_a_nonexistent_component_followed_by_dot_dot() {
+        let real = an_existing_dir();
+        let alias = real.join("no-such-harness-dir-9f3a").join("..");
+        let err = gate(Some(alias.as_os_str()), Some(&real))
+            .expect_err("the unresolved spelling still names the real config root");
+        assert!(err.contains("real config directory"), "{err}");
+    }
+
+    #[test]
+    fn nearest_ancestor_resolution_handles_a_junction_target_with_a_missing_tail() {
+        let real = PathBuf::from("real-config");
+        let alias = PathBuf::from("run")
+            .join("config-link")
+            .join("missing")
+            .join("..");
+        // Model the contract supplied by `canonicalize`: the junction itself
+        // resolves to the real directory, while descendants below the missing
+        // component do not exist. Injecting it keeps this regression test
+        // deterministic on Windows machines where creating symlinks needs an
+        // elevated token or Developer Mode.
+        let mut canonicalize = |path: &Path| {
+            if path == Path::new("run").join("config-link") || path == real {
+                Ok(real.clone())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "synthetic missing path",
+                ))
+            }
+        };
+        assert!(
+            resolves_same_with(&alias, &real, &mut canonicalize),
+            "a missing tail beneath a junction still resolves to the real root"
+        );
+    }
+
+    /// Distinct unresolved tails must remain unequal even though their nearest
+    /// existing ancestors can be resolved.
+    #[test]
+    fn resolves_same_keeps_distinct_unresolved_tails_unequal() {
         let real = an_existing_dir();
         assert!(!resolves_same(
             &real.join("no-such-harness-dir-9f3a"),
@@ -1809,6 +1908,12 @@ mod tests {
         assert!(e.contains("last"), "{e}");
         assert!(parse_region("chart:-1").is_err());
         assert!(parse_region("chart").unwrap_err().contains("chart:0"));
+        // Regions with no argument never accept a suffix. Interactive commands
+        // use this parser directly, so they must be as strict as scripts.
+        for name in ["window:1", "grid:typo", "chart-panel:"] {
+            let e = parse_region(name).expect_err("an argument-less region rejects a suffix");
+            assert!(e.contains("does not take an argument"), "{name}: {e}");
+        }
     }
 
     /// Every name a reply prints is a name the next request accepts.

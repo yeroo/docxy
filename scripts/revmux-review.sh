@@ -164,13 +164,16 @@ if [ -n "$PROFILE_MD" ]; then
   `#[cfg(test)]` module at the bottom of that file. gpui `#[test]` works for
   pure logic; constructing views or elements blows up the render macro, so
   helpers are deliberately written as pure free functions to stay testable.
-  "Add a test for the renderer or the view" is not a finding here — it cannot
-  be done.
+  A direct unit test for a renderer/view is not feasible, but a concrete visual
+  regression may still be covered through the scripted UI harness below.
 - Model behaviour is tested in `gridcore/src/*.rs` next to the code, and the
   load -> save -> load round-trips are the tests that matter for charts.
-- There is no browser or UI e2e harness. On-screen behaviour is verified
-  manually against an installer build, not in CI, so "no e2e coverage" is not
-  a finding either.
+- `uiharness` launches an isolated suite instance and runs committed `.uit`
+  cases through the app's real handlers. It can inspect reported state and
+  captured pixels for named regions. Report a missing `.uit` case when a
+  concrete, harness-reachable UI regression would otherwise go undetected;
+  do not demand coverage for interactions or renderer internals the harness
+  cannot reach.
 
 ## What is worth reporting
 

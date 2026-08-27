@@ -514,7 +514,17 @@ fn fail(mut out: StepOutcome, detail: impl Into<String>) -> StepOutcome {
 /// it turns up in the tab title and in every message about the file.
 fn path_arg(p: &Path) -> String {
     let s = p.display().to_string();
-    s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\")
+        && rest.as_bytes().get(1) == Some(&b':')
+        && rest.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && matches!(rest.as_bytes().get(2), Some(b'\\' | b'/'))
+    {
+        rest.to_string()
+    } else {
+        s
+    }
 }
 
 /// The keys an object has, for "the app reports no 'x'".
@@ -730,6 +740,14 @@ mod tests {
             r"C:\x\basic.xlsx"
         );
         assert_eq!(path_arg(Path::new("/tmp/basic.xlsx")), "/tmp/basic.xlsx");
+        assert_eq!(
+            path_arg(Path::new(r"\\?\UNC\server\share\basic.xlsx")),
+            r"\\server\share\basic.xlsx"
+        );
+        assert_eq!(
+            path_arg(Path::new(r"\\?\Volume{1234}\cases\basic.xlsx")),
+            r"\\?\Volume{1234}\cases\basic.xlsx"
+        );
     }
 
     #[test]

@@ -217,9 +217,9 @@ pub fn duplicate_case(scripts: &[(String, &Script)]) -> Option<String> {
 
 /// Parse a whole script.
 ///
-/// Pure. Blank lines are skipped and a `#` starts a comment to end of line —
-/// except inside a `type` step, whose text is taken verbatim, because `#` is a
-/// character a spreadsheet test has every reason to type.
+/// Pure. Blank lines are skipped and a `#` starts a comment to end of line,
+/// except inside a `type` step (whose text is verbatim) and a six-digit colour
+/// in a border assertion such as `#2f6fdb`.
 pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut cases: Vec<Case> = Vec::new();
     for (i, raw) in text.lines().enumerate() {

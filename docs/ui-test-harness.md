@@ -59,7 +59,7 @@ Useful flags on `run`:
 |---|---|
 | `--suite EXE` | drive this binary. Otherwise `$UIHARNESS_SUITE` if it is set (an error if it does not name a file), otherwise the first build found — release before debug, under `suite/target/` then `target/`, relative to the repository this crate was built from and then the working directory. Release wins over debug whatever their dates, so every run prints the binary it drove as its first line — that is what makes a stale release build answering for a fresh debug one visible |
 | `--run DIR` | where evidence is filed (default `./uiharness-runs`, which is git-ignored). The path a capture lands on is `<case>/<line>-<region>.png`, so two runs sharing this directory *at the same time* would file over each other's pictures — give them different `--run` directories if you run them in parallel. The instances themselves never share anything: each gets its own sandbox |
-| `--sandbox DIR` | the throwaway config root (default `<run>/sandbox-<pid>`, **erased before the launch**; named for the running process so two overlapping runs — or a run started while a `--keep` instance is still up — cannot delete each other's live control directory. A directory you name yourself is yours to manage, and is kept) |
+| `--sandbox DIR` | the throwaway config root (default `<run>/sandbox-<pid>-<timestamp>`). Every default is unique and retained for diagnosis; the harness performs no recursive cleanup. A directory you name yourself is also yours to manage and is kept |
 | `--keep` | leave the instance up after the script ends, to poke at the window a case failed on |
 
 ### Evidence
@@ -353,9 +353,9 @@ documents. The full case file was then run. Afterwards the real directory was
 made had landed in the sandbox instead:
 
 ```text
-target/uiharness-runs/sandbox-<pid>/docxy/session.json
-target/uiharness-runs/sandbox-<pid>/docxy/hot/tab-0.docx
-target/uiharness-runs/sandbox-<pid>/docxy/hot/tab-1.xlsx
+target/uiharness-runs/sandbox-<pid>-<timestamp>/docxy/session.json
+target/uiharness-runs/sandbox-<pid>-<timestamp>/docxy/hot/tab-0.docx
+target/uiharness-runs/sandbox-<pid>-<timestamp>/docxy/hot/tab-1.xlsx
 ```
 
 That pair is the whole proof: the run *did* persist, and it persisted somewhere

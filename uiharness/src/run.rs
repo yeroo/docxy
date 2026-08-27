@@ -22,7 +22,8 @@ use std::path::{Path, PathBuf};
 
 /// A file-system-safe version of `name`: anything that is not a letter, digit,
 /// dot, dash or underscore becomes a dash, runs of dashes collapse, and the
-/// result is trimmed and capped.
+/// result is trimmed and capped. Windows-reserved device basenames and trailing
+/// dots are rewritten too, because these slugs become path components.
 ///
 /// Test names are prose (`drag-to-select does not fill`) and region names carry
 /// colons (`cell:A1:C5`) — a colon in a Windows path is a stream separator, so
@@ -38,17 +39,35 @@ pub fn slug(name: &str) -> String {
     }
     let s = out.trim_matches('-');
     let s: String = s.chars().take(80).collect();
-    let s = s.trim_end_matches('-').to_string();
+    let mut s = s.trim_end_matches(['-', '.', ' ']).to_string();
     // `.` and `..` survive the filter above, and a slug is joined beneath the
     // run directory as one path component — so `test ..` would resolve a
     // capture to `<run>/../002-grid.png` and truncate a same-named PNG outside
     // the evidence directory. Nothing else is only dots, so refusing the whole
     // class costs no legitimate name.
-    if s.is_empty() || s.chars().all(|c| c == '.') {
-        "unnamed".to_string()
-    } else {
-        s
+    if s.is_empty() {
+        return "unnamed".to_string();
     }
+
+    // Win32 treats these basenames as devices even when an extension follows
+    // (`con.png` is still CON). Prefixing keeps the spelling recognizable while
+    // making it an ordinary directory name. Do this after trimming trailing
+    // dots so `CON.` cannot bypass the check.
+    let stem = s.split('.').next().unwrap_or_default();
+    let reserved = matches!(stem, "con" | "prn" | "aux" | "nul")
+        || stem
+            .strip_prefix("com")
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
+        || stem
+            .strip_prefix("lpt")
+            .is_some_and(|n| matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"));
+    if reserved {
+        s.insert(0, '_');
+        s.truncate(80);
+        let trimmed_len = s.trim_end_matches(['-', '.', ' ']).len();
+        s.truncate(trimmed_len);
+    }
+    s
 }
 
 /// One run's output directory.
@@ -126,6 +145,25 @@ mod tests {
         assert_eq!(slug("a..b"), "a..b");
         assert_eq!(slug("  spaced  "), "spaced");
         assert_eq!(slug("--x--"), "x");
+    }
+
+    #[test]
+    fn slug_avoids_windows_device_names_and_trailing_dot_aliases() {
+        for name in [
+            "CON", "con.txt", "PRN", "AUX.log", "NUL", "COM1", "LPT9.csv",
+        ] {
+            assert!(slug(name).starts_with('_'), "{name}: {}", slug(name));
+        }
+        assert_eq!(slug("smoke."), "smoke");
+        assert_eq!(slug("smoke..."), "smoke");
+        assert_eq!(slug("ordinary.txt"), "ordinary.txt");
+
+        // Prefixing a capped reserved name must not expose a trailing dot and
+        // let Win32 alias it with a different accepted slug.
+        let capped_reserved = format!("con.{}.x", "a".repeat(74));
+        let ordinary_alias = format!("_con.{}", "a".repeat(74));
+        assert_eq!(slug(&capped_reserved), slug(&ordinary_alias));
+        assert!(!slug(&capped_reserved).ends_with('.'));
     }
 
     #[test]

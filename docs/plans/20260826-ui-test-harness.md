@@ -749,19 +749,13 @@ having; the second is where the wrong assumption was.
   wedged by a dialog is not a control surface. It has no unit test of its own —
   the guard is one condition on a method that needs a live window — and is
   covered by the case file, whose fourth case is the run that found it.
-- `.ralphex/config` gained `max_iterations = 15` and `idle_timeout = 10m`
-  (commit `d032483`), with the matching section of `docs/ralphex-revmux.md`
-  rewritten. **This has nothing to do with the harness** — it is agent-runner
-  tuning that happened to land inside this branch's range, and it is recorded
-  here because two review rounds flagged its absence: the plan is presented as
-  the complete account of the range, and anyone bisecting a change in runner
-  behaviour to these commits would otherwise find it filed under "the UI test
-  harness". Not reverted or split out: the caps were the live settings of the
-  loop that was running at the time.
+- `.ralphex/config` briefly gained task-wide `max_iterations` and `idle_timeout`
+  tuning in commit `d032483`. The final review correctly classified those as
+  unrelated to the UI harness, so this branch removes them again; only the
+  external-review convergence controls remain project-local.
 
-104 tests in `uiharness` (35 new: 12 for the script parser, 12 for the runner's
-comparisons, 3 for the launcher, 2 for the new probe readings, plus the fixture
-and committed-case checks); suite 178, `gridcore` 370. Clippy `-D warnings` and
+122 tests across the `uiharness` targets; suite 189, `gridcore` 370. Clippy
+`-D warnings` and
 `cargo fmt --check` clean in both workspaces.
 
 ### Task 7: Verify acceptance criteria

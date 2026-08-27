@@ -21,7 +21,8 @@ That split is load-bearing: a change to a `gridcore` / `docxcore` public type ca
 compile green in one workspace while breaking the other, because only the root
 one builds `xlsxy`, `gridwasm` and the TUIs against those types. **Build and test
 both** whenever you touch a core crate's public API. CI (`.github/workflows/ci.yml`)
-only covers the root workspace, so the suite's tests are on you.
+formats, lints and tests both workspaces, and contributors should run both
+locally before sending a change.
 
 ## Testing
 
