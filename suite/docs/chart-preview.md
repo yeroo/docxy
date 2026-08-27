@@ -42,20 +42,24 @@ left gutter for values and the bottom gutter for categories. Bar charts reserve
 the left gutter for categories and the bottom gutter for values. Pie charts use
 the body as their plot and reserve no axis gutters.
 
-Category labels are planned from the actual plot width. Dense labels are
-thinned deterministically, always retaining the first and last categories.
-Visible text is shortened by Unicode scalar values to a per-slot limit capped
-at 18 characters, and shortened labels expose the full text in a tooltip.
+Horizontal category labels on column and line cards are planned from the
+actual plot width. Bar-card category labels are planned from the plot height:
+each retained label receives a fixed 12-pixel row, and dense categories are
+thinned deterministically to rows that fit without overlap. Horizontal labels
+are shortened by Unicode scalar values to a per-slot limit capped at 18
+characters, while bar labels are shortened to the available category-axis
+width. Shortened labels expose the full text in a tooltip.
 
 Clustered columns are also sized from the plot width rather than a fixed bar
 width. Each category owns one slot; within it, the target bar width is 2–24 px,
-the target gap between series is 1–4 px, and the target gap between categories
-is 4–24 px and at most 40% of its slot. Once bars reach their 24 px maximum,
-any remaining slot width stays as unused space between clusters, so the actual
-space can exceed that target gap on wide charts. Extremely dense charts may
-compress below the 2 px target instead of overflowing their plot. The renderer
-bounds an imported card to 512 points and 32 plotted series so malformed caches
-cannot produce an unbounded element tree.
+the target gap between series is 1–4 px, and the nominal target gap between
+categories is 4–24 px. That category-gap target is also capped at 40% of its
+slot, so it falls below 4 px when that cap is smaller. Once bars reach their
+24 px maximum, any remaining slot width stays as unused space between clusters,
+so the actual space can exceed that target gap on wide charts. Extremely dense
+charts may compress below the 2 px target instead of overflowing their plot.
+The renderer bounds an imported card to 512 points and 32 plotted series so
+malformed caches cannot produce an unbounded element tree.
 
 ## Intentional limits
 

@@ -64,14 +64,14 @@ orientation-aware implementation and its conditional gap floor.
 
 ### Task 3: Correct the remaining chart-preview contracts
 
-- [ ] document that horizontal labels use plot width and bar labels use plot
+- [x] document that horizontal labels use plot width and bar labels use plot
       height with 12-pixel row capacity; do not claim rendered cards exercise a
       helper-only sub-12-pixel fallback
-- [ ] document that the nominal 4–24-pixel category-gap target can fall below
+- [x] document that the nominal 4–24-pixel category-gap target can fall below
       4 pixels when the 40%-of-slot cap is smaller
-- [ ] sweep the focused chart-preview documentation for equivalent absolute
+- [x] sweep the focused chart-preview documentation for equivalent absolute
       orientation and gap-floor claims
-- [ ] run documentation/search and whitespace checks before Task 4
+- [x] run documentation/search and whitespace checks before Task 4
 
 ### Task 4: [Final] Verify and archive the second-review fixes
 
