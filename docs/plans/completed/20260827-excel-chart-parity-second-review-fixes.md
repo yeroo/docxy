@@ -75,12 +75,12 @@ orientation-aware implementation and its conditional gap floor.
 
 ### Task 4: [Final] Verify and archive the second-review fixes
 
-- [ ] re-read all four round-02 findings against the resulting diff and verify
+- [x] re-read all four round-02 findings against the resulting diff and verify
       the mechanisms rather than only the quoted examples
-- [ ] run `cargo test` and `cargo test --manifest-path suite/Cargo.toml`
-- [ ] run root and suite `cargo clippy --all-targets -- -D warnings`
-- [ ] run root and suite `cargo fmt --check` and `git diff --check`
-- [ ] record final counts and deliberate exclusions here, then move this plan
+- [x] run `cargo test` and `cargo test --manifest-path suite/Cargo.toml`
+- [x] run root and suite `cargo clippy --all-targets -- -D warnings`
+- [x] run root and suite `cargo fmt --check` and `git diff --check`
+- [x] record final counts and deliberate exclusions here, then move this plan
       to `docs/plans/completed/`
 
 ## Review record
@@ -91,3 +91,15 @@ orientation-aware implementation and its conditional gap floor.
   projection correction, and two chart-preview documentation corrections.
 - Excluded findings: all entries classified as `pre_existing` and every
   previously deferred chart/package/testing item.
+- Final finding count: 4/4 in-scope round-02 minor findings were re-read against
+  the resulting diff and verified closed at the planner/renderer, fixture
+  projection, and documentation-contract levels.
+- Final validation count: root tests reported 2,325 passed, 0 failed and 1
+  ignored; suite tests reported 200 passed and 0 failed. Both Clippy invocations
+  passed with warnings denied, both format checks passed, and `git diff --check`
+  passed.
+- Deliberate exclusions: the report's two `pre_existing` entries are duplicate
+  descriptions of one shortened source comment at `suite/docxy/src/main.rs:3341`;
+  both entries (one distinct issue) remain unchanged. Also unchanged by scope are
+  the deferred pie/non-finite and 512-point scale findings, the stale
+  `chart_grips` comment, undo/package behavior, OCR, and golden images.
