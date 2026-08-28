@@ -1,0 +1,15 @@
+# Focused pixel evidence for chart-kind rendering. Pure geometry tests pin the
+# exact vertices and angles; these captures prove GPUI paints those paths in a
+# real desktop window.
+
+test a line chart connects its point markers
+  open ../fixtures/chart-kinds.xlsx
+  select chart 0
+  assert chart_sel is 0
+  shot chart:0
+
+test a pie chart paints circular radial slices
+  open ../fixtures/chart-kinds.xlsx
+  select chart 1
+  assert chart_sel is 1
+  shot chart:1

@@ -18473,6 +18473,190 @@ fn chart_scale(values: impl IntoIterator<Item = f64>) -> ChartScale {
     }
 }
 
+const CHART_LINE_MARKER_RADIUS: f32 = 3.5;
+const CHART_PIE_INSET: f32 = 4.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct ChartPoint {
+    x: f32,
+    y: f32,
+}
+
+/// Resolve one line series to marker centres in the plot's top-left coordinate
+/// system. The centres stay inside the plot by their marker radius, so the
+/// polyline and the dots share exactly the same vertices even at zero/max.
+fn chart_line_points(
+    values: &[f64],
+    category_count: usize,
+    plot_width: f32,
+    plot_height: f32,
+    scale: &ChartScale,
+) -> Vec<ChartPoint> {
+    if category_count == 0 {
+        return Vec::new();
+    }
+
+    let plot_width = chart_dimension(plot_width);
+    let plot_height = chart_dimension(plot_height);
+    let slot = plot_width / category_count as f32;
+    let contain = |coordinate: f32, extent: f32| {
+        if extent <= CHART_LINE_MARKER_RADIUS * 2.0 {
+            extent / 2.0
+        } else {
+            coordinate.clamp(CHART_LINE_MARKER_RADIUS, extent - CHART_LINE_MARKER_RADIUS)
+        }
+    };
+
+    (0..category_count)
+        .map(|index| {
+            let value = values.get(index).copied().unwrap_or(0.0);
+            ChartPoint {
+                x: contain(slot * (index as f32 + 0.5), plot_width),
+                y: contain(plot_height * (1.0 - scale.fraction(value)), plot_height),
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ChartPieSlice {
+    category_index: usize,
+    start_angle: f32,
+    end_angle: f32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ChartPieGeometry {
+    center: ChartPoint,
+    radius: f32,
+    slices: Vec<ChartPieSlice>,
+}
+
+/// Build a circular pie in the largest square that fits the plot. Values are
+/// normalized by their maximum before summing, avoiding overflow from large
+/// but finite imported caches. Negative and non-finite values remain empty,
+/// matching the rest of the lightweight chart preview.
+fn chart_pie_geometry(values: &[f64], plot_width: f32, plot_height: f32) -> ChartPieGeometry {
+    let plot_width = chart_dimension(plot_width);
+    let plot_height = chart_dimension(plot_height);
+    let center = ChartPoint {
+        x: plot_width / 2.0,
+        y: plot_height / 2.0,
+    };
+    let radius = (plot_width.min(plot_height) / 2.0 - CHART_PIE_INSET).max(0.0);
+    let clean = values
+        .iter()
+        .map(|value| {
+            if value.is_finite() {
+                value.max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .collect::<Vec<_>>();
+    let max = clean.iter().copied().fold(0.0f64, f64::max);
+    if max == 0.0 || radius == 0.0 {
+        return ChartPieGeometry {
+            center,
+            radius,
+            slices: Vec::new(),
+        };
+    }
+
+    let weights = clean.iter().map(|value| value / max).collect::<Vec<_>>();
+    let total = weights.iter().sum::<f64>();
+    let positive_count = weights.iter().filter(|value| **value > 0.0).count();
+    let first_angle = -std::f32::consts::FRAC_PI_2;
+    let final_angle = first_angle + std::f32::consts::TAU;
+    let mut start_angle = first_angle;
+    let mut positive_seen = 0usize;
+    let mut slices = Vec::with_capacity(positive_count);
+    for (category_index, weight) in weights.into_iter().enumerate() {
+        if weight <= 0.0 {
+            continue;
+        }
+        positive_seen += 1;
+        let end_angle = if positive_seen == positive_count {
+            final_angle
+        } else {
+            start_angle + std::f32::consts::TAU * (weight / total) as f32
+        };
+        slices.push(ChartPieSlice {
+            category_index,
+            start_angle,
+            end_angle,
+        });
+        start_angle = end_angle;
+    }
+
+    ChartPieGeometry {
+        center,
+        radius,
+        slices,
+    }
+}
+
+fn chart_line_path(points: &[ChartPoint], origin: Point<Pixels>) -> Option<Path<Pixels>> {
+    if points.len() < 2 {
+        return None;
+    }
+    let at =
+        |chart_point: ChartPoint| point(origin.x + px(chart_point.x), origin.y + px(chart_point.y));
+    let mut builder = PathBuilder::stroke(px(2.0));
+    builder.move_to(at(points[0]));
+    for chart_point in &points[1..] {
+        builder.line_to(at(*chart_point));
+    }
+    builder.build().ok()
+}
+
+fn chart_pie_slice_path(
+    geometry: &ChartPieGeometry,
+    slice: ChartPieSlice,
+    origin: Point<Pixels>,
+) -> Option<Path<Pixels>> {
+    if geometry.radius <= 0.0 || slice.end_angle <= slice.start_angle {
+        return None;
+    }
+    let center = point(
+        origin.x + px(geometry.center.x),
+        origin.y + px(geometry.center.y),
+    );
+    let on_circle = |angle: f32| {
+        point(
+            center.x + px(geometry.radius * angle.cos()),
+            center.y + px(geometry.radius * angle.sin()),
+        )
+    };
+    let radii = point(px(geometry.radius), px(geometry.radius));
+    let span = slice.end_angle - slice.start_angle;
+    let mut builder = PathBuilder::fill();
+    builder.move_to(center);
+    builder.line_to(on_circle(slice.start_angle));
+    if span >= std::f32::consts::TAU - 0.0001 {
+        // SVG-style arcs whose start and end coincide are empty. Two half-arcs
+        // make a one-category pie a real disk instead of a missing shape.
+        builder.arc_to(
+            radii,
+            px(0.0),
+            false,
+            true,
+            on_circle(slice.start_angle + std::f32::consts::PI),
+        );
+        builder.arc_to(radii, px(0.0), false, true, on_circle(slice.end_angle));
+    } else {
+        builder.arc_to(
+            radii,
+            px(0.0),
+            span > std::f32::consts::PI,
+            true,
+            on_circle(slice.end_angle),
+        );
+    }
+    builder.close();
+    builder.build().ok()
+}
+
 /// Pixel rectangles used by the card renderer. Every rectangle is relative to
 /// the card and is kept non-negative even when a malformed anchor or a pure
 /// helper test supplies dimensions smaller than the UI's minimum chart size.
@@ -19107,37 +19291,52 @@ fn chart_card(data: &gridcore::sheet::ChartData, chart_id: usize, w: f32, h: f32
             plot = plot.child(marks);
         }
         ChartRenderPath::Line => {
-            // The lightweight line preview retains its existing point marks;
-            // their centres now share the scale and bounded plot rectangle.
-            let category_slot = if ncat == 0 {
-                0.0
-            } else {
-                layout.plot.w / ncat as f32
-            };
+            let series_geometry = plotted
+                .iter()
+                .enumerate()
+                .map(|(series_index, series)| {
+                    (
+                        chart_line_points(
+                            &series.values,
+                            ncat,
+                            layout.plot.w,
+                            layout.plot.h,
+                            &scale,
+                        ),
+                        ser_color(series_index),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let painted_geometry = series_geometry.clone();
+            let lines = canvas(
+                |_bounds, _window, _cx| {},
+                move |bounds: Bounds<Pixels>, _state, window: &mut Window, _cx| {
+                    for (points, color) in &painted_geometry {
+                        if let Some(path) = chart_line_path(points, bounds.origin) {
+                            window.paint_path(path, rgb(*color));
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .size_full();
             let mut marks = div().absolute().size_full();
-            for ci in 0..ncat {
-                let centre_x = category_slot * (ci as f32 + 0.5);
-                for (si, series) in plotted.iter().enumerate() {
-                    let value = series.values.get(ci).copied().unwrap_or(0.0);
-                    let left = (centre_x - 3.5).clamp(0.0, (layout.plot.w - 7.0).max(0.0));
-                    let bottom = (layout.plot.h * scale.fraction(value) - 3.5)
-                        .clamp(0.0, (layout.plot.h - 7.0).max(0.0));
+            for (points, color) in &series_geometry {
+                for chart_point in points {
                     marks = marks.child(
                         div()
                             .absolute()
-                            .left(px(left))
-                            .bottom(px(bottom))
+                            .left(px(chart_point.x - CHART_LINE_MARKER_RADIUS))
+                            .top(px(chart_point.y - CHART_LINE_MARKER_RADIUS))
                             .size(px(7.))
                             .rounded(px(4.))
-                            .bg(rgb(ser_color(si))),
+                            .bg(rgb(*color)),
                     );
                 }
             }
-            plot = plot.child(marks);
+            plot = plot.child(lines).child(marks);
         }
         ChartRenderPath::Pie => {
-            // Pie remains deliberately axis-free. Its compact preview is a
-            // 100%-stacked proportion bar; its per-category legend is below.
             let values = (0..ncat)
                 .map(|ci| {
                     plotted
@@ -19145,31 +19344,38 @@ fn chart_card(data: &gridcore::sheet::ChartData, chart_id: usize, w: f32, h: f32
                         .and_then(|series| series.values.get(ci))
                         .copied()
                         .unwrap_or(0.0)
-                        .max(0.0)
                 })
                 .collect::<Vec<_>>();
-            let total = values.iter().sum::<f64>().max(1.0);
-            let mut slices = h_flex()
-                .w_full()
-                .h(px(30.0f32.min(layout.plot.h)))
-                .rounded(px(4.))
-                .overflow_hidden();
-            for (ci, value) in values.iter().enumerate() {
-                slices = slices.child(
-                    div()
-                        .h_full()
-                        .w(relative((*value / total) as f32))
-                        .bg(rgb(PALETTE[ci % PALETTE.len()])),
-                );
-            }
-            plot = plot.child(
-                v_flex()
-                    .absolute()
-                    .size_full()
-                    .justify_center()
-                    .px_3()
-                    .child(slices),
-            );
+            let geometry = chart_pie_geometry(&values, layout.plot.w, layout.plot.h);
+            let pie = canvas(
+                |_bounds, _window, _cx| {},
+                move |bounds: Bounds<Pixels>, _state, window: &mut Window, _cx| {
+                    if geometry.slices.is_empty() {
+                        let empty = ChartPieSlice {
+                            category_index: 0,
+                            start_angle: -std::f32::consts::FRAC_PI_2,
+                            end_angle: -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU,
+                        };
+                        if let Some(path) = chart_pie_slice_path(&geometry, empty, bounds.origin) {
+                            window.paint_path(path, rgb(0xe3e3e3));
+                        }
+                    } else {
+                        for slice in &geometry.slices {
+                            if let Some(path) =
+                                chart_pie_slice_path(&geometry, *slice, bounds.origin)
+                            {
+                                window.paint_path(
+                                    path,
+                                    rgb(PALETTE[slice.category_index % PALETTE.len()]),
+                                );
+                            }
+                        }
+                    }
+                },
+            )
+            .absolute()
+            .size_full();
+            plot = plot.child(pie);
         }
         ChartRenderPath::Column => {
             debug_assert!(path.uses_column_geometry());
@@ -20400,15 +20606,16 @@ fn main() {
 #[cfg(test)]
 mod grid_geom_tests {
     use super::{
-        BRAND, CHART_CATEGORIES_COLOR, CHART_NAME_COLOR, CHART_VALUES_COLOR,
-        ChartCategoryLabelOrientation, ChartSlot, ChartSourceArea, EdgeMask, GRID_MAX_VISIBLE_ROWS,
-        GridOverlay, MAX_COLUMN_BAR_GAP, MAX_COLUMN_BAR_W, MIN_COLUMN_BAR_GAP, MIN_COLUMN_BAR_W,
-        PanelEvent, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W, RangeBorderPlan, RefText,
-        SHEET_HEADER_SELECTED_BG, SHEET_HEADER_SELECTED_FG, SHEET_ROW_H, SelectTarget,
-        SelectionAfter, VERTICAL_CATEGORY_LABEL_ROW_HEIGHT, arm_fill, border_range,
+        BRAND, CHART_CATEGORIES_COLOR, CHART_LINE_MARKER_RADIUS, CHART_NAME_COLOR,
+        CHART_VALUES_COLOR, ChartCategoryLabelOrientation, ChartSlot, ChartSourceArea, EdgeMask,
+        GRID_MAX_VISIBLE_ROWS, GridOverlay, MAX_COLUMN_BAR_GAP, MAX_COLUMN_BAR_W,
+        MIN_COLUMN_BAR_GAP, MIN_COLUMN_BAR_W, PanelEvent, RANGE_BORDER_CELL_CAP, RANGE_BORDER_W,
+        RangeBorderPlan, RefText, SHEET_HEADER_SELECTED_BG, SHEET_HEADER_SELECTED_FG, SHEET_ROW_H,
+        SelectTarget, SelectionAfter, VERTICAL_CATEGORY_LABEL_ROW_HEIGHT, arm_fill, border_range,
         bounded_label_preview, cell_selection_shown, char_to_byte, chart_areas_at,
-        chart_card_layout, chart_category_label_plan, chart_column_layout, chart_panel_after,
-        chart_panel_shown, chart_ref_of, chart_render_path, chart_scale, chart_slot_color,
+        chart_card_layout, chart_category_label_plan, chart_column_layout, chart_line_path,
+        chart_line_points, chart_panel_after, chart_panel_shown, chart_pie_geometry,
+        chart_pie_slice_path, chart_ref_of, chart_render_path, chart_scale, chart_slot_color,
         chart_source_areas, col_at_x, col_px, dash_fit, edit_runs, fill_box, formula_ref_tokens,
         gesture_in_flight, last_visible_col, may_arm_fill, parse_ref_text, press_selection,
         preview_range, range_a1, range_border_cell_count, range_border_dashed, range_border_plan,
@@ -20417,6 +20624,7 @@ mod grid_geom_tests {
         series_move, series_name_shown, series_remove, series_resolved_preview, sheet_index_of,
         shift_col, shift_row, shown_sel, snap_range_rows, source_ref_text,
     };
+    use gpui::{point, px};
 
     #[test]
     fn selected_header_range_follows_selection_and_pointing_precedence() {
@@ -23370,6 +23578,83 @@ mod grid_geom_tests {
             large.ticks.each_ref().map(|tick| tick.label.as_str()),
             ["0", "1.3M", "2.5M"]
         );
+    }
+
+    #[test]
+    fn line_geometry_connects_every_marker_in_series_order() {
+        let scale = chart_scale([10.0, 30.0, 20.0, 40.0]);
+        let points = chart_line_points(&[10.0, 30.0, 20.0, 40.0], 4, 200.0, 100.0, &scale);
+
+        assert_eq!(points.len(), 4);
+        assert_eq!(
+            points.windows(2).count(),
+            3,
+            "four dots require three lines"
+        );
+        assert!(points.windows(2).all(|pair| pair[0].x < pair[1].x));
+        assert_eq!(points[0].x, 25.0);
+        assert_eq!(points[3].x, 175.0);
+        assert_eq!(points[3].y, CHART_LINE_MARKER_RADIUS);
+        assert!(
+            chart_line_path(&points, point(px(0.0), px(0.0))).is_some(),
+            "two or more markers must produce a painted path"
+        );
+
+        let one = chart_line_points(&[10.0], 1, 200.0, 100.0, &scale);
+        assert!(chart_line_path(&one, point(px(0.0), px(0.0))).is_none());
+        assert!(chart_line_points(&[], 0, 200.0, 100.0, &scale).is_empty());
+    }
+
+    #[test]
+    fn pie_geometry_is_a_centered_circle_with_radial_slices() {
+        let pie = chart_pie_geometry(&[1.0, 2.0, 1.0], 240.0, 180.0);
+
+        assert_eq!(pie.center, super::ChartPoint { x: 120.0, y: 90.0 });
+        assert_eq!(pie.radius, 86.0, "radius comes from the smaller dimension");
+        assert_eq!(pie.slices.len(), 3);
+        assert_eq!(pie.slices[0].category_index, 0);
+        assert_eq!(pie.slices[1].category_index, 1);
+        assert_eq!(pie.slices[2].category_index, 2);
+        assert_eq!(
+            pie.slices.first().unwrap().start_angle,
+            -std::f32::consts::FRAC_PI_2
+        );
+        assert!(
+            (pie.slices.last().unwrap().end_angle
+                - (-std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU))
+                .abs()
+                < f32::EPSILON
+        );
+        for pair in pie.slices.windows(2) {
+            assert_eq!(pair[0].end_angle, pair[1].start_angle);
+        }
+        assert!(chart_pie_slice_path(&pie, pie.slices[0], point(px(0.0), px(0.0))).is_some());
+
+        let single = chart_pie_geometry(&[5.0], 120.0, 120.0);
+        assert_eq!(single.slices.len(), 1);
+        assert!(
+            (single.slices[0].end_angle - single.slices[0].start_angle - std::f32::consts::TAU)
+                .abs()
+                < f32::EPSILON
+        );
+        assert!(chart_pie_slice_path(&single, single.slices[0], point(px(0.0), px(0.0))).is_some());
+    }
+
+    #[test]
+    fn pie_geometry_ignores_invalid_values_without_overflowing() {
+        let pie = chart_pie_geometry(&[f64::MAX, f64::MAX, -1.0, f64::INFINITY], 100.0, 80.0);
+        assert_eq!(pie.slices.len(), 2);
+        let spans = pie
+            .slices
+            .iter()
+            .map(|slice| slice.end_angle - slice.start_angle)
+            .collect::<Vec<_>>();
+        assert!((spans[0] - std::f32::consts::PI).abs() < 0.0001);
+        assert!((spans[1] - std::f32::consts::PI).abs() < 0.0001);
+
+        let empty = chart_pie_geometry(&[0.0, -1.0, f64::NAN], 100.0, 80.0);
+        assert!(empty.slices.is_empty());
+        assert_eq!(empty.radius, 36.0);
     }
 
     fn assert_chart_rect_inside(rect: super::ChartRect, width: f32, height: f32) {

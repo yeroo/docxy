@@ -1,8 +1,9 @@
 //! The harness's own fixture workbook, and the generator that made it.
 //!
-//! `fixtures/basic.xlsx` is committed, because a UI test must not depend on a
-//! build step running first — but a committed binary nobody can regenerate is
-//! the other failure, so the recipe lives here next to the check:
+//! `fixtures/basic.xlsx` and `fixtures/chart-kinds.xlsx` are committed, because
+//! a UI test must not depend on a build step running first — but committed
+//! binaries nobody can regenerate are the other failure, so both recipes live
+//! here next to their checks:
 //!
 //! ```text
 //! UIHARNESS_REGEN_FIXTURE=1 cargo test -p uiharness --test fixture
@@ -18,7 +19,7 @@
 //! the harness's own directory.
 
 use gridcore::sheet::{Cell, CellValue, ChartData, ChartSeries, ChartSource, DrawingKind};
-use gridcore::xlsx::{load_xlsx, new_xlsx, save_xlsx};
+use gridcore::xlsx::{SheetPackage, load_xlsx, new_xlsx, save_xlsx};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -27,6 +28,12 @@ fn fixture_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("fixtures")
         .join("basic.xlsx")
+}
+
+fn chart_kinds_fixture_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures")
+        .join("chart-kinds.xlsx")
 }
 
 /// The rows the fixture holds: a header row and four regions with two
@@ -43,18 +50,7 @@ const ROWS: [(&str, f64, f64); 4] = [
 /// Build the fixture from literals.
 fn build() -> Vec<u8> {
     let mut pkg = new_xlsx();
-    {
-        let sheet = &mut pkg.workbook.sheets[0];
-        for (c, h) in HEADERS.iter().enumerate() {
-            sheet.set_cell(0, c as u32, Cell::text(h));
-        }
-        for (r, (name, q1, q2)) in ROWS.iter().enumerate() {
-            let row = r as u32 + 1;
-            sheet.set_cell(row, 0, Cell::text(name));
-            sheet.set_cell(row, 1, Cell::number(*q1));
-            sheet.set_cell(row, 2, Cell::number(*q2));
-        }
-    }
+    populate_cells(&mut pkg);
     // A chart, so the "one selection at a time" case has something to select.
     // Anchored well below and right of A1:D5: every case that drags over cells
     // uses that corner, and a card sitting on top of it would put a chart press
@@ -82,6 +78,82 @@ fn build() -> Vec<u8> {
         ..ChartData::default()
     };
     pkg.add_chart(0, (8, 1), (20, 7), &data);
+    save_xlsx(&pkg)
+}
+
+fn populate_cells(pkg: &mut SheetPackage) {
+    let sheet = &mut pkg.workbook.sheets[0];
+    for (c, h) in HEADERS.iter().enumerate() {
+        sheet.set_cell(0, c as u32, Cell::text(h));
+    }
+    for (r, (name, q1, q2)) in ROWS.iter().enumerate() {
+        let row = r as u32 + 1;
+        sheet.set_cell(row, 0, Cell::text(name));
+        sheet.set_cell(row, 1, Cell::number(*q1));
+        sheet.set_cell(row, 2, Cell::number(*q2));
+    }
+}
+
+/// A focused visual fixture for the two renderer paths that cannot be proved
+/// by the selection fixture's bar chart. Both cards fit in the initial grid
+/// viewport so PrintWindow crops contain the same pixels a user sees.
+fn build_chart_kinds() -> Vec<u8> {
+    let mut pkg = new_xlsx();
+    populate_cells(&mut pkg);
+    let source = |range| ChartSource {
+        sheet: "Sheet1".to_string(),
+        range,
+        cat_col: 0,
+    };
+    let categories = ROWS
+        .iter()
+        .map(|(name, _, _)| name.to_string())
+        .collect::<Vec<_>>();
+    let q1 = ChartSeries {
+        name: "Q1".to_string(),
+        values: ROWS.iter().map(|(_, value, _)| *value).collect(),
+        col: Some(1),
+        values_ref: Some(source((1, 1, 4, 1))),
+        name_ref: Some("Sheet1!$B$1".to_string()),
+        ..ChartSeries::default()
+    };
+    let q2 = ChartSeries {
+        name: "Q2".to_string(),
+        values: ROWS.iter().map(|(_, _, value)| *value).collect(),
+        col: Some(2),
+        values_ref: Some(source((1, 2, 4, 2))),
+        name_ref: Some("Sheet1!$C$1".to_string()),
+        ..ChartSeries::default()
+    };
+    let common = || ChartData {
+        categories: categories.clone(),
+        source: Some(source((0, 0, 4, 2))),
+        categories_ref: Some(source((1, 0, 4, 0))),
+        edited: true,
+        ..ChartData::default()
+    };
+    pkg.add_chart(
+        0,
+        (1, 4),
+        (10, 10),
+        &ChartData {
+            title: "Quarter trend".to_string(),
+            kind: "line".to_string(),
+            series: vec![q1.clone(), q2],
+            ..common()
+        },
+    );
+    pkg.add_chart(
+        0,
+        (11, 4),
+        (20, 10),
+        &ChartData {
+            title: "Q1 share".to_string(),
+            kind: "pie".to_string(),
+            series: vec![q1],
+            ..common()
+        },
+    );
     save_xlsx(&pkg)
 }
 
@@ -159,6 +231,24 @@ fn check(bytes: &[u8]) {
     );
 }
 
+fn check_chart_kinds(bytes: &[u8]) {
+    let pkg = load_xlsx(bytes).expect("the chart-kinds fixture is a readable xlsx");
+    let charts = pkg.workbook.sheets[0]
+        .drawings
+        .iter()
+        .filter_map(|drawing| match &drawing.kind {
+            DrawingKind::Chart(chart) => Some(chart),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(charts.len(), 2);
+    assert_eq!(charts[0].kind, "line");
+    assert_eq!(charts[0].series.len(), 2);
+    assert_eq!(charts[1].kind, "pie");
+    assert_eq!(charts[1].series.len(), 1);
+    assert_eq!(charts[1].categories, ["North", "South", "East", "West"]);
+}
+
 /// The committed fixture's bytes. It is written only when the caller explicitly
 /// asks for regeneration; a missing committed asset is a test failure.
 ///
@@ -174,10 +264,33 @@ fn fixture_bytes() -> &'static [u8] {
     })
 }
 
+fn chart_kinds_fixture_bytes() -> &'static [u8] {
+    static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+    BYTES.get_or_init(|| {
+        let path = chart_kinds_fixture_path();
+        read_generated_fixture(
+            &path,
+            std::env::var_os("UIHARNESS_REGEN_FIXTURE").is_some(),
+            build_chart_kinds,
+            check_chart_kinds,
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    })
+}
+
 fn read_fixture(path: &Path, regenerate: bool) -> Result<Vec<u8>, String> {
+    read_generated_fixture(path, regenerate, build, check)
+}
+
+fn read_generated_fixture(
+    path: &Path,
+    regenerate: bool,
+    build_fixture: fn() -> Vec<u8>,
+    check_fixture: fn(&[u8]),
+) -> Result<Vec<u8>, String> {
     if regenerate {
-        let bytes = build();
-        check(&bytes);
+        let bytes = build_fixture();
+        check_fixture(&bytes);
         std::fs::create_dir_all(path.parent().expect("the fixture has a parent"))
             .map_err(|e| format!("{}: {e}", path.display()))?;
         std::fs::write(path, &bytes).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -206,6 +319,11 @@ fn a_missing_fixture_fails_without_recreating_the_source_tree() {
 #[test]
 fn the_fixture_workbook_is_what_the_cases_are_written_against() {
     check(fixture_bytes());
+}
+
+#[test]
+fn the_chart_kinds_fixture_is_what_the_visual_case_expects() {
+    check_chart_kinds(chart_kinds_fixture_bytes());
 }
 
 /// The stable chart content this fixture generator deliberately authors.
@@ -250,6 +368,16 @@ fn stable_fixture_chart(data: &ChartData) -> StableFixtureChart<'_> {
     }
 }
 
+fn stable_fixture_cells(sheet: &gridcore::sheet::Sheet) -> Vec<((u32, u32), Cell)> {
+    let mut cells = sheet
+        .cells
+        .iter()
+        .map(|(position, cell)| (*position, cell.clone()))
+        .collect::<Vec<_>>();
+    cells.sort_by_key(|(position, _)| *position);
+    cells
+}
+
 /// The generator and the committed file must not have drifted apart: a change
 /// to `build()` that nobody regenerated would leave the recipe lying.
 ///
@@ -268,12 +396,7 @@ fn the_committed_fixture_matches_the_generator() {
     let why = "regenerate with UIHARNESS_REGEN_FIXTURE=1 cargo test -p uiharness --test fixture";
     let (sa, sb) = (&a.workbook.sheets[0], &b.workbook.sheets[0]);
     assert_eq!(sa.name, sb.name, "{why}");
-    let cells = |s: &gridcore::sheet::Sheet| {
-        let mut v: Vec<((u32, u32), Cell)> = s.cells.iter().map(|(k, c)| (*k, c.clone())).collect();
-        v.sort_by_key(|(k, _)| *k);
-        v
-    };
-    assert_eq!(cells(sa), cells(sb), "{why}");
+    assert_eq!(stable_fixture_cells(sa), stable_fixture_cells(sb), "{why}");
     assert_eq!(sa.drawings.len(), sb.drawings.len(), "{why}");
     for (x, y) in sa.drawings.iter().zip(&sb.drawings) {
         assert_eq!((x.from, x.to), (y.from, y.to), "the chart moved — {why}");
@@ -283,6 +406,27 @@ fn the_committed_fixture_matches_the_generator() {
             }
             (u, v) => panic!("the fixture's drawing changed kind: {u:?} vs {v:?} — {why}"),
         }
+    }
+}
+
+#[test]
+fn the_committed_chart_kinds_fixture_matches_the_generator() {
+    let generated = load_xlsx(&build_chart_kinds()).unwrap();
+    let committed = load_xlsx(chart_kinds_fixture_bytes()).unwrap();
+    let generated = &generated.workbook.sheets[0];
+    let committed = &committed.workbook.sheets[0];
+    assert_eq!(
+        stable_fixture_cells(generated),
+        stable_fixture_cells(committed)
+    );
+    assert_eq!(generated.drawings.len(), committed.drawings.len());
+    for (left, right) in generated.drawings.iter().zip(&committed.drawings) {
+        assert_eq!((left.from, left.to), (right.from, right.to));
+        let (DrawingKind::Chart(left), DrawingKind::Chart(right)) = (&left.kind, &right.kind)
+        else {
+            panic!("the chart-kinds fixture contains a non-chart drawing")
+        };
+        assert_eq!(stable_fixture_chart(left), stable_fixture_chart(right));
     }
 }
 
