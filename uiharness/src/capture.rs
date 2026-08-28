@@ -62,7 +62,7 @@ pub fn is_blank(img: &Image) -> bool {
         return true;
     }
     let first = &img.px[0..4];
-    img.px.chunks_exact(4).all(|p| p == first)
+    img.px.as_chunks::<4>().0.iter().all(|p| &p[..] == first)
 }
 
 #[cfg(windows)]
@@ -285,7 +285,7 @@ mod win {
         let n = w as usize * h as usize * 4;
         let src = unsafe { std::slice::from_raw_parts(bits as *const u8, n) };
         let mut px = Vec::with_capacity(n);
-        for p in src.chunks_exact(4) {
+        for p in src.as_chunks::<4>().0 {
             px.extend_from_slice(&[p[2], p[1], p[0], 0xff]);
         }
         Image::from_rgba(w as u32, h as u32, px).expect("the DIB is exactly w*h*4 bytes")
