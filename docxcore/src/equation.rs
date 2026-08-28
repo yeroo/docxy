@@ -545,8 +545,8 @@ fn cfb_read_stream(data: &[u8], name: &str) -> Option<Vec<u8>> {
             break;
         }
         let sec = sector(s)?;
-        for c in sec.chunks_exact(4) {
-            fat.push(u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+        for c in sec.as_chunks::<4>().0 {
+            fat.push(u32::from_le_bytes(*c));
         }
     }
     let chain = |start: u32| -> Vec<u32> {
@@ -576,15 +576,17 @@ fn cfb_read_stream(data: &[u8], name: &str) -> Option<Vec<u8>> {
     let mut root_start = 0u32;
     let mut root_size = 0u32;
     let mut want: Option<(u32, u32)> = None;
-    for e in dir.chunks_exact(128) {
+    for e in dir.as_chunks::<128>().0 {
         let nlen = u16::from_le_bytes([e[0x40], e[0x41]]) as usize;
         if !(2..=64).contains(&nlen) {
             continue;
         }
         let entry_type = e[0x42];
         let nm: String = e[..nlen - 2]
-            .chunks_exact(2)
-            .map(|c| char::from_u32(u16::from_le_bytes([c[0], c[1]]) as u32).unwrap_or('\u{fffd}'))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| char::from_u32(u16::from_le_bytes(*c) as u32).unwrap_or('\u{fffd}'))
             .collect();
         let start = u32::from_le_bytes([e[0x74], e[0x75], e[0x76], e[0x77]]);
         let size = u32::from_le_bytes([e[0x78], e[0x79], e[0x7a], e[0x7b]]);
@@ -610,8 +612,10 @@ fn cfb_read_stream(data: &[u8], name: &str) -> Option<Vec<u8>> {
     ministream.truncate(root_size as usize);
     let minifat_bytes = read_chain(minifat_start);
     let minifat: Vec<u32> = minifat_bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect();
     let mut out = Vec::new();
     let mut s = start;
