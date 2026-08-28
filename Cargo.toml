@@ -3,7 +3,7 @@ resolver = "2"
 members = ["opccore", "docxcore", "gridcore", "ctlcore", "ribboncore", "ribbonspec", "backstagecore", "docxy", "xlsxy", "projcore", "yppxy", "mppread", "docxwasm", "gridwasm", "mailcore", "lookxy", "editcore", "comshimcore", "xlcomshim", "wordcomshim", "uiharness"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 # MSRV is driven by dependencies (darling/image/instability need 1.88).
 rust-version = "1.88"

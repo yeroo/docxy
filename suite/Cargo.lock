@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "ctlcore"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "ctor"
@@ -1537,7 +1537,7 @@ dependencies = [
 
 [[package]]
 name = "docxcore"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "opccore",
 ]
@@ -5509,7 +5509,7 @@ dependencies = [
 
 [[package]]
 name = "ribbonspec"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "ring"
