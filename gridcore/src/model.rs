@@ -22,9 +22,9 @@ use crate::frame::{Frame, PivotOut, key_of, keys_lt};
 /// A many-to-one relationship: each `from` row matches at most one `to` row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Relationship {
-    /// Many side: (table, column) — e.g. Sales[ProductID].
+    /// Many side: (table, column) — e.g. `Sales[ProductID]`.
     pub from: (String, String),
-    /// One side: (table, column) with unique keys — e.g. Products[ID].
+    /// One side: (table, column) with unique keys — e.g. `Products[ID]`.
     pub to: (String, String),
 }
 

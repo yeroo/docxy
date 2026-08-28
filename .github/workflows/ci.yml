@@ -81,6 +81,31 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
+  suite:
+    name: desktop suite
+    # ⚠️ `suite/` is its OWN workspace, so the `cargo test --workspace` above
+    # does not reach it — its unit tests (the harness isolation gate, the region
+    # and key parsers, the config-root override) would only ever run on whoever
+    # remembered to type this by hand. The gate is what stops a `--harness`
+    # instance writing over the user's real session, so a regression in it must
+    # not be able to ship green. Windows because gpui builds and tests there and
+    # that is where the desktop suite ships.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: suite
+      - name: Format
+        run: cargo fmt --all --check --manifest-path suite/Cargo.toml
+      - name: Clippy
+        run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path suite/Cargo.toml --locked
+
   jetbrains:
     name: jetbrains plugin
     runs-on: ubuntu-latest

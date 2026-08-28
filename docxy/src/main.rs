@@ -671,17 +671,24 @@ impl PickerKind {
                 "\u{2014}", "\u{2013}", "\u{2011}", "\u{2026}", "\u{2022}", "\u{00B7}", "\u{00A9}",
                 "\u{00AE}", "\u{2122}", "\u{00B0}", "\u{00B1}", "\u{00D7}", "\u{00F7}", "\u{2260}",
                 "\u{2264}", "\u{2265}", "\u{221E}", "\u{00A7}", "\u{00B6}", "\u{20AC}", "\u{00A3}",
-                "\u{00A5}",
-                // Typographic quotes: guillemets, low/high, angle.
+                "\u{00A5}", // Typographic quotes: guillemets, low/high, angle.
                 "\u{00AB}", "\u{00BB}", "\u{201E}", "\u{201C}", "\u{201D}", "\u{201A}", "\u{2018}",
-                "\u{2019}", "\u{2039}", "\u{203A}",
-                "\u{2190}", "\u{2192}", "\u{2191}", "\u{2193}", "\u{03B1}", "\u{03B2}", "\u{03C0}",
-                "\u{03BC}", "\u{03A9}", "\u{221A}", "\u{2211}", "\u{2605}",
+                "\u{2019}", "\u{2039}", "\u{203A}", "\u{2190}", "\u{2192}", "\u{2191}", "\u{2193}",
+                "\u{03B1}", "\u{03B2}", "\u{03C0}", "\u{03BC}", "\u{03A9}", "\u{221A}", "\u{2211}",
+                "\u{2605}",
             ],
             PickerKind::LineSpacing => &["1.0", "1.15", "1.5", "2.0", "2.5", "3.0"],
             PickerKind::Equation => &[
-                "x\u{00B2}", "a\u{207F}", "a/b", "\u{221A}x", "\u{03A3}", "\u{222B}", "lim",
-                "\u{03B1}\u{03B2}\u{03B3}", "a\u{00B2}+b\u{00B2}=c\u{00B2}", "Quadratic",
+                "x\u{00B2}",
+                "a\u{207F}",
+                "a/b",
+                "\u{221A}x",
+                "\u{03A3}",
+                "\u{222B}",
+                "lim",
+                "\u{03B1}\u{03B2}\u{03B3}",
+                "a\u{00B2}+b\u{00B2}=c\u{00B2}",
+                "Quadratic",
             ],
         }
     }
@@ -1230,13 +1237,16 @@ impl App {
             LineSpacing => self.open_picker(PickerKind::LineSpacing),
             PageNumber => {
                 let inl = self.build_field(FieldKind::Page);
-                self.editor.paste(&Clip { paras: vec![vec![inl]] });
+                self.editor.paste(&Clip {
+                    paras: vec![vec![inl]],
+                });
                 self.after_edit();
                 self.status = Some("Inserted page number".to_string());
             }
             PageBreak => {
-                self.editor
-                    .paste(&Clip { paras: vec![vec![Inline::Break(BreakKind::Page)]] });
+                self.editor.paste(&Clip {
+                    paras: vec![vec![Inline::Break(BreakKind::Page)]],
+                });
                 self.after_edit();
                 self.status = Some("Inserted page break".to_string());
             }
@@ -1261,7 +1271,10 @@ impl App {
                 self.pkg.set_auto_hyphenation(on);
                 self.modified = true;
                 self.dirty = true;
-                self.status = Some(format!("Automatic hyphenation: {}", if on { "on" } else { "off" }));
+                self.status = Some(format!(
+                    "Automatic hyphenation: {}",
+                    if on { "on" } else { "off" }
+                ));
             }
             Paste => self.do_paste(),
             Bold => {
@@ -2860,7 +2873,14 @@ impl App {
             raw_tblpr: Some(TBLPR.to_string()),
         };
         let body = &mut self.editor.doc.body;
-        let at = self.editor.caret.path.first().copied().unwrap_or(0).min(body.len().saturating_sub(1));
+        let at = self
+            .editor
+            .caret
+            .path
+            .first()
+            .copied()
+            .unwrap_or(0)
+            .min(body.len().saturating_sub(1));
         let pos = (at + 1).min(body.len());
         body.insert(pos, Block::Table(table));
         self.editor.clear_selection();
@@ -3114,7 +3134,10 @@ impl App {
     fn open_picker(&mut self, kind: PickerKind) {
         // Symbol inserts at the caret and Line Spacing applies to the caret
         // paragraph, so neither needs a selection; the font/colour pickers do.
-        let needs_sel = !matches!(kind, PickerKind::Symbol | PickerKind::LineSpacing | PickerKind::Equation);
+        let needs_sel = !matches!(
+            kind,
+            PickerKind::Symbol | PickerKind::LineSpacing | PickerKind::Equation
+        );
         if needs_sel && !self.editor.has_selection() {
             self.status = Some(format!("Select text first, then {}", kind.title().trim()));
             self.dirty = true;
@@ -7753,7 +7776,6 @@ mod tests {
         }
     }
 
-
     // ---- "Word basics" curriculum ------------------------------------------
     // Each standard beginner-Word lesson, run through the real key / ribbon
     // handlers and checked on the resulting document. Mirrors suite/docxy's
@@ -7761,7 +7783,17 @@ mod tests {
 
     fn run0(app: &App) -> &Run {
         match &app.editor.doc.body[0] {
-            Block::Paragraph(p) => p.content.iter().find_map(|i| if let Inline::Run(r) = i { Some(r) } else { None }).expect("a run"),
+            Block::Paragraph(p) => p
+                .content
+                .iter()
+                .find_map(|i| {
+                    if let Inline::Run(r) = i {
+                        Some(r)
+                    } else {
+                        None
+                    }
+                })
+                .expect("a run"),
             _ => panic!("expected a paragraph"),
         }
     }
@@ -7788,7 +7820,10 @@ mod tests {
         app.run_act(ribbon::Act::Italic);
         app.run_act(ribbon::Act::Underline);
         let r = run0(&app);
-        assert!(r.props.bold && r.props.italic && r.props.underline, "B/I/U not all applied");
+        assert!(
+            r.props.bold && r.props.italic && r.props.underline,
+            "B/I/U not all applied"
+        );
     }
 
     #[test]
@@ -7879,7 +7914,10 @@ mod tests {
         let mut app = app_with(&["text"]);
         app.editor.select_all();
         app.run_act(ribbon::Act::GrowFont);
-        assert!(run0(&app).props.size_half_pts.is_some(), "grow font set no size");
+        assert!(
+            run0(&app).props.size_half_pts.is_some(),
+            "grow font set no size"
+        );
     }
 
     #[test]
@@ -7913,7 +7951,19 @@ mod tests {
     fn lesson_18_insert_table() {
         let mut app = app_with(&["text"]);
         app.run_act(ribbon::Act::InsertTable);
-        let t = app.editor.doc.body.iter().find_map(|b| if let Block::Table(t) = b { Some(t) } else { None }).expect("no table inserted");
+        let t = app
+            .editor
+            .doc
+            .body
+            .iter()
+            .find_map(|b| {
+                if let Block::Table(t) = b {
+                    Some(t)
+                } else {
+                    None
+                }
+            })
+            .expect("no table inserted");
         assert_eq!(t.rows.len(), 2);
         assert_eq!(t.rows[0].cells.len(), 2);
     }
@@ -7925,7 +7975,11 @@ mod tests {
         app.run_act(ribbon::Act::InsertSymbol);
         assert!(app.font_picker.is_some(), "symbol picker did not open");
         app.apply_picker(); // sel 0 = em dash
-        assert!(first_line(&app).ends_with('\u{2014}'), "em dash not inserted: {}", first_line(&app));
+        assert!(
+            first_line(&app).ends_with('\u{2014}'),
+            "em dash not inserted: {}",
+            first_line(&app)
+        );
     }
 
     #[test]
@@ -7934,7 +7988,11 @@ mod tests {
         app.run_act(ribbon::Act::LineSpacing);
         app.font_picker.as_mut().expect("line-spacing picker").sel = 2; // "1.5"
         app.apply_picker();
-        assert_eq!(props0(&app).spacing.line, Some(360), "line spacing not 1.5x");
+        assert_eq!(
+            props0(&app).spacing.line,
+            Some(360),
+            "line spacing not 1.5x"
+        );
     }
 
     #[test]
@@ -7944,10 +8002,16 @@ mod tests {
         app.editor.move_end();
         app.run_act(ribbon::Act::InsertSymbol);
         let items = PickerKind::Symbol.items();
-        let idx = items.iter().position(|&s| s == "\u{00AB}").expect("no guillemet in symbol picker");
+        let idx = items
+            .iter()
+            .position(|&s| s == "\u{00AB}")
+            .expect("no guillemet in symbol picker");
         app.font_picker.as_mut().unwrap().sel = idx;
         app.apply_picker();
-        assert!(first_line(&app).ends_with('\u{00AB}'), "guillemet not inserted");
+        assert!(
+            first_line(&app).ends_with('\u{00AB}'),
+            "guillemet not inserted"
+        );
     }
 
     #[test]
@@ -7970,8 +8034,14 @@ mod tests {
     fn lesson_24_non_breaking_space() {
         let mut app = app_with(&["ab"]);
         app.editor.move_end();
-        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL | KeyModifiers::SHIFT));
-        assert!(first_line(&app).ends_with('\u{00A0}'), "no non-breaking space inserted");
+        app.on_key(KeyEvent::new(
+            KeyCode::Char(' '),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ));
+        assert!(
+            first_line(&app).ends_with('\u{00A0}'),
+            "no non-breaking space inserted"
+        );
     }
 
     #[test]
@@ -7994,7 +8064,11 @@ mod tests {
         app.run_act(ribbon::Act::Bold);
         let doc = app.current_document();
         match &doc.body[0] {
-            Block::Paragraph(p) => assert!(p.content.iter().any(|i| matches!(i, Inline::Run(r) if r.props.bold))),
+            Block::Paragraph(p) => assert!(
+                p.content
+                    .iter()
+                    .any(|i| matches!(i, Inline::Run(r) if r.props.bold))
+            ),
             _ => panic!(),
         }
     }

@@ -436,7 +436,12 @@ fn insert_groups() -> Vec<Group> {
             width: 12,
             rows: [
                 vec![btn("▐▐ Columns", 10, Columns, "Newspaper columns (1/2/3)")],
-                vec![btn("‑ Hyphenate", 11, Hyphenation, "Toggle automatic hyphenation")],
+                vec![btn(
+                    "‑ Hyphenate",
+                    11,
+                    Hyphenation,
+                    "Toggle automatic hyphenation",
+                )],
             ],
         },
         Group {

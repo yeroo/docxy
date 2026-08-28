@@ -16,14 +16,14 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{
-    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX,
-    DISP_E_MEMBERNOTFOUND, E_POINTER, S_FALSE, S_OK,
+    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, DISP_E_MEMBERNOTFOUND,
+    E_POINTER, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoInitializeEx, CoRegisterClassObject,
-    CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS, DISPATCH_PROPERTYPUT,
-    DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory, IClassFactory_Impl, IDispatch,
-    IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
+    CoResumeClassObjects, CoRevokeClassObject, CoUninitialize, DISPATCH_FLAGS,
+    DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
+    IClassFactory_Impl, IDispatch, IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage,
@@ -83,12 +83,20 @@ pub fn install_panic_hook() {
 
 /// The VARTYPE tag (masking BYREF/ARRAY flags). A VARIANT begins with its 16-bit
 /// `vt` field, so this read is layout-stable.
+///
+/// # Safety
+/// `v` must be a valid, non-null pointer to an initialized `VARIANT`.
 pub unsafe fn vt_of(v: *const VARIANT) -> u16 {
     unsafe { *(v as *const u16) & 0x0fff }
 }
 
 /// Positional argument `i` (0 = first), accounting for `rgvarg` being stored in
 /// reverse order. `None` if omitted.
+///
+/// # Safety
+/// `p` must be null or point to a valid `DISPPARAMS` whose `rgvarg` holds at
+/// least `cArgs` initialized VARIANTs, all of which outlive `'a` — which is the
+/// contract COM already gives an `IDispatch::Invoke` implementation.
 pub unsafe fn arg<'a>(p: *const DISPPARAMS, i: u32) -> Option<&'a VARIANT> {
     unsafe {
         if p.is_null() {
@@ -102,10 +110,18 @@ pub unsafe fn arg<'a>(p: *const DISPPARAMS, i: u32) -> Option<&'a VARIANT> {
     }
 }
 
+/// Argument `i` as a string, `None` when omitted or uncoercible.
+///
+/// # Safety
+/// Same as [`arg`].
 pub unsafe fn arg_string(p: *const DISPPARAMS, i: u32) -> Option<String> {
     unsafe { arg(p, i).and_then(variant_to_string) }
 }
 
+/// Argument `i` as an `i32`, `None` when omitted or uncoercible.
+///
+/// # Safety
+/// Same as [`arg`].
 pub unsafe fn arg_i32(p: *const DISPPARAMS, i: u32) -> Option<i32> {
     unsafe {
         arg(p, i).and_then(|v| {
@@ -120,8 +136,15 @@ pub unsafe fn arg_i32(p: *const DISPPARAMS, i: u32) -> Option<i32> {
 }
 
 /// Argument `i` as a bool, `default` when omitted/uncoercible.
+///
+/// # Safety
+/// Same as [`arg`].
 pub unsafe fn arg_bool(p: *const DISPPARAMS, i: u32, default: bool) -> bool {
-    unsafe { arg(p, i).and_then(|v| bool::try_from(v).ok()).unwrap_or(default) }
+    unsafe {
+        arg(p, i)
+            .and_then(|v| bool::try_from(v).ok())
+            .unwrap_or(default)
+    }
 }
 
 pub fn variant_to_string(v: &VARIANT) -> Option<String> {
@@ -137,6 +160,11 @@ pub fn variant_to_string(v: &VARIANT) -> Option<String> {
 }
 
 /// Write a result VARIANT (guarding a null out-pointer, as for void methods).
+///
+/// # Safety
+/// `pvarresult` must be null or point to writable, properly aligned storage for
+/// a `VARIANT`. Any VARIANT already there is overwritten without being cleared,
+/// so the caller must not pass an owning slot it still has a claim on.
 pub unsafe fn put(pvarresult: *mut VARIANT, value: VARIANT) {
     if !pvarresult.is_null() {
         unsafe { std::ptr::write(pvarresult, value) };
@@ -171,11 +199,16 @@ pub fn synth_id(name: &str) -> i32 {
     })
 }
 pub fn synth_name(id: i32) -> Option<String> {
-    (id >= SYNTH_BASE).then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
+    (id >= SYNTH_BASE)
+        .then(|| SYNTH.with(|s| s.borrow().get((id - SYNTH_BASE) as usize).cloned()))?
 }
 
 /// The default arm for any dispid an object doesn't handle: log the member and
 /// degrade benignly — swallow a put, hand back a do-nothing object for a get.
+///
+/// # Safety
+/// `params` must satisfy [`arg`]'s contract and `result` [`put`]'s — i.e. the
+/// pointers `IDispatch::Invoke` was handed, passed straight through.
 pub unsafe fn unhandled(
     id: i32,
     wflags: DISPATCH_FLAGS,
@@ -193,7 +226,11 @@ pub unsafe fn unhandled(
     // `coll(1)` call), so the arg count is the only reliable discriminator — a
     // real default-indexed get like `unknownColl(1)` has cArgs>=1 and must keep
     // degrading gracefully (return the do-nothing object so the chain flows).
-    let cargs = if params.is_null() { 0 } else { unsafe { (*params).cArgs } };
+    let cargs = if params.is_null() {
+        0
+    } else {
+        unsafe { (*params).cArgs }
+    };
     if id == 0 && cargs == 0 && !is_put(wflags) {
         log("  -> default-value probe on an object with no default -> DISP_E_MEMBERNOTFOUND");
         return Err(DISP_E_MEMBERNOTFOUND.into());
@@ -274,6 +311,11 @@ impl IDispatch_Impl for NullObject_Impl {
 
 /// Shared `GetIDsOfNames`: resolve the first name via `resolver`; an unmodeled
 /// name gets a synthetic id (so the follow-up Invoke reaches [`unhandled`]).
+///
+/// # Safety
+/// `rgsznames` must point to `cnames` valid, NUL-terminated wide strings and
+/// `rgdispid` to writable storage for `cnames` `i32`s — the pointers
+/// `IDispatch::GetIDsOfNames` was handed.
 pub unsafe fn resolve_names(
     who: &str,
     rgsznames: *const PCWSTR,
@@ -385,13 +427,20 @@ impl IClassFactory_Impl for ShimFactory_Impl {
 
 /// Whether COM launched us as a server (`-Embedding` / `/automation` / `--serve`).
 pub fn should_serve() -> bool {
-    let joined = std::env::args().collect::<Vec<_>>().join(" ").to_lowercase();
+    let joined = std::env::args()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
     joined.contains("-embedding") || joined.contains("/automation") || joined.contains("--serve")
 }
 
 /// Run the out-of-process (LocalServer32) message loop: register a class object
 /// for both CLSIDs, pump messages until the last Application drops, then revoke.
-pub fn run_local_server(shim_clsid: GUID, app_clsid: GUID, create: fn() -> IDispatch) -> Result<()> {
+pub fn run_local_server(
+    shim_clsid: GUID,
+    app_clsid: GUID,
+    create: fn() -> IDispatch,
+) -> Result<()> {
     unsafe {
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         log("server starting; registering class object");
@@ -423,6 +472,11 @@ pub fn run_local_server(shim_clsid: GUID, app_clsid: GUID, create: fn() -> IDisp
 
 /// The in-process (InprocServer32) `DllGetClassObject`: hand back the class object
 /// for either CLSID. Each shim's `#[no_mangle]` export forwards here.
+///
+/// # Safety
+/// `rclsid` and `riid` must be null or point to valid `GUID`s, and `ppv` must be
+/// null or point to writable storage for one pointer — the arguments COM passes
+/// to `DllGetClassObject`. Nulls are checked and rejected with `E_POINTER`.
 pub unsafe fn dll_get_class_object(
     shim_clsid: GUID,
     app_clsid: GUID,

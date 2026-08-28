@@ -1,0 +1,87 @@
+# The regressions that reached an installer because nothing but a person
+# looking at a window could have caught them. Run with:
+#
+#   cargo run -p uiharness -- run uiharness/cases/sheet-selection.uit
+#
+# The fixture is the harness's own; nothing here reads a user document.
+
+# ---------------------------------------------------------------------------
+# 1. A drag over cells selects them. It does not fill them, and it does not
+#    arm a fill — the auto-fill-on-sweep regression.
+# ---------------------------------------------------------------------------
+test drag-to-select does not fill
+  open ../fixtures/basic.xlsx
+  click A1
+  snapshot A1:C5
+  drag A1 -> C5
+  assert range is A1:C5
+  assert no fill preview
+  assert dragging is false
+  assert cells unchanged
+  shot cell:A1:C5
+
+# ---------------------------------------------------------------------------
+# 2. The same sweep's border is SOLID. Dashes mean point mode — the grid is
+#    picking cells into a formula — and an ordinary selection wearing them was
+#    the second regression.
+# ---------------------------------------------------------------------------
+test a swept selection is solid, not dashed
+  open ../fixtures/basic.xlsx
+  click A1
+  drag A1 -> C5
+  assert picking is false
+  assert border A1:C5 solid teal
+
+# ---------------------------------------------------------------------------
+# 3. A range that really is being pointed at DOES dash. The pair is the point:
+#    a harness that only checked case 2 would pass with the dashes removed
+#    altogether.
+#
+#    "Pointing" is a REFERENCE FIELD holding the keyboard — the chart panel's
+#    or an entry bar's — not a formula being typed into a cell. See the note
+#    under this case in the plan: a half-typed `=SUM(` picks its cells too, but
+#    the grid marks those with the blue reference wash, not with dashes.
+# ---------------------------------------------------------------------------
+test a pointed range dashes
+  open ../fixtures/basic.xlsx
+  select chart 0
+  focus chart-range
+  assert picking is true
+  drag A1 -> B4
+  assert range_preview is A1:B4
+  assert border A1:B4 dashed teal
+  key escape
+
+# ---------------------------------------------------------------------------
+# 4. Typing a formula and dragging out its argument is the OTHER kind of
+#    pointing, and it looks different on purpose: the reference wears the
+#    formula's own colour, solid, and the cells under it are washed with it.
+#    Recorded as a case because the first draft of case 3 asserted dashes here
+#    and was wrong about the app rather than the app being wrong.
+# ---------------------------------------------------------------------------
+test a formula reference is washed, not dashed
+  open ../fixtures/basic.xlsx
+  click E2
+  type =SUM(
+  assert editing is true
+  drag A1 -> B4
+  assert picking is false
+  assert border A1:B4 solid #2f6fdb
+  key escape
+
+# ---------------------------------------------------------------------------
+# 5. One selection at a time. Selecting a chart while a cell is being edited
+#    must end the edit — the invisible caret that stayed behind the card and
+#    swallowed every keystroke — and the keyboard must then reach the chart,
+#    which Escape proves by deselecting it.
+# ---------------------------------------------------------------------------
+test one selection at a time
+  open ../fixtures/basic.xlsx
+  click E2
+  type 99
+  assert editing is true
+  select chart 0
+  assert editing is false
+  assert chart_sel is 0
+  key escape
+  assert chart_sel is nothing

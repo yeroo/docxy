@@ -21,6 +21,20 @@ repository = "https://github.com/yeroo/docxy"
 # (gpui-component built against a newer gpui than a stale pinned rev). Both use
 # `{ git = ".../zed" }`; cargo unifies them to one commit, and reproducibility
 # comes from our committed suite/Cargo.lock (bump with `cargo update -p gpui`).
+# The same accepted style choices the root workspace records, so this workspace
+# can also run `clippy -D warnings`: index loops over parallel grids read clearer
+# than combinators, and nested `if let { if … }` reads clearer than a let-chain.
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+explicit_counter_loop = "allow"
+should_implement_trait = "allow"
+field_reassign_with_default = "allow"
+collapsible_if = "allow"
+large_enum_variant = "allow"
+# The two grid render entry points (`sheet_el`, `sheet_row`) take a slice of view
+# state each; bundling it into structs only moves the parameters somewhere else.
+too_many_arguments = "allow"
+
 [workspace.dependencies]
 gpui = { git = "https://github.com/zed-industries/zed" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit", "x11", "wayland", "runtime_shaders"] }

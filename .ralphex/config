@@ -1,0 +1,41 @@
+# ralphex — docxy-local overrides.
+#
+# The external review phase runs revmux (a panel of review agents, then a
+# verification pass) instead of a single codex pass.
+#
+# ralphex has no revmux integration of its own — `external_review_tool` only
+# accepts codex/custom/none, so this goes through the generic custom hook.
+# pkg/executor/custom.go runs it as `exec.Command(script, promptFile)`, a direct
+# exec with NO shell, and Windows cannot exec a .sh that way (verified: it fails
+# with "%1 is not a valid Win32 application"). Hence a .cmd that bridges into Git
+# bash, rather than the .sh the upstream scripts/opencode example ships.
+#
+# The path must use backslashes: a forward-slash relative path reaches cmd.exe
+# as a command name and fails with "'scripts' is not recognized".
+external_review_tool = custom
+
+# ---------------------------------------------------------------------------
+# Convergence: bound what the review loop can cost.
+# ---------------------------------------------------------------------------
+#
+# Without these the external loop runs to max(3, max_iterations/5) = 10 rounds,
+# and each round is a full revmux panel. That is the token sink.
+#
+# The observed shape across four plans: every Major finding arrived in round 1
+# or 2. Every round after that reported Minor documentation nits, and each
+# round's own doc fix seeded the next round's findings — a loop reviewing
+# itself rather than the work, which never converges on its own. One run went
+# 14 rounds over 4h14m.
+#
+# Three layers, cheapest first:
+#   1. scripts/revmux-review.sh narrows the roster to `final` (two agents,
+#      nothing below Major reported) from round 3 on. This is what actually
+#      ends the tail.
+#   2. review_patience stops the loop when rounds stop producing commits, which
+#      is what a disagreement between the panel and ralphex looks like.
+#   3. max_external_iterations is the hard ceiling if both of the above are
+#      wrong about something.
+max_external_iterations = 3
+review_patience = 2
+
+custom_review_script = scripts\revmux-review.cmd

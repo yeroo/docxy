@@ -1,0 +1,31 @@
+# Focused live evidence for the neutral selected headers and chart preview.
+# Text is checked by the suite's pure helpers and inspected in these captures;
+# the harness deliberately does not include OCR.
+
+test a selected range darkens every affected header
+  open ../fixtures/basic.xlsx
+  click B2
+  drag B2 -> D5
+  assert range is B2:D5
+  assert sel_hidden is false
+  assert range_preview is nothing
+  shot window
+  shot grid
+
+test a pointed range owns headers while a chart is selected
+  open ../fixtures/basic.xlsx
+  click B2
+  drag B2 -> D5
+  select chart 0
+  assert chart_sel is 0
+  assert panel_chart is 0
+  assert sel_hidden is true
+  focus categories
+  assert picking is true
+  drag A2 -> A5
+  assert range_preview is A2:A5
+  assert sel_hidden is true
+  shot window
+  shot grid
+  shot chart:0
+  shot chart-panel

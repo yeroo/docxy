@@ -22,6 +22,11 @@ pub use win::DISP_IFACES;
 
 #[cfg(windows)]
 mod win {
+    // The vtable-stub arities in the `include!`d gen_*.rs are Word's, not
+    // ours: `#[interface]` gives each expanded slot the real interface's
+    // parameter list, and several of Word's run well past clippy's
+    // 7-argument advice. There is nothing here to refactor.
+    #![allow(clippy::too_many_arguments)]
     #![allow(non_snake_case)]
 
     use std::cell::RefCell;
@@ -35,7 +40,7 @@ mod win {
     use comshimcore::*;
 
     use docxcore::model::{
-        Align, Block, BreakKind, Cell, Document, Inline, Paragraph, ParProps, Row, Run, RunProps,
+        Align, Block, BreakKind, Cell, Document, Inline, ParProps, Paragraph, Row, Run, RunProps,
         Table, VMerge,
     };
     use docxcore::package::{Package, load_package, new_package, save_package};
@@ -72,13 +77,41 @@ mod win {
     /// each object correctly. Single source of truth for both. Names are prefixed
     /// `Docxy` to avoid colliding with the dual interfaces in the same typelib.
     pub const DISP_IFACES: &[(&str, u128, u128)] = &[
-        ("DocxyWordApplication", 0x00020970_0000_0000_c000_000000000046, 0xd0c9b001_0002_0970_b1a4_2e7c8d5f0a92),
-        ("DocxyDocuments", 0x0002096c_0000_0000_c000_000000000046, 0xd0c9b002_0002_096c_b1a4_2e7c8d5f0a92),
-        ("DocxyDocument", 0x0002096b_0000_0000_c000_000000000046, 0xd0c9b003_0002_096b_b1a4_2e7c8d5f0a92),
-        ("DocxySelection", 0x00020975_0000_0000_c000_000000000046, 0xd0c9b004_0002_0975_b1a4_2e7c8d5f0a92),
-        ("DocxyWordRange", 0x0002095e_0000_0000_c000_000000000046, 0xd0c9b005_0002_095e_b1a4_2e7c8d5f0a92),
-        ("DocxyWordFont", 0x00020952_0000_0000_c000_000000000046, 0xd0c9b006_0002_0952_b1a4_2e7c8d5f0a92),
-        ("DocxyParagraphFormat", 0x00020953_0000_0000_c000_000000000046, 0xd0c9b007_0002_0953_b1a4_2e7c8d5f0a92),
+        (
+            "DocxyWordApplication",
+            0x00020970_0000_0000_c000_000000000046,
+            0xd0c9b001_0002_0970_b1a4_2e7c8d5f0a92,
+        ),
+        (
+            "DocxyDocuments",
+            0x0002096c_0000_0000_c000_000000000046,
+            0xd0c9b002_0002_096c_b1a4_2e7c8d5f0a92,
+        ),
+        (
+            "DocxyDocument",
+            0x0002096b_0000_0000_c000_000000000046,
+            0xd0c9b003_0002_096b_b1a4_2e7c8d5f0a92,
+        ),
+        (
+            "DocxySelection",
+            0x00020975_0000_0000_c000_000000000046,
+            0xd0c9b004_0002_0975_b1a4_2e7c8d5f0a92,
+        ),
+        (
+            "DocxyWordRange",
+            0x0002095e_0000_0000_c000_000000000046,
+            0xd0c9b005_0002_095e_b1a4_2e7c8d5f0a92,
+        ),
+        (
+            "DocxyWordFont",
+            0x00020952_0000_0000_c000_000000000046,
+            0xd0c9b006_0002_0952_b1a4_2e7c8d5f0a92,
+        ),
+        (
+            "DocxyParagraphFormat",
+            0x00020953_0000_0000_c000_000000000046,
+            0xd0c9b007_0002_0953_b1a4_2e7c8d5f0a92,
+        ),
     ];
 
     /// Return the ITypeInfo for one of OUR dispinterface IIDs from our registered
@@ -201,8 +234,9 @@ mod win {
 
         fn open(path: &str) -> std::io::Result<DocState> {
             let bytes = std::fs::read(path)?;
-            let pkg = load_package(&bytes)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}")))?;
+            let pkg = load_package(&bytes).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e:?}"))
+            })?;
             Ok(DocState {
                 pkg,
                 path: Some(path.to_string()),
@@ -527,7 +561,6 @@ mod win {
         std::env::var("WORDCOMSHIM_APP_NAME").unwrap_or_else(|_| "Docxy".to_string())
     }
 
-
     unsafe fn put_disp<T: IntoDisp>(pvarresult: *mut VARIANT, obj: T) {
         unsafe { put(pvarresult, VARIANT::from(obj.into_disp())) };
     }
@@ -668,7 +701,11 @@ mod win {
         let d: IWordDoc = DocumentObj { doc }.into();
         unsafe { out_iface(ret, d) }
     }
-    unsafe fn vt_docs_item(_t: &Documents_Impl, index: *const VARIANT, ret: *mut *mut c_void) -> HRESULT {
+    unsafe fn vt_docs_item(
+        _t: &Documents_Impl,
+        index: *const VARIANT,
+        ret: *mut *mut c_void,
+    ) -> HRESULT {
         let idx = (variant_i32(index).max(1) as usize) - 1;
         if !reg(|r| idx < r.docs.len()) {
             return DISP_E_BADINDEX;
@@ -783,37 +820,78 @@ mod win {
     // late-bound by the client after the vtable returns them) + Range's direct
     // Bold/Italic/Underline (I4 in Word: -1/0).
     unsafe fn vt_sel_font(t: &Selection_Impl, ret: *mut *mut c_void) -> HRESULT {
-        let f: IFont = WordFont { doc: t.doc, all: false }.into();
+        let f: IFont = WordFont {
+            doc: t.doc,
+            all: false,
+        }
+        .into();
         unsafe { out_iface(ret, f) }
     }
     unsafe fn vt_sel_paraformat(t: &Selection_Impl, ret: *mut *mut c_void) -> HRESULT {
-        let f: IParaFmt = ParaFmt { doc: t.doc, all: false }.into();
+        let f: IParaFmt = ParaFmt {
+            doc: t.doc,
+            all: false,
+        }
+        .into();
         unsafe { out_iface(ret, f) }
     }
     unsafe fn vt_rng_font(t: &Range_Impl, ret: *mut *mut c_void) -> HRESULT {
-        let f: IFont = WordFont { doc: t.doc, all: true }.into();
+        let f: IFont = WordFont {
+            doc: t.doc,
+            all: true,
+        }
+        .into();
         unsafe { out_iface(ret, f) }
     }
     unsafe fn vt_rng_paraformat(t: &Range_Impl, ret: *mut *mut c_void) -> HRESULT {
-        let f: IParaFmt = ParaFmt { doc: t.doc, all: true }.into();
+        let f: IParaFmt = ParaFmt {
+            doc: t.doc,
+            all: true,
+        }
+        .into();
         unsafe { out_iface(ret, f) }
     }
     unsafe fn vt_rng_bold_get(t: &Range_Impl, ret: *mut i32) -> HRESULT {
-        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.bold).unwrap_or(false)) { -1 } else { 0 }) }
+        unsafe {
+            out_i4(
+                ret,
+                if reg(|r| r.docs.get(t.doc).map(|d| d.cur.bold).unwrap_or(false)) {
+                    -1
+                } else {
+                    0
+                },
+            )
+        }
     }
     unsafe fn vt_rng_bold_put(t: &Range_Impl, v: i32) -> HRESULT {
         set_font(t.doc, true, |p| p.bold = v != 0);
         S_OK
     }
     unsafe fn vt_rng_italic_get(t: &Range_Impl, ret: *mut i32) -> HRESULT {
-        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.italic).unwrap_or(false)) { -1 } else { 0 }) }
+        unsafe {
+            out_i4(
+                ret,
+                if reg(|r| r.docs.get(t.doc).map(|d| d.cur.italic).unwrap_or(false)) {
+                    -1
+                } else {
+                    0
+                },
+            )
+        }
     }
     unsafe fn vt_rng_italic_put(t: &Range_Impl, v: i32) -> HRESULT {
         set_font(t.doc, true, |p| p.italic = v != 0);
         S_OK
     }
     unsafe fn vt_rng_underline_get(t: &Range_Impl, ret: *mut i32) -> HRESULT {
-        unsafe { out_i4(ret, i32::from(reg(|r| r.docs.get(t.doc).map(|d| d.cur.underline).unwrap_or(false)))) }
+        unsafe {
+            out_i4(
+                ret,
+                i32::from(reg(|r| {
+                    r.docs.get(t.doc).map(|d| d.cur.underline).unwrap_or(false)
+                })),
+            )
+        }
     }
     unsafe fn vt_rng_underline_put(t: &Range_Impl, v: i32) -> HRESULT {
         set_font(t.doc, true, |p| p.underline = v != 0);
@@ -846,21 +924,46 @@ mod win {
 
     // _Font (dual): the create-path character-format members.
     unsafe fn vt_font_bold_get(t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
-        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.bold).unwrap_or(false)) { -1 } else { 0 }) }
+        unsafe {
+            out_i4(
+                ret,
+                if reg(|r| r.docs.get(t.doc).map(|d| d.cur.bold).unwrap_or(false)) {
+                    -1
+                } else {
+                    0
+                },
+            )
+        }
     }
     unsafe fn vt_font_bold_put(t: &WordFont_Impl, v: i32) -> HRESULT {
         set_font(t.doc, t.all, |p| p.bold = v != 0);
         S_OK
     }
     unsafe fn vt_font_italic_get(t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
-        unsafe { out_i4(ret, if reg(|r| r.docs.get(t.doc).map(|d| d.cur.italic).unwrap_or(false)) { -1 } else { 0 }) }
+        unsafe {
+            out_i4(
+                ret,
+                if reg(|r| r.docs.get(t.doc).map(|d| d.cur.italic).unwrap_or(false)) {
+                    -1
+                } else {
+                    0
+                },
+            )
+        }
     }
     unsafe fn vt_font_italic_put(t: &WordFont_Impl, v: i32) -> HRESULT {
         set_font(t.doc, t.all, |p| p.italic = v != 0);
         S_OK
     }
     unsafe fn vt_font_underline_get(t: &WordFont_Impl, ret: *mut i32) -> HRESULT {
-        unsafe { out_i4(ret, i32::from(reg(|r| r.docs.get(t.doc).map(|d| d.cur.underline).unwrap_or(false)))) }
+        unsafe {
+            out_i4(
+                ret,
+                i32::from(reg(|r| {
+                    r.docs.get(t.doc).map(|d| d.cur.underline).unwrap_or(false)
+                })),
+            )
+        }
     }
     unsafe fn vt_font_underline_put(t: &WordFont_Impl, v: i32) -> HRESULT {
         set_font(t.doc, t.all, |p| p.underline = v != 0);
@@ -899,7 +1002,12 @@ mod win {
 
     // _ParagraphFormat (dual): Alignment.
     unsafe fn vt_para_align_get(t: &ParaFmt_Impl, ret: *mut i32) -> HRESULT {
-        let a = reg(|r| r.docs.get(t.doc).map(|d| d.cur_align).unwrap_or(Align::Left));
+        let a = reg(|r| {
+            r.docs
+                .get(t.doc)
+                .map(|d| d.cur_align)
+                .unwrap_or(Align::Left)
+        });
         unsafe { out_i4(ret, align_to_wd(a)) }
     }
     unsafe fn vt_para_align_put(t: &ParaFmt_Impl, v: i32) -> HRESULT {
@@ -971,7 +1079,10 @@ mod win {
             _ae: *mut u32,
         ) -> Result<()> {
             unsafe {
-                log(&format!("Application::Invoke id={id} put={}", is_put(wflags)));
+                log(&format!(
+                    "Application::Invoke id={id} put={}",
+                    is_put(wflags)
+                ));
                 match id {
                     // Application.Name — honest default; opt in via WORDCOMSHIM_APP_NAME.
                     0 => put(result, VARIANT::from(app_name().as_str())),
@@ -1130,7 +1241,10 @@ mod win {
         ) -> Result<()> {
             let doc = self.doc;
             unsafe {
-                log(&format!("Document[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                log(&format!(
+                    "Document[{doc}]::Invoke id={id} put={}",
+                    is_put(wflags)
+                ));
                 match id {
                     41 | 2000 => put_disp(result, Range { doc }), // Content / Range
                     // SaveAs / SaveAs2 / SaveAs2000 — filename in arg 0.
@@ -1147,24 +1261,36 @@ mod win {
                     }
                     108 => {
                         let res = reg(|r| {
-                            r.docs.get_mut(doc).map(|d| {
-                                d.path
-                                    .clone()
-                                    .map(|p| d.save_as(&p))
-                                    .unwrap_or(Ok(()))
-                            })
+                            r.docs
+                                .get_mut(doc)
+                                .map(|d| d.path.clone().map(|p| d.save_as(&p)).unwrap_or(Ok(())))
                         });
                         if !matches!(res, Some(Ok(()))) {
                             log("Document.Save: no path (needs SaveAs)");
                         }
                     }
                     1105 => {} // Close — keep the slot so indices stay stable
-                    0 => put(result, VARIANT::from(BSTR::from(reg(|r| {
-                        r.docs.get(doc).map(|d| d.name()).unwrap_or_default()
-                    }).as_str()))),
-                    3 | 29 => put(result, VARIANT::from(BSTR::from(reg(|r| {
-                        r.docs.get(doc).and_then(|d| d.path.clone()).unwrap_or_default()
-                    }).as_str()))), // Path / FullName
+                    0 => put(
+                        result,
+                        VARIANT::from(BSTR::from(
+                            reg(|r| r.docs.get(doc).map(|d| d.name()).unwrap_or_default()).as_str(),
+                        )),
+                    ),
+                    // Path is the CONTAINING FOLDER, FullName the whole path —
+                    // collapsing them made the idiomatic `doc.Path & "\" &
+                    // doc.Name` produce the filename twice.
+                    3 | 29 => {
+                        let full = reg(|r| r.docs.get(doc).and_then(|d| d.path.clone()))
+                            .unwrap_or_default();
+                        let out = if id == 3 {
+                            full.rsplit_once(['\\', '/'])
+                                .map(|(dir, _)| dir.to_string())
+                                .unwrap_or_default()
+                        } else {
+                            full
+                        };
+                        put(result, VARIANT::from(BSTR::from(out.as_str())));
+                    }
                     113 | 65535 => {} // Activate / Select — no-op
                     6 => put_disp(result, Tables { doc }),
                     _ => return unhandled(id, wflags, params, result),
@@ -1221,7 +1347,10 @@ mod win {
         ) -> Result<()> {
             let doc = self.doc;
             unsafe {
-                log(&format!("Selection[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                log(&format!(
+                    "Selection[{doc}]::Invoke id={id} put={}",
+                    is_put(wflags)
+                ));
                 match id {
                     507 => {
                         if let Some(s) = arg_string(params, 0) {
@@ -1261,9 +1390,39 @@ mod win {
                     }
                     400 => put_disp(result, Range { doc }),
                     5 => put_disp(result, WordFont { doc, all: false }),
-                    0x6001 => return bool_prop(doc, false, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
-                    0x6002 => return bool_prop(doc, false, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
-                    0x6003 => return bool_prop(doc, false, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    0x6001 => {
+                        return bool_prop(
+                            doc,
+                            false,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.bold = on,
+                            |p| p.bold,
+                        );
+                    }
+                    0x6002 => {
+                        return bool_prop(
+                            doc,
+                            false,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.italic = on,
+                            |p| p.italic,
+                        );
+                    }
+                    0x6003 => {
+                        return bool_prop(
+                            doc,
+                            false,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.underline = on,
+                            |p| p.underline,
+                        );
+                    }
                     1102 => put_disp(result, ParaFmt { doc, all: false }),
                     // InsertBreak([Type]) — wdPageBreak(7)/Column(8)/Line(6);
                     // section breaks (0..3) fall back to a page break.
@@ -1350,7 +1509,10 @@ mod win {
         ) -> Result<()> {
             let doc = self.doc;
             unsafe {
-                log(&format!("Range[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                log(&format!(
+                    "Range[{doc}]::Invoke id={id} put={}",
+                    is_put(wflags)
+                ));
                 match id {
                     0 => {
                         if is_put(wflags) {
@@ -1381,9 +1543,39 @@ mod win {
                     }),
                     // Range.Font/Bold/etc. format the EXISTING text (all runs).
                     5 => put_disp(result, WordFont { doc, all: true }),
-                    130 => return bool_prop(doc, true, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
-                    131 => return bool_prop(doc, true, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
-                    139 => return bool_prop(doc, true, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    130 => {
+                        return bool_prop(
+                            doc,
+                            true,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.bold = on,
+                            |p| p.bold,
+                        );
+                    }
+                    131 => {
+                        return bool_prop(
+                            doc,
+                            true,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.italic = on,
+                            |p| p.italic,
+                        );
+                    }
+                    139 => {
+                        return bool_prop(
+                            doc,
+                            true,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.underline = on,
+                            |p| p.underline,
+                        );
+                    }
                     1102 => put_disp(result, ParaFmt { doc, all: true }),
                     68 => put_disp(result, ListFormat { doc }),
                     _ => return unhandled(id, wflags, params, result),
@@ -1502,11 +1694,44 @@ mod win {
         ) -> Result<()> {
             let (doc, all) = (self.doc, self.all);
             unsafe {
-                log(&format!("Font[{doc}]::Invoke id={id} put={}", is_put(wflags)));
+                log(&format!(
+                    "Font[{doc}]::Invoke id={id} put={}",
+                    is_put(wflags)
+                ));
                 match id {
-                    130 => return bool_prop(doc, all, wflags, params, result, |p, on| p.bold = on, |p| p.bold),
-                    131 => return bool_prop(doc, all, wflags, params, result, |p, on| p.italic = on, |p| p.italic),
-                    140 => return bool_prop(doc, all, wflags, params, result, |p, on| p.underline = on, |p| p.underline),
+                    130 => {
+                        return bool_prop(
+                            doc,
+                            all,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.bold = on,
+                            |p| p.bold,
+                        );
+                    }
+                    131 => {
+                        return bool_prop(
+                            doc,
+                            all,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.italic = on,
+                            |p| p.italic,
+                        );
+                    }
+                    140 => {
+                        return bool_prop(
+                            doc,
+                            all,
+                            wflags,
+                            params,
+                            result,
+                            |p, on| p.underline = on,
+                            |p| p.underline,
+                        );
+                    }
                     141 => {
                         if is_put(wflags) {
                             if let Some(pt) = arg(params, 0).and_then(|v| f64::try_from(v).ok()) {
@@ -1706,7 +1931,12 @@ mod win {
                         let tno = arg_i32(params, 0).unwrap_or(1).max(1) as usize;
                         put_disp(result, WordTable { doc, tno });
                     }
-                    3 => put(result, VARIANT::from(reg(|r| r.docs.get(doc).map(|d| d.table_count()).unwrap_or(0)) as i32)),
+                    3 => put(
+                        result,
+                        VARIANT::from(
+                            reg(|r| r.docs.get(doc).map(|d| d.table_count()).unwrap_or(0)) as i32,
+                        ),
+                    ),
                     _ => return unhandled(id, wflags, params, result),
                 }
                 Ok(())
@@ -1818,7 +2048,10 @@ mod win {
                             });
                         } else {
                             let t = reg(|r| {
-                                r.docs.get(doc).map(|d| d.cell_text(tno, row, col)).unwrap_or_default()
+                                r.docs
+                                    .get(doc)
+                                    .map(|d| d.cell_text(tno, row, col))
+                                    .unwrap_or_default()
                             });
                             put(result, VARIANT::from(BSTR::from(t.as_str())));
                         }

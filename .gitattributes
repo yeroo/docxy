@@ -6,3 +6,8 @@
 *.wmf binary
 tools/comshim/docxy-excel.tlb binary
 tools/wordshim/docxy-word.tlb binary
+
+# Batch files are run by cmd.exe, which mis-parses multi-line blocks in an
+# LF-only file. Check these out with CRLF whatever the global rule says.
+*.cmd text eol=crlf
+*.bat text eol=crlf

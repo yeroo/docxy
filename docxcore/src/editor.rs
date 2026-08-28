@@ -284,8 +284,14 @@ impl Editor {
     pub fn insert_equation(&mut self, latex: &str, display: bool) {
         let raw = crate::latex::latex_to_omml(latex, display);
         let text = crate::omath::render_omath(&raw);
-        let inl = Inline::Equation { raw, text, latex: Some(latex.to_string()) };
-        self.paste(&Clip { paras: vec![vec![inl]] });
+        let inl = Inline::Equation {
+            raw,
+            text,
+            latex: Some(latex.to_string()),
+        };
+        self.paste(&Clip {
+            paras: vec![vec![inl]],
+        });
     }
 
     pub fn backspace(&mut self) {
@@ -998,7 +1004,11 @@ impl Editor {
         use crate::model::{TabLeader, TabStop};
         self.for_each_para(move |pr| {
             pr.tabs.retain(|t| (t.pos - pos).abs() > 180);
-            pr.tabs.push(TabStop { pos, align, leader: TabLeader::None });
+            pr.tabs.push(TabStop {
+                pos,
+                align,
+                leader: TabLeader::None,
+            });
             pr.tabs.sort_by_key(|t| t.pos);
         });
     }
@@ -1008,7 +1018,12 @@ impl Editor {
     pub fn remove_tab_stop_near(&mut self, pos: i32, tol: i32) -> bool {
         let before = self.caret_para_props().tabs.len();
         self.for_each_para(move |pr| {
-            if let Some((i, _)) = pr.tabs.iter().enumerate().min_by_key(|(_, t)| (t.pos - pos).abs()) {
+            if let Some((i, _)) = pr
+                .tabs
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, t)| (t.pos - pos).abs())
+            {
                 if (pr.tabs[i].pos - pos).abs() <= tol {
                     pr.tabs.remove(i);
                 }
@@ -2332,8 +2347,20 @@ mod tests {
     fn insert_equation_builds_omml_and_text() {
         let mut ed = Editor::new(doc(&[""]));
         ed.insert_equation("x^2", false);
-        let Block::Paragraph(p) = &ed.doc.body[0] else { panic!() };
-        let eq = p.content.iter().find_map(|i| if let Inline::Equation { raw, text, latex } = i { Some((raw, text, latex)) } else { None }).expect("equation inline");
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
+        let eq = p
+            .content
+            .iter()
+            .find_map(|i| {
+                if let Inline::Equation { raw, text, latex } = i {
+                    Some((raw, text, latex))
+                } else {
+                    None
+                }
+            })
+            .expect("equation inline");
         assert!(eq.0.contains("<m:oMath"), "no OMML: {}", eq.0);
         assert_eq!(eq.2.as_deref(), Some("x^2"));
         assert!(!eq.1.is_empty(), "no rendered text");
@@ -2344,7 +2371,9 @@ mod tests {
         let mut ed = Editor::new(doc(&["ab"]));
         ed.caret = Caret::at(vec![0], 1); // between a and b
         ed.insert_tab();
-        let Block::Paragraph(p) = &ed.doc.body[0] else { panic!() };
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!()
+        };
         assert!(
             p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
             "no tab inline inserted: {:?}",

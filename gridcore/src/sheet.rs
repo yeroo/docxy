@@ -224,8 +224,14 @@ pub struct Sheet {
     /// enforced on edit.
     pub validations: Vec<DataValidation>,
     /// Floating drawings anchored to the grid (`xl/drawings/*`): pictures and
-    /// charts. Rendered as an overlay; not editable.
+    /// charts. Rendered as an overlay; only their anchors are editable.
     pub drawings: Vec<Drawing>,
+    /// The part path these `drawings` were read from, so a save can write their
+    /// anchors back into it (the part itself round-trips verbatim otherwise).
+    pub drawing_part: Option<String>,
+    /// [`Drawing::anchor_ix`] of drawings deleted since the file was loaded —
+    /// the same round-trip means a save has to strike them from the part too.
+    pub drawings_removed: Vec<usize>,
     /// Sheet protection: `Some(attrs)` holds the raw attribute string of the
     /// worksheet's `<sheetProtection>` element (e.g. `sheet="1" objects="1"`),
     /// serialized verbatim so any existing password hash / flag set round-trips.
@@ -251,6 +257,11 @@ impl Sheet {
 /// A floating drawing anchored over a cell rectangle (a picture or a chart).
 #[derive(Clone, Debug)]
 pub struct Drawing {
+    /// This drawing's position among ALL anchors in its part — anchors we can't
+    /// render (shapes, text boxes) are skipped here but still occupy a slot, so
+    /// a save needs this to rewrite the right element. A drawing `add_chart`
+    /// spliced in gets the index it landed at, so it is addressable too.
+    pub anchor_ix: usize,
     /// Top-left anchor cell `(row, col)`, 0-based.
     pub from: (u32, u32),
     /// Bottom-right extent `(row, col)`, 0-based, inclusive-ish. For a
@@ -271,20 +282,548 @@ pub enum DrawingKind {
 
 /// The cached data of a chart (`xl/charts/chartN.xml`), enough to draw a simple
 /// bar/pie/line representation without re-running the plot area.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChartData {
     pub title: String,
     /// `bar` / `pie` / `line` / `area` / `scatter` … (the plot element's local name).
     pub kind: String,
     pub categories: Vec<String>,
     pub series: Vec<ChartSeries>,
+    /// The cells the chart plots, when it is range-backed rather than a frozen
+    /// snapshot — the whole box, header row and labels included. Read from the
+    /// `<c:f>` refs on load; written back on save, so Excel sees a live chart too.
+    pub source: Option<ChartSource>,
+    /// The cells holding the category labels, when known. A series UI edits this
+    /// on its own, so it can't be derived from `source` alone.
+    pub categories_ref: Option<ChartSource>,
+    /// The chart part this came from (`xl/charts/chartN.xml`), so an edit can be
+    /// written back into it.
+    pub part: Option<String>,
+    /// Set once the user changes something here. The part round-trips verbatim
+    /// otherwise; only an edited chart is regenerated (and so loses whatever
+    /// formatting we don't model).
+    pub edited: bool,
+    /// The plot area holds something the writer cannot reproduce: a grouping it
+    /// doesn't emit (stacked, percentStacked), or more than one plot group (a
+    /// combo chart — bars and a line sharing one plot area, often on two axes).
+    /// `kind` records only the FIRST group, so regenerating such a part would
+    /// silently turn a stacked chart into a clustered one, or fold every series
+    /// of a combo onto one axis pair as bars. Those parts round-trip verbatim
+    /// instead, the same escape hatch scatter and area use.
+    ///
+    /// A `<c:pieChart>` holding several `<c:ser>` is NOT one of those shapes,
+    /// though it used to be. `CT_PieChart` declares `ser` with
+    /// `maxOccurs="unbounded"`, so the file is valid and Excel merely plots the
+    /// first; the hold-back existed only because `chart_space_xml`'s pie arm
+    /// wrote `series.first()` and regenerating such a part came back short. The
+    /// arm writes every series now, so the shape round-trips and the chart
+    /// stays editable — see `suite/docs/pie-series.md`, which also records
+    /// what an imported pie trades for that: like every other writable chart,
+    /// its part is regenerated on edit, so per-slice `<c:dPt>` fills, data
+    /// labels and legend placement go the way they do everywhere else.
+    pub complex: bool,
+    /// Which way round the chart reads its range: `false` (the default) is
+    /// Excel's column orientation — each column of `source` is a series, the
+    /// first text column supplies the category labels. `true` is the transpose:
+    /// each row is a series, the first text row supplies the categories.
+    ///
+    /// SpreadsheetML has no orientation element, so this is NOT stored in the
+    /// file: Excel infers it from the shape of the refs a chart holds (a
+    /// `<c:val>` spanning `$B$2:$B$5` is a column series, `$B$2:$D$2` a row
+    /// one), and so does the loader. The flag exists so the UI can show and
+    /// flip the choice, and so the chart can be re-derived from its range.
+    pub by_row: bool,
+}
+
+/// The worksheet range a chart plots: the sheet by name (as the `<c:f>` refs
+/// spell it) and the 0-based inclusive cell box, header row and label column
+/// included.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChartSource {
+    pub sheet: String,
+    pub range: (u32, u32, u32, u32),
+    /// The column inside `range` holding the category labels — when the chart
+    /// is read COLUMN-wise. A row-oriented chart ([`ChartData::by_row`]) takes
+    /// its labels from a row, which no column index can express, so this holds
+    /// the column its SERIES NAMES come from instead. The writer must therefore
+    /// derive a row chart's `<c:cat>` from `ChartData::categories_ref`, never
+    /// from here.
+    pub cat_col: u32,
+}
+
+/// A sheet name as a formula/`<c:f>` reference spells it. Anything that isn't a
+/// bare identifier has to be quoted — spaces, but also `-`, `(`, `.`, `&`, a
+/// leading digit — and an apostrophe inside the name is doubled. Excel reports a
+/// workbook whose chart refs get this wrong as needing repair, and drops the
+/// chart.
+pub fn quote_sheet_name(name: &str) -> String {
+    if name.is_empty() {
+        return String::new(); // no sheet part at all
+    }
+    let bare = !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.')
+        // A name shaped like a cell reference (`A1`, `XFD1048576`) must be
+        // quoted too, or `A1!$B$2` reads as a range.
+        && parse_cell_name(name).is_none();
+    if bare {
+        name.to_string()
+    } else {
+        format!("'{}'", name.replace('\'', "''"))
+    }
+}
+
+impl ChartSource {
+    /// The `Sheet1!` a ref carries in front of its cells — nothing at all when
+    /// the source names no sheet, since a bare `!$A$1` is not a reference Excel
+    /// will read.
+    fn prefix(&self) -> String {
+        match quote_sheet_name(&self.sheet) {
+            n if n.is_empty() => String::new(),
+            n => format!("{n}!"),
+        }
+    }
+
+    /// The `Sheet1!$A$1:$D$5` form a chart's `<c:f>` refs use. `rows` narrows it
+    /// to one column of the box (a series), leaving the header row out.
+    pub fn f_ref(&self, c1: u32, c2: u32, skip_header: bool) -> String {
+        let (r1, _, r2, _) = self.range;
+        let top = if skip_header {
+            r1.saturating_add(1).min(r2)
+        } else {
+            r1
+        };
+        let name = self.prefix();
+        format!(
+            "{name}${}${}:${}${}",
+            col_name(c1),
+            top + 1,
+            col_name(c2),
+            r2 + 1
+        )
+    }
+
+    /// This source's own cells as an absolute ref — for a per-series range,
+    /// which already excludes the header row.
+    pub fn to_ref(&self) -> String {
+        let (r1, c1, r2, c2) = self.range;
+        let name = self.prefix();
+        format!(
+            "{name}${}${}:${}${}",
+            col_name(c1),
+            r1 + 1,
+            col_name(c2),
+            r2 + 1
+        )
+    }
+
+    /// The single header cell above `col` — a series' name ref.
+    pub fn header_ref(&self, col: u32) -> String {
+        let name = self.prefix();
+        format!("{name}${}${}", col_name(col), self.range.0 + 1)
+    }
+
+    /// The single label cell left of `row` — a row-oriented series' name ref,
+    /// the transpose of [`header_ref`](Self::header_ref).
+    pub fn label_ref(&self, row: u32) -> String {
+        let name = self.prefix();
+        format!("{name}${}${}", col_name(self.range.1), row + 1)
+    }
+
+    /// Parse a `Sheet1!$A$1:$D$5` ref (the sheet part optional).
+    pub fn parse_f_ref(s: &str) -> Option<ChartSource> {
+        let (sheet, cells) = match s.rsplit_once('!') {
+            // The inverse of `quote_sheet_name`: unwrap the quotes and undo the
+            // apostrophe doubling, so a sheet called `Bob's data` survives a
+            // round trip instead of coming back as `Bob''s data`.
+            Some((a, b)) => {
+                let name = match a.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+                    Some(inner) => inner.replace("''", "'"),
+                    None => a.to_string(),
+                };
+                (name, b)
+            }
+            None => (String::new(), s),
+        };
+        let range = parse_range_name(cells)?;
+        Some(ChartSource {
+            sheet,
+            range,
+            cat_col: range.1,
+        })
+    }
+
+    /// Grow to also cover `other`'s cells (same sheet assumed — a chart drawing
+    /// from two sheets keeps only the first).
+    pub fn union(&mut self, other: &ChartSource) {
+        let (r1, c1, r2, c2) = self.range;
+        let (or1, oc1, or2, oc2) = other.range;
+        self.range = (r1.min(or1), c1.min(oc1), r2.max(or2), c2.max(oc2));
+    }
+}
+
+/// The numbers in a range, row-major, with blanks and text as 0 — what a chart
+/// series plots when it is pointed at those cells.
+pub fn range_numbers(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<f64> {
+    let (r1, c1, r2, c2) = range;
+    (r1..=r2)
+        .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
+        .map(|(r, c)| match sheet.cell(r, c).map(|cl| &cl.value) {
+            Some(CellValue::Number(n)) => *n,
+            _ => 0.0,
+        })
+        .collect()
+}
+
+/// One cell as a chart reads it: the text of a label, a series name or a
+/// category.
+///
+/// Every chart path goes through here so that one cell cannot read two ways.
+/// `format_with` is what makes a boolean Excel's `TRUE` rather than Rust's
+/// `true` and a number the General spelling of itself; the panel's fields reach
+/// the same answer through [`range_labels`], so naming a series by hand and
+/// deriving the same name from the range agree, and `Switch Row/Column` cannot
+/// silently respell one.
+fn cell_text(sheet: &Sheet, r: u32, c: u32) -> String {
+    match sheet.cell(r, c).map(|cl| &cl.value) {
+        Some(CellValue::Text(t)) => t.clone(),
+        Some(v @ (CellValue::Number(_) | CellValue::Bool(_) | CellValue::Error(_))) => {
+            format_with(&Xf::default(), v, false)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The text in a range, row-major — category labels, or a series name.
+pub fn range_labels(sheet: &Sheet, range: (u32, u32, u32, u32)) -> Vec<String> {
+    let (r1, c1, r2, c2) = range;
+    (r1..=r2)
+        .flat_map(|r| (c1..=c2).map(move |c| (r, c)))
+        .map(|(r, c)| cell_text(sheet, r, c))
+        .collect()
+}
+
+/// Read a chart's data out of a worksheet range, either way round.
+///
+/// With `by_row` false — Excel's default, and the only thing docxy wrote before
+/// orientation existed — the first row names the series, one column of labels
+/// becomes the categories, and every column that holds numbers becomes a
+/// series. With `by_row` true it is the transpose: the first column names the
+/// series, one row of labels becomes the categories, and every numeric row is a
+/// series.
+///
+/// This is what the Insert button plots, what re-pointing a chart at a new range
+/// replots, and what Switch Row/Column re-derives.
+pub fn chart_from_range(
+    sheet: &Sheet,
+    sheet_name: &str,
+    range: (u32, u32, u32, u32),
+    kind: &str,
+    by_row: bool,
+) -> Option<ChartData> {
+    if by_row {
+        chart_from_rows(sheet, sheet_name, range, kind)
+    } else {
+        chart_from_columns(sheet, sheet_name, range, kind)
+    }
+}
+
+/// The column reading of a range: one series per numeric column. Kept as it was
+/// before orientation existed, so a column chart still comes out byte-for-byte
+/// what it always did — with one carve-out. Its own `text_of` used to spell a
+/// boolean label Rust's way (`true`); lifting it into the shared [`cell_text`]
+/// gives it Excel's `TRUE`, the spelling every other chart path and the panel's
+/// own fields already used. Nothing else moved: numbers and errors render
+/// identically, and `text_of` never fed the numeric-vs-text classification
+/// below, which reads `sheet.cell` directly.
+fn chart_from_columns(
+    sheet: &Sheet,
+    sheet_name: &str,
+    range: (u32, u32, u32, u32),
+    kind: &str,
+) -> Option<ChartData> {
+    let (r0, c0, r1, c1) = range;
+    if r1 <= r0 {
+        return None; // header row only — nothing to plot
+    }
+    let text_of = |r: u32, c: u32| cell_text(sheet, r, c);
+    // A column is a series if it is mostly numbers; the first that isn't
+    // supplies the category labels.
+    let (mut cat_col, mut num_cols) = (None, Vec::new());
+    for c in c0..=c1 {
+        let (mut nums, mut txts) = (0u32, 0u32);
+        for r in (r0 + 1)..=r1 {
+            match sheet.cell(r, c).map(|cl| &cl.value) {
+                Some(CellValue::Number(_)) => nums += 1,
+                Some(CellValue::Text(_)) => txts += 1,
+                _ => {}
+            }
+        }
+        if nums > 0 && nums >= txts {
+            num_cols.push(c);
+        } else if cat_col.is_none() {
+            cat_col = Some(c);
+        }
+    }
+    if num_cols.is_empty() {
+        return None;
+    }
+    // Keep "we found a label column" apart from "we had to pick one". Every
+    // column being numeric (`Year | Sales`) falls back to the first, which is
+    // itself plotted — naming it in `<c:cat>` would label the numbers with
+    // themselves. Excel writes literal categories in that case, so we do too.
+    let label_col = cat_col;
+    let cat_col = cat_col.unwrap_or(c0);
+    let rows: Vec<u32> = (r0 + 1..=r1).collect();
+    let title = text_of(r0, cat_col);
+    let src = |c1: u32, c2: u32| ChartSource {
+        sheet: sheet_name.to_string(),
+        range: (r0 + 1, c1, r1, c2),
+        cat_col,
+    };
+    let series = num_cols
+        .iter()
+        .map(|&c| ChartSeries {
+            name: text_of(r0, c),
+            col: Some(c),
+            values_ref: Some(src(c, c)),
+            name_ref: Some(
+                ChartSource {
+                    sheet: sheet_name.to_string(),
+                    range,
+                    cat_col,
+                }
+                .header_ref(c),
+            ),
+            values: rows
+                .iter()
+                .map(|&r| match sheet.cell(r, c).map(|cl| &cl.value) {
+                    Some(CellValue::Number(n)) => *n,
+                    _ => 0.0,
+                })
+                .collect(),
+            color: None,
+            // Authored from a range, so it plots through `<c:val>`; only a
+            // scatter or bubble read from a file carries point refs.
+            point_refs: Vec::new(),
+            points_unheld: false,
+            points_ref_unheld: false,
+        })
+        .collect();
+    Some(ChartData {
+        title: if title.is_empty() {
+            "Chart".into()
+        } else {
+            title
+        },
+        kind: kind.to_string(),
+        categories: rows.iter().map(|&r| text_of(r, cat_col)).collect(),
+        series,
+        source: Some(ChartSource {
+            sheet: sheet_name.to_string(),
+            range,
+            cat_col,
+        }),
+        categories_ref: label_col.map(|c| src(c, c)),
+        part: None,
+        edited: true,
+        // Authored here, so it is exactly what the writer emits.
+        complex: false,
+        by_row: false,
+    })
+}
+
+/// The row reading of a range: one series per numeric row, the transpose of
+/// [`chart_from_columns`]. The first column holds the series names, the first
+/// row that isn't numeric supplies the category labels.
+fn chart_from_rows(
+    sheet: &Sheet,
+    sheet_name: &str,
+    range: (u32, u32, u32, u32),
+    kind: &str,
+) -> Option<ChartData> {
+    let (r0, c0, r1, c1) = range;
+    if c1 <= c0 {
+        return None; // label column only — nothing to plot
+    }
+    let text_of = |r: u32, c: u32| cell_text(sheet, r, c);
+    // A row is a series if it is mostly numbers; the first that isn't supplies
+    // the category labels.
+    let (mut cat_row, mut num_rows) = (None, Vec::new());
+    for r in r0..=r1 {
+        let (mut nums, mut txts) = (0u32, 0u32);
+        for c in (c0 + 1)..=c1 {
+            match sheet.cell(r, c).map(|cl| &cl.value) {
+                Some(CellValue::Number(_)) => nums += 1,
+                Some(CellValue::Text(_)) => txts += 1,
+                _ => {}
+            }
+        }
+        if nums > 0 && nums >= txts {
+            num_rows.push(r);
+        } else if cat_row.is_none() {
+            cat_row = Some(r);
+        }
+    }
+    if num_rows.is_empty() {
+        return None;
+    }
+    // Same split as the column branch: "we found a label row" is not "we had to
+    // pick one". Every row being numeric means the fallback row is itself
+    // plotted, and naming it in `<c:cat>` would label the numbers with
+    // themselves — so the categories go out as literals instead.
+    let label_row = cat_row;
+    let cat_row = cat_row.unwrap_or(r0);
+    let cols: Vec<u32> = (c0 + 1..=c1).collect();
+    let title = text_of(cat_row, c0);
+    // `cat_col` names the column the SERIES NAMES come from here, not the
+    // categories: it is a column index and a row chart takes its labels from a
+    // row, which no column index can express. The writer must therefore derive a
+    // row chart's `<c:cat>` from `categories_ref`, never from `cat_col`.
+    let src = |r_a: u32, r_b: u32| ChartSource {
+        sheet: sheet_name.to_string(),
+        range: (r_a, c0 + 1, r_b, c1),
+        cat_col: c0,
+    };
+    let whole = ChartSource {
+        sheet: sheet_name.to_string(),
+        range,
+        cat_col: c0,
+    };
+    let series = num_rows
+        .iter()
+        .map(|&r| ChartSeries {
+            name: text_of(r, c0),
+            // A row series occupies no single column, and `col` feeds two
+            // column-shaped decisions (the writer's fallback ref and
+            // `claimed_col`). A row index here would make both quietly wrong
+            // rather than inapplicable; `values_ref` is always set, so the
+            // fallback is never reached.
+            col: None,
+            values_ref: Some(src(r, r)),
+            name_ref: Some(whole.label_ref(r)),
+            values: cols
+                .iter()
+                .map(|&c| match sheet.cell(r, c).map(|cl| &cl.value) {
+                    Some(CellValue::Number(n)) => *n,
+                    _ => 0.0,
+                })
+                .collect(),
+            color: None,
+            // Authored from a range, so it plots through `<c:val>`; only a
+            // scatter or bubble read from a file carries point refs.
+            point_refs: Vec::new(),
+            points_unheld: false,
+            points_ref_unheld: false,
+        })
+        .collect();
+    Some(ChartData {
+        title: if title.is_empty() {
+            "Chart".into()
+        } else {
+            title
+        },
+        kind: kind.to_string(),
+        categories: cols.iter().map(|&c| text_of(cat_row, c)).collect(),
+        series,
+        source: Some(whole),
+        categories_ref: label_row.map(|r| src(r, r)),
+        part: None,
+        edited: true,
+        // Authored here, so it is exactly what the writer emits.
+        complex: false,
+        by_row: true,
+    })
 }
 
 /// One data series of a [`ChartData`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChartSeries {
     pub name: String,
     pub values: Vec<f64>,
+    /// Explicit series colour (`0xRRGGBB`) from its `<c:spPr>` solid fill;
+    /// `None` leaves it to the renderer's palette.
+    pub color: Option<u32>,
+    /// The worksheet column this series reads, when the chart is range-backed
+    /// and read COLUMN-wise. Always `None` for a row-oriented series
+    /// ([`ChartData::by_row`]), which occupies every column of its ref rather
+    /// than one — `None` here means "no single column", not "not range-backed".
+    /// It feeds the writer's column-shaped fallback ref and `claimed_col`, so a
+    /// row series' left-hand column here would make both quietly wrong rather
+    /// than inapplicable.
+    pub col: Option<u32>,
+    /// The cells this series' values come from. Set independently of the chart's
+    /// overall box, so one series can be re-pointed without touching the others.
+    pub values_ref: Option<ChartSource>,
+    /// The `<c:f>` ref naming this series (usually its header cell), verbatim.
+    pub name_ref: Option<String>,
+    /// The cells a SCATTER's or BUBBLE's points come from: its `<c:xVal>`,
+    /// `<c:yVal>` and `<c:bubbleSize>` refs, in document order.
+    ///
+    /// Those kinds plot from their own elements rather than from `<c:val>`, so
+    /// the loader leaves `values_ref` `None` for them. They are still NUMBERS,
+    /// and the chart's box is built from the numbers — keeping them here is
+    /// what lets the panel's `rebuild_source` see the same cells the loader
+    /// folded, instead of rebuilding a scatter's box out of its label cells
+    /// alone and collapsing the DATA RANGE it shows.
+    ///
+    /// The two slots CAN coexist: the panel's SERIES VALUES field is offered
+    /// for every kind, so re-pointing a scatter's series installs a
+    /// `values_ref` beside these. That is deliberate — the part still
+    /// round-trips verbatim, so the next `parse_chart` reads these refs back
+    /// out of it, and clearing them on a re-point would collapse the box the
+    /// reload rebuilds. `rebuild_source` folds both, in that order.
+    ///
+    /// Empty for every kind the writer authors: nothing here derives them for
+    /// one, and `chart_set_kind` — the one door that converts an imported chart
+    /// into a writable kind — leaves none behind, because the writer regenerates
+    /// such a part from `values_ref`, `categories_ref` and the box alone. It
+    /// gets there two ways: a series that gained a `values_ref` from a re-point
+    /// simply has these cleared (`chart_take_kind`), while one still carrying
+    /// nothing but points would regenerate as an EMPTY chart, so that chart is
+    /// re-derived from its box instead (`chart_reauthored`) and comes back with
+    /// real `values_ref`s and no points at all.
+    ///
+    /// Re-based by `edit::rename_sheet_in_chart` and `edit::shift_chart_refs`
+    /// like every other [`ChartSource`] a chart holds.
+    pub point_refs: Vec<ChartSource>,
+    /// This series had `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` points the model
+    /// could not turn into a ref: a `<c:numLit>` (literal points, no `<c:f>` at
+    /// all) or an `<c:f>` [`ChartSource::parse_f_ref`] refuses — a whole column,
+    /// a defined name, a multi-area ref.
+    ///
+    /// Set per point ELEMENT, not per series: whenever ANY ONE of the series'
+    /// `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` held points it yielded no ref for.
+    /// So it can sit beside a NON-EMPTY `point_refs` when only one half was
+    /// readable — a `<c:xVal>` naming `Sheet1!$A:$A` next to a `<c:yVal>` naming
+    /// `Sheet1!$B$2:$B$3` leaves one ref and this mark.
+    ///
+    /// It has to be recorded separately because nothing else on the series
+    /// remembers the unreadable half: `values_ref` and `col` are `None` and
+    /// `values` empty for a scatter either way, so a series whose points were ALL
+    /// unreadable is indistinguishable from the empty one "+ Series" pushes.
+    /// `chart_would_lose_points` asks both slots, which is what
+    /// keeps picking a writable type from relabelling this chart and letting the
+    /// next save write `<c:ptCount val="0"/>` over a plot it could never re-read.
+    ///
+    /// Never set by anything docxy authors — like `point_refs`, it only ever
+    /// arrives from a file, and `chart_take_kind` clears it with them.
+    pub points_unheld: bool,
+    /// The narrower half of [`Self::points_unheld`]: one of those point elements
+    /// held an `<c:f>` NAMING cells that [`ChartSource::parse_f_ref`] refused —
+    /// a whole column, a defined name, a multi-area ref.
+    ///
+    /// The two are worth telling apart because they answer different questions
+    /// about the chart's BOX. Literal points (`<c:numLit>`) live in no cells at
+    /// all, so no box could have covered them and the one the chart has is the
+    /// best that exists. A refused REF names cells the fold then skipped, so the
+    /// box is provably short of the plot and re-deriving from it would drop the
+    /// half that is off it. Only this mark says the second thing; `points_unheld`
+    /// says either, which is all `chart_would_lose_points` needs to know.
+    ///
+    /// Set per point ELEMENT like its wider half, and cleared with it.
+    pub points_ref_unheld: bool,
 }
 
 /// One data-validation rule over a set of cell ranges.
@@ -433,7 +972,11 @@ impl Sheet {
         let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
         let cleaned = strip_xml_attr(&cur, "hidden");
         let next = if hidden {
-            if cleaned.is_empty() { "hidden=\"1\"".to_string() } else { format!("{cleaned} hidden=\"1\"") }
+            if cleaned.is_empty() {
+                "hidden=\"1\"".to_string()
+            } else {
+                format!("{cleaned} hidden=\"1\"")
+            }
         } else {
             cleaned
         };
@@ -450,9 +993,13 @@ impl Sheet {
         self.row_attrs
             .get(&row)
             .and_then(|a| {
-                a.find("outlineLevel=\"").map(|i| i + "outlineLevel=\"".len()).and_then(|s| {
-                    a[s..].find('"').and_then(|e| a[s..s + e].parse::<u8>().ok())
-                })
+                a.find("outlineLevel=\"")
+                    .map(|i| i + "outlineLevel=\"".len())
+                    .and_then(|s| {
+                        a[s..]
+                            .find('"')
+                            .and_then(|e| a[s..s + e].parse::<u8>().ok())
+                    })
             })
             .unwrap_or(0)
     }
@@ -463,7 +1010,11 @@ impl Sheet {
         let cur = self.row_attrs.get(&row).cloned().unwrap_or_default();
         let cleaned = strip_xml_attr(&cur, "outlineLevel");
         let next = if level > 0 {
-            if cleaned.is_empty() { format!("outlineLevel=\"{level}\"") } else { format!("{cleaned} outlineLevel=\"{level}\"") }
+            if cleaned.is_empty() {
+                format!("outlineLevel=\"{level}\"")
+            } else {
+                format!("{cleaned} outlineLevel=\"{level}\"")
+            }
         } else {
             cleaned
         };
@@ -477,14 +1028,22 @@ impl Sheet {
     /// The deepest outline level used by any row (for `<sheetFormatPr
     /// outlineLevelRow>` and collapse controls). 0 when the sheet is flat.
     pub fn max_row_outline(&self) -> u8 {
-        self.row_attrs.keys().map(|&r| self.row_outline(r)).max().unwrap_or(0)
+        self.row_attrs
+            .keys()
+            .map(|&r| self.row_outline(r))
+            .max()
+            .unwrap_or(0)
     }
 
     /// The row's explicit height in points (`<row ht="…">`), or `None` when it
     /// uses the sheet default.
     pub fn row_height(&self, row: u32) -> Option<f64> {
         self.row_attrs.get(&row).and_then(|a| {
-            a.find("ht=\"").map(|i| i + "ht=\"".len()).and_then(|s| a[s..].find('"').and_then(|e| a[s..s + e].parse::<f64>().ok()))
+            a.find("ht=\"").map(|i| i + "ht=\"".len()).and_then(|s| {
+                a[s..]
+                    .find('"')
+                    .and_then(|e| a[s..s + e].parse::<f64>().ok())
+            })
         })
     }
 
@@ -497,7 +1056,11 @@ impl Sheet {
         let next = match pts {
             Some(h) => {
                 let h = format!("ht=\"{h}\" customHeight=\"1\"");
-                if cleaned.is_empty() { h } else { format!("{cleaned} {h}") }
+                if cleaned.is_empty() {
+                    h
+                } else {
+                    format!("{cleaned} {h}")
+                }
             }
             None => cleaned,
         };
@@ -1186,6 +1749,306 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn range_readers_take_a_column_of_cells_as_numbers_or_labels() {
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("B1", Cell::text("Qty")),
+            ("B2", Cell::number(2.0)),
+            ("B3", Cell::text("n/a")),
+            ("B4", Cell::number(5.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        // B2:B4 as a series: text and blanks plot as zero, in row order.
+        assert_eq!(range_numbers(&sh, (1, 1, 3, 1)), vec![2.0, 0.0, 5.0]);
+        // The same cells as labels: numbers render the way the grid shows them.
+        assert_eq!(range_labels(&sh, (1, 1, 3, 1)), vec!["2", "n/a", "5"]);
+        // A single cell is the usual case for a series name.
+        assert_eq!(range_labels(&sh, (0, 1, 0, 1)), vec!["Qty"]);
+        // Cells that were never set read as empty rather than panicking.
+        assert_eq!(range_numbers(&sh, (10, 10, 10, 11)), vec![0.0, 0.0]);
+        assert_eq!(range_labels(&sh, (10, 10, 10, 10)), vec![""]);
+    }
+
+    #[test]
+    fn a_chart_is_column_oriented_unless_told_otherwise() {
+        // Orientation is not stored in the file, so every chart that predates it
+        // — which is every chart in every existing workbook — must read as
+        // column-oriented. Flipping this default would silently transpose them
+        // all, so pin it here rather than trusting `bool::default()` to stay put.
+        assert!(!ChartData::default().by_row);
+
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        // And a chart built from a range is column-oriented too.
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 1, 1), "column", false).expect("chart");
+        assert!(!cd.by_row);
+    }
+
+    #[test]
+    fn chart_from_range_picks_labels_and_numeric_series() {
+        // A1:C3 — a label column and two numeric columns under a header row.
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Price")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(1199.0)),
+            ("A3", Cell::text("Dock")),
+            ("B3", Cell::number(5.0)),
+            ("C3", Cell::number(179.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 2, 2), "column", false).expect("chart");
+        assert_eq!(cd.title, "Item"); // the label column's header names the chart
+        assert_eq!(cd.categories, vec!["Laptop", "Dock"]);
+        assert_eq!(cd.series.len(), 2);
+        assert_eq!(cd.series[0].name, "Qty");
+        assert_eq!(cd.series[0].values, vec![2.0, 5.0]);
+        assert_eq!(cd.series[1].values, vec![1199.0, 179.0]);
+        // Each series remembers its column, so a save can write live refs.
+        assert_eq!((cd.series[0].col, cd.series[1].col), (Some(1), Some(2)));
+        let src = cd.source.expect("source");
+        assert_eq!(
+            (src.sheet.as_str(), src.range, src.cat_col),
+            ("Budget", (0, 0, 2, 2), 0)
+        );
+
+        // A range with nothing numeric in it can't be plotted.
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 2, 0), "column", false).is_none());
+        // Neither can a header row on its own.
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 0, 2), "column", false).is_none());
+        // The label column was found, so its cells name the categories.
+        assert_eq!(
+            cd.categories_ref.map(|s| s.range),
+            Some((1, 0, 2, 0)),
+            "categories come from the label column"
+        );
+    }
+
+    /// The Overview's worked example: one row per item, a header row of column
+    /// headings.
+    fn overview_sheet() -> Sheet {
+        let mut sh = Sheet {
+            name: "Budget".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Item")),
+            ("B1", Cell::text("Qty")),
+            ("C1", Cell::text("Unit price")),
+            ("D1", Cell::text("Total")),
+            ("A2", Cell::text("Laptop")),
+            ("B2", Cell::number(2.0)),
+            ("C2", Cell::number(1199.0)),
+            ("D2", Cell::number(2398.0)),
+            ("A3", Cell::text("Monitor")),
+            ("B3", Cell::number(4.0)),
+            ("C3", Cell::number(249.5)),
+            ("D3", Cell::number(998.0)),
+            ("A4", Cell::text("Keyboard")),
+            ("B4", Cell::number(6.0)),
+            ("C4", Cell::number(39.99)),
+            ("D4", Cell::number(239.94)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        sh
+    }
+
+    #[test]
+    fn chart_from_rows_picks_labels_and_numeric_series() {
+        let sh = overview_sheet();
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true).expect("chart");
+        assert!(cd.by_row);
+        // The label row's first cell names the chart, as the label column's
+        // header does the other way round.
+        assert_eq!(cd.title, "Item");
+        assert_eq!(cd.categories, vec!["Qty", "Unit price", "Total"]);
+        assert_eq!(cd.series.len(), 3);
+        let names: Vec<&str> = cd.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Laptop", "Monitor", "Keyboard"]);
+        assert_eq!(cd.series[0].values, vec![2.0, 1199.0, 2398.0]);
+        assert_eq!(cd.series[2].values, vec![6.0, 39.99, 239.94]);
+        // A row series names no column — `col` feeds column-shaped decisions
+        // only, and a row index there would be silently wrong.
+        assert!(cd.series.iter().all(|s| s.col.is_none()));
+        // Each slot's ref is the row rectangle / the label cell left of it.
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((1, 1, 1, 3))
+        );
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Budget!$A$2"));
+        assert_eq!(cd.series[2].name_ref.as_deref(), Some("Budget!$A$4"));
+        assert_eq!(
+            cd.series[2].values_ref.as_ref().map(|s| s.to_ref()),
+            Some("Budget!$B$4:$D$4".to_string())
+        );
+        // The label row was found, so its cells name the categories.
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|s| s.range),
+            Some((0, 1, 0, 3)),
+            "categories come from the label row"
+        );
+        let src = cd.source.expect("source");
+        assert_eq!(
+            (src.sheet.as_str(), src.range, src.cat_col),
+            ("Budget", (0, 0, 3, 3), 0)
+        );
+
+        // A range with nothing numeric across a row can't be plotted.
+        let cd = chart_from_range(&sh, "Budget", (0, 0, 3, 0), "column", true);
+        assert!(cd.is_none(), "a label column on its own plots nothing");
+        // Nor can a label column plus a row of headings, with no numbers.
+        assert!(chart_from_range(&sh, "Budget", (0, 0, 0, 3), "column", true).is_none());
+    }
+
+    #[test]
+    fn the_two_orientations_of_one_range_are_transposes() {
+        let sh = overview_sheet();
+        let by_col = chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", false).expect("cols");
+        let by_row = chart_from_range(&sh, "Budget", (0, 0, 3, 3), "column", true).expect("rows");
+
+        // Series and categories swap places.
+        let col_names: Vec<&str> = by_col.series.iter().map(|s| s.name.as_str()).collect();
+        let row_names: Vec<&str> = by_row.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(col_names, by_row.categories.iter().collect::<Vec<_>>());
+        assert_eq!(row_names, by_col.categories.iter().collect::<Vec<_>>());
+
+        // And the numbers are the same grid, read the other way.
+        for (i, s) in by_col.series.iter().enumerate() {
+            for (j, v) in s.values.iter().enumerate() {
+                assert_eq!(*v, by_row.series[j].values[i], "cell ({j},{i})");
+            }
+        }
+        // Both name the same box, and only the flag differs.
+        assert_eq!(
+            by_col.source.as_ref().map(|s| s.range),
+            by_row.source.as_ref().map(|s| s.range)
+        );
+        assert!(!by_col.by_row && by_row.by_row);
+    }
+
+    #[test]
+    fn an_all_numeric_row_table_writes_literal_categories_not_a_plotted_row() {
+        // The row analogue of `Year | Sales`: every row is numeric, so the
+        // fallback category row is itself plotted. Naming it in `<c:cat>` would
+        // label the numbers with themselves.
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Year")),
+            ("B1", Cell::number(2024.0)),
+            ("C1", Cell::number(2025.0)),
+            ("A2", Cell::text("Sales")),
+            ("B2", Cell::number(10.0)),
+            ("C2", Cell::number(20.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let cd = chart_from_range(&sh, "Data", (0, 0, 1, 2), "column", true).expect("chart");
+        assert_eq!(cd.categories_ref, None);
+        // Both rows plot; the first also supplies the labels, as literals.
+        let names: Vec<&str> = cd.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["Year", "Sales"]);
+        assert_eq!(cd.categories, vec!["2024", "2025"]);
+    }
+
+    /// A cell must read the same however a chart path reaches it. Deriving a
+    /// name through `chart_from_range` and typing the same cell into the
+    /// panel's SERIES NAME field (which goes through `range_labels`) used to
+    /// disagree on a boolean — Rust's `true` against Excel's `TRUE` — so
+    /// `Switch Row/Column` respelled a name it had no business touching.
+    #[test]
+    fn a_derived_label_reads_the_same_as_the_one_a_field_would_show() {
+        let boolean = |b: bool| Cell {
+            value: CellValue::Bool(b),
+            ..Cell::default()
+        };
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Flag")),
+            ("B1", Cell::text("Qty")),
+            ("A2", boolean(true)),
+            ("B2", Cell::number(2.0)),
+            ("A3", boolean(false)),
+            ("B3", Cell::number(4.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        // Column reading: the boolean cells are the category labels.
+        let by_col = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column", false).expect("cols");
+        assert_eq!(by_col.categories, range_labels(&sh, (1, 0, 2, 0)));
+        assert_eq!(by_col.categories, vec!["TRUE", "FALSE"]);
+        // Row reading: the same cells name the series.
+        let by_row = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column", true).expect("rows");
+        let names: Vec<String> = by_row.series.iter().map(|s| s.name.clone()).collect();
+        // Row 0 holds `Qty`, so it is the label row, not a series; the two
+        // boolean cells below it name the two series.
+        assert_eq!(names, range_labels(&sh, (1, 0, 2, 0)));
+        assert_eq!(names, vec!["TRUE", "FALSE"]);
+    }
+
+    #[test]
+    fn an_all_numeric_table_writes_literal_categories_not_a_plotted_column() {
+        // `Year | Sales` has no label column, so `cat_col` falls back to the
+        // first — which is itself plotted. Naming it in `<c:cat>` would label
+        // the numbers with themselves, on top of the bogus Year series.
+        let mut sh = Sheet {
+            name: "Data".into(),
+            ..Sheet::default()
+        };
+        for (addr, cell) in [
+            ("A1", Cell::text("Year")),
+            ("B1", Cell::text("Sales")),
+            ("A2", Cell::number(2024.0)),
+            ("B2", Cell::number(10.0)),
+            ("A3", Cell::number(2025.0)),
+            ("B3", Cell::number(20.0)),
+        ] {
+            let (r, c) = parse_cell_name(addr).unwrap();
+            sh.set_cell(r, c, cell);
+        }
+        let cd = chart_from_range(&sh, "Data", (0, 0, 2, 1), "column", false).expect("chart");
+        assert_eq!(cd.categories_ref, None);
+        // The labels are still there, as literals — the writer emits `<c:strLit>`.
+        assert_eq!(cd.categories, vec!["2024", "2025"]);
+        let out = crate::xlsx::chart_space_xml(&cd);
+        assert!(out.contains("<c:cat><c:strLit"), "{out}");
+        assert!(!out.contains("<c:cat><c:strRef"), "{out}");
+    }
 
     #[test]
     fn col_names_round_trip() {

@@ -254,9 +254,7 @@ impl Package {
     /// Whether the document uses distinct even/odd page headers/footers
     /// (`<w:evenAndOddHeaders/>` in `word/settings.xml`).
     pub fn has_even_odd(&self) -> bool {
-        self.part("word/settings.xml")
-            .map(|b| String::from_utf8_lossy(b).contains("<w:evenAndOddHeaders"))
-            .unwrap_or(false)
+        self.settings_flag("w:evenAndOddHeaders").unwrap_or(false)
     }
 
     /// Toggle distinct even/odd headers/footers (`<w:evenAndOddHeaders/>`).
@@ -266,9 +264,14 @@ impl Package {
 
     /// Whether automatic hyphenation is on (`<w:autoHyphenation/>` in settings).
     pub fn has_auto_hyphenation(&self) -> bool {
-        self.part("word/settings.xml")
-            .map(|b| String::from_utf8_lossy(b).contains("<w:autoHyphenation"))
-            .unwrap_or(false)
+        self.settings_flag("w:autoHyphenation").unwrap_or(false)
+    }
+
+    /// A boolean flag element's state in `word/settings.xml`: `None` when the
+    /// element is absent, otherwise its `w:val` (absent `w:val` means on).
+    fn settings_flag(&self, elem: &str) -> Option<bool> {
+        let b = self.part("word/settings.xml")?;
+        settings_flag_of(&String::from_utf8_lossy(b), elem)
     }
 
     /// Toggle automatic hyphenation for the document (`<w:autoHyphenation/>`).
@@ -285,19 +288,44 @@ impl Package {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         let name = "word/settings.xml";
-        let tag = format!("<{elem}");
         if let Some(b) = self.part(name) {
             let xml = String::from_utf8_lossy(b).into_owned();
-            let has = xml.contains(&tag);
-            if on && !has {
-                let gt = xml.find("<w:settings").and_then(|s| xml[s..].find('>').map(|e| s + e + 1));
-                if let Some(pos) = gt {
-                    let new = format!("{}<{elem}/>{}", &xml[..pos], &xml[pos..]);
-                    self.set_part(name, new.into_bytes());
-                }
-            } else if !on && has {
-                self.set_part(name, remove_element(&xml, elem).into_bytes());
+            let cur = settings_flag_of(&xml, elem);
+            if cur == Some(on) {
+                return; // already in the wanted state
             }
+            // Word writes an explicit off as `<w:autoHyphenation w:val="false"/>`.
+            // Turning the flag ON therefore has to REPLACE that element, not skip
+            // because "the tag is already there" — which is what made the toggle
+            // look dead until it was pressed twice.
+            let xml = if cur.is_some() {
+                remove_element(&xml, elem)
+            } else {
+                xml
+            };
+            if !on {
+                self.set_part(name, xml.into_bytes());
+                return;
+            }
+            // `<w:settings … />` is a legal empty root; splicing after its `>`
+            // would append a SECOND root element and make the part unparseable.
+            let Some(s) = xml.find("<w:settings") else {
+                return; // not a settings part we recognise; leave it alone
+            };
+            let Some(rel) = xml[s..].find('>') else {
+                return;
+            };
+            let gt = s + rel;
+            let new = if xml[..gt].ends_with('/') {
+                format!(
+                    "{}><{elem}/></w:settings>{}",
+                    &xml[..gt - 1],
+                    &xml[gt + 1..]
+                )
+            } else {
+                format!("{}<{elem}/>{}", &xml[..gt + 1], &xml[gt + 1..])
+            };
+            self.set_part(name, new.into_bytes());
             return;
         }
         if !on {
@@ -312,7 +340,11 @@ impl Package {
             let ct = String::from_utf8_lossy(b).into_owned();
             if !ct.contains("settings+xml") {
                 let ov = "<Override PartName=\"/word/settings.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.wordprocessingml.settings+xml\"/>";
-                self.set_part("[Content_Types].xml", ct.replacen("</Types>", &format!("{ov}</Types>"), 1).into_bytes());
+                self.set_part(
+                    "[Content_Types].xml",
+                    ct.replacen("</Types>", &format!("{ov}</Types>"), 1)
+                        .into_bytes(),
+                );
             }
         }
         let rels_name = "word/_rels/document.xml.rels";
@@ -320,8 +352,14 @@ impl Package {
             let rels = String::from_utf8_lossy(b).into_owned();
             if !rels.contains("settings.xml") {
                 let rid = next_rid(&rels);
-                let rel = format!("<Relationship Id=\"{rid}\" Type=\"{R_NS}/settings\" Target=\"settings.xml\"/>");
-                self.set_part(rels_name, rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1).into_bytes());
+                let rel = format!(
+                    "<Relationship Id=\"{rid}\" Type=\"{R_NS}/settings\" Target=\"settings.xml\"/>"
+                );
+                self.set_part(
+                    rels_name,
+                    rels.replacen("</Relationships>", &format!("{rel}</Relationships>"), 1)
+                        .into_bytes(),
+                );
             }
         }
     }
@@ -428,10 +466,17 @@ impl Package {
     pub fn set_page_margins(&mut self, top: i32, right: i32, bottom: i32, left: i32) {
         let mut s = std::mem::take(&mut self.sect_pr);
         if !s.contains("<w:pgMar") {
-            let mar = format!("<w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>");
+            let mar = format!(
+                "<w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
+            );
             s = inject_sect_child(&s, &mar);
         } else {
-            for (k, v) in [("w:top", top), ("w:right", right), ("w:bottom", bottom), ("w:left", left)] {
+            for (k, v) in [
+                ("w:top", top),
+                ("w:right", right),
+                ("w:bottom", bottom),
+                ("w:left", left),
+            ] {
                 s = set_pgmar_attr(&s, k, v);
             }
         }
@@ -746,7 +791,11 @@ fn set_pgmar_attr(sect: &str, key: &str, val: i32) -> String {
         format!("{}{}{}", &el[..vs], val, &el[ve..])
     } else {
         let trimmed = el.trim_end_matches('/').trim_end();
-        let slash = if el.trim_end().ends_with('/') { "/" } else { "" };
+        let slash = if el.trim_end().ends_with('/') {
+            "/"
+        } else {
+            ""
+        };
         format!("{trimmed} {key}=\"{val}\"{slash}")
     };
     format!("{}{}{}", &sect[..ts], new_el, &sect[end..])
@@ -809,6 +858,56 @@ fn insert_after_element(sect: &str, after: &str, child: &str) -> String {
 }
 
 /// Remove the first `<name/>`, `<name .../>`, or `<name ...>…</name>` element.
+/// An attribute's value out of a raw tag body (`w:val="false"`), either quote
+/// style. `None` when the attribute isn't there.
+fn tag_attr(attrs: &str, name: &str) -> Option<String> {
+    let pat = format!("{name}=");
+    let mut from = 0usize;
+    while let Some(rel) = attrs[from..].find(&pat) {
+        let at = from + rel;
+        // `w:val=` must not be the tail of `w:someOtherVal=`.
+        let ok = attrs[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| c.is_whitespace());
+        let rest = attrs[at + pat.len()..].trim_start();
+        let q = rest.chars().next();
+        if ok && matches!(q, Some('"') | Some('\'')) {
+            let q = q.unwrap();
+            let body = &rest[q.len_utf8()..];
+            return body.find(q).map(|e| body[..e].to_string());
+        }
+        from = at + pat.len();
+    }
+    None
+}
+
+/// A boolean settings element's state in `xml`: `None` when absent, otherwise
+/// its `w:val` (an absent `w:val` means on, per the OOXML on/off type).
+///
+/// A bare `contains("<w:autoHyphenation")` reads Word's explicit
+/// `<w:autoHyphenation w:val="false"/>` as ON, and matches the unrelated
+/// `<w:autoHyphenationZone>` too.
+fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
+    let open = format!("<{elem}");
+    let mut from = 0usize;
+    while let Some(rel) = xml[from..].find(&open) {
+        let start = from + rel;
+        let after = start + open.len();
+        let rest = &xml[after..];
+        if rest.starts_with([' ', '/', '>', '\t', '\n', '\r']) {
+            let end = rest.find('>').map(|e| after + e).unwrap_or(xml.len());
+            let val = tag_attr(&xml[after..end], "w:val");
+            return Some(!matches!(
+                val.as_deref(),
+                Some("false") | Some("0") | Some("off")
+            ));
+        }
+        from = after;
+    }
+    None
+}
+
 fn remove_element(xml: &str, name: &str) -> String {
     let open = format!("<{name}");
     let Some(start) = xml.find(&open) else {
@@ -1242,6 +1341,71 @@ mod tests {
     use crate::model::{Block, Inline};
     use crate::zipwrite::write_zip;
 
+    /// Word writes an explicit off as `w:val="false"`, which a bare `contains`
+    /// reads as ON — and then `set_settings_flag(.., true)` no-ops because "the
+    /// tag is already there", so the toggle looks dead until pressed twice.
+    #[test]
+    fn settings_flag_reads_w_val() {
+        let f = |x: &str| settings_flag_of(x, "w:autoHyphenation");
+        assert_eq!(f("<w:settings/>"), None);
+        assert_eq!(
+            f("<w:settings><w:autoHyphenation/></w:settings>"),
+            Some(true)
+        );
+        assert_eq!(
+            f(r#"<w:settings><w:autoHyphenation w:val="false"/></w:settings>"#),
+            Some(false)
+        );
+        assert_eq!(
+            f(r#"<w:settings><w:autoHyphenation w:val="0"/></w:settings>"#),
+            Some(false)
+        );
+        assert_eq!(
+            f(r#"<w:settings><w:autoHyphenation w:val="true"/></w:settings>"#),
+            Some(true)
+        );
+        // A longer element that merely starts with the same name is not it.
+        assert_eq!(
+            f("<w:settings><w:autoHyphenationZone>0</w:autoHyphenationZone></w:settings>"),
+            None
+        );
+    }
+
+    /// Turning a flag on has to REPLACE an explicit `w:val="false"`, and a
+    /// self-closing `<w:settings/>` root must be opened rather than having a
+    /// second root element appended after it.
+    #[test]
+    fn set_settings_flag_replaces_explicit_off_and_opens_empty_root() {
+        let mut p = load_package(&make_docx("<w:document/>")).unwrap();
+        p.set_part(
+            "word/settings.xml",
+            br#"<w:settings xmlns:w="w"><w:autoHyphenation w:val="false"/></w:settings>"#.to_vec(),
+        );
+        assert!(!p.has_auto_hyphenation());
+        p.set_auto_hyphenation(true);
+        assert!(p.has_auto_hyphenation());
+        let xml = String::from_utf8(p.part("word/settings.xml").unwrap().to_vec()).unwrap();
+        assert!(
+            !xml.contains("w:val=\"false\""),
+            "stale off left behind: {xml}"
+        );
+        p.set_auto_hyphenation(false);
+        assert!(!p.has_auto_hyphenation());
+
+        // Self-closing root: the flag lands INSIDE it, not after it.
+        p.set_part(
+            "word/settings.xml",
+            br#"<w:settings xmlns:w="w"/>"#.to_vec(),
+        );
+        p.set_even_odd(true);
+        let xml = String::from_utf8(p.part("word/settings.xml").unwrap().to_vec()).unwrap();
+        assert_eq!(
+            xml,
+            r#"<w:settings xmlns:w="w"><w:evenAndOddHeaders/></w:settings>"#
+        );
+        assert!(p.has_even_odd());
+    }
+
     /// Build a tiny but valid .docx in memory.
     fn make_docx(document_xml: &str) -> Vec<u8> {
         let ct = r#"<?xml version="1.0"?><Types/>"#;
@@ -1383,10 +1547,15 @@ mod tests {
         assert_eq!(pkg.sect_pr().matches("<w:titlePg").count(), 1);
         let first = pkg.create_hf(true, "first").expect("first header");
         assert!(pkg.sect_pr().contains("w:type=\"first\""));
-        assert_eq!(crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some(), true);
+        assert!(
+            crate::load::header_footer_ref_rid(pkg.sect_pr(), "headerReference", "first").is_some()
+        );
         pkg.set_title_pg(false);
         assert!(!pkg.has_title_pg() && !pkg.sect_pr().contains("titlePg"));
-        assert!(pkg.part(&first).is_some(), "first part kept when toggled off");
+        assert!(
+            pkg.part(&first).is_some(),
+            "first part kept when toggled off"
+        );
 
         // Even/odd headers (creates settings.xml from scratch here).
         assert!(!pkg.has_even_odd());

@@ -82,8 +82,10 @@ pub fn utf16le_string(b: &[u8]) -> Option<String> {
         return None;
     }
     let units: Vec<u16> = b
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
     let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
     let s = String::from_utf16(&units[..end]).ok()?;

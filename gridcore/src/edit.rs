@@ -176,11 +176,16 @@ pub fn dedupe_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, has_header
     let mut seen = std::collections::HashSet::new();
     let mut uniques: Vec<Vec<Option<crate::sheet::Cell>>> = Vec::new();
     for r in start..=r2 {
-        let row: Vec<Option<crate::sheet::Cell>> = (0..=max_c).map(|c| s.cell(r, c).cloned()).collect();
+        let row: Vec<Option<crate::sheet::Cell>> =
+            (0..=max_c).map(|c| s.cell(r, c).cloned()).collect();
         // Signature over the cells' values (formatting doesn't count for dedup).
         let key: Vec<String> = row
             .iter()
-            .map(|c| c.as_ref().map(|cl| format!("{:?}", cl.value)).unwrap_or_default())
+            .map(|c| {
+                c.as_ref()
+                    .map(|cl| format!("{:?}", cl.value))
+                    .unwrap_or_default()
+            })
             .collect();
         if seen.insert(key) {
             uniques.push(row);
@@ -250,23 +255,29 @@ pub fn parse_sort_spec(s: &str) -> Option<Vec<(u32, bool)>> {
 /// every key column regardless of direction; cross-type order is number < text
 /// < bool. The sort is stable, so rows equal on all keys keep their order.
 /// Returns the number of rows reordered.
+///
+/// `r2` is clamped to the last used row: `A1:A1048576` is the ordinary "the
+/// whole column" idiom, and materialising a million rows × every used column
+/// would exhaust memory long before it sorted anything. Rows past the used
+/// region are empty, so they sort last either way.
 pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32, bool)]) -> usize {
     use std::cmp::Ordering;
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
-    if keys.is_empty() || r2 <= r1 {
+    let (used_rows, cols) = s.used_size();
+    if cols == 0 || used_rows == 0 {
         return 0;
     }
-    let (_, cols) = s.used_size();
-    if cols == 0 {
+    let r2 = r2.min(used_rows - 1);
+    if keys.is_empty() || r2 <= r1 {
         return 0;
     }
     let max_c = cols - 1;
     let mut rows: Vec<Vec<Option<Cell>>> = (r1..=r2)
         .map(|r| (0..=max_c).map(|c| s.cell(r, c).cloned()).collect())
         .collect();
-    let is_blank = |cell: &Option<Cell>| cell.as_ref().map_or(true, |c| c.is_blank());
+    let is_blank = |cell: &Option<Cell>| cell.as_ref().is_none_or(|c| c.is_blank());
     // Cross-type rank so values of different kinds order deterministically.
     let rank = |cell: &Option<Cell>| match cell.as_ref().map(|c| &c.value) {
         Some(CellValue::Number(_)) => 0,
@@ -274,9 +285,16 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
         Some(CellValue::Bool(_)) => 2,
         _ => 3,
     };
-    let value_cmp = |ka: &Option<Cell>, kb: &Option<Cell>| match (ka.as_ref().map(|c| &c.value), kb.as_ref().map(|c| &c.value)) {
-        (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-        (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => x.to_lowercase().cmp(&y.to_lowercase()),
+    let value_cmp = |ka: &Option<Cell>, kb: &Option<Cell>| match (
+        ka.as_ref().map(|c| &c.value),
+        kb.as_ref().map(|c| &c.value),
+    ) {
+        (Some(CellValue::Number(x)), Some(CellValue::Number(y))) => {
+            x.partial_cmp(y).unwrap_or(Ordering::Equal)
+        }
+        (Some(CellValue::Text(x)), Some(CellValue::Text(y))) => {
+            x.to_lowercase().cmp(&y.to_lowercase())
+        }
         (Some(CellValue::Bool(x)), Some(CellValue::Bool(y))) => x.cmp(y),
         _ => rank(ka).cmp(&rank(kb)),
     };
@@ -317,6 +335,143 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
     (r2 - r1 + 1) as usize
 }
 
+/// Auto-fill from a source range by dragging its fill handle. `to` is the far
+/// corner the handle reached; the dominant axis (down or right) decides the
+/// direction. A source line of ≥2 numbers extends as a linear series (step =
+/// difference of the last two); otherwise the source cells are copied/cycled.
+/// Copied formulas are re-based like Excel's: relative references shift by the
+/// copy's row/column distance, absolute (`$`) ones stay put. Returns the count
+/// of filled cells.
+pub fn autofill(
+    wb: &mut Workbook,
+    sheet: usize,
+    src: (u32, u32, u32, u32),
+    to: (u32, u32),
+) -> usize {
+    let (sr0, sc0, sr1, sc1) = src;
+    let (tr, tc) = to;
+    // A denormalized source has no cells to read, and the pattern walk below
+    // divides by their count.
+    if sr0 > sr1 || sc0 > sc1 {
+        return 0;
+    }
+    let dr = tr.saturating_sub(sr1);
+    let dc = tc.saturating_sub(sc1);
+    if dr == 0 && dc == 0 {
+        return 0;
+    }
+    let Some(s) = wb.sheets.get_mut(sheet) else {
+        return 0;
+    };
+    let mut filled = 0;
+    if dr >= dc {
+        // Fill DOWN: extend each column into rows sr1+1..=tr.
+        let count = (tr - sr1) as usize;
+        for c in sc0..=sc1 {
+            let srcvals: Vec<Option<Cell>> = (sr0..=sr1).map(|r| s.cell(r, c).cloned()).collect();
+            let len = srcvals.len();
+            for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
+                let dst = sr1 + 1 + k as u32;
+                // A copied cell came from src[k % len]; shift its formula by the
+                // distance it travelled.
+                rebase(
+                    &mut cell,
+                    i64::from(dst) - i64::from(sr0 + (k % len) as u32),
+                    0,
+                );
+                s.set_cell(dst, c, cell);
+                filled += 1;
+            }
+        }
+    } else {
+        // Fill RIGHT: extend each row into columns sc1+1..=tc.
+        let count = (tc - sc1) as usize;
+        for r in sr0..=sr1 {
+            let srcvals: Vec<Option<Cell>> = (sc0..=sc1).map(|c| s.cell(r, c).cloned()).collect();
+            let len = srcvals.len();
+            for (k, mut cell) in extend_series(&srcvals, count).into_iter().enumerate() {
+                let dst = sc1 + 1 + k as u32;
+                rebase(
+                    &mut cell,
+                    0,
+                    i64::from(dst) - i64::from(sc0 + (k % len) as u32),
+                );
+                s.set_cell(r, dst, cell);
+                filled += 1;
+            }
+        }
+    }
+    filled
+}
+
+/// Shift a filled cell's formula by (`dr`, `dc`).
+///
+/// A copy never inherits the source's `<f>` attributes: `t="array" ref="A1:A3"`
+/// or a shared group's `si` names cells this copy does not own, and writing the
+/// same `ref`/`si` out from several cells is what makes Excel offer to repair
+/// the file. Dropped, the copy is an ordinary formula computing the same thing
+/// — which is also what makes it safe to shift.
+fn rebase(cell: &mut Cell, dr: i64, dc: i64) {
+    if cell.f_attrs.take().is_some() && cell.formula.as_deref() == Some("") {
+        // A shared-group follower whose master wouldn't parse carries no text of
+        // its own; without the group marker there is no formula left to write.
+        cell.formula = None;
+    }
+    if (dr, dc) == (0, 0) {
+        return;
+    }
+    if let Some(f) = &cell.formula {
+        if let Some(shifted) = crate::formula::translate_formula(f, dr, dc) {
+            cell.formula = Some(shifted);
+        }
+    }
+}
+
+/// Produce `count` cells continuing a source line: a numeric series when every
+/// source cell is a number (≥2 of them), else the source pattern copied/cycled.
+fn extend_series(src: &[Option<Cell>], count: usize) -> Vec<Cell> {
+    // Formulas carry a cached numeric result; extending them as a linear series
+    // would silently replace the formulas with numbers, so copy them instead.
+    if src
+        .iter()
+        .flatten()
+        .any(|c| c.formula.is_some() || c.f_attrs.is_some())
+    {
+        return (0..count)
+            .map(|k| src[k % src.len()].clone().unwrap_or_default())
+            .collect();
+    }
+    let nums: Option<Vec<f64>> = src
+        .iter()
+        .map(|c| match c.as_ref().map(|x| &x.value) {
+            Some(CellValue::Number(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if let Some(nums) = nums {
+        if nums.len() >= 2 {
+            let step = nums[nums.len() - 1] - nums[nums.len() - 2];
+            let last = nums[nums.len() - 1];
+            let style = src
+                .last()
+                .and_then(|c| c.as_ref())
+                .map(|c| c.style)
+                .unwrap_or(0);
+            return (0..count)
+                .map(|k| {
+                    let mut cell = Cell::number(last + step * (k as f64 + 1.0));
+                    cell.style = style; // carry the source formatting
+                    cell
+                })
+                .collect();
+        }
+    }
+    // Copy / cycle the source cells (single value → repeat it).
+    (0..count)
+        .map(|k| src[k % src.len()].clone().unwrap_or_default())
+        .collect()
+}
+
 /// Insert subtotal rows into a region already grouped by `group_col`: at each
 /// change in that column's value, add a `SUBTOTAL(9, …)` row over the numeric
 /// `sum_cols` (inferred from the data when the slice is empty), then a grand
@@ -325,7 +480,15 @@ pub fn sort_rows(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, keys: &[(u32
 /// first (Excel requires this too). Grand totals use `SUBTOTAL` precisely
 /// because it skips the nested per-group subtotals. Returns the number of rows
 /// added (groups + 1), or 0 when there's nothing to total.
-pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u32, sum_cols: &[u32], has_header: bool) -> usize {
+pub fn subtotal(
+    wb: &mut Workbook,
+    sheet: usize,
+    r1: u32,
+    r2: u32,
+    group_col: u32,
+    sum_cols: &[u32],
+    has_header: bool,
+) -> usize {
     use crate::sheet::cell_name;
     let start = if has_header { r1 + 1 } else { r1 };
     if r2 < start {
@@ -347,13 +510,19 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
         (max_c, detail)
     };
     let gc = group_col as usize;
-    let key_of = |row: &[Option<Cell>]| row.get(gc).and_then(|c| c.as_ref()).map(|c| format!("{:?}", c.value)).unwrap_or_default();
-    let label_of = |row: &[Option<Cell>]| match row.get(gc).and_then(|c| c.as_ref()).map(|c| &c.value) {
-        Some(CellValue::Text(t)) => t.clone(),
-        Some(CellValue::Number(n)) => n.to_string(),
-        Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-        _ => String::new(),
+    let key_of = |row: &[Option<Cell>]| {
+        row.get(gc)
+            .and_then(|c| c.as_ref())
+            .map(|c| format!("{:?}", c.value))
+            .unwrap_or_default()
     };
+    let label_of =
+        |row: &[Option<Cell>]| match row.get(gc).and_then(|c| c.as_ref()).map(|c| &c.value) {
+            Some(CellValue::Text(t)) => t.clone(),
+            Some(CellValue::Number(n)) => n.to_string(),
+            Some(CellValue::Bool(b)) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            _ => String::new(),
+        };
     // Runs of consecutive equal group values: (label, start_idx, end_idx).
     let mut runs: Vec<(String, usize, usize)> = Vec::new();
     let mut i = 0;
@@ -375,7 +544,17 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
         sum_cols.to_vec()
     } else {
         (0..=max_c)
-            .filter(|&c| c != group_col && detail.iter().any(|row| matches!(row.get(c as usize).and_then(|x| x.as_ref()).map(|x| &x.value), Some(CellValue::Number(_)))))
+            .filter(|&c| {
+                c != group_col
+                    && detail.iter().any(|row| {
+                        matches!(
+                            row.get(c as usize)
+                                .and_then(|x| x.as_ref())
+                                .map(|x| &x.value),
+                            Some(CellValue::Number(_))
+                        )
+                    })
+            })
             .collect()
     };
     let added = runs.len() + 1;
@@ -413,7 +592,11 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
             s.set_row_outline(out, 1);
             out += 1;
         }
-        let text = if label.is_empty() { "Total".to_string() } else { format!("{label} Total") };
+        let text = if label.is_empty() {
+            "Total".to_string()
+        } else {
+            format!("{label} Total")
+        };
         subtotal_row(s, out, &text, first, out - 1);
         out += 1;
     }
@@ -426,10 +609,25 @@ pub fn subtotal(wb: &mut Workbook, sheet: usize, r1: u32, r2: u32, group_col: u3
 /// the parts into `col`, `col+1`, … (overwriting adjacent cells, as Excel does).
 /// Numeric-looking parts become numbers. Rows without the delimiter are left
 /// alone. Returns how many rows were split.
-pub fn text_to_columns(wb: &mut Workbook, sheet: usize, col: u32, r1: u32, r2: u32, delim: char) -> usize {
+///
+/// `r2` is clamped to the last used row, so the `A1:A1048576` whole-column
+/// idiom walks the sheet rather than a million empty rows (see `sort_rows`).
+pub fn text_to_columns(
+    wb: &mut Workbook,
+    sheet: usize,
+    col: u32,
+    r1: u32,
+    r2: u32,
+    delim: char,
+) -> usize {
     let Some(s) = wb.sheets.get_mut(sheet) else {
         return 0;
     };
+    let used_rows = s.used_size().0;
+    if used_rows == 0 {
+        return 0;
+    }
+    let r2 = r2.min(used_rows - 1);
     let splits: Vec<(u32, Vec<String>)> = (r1..=r2)
         .filter_map(|r| {
             let cell = s.cell(r, col)?;
@@ -495,7 +693,210 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
             }
         }
     }
+    // A chart's refs name their sheet the same way, and a save writes them back
+    // out as `<c:f>` — left behind, they'd point at a sheet that no longer
+    // exists and Excel would drop the chart's data.
+    for sheet in &mut wb.sheets {
+        for dw in &mut sheet.drawings {
+            if let crate::sheet::DrawingKind::Chart(cd) = &mut dw.kind {
+                rename_sheet_in_chart(cd, &old, new_name);
+            }
+        }
+    }
     wb.sheets[idx].name = new_name.to_string();
+}
+
+/// Point every ref a chart holds at `new_name` where it named `old`. Public so
+/// the UI can do the same for charts it authored, which live outside the
+/// workbook until they are saved.
+pub fn rename_sheet_in_chart(cd: &mut crate::sheet::ChartData, old: &str, new_name: &str) {
+    fn retarget(src: &mut crate::sheet::ChartSource, old: &str, new_name: &str) -> bool {
+        let hit = src.sheet.eq_ignore_ascii_case(old);
+        if hit {
+            src.sheet = new_name.to_string();
+        }
+        hit
+    }
+    let mut changed = false;
+    for s in cd.source.iter_mut().chain(cd.categories_ref.iter_mut()) {
+        changed |= retarget(s, old, new_name);
+    }
+    for ser in &mut cd.series {
+        if let Some(s) = ser.values_ref.as_mut() {
+            changed |= retarget(s, old, new_name);
+        }
+        // A scatter's or bubble's points are the only numbers such a series
+        // has, and the panel's `rebuild_source` folds them FIRST — leaving them
+        // behind would seed the box with the old name and then skip the
+        // correctly-renamed slots after it for the sheet mismatch, so DATA
+        // RANGE would name a sheet the workbook no longer has.
+        for s in &mut ser.point_refs {
+            changed |= retarget(s, old, new_name);
+        }
+        // The name ref is kept verbatim as its `<c:f>` text, so it has to go
+        // back through the same spelling rules (quoting included). A single cell
+        // stays a single cell rather than becoming `$B$1:$B$1`.
+        if let Some(mut p) = ser
+            .name_ref
+            .as_deref()
+            .and_then(crate::sheet::ChartSource::parse_f_ref)
+        {
+            if retarget(&mut p, old, new_name) {
+                let (r1, c1, r2, c2) = p.range;
+                ser.name_ref = Some(if (r1, c1) == (r2, c2) {
+                    p.header_ref(c1)
+                } else {
+                    p.to_ref()
+                });
+                changed = true;
+            }
+        }
+    }
+    // Only a chart whose refs actually moved is regenerated on save; the rest
+    // round-trip verbatim, formatting and all.
+    //
+    // `edited` is a REQUEST to regenerate, not a promise: `save_xlsx` also asks
+    // `chart_is_writable`, and a scatter, bubble, stacked or combo chart fails
+    // it, so its part is copied byte for byte and the `<c:f>` on disk keeps the
+    // old sheet name until something makes the chart writable. That is the same
+    // trade-off `chart_kind_is_writable`'s own comment records for every other
+    // slot on such a chart — a stale ref beats a destroyed chart — and it is
+    // why re-basing them here is still worth doing: the panel, `rebuild_source`
+    // and the next re-derivation all read the model, not the part.
+    cd.edited |= changed;
+}
+
+/// Move every ref a chart holds on `target` through a row/column insert or
+/// delete. Public alongside [`rename_sheet_in_chart`] and for the same reason:
+/// a chart the UI authored lives outside the workbook until it is saved, and has
+/// to be shifted by the same rules.
+///
+/// A range whose rows (or columns) are wholly deleted loses its ref rather than
+/// keeping a dangling one — the cached values still draw the card, and a chart
+/// that plots nothing beats one plotting a stranger's numbers.
+pub fn shift_chart_refs(
+    cd: &mut crate::sheet::ChartData,
+    target: &str,
+    home: bool,
+    shift: &EditShift,
+) -> bool {
+    // A ref with no sheet name means the chart's OWN sheet — which is the edited
+    // one only when the drawing itself lives there. `home` says so: a chart
+    // sitting on "Report" whose refs read `$B$2:$B$10` plots Report's cells, and
+    // deleting rows on "Data" must leave it alone.
+    let mine = |s: &crate::sheet::ChartSource| -> bool {
+        (home && s.sheet.is_empty()) || s.sheet.eq_ignore_ascii_case(target)
+    };
+    /// `Some(src)` shifted in place, `None` = the ref's cells are all gone.
+    fn moved(
+        src: &crate::sheet::ChartSource,
+        shift: &EditShift,
+    ) -> Option<crate::sheet::ChartSource> {
+        let (r1, c1, r2, c2) = src.range;
+        let (r1, c1, r2, c2) = if shift.rows {
+            let (a, b) = span(r1, r2, shift)?;
+            (a, c1, b, c2)
+        } else {
+            let (a, b) = span(c1, c2, shift)?;
+            (r1, a, r2, b)
+        };
+        let mut out = src.clone();
+        out.range = (r1, c1, r2, c2);
+        // The label column rides along with the box it names.
+        if !shift.rows {
+            out.cat_col = point(src.cat_col, shift).unwrap_or(c1);
+        }
+        Some(out)
+    }
+    // Shift one slot; `true` if it came out different (gone included).
+    let shift_slot = |slot: &mut Option<crate::sheet::ChartSource>| -> bool {
+        let Some(s) = slot.as_ref().filter(|s| mine(s)) else {
+            return false;
+        };
+        let next = moved(s, shift);
+        let hit = next.as_ref() != Some(s);
+        *slot = next;
+        hit
+    };
+    // Which sheet a ref-less series reads: `chart_space_xml` derives its cells
+    // from the chart's box, so that box decides whether its column is an index
+    // into the edited grid. (Shifting leaves the sheet name alone, so reading it
+    // after `shift_slot` is the same answer.)
+    let source_mine = cd.source.as_ref().is_some_and(&mine);
+    let mut changed = shift_slot(&mut cd.source);
+    changed |= shift_slot(&mut cd.categories_ref);
+    for ser in &mut cd.series {
+        let had_values = ser.values_ref.is_some();
+        changed |= shift_slot(&mut ser.values_ref);
+        if had_values && ser.values_ref.is_none() {
+            // `chart_space_xml` derives a ref-less series' cells from the
+            // chart's box and this column, so leaving `col` behind would put
+            // back exactly the dangling ref the drop above is for.
+            ser.col = None;
+        }
+        // A scatter's/bubble's points follow the grid like any other ref, and
+        // are dropped rather than left dangling when their cells are wholly
+        // deleted — the same rule `shift_slot` applies to `values_ref`, and for
+        // the same reason: these ARE the series' numbers, and `rebuild_source`
+        // folds them first, so a stale one drags the panel's box back onto the
+        // pre-edit rectangle.
+        ser.point_refs.retain_mut(|s| {
+            if !mine(s) {
+                return true;
+            }
+            match moved(s, shift) {
+                Some(next) => {
+                    changed |= next != *s;
+                    *s = next;
+                    true
+                }
+                None => {
+                    changed = true;
+                    false
+                }
+            }
+        });
+        // The column a series plots is an index into the grid like any other —
+        // but only into the grid it actually reads. Shifting it for a column
+        // inserted on some OTHER sheet would leave `col` contradicting
+        // `values_ref`, and would mark a chart nobody touched for regeneration.
+        let col_mine = match ser.values_ref.as_ref() {
+            Some(v) => mine(v),
+            None => source_mine,
+        };
+        if !shift.rows && col_mine {
+            if let Some(c) = ser.col {
+                let next = point(c, shift);
+                changed |= next != Some(c);
+                ser.col = next;
+            }
+        }
+        // `name_ref` is kept as its `<c:f>` text, so it round-trips through the
+        // same spelling rules `rename_sheet_in_chart` uses.
+        if let Some(p) = ser
+            .name_ref
+            .as_deref()
+            .and_then(crate::sheet::ChartSource::parse_f_ref)
+            .filter(|p| mine(p))
+        {
+            let next = moved(&p, shift);
+            if next.as_ref() != Some(&p) {
+                changed = true;
+                ser.name_ref = next.map(|p| {
+                    let (r1, c1, r2, c2) = p.range;
+                    if (r1, c1) == (r2, c2) {
+                        p.header_ref(c1)
+                    } else {
+                        p.to_ref()
+                    }
+                });
+            }
+        }
+    }
+    // Only a chart whose refs actually moved is regenerated on save — and only
+    // if `chart_is_writable` also says yes; see `rename_sheet_in_chart`.
+    cd.edited |= changed;
+    changed
 }
 
 /// The shared core: move the grid on the target sheet, then rewrite every
@@ -529,6 +930,19 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         // Defined names have no home sheet; only sheet-qualified refs shift.
         if let Some(updated) = adjust_formula_for_edit(&dn.formula, false, &target_name, &shift) {
             dn.formula = updated;
+        }
+    }
+
+    // Chart refs follow the grid too. They are WRITTEN back out as `<c:f>` now,
+    // so a stale one doesn't just mis-draw our card: Excel re-reads it and plots
+    // whatever moved into those cells. A delete is the worse half — the ref can
+    // end up naming cells that hold something else entirely.
+    for (s, sheet) in wb.sheets.iter_mut().enumerate() {
+        let home_is_target = s == idx;
+        for dw in &mut sheet.drawings {
+            if let crate::sheet::DrawingKind::Chart(cd) = &mut dw.kind {
+                shift_chart_refs(cd, &target_name, home_is_target, &shift);
+            }
         }
     }
 
@@ -588,9 +1002,21 @@ fn point(v: u32, shift: &EditShift) -> Option<u32> {
 /// A span through the shift (deletes clamp); None = span fully deleted.
 fn span(a: u32, b: u32, shift: &EditShift) -> Option<(u32, u32)> {
     let at = shift.at;
-    let lo = point(a.min(b), shift).unwrap_or(at);
+    // `point` says `None` for two different things. On a DELETE the coordinate
+    // is gone, and the span clamps to the edit point. On an INSERT it was pushed
+    // off the end of the sheet — it clamps to the last row/column instead, since
+    // collapsing to `at - 1` would silently truncate a sheet-wide
+    // `<col min="1" max="16384">`, or a chart ref reading a whole column, down
+    // to the few cells before the insert.
+    let last = (if shift.rows { MAX_ROWS } else { MAX_COLS }) - 1;
+    let lo = match point(a.min(b), shift) {
+        Some(l) => l,
+        None if shift.delta > 0 => last,
+        None => at,
+    };
     let hi = match point(a.max(b), shift) {
         Some(h) => h,
+        None if shift.delta > 0 => last,
         None => at.checked_sub(1)?,
     };
     (lo <= hi).then_some((lo, hi))
@@ -699,6 +1125,233 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_column_sort_stops_at_the_last_used_row() {
+        // `A1:A1048576` is the ordinary "sort this column" idiom, and the range
+        // field passes it straight through. Materialising a million rows ×
+        // every used column would exhaust memory long before it sorted
+        // anything; the rows past the used region are empty either way.
+        let mut w = wb(&[
+            ("A1", Cell::text("Pear")),
+            ("A2", Cell::text("Apple")),
+            ("A3", Cell::text("Fig")),
+        ]);
+        let n = sort_rows(&mut w, 0, 0, crate::sheet::MAX_ROWS - 1, &[(0, true)]);
+        assert_eq!(n, 3, "the used rows, not a million");
+        let s = &w.sheets[0];
+        let col = |r: u32| s.cell(r, 0).map(|c| c.value.clone());
+        assert_eq!(col(0), Some(CellValue::Text("Apple".into())));
+        assert_eq!(col(1), Some(CellValue::Text("Fig".into())));
+        assert_eq!(col(2), Some(CellValue::Text("Pear".into())));
+        // An empty sheet has nothing to clamp against, and says so.
+        assert_eq!(sort_rows(&mut wb(&[]), 0, 0, 100, &[(0, true)]), 0);
+    }
+
+    #[test]
+    fn a_whole_column_text_to_columns_stops_at_the_last_used_row() {
+        let mut w = wb(&[("A1", Cell::text("a,b")), ("A2", Cell::text("c,d"))]);
+        let n = text_to_columns(&mut w, 0, 0, 0, crate::sheet::MAX_ROWS - 1, ',');
+        assert_eq!(n, 2);
+        let s = &w.sheets[0];
+        assert_eq!(
+            s.cell(0, 1).map(|c| c.value.clone()),
+            Some(CellValue::Text("b".into()))
+        );
+        assert_eq!(text_to_columns(&mut wb(&[]), 0, 0, 0, 100, ','), 0);
+    }
+
+    #[test]
+    fn autofill_series_down_and_copy_right() {
+        // A1=1, A2=2  → fill down to A5 should give the series 3,4,5.
+        let mut w = wb(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
+        let n = autofill(&mut w, 0, (0, 0, 1, 0), (4, 0));
+        assert_eq!(n, 3);
+        let s = &w.sheets[0];
+        let num = |r: u32| match s.cell(r, 0).map(|c| c.value.clone()) {
+            Some(CellValue::Number(x)) => x,
+            v => panic!("A{} not number: {v:?}", r + 1),
+        };
+        assert_eq!((num(2), num(3), num(4)), (3.0, 4.0, 5.0));
+
+        // A single text cell copied to the right (B1..D1 = "x").
+        let mut w2 = wb(&[("A1", Cell::text("x"))]);
+        let n2 = autofill(&mut w2, 0, (0, 0, 0, 0), (0, 3));
+        assert_eq!(n2, 3);
+        let s2 = &w2.sheets[0];
+        for c in 1..=3 {
+            assert_eq!(
+                s2.cell(0, c).map(|x| x.value.clone()),
+                Some(CellValue::Text("x".into()))
+            );
+        }
+    }
+
+    #[test]
+    fn autofill_step_of_five_and_no_op() {
+        // 0,5 → 10,15,20 (step 5).
+        let mut w = wb(&[("A1", Cell::number(0.0)), ("A2", Cell::number(5.0))]);
+        autofill(&mut w, 0, (0, 0, 1, 0), (4, 0));
+        let s = &w.sheets[0];
+        assert_eq!(
+            s.cell(4, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(20.0))
+        );
+        // Dragging back onto the source (no extension) fills nothing.
+        assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (1, 0)), 0);
+    }
+
+    #[test]
+    fn autofill_rebases_relative_refs_but_not_absolute() {
+        // D1 = B1*C1 over three rows of data; drag D1's handle down to D3.
+        let mut w = wb(&[
+            ("B1", Cell::number(2.0)),
+            ("C1", Cell::number(3.0)),
+            ("B2", Cell::number(4.0)),
+            ("C2", Cell::number(5.0)),
+            ("B3", Cell::number(6.0)),
+            ("C3", Cell::number(7.0)),
+            ("A1", Cell::number(10.0)), // the fixed rate $A$1
+        ]);
+        w.sheets[0].set_cell(
+            0,
+            3,
+            Cell {
+                formula: Some("B1*C1*$A$1".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(autofill(&mut w, 0, (0, 3, 0, 3), (2, 3)), 2);
+        let f = |r: u32| w.sheets[0].cell(r, 3).and_then(|c| c.formula.clone());
+        assert_eq!(f(1).as_deref(), Some("B2*C2*$A$1"));
+        assert_eq!(f(2).as_deref(), Some("B3*C3*$A$1"));
+
+        let mut eng = Engine::new(&w);
+        eng.recalc_all(&mut w);
+        assert_eq!(value_at(&w, "D2"), CellValue::Number(200.0));
+        assert_eq!(value_at(&w, "D3"), CellValue::Number(420.0));
+    }
+
+    #[test]
+    fn autofill_right_rebases_columns_not_rows() {
+        // B1 = B2+B3, dragged RIGHT to D1: the refs must walk columns.
+        let mut w = wb(&[("B2", Cell::number(1.0)), ("B3", Cell::number(2.0))]);
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some("B2+B3".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (0, 3)), 2);
+        let f = |c: u32| w.sheets[0].cell(0, c).and_then(|x| x.formula.clone());
+        assert_eq!(f(2).as_deref(), Some("C2+C3"));
+        assert_eq!(f(3).as_deref(), Some("D2+D3"));
+    }
+
+    #[test]
+    fn autofill_cycles_a_non_numeric_pattern() {
+        // "x","y" filled down five rows repeats the pair, rather than trying to
+        // read a series out of text.
+        let mut w = wb(&[("A1", Cell::text("x")), ("A2", Cell::text("y"))]);
+        assert_eq!(autofill(&mut w, 0, (0, 0, 1, 0), (6, 0)), 5);
+        let t = |r: u32| match w.sheets[0].cell(r, 0).map(|c| c.value.clone()) {
+            Some(CellValue::Text(s)) => s,
+            v => panic!("A{} not text: {v:?}", r + 1),
+        };
+        assert_eq!(
+            (t(2), t(3), t(4), t(5), t(6)),
+            ("x".into(), "y".into(), "x".into(), "y".into(), "x".into())
+        );
+    }
+
+    #[test]
+    fn autofill_drops_the_group_marker_from_a_copied_formula() {
+        // `f_attrs` names cells the SOURCE owns — a shared group's `si`, an array
+        // formula's `ref`. Copied along, several cells would claim the same
+        // group and Excel would offer to repair the file; and while the marker
+        // stayed on, the copy went unshifted and quietly recomputed the source's
+        // own formula. The copy is a plain formula of its own instead.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some("A1*2".into()),
+                f_attrs: Some(" t=\"shared\" si=\"0\"".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (2, 1)), 2);
+        let cell = |r: u32| w.sheets[0].cell(r, 1).cloned().unwrap();
+        assert_eq!(
+            cell(1).formula.as_deref(),
+            Some("A2*2"),
+            "the copy shifts like any other formula"
+        );
+        assert_eq!(cell(2).formula.as_deref(), Some("A3*2"));
+        assert!(cell(1).f_attrs.is_none() && cell(2).f_attrs.is_none());
+        // The source keeps its own group intact.
+        assert_eq!(cell(0).formula.as_deref(), Some("A1*2"));
+        assert!(cell(0).f_attrs.is_some());
+    }
+
+    #[test]
+    fn autofill_of_an_unparseable_shared_follower_leaves_no_empty_formula() {
+        // A follower whose master didn't parse carries the marker and no text;
+        // dropping the marker must drop the empty `<f>` with it.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some(String::new()),
+                f_attrs: Some(" t=\"shared\" si=\"3\"".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(autofill(&mut w, 0, (0, 1, 0, 1), (1, 1)), 1);
+        // Nothing left to write: a blank copy isn't stored at all.
+        let copy = w.sheets[0].cell(1, 1).cloned().unwrap_or_default();
+        assert!(copy.formula.is_none() && copy.f_attrs.is_none());
+    }
+
+    #[test]
+    fn autofill_refuses_a_denormalized_source() {
+        // A backwards range has no cells to read, and the pattern walk divides
+        // by their count — this used to panic rather than decline.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        assert_eq!(autofill(&mut w, 0, (3, 0, 1, 0), (9, 0)), 0);
+        assert_eq!(autofill(&mut w, 0, (0, 3, 0, 1), (0, 9)), 0);
+    }
+
+    #[test]
+    fn autofill_copies_formulas_instead_of_extending_their_values() {
+        // Two formula cells whose RESULTS look like a series (1, 2) must still
+        // fill as copied formulas, not as the numbers 3, 4.
+        let mut w = wb(&[("A1", Cell::number(1.0)), ("A2", Cell::number(2.0))]);
+        w.sheets[0].set_cell(
+            0,
+            1,
+            Cell {
+                formula: Some("A1".into()),
+                ..Default::default()
+            },
+        );
+        w.sheets[0].set_cell(
+            1,
+            1,
+            Cell {
+                formula: Some("A2".into()),
+                ..Default::default()
+            },
+        );
+        autofill(&mut w, 0, (0, 1, 1, 1), (3, 1));
+        let f = |r: u32| w.sheets[0].cell(r, 1).and_then(|c| c.formula.clone());
+        assert_eq!(f(2).as_deref(), Some("A3"));
+        assert_eq!(f(3).as_deref(), Some("A4"));
+    }
+
+    #[test]
     fn subtotal_inserts_group_and_grand_totals() {
         // Region A1:B5 — header + two groups (A: 1,2 / B: 4), pre-sorted.
         let mut w = wb(&[
@@ -743,14 +1396,23 @@ mod tests {
         // Ascending: 1,2,3,blank
         sort_rows(&mut w, 0, 0, 3, &[(0, true)]);
         let s = &w.sheets[0];
-        assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(1.0)));
-        assert_eq!(s.cell(2, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
-        assert!(s.cell(3, 0).map_or(true, |c| c.is_blank()));
+        assert_eq!(
+            s.cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(1.0))
+        );
+        assert_eq!(
+            s.cell(2, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(3.0))
+        );
+        assert!(s.cell(3, 0).is_none_or(|c| c.is_blank()));
         // Descending: 3,2,1,blank (blank still last)
         sort_rows(&mut w, 0, 0, 3, &[(0, false)]);
         let s = &w.sheets[0];
-        assert_eq!(s.cell(0, 0).map(|c| c.value.clone()), Some(CellValue::Number(3.0)));
-        assert!(s.cell(3, 0).map_or(true, |c| c.is_blank()));
+        assert_eq!(
+            s.cell(0, 0).map(|c| c.value.clone()),
+            Some(CellValue::Number(3.0))
+        );
+        assert!(s.cell(3, 0).is_none_or(|c| c.is_blank()));
     }
 
     #[test]
@@ -858,6 +1520,355 @@ mod tests {
         eng.recalc_all(&mut w);
         assert_eq!(value_at(&w, "B1"), CellValue::Number(8.0));
         assert_eq!(value_at(&w, "B3"), CellValue::Error("#REF!".into()));
+    }
+
+    #[test]
+    fn rename_sheet_follows_a_charts_refs() {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, Drawing, DrawingKind};
+        let src = |r: (u32, u32, u32, u32)| ChartSource {
+            sheet: "Data".into(),
+            range: r,
+            cat_col: 0,
+        };
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].name = "Data".into();
+        w.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (0, 0),
+            to: (5, 5),
+            kind: DrawingKind::Chart(ChartData {
+                source: Some(src((0, 0, 3, 2))),
+                categories_ref: Some(src((1, 0, 3, 0))),
+                series: vec![ChartSeries {
+                    name: "Qty".into(),
+                    values_ref: Some(src((1, 1, 3, 1))),
+                    name_ref: Some("Data!$B$1".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        });
+        rename_sheet(&mut w, 0, "Numbers Etc");
+        let DrawingKind::Chart(cd) = &w.sheets[0].drawings[0].kind else {
+            panic!("still a chart")
+        };
+        assert_eq!(
+            cd.source.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers Etc")
+        );
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers Etc")
+        );
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers Etc")
+        );
+        // The name ref is text, and comes back quoted — a single cell still.
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("'Numbers Etc'!$B$1"));
+        // Its refs moved, so the part has to be regenerated on save.
+        assert!(cd.edited);
+    }
+
+    /// A chart on "Data" plotting `A1:C4`, categories in A, one series in B.
+    fn chart_wb() -> Workbook {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, Drawing, DrawingKind};
+        let src = |r: (u32, u32, u32, u32)| ChartSource {
+            sheet: "Data".into(),
+            range: r,
+            cat_col: 0,
+        };
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].name = "Data".into();
+        w.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (0, 0),
+            to: (5, 5),
+            kind: DrawingKind::Chart(ChartData {
+                source: Some(src((0, 0, 3, 2))),
+                categories_ref: Some(src((1, 0, 3, 0))),
+                series: vec![ChartSeries {
+                    name: "Qty".into(),
+                    col: Some(1),
+                    values_ref: Some(src((1, 1, 3, 1))),
+                    name_ref: Some("Data!$B$1".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        });
+        w
+    }
+
+    fn chart_of(w: &Workbook) -> &crate::sheet::ChartData {
+        match &w.sheets[0].drawings[0].kind {
+            crate::sheet::DrawingKind::Chart(cd) => cd,
+            other => panic!("expected a chart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_row_insert_moves_a_charts_refs_with_the_grid() {
+        // Chart refs are WRITTEN back out as `<c:f>` now, so a stale one isn't
+        // just a mis-drawn card: Excel re-reads it and plots whatever moved into
+        // those cells.
+        let mut w = chart_wb();
+        insert_rows(&mut w, 0, 1, 2); // two rows above the data body
+        let cd = chart_of(&w);
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 5, 2)));
+        assert_eq!(
+            cd.categories_ref.as_ref().map(|s| s.range),
+            Some((3, 0, 5, 0))
+        );
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((3, 1, 5, 1))
+        );
+        // The header row didn't move, so neither did the name ref.
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Data!$B$1"));
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn a_column_insert_moves_a_charts_columns_and_its_name_ref() {
+        let mut w = chart_wb();
+        insert_cols(&mut w, 0, 0, 1); // one column to the left of everything
+        let cd = chart_of(&w);
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 1, 3, 3)));
+        assert_eq!(cd.source.as_ref().map(|s| s.cat_col), Some(1));
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((1, 2, 3, 2))
+        );
+        assert_eq!(cd.series[0].col, Some(2));
+        assert_eq!(cd.series[0].name_ref.as_deref(), Some("Data!$C$1"));
+    }
+
+    #[test]
+    fn deleting_a_charts_only_column_drops_the_ref_instead_of_dangling() {
+        // A ref that survives a full delete names cells that now hold something
+        // else entirely — worse than a chart that plots nothing.
+        let mut w = chart_wb();
+        delete_cols(&mut w, 0, 1, 1); // column B, the series' own column
+        let cd = chart_of(&w);
+        assert_eq!(cd.series[0].values_ref, None);
+        assert_eq!(cd.series[0].name_ref, None);
+        assert_eq!(cd.series[0].col, None);
+        // The box shrank rather than vanishing: A and C are still in it.
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 3, 1)));
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn deleting_a_charts_rows_drops_the_column_the_writer_would_derive_from() {
+        // A ROW delete can empty a series' range too, and `col` isn't touched
+        // by a row shift — but `chart_space_xml` derives a ref-less series'
+        // cells from the chart's box and that column, putting the dangling ref
+        // straight back. The drop has to take `col` with it.
+        let mut w = chart_wb();
+        let rows = match chart_of(&w).series[0].values_ref {
+            Some(ref v) => (v.range.0, v.range.2),
+            None => panic!("the fixture's series should start with a ref"),
+        };
+        delete_rows(&mut w, 0, rows.0, rows.1 - rows.0 + 1);
+        let cd = chart_of(&w);
+        assert_eq!(cd.series[0].values_ref, None);
+        assert_eq!(cd.series[0].col, None, "or the writer re-derives the ref");
+    }
+
+    /// A scatter on "Data": no `<c:val>` at all, its numbers in `<c:xVal>`
+    /// (A2:A4) and `<c:yVal>` (B2:B4), named from B1.
+    fn scatter_wb() -> Workbook {
+        use crate::sheet::{ChartData, ChartSeries, ChartSource, Drawing, DrawingKind};
+        let src = |r: (u32, u32, u32, u32)| ChartSource {
+            sheet: "Data".into(),
+            range: r,
+            cat_col: 0,
+        };
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].name = "Data".into();
+        w.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
+            from: (0, 0),
+            to: (5, 5),
+            kind: DrawingKind::Chart(ChartData {
+                kind: "scatter".into(),
+                source: Some(src((0, 0, 3, 1))),
+                series: vec![ChartSeries {
+                    name: "Qty".into(),
+                    point_refs: vec![src((1, 0, 3, 0)), src((1, 1, 3, 1))],
+                    name_ref: Some("Data!$B$1".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+        });
+        w
+    }
+
+    #[test]
+    fn a_rename_follows_a_scatters_point_refs() {
+        // `point_refs` are the only ref a scatter's series has, and the panel's
+        // `rebuild_source` folds them FIRST. Left on the old name they seed the
+        // box with a sheet the workbook hasn't got, and every correctly-renamed
+        // slot after them is skipped for the mismatch.
+        let mut w = scatter_wb();
+        rename_sheet(&mut w, 0, "Numbers");
+        let cd = chart_of(&w);
+        assert!(
+            cd.series[0].point_refs.iter().all(|p| p.sheet == "Numbers"),
+            "got {:?}",
+            cd.series[0].point_refs
+        );
+        assert_eq!(
+            cd.source.as_ref().map(|s| s.sheet.as_str()),
+            Some("Numbers")
+        );
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn a_row_insert_moves_a_scatters_point_refs() {
+        let mut w = scatter_wb();
+        insert_rows(&mut w, 0, 0, 2); // two rows above the data body
+        let cd = chart_of(&w);
+        assert_eq!(
+            cd.series[0]
+                .point_refs
+                .iter()
+                .map(|p| p.range)
+                .collect::<Vec<_>>(),
+            vec![(3, 0, 5, 0), (3, 1, 5, 1)],
+        );
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((2, 0, 5, 1)));
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn deleting_a_scatters_x_cells_drops_that_point_ref_instead_of_dangling() {
+        // Same rule as `values_ref`: a wholly-deleted range loses its ref rather
+        // than plotting whatever moved into those cells.
+        let mut w = scatter_wb();
+        delete_cols(&mut w, 0, 0, 1); // column A, the X values
+        let cd = chart_of(&w);
+        assert_eq!(
+            cd.series[0]
+                .point_refs
+                .iter()
+                .map(|p| p.range)
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 3, 0)],
+            "the X ref should be gone and Y should have moved left",
+        );
+        assert!(cd.edited);
+    }
+
+    #[test]
+    fn a_scatter_on_another_sheet_keeps_its_point_refs() {
+        let mut w = scatter_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Other".into(),
+            ..Default::default()
+        });
+        insert_rows(&mut w, 1, 0, 5); // edit the OTHER sheet
+        let cd = chart_of(&w);
+        assert_eq!(
+            cd.series[0]
+                .point_refs
+                .iter()
+                .map(|p| p.range)
+                .collect::<Vec<_>>(),
+            vec![(1, 0, 3, 0), (1, 1, 3, 1)],
+        );
+        assert!(!cd.edited);
+    }
+
+    #[test]
+    fn a_chart_on_another_sheet_is_left_alone() {
+        let mut w = chart_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Other".into(),
+            ..Default::default()
+        });
+        insert_rows(&mut w, 1, 0, 5); // edit the OTHER sheet
+        let cd = chart_of(&w);
+        assert_eq!(cd.source.as_ref().map(|s| s.range), Some((0, 0, 3, 2)));
+        assert!(!cd.edited);
+    }
+
+    #[test]
+    fn a_column_insert_elsewhere_leaves_a_charts_plotted_column_alone() {
+        // `ser.col` is an index into the grid the series READS. Shifting it for
+        // a column inserted on some other sheet leaves it contradicting
+        // `values_ref` — and `chart_space_xml` derives a ref-less series' cells
+        // from it — while also marking a chart nobody touched as edited.
+        let mut w = chart_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Other".into(),
+            ..Default::default()
+        });
+        insert_cols(&mut w, 1, 0, 3); // three columns on the OTHER sheet
+        let cd = chart_of(&w);
+        assert_eq!(cd.series[0].col, Some(1));
+        assert_eq!(
+            cd.series[0].values_ref.as_ref().map(|s| s.range),
+            Some((1, 1, 3, 1))
+        );
+        assert!(!cd.edited);
+    }
+
+    #[test]
+    fn an_insert_pushing_a_span_off_the_sheet_clamps_to_the_last_column() {
+        // `point` says None both for "deleted" and for "pushed past the last
+        // column". Reading the second as the first collapses the span to just
+        // before the edit — and Excel writes `<col min="1" max="16384"/>` for a
+        // sheet-wide width, so every column past the insert would revert.
+        let mut w = wb(&[("A1", Cell::number(1.0))]);
+        w.sheets[0].col_defs.push(crate::sheet::ColDef {
+            min: 0,
+            max: crate::sheet::MAX_COLS - 1,
+            width: Some(20.0),
+            attrs: String::new(),
+        });
+        insert_cols(&mut w, 0, 3, 1);
+        let d = &w.sheets[0].col_defs[0];
+        assert_eq!((d.min, d.max), (0, crate::sheet::MAX_COLS - 1));
+    }
+
+    #[test]
+    fn an_unqualified_ref_belongs_to_the_charts_own_sheet() {
+        use crate::sheet::{ChartData, ChartSource, Drawing, DrawingKind};
+        // A `<c:f>` with no `!` means the sheet the CHART sits on. Put such a
+        // chart on "Report" and edit "Data": nothing about Report moved, so
+        // Report's chart must not move either — and must not be marked edited,
+        // which would regenerate a part the user never touched.
+        let mut w = chart_wb();
+        w.sheets.push(crate::sheet::Sheet {
+            name: "Report".into(),
+            drawings: vec![Drawing {
+                anchor_ix: 0,
+                from: (0, 0),
+                to: (5, 5),
+                kind: DrawingKind::Chart(ChartData {
+                    source: Some(ChartSource {
+                        sheet: String::new(),
+                        range: (1, 1, 9, 1),
+                        cat_col: 0,
+                    }),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        });
+        delete_rows(&mut w, 0, 1, 5); // five rows off "Data"
+        let far = match &w.sheets[1].drawings[0].kind {
+            DrawingKind::Chart(cd) => cd,
+            other => panic!("expected a chart, got {other:?}"),
+        };
+        assert_eq!(far.source.as_ref().map(|s| s.range), Some((1, 1, 9, 1)));
+        assert!(!far.edited);
+        // The chart that IS on "Data" still follows the grid.
+        assert!(chart_of(&w).edited);
     }
 
     #[test]

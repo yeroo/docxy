@@ -1366,6 +1366,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctlcore"
+version = "0.4.0"
+
+[[package]]
 name = "ctor"
 version = "1.0.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1542,6 +1546,7 @@ dependencies = [
 name = "docxy"
 version = "0.1.0"
 dependencies = [
+ "ctlcore",
  "dirs 5.0.1",
  "docxcore",
  "embed-resource",

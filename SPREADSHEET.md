@@ -24,8 +24,10 @@ bold/italic/color); reproducing Excel's visual styling is a non-goal.
   own cached values — a scoreboard, not a claim (§8).
 - Grid editing UX with Excel muscle memory: formula bar, A1 navigation, range
   selection, fill-down semantics, ref-translating copy/paste.
-- Lossless save: everything unmodeled (charts, pivots, conditional formatting,
-  print setup…) preserved byte-for-byte.
+- Lossless save: everything unmodeled (pivots, conditional formatting, print
+  setup…) preserved byte-for-byte. Charts are now modeled (§4a), so an *edited*
+  chart is regenerated and a moved/deleted drawing has its anchor rewritten;
+  untouched ones still round-trip verbatim.
 - Headless CLI: `xlsxy in.xlsx --recalc out.xlsx`, `xlsxy in.xlsx --csv out.csv`.
 
 **Non-goals (at least initially)**
@@ -103,8 +105,17 @@ worksheet XML sources.
 **On save:**
 - Regenerate only `<sheetData>` (and `<cols>`/`<dimension>` when touched) and
   **splice** it into the original worksheet XML — sheet-level features we don't
-  model (conditional formatting, data validation, drawings, sheet views) ride
+  model (conditional formatting, data validation, sheet views) ride
   along untouched. This is the spreadsheet analogue of docxy's `sectPr` splice.
+- Rewrite the drawing part's anchors in place (`drawing::rewrite_anchors`) so a
+  moved or deleted drawing persists. Every other byte of that part survives —
+  including whole anchors for shapes and text boxes we don't model, which is
+  what `Drawing::anchor_ix` (an index over ALL anchors, not just parsed ones)
+  exists to get right. A chart this session authored carries its own new part
+  and is marked `ANCHOR_AUTHORED`, so it never claims an index in the old one.
+- Regenerate a chart part only when its `ChartData::edited` is set; an untouched
+  chart's `xl/charts/chartN.xml` is copied verbatim, keeping the formatting the
+  model doesn't carry.
 - Append new strings to `sharedStrings.xml` (existing entries untouched, so
   unedited rich-text strings survive), update its counts.
 - Drop `xl/calcChain.xml` (its content-type override and relationship too) and
@@ -116,6 +127,130 @@ worksheet XML sources.
 
 **Fidelity gate:** load → save → reload is semantically identical; saved files
 open cleanly in Excel; a corpus round-trip test enforces it (§8).
+
+### 4a. Charts as a live, range-backed model
+
+Charts were "unmodeled, preserved"; they are now read and written as *ranges*
+rather than as frozen number caches, which is what lets an editor repoint one.
+
+- **Parsing** (`gridcore::drawing::parse_chart`): each `<c:ser>`'s `<c:f>`
+  becomes that series' `values_ref` / `name_ref`, `<c:cat>`'s becomes the
+  chart's `categories_ref` *when it is a supported single-level ref naming a
+  single line of cells*, and a fill directly on the series gives its `color`.
+  The union of those refs is the chart's own box, `ChartData::source`.
+- **`ChartSource`** carries `(sheet, range, cat_col)` and knows how to write
+  itself back as an absolute `Sheet1!$B$2:$B$5` (`f_ref` / `to_ref` /
+  `header_ref`, and `label_ref` for the row reading below) and how to read one
+  back (`parse_f_ref`), plus `union`. `cat_col` means the label column only in
+  the column reading; on a row chart it holds the column the *series names* come
+  from, since labels in a row are not a column index.
+- **Building one from cells** (`sheet::chart_from_range`): the header row names
+  each series, the first mostly-non-numeric column supplies the category labels,
+  and every mostly-numeric column becomes a series. That is the **column**
+  reading (`by_row: false`); with `by_row: true` it is the transpose — the first
+  column names each series, one row of labels supplies the categories, and every
+  mostly-numeric row becomes a series (see *Chart orientation* at the end of
+  this section, and
+  [`suite/docs/chart-orientation.md`](suite/docs/chart-orientation.md)).
+  `range_numbers` / `range_labels` read the cells a field points at.
+- **Writing** (`xlsx::chart_space_xml`): an edited chart is written with live
+  `numRef` / `strRef` refs *and* their caches, so Excel treats it as a real
+  chart bound to the cells and updates it when they change. Each cache is sized
+  from its own slot — a series' point count is its own values' — because series
+  are re-pointed one at a time and a chart-wide count would pad the short ones
+  with zeros the next parse would read back as real points.
+- **Only what can be authored is regenerated** (`xlsx::chart_is_writable`):
+  `chart_kind_is_writable` accepts bar, column, line and pie, and
+  `ChartData::complex` (set by `parse_chart` when the plot area holds more than
+  one `*Chart` group, or a `<c:grouping>` that isn't `clustered`/`standard`)
+  vetoes the rest. A scatter, doughnut, radar, bubble, stacked or combo chart
+  round-trips **verbatim** even when marked edited. A **multi-series pie** does
+  NOT, any more: `CT_PieChart` declares `ser` with `maxOccurs="unbounded"`
+  (`EG_PieChartShared`, ECMA-376 Part 1 `dml-chart.xsd`), so a `<c:pieChart>`
+  holding several `<c:ser>` is schema-valid — Excel merely plots the first — and
+  `chart_space_xml`'s pie arm writes every one of them, the same `{sers}` the
+  bar and line arms use. It used to emit `series.first()` alone, which is why
+  `parse_chart` marked such a chart `complex` and why every panel door refused
+  to build one; the writer stopped losing series, so both went
+  (`a_pie_that_arrives_with_two_series_stays_editable`,
+  `three_series_clicked_to_pie_survive_a_save_and_a_reopen`, and
+  [`suite/docs/pie-series.md`](suite/docs/pie-series.md)). The trade is the
+  usual one, said here because this change moved a class of chart across it: an
+  imported multi-series pie is now REGENERATED on edit rather than copied, so
+  its per-slice `<c:dPt>` fills, `<c:dLbls>`, legend placement and
+  `<c:firstSliceAng>` go the way they do on every other writable chart, where
+  before they round-tripped verbatim. A scatter's and a bubble's
+  `<c:xVal>`/`<c:yVal>`/`<c:bubbleSize>` ARE read — each folds into
+  `ChartData::source` and is kept on the series as `ChartSeries::point_refs`,
+  so the panel's `rebuild_source` sees the same cells the loader did instead of
+  rebuilding such a chart's box out of its label cells alone. What the LOADER
+  never gives those kinds is a `values_ref` or a cached point: the numbers under
+  `<c:xVal>` are not read, so regenerating one would write an EMPTY column
+  chart, which is why the kind isn't writable and the part round-trips verbatim.
+  (Live, the two slots can coexist — the panel's SERIES VALUES field is offered
+  for every kind, so re-pointing a scatter's series installs a `values_ref`
+  beside its `point_refs`, and `rebuild_source` folds both. Picking a writable
+  TYPE doesn't relabel such a chart into that empty chart either: if ANY of its
+  series still carries nothing but points, `chart_set_kind` authors the whole
+  chart afresh from its own box, so a half-re-pointed scatter can't keep the
+  series the user touched and lose the one nobody did. Points the loader could
+  not turn into a ref at all — a literal `<c:numLit>`, or an `<c:f>` too big to
+  hold — add nothing to `point_refs` and are recorded as
+  `ChartSeries::points_unheld` instead, so that door is shut on them too rather
+  than left open by the empty vec. The mark is per point ELEMENT, so a series
+  with one readable half and one unreadable one carries both it and a ref.) A
+  series `<c:f>` this model can't hold (a whole column, a defined name, a
+  multi-area ref) — under `<c:tx>`, `<c:val>` or `<c:cat>`, where `complex` is
+  the only place to say it — sets `complex` for the same reason: the slot
+  stays empty, and regenerating would write the cached numbers back as
+  `<c:numLit>`, freezing a live chart. A **`<c:multiLvlStrRef>` category** is
+  refused alongside them, for a reason of its own: that is Excel's MULTI-LEVEL
+  category (one `<c:lvl>` per level) where this model holds a single line of
+  labels, so regenerating would write a one-level `<c:strRef>` naming *every*
+  level's cells beside a cache holding one level's — the ref and its cache in
+  different orders. It is the import-side twin of the panel's
+  `categories_shape_err`. The **element** is what decides, not the shape of
+  its `<c:f>`: the usual multi-level ref is a rectangle, but two levels over
+  one category name the *line* `$A$2:$B$2`, which nothing in the range tells
+  from an ordinary row of labels. A `<c:cat>` rectangle stays refused on its
+  own account whoever wrote it, being a shape neither reading produces. Such a
+  chart comes back with `categories_ref = None`, a narrower `source` box and
+  its part kept verbatim (`parse_chart`,
+  `a_multi_level_category_ref_is_one_this_model_cannot_hold`,
+  `a_multi_level_category_over_one_category_is_refused_too`) — so unlike the
+  orientation cases the rest of this section describes, the symptom is a
+  frozen, shrunk-box chart rather than one that reads the wrong way round.
+  (Every kind above fires on a column-oriented chart too: a `<c:val>` of
+  `Sheet1!$B:$B` is the commonest of the lot, and it is a column chart's ref
+  far more often than a row chart's.)
+- **Sparse caches**: Excel omits the `<c:pt>` for a blank or non-numeric source
+  cell, so the parse places each point at its `idx` rather than appending.
+  Appending would shift everything after a gap one place left, and an edited
+  chart would write that shift back.
+- **Structural edits follow the refs** (`edit::shift_chart_refs`, called from
+  `structural_edit`): inserting or deleting rows and columns re-bases every
+  `ChartSource` — a `home` flag distinguishes a chart's own sheet from a
+  sheet-qualified ref — and a series whose cells are wholly deleted loses its
+  ref rather than being left plotting a stranger's numbers.
+- **Anchors are editable**: `Sheet::drawing_part`, `Sheet::drawings_removed` and
+  `Drawing::anchor_ix` are what let a save move or delete one drawing without
+  touching the rest of the part (see the save bullets above).
+
+Both editors use this: xlsxy's Insert ▸ Chart and the desktop suite's Chart
+panel, whose range fields are documented in
+[`suite/docs/range-selector.md`](suite/docs/range-selector.md). Those fields
+show and accept references the way Excel writes them — `=Budget!$A$1:$D$5`, with
+the `$` anchors and the sheet qualifier — and a qualifier naming another sheet is
+resolved against the workbook, so a chart can plot a sheet it doesn't float over.
+
+**Chart orientation.** Which way round a chart reads its range — each column a
+series (the default, and every chart written before the feature existed) or each
+row — is `ChartData::by_row`. Nothing in SpreadsheetML stores it, so the writer emits
+whatever rectangle each ref holds and the loader **infers** the flag back from
+their shape; the panel's `Switch Row/Column` button flips it by re-deriving the
+chart through `chart_from_range`. The inference's ambiguous cases and the
+`<c:cat>` fallback a row chart must not take are written up in
+[`suite/docs/chart-orientation.md`](suite/docs/chart-orientation.md).
 
 ---
 

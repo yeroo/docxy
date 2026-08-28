@@ -61,7 +61,7 @@ pub fn render(bytes: &[u8], w: u32, h: u32) -> Option<image::RgbaImage> {
         let n = (w * h * 4) as usize;
         let src = std::slice::from_raw_parts(bits as *const u8, n);
         let mut rgba = Vec::with_capacity(n);
-        for px in src.chunks_exact(4) {
+        for px in src.as_chunks::<4>().0 {
             // BGRX from GDI. These metafiles are mostly equations: black line-art on
             // the white page we filled. Drop the page to transparent so it blends
             // with the terminal instead of showing as a white sticker.

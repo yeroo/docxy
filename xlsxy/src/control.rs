@@ -1543,6 +1543,7 @@ mod tests {
         use gridcore::sheet::{ChartData, ChartSeries, Drawing, DrawingKind};
         let mut a = app();
         a.pkg.workbook.sheets[0].drawings.push(Drawing {
+            anchor_ix: 0,
             from: (0, 0),
             to: (10, 5),
             kind: DrawingKind::Chart(ChartData {
@@ -1552,7 +1553,9 @@ mod tests {
                 series: vec![ChartSeries {
                     name: "Q1".into(),
                     values: vec![10.0, 20.0],
+                    ..Default::default()
                 }],
+                ..Default::default()
             }),
         });
         let r = dispatch(&mut a, "chart.list", &Json::Null).unwrap();

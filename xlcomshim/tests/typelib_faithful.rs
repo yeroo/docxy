@@ -12,6 +12,7 @@
 //!     return-value convention,
 //!   * each parameter (and the return) ABI-equivalent in type, honoring the two
 //!     deliberate flattenings (enum -> I4, interface pointer -> IUnknown).
+//!
 //! That is thousands of assertions — one per parameter across ~940 methods —
 //! covering every corner of the surface.
 //!
@@ -101,10 +102,7 @@ unsafe fn abi_class(ti: &ITypeInfo, td: *const TYPEDESC) -> String {
             VT_DISPATCH | VT_UNKNOWN => "iface".into(),
             VT_USERDEFINED => {
                 // enum -> i4, everything else (interface/dispatch/coclass) -> iface
-                let kind = (*node)
-                    .Anonymous
-                    .hreftype
-                    .pipe(|href| ref_kind(ti, href));
+                let kind = (*node).Anonymous.hreftype.pipe(|href| ref_kind(ti, href));
                 match kind {
                     Some(TKIND_ENUM) => "i4".into(),
                     _ => "iface".into(),
@@ -189,11 +187,7 @@ fn typelib_matches_excel_oracle() {
             .status()
             .expect("run mktypelib");
         assert!(status.success(), "mktypelib failed");
-        let out_w: Vec<u16> = out
-            .to_string_lossy()
-            .encode_utf16()
-            .chain([0])
-            .collect();
+        let out_w: Vec<u16> = out.to_string_lossy().encode_utf16().chain([0]).collect();
         let ours: ITypeLib =
             LoadTypeLibEx(PCWSTR(out_w.as_ptr()), REGKIND_NONE).expect("load our tlb");
 
