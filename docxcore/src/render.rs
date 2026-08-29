@@ -175,10 +175,9 @@ impl LineSeg {
     }
     /// Column span [first, last] this segment occupies on screen.
     pub fn col_range(&self) -> (usize, usize) {
-        (
-            self.col0,
-            self.col0 + self.cols.last().copied().unwrap_or(0),
-        )
+        let min = self.cols.iter().copied().min().unwrap_or(0);
+        let max = self.cols.iter().copied().max().unwrap_or(0);
+        (self.col0 + min, self.col0 + max)
     }
 }
 
@@ -240,6 +239,49 @@ impl LineMap {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BidiBaseDirection {
+    Auto,
+    Ltr,
+    Rtl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BidiRunDirection {
+    #[default]
+    Natural,
+    Ltr,
+    Rtl,
+    LtrOverride,
+    RtlOverride,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BidiInputGlyph {
+    pub ch: char,
+    pub display: Option<String>,
+    pub logical_offset: Option<usize>,
+    pub direction: BidiRunDirection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BidiVisualCluster {
+    pub glyphs: Vec<usize>,
+    pub logical: Option<std::ops::Range<usize>>,
+    pub level: u8,
+    pub cells: std::ops::Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BidiVisualLine {
+    pub clusters: Vec<BidiVisualCluster>,
+    pub width: usize,
+}
+
+pub trait BidiProjector: std::fmt::Debug {
+    fn project_line(&self, base: BidiBaseDirection, glyphs: &[BidiInputGlyph]) -> BidiVisualLine;
+}
+
 #[derive(Debug, Clone)]
 pub struct RenderOptions {
     pub width: usize,
@@ -262,6 +304,10 @@ pub struct RenderOptions {
     pub title_page: bool,
     /// Even pages use the `even` variant (`<w:evenAndOddHeaders/>`).
     pub even_odd: bool,
+    /// Optional UI-provided Unicode Bidirectional Algorithm projection. Keeping
+    /// this as a hook lets `docxcore` stay dependency-free while `docxy` supplies
+    /// the actual UBA implementation for terminal display.
+    pub bidi: Option<Rc<dyn BidiProjector>>,
 }
 
 /// The three header (or footer) variants a section can define.
@@ -287,6 +333,7 @@ impl Default for RenderOptions {
             footers: PageParts::default(),
             title_page: false,
             even_odd: false,
+            bidi: None,
         }
     }
 }
@@ -950,6 +997,7 @@ struct Glyph {
     style: Style,
     link: Option<Rc<str>>,
     src: Option<usize>,
+    dir: BidiRunDirection,
     /// Set on the first cell of a small inline image (e.g. an equation) embedded
     /// in the text flow. The remaining cells are blank fillers reserving its width.
     img: Option<Rc<InlineImg>>,
@@ -973,7 +1021,12 @@ fn char_width(c: char) -> usize {
     if u == 0 {
         return 0;
     }
-    if (0x0300..=0x036F).contains(&u) || (0x200B..=0x200F).contains(&u) {
+    if (0x0300..=0x036F).contains(&u)
+        || (0x200B..=0x200F).contains(&u)
+        || (0x202A..=0x202E).contains(&u)
+        || (0x2066..=0x2069).contains(&u)
+        || u == 0x061C
+    {
         return 0; // combining marks / zero-width
     }
     let wide = matches!(u,
@@ -1000,9 +1053,21 @@ fn str_width(s: &str) -> usize {
     s.chars().map(char_width).sum()
 }
 
+fn is_bidi_format(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x061C | 0x200E | 0x200F | 0x202A..=0x202E | 0x2066..=0x2069
+    )
+}
+
+fn glyph_display(g: &Glyph) -> Option<char> {
+    let ch = g.disp.unwrap_or(g.ch);
+    (!is_bidi_format(ch)).then_some(ch)
+}
+
 /// Display width of a glyph (its shown char), in terminal cells.
 fn glyph_w(g: &Glyph) -> usize {
-    char_width(g.disp.unwrap_or(g.ch))
+    glyph_display(g).map(char_width).unwrap_or(0)
 }
 
 /// Style for invisible-character marks: a muted gray.
@@ -1024,6 +1089,25 @@ fn style_from_run(p: &RunProps) -> Style {
         // reversed video (same as a selection).
         highlight: p.highlight.is_some(),
         color: p.color.as_deref().and_then(parse_hex).map(quantize),
+    }
+}
+
+fn run_direction(p: &RunProps) -> BidiRunDirection {
+    if p.rtl {
+        BidiRunDirection::Rtl
+    } else {
+        BidiRunDirection::Natural
+    }
+}
+
+fn paragraph_base_direction(para: &Paragraph, opts: &RenderOptions) -> BidiBaseDirection {
+    match opts
+        .styles
+        .paragraph_rtl_override(para.props.style_id.as_deref(), &para.props)
+    {
+        Some(true) => BidiBaseDirection::Rtl,
+        Some(false) => BidiBaseDirection::Ltr,
+        None => BidiBaseDirection::Auto,
     }
 }
 
@@ -1127,7 +1211,12 @@ fn flatten_para(
     let sel_at = |mc: usize| sel.iter().any(|(s, e)| mc >= *s && mc < *e);
 
     // A normal text char, shown as `·` (gray) when it's a space and invisibles on.
-    let make = |ch: char, style: &Style, link: Option<Rc<str>>, mc: usize| -> Glyph {
+    let make = |ch: char,
+                style: &Style,
+                link: Option<Rc<str>>,
+                mc: usize,
+                dir: BidiRunDirection|
+     -> Glyph {
         let mut g = if inv && ch == ' ' {
             let mut st = invis_style();
             st.underline = style.underline; // keep link underline on a dotted link-space
@@ -1137,6 +1226,7 @@ fn flatten_para(
                 style: st,
                 link,
                 src: Some(mc),
+                dir,
                 img: None,
             }
         } else {
@@ -1146,6 +1236,7 @@ fn flatten_para(
                 style: style.clone(),
                 link,
                 src: Some(mc),
+                dir,
                 img: None,
             }
         };
@@ -1182,11 +1273,12 @@ fn flatten_para(
                 if heading {
                     st.bold = true;
                 }
+                let dir = run_direction(&eff);
                 for ch in r.text.chars() {
                     segs.last_mut()
                         .unwrap()
                         .glyphs
-                        .push(make(ch, &st, None, mc));
+                        .push(make(ch, &st, None, mc, dir));
                     mc += 1;
                 }
             }
@@ -1209,11 +1301,15 @@ fn flatten_para(
                     if heading {
                         st.bold = true;
                     }
+                    let dir = run_direction(&eff);
                     for ch in run.text.chars() {
-                        segs.last_mut()
-                            .unwrap()
-                            .glyphs
-                            .push(make(ch, &st, Some(rc.clone()), mc));
+                        segs.last_mut().unwrap().glyphs.push(make(
+                            ch,
+                            &st,
+                            Some(rc.clone()),
+                            mc,
+                            dir,
+                        ));
                         mc += 1;
                     }
                 }
@@ -1268,6 +1364,7 @@ fn flatten_para(
                         style,
                         link: None,
                         src: Some(mc),
+                        dir: run_direction(rp),
                         img: None,
                     });
                 }
@@ -1283,6 +1380,7 @@ fn flatten_para(
                                 style: invis_style(),
                                 link: None,
                                 src: None,
+                                dir: BidiRunDirection::Natural,
                                 img: None,
                             });
                         }
@@ -1320,6 +1418,7 @@ fn flatten_para(
                             style: Style::default(),
                             link: None,
                             src: None,
+                            dir: BidiRunDirection::Natural,
                             img: (i == 0).then(|| rc.clone()),
                         });
                     }
@@ -1343,6 +1442,7 @@ fn flatten_para(
                         style: st.clone(),
                         link: None,
                         src: None,
+                        dir: BidiRunDirection::Natural,
                         img: None,
                     });
                 }
@@ -1357,6 +1457,7 @@ fn flatten_para(
                         style: st.clone(),
                         link: None,
                         src: None,
+                        dir: BidiRunDirection::Natural,
                         img: None,
                     });
                 }
@@ -1372,6 +1473,7 @@ fn flatten_para(
                             &r.props,
                         );
                         let st = style_from_run(&eff);
+                        let dir = run_direction(&eff);
                         for ch in r.text.chars() {
                             segs.last_mut().unwrap().glyphs.push(Glyph {
                                 ch,
@@ -1379,6 +1481,7 @@ fn flatten_para(
                                 style: st.clone(),
                                 link: None,
                                 src: None,
+                                dir,
                                 img: None,
                             });
                         }
@@ -1395,6 +1498,7 @@ fn flatten_para(
                         style: st.clone(),
                         link: None,
                         src: None,
+                        dir: BidiRunDirection::Natural,
                         img: None,
                     });
                 }
@@ -1428,6 +1532,7 @@ fn flatten_para(
             style: invis_style(),
             link: None,
             src: None,
+            dir: BidiRunDirection::Natural,
             img: None,
         });
     }
@@ -1507,49 +1612,197 @@ fn is_trim_space(g: &Glyph) -> bool {
     g.ch == ' ' && !g.style.underline && !g.style.strike
 }
 
-fn glyphs_to_spans(glyphs: &[Glyph]) -> Vec<Span> {
-    let mut spans: Vec<Span> = Vec::new();
-    for g in glyphs {
-        let gl = g.link.as_deref();
-        let ch = g.disp.unwrap_or(g.ch);
-        if let Some(last) = spans.last_mut() {
-            if last.style == g.style && last.link.as_deref() == gl {
-                last.text.push(ch);
-                continue;
-            }
-        }
-        spans.push(Span {
-            text: ch.to_string(),
-            style: g.style.clone(),
-            link: g.link.as_ref().map(|r| r.to_string()),
+#[derive(Debug, Clone)]
+struct ProjectedLine {
+    spans: Vec<Span>,
+    width: usize,
+    start: usize,
+    cols: Vec<usize>,
+    glyph_cells: Vec<Option<std::ops::Range<usize>>>,
+}
+
+fn project_line(
+    glyphs: &[Glyph],
+    base: BidiBaseDirection,
+    projector: Option<&dyn BidiProjector>,
+) -> ProjectedLine {
+    let visual = if let Some(projector) = projector {
+        let input: Vec<BidiInputGlyph> = glyphs
+            .iter()
+            .map(|g| BidiInputGlyph {
+                ch: g.ch,
+                display: g.disp.map(|ch| ch.to_string()),
+                logical_offset: g.src,
+                direction: g.dir,
+            })
+            .collect();
+        projector.project_line(base, &input)
+    } else {
+        identity_visual_line(glyphs)
+    };
+
+    let spans = projected_spans(glyphs, &visual);
+    let glyph_cells = projected_glyph_cells(glyphs, &visual);
+    let (start, cols) = projected_extent(&visual);
+    ProjectedLine {
+        spans,
+        width: visual.width,
+        start,
+        cols,
+        glyph_cells,
+    }
+}
+
+fn identity_visual_line(glyphs: &[Glyph]) -> BidiVisualLine {
+    let mut width = 0usize;
+    let mut clusters = Vec::with_capacity(glyphs.len());
+    for (idx, glyph) in glyphs.iter().enumerate() {
+        let start = width;
+        width += glyph_w(glyph);
+        clusters.push(BidiVisualCluster {
+            glyphs: vec![idx],
+            logical: glyph.src.map(|s| s..s + 1),
+            level: 0,
+            cells: start..width,
         });
+    }
+    BidiVisualLine { clusters, width }
+}
+
+fn projected_spans(glyphs: &[Glyph], visual: &BidiVisualLine) -> Vec<Span> {
+    let mut spans: Vec<Span> = Vec::new();
+    for cluster in &visual.clusters {
+        for &idx in &cluster.glyphs {
+            let Some(g) = glyphs.get(idx) else {
+                continue;
+            };
+            let gl = g.link.as_deref();
+            let Some(ch) = glyph_display(g) else {
+                continue;
+            };
+            if let Some(last) = spans.last_mut() {
+                if last.style == g.style && last.link.as_deref() == gl {
+                    last.text.push(ch);
+                    continue;
+                }
+            }
+            spans.push(Span {
+                text: ch.to_string(),
+                style: g.style.clone(),
+                link: g.link.as_ref().map(|r| r.to_string()),
+            });
+        }
     }
     spans
 }
 
-/// Compute (start offset, column boundaries) for a wrapped line of glyphs.
-fn glyph_extent(glyphs: &[Glyph]) -> (usize, Vec<usize>) {
-    let mut cols = Vec::new();
-    let mut start = None;
-    let mut last_src = None;
-    let mut col = 0usize;
-    let mut last_end = 0usize;
-    for g in glyphs {
-        let w = glyph_w(g);
-        if let Some(s) = g.src {
-            if last_src != Some(s) {
-                if start.is_none() {
-                    start = Some(s);
-                }
-                cols.push(col);
-                last_src = Some(s);
-            }
-            last_end = col + w;
+fn projected_glyph_cells(
+    glyphs: &[Glyph],
+    visual: &BidiVisualLine,
+) -> Vec<Option<std::ops::Range<usize>>> {
+    let mut out = vec![None; glyphs.len()];
+    for cluster in &visual.clusters {
+        let mut col = cluster.cells.start;
+        for &idx in &cluster.glyphs {
+            let Some(glyph) = glyphs.get(idx) else {
+                continue;
+            };
+            let end = col + glyph_w(glyph);
+            out[idx] = Some(col..end);
+            col = end;
         }
-        col += w;
     }
-    cols.push(last_end);
-    (start.unwrap_or(0), cols)
+    out
+}
+
+#[derive(Debug, Clone)]
+struct LogicalExtent {
+    start: usize,
+    end: usize,
+    level: u8,
+    cells: std::ops::Range<usize>,
+}
+
+fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
+    let mut extents: Vec<LogicalExtent> = Vec::new();
+    for cluster in &visual.clusters {
+        let Some(logical) = &cluster.logical else {
+            continue;
+        };
+        if let Some(existing) = extents
+            .iter_mut()
+            .find(|extent| extent.start == logical.start && extent.end == logical.end)
+        {
+            existing.cells.start = existing.cells.start.min(cluster.cells.start);
+            existing.cells.end = existing.cells.end.max(cluster.cells.end);
+        } else {
+            extents.push(LogicalExtent {
+                start: logical.start,
+                end: logical.end,
+                level: cluster.level,
+                cells: cluster.cells.clone(),
+            });
+        }
+    }
+
+    if extents.is_empty() {
+        return (0, vec![0]);
+    }
+
+    let start = extents.iter().map(|extent| extent.start).min().unwrap_or(0);
+    let end = extents
+        .iter()
+        .map(|extent| extent.end)
+        .max()
+        .unwrap_or(start);
+    let mut cols = vec![None; end.saturating_sub(start) + 1];
+    extents.sort_by_key(|extent| (extent.start, extent.end));
+    for extent in extents {
+        let leading = if extent.level % 2 == 1 {
+            extent.cells.end
+        } else {
+            extent.cells.start
+        };
+        let trailing = if extent.level % 2 == 1 {
+            extent.cells.start
+        } else {
+            extent.cells.end
+        };
+        let s = extent.start - start;
+        let e = extent.end - start;
+        cols[s].get_or_insert(leading);
+        cols[e] = Some(trailing);
+        for slot in cols.iter_mut().take(e).skip(s + 1) {
+            slot.get_or_insert(leading);
+        }
+    }
+
+    let mut last = 0usize;
+    let cols = cols
+        .into_iter()
+        .map(|col| {
+            if let Some(col) = col {
+                last = col;
+            }
+            last
+        })
+        .collect();
+    (start, cols)
+}
+
+fn prefix_glyphs(prefix: &str) -> Vec<Glyph> {
+    prefix
+        .chars()
+        .map(|ch| Glyph {
+            ch,
+            disp: None,
+            style: Style::default(),
+            link: None,
+            src: None,
+            dir: BidiRunDirection::Natural,
+            img: None,
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1627,6 +1880,7 @@ fn render_paragraph(
         }
     }
     let mut line_idx = 0usize;
+    let base_direction = paragraph_base_direction(para, opts);
     for seg in &segs {
         if let Some(bidx) = seg.block {
             emit_block_item(
@@ -1665,19 +1919,18 @@ fn render_paragraph(
             } else {
                 &cont_prefix
             };
-            let body_w = gl.iter().map(glyph_w).sum::<usize>();
-            let total = prefix.chars().count() + body_w;
+            let prefix_count = prefix.chars().count();
+            let mut line_glyphs = prefix_glyphs(prefix);
+            line_glyphs.extend(gl.iter().cloned());
+            let projected = project_line(&line_glyphs, base_direction, opts.bidi.as_deref());
+            let total = projected.width;
             let align = opts
                 .styles
                 .effective_align(para.props.style_id.as_deref(), para.props.align);
-            // A right-to-left (`w:bidi`) paragraph anchors to the right, as Word
-            // does: with no explicit `w:jc`, the paragraph "start" is the right
-            // edge. (Terminal cells can't shape/reorder the script itself, so this
-            // right-alignment is the visual cue; explicit centre/justify are kept.)
-            let rtl = opts
-                .styles
-                .effective_rtl(para.props.style_id.as_deref(), &para.props);
-            let align = if rtl && align == Align::Left {
+            // Bidi direction chooses the paragraph's base embedding level.
+            // Alignment is still just padding around the projected visual line:
+            // it must not reverse text a second time.
+            let align = if base_direction == BidiBaseDirection::Rtl && align == Align::Left {
                 Align::Right
             } else {
                 align
@@ -1691,15 +1944,17 @@ fn render_paragraph(
             if lead > 0 {
                 line.spans.push(Line::text_span(" ".repeat(lead)));
             }
-            if !prefix.is_empty() {
-                line.spans.push(Line::text_span(prefix.clone()));
-            }
-            line.spans.extend(glyphs_to_spans(&gl));
-            let prefix_cols = lead + prefix.chars().count();
-            let (start, cols) = glyph_extent(&gl);
+            let line_start_col = projected.cols.iter().copied().min().unwrap_or(0);
+            line.spans.extend(projected.spans.clone());
+            let prefix_cols = lead + line_start_col;
+            let cols = projected
+                .cols
+                .iter()
+                .map(|col| col.saturating_sub(line_start_col))
+                .collect();
             let lseg = LineSeg {
                 path: path.to_vec(),
-                start,
+                start: projected.start,
                 col0: prefix_cols,
                 cols,
             };
@@ -1709,10 +1964,17 @@ fn render_paragraph(
             let mut reserve = 0usize;
             for (i, g) in gl.iter().enumerate() {
                 if let Some(img) = &g.img {
+                    let projected_idx = prefix_count + i;
+                    let col = projected
+                        .glyph_cells
+                        .get(projected_idx)
+                        .and_then(|cells| cells.as_ref())
+                        .map(|cells| lead + cells.start)
+                        .unwrap_or(prefix_cols + i);
                     images.push(ImageBox {
                         rid: img.rid.clone(),
                         row,
-                        col: prefix_cols + i,
+                        col,
                         cols: img.cols,
                         rows: img.rows,
                         src_row: 0,

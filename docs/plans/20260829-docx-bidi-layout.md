@@ -94,15 +94,15 @@ Task 1 notes:
 
 ### Task 3: Integrate bidi with wrapping and alignment
 
-- [ ] make line wrapping produce logical ranges and a visual projection per line,
+- [x] make line wrapping produce logical ranges and a visual projection per line,
       with paragraph base direction applied independently after each wrap
-- [ ] align RTL and explicitly aligned paragraphs without double-reversing or
+- [x] align RTL and explicitly aligned paragraphs without double-reversing or
       treating right alignment as reordering
-- [ ] integrate projections in ordinary paragraphs, list labels, table cells,
+- [x] integrate projections in ordinary paragraphs, list labels, table cells,
       headers/footers, page view, fields, hyperlinks, and revision display spans
-- [ ] preserve clipping, scrolling, tiny viewport, and horizontal offset behavior
-- [ ] add renderer-state tests for wrapped LTR/RTL/mixed text in body and tables
-- [ ] run `cargo test -p docxy` before Task 4
+- [x] preserve clipping, scrolling, tiny viewport, and horizontal offset behavior
+- [x] add renderer-state tests for wrapped LTR/RTL/mixed text in body and tables
+- [x] run `cargo test -p docxy` before Task 4
 
 ### Task 4: Route navigation, selection, and mouse input through the map
 

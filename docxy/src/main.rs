@@ -1198,6 +1198,7 @@ impl App {
             },
             title_page: self.title_page,
             even_odd: self.even_odd,
+            bidi: Some(bidi::projector()),
         }
     }
 
@@ -5868,6 +5869,7 @@ impl backstage::BackstageHost for App {
                 let opts = RenderOptions {
                     width: w,
                     styles: Rc::new(styles),
+                    bidi: Some(bidi::projector()),
                     ..RenderOptions::default()
                 };
                 docxcore::render::render(&pkg.document, &opts)
@@ -6658,6 +6660,191 @@ mod tests {
         // Unknown/blank lines are ignored; missing keys default off.
         let partial = ViewPrefs::parse("invisibles=1\nbogus=1\n");
         assert!(partial.invisibles && !partial.page_view && !partial.borderless);
+    }
+
+    fn bidi_opts(width: usize) -> RenderOptions {
+        RenderOptions {
+            width,
+            bidi: Some(bidi::projector()),
+            ..RenderOptions::default()
+        }
+    }
+
+    fn bidi_run(text: &str) -> Inline {
+        Inline::Run(Run {
+            text: text.to_string(),
+            props: RunProps::default(),
+        })
+    }
+
+    fn bidi_run_with(text: &str, props: RunProps) -> Inline {
+        Inline::Run(Run {
+            text: text.to_string(),
+            props,
+        })
+    }
+
+    fn bidi_para(text: &str) -> Block {
+        Block::Paragraph(MPara {
+            props: ParProps::default(),
+            content: vec![bidi_run(text)],
+        })
+    }
+
+    fn bidi_para_with(props: ParProps, content: Vec<Inline>) -> Block {
+        Block::Paragraph(MPara { props, content })
+    }
+
+    fn bidi_doc(blocks: Vec<Block>) -> Document {
+        Document { body: blocks }
+    }
+
+    #[test]
+    fn bidi_renderer_wraps_body_lines_in_visual_order() {
+        let doc = bidi_doc(vec![bidi_para("abc אבג def")]);
+        let (lines, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(7));
+        let plain: Vec<String> = lines.iter().map(|line| line.plain()).collect();
+
+        assert_eq!(plain, vec!["abc גבא", "def"]);
+        assert_eq!(maps[0].segs[0].start, 0);
+        assert_eq!(maps[1].segs[0].start, 8);
+        assert_eq!(maps[0].segs[0].col_for_offset(0), Some(0));
+    }
+
+    #[test]
+    fn bidi_renderer_keeps_alignment_separate_from_reordering() {
+        let mut right = ParProps::default();
+        right.align = Align::Right;
+        let right_doc = bidi_doc(vec![bidi_para_with(right, vec![bidi_run("abc אבג")])]);
+        let right_line = docxcore::render::render(&right_doc, &bidi_opts(12))[0].plain();
+        assert_eq!(right_line, "     abc גבא");
+
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let rtl_doc = bidi_doc(vec![bidi_para_with(rtl, vec![bidi_run("שלום")])]);
+        let rtl_line = docxcore::render::render(&rtl_doc, &bidi_opts(8))[0].plain();
+        assert_eq!(rtl_line, "    םולש");
+    }
+
+    #[test]
+    fn bidi_renderer_projects_table_cells_and_maps() {
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let cell = |block: Block| Cell {
+            grid_span: 1,
+            v_merge: VMerge::None,
+            blocks: vec![block],
+            ..Cell::default()
+        };
+        let table = Table {
+            grid: vec![100, 100],
+            rows: vec![Row {
+                cells: vec![
+                    cell(bidi_para("abc אבג")),
+                    cell(bidi_para_with(rtl, vec![bidi_run("שלום")])),
+                ],
+                ..Row::default()
+            }],
+            ..Table::default()
+        };
+        let doc = bidi_doc(vec![Block::Table(table)]);
+        let (lines, maps) = docxcore::render::render_mapped(&doc, &bidi_opts(30));
+        let joined = lines
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("abc גבא"), "{joined}");
+        assert!(joined.contains("םולש"), "{joined}");
+        assert!(maps.iter().any(|map| {
+            map.segs
+                .iter()
+                .any(|seg| seg.path == vec![0, 0, 0, 0] && seg.col_for_offset(0).is_some())
+        }));
+        assert!(maps.iter().any(|map| {
+            map.segs
+                .iter()
+                .any(|seg| seg.path == vec![0, 0, 1, 0] && seg.col_for_offset(0).is_some())
+        }));
+    }
+
+    #[test]
+    fn bidi_renderer_projects_page_header_footer_and_body() {
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let opts = RenderOptions {
+            width: 50,
+            page_view: true,
+            headers: PageParts {
+                default: Rc::new(vec![bidi_para_with(rtl.clone(), vec![bidi_run("שלום")])]),
+                ..PageParts::default()
+            },
+            footers: PageParts {
+                default: Rc::new(vec![bidi_para_with(rtl, vec![bidi_run("אבג")])]),
+                ..PageParts::default()
+            },
+            bidi: Some(bidi::projector()),
+            ..RenderOptions::default()
+        };
+        let doc = bidi_doc(vec![bidi_para("body אבג")]);
+        let rendered = render_with_page_layout(&doc, &opts);
+        let joined = rendered
+            .lines
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(joined.contains("םולש"), "{joined}");
+        assert!(joined.contains("גבא"), "{joined}");
+        assert!(joined.contains("body גבא"), "{joined}");
+    }
+
+    #[test]
+    fn bidi_renderer_preserves_link_field_and_revision_spans() {
+        let link = Inline::Hyperlink(Hyperlink {
+            target: Some("https://x.test/".to_string()),
+            runs: vec![Run {
+                text: "go אבג".to_string(),
+                props: RunProps::default(),
+            }],
+            ..Hyperlink::default()
+        });
+        let field = Inline::Field {
+            raw: "<w:fldSimple/>".to_string(),
+            text: "REF אבג".to_string(),
+        };
+        let strike = RunProps {
+            strike: true,
+            ..RunProps::default()
+        };
+        let revision = Inline::Revision {
+            kind: RevisionKind::Delete,
+            metadata: RevisionMetadata::default(),
+            raw: "<w:del/>".to_string(),
+            content: vec![bidi_run_with("old אב", strike)],
+            content_changed: false,
+        };
+        let doc = bidi_doc(vec![
+            bidi_para_with(ParProps::default(), vec![link]),
+            bidi_para_with(ParProps::default(), vec![field]),
+            bidi_para_with(ParProps::default(), vec![revision]),
+        ]);
+        let lines = docxcore::render::render(&doc, &bidi_opts(30));
+        let plain: Vec<String> = lines.iter().map(|line| line.plain()).collect();
+
+        assert_eq!(plain[0], "go גבא");
+        assert_eq!(plain[1], "REF גבא");
+        assert_eq!(plain[2], "old בא");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .filter(|span| !span.text.trim().is_empty())
+                .all(|span| span.link.as_deref() == Some("https://x.test/"))
+        );
+        assert!(lines[2].spans.iter().any(|span| span.style.strike));
     }
 
     fn key(code: KeyCode) -> KeyEvent {

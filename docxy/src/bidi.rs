@@ -8,7 +8,12 @@
 #![allow(dead_code)]
 
 use std::ops::Range;
+use std::rc::Rc;
 
+use docxcore::render::{
+    BidiBaseDirection as CoreBaseDirection, BidiInputGlyph, BidiProjector, BidiRunDirection,
+    BidiVisualCluster, BidiVisualLine,
+};
 use unicode_bidi::{BidiInfo, Level, ParagraphBidiInfo};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -218,6 +223,66 @@ impl<T: Clone> VisualLineBuilder<T> {
             }
         }
         (text, sources)
+    }
+}
+
+#[derive(Debug, Default)]
+struct UnicodeBidiProjector;
+
+pub(crate) fn projector() -> Rc<dyn BidiProjector> {
+    Rc::new(UnicodeBidiProjector)
+}
+
+impl BidiProjector for UnicodeBidiProjector {
+    fn project_line(&self, base: CoreBaseDirection, glyphs: &[BidiInputGlyph]) -> BidiVisualLine {
+        let mut builder = VisualLineBuilder::new(base_direction(base));
+        for (idx, glyph) in glyphs.iter().enumerate() {
+            builder.push_char(glyph.ch, glyph.display.clone(), glyph.logical_offset, idx);
+        }
+
+        let mut start = 0usize;
+        while start < glyphs.len() {
+            let direction = glyphs[start].direction;
+            let mut end = start + 1;
+            while end < glyphs.len() && glyphs[end].direction == direction {
+                end += 1;
+            }
+            builder.push_direction(start, run_direction(direction));
+            start = end;
+        }
+
+        let line = builder.build();
+        BidiVisualLine {
+            width: line.width,
+            clusters: line
+                .clusters
+                .into_iter()
+                .map(|cluster| BidiVisualCluster {
+                    glyphs: cluster.chars.iter().map(|ch| ch.owner).collect(),
+                    logical: cluster.logical,
+                    level: cluster.level,
+                    cells: cluster.cells,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn base_direction(direction: CoreBaseDirection) -> BaseDirection {
+    match direction {
+        CoreBaseDirection::Auto => BaseDirection::Auto,
+        CoreBaseDirection::Ltr => BaseDirection::Ltr,
+        CoreBaseDirection::Rtl => BaseDirection::Rtl,
+    }
+}
+
+fn run_direction(direction: BidiRunDirection) -> RunDirection {
+    match direction {
+        BidiRunDirection::Natural => RunDirection::Natural,
+        BidiRunDirection::Ltr => RunDirection::Ltr,
+        BidiRunDirection::Rtl => RunDirection::Rtl,
+        BidiRunDirection::LtrOverride => RunDirection::LtrOverride,
+        BidiRunDirection::RtlOverride => RunDirection::RtlOverride,
     }
 }
 

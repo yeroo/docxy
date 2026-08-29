@@ -153,19 +153,30 @@ impl StyleSheet {
     /// Effective paragraph direction: direct `w:bidi` wins; an explicit direct
     /// off value captured in `raw_props` blocks style inheritance.
     pub fn effective_rtl(&self, para_style: Option<&str>, direct: &ParProps) -> bool {
+        self.paragraph_rtl_override(para_style, direct)
+            .unwrap_or(false)
+    }
+
+    /// Explicit or inherited paragraph direction, if OOXML provides one.
+    /// `None` means layout should infer the bidi base direction from content.
+    pub fn paragraph_rtl_override(
+        &self,
+        para_style: Option<&str>,
+        direct: &ParProps,
+    ) -> Option<bool> {
         if direct.rtl {
-            return true;
+            return Some(true);
         }
         if has_raw_child(&direct.raw_props, "bidi") {
-            return false;
+            return Some(false);
         }
         if let Some(s) = para_style {
             let mut seen = HashSet::new();
             if let Some(rtl) = self.fold_rtl(s, &mut seen) {
-                return rtl;
+                return Some(rtl);
             }
         }
-        false
+        None
     }
 
     fn fold(&self, agg: &mut PartialRun, id: &str, seen: &mut HashSet<String>) {
