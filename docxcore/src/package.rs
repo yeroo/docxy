@@ -18,6 +18,7 @@ use crate::serialize::document_to_xml;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 use crate::zipwrite::write_zip;
+use std::borrow::Cow;
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
@@ -25,6 +26,47 @@ fn decode_xml_entities(s: &str) -> String {
     let mut decoded = String::new();
     XmlParser::append_decoded(s, &mut decoded);
     decoded
+}
+
+/// Decode an OPC XML part in one of the encodings XML processors must
+/// recognize without an external declaration. OOXML normally uses UTF-8, but
+/// valid packages may use UTF-16LE/BE for individual XML parts.
+fn decode_xml_part(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    if let Some(utf8) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
+        return std::str::from_utf8(utf8).ok().map(Cow::Borrowed);
+    }
+
+    let utf16 = if let Some(rest) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        Some((rest, true))
+    } else if let Some(rest) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        Some((rest, false))
+    } else if bytes.starts_with(&[b'<', 0, b'?', 0]) {
+        Some((bytes, true))
+    } else if bytes.starts_with(&[0, b'<', 0, b'?']) {
+        Some((bytes, false))
+    } else {
+        None
+    };
+
+    if let Some((encoded, little_endian)) = utf16 {
+        let mut chunks = encoded.chunks_exact(2);
+        let units = chunks
+            .by_ref()
+            .map(|pair| {
+                if little_endian {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                }
+            })
+            .collect::<Vec<_>>();
+        if !chunks.remainder().is_empty() {
+            return None;
+        }
+        return String::from_utf16(&units).ok().map(Cow::Owned);
+    }
+
+    std::str::from_utf8(bytes).ok().map(Cow::Borrowed)
 }
 
 /// Whether `w:documentProtection` is actually enforced.
@@ -159,6 +201,27 @@ pub struct Watermark {
     pub header: WatermarkHeader,
 }
 
+/// Compatibility label derived from already-parsed watermark metadata.
+/// Renderers can keep the structured records as their single source of truth
+/// without asking the package to parse the same header parts a second time.
+pub fn watermark_label_from(watermarks: &[Watermark]) -> Option<String> {
+    watermarks
+        .iter()
+        .find_map(|watermark| match &watermark.kind {
+            WatermarkKind::Text(text) => Some(text.clone()),
+            WatermarkKind::Picture | WatermarkKind::Unknown => None,
+        })
+        .or_else(|| {
+            watermarks
+                .iter()
+                .find_map(|watermark| match watermark.kind {
+                    WatermarkKind::Picture => Some("picture (preview unavailable)".to_string()),
+                    WatermarkKind::Unknown => Some("unsupported (preview unavailable)".to_string()),
+                    WatermarkKind::Text(_) => None,
+                })
+        })
+}
+
 fn local_name(name: &str) -> &str {
     name.rsplit_once(':').map_or(name, |(_, local)| local)
 }
@@ -216,9 +279,12 @@ fn parse_protection(xml: &str) -> Protection {
             }
             Event::Start if local_name(parser.name()) == "writeProtection" => {
                 protection.source.write_protection_present = true;
-                protection.advisory_write_protection = true;
-                protection.source.write_recommended_value =
-                    decoded_attr_by_local(&parser, "recommended");
+                let recommended = decoded_attr_by_local(&parser, "recommended");
+                protection.advisory_write_protection = recommended
+                    .as_deref()
+                    .and_then(parse_ooxml_bool)
+                    .unwrap_or(false);
+                protection.source.write_recommended_value = recommended;
             }
             Event::Eof => break,
             _ => {}
@@ -276,10 +342,6 @@ fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
                 }
                 if let Some(shape) = shapes.last_mut() {
                     shape.texts.push(text);
-                } else {
-                    // Keep compatibility with producers that omit the surrounding
-                    // VML shape but still use Word's watermark textpath encoding.
-                    out.push(WatermarkKind::Text(text));
                 }
             }
             Event::Start if local_name(parser.name()) == "imagedata" => {
@@ -299,7 +361,7 @@ fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
                 let Some(shape) = shapes.pop() else {
                     continue;
                 };
-                if !shape.texts.is_empty() {
+                if shape.marked && !shape.texts.is_empty() {
                     out.extend(shape.texts.into_iter().map(WatermarkKind::Text));
                 } else if shape.marked && shape.picture {
                     out.push(WatermarkKind::Picture);
@@ -347,12 +409,20 @@ impl Package {
         let Some(bytes) = self.part("word/settings.xml") else {
             return Protection::default();
         };
-        let Ok(xml) = std::str::from_utf8(bytes) else {
-            let mut protection = Protection::default();
-            protection.source.settings_part_present = true;
-            return protection;
+        let Some(xml) = decode_xml_part(bytes) else {
+            return Protection {
+                enforcement: ProtectionEnforcement::Enforced,
+                edit_mode: Some(ProtectionEditMode::Unknown(
+                    "unreadable settings XML".to_string(),
+                )),
+                source: ProtectionSource {
+                    settings_part_present: true,
+                    ..ProtectionSource::default()
+                },
+                ..Protection::default()
+            };
         };
-        parse_protection(xml)
+        parse_protection(&xml)
     }
 
     /// Compatibility label for existing status and control surfaces.
@@ -372,14 +442,10 @@ impl Package {
 
         let rels = self
             .part("word/_rels/document.xml.rels")
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .map(parse_rels_xml)
+            .and_then(decode_xml_part)
+            .map(|xml| parse_rels_xml(&xml))
             .unwrap_or_default();
-        let even_and_odd = self
-            .part("word/settings.xml")
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .and_then(|xml| settings_flag_of(xml, "w:evenAndOddHeaders"))
-            .unwrap_or(false);
+        let even_and_odd = self.has_even_odd();
 
         let mut sections: Vec<&str> = self
             .document
@@ -434,10 +500,10 @@ impl Package {
                 let Some(bytes) = self.part(&header.part_name) else {
                     continue;
                 };
-                let Ok(xml) = std::str::from_utf8(bytes) else {
+                let Some(xml) = decode_xml_part(bytes) else {
                     continue;
                 };
-                for kind in watermark_kinds(xml) {
+                for kind in watermark_kinds(&xml) {
                     out.push(Watermark {
                         kind,
                         header: WatermarkHeader {
@@ -457,19 +523,7 @@ impl Package {
     /// Compatibility label for status text while renderers consume [`Watermark`].
     pub fn watermark_label(&self) -> Option<String> {
         let watermarks = self.watermarks();
-        watermarks
-            .iter()
-            .find_map(|w| match &w.kind {
-                WatermarkKind::Text(text) => Some(text.clone()),
-                WatermarkKind::Picture | WatermarkKind::Unknown => None,
-            })
-            .or_else(|| {
-                watermarks.iter().find_map(|w| match w.kind {
-                    WatermarkKind::Picture => Some("picture (preview unavailable)".to_string()),
-                    WatermarkKind::Unknown => Some("unsupported (preview unavailable)".to_string()),
-                    WatermarkKind::Text(_) => None,
-                })
-            })
+        watermark_label_from(&watermarks)
     }
 
     /// Whether the document defines page borders (`w:pgBorders` in any section).
@@ -603,7 +657,8 @@ impl Package {
     /// element is absent, otherwise its `w:val` (absent `w:val` means on).
     fn settings_flag(&self, elem: &str) -> Option<bool> {
         let b = self.part("word/settings.xml")?;
-        settings_flag_of(&String::from_utf8_lossy(b), elem)
+        let xml = decode_xml_part(b)?;
+        settings_flag_of(&xml, elem)
     }
 
     /// Toggle automatic hyphenation for the document (`<w:autoHyphenation/>`).
@@ -1896,6 +1951,48 @@ mod tests {
             Some("true")
         );
         assert_eq!(protection.label(), Some("read-only (recommended)"));
+
+        for xml in [
+            r#"<w:settings><w:writeProtection w:recommended="false"/></w:settings>"#,
+            r#"<w:settings><w:writeProtection/></w:settings>"#,
+        ] {
+            let protection = parse_protection(xml);
+            assert!(protection.source.write_protection_present);
+            assert!(!protection.advisory_write_protection, "{xml}");
+            assert_eq!(protection.label(), None, "{xml}");
+        }
+    }
+
+    #[test]
+    fn protection_decodes_utf16_settings_and_fails_closed_when_unreadable() {
+        fn utf16le(xml: &str) -> Vec<u8> {
+            [0xff, 0xfe]
+                .into_iter()
+                .chain(xml.encode_utf16().flat_map(u16::to_le_bytes))
+                .collect()
+        }
+
+        let bytes = make_metadata_docx(BODY, Some("<w:settings/>"), None, &[]);
+        let mut pkg = load_package(&bytes).expect("load");
+        assert!(pkg.set_part(
+            "word/settings.xml",
+            utf16le(
+                r#"<?xml version="1.0" encoding="UTF-16"?><w:settings><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#,
+            ),
+        ));
+        assert_eq!(
+            pkg.protection().edit_mode,
+            Some(ProtectionEditMode::ReadOnly)
+        );
+        assert_eq!(pkg.protection_label(), Some("read-only"));
+
+        assert!(pkg.set_part("word/settings.xml", vec![0xff, 0xfe, 0x00]));
+        let unreadable = pkg.protection();
+        assert!(unreadable.is_enforced());
+        assert!(matches!(
+            unreadable.edit_mode,
+            Some(ProtectionEditMode::Unknown(ref mode)) if mode == "unreadable settings XML"
+        ));
     }
 
     #[test]
@@ -2000,6 +2097,47 @@ mod tests {
                 .watermark_label()
                 .as_deref(),
             Some("picture (preview unavailable)")
+        );
+    }
+
+    #[test]
+    fn watermark_detection_requires_a_marker_and_covers_drawingml_pictures() {
+        assert!(watermark_kinds(
+            r#"<v:shape id="DecorativeWordArt"><v:textpath string="Quarterly report"/></v:shape>"#
+        )
+        .is_empty());
+        assert!(watermark_kinds(r#"<v:textpath string="Quarterly report"/>"#).is_empty());
+        assert_eq!(
+            watermark_kinds(r#"<wp:docPr id="7" name="Watermark picture"/>"#),
+            vec![WatermarkKind::Picture]
+        );
+
+        let document = r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p/><w:sectPr><w:headerReference w:type="default" r:id="rHeader"/></w:sectPr></w:body></w:document>"#;
+        let rels =
+            r#"<Relationships><Relationship Id="rHeader" Target="header1.xml"/></Relationships>"#;
+        let ordinary = make_metadata_docx(
+            document,
+            None,
+            Some(rels),
+            &[(
+                "header1.xml",
+                r#"<w:hdr xmlns:w="w" xmlns:v="v"><v:shape id="DecorativeWordArt"><v:textpath string="Quarterly report"/></v:shape></w:hdr>"#,
+            )],
+        );
+        assert!(load_package(&ordinary).unwrap().watermarks().is_empty());
+
+        let drawing = make_metadata_docx(
+            document,
+            None,
+            Some(rels),
+            &[(
+                "header1.xml",
+                r#"<w:hdr xmlns:w="w" xmlns:wp="wp"><wp:docPr id="7" name="Watermark picture"/></w:hdr>"#,
+            )],
+        );
+        assert_eq!(
+            load_package(&drawing).unwrap().watermarks()[0].kind,
+            WatermarkKind::Picture
         );
     }
 

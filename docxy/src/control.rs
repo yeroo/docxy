@@ -165,8 +165,8 @@ fn path_info(app: &App) -> Json {
     if let Some(p) = app.doc_protection.label() {
         fields.push(("protection", Json::Str(p.to_string())));
     }
-    if let Some(w) = &app.doc_watermark {
-        fields.push(("watermark", Json::Str(w.clone())));
+    if let Some(w) = app.watermark_state.label() {
+        fields.push(("watermark", Json::Str(w)));
     }
     Json::obj(fields)
 }
@@ -705,6 +705,7 @@ fn finish_edit(app: &mut App) {
     app.editor.clamp();
     app.modified = true;
     app.dirty = true;
+    app.refresh_watermark_state_if_needed();
 }
 
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
@@ -1476,13 +1477,16 @@ mod tests {
 
     #[test]
     fn path_reports_protection_and_watermark_when_set() {
-        let mut app = app_with(&["x"]);
+        let mut app = App::new(
+            crate::test_fixtures::WatermarkFixture::Text.package(),
+            "watermark.docx",
+            false,
+        );
         app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
         app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::ReadOnly);
-        app.doc_watermark = Some("CONFIDENTIAL".to_string());
         let r = path_info(&app);
         assert_eq!(r.get_str("protection"), Some("read-only"));
-        assert_eq!(r.get_str("watermark"), Some("CONFIDENTIAL"));
+        assert_eq!(r.get_str("watermark"), Some("CONFIDENTIAL & REVIEW"));
     }
 
     #[test]
@@ -1720,6 +1724,16 @@ mod tests {
                 Some("read-only (recommended)"),
                 None,
                 None,
+            ),
+            (
+                ProtectionFixture::Unknown,
+                Some("restricted editing"),
+                Some(
+                    "protection_denied:unsupported_mode: the document uses unsupported protection mode 'producerSpecific'",
+                ),
+                Some(
+                    "protection_denied:unsupported_mode: the document uses unsupported protection mode 'producerSpecific'",
+                ),
             ),
         ];
 

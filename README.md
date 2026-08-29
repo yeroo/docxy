@@ -63,6 +63,14 @@ docxy assets/sample.docx
 - **Find & replace**, full **clipboard** (syncs with the OS clipboard),
   **selection + formatting**, word navigation, and **show-invisibles**.
 - **Headers & footers**, multi-section page layout, and **print/page view**.
+- **DOCX protection** honored across TUI and automation edits: read-only,
+  comments-only, and formatting-only restrictions are enforced; unsupported
+  forms-only and tracked-changes-only editing fails closed. Advisory write
+  protection remains editable and is shown as a warning.
+- **Watermark previews** in page view: applied text watermarks render as
+  non-interactive overlays, while picture or unsupported watermarks show a
+  preview-unavailable label. Overlay text never enters copy/export output or
+  saved OOXML.
 
 ### Markdown
 - Open and edit `.md` files directly; **Save As** to a `.md` or `.docx` name

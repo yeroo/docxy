@@ -4,8 +4,8 @@
 //! document lines or caret maps, so it cannot affect editing, hit testing,
 //! selection, copy, export, or saved OOXML.
 
-use docxcore::model::Block;
-use docxcore::package::{HeaderVariant, Package, Watermark, WatermarkKind};
+use docxcore::model::{Block, Document};
+use docxcore::package::{HeaderVariant, Package, Watermark, WatermarkKind, watermark_label_from};
 use docxcore::render::{Line, PageBox};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -15,9 +15,13 @@ pub(crate) struct State {
     marks: Vec<Watermark>,
     title_page_sections: Vec<bool>,
     even_odd: bool,
+    /// Body section properties used to build `marks`. `None` is reserved for
+    /// synthetic renderer-test states that are not tied to a live document.
+    section_breaks: Option<Vec<String>>,
 }
 
 impl State {
+    #[cfg(test)]
     pub(crate) fn new(
         marks: Vec<Watermark>,
         title_page_sections: Vec<bool>,
@@ -27,11 +31,12 @@ impl State {
             marks,
             title_page_sections,
             even_odd,
+            section_breaks: None,
         }
     }
 
     pub(crate) fn from_package(pkg: &Package) -> Self {
-        let mut title_page_sections = pkg
+        let section_breaks = pkg
             .document
             .body
             .iter()
@@ -39,16 +44,44 @@ impl State {
                 Block::Paragraph(p) => p.props.section_break.as_deref(),
                 Block::Table(_) | Block::Raw(_) => None,
             })
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let mut title_page_sections = section_breaks
+            .iter()
             .map(|sect_pr| flag_on(sect_pr, "titlePg"))
             .collect::<Vec<_>>();
         title_page_sections.push(flag_on(pkg.sect_pr(), "titlePg"));
 
-        let even_odd = pkg
-            .part("word/settings.xml")
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            .is_some_and(|xml| flag_on(xml, "evenAndOddHeaders"));
+        let even_odd = pkg.has_even_odd();
 
-        Self::new(pkg.watermarks(), title_page_sections, even_odd)
+        Self {
+            marks: pkg.watermarks(),
+            title_page_sections,
+            even_odd,
+            section_breaks: Some(section_breaks),
+        }
+    }
+
+    pub(crate) fn label(&self) -> Option<String> {
+        watermark_label_from(&self.marks)
+    }
+
+    pub(crate) fn matches_document_sections(&self, document: &Document) -> bool {
+        let Some(expected) = &self.section_breaks else {
+            return true;
+        };
+        expected
+            .iter()
+            .map(String::as_str)
+            .eq(document.body.iter().filter_map(|block| match block {
+                Block::Paragraph(paragraph) => paragraph.props.section_break.as_deref(),
+                Block::Table(_) | Block::Raw(_) => None,
+            }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_count(&self) -> usize {
+        self.marks.len()
     }
 
     fn variant_for(&self, page: &PageBox) -> HeaderVariant {
@@ -293,6 +326,7 @@ mod tests {
             ],
             title_page_sections: vec![true, false],
             even_odd: true,
+            section_breaks: None,
         };
         let pages = vec![
             page(0, 0, 0, 0, 20, 50),
@@ -324,6 +358,7 @@ mod tests {
             ],
             title_page_sections: vec![false],
             even_odd: false,
+            section_breaks: None,
         };
 
         let overlays = layout(&state, &[page(0, 0, 0, 0, 20, 80)], &blank_lines(20));
@@ -343,6 +378,7 @@ mod tests {
             )],
             title_page_sections: vec![false],
             even_odd: false,
+            section_breaks: None,
         };
         let pages = [
             page(0, 0, 0, 0, 5, 16),
@@ -381,6 +417,7 @@ mod tests {
             )],
             title_page_sections: vec![false],
             even_odd: false,
+            section_breaks: None,
         };
         let page = page(0, 0, 0, 0, 5, 20);
         let lines = vec![

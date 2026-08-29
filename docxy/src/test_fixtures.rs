@@ -20,10 +20,11 @@ pub(crate) enum ProtectionFixture {
     TrackedChanges,
     FormattingOnly,
     Advisory,
+    Unknown,
 }
 
 impl ProtectionFixture {
-    pub(crate) const ALL: [Self; 7] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::Unrestricted,
         Self::ReadOnly,
         Self::Comments,
@@ -31,6 +32,7 @@ impl ProtectionFixture {
         Self::TrackedChanges,
         Self::FormattingOnly,
         Self::Advisory,
+        Self::Unknown,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -42,6 +44,7 @@ impl ProtectionFixture {
             Self::TrackedChanges => "tracked-changes",
             Self::FormattingOnly => "formatting-only",
             Self::Advisory => "advisory-write-protection",
+            Self::Unknown => "unknown-protection-mode",
         }
     }
 
@@ -64,6 +67,9 @@ impl ProtectionFixture {
                 r#"<w:documentProtection w:edit="none" w:formatting="1" w:enforcement="1"/>"#
             }
             Self::Advisory => r#"<w:writeProtection w:recommended="true"/>"#,
+            Self::Unknown => {
+                r#"<w:documentProtection w:edit="producerSpecific" w:enforcement="1"/>"#
+            }
         };
         let settings = format!(
             r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:settings xmlns:w="{W}">{restriction}</w:settings>"#
@@ -249,6 +255,11 @@ mod tests {
         assert!(parsed[5].1.formatting_locked);
         assert!(parsed[6].1.advisory_write_protection);
         assert_eq!(parsed[6].1.enforcement, ProtectionEnforcement::Absent);
+        assert_eq!(
+            parsed[7].1.edit_mode,
+            Some(ProtectionEditMode::Unknown("producerSpecific".to_string()))
+        );
+        assert_eq!(parsed[7].1.label(), Some("restricted editing"));
     }
 
     #[test]

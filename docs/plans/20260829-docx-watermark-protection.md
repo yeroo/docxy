@@ -125,7 +125,7 @@ Keep advisory write protection distinct from enforced restrictions.
 
 Final evidence (2026-08-29):
 
-- Workspace validation: `cargo test` reported 2,370 passed, 0 failed, and 1
+- Workspace validation: `cargo test` reported 2,376 passed, 0 failed, and 1
   ignored across 53 test-result suites; `cargo clippy --all-targets -- -D
   warnings`, `cargo fmt --check`, and `git diff --check` passed.
 - Reusable complete-package fixtures: `docxy/src/test_fixtures.rs` covers every

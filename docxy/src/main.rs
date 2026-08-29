@@ -790,9 +790,8 @@ struct App {
     /// Structured document-protection policy metadata. Display text is derived
     /// from its compatibility label; authorization never compares UI strings.
     doc_protection: Protection,
-    doc_watermark: Option<String>,
-    /// Structured page/header-scoped watermark state used only by the TUI
-    /// overlay renderer. `doc_watermark` above remains the compatibility label.
+    /// Structured page/header-scoped watermark state used by both the TUI
+    /// overlay renderer and compatibility status labels.
     watermark_state: watermark::State,
     doc_page_borders: bool,
     scroll: usize,
@@ -944,10 +943,7 @@ impl App {
         let headers = parts("headerReference");
         let footers = parts("footerReference");
         let title_page = flag_on(pkg.sect_pr(), "titlePg");
-        let even_odd = pkg
-            .part("word/settings.xml")
-            .map(|b| flag_on(std::str::from_utf8(b).unwrap_or(""), "evenAndOddHeaders"))
-            .unwrap_or(false);
+        let even_odd = pkg.has_even_odd();
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let comments = docxcore::comments::parse_comments(&pkg);
@@ -968,7 +964,6 @@ impl App {
         };
         docxcore::field::recompute(&mut pkg.document, &field_ctx);
         let doc_protection = pkg.protection();
-        let doc_watermark = pkg.watermark_label();
         let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
@@ -1005,7 +1000,6 @@ impl App {
             quit_requested: false,
             status: None,
             doc_protection,
-            doc_watermark,
             watermark_state,
             doc_page_borders,
             scroll: 0,
@@ -1174,7 +1168,10 @@ impl App {
                     ribbon::Focus::Tab(i) if self.ribbon.tab_label(i) == Some("File") => {
                         self.open_backstage();
                     }
-                    ribbon::Focus::Tab(_) => self.ribbon_focus = self.ribbon.enter_body(),
+                    ribbon::Focus::Tab(_) => {
+                        self.ribbon_focus = self.ribbon.enter_body();
+                        self.dirty = true;
+                    }
                     ribbon::Focus::Button(_) => {
                         if let Some((act, _)) = self.ribbon.focus_act(self.ribbon_focus) {
                             self.run_act(act);
@@ -1182,7 +1179,6 @@ impl App {
                     }
                     ribbon::Focus::None => {}
                 }
-                self.dirty = true;
                 Some(false)
             }
             _ => None,
@@ -1809,10 +1805,7 @@ impl App {
         self.headers = parts("headerReference");
         self.footers = parts("footerReference");
         self.title_page = flag_on(pkg.sect_pr(), "titlePg");
-        self.even_odd = pkg
-            .part("word/settings.xml")
-            .map(|b| flag_on(std::str::from_utf8(b).unwrap_or(""), "evenAndOddHeaders"))
-            .unwrap_or(false);
+        self.even_odd = pkg.has_even_odd();
         self.header_part = hf_part_name(&pkg, &rels, "headerReference");
         self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
         self.comments = docxcore::comments::parse_comments(&pkg);
@@ -1822,7 +1815,6 @@ impl App {
         self.comment_sel = 0;
         self.comment_active = false;
         self.doc_protection = pkg.protection();
-        self.doc_watermark = pkg.watermark_label();
         self.watermark_state = watermark::State::from_package(&pkg);
         self.doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
@@ -1851,8 +1843,16 @@ impl App {
     fn refresh_watermark_state(&mut self) {
         let mut live = self.pkg.clone();
         live.document = self.editor.doc.clone();
-        self.doc_watermark = live.watermark_label();
         self.watermark_state = watermark::State::from_package(&live);
+    }
+
+    fn refresh_watermark_state_if_needed(&mut self) {
+        if !self
+            .watermark_state
+            .matches_document_sections(&self.editor.doc)
+        {
+            self.refresh_watermark_state();
+        }
     }
 
     /// A compact status-line suffix for document-level notices (protection,
@@ -1862,7 +1862,7 @@ impl App {
         if let Some(p) = self.doc_protection.label() {
             parts.push(format!("Protected: {p}"));
         }
-        if let Some(w) = &self.doc_watermark {
+        if let Some(w) = self.watermark_state.label() {
             parts.push(format!("Watermark: {w}"));
         }
         if self.doc_page_borders {
@@ -1903,15 +1903,14 @@ impl App {
         use protection::MutationKind;
         use ribbon::Act::*;
         match act {
-            Cut | PageBreak | InsertTable => Some(MutationKind::Structure),
-            Paste | PageNumber | ChangeCase => Some(MutationKind::Content),
+            PageBreak | InsertTable => Some(MutationKind::Structure),
+            PageNumber | ChangeCase => Some(MutationKind::Content),
             HorizontalLine | Columns | Hyphenation | Bold | Italic | Underline | Strike
-            | Subscript | Superscript | GrowFont | ShrinkFont | ClearFormatting | Bullets
-            | Numbering | IncreaseIndent | DecreaseIndent | FirstLineIndent | HangingIndent
-            | Sort | ParaBorders | AlignLeft | AlignCenter | AlignRight | Justify
-            | ApplyStyle(_) => Some(MutationKind::Formatting),
-            DeleteComment => Some(MutationKind::Comment),
-            EditHeader | EditFooter => Some(MutationKind::Content),
+            | Subscript | Superscript | GrowFont | ShrinkFont | ClearFormatting
+            | IncreaseIndent | DecreaseIndent | FirstLineIndent | HangingIndent | Sort
+            | AlignLeft | AlignCenter | AlignRight | Justify | ApplyStyle(_) => {
+                Some(MutationKind::Formatting)
+            }
             _ => None,
         }
     }
@@ -1925,8 +1924,6 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('f') if alt => None,
-            KeyCode::Char('x') if ctrl => Some(MutationKind::Structure),
-            KeyCode::Char('v') if ctrl && !alt => Some(MutationKind::Content),
             KeyCode::Char(' ') if ctrl && shift => Some(MutationKind::Content),
             KeyCode::Char(
                 'b' | 'i' | 'u' | ']' | '[' | '=' | '+' | ' ' | 'm' | 'l' | 'e' | 'r' | 'j',
@@ -1936,7 +1933,6 @@ impl App {
             KeyCode::Char(_) if !ctrl => Some(MutationKind::Content),
             KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => Some(MutationKind::Structure),
             KeyCode::Tab => Some(MutationKind::Content),
-            KeyCode::F(8) => Some(MutationKind::Formatting),
             _ => None,
         }
     }
@@ -2053,21 +2049,23 @@ impl App {
             KeyCode::Esc => {
                 self.comment_input = None;
                 self.status = Some("Comment cancelled".to_string());
+                self.dirty = true;
             }
             KeyCode::Enter => self.commit_comment(),
             KeyCode::Backspace => {
                 if let Some(s) = self.comment_input.as_mut() {
                     s.pop();
                 }
+                self.dirty = true;
             }
             KeyCode::Char(c) => {
                 if let Some(s) = self.comment_input.as_mut() {
                     s.push(c);
                 }
+                self.dirty = true;
             }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -2570,6 +2568,13 @@ impl App {
         self.modified = true;
         self.dirty = true;
         self.status = None;
+        // The editable body lives outside `pkg`. Any successful body edit can
+        // remove, restore, or move a paragraph carrying `w:sectPr`, so refresh
+        // the page/header scope before the next overlay layout. Header/footer
+        // edits use a temporary editor and refresh when that part is committed.
+        if self.hf_edit.is_none() {
+            self.refresh_watermark_state_if_needed();
+        }
     }
 
     /// Enter focus-editing of the default header (or footer): park the body
@@ -2952,15 +2957,19 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::BackTab => {
                 ps.sel = ps.sel.saturating_sub(1);
+                self.dirty = true;
             }
             KeyCode::Down | KeyCode::Tab => {
                 ps.sel = (ps.sel + 1).min(ps.opts.len().saturating_sub(1));
+                self.dirty = true;
             }
             KeyCode::Enter => self.apply_paste_special(),
-            KeyCode::Esc => self.paste_special = None,
+            KeyCode::Esc => {
+                self.paste_special = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -2978,8 +2987,8 @@ impl App {
             self.apply_paste_special();
         } else if self.ps_btns[1].contains(p) {
             self.paste_special = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     /// The computed value of `kind`, with a fresh clock for date/time fields.
@@ -2994,9 +3003,6 @@ impl App {
     /// Insert a bordered `rows`×`cols` table just after the caret's block, with
     /// the caret landing in the first cell.
     fn insert_table(&mut self, rows: usize, cols: usize) {
-        if !self.mutation_allowed(protection::MutationKind::Structure) {
-            return;
-        }
         const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
 <w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
 <w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
@@ -3070,13 +3076,21 @@ impl App {
             return false;
         };
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(FieldKind::ALL.len() - 1),
+            KeyCode::Up | KeyCode::BackTab => {
+                d.sel = d.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                d.sel = (d.sel + 1).min(FieldKind::ALL.len() - 1);
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_insert_field(),
-            KeyCode::Esc => self.insert_field = None,
+            KeyCode::Esc => {
+                self.insert_field = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -3093,8 +3107,8 @@ impl App {
             self.apply_insert_field();
         } else if self.if_btns[1].contains(p) {
             self.insert_field = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     // ---- Paragraph dialog (precise indent) ----
@@ -3133,15 +3147,29 @@ impl App {
             return false;
         };
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(ParagraphDialog::ROWS - 1),
-            KeyCode::Left => d.adjust(-1),
-            KeyCode::Right => d.adjust(1),
+            KeyCode::Up | KeyCode::BackTab => {
+                d.sel = d.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                d.sel = (d.sel + 1).min(ParagraphDialog::ROWS - 1);
+                self.dirty = true;
+            }
+            KeyCode::Left => {
+                d.adjust(-1);
+                self.dirty = true;
+            }
+            KeyCode::Right => {
+                d.adjust(1);
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_para_dialog(),
-            KeyCode::Esc => self.para_dialog = None,
+            KeyCode::Esc => {
+                self.para_dialog = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -3158,8 +3186,8 @@ impl App {
             self.apply_para_dialog();
         } else if self.pd_btns[1].contains(p) {
             self.para_dialog = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     // ---- Apply-Styles dialog ----
@@ -3204,15 +3232,29 @@ impl App {
         };
         let n = d.items.len();
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(n.saturating_sub(1)),
-            KeyCode::Home => d.sel = 0,
-            KeyCode::End => d.sel = n.saturating_sub(1),
+            KeyCode::Up | KeyCode::BackTab => {
+                d.sel = d.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                d.sel = (d.sel + 1).min(n.saturating_sub(1));
+                self.dirty = true;
+            }
+            KeyCode::Home => {
+                d.sel = 0;
+                self.dirty = true;
+            }
+            KeyCode::End => {
+                d.sel = n.saturating_sub(1);
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_styles_dialog(),
-            KeyCode::Esc => self.styles_dialog = None,
+            KeyCode::Esc => {
+                self.styles_dialog = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -3230,8 +3272,8 @@ impl App {
             self.apply_styles_dialog();
         } else if self.sd_btns[1].contains(p) {
             self.styles_dialog = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     /// Re-read numbering.xml from the package (after a list is created/changed).
@@ -3360,13 +3402,21 @@ impl App {
         };
         let n = p.kind.items().len();
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => p.sel = p.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Up | KeyCode::BackTab => {
+                p.sel = p.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                p.sel = (p.sel + 1).min(n.saturating_sub(1));
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_picker(),
-            KeyCode::Esc => self.font_picker = None,
+            KeyCode::Esc => {
+                self.font_picker = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -3383,8 +3433,8 @@ impl App {
             self.apply_picker();
         } else if self.fp_btns[1].contains(pos) {
             self.font_picker = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     /// The hyperlink target at a given document line and column, if any.
@@ -3465,7 +3515,6 @@ impl App {
             }
             ribbon::Hit::Button(act) => {
                 self.run_act(act);
-                self.dirty = true;
             }
             ribbon::Hit::Outside => {}
         }
@@ -4479,16 +4528,12 @@ impl App {
             }
             KeyCode::Char('z') if ctrl => {
                 if self.editor.undo() {
-                    self.modified = true;
-                    self.dirty = true;
-                    self.status = None;
+                    self.after_edit();
                 }
             }
             KeyCode::Char('y') if ctrl => {
                 if self.editor.redo() {
-                    self.modified = true;
-                    self.dirty = true;
-                    self.status = None;
+                    self.after_edit();
                 }
             }
             KeyCode::Char(c) if !ctrl => {
@@ -4981,7 +5026,11 @@ impl App {
                     )
                 };
                 match &self.status {
-                    Some(msg) => format!(" {m} {dirty_mark}{}  │ {msg}", self.path),
+                    Some(msg) => format!(
+                        " {m} {dirty_mark}{}  │ {msg}{}",
+                        self.path,
+                        self.doc_notice()
+                    ),
                     None => format!(
                         " {m}  │ {dirty_mark}{}  ln {cr} col {cc}{pending}{}",
                         self.path,
@@ -4991,7 +5040,7 @@ impl App {
             }
         } else {
             match &self.status {
-                Some(msg) => format!("{left} │ {msg}"),
+                Some(msg) => format!("{left} │ {msg}{}", self.doc_notice()),
                 None => format!(
                     "{left}│ Ctrl-S save · Ctrl-F find · Ctrl-Q quit{}",
                     self.doc_notice()
@@ -6638,12 +6687,153 @@ mod tests {
         // Each surfaced feature appears in the notice.
         app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
         app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::ReadOnly);
-        app.doc_watermark = Some("CONFIDENTIAL".to_string());
+        app.watermark_state = watermark::State::new(
+            vec![Watermark {
+                kind: WatermarkKind::Text("CONFIDENTIAL".to_string()),
+                header: WatermarkHeader {
+                    section_index: 0,
+                    variant: HeaderVariant::Default,
+                    relationship_id: "rIdWatermark".to_string(),
+                    part_name: "word/header1.xml".to_string(),
+                    inherited: false,
+                },
+            }],
+            vec![false],
+            false,
+        );
         app.doc_page_borders = true;
         let n = app.doc_notice();
         assert!(n.contains("Protected: read-only"), "{n}");
         assert!(n.contains("Watermark: CONFIDENTIAL"), "{n}");
         assert!(n.contains("Page border"), "{n}");
+    }
+
+    #[test]
+    fn transient_status_does_not_hide_advisory_protection_notice() {
+        let mut app = App::new(
+            crate::test_fixtures::ProtectionFixture::Advisory.package(),
+            "advisory.docx",
+            false,
+        );
+        app.status = Some("opened advisory.docx".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = format!("{:?}", terminal.backend().buffer());
+        assert!(screen.contains("opened advisory.docx"), "{screen}");
+        assert!(
+            screen.contains("Protected: read-only (recommended)"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn watermark_scope_refreshes_after_section_edit_and_undo() {
+        let mut app = App::new(
+            crate::test_fixtures::WatermarkFixture::InheritedText.package(),
+            "inherited.docx",
+            false,
+        );
+        assert_eq!(app.watermark_state.mark_count(), 2);
+
+        assert!(app.editor.set_caret_section_break(None));
+        app.after_edit();
+        assert_eq!(app.watermark_state.mark_count(), 0);
+
+        assert!(app.editor.undo());
+        app.after_edit();
+        assert_eq!(app.watermark_state.mark_count(), 2);
+    }
+
+    #[test]
+    fn denied_ribbon_keyboard_and_mouse_actions_preserve_renderer_state() {
+        let mut app = app_with(&["format me"]);
+        app.editor.select_all();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        app.ribbon_open = true;
+
+        let bold_index = (0..128)
+            .find(|&index| {
+                matches!(
+                    app.ribbon.focus_act(ribbon::Focus::Button(index)),
+                    Some((ribbon::Act::Bold, _))
+                )
+            })
+            .expect("Bold ribbon button");
+        app.ribbon_focus = ribbon::Focus::Button(bold_index);
+        app.dirty = false;
+        app.status = None;
+        app.ribbon_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("formatting is locked"))
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let (x, y) = (0..ribbon::EXPANDED_H)
+            .flat_map(|y| (0..140).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                matches!(
+                    app.ribbon.hit(x, y, true),
+                    ribbon::Hit::Button(ribbon::Act::Bold)
+                )
+            })
+            .expect("Bold ribbon hit target");
+        app.dirty = false;
+        app.status = None;
+        app.ribbon_click(x, y);
+        assert!(!app.dirty);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("formatting is locked"))
+        );
+    }
+
+    #[test]
+    fn denied_dialog_keyboard_and_mouse_commits_preserve_renderer_state() {
+        let mut app = app_with(&["format me"]);
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+
+        app.open_para_dialog();
+        app.dirty = false;
+        app.status = None;
+        app.para_dialog_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert!(app.para_dialog.is_some());
+
+        app.pd_btns[0] = Rect::new(3, 3, 4, 1);
+        app.dirty = false;
+        app.status = None;
+        app.para_dialog_mouse(3, 3);
+        assert!(!app.dirty);
+        assert!(app.para_dialog.is_some());
+
+        app.editor.select_all();
+        app.open_picker(PickerKind::FontColor);
+        app.fp_btns[0] = Rect::new(5, 5, 4, 1);
+        app.dirty = false;
+        app.status = None;
+        app.picker_mouse(5, 5);
+        assert!(!app.dirty);
+        assert!(app.font_picker.is_some());
+
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        app.insert_field = Some(InsertFieldDialog { sel: 0 });
+        app.dirty = false;
+        app.status = None;
+        app.insert_field_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert!(app.insert_field.is_some());
+
+        app.comment_input = Some("note".to_string());
+        app.dirty = false;
+        app.status = None;
+        app.comment_input_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert_eq!(app.comment_input.as_deref(), Some("note"));
     }
 
     #[test]
@@ -6909,6 +7099,10 @@ mod tests {
             (
                 ProtectionFixture::TrackedChanges,
                 "Edit blocked: tracked-only editing is not supported; use Word to create tracked changes.",
+            ),
+            (
+                ProtectionFixture::Unknown,
+                "Edit blocked: the document uses unsupported protection mode 'producerSpecific'.",
             ),
         ];
         for (fixture, expected_status) in denied {
