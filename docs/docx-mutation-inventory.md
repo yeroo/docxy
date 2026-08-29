@@ -34,6 +34,7 @@ part, and adding a comment is Comment even though it also adds body anchors.
 | Character editing | Shift+F3 case cycling | Content |
 | Character formatting | bold, italic, underline, strike, subscript, superscript, grow/shrink font, clear formatting | Formatting |
 | Paragraph formatting | alignment, indentation, line spacing, styles, font/color/highlight pickers, paragraph dialog, borders, horizontal-rule autoformat | Formatting |
+| Paragraph ordering | Sort | Structure |
 | Lists | bullets and numbering, including numbering-part creation | Formatting |
 | Insert ribbon/dialogs | symbols, fields, page number, equations | Content |
 | Insert ribbon/dialogs | table, page break, section break | Structure |

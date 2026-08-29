@@ -6,7 +6,7 @@
 
 use docxcore::model::{Block, Document};
 use docxcore::package::{HeaderVariant, Package, Watermark, WatermarkKind, watermark_label_from};
-use docxcore::render::{Line, PageBox};
+use docxcore::render::{ImageBox, Line, PageBox};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -120,7 +120,12 @@ pub(crate) struct Overlay {
 }
 
 /// Build at most one deterministic, terminal-honest label for each page.
-pub(crate) fn layout(state: &State, pages: &[PageBox], lines: &[Line]) -> Vec<Overlay> {
+pub(crate) fn layout(
+    state: &State,
+    pages: &[PageBox],
+    lines: &[Line],
+    images: &[ImageBox],
+) -> Vec<Overlay> {
     let mut overlays = Vec::new();
     let mut previous_page_number = 0usize;
     let mut current_section = None;
@@ -189,9 +194,10 @@ pub(crate) fn layout(state: &State, pages: &[PageBox], lines: &[Line]) -> Vec<Ov
         let center = first_inner + inner_rows / 2;
         let row = (first_inner..end_inner)
             .filter(|&row| {
-                lines.get(row).is_some_and(|line| {
-                    display_range_is_blank(&line.plain(), page.col + 1, inner_width)
-                })
+                !image_occupies_page_row(images, page, row)
+                    && lines.get(row).is_some_and(|line| {
+                        display_range_is_blank(&line.plain(), page.col + 1, inner_width)
+                    })
             })
             .min_by_key(|row| row.abs_diff(center))
             .unwrap_or(page.row);
@@ -202,6 +208,16 @@ pub(crate) fn layout(state: &State, pages: &[PageBox], lines: &[Line]) -> Vec<Ov
         });
     }
     overlays
+}
+
+fn image_occupies_page_row(images: &[ImageBox], page: &PageBox, row: usize) -> bool {
+    let page_left = page.col + 1;
+    let page_right = page.col + page.cols.saturating_sub(1);
+    images.iter().any(|image| {
+        let image_bottom = image.row.saturating_add(image.rows);
+        let image_right = image.col.saturating_add(image.cols);
+        row >= image.row && row < image_bottom && image.col < page_right && image_right > page_left
+    })
 }
 
 fn display_range_is_blank(text: &str, start: usize, width: usize) -> bool {
@@ -371,7 +387,7 @@ mod tests {
             page(1, 1, 3, 63, 20, 50),
         ];
 
-        let overlays = layout(&state, &pages, &blank_lines(100));
+        let overlays = layout(&state, &pages, &blank_lines(100), &[]);
 
         assert_eq!(overlays.len(), 3);
         assert!(overlays[0].text.contains("FIRST ZERO"));
@@ -407,7 +423,7 @@ mod tests {
         };
         let pages = [page(0, 0, 0, 0, 20, 50), page(0, 1, 1, 21, 20, 50)];
 
-        let overlays = layout(&state, &pages, &blank_lines(50));
+        let overlays = layout(&state, &pages, &blank_lines(50), &[]);
 
         assert_eq!(overlays.len(), 2);
         assert!(overlays[0].text.contains("EVEN"));
@@ -431,7 +447,7 @@ mod tests {
             section_breaks: None,
         };
 
-        let overlays = layout(&state, &[page(0, 0, 0, 0, 20, 80)], &blank_lines(20));
+        let overlays = layout(&state, &[page(0, 0, 0, 0, 20, 80)], &blank_lines(20), &[]);
 
         assert_eq!(overlays.len(), 1);
         assert!(overlays[0].text.contains("picture preview unavailable"));
@@ -457,7 +473,7 @@ mod tests {
             page(0, 2, 2, 9, 3, 3),
         ];
 
-        let overlays = layout(&state, &pages, &blank_lines(12));
+        let overlays = layout(&state, &pages, &blank_lines(12), &[]);
 
         assert_eq!(
             overlays.len(),
@@ -475,7 +491,7 @@ mod tests {
             title_page_sections: vec![false],
             ..State::default()
         };
-        assert!(layout(&state, &[page(0, 0, 0, 0, 20, 80)], &blank_lines(20)).is_empty());
+        assert!(layout(&state, &[page(0, 0, 0, 0, 20, 80)], &blank_lines(20), &[],).is_empty());
     }
 
     #[test]
@@ -503,7 +519,43 @@ mod tests {
             5
         ];
 
-        let overlays = layout(&state, std::slice::from_ref(&page), &lines);
+        let overlays = layout(&state, std::slice::from_ref(&page), &lines, &[]);
+
+        assert_eq!(overlays[0].row, page.row);
+    }
+
+    #[test]
+    fn image_rows_are_not_selected_for_watermark_labels() {
+        let state = State {
+            marks: vec![mark(
+                0,
+                HeaderVariant::Default,
+                WatermarkKind::Text("IMAGE PAGE".to_string()),
+            )],
+            title_page_sections: vec![false],
+            page_number_starts: vec![None],
+            even_odd: false,
+            section_breaks: None,
+        };
+        let page = page(0, 0, 0, 0, 7, 30);
+        let image = ImageBox {
+            rid: "rIdImage".to_string(),
+            row: 1,
+            col: 4,
+            cols: 28,
+            rows: 5,
+            src_row: 0,
+            full_rows: 5,
+            bordered: false,
+            label: "image".to_string(),
+        };
+
+        let overlays = layout(
+            &state,
+            std::slice::from_ref(&page),
+            &blank_lines(7),
+            std::slice::from_ref(&image),
+        );
 
         assert_eq!(overlays[0].row, page.row);
     }

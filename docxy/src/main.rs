@@ -1916,12 +1916,11 @@ impl App {
         match act {
             PageBreak | InsertTable => Some(MutationKind::Structure),
             PageNumber | ChangeCase => Some(MutationKind::Content),
+            Sort => Some(MutationKind::Structure),
             HorizontalLine | Columns | Hyphenation | Bold | Italic | Underline | Strike
             | Subscript | Superscript | GrowFont | ShrinkFont | ClearFormatting
-            | IncreaseIndent | DecreaseIndent | FirstLineIndent | HangingIndent | Sort
-            | AlignLeft | AlignCenter | AlignRight | Justify | ApplyStyle(_) => {
-                Some(MutationKind::Formatting)
-            }
+            | IncreaseIndent | DecreaseIndent | FirstLineIndent | HangingIndent | AlignLeft
+            | AlignCenter | AlignRight | Justify | ApplyStyle(_) => Some(MutationKind::Formatting),
             _ => None,
         }
     }
@@ -2380,7 +2379,7 @@ impl App {
                 }
             }
             let watermark_overlays = if self.hf_edit.is_none() {
-                watermark::layout(&self.watermark_state, &pages, &lines)
+                watermark::layout(&self.watermark_state, &pages, &lines, &images)
             } else {
                 Vec::new()
             };
@@ -2875,18 +2874,30 @@ impl App {
             None => (self.clipboard.clone(), true),
         };
         if let Some(c) = clip {
-            if !self.mutation_allowed(protection::MutationKind::Content) {
-                return;
-            }
-            if keeps_source_formatting
-                && clip_has_formatting(&c)
-                && !self.mutation_allowed(protection::MutationKind::Formatting)
-            {
+            if !self.paste_allowed(
+                protection::MutationKind::Content,
+                &c,
+                keeps_source_formatting,
+            ) {
                 return;
             }
             self.editor.paste(&c);
             self.after_edit();
         }
+    }
+
+    /// Authorize the semantic insertion plus any formatting carried by a rich
+    /// internal clip before a paste path moves the caret or changes the editor.
+    fn paste_allowed(
+        &mut self,
+        mutation: protection::MutationKind,
+        clip: &Clip,
+        keeps_source_formatting: bool,
+    ) -> bool {
+        self.mutation_allowed(mutation)
+            && (!keeps_source_formatting
+                || !clip_has_formatting(clip)
+                || self.mutation_allowed(protection::MutationKind::Formatting))
     }
 
     /// Open the Paste Special dialog, offering the paste formats that make sense
@@ -2938,17 +2949,23 @@ impl App {
 
     /// Carry out the highlighted Paste Special option and close the dialog.
     fn apply_paste_special(&mut self) {
-        if !self.mutation_allowed(protection::MutationKind::Content) {
+        let selection = self.paste_special.as_ref().and_then(|paste| {
+            paste
+                .opts
+                .get(paste.sel)
+                .copied()
+                .map(|selected| (selected, paste.rich.clone()))
+        });
+        let Some((selected, rich)) = selection else {
             return;
-        }
-        let selected = self
-            .paste_special
-            .as_ref()
-            .and_then(|paste| paste.opts.get(paste.sel))
-            .copied();
-        if selected == Some(PasteOpt::KeepSource)
-            && !self.mutation_allowed(protection::MutationKind::Formatting)
-        {
+        };
+        let authorization_clip = rich.as_ref().filter(|_| selected == PasteOpt::KeepSource);
+        let plain = Clip::default();
+        if !self.paste_allowed(
+            protection::MutationKind::Content,
+            authorization_clip.unwrap_or(&plain),
+            authorization_clip.is_some(),
+        ) {
             return;
         }
         let Some(ps) = self.paste_special.take() else {
@@ -4102,7 +4119,7 @@ impl App {
         } else {
             protection::MutationKind::Content
         };
-        if !self.mutation_allowed(mutation) {
+        if !self.paste_allowed(mutation, &c, true) {
             return;
         }
         if linewise {
@@ -5896,17 +5913,32 @@ fn looks_like_url(s: &str) -> bool {
 /// Whether an internal clip would carry direct character formatting into the
 /// destination rather than merely inserting content in the caret's style.
 fn clip_has_formatting(clip: &Clip) -> bool {
+    fn blocks_have_formatting(blocks: &[Block]) -> bool {
+        blocks.iter().any(|block| match block {
+            Block::Paragraph(paragraph) => {
+                paragraph.props != Default::default()
+                    || paragraph.content.iter().any(inline_has_formatting)
+            }
+            Block::Table(table) => table.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .any(|cell| blocks_have_formatting(&cell.blocks))
+            }),
+            Block::Raw(_) => false,
+        })
+    }
+
     fn inline_has_formatting(inline: &Inline) -> bool {
         match inline {
             Inline::Run(run) => run.props != RunProps::default(),
             Inline::Hyperlink(link) => link.runs.iter().any(|run| run.props != RunProps::default()),
             Inline::Tab(props) => *props != RunProps::default(),
             Inline::Revision { content, .. } => content.iter().any(inline_has_formatting),
+            Inline::TextBox { blocks, .. } => blocks_have_formatting(blocks),
             Inline::Break(_)
             | Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
-            | Inline::TextBox { .. }
             | Inline::Field { .. }
             | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => false,
@@ -7403,6 +7435,25 @@ mod tests {
     }
 
     #[test]
+    fn formatting_lock_allows_structural_paragraph_sorting() {
+        let mut app = app_with(&["zebra", "alpha"]);
+        app.editor.select_all();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+
+        app.run_act(ribbon::Act::Sort);
+
+        let paragraphs = app
+            .editor
+            .doc
+            .body
+            .iter()
+            .map(Block::plain_text)
+            .collect::<Vec<_>>();
+        assert_eq!(paragraphs, ["alpha", "zebra"]);
+        assert!(app.modified);
+    }
+
+    #[test]
     fn formatting_lock_skips_hrule_autoformat_but_keeps_newline_editing() {
         let mut app = app_with(&["---"]);
         app.editor.move_end();
@@ -7470,6 +7521,59 @@ mod tests {
         allowed.on_key(key(KeyCode::Char('x')));
         assert_eq!(first_line(&allowed), "bc");
         assert!(allowed.modified);
+    }
+
+    #[test]
+    fn formatting_lock_denies_rich_vim_pastes_before_moving_the_caret() {
+        let bold_run = Run {
+            text: "rich".to_string(),
+            props: RunProps {
+                bold: true,
+                ..RunProps::default()
+            },
+        };
+        let mut charwise = vim_app(&["dest"]);
+        charwise.clipboard = Some(Clip {
+            paras: vec![vec![Inline::Run(bold_run.clone())]],
+        });
+        protect(&mut charwise, ProtectionEditMode::Unrestricted, true);
+        let charwise_doc = charwise.editor.doc.clone();
+        let charwise_caret = charwise.editor.caret.clone();
+
+        charwise.on_key(key(KeyCode::Char('p')));
+
+        assert_eq!(charwise.editor.doc, charwise_doc);
+        assert_eq!(charwise.editor.caret, charwise_caret);
+        assert!(!charwise.modified);
+        assert_eq!(
+            charwise.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+
+        let mut linewise = vim_app(&["dest"]);
+        linewise.clipboard = Some(Clip {
+            paras: vec![vec![Inline::TextBox {
+                raw: String::new(),
+                blocks: vec![Block::Paragraph(docxcore::model::Paragraph {
+                    props: Default::default(),
+                    content: vec![Inline::Run(bold_run)],
+                })],
+            }]],
+        });
+        linewise.vim.as_mut().unwrap().linewise_clip = true;
+        protect(&mut linewise, ProtectionEditMode::Unrestricted, true);
+        let linewise_doc = linewise.editor.doc.clone();
+        let linewise_caret = linewise.editor.caret.clone();
+
+        linewise.on_key(key(KeyCode::Char('P')));
+
+        assert_eq!(linewise.editor.doc, linewise_doc);
+        assert_eq!(linewise.editor.caret, linewise_caret);
+        assert!(!linewise.modified);
+        assert_eq!(
+            linewise.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
     }
 
     #[test]
