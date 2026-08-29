@@ -34,69 +34,80 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 ### Task 1: Specify row wrapper boundaries in the model
 
-- [ ] add a compact table-child or row-boundary representation capable of
+- [x] add a compact table-child or row-boundary representation capable of
       expressing raw `w:sdt` open/close boundaries, nesting, and empty controls
       without turning visible rows into opaque XML
-- [ ] define invariants for balanced boundaries, row ownership, cloning, plain
+- [x] define invariants for balanced boundaries, row ownership, cloning, plain
       text, equality, and default/newly-created tables
-- [ ] document how inserts and deletes at the first/last row of a control behave
-- [ ] add model-level tests for plain rows, one controlled row, multiple rows,
+- [x] document how inserts and deletes at the first/last row of a control behave
+- [x] add model-level tests for plain rows, one controlled row, multiple rows,
       nested controls, adjacent controls, and an empty control
-- [ ] run `cargo test -p docxcore` before Task 2
+- [x] run `cargo test -p docxcore` before Task 2
 
 ### Task 2: Parse row-level controls losslessly
 
-- [ ] replace the flattening `parse_sdt_rows` path with parsing that captures
+- [x] replace the flattening `parse_sdt_rows` path with parsing that captures
       `w:sdtPr`, `w:sdtEndPr`, wrapper boundaries, unknown children, and content
       in original document order
-- [ ] retain normally parsed `w:tr` rows inside the captured boundaries so they
+- [x] retain normally parsed `w:tr` rows inside the captured boundaries so they
       stay visible and editable
-- [ ] handle nested, adjacent, empty, and malformed/truncated controls without a
+- [x] handle nested, adjacent, empty, and malformed/truncated controls without a
       panic or accidental row loss
-- [ ] add loader fixtures asserting both visible row data and exact wrapper
+- [x] add loader fixtures asserting both visible row data and exact wrapper
       metadata for all boundary cases
-- [ ] run `cargo test -p docxcore` before Task 3
+- [x] run `cargo test -p docxcore` before Task 3
 
 ### Task 3: Serialize balanced schema-valid table children
 
-- [ ] emit table properties/grid and the mixed row/boundary sequence in legal
+- [x] emit table properties/grid and the mixed row/boundary sequence in legal
       WordprocessingML order
-- [ ] preserve captured wrapper/property XML verbatim unless a modeled row edit
+- [x] preserve captured wrapper/property XML verbatim unless a modeled row edit
       requires only the row payload to change
-- [ ] prevent unbalanced raw boundaries from producing invalid output; validate
+- [x] prevent unbalanced raw boundaries from producing invalid output; validate
       or normalize them at the narrowest responsible layer
-- [ ] add parse-save-parse tests for nesting, empty controls, unknown properties,
+- [x] add parse-save-parse tests for nesting, empty controls, unknown properties,
       Unicode content, and multiple controlled row groups
-- [ ] run `cargo test -p docxcore` before Task 4
+- [x] run `cargo test -p docxcore` before Task 4
 
 ### Task 4: Make row editing boundary-safe
 
-- [ ] audit table row insertion, deletion, split/merge, copy/paste, and cloning
+- [x] audit table row insertion, deletion, split/merge, copy/paste, and cloning
       helpers for assumptions that `Table::rows` is the complete child sequence
-- [ ] preserve control membership for edits within a group and apply the Task 1
+- [x] preserve control membership for edits within a group and apply the Task 1
       boundary rule for edits at its edges
-- [ ] ensure deleting every visible row does not silently delete an otherwise
+- [x] ensure deleting every visible row does not silently delete an otherwise
       non-empty control definition unless that is the documented operation
-- [ ] add focused editor tests including undo/redo where the public editor exposes
+- [x] add focused editor tests including undo/redo where the public editor exposes
       the affected table operation
-- [ ] run `cargo test -p docxcore` before Task 5
+- [x] run `cargo test -p docxcore` before Task 5
 
 ### Task 5: Add realistic package and regression coverage
 
-- [ ] add a minimal DOCX/package fixture with repeating-section properties,
+- [x] add a minimal DOCX/package fixture with repeating-section properties,
       nested/adjacent controls, row properties, merged cells, and unknown XML
-- [ ] verify package round-trip retains wrapper counts/order and document text,
+- [x] verify package round-trip retains wrapper counts/order and document text,
       and that a targeted cell edit stays inside its original control
-- [ ] rerun existing block- and inline-content-control tests to prove their raw
+- [x] rerun existing block- and inline-content-control tests to prove their raw
       boundaries and invisible rendering remain unchanged
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --check`, and `git diff --check`
 
 ### Task 6: [Final] Record the row-control contract
 
-- [ ] update the relevant DOCX support/gap documentation with the representation,
+- [x] update the relevant DOCX support/gap documentation with the representation,
       boundary-edit behavior, validation evidence, and deliberate UI deferrals
-- [ ] record final test counts and fixture paths in this plan
+- [x] record final test counts and fixture paths in this plan
+
+Final validation record (2026-08-29):
+
+- `cargo test` passed across the workspace, including 470 `docxcore` unit tests
+  and 10 package integration tests.
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, and
+  `git diff --check` passed.
+- Package fixture: `docxcore/tests/fixtures/row-content-controls.docx`.
+- Reproducible fixture generator:
+  `docxcore/tests/fixtures/generate-row-content-controls.ps1`.
+- Package round-trip, targeted-edit, and block/inline regression tests:
+  `docxcore/tests/docx_integration.rs`.
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*
-

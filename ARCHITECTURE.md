@@ -163,11 +163,16 @@ Hyperlink { rel_id, runs: Vec<Run> }
 Table
   grid: Vec<ColWidth>
   rows: Vec<Row>
+  row_boundaries: Vec<TableRowBoundary>  # ordered invisible children at row gaps
 Row -> Vec<Cell>; Cell { props, blocks: Vec<Block> }   # cells hold blocks (nesting)
 ```
 
 `RunProps`/`ParProps` keep an **`other: RawXml`** bucket for attributes/elements
 we don't interpret, so re-serialization is lossless for the parts we *do* touch.
+`TableRowBoundary` similarly preserves row-level content-control open/close XML
+and unknown table children without hiding editable rows. Its anchors must remain
+ordered, in range, balanced, and properly nested; row-count changes therefore
+go through `Table::insert_row` and `Table::remove_row`.
 
 ---
 

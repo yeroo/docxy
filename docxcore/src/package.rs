@@ -15,6 +15,7 @@
 use crate::load::{LoadError, parse_document_xml, parse_rels_xml};
 use crate::model::Document;
 use crate::serialize::document_to_xml;
+use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 use crate::zipwrite::write_zip;
 
@@ -1167,7 +1168,7 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
     let original_doc = String::from_utf8_lossy(&parts[pkg.doc_index].1).into_owned();
     let mut xml = document_to_xml(&document);
     if let (Some(attrs), Some(doc_pos), Some(body_pos)) = (
-        document_root_attrs(&original_doc),
+        document_root_attrs(&original_doc, &xml),
         xml.find("<w:document"),
         xml.find("<w:body>"),
     ) {
@@ -1184,38 +1185,105 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
     write_zip(&parts)
 }
 
-/// The attributes of the original `<w:document …>` element — all the `xmlns:*`
-/// declarations Word wrote — so the regenerated body's preserved raw slices stay
-/// namespace-bound. Ensures the `w`/`r`/`m` prefixes our serializer emits are
-/// present even if the original omitted them (e.g. a freshly created document's
-/// minimal template root).
-fn document_root_attrs(original: &str) -> Option<String> {
-    let start = original.find("<w:document")?;
-    let rest = &original[start + "<w:document".len()..];
-    let end = rest.find('>')?;
-    let mut attrs = rest[..end].trim().trim_end_matches('/').trim().to_string();
-    for (prefix, uri) in [
-        (
-            "xmlns:w",
-            "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
-        ),
-        (
-            "xmlns:r",
-            "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-        ),
-        (
-            "xmlns:m",
-            "http://schemas.openxmlformats.org/officeDocument/2006/math",
-        ),
-    ] {
-        if !attrs.contains(prefix) {
-            if !attrs.is_empty() {
-                attrs.push(' ');
+/// Merge the original `<w:document …>` attributes with every declaration the
+/// semantic serializer requires. Original files often carry additional
+/// namespace bindings used by preserved raw XML, while freshly-created package
+/// roots carry none. `mc:Ignorable` is token-valued and therefore needs a union
+/// rather than first-writer-wins behavior.
+fn document_root_attrs(original: &str, generated: &str) -> Option<String> {
+    let mut attrs = xml_root_attrs(original, "w:document")?;
+    let generated_attrs = xml_root_attrs(generated, "w:document")?;
+    for (name, value) in &generated_attrs {
+        if name == "xmlns" || name.starts_with("xmlns:") {
+            if !attrs.iter().any(|(key, _)| key == name) {
+                attrs.push((name.clone(), value.clone()));
             }
-            attrs.push_str(&format!("{prefix}=\"{uri}\""));
+            continue;
+        }
+
+        let existing_index = attrs.iter().enumerate().find_map(|(index, (key, _))| {
+            same_expanded_attribute(&attrs, key, &generated_attrs, name).then_some(index)
+        });
+        let local_name = name
+            .split_once(':')
+            .map_or(name.as_str(), |(_, local)| local);
+        if local_name == "Ignorable"
+            && (existing_index.is_some()
+                || attribute_namespace(&generated_attrs, name)
+                    == Some("http://schemas.openxmlformats.org/markup-compatibility/2006"))
+        {
+            if let Some(index) = existing_index {
+                let existing = &mut attrs[index].1;
+                for token in value.split_whitespace() {
+                    if !existing.split_whitespace().any(|item| item == token) {
+                        if !existing.is_empty() {
+                            existing.push(' ');
+                        }
+                        existing.push_str(token);
+                    }
+                }
+            } else {
+                attrs.push((name.clone(), value.clone()));
+            }
+        } else if existing_index.is_none() {
+            attrs.push((name.clone(), value.clone()));
         }
     }
-    Some(attrs)
+
+    Some(
+        attrs
+            .into_iter()
+            .map(|(name, value)| format!("{name}=\"{}\"", esc_xml_attr(&value)))
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn attribute_namespace<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let (prefix, _) = name.split_once(':')?;
+    attrs.iter().find_map(|(declaration, value)| {
+        (declaration.strip_prefix("xmlns:") == Some(prefix)).then_some(value.as_str())
+    })
+}
+
+fn same_expanded_attribute(
+    left_attrs: &[(String, String)],
+    left_name: &str,
+    right_attrs: &[(String, String)],
+    right_name: &str,
+) -> bool {
+    let left_local = left_name
+        .split_once(':')
+        .map_or(left_name, |(_, local)| local);
+    let right_local = right_name
+        .split_once(':')
+        .map_or(right_name, |(_, local)| local);
+    left_local == right_local
+        && attribute_namespace(left_attrs, left_name)
+            == attribute_namespace(right_attrs, right_name)
+}
+
+fn xml_root_attrs(xml: &str, root_name: &str) -> Option<Vec<(String, String)>> {
+    let mut parser = XmlParser::new(xml);
+    loop {
+        match parser.next() {
+            Event::Start if parser.name() == root_name => {
+                return Some(
+                    parser
+                        .attrs()
+                        .iter()
+                        .map(|attr| {
+                            let mut value = String::new();
+                            XmlParser::append_decoded(attr.value, &mut value);
+                            (attr.name.to_string(), value)
+                        })
+                        .collect(),
+                );
+            }
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
 }
 
 /// Highest `rIdN` number in a `.rels` string, plus one (the next free id).
@@ -1954,6 +2022,88 @@ mod tests {
             "new relationship missing from freshly-created rels part: {rels_xml}"
         );
         assert!(pkg.part("word/media/image1.png").is_some());
+    }
+
+    #[test]
+    fn new_package_keeps_repeating_section_namespaces_on_save() {
+        use crate::model::{Table, TableRowBoundary};
+
+        let document = Document {
+            body: vec![Block::Table(Table {
+                row_boundaries: vec![
+                    TableRowBoundary::sdt_open(
+                        0,
+                        "<w:sdt><w:sdtPr><w15:repeatingSection/></w:sdtPr><w:sdtContent>",
+                    ),
+                    TableRowBoundary::sdt_close(0, "</w:sdtContent></w:sdt>"),
+                ],
+                ..Default::default()
+            })],
+        };
+        let bytes = save_package(&new_package(document));
+        let reloaded = load_package(&bytes).expect("reload repeating-section package");
+        let doc_xml = String::from_utf8_lossy(reloaded.part("word/document.xml").unwrap());
+        assert!(
+            doc_xml.contains("xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"")
+        );
+        assert!(
+            doc_xml.contains(
+                "xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\""
+            )
+        );
+        let root_start = doc_xml.find("<w:document").expect("document root");
+        let root_end = root_start
+            + doc_xml[root_start..]
+                .find('>')
+                .expect("document root terminator");
+        assert!(doc_xml[root_start..root_end].contains("mc:Ignorable=\"w15\""));
+        assert!(doc_xml.contains("<w15:repeatingSection/>"));
+    }
+
+    #[test]
+    fn package_keeps_body_scoped_mc_namespaces_used_only_by_row_metadata() {
+        let document = "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body \
+            xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
+            xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" \
+            xmlns:ux=\"urn:body-extension\" mc:Ignorable=\"w15 ux\"><w:tbl>\
+            <w:sdt><w:sdtPr><mc:AlternateContent>\
+            <mc:Choice Requires=\"w15\"><w:alias w:val=\"choice\"/></mc:Choice>\
+            <mc:Fallback/></mc:AlternateContent><ux:property/></w:sdtPr><w:sdtContent>\
+            <w:tr><w:tc><w:p><w:r><w:t>visible</w:t></w:r></w:p></w:tc></w:tr>\
+            </w:sdtContent></w:sdt></w:tbl></w:body></w:document>";
+        let package = load_package(&make_docx(document)).expect("load body-scoped namespaces");
+        let saved = save_package(&package);
+        let reloaded = load_package(&saved).expect("reload body-scoped namespaces");
+        let xml = String::from_utf8_lossy(reloaded.part("word/document.xml").unwrap());
+
+        assert!(xml.contains(
+            "<w:tbl xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" xmlns:ux=\"urn:body-extension\" mc:Ignorable=\"w15 ux\">"
+        ));
+        assert!(xml.contains("<mc:AlternateContent>"));
+        assert!(xml.contains("<ux:property/>"));
+        assert!(xml.contains("mc:Ignorable=\"w15 ux\""));
+        assert_eq!(reloaded.document.plain_text(), "visible\n");
+    }
+
+    #[test]
+    fn document_root_ignorable_tokens_are_merged() {
+        let original = "<w:document xmlns:mc=\"urn:mc\" mc:Ignorable=\"w14\"/>";
+        let generated =
+            "<w:document xmlns:w15=\"urn:w15\" xmlns:mc=\"urn:mc\" mc:Ignorable=\"w15\"/>";
+        let attrs = document_root_attrs(original, generated).unwrap();
+        assert!(attrs.contains("xmlns:w15=\"urn:w15\""));
+        assert!(attrs.contains("mc:Ignorable=\"w14 w15\""));
+    }
+
+    #[test]
+    fn document_root_ignorable_aliases_are_merged_by_expanded_name() {
+        let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+        let original = format!("<w:document xmlns:mce=\"{mc}\" mce:Ignorable=\"w14\"/>");
+        let generated = format!("<w:document xmlns:mc=\"{mc}\" mc:Ignorable=\"w15\"/>");
+        let attrs = document_root_attrs(&original, &generated).unwrap();
+
+        assert!(attrs.contains("mce:Ignorable=\"w14 w15\""));
+        assert!(!attrs.contains(" mc:Ignorable="));
     }
 
     #[test]

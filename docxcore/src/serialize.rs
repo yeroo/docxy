@@ -7,25 +7,88 @@
 //! `sectPr`, bookmarks) is preserved separately by the package layer, not here.
 
 use crate::model::*;
+use crate::xml::{Event, XmlParser};
 
 const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
 /// Serialize a document to the bytes of `word/document.xml`.
 pub fn document_to_xml(doc: &Document) -> String {
+    let mut body = String::new();
+    for block in &doc.body {
+        write_block(&mut body, block);
+    }
+
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
-    // The `m:` namespace is declared so equations (`<m:oMath>`) authored from
-    // Markdown serialize as valid Office Math.
+    // `m:` supports equations authored from Markdown. Row-level repeating
+    // sections use the Office 2013 `w15:` vocabulary, which must stay bound
+    // when their captured properties are placed in the new document root.
     s.push_str(&format!(
-        "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\"><w:body>"
+        "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\""
     ));
-    for block in &doc.body {
-        write_block(&mut s, block);
+    let uses_w15 = xml_uses_prefix(&body, "w15");
+    let uses_mc = uses_w15 || xml_uses_prefix(&body, "mc");
+    if uses_mc {
+        s.push_str(&format!(" xmlns:mc=\"{MC_NS}\""));
     }
+    if uses_w15 {
+        s.push_str(&format!(" xmlns:w15=\"{W15_NS}\" mc:Ignorable=\"w15\""));
+    }
+    s.push_str("><w:body>");
+    s.push_str(&body);
     s.push_str("</w:body></w:document>");
     s
+}
+
+fn xml_uses_prefix(xml: &str, prefix: &str) -> bool {
+    let qualified_prefix = format!("{prefix}:");
+    let namespace_name = format!("xmlns:{prefix}");
+    let mut parser = XmlParser::new(xml);
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let mut used = parser.name().starts_with(&qualified_prefix);
+                for attr in parser.attrs() {
+                    if !attr.name.starts_with("xmlns") && attr.name.starts_with(&qualified_prefix) {
+                        used = true;
+                    }
+                    let local_name = attr
+                        .name
+                        .split_once(':')
+                        .map_or(attr.name, |(_, local)| local);
+                    if matches!(
+                        local_name,
+                        "Ignorable"
+                            | "ProcessContent"
+                            | "PreserveElements"
+                            | "PreserveAttributes"
+                            | "Requires"
+                    ) && attr.value.split_whitespace().any(|token| {
+                        token == prefix
+                            || token
+                                .strip_prefix(prefix)
+                                .is_some_and(|suffix| suffix.starts_with(':'))
+                    }) {
+                        used = true;
+                    }
+                }
+                if used
+                    && !parser
+                        .namespace_attrs()
+                        .iter()
+                        .any(|attr| attr.name == namespace_name)
+                {
+                    return true;
+                }
+            }
+            Event::Eof => return false,
+            Event::End | Event::Text => {}
+        }
+    }
 }
 
 /// Serialize just the block content (no document wrapper), for splicing back into
@@ -496,7 +559,22 @@ fn write_rpr(s: &mut String, p: &RunProps) {
 }
 
 fn write_table(s: &mut String, t: &Table) {
-    s.push_str("<w:tbl>");
+    s.push_str("<w:tbl");
+    for (name, value) in &t.namespace_declarations {
+        s.push(' ');
+        s.push_str(name);
+        s.push_str("=\"");
+        esc_attr(value, s);
+        s.push('"');
+    }
+    for (name, value) in &t.markup_compatibility_attributes {
+        s.push(' ');
+        s.push_str(name);
+        s.push_str("=\"");
+        esc_attr(value, s);
+        s.push('"');
+    }
+    s.push('>');
     // tblPr is the first tbl child; preserved verbatim when present.
     if let Some(raw) = &t.raw_tblpr {
         s.push_str(raw);
@@ -508,18 +586,294 @@ fn write_table(s: &mut String, t: &Table) {
         }
         s.push_str("</w:tblGrid>");
     }
-    for row in &t.rows {
-        s.push_str("<w:tr>");
-        // trPr / tblPrEx precede the cells; preserved verbatim.
-        for raw in &row.raw_props {
-            s.push_str(raw);
+    // A boundary-aware table is a mixed child sequence. tblPr/tblGrid remain
+    // first as required by CT_Tbl; each gap's invisible children are then
+    // emitted immediately before the visible row anchored at that gap.
+    //
+    // `document_to_xml` cannot report a model-validation error. If a caller
+    // constructs an invalid boundary sequence, omit the whole sequence and
+    // retain every visible row instead of writing unbalanced XML. Loaders and
+    // row-edit helpers maintain the invariant, so this recovery affects only
+    // malformed manually-constructed models.
+    if t.validate_row_boundaries().is_ok() {
+        let mut boundary_index = 0;
+        let mut content_stack = Vec::new();
+        for row_index in 0..=t.rows.len() {
+            while boundary_index < t.row_boundaries.len()
+                && t.row_boundaries[boundary_index].at == row_index
+            {
+                match &t.row_boundaries[boundary_index].kind {
+                    TableRowBoundaryKind::SdtOpen(raw) => {
+                        let is_empty_control = matches!(
+                            t.row_boundaries.get(boundary_index + 1),
+                            Some(TableRowBoundary {
+                                at,
+                                kind: TableRowBoundaryKind::SdtClose(_),
+                            }) if *at == row_index
+                        );
+                        content_stack.push(write_sdt_open(s, raw, is_empty_control));
+                    }
+                    TableRowBoundaryKind::SdtClose(raw) => {
+                        let content_needs_close = content_stack
+                            .pop()
+                            .expect("validated row boundaries have a matching SDT open");
+                        write_sdt_close(s, raw, content_needs_close);
+                    }
+                    TableRowBoundaryKind::Raw(raw) => s.push_str(raw),
+                }
+                boundary_index += 1;
+            }
+            if let Some(row) = t.rows.get(row_index) {
+                write_row(s, row);
+            }
         }
-        for cell in &row.cells {
-            write_cell(s, cell);
+        debug_assert!(content_stack.is_empty());
+        debug_assert_eq!(boundary_index, t.row_boundaries.len());
+    } else {
+        for row in &t.rows {
+            write_row(s, row);
         }
-        s.push_str("</w:tr>");
     }
     s.push_str("</w:tbl>");
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SdtOpenShape {
+    ContentOpen(usize),
+    ContentEmpty(usize),
+    MissingContent(usize),
+    Invalid,
+}
+
+/// Return the byte length ending after the last lexically complete XML token.
+/// This is deliberately narrower than XML validation: it lets the structural
+/// SDT checks below retain complete captured markup while dropping a final tag,
+/// comment, CDATA section, or processing instruction cut off at EOF.
+fn complete_xml_prefix_len(raw: &str) -> usize {
+    let bytes = raw.as_bytes();
+    let mut pos = 0;
+    while pos < raw.len() {
+        let Some(relative_start) = raw[pos..].find('<') else {
+            return raw.len();
+        };
+        let start = pos + relative_start;
+        let tail = &raw[start..];
+        let end = if tail.starts_with("<!--") {
+            tail.find("-->").map(|offset| start + offset + 3)
+        } else if tail.starts_with("<![CDATA[") {
+            tail.find("]]>").map(|offset| start + offset + 3)
+        } else if tail.starts_with("<?") {
+            tail.find("?>").map(|offset| start + offset + 2)
+        } else {
+            let mut quote = None;
+            let mut end = None;
+            for (offset, byte) in bytes[start + 1..].iter().copied().enumerate() {
+                match byte {
+                    b'\'' | b'"' if quote.is_none() => quote = Some(byte),
+                    _ if quote == Some(byte) => quote = None,
+                    b'>' if quote.is_none() => {
+                        end = Some(start + offset + 2);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            end
+        };
+        let Some(end) = end else {
+            return start;
+        };
+        pos = end;
+    }
+    raw.len()
+}
+
+/// Inspect the captured SDT prefix without changing it. A valid row-control
+/// prefix ends with either an open or self-closing direct `w:sdtContent` child.
+fn sdt_open_shape(raw: &str) -> SdtOpenShape {
+    let complete_len = complete_xml_prefix_len(raw);
+    let mut parser = XmlParser::new(&raw[..complete_len]);
+    if parser.next() != Event::Start || parser.name() != "w:sdt" {
+        return SdtOpenShape::Invalid;
+    }
+
+    let mut stack = vec!["w:sdt".to_string()];
+    let mut safe_end = parser.pos();
+    loop {
+        match parser.next() {
+            Event::Start if stack.len() == 1 && parser.name() == "w:sdtContent" => {
+                let tag = parser.raw_slice(parser.start_pos(), parser.pos());
+                return if tag.trim_end().ends_with("/>") {
+                    SdtOpenShape::ContentEmpty(parser.pos())
+                } else {
+                    SdtOpenShape::ContentOpen(parser.pos())
+                };
+            }
+            Event::Start => stack.push(parser.name().to_string()),
+            Event::End if stack.len() == 1 => {
+                return SdtOpenShape::MissingContent(safe_end);
+            }
+            Event::End => {
+                if stack.last().map(String::as_str) != Some(parser.name()) {
+                    return SdtOpenShape::MissingContent(safe_end);
+                }
+                stack.pop();
+                if stack.len() == 1 {
+                    safe_end = parser.pos();
+                }
+            }
+            Event::Eof => {
+                if stack.len() == 1 {
+                    safe_end = complete_len;
+                }
+                return SdtOpenShape::MissingContent(safe_end);
+            }
+            Event::Text if stack.len() == 1 => safe_end = parser.pos(),
+            Event::Text => {}
+        }
+    }
+}
+
+/// Emit an SDT prefix and return whether its content element still needs a
+/// closing tag. Valid captured prefixes are copied exactly; recovery adds only
+/// structural tags absent from malformed/truncated source.
+fn write_sdt_open(s: &mut String, raw: &str, is_empty_control: bool) -> bool {
+    match sdt_open_shape(raw) {
+        SdtOpenShape::ContentOpen(end) => {
+            s.push_str(&raw[..end]);
+            true
+        }
+        SdtOpenShape::ContentEmpty(end) => {
+            let complete = &raw[..end];
+            if is_empty_control {
+                s.push_str(complete);
+                false
+            } else {
+                // A self-closing content tag cannot own rows. This can only
+                // arise in a manually-mutated model; open that exact captured
+                // tag and let the matching close boundary finish it.
+                let slash = complete
+                    .rfind("/>")
+                    .expect("ContentEmpty shape has a self-closing tag");
+                s.push_str(&complete[..slash]);
+                s.push('>');
+                s.push_str(&complete[slash + 2..]);
+                true
+            }
+        }
+        SdtOpenShape::MissingContent(end) => {
+            s.push_str(&raw[..end]);
+            s.push_str("<w:sdtContent>");
+            true
+        }
+        SdtOpenShape::Invalid => {
+            s.push_str("<w:sdt><w:sdtContent>");
+            true
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SdtCloseShape {
+    safe_end: usize,
+    content_close_ranges: Vec<(usize, usize)>,
+    sdt_close_range: Option<(usize, usize)>,
+}
+
+fn sdt_close_shape(raw: &str) -> SdtCloseShape {
+    let complete_len = complete_xml_prefix_len(raw);
+    let mut parser = XmlParser::new(&raw[..complete_len]);
+    let mut shape = SdtCloseShape {
+        safe_end: 0,
+        content_close_ranges: Vec::new(),
+        sdt_close_range: None,
+    };
+    let mut stack = Vec::new();
+    loop {
+        let event_start = parser.pos();
+        match parser.next() {
+            Event::Start => {
+                if stack.is_empty() {
+                    shape.safe_end = parser.start_pos();
+                }
+                stack.push(parser.name().to_string());
+            }
+            Event::End if !stack.is_empty() => {
+                if stack.last().map(String::as_str) != Some(parser.name()) {
+                    return shape;
+                }
+                stack.pop();
+                if stack.is_empty() {
+                    shape.safe_end = parser.pos();
+                }
+            }
+            Event::End if parser.name() == "w:sdtContent" => {
+                shape.content_close_ranges.push((event_start, parser.pos()));
+                shape.safe_end = parser.pos();
+            }
+            Event::End if parser.name() == "w:sdt" => {
+                shape.sdt_close_range = Some((event_start, parser.pos()));
+                shape.safe_end = parser.pos();
+                return shape;
+            }
+            Event::End => return shape,
+            Event::Text if stack.is_empty() => shape.safe_end = parser.pos(),
+            Event::Text => {}
+            Event::Eof => {
+                if stack.is_empty() {
+                    shape.safe_end = complete_len;
+                }
+                return shape;
+            }
+        }
+    }
+}
+
+fn write_sdt_close(s: &mut String, raw: &str, content_needs_close: bool) {
+    let shape = sdt_close_shape(raw);
+    let expected_content_closes = if content_needs_close { 1 } else { 0 };
+    if shape.content_close_ranges.len() == expected_content_closes
+        && shape.sdt_close_range.is_some()
+    {
+        s.push_str(&raw[..shape.safe_end]);
+        return;
+    }
+
+    // Contradictory/duplicate structural closes are unsafe to copy verbatim.
+    // Retain every other complete suffix token, but emit exactly the closes
+    // required by the normalized opening shape.
+    if content_needs_close {
+        s.push_str("</w:sdtContent>");
+    }
+
+    let mut structural_ranges = shape.content_close_ranges;
+    if let Some(range) = shape.sdt_close_range {
+        structural_ranges.push(range);
+    }
+    structural_ranges.sort_unstable_by_key(|(start, _)| *start);
+    let mut copied_through = 0;
+    for (start, end) in structural_ranges {
+        if copied_through < start {
+            s.push_str(&raw[copied_through..start]);
+        }
+        copied_through = copied_through.max(end);
+    }
+    if copied_through < shape.safe_end {
+        s.push_str(&raw[copied_through..shape.safe_end]);
+    }
+    s.push_str("</w:sdt>");
+}
+
+fn write_row(s: &mut String, row: &Row) {
+    s.push_str("<w:tr>");
+    // trPr / tblPrEx precede the cells; preserved verbatim.
+    for raw in &row.raw_props {
+        s.push_str(raw);
+    }
+    for cell in &row.cells {
+        write_cell(s, cell);
+    }
+    s.push_str("</w:tr>");
 }
 
 fn write_cell(s: &mut String, cell: &Cell) {
@@ -584,6 +938,38 @@ mod tests {
     }
 
     #[test]
+    fn generated_repeating_section_roundtrips_without_importing_root_namespaces() {
+        let d = Document {
+            body: vec![Block::Table(Table {
+                row_boundaries: vec![
+                    TableRowBoundary::sdt_open(
+                        0,
+                        "<w:sdt><w:sdtPr><w15:repeatingSection/></w:sdtPr><w:sdtContent>",
+                    ),
+                    TableRowBoundary::sdt_close(0, "</w:sdtContent></w:sdt>"),
+                ],
+                ..Default::default()
+            })],
+        };
+
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn visible_w15_text_does_not_add_extension_namespaces() {
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![run("visible w15:text", RunProps::default())],
+            )],
+        };
+
+        let xml = document_to_xml(&d);
+        assert!(!xml.contains("xmlns:w15="));
+        assert!(!xml.contains("mc:Ignorable="));
+    }
+
+    #[test]
     fn preserves_unmodeled_para_table_and_cell_props() {
         // A paragraph carrying shading (unmodeled) + spacing (modeled), and a
         // table whose tblPr / trPr / tcPr carry borders + shading — none of which
@@ -615,6 +1001,9 @@ mod tests {
                 cells: vec![cell],
                 raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
             }],
+            namespace_declarations: vec![],
+            markup_compatibility_attributes: vec![],
+            row_boundaries: vec![],
             raw_tblpr: Some(
                 "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
                     .to_string(),
@@ -1115,5 +1504,477 @@ mod tests {
             body: vec![Block::Table(t)],
         };
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    fn table_xml(children: &str) -> String {
+        format!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:tbl>{children}</w:tbl></w:body></w:document>"
+        )
+    }
+
+    fn row_xml(text: &str) -> String {
+        format!("<w:tr><w:tc><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc></w:tr>")
+    }
+
+    #[test]
+    fn row_controls_roundtrip_nested_empty_unknown_unicode_and_multiple_groups() {
+        let tbl_pr = "<w:tblPr><w:tblStyle w:val=\"TableGrid\"/></w:tblPr>";
+        let grid = "<w:tblGrid><w:gridCol w:w=\"2400\"/></w:tblGrid>";
+        let outer_open = "<w:sdt data-source=\"orders\"><w:sdtPr><w:alias w:val=\"Заказы\"/><w15:repeatingSection w15:sectionTitle=\"Order\"/></w:sdtPr><w:sdtEndPr><w:rPr><w:b/></w:rPr></w:sdtEndPr><w:sdtContent>";
+        let inner_open = "<w:sdt><w:sdtPr><w:tag w:val=\"nested\"/></w:sdtPr><w:sdtContent>";
+        let empty_open = "<w:sdt><w:sdtPr><w:alias w:val=\"empty\"/></w:sdtPr><w:sdtContent>";
+        let group_open = "<w:sdt xmlns:ux=\"urn:docxy:fixture\"><w:sdtPr><ux:unknown ux:val=\"kept\"/></w:sdtPr><w:sdtContent>";
+        let unknown_child =
+            "<w:customXml w:uri=\"urn:rows\"><w:future w:val=\"preserve\"/></w:customXml>";
+        let close = "</w:sdtContent></w:sdt>";
+        let children = format!(
+            "{tbl_pr}{grid}{outer_open}{}{inner_open}{}{close}{close}{empty_open}{close}{group_open}{}{unknown_child}{}{close}",
+            row_xml("Привет 🌍"),
+            row_xml("東京"),
+            row_xml("α"),
+            row_xml("β")
+        );
+        let source = format!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\"><w:body><w:tbl>{children}</w:tbl></w:body></w:document>"
+        );
+
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+
+        for raw in [
+            outer_open,
+            inner_open,
+            empty_open,
+            group_open,
+            unknown_child,
+        ] {
+            assert!(saved.contains(raw), "captured wrapper XML changed: {raw}");
+        }
+        assert_eq!(saved.matches(close).count(), 4);
+        assert!(
+            saved.contains("xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"")
+        );
+        let at = |needle: &str| {
+            saved
+                .find(needle)
+                .unwrap_or_else(|| panic!("missing {needle}"))
+        };
+        assert!(
+            at(tbl_pr) < at(grid) && at(grid) < at(outer_open) && at(outer_open) < at("<w:tr>"),
+            "table properties, grid, boundaries, and rows are out of schema order"
+        );
+
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        assert_eq!(reparsed, parsed);
+        assert_eq!(reparsed.plain_text(), "Привет 🌍\n東京\nα\nβ\n");
+    }
+
+    #[test]
+    fn editing_controlled_row_changes_only_row_payload() {
+        let open = "<w:sdt data-origin=\"fixture\"><w:sdtPr><w:alias w:val=\"Repeat\"/><w:tag w:val=\"rows\"/></w:sdtPr><w:sdtEndPr><w:rPr><w:i/></w:rPr></w:sdtEndPr><w:sdtContent>";
+        let close = "</w:sdtContent><w:future w:val=\"tail\"/></w:sdt>";
+        let source = table_xml(&format!("{open}{}{close}", row_xml("before")));
+        let mut parsed = parse_document_xml(&source, &Relationships::default());
+
+        let Block::Table(table) = &mut parsed.body[0] else {
+            panic!("expected table");
+        };
+        let Block::Paragraph(paragraph) = &mut table.rows[0].cells[0].blocks[0] else {
+            panic!("expected paragraph");
+        };
+        let Inline::Run(run) = &mut paragraph.content[0] else {
+            panic!("expected run");
+        };
+        run.text = "after ✓".to_string();
+
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains(open), "opening wrapper changed");
+        assert!(saved.contains(close), "closing wrapper changed");
+        assert!(saved.contains("after ✓</w:t>"));
+        assert!(!saved.contains(">before<"));
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()),
+            parsed
+        );
+    }
+
+    #[test]
+    fn invalid_boundary_sequences_cannot_emit_unbalanced_wrappers() {
+        let row = Row {
+            cells: vec![Cell {
+                blocks: vec![para(
+                    ParProps::default(),
+                    vec![run("visible", RunProps::default())],
+                )],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let invalid_sequences = [
+            vec![TableRowBoundary::sdt_open(0, "<w:sdt><w:sdtContent>")],
+            vec![TableRowBoundary::sdt_close(1, "</w:sdtContent></w:sdt>")],
+        ];
+
+        for row_boundaries in invalid_sequences {
+            let document = Document {
+                body: vec![Block::Table(Table {
+                    rows: vec![row.clone()],
+                    row_boundaries,
+                    ..Default::default()
+                })],
+            };
+            let saved = document_to_xml(&document);
+            assert!(!saved.contains("<w:sdt>"));
+            assert!(!saved.contains("</w:sdt>"));
+            let reparsed = parse_document_xml(&saved, &Relationships::default());
+            assert_eq!(reparsed.plain_text(), "visible\n");
+        }
+    }
+
+    #[test]
+    fn truncated_boundary_fragments_receive_only_missing_closing_tags() {
+        let open = "<w:sdt><w:sdtPr><w:alias w:val=\"truncated\"/></w:sdtPr><w:sdtContent>";
+        let source = format!("<w:document><w:body><w:tbl>{open}{}", row_xml("survives"));
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+
+        assert!(saved.contains(open), "captured prefix changed");
+        assert!(
+            saved.contains(
+                "survives</w:t></w:r></w:p></w:tc></w:tr></w:sdtContent></w:sdt></w:tbl>"
+            )
+        );
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert!(table.validate_row_boundaries().is_ok());
+        assert_eq!(reparsed.plain_text(), "survives\n");
+    }
+
+    #[test]
+    fn truncated_control_before_content_is_normalized_to_balanced_xml() {
+        let source = table_xml("<w:sdt><w:sdtPr/>");
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let Block::Table(table) = &parsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_boundaries.len(), 2);
+        assert!(table.validate_row_boundaries().is_ok());
+
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:sdt><w:sdtPr/><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert_eq!(saved.matches("<w:sdt>").count(), 1);
+        assert_eq!(saved.matches("</w:sdt>").count(), 1);
+        assert_eq!(saved.matches("<w:sdtContent>").count(), 1);
+        assert_eq!(saved.matches("</w:sdtContent>").count(), 1);
+
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert!(table.validate_row_boundaries().is_ok());
+    }
+
+    #[test]
+    fn lexically_truncated_boundary_tags_are_removed_before_balancing() {
+        let partial_open = "<w:document><w:body><w:tbl><w:sdt><w:sdtPr";
+        let parsed = parse_document_xml(partial_open, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:tbl><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert!(!saved.contains("<w:sdtPr<"));
+
+        let mismatched_open = "<w:document><w:body><w:tbl><w:sdt><w:sdtPr></w:future>";
+        let parsed = parse_document_xml(mismatched_open, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:tbl><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert!(!saved.contains("<w:sdtPr></w:future>"));
+
+        let mismatched_closed = table_xml("<w:sdt><w:sdtPr></w:future></w:sdt>");
+        let parsed = parse_document_xml(&mismatched_closed, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:tbl><w:sdt><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert!(!saved.contains("<w:sdtPr></w:future>"));
+
+        let open = "<w:sdt><w:sdtPr><w:alias w:val=\"tail\"/></w:sdtPr><w:sdtContent>";
+        let partial_close = format!(
+            "<w:document><w:body><w:tbl>{open}{}</w:sdtContent><w:future",
+            row_xml("visible")
+        );
+        let parsed = parse_document_xml(&partial_close, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(!saved.contains("<w:future"));
+        assert!(
+            saved
+                .contains("visible</w:t></w:r></w:p></w:tc></w:tr></w:sdtContent></w:sdt></w:tbl>")
+        );
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()).plain_text(),
+            "visible\n"
+        );
+    }
+
+    #[test]
+    fn truncated_unknown_table_children_are_not_emitted_as_raw_xml() {
+        let inside_control = format!(
+            "<w:document><w:body><w:tbl><w:sdt><w:sdtContent>{}<w:customXml>",
+            row_xml("visible")
+        );
+        let parsed = parse_document_xml(&inside_control, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(!saved.contains("<w:customXml>"));
+        assert!(saved.contains("</w:sdtContent></w:sdt></w:tbl>"));
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()).plain_text(),
+            "visible\n"
+        );
+
+        let table_child = "<w:document><w:body><w:tbl><w:customXml>";
+        let saved = document_to_xml(&parse_document_xml(table_child, &Relationships::default()));
+        assert!(!saved.contains("<w:customXml>"));
+        assert!(saved.contains("<w:tbl></w:tbl>"));
+    }
+
+    #[test]
+    fn nested_sdt_in_truncated_tail_does_not_mask_missing_outer_close() {
+        let open = "<w:sdt><w:sdtPr><w:alias w:val=\"outer\"/></w:sdtPr><w:sdtContent>";
+        let source = format!(
+            "<w:document><w:body><w:tbl>{open}{}</w:sdtContent><w:customXml><w:sdt/></w:customXml>",
+            row_xml("visible")
+        );
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(
+            saved.contains("</w:sdtContent><w:customXml><w:sdt/></w:customXml></w:sdt></w:tbl>")
+        );
+        assert_eq!(saved.matches("</w:sdt>").count(), 1);
+
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert!(table.validate_row_boundaries().is_ok());
+        assert_eq!(reparsed.plain_text(), "visible\n");
+    }
+
+    #[test]
+    fn row_control_keeps_namespaces_inherited_from_body_and_table() {
+        let open = "<w:sdt><w:sdtPr><mc:AlternateContent><mc:Choice Requires=\"w15\"><w:alias w:val=\"choice\"/></mc:Choice><mc:Fallback/></mc:AlternateContent><ux:bodyProperty/><tv:tableProperty/></w:sdtPr><w:sdtContent>";
+        let source = format!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" xmlns:ux=\"urn:body\" mc:Ignorable=\"ux w15\"><w:tbl xmlns:tv=\"urn:table\" mc:Ignorable=\"tv\" mc:PreserveElements=\"tv:tableProperty\">{open}{}</w:sdtContent></w:sdt></w:tbl></w:body></w:document>",
+            row_xml("visible")
+        );
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let Block::Table(table) = &parsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(
+            table.namespace_declarations,
+            vec![
+                ("xmlns:mc".to_string(), MC_NS.to_string()),
+                ("xmlns:w15".to_string(), W15_NS.to_string()),
+                ("xmlns:ux".to_string(), "urn:body".to_string()),
+                ("xmlns:tv".to_string(), "urn:table".to_string()),
+            ]
+        );
+        assert_eq!(
+            table.markup_compatibility_attributes,
+            vec![
+                ("mc:Ignorable".to_string(), "ux w15 tv".to_string()),
+                (
+                    "mc:PreserveElements".to_string(),
+                    "tv:tableProperty".to_string()
+                ),
+            ]
+        );
+
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains(&format!(
+            "<w:tbl xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" xmlns:ux=\"urn:body\" xmlns:tv=\"urn:table\" mc:Ignorable=\"ux w15 tv\" mc:PreserveElements=\"tv:tableProperty\">"
+        )));
+        assert!(saved.contains(open), "captured control properties changed");
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()),
+            parsed
+        );
+    }
+
+    #[test]
+    fn row_control_keeps_document_scoped_markup_compatibility_attributes() {
+        let open = "<w:sdt><w:sdtPr><ux:property/></w:sdtPr><w:sdtContent>";
+        let source = format!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:document-extension\" mc:Ignorable=\"ux\" mc:PreserveElements=\"ux:property\"><w:body><w:tbl>{open}{}</w:sdtContent></w:sdt></w:tbl></w:body></w:document>",
+            row_xml("visible")
+        );
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let Block::Table(table) = &parsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(
+            table.markup_compatibility_attributes,
+            vec![
+                ("mc:Ignorable".to_string(), "ux".to_string()),
+                ("mc:PreserveElements".to_string(), "ux:property".to_string()),
+            ]
+        );
+
+        let saved = document_to_xml(&parsed);
+        let root_start = saved.find("<w:document").expect("document root");
+        let root_end = root_start
+            + saved[root_start..]
+                .find('>')
+                .expect("document root terminator");
+        assert!(saved[root_start..root_end].contains(&format!("xmlns:mc=\"{MC_NS}\"")));
+        assert!(saved.contains(
+            "<w:tbl xmlns:ux=\"urn:document-extension\" mc:Ignorable=\"ux\" mc:PreserveElements=\"ux:property\">"
+        ));
+        assert!(saved.contains(open));
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()),
+            parsed
+        );
+    }
+
+    #[test]
+    fn visible_row_after_premature_content_close_is_repaired_inside_wrapper() {
+        let open = "<w:sdt><w:sdtPr><w:alias w:val=\"recovered\"/></w:sdtPr><w:sdtContent>";
+        let metadata = "<w:customXml w:uri=\"urn:after-close\"/>";
+        let source = table_xml(&format!(
+            "{open}{}</w:sdtContent>{metadata}{}</w:sdt>",
+            row_xml("before"),
+            row_xml("recovered")
+        ));
+
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        assert_eq!(parsed.plain_text(), "before\nrecovered\n");
+
+        let saved = document_to_xml(&parsed);
+        assert_eq!(saved.matches("<w:sdtContent>").count(), 1);
+        assert_eq!(saved.matches("</w:sdtContent>").count(), 1);
+        assert_eq!(saved.matches("</w:sdt>").count(), 1);
+        assert!(saved.contains(metadata), "intervening metadata was dropped");
+        assert!(
+            saved.find(metadata).unwrap() < saved.find("recovered</w:t>").unwrap(),
+            "intervening metadata moved after the recovered row"
+        );
+
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0], vec![0]]));
+        assert_eq!(reparsed.plain_text(), "before\nrecovered\n");
+
+        let nested_open = "<w:sdt><w:sdtPr><w:alias w:val=\"nested\"/></w:sdtPr><w:sdtContent>";
+        let nested_source = table_xml(&format!(
+            "{open}{}</w:sdtContent>{nested_open}{}{}</w:sdt></w:sdt>",
+            row_xml("before"),
+            row_xml("nested recovered"),
+            "</w:sdtContent>"
+        ));
+        let nested = parse_document_xml(&nested_source, &Relationships::default());
+        let nested_saved = document_to_xml(&nested);
+        assert_eq!(nested_saved.matches("<w:sdtContent>").count(), 2);
+        assert_eq!(nested_saved.matches("</w:sdtContent>").count(), 2);
+        assert_eq!(nested_saved.matches("</w:sdt>").count(), 2);
+        let nested_reparsed = parse_document_xml(&nested_saved, &Relationships::default());
+        let Block::Table(table) = &nested_reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0], vec![0, 1]]));
+        assert_eq!(nested_reparsed.plain_text(), "before\nnested recovered\n");
+    }
+
+    #[test]
+    fn self_closing_content_is_opened_when_a_mutated_model_assigns_it_rows() {
+        let document = Document {
+            body: vec![Block::Table(Table {
+                rows: vec![Row {
+                    cells: vec![Cell {
+                        blocks: vec![para(
+                            ParProps::default(),
+                            vec![run("owned", RunProps::default())],
+                        )],
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                row_boundaries: vec![
+                    TableRowBoundary::sdt_open(
+                        0,
+                        "<w:sdt><w:sdtPr><w:alias w:val=\"was-empty\"/></w:sdtPr><w:sdtContent/>",
+                    ),
+                    TableRowBoundary::sdt_close(1, "</w:sdt>"),
+                ],
+                ..Default::default()
+            })],
+        };
+
+        let saved = document_to_xml(&document);
+        assert!(saved.contains("<w:sdtContent><w:tr>"));
+        assert!(saved.contains("</w:tr></w:sdtContent></w:sdt>"));
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0]]));
+    }
+
+    #[test]
+    fn malformed_rows_after_self_closing_content_are_recovered_without_panic() {
+        let source = table_xml(&format!(
+            "<w:sdt><w:sdtContent/>{}</w:sdt>",
+            row_xml("direct")
+        ));
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        assert_eq!(parsed.plain_text(), "direct\n");
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:sdtContent><w:tr>"));
+        assert!(saved.contains("</w:tr></w:sdtContent></w:sdt>"));
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0]]));
+
+        let nested_source = table_xml(&format!(
+            "<w:sdt><w:sdtContent><w:sdt><w:sdtContent/>{}</w:sdt></w:sdtContent></w:sdt>",
+            row_xml("nested")
+        ));
+        let nested = parse_document_xml(&nested_source, &Relationships::default());
+        assert_eq!(nested.plain_text(), "nested\n");
+        let nested_saved = document_to_xml(&nested);
+        assert_eq!(nested_saved.matches("<w:sdtContent>").count(), 2);
+        assert_eq!(nested_saved.matches("</w:sdtContent>").count(), 2);
+        let nested_reparsed = parse_document_xml(&nested_saved, &Relationships::default());
+        let Block::Table(table) = &nested_reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0, 1]]));
+    }
+
+    #[test]
+    fn contradictory_and_duplicate_content_closes_are_normalized() {
+        let self_closing = table_xml("<w:sdt><w:sdtContent/></w:sdtContent></w:sdt>");
+        let parsed = parse_document_xml(&self_closing, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:sdt><w:sdtContent/></w:sdt>"));
+        assert_eq!(saved.matches("</w:sdtContent>").count(), 0);
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert!(table.validate_row_boundaries().is_ok());
+
+        let duplicate = table_xml("<w:sdt><w:sdtContent></w:sdtContent></w:sdtContent></w:sdt>");
+        let parsed = parse_document_xml(&duplicate, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:sdt><w:sdtContent></w:sdtContent></w:sdt>"));
+        assert_eq!(saved.matches("</w:sdtContent>").count(), 1);
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert!(table.validate_row_boundaries().is_ok());
     }
 }

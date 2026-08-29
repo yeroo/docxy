@@ -2,10 +2,19 @@
 //!
 //! Ported from rust365 (`src/xml.rs`), unchanged logic, plus unit tests.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XmlAttr<'a> {
     pub name: &'a str,
     pub value: &'a str, // raw, entities NOT decoded
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct XmlScopedAttr<'a> {
+    pub element_name: &'a str,
+    pub attr: XmlAttr<'a>,
+}
+
+type NamespaceScopeChange<'a> = (usize, Option<XmlScopedAttr<'a>>);
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Event {
@@ -15,12 +24,18 @@ pub enum Event {
     Eof,
 }
 
+#[derive(Clone)]
 pub struct XmlParser<'a> {
     xml: &'a [u8],
     pos: usize,
     m_name: &'a str,
     m_text: &'a str,
     m_attrs: Vec<XmlAttr<'a>>,
+    m_namespaces: Vec<XmlAttr<'a>>,
+    m_namespace_elements: Vec<&'a str>,
+    namespace_changes: Vec<Vec<NamespaceScopeChange<'a>>>,
+    m_markup_compatibility_attrs: Vec<XmlScopedAttr<'a>>,
+    markup_compatibility_scope_counts: Vec<usize>,
     pending_end: bool,
     /// Byte index of the `<` of the most recent start tag (for raw capture).
     m_start: usize,
@@ -47,6 +62,11 @@ impl<'a> XmlParser<'a> {
             m_name: "",
             m_text: "",
             m_attrs: Vec::new(),
+            m_namespaces: Vec::new(),
+            m_namespace_elements: Vec::new(),
+            namespace_changes: Vec::new(),
+            m_markup_compatibility_attrs: Vec::new(),
+            markup_compatibility_scope_counts: Vec::new(),
             pending_end: false,
             m_start: 0,
         }
@@ -95,9 +115,123 @@ impl<'a> XmlParser<'a> {
         &self.m_attrs
     }
 
+    /// Namespace declarations in scope for the current start element. Later
+    /// declarations of the same prefix replace ancestor bindings until their
+    /// element ends.
+    pub fn namespace_attrs(&self) -> &[XmlAttr<'a>] {
+        &self.m_namespaces
+    }
+
+    /// Namespace declarations in scope for the current start element together
+    /// with the element on which each effective binding was declared.
+    pub fn namespace_scoped_attrs(&self) -> impl Iterator<Item = XmlScopedAttr<'a>> + '_ {
+        self.m_namespaces
+            .iter()
+            .copied()
+            .zip(self.m_namespace_elements.iter().copied())
+            .map(|(attr, element_name)| XmlScopedAttr { element_name, attr })
+    }
+
+    /// Markup-compatibility attributes active at the current start element,
+    /// together with the element on which each attribute was declared.
+    ///
+    /// Unlike ordinary XML attributes, MCE attributes such as `mc:Ignorable`
+    /// establish semantics for descendant markup. Consumers that rebuild an
+    /// ancestor can use this list to redeclare the effective attributes at the
+    /// preserved subtree.
+    pub fn markup_compatibility_attrs(&self) -> &[XmlScopedAttr<'a>] {
+        &self.m_markup_compatibility_attrs
+    }
+
+    fn push_namespace_scope(&mut self) {
+        let mut changes = Vec::new();
+        let element_name = self.m_name;
+        for attr in self
+            .m_attrs
+            .iter()
+            .copied()
+            .filter(|attr| attr.name == "xmlns" || attr.name.starts_with("xmlns:"))
+        {
+            if let Some(index) = self
+                .m_namespaces
+                .iter()
+                .position(|existing| existing.name == attr.name)
+            {
+                changes.push((
+                    index,
+                    Some(XmlScopedAttr {
+                        attr: self.m_namespaces[index],
+                        element_name: self.m_namespace_elements[index],
+                    }),
+                ));
+                self.m_namespaces[index] = attr;
+                self.m_namespace_elements[index] = element_name;
+            } else {
+                let index = self.m_namespaces.len();
+                changes.push((index, None));
+                self.m_namespaces.push(attr);
+                self.m_namespace_elements.push(element_name);
+            }
+        }
+        self.namespace_changes.push(changes);
+    }
+
+    fn push_markup_compatibility_scope(&mut self) {
+        const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+
+        let element_name = self.m_name;
+        let scoped = self
+            .m_attrs
+            .iter()
+            .copied()
+            .filter(|attr| {
+                let Some((prefix, _)) = attr.name.split_once(':') else {
+                    return false;
+                };
+                self.m_namespaces.iter().any(|namespace| {
+                    namespace.name.strip_prefix("xmlns:") == Some(prefix)
+                        && namespace.value == MC_NS
+                })
+            })
+            .map(|attr| XmlScopedAttr { element_name, attr })
+            .collect::<Vec<_>>();
+        self.markup_compatibility_scope_counts.push(scoped.len());
+        self.m_markup_compatibility_attrs.extend(scoped);
+    }
+
+    fn pop_namespace_scope(&mut self) {
+        let Some(changes) = self.namespace_changes.pop() else {
+            return;
+        };
+        for (index, previous) in changes.into_iter().rev() {
+            if let Some(previous) = previous {
+                self.m_namespaces[index] = previous.attr;
+                self.m_namespace_elements[index] = previous.element_name;
+            } else {
+                debug_assert_eq!(index + 1, self.m_namespaces.len());
+                self.m_namespaces.pop();
+                self.m_namespace_elements.pop();
+            }
+        }
+    }
+
+    fn pop_markup_compatibility_scope(&mut self) {
+        let Some(count) = self.markup_compatibility_scope_counts.pop() else {
+            return;
+        };
+        self.m_markup_compatibility_attrs
+            .truncate(self.m_markup_compatibility_attrs.len() - count);
+    }
+
+    fn pop_scopes(&mut self) {
+        self.pop_markup_compatibility_scope();
+        self.pop_namespace_scope();
+    }
+
     pub fn next(&mut self) -> Event {
         if self.pending_end {
             self.pending_end = false;
+            self.pop_scopes();
             return Event::End;
         }
         let size = self.xml.len();
@@ -131,6 +265,7 @@ impl<'a> XmlParser<'a> {
                 }
                 self.m_name = self.slice(start, end);
                 self.pos = gt + 1;
+                self.pop_scopes();
                 return Event::End;
             }
 
@@ -197,6 +332,8 @@ impl<'a> XmlParser<'a> {
                 let d = self.xml[self.pos];
                 if d == b'>' {
                     self.pos += 1;
+                    self.push_namespace_scope();
+                    self.push_markup_compatibility_scope();
                     return Event::Start;
                 }
                 if d == b'/' {
@@ -205,6 +342,8 @@ impl<'a> XmlParser<'a> {
                         self.pos += 1;
                     }
                     self.pending_end = true;
+                    self.push_namespace_scope();
+                    self.push_markup_compatibility_scope();
                     return Event::Start;
                 }
                 // attribute
@@ -255,6 +394,28 @@ impl<'a> XmlParser<'a> {
                 Event::Eof => return,
                 Event::Start => depth += 1,
                 Event::End => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    /// Consume through the matching End and report whether the complete
+    /// element was present. Returns `false` when EOF truncates the element or
+    /// an end tag does not match its corresponding start tag.
+    pub fn skip_element_complete(&mut self) -> bool {
+        let mut open_names = vec![self.m_name];
+        loop {
+            match self.next() {
+                Event::Eof => return false,
+                Event::Start => open_names.push(self.m_name),
+                Event::End => {
+                    if open_names.pop() != Some(self.m_name) {
+                        return false;
+                    }
+                    if open_names.is_empty() {
+                        return true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -385,6 +546,86 @@ mod tests {
     }
 
     #[test]
+    fn namespace_scope_tracks_inheritance_and_rebinding() {
+        let mut p = XmlParser::new(
+            r#"<root xmlns:a="urn:outer"><child xmlns:a="urn:inner" xmlns:b="urn:b"><leaf/></child><after/></root>"#,
+        );
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.namespace_attrs()[0].value, "urn:outer");
+        assert_eq!(
+            p.namespace_scoped_attrs().collect::<Vec<_>>(),
+            vec![XmlScopedAttr {
+                element_name: "root",
+                attr: XmlAttr {
+                    name: "xmlns:a",
+                    value: "urn:outer",
+                },
+            }]
+        );
+
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.namespace_attrs()[0].value, "urn:inner");
+        assert_eq!(p.namespace_attrs()[1].name, "xmlns:b");
+        assert!(
+            p.namespace_scoped_attrs()
+                .all(|scoped| scoped.element_name == "child")
+        );
+
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.namespace_attrs()[0].value, "urn:inner");
+        assert_eq!(p.next(), Event::End);
+        assert_eq!(p.next(), Event::End);
+
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.name(), "after");
+        assert_eq!(
+            p.namespace_attrs(),
+            &[XmlAttr {
+                name: "xmlns:a",
+                value: "urn:outer",
+            }]
+        );
+        assert_eq!(
+            p.namespace_scoped_attrs().next().unwrap().element_name,
+            "root"
+        );
+    }
+
+    #[test]
+    fn markup_compatibility_scope_tracks_declaring_elements() {
+        let mut p = XmlParser::new(
+            r#"<w:document xmlns:w="urn:w" xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006" mc:Ignorable="w14"><w:body mc:Ignorable="w15"><w:tbl/></w:body><w:after/></w:document>"#,
+        );
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(
+            p.markup_compatibility_attrs(),
+            &[
+                XmlScopedAttr {
+                    element_name: "w:document",
+                    attr: XmlAttr {
+                        name: "mc:Ignorable",
+                        value: "w14",
+                    },
+                },
+                XmlScopedAttr {
+                    element_name: "w:body",
+                    attr: XmlAttr {
+                        name: "mc:Ignorable",
+                        value: "w15",
+                    },
+                },
+            ]
+        );
+        assert_eq!(p.next(), Event::End);
+        assert_eq!(p.next(), Event::End);
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.markup_compatibility_attrs().len(), 1);
+        assert_eq!(p.markup_compatibility_attrs()[0].element_name, "w:document");
+    }
+
+    #[test]
     fn skips_prolog_comments_and_pi() {
         let xml = "<?xml version=\"1.0\"?><!-- c --><root><?pi data?>t</root>";
         let mut p = XmlParser::new(xml);
@@ -414,6 +655,21 @@ mod tests {
         assert_eq!(p.name(), "r");
         assert_eq!(p.next(), Event::Start); // <next/>
         assert_eq!(p.name(), "next");
+    }
+
+    #[test]
+    fn skip_element_reports_truncated_input() {
+        let mut complete = XmlParser::new("<a><b/></a>");
+        assert_eq!(complete.next(), Event::Start);
+        assert!(complete.skip_element_complete());
+
+        let mut truncated = XmlParser::new("<a><b>");
+        assert_eq!(truncated.next(), Event::Start);
+        assert!(!truncated.skip_element_complete());
+
+        let mut mismatched = XmlParser::new("<a><b></a></b>");
+        assert_eq!(mismatched.next(), Event::Start);
+        assert!(!mismatched.skip_element_complete());
     }
 
     #[test]

@@ -2624,6 +2624,28 @@ mod tests {
         }
     }
 
+    fn controlled_table_doc() -> Document {
+        let mut document = table_doc();
+        let Block::Table(table) = &mut document.body[1] else {
+            unreachable!();
+        };
+        table.row_boundaries = vec![
+            TableRowBoundary::sdt_open(
+                0,
+                "<w:sdt><w:sdtPr><w:alias w:val=\"rows\"/></w:sdtPr><w:sdtContent>",
+            ),
+            TableRowBoundary::sdt_close(2, "</w:sdtContent></w:sdt>"),
+        ];
+        document
+    }
+
+    fn controlled_table_boundaries(editor: &Editor) -> Vec<TableRowBoundary> {
+        let Block::Table(table) = &editor.doc.body[1] else {
+            unreachable!();
+        };
+        table.row_boundaries.clone()
+    }
+
     #[test]
     fn caret_visits_cells_in_reading_order() {
         let paths = all_paragraph_paths(&table_doc().body);
@@ -2665,6 +2687,75 @@ mod tests {
         assert!(ed.undo());
         let p = resolve_para(&ed.doc.body, &[1, 0, 0, 0]).unwrap();
         assert_eq!(p.plain_text(), "A");
+    }
+
+    #[test]
+    fn controlled_row_edit_undo_and_redo_preserve_boundaries() {
+        let mut ed = Editor::new(controlled_table_doc());
+        let boundaries = controlled_table_boundaries(&ed);
+        ed.caret = Caret::at(vec![1, 0, 0, 0], 1);
+
+        ed.insert_str("!");
+        assert_eq!(controlled_table_boundaries(&ed), boundaries);
+        assert_eq!(
+            resolve_para(&ed.doc.body, &[1, 0, 0, 0])
+                .unwrap()
+                .plain_text(),
+            "A!"
+        );
+
+        assert!(ed.undo());
+        assert_eq!(controlled_table_boundaries(&ed), boundaries);
+        assert_eq!(
+            resolve_para(&ed.doc.body, &[1, 0, 0, 0])
+                .unwrap()
+                .plain_text(),
+            "A"
+        );
+
+        assert!(ed.redo());
+        assert_eq!(controlled_table_boundaries(&ed), boundaries);
+        assert_eq!(
+            resolve_para(&ed.doc.body, &[1, 0, 0, 0])
+                .unwrap()
+                .plain_text(),
+            "A!"
+        );
+    }
+
+    #[test]
+    fn controlled_row_copy_paste_and_paragraph_split_merge_keep_boundaries() {
+        let mut ed = Editor::new(controlled_table_doc());
+        let boundaries = controlled_table_boundaries(&ed);
+
+        ed.anchor = Some(Caret::at(vec![1, 0, 0, 0], 0));
+        ed.caret = Caret::at(vec![1, 0, 0, 0], 1);
+        let clip = ed.copy().unwrap();
+        ed.clear_selection();
+        ed.caret = Caret::at(vec![1, 1, 0, 0], 1);
+        ed.paste(&clip);
+        assert_eq!(controlled_table_boundaries(&ed), boundaries);
+        assert_eq!(
+            resolve_para(&ed.doc.body, &[1, 1, 0, 0])
+                .unwrap()
+                .plain_text(),
+            "CA"
+        );
+
+        ed.caret = Caret::at(vec![1, 0, 1, 0], 1);
+        ed.insert_newline();
+        assert_eq!(controlled_table_boundaries(&ed), boundaries);
+        assert_eq!(ed.caret, Caret::at(vec![1, 0, 1, 1], 0));
+
+        ed.backspace();
+        assert_eq!(controlled_table_boundaries(&ed), boundaries);
+        assert_eq!(ed.caret, Caret::at(vec![1, 0, 1, 0], 1));
+        assert_eq!(
+            resolve_para(&ed.doc.body, &[1, 0, 1, 0])
+                .unwrap()
+                .plain_text(),
+            "B"
+        );
     }
 
     #[test]

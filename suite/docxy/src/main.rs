@@ -10177,6 +10177,54 @@ impl Docxy {
         }
     }
 
+    /// Apply a row-only Table Tools command without GPUI state so boundary and
+    /// caret behavior can be covered at the command-wiring layer.
+    fn apply_table_row_op(
+        table: &mut Table,
+        table_index: usize,
+        row: usize,
+        col: usize,
+        ncols: usize,
+        act: Act,
+    ) -> Option<Caret> {
+        use Act::*;
+        match act {
+            RowAbove | RowBelow => {
+                let at = if matches!(act, RowAbove) {
+                    row
+                } else {
+                    row + 1
+                }
+                .min(table.rows.len());
+                let new = docxcore::model::Row {
+                    cells: (0..ncols).map(|_| Self::empty_cell()).collect(),
+                    raw_props: vec![],
+                };
+                let inserted = table.insert_row(at, new);
+                debug_assert!(inserted);
+                Some(Caret::at(
+                    vec![
+                        table_index,
+                        at.min(table.rows.len() - 1),
+                        col.min(ncols - 1),
+                        0,
+                    ],
+                    0,
+                ))
+            }
+            DelRow if table.rows.len() > 1 => {
+                let removed = table.remove_row(row);
+                debug_assert!(removed.is_some());
+                let nr = table.rows.len();
+                Some(Caret::at(
+                    vec![table_index, row.min(nr - 1), col.min(ncols - 1), 0],
+                    0,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     /// Run a Table Tools operation relative to the caret's cell.
     fn table_op(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         use Act::*;
@@ -10192,21 +10240,12 @@ impl Docxy {
                         .len()
                         .max(table.rows.first().map_or(0, |r| r.cells.len()));
                     match act {
-                        RowAbove | RowBelow => {
-                            let at = if matches!(act, RowAbove) {
-                                row
-                            } else {
-                                row + 1
-                            };
-                            let new = docxcore::model::Row {
-                                cells: (0..ncols).map(|_| Self::empty_cell()).collect(),
-                                raw_props: vec![],
-                            };
-                            table.rows.insert(at.min(table.rows.len()), new);
-                            ed.caret = Caret::at(
-                                vec![tb, at.min(table.rows.len() - 1), col.min(ncols - 1), 0],
-                                0,
-                            );
+                        RowAbove | RowBelow | DelRow => {
+                            if let Some(caret) =
+                                Self::apply_table_row_op(table, tb, row, col, ncols, act)
+                            {
+                                ed.caret = caret;
+                            }
                         }
                         ColLeft | ColRight => {
                             let at = if matches!(act, ColLeft) { col } else { col + 1 };
@@ -10216,14 +10255,6 @@ impl Docxy {
                             let w = table.grid.first().copied().unwrap_or(2340);
                             table.grid.insert(at.min(table.grid.len()), w);
                             ed.caret = Caret::at(vec![tb, row, at, 0], 0);
-                        }
-                        DelRow => {
-                            if table.rows.len() > 1 {
-                                table.rows.remove(row);
-                                let nr = table.rows.len();
-                                ed.caret =
-                                    Caret::at(vec![tb, row.min(nr - 1), col.min(ncols - 1), 0], 0);
-                            }
                         }
                         DelCol => {
                             if ncols > 1 {
@@ -10287,6 +10318,9 @@ impl Docxy {
         let table = Table {
             grid: vec![col_w; cols],
             rows: (0..rows).map(|_| mk_row()).collect(),
+            namespace_declarations: vec![],
+            markup_compatibility_attributes: vec![],
+            row_boundaries: vec![],
             raw_tblpr: Some(TBLPR.to_string()),
         };
         let idx = self.active;
@@ -11907,6 +11941,71 @@ impl Docxy {
         }
         self.scroll_to_caret();
         cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod doc_table_row_tests {
+    use super::{Act, Block, Caret, Document, Docxy, Paragraph, Table};
+    use docxcore::load::{Relationships, parse_document_xml};
+    use docxcore::model::{Cell, Row, TableRowBoundary};
+    use docxcore::serialize::document_to_xml;
+
+    fn row() -> Row {
+        Row {
+            cells: vec![Cell {
+                blocks: vec![Block::Paragraph(Paragraph::default())],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn adjacent_table() -> Table {
+        Table {
+            rows: vec![row(), row()],
+            row_boundaries: vec![
+                TableRowBoundary::sdt_open(0, "<w:sdt><w:sdtContent>"),
+                TableRowBoundary::sdt_close(1, "</w:sdtContent></w:sdt>"),
+                TableRowBoundary::sdt_open(1, "<w:sdt><w:sdtContent>"),
+                TableRowBoundary::sdt_close(2, "</w:sdtContent></w:sdt>"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn table_row_commands_preserve_control_ownership_and_caret() {
+        for act in [Act::RowAbove, Act::RowBelow] {
+            let mut table = adjacent_table();
+            let (row, expected_row) = if matches!(act, Act::RowAbove) {
+                (1, 1)
+            } else {
+                (0, 1)
+            };
+            let caret = Docxy::apply_table_row_op(&mut table, 3, row, 0, 1, act)
+                .expect("row insertion applies");
+            assert_eq!(caret, Caret::at(vec![3, expected_row, 0, 0], 0));
+            assert_eq!(
+                table.row_control_owners(),
+                Ok(vec![vec![0], vec![2], vec![2]])
+            );
+        }
+
+        let mut table = adjacent_table();
+        let caret = Docxy::apply_table_row_op(&mut table, 3, 0, 0, 1, Act::DelRow)
+            .expect("row deletion applies");
+        assert_eq!(caret, Caret::at(vec![3, 0, 0, 0], 0));
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![2]]));
+
+        let xml = document_to_xml(&Document {
+            body: vec![Block::Table(table)],
+        });
+        let reparsed = parse_document_xml(&xml, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![2]]));
     }
 }
 
