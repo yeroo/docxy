@@ -111,6 +111,15 @@ const DOCX_CTL: EditorSpec['ctl'] = {
     // Wave-3 mutating verbs (block-range formatting).
     'doc.format',
     'doc.set-style',
+    // Tracked-change review/navigation.
+    'doc.revisions',
+    'doc.revision-current',
+    'doc.revision-next',
+    'doc.revision-previous',
+    'doc.revision-accept',
+    'doc.revision-reject',
+    'doc.revisions-accept-all',
+    'doc.revisions-reject-all',
   ]),
   mutatingVerbs: new Set([
     'doc.replace-range',
@@ -133,6 +142,10 @@ const DOCX_CTL: EditorSpec['ctl'] = {
     // see docxwasm's ctl_format/ctl_set_style doc comments).
     'doc.format',
     'doc.set-style',
+    'doc.revision-accept',
+    'doc.revision-reject',
+    'doc.revisions-accept-all',
+    'doc.revisions-reject-all',
   ]),
 };
 
@@ -705,7 +718,11 @@ class OffxyEditorProvider implements vscode.CustomEditorProvider<BinaryDocument>
     return {
       callWasm: (requestJson: string) => {
         const verb = ctlVerbOf(requestJson);
-        const repaint = verb !== undefined && this.spec.ctl.mutatingVerbs.has(verb);
+        const repaint =
+          verb !== undefined &&
+          (this.spec.ctl.mutatingVerbs.has(verb) ||
+            verb === 'doc.revision-next' ||
+            verb === 'doc.revision-previous');
         return document.requestCtl(requestJson, repaint);
       },
 

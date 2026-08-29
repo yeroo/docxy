@@ -37,8 +37,9 @@ use docxcore::load::parse_header_footer;
 use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::markdown::{from_markdown, to_markdown_with};
 use docxcore::model::{
-    Align, Block, BreakKind, Cell, Document, Hyperlink, Inline, PageGeom, Row, Run, RunProps,
-    Table, VMerge,
+    Align, Block, BreakKind, Cell, Document, Hyperlink, Inline, PageGeom, PropertyScope,
+    RevisionAddress, RevisionCategory, RevisionKind, Row, Run, RunProps, Table,
+    UnsupportedRevisionKind, VMerge,
 };
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{
@@ -49,6 +50,7 @@ use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
     Span as DocSpan, Style as DocStyle, render_with_images, render_with_page_layout,
 };
+use docxcore::review::{RevisionAction, RevisionOutcome};
 use docxcore::serialize::blocks_to_xml;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 use std::rc::Rc;
@@ -444,10 +446,80 @@ enum ConfirmAction {
     Exit,
     /// Overwrite an existing PDF at this path during Export.
     OverwritePdf(std::path::PathBuf),
+    /// Apply one undoable action to every tracked change in the document.
+    ReviewAll(RevisionAction),
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
 // across all apps); docxy only supplies the action carried on Yes.
+
+pub(crate) fn property_scope_name(scope: PropertyScope) -> &'static str {
+    match scope {
+        PropertyScope::Run => "run properties",
+        PropertyScope::Paragraph => "paragraph properties",
+        PropertyScope::Table => "table properties",
+        PropertyScope::TableRow => "row properties",
+        PropertyScope::TableCell => "cell properties",
+        PropertyScope::Section => "section properties",
+    }
+}
+
+pub(crate) fn unsupported_revision_name(kind: &UnsupportedRevisionKind) -> String {
+    use UnsupportedRevisionKind::*;
+    match kind {
+        MoveFrom => "move-from".to_string(),
+        MoveTo => "move-to".to_string(),
+        MoveFromRangeStart => "move-from range start".to_string(),
+        MoveFromRangeEnd => "move-from range end".to_string(),
+        MoveToRangeStart => "move-to range start".to_string(),
+        MoveToRangeEnd => "move-to range end".to_string(),
+        CustomXmlInsRangeStart => "custom-XML insertion range start".to_string(),
+        CustomXmlInsRangeEnd => "custom-XML insertion range end".to_string(),
+        CustomXmlDelRangeStart => "custom-XML deletion range start".to_string(),
+        CustomXmlDelRangeEnd => "custom-XML deletion range end".to_string(),
+        CustomXmlMoveFromRangeStart => "custom-XML move-from range start".to_string(),
+        CustomXmlMoveFromRangeEnd => "custom-XML move-from range end".to_string(),
+        CustomXmlMoveToRangeStart => "custom-XML move-to range start".to_string(),
+        CustomXmlMoveToRangeEnd => "custom-XML move-to range end".to_string(),
+        CellInsert => "cell insertion".to_string(),
+        CellDelete => "cell deletion".to_string(),
+        CellMerge => "cell merge".to_string(),
+        ConflictInsert => "conflict insertion".to_string(),
+        ConflictDelete => "conflict deletion".to_string(),
+        Other(name) => name.clone(),
+    }
+}
+
+pub(crate) fn revision_category_name(category: &RevisionCategory) -> String {
+    match category {
+        RevisionCategory::Inline(RevisionKind::Insert) => "insertion".to_string(),
+        RevisionCategory::Inline(RevisionKind::Delete) => "deletion".to_string(),
+        RevisionCategory::Property(scope) => property_scope_name(*scope).to_string(),
+        RevisionCategory::Unsupported(kind) => {
+            format!("unsupported {}", unsupported_revision_name(kind))
+        }
+    }
+}
+
+fn revision_status(address: &RevisionAddress, total: usize) -> String {
+    let mut details = vec![format!("target {}", address.target.0)];
+    if let Some(id) = address.metadata.id.as_deref() {
+        details.push(format!("id {id}"));
+    }
+    if let Some(author) = address.metadata.author.as_deref() {
+        details.push(format!("author {author}"));
+    }
+    if let Some(date) = address.metadata.date.as_deref() {
+        details.push(format!("date {date}"));
+    }
+    format!(
+        "Change {}/{}: {} ({})",
+        address.ordinal + 1,
+        total,
+        revision_category_name(&address.category),
+        details.join(" · ")
+    )
+}
 
 /// One way to paste the clipboard, offered by the Paste Special dialog.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1232,6 +1304,158 @@ impl App {
         self.dirty = true;
     }
 
+    fn navigate_revision(&mut self, previous: bool) {
+        let location = if previous {
+            self.editor.previous_revision()
+        } else {
+            self.editor.next_revision()
+        };
+        self.status = Some(match location {
+            Some(location) => {
+                let total = self.editor.revision_locations().len();
+                revision_status(&location.address, total)
+            }
+            None => "No tracked changes in this document.".to_string(),
+        });
+        self.dirty = true;
+    }
+
+    fn review_current_revision(&mut self, action: RevisionAction) {
+        let Some(target) = self
+            .editor
+            .current_revision()
+            .map(|location| location.address.target)
+        else {
+            self.status = Some(
+                "No change at the caret. Use Previous Change or Next Change first.".to_string(),
+            );
+            self.dirty = true;
+            return;
+        };
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
+        let outcome = match action {
+            RevisionAction::Accept => self.editor.accept_revision(target),
+            RevisionAction::Reject => self.editor.reject_revision(target),
+        };
+        let changed = outcome.is_applied();
+        let message = Self::revision_outcome_status(&outcome);
+        if changed {
+            self.after_edit();
+        }
+        self.status = Some(message);
+        self.dirty = true;
+    }
+
+    fn revision_outcome_status(outcome: &RevisionOutcome) -> String {
+        match outcome {
+            RevisionOutcome::Applied {
+                target,
+                action,
+                category,
+            } => format!(
+                "{} {} (target {}).",
+                match action {
+                    RevisionAction::Accept => "Accepted",
+                    RevisionAction::Reject => "Rejected",
+                },
+                revision_category_name(category),
+                target.0
+            ),
+            RevisionOutcome::Stale { target, .. } => {
+                format!(
+                    "Change target {} is stale; refresh the review list.",
+                    target.0
+                )
+            }
+            RevisionOutcome::Unsupported { target, kind, .. } => format!(
+                "Change target {} is unsupported ({}); it was left untouched.",
+                target.0,
+                unsupported_revision_name(kind)
+            ),
+            RevisionOutcome::Malformed { target, .. } => format!(
+                "Change target {} is malformed; it was left untouched.",
+                target.0
+            ),
+        }
+    }
+
+    fn request_review_all(&mut self, action: RevisionAction) {
+        let total = self.editor.revision_locations().len();
+        if total == 0 {
+            self.status = Some("No tracked changes in this document.".to_string());
+            self.dirty = true;
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
+        let verb = match action {
+            RevisionAction::Accept => "Accept",
+            RevisionAction::Reject => "Reject",
+        };
+        self.confirm = Some(
+            backstage::Confirm::new(
+                format!("{verb} all {total} tracked changes?"),
+                ConfirmAction::ReviewAll(action),
+                Color::LightBlue,
+            )
+            .default_no(),
+        );
+        self.dirty = true;
+    }
+
+    fn apply_review_all(&mut self, action: RevisionAction) {
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
+        let outcomes = match action {
+            RevisionAction::Accept => self.editor.accept_all_revisions(),
+            RevisionAction::Reject => self.editor.reject_all_revisions(),
+        };
+        let applied = outcomes
+            .iter()
+            .filter(|outcome| outcome.is_applied())
+            .count();
+        let unsupported = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, RevisionOutcome::Unsupported { .. }))
+            .count();
+        let malformed = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, RevisionOutcome::Malformed { .. }))
+            .count();
+        let stale = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, RevisionOutcome::Stale { .. }))
+            .count();
+        if applied > 0 {
+            self.after_edit();
+        }
+        let verb = match action {
+            RevisionAction::Accept => "Accepted",
+            RevisionAction::Reject => "Rejected",
+        };
+        let mut message = format!("{verb} {applied} of {} tracked changes", outcomes.len());
+        let mut skipped = Vec::new();
+        if unsupported > 0 {
+            skipped.push(format!("{unsupported} unsupported"));
+        }
+        if malformed > 0 {
+            skipped.push(format!("{malformed} malformed"));
+        }
+        if stale > 0 {
+            skipped.push(format!("{stale} stale"));
+        }
+        if !skipped.is_empty() {
+            message.push_str(&format!("; left {} untouched", skipped.join(", ")));
+        }
+        message.push('.');
+        self.status = Some(message);
+        self.dirty = true;
+    }
+
     /// Run a ribbon command, mapping it to the matching editor operation.
     fn run_act(&mut self, act: ribbon::Act) {
         use ribbon::Act::*;
@@ -1401,6 +1625,12 @@ impl App {
             NextComment => self.nav_comment(1),
             NewComment => self.start_comment(),
             DeleteComment => self.delete_comment(),
+            PrevRevision => self.navigate_revision(true),
+            NextRevision => self.navigate_revision(false),
+            AcceptRevision => self.review_current_revision(RevisionAction::Accept),
+            RejectRevision => self.review_current_revision(RevisionAction::Reject),
+            AcceptAllRevisions => self.request_review_all(RevisionAction::Accept),
+            RejectAllRevisions => self.request_review_all(RevisionAction::Reject),
             ReadMode => self.set_page_view(false),
             PrintLayout => self.set_page_view(true),
             DarkMode => {
@@ -1680,6 +1910,10 @@ impl App {
                         self.write_pdf(out);
                         false
                     }
+                    ConfirmAction::ReviewAll(action) => {
+                        self.apply_review_all(action);
+                        false
+                    }
                 }
             }
         }
@@ -1933,6 +2167,8 @@ impl App {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            KeyCode::Left | KeyCode::Right if alt && shift => None,
+            KeyCode::Char('a' | 'A' | 'r' | 'R') if alt && shift => Some(MutationKind::Content),
             KeyCode::Char('f') if alt => None,
             KeyCode::Char(' ') if ctrl && shift => Some(MutationKind::Content),
             KeyCode::Char(
@@ -4503,6 +4739,14 @@ impl App {
             }
         }
         match key.code {
+            KeyCode::Left if alt && shift => self.navigate_revision(true),
+            KeyCode::Right if alt && shift => self.navigate_revision(false),
+            KeyCode::Char('a' | 'A') if alt && shift => {
+                self.review_current_revision(RevisionAction::Accept)
+            }
+            KeyCode::Char('r' | 'R') if alt && shift => {
+                self.review_current_revision(RevisionAction::Reject)
+            }
             // Esc clears a selection but never quits — use Ctrl+Q to quit.
             KeyCode::Esc => {
                 if self.editor.has_selection() {
@@ -6335,7 +6579,8 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
 mod tests {
     use super::*;
     use docxcore::model::{
-        Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, Run, RunProps,
+        Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, RevisionMetadata, Run,
+        RunProps,
     };
     use docxcore::package::{
         HeaderVariant, ProtectionEditMode, ProtectionEnforcement, Watermark, WatermarkHeader,
@@ -6412,6 +6657,9 @@ mod tests {
     }
     fn ctrl(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::CONTROL)
+    }
+    fn alt_shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT | KeyModifiers::SHIFT)
     }
 
     #[test]
@@ -7133,6 +7381,54 @@ mod tests {
         app
     }
 
+    fn app_with_revisions() -> App {
+        let metadata = |id: &str, author: &str| RevisionMetadata {
+            id: Some(id.to_string()),
+            author: Some(author.to_string()),
+            date: Some("2026-08-29T10:00:00Z".to_string()),
+            ..RevisionMetadata::default()
+        };
+        let content = vec![
+            Inline::Revision {
+                kind: RevisionKind::Insert,
+                metadata: metadata("51", "Ada"),
+                raw: "<w:ins/>".to_string(),
+                content: vec![Inline::Run(Run {
+                    text: "inserted".to_string(),
+                    props: RunProps::default(),
+                })],
+                content_changed: false,
+            },
+            Inline::UnsupportedRevision {
+                kind: UnsupportedRevisionKind::MoveToRangeStart,
+                metadata: metadata("52", "Grace"),
+                raw: "<w:moveToRangeStart/>".to_string(),
+            },
+            Inline::Revision {
+                kind: RevisionKind::Delete,
+                metadata: metadata("53", "Linus"),
+                raw: "<w:del/>".to_string(),
+                content: vec![Inline::Run(Run {
+                    text: "deleted".to_string(),
+                    props: RunProps::default(),
+                })],
+                content_changed: false,
+            },
+        ];
+        let mut app = App::new(
+            new_package(Document {
+                body: vec![Block::Paragraph(MPara {
+                    props: ParProps::default(),
+                    content,
+                })],
+            }),
+            "review.docx",
+            false,
+        );
+        app.os_clip = None;
+        app
+    }
+
     fn fixture_app(fixture: crate::test_fixtures::ProtectionFixture) -> App {
         let mut app = App::new(
             fixture.package(),
@@ -7317,6 +7613,116 @@ mod tests {
             assert_eq!(first_line(&app), "Fixture body!", "{fixture:?}");
             assert!(app.modified, "{fixture:?}");
         }
+    }
+
+    #[test]
+    fn review_navigation_status_and_shortcuts_include_kind_and_metadata() {
+        let mut app = app_with_revisions();
+        app.run_act(ribbon::Act::NextRevision);
+        let status = app.status.as_deref().unwrap();
+        assert!(status.contains("Change 2/3"), "{status}");
+        assert!(
+            status.contains("unsupported move-to range start"),
+            "{status}"
+        );
+        assert!(status.contains("id 52"), "{status}");
+        assert!(status.contains("author Grace"), "{status}");
+        assert!(status.contains("date 2026-08-29T10:00:00Z"), "{status}");
+
+        app.on_key(alt_shift(KeyCode::Left));
+        let current = app.editor.current_revision().unwrap();
+        assert_eq!(current.address.target.0, 1);
+        assert!(app.status.as_deref().unwrap().contains("Change 1/3"));
+
+        let before = app.editor.doc.clone();
+        app.on_key(alt_shift(KeyCode::Char('A')));
+        assert!(app.modified);
+        assert_eq!(app.editor.revision_locations().len(), 2);
+        let status = app.status.as_deref().unwrap();
+        assert!(status.contains("Accepted insertion (target 1)"), "{status}");
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.doc, before);
+    }
+
+    #[test]
+    fn review_all_ribbon_actions_use_default_no_confirmation_and_one_undo() {
+        let mut app = app_with_revisions();
+        let before = app.editor.doc.clone();
+        app.run_act(ribbon::Act::AcceptAllRevisions);
+        let confirm = app.confirm.as_ref().expect("accept all confirmation");
+        assert!(
+            !confirm.yes_selected(),
+            "destructive review defaulted to Yes"
+        );
+        assert!(confirm.prompt().contains("Accept all 3 tracked changes"));
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.confirm.is_none());
+        assert_eq!(app.editor.doc, before, "default No changed the document");
+        assert!(!app.modified);
+
+        app.run_act(ribbon::Act::RejectAllRevisions);
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.modified);
+        assert_eq!(app.editor.revision_locations().len(), 1);
+        let status = app.status.as_deref().unwrap();
+        assert!(
+            status.contains("Rejected 2 of 3 tracked changes"),
+            "{status}"
+        );
+        assert!(status.contains("1 unsupported"), "{status}");
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.doc, before);
+        assert!(!app.editor.undo(), "review-all pushed multiple checkpoints");
+    }
+
+    #[test]
+    fn unsupported_review_action_is_reported_without_mutation() {
+        let mut app = app_with_revisions();
+        app.run_act(ribbon::Act::NextRevision);
+        let before = app.editor.doc.clone();
+        app.run_act(ribbon::Act::RejectRevision);
+        assert_eq!(app.editor.doc, before);
+        assert!(!app.modified);
+        let status = app.status.as_deref().unwrap();
+        assert!(
+            status.contains("unsupported (move-to range start)"),
+            "{status}"
+        );
+        assert!(status.contains("left untouched"), "{status}");
+    }
+
+    #[test]
+    fn tracked_only_protection_blocks_review_and_untracked_tui_edits() {
+        let mut app = app_with_revisions();
+        protect(&mut app, ProtectionEditMode::TrackedChanges, false);
+        let before = app.editor.doc.clone();
+
+        app.run_act(ribbon::Act::AcceptRevision);
+        assert_eq!(app.editor.doc, before);
+        assert!(!app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "Edit blocked: tracked-only editing is not supported; use Word to create tracked changes."
+            )
+        );
+
+        app.status = None;
+        app.run_act(ribbon::Act::AcceptAllRevisions);
+        assert!(app.confirm.is_none(), "denied review opened a confirmation");
+        assert_eq!(app.editor.doc, before);
+
+        app.status = None;
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.editor.doc, before);
+        assert!(!app.modified);
+        assert!(!app.editor.undo());
+        assert_eq!(
+            app.status.as_deref(),
+            Some(
+                "Edit blocked: tracked-only editing is not supported; use Word to create tracked changes."
+            )
+        );
     }
 
     #[test]

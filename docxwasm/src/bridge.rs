@@ -17,13 +17,17 @@
 use std::rc::Rc;
 
 use docxcore::agent;
-use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::editor::{Caret, Clip, Editor, RevisionLocation};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_rels_xml};
-use docxcore::model::{Align, Block, Inline};
+use docxcore::model::{
+    Align, Block, Inline, PropertyScope, RevisionCategory, RevisionKind, RevisionTarget,
+    UnsupportedRevisionKind,
+};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
 use docxcore::render::{self, Color, ImageBox, LineMap, RenderOptions};
+use docxcore::review::{MalformedRevisionReason, RevisionAction, RevisionOutcome};
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 
 use crate::json;
@@ -415,6 +419,14 @@ impl Session {
             "doc.footer" => Ok(self.ctl_header_footer("footerReference")),
             "doc.metadata" => Ok(self.ctl_metadata()),
             "doc.stats" => Ok(self.ctl_stats()),
+            "doc.revisions" => Ok(self.ctl_revisions()),
+            "doc.revision-current" => Ok(self.ctl_revision_current()),
+            "doc.revision-next" => Ok(self.ctl_navigate_revision(false)),
+            "doc.revision-previous" => Ok(self.ctl_navigate_revision(true)),
+            "doc.revision-accept" => self.ctl_review_revision(args, RevisionAction::Accept),
+            "doc.revision-reject" => self.ctl_review_revision(args, RevisionAction::Reject),
+            "doc.revisions-accept-all" => Ok(self.ctl_review_all_revisions(RevisionAction::Accept)),
+            "doc.revisions-reject-all" => Ok(self.ctl_review_all_revisions(RevisionAction::Reject)),
             "doc.replace-all" => self.ctl_replace_all(args),
             "doc.format" => self.ctl_format(args),
             "doc.set-style" => self.ctl_set_style(args),
@@ -848,6 +860,109 @@ impl Session {
         )
     }
 
+    fn ctl_revisions(&self) -> String {
+        let locations = self.editor.revision_locations();
+        let current = self
+            .editor
+            .current_revision()
+            .map(|location| location.address.target);
+        let mut out = format!("{{\"count\":{},\"revisions\":[", locations.len());
+        for (index, location) in locations.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_revision_location(&mut out, location, current == Some(location.address.target));
+        }
+        out.push_str("]}");
+        out
+    }
+
+    fn ctl_revision_current(&self) -> String {
+        self.ctl_revision_selection(self.editor.current_revision())
+    }
+
+    fn ctl_navigate_revision(&mut self, previous: bool) -> String {
+        let location = if previous {
+            self.editor.previous_revision()
+        } else {
+            self.editor.next_revision()
+        };
+        self.ctl_revision_selection(location)
+    }
+
+    fn ctl_revision_selection(&self, location: Option<RevisionLocation>) -> String {
+        let count = self.editor.revision_locations().len();
+        let mut out = format!("{{\"count\":{count},\"revision\":");
+        match location {
+            Some(location) => push_revision_location(&mut out, &location, true),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        out
+    }
+
+    fn ctl_review_revision(
+        &mut self,
+        args: &json::Json,
+        action: RevisionAction,
+    ) -> Result<String, String> {
+        let raw = args
+            .get_str("revision")
+            .ok_or("revision action needs a 'revision' stable target string")?;
+        let value = raw
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| format!("bad revision target '{raw}'"))?;
+        let outcome = match action {
+            RevisionAction::Accept => self.editor.accept_revision(RevisionTarget(value)),
+            RevisionAction::Reject => self.editor.reject_revision(RevisionTarget(value)),
+        };
+        let applied = outcome.is_applied();
+        if applied {
+            self.finish_ctl_edit();
+        }
+        let mut out = String::new();
+        push_revision_outcome(&mut out, &outcome);
+        out.pop();
+        out.push_str(if applied {
+            ",\"undoSteps\":1}"
+        } else {
+            ",\"undoSteps\":0}"
+        });
+        Ok(out)
+    }
+
+    fn ctl_review_all_revisions(&mut self, action: RevisionAction) -> String {
+        let outcomes = match action {
+            RevisionAction::Accept => self.editor.accept_all_revisions(),
+            RevisionAction::Reject => self.editor.reject_all_revisions(),
+        };
+        let applied = outcomes
+            .iter()
+            .filter(|outcome| outcome.is_applied())
+            .count();
+        if applied > 0 {
+            self.finish_ctl_edit();
+        }
+        let mut out = format!(
+            "{{\"total\":{},\"applied\":{applied},\"outcomes\":[",
+            outcomes.len()
+        );
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_revision_outcome(&mut out, outcome);
+        }
+        out.push_str(if applied > 0 {
+            "],\"undoSteps\":1}"
+        } else {
+            "],\"undoSteps\":0}"
+        });
+        out
+    }
+
     /// `{query, text, case_sensitive?}` -> `{replaced, undoSteps}`.
     ///
     /// `undoSteps` is the internal field (see `ctl_replace_range`'s doc
@@ -1200,6 +1315,184 @@ fn parse_mermaid_images(
         .collect()
 }
 
+fn property_scope_name(scope: PropertyScope) -> &'static str {
+    match scope {
+        PropertyScope::Run => "run properties",
+        PropertyScope::Paragraph => "paragraph properties",
+        PropertyScope::Table => "table properties",
+        PropertyScope::TableRow => "row properties",
+        PropertyScope::TableCell => "cell properties",
+        PropertyScope::Section => "section properties",
+    }
+}
+
+fn unsupported_revision_name(kind: &UnsupportedRevisionKind) -> String {
+    use UnsupportedRevisionKind::*;
+    match kind {
+        MoveFrom => "move-from".to_string(),
+        MoveTo => "move-to".to_string(),
+        MoveFromRangeStart => "move-from range start".to_string(),
+        MoveFromRangeEnd => "move-from range end".to_string(),
+        MoveToRangeStart => "move-to range start".to_string(),
+        MoveToRangeEnd => "move-to range end".to_string(),
+        CustomXmlInsRangeStart => "custom-XML insertion range start".to_string(),
+        CustomXmlInsRangeEnd => "custom-XML insertion range end".to_string(),
+        CustomXmlDelRangeStart => "custom-XML deletion range start".to_string(),
+        CustomXmlDelRangeEnd => "custom-XML deletion range end".to_string(),
+        CustomXmlMoveFromRangeStart => "custom-XML move-from range start".to_string(),
+        CustomXmlMoveFromRangeEnd => "custom-XML move-from range end".to_string(),
+        CustomXmlMoveToRangeStart => "custom-XML move-to range start".to_string(),
+        CustomXmlMoveToRangeEnd => "custom-XML move-to range end".to_string(),
+        CellInsert => "cell insertion".to_string(),
+        CellDelete => "cell deletion".to_string(),
+        CellMerge => "cell merge".to_string(),
+        ConflictInsert => "conflict insertion".to_string(),
+        ConflictDelete => "conflict deletion".to_string(),
+        Other(name) => name.clone(),
+    }
+}
+
+fn revision_category_name(category: &RevisionCategory) -> String {
+    match category {
+        RevisionCategory::Inline(RevisionKind::Insert) => "insertion".to_string(),
+        RevisionCategory::Inline(RevisionKind::Delete) => "deletion".to_string(),
+        RevisionCategory::Property(scope) => property_scope_name(*scope).to_string(),
+        RevisionCategory::Unsupported(kind) => {
+            format!("unsupported {}", unsupported_revision_name(kind))
+        }
+    }
+}
+
+fn push_string_field(out: &mut String, key: &str, value: &str) {
+    out.push_str(",\"");
+    out.push_str(key);
+    out.push_str("\":");
+    json::push_str(out, value);
+}
+
+fn push_caret(out: &mut String, caret: &Caret) {
+    out.push_str("{\"path\":[");
+    for (index, part) in caret.path.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&part.to_string());
+    }
+    out.push_str("],\"offset\":");
+    out.push_str(&caret.offset.to_string());
+    out.push('}');
+}
+
+fn push_revision_location(out: &mut String, location: &RevisionLocation, current: bool) {
+    let address = &location.address;
+    out.push_str("{\"revision\":");
+    json::push_str(out, &address.target.0.to_string());
+    out.push_str(",\"ordinal\":");
+    out.push_str(&(address.ordinal + 1).to_string());
+    out.push_str(",\"depth\":");
+    out.push_str(&address.depth.to_string());
+    push_string_field(out, "kind", &revision_category_name(&address.category));
+    out.push_str(",\"supported\":");
+    out.push_str(
+        if matches!(&address.category, RevisionCategory::Unsupported(_)) {
+            "false"
+        } else {
+            "true"
+        },
+    );
+    out.push_str(",\"current\":");
+    out.push_str(if current { "true" } else { "false" });
+    out.push_str(",\"start\":");
+    push_caret(out, &location.start);
+    out.push_str(",\"end\":");
+    push_caret(out, &location.end);
+    if let Some(parent) = address.parent {
+        push_string_field(out, "parent", &parent.0.to_string());
+    }
+    match &address.category {
+        RevisionCategory::Inline(_) => {}
+        RevisionCategory::Property(scope) => {
+            push_string_field(out, "scope", property_scope_name(*scope));
+        }
+        RevisionCategory::Unsupported(kind) => {
+            push_string_field(out, "unsupported_kind", &unsupported_revision_name(kind));
+        }
+    }
+    if let Some(id) = address.metadata.id.as_deref() {
+        push_string_field(out, "id", id);
+    }
+    if let Some(author) = address.metadata.author.as_deref() {
+        push_string_field(out, "author", author);
+    }
+    if let Some(date) = address.metadata.date.as_deref() {
+        push_string_field(out, "date", date);
+    }
+    out.push('}');
+}
+
+fn action_name(action: RevisionAction) -> &'static str {
+    match action {
+        RevisionAction::Accept => "accept",
+        RevisionAction::Reject => "reject",
+    }
+}
+
+fn push_revision_outcome(out: &mut String, outcome: &RevisionOutcome) {
+    let (target, action) = match outcome {
+        RevisionOutcome::Applied { target, action, .. }
+        | RevisionOutcome::Stale { target, action }
+        | RevisionOutcome::Unsupported { target, action, .. }
+        | RevisionOutcome::Malformed { target, action, .. } => (*target, *action),
+    };
+    out.push_str("{\"status\":");
+    json::push_str(
+        out,
+        if matches!(outcome, RevisionOutcome::Applied { .. }) {
+            "applied"
+        } else {
+            "error"
+        },
+    );
+    push_string_field(out, "revision", &target.0.to_string());
+    push_string_field(out, "action", action_name(action));
+    match outcome {
+        RevisionOutcome::Applied { category, .. } => {
+            push_string_field(out, "kind", &revision_category_name(category));
+        }
+        RevisionOutcome::Stale { .. } => {
+            out.push_str(",\"error\":{\"code\":\"stale_revision\",\"message\":");
+            json::push_str(out, "the stable revision target no longer exists");
+            out.push('}');
+        }
+        RevisionOutcome::Unsupported { kind, .. } => {
+            out.push_str(",\"error\":{\"code\":\"unsupported_revision\",\"kind\":");
+            json::push_str(out, &unsupported_revision_name(kind));
+            out.push_str(",\"message\":");
+            json::push_str(
+                out,
+                "this revision kind is preserved but cannot be acted on",
+            );
+            out.push('}');
+        }
+        RevisionOutcome::Malformed { reason, .. } => {
+            out.push_str(",\"error\":{\"code\":\"malformed_revision\",\"message\":");
+            json::push_str(out, "the revision cannot be transformed safely");
+            match reason {
+                MalformedRevisionReason::PropertyScopeMismatch { expected, actual }
+                | MalformedRevisionReason::PropertySnapshotScopeMismatch { expected, actual } => {
+                    push_string_field(out, "expected_scope", property_scope_name(*expected));
+                    push_string_field(out, "actual_scope", property_scope_name(*actual));
+                }
+                MalformedRevisionReason::PropertySnapshot { scope } => {
+                    push_string_field(out, "scope", property_scope_name(*scope));
+                }
+            }
+            out.push('}');
+        }
+    }
+    out.push('}');
+}
+
 /// Splice `"ok":true` into a ctl verb's result object string (`{…}`),
 /// completing the success envelope. Handles the genuinely-empty-object case
 /// (`doc.metadata` on a package with no set properties returns `"{}"`) so the
@@ -1418,6 +1711,17 @@ mod tests {
              <w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
         );
         let doc = docxcore::load::parse_document_xml(&xml, &Default::default());
+        save_package(&new_package(doc))
+    }
+
+    fn sample_revision_docx() -> Vec<u8> {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body><w:p>
+                <w:ins w:id="61" w:author="Ada" w:date="2026-08-29T10:00:00Z"><w:r><w:t>new</w:t></w:r></w:ins>
+                <w:moveFromRangeStart w:id="62" w:author="Grace"/>
+                <w:del w:id="63" w:author="Linus"><w:r><w:delText>old</w:delText></w:r></w:del>
+            </w:p></w:body></w:document>"#;
+        let doc = docxcore::load::parse_document_xml(xml, &Default::default());
         save_package(&new_package(doc))
     }
 
@@ -1974,6 +2278,63 @@ mod tests {
         );
         let err2 = s.ctl(r#"{"verb":"doc.export","args":{"format":"rtf"}}"#);
         assert!(err2.contains("unknown format 'rtf'"), "{err2}");
+    }
+
+    #[test]
+    fn ctl_revision_navigation_and_actions_match_the_terminal_contract() {
+        let mut s = Session::open(&sample_revision_docx()).expect("open");
+        let list = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(list.contains("\"count\":3"), "{list}");
+        assert!(list.contains("\"revision\":\"1\""), "{list}");
+        assert!(list.contains("\"kind\":\"insertion\""), "{list}");
+        assert!(list.contains("\"id\":\"61\""), "{list}");
+        assert!(list.contains("\"author\":\"Ada\""), "{list}");
+
+        let next = s.ctl(r#"{"verb":"doc.revision-next","args":{}}"#);
+        assert!(next.contains("\"revision\":\"2\""), "{next}");
+        assert!(
+            next.contains("\"unsupported_kind\":\"move-from range start\""),
+            "{next}"
+        );
+
+        let accepted = s.ctl(r#"{"verb":"doc.revision-accept","args":{"revision":"1"}}"#);
+        assert!(accepted.contains("\"status\":\"applied\""), "{accepted}");
+        assert!(accepted.contains("\"undoSteps\":1"), "{accepted}");
+        assert!(s.is_dirty());
+
+        let stale = s.ctl(r#"{"verb":"doc.revision-reject","args":{"revision":"999"}}"#);
+        assert!(stale.contains("\"code\":\"stale_revision\""), "{stale}");
+        assert!(stale.contains("\"undoSteps\":0"), "{stale}");
+
+        let unsupported = s.ctl(r#"{"verb":"doc.revision-accept","args":{"revision":"2"}}"#);
+        assert!(
+            unsupported.contains("\"code\":\"unsupported_revision\""),
+            "{unsupported}"
+        );
+        assert!(unsupported.contains("\"undoSteps\":0"), "{unsupported}");
+
+        let undo = s.ctl(r#"{"verb":"doc.undo","args":{}}"#);
+        assert!(undo.contains("\"done\":true"), "{undo}");
+        let restored = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(restored.contains("\"count\":3"), "{restored}");
+    }
+
+    #[test]
+    fn ctl_revision_all_is_one_wasm_undo_checkpoint_with_structured_skips() {
+        let mut s = Session::open(&sample_revision_docx()).expect("open");
+        let result = s.ctl(r#"{"verb":"doc.revisions-reject-all","args":{}}"#);
+        assert!(result.contains("\"total\":3"), "{result}");
+        assert!(result.contains("\"applied\":2"), "{result}");
+        assert!(
+            result.contains("\"code\":\"unsupported_revision\""),
+            "{result}"
+        );
+        assert!(result.contains("\"undoSteps\":1"), "{result}");
+        let remaining = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(remaining.contains("\"count\":1"), "{remaining}");
+        s.ctl(r#"{"verb":"doc.undo","args":{}}"#);
+        let restored = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(restored.contains("\"count\":3"), "{restored}");
     }
 
     #[test]

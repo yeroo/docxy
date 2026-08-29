@@ -480,6 +480,130 @@
     }
   },
   {
+    "name": "docxy_revisions",
+    "description": "List tracked changes in document order with stable revision ids, kinds, metadata, and editor-safe locations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_revision_current",
+    "description": "Return the tracked change currently selected by review navigation or located at the caret.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_revision_next",
+    "description": "Select and return the next tracked change, wrapping at the end of the document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_revision_previous",
+    "description": "Select and return the previous tracked change, wrapping at the start of the document.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_revision_accept",
+    "description": "Accept one tracked change by its stable revision id. Undoable; returns a structured stale, unsupported, or malformed outcome.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string",
+          "description": "Stable revision id returned by docxy_revisions."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "revision"
+      ]
+    }
+  },
+  {
+    "name": "docxy_revision_reject",
+    "description": "Reject one tracked change by its stable revision id. Undoable; returns a structured stale, unsupported, or malformed outcome.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "revision": {
+          "type": "string",
+          "description": "Stable revision id returned by docxy_revisions."
+        },
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": [
+        "revision"
+      ]
+    }
+  },
+  {
+    "name": "docxy_revisions_accept_all",
+    "description": "Accept every supported tracked change as one undoable transaction and return each structured outcome.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "docxy_revisions_reject_all",
+    "description": "Reject every supported tracked change as one undoable transaction and return each structured outcome.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Optional: which docxy to act on (a substring of its instance/pane id) when several are open."
+        }
+      },
+      "required": []
+    }
+  },
+  {
     "name": "xlsxy_list",
     "description": "List the xlsxy editors currently running on this machine (instance/pane id, port, pid).",
     "inputSchema": {

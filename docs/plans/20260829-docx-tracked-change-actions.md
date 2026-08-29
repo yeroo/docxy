@@ -85,16 +85,16 @@ schema-valid OOXML.
 
 ### Task 5: Add TUI Review actions and automation verbs
 
-- [ ] add discoverable Review UI/status for previous/next, accept/reject current,
+- [x] add discoverable Review UI/status for previous/next, accept/reject current,
       and accept/reject all, including revision kind and metadata when present
-- [ ] keep destructive all-actions behind the repository's normal confirmation
+- [x] keep destructive all-actions behind the repository's normal confirmation
       pattern and make keyboard/ribbon behavior consistent
-- [ ] add control verbs and MCP declarations/results using stable target IDs and
+- [x] add control verbs and MCP declarations/results using stable target IDs and
       structured unsupported/stale errors
-- [ ] respect the central document-protection policy when it exists; tracked-only
+- [x] respect the central document-protection policy when it exists; tracked-only
       protection must not permit untracked ordinary mutations
-- [ ] add TUI and dispatch tests for navigation, confirmation, actions, and errors
-- [ ] run `cargo test -p docxy` before Task 6
+- [x] add TUI and dispatch tests for navigation, confirmation, actions, and errors
+- [x] run `cargo test -p docxy` before Task 6
 
 ### Task 6: Verify package round-trips and interoperability
 

@@ -561,6 +561,60 @@ function docxyToolDefs() {
       ]),
       ['start'],
     ),
+    tool(
+      'docxy_revisions',
+      'List tracked changes in document order with stable revision ids, kinds, metadata, and editor-safe locations.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_revision_current',
+      'Return the tracked change currently selected by review navigation or located at the caret.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_revision_next',
+      'Select and return the next tracked change, wrapping at the end of the document.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_revision_previous',
+      'Select and return the previous tracked change, wrapping at the start of the document.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_revision_accept',
+      'Accept one tracked change by its stable revision id. Undoable; returns a structured stale, unsupported, or malformed outcome.',
+      Object.fromEntries([
+        ['revision', prop('string', 'Stable revision id returned by docxy_revisions.')],
+        target(),
+      ]),
+      ['revision'],
+    ),
+    tool(
+      'docxy_revision_reject',
+      'Reject one tracked change by its stable revision id. Undoable; returns a structured stale, unsupported, or malformed outcome.',
+      Object.fromEntries([
+        ['revision', prop('string', 'Stable revision id returned by docxy_revisions.')],
+        target(),
+      ]),
+      ['revision'],
+    ),
+    tool(
+      'docxy_revisions_accept_all',
+      'Accept every supported tracked change as one undoable transaction and return each structured outcome.',
+      Object.fromEntries([target()]),
+      [],
+    ),
+    tool(
+      'docxy_revisions_reject_all',
+      'Reject every supported tracked change as one undoable transaction and return each structured outcome.',
+      Object.fromEntries([target()]),
+      [],
+    ),
   ];
 }
 
@@ -969,6 +1023,14 @@ const DOCXY_VERBS = {
   docxy_redo: 'doc.redo',
   docxy_format: 'doc.format',
   docxy_set_style: 'doc.set-style',
+  docxy_revisions: 'doc.revisions',
+  docxy_revision_current: 'doc.revision-current',
+  docxy_revision_next: 'doc.revision-next',
+  docxy_revision_previous: 'doc.revision-previous',
+  docxy_revision_accept: 'doc.revision-accept',
+  docxy_revision_reject: 'doc.revision-reject',
+  docxy_revisions_accept_all: 'doc.revisions-accept-all',
+  docxy_revisions_reject_all: 'doc.revisions-reject-all',
 };
 
 const XLSXY_VERBS = {

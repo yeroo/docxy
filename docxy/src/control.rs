@@ -32,15 +32,24 @@
 //! | `doc.stats` | — | `{words, chars, paragraphs, blocks}` |
 //! | `doc.replace-all` | `{query, text, case_sensitive?}` | `{replaced}` |
 //! | `doc.undo` / `doc.redo` | — | `{done}` (false = nothing to undo/redo) |
+//! | `doc.revisions` / `doc.revision-current` | — | stable revision ids, kinds, metadata, and current selection |
+//! | `doc.revision-next` / `doc.revision-previous` | — | navigate and return the selected stable revision |
+//! | `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
+//! | `doc.revisions-accept-all` / `doc.revisions-reject-all` | — | one undoable transaction and per-revision outcomes |
 //! | `doc.export-pdf` | `{path}` | `{path}` (absolutized; refuses to overwrite) |
 //! | `doc.format` | `{start, end?, patch}` | `{formatted}` — one undo checkpoint; `patch` keys: `bold`/`italic`/`underline`/`strike`/`color`/`highlight`/`font`/`size` (≥1 required), set-to-value semantics |
 //! | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — one undo checkpoint; ≥1 of `style`/`align` required |
 
-use crate::{App, DocFormat, protection::MutationKind};
+use crate::{
+    App, DocFormat, property_scope_name, protection::MutationKind, revision_category_name,
+    unsupported_revision_name,
+};
 use ctlcore::json::Json;
 use docxcore::agent;
+use docxcore::editor::RevisionLocation;
 use docxcore::export::{PdfOptions, to_pdf};
-use docxcore::model::Block;
+use docxcore::model::{Block, RevisionCategory, RevisionTarget};
+use docxcore::review::{MalformedRevisionReason, RevisionAction, RevisionOutcome};
 use std::path::Path;
 
 /// The directory where docxy publishes its control discovery files:
@@ -65,7 +74,13 @@ pub fn instance_name() -> String {
 pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
     Some(match verb {
         "doc.replace-range" | "doc.insert" | "doc.append" => MutationKind::Structure,
-        "doc.replace-all" | "doc.undo" | "doc.redo" => MutationKind::Content,
+        "doc.replace-all"
+        | "doc.undo"
+        | "doc.redo"
+        | "doc.revision-accept"
+        | "doc.revision-reject"
+        | "doc.revisions-accept-all"
+        | "doc.revisions-reject-all" => MutationKind::Content,
         "doc.format" | "doc.set-style" => MutationKind::Formatting,
         _ => return None,
     })
@@ -99,6 +114,14 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         "doc.footer" => Ok(header_footer(&app.footers.default)),
         "doc.metadata" => Ok(metadata(app)),
         "doc.stats" => Ok(stats(app)),
+        "doc.revisions" => Ok(revisions(app)),
+        "doc.revision-current" => Ok(current_revision(app)),
+        "doc.revision-next" => Ok(navigate_revision(app, false)),
+        "doc.revision-previous" => Ok(navigate_revision(app, true)),
+        "doc.revision-accept" => review_revision(app, args, RevisionAction::Accept),
+        "doc.revision-reject" => review_revision(app, args, RevisionAction::Reject),
+        "doc.revisions-accept-all" => Ok(review_all_revisions(app, RevisionAction::Accept)),
+        "doc.revisions-reject-all" => Ok(review_all_revisions(app, RevisionAction::Reject)),
         "doc.replace-all" => replace_all(app, args),
         "doc.format" => format(app, args),
         "doc.set-style" => set_style(app, args),
@@ -365,6 +388,265 @@ fn stats(app: &App) -> Json {
         ("chars", Json::Num(chars as f64)),
         ("paragraphs", Json::Num(paragraphs as f64)),
         ("blocks", Json::Num(blocks as f64)),
+    ])
+}
+
+fn revision_location_json(location: &RevisionLocation, current: bool) -> Json {
+    let address = &location.address;
+    let mut fields = vec![
+        ("revision", Json::Str(address.target.0.to_string())),
+        ("ordinal", Json::Num((address.ordinal + 1) as f64)),
+        ("depth", Json::Num(address.depth as f64)),
+        ("kind", Json::Str(revision_category_name(&address.category))),
+        (
+            "supported",
+            Json::Bool(!matches!(
+                &address.category,
+                RevisionCategory::Unsupported(_)
+            )),
+        ),
+        ("current", Json::Bool(current)),
+        (
+            "start",
+            Json::obj(vec![
+                (
+                    "path",
+                    Json::Arr(
+                        location
+                            .start
+                            .path
+                            .iter()
+                            .map(|part| Json::Num(*part as f64))
+                            .collect(),
+                    ),
+                ),
+                ("offset", Json::Num(location.start.offset as f64)),
+            ]),
+        ),
+        (
+            "end",
+            Json::obj(vec![
+                (
+                    "path",
+                    Json::Arr(
+                        location
+                            .end
+                            .path
+                            .iter()
+                            .map(|part| Json::Num(*part as f64))
+                            .collect(),
+                    ),
+                ),
+                ("offset", Json::Num(location.end.offset as f64)),
+            ]),
+        ),
+    ];
+    if let Some(parent) = address.parent {
+        fields.push(("parent", Json::Str(parent.0.to_string())));
+    }
+    match &address.category {
+        RevisionCategory::Inline(_) => {}
+        RevisionCategory::Property(scope) => {
+            fields.push(("scope", Json::Str(property_scope_name(*scope).to_string())));
+        }
+        RevisionCategory::Unsupported(kind) => {
+            fields.push((
+                "unsupported_kind",
+                Json::Str(unsupported_revision_name(kind)),
+            ));
+        }
+    }
+    if let Some(id) = address.metadata.id.as_ref() {
+        fields.push(("id", Json::Str(id.clone())));
+    }
+    if let Some(author) = address.metadata.author.as_ref() {
+        fields.push(("author", Json::Str(author.clone())));
+    }
+    if let Some(date) = address.metadata.date.as_ref() {
+        fields.push(("date", Json::Str(date.clone())));
+    }
+    Json::obj(fields)
+}
+
+/// Enumerate revisions in current document order. Stable targets are strings
+/// so the full u64 identity survives JSON implementations whose numbers are
+/// limited to 53 bits.
+fn revisions(app: &App) -> Json {
+    let locations = app.editor.revision_locations();
+    let current = app
+        .editor
+        .current_revision()
+        .map(|location| location.address.target);
+    let items = locations
+        .iter()
+        .map(|location| revision_location_json(location, current == Some(location.address.target)))
+        .collect();
+    Json::obj(vec![
+        ("count", Json::Num(locations.len() as f64)),
+        ("revisions", Json::Arr(items)),
+    ])
+}
+
+fn revision_selection(app: &App, location: Option<RevisionLocation>) -> Json {
+    let count = app.editor.revision_locations().len();
+    Json::obj(vec![
+        ("count", Json::Num(count as f64)),
+        (
+            "revision",
+            location
+                .as_ref()
+                .map(|location| revision_location_json(location, true))
+                .unwrap_or(Json::Null),
+        ),
+    ])
+}
+
+fn current_revision(app: &App) -> Json {
+    revision_selection(app, app.editor.current_revision())
+}
+
+fn navigate_revision(app: &mut App, previous: bool) -> Json {
+    let location = if previous {
+        app.editor.previous_revision()
+    } else {
+        app.editor.next_revision()
+    };
+    app.dirty = true;
+    revision_selection(app, location)
+}
+
+fn revision_target_arg(args: &Json) -> Result<RevisionTarget, String> {
+    let raw = args
+        .get_str("revision")
+        .ok_or("revision action needs a 'revision' stable target string")?;
+    let value = raw
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value != 0)
+        .ok_or_else(|| format!("bad revision target '{raw}'"))?;
+    Ok(RevisionTarget(value))
+}
+
+fn action_name(action: RevisionAction) -> &'static str {
+    match action {
+        RevisionAction::Accept => "accept",
+        RevisionAction::Reject => "reject",
+    }
+}
+
+fn scope_error_fields(reason: &MalformedRevisionReason) -> Vec<(&'static str, Json)> {
+    match reason {
+        MalformedRevisionReason::PropertyScopeMismatch { expected, actual }
+        | MalformedRevisionReason::PropertySnapshotScopeMismatch { expected, actual } => vec![
+            (
+                "expected_scope",
+                Json::Str(property_scope_name(*expected).to_string()),
+            ),
+            (
+                "actual_scope",
+                Json::Str(property_scope_name(*actual).to_string()),
+            ),
+        ],
+        MalformedRevisionReason::PropertySnapshot { scope } => {
+            vec![("scope", Json::Str(property_scope_name(*scope).to_string()))]
+        }
+    }
+}
+
+fn revision_outcome_json(outcome: &RevisionOutcome) -> Json {
+    let (target, action) = match outcome {
+        RevisionOutcome::Applied { target, action, .. }
+        | RevisionOutcome::Stale { target, action }
+        | RevisionOutcome::Unsupported { target, action, .. }
+        | RevisionOutcome::Malformed { target, action, .. } => (*target, *action),
+    };
+    let mut fields = vec![
+        ("revision", Json::Str(target.0.to_string())),
+        ("action", Json::Str(action_name(action).to_string())),
+    ];
+    match outcome {
+        RevisionOutcome::Applied { category, .. } => {
+            fields.insert(0, ("status", Json::Str("applied".to_string())));
+            fields.push(("kind", Json::Str(revision_category_name(category))));
+        }
+        RevisionOutcome::Stale { .. } => {
+            fields.insert(0, ("status", Json::Str("error".to_string())));
+            fields.push((
+                "error",
+                Json::obj(vec![
+                    ("code", Json::Str("stale_revision".to_string())),
+                    (
+                        "message",
+                        Json::Str("the stable revision target no longer exists".to_string()),
+                    ),
+                ]),
+            ));
+        }
+        RevisionOutcome::Unsupported { kind, .. } => {
+            fields.insert(0, ("status", Json::Str("error".to_string())));
+            fields.push((
+                "error",
+                Json::obj(vec![
+                    ("code", Json::Str("unsupported_revision".to_string())),
+                    ("kind", Json::Str(unsupported_revision_name(kind))),
+                    (
+                        "message",
+                        Json::Str(
+                            "this revision kind is preserved but cannot be acted on".to_string(),
+                        ),
+                    ),
+                ]),
+            ));
+        }
+        RevisionOutcome::Malformed { reason, .. } => {
+            fields.insert(0, ("status", Json::Str("error".to_string())));
+            let mut error = vec![
+                ("code", Json::Str("malformed_revision".to_string())),
+                (
+                    "message",
+                    Json::Str("the revision cannot be transformed safely".to_string()),
+                ),
+            ];
+            error.extend(scope_error_fields(reason));
+            fields.push(("error", Json::obj(error)));
+        }
+    }
+    Json::obj(fields)
+}
+
+fn review_revision(app: &mut App, args: &Json, action: RevisionAction) -> Result<Json, String> {
+    let target = revision_target_arg(args)?;
+    let outcome = match action {
+        RevisionAction::Accept => app.editor.accept_revision(target),
+        RevisionAction::Reject => app.editor.reject_revision(target),
+    };
+    if outcome.is_applied() {
+        finish_edit(app);
+        ctlcore::signal_activity();
+    }
+    Ok(revision_outcome_json(&outcome))
+}
+
+fn review_all_revisions(app: &mut App, action: RevisionAction) -> Json {
+    let outcomes = match action {
+        RevisionAction::Accept => app.editor.accept_all_revisions(),
+        RevisionAction::Reject => app.editor.reject_all_revisions(),
+    };
+    let applied = outcomes
+        .iter()
+        .filter(|outcome| outcome.is_applied())
+        .count();
+    if applied > 0 {
+        finish_edit(app);
+        ctlcore::signal_activity();
+    }
+    Json::obj(vec![
+        ("total", Json::Num(outcomes.len() as f64)),
+        ("applied", Json::Num(applied as f64)),
+        (
+            "outcomes",
+            Json::Arr(outcomes.iter().map(revision_outcome_json).collect()),
+        ),
     ])
 }
 
@@ -793,7 +1075,10 @@ fn parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps};
+    use docxcore::model::{
+        Block, Document, Inline, ParProps, Paragraph, RevisionKind, RevisionMetadata, Run,
+        RunProps, UnsupportedRevisionKind,
+    };
     use docxcore::package::{
         ProtectionEditMode, ProtectionEnforcement, load_package, new_package, save_package,
     };
@@ -817,6 +1102,52 @@ mod tests {
 
     fn app_with(paras: &[&str]) -> App {
         App::new(new_package(doc_with(paras)), "ctl-test.docx", false)
+    }
+
+    fn revision_app() -> App {
+        let metadata = |id: &str, author: &str| RevisionMetadata {
+            id: Some(id.to_string()),
+            author: Some(author.to_string()),
+            date: Some("2026-08-29T10:00:00Z".to_string()),
+            ..RevisionMetadata::default()
+        };
+        let paragraph = Paragraph {
+            props: ParProps::default(),
+            content: vec![
+                Inline::Revision {
+                    kind: RevisionKind::Insert,
+                    metadata: metadata("41", "Ada"),
+                    raw: "<w:ins/>".to_string(),
+                    content: vec![Inline::Run(Run {
+                        text: "inserted".to_string(),
+                        props: RunProps::default(),
+                    })],
+                    content_changed: false,
+                },
+                Inline::UnsupportedRevision {
+                    kind: UnsupportedRevisionKind::MoveFromRangeStart,
+                    metadata: metadata("42", "Grace"),
+                    raw: "<w:moveFromRangeStart/>".to_string(),
+                },
+                Inline::Revision {
+                    kind: RevisionKind::Delete,
+                    metadata: metadata("43", "Linus"),
+                    raw: "<w:del/>".to_string(),
+                    content: vec![Inline::Run(Run {
+                        text: "deleted".to_string(),
+                        props: RunProps::default(),
+                    })],
+                    content_changed: false,
+                },
+            ],
+        };
+        App::new(
+            new_package(Document {
+                body: vec![Block::Paragraph(paragraph)],
+            }),
+            "revision-test.docx",
+            false,
+        )
     }
 
     fn paras(app: &App) -> Vec<String> {
@@ -1544,6 +1875,168 @@ mod tests {
     }
 
     #[test]
+    fn revision_listing_and_navigation_report_stable_ids_metadata_and_kinds() {
+        let mut app = revision_app();
+        let listing = dispatch(&mut app, "doc.revisions", &Json::Null).unwrap();
+        assert_eq!(listing.get_usize("count"), Some(3));
+        let items = listing.get("revisions").unwrap().as_array().unwrap();
+        assert_eq!(items[0].get_str("revision"), Some("1"));
+        assert_eq!(items[0].get_str("kind"), Some("insertion"));
+        assert_eq!(items[0].get_str("id"), Some("41"));
+        assert_eq!(items[0].get_str("author"), Some("Ada"));
+        assert_eq!(items[0].get_str("date"), Some("2026-08-29T10:00:00Z"));
+        assert_eq!(
+            items[0].get("supported").and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            items[1].get("supported").and_then(Json::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            items[1].get_str("unsupported_kind"),
+            Some("move-from range start")
+        );
+
+        let next = dispatch(&mut app, "doc.revision-next", &Json::Null).unwrap();
+        let selected = next.get("revision").unwrap();
+        assert_eq!(selected.get_str("revision"), Some("2"));
+        assert_eq!(selected.get("current").and_then(Json::as_bool), Some(true));
+        let previous = dispatch(&mut app, "doc.revision-previous", &Json::Null).unwrap();
+        assert_eq!(
+            previous.get("revision").unwrap().get_str("revision"),
+            Some("1")
+        );
+    }
+
+    #[test]
+    fn revision_actions_are_stable_structured_and_undoable() {
+        let mut app = revision_app();
+        let before = app.editor.doc.clone();
+        let result = dispatch(
+            &mut app,
+            "doc.revision-accept",
+            &args(vec![("revision", Json::Str("1".to_string()))]),
+        )
+        .unwrap();
+        assert_eq!(result.get_str("status"), Some("applied"));
+        assert_eq!(result.get_str("revision"), Some("1"));
+        assert_eq!(result.get_str("action"), Some("accept"));
+        assert_eq!(result.get_str("kind"), Some("insertion"));
+        assert!(app.modified);
+        assert_eq!(app.editor.revision_locations().len(), 2);
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.doc, before);
+
+        let stale = dispatch(
+            &mut app,
+            "doc.revision-reject",
+            &args(vec![("revision", Json::Str("999".to_string()))]),
+        )
+        .unwrap();
+        assert_eq!(stale.get_str("status"), Some("error"));
+        assert_eq!(
+            stale.get("error").unwrap().get_str("code"),
+            Some("stale_revision")
+        );
+
+        let unsupported = dispatch(
+            &mut app,
+            "doc.revision-accept",
+            &args(vec![("revision", Json::Str("2".to_string()))]),
+        )
+        .unwrap();
+        assert_eq!(unsupported.get_str("status"), Some("error"));
+        let error = unsupported.get("error").unwrap();
+        assert_eq!(error.get_str("code"), Some("unsupported_revision"));
+        assert_eq!(error.get_str("kind"), Some("move-from range start"));
+        assert_eq!(app.editor.doc, before);
+    }
+
+    #[test]
+    fn accept_all_reports_skips_and_uses_one_undo_transaction() {
+        let mut app = revision_app();
+        let before = app.editor.doc.clone();
+        let result = dispatch(&mut app, "doc.revisions-accept-all", &Json::Null).unwrap();
+        assert_eq!(result.get_usize("total"), Some(3));
+        assert_eq!(result.get_usize("applied"), Some(2));
+        let outcomes = result.get("outcomes").unwrap().as_array().unwrap();
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().any(|outcome| {
+            outcome.get("error").and_then(|error| error.get_str("code"))
+                == Some("unsupported_revision")
+        }));
+        assert_eq!(app.editor.revision_locations().len(), 1);
+        assert!(app.editor.undo());
+        assert_eq!(app.editor.doc, before);
+        assert!(
+            !app.editor.undo(),
+            "accept-all pushed more than one checkpoint"
+        );
+    }
+
+    #[test]
+    fn tracked_only_protection_denies_review_and_ordinary_mutations() {
+        let mut app = revision_app();
+        protect(&mut app, ProtectionEditMode::TrackedChanges, false);
+        let before = app.editor.doc.clone();
+        let review_error = dispatch(
+            &mut app,
+            "doc.revision-accept",
+            &args(vec![("revision", Json::Str("1".to_string()))]),
+        )
+        .unwrap_err();
+        assert!(review_error.starts_with("protection_denied:tracked_changes_unsupported:"));
+        let edit_error = dispatch(
+            &mut app,
+            "doc.insert",
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("untracked".to_string())),
+            ]),
+        )
+        .unwrap_err();
+        assert!(edit_error.starts_with("protection_denied:tracked_changes_unsupported:"));
+        assert_eq!(app.editor.doc, before);
+        assert!(!app.modified);
+        assert!(!app.editor.undo());
+    }
+
+    #[test]
+    fn revision_action_requires_a_nonzero_stable_target_string() {
+        let mut app = revision_app();
+        assert_eq!(
+            dispatch(&mut app, "doc.revision-accept", &Json::Null).unwrap_err(),
+            "revision action needs a 'revision' stable target string"
+        );
+        assert_eq!(
+            dispatch(
+                &mut app,
+                "doc.revision-accept",
+                &args(vec![("revision", Json::Str("0".to_string()))]),
+            )
+            .unwrap_err(),
+            "bad revision target '0'"
+        );
+    }
+
+    #[test]
+    fn malformed_revision_outcome_has_structured_scope_error() {
+        let result = revision_outcome_json(&RevisionOutcome::Malformed {
+            target: RevisionTarget(77),
+            action: RevisionAction::Reject,
+            reason: MalformedRevisionReason::PropertySnapshot {
+                scope: docxcore::model::PropertyScope::TableCell,
+            },
+        });
+        assert_eq!(result.get_str("status"), Some("error"));
+        assert_eq!(result.get_str("revision"), Some("77"));
+        let error = result.get("error").unwrap();
+        assert_eq!(error.get_str("code"), Some("malformed_revision"));
+        assert_eq!(error.get_str("scope"), Some("cell properties"));
+    }
+
+    #[test]
     fn path_has_no_protection_or_watermark_keys_when_unset() {
         let app = app_with(&["x"]);
         let r = path_info(&app);
@@ -1578,6 +2071,10 @@ mod tests {
             ("doc.redo", Content),
             ("doc.format", Formatting),
             ("doc.set-style", Formatting),
+            ("doc.revision-accept", Content),
+            ("doc.revision-reject", Content),
+            ("doc.revisions-accept-all", Content),
+            ("doc.revisions-reject-all", Content),
         ];
         for (verb, expected) in mutating {
             assert_eq!(mutation_kind_for_verb(verb), Some(expected), "{verb}");
@@ -1595,6 +2092,10 @@ mod tests {
             "doc.footer",
             "doc.metadata",
             "doc.stats",
+            "doc.revisions",
+            "doc.revision-current",
+            "doc.revision-next",
+            "doc.revision-previous",
             "doc.export-pdf",
             "doc.save",
             "doc.reload",
@@ -1645,6 +2146,16 @@ mod tests {
             ),
             ("doc.undo", Json::Null),
             ("doc.redo", Json::Null),
+            (
+                "doc.revision-accept",
+                args(vec![("revision", Json::Str("1".into()))]),
+            ),
+            (
+                "doc.revision-reject",
+                args(vec![("revision", Json::Str("1".into()))]),
+            ),
+            ("doc.revisions-accept-all", Json::Null),
+            ("doc.revisions-reject-all", Json::Null),
         ];
 
         for (verb, verb_args) in cases {
@@ -1950,6 +2461,10 @@ mod tests {
             ("doc.footer", Json::Null),
             ("doc.metadata", Json::Null),
             ("doc.stats", Json::Null),
+            ("doc.revisions", Json::Null),
+            ("doc.revision-current", Json::Null),
+            ("doc.revision-next", Json::Null),
+            ("doc.revision-previous", Json::Null),
         ];
         for (verb, verb_args) in cases {
             assert!(
