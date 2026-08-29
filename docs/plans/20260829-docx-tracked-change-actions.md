@@ -61,16 +61,16 @@ schema-valid OOXML.
 
 ### Task 3: Implement pure accept/reject transforms
 
-- [ ] add document-level operations for accept/reject by stable revision target
+- [x] add document-level operations for accept/reject by stable revision target
       and for accept/reject all in document order
-- [ ] implement insertion/deletion unwrap/remove semantics and recursively strip
+- [x] implement insertion/deletion unwrap/remove semantics and recursively strip
       revision display styling only when it came from the acted-on wrapper
-- [ ] implement current-versus-prior replacement for each property-change scope
+- [x] implement current-versus-prior replacement for each property-change scope
       while preserving unrelated properties and wrapper nesting
-- [ ] return explicit outcomes for stale, unsupported, or malformed targets
-- [ ] add exhaustive transform tests including adjacent/nested revisions, empty
+- [x] return explicit outcomes for stale, unsupported, or malformed targets
+- [x] add exhaustive transform tests including adjacent/nested revisions, empty
       content, fields/hyperlinks, tables, raw boundaries, and mixed property edits
-- [ ] run `cargo test -p docxcore` before Task 4
+- [x] run `cargo test -p docxcore` before Task 4
 
 ### Task 4: Integrate review operations with editor history
 

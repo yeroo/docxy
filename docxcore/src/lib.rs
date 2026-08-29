@@ -41,5 +41,6 @@ pub mod numbering;
 pub mod omath;
 pub mod package;
 pub mod render;
+pub mod review;
 pub mod serialize;
 pub mod styles;

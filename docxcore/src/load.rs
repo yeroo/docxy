@@ -895,6 +895,7 @@ fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -
         metadata,
         raw,
         content,
+        content_changed: false,
     }
 }
 
@@ -1007,6 +1008,11 @@ fn parse_present_property_snapshot(raw: &str, scope: PropertyScope) -> Option<Pr
             let mut props = ParProps::default();
             parse_ppr(&mut parser, &mut props);
             props.property_change = None;
+            if props.heading_level.is_none() {
+                if let Some(style_id) = &props.style_id {
+                    props.heading_level = heading_level(style_id);
+                }
+            }
             PropertyState::Paragraph(Box::new(props))
         }
         PropertyScope::Table => PropertyState::Table(raw.to_string()),
@@ -1094,8 +1100,20 @@ fn parse_raw_or_unsupported_revision(p: &mut XmlParser, out: &mut Vec<Inline>) {
 /// deletion, underline for an insertion (Word's markup convention).
 fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
     let apply = |props: &mut RunProps| match kind {
-        RevisionKind::Delete => props.strike = true,
-        RevisionKind::Insert => props.underline = true,
+        RevisionKind::Delete => {
+            if props.revision_cues.deletions == 0 && !props.strike {
+                props.strike = true;
+                props.revision_cues.strike_added = true;
+            }
+            props.revision_cues.deletions = props.revision_cues.deletions.saturating_add(1);
+        }
+        RevisionKind::Insert => {
+            if props.revision_cues.insertions == 0 && !props.underline {
+                props.underline = true;
+                props.revision_cues.underline_added = true;
+            }
+            props.revision_cues.insertions = props.revision_cues.insertions.saturating_add(1);
+        }
     };
     match inl {
         Inline::Run(r) => apply(&mut r.props),
@@ -1343,6 +1361,7 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                 | "w:object"
                 | "w:fldChar"
                 | "w:instrText"
+                | "w:delInstrText"
                 | "w:sym"
                 | "w:commentReference"
                 | "w:footnoteReference"

@@ -482,9 +482,19 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     s.push_str("</w:pPr>");
 }
 
+#[derive(Clone, Copy)]
+enum RunTextKind {
+    Normal,
+    Deleted,
+}
+
 fn write_inline(s: &mut String, item: &Inline) {
+    write_inline_with_text_kind(s, item, RunTextKind::Normal);
+}
+
+fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunTextKind) {
     match item {
-        Inline::Run(r) => write_run(s, r),
+        Inline::Run(r) => write_run(s, r, text_kind),
         Inline::Tab(props) => {
             s.push_str("<w:r>");
             write_rpr(s, props);
@@ -509,7 +519,7 @@ fn write_inline(s: &mut String, item: &Inline) {
             }
             s.push('>');
             for r in &h.runs {
-                write_run(s, r);
+                write_run(s, r, text_kind);
             }
             s.push_str("</w:hyperlink>");
         }
@@ -517,9 +527,22 @@ fn write_inline(s: &mut String, item: &Inline) {
         Inline::Chart { raw, .. } => s.push_str(raw),
         Inline::Equation { raw, .. } => s.push_str(raw),
         Inline::Field { raw, .. } => s.push_str(raw),
-        // Tracked change: re-emit the original <w:ins>/<w:del> verbatim (the
-        // display `content` is not serialized).
-        Inline::Revision { raw, .. } => s.push_str(raw),
+        // Untouched tracked changes remain byte-faithful. If a descendant was
+        // acted on, retain the exact wrapper start tag/metadata and rebuild only
+        // its inline payload so the nested action survives save/reload.
+        Inline::Revision {
+            kind,
+            raw,
+            content,
+            content_changed,
+            ..
+        } => {
+            if *content_changed {
+                write_changed_revision(s, *kind, raw, content);
+            } else {
+                s.push_str(raw);
+            }
+        }
         Inline::UnsupportedRevision { raw, .. } => s.push_str(raw),
         // Footnote/endnote reference: re-emit the original reference run verbatim.
         Inline::FootnoteRef { raw, .. } => s.push_str(raw),
@@ -540,12 +563,50 @@ fn write_inline(s: &mut String, item: &Inline) {
     }
 }
 
-fn write_run(s: &mut String, r: &Run) {
+fn write_changed_revision(s: &mut String, kind: RevisionKind, raw: &str, content: &[Inline]) {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start {
+        s.push_str(raw);
+        return;
+    }
+    let name = parser.name().to_string();
+    let opening_end = parser.pos();
+    let opening = &raw[..opening_end];
+    if opening.trim_end().ends_with("/>") {
+        if let Some(slash) = opening.rfind("/>") {
+            s.push_str(&opening[..slash]);
+            s.push('>');
+        } else {
+            s.push_str(opening);
+        }
+    } else {
+        s.push_str(opening);
+    }
+
+    let text_kind = match kind {
+        RevisionKind::Insert => RunTextKind::Normal,
+        RevisionKind::Delete => RunTextKind::Deleted,
+    };
+    for item in content {
+        write_inline_with_text_kind(s, item, text_kind);
+    }
+    s.push_str("</");
+    s.push_str(&name);
+    s.push('>');
+}
+
+fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
     s.push_str("<w:r>");
     write_rpr(s, &r.props);
-    s.push_str("<w:t xml:space=\"preserve\">");
+    match text_kind {
+        RunTextKind::Normal => s.push_str("<w:t xml:space=\"preserve\">"),
+        RunTextKind::Deleted => s.push_str("<w:delText xml:space=\"preserve\">"),
+    }
     esc_text(&r.text, s);
-    s.push_str("</w:t></w:r>");
+    match text_kind {
+        RunTextKind::Normal => s.push_str("</w:t></w:r>"),
+        RunTextKind::Deleted => s.push_str("</w:delText></w:r>"),
+    }
 }
 
 fn rpr_rank(local: &str) -> u32 {
@@ -602,10 +663,15 @@ fn rpr_rank(local: &str) -> u32 {
 }
 
 fn write_rpr(s: &mut String, p: &RunProps) {
+    // Revision underline/strike are renderer cues, never direct OOXML
+    // properties. Preserve a genuine direct value, but omit a cue that was
+    // introduced only by an enclosing insertion/deletion wrapper.
+    let underline = p.underline && !p.revision_cues.underline_added;
+    let strike = p.strike && !p.revision_cues.strike_added;
     let has_any = p.bold
         || p.italic
-        || p.underline
-        || p.strike
+        || underline
+        || strike
         || p.code
         || p.caps
         || p.small_caps
@@ -652,7 +718,7 @@ fn write_rpr(s: &mut String, p: &RunProps) {
     if p.small_caps {
         parts.push((rpr_rank("smallCaps"), "<w:smallCaps/>".to_string()));
     }
-    if p.strike {
+    if strike {
         parts.push((rpr_rank("strike"), "<w:strike/>".to_string()));
     }
     if p.vanish {
@@ -673,7 +739,7 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         xml.push_str("\"/>");
         parts.push((rpr_rank("highlight"), xml));
     }
-    if p.underline {
+    if underline {
         parts.push((rpr_rank("u"), "<w:u w:val=\"single\"/>".to_string()));
     }
     match p.vert_align {
@@ -696,12 +762,12 @@ fn write_rpr(s: &mut String, p: &RunProps) {
             || matches!(name, "i" if p.italic)
             || matches!(name, "caps" if p.caps)
             || matches!(name, "smallCaps" if p.small_caps)
-            || matches!(name, "strike" if p.strike)
+            || matches!(name, "strike" if strike)
             || matches!(name, "vanish" if p.vanish)
             || matches!(name, "color" if p.color.is_some())
             || matches!(name, "sz" if p.size_half_pts.is_some())
             || matches!(name, "highlight" if p.highlight.is_some())
-            || matches!(name, "u" if p.underline)
+            || matches!(name, "u" if underline)
             || matches!(name, "vertAlign" if p.vert_align != VertAlign::Baseline)
             || matches!(name, "rPrChange" if p.property_change.is_some());
         if !superseded {

@@ -1580,11 +1580,13 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 metadata,
                 raw,
                 content,
+                content_changed,
             } => out.push(Inline::Revision {
                 kind: *kind,
                 metadata: metadata.clone(),
                 raw: raw.clone(),
                 content: content.clone(),
+                content_changed: *content_changed,
             }),
             Inline::UnsupportedRevision {
                 kind,

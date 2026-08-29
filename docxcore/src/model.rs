@@ -54,6 +54,24 @@ pub struct RunProps {
     /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
     /// current state; `previous` on the change retains the prior snapshot.
     pub property_change: Option<PropertyChange>,
+    /// Display-only formatting contributed by enclosing revision wrappers.
+    ///
+    /// The public formatting fields remain the effective render state. These
+    /// counters remember whether underline/strike was added solely for review
+    /// display so accepting or rejecting a wrapper never removes genuine direct
+    /// formatting. They are not serialized as document properties.
+    #[doc(hidden)]
+    pub revision_cues: RevisionDisplayCues,
+}
+
+/// Provenance for the underline/strike cues used to render tracked changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[doc(hidden)]
+pub struct RevisionDisplayCues {
+    pub insertions: u32,
+    pub deletions: u32,
+    pub underline_added: bool,
+    pub strike_added: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -143,6 +161,10 @@ pub enum Inline {
         metadata: RevisionMetadata,
         raw: String,
         content: Vec<Inline>,
+        /// Set after an action changes a descendant. Untouched wrappers continue
+        /// to serialize from `raw`; changed wrappers rebuild only their content.
+        #[doc(hidden)]
+        content_changed: bool,
     },
     /// A recognized but deliberately unsupported revision record (move ranges,
     /// custom-XML ranges, and table-cell revision records). Keeping it distinct
@@ -1425,6 +1447,7 @@ mod tests {
             },
             raw: format!("<w:{:?}/>", kind),
             content,
+            content_changed: false,
         }
     }
 
@@ -1470,6 +1493,7 @@ mod tests {
             metadata: std::mem::take(&mut outer_metadata),
             raw: "<w:ins w:id=\"7\" w:future=\"kept\">...</w:ins>".to_string(),
             content: vec![inner],
+            content_changed: false,
         };
         let mut document = Document {
             body: vec![Block::Paragraph(Paragraph {
