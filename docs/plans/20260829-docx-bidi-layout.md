@@ -35,16 +35,48 @@ and wide glyphs in visual order with correct caret, selection, and mouse mapping
 
 ### Task 1: Specify bidi inputs and choose the layout dependency
 
-- [ ] inventory paragraph/run direction data, current wrapping/cell-width logic,
+- [x] inventory paragraph/run direction data, current wrapping/cell-width logic,
       caret/selection mapping, mouse hit testing, tables, and page-view paths
-- [ ] select a maintained UBA implementation compatible with Rust 1.88 and the
+- [x] select a maintained UBA implementation compatible with Rust 1.88 and the
       repository's licensing/dependency policy; add it only to the appropriate UI
       crate and record why it is needed
-- [ ] structure run-level RTL/override data currently hidden in raw run properties
+- [x] structure run-level RTL/override data currently hidden in raw run properties
       without breaking lossless serialization
-- [ ] define base-direction and override precedence for OOXML and Unicode controls
-- [ ] add loader/model tests for paragraph and run direction round-trips
-- [ ] run `cargo test -p docxcore` before Task 2
+- [x] define base-direction and override precedence for OOXML and Unicode controls
+- [x] add loader/model tests for paragraph and run direction round-trips
+- [x] run `cargo test -p docxcore` before Task 2
+
+Task 1 notes:
+
+- Direction inputs: direct paragraph `w:bidi` is modeled as `ParProps.rtl`;
+  direct run `w:rtl` is modeled as `RunProps.rtl`; explicit-off `w:bidi` and
+  `w:rtl` stay in `raw_props` so absence, style inheritance, and direct off
+  remain distinguishable for save and layout. `styles.xml` now resolves
+  run-level `w:rtl` and paragraph-style `w:bidi` through `StyleSheet`.
+- Current rendering inventory: `docxcore/src/render.rs` flattens logical inlines
+  in `flatten_para`, measures with `char_width`/`str_width`/`glyph_w`, wraps in
+  `wrap_glyphs`, and derives editable columns in `glyph_extent`/`LineMap`.
+  `w:bidi` was only a right-alignment cue; no UBA projection exists yet.
+- Mapping inventory: docxy keeps editor offsets logical. `docxy/src/main.rs`
+  consumes `LineMap` in `caret_screen`, `move_vert`, `click_caret`, `link_at`,
+  mouse drag selection, and keyboard selection extension; table rendering shifts
+  cell maps in `render_table`; page view frames/paginates body maps and drops
+  header/footer maps so body clicks do not collide with repeated page chrome.
+- Dependency decision: use `unicode-bidi` 0.3.18 in `docxy` only. `cargo info`
+  reports license `MIT OR Apache-2.0` and `rust-version` 1.47.0, which is
+  compatible with the workspace MIT license and Rust 1.88 MSRV while preserving
+  the std-only `docxcore` boundary.
+- Base-direction precedence for layout: direct paragraph `w:bidi` on wins;
+  direct paragraph `w:bidi` off blocks style inheritance; otherwise paragraph
+  style chain `w:bidi` applies; otherwise infer from the line's first strong
+  directional character with LTR as the no-strong fallback.
+- Run-direction precedence for layout: Unicode bidi controls remain in logical
+  text and are interpreted by the UBA implementation; OOXML directional
+  containers such as `w:bdo`/`w:dir`, when parsed by the projection layer, create
+  explicit override/embedding ranges; direct run `w:rtl` wins over run style or
+  document defaults; run style/default `w:rtl` wins over paragraph base for that
+  run. Editor storage, copy/export, undo/redo, and public control offsets remain
+  logical.
 
 ### Task 2: Build a reusable visual-line projection
 
@@ -103,4 +135,3 @@ and wide glyphs in visual order with correct caret, selection, and mouse mapping
 - [ ] record final test counts and deliberate deferrals in this plan
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*
-

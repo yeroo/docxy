@@ -1674,7 +1674,10 @@ fn render_paragraph(
             // does: with no explicit `w:jc`, the paragraph "start" is the right
             // edge. (Terminal cells can't shape/reorder the script itself, so this
             // right-alignment is the visual cue; explicit centre/justify are kept.)
-            let align = if para.props.rtl && align == Align::Left {
+            let rtl = opts
+                .styles
+                .effective_rtl(para.props.style_id.as_deref(), &para.props);
+            let align = if rtl && align == Align::Left {
                 Align::Right
             } else {
                 align

@@ -11,7 +11,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{Align, BorderKind, ParBorders, RunProps, TabAlign, TabLeader, TabStop};
+use crate::model::{
+    Align, BorderKind, ParBorders, ParProps, RunProps, TabAlign, TabLeader, TabStop,
+};
 use crate::xml::{Event, XmlParser};
 
 #[derive(Debug, Clone, Default)]
@@ -20,6 +22,7 @@ struct PartialRun {
     italic: Option<bool>,
     underline: Option<bool>,
     strike: Option<bool>,
+    rtl: Option<bool>,
     color: Option<String>,
     size: Option<u32>,
     font: Option<String>,
@@ -39,6 +42,9 @@ impl PartialRun {
         if o.strike.is_some() {
             self.strike = o.strike;
         }
+        if o.rtl.is_some() {
+            self.rtl = o.rtl;
+        }
         if o.color.is_some() {
             self.color = o.color.clone();
         }
@@ -56,6 +62,7 @@ struct StyleDef {
     based_on: Option<String>,
     run: PartialRun,
     align: Option<Align>,
+    rtl: Option<bool>,
     tabs: Vec<TabStop>,
     borders: ParBorders,
     /// Display name (`w:name`), e.g. "heading 1".
@@ -112,6 +119,13 @@ impl StyleSheet {
             caps: direct.caps,
             small_caps: direct.small_caps,
             vanish: direct.vanish,
+            rtl: if direct.rtl {
+                true
+            } else if has_raw_child(&direct.raw_props, "rtl") {
+                false
+            } else {
+                agg.rtl.unwrap_or(false)
+            },
             vert_align: direct.vert_align,
             color: direct.color.clone().or_else(|| agg.color.clone()),
             highlight: direct.highlight.clone(),
@@ -136,6 +150,24 @@ impl StyleSheet {
         Align::Left
     }
 
+    /// Effective paragraph direction: direct `w:bidi` wins; an explicit direct
+    /// off value captured in `raw_props` blocks style inheritance.
+    pub fn effective_rtl(&self, para_style: Option<&str>, direct: &ParProps) -> bool {
+        if direct.rtl {
+            return true;
+        }
+        if has_raw_child(&direct.raw_props, "bidi") {
+            return false;
+        }
+        if let Some(s) = para_style {
+            let mut seen = HashSet::new();
+            if let Some(rtl) = self.fold_rtl(s, &mut seen) {
+                return rtl;
+            }
+        }
+        false
+    }
+
     fn fold(&self, agg: &mut PartialRun, id: &str, seen: &mut HashSet<String>) {
         if !seen.insert(id.to_string()) {
             return;
@@ -155,6 +187,17 @@ impl StyleSheet {
         let def = self.styles.get(id)?;
         let base = def.based_on.as_ref().and_then(|b| self.fold_align(b, seen));
         def.align.or(base)
+    }
+
+    fn fold_rtl(&self, id: &str, seen: &mut HashSet<String>) -> Option<bool> {
+        if !seen.insert(id.to_string()) {
+            return None;
+        }
+        let Some(def) = self.styles.get(id) else {
+            return None;
+        };
+        let base = def.based_on.as_ref().and_then(|b| self.fold_rtl(b, seen));
+        def.rtl.or(base)
     }
 
     /// Tab stops for a paragraph style (the most-derived style that defines any,
@@ -231,6 +274,18 @@ fn map_align(jc: &str) -> Option<Align> {
         "left" | "start" => Some(Align::Left),
         _ => None,
     }
+}
+
+fn has_raw_child(raw_props: &[String], local: &str) -> bool {
+    raw_props.iter().any(|raw| {
+        let mut parser = XmlParser::new(raw);
+        parser.next() == Event::Start
+            && parser
+                .name()
+                .rsplit(':')
+                .next()
+                .is_some_and(|name| name == local)
+    })
 }
 
 /// Parse `styles.xml` into a [`StyleSheet`].
@@ -328,6 +383,7 @@ fn parse_partial_rpr(p: &mut XmlParser, run: &mut PartialRun) {
                     "w:i" | "w:iCs" => run.italic = Some(toggle(val)),
                     "w:u" => run.underline = Some(toggle(val)),
                     "w:strike" | "w:dstrike" => run.strike = Some(toggle(val)),
+                    "w:rtl" => run.rtl = Some(toggle(val)),
                     "w:color" => {
                         if !val.is_empty() && val != "auto" {
                             run.color = Some(val.to_ascii_uppercase());
@@ -361,6 +417,10 @@ fn parse_style_ppr(p: &mut XmlParser, def: &mut StyleDef) {
             Event::Start => match p.name() {
                 "w:jc" => {
                     def.align = map_align(p.attr("w:val"));
+                    p.skip_element();
+                }
+                "w:bidi" => {
+                    def.rtl = Some(toggle(p.attr("w:val")));
                     p.skip_element();
                 }
                 "w:tabs" => parse_tabs(p, &mut def.tabs),
@@ -515,6 +575,30 @@ mod tests {
     }
 
     #[test]
+    fn run_rtl_resolves_from_styles() {
+        let xml = r#"<w:styles>
+            <w:docDefaults><w:rPrDefault><w:rPr><w:rtl/></w:rPr></w:rPrDefault></w:docDefaults>
+            <w:style w:type="character" w:styleId="Latin"><w:rPr><w:rtl w:val="0"/></w:rPr></w:style>
+            <w:style w:type="character" w:styleId="Hebrew"><w:rPr><w:rtl/></w:rPr></w:style>
+            </w:styles>"#;
+        let ss = parse_styles_xml(xml);
+        assert!(ss.effective_run(None, None, &RunProps::default()).rtl);
+        assert!(
+            !ss.effective_run(None, Some("Latin"), &RunProps::default())
+                .rtl
+        );
+        assert!(
+            ss.effective_run(None, Some("Hebrew"), &RunProps::default())
+                .rtl
+        );
+        let direct_off = RunProps {
+            raw_props: vec!["<w:rtl w:val=\"0\"/>".to_string()],
+            ..RunProps::default()
+        };
+        assert!(!ss.effective_run(None, Some("Hebrew"), &direct_off).rtl);
+    }
+
+    #[test]
     fn alignment_inherited_from_style() {
         let xml = r#"<w:styles><w:style w:styleId="Centered"><w:pPr><w:jc w:val="center"/></w:pPr></w:style></w:styles>"#;
         let ss = parse_styles_xml(xml);
@@ -526,6 +610,23 @@ mod tests {
             ss.effective_align(Some("Centered"), Align::Right),
             Align::Right
         ); // direct wins
+    }
+
+    #[test]
+    fn paragraph_rtl_inherited_from_style() {
+        let xml = r#"<w:styles>
+            <w:style w:styleId="Base"><w:pPr><w:bidi/></w:pPr></w:style>
+            <w:style w:styleId="Derived"><w:basedOn w:val="Base"/><w:pPr><w:bidi w:val="0"/></w:pPr></w:style>
+            </w:styles>"#;
+        let ss = parse_styles_xml(xml);
+        let mut direct = ParProps::default();
+        assert!(ss.effective_rtl(Some("Base"), &direct));
+        assert!(!ss.effective_rtl(Some("Derived"), &direct));
+        direct.rtl = true;
+        assert!(ss.effective_rtl(Some("Derived"), &direct));
+        direct.rtl = false;
+        direct.raw_props = vec!["<w:bidi w:val=\"0\"/>".to_string()];
+        assert!(!ss.effective_rtl(Some("Base"), &direct));
     }
 
     #[test]

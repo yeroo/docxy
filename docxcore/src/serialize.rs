@@ -716,6 +716,7 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         || p.caps
         || p.small_caps
         || p.vanish
+        || p.rtl
         || p.vert_align != VertAlign::Baseline
         || p.color.is_some()
         || p.highlight.is_some()
@@ -793,6 +794,9 @@ fn write_rpr(s: &mut String, p: &RunProps) {
             "<w:vertAlign w:val=\"subscript\"/>".to_string(),
         )),
     }
+    if p.rtl {
+        parts.push((rpr_rank("rtl"), "<w:rtl/>".to_string()));
+    }
     // Explicit-off toggles are retained as raw children so they remain distinct
     // from absent/style-derived values. A later direct edit to the same primary
     // property wins without emitting a contradictory duplicate.
@@ -809,6 +813,7 @@ fn write_rpr(s: &mut String, p: &RunProps) {
             || matches!(name, "highlight" if p.highlight.is_some())
             || matches!(name, "u" if underline)
             || matches!(name, "vertAlign" if p.vert_align != VertAlign::Baseline)
+            || matches!(name, "rtl" if p.rtl)
             || matches!(name, "rPrChange" if p.property_change.is_some());
         if !superseded {
             parts.push((rpr_rank(name), raw.clone()));
@@ -1513,6 +1518,7 @@ mod tests {
             caps: true,
             small_caps: true,
             vanish: true,
+            rtl: true,
             vert_align: VertAlign::Superscript,
             color: Some("FF0000".to_string()),
             highlight: Some("yellow".to_string()),
