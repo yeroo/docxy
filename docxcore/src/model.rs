@@ -875,6 +875,32 @@ mod tests {
     }
 
     #[test]
+    fn removed_rows_preserve_nested_and_adjacent_edge_ownership() {
+        let mut nested = table(
+            &["outer", "inner first", "inner last", "outer again"],
+            vec![open(0, "outer"), open(1, "inner"), close(3), close(4)],
+        );
+        assert_eq!(nested.remove_row(1), Some(row("inner first")));
+        assert_eq!(nested.remove_row(1), Some(row("inner last")));
+        assert_eq!(nested.row_control_owners(), Ok(vec![vec![0], vec![0]]));
+        assert_eq!(nested.row_boundaries[1].at, 1);
+        assert_eq!(nested.row_boundaries[2].at, 1);
+        assert!(nested.validate_row_boundaries().is_ok());
+
+        let mut adjacent = table(
+            &["left", "right"],
+            vec![open(0, "left"), close(1), open(1, "right"), close(2)],
+        );
+        assert_eq!(adjacent.remove_row(0), Some(row("left")));
+        assert_eq!(adjacent.row_control_owners(), Ok(vec![vec![2]]));
+        assert_eq!(
+            adjacent.row_boundaries,
+            vec![open(0, "left"), close(0), open(0, "right"), close(1)]
+        );
+        assert!(adjacent.validate_row_boundaries().is_ok());
+    }
+
+    #[test]
     fn deleting_every_visible_row_retains_nonempty_control_definition() {
         let raw_child =
             TableRowBoundary::raw(1, "<w:customXml w:uri=\"urn:definition-metadata\"/>");

@@ -84,7 +84,7 @@ Cloning and equality include boundary metadata, while plain text and rendering
 ignore it. Callers that change row count must use `Table::insert_row` and
 `Table::remove_row` rather than mutate `Table::rows` directly.
 
-Validation on 2026-08-29 covered 457 `docxcore` unit tests and 10 package
+Validation on 2026-08-29 covered 459 `docxcore` unit tests and 10 package
 integration tests, followed by the full workspace test suite, all-target
 Clippy with warnings denied, formatting, and whitespace checks. The fixture is
 `docxcore/tests/fixtures/row-content-controls.docx`; its reproducible generator

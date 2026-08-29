@@ -541,7 +541,9 @@ fn write_table(s: &mut String, t: &Table) {
                         content_stack.push(write_sdt_open(s, raw, is_empty_control));
                     }
                     TableRowBoundaryKind::SdtClose(raw) => {
-                        let content_needs_close = content_stack.pop().unwrap_or(true);
+                        let content_needs_close = content_stack
+                            .pop()
+                            .expect("validated row boundaries have a matching SDT open");
                         write_sdt_close(s, raw, content_needs_close);
                     }
                     TableRowBoundaryKind::Raw(raw) => s.push_str(raw),
@@ -611,16 +613,16 @@ fn write_sdt_open(s: &mut String, raw: &str, is_empty_control: bool) -> bool {
             if is_empty_control {
                 s.push_str(raw);
                 false
-            } else if let Some(slash) = raw.rfind("/>") {
+            } else {
                 // A self-closing content tag cannot own rows. This can only
                 // arise in a manually-mutated model; open that exact captured
                 // tag and let the matching close boundary finish it.
+                let slash = raw
+                    .rfind("/>")
+                    .expect("ContentEmpty shape has a self-closing tag");
                 s.push_str(&raw[..slash]);
                 s.push('>');
                 s.push_str(&raw[slash + 2..]);
-                true
-            } else {
-                s.push_str("<w:sdt><w:sdtContent>");
                 true
             }
         }
@@ -1410,6 +1412,56 @@ mod tests {
         };
         assert!(table.validate_row_boundaries().is_ok());
         assert_eq!(reparsed.plain_text(), "survives\n");
+    }
+
+    #[test]
+    fn visible_row_after_premature_content_close_is_repaired_inside_wrapper() {
+        let open = "<w:sdt><w:sdtPr><w:alias w:val=\"recovered\"/></w:sdtPr><w:sdtContent>";
+        let metadata = "<w:customXml w:uri=\"urn:after-close\"/>";
+        let source = table_xml(&format!(
+            "{open}{}</w:sdtContent>{metadata}{}</w:sdt>",
+            row_xml("before"),
+            row_xml("recovered")
+        ));
+
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        assert_eq!(parsed.plain_text(), "before\nrecovered\n");
+
+        let saved = document_to_xml(&parsed);
+        assert_eq!(saved.matches("<w:sdtContent>").count(), 1);
+        assert_eq!(saved.matches("</w:sdtContent>").count(), 1);
+        assert_eq!(saved.matches("</w:sdt>").count(), 1);
+        assert!(saved.contains(metadata), "intervening metadata was dropped");
+        assert!(
+            saved.find(metadata).unwrap() < saved.find("recovered</w:t>").unwrap(),
+            "intervening metadata moved after the recovered row"
+        );
+
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0], vec![0]]));
+        assert_eq!(reparsed.plain_text(), "before\nrecovered\n");
+
+        let nested_open = "<w:sdt><w:sdtPr><w:alias w:val=\"nested\"/></w:sdtPr><w:sdtContent>";
+        let nested_source = table_xml(&format!(
+            "{open}{}</w:sdtContent>{nested_open}{}{}</w:sdt></w:sdt>",
+            row_xml("before"),
+            row_xml("nested recovered"),
+            "</w:sdtContent>"
+        ));
+        let nested = parse_document_xml(&nested_source, &Relationships::default());
+        let nested_saved = document_to_xml(&nested);
+        assert_eq!(nested_saved.matches("<w:sdtContent>").count(), 2);
+        assert_eq!(nested_saved.matches("</w:sdtContent>").count(), 2);
+        assert_eq!(nested_saved.matches("</w:sdt>").count(), 2);
+        let nested_reparsed = parse_document_xml(&nested_saved, &Relationships::default());
+        let Block::Table(table) = &nested_reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0], vec![0, 1]]));
+        assert_eq!(nested_reparsed.plain_text(), "before\nnested recovered\n");
     }
 
     #[test]
