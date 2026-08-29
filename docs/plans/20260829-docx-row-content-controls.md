@@ -83,13 +83,13 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 ### Task 5: Add realistic package and regression coverage
 
-- [ ] add a minimal DOCX/package fixture with repeating-section properties,
+- [x] add a minimal DOCX/package fixture with repeating-section properties,
       nested/adjacent controls, row properties, merged cells, and unknown XML
-- [ ] verify package round-trip retains wrapper counts/order and document text,
+- [x] verify package round-trip retains wrapper counts/order and document text,
       and that a targeted cell edit stays inside its original control
-- [ ] rerun existing block- and inline-content-control tests to prove their raw
+- [x] rerun existing block- and inline-content-control tests to prove their raw
       boundaries and invisible rendering remain unchanged
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --check`, and `git diff --check`
 
 ### Task 6: [Final] Record the row-control contract
