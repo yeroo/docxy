@@ -12,6 +12,7 @@
 //! line-map, and routes keys into a `docxcore::editor::Editor`.
 
 mod backstage;
+mod bidi;
 mod control;
 mod mcp;
 mod metafile;

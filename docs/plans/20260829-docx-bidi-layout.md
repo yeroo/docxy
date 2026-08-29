@@ -80,17 +80,17 @@ Task 1 notes:
 
 ### Task 2: Build a reusable visual-line projection
 
-- [ ] create a pure layout type mapping logical text/run offsets to visual glyph
+- [x] create a pure layout type mapping logical text/run offsets to visual glyph
       clusters and terminal cell spans for one wrapped line
-- [ ] apply UBA levels/reordering before cell placement while keeping style,
+- [x] apply UBA levels/reordering before cell placement while keeping style,
       hyperlink, field, revision, and source-offset ownership attached to clusters
-- [ ] handle combining marks, emoji sequences supported by the existing width
+- [x] handle combining marks, emoji sequences supported by the existing width
       policy, zero-width controls, tabs, and wide characters without invalid maps
-- [ ] expose visual-to-logical hit testing plus logical caret-leading/trailing
+- [x] expose visual-to-logical hit testing plus logical caret-leading/trailing
       positions with documented boundary behavior
-- [ ] add table-driven tests from standard bidi examples and focused mixed-script
+- [x] add table-driven tests from standard bidi examples and focused mixed-script
       terminal-width cases
-- [ ] run `cargo test -p docxy` before Task 3
+- [x] run `cargo test -p docxy` before Task 3
 
 ### Task 3: Integrate bidi with wrapping and alignment
 
