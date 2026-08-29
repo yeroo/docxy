@@ -238,6 +238,12 @@ fn local_name(name: &str) -> &str {
 
 const WORDPROCESSINGML_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
 const STRICT_WORDPROCESSINGML_NS: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
+const PACKAGE_RELATIONSHIPS_NS: &str =
+    "http://schemas.openxmlformats.org/package/2006/relationships";
+const SETTINGS_RELATIONSHIP_TYPE: &str =
+    "http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings";
+const STRICT_SETTINGS_RELATIONSHIP_TYPE: &str =
+    "http://purl.oclc.org/ooxml/officeDocument/relationships/settings";
 
 fn namespace_scope(
     parser: &XmlParser<'_>,
@@ -300,6 +306,23 @@ fn decoded_attr_by_local(parser: &XmlParser<'_>, name: &str) -> Option<String> {
         .attrs()
         .iter()
         .find(|attr| local_name(attr.name) == name)
+        .map(|attr| decode_xml_entities(attr.value))
+}
+
+fn package_relationships_name(name: &str, namespaces: &[(String, String)]) -> bool {
+    let prefix = name.split_once(':').map_or("", |(prefix, _)| prefix);
+    namespaces
+        .iter()
+        .rev()
+        .find(|(bound, _)| bound == prefix)
+        .is_some_and(|(_, uri)| uri == PACKAGE_RELATIONSHIPS_NS)
+}
+
+fn decoded_unqualified_attr(parser: &XmlParser<'_>, name: &str) -> Option<String> {
+    parser
+        .attrs()
+        .iter()
+        .find(|attr| attr.name == name)
         .map(|attr| decode_xml_entities(attr.value))
 }
 
@@ -436,29 +459,63 @@ fn resolve_document_relationship_target(target: &str) -> Option<String> {
     (!components.is_empty()).then(|| components.join("/"))
 }
 
-fn related_part_target(xml: &str, relationship_type: &str) -> Result<Option<String>, ()> {
+fn settings_part_target(xml: &str) -> Result<Option<String>, ()> {
     let mut parser = XmlParser::new(xml);
+    let mut namespace_stack = Vec::<Vec<(String, String)>>::new();
+    let mut root_seen = false;
+    let mut target = None;
     loop {
         match parser.next() {
-            Event::Start if local_name(parser.name()) == "Relationship" => {
-                let relation_type = decoded_attr_by_local(&parser, "Type");
-                if relation_type
-                    .as_deref()
-                    .is_some_and(|value| value.ends_with(&format!("/{relationship_type}")))
-                {
-                    if decoded_attr_by_local(&parser, "TargetMode")
-                        .as_deref()
-                        .is_some_and(|value| value.eq_ignore_ascii_case("External"))
+            Event::Start => {
+                let scope = namespace_scope(&parser, namespace_stack.last().map(Vec::as_slice));
+                namespace_stack.push(scope);
+                let namespaces = namespace_stack.last().expect("scope was just pushed");
+                if !root_seen {
+                    root_seen = true;
+                    if local_name(parser.name()) != "Relationships"
+                        || !package_relationships_name(parser.name(), namespaces)
                     {
                         return Err(());
                     }
-                    return decoded_attr_by_local(&parser, "Target")
-                        .filter(|target| !target.is_empty())
-                        .map(Some)
-                        .ok_or(());
+                    continue;
+                }
+                if namespace_stack.len() != 2
+                    || local_name(parser.name()) != "Relationship"
+                    || !package_relationships_name(parser.name(), namespaces)
+                {
+                    continue;
+                }
+                if parser.attrs().iter().any(|attr| {
+                    matches!(
+                        local_name(attr.name),
+                        "Id" | "Type" | "Target" | "TargetMode"
+                    ) && !matches!(attr.name, "Id" | "Type" | "Target" | "TargetMode")
+                }) {
+                    return Err(());
+                }
+                let relation_type = decoded_unqualified_attr(&parser, "Type");
+                if matches!(
+                    relation_type.as_deref(),
+                    Some(SETTINGS_RELATIONSHIP_TYPE | STRICT_SETTINGS_RELATIONSHIP_TYPE)
+                ) {
+                    if target.is_some()
+                        || decoded_unqualified_attr(&parser, "TargetMode")
+                            .as_deref()
+                            .is_some_and(|value| value != "Internal")
+                    {
+                        return Err(());
+                    }
+                    target = Some(
+                        decoded_unqualified_attr(&parser, "Target")
+                            .filter(|target| !target.is_empty())
+                            .ok_or(())?,
+                    );
                 }
             }
-            Event::Eof => return Ok(None),
+            Event::End => {
+                namespace_stack.pop();
+            }
+            Event::Eof => return root_seen.then_some(target).ok_or(()),
             _ => {}
         }
     }
@@ -553,8 +610,8 @@ impl Package {
     fn settings_part_name(&self) -> Result<Option<String>, &'static str> {
         if let Some(rels) = self.part("word/_rels/document.xml.rels") {
             let xml = decode_xml_part(rels).ok_or("unreadable document relationships XML")?;
-            if let Some(target) = related_part_target(&xml, "settings")
-                .map_err(|()| "invalid settings relationship")?
+            if let Some(target) =
+                settings_part_target(&xml).map_err(|()| "invalid settings relationship")?
             {
                 let name = resolve_document_relationship_target(&target)
                     .ok_or("invalid settings relationship target")?;
@@ -2271,7 +2328,7 @@ mod tests {
 
     #[test]
     fn protection_resolves_a_nonstandard_related_settings_part_and_fails_closed_if_missing() {
-        let rels = r#"<Relationships><Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="metadata/settings2.xml"/></Relationships>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="metadata/settings2.xml"/></Relationships>"#;
         let bytes = make_metadata_docx(BODY, None, Some(rels), &[]);
         let mut pkg = load_package(&bytes).expect("load");
         pkg.parts.push((
@@ -2288,6 +2345,70 @@ mod tests {
         assert!(matches!(
             missing.edit_mode,
             Some(ProtectionEditMode::Unknown(ref reason)) if reason == "missing related settings part"
+        ));
+    }
+
+    #[test]
+    fn protection_accepts_only_unambiguous_official_settings_relationships() {
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rIdCustom" Type="urn:vendor/settings" Target="metadata/unprotected.xml"/>
+            <Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>
+            </Relationships>"#;
+        let protected = r#"<w:settings><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#;
+        let bytes = make_metadata_docx(
+            BODY,
+            Some(protected),
+            Some(rels),
+            &[("metadata/unprotected.xml", "<w:settings/>")],
+        );
+        let pkg = load_package(&bytes).expect("load");
+        assert_eq!(pkg.protection_label(), Some("read-only"));
+
+        let strict_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rIdSettings" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/settings" Target="metadata/settings2.xml"/>
+            </Relationships>"#;
+        let bytes = make_metadata_docx(
+            BODY,
+            None,
+            Some(strict_rels),
+            &[("metadata/settings2.xml", protected)],
+        );
+        let pkg = load_package(&bytes).expect("load");
+        assert_eq!(pkg.protection_label(), Some("read-only"));
+
+        let duplicate_rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+            <Relationship Id="rIdSettings1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/>
+            <Relationship Id="rIdSettings2" Type="http://purl.oclc.org/ooxml/officeDocument/relationships/settings" Target="metadata/unprotected.xml"/>
+            </Relationships>"#;
+        let bytes = make_metadata_docx(
+            BODY,
+            Some(protected),
+            Some(duplicate_rels),
+            &[("metadata/unprotected.xml", "<w:settings/>")],
+        );
+        let duplicate = load_package(&bytes).expect("load").protection();
+        assert!(duplicate.is_enforced());
+        assert!(matches!(
+            duplicate.edit_mode,
+            Some(ProtectionEditMode::Unknown(ref reason))
+                if reason == "invalid settings relationship"
+        ));
+
+        let wrong_namespace = r#"<Relationships xmlns="urn:vendor-relationships">
+            <Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="metadata/unprotected.xml"/>
+            </Relationships>"#;
+        let bytes = make_metadata_docx(
+            BODY,
+            Some(protected),
+            Some(wrong_namespace),
+            &[("metadata/unprotected.xml", "<w:settings/>")],
+        );
+        let invalid = load_package(&bytes).expect("load").protection();
+        assert!(invalid.is_enforced());
+        assert!(matches!(
+            invalid.edit_mode,
+            Some(ProtectionEditMode::Unknown(ref reason))
+                if reason == "invalid settings relationship"
         ));
     }
 
@@ -2329,8 +2450,7 @@ mod tests {
             <w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rIdHeader"/></w:sectPr></w:pPr><w:r><w:t>Section one</w:t></w:r></w:p>
             <w:p><w:r><w:t>Section two</w:t></w:r></w:p><w:sectPr/>
             </w:body></w:document>"#;
-        let rels =
-            r#"<Relationships><Relationship Id="rIdHeader" Target="header1.xml"/></Relationships>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader" Target="header1.xml"/></Relationships>"#;
         let header = r#"<w:hdr xmlns:w="w" xmlns:v="v"><w:p><w:r><w:pict>
             <v:shape id="PowerPlusWaterMarkObject"><v:textpath string="CONFIDENTIAL &amp; DRAFT &#x2014; &#65;"/></v:shape>
             </w:pict></w:r></w:p></w:hdr>"#;
@@ -2367,7 +2487,7 @@ mod tests {
             <w:headerReference w:type="even" r:id="rEven"/><w:titlePg/>
             </w:sectPr></w:body></w:document>"#;
         let settings = r#"<w:settings><w:evenAndOddHeaders w:val="on"/></w:settings>"#;
-        let rels = r#"<Relationships>
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
             <Relationship Id="rDefault" Target="header1.xml"/>
             <Relationship Id="rFirst" Target="header2.xml"/>
             <Relationship Id="rEven" Target="header3.xml"/>
@@ -2441,8 +2561,7 @@ mod tests {
         );
 
         let document = r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p/><w:sectPr><w:headerReference w:type="default" r:id="rHeader"/></w:sectPr></w:body></w:document>"#;
-        let rels =
-            r#"<Relationships><Relationship Id="rHeader" Target="header1.xml"/></Relationships>"#;
+        let rels = r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rHeader" Target="header1.xml"/></Relationships>"#;
         let ordinary = make_metadata_docx(
             document,
             None,

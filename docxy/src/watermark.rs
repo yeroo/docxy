@@ -402,6 +402,53 @@ mod tests {
     }
 
     #[test]
+    fn parity_padding_keeps_following_section_on_its_applied_watermark_variant() {
+        let state = State {
+            marks: vec![
+                mark(
+                    0,
+                    HeaderVariant::Default,
+                    WatermarkKind::Text("SECTION ZERO ODD".to_string()),
+                ),
+                mark(
+                    0,
+                    HeaderVariant::Even,
+                    WatermarkKind::Text("SECTION ZERO EVEN".to_string()),
+                ),
+                mark(
+                    1,
+                    HeaderVariant::Default,
+                    WatermarkKind::Text("SECTION ONE ODD".to_string()),
+                ),
+                mark(
+                    1,
+                    HeaderVariant::Even,
+                    WatermarkKind::Text("SECTION ONE EVEN".to_string()),
+                ),
+            ],
+            title_page_sections: vec![false, false],
+            page_number_starts: vec![None, None],
+            even_odd: true,
+            section_breaks: None,
+        };
+        // An odd-page break after physical page 1 inserts page 2 into section 0,
+        // so section 1 begins on physical/logical page 3 and uses its default mark.
+        let pages = [
+            page(0, 0, 0, 0, 20, 60),
+            page(0, 1, 1, 21, 20, 60),
+            page(1, 0, 2, 42, 20, 60),
+        ];
+
+        let overlays = layout(&state, &pages, &blank_lines(70), &[]);
+
+        assert_eq!(overlays.len(), 3);
+        assert!(overlays[0].text.contains("SECTION ZERO ODD"));
+        assert!(overlays[1].text.contains("SECTION ZERO EVEN"));
+        assert!(overlays[2].text.contains("SECTION ONE ODD"));
+        assert!(!overlays[2].text.contains("SECTION ONE EVEN"));
+    }
+
+    #[test]
     fn restarted_page_numbering_drives_even_header_watermarks() {
         let state = State {
             marks: vec![

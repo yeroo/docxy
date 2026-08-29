@@ -4162,12 +4162,15 @@ impl App {
                 return;
             }
             let n = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
+            let mut changed = false;
             for _ in 0..n {
-                if self.editor.redo() {
-                    self.modified = true;
-                }
+                changed |= self.editor.redo();
             }
-            self.dirty = true;
+            if changed {
+                self.after_edit();
+            } else {
+                self.dirty = true;
+            }
             return;
         }
         let mode = self.vim.as_ref().unwrap().mode;
@@ -4295,12 +4298,15 @@ impl App {
                     return;
                 }
                 let n = self.vim.as_mut().unwrap().take_count();
+                let mut changed = false;
                 for _ in 0..n {
-                    if self.editor.undo() {
-                        self.modified = true;
-                    }
+                    changed |= self.editor.undo();
                 }
-                self.dirty = true;
+                if changed {
+                    self.after_edit();
+                } else {
+                    self.dirty = true;
+                }
             }
             'v' => {
                 let cur = self.editor.caret.clone();
@@ -6833,6 +6839,27 @@ mod tests {
         assert!(app.editor.undo());
         app.after_edit();
         assert_eq!(app.watermark_state.mark_count(), 2);
+    }
+
+    #[test]
+    fn vim_history_refreshes_watermark_section_scope() {
+        let mut app = App::new(
+            crate::test_fixtures::WatermarkFixture::InheritedText.package(),
+            "inherited.docx",
+            false,
+        );
+        app.vim = Some(VimState::new());
+        assert_eq!(app.watermark_state.mark_count(), 2);
+
+        assert!(app.editor.set_caret_section_break(None));
+        app.after_edit();
+        assert_eq!(app.watermark_state.mark_count(), 0);
+
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.watermark_state.mark_count(), 2);
+
+        app.on_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(app.watermark_state.mark_count(), 0);
     }
 
     #[test]

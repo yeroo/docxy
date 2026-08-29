@@ -2399,7 +2399,7 @@ mod tests {
         let header_xml = r#"<?xml version="1.0"?><w:hdr xmlns:v="y"><w:p><v:shape id="PowerPlusWaterMarkObject"><v:textpath string="CONFIDENTIAL"/></v:shape></w:p></w:hdr>"#;
         let ct = r#"<?xml version="1.0"?><Types/>"#;
         let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
-        let doc_rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rIdHeader" Target="header1.xml"/></Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader" Target="header1.xml"/></Relationships>"#;
         let bytes = docxcore::zipwrite::write_zip(&[
             ("[Content_Types].xml".into(), ct.into()),
             ("_rels/.rels".into(), rels.into()),
