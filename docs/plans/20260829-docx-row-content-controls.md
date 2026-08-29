@@ -59,15 +59,15 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 ### Task 3: Serialize balanced schema-valid table children
 
-- [ ] emit table properties/grid and the mixed row/boundary sequence in legal
+- [x] emit table properties/grid and the mixed row/boundary sequence in legal
       WordprocessingML order
-- [ ] preserve captured wrapper/property XML verbatim unless a modeled row edit
+- [x] preserve captured wrapper/property XML verbatim unless a modeled row edit
       requires only the row payload to change
-- [ ] prevent unbalanced raw boundaries from producing invalid output; validate
+- [x] prevent unbalanced raw boundaries from producing invalid output; validate
       or normalize them at the narrowest responsible layer
-- [ ] add parse-save-parse tests for nesting, empty controls, unknown properties,
+- [x] add parse-save-parse tests for nesting, empty controls, unknown properties,
       Unicode content, and multiple controlled row groups
-- [ ] run `cargo test -p docxcore` before Task 4
+- [x] run `cargo test -p docxcore` before Task 4
 
 ### Task 4: Make row editing boundary-safe
 
