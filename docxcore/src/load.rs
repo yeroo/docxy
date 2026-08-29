@@ -12,6 +12,8 @@ use crate::model::*;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 
+const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum LoadError {
     /// Not a ZIP/OPC container.
@@ -1295,17 +1297,38 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
 
 fn reconstructed_markup_compatibility_attrs(p: &XmlParser<'_>) -> Vec<(String, String)> {
     let mut merged: Vec<(String, String)> = Vec::new();
-    for scoped in p
-        .markup_compatibility_attrs()
-        .iter()
-        // Package saving retains the original w:document attributes, while
-        // w:body and w:tbl are reconstructed from the semantic model.
-        .filter(|scoped| scoped.element_name != "w:document")
-    {
+    let has_standard_w15_binding = p.namespace_attrs().iter().any(|attr| {
+        attr.name == "xmlns:w15" && {
+            let mut binding = String::new();
+            XmlParser::append_decoded(attr.value, &mut binding);
+            binding == W15_NS
+        }
+    });
+    // `document_to_xml` reconstructs every ancestor, and a parsed table can
+    // be cloned into a fresh document/package. Redeclare all effective MCE
+    // attributes at the table so either path retains their semantics.
+    for scoped in p.markup_compatibility_attrs() {
         let name = scoped.attr.name;
         let local_name = name.split_once(':').map_or(name, |(_, local)| local);
         let mut value = String::new();
         XmlParser::append_decoded(scoped.attr.value, &mut value);
+        if scoped.element_name == "w:document"
+            && local_name == "Ignorable"
+            && has_standard_w15_binding
+        {
+            // `document_to_xml` guarantees this one root token whenever the
+            // reconstructed body contains the w15 vocabulary. Avoid importing
+            // the serializer's own declaration into otherwise-empty table
+            // metadata; every arbitrary document-scoped token is still kept.
+            value = value
+                .split_whitespace()
+                .filter(|token| *token != "w15")
+                .collect::<Vec<_>>()
+                .join(" ");
+            if value.is_empty() {
+                continue;
+            }
+        }
 
         if let Some((_, existing)) = merged.iter_mut().find(|(existing_name, _)| {
             existing_name
@@ -1414,6 +1437,7 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
     // `</w:sdtContent>` tag. A self-closing `<w:sdtContent/>` has no such tag.
     let mut tail_start = None;
     let mut content_start_was_empty = false;
+    let mut pre_content_is_complete = true;
     // A content close encountered before a later visible child. Recovery moves
     // that exact tag after the child so serialization repairs the wrapper
     // instead of emitting the close twice around an out-of-content row.
@@ -1454,8 +1478,11 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
             Event::Start if !opened => {
                 // Properties and unknown pre-content children are included in
                 // the eventual open boundary. If no content exists, the whole
-                // control is retained as one opaque raw boundary below.
-                p.skip_element();
+                // control is retained as one opaque raw boundary below only
+                // when its children were structurally complete.
+                if !p.skip_element_complete() {
+                    pre_content_is_complete = false;
+                }
             }
             Event::Start if in_content => match p.name() {
                 "w:tr" => table.rows.push(parse_row(p, rels)),
@@ -1535,10 +1562,21 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                     table
                         .row_boundaries
                         .push(TableRowBoundary::sdt_close(table.rows.len(), raw));
-                } else {
+                } else if pre_content_is_complete {
                     table.row_boundaries.push(TableRowBoundary::raw(
                         table.rows.len(),
                         p.raw_slice(sdt_start, p.pos()),
+                    ));
+                } else {
+                    // A name-mismatched pre-content child must not bypass the
+                    // SDT serializer's structural normalization as opaque Raw.
+                    table.row_boundaries.push(TableRowBoundary::sdt_open(
+                        table.rows.len(),
+                        p.raw_slice(sdt_start, event_start),
+                    ));
+                    table.row_boundaries.push(TableRowBoundary::sdt_close(
+                        table.rows.len(),
+                        p.raw_slice(event_start, p.pos()),
                     ));
                 }
                 return false;
