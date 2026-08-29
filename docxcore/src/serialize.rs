@@ -615,6 +615,7 @@ mod tests {
                 cells: vec![cell],
                 raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
             }],
+            row_boundaries: vec![],
             raw_tblpr: Some(
                 "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
                     .to_string(),

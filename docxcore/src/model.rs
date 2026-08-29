@@ -504,14 +504,207 @@ pub struct Row {
     pub raw_props: Vec<String>,
 }
 
+/// An invisible table child anchored at the gap before `rows[at]` (or after the
+/// last row when `at == rows.len()`). Boundary order is significant when
+/// several children share a gap: all of them are applied in vector order before
+/// the row at that position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRowBoundary {
+    pub at: usize,
+    pub kind: TableRowBoundaryKind,
+}
+
+impl TableRowBoundary {
+    pub fn sdt_open(at: usize, raw: impl Into<String>) -> Self {
+        Self {
+            at,
+            kind: TableRowBoundaryKind::SdtOpen(raw.into()),
+        }
+    }
+
+    pub fn sdt_close(at: usize, raw: impl Into<String>) -> Self {
+        Self {
+            at,
+            kind: TableRowBoundaryKind::SdtClose(raw.into()),
+        }
+    }
+
+    pub fn raw(at: usize, raw: impl Into<String>) -> Self {
+        Self {
+            at,
+            kind: TableRowBoundaryKind::Raw(raw.into()),
+        }
+    }
+}
+
+/// The raw, invisible XML represented by a [`TableRowBoundary`]. SDT opens and
+/// closes affect row ownership; `Raw` preserves an otherwise unknown table
+/// child at its exact row gap without affecting the control stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableRowBoundaryKind {
+    /// Verbatim `<w:sdt>...<w:sdtContent>` prefix.
+    SdtOpen(String),
+    /// Verbatim `</w:sdtContent></w:sdt>` suffix.
+    SdtClose(String),
+    /// Any other invisible table child found between rows or SDT boundaries.
+    Raw(String),
+}
+
+/// A violated [`Table::row_boundaries`] invariant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableRowBoundaryError {
+    PositionOutOfBounds {
+        boundary_index: usize,
+        at: usize,
+        row_count: usize,
+    },
+    PositionOutOfOrder {
+        boundary_index: usize,
+        previous_at: usize,
+        at: usize,
+    },
+    UnexpectedClose {
+        boundary_index: usize,
+        at: usize,
+    },
+    UnclosedOpen {
+        boundary_index: usize,
+        at: usize,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Table {
     /// Column widths in twips (`w:tblGrid`/`w:gridCol`).
     pub grid: Vec<u32>,
     pub rows: Vec<Row>,
+    /// Invisible row-level content-control boundaries and unknown table
+    /// children, ordered by `at` and then by vector position.
+    ///
+    /// In a valid table every `at` is in `0..=rows.len()`, positions never
+    /// decrease, and SDT opens/closes are balanced and properly nested. A row is
+    /// owned by the SDTs left on the stack after all boundaries at its preceding
+    /// gap have been applied. Consequently, nested and adjacent controls and an
+    /// empty control (an open and close at the same gap) are all lossless while
+    /// `rows` remains the ordinary visible/editable row list.
+    ///
+    /// Derived cloning copies boundary XML and derived equality compares it;
+    /// plain text intentionally comes only from `rows`. New/default tables have
+    /// no boundaries. Code changing row count should use [`Table::insert_row`]
+    /// and [`Table::remove_row`] so anchors stay synchronized.
+    pub row_boundaries: Vec<TableRowBoundary>,
     /// The table's entire `w:tblPr` verbatim (borders, shading, width, style,
     /// look, layout), preserved so save round-trips table formatting.
     pub raw_tblpr: Option<String>,
+}
+
+impl Table {
+    /// Verify that row-boundary anchors are ordered, in range, and form a
+    /// balanced, properly nested SDT stack.
+    pub fn validate_row_boundaries(&self) -> Result<(), TableRowBoundaryError> {
+        let mut previous_at = 0;
+        let mut open_boundaries = Vec::new();
+
+        for (boundary_index, boundary) in self.row_boundaries.iter().enumerate() {
+            if boundary.at > self.rows.len() {
+                return Err(TableRowBoundaryError::PositionOutOfBounds {
+                    boundary_index,
+                    at: boundary.at,
+                    row_count: self.rows.len(),
+                });
+            }
+            if boundary_index > 0 && boundary.at < previous_at {
+                return Err(TableRowBoundaryError::PositionOutOfOrder {
+                    boundary_index,
+                    previous_at,
+                    at: boundary.at,
+                });
+            }
+            previous_at = boundary.at;
+
+            match &boundary.kind {
+                TableRowBoundaryKind::SdtOpen(_) => open_boundaries.push(boundary_index),
+                TableRowBoundaryKind::SdtClose(_) => {
+                    if open_boundaries.pop().is_none() {
+                        return Err(TableRowBoundaryError::UnexpectedClose {
+                            boundary_index,
+                            at: boundary.at,
+                        });
+                    }
+                }
+                TableRowBoundaryKind::Raw(_) => {}
+            }
+        }
+
+        if let Some(boundary_index) = open_boundaries.pop() {
+            return Err(TableRowBoundaryError::UnclosedOpen {
+                boundary_index,
+                at: self.row_boundaries[boundary_index].at,
+            });
+        }
+        Ok(())
+    }
+
+    /// Return the opening-boundary indices that own each visible row, ordered
+    /// outermost to innermost. This is also the precise ownership rule used for
+    /// edits at a control edge.
+    pub fn row_control_owners(&self) -> Result<Vec<Vec<usize>>, TableRowBoundaryError> {
+        self.validate_row_boundaries()?;
+        let mut owners = Vec::with_capacity(self.rows.len());
+        let mut open_boundaries = Vec::new();
+        let mut boundary_index = 0;
+
+        for row_index in 0..self.rows.len() {
+            while boundary_index < self.row_boundaries.len()
+                && self.row_boundaries[boundary_index].at == row_index
+            {
+                match &self.row_boundaries[boundary_index].kind {
+                    TableRowBoundaryKind::SdtOpen(_) => open_boundaries.push(boundary_index),
+                    TableRowBoundaryKind::SdtClose(_) => {
+                        open_boundaries.pop();
+                    }
+                    TableRowBoundaryKind::Raw(_) => {}
+                }
+                boundary_index += 1;
+            }
+            owners.push(open_boundaries.clone());
+        }
+        Ok(owners)
+    }
+
+    /// Insert before `index`, keeping every boundary at that gap before the new
+    /// row. Therefore insertion at a control's first row inherits that row's
+    /// ownership, while insertion immediately after its last row (after the
+    /// close boundary) stays outside. Returns `false` for an invalid index.
+    pub fn insert_row(&mut self, index: usize, row: Row) -> bool {
+        if index > self.rows.len() {
+            return false;
+        }
+        for boundary in &mut self.row_boundaries {
+            if boundary.at > index {
+                boundary.at += 1;
+            }
+        }
+        self.rows.insert(index, row);
+        true
+    }
+
+    /// Remove a visible row and collapse the following row gap onto its
+    /// preceding gap. Deleting a control's first or last row leaves every
+    /// remaining group row under the same boundaries; deleting its final visible
+    /// row retains a balanced empty control rather than discarding its definition.
+    pub fn remove_row(&mut self, index: usize) -> Option<Row> {
+        if index >= self.rows.len() {
+            return None;
+        }
+        let row = self.rows.remove(index);
+        for boundary in &mut self.row_boundaries {
+            if boundary.at > index {
+                boundary.at -= 1;
+            }
+        }
+        Some(row)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -567,5 +760,161 @@ impl Document {
             }
         }
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(text: &str) -> Row {
+        Row {
+            cells: vec![Cell {
+                blocks: vec![Block::Paragraph(Paragraph {
+                    content: vec![Inline::Run(Run {
+                        text: text.to_string(),
+                        ..Default::default()
+                    })],
+                    ..Default::default()
+                })],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn table(texts: &[&str], row_boundaries: Vec<TableRowBoundary>) -> Table {
+        Table {
+            rows: texts.iter().map(|text| row(text)).collect(),
+            row_boundaries,
+            ..Default::default()
+        }
+    }
+
+    fn open(at: usize, name: &str) -> TableRowBoundary {
+        TableRowBoundary::sdt_open(
+            at,
+            format!("<w:sdt><w:sdtPr><w:alias w:val=\"{name}\"/></w:sdtPr><w:sdtContent>"),
+        )
+    }
+
+    fn close(at: usize) -> TableRowBoundary {
+        TableRowBoundary::sdt_close(at, "</w:sdtContent></w:sdt>")
+    }
+
+    #[test]
+    fn plain_rows_and_default_tables_have_no_boundary_owners() {
+        let empty = Table::default();
+        assert!(empty.row_boundaries.is_empty());
+        assert_eq!(empty.row_control_owners(), Ok(Vec::new()));
+
+        let plain = table(&["one", "two"], vec![]);
+        assert_eq!(plain.row_control_owners(), Ok(vec![vec![], vec![]]));
+        assert_eq!(Block::Table(plain).plain_text(), "one\ntwo\n");
+    }
+
+    #[test]
+    fn one_controlled_row_is_visible_cloneable_and_compared_with_its_wrapper() {
+        let controlled = table(&["visible"], vec![open(0, "single"), close(1)]);
+        assert_eq!(controlled.row_control_owners(), Ok(vec![vec![0]]));
+        assert_eq!(Block::Table(controlled.clone()).plain_text(), "visible\n");
+        assert_eq!(controlled.clone(), controlled);
+
+        let mut changed_wrapper = controlled.clone();
+        changed_wrapper.row_boundaries[0] = open(0, "changed");
+        assert_ne!(changed_wrapper, controlled);
+    }
+
+    #[test]
+    fn multiple_controlled_rows_follow_edge_insert_and_delete_rules() {
+        let mut controlled = table(&["first", "last"], vec![open(0, "group"), close(2)]);
+
+        assert!(controlled.insert_row(0, row("inserted at first")));
+        assert_eq!(controlled.row_boundaries[1].at, 3);
+        assert_eq!(
+            controlled.row_control_owners(),
+            Ok(vec![vec![0], vec![0], vec![0]])
+        );
+
+        assert!(controlled.insert_row(3, row("inserted after last")));
+        assert_eq!(
+            controlled.row_control_owners(),
+            Ok(vec![vec![0], vec![0], vec![0], vec![]])
+        );
+
+        assert_eq!(controlled.remove_row(0), Some(row("inserted at first")));
+        assert_eq!(controlled.remove_row(0), Some(row("first")));
+        assert_eq!(controlled.remove_row(0), Some(row("last")));
+        assert_eq!(controlled.row_boundaries[0].at, 0);
+        assert_eq!(controlled.row_boundaries[1].at, 0);
+        assert_eq!(controlled.row_control_owners(), Ok(vec![vec![]]));
+        assert!(controlled.validate_row_boundaries().is_ok());
+    }
+
+    #[test]
+    fn nested_controls_record_outer_to_inner_row_ownership() {
+        let nested = table(
+            &["outer", "nested", "outer again"],
+            vec![open(0, "outer"), open(1, "inner"), close(2), close(3)],
+        );
+
+        assert_eq!(
+            nested.row_control_owners(),
+            Ok(vec![vec![0], vec![0, 1], vec![0]])
+        );
+    }
+
+    #[test]
+    fn adjacent_controls_share_a_gap_without_sharing_rows() {
+        let adjacent = table(
+            &["left", "right"],
+            vec![open(0, "left"), close(1), open(1, "right"), close(2)],
+        );
+
+        assert_eq!(adjacent.row_control_owners(), Ok(vec![vec![0], vec![2]]));
+    }
+
+    #[test]
+    fn empty_control_and_unknown_child_are_preserved_at_one_gap() {
+        let empty = table(
+            &[],
+            vec![
+                open(0, "empty"),
+                TableRowBoundary::raw(0, "<w:customXml w:uri=\"urn:test\"/>"),
+                close(0),
+            ],
+        );
+
+        assert!(empty.validate_row_boundaries().is_ok());
+        assert_eq!(empty.row_control_owners(), Ok(Vec::new()));
+        assert_eq!(Block::Table(empty.clone()).plain_text(), "");
+        assert_eq!(empty.clone(), empty);
+    }
+
+    #[test]
+    fn invalid_boundaries_report_range_order_and_balance_errors() {
+        let out_of_bounds = table(&[], vec![open(1, "bad"), close(1)]);
+        assert!(matches!(
+            out_of_bounds.validate_row_boundaries(),
+            Err(TableRowBoundaryError::PositionOutOfBounds { .. })
+        ));
+
+        let out_of_order = table(&["row"], vec![open(1, "bad"), close(0)]);
+        assert!(matches!(
+            out_of_order.validate_row_boundaries(),
+            Err(TableRowBoundaryError::PositionOutOfOrder { .. })
+        ));
+
+        let unexpected_close = table(&[], vec![close(0)]);
+        assert!(matches!(
+            unexpected_close.validate_row_boundaries(),
+            Err(TableRowBoundaryError::UnexpectedClose { .. })
+        ));
+
+        let unclosed = table(&[], vec![open(0, "bad")]);
+        assert!(matches!(
+            unclosed.validate_row_boundaries(),
+            Err(TableRowBoundaryError::UnclosedOpen { .. })
+        ));
     }
 }

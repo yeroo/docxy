@@ -34,15 +34,15 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 ### Task 1: Specify row wrapper boundaries in the model
 
-- [ ] add a compact table-child or row-boundary representation capable of
+- [x] add a compact table-child or row-boundary representation capable of
       expressing raw `w:sdt` open/close boundaries, nesting, and empty controls
       without turning visible rows into opaque XML
-- [ ] define invariants for balanced boundaries, row ownership, cloning, plain
+- [x] define invariants for balanced boundaries, row ownership, cloning, plain
       text, equality, and default/newly-created tables
-- [ ] document how inserts and deletes at the first/last row of a control behave
-- [ ] add model-level tests for plain rows, one controlled row, multiple rows,
+- [x] document how inserts and deletes at the first/last row of a control behave
+- [x] add model-level tests for plain rows, one controlled row, multiple rows,
       nested controls, adjacent controls, and an empty control
-- [ ] run `cargo test -p docxcore` before Task 2
+- [x] run `cargo test -p docxcore` before Task 2
 
 ### Task 2: Parse row-level controls losslessly
 
@@ -99,4 +99,3 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 - [ ] record final test counts and fixture paths in this plan
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*
-
