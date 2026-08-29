@@ -94,8 +94,20 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 ### Task 6: [Final] Record the row-control contract
 
-- [ ] update the relevant DOCX support/gap documentation with the representation,
+- [x] update the relevant DOCX support/gap documentation with the representation,
       boundary-edit behavior, validation evidence, and deliberate UI deferrals
-- [ ] record final test counts and fixture paths in this plan
+- [x] record final test counts and fixture paths in this plan
+
+Final validation record (2026-08-29):
+
+- `cargo test` passed across the workspace, including 457 `docxcore` unit tests
+  and 10 package integration tests.
+- `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, and
+  `git diff --check` passed.
+- Package fixture: `docxcore/tests/fixtures/row-content-controls.docx`.
+- Reproducible fixture generator:
+  `docxcore/tests/fixtures/generate-row-content-controls.ps1`.
+- Package round-trip, targeted-edit, and block/inline regression tests:
+  `docxcore/tests/docx_integration.rs`.
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*

@@ -51,12 +51,51 @@ fields**, and **external hyperlinks**.
 | **D1** | **Table / cell / paragraph *properties* dropped on save** — `tblPr`, `trPr`, most of `tcPr`, `w:shd`, `w:pBdr` sides, widths, `vAlign`, `w:spacing`, `outlineLvl` | tables **47** + shading **21** + ParaPr | MISSING (lost on save) | round-trip + render | **Critical** (silent data loss) |
 | **D2** | **Footnotes & endnotes** — `footnotes.xml`/`endnotes.xml` never read; reference run emitted empty → **anchor lost on save**, part orphaned | 9 + 5 = **14** | MISSING | load + render markers + panel | High |
 | **D3** | **Tracked changes** — `w:ins`/`w:del` become opaque `Raw`, so inserted text is **invisible** and deletions vanish; no accept/reject | **22** | PRESERVED-but-hidden | model + render + accept/reject | High |
-| **D4** | **Content-control wrappers** — `sdtContent` is shown/editable but `w:sdt`/`sdtPr` (incl. data binding) not rebuilt on save → degrades to plain text | **27** | DISPLAY (wrapper lost) | reconstruct wrapper | Medium |
+| **D4** | **Content controls** — block, inline, and table-row `w:sdt` wrappers and arbitrary properties round-trip while their content remains visible/editable; authoring and form UX are not exposed | **27** | PRESERVED + editable payload | property/form UI (deferred) | Low |
 | **D5** | **Symbols** (`w:sym`) — preserved but glyph never rendered → symbol chars invisible | **11** | PRESERVED-but-hidden | map to Unicode/font glyph | Medium |
 | **D6** | **Internal links & bookmarks** — anchor hyperlinks unwrapped to plain text; bookmarks round-trip but aren't navigation targets | bookmarks **30**, hyperlinks 28 | DISPLAY (inert) | clickable in-doc nav | Medium |
 | **D7** | **RTL / bidi** — `w:bidi` flag round-trips but text isn't visually reversed; run-level `w:rtl` dropped | **6** | DISPLAY (LTR only) | visual reorder | Low-Med |
 | **D8** | **Watermarks, page borders, protection** — preserved byte-faithful but inert (not rendered / not surfaced) | 8 + 3 + 2 | PRESERVED | render / surface | Low |
 | — | **Encrypted docx** — detected and refused | 2 | MISSING (rejected) | out of scope (needs crypto) | — |
+
+#### D4 row-level content-control contract
+
+Row-level controls (including `w15:repeatingSection` and
+`w15:repeatingSectionItem`) use a mixed logical table-child representation.
+`Table::rows` remains the ordinary visible/editable row list, while
+`Table::row_boundaries` stores invisible children at row gaps. An `SdtOpen`
+boundary contains the captured `<w:sdt>...<w:sdtContent>` prefix, an
+`SdtClose` contains the captured suffix, and `Raw` retains any otherwise
+unknown child in its original position. This preserves wrapper attributes,
+`w:sdtPr`, `w:sdtEndPr`, unknown XML, nesting, adjacency, and empty controls.
+Boundary anchors must be ordered, in range, balanced, and properly nested;
+serialization validates that invariant and never emits an invalid boundary
+stream. Malformed or truncated input is recovered to a balanced model without
+dropping visible rows.
+
+All boundaries at a row gap are applied before the row at that position. Thus
+inserting at a control's first row inherits that row's active controls;
+inserting after its closing boundary remains outside; and a shared
+close-then-open gap deterministically assigns the inserted row to the following
+control. Deletion collapses the following gap onto the preceding one. Deleting
+the first or last row keeps the remaining rows in the same group, and deleting
+the final visible row retains the definition as a balanced empty control.
+Cloning and equality include boundary metadata, while plain text and rendering
+ignore it. Callers that change row count must use `Table::insert_row` and
+`Table::remove_row` rather than mutate `Table::rows` directly.
+
+Validation on 2026-08-29 covered 457 `docxcore` unit tests and 10 package
+integration tests, followed by the full workspace test suite, all-target
+Clippy with warnings denied, formatting, and whitespace checks. The fixture is
+`docxcore/tests/fixtures/row-content-controls.docx`; its reproducible generator
+is `docxcore/tests/fixtures/generate-row-content-controls.ps1`, and the package
+assertions are in `docxcore/tests/docx_integration.rs`. They cover repeating
+sections, nested/adjacent/empty controls, unknown XML, row properties, merged
+cells, targeted cell editing, and existing block/inline wrapper behavior.
+
+Deliberate deferrals are a form-filling UI, content-control/data-binding
+property editing, and protection enforcement. These properties are preserved
+but remain inert; wrapper metadata is not rendered as document text.
 
 ---
 
@@ -144,8 +183,11 @@ Render `w:sym` glyphs (symbol-font → Unicode map); visually reorder RTL runs;
 make internal hyperlinks/bookmarks navigable (jump to anchor).
 
 **Phase D-5 — Structure preservation & inert features _(Lower)_**
-Reconstruct `w:sdt` wrappers on save (sdt 27); render watermarks & page borders;
-surface protection state. SVG decode if a raster path is added.
+`w:sdt` wrapper reconstruction is complete for block, inline, and row-level
+controls (see the D4 contract above). Remaining optional work is authoring
+content-control properties/forms, rendering watermarks and page borders, and
+surfacing protection state. SVG decode remains optional if a raster path is
+added.
 
 ### xlsxy
 
