@@ -63,6 +63,10 @@ docxy assets/sample.docx
 - **Find & replace**, full **clipboard** (syncs with the OS clipboard),
   **selection + formatting**, word navigation, and **show-invisibles**.
 - **Headers & footers**, multi-section page layout, and **print/page view**.
+- **Tracked-change review** for insertions, deletions, and run/paragraph/table/
+  row/cell/section property changes. Review previous/next, accept or reject the
+  current change, or confirm accept/reject all; each action is undoable and
+  survives save/reload. Unsupported move/custom records stay lossless.
 - **DOCX protection** honored across TUI and automation edits: read-only,
   comments-only, and formatting-only restrictions are enforced; unsupported
   forms-only and tracked-changes-only editing fails closed. Recommendation-only
@@ -134,6 +138,8 @@ docxy in.md    --docx out.docx  # convert Markdown → Word
 | F2 · F3 · F4 | page view · show marks · table borders |
 | F6 · F7 | edit header · edit footer (Esc returns) |
 | F8 · F9 | insert landscape · portrait section at cursor |
+| Alt-Shift-←/→ | previous / next tracked change |
+| Alt-Shift-A/R | accept / reject current tracked change |
 | mouse | click to move · click a link to open · wheel/drag to scroll/select |
 
 ## Xlsxy — spreadsheets too

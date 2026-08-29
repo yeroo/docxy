@@ -115,8 +115,24 @@ id 199 and `w:customXmlInsRangeStart` id 198; actions report and preserve both.
 
 ### Task 7: [Final] Document review semantics
 
-- [ ] update DOCX support and control/MCP docs with supported revision kinds,
+- [x] update DOCX support and control/MCP docs with supported revision kinds,
       accept/reject rules, navigation/undo behavior, and deliberate exclusions
-- [ ] record final test counts and fixture/evidence paths in this plan
+- [x] record final test counts and fixture/evidence paths in this plan
+
+Final validation: `cargo test` passed 2,476 tests with 0 failures and 1 ignored
+(including 18 focused revision integration tests: 7 pure transforms, 7 editor
+history/navigation tests, and 4 package round-trip tests). The final
+`cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, and
+`git diff --check` gates all passed.
+
+Fixture/evidence paths: `docxcore/tests/fixtures/revision-package.xml`,
+`docxcore/tests/fixtures/revision-comments.xml`,
+`docxcore/tests/revision_actions.rs`,
+`docxcore/tests/editor_revision_actions.rs`, and
+`docxcore/tests/revision_package_roundtrip.rs`. The package suite validates
+untouched/current/all/undo/redo/save/reload artifacts using the independent OPC
+ZIP reader, balanced-XML checks, and both DOCX loaders; deliberate unsupported
+records remain `w:moveFromRangeStart` id 199 and
+`w:customXmlInsRangeStart` id 198.
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*

@@ -1,45 +1,93 @@
-# DOCX tracked-change inventory
+# DOCX tracked-change support and review semantics
 
-This inventory records the revision markup present before tracked-change actions
-were implemented and defines the model boundary used by the implementation plan.
+docxy imports WordprocessingML tracked changes as reviewable document state.
+Untouched records retain their source metadata and unknown XML, while supported
+records can be accepted or rejected from the terminal Review ribbon or through
+the control/MCP surface. Review changes survive DOCX save and reload.
 
-## Existing fixture coverage
-
-The packaged `.docx` fixtures under `docxcore/tests/fixtures`, `assets`, and the
-editor integrations contain no WordprocessingML revision elements. The existing
-in-source XML fixtures cover:
-
-| Fixture/test | Revision form | Pre-project representation |
-| --- | --- | --- |
-| `docxcore/src/serialize.rs` tracked-change round-trip | `w:ins`, `w:del`, `w:delText` | Visible `Inline::Revision` with opaque wrapper XML |
-| `docxcore/src/package.rs` section extraction test | `w:sectPrChange` | Preserved only inside opaque trailing `w:sectPr` XML |
-
-Task 1 adds model fixtures for nested insert/delete wrappers, all six property
-scopes, missing metadata, move/custom records, and a future unknown revision
-kind. Task 6 remains responsible for adding realistic packaged `.docx` fixtures.
-
-## Classification contract
+## Supported records
 
 | Classification | WordprocessingML forms | Review behavior |
 | --- | --- | --- |
-| Inline content | `w:ins`, `w:del` (including `w:delText`) | Supported accept/reject target |
-| Property change | `w:rPrChange`, `w:pPrChange`, `w:tblPrChange`, `w:trPrChange`, `w:tcPrChange`, `w:sectPrChange` | Supported accept/reject target; current properties live on the owner and the prior property container lives on `PropertyChange` |
-| Move revision | `w:moveFrom`, `w:moveTo`, their range start/end markers | Lossless, explicitly unsupported |
-| Custom-XML revision | insert/delete/move custom-XML range start/end markers | Lossless, explicitly unsupported |
-| Other unsupported revision | cell insert/delete/merge, conflict insert/delete, or a future producer-specific kind | Lossless, explicitly unsupported |
+| Inline insertion | `w:ins` | Accept unwraps and keeps the inserted content; reject removes the wrapper and its content. |
+| Inline deletion | `w:del`, including `w:delText` and `w:delInstrText` | Accept removes the wrapper and its content; reject restores ordinary text/content and removes only the display cue contributed by the deletion wrapper. |
+| Run properties | `w:rPrChange` | Accept keeps the current `w:rPr`; reject restores the prior `w:rPr` snapshot. |
+| Paragraph properties | `w:pPrChange` | Accept keeps the current `w:pPr`; reject restores the prior `w:pPr` snapshot without consuming an independent section change. |
+| Table properties | `w:tblPrChange` | Accept keeps current table properties; reject restores the prior property container. |
+| Row properties | `w:trPrChange` | Accept keeps current row properties; reject restores the prior property container. |
+| Cell properties | `w:tcPrChange` | Accept keeps current cell properties; reject restores the prior property container. |
+| Section properties | `w:sectPrChange` | Accept keeps current section properties; reject restores the prior section snapshot. |
 
-Every modeled record carries `RevisionMetadata`: a document-local stable target,
-optional source id/author/date, and decoded unknown attributes. The complete raw
-wrapper stays on the owning revision node, so unknown XML is retained exactly.
-Property changes also retain a present, absent, or malformed prior snapshot.
+An absent prior property container means rejection restores the default/absent
+state. Boolean toggles and direct values are restored from the snapshot rather
+than recomputed from styles. Unrelated and unmodeled property children are
+preserved. A malformed or scope-mismatched snapshot is reported as malformed
+and left untouched rather than guessed at.
 
-## Addressing and order
+## Order, navigation, and history
 
-`RevisionTarget` is assigned once after parsing and stored on the node. It is not
-a block index or a structural path, so removing an earlier revision does not
-invalidate a target. `Document::revisions` computes a fresh ordinal for display
-and navigation each time while actions resolve the stable target. Enumeration is
-source preorder (outer wrapper before nested content) and records parent/depth;
-bulk transforms can therefore process greater depth first for deterministic
-innermost-to-outermost behavior. Cloning preserves targets, metadata, snapshots,
-nesting, and raw XML.
+Every record has a document-local `RevisionTarget` that remains stable when an
+earlier change is removed or unwrapped. Enumeration and navigation recompute
+document order after each action and report one-based ordinals, nesting depth,
+parent target, kind, supported state, source `id`/`author`/`date` when present,
+and an editor-safe start/end location. Stable targets are encoded as strings on
+the control/MCP wire so all 64 identity bits survive JSON clients.
+
+Previous/next navigation wraps at the document ends. The current change is the
+one explicitly selected by review navigation, or the change at the caret when
+there is no surviving review selection. If acted-on content disappears, the
+caret, selection, table path, and viewport are repaired to a valid location.
+
+Accept/reject-current is one undoable transaction when it applies. Accept/reject
+all snapshots the initial revision list, transforms nested records
+innermost-first, returns outcomes in the original document order, and creates
+one undo transaction for all applied records. One undo restores the entire
+action and redo reapplies it exactly. Stale, unsupported, and malformed targets
+are structured no-ops and do not create a history entry; bulk actions continue
+past them and report each skipped outcome.
+
+In the terminal TUI, the Review ribbon provides Previous Change, Next Change,
+Accept, Reject, Accept All, and Reject All. Navigation status includes revision
+kind, stable target, and source metadata when present. The keyboard shortcuts
+are Alt+Shift+Left/Right for previous/next and Alt+Shift+A/R for accept/reject
+current. Accept All and Reject All require an explicit, default-No confirmation.
+
+## Fidelity and deliberate exclusions
+
+Modeled records retain optional source id, author, date, unknown attributes,
+nesting, property snapshots, and their complete raw wrapper until acted on.
+Normal edits beside an untouched revision preserve its wrapper boundary.
+Comments, content controls, fields, hyperlinks, tables, raw boundaries, and
+unknown producer extensions around or inside supported content remain intact.
+
+Move revisions (`w:moveFrom`, `w:moveTo`, and their range markers), custom-XML
+revision range markers, cell insert/delete/merge records, conflict revisions,
+and future producer-specific revision kinds are deliberately unsupported. They
+remain lossless and visible in enumeration with `supported:false`; an action
+returns `unsupported_revision` and does not remove or reinterpret the record.
+Malformed property snapshots similarly return `malformed_revision`. A target
+removed by an earlier action returns `stale_revision`.
+
+docxy reviews imported changes but does not record new edits as tracked changes.
+Consequently, an enforced tracked-changes-only protection mode still fails
+closed for ordinary edits and for accept/reject actions. Move tracking,
+comparison, revision balloons, real-time collaboration, authorship
+configuration, and automatic tracking of new edits are out of scope.
+
+## Interoperability evidence
+
+The realistic package fixture combines nested inline changes, all six property
+scopes, comments, content controls, tables, section properties, unknown
+attributes/children, and deliberate unsupported records:
+
+- `docxcore/tests/fixtures/revision-package.xml`
+- `docxcore/tests/fixtures/revision-comments.xml`
+- `docxcore/tests/revision_package_roundtrip.rs`
+
+The package suite verifies untouched, accept/reject-current, accept/reject-all,
+undo, redo, save, and reload results. Every produced artifact is opened through
+the independent OPC ZIP reader, checked for balanced XML and required package
+relationships, and loaded by both DOCX loaders. The deliberate unsupported
+evidence is `w:moveFromRangeStart` id 199 and
+`w:customXmlInsRangeStart` id 198; every review workflow reports and preserves
+both.
