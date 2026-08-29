@@ -65,8 +65,9 @@ docxy assets/sample.docx
 - **Headers & footers**, multi-section page layout, and **print/page view**.
 - **DOCX protection** honored across TUI and automation edits: read-only,
   comments-only, and formatting-only restrictions are enforced; unsupported
-  forms-only and tracked-changes-only editing fails closed. Advisory write
-  protection remains editable and is shown as a warning.
+  forms-only and tracked-changes-only editing fails closed. Recommendation-only
+  write protection remains editable with a warning; password-backed write
+  protection fails closed as read-only until password verification is supported.
 - **Watermark previews** in page view: applied text watermarks render as
   non-interactive overlays, while picture or unsupported watermarks show a
   preview-unavailable label. Overlay text never enters copy/export output or

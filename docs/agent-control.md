@@ -113,7 +113,8 @@ Notes:
 ### DOCX protection and watermark behavior
 
 `doc.path` reports a human-readable `protection` value when a document declares
-one: `read-only`, `comments only`, `formatting locked`, `form fields only`,
+one: `read-only` (including password-backed write protection), `comments only`,
+`formatting locked`, `form fields only`,
 `tracked changes only`, `restricted editing`, or the advisory
 `read-only (recommended)`. The optional `watermark` value contains the first
 applied text watermark, or `picture (preview unavailable)` /
@@ -127,7 +128,8 @@ same checks and do not maintain a second policy table:
 
 | Protection state | Content | Structure | Formatting | Comments | Package metadata |
 |---|---:|---:|---:|---:|---:|
-| absent, disabled, or advisory write protection | allow | allow | allow | allow | allow |
+| absent, disabled, or recommendation-only write protection | allow | allow | allow | allow | allow |
+| password-backed write protection | deny | deny | deny | deny | deny |
 | enforced read-only | deny | deny | deny | deny | deny |
 | enforced comments-only | deny | deny | deny | allow | deny |
 | enforced formatting-only | allow | allow | deny | allow | allow |
@@ -140,10 +142,13 @@ The current mutating control/MCP operations cover Structure
 `doc.undo`, `doc.redo`), and Formatting (`doc.format`, `doc.set-style`). There
 is no comment-writing control verb yet, so comments-only protection denies all
 current automation edits even though comment mutations in the TUI are allowed.
+Markdown control/MCP inserts that carry styles, numbering, or direct run
+formatting additionally require Formatting authorization.
 Read, navigation, inspection, export, same-format save, open/reload, and new-file
 operations remain available. Cross-format Save As in the TUI is package
 metadata and is protected; same-format save only persists already-authorized
-changes and is not a new mutation.
+changes and is not a new mutation. When nothing was edited, the original main
+document XML is preserved verbatim rather than regenerated.
 
 Denied control and MCP requests return
 `protection_denied:<stable_code>: <explanation>`, where `<stable_code>` is one
@@ -157,9 +162,10 @@ errors.
 Forms-only, tracked-changes-only, and unknown enforced modes deliberately fail
 closed. docxy cannot yet make conforming form-field-only edits or automatically
 record ordinary edits as tracked changes; use Word for those edits until those
-editing models exist. Advisory `w:writeProtection` is different: the TUI shows
-a warning and `doc.path` reports `read-only (recommended)`, but all edits remain
-allowed.
+editing models exist. Recommendation-only `w:writeProtection` is different: the
+TUI shows a warning and `doc.path` reports `read-only (recommended)`, but all
+edits remain allowed. A password/hash-backed declaration is enforced read-only
+until docxy can verify the password.
 
 In page view, applied text watermarks are rendered as muted page overlays using
 the correct inherited default/first/even header. They are not part of document

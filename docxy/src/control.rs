@@ -480,6 +480,10 @@ fn markdown_flag(args: &Json) -> bool {
 /// comments.
 fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
     let mut blocks = agent::parse_markdown_blocks(text)?;
+    if blocks_carry_formatting(&blocks) {
+        app.authorize_mutation(MutationKind::Formatting)
+            .map_err(|denial| denial.control_error())?;
+    }
 
     let (needs_bullet, needs_decimal) = agent::referenced_numbering_kinds(&blocks);
     if needs_bullet || needs_decimal {
@@ -504,6 +508,42 @@ fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, Stri
     }
 
     Ok(blocks)
+}
+
+/// Markdown is a transport syntax, not a single mutation class. Plain parsed
+/// blocks remain a structure/content edit, while styles, numbering, or direct
+/// run/paragraph properties additionally require formatting authorization.
+fn blocks_carry_formatting(blocks: &[Block]) -> bool {
+    fn inline_carries_formatting(inline: &docxcore::model::Inline) -> bool {
+        use docxcore::model::{Inline, RunProps};
+        match inline {
+            Inline::Run(run) => run.props != RunProps::default(),
+            Inline::Hyperlink(link) => link.runs.iter().any(|run| run.props != RunProps::default()),
+            Inline::Tab(props) => *props != RunProps::default(),
+            Inline::TextBox { blocks, .. } => blocks_carry_formatting(blocks),
+            Inline::Revision { content, .. } => content.iter().any(inline_carries_formatting),
+            Inline::Break(_)
+            | Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::Equation { .. }
+            | Inline::Field { .. }
+            | Inline::FootnoteRef { .. }
+            | Inline::Raw(_) => false,
+        }
+    }
+
+    blocks.iter().any(|block| match block {
+        Block::Paragraph(paragraph) => {
+            paragraph.props != Default::default()
+                || paragraph.content.iter().any(inline_carries_formatting)
+        }
+        Block::Table(table) => table.rows.iter().any(|row| {
+            row.cells
+                .iter()
+                .any(|cell| blocks_carry_formatting(&cell.blocks))
+        }),
+        Block::Raw(_) => false,
+    })
 }
 
 /// `doc.replace-all`: replace every occurrence of `query` with `text` across
@@ -1214,6 +1254,41 @@ mod tests {
     }
 
     #[test]
+    fn formatting_lock_rejects_formatted_markdown_before_package_mutation() {
+        let mut app = app_with(&["A"]);
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        let document = app.editor.doc.clone();
+        let package = package_snapshot(&app);
+
+        let error = dispatch(
+            &mut app,
+            "doc.insert",
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("# Heading\n\n- item".to_string())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("protection_denied:formatting_locked:"));
+        assert_eq!(app.editor.doc, document);
+        assert_eq!(package_snapshot(&app), package);
+        assert!(!app.modified);
+
+        let result = dispatch(
+            &mut app,
+            "doc.insert",
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("plain".to_string())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        );
+        assert!(result.is_ok(), "plain Markdown is only a structure edit");
+    }
+
+    #[test]
     fn markdown_heading_into_a_fresh_package_ensures_heading1_and_persists_it() {
         let mut app = app_with(&["Existing"]);
         let styles_before =
@@ -1724,6 +1799,12 @@ mod tests {
                 Some("read-only (recommended)"),
                 None,
                 None,
+            ),
+            (
+                ProtectionFixture::PasswordWrite,
+                Some("read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
             ),
             (
                 ProtectionFixture::Unknown,

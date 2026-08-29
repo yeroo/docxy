@@ -14,6 +14,7 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) struct State {
     marks: Vec<Watermark>,
     title_page_sections: Vec<bool>,
+    page_number_starts: Vec<Option<usize>>,
     even_odd: bool,
     /// Body section properties used to build `marks`. `None` is reserved for
     /// synthetic renderer-test states that are not tied to a live document.
@@ -27,9 +28,11 @@ impl State {
         title_page_sections: Vec<bool>,
         even_odd: bool,
     ) -> Self {
+        let page_number_starts = vec![None; title_page_sections.len()];
         Self {
             marks,
             title_page_sections,
+            page_number_starts,
             even_odd,
             section_breaks: None,
         }
@@ -51,12 +54,18 @@ impl State {
             .map(|sect_pr| flag_on(sect_pr, "titlePg"))
             .collect::<Vec<_>>();
         title_page_sections.push(flag_on(pkg.sect_pr(), "titlePg"));
+        let mut page_number_starts = section_breaks
+            .iter()
+            .map(|sect_pr| page_number_start(sect_pr))
+            .collect::<Vec<_>>();
+        page_number_starts.push(page_number_start(pkg.sect_pr()));
 
         let even_odd = pkg.has_even_odd();
 
         Self {
             marks: pkg.watermarks(),
             title_page_sections,
+            page_number_starts,
             even_odd,
             section_breaks: Some(section_breaks),
         }
@@ -84,7 +93,7 @@ impl State {
         self.marks.len()
     }
 
-    fn variant_for(&self, page: &PageBox) -> HeaderVariant {
+    fn variant_for(&self, page: &PageBox, logical_page_number: usize) -> HeaderVariant {
         if page.section_page_index == 0
             && self
                 .title_page_sections
@@ -93,7 +102,7 @@ impl State {
                 .unwrap_or(false)
         {
             HeaderVariant::First
-        } else if self.even_odd && page.document_page_index % 2 == 1 {
+        } else if self.even_odd && logical_page_number.is_multiple_of(2) {
             HeaderVariant::Even
         } else {
             HeaderVariant::Default
@@ -113,7 +122,22 @@ pub(crate) struct Overlay {
 /// Build at most one deterministic, terminal-honest label for each page.
 pub(crate) fn layout(state: &State, pages: &[PageBox], lines: &[Line]) -> Vec<Overlay> {
     let mut overlays = Vec::new();
+    let mut previous_page_number = 0usize;
+    let mut current_section = None;
+    let mut section_start = 1usize;
     for page in pages {
+        if current_section != Some(page.section_index) || page.section_page_index == 0 {
+            section_start = state
+                .page_number_starts
+                .get(page.section_index)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| previous_page_number.saturating_add(1).max(1));
+            current_section = Some(page.section_index);
+        }
+        let logical_page_number = section_start.saturating_add(page.section_page_index);
+        previous_page_number = logical_page_number;
+
         // A usable page needs two border cells/rows and at least one inner cell.
         let inner_width = page.cols.saturating_sub(2);
         let inner_rows = page.rows.saturating_sub(2);
@@ -121,7 +145,7 @@ pub(crate) fn layout(state: &State, pages: &[PageBox], lines: &[Line]) -> Vec<Ov
             continue;
         }
 
-        let variant = state.variant_for(page);
+        let variant = state.variant_for(page, logical_page_number);
         let mut texts = Vec::new();
         let mut picture = false;
         let mut unsupported = false;
@@ -262,6 +286,17 @@ fn flag_on(xml: &str, tag: &str) -> bool {
     )
 }
 
+fn page_number_start(xml: &str) -> Option<usize> {
+    let start = xml.find("<w:pgNumType")?;
+    let end = xml[start..]
+        .find('>')
+        .map(|offset| start + offset)
+        .unwrap_or(xml.len());
+    docxcore::load::xml_attr_value(&xml[start..end], "w:start")?
+        .parse()
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -325,6 +360,7 @@ mod tests {
                 ),
             ],
             title_page_sections: vec![true, false],
+            page_number_starts: vec![None, None],
             even_odd: true,
             section_breaks: None,
         };
@@ -350,6 +386,39 @@ mod tests {
     }
 
     #[test]
+    fn restarted_page_numbering_drives_even_header_watermarks() {
+        let state = State {
+            marks: vec![
+                mark(
+                    0,
+                    HeaderVariant::Default,
+                    WatermarkKind::Text("ODD".to_string()),
+                ),
+                mark(
+                    0,
+                    HeaderVariant::Even,
+                    WatermarkKind::Text("EVEN".to_string()),
+                ),
+            ],
+            title_page_sections: vec![false],
+            page_number_starts: vec![Some(2)],
+            even_odd: true,
+            section_breaks: None,
+        };
+        let pages = [page(0, 0, 0, 0, 20, 50), page(0, 1, 1, 21, 20, 50)];
+
+        let overlays = layout(&state, &pages, &blank_lines(50));
+
+        assert_eq!(overlays.len(), 2);
+        assert!(overlays[0].text.contains("EVEN"));
+        assert!(overlays[1].text.contains("ODD"));
+        assert_eq!(
+            page_number_start(r#"<w:sectPr><w:pgNumType w:start="2"/></w:sectPr>"#),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn picture_and_unsupported_fallbacks_are_specific() {
         let state = State {
             marks: vec![
@@ -357,6 +426,7 @@ mod tests {
                 mark(0, HeaderVariant::Default, WatermarkKind::Unknown),
             ],
             title_page_sections: vec![false],
+            page_number_starts: vec![None],
             even_odd: false,
             section_breaks: None,
         };
@@ -377,6 +447,7 @@ mod tests {
                 WatermarkKind::Text("機密 e\u{301} — ПРОЕКТ".to_string()),
             )],
             title_page_sections: vec![false],
+            page_number_starts: vec![None],
             even_odd: false,
             section_breaks: None,
         };
@@ -416,6 +487,7 @@ mod tests {
                 WatermarkKind::Text("DENSE".to_string()),
             )],
             title_page_sections: vec![false],
+            page_number_starts: vec![None],
             even_odd: false,
             section_breaks: None,
         };

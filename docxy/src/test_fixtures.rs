@@ -20,11 +20,12 @@ pub(crate) enum ProtectionFixture {
     TrackedChanges,
     FormattingOnly,
     Advisory,
+    PasswordWrite,
     Unknown,
 }
 
 impl ProtectionFixture {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Unrestricted,
         Self::ReadOnly,
         Self::Comments,
@@ -32,6 +33,7 @@ impl ProtectionFixture {
         Self::TrackedChanges,
         Self::FormattingOnly,
         Self::Advisory,
+        Self::PasswordWrite,
         Self::Unknown,
     ];
 
@@ -44,6 +46,7 @@ impl ProtectionFixture {
             Self::TrackedChanges => "tracked-changes",
             Self::FormattingOnly => "formatting-only",
             Self::Advisory => "advisory-write-protection",
+            Self::PasswordWrite => "password-write-protection",
             Self::Unknown => "unknown-protection-mode",
         }
     }
@@ -67,6 +70,7 @@ impl ProtectionFixture {
                 r#"<w:documentProtection w:edit="none" w:formatting="1" w:enforcement="1"/>"#
             }
             Self::Advisory => r#"<w:writeProtection w:recommended="true"/>"#,
+            Self::PasswordWrite => r#"<w:writeProtection w:hashValue="YWJjZA=="/>"#,
             Self::Unknown => {
                 r#"<w:documentProtection w:edit="producerSpecific" w:enforcement="1"/>"#
             }
@@ -237,7 +241,7 @@ mod tests {
     };
 
     #[test]
-    fn protection_catalog_contains_every_supported_mode_and_advisory_case() {
+    fn protection_catalog_contains_every_supported_mode_and_write_protection_case() {
         let parsed =
             ProtectionFixture::ALL.map(|fixture| (fixture, fixture.package().protection()));
 
@@ -255,11 +259,13 @@ mod tests {
         assert!(parsed[5].1.formatting_locked);
         assert!(parsed[6].1.advisory_write_protection);
         assert_eq!(parsed[6].1.enforcement, ProtectionEnforcement::Absent);
+        assert!(parsed[7].1.enforced_write_protection);
+        assert_eq!(parsed[7].1.label(), Some("read-only"));
         assert_eq!(
-            parsed[7].1.edit_mode,
+            parsed[8].1.edit_mode,
             Some(ProtectionEditMode::Unknown("producerSpecific".to_string()))
         );
-        assert_eq!(parsed[7].1.label(), Some("restricted editing"));
+        assert_eq!(parsed[8].1.label(), Some("restricted editing"));
     }
 
     #[test]

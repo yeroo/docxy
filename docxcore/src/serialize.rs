@@ -509,15 +509,28 @@ fn write_table(s: &mut String, t: &Table) {
         s.push_str("</w:tblGrid>");
     }
     for row in &t.rows {
+        for raw in &row.raw_props {
+            if raw.trim_start().starts_with("<w:sdt") {
+                s.push_str(raw);
+            }
+        }
         s.push_str("<w:tr>");
         // trPr / tblPrEx precede the cells; preserved verbatim.
         for raw in &row.raw_props {
-            s.push_str(raw);
+            let trimmed = raw.trim_start();
+            if !trimmed.starts_with("<w:sdt") && !trimmed.starts_with("</w:sdtContent>") {
+                s.push_str(raw);
+            }
         }
         for cell in &row.cells {
             write_cell(s, cell);
         }
         s.push_str("</w:tr>");
+        for raw in &row.raw_props {
+            if raw.trim_start().starts_with("</w:sdtContent>") {
+                s.push_str(raw);
+            }
+        }
     }
     s.push_str("</w:tbl>");
 }

@@ -27,7 +27,8 @@ part, and adding a comment is Comment even though it also adds body anchors.
 | Body keys | printable characters, non-breaking space, Tab | Content |
 | Body keys | Enter, Backspace, Delete | Structure |
 | Clipboard | Cut | Structure |
-| Clipboard | Paste and every Paste Special commit | Content |
+| Clipboard | Plain/merge paste | Content |
+| Clipboard | Rich paste / Paste Special Keep Source Formatting | Content and Formatting |
 | History | Undo and Redo | Content; protected sessions can only contain previously authorized editor changes |
 | Find/replace | replace-current and replace-all from the find bar | Content |
 | Character editing | Shift+F3 case cycling | Content |
@@ -65,16 +66,17 @@ open, navigation, and cancel paths are non-mutating.
 
 | Control verb | Class |
 |---|---|
-| `doc.replace-range` | Structure |
-| `doc.insert` | Structure |
-| `doc.append` | Structure |
+| `doc.replace-range` | Structure; Markdown carrying formatting also requires Formatting |
+| `doc.insert` | Structure; Markdown carrying formatting also requires Formatting |
+| `doc.append` | Structure; Markdown carrying formatting also requires Formatting |
 | `doc.replace-all` | Content |
 | `doc.format` | Formatting |
 | `doc.set-style` | Formatting |
 | `doc.undo`, `doc.redo` | Content |
 
-The Markdown forms of replace/insert/append keep the same Structure class even
-when they add numbering or style definitions. All other current control verbs
+The Markdown forms of replace/insert/append keep their Structure requirement and
+add a Formatting requirement when parsed blocks carry styles, numbering, or
+direct formatting. All other current control verbs
 are read, export, persistence, or document-lifecycle operations. MCP has no
 independent mutation implementation: `docxy_replace_range`, `docxy_insert`,
 `docxy_append`, `docxy_replace_all`, `docxy_format`, `docxy_set_style`,
@@ -84,7 +86,8 @@ independent mutation implementation: `docxy_replace_range`, `docxy_insert`,
 
 | Protection state | Content | Structure | Formatting | Comment | Package metadata |
 |---|---:|---:|---:|---:|---:|
-| absent, disabled, or advisory write protection | allow | allow | allow | allow | allow |
+| absent, disabled, or recommendation-only write protection | allow | allow | allow | allow | allow |
+| password-backed write protection | deny | deny | deny | deny | deny |
 | enforced read-only | deny | deny | deny | deny | deny |
 | enforced comments-only | deny | deny | deny | allow | deny |
 | enforced formatting-only | allow | allow | deny | allow | allow |

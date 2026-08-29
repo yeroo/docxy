@@ -43,6 +43,7 @@ use docxcore::model::{
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{
     Package, Protection, load_package, new_markdown_package, new_package, save_package,
+    save_package_preserving_document,
 };
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
@@ -922,7 +923,7 @@ struct App {
 }
 
 impl App {
-    fn new(mut pkg: Package, path: &str, vim: bool) -> Self {
+    fn new(pkg: Package, path: &str, vim: bool) -> Self {
         let styles = pkg
             .part("word/styles.xml")
             .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
@@ -948,9 +949,12 @@ impl App {
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let comments = docxcore::comments::parse_comments(&pkg);
         let notes = docxcore::notes::parse_notes(&pkg);
+        let doc_protection = pkg.protection();
         // Recompute fields that depend on the clock / document properties (DATE,
         // TIME, AUTHOR, CREATEDATE, …) so they show a live value like Word does,
-        // rather than the value last cached in the file.
+        // rather than the value last cached in the file. This is a content
+        // mutation, so protected modes that disallow content keep the cached
+        // result both on screen and on save.
         let field_ctx = docxcore::field::FieldContext {
             now: local_now(),
             props: pkg
@@ -962,11 +966,12 @@ impl App {
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         };
-        docxcore::field::recompute(&mut pkg.document, &field_ctx);
-        let doc_protection = pkg.protection();
+        let mut doc = pkg.document.clone();
+        if protection::authorize(&doc_protection, protection::MutationKind::Content).is_ok() {
+            docxcore::field::recompute(&mut doc, &field_ctx);
+        }
         let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
-        let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
             editor: Editor::new(doc),
@@ -1633,8 +1638,14 @@ impl App {
                 (md.into_bytes(), pkg)
             }
             DocFormat::Docx => {
-                self.pkg.document = self.current_document();
-                (save_package(&self.pkg), self.pkg.clone())
+                let bytes = if self.format == DocFormat::Docx && !self.modified {
+                    save_package_preserving_document(&self.pkg)
+                } else {
+                    self.pkg.document = self.current_document();
+                    save_package(&self.pkg)
+                };
+                let pkg = load_package(&bytes).unwrap_or_else(|_| self.pkg.clone());
+                (bytes, pkg)
             }
         };
         match std::fs::write(&path, &bytes) {
@@ -1838,8 +1849,8 @@ impl App {
     }
 
     /// Refresh watermark labels/scopes after a live header or section change.
-    /// `App` parks the editable document outside `pkg`, so use a temporary
-    /// package view containing the current body when resolving section headers.
+    /// Use a temporary package view containing the current editor body when
+    /// resolving section headers; `pkg.document` is the last saved baseline.
     fn refresh_watermark_state(&mut self) {
         let mut live = self.pkg.clone();
         live.document = self.editor.doc.clone();
@@ -2714,12 +2725,21 @@ impl App {
         let bytes = match self.format {
             DocFormat::Markdown => self.current_markdown().into_bytes(),
             DocFormat::Docx => {
-                self.pkg.document = self.editor.doc.clone();
-                save_package(&self.pkg)
+                if self.modified {
+                    self.pkg.document = self.editor.doc.clone();
+                    save_package(&self.pkg)
+                } else {
+                    save_package_preserving_document(&self.pkg)
+                }
             }
         };
         match std::fs::write(&path, &bytes) {
             Ok(()) => {
+                if self.format == DocFormat::Docx {
+                    if let Ok(pkg) = load_package(&bytes) {
+                        self.pkg = pkg;
+                    }
+                }
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", path, bytes.len()));
             }
@@ -2846,16 +2866,22 @@ impl App {
 
     fn do_paste(&mut self) {
         let os_text = self.os_get();
-        let clip = match os_text {
+        let (clip, keeps_source_formatting) = match os_text {
             // Our own content is still on the clipboard -> paste with full styling.
-            Some(t) if Some(&t) == self.clip_text.as_ref() => self.clipboard.clone(),
+            Some(t) if Some(&t) == self.clip_text.as_ref() => (self.clipboard.clone(), true),
             // External text -> paste as plain.
-            Some(t) => Some(Clip::from_text(&t)),
+            Some(t) => (Some(Clip::from_text(&t)), false),
             // OS clipboard unavailable -> fall back to the internal clip.
-            None => self.clipboard.clone(),
+            None => (self.clipboard.clone(), true),
         };
         if let Some(c) = clip {
             if !self.mutation_allowed(protection::MutationKind::Content) {
+                return;
+            }
+            if keeps_source_formatting
+                && clip_has_formatting(&c)
+                && !self.mutation_allowed(protection::MutationKind::Formatting)
+            {
                 return;
             }
             self.editor.paste(&c);
@@ -2913,6 +2939,16 @@ impl App {
     /// Carry out the highlighted Paste Special option and close the dialog.
     fn apply_paste_special(&mut self) {
         if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
+        let selected = self
+            .paste_special
+            .as_ref()
+            .and_then(|paste| paste.opts.get(paste.sel))
+            .copied();
+        if selected == Some(PasteOpt::KeepSource)
+            && !self.mutation_allowed(protection::MutationKind::Formatting)
+        {
             return;
         }
         let Some(ps) = self.paste_special.take() else {
@@ -5857,6 +5893,29 @@ fn looks_like_url(s: &str) -> bool {
             || t.starts_with("www."))
 }
 
+/// Whether an internal clip would carry direct character formatting into the
+/// destination rather than merely inserting content in the caret's style.
+fn clip_has_formatting(clip: &Clip) -> bool {
+    fn inline_has_formatting(inline: &Inline) -> bool {
+        match inline {
+            Inline::Run(run) => run.props != RunProps::default(),
+            Inline::Hyperlink(link) => link.runs.iter().any(|run| run.props != RunProps::default()),
+            Inline::Tab(props) => *props != RunProps::default(),
+            Inline::Revision { content, .. } => content.iter().any(inline_has_formatting),
+            Inline::Break(_)
+            | Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::Equation { .. }
+            | Inline::TextBox { .. }
+            | Inline::Field { .. }
+            | Inline::FootnoteRef { .. }
+            | Inline::Raw(_) => false,
+        }
+    }
+
+    clip.paras.iter().flatten().any(inline_has_formatting)
+}
+
 /// Open a URL with the OS default handler — **without a shell** (the URL is
 /// passed as a direct argument), and only after [`safe_url`] has approved it.
 fn open_url(url: &str) {
@@ -7093,6 +7152,10 @@ mod tests {
                 "Edit blocked: the document is protected read-only.",
             ),
             (
+                ProtectionFixture::PasswordWrite,
+                "Edit blocked: the document is protected read-only.",
+            ),
+            (
                 ProtectionFixture::Forms,
                 "Edit blocked: form-fields-only editing is not supported; use Word to edit form fields.",
             ),
@@ -7205,6 +7268,10 @@ mod tests {
         for (name, package) in fixtures {
             let expected_protection = package.protection();
             let expected_watermarks = package.watermarks();
+            let expected_document_xml = package
+                .part("word/document.xml")
+                .expect("fixture main document")
+                .to_vec();
             let preserved = package
                 .part_names()
                 .into_iter()
@@ -7222,6 +7289,11 @@ mod tests {
             let reloaded = load_package(&bytes).expect("reload TUI-saved fixture");
             assert_eq!(reloaded.protection(), expected_protection, "{name}");
             assert_eq!(reloaded.watermarks(), expected_watermarks, "{name}");
+            assert_eq!(
+                reloaded.part("word/document.xml"),
+                Some(expected_document_xml.as_slice()),
+                "{name}: untouched saves must preserve the main document verbatim"
+            );
             for (part, expected) in &preserved {
                 assert_eq!(
                     reloaded.part(part),
@@ -7230,6 +7302,31 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn protected_load_does_not_recompute_cached_field_content() {
+        use crate::test_fixtures::ProtectionFixture;
+
+        let field_document = Document {
+            body: vec![Block::Paragraph(docxcore::model::Paragraph {
+                props: Default::default(),
+                content: vec![Inline::Field {
+                    raw: r#"<w:fldSimple w:instr="= 2+2"><w:r><w:t>OLD</w:t></w:r></w:fldSimple>"#
+                        .to_string(),
+                    text: "OLD".to_string(),
+                }],
+            })],
+        };
+        let mut protected = ProtectionFixture::ReadOnly.package();
+        protected.document = field_document.clone();
+        let protected_app = App::new(protected, "protected.docx", false);
+        assert_eq!(protected_app.editor.doc, field_document);
+
+        let mut unrestricted = ProtectionFixture::Unrestricted.package();
+        unrestricted.document = field_document;
+        let unrestricted_app = App::new(unrestricted, "unrestricted.docx", false);
+        assert_eq!(first_line(&unrestricted_app), "4");
     }
 
     #[test]
@@ -8397,6 +8494,38 @@ mod tests {
         assert!(app.paste_special.is_none(), "dialog closes after pasting");
         assert!(app.modified);
         assert!(para_text(&app, 0).starts_with("hi"), "text was inserted");
+    }
+
+    #[test]
+    fn formatting_lock_blocks_rich_paste_but_allows_plain_internal_text() {
+        let mut app = app_with(&["dest"]);
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        app.os_clip = None;
+        app.clipboard = Some(Clip {
+            paras: vec![vec![Inline::Run(Run {
+                text: "rich".to_string(),
+                props: RunProps {
+                    bold: true,
+                    ..RunProps::default()
+                },
+            })]],
+        });
+        let before = app.editor.doc.clone();
+
+        app.do_paste();
+
+        assert_eq!(app.editor.doc, before);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+        assert!(!app.modified);
+
+        app.clipboard = Some(Clip::from_text("plain"));
+        app.status = None;
+        app.do_paste();
+        assert!(app.modified);
+        assert!(para_text(&app, 0).starts_with("plain"));
     }
 
     #[test]

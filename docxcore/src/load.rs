@@ -1301,9 +1301,12 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
                 "w:tblGrid" => parse_tblgrid(p, &mut table.grid),
                 "w:tr" => table.rows.push(parse_row(p, rels)),
                 // A row-level content control (Repeating Section) wraps its
-                // `<w:tr>` rows in `<w:sdt><w:sdtContent>`. Unwrap it so the
-                // rows survive round-trip.
-                "w:sdt" => parse_sdt_rows(p, rels, &mut table.rows),
+                // `<w:tr>` rows in `<w:sdt><w:sdtContent>`. Keep boundary XML
+                // on the first/last contained rows so the wrapper survives save.
+                "w:sdt" => {
+                    let opening = p.raw_slice(p.start_pos(), p.pos()).to_string();
+                    parse_sdt_rows(p, rels, &mut table.rows, opening);
+                }
                 // Whole table properties (borders/shading/width/style) preserved.
                 "w:tblPr" => {
                     let start = p.start_pos();
@@ -1319,29 +1322,61 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
     table
 }
 
-/// Unwrap a row-level content control (`<w:sdt>` wrapping `<w:tr>` rows — a
-/// "Repeating Section") into `rows`. The `Table` model has no Raw-boundary
-/// facility for rows the way blocks do, so the control wrapper itself isn't
-/// preserved — but the row data (the important content) always is, rather than
-/// being dropped as an unrecognized element.
-fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, rows: &mut Vec<Row>) {
+/// Parse a row-level content control (`<w:sdt>` wrapping `<w:tr>` rows — a
+/// "Repeating Section") into `rows`. Wrapper boundaries are stored in the
+/// first/last row's `raw_props`; the serializer recognizes those boundary XML
+/// fragments and emits them outside `<w:tr>` rather than as row properties.
+fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, rows: &mut Vec<Row>, opening: String) {
+    let first_row = rows.len();
+    let mut before_content = String::new();
+    let mut after_content = String::new();
+    let mut content_opening = "<w:sdtContent>".to_string();
+    let mut saw_content = false;
     loop {
         match p.next() {
-            Event::Start if p.name() == "w:sdtContent" => loop {
-                match p.next() {
-                    Event::Start => match p.name() {
-                        "w:tr" => rows.push(parse_row(p, rels)),
-                        "w:sdt" => parse_sdt_rows(p, rels, rows), // nested section
-                        _ => p.skip_element(),
-                    },
-                    Event::End | Event::Eof => break,
-                    Event::Text => {}
+            Event::Start if p.name() == "w:sdtContent" => {
+                saw_content = true;
+                content_opening = p.raw_slice(p.start_pos(), p.pos()).to_string();
+                loop {
+                    match p.next() {
+                        Event::Start => match p.name() {
+                            "w:tr" => rows.push(parse_row(p, rels)),
+                            "w:sdt" => {
+                                let nested_opening =
+                                    p.raw_slice(p.start_pos(), p.pos()).to_string();
+                                parse_sdt_rows(p, rels, rows, nested_opening);
+                            }
+                            _ => p.skip_element(),
+                        },
+                        Event::End | Event::Eof => break,
+                        Event::Text => {}
+                    }
                 }
-            },
-            Event::Start => p.skip_element(), // w:sdtPr, w:sdtEndPr
+            }
+            Event::Start => {
+                let start = p.start_pos();
+                p.skip_element();
+                let raw = p.raw_slice(start, p.pos());
+                if saw_content {
+                    after_content.push_str(raw);
+                } else {
+                    before_content.push_str(raw);
+                }
+            }
             Event::End | Event::Eof => break,
             Event::Text => {}
         }
+    }
+
+    if saw_content && rows.len() > first_row {
+        let prefix = format!("{opening}{before_content}{content_opening}");
+        // Nested wrappers attach themselves first. The outer opening must precede
+        // them, while its closing must follow every nested closing.
+        rows[first_row].raw_props.insert(0, prefix);
+        rows.last_mut()
+            .expect("at least one row was added")
+            .raw_props
+            .push(format!("</w:sdtContent>{after_content}</w:sdt>"));
     }
 }
 
@@ -1976,6 +2011,13 @@ mod tests {
         assert_eq!(t.rows[0].cells[0].blocks[0].plain_text(), "plain");
         assert_eq!(t.rows[1].cells[0].blocks[0].plain_text(), "r1");
         assert_eq!(t.rows[2].cells[0].blocks[0].plain_text(), "r2");
+        let saved = crate::serialize::document_to_xml(&d);
+        assert!(saved.contains("<w:sdt>"), "row-level sdt wrapper lost");
+        assert!(
+            saved.contains("<w:alias w:val=\"Repeat\"/>"),
+            "row-level sdt properties lost"
+        );
+        assert!(saved.contains("<w:sdtContent>"));
     }
 
     #[test]

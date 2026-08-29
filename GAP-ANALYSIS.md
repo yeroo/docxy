@@ -46,14 +46,15 @@ fields**, and **external hyperlinks**.
 
 ### Document protection and watermark guarantees
 
-`docxcore` parses `w:documentProtection` and advisory `w:writeProtection` as
-structured metadata. docxy applies one policy to TUI, control, and MCP mutation
-routes before they touch the document, package parts, history, dirty flag, or
-save state:
+`docxcore` parses `w:documentProtection` plus recommendation-only and
+password-backed `w:writeProtection` as structured metadata. docxy applies one
+policy to TUI, control, and MCP mutation routes before they touch the document,
+package parts, history, dirty flag, or save state:
 
 | Protection state | Content | Structure | Formatting | Comments | Package metadata |
 |---|---:|---:|---:|---:|---:|
-| absent, disabled, or advisory write protection | allow | allow | allow | allow | allow |
+| absent, disabled, or recommendation-only write protection | allow | allow | allow | allow | allow |
+| password-backed write protection | deny | deny | deny | deny | deny |
 | enforced read-only | deny | deny | deny | deny | deny |
 | enforced comments-only | deny | deny | deny | allow | deny |
 | enforced formatting-only | allow | allow | deny | allow | allow |
@@ -61,12 +62,15 @@ save state:
 | enforced tracked-changes-only | deny | deny | deny | deny | deny |
 | enforced unknown mode | deny | deny | deny | deny | deny |
 
-The last three modes deliberately fail closed. docxy cannot yet restrict edits
+Password-backed write protection and the last three modes deliberately fail
+closed. docxy cannot yet verify a password, restrict edits
 to modeled form fields or automatically emit tracked revisions, so allowing an
 ordinary edit would violate the document's declared protection. Advisory write
 protection remains editable and is shown as `read-only (recommended)` rather
 than being treated as enforced protection. Navigation, selection, copy, find,
-inspection, same-format save, and export remain available in every mode. The
+inspection, same-format save, and export remain available in every mode.
+Untouched same-format saves preserve the original main document XML verbatim.
+The
 complete mutation classification and stable denial codes are in
 [`docs/docx-mutation-inventory.md`](docs/docx-mutation-inventory.md).
 

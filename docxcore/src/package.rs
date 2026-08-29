@@ -105,29 +105,37 @@ pub struct ProtectionSource {
     pub edit_value: Option<String>,
     pub formatting_value: Option<String>,
     pub write_recommended_value: Option<String>,
+    /// Whether `w:writeProtection` carried a password verifier (`password`,
+    /// `hash`, or `hashValue`) rather than only the advisory UI flag.
+    pub write_credential_present: bool,
 }
 
 /// Structured protection metadata from `word/settings.xml`.
 ///
-/// Enforced document restrictions and advisory `w:writeProtection` deliberately
-/// coexist in this model: callers must not turn the latter into an edit denial.
+/// Enforced document restrictions and recommendation-only `w:writeProtection`
+/// deliberately coexist in this model. Password-backed write protection is a
+/// real write lock; only the recommendation-only form remains advisory.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Protection {
     pub enforcement: ProtectionEnforcement,
     pub edit_mode: Option<ProtectionEditMode>,
     pub formatting_locked: bool,
     pub advisory_write_protection: bool,
+    pub enforced_write_protection: bool,
     pub source: ProtectionSource,
 }
 
 impl Protection {
     pub fn is_enforced(&self) -> bool {
-        self.enforcement == ProtectionEnforcement::Enforced
+        self.enforcement == ProtectionEnforcement::Enforced || self.enforced_write_protection
     }
 
     /// Compatibility label for status text. Authorization must inspect the
     /// structured fields above instead of comparing this human-readable value.
     pub fn label(&self) -> Option<&'static str> {
+        if self.enforced_write_protection {
+            return Some("read-only");
+        }
         if self.is_enforced() {
             match self.edit_mode.as_ref() {
                 Some(ProtectionEditMode::ReadOnly) => return Some("read-only"),
@@ -280,11 +288,18 @@ fn parse_protection(xml: &str) -> Protection {
             Event::Start if local_name(parser.name()) == "writeProtection" => {
                 protection.source.write_protection_present = true;
                 let recommended = decoded_attr_by_local(&parser, "recommended");
-                protection.advisory_write_protection = recommended
-                    .as_deref()
-                    .and_then(parse_ooxml_bool)
-                    .unwrap_or(false);
+                let credential_present = parser.attrs().iter().any(|attr| {
+                    matches!(local_name(attr.name), "password" | "hash" | "hashValue")
+                        && !attr.value.is_empty()
+                });
+                protection.enforced_write_protection = credential_present;
+                protection.advisory_write_protection = !credential_present
+                    && recommended
+                        .as_deref()
+                        .and_then(parse_ooxml_bool)
+                        .unwrap_or(false);
                 protection.source.write_recommended_value = recommended;
+                protection.source.write_credential_present = credential_present;
             }
             Event::Eof => break,
             _ => {}
@@ -293,15 +308,52 @@ fn parse_protection(xml: &str) -> Protection {
     protection
 }
 
-fn resolve_word_part_name(target: &str) -> String {
-    if let Some(absolute) = target.strip_prefix('/') {
-        return absolute.to_string();
+fn resolve_document_relationship_target(target: &str) -> Option<String> {
+    if target.contains('\\') || target.contains("://") {
+        return None;
     }
-    let relative = target.trim_start_matches("./");
-    if relative.starts_with("word/") {
-        relative.to_string()
+    let mut components = if target.starts_with('/') {
+        Vec::new()
     } else {
-        format!("word/{relative}")
+        vec!["word"]
+    };
+    for component in target.trim_start_matches('/').split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                components.pop()?;
+            }
+            value => components.push(value),
+        }
+    }
+    (!components.is_empty()).then(|| components.join("/"))
+}
+
+fn related_part_target(xml: &str, relationship_type: &str) -> Result<Option<String>, ()> {
+    let mut parser = XmlParser::new(xml);
+    loop {
+        match parser.next() {
+            Event::Start if local_name(parser.name()) == "Relationship" => {
+                let relation_type = decoded_attr_by_local(&parser, "Type");
+                if relation_type
+                    .as_deref()
+                    .is_some_and(|value| value.ends_with(&format!("/{relationship_type}")))
+                {
+                    if decoded_attr_by_local(&parser, "TargetMode")
+                        .as_deref()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("External"))
+                    {
+                        return Err(());
+                    }
+                    return decoded_attr_by_local(&parser, "Target")
+                        .filter(|target| !target.is_empty())
+                        .map(Some)
+                        .ok_or(());
+                }
+            }
+            Event::Eof => return Ok(None),
+            _ => {}
+        }
     }
 }
 
@@ -388,6 +440,29 @@ pub struct Package {
 }
 
 impl Package {
+    /// Resolve the settings part through the main document relationship. The
+    /// conventional name remains a compatibility fallback for older fixtures
+    /// and producer packages that omitted the otherwise-required relationship.
+    fn settings_part_name(&self) -> Result<Option<String>, &'static str> {
+        if let Some(rels) = self.part("word/_rels/document.xml.rels") {
+            let xml = decode_xml_part(rels).ok_or("unreadable document relationships XML")?;
+            if let Some(target) = related_part_target(&xml, "settings")
+                .map_err(|()| "invalid settings relationship")?
+            {
+                let name = resolve_document_relationship_target(&target)
+                    .ok_or("invalid settings relationship target")?;
+                if self.part(&name).is_none() {
+                    return Err("missing related settings part");
+                }
+                return Ok(Some(name));
+            }
+        }
+        Ok(self
+            .part("word/settings.xml")
+            .is_some()
+            .then(|| "word/settings.xml".to_string()))
+    }
+
     /// Names of all parts in the container (for inspection/tests).
     pub fn part_names(&self) -> Vec<&str> {
         self.parts.iter().map(|(n, _)| n.as_str()).collect()
@@ -404,11 +479,22 @@ impl Package {
         self.sect_pr = xml;
     }
 
-    /// Structured protection state from `word/settings.xml`.
+    /// Structured protection state from the document's related settings part.
     pub fn protection(&self) -> Protection {
-        let Some(bytes) = self.part("word/settings.xml") else {
-            return Protection::default();
+        let name = match self.settings_part_name() {
+            Ok(Some(name)) => name,
+            Ok(None) => return Protection::default(),
+            Err(reason) => {
+                return Protection {
+                    enforcement: ProtectionEnforcement::Enforced,
+                    edit_mode: Some(ProtectionEditMode::Unknown(reason.to_string())),
+                    ..Protection::default()
+                };
+            }
         };
+        let bytes = self
+            .part(&name)
+            .expect("settings_part_name verifies that the related part exists");
         let Some(xml) = decode_xml_part(bytes) else {
             return Protection {
                 enforcement: ProtectionEnforcement::Enforced,
@@ -477,10 +563,12 @@ impl Package {
                     "headerReference",
                     variant.as_ooxml(),
                 ) {
-                    applied[slot] = rels.target(&relationship_id).map(|target| AppliedHeader {
-                        relationship_id,
-                        part_name: resolve_word_part_name(target),
-                        inherited: false,
+                    applied[slot] = rels.target(&relationship_id).and_then(|target| {
+                        Some(AppliedHeader {
+                            relationship_id,
+                            part_name: resolve_document_relationship_target(target)?,
+                            inherited: false,
+                        })
                     });
                 } else if let Some(header) = &mut applied[slot] {
                     header.inherited = true;
@@ -653,10 +741,11 @@ impl Package {
         self.settings_flag("w:autoHyphenation").unwrap_or(false)
     }
 
-    /// A boolean flag element's state in `word/settings.xml`: `None` when the
+    /// A boolean flag element's state in the related settings part: `None` when the
     /// element is absent, otherwise its `w:val` (absent `w:val` means on).
     fn settings_flag(&self, elem: &str) -> Option<bool> {
-        let b = self.part("word/settings.xml")?;
+        let name = self.settings_part_name().ok()??;
+        let b = self.part(&name)?;
         let xml = decode_xml_part(b)?;
         settings_flag_of(&xml, elem)
     }
@@ -674,7 +763,11 @@ impl Package {
     fn set_settings_flag(&mut self, elem: &str, on: bool) {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        let name = "word/settings.xml";
+        let existing_name = match self.settings_part_name() {
+            Ok(name) => name,
+            Err(_) => return,
+        };
+        let name = existing_name.as_deref().unwrap_or("word/settings.xml");
         if let Some(b) = self.part(name) {
             let xml = String::from_utf8_lossy(b).into_owned();
             let cur = settings_flag_of(&xml, elem);
@@ -1396,6 +1489,7 @@ pub fn new_package(document: Document) -> Package {
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>"#;
     let styles = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"></w:styles>"#;
+    let document_xml = document_to_xml(&document);
 
     let parts = vec![
         (
@@ -1403,7 +1497,7 @@ pub fn new_package(document: Document) -> Package {
             content_types.as_bytes().to_vec(),
         ),
         ("_rels/.rels".to_string(), root_rels.as_bytes().to_vec()),
-        ("word/document.xml".to_string(), b"<w:document/>".to_vec()),
+        ("word/document.xml".to_string(), document_xml.into_bytes()),
         (
             "word/_rels/document.xml.rels".to_string(),
             doc_rels.as_bytes().to_vec(),
@@ -1569,6 +1663,14 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
     }
     parts[pkg.doc_index].1 = xml.into_bytes();
     write_zip(&parts)
+}
+
+/// Serialize a package without regenerating its main document part. This is the
+/// correct same-format save path when the live document has no user-authorized
+/// edits: all original OOXML wrappers and cached field results remain byte-for-
+/// byte intact while the container itself may be rewritten.
+pub fn save_package_preserving_document(pkg: &Package) -> Vec<u8> {
+    write_zip(&pkg.parts)
 }
 
 /// The attributes of the original `<w:document …>` element — all the `xmlns:*`
@@ -1961,6 +2063,46 @@ mod tests {
             assert!(!protection.advisory_write_protection, "{xml}");
             assert_eq!(protection.label(), None, "{xml}");
         }
+    }
+
+    #[test]
+    fn password_backed_write_protection_is_enforced_read_only() {
+        for credential in [
+            r#"w:password="ABCD""#,
+            r#"w:hash="YWJjZA==""#,
+            r#"w:hashValue="YWJjZA==""#,
+        ] {
+            let protection = parse_protection(&format!(
+                r#"<w:settings><w:writeProtection w:recommended="true" {credential}/></w:settings>"#
+            ));
+            assert!(protection.is_enforced(), "{credential}");
+            assert!(protection.enforced_write_protection, "{credential}");
+            assert!(!protection.advisory_write_protection, "{credential}");
+            assert!(protection.source.write_credential_present, "{credential}");
+            assert_eq!(protection.label(), Some("read-only"), "{credential}");
+        }
+    }
+
+    #[test]
+    fn protection_resolves_a_nonstandard_related_settings_part_and_fails_closed_if_missing() {
+        let rels = r#"<Relationships><Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="metadata/settings2.xml"/></Relationships>"#;
+        let bytes = make_metadata_docx(BODY, None, Some(rels), &[]);
+        let mut pkg = load_package(&bytes).expect("load");
+        pkg.parts.push((
+            "word/metadata/settings2.xml".to_string(),
+            br#"<w:settings><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#
+                .to_vec(),
+        ));
+
+        assert_eq!(pkg.protection_label(), Some("read-only"));
+        pkg.parts
+            .retain(|(name, _)| name != "word/metadata/settings2.xml");
+        let missing = pkg.protection();
+        assert!(missing.is_enforced());
+        assert!(matches!(
+            missing.edit_mode,
+            Some(ProtectionEditMode::Unknown(ref reason)) if reason == "missing related settings part"
+        ));
     }
 
     #[test]

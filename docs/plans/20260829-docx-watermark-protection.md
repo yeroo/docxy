@@ -5,7 +5,8 @@
 Replace the current status-only DOCX watermark/protection hints with honest
 behavior in the terminal editor: text watermarks are visible in page view and
 enforced Word document-protection modes constrain every docxy mutation path.
-Keep advisory write protection distinct from enforced restrictions.
+Keep recommendation-only write protection distinct from password-backed and
+document-level enforced restrictions.
 
 ## Scope boundaries
 
@@ -18,7 +19,9 @@ Keep advisory write protection distinct from enforced restrictions.
   them without a separate header-layout project.
 - Do not implement password removal, protection bypass, form-field editing, or
   automatic tracked-change creation in this plan.
-- `w:writeProtection` is advisory and must not silently become mandatory.
+- Recommendation-only `w:writeProtection` is advisory and must not silently
+  become mandatory; password/hash-backed write protection fails closed until
+  password verification exists.
 
 ## Acceptance criteria
 
@@ -30,7 +33,8 @@ Keep advisory write protection distinct from enforced restrictions.
 - Because docxy cannot yet perform conforming form-field-only or automatically
   tracked edits, enforced `forms` and `trackedChanges` modes fail closed with an
   accurate actionable status rather than writing nonconforming changes.
-- Advisory write protection remains editable after a visible warning.
+- Recommendation-only write protection remains editable after a visible warning;
+  password-backed write protection is enforced read-only.
 - A text watermark is visibly associated with every affected page in page view,
   without entering copy/export text or changing saved OOXML.
 - All rejected paths return a stable reason and leave document, undo/redo,
@@ -41,7 +45,8 @@ Keep advisory write protection distinct from enforced restrictions.
 ### Task 1: Model protection and watermark metadata structurally
 
 - [x] replace the string-only protection accessor with enums/structs covering
-      enforcement, edit mode, formatting lock, advisory write protection, and
+      enforcement, edit mode, formatting lock, recommendation/password-backed
+      write protection, and
       the source metadata needed for user-facing explanations
 - [x] represent text versus picture/unknown watermarks and associate header
       metadata with the sections/pages it applies to when package relationships
@@ -49,7 +54,8 @@ Keep advisory write protection distinct from enforced restrictions.
 - [x] keep a compatibility label helper for status text rather than making UI
       strings the policy API
 - [x] test boolean lexical forms, absent/disabled enforcement, every edit mode,
-      formatting-only, advisory protection, text entity decoding, and picture
+      formatting-only, recommendation/password-backed protection, text entity
+      decoding, and picture
       fallback detection
 - [x] run `cargo test -p docxcore` before Task 2
 
@@ -106,8 +112,9 @@ Keep advisory write protection distinct from enforced restrictions.
 
 ### Task 6: Verify end-to-end behavior
 
-- [x] add package fixtures for all protection modes, advisory protection, text
-      watermark, picture watermark, and section header inheritance
+- [x] add package fixtures for all protection modes, recommendation/password-backed
+      write protection, text watermark, picture watermark, and section header
+      inheritance
 - [x] exercise TUI and control attempts against fixtures and verify allowed/denied
       behavior, history invariants, status/errors, overlay state, and lossless save
 - [x] capture a sandboxed page-view watermark fixture when the existing UI
@@ -125,12 +132,12 @@ Keep advisory write protection distinct from enforced restrictions.
 
 Final evidence (2026-08-29):
 
-- Workspace validation: `cargo test` reported 2,376 passed, 0 failed, and 1
+- Workspace validation: `cargo test` reported 2,383 passed, 0 failed, and 1
   ignored across 53 test-result suites; `cargo clippy --all-targets -- -D
   warnings`, `cargo fmt --check`, and `git diff --check` passed.
 - Reusable complete-package fixtures: `docxy/src/test_fixtures.rs` covers every
-  protection mode, advisory write protection, text/picture watermarks, and
-  inherited section headers.
+  protection mode, recommendation/password-backed write protection,
+  text/picture watermarks, and inherited section headers.
 - End-to-end evidence: `docxy/src/main.rs` tests
   `protection_package_fixtures_drive_tui_policy_status_and_history`,
   `package_watermark_fixtures_drive_overlay_state_and_sandboxed_capture`, and

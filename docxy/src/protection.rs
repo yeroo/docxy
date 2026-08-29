@@ -79,15 +79,20 @@ impl ProtectionDenial {
 
 /// Authorize a mutation against structured package protection metadata.
 ///
-/// Advisory `w:writeProtection` is never an enforcement signal. Enforced form,
-/// tracked-change, and unknown modes fail closed because docxy cannot currently
-/// produce conforming edits for those modes. A formatting lock is evaluated
-/// after the edit-mode restriction, so comments remain possible in comments-
-/// only documents even when formatting is also locked.
+/// Recommendation-only `w:writeProtection` is not an enforcement signal, but a
+/// password/hash-backed declaration is a real write lock and is treated as
+/// read-only until password verification exists. Enforced form, tracked-change,
+/// and unknown modes fail closed because docxy cannot currently produce
+/// conforming edits for those modes. A formatting lock is evaluated after the
+/// edit-mode restriction, so comments remain possible in comments-only
+/// documents even when formatting is also locked.
 pub(crate) fn authorize(
     protection: &Protection,
     mutation: MutationKind,
 ) -> Result<(), ProtectionDenial> {
+    if protection.enforced_write_protection {
+        return Err(ProtectionDenial::ReadOnly);
+    }
     if !protection.is_enforced() {
         return Ok(());
     }
@@ -181,6 +186,15 @@ mod tests {
             &protected(Some(ProtectionEditMode::ReadOnly), false),
             ProtectionDenial::ReadOnly,
         );
+    }
+
+    #[test]
+    fn password_backed_write_protection_denies_every_mutation_class() {
+        let protection = Protection {
+            enforced_write_protection: true,
+            ..Protection::default()
+        };
+        assert_all_denied(&protection, ProtectionDenial::ReadOnly);
     }
 
     #[test]

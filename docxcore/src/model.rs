@@ -499,8 +499,10 @@ impl Default for Cell {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Row {
     pub cells: Vec<Cell>,
-    /// Verbatim `w:trPr` / `w:tblPrEx` XML (row height, header flag, exceptions),
-    /// preserved so save doesn't drop row formatting. Re-emitted in document order.
+    /// Verbatim `w:trPr` / `w:tblPrEx` XML (row height, header flag, exceptions)
+    /// plus row-level content-control boundary XML. Properties are re-emitted
+    /// inside the row; recognized boundaries are re-emitted immediately outside
+    /// the first/last wrapped row.
     pub raw_props: Vec<String>,
 }
 
