@@ -12,6 +12,10 @@ use crate::model::*;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 
+const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const M_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/math";
+const MC_NS: &str = "http://schemas.openxmlformats.org/markup-compatibility/2006";
 const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1297,10 +1301,10 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
 
 fn reconstructed_markup_compatibility_attrs(p: &XmlParser<'_>) -> Vec<(String, String)> {
     let mut merged: Vec<(String, String)> = Vec::new();
-    let has_standard_w15_binding = p.namespace_attrs().iter().any(|attr| {
-        attr.name == "xmlns:w15" && {
+    let has_standard_document_w15_binding = p.namespace_scoped_attrs().any(|scoped| {
+        scoped.element_name == "w:document" && scoped.attr.name == "xmlns:w15" && {
             let mut binding = String::new();
-            XmlParser::append_decoded(attr.value, &mut binding);
+            XmlParser::append_decoded(scoped.attr.value, &mut binding);
             binding == W15_NS
         }
     });
@@ -1314,7 +1318,7 @@ fn reconstructed_markup_compatibility_attrs(p: &XmlParser<'_>) -> Vec<(String, S
         XmlParser::append_decoded(scoped.attr.value, &mut value);
         if scoped.element_name == "w:document"
             && local_name == "Ignorable"
-            && has_standard_w15_binding
+            && has_standard_document_w15_binding
         {
             // `document_to_xml` guarantees this one root token whenever the
             // reconstructed body contains the w15 vocabulary. Avoid importing
@@ -1359,13 +1363,19 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
     // used only by preserved markup or QName-valued attributes, which cannot be
     // inferred from a search for `w15:` elements.
     let namespace_declarations = p
-        .namespace_attrs()
-        .iter()
-        .filter(|attr| !matches!(attr.name, "xmlns:w" | "xmlns:r" | "xmlns:m"))
-        .map(|attr| {
+        .namespace_scoped_attrs()
+        .filter_map(|scoped| {
             let mut value = String::new();
-            XmlParser::append_decoded(attr.value, &mut value);
-            (attr.name.to_string(), value)
+            XmlParser::append_decoded(scoped.attr.value, &mut value);
+            let guaranteed = match scoped.attr.name {
+                "xmlns:w" => value == W_NS,
+                "xmlns:r" => value == R_NS,
+                "xmlns:m" => value == M_NS,
+                "xmlns:mc" => scoped.element_name == "w:document" && value == MC_NS,
+                "xmlns:w15" => scoped.element_name == "w:document" && value == W15_NS,
+                _ => false,
+            };
+            (!guaranteed).then(|| (scoped.attr.name.to_string(), value))
         })
         .collect();
     let markup_compatibility_attributes = reconstructed_markup_compatibility_attrs(p);
@@ -1480,7 +1490,9 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                 // the eventual open boundary. If no content exists, the whole
                 // control is retained as one opaque raw boundary below only
                 // when its children were structurally complete.
+                let checkpoint = p.clone();
                 if !p.skip_element_complete() {
+                    *p = checkpoint;
                     pre_content_is_complete = false;
                 }
             }
@@ -2410,6 +2422,51 @@ mod tests {
             ]
         );
         assert!(truncated.validate_row_boundaries().is_ok());
+    }
+
+    #[test]
+    fn unclosed_pre_content_property_does_not_consume_visible_rows() {
+        let xml = table_document(&format!(
+            "<w:sdt><w:sdtPr><w:sdtContent>{}</w:sdtContent></w:sdt>",
+            xml_row("recovered from malformed properties")
+        ));
+
+        let parsed = doc(&xml);
+        let table = first_table(&parsed);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(
+            table.rows[0].cells[0].blocks[0].plain_text(),
+            "recovered from malformed properties"
+        );
+        assert!(table.validate_row_boundaries().is_ok());
+
+        let saved = crate::serialize::document_to_xml(&parsed);
+        let reparsed = doc(&saved);
+        assert_eq!(
+            first_table(&reparsed).rows[0].cells[0].blocks[0].plain_text(),
+            "recovered from malformed properties"
+        );
+    }
+
+    #[test]
+    fn conflicting_serializer_prefix_binding_is_preserved_at_the_table() {
+        let xml = format!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:m=\"urn:custom\"><w:body><w:tbl>\
+             <w:sdt><w:sdtPr><m:property/></w:sdtPr><w:sdtContent>{}</w:sdtContent></w:sdt>\
+             </w:tbl></w:body></w:document>",
+            xml_row("visible")
+        );
+
+        let parsed = doc(&xml);
+        let table = first_table(&parsed);
+        assert!(
+            table
+                .namespace_declarations
+                .contains(&("xmlns:m".to_string(), "urn:custom".to_string()))
+        );
+        let saved = crate::serialize::document_to_xml(&parsed);
+        assert!(saved.contains("<w:tbl xmlns:m=\"urn:custom\""));
+        assert!(saved.contains("<m:property/>"));
     }
 
     #[test]

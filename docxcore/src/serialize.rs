@@ -30,15 +30,65 @@ pub fn document_to_xml(doc: &Document) -> String {
     s.push_str(&format!(
         "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\""
     ));
-    if body.contains("w15:") {
-        s.push_str(&format!(
-            " xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" mc:Ignorable=\"w15\""
-        ));
+    let uses_w15 = xml_uses_prefix(&body, "w15");
+    let uses_mc = uses_w15 || xml_uses_prefix(&body, "mc");
+    if uses_mc {
+        s.push_str(&format!(" xmlns:mc=\"{MC_NS}\""));
+    }
+    if uses_w15 {
+        s.push_str(&format!(" xmlns:w15=\"{W15_NS}\" mc:Ignorable=\"w15\""));
     }
     s.push_str("><w:body>");
     s.push_str(&body);
     s.push_str("</w:body></w:document>");
     s
+}
+
+fn xml_uses_prefix(xml: &str, prefix: &str) -> bool {
+    let qualified_prefix = format!("{prefix}:");
+    let namespace_name = format!("xmlns:{prefix}");
+    let mut parser = XmlParser::new(xml);
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let mut used = parser.name().starts_with(&qualified_prefix);
+                for attr in parser.attrs() {
+                    if !attr.name.starts_with("xmlns") && attr.name.starts_with(&qualified_prefix) {
+                        used = true;
+                    }
+                    let local_name = attr
+                        .name
+                        .split_once(':')
+                        .map_or(attr.name, |(_, local)| local);
+                    if matches!(
+                        local_name,
+                        "Ignorable"
+                            | "ProcessContent"
+                            | "PreserveElements"
+                            | "PreserveAttributes"
+                            | "Requires"
+                    ) && attr.value.split_whitespace().any(|token| {
+                        token == prefix
+                            || token
+                                .strip_prefix(prefix)
+                                .is_some_and(|suffix| suffix.starts_with(':'))
+                    }) {
+                        used = true;
+                    }
+                }
+                if used
+                    && !parser
+                        .namespace_attrs()
+                        .iter()
+                        .any(|attr| attr.name == namespace_name)
+                {
+                    return true;
+                }
+            }
+            Event::Eof => return false,
+            Event::End | Event::Text => {}
+        }
+    }
 }
 
 /// Serialize just the block content (no document wrapper), for splicing back into
@@ -885,6 +935,38 @@ mod tests {
             )],
         };
         assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn generated_repeating_section_roundtrips_without_importing_root_namespaces() {
+        let d = Document {
+            body: vec![Block::Table(Table {
+                row_boundaries: vec![
+                    TableRowBoundary::sdt_open(
+                        0,
+                        "<w:sdt><w:sdtPr><w15:repeatingSection/></w:sdtPr><w:sdtContent>",
+                    ),
+                    TableRowBoundary::sdt_close(0, "</w:sdtContent></w:sdt>"),
+                ],
+                ..Default::default()
+            })],
+        };
+
+        assert_eq!(roundtrip(&d, &Relationships::default()), d);
+    }
+
+    #[test]
+    fn visible_w15_text_does_not_add_extension_namespaces() {
+        let d = Document {
+            body: vec![para(
+                ParProps::default(),
+                vec![run("visible w15:text", RunProps::default())],
+            )],
+        };
+
+        let xml = document_to_xml(&d);
+        assert!(!xml.contains("xmlns:w15="));
+        assert!(!xml.contains("mc:Ignorable="));
     }
 
     #[test]
@@ -1737,9 +1819,15 @@ mod tests {
         );
 
         let saved = document_to_xml(&parsed);
-        assert!(saved.contains(&format!(
-            "<w:tbl xmlns:mc=\"{MC_NS}\" xmlns:ux=\"urn:document-extension\" mc:Ignorable=\"ux\" mc:PreserveElements=\"ux:property\">"
-        )));
+        let root_start = saved.find("<w:document").expect("document root");
+        let root_end = root_start
+            + saved[root_start..]
+                .find('>')
+                .expect("document root terminator");
+        assert!(saved[root_start..root_end].contains(&format!("xmlns:mc=\"{MC_NS}\"")));
+        assert!(saved.contains(
+            "<w:tbl xmlns:ux=\"urn:document-extension\" mc:Ignorable=\"ux\" mc:PreserveElements=\"ux:property\">"
+        ));
         assert!(saved.contains(open));
         assert_eq!(
             parse_document_xml(&saved, &Relationships::default()),

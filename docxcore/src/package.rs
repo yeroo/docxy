@@ -1192,9 +1192,28 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
 /// rather than first-writer-wins behavior.
 fn document_root_attrs(original: &str, generated: &str) -> Option<String> {
     let mut attrs = xml_root_attrs(original, "w:document")?;
-    for (name, value) in xml_root_attrs(generated, "w:document")? {
-        if name == "mc:Ignorable" {
-            if let Some((_, existing)) = attrs.iter_mut().find(|(key, _)| key == &name) {
+    let generated_attrs = xml_root_attrs(generated, "w:document")?;
+    for (name, value) in &generated_attrs {
+        if name == "xmlns" || name.starts_with("xmlns:") {
+            if !attrs.iter().any(|(key, _)| key == name) {
+                attrs.push((name.clone(), value.clone()));
+            }
+            continue;
+        }
+
+        let existing_index = attrs.iter().enumerate().find_map(|(index, (key, _))| {
+            same_expanded_attribute(&attrs, key, &generated_attrs, name).then_some(index)
+        });
+        let local_name = name
+            .split_once(':')
+            .map_or(name.as_str(), |(_, local)| local);
+        if local_name == "Ignorable"
+            && (existing_index.is_some()
+                || attribute_namespace(&generated_attrs, name)
+                    == Some("http://schemas.openxmlformats.org/markup-compatibility/2006"))
+        {
+            if let Some(index) = existing_index {
+                let existing = &mut attrs[index].1;
                 for token in value.split_whitespace() {
                     if !existing.split_whitespace().any(|item| item == token) {
                         if !existing.is_empty() {
@@ -1204,10 +1223,10 @@ fn document_root_attrs(original: &str, generated: &str) -> Option<String> {
                     }
                 }
             } else {
-                attrs.push((name, value));
+                attrs.push((name.clone(), value.clone()));
             }
-        } else if !attrs.iter().any(|(key, _)| key == &name) {
-            attrs.push((name, value));
+        } else if existing_index.is_none() {
+            attrs.push((name.clone(), value.clone()));
         }
     }
 
@@ -1218,6 +1237,30 @@ fn document_root_attrs(original: &str, generated: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join(" "),
     )
+}
+
+fn attribute_namespace<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    let (prefix, _) = name.split_once(':')?;
+    attrs.iter().find_map(|(declaration, value)| {
+        (declaration.strip_prefix("xmlns:") == Some(prefix)).then_some(value.as_str())
+    })
+}
+
+fn same_expanded_attribute(
+    left_attrs: &[(String, String)],
+    left_name: &str,
+    right_attrs: &[(String, String)],
+    right_name: &str,
+) -> bool {
+    let left_local = left_name
+        .split_once(':')
+        .map_or(left_name, |(_, local)| local);
+    let right_local = right_name
+        .split_once(':')
+        .map_or(right_name, |(_, local)| local);
+    left_local == right_local
+        && attribute_namespace(left_attrs, left_name)
+            == attribute_namespace(right_attrs, right_name)
 }
 
 fn xml_root_attrs(xml: &str, root_name: &str) -> Option<Vec<(String, String)>> {
@@ -2050,6 +2093,17 @@ mod tests {
         let attrs = document_root_attrs(original, generated).unwrap();
         assert!(attrs.contains("xmlns:w15=\"urn:w15\""));
         assert!(attrs.contains("mc:Ignorable=\"w14 w15\""));
+    }
+
+    #[test]
+    fn document_root_ignorable_aliases_are_merged_by_expanded_name() {
+        let mc = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+        let original = format!("<w:document xmlns:mce=\"{mc}\" mce:Ignorable=\"w14\"/>");
+        let generated = format!("<w:document xmlns:mc=\"{mc}\" mc:Ignorable=\"w15\"/>");
+        let attrs = document_root_attrs(&original, &generated).unwrap();
+
+        assert!(attrs.contains("mce:Ignorable=\"w14 w15\""));
+        assert!(!attrs.contains(" mc:Ignorable="));
     }
 
     #[test]

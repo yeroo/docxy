@@ -14,6 +14,8 @@ pub struct XmlScopedAttr<'a> {
     pub attr: XmlAttr<'a>,
 }
 
+type NamespaceScopeChange<'a> = (usize, Option<XmlScopedAttr<'a>>);
+
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Event {
     Start,
@@ -22,6 +24,7 @@ pub enum Event {
     Eof,
 }
 
+#[derive(Clone)]
 pub struct XmlParser<'a> {
     xml: &'a [u8],
     pos: usize,
@@ -29,7 +32,8 @@ pub struct XmlParser<'a> {
     m_text: &'a str,
     m_attrs: Vec<XmlAttr<'a>>,
     m_namespaces: Vec<XmlAttr<'a>>,
-    namespace_changes: Vec<Vec<(usize, Option<XmlAttr<'a>>)>>,
+    m_namespace_elements: Vec<&'a str>,
+    namespace_changes: Vec<Vec<NamespaceScopeChange<'a>>>,
     m_markup_compatibility_attrs: Vec<XmlScopedAttr<'a>>,
     markup_compatibility_scope_counts: Vec<usize>,
     pending_end: bool,
@@ -59,6 +63,7 @@ impl<'a> XmlParser<'a> {
             m_text: "",
             m_attrs: Vec::new(),
             m_namespaces: Vec::new(),
+            m_namespace_elements: Vec::new(),
             namespace_changes: Vec::new(),
             m_markup_compatibility_attrs: Vec::new(),
             markup_compatibility_scope_counts: Vec::new(),
@@ -117,6 +122,16 @@ impl<'a> XmlParser<'a> {
         &self.m_namespaces
     }
 
+    /// Namespace declarations in scope for the current start element together
+    /// with the element on which each effective binding was declared.
+    pub fn namespace_scoped_attrs(&self) -> impl Iterator<Item = XmlScopedAttr<'a>> + '_ {
+        self.m_namespaces
+            .iter()
+            .copied()
+            .zip(self.m_namespace_elements.iter().copied())
+            .map(|(attr, element_name)| XmlScopedAttr { element_name, attr })
+    }
+
     /// Markup-compatibility attributes active at the current start element,
     /// together with the element on which each attribute was declared.
     ///
@@ -130,6 +145,7 @@ impl<'a> XmlParser<'a> {
 
     fn push_namespace_scope(&mut self) {
         let mut changes = Vec::new();
+        let element_name = self.m_name;
         for attr in self
             .m_attrs
             .iter()
@@ -141,12 +157,20 @@ impl<'a> XmlParser<'a> {
                 .iter()
                 .position(|existing| existing.name == attr.name)
             {
-                changes.push((index, Some(self.m_namespaces[index])));
+                changes.push((
+                    index,
+                    Some(XmlScopedAttr {
+                        attr: self.m_namespaces[index],
+                        element_name: self.m_namespace_elements[index],
+                    }),
+                ));
                 self.m_namespaces[index] = attr;
+                self.m_namespace_elements[index] = element_name;
             } else {
                 let index = self.m_namespaces.len();
                 changes.push((index, None));
                 self.m_namespaces.push(attr);
+                self.m_namespace_elements.push(element_name);
             }
         }
         self.namespace_changes.push(changes);
@@ -181,10 +205,12 @@ impl<'a> XmlParser<'a> {
         };
         for (index, previous) in changes.into_iter().rev() {
             if let Some(previous) = previous {
-                self.m_namespaces[index] = previous;
+                self.m_namespaces[index] = previous.attr;
+                self.m_namespace_elements[index] = previous.element_name;
             } else {
                 debug_assert_eq!(index + 1, self.m_namespaces.len());
                 self.m_namespaces.pop();
+                self.m_namespace_elements.pop();
             }
         }
     }
@@ -526,10 +552,24 @@ mod tests {
         );
         assert_eq!(p.next(), Event::Start);
         assert_eq!(p.namespace_attrs()[0].value, "urn:outer");
+        assert_eq!(
+            p.namespace_scoped_attrs().collect::<Vec<_>>(),
+            vec![XmlScopedAttr {
+                element_name: "root",
+                attr: XmlAttr {
+                    name: "xmlns:a",
+                    value: "urn:outer",
+                },
+            }]
+        );
 
         assert_eq!(p.next(), Event::Start);
         assert_eq!(p.namespace_attrs()[0].value, "urn:inner");
         assert_eq!(p.namespace_attrs()[1].name, "xmlns:b");
+        assert!(
+            p.namespace_scoped_attrs()
+                .all(|scoped| scoped.element_name == "child")
+        );
 
         assert_eq!(p.next(), Event::Start);
         assert_eq!(p.namespace_attrs()[0].value, "urn:inner");
@@ -544,6 +584,10 @@ mod tests {
                 name: "xmlns:a",
                 value: "urn:outer",
             }]
+        );
+        assert_eq!(
+            p.namespace_scoped_attrs().next().unwrap().element_name,
+            "root"
         );
     }
 
