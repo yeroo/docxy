@@ -92,17 +92,17 @@ Keep advisory write protection distinct from enforced restrictions.
 
 ### Task 5: Render terminal-safe watermark overlays
 
-- [ ] add a deterministic page-view overlay for text watermarks using muted,
+- [x] add a deterministic page-view overlay for text watermarks using muted,
       non-interactive cells that never participate in document hit testing,
       selection, copy, export, or caret mapping
-- [ ] apply section/header inheritance correctly enough that first/even/default
+- [x] apply section/header inheritance correctly enough that first/even/default
       headers do not paint a watermark on unrelated pages
-- [ ] keep document text legible and make clipping/tiny-page behavior safe; do
+- [x] keep document text legible and make clipping/tiny-page behavior safe; do
       not claim rotation or opacity that the terminal cannot provide
-- [ ] show a specific fallback indicator for picture/unsupported watermarks
-- [ ] add pure layout tests and renderer state tests for multi-page, section,
+- [x] show a specific fallback indicator for picture/unsupported watermarks
+- [x] add pure layout tests and renderer state tests for multi-page, section,
       Unicode, tiny viewport, and no-watermark cases
-- [ ] run `cargo test -p docxy` before Task 6
+- [x] run `cargo test -p docxy` before Task 6
 
 ### Task 6: Verify end-to-end behavior
 

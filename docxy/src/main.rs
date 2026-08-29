@@ -18,6 +18,7 @@ mod metafile;
 mod protection;
 mod ribbon;
 mod skill;
+mod watermark;
 
 use std::collections::HashMap;
 use std::io;
@@ -43,7 +44,7 @@ use docxcore::package::{
 };
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
-    Span as DocSpan, Style as DocStyle, render_with_images,
+    Span as DocSpan, Style as DocStyle, render_with_images, render_with_page_layout,
 };
 use docxcore::serialize::blocks_to_xml;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
@@ -788,6 +789,9 @@ struct App {
     /// from its compatibility label; authorization never compares UI strings.
     doc_protection: Protection,
     doc_watermark: Option<String>,
+    /// Structured page/header-scoped watermark state used only by the TUI
+    /// overlay renderer. `doc_watermark` above remains the compatibility label.
+    watermark_state: watermark::State,
     doc_page_borders: bool,
     scroll: usize,
     viewport_h: usize,
@@ -903,6 +907,9 @@ struct App {
     maps: Vec<LineMap>,
     /// Where each embedded image's placeholder box sits (for pixel overlay).
     images: Vec<ImageBox>,
+    /// Page-view-only labels painted after document rendering. They are kept
+    /// outside `lines` and `maps`, so they cannot become editable or selectable.
+    watermark_overlays: Vec<watermark::Overlay>,
     /// document.xml relationships (rId → media target).
     rels: Relationships,
     /// Terminal graphics capability (kitty/iTerm2/Sixel/half-block); None = no overlay.
@@ -960,6 +967,7 @@ impl App {
         docxcore::field::recompute(&mut pkg.document, &field_ctx);
         let doc_protection = pkg.protection();
         let doc_watermark = pkg.watermark_label();
+        let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         App {
@@ -996,6 +1004,7 @@ impl App {
             status: None,
             doc_protection,
             doc_watermark,
+            watermark_state,
             doc_page_borders,
             scroll: 0,
             viewport_h: 1,
@@ -1068,6 +1077,7 @@ impl App {
             lines: Vec::new(),
             maps: Vec::new(),
             images: Vec::new(),
+            watermark_overlays: Vec::new(),
             rels,
             picker: None,
             img_cache: HashMap::new(),
@@ -1811,6 +1821,7 @@ impl App {
         self.comment_active = false;
         self.doc_protection = pkg.protection();
         self.doc_watermark = pkg.watermark_label();
+        self.watermark_state = watermark::State::from_package(&pkg);
         self.doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         self.pkg = pkg;
@@ -1830,6 +1841,16 @@ impl App {
         self.find = None;
         self.img_cache.clear();
         self.dirty = true;
+    }
+
+    /// Refresh watermark labels/scopes after a live header or section change.
+    /// `App` parks the editable document outside `pkg`, so use a temporary
+    /// package view containing the current body when resolving section headers.
+    fn refresh_watermark_state(&mut self) {
+        let mut live = self.pkg.clone();
+        live.document = self.editor.doc.clone();
+        self.doc_watermark = live.watermark_label();
+        self.watermark_state = watermark::State::from_package(&live);
     }
 
     /// A compact status-line suffix for document-level notices (protection,
@@ -2295,8 +2316,11 @@ impl App {
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
             let opts = self.options(width);
-            let (mut lines, mut maps, mut images, _mmd) =
-                render_with_images(&self.editor.doc, &opts);
+            let rendered = render_with_page_layout(&self.editor.doc, &opts);
+            let mut lines = rendered.lines;
+            let mut maps = rendered.maps;
+            let mut images = rendered.images;
+            let pages = rendered.pages;
             // While editing a header/footer, show the rest of the page (the parked
             // document body) dimmed and read-only below/above the editable surface,
             // the way Word greys out the body. The body's caret maps are dropped so
@@ -2344,9 +2368,15 @@ impl App {
                     maps = nm;
                 }
             }
+            let watermark_overlays = if self.hf_edit.is_none() {
+                watermark::layout(&self.watermark_state, &pages, &lines)
+            } else {
+                Vec::new()
+            };
             self.lines = lines;
             self.maps = maps;
             self.images = images;
+            self.watermark_overlays = watermark_overlays;
             self.rendered_width = width;
             self.dirty = false;
         }
@@ -2630,6 +2660,7 @@ impl App {
                 let new_xml = splice_hf(&orig, &blocks, tag);
                 self.pkg.set_part(&hf.part, new_xml.into_bytes());
             }
+            self.refresh_watermark_state();
             self.modified = true;
         }
         self.page_view = hf.saved_page_view;
@@ -2658,6 +2689,7 @@ impl App {
             return;
         }
         self.pkg.set_sect_pr(orient_sectpr(&current, landscape));
+        self.refresh_watermark_state();
         self.modified = true;
         self.dirty = true;
         let o = if landscape { "landscape" } else { "portrait" };
@@ -4809,6 +4841,11 @@ impl App {
         }
         f.render_widget(para, content);
 
+        // Paint watermarks as a final, muted screen layer. Because these labels
+        // never enter `lines` or `maps`, clicks, the caret, selection, copy,
+        // export, and saved OOXML continue to see only real document content.
+        self.draw_watermark_overlays(f, content);
+
         // The comments panel, slid in from the right as the canvas scrolls.
         if comments_aside {
             let h = self.comments_hscroll as u16;
@@ -4979,6 +5016,44 @@ impl App {
         }
         if self.font_picker.is_some() {
             self.draw_picker(f, f.area());
+        }
+    }
+
+    fn draw_watermark_overlays(&self, f: &mut Frame, content: Rect) {
+        if !self.page_view || content.width == 0 || content.height == 0 {
+            return;
+        }
+        let style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let hscroll = self.doc_hscroll as usize;
+        let buf = f.buffer_mut();
+        for overlay in &self.watermark_overlays {
+            let Some(view_row) = overlay.row.checked_sub(self.scroll) else {
+                continue;
+            };
+            if view_row >= content.height as usize {
+                continue;
+            }
+
+            let (view_col, text) = if overlay.col >= hscroll {
+                (overlay.col - hscroll, overlay.text.clone())
+            } else {
+                let (gap, suffix) =
+                    watermark::suffix_after_cols(&overlay.text, hscroll - overlay.col);
+                (gap, suffix)
+            };
+            if text.is_empty() || view_col >= content.width as usize {
+                continue;
+            }
+            let max_width = content.width as usize - view_col;
+            buf.set_stringn(
+                content.x + view_col as u16,
+                content.y + view_row as u16,
+                text,
+                max_width,
+                style,
+            );
         }
     }
 
@@ -6107,7 +6182,10 @@ mod tests {
     use docxcore::model::{
         Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, Run, RunProps,
     };
-    use docxcore::package::{ProtectionEditMode, ProtectionEnforcement, new_package};
+    use docxcore::package::{
+        HeaderVariant, ProtectionEditMode, ProtectionEnforcement, Watermark, WatermarkHeader,
+        WatermarkKind, new_package,
+    };
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -6326,6 +6404,157 @@ mod tests {
         let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
         app.load_package_state(new_package(Document { body }), "x.md".to_string());
         assert!(!app.page_view);
+    }
+
+    #[test]
+    fn page_layout_reports_multi_page_section_scope() {
+        let first = MPara {
+            props: ParProps {
+                section_break: Some("<w:sectPr/>".to_string()),
+                ..ParProps::default()
+            },
+            content: vec![
+                Inline::Run(Run {
+                    text: "first page".to_string(),
+                    props: RunProps::default(),
+                }),
+                Inline::Break(BreakKind::Page),
+                Inline::Run(Run {
+                    text: "second page".to_string(),
+                    props: RunProps::default(),
+                }),
+            ],
+        };
+        let second = MPara {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: "second section".to_string(),
+                props: RunProps::default(),
+            })],
+        };
+        let doc = Document {
+            body: vec![Block::Paragraph(first), Block::Paragraph(second)],
+        };
+        let opts = RenderOptions {
+            width: 80,
+            page_view: true,
+            ..RenderOptions::default()
+        };
+
+        let rendered = render_with_page_layout(&doc, &opts);
+        let (lines, maps, pages) = (rendered.lines, rendered.maps, rendered.pages);
+
+        assert_eq!(lines.len(), maps.len());
+        assert_eq!(pages.len(), 3, "expected two pages then one: {pages:?}");
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| (
+                    page.section_index,
+                    page.section_page_index,
+                    page.document_page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+        );
+        assert!(pages.iter().all(|page| {
+            page.rows >= 3 && page.cols >= 3 && page.row + page.rows <= lines.len()
+        }));
+    }
+
+    #[test]
+    fn page_watermark_is_visible_but_absent_from_document_and_interaction_state() {
+        let mut app = app_with(&["body text"]);
+        app.watermark_state = watermark::State::new(
+            vec![Watermark {
+                kind: WatermarkKind::Text("機密 SECRET".to_string()),
+                header: WatermarkHeader {
+                    section_index: 0,
+                    variant: HeaderVariant::Default,
+                    relationship_id: "rIdWatermark".to_string(),
+                    part_name: "word/header1.xml".to_string(),
+                    inherited: false,
+                },
+            }],
+            vec![false],
+            false,
+        );
+        app.page_view = true;
+        app.light_page = true;
+        app.dirty = true;
+        let document_before = app.editor.doc.clone();
+
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+
+        let screen = format!("{:?}", term.backend().buffer());
+        assert!(
+            screen.contains("[Watermark: 機密 SECRET]"),
+            "watermark overlay missing from page view: {screen}"
+        );
+        assert!(
+            app.lines
+                .iter()
+                .all(|line| !line.plain().contains("機密 SECRET")),
+            "overlay text must not enter rendered document lines"
+        );
+        assert_eq!(app.editor.doc, document_before);
+        assert!(app.maps.iter().any(LineMap::is_editable));
+        assert!(
+            app.maps
+                .iter()
+                .flat_map(|map| &map.segs)
+                .all(|seg| seg.path.first() == Some(&0)),
+            "overlay must not add a caret/hit-testing segment"
+        );
+
+        app.editor.select_all();
+        app.do_copy();
+        assert_eq!(app.clip_text.as_deref(), Some("body text"));
+
+        app.page_view = false;
+        app.dirty = true;
+        app.ensure_rendered(99);
+        assert!(app.watermark_overlays.is_empty());
+        assert!(
+            app.lines
+                .iter()
+                .all(|line| !line.plain().contains("機密 SECRET"))
+        );
+    }
+
+    #[test]
+    fn watermark_renderer_handles_tiny_viewports_and_plain_documents() {
+        let mut plain = app_with(&["plain"]);
+        plain.page_view = true;
+        plain.dirty = true;
+        plain.ensure_rendered(7);
+        assert!(plain.watermark_overlays.is_empty());
+
+        let mut app = app_with(&["body"]);
+        app.watermark_state = watermark::State::new(
+            vec![Watermark {
+                kind: WatermarkKind::Text("超長い機密透かし".to_string()),
+                header: WatermarkHeader {
+                    section_index: 0,
+                    variant: HeaderVariant::Default,
+                    relationship_id: "rIdWatermark".to_string(),
+                    part_name: "word/header1.xml".to_string(),
+                    inherited: false,
+                },
+            }],
+            vec![false],
+            false,
+        );
+        app.page_view = true;
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(8, 4)).unwrap();
+
+        term.draw(|frame| app.draw(frame)).unwrap();
+
+        assert!(!app.watermark_overlays.is_empty());
+        assert_eq!(term.backend().buffer().area.width, 8);
+        assert_eq!(term.backend().buffer().area.height, 4);
     }
 
     #[test]

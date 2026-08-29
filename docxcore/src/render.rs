@@ -333,6 +333,37 @@ pub struct MermaidBox {
     pub source: String,
 }
 
+/// Geometry and document scope of one page produced by print-layout rendering.
+///
+/// This is deliberately separate from [`LineMap`]: page decorations such as a
+/// terminal watermark can use it without becoming editable text or affecting
+/// caret, selection, copy, or hit-testing coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageBox {
+    /// Zero-based section index in document order.
+    pub section_index: usize,
+    /// Zero-based page index within the section.
+    pub section_page_index: usize,
+    /// Zero-based page index across the rendered document.
+    pub document_page_index: usize,
+    /// Top row and left column of the page border in rendered cells.
+    pub row: usize,
+    pub col: usize,
+    /// Page dimensions including the border, excluding the inter-page gap.
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Complete terminal render state, including print-layout page geometry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageRender {
+    pub lines: Vec<Line>,
+    pub maps: Vec<LineMap>,
+    pub images: Vec<ImageBox>,
+    pub mermaid: Vec<MermaidBox>,
+    pub pages: Vec<PageBox>,
+}
+
 /// The relationship id of an embedded image from its raw run XML — DrawingML
 /// `<a:blip r:embed="..">` or VML `<v:imagedata r:id="..">`.
 fn embed_rid(raw: &str) -> Option<String> {
@@ -356,6 +387,18 @@ pub fn render_with_images(
     doc: &Document,
     opts: &RenderOptions,
 ) -> (Vec<Line>, Vec<LineMap>, Vec<ImageBox>, Vec<MermaidBox>) {
+    let rendered = render_with_page_layout(doc, opts);
+    (
+        rendered.lines,
+        rendered.maps,
+        rendered.images,
+        rendered.mermaid,
+    )
+}
+
+/// Like [`render_with_images`], plus page-box geometry and section/page indexes.
+/// Continuous view returns no page boxes.
+pub fn render_with_page_layout(doc: &Document, opts: &RenderOptions) -> PageRender {
     if !opts.page_view {
         let w = opts.width.max(8);
         let mut images = Vec::new();
@@ -421,7 +464,13 @@ pub fn render_with_images(
             mermaid.append(&mut foot_mmd);
         }
         let (lines, maps) = out.into_iter().unzip();
-        return (lines, maps, images, mermaid);
+        return PageRender {
+            lines,
+            maps,
+            images,
+            mermaid,
+            pages: Vec::new(),
+        };
     }
 
     // Print layout: split the body into sections (each `section_break` paragraph
@@ -432,7 +481,11 @@ pub fn render_with_images(
     let mut out: Vec<(Line, LineMap)> = Vec::new();
     let mut images: Vec<ImageBox> = Vec::new();
     let mut mermaid: Vec<MermaidBox> = Vec::new();
-    for (start, end, geom, col_tw) in sections(doc, opts.page) {
+    let mut page_boxes: Vec<PageBox> = Vec::new();
+    let mut document_page_index = 0usize;
+    for (section_index, (start, end, geom, col_tw)) in
+        sections(doc, opts.page).into_iter().enumerate()
+    {
         let m = page_metrics(opts.width, geom);
         let content_width = m.content_cols;
         let ncols = geom.cols.max(1) as usize;
@@ -495,7 +548,18 @@ pub fn render_with_images(
             rebase(&mut p);
             p
         };
-        let pages = paginate(pairs, opts, geom, &mut sec_imgs, &mut sec_mmd, &pl);
+        let (pages, mut section_boxes) = paginate(
+            pairs,
+            opts,
+            geom,
+            &mut sec_imgs,
+            &mut sec_mmd,
+            &pl,
+            PageScope {
+                section_index,
+                document_page_offset: document_page_index,
+            },
+        );
         let base = out.len();
         for ib in &mut sec_imgs {
             ib.row += base;
@@ -503,12 +567,23 @@ pub fn render_with_images(
         for mb in &mut sec_mmd {
             mb.row += base;
         }
+        for page in &mut section_boxes {
+            page.row += base;
+        }
+        document_page_index += section_boxes.len();
         out.extend(pages);
         images.extend(sec_imgs);
         mermaid.extend(sec_mmd);
+        page_boxes.extend(section_boxes);
     }
     let (lines, maps) = out.into_iter().unzip();
-    (lines, maps, images, mermaid)
+    PageRender {
+        lines,
+        maps,
+        images,
+        mermaid,
+        pages: page_boxes,
+    }
 }
 
 /// A copy of `opts` with path-keyed inputs (selection, list markers) rebased to a
@@ -2706,6 +2781,12 @@ fn flow_columns(
     out
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PageScope {
+    section_index: usize,
+    document_page_offset: usize,
+}
+
 fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
@@ -2713,7 +2794,8 @@ fn paginate(
     images: &mut Vec<ImageBox>,
     mermaid: &mut Vec<MermaidBox>,
     pl: &PageLines,
-) -> Vec<(Line, LineMap)> {
+    scope: PageScope,
+) -> (Vec<(Line, LineMap)>, Vec<PageBox>) {
     let m = page_metrics(opts.width, geom);
     let inner_w = m.content_cols + m.ml + m.mr;
     let pad = |n: usize| " ".repeat(n);
@@ -2822,6 +2904,7 @@ fn paginate(
     };
 
     let mut out: Vec<(Line, LineMap)> = Vec::new();
+    let mut page_boxes = Vec::with_capacity(total_pages);
     let mut new_row = vec![usize::MAX; total_in];
     let mut it = items.into_iter().peekable();
     // A table border carried over from the previous page (the table was split):
@@ -2833,6 +2916,7 @@ fn paginate(
         ('┌', '┐', '└', '┘')
     };
     for page in 0..total_pages {
+        let page_row = out.len();
         out.push(border(tl, tr));
         // Top margin, with this page's header drawn into it.
         let header = pl.header(page);
@@ -2898,6 +2982,15 @@ fn paginate(
             }
         }
         out.push(border(bl, br));
+        page_boxes.push(PageBox {
+            section_index: scope.section_index,
+            section_page_index: page,
+            document_page_index: scope.document_page_offset + page,
+            row: page_row,
+            col: m.center,
+            rows: out.len() - page_row,
+            cols: inner_w + 2,
+        });
         out.push((Line { spans: Vec::new() }, LineMap::default())); // gap between pages
     }
 
@@ -2965,7 +3058,7 @@ fn paginate(
         }
     }
     *mermaid = placed_mmd;
-    out
+    (out, page_boxes)
 }
 
 #[cfg(test)]
@@ -4634,7 +4727,18 @@ mod tests {
             bordered: false,
             label: String::new(),
         }];
-        paginate(image_pairs(n), &o, geom, &mut imgs, &mut Vec::new(), &pl);
+        paginate(
+            image_pairs(n),
+            &o,
+            geom,
+            &mut imgs,
+            &mut Vec::new(),
+            &pl,
+            PageScope {
+                section_index: 0,
+                document_page_offset: 0,
+            },
+        );
 
         assert!(imgs.len() >= 2, "tall image should be cut across pages");
         assert!(imgs.iter().all(|i| i.rid == "r" && i.full_rows == n));
@@ -4681,7 +4785,18 @@ mod tests {
             bordered: false,
             label: String::new(),
         }];
-        paginate(pairs, &o, geom, &mut imgs, &mut Vec::new(), &pl);
+        paginate(
+            pairs,
+            &o,
+            geom,
+            &mut imgs,
+            &mut Vec::new(),
+            &pl,
+            PageScope {
+                section_index: 0,
+                document_page_offset: 0,
+            },
+        );
 
         // Kept whole (one slice) rather than cut at the page boundary.
         assert_eq!(imgs.len(), 1, "image should not be split: {imgs:?}");

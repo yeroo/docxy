@@ -425,6 +425,8 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "ribboncore",
+ "unicode-segmentation",
+ "unicode-width 0.2.0",
  "windows-sys 0.61.2",
 ]
 
