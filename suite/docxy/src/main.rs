@@ -10202,7 +10202,9 @@ impl Docxy {
                                 cells: (0..ncols).map(|_| Self::empty_cell()).collect(),
                                 raw_props: vec![],
                             };
-                            table.rows.insert(at.min(table.rows.len()), new);
+                            let at = at.min(table.rows.len());
+                            let inserted = table.insert_row(at, new);
+                            debug_assert!(inserted);
                             ed.caret = Caret::at(
                                 vec![tb, at.min(table.rows.len() - 1), col.min(ncols - 1), 0],
                                 0,
@@ -10219,7 +10221,8 @@ impl Docxy {
                         }
                         DelRow => {
                             if table.rows.len() > 1 {
-                                table.rows.remove(row);
+                                let removed = table.remove_row(row);
+                                debug_assert!(removed.is_some());
                                 let nr = table.rows.len();
                                 ed.caret =
                                     Caret::at(vec![tb, row.min(nr - 1), col.min(ncols - 1), 0], 0);
@@ -10287,6 +10290,7 @@ impl Docxy {
         let table = Table {
             grid: vec![col_w; cols],
             rows: (0..rows).map(|_| mk_row()).collect(),
+            row_boundaries: vec![],
             raw_tblpr: Some(TBLPR.to_string()),
         };
         let idx = self.active;

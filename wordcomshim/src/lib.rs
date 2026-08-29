@@ -461,6 +461,7 @@ mod win {
                         raw_props: vec![],
                     })
                     .collect(),
+                row_boundaries: vec![],
                 raw_tblpr: Some(TBLPR.to_string()),
             };
             self.pkg.document.body.push(Block::Table(table));

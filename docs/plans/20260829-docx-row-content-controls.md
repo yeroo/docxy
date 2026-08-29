@@ -71,15 +71,15 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 ### Task 4: Make row editing boundary-safe
 
-- [ ] audit table row insertion, deletion, split/merge, copy/paste, and cloning
+- [x] audit table row insertion, deletion, split/merge, copy/paste, and cloning
       helpers for assumptions that `Table::rows` is the complete child sequence
-- [ ] preserve control membership for edits within a group and apply the Task 1
+- [x] preserve control membership for edits within a group and apply the Task 1
       boundary rule for edits at its edges
-- [ ] ensure deleting every visible row does not silently delete an otherwise
+- [x] ensure deleting every visible row does not silently delete an otherwise
       non-empty control definition unless that is the documented operation
-- [ ] add focused editor tests including undo/redo where the public editor exposes
+- [x] add focused editor tests including undo/redo where the public editor exposes
       the affected table operation
-- [ ] run `cargo test -p docxcore` before Task 5
+- [x] run `cargo test -p docxcore` before Task 5
 
 ### Task 5: Add realistic package and regression coverage
 

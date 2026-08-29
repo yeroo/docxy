@@ -2870,6 +2870,7 @@ impl App {
         let table = Table {
             grid: vec![col_w; cols],
             rows: (0..rows).map(|_| mk_row()).collect(),
+            row_boundaries: vec![],
             raw_tblpr: Some(TBLPR.to_string()),
         };
         let body = &mut self.editor.doc.body;

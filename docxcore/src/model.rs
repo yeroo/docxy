@@ -852,6 +852,52 @@ mod tests {
     }
 
     #[test]
+    fn inserted_rows_follow_nested_and_adjacent_edge_ownership() {
+        let mut nested = table(
+            &["outer", "inner", "outer again"],
+            vec![open(0, "outer"), open(1, "inner"), close(2), close(3)],
+        );
+        assert!(nested.insert_row(1, row("inserted at inner first row")));
+        assert_eq!(
+            nested.row_control_owners(),
+            Ok(vec![vec![0], vec![0, 1], vec![0, 1], vec![0]])
+        );
+
+        let mut adjacent = table(
+            &["left", "right"],
+            vec![open(0, "left"), close(1), open(1, "right"), close(2)],
+        );
+        assert!(adjacent.insert_row(1, row("inserted at shared edge")));
+        assert_eq!(
+            adjacent.row_control_owners(),
+            Ok(vec![vec![0], vec![2], vec![2]])
+        );
+    }
+
+    #[test]
+    fn deleting_every_visible_row_retains_nonempty_control_definition() {
+        let raw_child =
+            TableRowBoundary::raw(1, "<w:customXml w:uri=\"urn:definition-metadata\"/>");
+        let mut controlled = table(
+            &["first", "last"],
+            vec![open(0, "definition"), raw_child.clone(), close(2)],
+        );
+
+        assert_eq!(controlled.remove_row(0), Some(row("first")));
+        assert_eq!(controlled.remove_row(0), Some(row("last")));
+        assert!(controlled.rows.is_empty());
+        assert_eq!(
+            controlled.row_boundaries,
+            vec![
+                open(0, "definition"),
+                TableRowBoundary { at: 0, ..raw_child },
+                close(0),
+            ]
+        );
+        assert!(controlled.validate_row_boundaries().is_ok());
+    }
+
+    #[test]
     fn nested_controls_record_outer_to_inner_row_ownership() {
         let nested = table(
             &["outer", "nested", "outer again"],
