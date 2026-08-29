@@ -461,6 +461,7 @@ mod win {
                         raw_props: vec![],
                     })
                     .collect(),
+                namespace_declarations: vec![],
                 row_boundaries: vec![],
                 raw_tblpr: Some(TBLPR.to_string()),
             };

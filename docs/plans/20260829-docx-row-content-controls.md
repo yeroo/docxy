@@ -100,7 +100,7 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 Final validation record (2026-08-29):
 
-- `cargo test` passed across the workspace, including 459 `docxcore` unit tests
+- `cargo test` passed across the workspace, including 463 `docxcore` unit tests
   and 10 package integration tests.
 - `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`, and
   `git diff --check` passed.

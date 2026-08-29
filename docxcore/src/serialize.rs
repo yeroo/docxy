@@ -17,18 +17,26 @@ const W15_NS: &str = "http://schemas.microsoft.com/office/word/2012/wordml";
 
 /// Serialize a document to the bytes of `word/document.xml`.
 pub fn document_to_xml(doc: &Document) -> String {
+    let mut body = String::new();
+    for block in &doc.body {
+        write_block(&mut body, block);
+    }
+
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     // `m:` supports equations authored from Markdown. Row-level repeating
     // sections use the Office 2013 `w15:` vocabulary, which must stay bound
     // when their captured properties are placed in the new document root.
     s.push_str(&format!(
-        "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\" \
-         xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" mc:Ignorable=\"w15\"><w:body>"
+        "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\""
     ));
-    for block in &doc.body {
-        write_block(&mut s, block);
+    if body.contains("w15:") {
+        s.push_str(&format!(
+            " xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" mc:Ignorable=\"w15\""
+        ));
     }
+    s.push_str("><w:body>");
+    s.push_str(&body);
     s.push_str("</w:body></w:document>");
     s
 }
@@ -501,7 +509,15 @@ fn write_rpr(s: &mut String, p: &RunProps) {
 }
 
 fn write_table(s: &mut String, t: &Table) {
-    s.push_str("<w:tbl>");
+    s.push_str("<w:tbl");
+    for (name, value) in &t.namespace_declarations {
+        s.push(' ');
+        s.push_str(name);
+        s.push_str("=\"");
+        esc_attr(value, s);
+        s.push('"');
+    }
+    s.push('>');
     // tblPr is the first tbl child; preserved verbatim when present.
     if let Some(raw) = &t.raw_tblpr {
         s.push_str(raw);
@@ -594,7 +610,8 @@ fn sdt_open_shape(raw: &str) -> SdtOpenShape {
             Event::Start => depth += 1,
             Event::End if depth == 1 => return SdtOpenShape::Invalid,
             Event::End => depth -= 1,
-            Event::Eof => return SdtOpenShape::MissingContent,
+            Event::Eof if depth == 1 => return SdtOpenShape::MissingContent,
+            Event::Eof => return SdtOpenShape::Invalid,
             Event::Text => {}
         }
     }
@@ -768,6 +785,7 @@ mod tests {
                 cells: vec![cell],
                 raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
             }],
+            namespace_declarations: vec![],
             row_boundaries: vec![],
             raw_tblpr: Some(
                 "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
@@ -1412,6 +1430,58 @@ mod tests {
         };
         assert!(table.validate_row_boundaries().is_ok());
         assert_eq!(reparsed.plain_text(), "survives\n");
+    }
+
+    #[test]
+    fn truncated_control_before_content_is_normalized_to_balanced_xml() {
+        let source = table_xml("<w:sdt><w:sdtPr/>");
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let Block::Table(table) = &parsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_boundaries.len(), 2);
+        assert!(table.validate_row_boundaries().is_ok());
+
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:sdt><w:sdtPr/><w:sdtContent></w:sdtContent></w:sdt></w:tbl>"));
+        assert_eq!(saved.matches("<w:sdt>").count(), 1);
+        assert_eq!(saved.matches("</w:sdt>").count(), 1);
+        assert_eq!(saved.matches("<w:sdtContent>").count(), 1);
+        assert_eq!(saved.matches("</w:sdtContent>").count(), 1);
+
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert!(table.validate_row_boundaries().is_ok());
+    }
+
+    #[test]
+    fn row_control_keeps_namespaces_inherited_from_body_and_table() {
+        let open = "<w:sdt><w:sdtPr><ux:bodyProperty/><tv:tableProperty/></w:sdtPr><w:sdtContent>";
+        let source = format!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body xmlns:ux=\"urn:body\"><w:tbl xmlns:tv=\"urn:table\">{open}{}</w:sdtContent></w:sdt></w:tbl></w:body></w:document>",
+            row_xml("visible")
+        );
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        let Block::Table(table) = &parsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(
+            table.namespace_declarations,
+            vec![
+                ("xmlns:ux".to_string(), "urn:body".to_string()),
+                ("xmlns:tv".to_string(), "urn:table".to_string()),
+            ]
+        );
+
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:tbl xmlns:ux=\"urn:body\" xmlns:tv=\"urn:table\">"));
+        assert!(saved.contains(open), "captured control properties changed");
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()),
+            parsed
+        );
     }
 
     #[test]

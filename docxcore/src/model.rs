@@ -578,6 +578,10 @@ pub struct Table {
     /// Column widths in twips (`w:tblGrid`/`w:gridCol`).
     pub grid: Vec<u32>,
     pub rows: Vec<Row>,
+    /// Nonstandard namespace bindings inherited by preserved raw table
+    /// children. The serializer redeclares them on `w:tbl` because document and
+    /// body ancestors are reconstructed during save.
+    pub namespace_declarations: Vec<(String, String)>,
     /// Invisible row-level content-control boundaries and unknown table
     /// children, ordered by `at` and then by vector position.
     ///

@@ -2,6 +2,7 @@
 //!
 //! Ported from rust365 (`src/xml.rs`), unchanged logic, plus unit tests.
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct XmlAttr<'a> {
     pub name: &'a str,
     pub value: &'a str, // raw, entities NOT decoded
@@ -21,6 +22,8 @@ pub struct XmlParser<'a> {
     m_name: &'a str,
     m_text: &'a str,
     m_attrs: Vec<XmlAttr<'a>>,
+    m_namespaces: Vec<XmlAttr<'a>>,
+    namespace_changes: Vec<Vec<(usize, Option<XmlAttr<'a>>)>>,
     pending_end: bool,
     /// Byte index of the `<` of the most recent start tag (for raw capture).
     m_start: usize,
@@ -47,6 +50,8 @@ impl<'a> XmlParser<'a> {
             m_name: "",
             m_text: "",
             m_attrs: Vec::new(),
+            m_namespaces: Vec::new(),
+            namespace_changes: Vec::new(),
             pending_end: false,
             m_start: 0,
         }
@@ -95,9 +100,55 @@ impl<'a> XmlParser<'a> {
         &self.m_attrs
     }
 
+    /// Namespace declarations in scope for the current start element. Later
+    /// declarations of the same prefix replace ancestor bindings until their
+    /// element ends.
+    pub fn namespace_attrs(&self) -> &[XmlAttr<'a>] {
+        &self.m_namespaces
+    }
+
+    fn push_namespace_scope(&mut self) {
+        let mut changes = Vec::new();
+        for attr in self
+            .m_attrs
+            .iter()
+            .copied()
+            .filter(|attr| attr.name == "xmlns" || attr.name.starts_with("xmlns:"))
+        {
+            if let Some(index) = self
+                .m_namespaces
+                .iter()
+                .position(|existing| existing.name == attr.name)
+            {
+                changes.push((index, Some(self.m_namespaces[index])));
+                self.m_namespaces[index] = attr;
+            } else {
+                let index = self.m_namespaces.len();
+                changes.push((index, None));
+                self.m_namespaces.push(attr);
+            }
+        }
+        self.namespace_changes.push(changes);
+    }
+
+    fn pop_namespace_scope(&mut self) {
+        let Some(changes) = self.namespace_changes.pop() else {
+            return;
+        };
+        for (index, previous) in changes.into_iter().rev() {
+            if let Some(previous) = previous {
+                self.m_namespaces[index] = previous;
+            } else {
+                debug_assert_eq!(index + 1, self.m_namespaces.len());
+                self.m_namespaces.pop();
+            }
+        }
+    }
+
     pub fn next(&mut self) -> Event {
         if self.pending_end {
             self.pending_end = false;
+            self.pop_namespace_scope();
             return Event::End;
         }
         let size = self.xml.len();
@@ -131,6 +182,7 @@ impl<'a> XmlParser<'a> {
                 }
                 self.m_name = self.slice(start, end);
                 self.pos = gt + 1;
+                self.pop_namespace_scope();
                 return Event::End;
             }
 
@@ -197,6 +249,7 @@ impl<'a> XmlParser<'a> {
                 let d = self.xml[self.pos];
                 if d == b'>' {
                     self.pos += 1;
+                    self.push_namespace_scope();
                     return Event::Start;
                 }
                 if d == b'/' {
@@ -205,6 +258,7 @@ impl<'a> XmlParser<'a> {
                         self.pos += 1;
                     }
                     self.pending_end = true;
+                    self.push_namespace_scope();
                     return Event::Start;
                 }
                 // attribute
@@ -382,6 +436,34 @@ mod tests {
         assert_eq!(p.attr("flag"), "");
         assert_eq!(p.attr("missing"), "");
         assert_eq!(p.attrs().len(), 3);
+    }
+
+    #[test]
+    fn namespace_scope_tracks_inheritance_and_rebinding() {
+        let mut p = XmlParser::new(
+            r#"<root xmlns:a="urn:outer"><child xmlns:a="urn:inner" xmlns:b="urn:b"><leaf/></child><after/></root>"#,
+        );
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.namespace_attrs()[0].value, "urn:outer");
+
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.namespace_attrs()[0].value, "urn:inner");
+        assert_eq!(p.namespace_attrs()[1].name, "xmlns:b");
+
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.namespace_attrs()[0].value, "urn:inner");
+        assert_eq!(p.next(), Event::End);
+        assert_eq!(p.next(), Event::End);
+
+        assert_eq!(p.next(), Event::Start);
+        assert_eq!(p.name(), "after");
+        assert_eq!(
+            p.namespace_attrs(),
+            &[XmlAttr {
+                name: "xmlns:a",
+                value: "urn:outer",
+            }]
+        );
     }
 
     #[test]

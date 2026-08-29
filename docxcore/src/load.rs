@@ -1294,7 +1294,29 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
 }
 
 fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
-    let mut table = Table::default();
+    // Raw row-control properties can reference namespace prefixes declared on
+    // w:document, w:body, or w:tbl. Those ancestors are reconstructed on save,
+    // so carry every nonstandard in-scope binding with the table and redeclare
+    // it there. The serializer already guarantees the standard bindings.
+    let namespace_declarations = p
+        .namespace_attrs()
+        .iter()
+        .filter(|attr| {
+            !matches!(
+                attr.name,
+                "xmlns:w" | "xmlns:r" | "xmlns:m" | "xmlns:mc" | "xmlns:w15"
+            )
+        })
+        .map(|attr| {
+            let mut value = String::new();
+            XmlParser::append_decoded(attr.value, &mut value);
+            (attr.name.to_string(), value)
+        })
+        .collect();
+    let mut table = Table {
+        namespace_declarations,
+        ..Default::default()
+    };
     loop {
         match p.next() {
             Event::Start => match p.name() {
@@ -1344,9 +1366,9 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
 /// preserve nested controls in the same ordered sequence.
 ///
 /// Returns `true` when recovery consumed the enclosing table end or reached
-/// EOF. Truncated controls get an empty close boundary when no closing source
-/// exists; that keeps the model structurally balanced without inventing XML and
-/// lets the serializer's validation layer decide how to normalize it.
+/// EOF. Truncated controls get balanced open/close boundaries when no closing
+/// source exists; that keeps unclosed source fragments out of opaque `Raw`
+/// boundaries and lets the serializer normalize only the missing structure.
 fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) -> bool {
     let sdt_start = p.start_pos();
     let mut opened = false;
@@ -1482,10 +1504,13 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                         .row_boundaries
                         .push(TableRowBoundary::sdt_close(table.rows.len(), raw));
                 } else {
-                    table.row_boundaries.push(TableRowBoundary::raw(
+                    table.row_boundaries.push(TableRowBoundary::sdt_open(
                         table.rows.len(),
                         p.raw_slice(sdt_start, event_start),
                     ));
+                    table
+                        .row_boundaries
+                        .push(TableRowBoundary::sdt_close(table.rows.len(), ""));
                 }
                 return true;
             }
@@ -1502,10 +1527,13 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                         .row_boundaries
                         .push(TableRowBoundary::sdt_close(table.rows.len(), raw));
                 } else {
-                    table.row_boundaries.push(TableRowBoundary::raw(
+                    table.row_boundaries.push(TableRowBoundary::sdt_open(
                         table.rows.len(),
                         p.raw_slice(sdt_start, p.pos()),
                     ));
+                    table
+                        .row_boundaries
+                        .push(TableRowBoundary::sdt_close(table.rows.len(), ""));
                 }
                 return true;
             }
