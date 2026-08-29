@@ -141,8 +141,8 @@ fn path_info(app: &App) -> Json {
     ];
     // Only present when the package actually carries the state — an
     // unprotected, unwatermarked document must not gain these keys at all.
-    if let Some(p) = &app.doc_protection {
-        fields.push(("protection", Json::Str(p.clone())));
+    if let Some(p) = app.doc_protection.label() {
+        fields.push(("protection", Json::Str(p.to_string())));
     }
     if let Some(w) = &app.doc_watermark {
         fields.push(("watermark", Json::Str(w.clone())));
@@ -1434,7 +1434,8 @@ mod tests {
     #[test]
     fn path_reports_protection_and_watermark_when_set() {
         let mut app = app_with(&["x"]);
-        app.doc_protection = Some("read-only".to_string());
+        app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
+        app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::ReadOnly);
         app.doc_watermark = Some("CONFIDENTIAL".to_string());
         let r = path_info(&app);
         assert_eq!(r.get_str("protection"), Some("read-only"));

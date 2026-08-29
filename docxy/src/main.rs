@@ -15,6 +15,7 @@ mod backstage;
 mod control;
 mod mcp;
 mod metafile;
+mod protection;
 mod ribbon;
 mod skill;
 
@@ -37,7 +38,9 @@ use docxcore::model::{
     Table, VMerge,
 };
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
-use docxcore::package::{Package, load_package, new_markdown_package, new_package, save_package};
+use docxcore::package::{
+    Package, Protection, load_package, new_markdown_package, new_package, save_package,
+};
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
     Span as DocSpan, Style as DocStyle, render_with_images,
@@ -781,9 +784,9 @@ struct App {
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
     quit_requested: bool,
     status: Option<String>,
-    /// Document-level notices surfaced on open (protection state, watermark text,
-    /// page borders) — Word features docxy shows but doesn't render/enforce.
-    doc_protection: Option<String>,
+    /// Structured document-protection policy metadata. Display text is derived
+    /// from its compatibility label; authorization never compares UI strings.
+    doc_protection: Protection,
     doc_watermark: Option<String>,
     doc_page_borders: bool,
     scroll: usize,
@@ -955,7 +958,7 @@ impl App {
                 .unwrap_or_default(),
         };
         docxcore::field::recompute(&mut pkg.document, &field_ctx);
-        let doc_protection = pkg.protection_label().map(str::to_owned);
+        let doc_protection = pkg.protection();
         let doc_watermark = pkg.watermark_label();
         let doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
@@ -1796,7 +1799,7 @@ impl App {
         self.comments_scroll = 0;
         self.comment_sel = 0;
         self.comment_active = false;
-        self.doc_protection = pkg.protection_label().map(str::to_owned);
+        self.doc_protection = pkg.protection();
         self.doc_watermark = pkg.watermark_label();
         self.doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
@@ -1823,7 +1826,7 @@ impl App {
     /// watermark, page borders) — empty when the document has none.
     fn doc_notice(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(p) = &self.doc_protection {
+        if let Some(p) = self.doc_protection.label() {
             parts.push(format!("Protected: {p}"));
         }
         if let Some(w) = &self.doc_watermark {
@@ -1837,6 +1840,19 @@ impl App {
         } else {
             format!("  ·  {}", parts.join(" · "))
         }
+    }
+
+    /// The single App-level authorization decision used by interactive,
+    /// control, and MCP mutation routes.
+    // Task 2 defines the policy boundary; Tasks 3 and 4 attach every route to
+    // it. Keep the boundary explicit in the interim without accepting a build
+    // warning for the deliberately staged call sites.
+    #[allow(dead_code)]
+    fn authorize_mutation(
+        &self,
+        mutation: protection::MutationKind,
+    ) -> Result<(), protection::ProtectionDenial> {
+        protection::authorize(&self.doc_protection, mutation)
     }
 
     /// The comments review side panel: each comment's author/date, the quoted
@@ -6141,13 +6157,39 @@ mod tests {
         // A plain document shows nothing.
         assert_eq!(app.doc_notice(), "");
         // Each surfaced feature appears in the notice.
-        app.doc_protection = Some("read-only".to_string());
+        app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
+        app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::ReadOnly);
         app.doc_watermark = Some("CONFIDENTIAL".to_string());
         app.doc_page_borders = true;
         let n = app.doc_notice();
         assert!(n.contains("Protected: read-only"), "{n}");
         assert!(n.contains("Watermark: CONFIDENTIAL"), "{n}");
         assert!(n.contains("Page border"), "{n}");
+    }
+
+    #[test]
+    fn app_authorization_uses_structured_protection_not_the_display_label() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
+        app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::Comments);
+
+        assert_eq!(
+            app.authorize_mutation(protection::MutationKind::Comment),
+            Ok(())
+        );
+        let denial = app
+            .authorize_mutation(protection::MutationKind::Content)
+            .unwrap_err();
+        assert_eq!(denial.code(), "comments_only");
+        assert_eq!(
+            denial.control_error(),
+            "protection_denied:comments_only: only comment edits are allowed"
+        );
+        assert_eq!(
+            denial.tui_status(),
+            "Edit blocked: only comment edits are allowed."
+        );
     }
 
     #[test]

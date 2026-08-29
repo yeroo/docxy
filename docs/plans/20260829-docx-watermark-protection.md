@@ -55,16 +55,16 @@ Keep advisory write protection distinct from enforced restrictions.
 
 ### Task 2: Define one mutation authorization policy
 
-- [ ] inventory every TUI, ribbon/dialog, Vim, find/replace, header/footer,
+- [x] inventory every TUI, ribbon/dialog, Vim, find/replace, header/footer,
       comment, save-as conversion, control, and MCP route that can mutate a DOCX
-- [ ] classify mutations as content, structure, formatting, comment, or package
+- [x] classify mutations as content, structure, formatting, comment, or package
       metadata and implement one `App`-level authorization decision used by all
       routes
-- [ ] encode the acceptance-mode matrix, including fail-closed forms and tracked
+- [x] encode the acceptance-mode matrix, including fail-closed forms and tracked
       changes and advisory-only write protection
-- [ ] return stable machine-readable control errors plus concise TUI status text
-- [ ] test the full policy matrix independently of key bindings
-- [ ] run `cargo test -p docxy` before Task 3
+- [x] return stable machine-readable control errors plus concise TUI status text
+- [x] test the full policy matrix independently of key bindings
+- [x] run `cargo test -p docxy` before Task 3
 
 ### Task 3: Gate all interactive mutation paths
 
