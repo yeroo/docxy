@@ -98,14 +98,20 @@ schema-valid OOXML.
 
 ### Task 6: Verify package round-trips and interoperability
 
-- [ ] add realistic fixtures combining inline and property changes, nesting,
+- [x] add realistic fixtures combining inline and property changes, nesting,
       unknown metadata, comments/content controls, tables, and section properties
-- [ ] verify untouched, accept-current, reject-current, accept-all, reject-all,
+- [x] verify untouched, accept-current, reject-current, accept-all, reject-all,
       undo, redo, save, and reload outcomes against the fixture XML and visible text
-- [ ] open produced artifacts with the existing independent/package validators
+- [x] open produced artifacts with the existing independent/package validators
       available in the repository and record any deliberate unsupported records
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --check`, and `git diff --check`
+
+Fixture evidence: `docxcore/tests/fixtures/revision-package.xml` and
+`revision-comments.xml`; `revision_package_roundtrip.rs` validates untouched and
+acted-on DOCX artifacts with the OPC ZIP reader, XML balance checks, and both
+DOCX loaders. The deliberate unsupported records are `w:moveFromRangeStart`
+id 199 and `w:customXmlInsRangeStart` id 198; actions report and preserve both.
 
 ### Task 7: [Final] Document review semantics
 
