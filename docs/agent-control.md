@@ -110,6 +110,66 @@ Notes:
   `done:false` and does **not** mark the document modified or flash the
   agent-status dot — nothing actually changed.
 
+### DOCX protection and watermark behavior
+
+`doc.path` reports a human-readable `protection` value when a document declares
+one: `read-only`, `comments only`, `formatting locked`, `form fields only`,
+`tracked changes only`, `restricted editing`, or the advisory
+`read-only (recommended)`. The optional `watermark` value contains the first
+applied text watermark, or `picture (preview unavailable)` /
+`unsupported (preview unavailable)` when no text preview exists. These fields
+are status hints; mutation policy uses parsed OOXML metadata rather than these
+labels.
+
+The terminal TUI and control dispatcher use the same five mutation classes.
+MCP edit tools are thin mappings to those control verbs, so they inherit the
+same checks and do not maintain a second policy table:
+
+| Protection state | Content | Structure | Formatting | Comments | Package metadata |
+|---|---:|---:|---:|---:|---:|
+| absent, disabled, or advisory write protection | allow | allow | allow | allow | allow |
+| enforced read-only | deny | deny | deny | deny | deny |
+| enforced comments-only | deny | deny | deny | allow | deny |
+| enforced formatting-only | allow | allow | deny | allow | allow |
+| enforced forms-only | deny | deny | deny | deny | deny |
+| enforced tracked-changes-only | deny | deny | deny | deny | deny |
+| enforced unknown mode | deny | deny | deny | deny | deny |
+
+The current mutating control/MCP operations cover Structure
+(`doc.replace-range`, `doc.insert`, `doc.append`), Content (`doc.replace-all`,
+`doc.undo`, `doc.redo`), and Formatting (`doc.format`, `doc.set-style`). There
+is no comment-writing control verb yet, so comments-only protection denies all
+current automation edits even though comment mutations in the TUI are allowed.
+Read, navigation, inspection, export, same-format save, open/reload, and new-file
+operations remain available. Cross-format Save As in the TUI is package
+metadata and is protected; same-format save only persists already-authorized
+changes and is not a new mutation.
+
+Denied control and MCP requests return
+`protection_denied:<stable_code>: <explanation>`, where `<stable_code>` is one
+of `read_only`, `comments_only`, `formatting_locked`, `forms_unsupported`,
+`tracked_changes_unsupported`, or `unsupported_mode`. The check runs before
+argument parsing and before any mutation, so a rejected request does not alter
+the document, package parts, caret, undo/redo stacks, dirty state, or save
+state. Invalid arguments and unknown verbs retain their existing non-protection
+errors.
+
+Forms-only, tracked-changes-only, and unknown enforced modes deliberately fail
+closed. docxy cannot yet make conforming form-field-only edits or automatically
+record ordinary edits as tracked changes; use Word for those edits until those
+editing models exist. Advisory `w:writeProtection` is different: the TUI shows
+a warning and `doc.path` reports `read-only (recommended)`, but all edits remain
+allowed.
+
+In page view, applied text watermarks are rendered as muted page overlays using
+the correct inherited default/first/even header. They are not part of document
+text, selection, copy/export, caret/hit testing, or saved OOXML. Picture and
+unsupported watermarks receive a page-associated `preview unavailable`
+fallback. The status fields above remain available to control/MCP clients; the
+overlay itself is visual TUI state and is not returned as document content.
+The exhaustive route mapping is maintained in
+[`docx-mutation-inventory.md`](docx-mutation-inventory.md).
+
 ### Markdown-formatted writes
 
 `doc.insert`, `doc.replace-range`, and `doc.append` all take an optional

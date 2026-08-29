@@ -44,6 +44,42 @@ editable, creatable), **sections** (multi-section, landscape, page geometry),
 (OMML → Unicode; LaTeX authoring), **comments** (add/delete/show), **simple
 fields**, and **external hyperlinks**.
 
+### Document protection and watermark guarantees
+
+`docxcore` parses `w:documentProtection` and advisory `w:writeProtection` as
+structured metadata. docxy applies one policy to TUI, control, and MCP mutation
+routes before they touch the document, package parts, history, dirty flag, or
+save state:
+
+| Protection state | Content | Structure | Formatting | Comments | Package metadata |
+|---|---:|---:|---:|---:|---:|
+| absent, disabled, or advisory write protection | allow | allow | allow | allow | allow |
+| enforced read-only | deny | deny | deny | deny | deny |
+| enforced comments-only | deny | deny | deny | allow | deny |
+| enforced formatting-only | allow | allow | deny | allow | allow |
+| enforced forms-only | deny | deny | deny | deny | deny |
+| enforced tracked-changes-only | deny | deny | deny | deny | deny |
+| enforced unknown mode | deny | deny | deny | deny | deny |
+
+The last three modes deliberately fail closed. docxy cannot yet restrict edits
+to modeled form fields or automatically emit tracked revisions, so allowing an
+ordinary edit would violate the document's declared protection. Advisory write
+protection remains editable and is shown as `read-only (recommended)` rather
+than being treated as enforced protection. Navigation, selection, copy, find,
+inspection, same-format save, and export remain available in every mode. The
+complete mutation classification and stable denial codes are in
+[`docs/docx-mutation-inventory.md`](docs/docx-mutation-inventory.md).
+
+Applied VML text watermarks render as muted, centered labels on each applicable
+page in page view. Header inheritance and default/first/even variants determine
+which pages receive a label. The overlay prefers an empty page row and falls
+back to the page frame when content is dense; Unicode and narrow pages are
+clipped safely. It is a screen layer only: it never enters document text, hit
+testing, caret/selection maps, copy/export output, or saved OOXML. Picture and
+unrecognized watermarks show explicit `preview unavailable` labels because the
+terminal renderer does not rasterize those header shapes. Continuous view keeps
+the status indicator but does not paint page overlays.
+
 ### Ranked docx gaps
 
 | # | Gap | Corpus weight | Current | Target | Severity |
@@ -55,7 +91,7 @@ fields**, and **external hyperlinks**.
 | **D5** | **Symbols** (`w:sym`) — preserved but glyph never rendered → symbol chars invisible | **11** | PRESERVED-but-hidden | map to Unicode/font glyph | Medium |
 | **D6** | **Internal links & bookmarks** — anchor hyperlinks unwrapped to plain text; bookmarks round-trip but aren't navigation targets | bookmarks **30**, hyperlinks 28 | DISPLAY (inert) | clickable in-doc nav | Medium |
 | **D7** | **RTL / bidi** — `w:bidi` flag round-trips but text isn't visually reversed; run-level `w:rtl` dropped | **6** | DISPLAY (LTR only) | visual reorder | Low-Med |
-| **D8** | **Watermarks, page borders, protection** — preserved byte-faithful but inert (not rendered / not surfaced) | 8 + 3 + 2 | PRESERVED | render / surface | Low |
+| **D8** | **Page borders** — preserved byte-faithful and surfaced by a status indicator, but not drawn on the page | 3 | PRESERVED | render | Low |
 | — | **Encrypted docx** — detected and refused | 2 | MISSING (rejected) | out of scope (needs crypto) | — |
 
 ---
@@ -144,8 +180,8 @@ Render `w:sym` glyphs (symbol-font → Unicode map); visually reorder RTL runs;
 make internal hyperlinks/bookmarks navigable (jump to anchor).
 
 **Phase D-5 — Structure preservation & inert features _(Lower)_**
-Reconstruct `w:sdt` wrappers on save (sdt 27); render watermarks & page borders;
-surface protection state. SVG decode if a raster path is added.
+Reconstruct `w:sdt` wrappers on save (sdt 27) and render page borders. SVG
+decode remains relevant if a raster path is added for picture watermarks.
 
 ### xlsxy
 
