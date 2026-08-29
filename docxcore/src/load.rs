@@ -914,6 +914,139 @@ fn parse_revision_metadata(p: &XmlParser) -> RevisionMetadata {
     metadata
 }
 
+fn property_element_names(scope: PropertyScope) -> (&'static str, &'static str) {
+    match scope {
+        PropertyScope::Run => ("w:rPrChange", "w:rPr"),
+        PropertyScope::Paragraph => ("w:pPrChange", "w:pPr"),
+        PropertyScope::Table => ("w:tblPrChange", "w:tblPr"),
+        PropertyScope::TableRow => ("w:trPrChange", "w:trPr"),
+        PropertyScope::TableCell => ("w:tcPrChange", "w:tcPr"),
+        PropertyScope::Section => ("w:sectPrChange", "w:sectPr"),
+    }
+}
+
+/// Parse a complete `*PrChange` wrapper while retaining its exact XML. Unknown
+/// wrapper children do not make an otherwise valid prior snapshot unusable.
+fn parse_property_change(p: &mut XmlParser, scope: PropertyScope) -> PropertyChange {
+    let metadata = parse_revision_metadata(p);
+    let start = p.start_pos();
+    let complete = p.skip_element_complete();
+    let raw = p.raw_slice(start, p.pos()).to_string();
+    let previous = if complete {
+        parse_property_snapshot(&raw, scope)
+    } else {
+        PropertySnapshot::Malformed(raw.clone())
+    };
+    PropertyChange {
+        scope,
+        metadata,
+        raw,
+        previous,
+    }
+}
+
+fn parse_property_snapshot(raw: &str, scope: PropertyScope) -> PropertySnapshot {
+    let (_, snapshot_name) = property_element_names(scope);
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start {
+        return PropertySnapshot::Malformed(raw.to_string());
+    }
+
+    let mut snapshot = None;
+    let mut saw_other_content = false;
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let start = parser.start_pos();
+                let is_snapshot = parser.name() == snapshot_name;
+                let complete = parser.skip_element_complete();
+                if is_snapshot {
+                    if snapshot.is_some() || !complete {
+                        return PropertySnapshot::Malformed(raw.to_string());
+                    }
+                    snapshot = Some(parser.raw_slice(start, parser.pos()).to_string());
+                } else {
+                    saw_other_content = true;
+                }
+            }
+            Event::Text => {
+                if !parser.text().trim().is_empty() {
+                    saw_other_content = true;
+                }
+            }
+            Event::End => break,
+            Event::Eof => return PropertySnapshot::Malformed(raw.to_string()),
+        }
+    }
+
+    match snapshot {
+        Some(snapshot) => parse_present_property_snapshot(&snapshot, scope).map_or_else(
+            || PropertySnapshot::Malformed(snapshot),
+            PropertySnapshot::Present,
+        ),
+        None if saw_other_content => PropertySnapshot::Malformed(raw.to_string()),
+        None => PropertySnapshot::Absent,
+    }
+}
+
+fn parse_present_property_snapshot(raw: &str, scope: PropertyScope) -> Option<PropertyState> {
+    let (_, expected_name) = property_element_names(scope);
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != expected_name {
+        return None;
+    }
+    Some(match scope {
+        PropertyScope::Run => {
+            let mut props = RunProps::default();
+            parse_rpr(&mut parser, &mut props);
+            // A prior snapshot cannot itself own the current change record.
+            props.property_change = None;
+            PropertyState::Run(Box::new(props))
+        }
+        PropertyScope::Paragraph => {
+            let mut props = ParProps::default();
+            parse_ppr(&mut parser, &mut props);
+            props.property_change = None;
+            PropertyState::Paragraph(Box::new(props))
+        }
+        PropertyScope::Table => PropertyState::Table(raw.to_string()),
+        PropertyScope::TableRow => PropertyState::TableRow(raw.to_string()),
+        PropertyScope::TableCell => PropertyState::TableCell(raw.to_string()),
+        PropertyScope::Section => PropertyState::Section(raw.to_string()),
+    })
+}
+
+/// Remove the first direct `*PrChange` child from a raw current-property
+/// container and model it separately. Other raw children and whitespace keep
+/// their exact relative positions.
+fn split_property_change_container(
+    raw: &str,
+    scope: PropertyScope,
+) -> (String, Option<PropertyChange>) {
+    let (change_name, _) = property_element_names(scope);
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start {
+        return (raw.to_string(), None);
+    }
+
+    loop {
+        match parser.next() {
+            Event::Start if parser.name() == change_name => {
+                let start = parser.start_pos();
+                let change = parse_property_change(&mut parser, scope);
+                let end = parser.pos();
+                let mut current = String::with_capacity(raw.len() - (end - start));
+                current.push_str(&raw[..start]);
+                current.push_str(&raw[end..]);
+                return (current, Some(change));
+            }
+            Event::Start => parser.skip_element(),
+            Event::End | Event::Eof => return (raw.to_string(), None),
+            Event::Text => {}
+        }
+    }
+}
+
 fn unsupported_revision_kind(name: &str) -> Option<UnsupportedRevisionKind> {
     Some(match name {
         "w:moveFrom" => UnsupportedRevisionKind::MoveFrom,
@@ -1010,12 +1143,26 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     p.skip_element();
                 }
                 "w:jc" => {
+                    let start = p.start_pos();
                     props.align = map_align(p.attr("w:val"));
                     p.skip_element();
+                    // Explicit left is distinct from no direct value: it can
+                    // override a centered/right paragraph style.
+                    if props.align == Align::Left {
+                        props
+                            .raw_props
+                            .push(p.raw_slice(start, p.pos()).to_string());
+                    }
                 }
                 "w:bidi" => {
+                    let start = p.start_pos();
                     props.rtl = toggle_on(p.attr("w:val"));
                     p.skip_element();
+                    if !props.rtl {
+                        props
+                            .raw_props
+                            .push(p.raw_slice(start, p.pos()).to_string());
+                    }
                 }
                 "w:numPr" => parse_numpr(p, props),
                 "w:tabs" => parse_tab_stops(p, &mut props.tabs),
@@ -1050,10 +1197,19 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     p.skip_element();
                 }
                 "w:sectPr" => {
-                    // A mid-document section break — preserve it verbatim.
+                    // A mid-document section break. Its current properties stay
+                    // exact XML while a tracked prior snapshot is actionable.
                     let start = p.start_pos();
                     p.skip_element();
-                    props.section_break = Some(p.raw_slice(start, p.pos()).to_string());
+                    let raw = p.raw_slice(start, p.pos());
+                    let (current, change) =
+                        split_property_change_container(raw, PropertyScope::Section);
+                    props.section_break = Some(current);
+                    props.section_property_change = change;
+                }
+                "w:pPrChange" => {
+                    props.property_change =
+                        Some(parse_property_change(p, PropertyScope::Paragraph));
                 }
                 "w:framePr" => {
                     props.frame = Some(FramePr {
@@ -1213,13 +1369,50 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                 let start = p.start_pos();
                 let mut modeled = true;
                 match name {
-                    "w:b" | "w:bCs" => props.bold = toggle_on(val),
-                    "w:i" | "w:iCs" => props.italic = toggle_on(val),
-                    "w:u" => props.underline = toggle_on(val),
-                    "w:strike" | "w:dstrike" => props.strike = toggle_on(val),
-                    "w:caps" => props.caps = toggle_on(val),
-                    "w:smallCaps" => props.small_caps = toggle_on(val),
-                    "w:vanish" | "w:webHidden" => props.vanish = toggle_on(val),
+                    "w:b" => {
+                        props.bold = toggle_on(val);
+                        modeled = props.bold;
+                    }
+                    "w:bCs" => {
+                        props.bold = toggle_on(val);
+                        modeled = false;
+                    }
+                    "w:i" => {
+                        props.italic = toggle_on(val);
+                        modeled = props.italic;
+                    }
+                    "w:iCs" => {
+                        props.italic = toggle_on(val);
+                        modeled = false;
+                    }
+                    "w:u" => {
+                        props.underline = toggle_on(val);
+                        modeled = props.underline;
+                    }
+                    "w:strike" => {
+                        props.strike = toggle_on(val);
+                        modeled = props.strike;
+                    }
+                    "w:dstrike" => {
+                        props.strike = toggle_on(val);
+                        modeled = false;
+                    }
+                    "w:caps" => {
+                        props.caps = toggle_on(val);
+                        modeled = props.caps;
+                    }
+                    "w:smallCaps" => {
+                        props.small_caps = toggle_on(val);
+                        modeled = props.small_caps;
+                    }
+                    "w:vanish" => {
+                        props.vanish = toggle_on(val);
+                        modeled = props.vanish;
+                    }
+                    "w:webHidden" => {
+                        props.vanish = toggle_on(val);
+                        modeled = false;
+                    }
                     "w:vertAlign" => {
                         props.vert_align = match val {
                             "superscript" => VertAlign::Superscript,
@@ -1255,6 +1448,10 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                         if val.eq_ignore_ascii_case("Code") {
                             props.code = true;
                         }
+                    }
+                    "w:rPrChange" => {
+                        props.property_change = Some(parse_property_change(p, PropertyScope::Run));
+                        continue;
                     }
                     // `w:rStyle` with an empty val, or anything else we don't
                     // model, is preserved verbatim (character spacing, kern,
@@ -1458,7 +1655,11 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
                 "w:tblPr" => {
                     let start = p.start_pos();
                     p.skip_element();
-                    table.raw_tblpr = Some(p.raw_slice(start, p.pos()).to_string());
+                    let raw = p.raw_slice(start, p.pos());
+                    let (current, change) =
+                        split_property_change_container(raw, PropertyScope::Table);
+                    table.raw_tblpr = Some(current);
+                    table.property_change = change;
                 }
                 // Preserve unmodeled table children at the row gap where they
                 // occurred. Besides being lossless for extension markup, this
@@ -1717,7 +1918,13 @@ fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
 
 fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
     let mut row = Row::default();
-    parse_cells_into(p, rels, &mut row.cells, &mut row.raw_props);
+    parse_cells_into(
+        p,
+        rels,
+        &mut row.cells,
+        &mut row.raw_props,
+        &mut row.property_change,
+    );
     row
 }
 
@@ -1729,16 +1936,26 @@ fn parse_cells_into(
     rels: &Relationships,
     cells: &mut Vec<Cell>,
     raw: &mut Vec<String>,
+    property_change: &mut Option<PropertyChange>,
 ) {
     loop {
         match p.next() {
             Event::Start => match p.name() {
                 "w:tc" => cells.push(parse_cell(p, rels)),
-                "w:trPr" | "w:tblPrEx" => capture_element(p, raw),
+                "w:trPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    let property_xml = p.raw_slice(start, p.pos());
+                    let (current, change) =
+                        split_property_change_container(property_xml, PropertyScope::TableRow);
+                    raw.push(current);
+                    *property_change = change;
+                }
+                "w:tblPrEx" => capture_element(p, raw),
                 "w:sdt" => loop {
                     match p.next() {
                         Event::Start if p.name() == "w:sdtContent" => {
-                            parse_cells_into(p, rels, cells, raw)
+                            parse_cells_into(p, rels, cells, raw, property_change)
                         }
                         Event::Start => p.skip_element(),
                         Event::End | Event::Eof => break,
@@ -1765,9 +1982,13 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
                 "w:tcPr" => {
                     let start = p.start_pos();
                     let has_extra = parse_tcpr(p, &mut cell);
-                    if has_extra {
-                        cell.raw_tcpr = Some(p.raw_slice(start, p.pos()).to_string());
+                    let raw = p.raw_slice(start, p.pos());
+                    let (current, change) =
+                        split_property_change_container(raw, PropertyScope::TableCell);
+                    if has_extra || change.is_some() {
+                        cell.raw_tcpr = Some(current);
                     }
+                    cell.property_change = change;
                 }
                 "w:p" => cell.blocks.push(Block::Paragraph(parse_paragraph(p, rels))),
                 "w:tbl" => cell.blocks.push(Block::Table(parse_table(p, rels))),

@@ -47,8 +47,9 @@ pub struct RunProps {
     /// Character style id (`w:rStyle`).
     pub style_id: Option<String>,
     /// Verbatim XML of `w:rPr` children we don't model (character spacing
-    /// `w:spacing`/`w:kern`, `w:lang`, `w:shd`, `w:effect`, …), preserved so save
-    /// doesn't drop them. Re-emitted at the end of `w:rPr`.
+    /// `w:spacing`/`w:kern`, `w:lang`, `w:shd`, `w:effect`, …), plus explicit-off
+    /// toggles that must remain distinct from an absent/style-derived value.
+    /// Preserved children are re-emitted in schema order.
     pub raw_props: Vec<String>,
     /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
     /// current state; `previous` on the change retains the prior snapshot.
@@ -218,20 +219,57 @@ pub enum PropertyScope {
     Section,
 }
 
-/// The exact prior-property payload captured from a `*PrChange` record.
+/// The parsed prior-property payload captured from a `*PrChange` record.
 ///
-/// Task 2 parses `Present` snapshots into the scope's semantic properties. The
-/// raw container remains here even after that parse so malformed and unmodeled
-/// children can survive a clone and an untouched save.
+/// Run and paragraph properties use the same semantic types as their current
+/// owners. Table, row, cell, and section properties are not otherwise expanded
+/// by the editable model, so their scoped property container remains exact XML.
+/// In every case [`PropertyChange::raw`] retains the complete change wrapper,
+/// including producer-specific metadata and children.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PropertySnapshot {
-    /// A present prior property container such as `<w:rPr>...</w:rPr>`.
-    Present(String),
+    /// A present, structurally valid prior property container.
+    Present(PropertyState),
     /// The change record had no prior property container.
     #[default]
     Absent,
     /// Source intended to carry a snapshot but was structurally malformed.
     Malformed(String),
+}
+
+/// Scope-typed state held by [`PropertySnapshot::Present`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyState {
+    Run(Box<RunProps>),
+    Paragraph(Box<ParProps>),
+    Table(String),
+    TableRow(String),
+    TableCell(String),
+    Section(String),
+}
+
+impl PropertyState {
+    pub fn scope(&self) -> PropertyScope {
+        match self {
+            PropertyState::Run(_) => PropertyScope::Run,
+            PropertyState::Paragraph(_) => PropertyScope::Paragraph,
+            PropertyState::Table(_) => PropertyScope::Table,
+            PropertyState::TableRow(_) => PropertyScope::TableRow,
+            PropertyState::TableCell(_) => PropertyScope::TableCell,
+            PropertyState::Section(_) => PropertyScope::Section,
+        }
+    }
+
+    /// Exact XML for scopes whose current state is also stored as raw XML.
+    pub fn raw_xml(&self) -> Option<&str> {
+        match self {
+            PropertyState::Table(raw)
+            | PropertyState::TableRow(raw)
+            | PropertyState::TableCell(raw)
+            | PropertyState::Section(raw) => Some(raw),
+            PropertyState::Run(_) | PropertyState::Paragraph(_) => None,
+        }
+    }
 }
 
 /// A tracked property change attached to its current property owner.
@@ -356,8 +394,9 @@ pub struct ParProps {
     /// All-`None` means no `w:spacing` element is emitted.
     pub spacing: Spacing,
     /// Verbatim XML of `w:pPr` children we don't model (shading `w:shd`,
-    /// `w:keepNext`, `w:outlineLvl`, …), preserved so save doesn't
-    /// silently drop them. Re-emitted in `w:pPr` in document order.
+    /// `w:keepNext`, `w:outlineLvl`, …), plus explicit default/off values such as
+    /// direct-left `w:jc` and disabled `w:bidi`. Preserved so save does not
+    /// confuse a direct override with style inheritance.
     pub raw_props: Vec<String>,
     /// A tracked `w:pPrChange`; the remaining fields are the current state.
     pub property_change: Option<PropertyChange>,
@@ -1390,11 +1429,19 @@ mod tests {
     }
 
     fn property_change(scope: PropertyScope, prior: &str) -> Option<PropertyChange> {
+        let state = match scope {
+            PropertyScope::Run => PropertyState::Run(Box::default()),
+            PropertyScope::Paragraph => PropertyState::Paragraph(Box::default()),
+            PropertyScope::Table => PropertyState::Table(prior.to_string()),
+            PropertyScope::TableRow => PropertyState::TableRow(prior.to_string()),
+            PropertyScope::TableCell => PropertyState::TableCell(prior.to_string()),
+            PropertyScope::Section => PropertyState::Section(prior.to_string()),
+        };
         Some(PropertyChange {
             scope,
             metadata: RevisionMetadata::default(),
             raw: format!("<{scope:?}Change>{prior}</{scope:?}Change>"),
-            previous: PropertySnapshot::Present(prior.to_string()),
+            previous: PropertySnapshot::Present(state),
         })
     }
 

@@ -49,15 +49,15 @@ schema-valid OOXML.
 
 ### Task 2: Parse and serialize property-change semantics
 
-- [ ] parse `w:rPrChange`, `w:pPrChange`, `w:tblPrChange`, `w:trPrChange`,
+- [x] parse `w:rPrChange`, `w:pPrChange`, `w:tblPrChange`, `w:trPrChange`,
       `w:tcPrChange`, and `w:sectPrChange` into current/prior property state while
       retaining raw metadata not explicitly modeled
-- [ ] serialize untouched revisions losslessly and acted-on properties in legal
+- [x] serialize untouched revisions losslessly and acted-on properties in legal
       schema order without duplicating current or prior property children
-- [ ] cover boolean toggles, absent values, direct versus style-derived values,
+- [x] cover boolean toggles, absent values, direct versus style-derived values,
       raw unmodeled children, and malformed snapshots without panics
-- [ ] add parse-save-parse fixtures for all supported property scopes
-- [ ] run `cargo test -p docxcore` before Task 3
+- [x] add parse-save-parse fixtures for all supported property scopes
+- [x] run `cargo test -p docxcore` before Task 3
 
 ### Task 3: Implement pure accept/reject transforms
 
