@@ -80,15 +80,15 @@ Keep advisory write protection distinct from enforced restrictions.
 
 ### Task 4: Gate control and MCP mutations consistently
 
-- [ ] classify all mutating control verbs and apply the same policy before their
+- [x] classify all mutating control verbs and apply the same policy before their
       implementation runs; keep read-only verbs available
-- [ ] verify MCP-generated calls inherit those checks rather than maintaining a
+- [x] verify MCP-generated calls inherit those checks rather than maintaining a
       second policy table
-- [ ] standardize errors so automation can distinguish protection denial from
+- [x] standardize errors so automation can distinguish protection denial from
       invalid arguments or unsupported operations
-- [ ] add dispatch tests for each mutation class and prove rejected calls do not
+- [x] add dispatch tests for each mutation class and prove rejected calls do not
       alter the document or package
-- [ ] run `cargo test -p docxy` before Task 5
+- [x] run `cargo test -p docxy` before Task 5
 
 ### Task 5: Render terminal-safe watermark overlays
 

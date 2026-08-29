@@ -33,9 +33,6 @@ pub(crate) enum ProtectionDenial {
     UnsupportedMode(String),
 }
 
-// Denial rendering becomes production-reachable with the Task 3/4 route
-// adapters; Task 2 pins both forms in policy tests.
-#[allow(dead_code)]
 impl ProtectionDenial {
     /// Stable, machine-readable code for control and MCP callers.
     pub(crate) fn code(&self) -> &'static str {
