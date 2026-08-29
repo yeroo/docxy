@@ -1300,17 +1300,31 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
             Event::Start => match p.name() {
                 "w:tblGrid" => parse_tblgrid(p, &mut table.grid),
                 "w:tr" => table.rows.push(parse_row(p, rels)),
-                // A row-level content control (Repeating Section) wraps its
-                // `<w:tr>` rows in `<w:sdt><w:sdtContent>`. Unwrap it so the
-                // rows survive round-trip.
-                "w:sdt" => parse_sdt_rows(p, rels, &mut table.rows),
+                // Repeating sections and other row-level content controls keep
+                // their wrapper as invisible row-gap boundaries while their
+                // rows remain ordinary, editable model rows.
+                "w:sdt" => {
+                    if parse_sdt_rows(p, rels, &mut table) {
+                        break;
+                    }
+                }
                 // Whole table properties (borders/shading/width/style) preserved.
                 "w:tblPr" => {
                     let start = p.start_pos();
                     p.skip_element();
                     table.raw_tblpr = Some(p.raw_slice(start, p.pos()).to_string());
                 }
-                _ => p.skip_element(),
+                // Preserve unmodeled table children at the row gap where they
+                // occurred. Besides being lossless for extension markup, this
+                // is also the recovery path for unknown children around SDTs.
+                _ => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    table.row_boundaries.push(TableRowBoundary::raw(
+                        table.rows.len(),
+                        p.raw_slice(start, p.pos()),
+                    ));
+                }
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -1319,27 +1333,159 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
     table
 }
 
-/// Unwrap a row-level content control (`<w:sdt>` wrapping `<w:tr>` rows — a
-/// "Repeating Section") into `rows`. The `Table` model has no Raw-boundary
-/// facility for rows the way blocks do, so the control wrapper itself isn't
-/// preserved — but the row data (the important content) always is, rather than
-/// being dropped as an unrecognized element.
-fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, rows: &mut Vec<Row>) {
+/// Parse a row-level content control (`<w:sdt>` wrapping `<w:tr>` rows, such as
+/// a Repeating Section) into visible rows plus lossless wrapper boundaries.
+///
+/// The opening boundary is the exact source from `<w:sdt...>` through the
+/// `<w:sdtContent...>` start tag, so `w:sdtPr`, `w:sdtEndPr`, extension
+/// elements, attributes, and their order are retained. The closing boundary is
+/// the exact `</w:sdtContent>` through `</w:sdt>` suffix. Unknown children in
+/// the content are raw boundaries at their current row gap, and recursive calls
+/// preserve nested controls in the same ordered sequence.
+///
+/// Returns `true` when recovery consumed the enclosing table end or reached
+/// EOF. Truncated controls get an empty close boundary when no closing source
+/// exists; that keeps the model structurally balanced without inventing XML and
+/// lets the serializer's validation layer decide how to normalize it.
+fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) -> bool {
+    let sdt_start = p.start_pos();
+    let mut opened = false;
+    let mut in_content = false;
+    // Start of a suffix not yet captured. Normally this is the `<` of
+    // `</w:sdtContent>` and remains pending until the outer `</w:sdt>`.
+    let mut tail_start = None;
+
     loop {
+        let event_start = p.pos();
         match p.next() {
-            Event::Start if p.name() == "w:sdtContent" => loop {
-                match p.next() {
-                    Event::Start => match p.name() {
-                        "w:tr" => rows.push(parse_row(p, rels)),
-                        "w:sdt" => parse_sdt_rows(p, rels, rows), // nested section
-                        _ => p.skip_element(),
-                    },
-                    Event::End | Event::Eof => break,
-                    Event::Text => {}
+            Event::Start if !opened && p.name() == "w:sdtContent" => {
+                table.row_boundaries.push(TableRowBoundary::sdt_open(
+                    table.rows.len(),
+                    p.raw_slice(sdt_start, p.pos()),
+                ));
+                opened = true;
+                in_content = true;
+            }
+            // A row or nested SDT directly under w:sdt is malformed (the
+            // w:sdtContent wrapper is absent), but keeping it visible is safer
+            // than dropping user content. The raw prefix records the defect.
+            Event::Start if !opened && (p.name() == "w:tr" || p.name() == "w:sdt") => {
+                table.row_boundaries.push(TableRowBoundary::sdt_open(
+                    table.rows.len(),
+                    p.raw_slice(sdt_start, event_start),
+                ));
+                opened = true;
+                in_content = true;
+                if p.name() == "w:tr" {
+                    table.rows.push(parse_row(p, rels));
+                } else if parse_sdt_rows(p, rels, table) {
+                    table
+                        .row_boundaries
+                        .push(TableRowBoundary::sdt_close(table.rows.len(), ""));
+                    return true;
+                }
+            }
+            Event::Start if !opened => {
+                // Properties and unknown pre-content children are included in
+                // the eventual open boundary. If no content exists, the whole
+                // control is retained as one opaque raw boundary below.
+                p.skip_element();
+            }
+            Event::Start if in_content => match p.name() {
+                "w:tr" => table.rows.push(parse_row(p, rels)),
+                "w:sdt" => {
+                    if parse_sdt_rows(p, rels, table) {
+                        table
+                            .row_boundaries
+                            .push(TableRowBoundary::sdt_close(table.rows.len(), ""));
+                        return true;
+                    }
+                }
+                _ => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    table.row_boundaries.push(TableRowBoundary::raw(
+                        table.rows.len(),
+                        p.raw_slice(start, p.pos()),
+                    ));
                 }
             },
-            Event::Start => p.skip_element(), // w:sdtPr, w:sdtEndPr
-            Event::End | Event::Eof => break,
+            Event::Start => {
+                // A visible child after </w:sdtContent> is invalid but should
+                // not disappear. Flush the pending suffix as raw metadata, then
+                // retain rows/nested controls while waiting for </w:sdt>.
+                if p.name() == "w:tr" || p.name() == "w:sdt" {
+                    if let Some(start) = tail_start.take() {
+                        table.row_boundaries.push(TableRowBoundary::raw(
+                            table.rows.len(),
+                            p.raw_slice(start, event_start),
+                        ));
+                    }
+                    if p.name() == "w:tr" {
+                        table.rows.push(parse_row(p, rels));
+                    } else if parse_sdt_rows(p, rels, table) {
+                        table
+                            .row_boundaries
+                            .push(TableRowBoundary::sdt_close(table.rows.len(), ""));
+                        return true;
+                    }
+                } else {
+                    tail_start.get_or_insert(event_start);
+                    p.skip_element();
+                }
+            }
+            Event::End if p.name() == "w:sdtContent" && opened && in_content => {
+                in_content = false;
+                tail_start = Some(event_start);
+            }
+            Event::End if p.name() == "w:sdt" => {
+                if opened {
+                    let start = tail_start.unwrap_or(event_start);
+                    table.row_boundaries.push(TableRowBoundary::sdt_close(
+                        table.rows.len(),
+                        p.raw_slice(start, p.pos()),
+                    ));
+                } else {
+                    table.row_boundaries.push(TableRowBoundary::raw(
+                        table.rows.len(),
+                        p.raw_slice(sdt_start, p.pos()),
+                    ));
+                }
+                return false;
+            }
+            Event::End if p.name() == "w:tbl" => {
+                if opened {
+                    let raw = tail_start
+                        .map(|start| p.raw_slice(start, event_start))
+                        .unwrap_or("");
+                    table
+                        .row_boundaries
+                        .push(TableRowBoundary::sdt_close(table.rows.len(), raw));
+                } else {
+                    table.row_boundaries.push(TableRowBoundary::raw(
+                        table.rows.len(),
+                        p.raw_slice(sdt_start, event_start),
+                    ));
+                }
+                return true;
+            }
+            Event::End => {}
+            Event::Eof => {
+                if opened {
+                    let raw = tail_start
+                        .map(|start| p.raw_slice(start, p.pos()))
+                        .unwrap_or("");
+                    table
+                        .row_boundaries
+                        .push(TableRowBoundary::sdt_close(table.rows.len(), raw));
+                } else {
+                    table.row_boundaries.push(TableRowBoundary::raw(
+                        table.rows.len(),
+                        p.raw_slice(sdt_start, p.pos()),
+                    ));
+                }
+                return true;
+            }
             Event::Text => {}
         }
     }
@@ -1955,27 +2101,175 @@ mod tests {
         assert!(out.contains("<w:sdtContent>"), "inline sdtContent lost");
     }
 
-    #[test]
-    fn row_level_content_control_keeps_rows() {
-        // A Repeating Section wraps table rows in <w:sdt><w:sdtContent>. The rows
-        // must survive rather than being dropped as an unknown element.
-        let xml = "<w:document><w:body><w:tbl>\
-                   <w:tblGrid><w:gridCol w:w=\"100\"/></w:tblGrid>\
-                   <w:tr><w:tc><w:p><w:r><w:t>plain</w:t></w:r></w:p></w:tc></w:tr>\
-                   <w:sdt><w:sdtPr><w:alias w:val=\"Repeat\"/></w:sdtPr><w:sdtContent>\
-                   <w:tr><w:tc><w:p><w:r><w:t>r1</w:t></w:r></w:p></w:tc></w:tr>\
-                   <w:tr><w:tc><w:p><w:r><w:t>r2</w:t></w:r></w:p></w:tc></w:tr>\
-                   </w:sdtContent></w:sdt>\
-                   </w:tbl></w:body></w:document>";
-        let d = doc(xml);
-        let t = match &d.body[0] {
+    fn first_table(d: &Document) -> &Table {
+        match &d.body[0] {
             Block::Table(t) => t,
             _ => panic!("expected table"),
-        };
-        assert_eq!(t.rows.len(), 3, "rows inside the sdt were dropped");
-        assert_eq!(t.rows[0].cells[0].blocks[0].plain_text(), "plain");
-        assert_eq!(t.rows[1].cells[0].blocks[0].plain_text(), "r1");
-        assert_eq!(t.rows[2].cells[0].blocks[0].plain_text(), "r2");
+        }
+    }
+
+    fn xml_row(text: &str) -> String {
+        format!("<w:tr><w:tc><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:tc></w:tr>")
+    }
+
+    fn table_document(children: &str) -> String {
+        format!("<w:document><w:body><w:tbl>{children}</w:tbl></w:body></w:document>")
+    }
+
+    #[test]
+    fn row_level_control_keeps_visible_rows_and_exact_wrapper_metadata() {
+        let open = "<w:sdt data-origin=\"fixture\"><w:sdtPr><w:alias w:val=\"Repeat\"/><w:tag w:val=\"orders\"/></w:sdtPr><w:sdtEndPr><w:rPr><w:b/></w:rPr></w:sdtEndPr><w:sdtContent>";
+        let unknown =
+            "<w:customXml w:uri=\"urn:fixture\"><w:payload w:val=\"kept\"/></w:customXml>";
+        let close = "</w:sdtContent><w:future w:val=\"tail\"/></w:sdt>";
+        let xml = table_document(&format!(
+            "{}{}{}{}{}{}",
+            xml_row("plain"),
+            open,
+            xml_row("r1"),
+            unknown,
+            xml_row("r2"),
+            close
+        ));
+
+        let d = doc(&xml);
+        let table = first_table(&d);
+        assert_eq!(table.rows.len(), 3, "rows inside the sdt were dropped");
+        assert_eq!(table.rows[0].cells[0].blocks[0].plain_text(), "plain");
+        assert_eq!(table.rows[1].cells[0].blocks[0].plain_text(), "r1");
+        assert_eq!(table.rows[2].cells[0].blocks[0].plain_text(), "r2");
+        assert_eq!(
+            table.row_boundaries,
+            vec![
+                TableRowBoundary::sdt_open(1, open),
+                TableRowBoundary::raw(2, unknown),
+                TableRowBoundary::sdt_close(3, close),
+            ]
+        );
+        assert_eq!(
+            table.row_control_owners(),
+            Ok(vec![vec![], vec![0], vec![0]])
+        );
+    }
+
+    #[test]
+    fn nested_and_adjacent_row_controls_keep_order_and_ownership() {
+        let outer_open = "<w:sdt><w:sdtPr><w:alias w:val=\"outer\"/></w:sdtPr><w:sdtContent>";
+        let inner_open = "<w:sdt><w:sdtPr><w:alias w:val=\"inner\"/></w:sdtPr><w:sdtContent>";
+        let adjacent_open = "<w:sdt><w:sdtPr><w:alias w:val=\"adjacent\"/></w:sdtPr><w:sdtContent>";
+        let close = "</w:sdtContent></w:sdt>";
+        let xml = table_document(&format!(
+            "{outer_open}{}{inner_open}{}{close}{close}{adjacent_open}{}{close}",
+            xml_row("outer"),
+            xml_row("inner"),
+            xml_row("adjacent")
+        ));
+
+        let d = doc(&xml);
+        let table = first_table(&d);
+        assert_eq!(
+            table
+                .rows
+                .iter()
+                .map(|row| row.cells[0].blocks[0].plain_text())
+                .collect::<Vec<_>>(),
+            vec!["outer", "inner", "adjacent"]
+        );
+        assert_eq!(
+            table.row_boundaries,
+            vec![
+                TableRowBoundary::sdt_open(0, outer_open),
+                TableRowBoundary::sdt_open(1, inner_open),
+                TableRowBoundary::sdt_close(2, close),
+                TableRowBoundary::sdt_close(2, close),
+                TableRowBoundary::sdt_open(2, adjacent_open),
+                TableRowBoundary::sdt_close(3, close),
+            ]
+        );
+        assert_eq!(
+            table.row_control_owners(),
+            Ok(vec![vec![0], vec![0, 1], vec![4]])
+        );
+    }
+
+    #[test]
+    fn empty_row_controls_are_boundaries_without_visible_rows() {
+        let empty_open = "<w:sdt><w:sdtPr><w:alias w:val=\"empty\"/></w:sdtPr><w:sdtContent>";
+        let empty_close = "</w:sdtContent></w:sdt>";
+        let self_closing_open = "<w:sdt><w:sdtContent/>";
+        let self_closing_close = "</w:sdt>";
+        let xml = table_document(&format!(
+            "{empty_open}{empty_close}{self_closing_open}{self_closing_close}{}",
+            xml_row("after")
+        ));
+
+        let d = doc(&xml);
+        let table = first_table(&d);
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0].cells[0].blocks[0].plain_text(), "after");
+        assert_eq!(
+            table.row_boundaries,
+            vec![
+                TableRowBoundary::sdt_open(0, empty_open),
+                TableRowBoundary::sdt_close(0, empty_close),
+                TableRowBoundary::sdt_open(0, self_closing_open),
+                TableRowBoundary::sdt_close(0, self_closing_close),
+            ]
+        );
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![]]));
+    }
+
+    #[test]
+    fn malformed_and_truncated_row_controls_do_not_lose_rows() {
+        // Missing w:sdtContent: recover direct rows as controlled content and
+        // retain the exact malformed prefix rather than skipping the row.
+        let malformed_open = "<w:sdt><w:sdtPr><w:alias w:val=\"missing-content\"/></w:sdtPr>";
+        let malformed_xml = table_document(&format!(
+            "{malformed_open}{}</w:sdt>{}",
+            xml_row("recovered"),
+            xml_row("after")
+        ));
+        let malformed_doc = doc(&malformed_xml);
+        let malformed = first_table(&malformed_doc);
+        assert_eq!(malformed.rows.len(), 2);
+        assert_eq!(
+            malformed.rows[0].cells[0].blocks[0].plain_text(),
+            "recovered"
+        );
+        assert_eq!(malformed.rows[1].cells[0].blocks[0].plain_text(), "after");
+        assert_eq!(
+            malformed.row_boundaries,
+            vec![
+                TableRowBoundary::sdt_open(0, malformed_open),
+                TableRowBoundary::sdt_close(1, "</w:sdt>"),
+            ]
+        );
+        assert!(malformed.validate_row_boundaries().is_ok());
+
+        // EOF after a valid row: keep the row and use an empty raw close event
+        // to express that the source wrapper was truncated without inventing
+        // closing XML in the loader.
+        let truncated_open =
+            "<w:sdt><w:sdtPr><w:alias w:val=\"truncated\"/></w:sdtPr><w:sdtContent>";
+        let truncated_xml = format!(
+            "<w:document><w:body><w:tbl>{truncated_open}{}",
+            xml_row("still visible")
+        );
+        let truncated_doc = doc(&truncated_xml);
+        let truncated = first_table(&truncated_doc);
+        assert_eq!(truncated.rows.len(), 1);
+        assert_eq!(
+            truncated.rows[0].cells[0].blocks[0].plain_text(),
+            "still visible"
+        );
+        assert_eq!(
+            truncated.row_boundaries,
+            vec![
+                TableRowBoundary::sdt_open(0, truncated_open),
+                TableRowBoundary::sdt_close(1, ""),
+            ]
+        );
+        assert!(truncated.validate_row_boundaries().is_ok());
     }
 
     #[test]

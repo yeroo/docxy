@@ -46,16 +46,16 @@ the rows and discards `w:sdtPr`, `w:sdtEndPr`, nesting, and empty controls.
 
 ### Task 2: Parse row-level controls losslessly
 
-- [ ] replace the flattening `parse_sdt_rows` path with parsing that captures
+- [x] replace the flattening `parse_sdt_rows` path with parsing that captures
       `w:sdtPr`, `w:sdtEndPr`, wrapper boundaries, unknown children, and content
       in original document order
-- [ ] retain normally parsed `w:tr` rows inside the captured boundaries so they
+- [x] retain normally parsed `w:tr` rows inside the captured boundaries so they
       stay visible and editable
-- [ ] handle nested, adjacent, empty, and malformed/truncated controls without a
+- [x] handle nested, adjacent, empty, and malformed/truncated controls without a
       panic or accidental row loss
-- [ ] add loader fixtures asserting both visible row data and exact wrapper
+- [x] add loader fixtures asserting both visible row data and exact wrapper
       metadata for all boundary cases
-- [ ] run `cargo test -p docxcore` before Task 3
+- [x] run `cargo test -p docxcore` before Task 3
 
 ### Task 3: Serialize balanced schema-valid table children
 
