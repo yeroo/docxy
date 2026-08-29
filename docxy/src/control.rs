@@ -1672,6 +1672,150 @@ mod tests {
     }
 
     #[test]
+    fn package_fixtures_drive_control_policy_errors_and_denial_invariants() {
+        use crate::test_fixtures::ProtectionFixture;
+
+        let cases = [
+            (ProtectionFixture::Unrestricted, None, None, None),
+            (
+                ProtectionFixture::ReadOnly,
+                Some("read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+            ),
+            (
+                ProtectionFixture::Comments,
+                Some("comments only"),
+                Some("protection_denied:comments_only: only comment edits are allowed"),
+                Some("protection_denied:comments_only: only comment edits are allowed"),
+            ),
+            (
+                ProtectionFixture::Forms,
+                Some("form fields only"),
+                Some(
+                    "protection_denied:forms_unsupported: form-fields-only editing is not supported; use Word to edit form fields",
+                ),
+                Some(
+                    "protection_denied:forms_unsupported: form-fields-only editing is not supported; use Word to edit form fields",
+                ),
+            ),
+            (
+                ProtectionFixture::TrackedChanges,
+                Some("tracked changes only"),
+                Some(
+                    "protection_denied:tracked_changes_unsupported: tracked-only editing is not supported; use Word to create tracked changes",
+                ),
+                Some(
+                    "protection_denied:tracked_changes_unsupported: tracked-only editing is not supported; use Word to create tracked changes",
+                ),
+            ),
+            (
+                ProtectionFixture::FormattingOnly,
+                Some("formatting locked"),
+                None,
+                Some("protection_denied:formatting_locked: document formatting is locked"),
+            ),
+            (
+                ProtectionFixture::Advisory,
+                Some("read-only (recommended)"),
+                None,
+                None,
+            ),
+        ];
+
+        for (fixture, expected_label, structure_error, formatting_error) in cases {
+            let mut path_app = App::new(
+                fixture.package(),
+                &format!("{}.docx", fixture.name()),
+                false,
+            );
+            let path = dispatch(&mut path_app, "doc.path", &Json::Null).unwrap();
+            assert_eq!(path.get_str("protection"), expected_label, "{fixture:?}");
+
+            let mut structure = App::new(
+                fixture.package(),
+                &format!("{}.docx", fixture.name()),
+                false,
+            );
+            structure.dirty = false;
+            let structure_document = structure.editor.doc.clone();
+            let structure_caret = structure.editor.caret.clone();
+            let structure_package = package_snapshot(&structure);
+            let structure_result = dispatch(
+                &mut structure,
+                "doc.append",
+                &args(vec![("text", Json::Str("control append".into()))]),
+            );
+            match structure_error {
+                Some(expected) => {
+                    assert_eq!(structure_result.unwrap_err(), expected, "{fixture:?}");
+                    assert_eq!(structure.editor.doc, structure_document, "{fixture:?}");
+                    assert_eq!(structure.editor.caret, structure_caret, "{fixture:?}");
+                    assert_eq!(
+                        package_snapshot(&structure),
+                        structure_package,
+                        "{fixture:?}"
+                    );
+                    assert!(!structure.modified, "{fixture:?}");
+                    assert!(!structure.dirty, "{fixture:?}");
+                    structure.doc_protection = Default::default();
+                    assert!(
+                        !structure.editor.undo(),
+                        "{fixture:?} denial pushed history"
+                    );
+                }
+                None => {
+                    structure_result.unwrap();
+                    assert_eq!(paras(&structure), vec!["Fixture body", "control append"]);
+                    assert!(structure.modified, "{fixture:?}");
+                    assert!(structure.dirty, "{fixture:?}");
+                }
+            }
+
+            let mut formatting = App::new(
+                fixture.package(),
+                &format!("{}.docx", fixture.name()),
+                false,
+            );
+            formatting.dirty = false;
+            let formatting_document = formatting.editor.doc.clone();
+            let formatting_package = package_snapshot(&formatting);
+            let formatting_result = dispatch(
+                &mut formatting,
+                "doc.format",
+                &args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+                ]),
+            );
+            match formatting_error {
+                Some(expected) => {
+                    assert_eq!(formatting_result.unwrap_err(), expected, "{fixture:?}");
+                    assert_eq!(formatting.editor.doc, formatting_document, "{fixture:?}");
+                    assert_eq!(
+                        package_snapshot(&formatting),
+                        formatting_package,
+                        "{fixture:?}"
+                    );
+                    assert!(!formatting.modified, "{fixture:?}");
+                    assert!(!formatting.dirty, "{fixture:?}");
+                    formatting.doc_protection = Default::default();
+                    assert!(
+                        !formatting.editor.undo(),
+                        "{fixture:?} denial pushed history"
+                    );
+                }
+                None => {
+                    formatting_result.unwrap();
+                    assert_eq!(run_bold_flags(&formatting, 0), vec![true]);
+                    assert!(formatting.modified, "{fixture:?}");
+                    assert!(formatting.dirty, "{fixture:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn dispatch_errors_keep_protection_argument_and_unsupported_failures_distinct() {
         let mut protected = app_with(&["A"]);
         protect(&mut protected, ProtectionEditMode::ReadOnly, false);

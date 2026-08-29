@@ -18,6 +18,8 @@ mod metafile;
 mod protection;
 mod ribbon;
 mod skill;
+#[cfg(test)]
+mod test_fixtures;
 mod watermark;
 
 use std::collections::HashMap;
@@ -6558,6 +6560,76 @@ mod tests {
     }
 
     #[test]
+    fn package_watermark_fixtures_drive_overlay_state_and_sandboxed_capture() {
+        use crate::test_fixtures::WatermarkFixture;
+
+        let mut text = App::new(
+            WatermarkFixture::Text.package(),
+            "text-watermark.docx",
+            false,
+        );
+        text.os_clip = None;
+        text.page_view = true;
+        text.light_page = true;
+        text.dirty = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        terminal.draw(|frame| text.draw(frame)).unwrap();
+        let capture = format!("{:?}", terminal.backend().buffer());
+
+        assert!(capture.contains("[Watermark: CONFIDENTIAL & REVIEW]"));
+        assert!(capture.contains("Fixture body"));
+        assert_eq!(text.watermark_overlays.len(), 1);
+        assert!(
+            text.lines
+                .iter()
+                .all(|line| !line.plain().contains("CONFIDENTIAL & REVIEW"))
+        );
+        text.editor.select_all();
+        text.do_copy();
+        assert_eq!(text.clip_text.as_deref(), Some("Fixture body"));
+
+        // The TestBackend capture is deterministic and sandboxed under target;
+        // it gives manual evidence without OCR or a golden-image dependency.
+        let artifact_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-artifacts/docxy");
+        std::fs::create_dir_all(&artifact_dir).expect("create watermark artifact directory");
+        let artifact = artifact_dir.join("watermark-page-view.txt");
+        std::fs::write(&artifact, &capture).expect("write watermark page-view capture");
+        eprintln!("wrote {}", artifact.display());
+
+        let mut picture = App::new(
+            WatermarkFixture::Picture.package(),
+            "picture-watermark.docx",
+            false,
+        );
+        picture.page_view = true;
+        picture.dirty = true;
+        picture.ensure_rendered(99);
+        assert_eq!(picture.watermark_overlays.len(), 1);
+        assert!(
+            picture.watermark_overlays[0]
+                .text
+                .contains("picture preview unavailable")
+        );
+
+        let mut inherited = App::new(
+            WatermarkFixture::InheritedText.package(),
+            "inherited-watermark.docx",
+            false,
+        );
+        inherited.page_view = true;
+        inherited.dirty = true;
+        inherited.ensure_rendered(99);
+        assert_eq!(inherited.watermark_overlays.len(), 2);
+        assert!(
+            inherited
+                .watermark_overlays
+                .iter()
+                .all(|overlay| overlay.text.contains("INHERITED DRAFT"))
+        );
+    }
+
+    #[test]
     fn doc_notice_reports_surfaced_features() {
         let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
         let mut app = App::new(new_package(Document { body }), "a.docx", false);
@@ -6746,6 +6818,24 @@ mod tests {
         app
     }
 
+    fn fixture_app(fixture: crate::test_fixtures::ProtectionFixture) -> App {
+        let mut app = App::new(
+            fixture.package(),
+            &format!("{}.docx", fixture.name()),
+            false,
+        );
+        app.os_clip = None;
+        app
+    }
+
+    fn fixture_package_snapshot(app: &App) -> Vec<(String, Vec<u8>)> {
+        app.pkg
+            .part_names()
+            .into_iter()
+            .map(|name| (name.to_string(), app.pkg.part(name).unwrap().to_vec()))
+            .collect()
+    }
+
     fn protect(app: &mut App, mode: ProtectionEditMode, formatting_locked: bool) {
         app.doc_protection = Protection {
             enforcement: ProtectionEnforcement::Enforced,
@@ -6801,6 +6891,151 @@ mod tests {
         clean.on_key(key(KeyCode::Enter));
         unprotect(&mut clean);
         assert!(!clean.editor.undo(), "denial pushed an undo checkpoint");
+    }
+
+    #[test]
+    fn protection_package_fixtures_drive_tui_policy_status_and_history() {
+        use crate::test_fixtures::ProtectionFixture;
+
+        let denied = [
+            (
+                ProtectionFixture::ReadOnly,
+                "Edit blocked: the document is protected read-only.",
+            ),
+            (
+                ProtectionFixture::Forms,
+                "Edit blocked: form-fields-only editing is not supported; use Word to edit form fields.",
+            ),
+            (
+                ProtectionFixture::TrackedChanges,
+                "Edit blocked: tracked-only editing is not supported; use Word to create tracked changes.",
+            ),
+        ];
+        for (fixture, expected_status) in denied {
+            let mut app = fixture_app(fixture);
+            let fixture_protection = app.doc_protection.clone();
+
+            // Seed a redo entry while temporarily unrestricted. The fixture's
+            // denied attempt must neither push history nor clear that entry.
+            app.doc_protection = Protection::default();
+            app.editor.move_end();
+            app.on_key(key(KeyCode::Char('!')));
+            app.on_key(ctrl(KeyCode::Char('z')));
+            app.doc_protection = fixture_protection;
+            app.modified = false;
+            app.dirty = false;
+            app.status = None;
+
+            let document = app.editor.doc.clone();
+            let caret = app.editor.caret.clone();
+            let package = fixture_package_snapshot(&app);
+            app.on_key(key(KeyCode::Char('X')));
+
+            assert_eq!(app.editor.doc, document, "{fixture:?}");
+            assert_eq!(app.editor.caret, caret, "{fixture:?}");
+            assert_eq!(fixture_package_snapshot(&app), package, "{fixture:?}");
+            assert!(!app.modified, "{fixture:?} changed save state");
+            assert!(!app.dirty, "{fixture:?} dirtied layout state");
+            assert_eq!(app.status.as_deref(), Some(expected_status));
+
+            app.doc_protection = Protection::default();
+            assert!(app.editor.redo(), "{fixture:?} cleared pending redo");
+        }
+
+        let mut comments = fixture_app(ProtectionFixture::Comments);
+        comments.editor.select_all();
+        comments.run_act(ribbon::Act::NewComment);
+        for c in "fixture note".chars() {
+            comments.on_key(key(KeyCode::Char(c)));
+        }
+        comments.on_key(key(KeyCode::Enter));
+        assert_eq!(comments.comments.len(), 1);
+        assert!(comments.pkg.part("word/comments.xml").is_some());
+        comments.modified = false;
+        comments.dirty = false;
+        let commented = comments.editor.doc.clone();
+        comments.on_key(key(KeyCode::Char('X')));
+        assert_eq!(comments.editor.doc, commented);
+        assert!(!comments.modified);
+        assert!(!comments.dirty);
+        assert_eq!(
+            comments.status.as_deref(),
+            Some("Edit blocked: only comment edits are allowed.")
+        );
+
+        let mut formatting = fixture_app(ProtectionFixture::FormattingOnly);
+        formatting.editor.select_all();
+        formatting.dirty = false;
+        let unformatted = formatting.editor.doc.clone();
+        formatting.on_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(formatting.editor.doc, unformatted);
+        assert!(!formatting.modified);
+        assert!(!formatting.dirty);
+        assert_eq!(
+            formatting.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+        let mut formatting_content = fixture_app(ProtectionFixture::FormattingOnly);
+        formatting_content.editor.move_end();
+        formatting_content.on_key(key(KeyCode::Char('!')));
+        assert_eq!(first_line(&formatting_content), "Fixture body!");
+        assert!(formatting_content.modified);
+
+        for fixture in [ProtectionFixture::Unrestricted, ProtectionFixture::Advisory] {
+            let mut app = fixture_app(fixture);
+            if fixture == ProtectionFixture::Advisory {
+                assert!(
+                    app.doc_notice()
+                        .contains("Protected: read-only (recommended)")
+                );
+            }
+            app.editor.move_end();
+            app.on_key(key(KeyCode::Char('!')));
+            assert_eq!(first_line(&app), "Fixture body!", "{fixture:?}");
+            assert!(app.modified, "{fixture:?}");
+        }
+    }
+
+    #[test]
+    fn tui_save_preserves_protection_and_watermark_fixture_metadata() {
+        use crate::test_fixtures::{ProtectionFixture, WatermarkFixture};
+
+        let fixtures = ProtectionFixture::ALL
+            .into_iter()
+            .map(|fixture| (fixture.name(), fixture.package()))
+            .chain(
+                WatermarkFixture::ALL
+                    .into_iter()
+                    .map(|fixture| (fixture.name(), fixture.package())),
+            );
+        for (name, package) in fixtures {
+            let expected_protection = package.protection();
+            let expected_watermarks = package.watermarks();
+            let preserved = package
+                .part_names()
+                .into_iter()
+                .filter(|part| *part != "word/document.xml")
+                .map(|part| (part.to_string(), package.part(part).unwrap().to_vec()))
+                .collect::<Vec<_>>();
+            let path =
+                std::env::temp_dir().join(format!("docxy-{name}-{}-save.docx", std::process::id()));
+            let mut app = App::new(package, &path.to_string_lossy(), false);
+            app.save();
+            assert!(!app.modified, "{name}");
+
+            let bytes = std::fs::read(&path).expect("read saved fixture");
+            std::fs::remove_file(&path).expect("remove saved fixture");
+            let reloaded = load_package(&bytes).expect("reload TUI-saved fixture");
+            assert_eq!(reloaded.protection(), expected_protection, "{name}");
+            assert_eq!(reloaded.watermarks(), expected_watermarks, "{name}");
+            for (part, expected) in &preserved {
+                assert_eq!(
+                    reloaded.part(part),
+                    Some(expected.as_slice()),
+                    "{name}:{part}"
+                );
+            }
+        }
     }
 
     #[test]

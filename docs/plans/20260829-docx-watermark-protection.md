@@ -106,13 +106,13 @@ Keep advisory write protection distinct from enforced restrictions.
 
 ### Task 6: Verify end-to-end behavior
 
-- [ ] add package fixtures for all protection modes, advisory protection, text
+- [x] add package fixtures for all protection modes, advisory protection, text
       watermark, picture watermark, and section header inheritance
-- [ ] exercise TUI and control attempts against fixtures and verify allowed/denied
+- [x] exercise TUI and control attempts against fixtures and verify allowed/denied
       behavior, history invariants, status/errors, overlay state, and lossless save
-- [ ] capture a sandboxed page-view watermark fixture when the existing UI
+- [x] capture a sandboxed page-view watermark fixture when the existing UI
       harness can do so without OCR/golden-image expansion
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --check`, and `git diff --check`
 
 ### Task 7: [Final] Document guarantees and limitations
