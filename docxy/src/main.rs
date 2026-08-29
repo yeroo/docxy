@@ -955,8 +955,8 @@ impl App {
                 .unwrap_or_default(),
         };
         docxcore::field::recompute(&mut pkg.document, &field_ctx);
-        let doc_protection = pkg.protection();
-        let doc_watermark = pkg.watermark();
+        let doc_protection = pkg.protection_label().map(str::to_owned);
+        let doc_watermark = pkg.watermark_label();
         let doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         App {
@@ -1796,8 +1796,8 @@ impl App {
         self.comments_scroll = 0;
         self.comment_sel = 0;
         self.comment_active = false;
-        self.doc_protection = pkg.protection();
-        self.doc_watermark = pkg.watermark();
+        self.doc_protection = pkg.protection_label().map(str::to_owned);
+        self.doc_watermark = pkg.watermark_label();
         self.doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         self.pkg = pkg;

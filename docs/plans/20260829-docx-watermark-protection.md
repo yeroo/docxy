@@ -40,18 +40,18 @@ Keep advisory write protection distinct from enforced restrictions.
 
 ### Task 1: Model protection and watermark metadata structurally
 
-- [ ] replace the string-only protection accessor with enums/structs covering
+- [x] replace the string-only protection accessor with enums/structs covering
       enforcement, edit mode, formatting lock, advisory write protection, and
       the source metadata needed for user-facing explanations
-- [ ] represent text versus picture/unknown watermarks and associate header
+- [x] represent text versus picture/unknown watermarks and associate header
       metadata with the sections/pages it applies to when package relationships
       make that available
-- [ ] keep a compatibility label helper for status text rather than making UI
+- [x] keep a compatibility label helper for status text rather than making UI
       strings the policy API
-- [ ] test boolean lexical forms, absent/disabled enforcement, every edit mode,
+- [x] test boolean lexical forms, absent/disabled enforcement, every edit mode,
       formatting-only, advisory protection, text entity decoding, and picture
       fallback detection
-- [ ] run `cargo test -p docxcore` before Task 2
+- [x] run `cargo test -p docxcore` before Task 2
 
 ### Task 2: Define one mutation authorization policy
 
@@ -124,4 +124,3 @@ Keep advisory write protection distinct from enforced restrictions.
       on tracked-change and form-field editing in this plan
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*
-

@@ -670,11 +670,11 @@ impl Session {
         out.push_str(&self.editor.doc.body.len().to_string());
         out.push_str(",\"modified\":");
         out.push_str(if self.dirty { "true" } else { "false" });
-        if let Some(p) = self.pkg.protection() {
+        if let Some(p) = self.pkg.protection_label() {
             out.push_str(",\"protection\":");
-            json::push_str(&mut out, &p);
+            json::push_str(&mut out, p);
         }
-        if let Some(w) = self.pkg.watermark() {
+        if let Some(w) = self.pkg.watermark_label() {
             out.push_str(",\"watermark\":");
             json::push_str(&mut out, &w);
         }

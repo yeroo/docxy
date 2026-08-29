@@ -15,32 +15,303 @@
 use crate::load::{LoadError, parse_document_xml, parse_rels_xml};
 use crate::model::Document;
 use crate::serialize::document_to_xml;
+use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
 use crate::zipwrite::write_zip;
 
 const OLE2: [u8; 8] = [0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1];
 
-/// Read the value of attribute `attr` (given as `name="`) on the first `elem`
-/// element (given as its opening `<w:tag` prefix). Scoped to that one tag so an
-/// attribute of a later element can't be picked up by mistake.
-fn attr_in(hay: &str, elem: &str, attr: &str) -> Option<String> {
-    let start = hay.find(elem)?;
-    let tag = &hay[start..];
-    let end = tag.find('>').unwrap_or(tag.len());
-    let tag = &tag[..end];
-    let a = tag.find(attr)? + attr.len();
-    let rest = &tag[a..];
-    let q = rest.find('"')?;
-    Some(rest[..q].to_string())
+fn decode_xml_entities(s: &str) -> String {
+    let mut decoded = String::new();
+    XmlParser::append_decoded(s, &mut decoded);
+    decoded
 }
 
-/// Decode the handful of XML entities a watermark phrase might carry.
-fn decode_xml_entities(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+/// Whether `w:documentProtection` is actually enforced.
+///
+/// Keeping an absent value distinct from an explicit false value preserves the
+/// source information needed to explain why a protection declaration is not
+/// being applied. Both states are non-enforcing per OOXML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProtectionEnforcement {
+    #[default]
+    Absent,
+    Disabled,
+    Enforced,
+}
+
+/// The edit restriction declared by `w:documentProtection/@w:edit`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtectionEditMode {
+    Unrestricted,
+    ReadOnly,
+    Comments,
+    TrackedChanges,
+    Forms,
+    /// Preserve a future or producer-specific value so policy can fail closed
+    /// without losing the value needed for a useful explanation.
+    Unknown(String),
+}
+
+/// Raw settings metadata retained alongside the normalized protection model.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ProtectionSource {
+    pub settings_part_present: bool,
+    pub document_protection_present: bool,
+    pub write_protection_present: bool,
+    pub enforcement_value: Option<String>,
+    pub edit_value: Option<String>,
+    pub formatting_value: Option<String>,
+    pub write_recommended_value: Option<String>,
+}
+
+/// Structured protection metadata from `word/settings.xml`.
+///
+/// Enforced document restrictions and advisory `w:writeProtection` deliberately
+/// coexist in this model: callers must not turn the latter into an edit denial.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Protection {
+    pub enforcement: ProtectionEnforcement,
+    pub edit_mode: Option<ProtectionEditMode>,
+    pub formatting_locked: bool,
+    pub advisory_write_protection: bool,
+    pub source: ProtectionSource,
+}
+
+impl Protection {
+    pub fn is_enforced(&self) -> bool {
+        self.enforcement == ProtectionEnforcement::Enforced
+    }
+
+    /// Compatibility label for status text. Authorization must inspect the
+    /// structured fields above instead of comparing this human-readable value.
+    pub fn label(&self) -> Option<&'static str> {
+        if self.is_enforced() {
+            match self.edit_mode.as_ref() {
+                Some(ProtectionEditMode::ReadOnly) => return Some("read-only"),
+                Some(ProtectionEditMode::Comments) => return Some("comments only"),
+                Some(ProtectionEditMode::TrackedChanges) => {
+                    return Some("tracked changes only");
+                }
+                Some(ProtectionEditMode::Forms) => return Some("form fields only"),
+                Some(ProtectionEditMode::Unknown(_)) => return Some("restricted editing"),
+                Some(ProtectionEditMode::Unrestricted) | None => {}
+            }
+            if self.formatting_locked {
+                return Some("formatting locked");
+            }
+        }
+        self.advisory_write_protection
+            .then_some("read-only (recommended)")
+    }
+}
+
+/// Header variant, and therefore the page class, carrying a watermark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderVariant {
+    Default,
+    First,
+    Even,
+}
+
+impl HeaderVariant {
+    fn as_ooxml(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::First => "first",
+            Self::Even => "even",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Default => 0,
+            Self::First => 1,
+            Self::Even => 2,
+        }
+    }
+}
+
+/// The terminal-relevant kind of a watermark found in an applied header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatermarkKind {
+    Text(String),
+    Picture,
+    Unknown,
+}
+
+/// Relationship and section metadata describing where a watermark applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatermarkHeader {
+    /// Zero-based section index in document order.
+    pub section_index: usize,
+    pub variant: HeaderVariant,
+    pub relationship_id: String,
+    pub part_name: String,
+    /// True when this section inherits the header reference from an earlier one.
+    pub inherited: bool,
+}
+
+/// A watermark plus the applied header that supplies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Watermark {
+    pub kind: WatermarkKind,
+    pub header: WatermarkHeader,
+}
+
+fn local_name(name: &str) -> &str {
+    name.rsplit_once(':').map_or(name, |(_, local)| local)
+}
+
+fn decoded_attr_by_local(parser: &XmlParser<'_>, name: &str) -> Option<String> {
+    parser
+        .attrs()
+        .iter()
+        .find(|attr| local_name(attr.name) == name)
+        .map(|attr| decode_xml_entities(attr.value))
+}
+
+fn parse_ooxml_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "on" => Some(true),
+        "0" | "false" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn parse_protection(xml: &str) -> Protection {
+    let mut protection = Protection::default();
+    protection.source.settings_part_present = true;
+    let mut parser = XmlParser::new(xml);
+    loop {
+        match parser.next() {
+            Event::Start if local_name(parser.name()) == "documentProtection" => {
+                protection.source.document_protection_present = true;
+                let enforcement = decoded_attr_by_local(&parser, "enforcement");
+                let edit = decoded_attr_by_local(&parser, "edit");
+                let formatting = decoded_attr_by_local(&parser, "formatting");
+
+                protection.enforcement = match enforcement.as_deref() {
+                    None => ProtectionEnforcement::Absent,
+                    Some(value) if parse_ooxml_bool(value) == Some(true) => {
+                        ProtectionEnforcement::Enforced
+                    }
+                    Some(_) => ProtectionEnforcement::Disabled,
+                };
+                protection.edit_mode = edit.as_deref().map(|value| match value {
+                    "none" => ProtectionEditMode::Unrestricted,
+                    "readOnly" => ProtectionEditMode::ReadOnly,
+                    "comments" => ProtectionEditMode::Comments,
+                    "trackedChanges" => ProtectionEditMode::TrackedChanges,
+                    "forms" => ProtectionEditMode::Forms,
+                    other => ProtectionEditMode::Unknown(other.to_string()),
+                });
+                protection.formatting_locked = formatting
+                    .as_deref()
+                    .and_then(parse_ooxml_bool)
+                    .unwrap_or(false);
+                protection.source.enforcement_value = enforcement;
+                protection.source.edit_value = edit;
+                protection.source.formatting_value = formatting;
+            }
+            Event::Start if local_name(parser.name()) == "writeProtection" => {
+                protection.source.write_protection_present = true;
+                protection.advisory_write_protection = true;
+                protection.source.write_recommended_value =
+                    decoded_attr_by_local(&parser, "recommended");
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    protection
+}
+
+fn resolve_word_part_name(target: &str) -> String {
+    if let Some(absolute) = target.strip_prefix('/') {
+        return absolute.to_string();
+    }
+    let relative = target.trim_start_matches("./");
+    if relative.starts_with("word/") {
+        relative.to_string()
+    } else {
+        format!("word/{relative}")
+    }
+}
+
+fn marker_in_attrs(parser: &XmlParser<'_>) -> bool {
+    parser.attrs().iter().any(|attr| {
+        matches!(local_name(attr.name), "id" | "name" | "title" | "descr")
+            && decode_xml_entities(attr.value)
+                .to_ascii_lowercase()
+                .contains("watermark")
+    })
+}
+
+fn watermark_kinds(xml: &str) -> Vec<WatermarkKind> {
+    #[derive(Default)]
+    struct Shape {
+        marked: bool,
+        texts: Vec<String>,
+        picture: bool,
+    }
+
+    let mut parser = XmlParser::new(xml);
+    let mut shapes: Vec<Shape> = Vec::new();
+    let mut out = Vec::new();
+    loop {
+        match parser.next() {
+            Event::Start if local_name(parser.name()) == "shape" => {
+                shapes.push(Shape {
+                    marked: marker_in_attrs(&parser),
+                    ..Shape::default()
+                });
+            }
+            Event::Start if local_name(parser.name()) == "textpath" => {
+                let Some(text) = decoded_attr_by_local(&parser, "string") else {
+                    continue;
+                };
+                if text.trim().is_empty() {
+                    continue;
+                }
+                if let Some(shape) = shapes.last_mut() {
+                    shape.texts.push(text);
+                } else {
+                    // Keep compatibility with producers that omit the surrounding
+                    // VML shape but still use Word's watermark textpath encoding.
+                    out.push(WatermarkKind::Text(text));
+                }
+            }
+            Event::Start if local_name(parser.name()) == "imagedata" => {
+                if let Some(shape) = shapes.last_mut() {
+                    shape.picture = true;
+                    shape.marked |= marker_in_attrs(&parser);
+                }
+            }
+            Event::Start if local_name(parser.name()) == "docPr" => {
+                // DrawingML picture watermarks use a watermark-named docPr rather
+                // than VML's PowerPlusWaterMarkObject shape id.
+                if marker_in_attrs(&parser) {
+                    out.push(WatermarkKind::Picture);
+                }
+            }
+            Event::End if local_name(parser.name()) == "shape" => {
+                let Some(shape) = shapes.pop() else {
+                    continue;
+                };
+                if !shape.texts.is_empty() {
+                    out.extend(shape.texts.into_iter().map(WatermarkKind::Text));
+                } else if shape.marked && shape.picture {
+                    out.push(WatermarkKind::Picture);
+                } else if shape.marked {
+                    out.push(WatermarkKind::Unknown);
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// A loaded `.docx`: the editable [`Document`] plus all original parts so save
@@ -71,73 +342,134 @@ impl Package {
         self.sect_pr = xml;
     }
 
-    /// The document's protection state from `word/settings.xml`, as a short human
-    /// label (`read-only`, `comments only`, `tracked changes only`, `form fields
-    /// only`), or `None` when the document isn't protected. Surfaced so the reader
-    /// knows Word would restrict editing; docxy doesn't itself enforce it.
-    pub fn protection(&self) -> Option<String> {
-        let xml = self
-            .part("word/settings.xml")
-            .and_then(|b| std::str::from_utf8(b).ok())?;
-        // An enforced restriction (`w:documentProtection`). `w:edit` limits editing;
-        // `w:formatting="1"` (which can appear alone) locks styles/formatting.
-        if xml.contains("<w:documentProtection") {
-            let enforced = attr_in(xml, "<w:documentProtection", "w:enforcement=\"")
-                .map(|e| matches!(e.as_str(), "1" | "on" | "true"))
-                .unwrap_or(true);
-            if enforced {
-                let edit = attr_in(xml, "<w:documentProtection", "w:edit=\"");
-                let label = match edit.as_deref() {
-                    Some("readOnly") => Some("read-only"),
-                    Some("comments") => Some("comments only"),
-                    Some("trackedChanges") => Some("tracked changes only"),
-                    Some("forms") => Some("form fields only"),
-                    _ if attr_in(xml, "<w:documentProtection", "w:formatting=\"").as_deref()
-                        == Some("1") =>
-                    {
-                        Some("formatting locked")
-                    }
-                    _ => None,
-                };
-                if let Some(l) = label {
-                    return Some(l.to_string());
-                }
-            }
-        }
-        // A "recommend read-only on open" flag (`w:writeProtection`).
-        if xml.contains("<w:writeProtection") {
-            return Some("read-only (recommended)".to_string());
-        }
-        None
+    /// Structured protection state from `word/settings.xml`.
+    pub fn protection(&self) -> Protection {
+        let Some(bytes) = self.part("word/settings.xml") else {
+            return Protection::default();
+        };
+        let Ok(xml) = std::str::from_utf8(bytes) else {
+            let mut protection = Protection::default();
+            protection.source.settings_part_present = true;
+            return protection;
+        };
+        parse_protection(xml)
     }
 
-    /// The watermark text, if a header carries a VML WordArt watermark (Word's
-    /// text watermarks store the phrase in `<v:textpath string="…">`). Picture
-    /// watermarks return `None` (no text). Surfaced by docxy as an indicator.
-    pub fn watermark(&self) -> Option<String> {
-        for (name, bytes) in &self.parts {
-            if !name.contains("/header") {
-                continue;
-            }
-            let Ok(xml) = std::str::from_utf8(bytes) else {
-                continue;
-            };
-            // A header can hold several <v:textpath> (the shapetype's template one
-            // has no `string`); return the first that carries the watermark text.
-            let mut rest = xml;
-            while let Some(i) = rest.find("<v:textpath") {
-                rest = &rest[i..];
-                let end = rest.find('>').unwrap_or(rest.len());
-                if let Some(s) = attr_in(&rest[..end], "<v:textpath", "string=\"") {
-                    let t = decode_xml_entities(&s);
-                    if !t.trim().is_empty() {
-                        return Some(t);
-                    }
+    /// Compatibility label for existing status and control surfaces.
+    pub fn protection_label(&self) -> Option<&'static str> {
+        self.protection().label()
+    }
+
+    /// Watermarks in headers that are actually applied by document section
+    /// relationships. Each inherited header is associated with every section in
+    /// which it remains effective rather than merely scanning orphan header parts.
+    pub fn watermarks(&self) -> Vec<Watermark> {
+        const VARIANTS: [HeaderVariant; 3] = [
+            HeaderVariant::Default,
+            HeaderVariant::First,
+            HeaderVariant::Even,
+        ];
+
+        let rels = self
+            .part("word/_rels/document.xml.rels")
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .map(parse_rels_xml)
+            .unwrap_or_default();
+        let even_and_odd = self
+            .part("word/settings.xml")
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|xml| settings_flag_of(xml, "w:evenAndOddHeaders"))
+            .unwrap_or(false);
+
+        let mut sections: Vec<&str> = self
+            .document
+            .body
+            .iter()
+            .filter_map(|block| match block {
+                crate::model::Block::Paragraph(p) => p.props.section_break.as_deref(),
+                crate::model::Block::Table(_) | crate::model::Block::Raw(_) => None,
+            })
+            .collect();
+        // The trailing body sectPr describes the final section. Even an empty
+        // value represents the one implicit section of a document without sectPr.
+        sections.push(&self.sect_pr);
+
+        #[derive(Clone)]
+        struct AppliedHeader {
+            relationship_id: String,
+            part_name: String,
+            inherited: bool,
+        }
+
+        let mut applied: [Option<AppliedHeader>; 3] = [None, None, None];
+        let mut out = Vec::new();
+        for (section_index, sect_pr) in sections.into_iter().enumerate() {
+            for variant in VARIANTS {
+                let slot = variant.index();
+                if let Some(relationship_id) = crate::load::header_footer_ref_rid(
+                    sect_pr,
+                    "headerReference",
+                    variant.as_ooxml(),
+                ) {
+                    applied[slot] = rels.target(&relationship_id).map(|target| AppliedHeader {
+                        relationship_id,
+                        part_name: resolve_word_part_name(target),
+                        inherited: false,
+                    });
+                } else if let Some(header) = &mut applied[slot] {
+                    header.inherited = true;
                 }
-                rest = &rest[end..];
+            }
+
+            let title_page = settings_flag_of(sect_pr, "w:titlePg").unwrap_or(false);
+            for variant in VARIANTS {
+                if (variant == HeaderVariant::First && !title_page)
+                    || (variant == HeaderVariant::Even && !even_and_odd)
+                {
+                    continue;
+                }
+                let Some(header) = &applied[variant.index()] else {
+                    continue;
+                };
+                let Some(bytes) = self.part(&header.part_name) else {
+                    continue;
+                };
+                let Ok(xml) = std::str::from_utf8(bytes) else {
+                    continue;
+                };
+                for kind in watermark_kinds(xml) {
+                    out.push(Watermark {
+                        kind,
+                        header: WatermarkHeader {
+                            section_index,
+                            variant,
+                            relationship_id: header.relationship_id.clone(),
+                            part_name: header.part_name.clone(),
+                            inherited: header.inherited,
+                        },
+                    });
+                }
             }
         }
-        None
+        out
+    }
+
+    /// Compatibility label for status text while renderers consume [`Watermark`].
+    pub fn watermark_label(&self) -> Option<String> {
+        let watermarks = self.watermarks();
+        watermarks
+            .iter()
+            .find_map(|w| match &w.kind {
+                WatermarkKind::Text(text) => Some(text.clone()),
+                WatermarkKind::Picture | WatermarkKind::Unknown => None,
+            })
+            .or_else(|| {
+                watermarks.iter().find_map(|w| match w.kind {
+                    WatermarkKind::Picture => Some("picture (preview unavailable)".to_string()),
+                    WatermarkKind::Unknown => Some("unsupported (preview unavailable)".to_string()),
+                    WatermarkKind::Text(_) => None,
+                })
+            })
     }
 
     /// Whether the document defines page borders (`w:pgBorders` in any section).
@@ -1422,6 +1754,50 @@ mod tests {
         ])
     }
 
+    fn make_metadata_docx(
+        document_xml: &str,
+        settings_xml: Option<&str>,
+        document_rels_xml: Option<&str>,
+        headers: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut parts = vec![
+            (
+                "[Content_Types].xml".to_string(),
+                br#"<?xml version="1.0"?><Types/>"#.to_vec(),
+            ),
+            (
+                "_rels/.rels".to_string(),
+                br#"<?xml version="1.0"?><Relationships/>"#.to_vec(),
+            ),
+            (
+                "word/document.xml".to_string(),
+                document_xml.as_bytes().to_vec(),
+            ),
+            (
+                "word/styles.xml".to_string(),
+                br#"<?xml version="1.0"?><w:styles/>"#.to_vec(),
+            ),
+        ];
+        if let Some(settings) = settings_xml {
+            parts.push((
+                "word/settings.xml".to_string(),
+                settings.as_bytes().to_vec(),
+            ));
+        }
+        if let Some(rels) = document_rels_xml {
+            parts.push((
+                "word/_rels/document.xml.rels".to_string(),
+                rels.as_bytes().to_vec(),
+            ));
+        }
+        parts.extend(
+            headers
+                .iter()
+                .map(|(name, xml)| (format!("word/{name}"), xml.as_bytes().to_vec())),
+        );
+        write_zip(&parts)
+    }
+
     const BODY: &str = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
         <w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Hello</w:t></w:r></w:p>\
         <w:p><w:r><w:t>World</w:t></w:r></w:p>\
@@ -1429,35 +1805,226 @@ mod tests {
         </w:body></w:document>";
 
     #[test]
-    fn surfaces_protection_watermark_and_page_borders() {
+    fn protection_boolean_lexical_forms_and_enforcement_defaults() {
+        for value in ["1", "true", "on", "TRUE", "ON"] {
+            let protection = parse_protection(&format!(
+                r#"<w:settings><w:documentProtection w:edit="readOnly" w:enforcement="{value}"/></w:settings>"#
+            ));
+            assert_eq!(
+                protection.enforcement,
+                ProtectionEnforcement::Enforced,
+                "{value}"
+            );
+            assert!(protection.is_enforced(), "{value}");
+        }
+        for value in ["0", "false", "off", "FALSE", "OFF"] {
+            let protection = parse_protection(&format!(
+                r#"<w:settings><w:documentProtection w:edit="readOnly" w:enforcement="{value}"/></w:settings>"#
+            ));
+            assert_eq!(
+                protection.enforcement,
+                ProtectionEnforcement::Disabled,
+                "{value}"
+            );
+            assert!(!protection.is_enforced(), "{value}");
+            assert_eq!(protection.label(), None, "{value}");
+        }
+
+        let absent = parse_protection(
+            r#"<w:settings><w:documentProtection w:edit="readOnly"/></w:settings>"#,
+        );
+        assert_eq!(absent.enforcement, ProtectionEnforcement::Absent);
+        assert!(!absent.is_enforced());
+        assert_eq!(absent.label(), None);
+        assert!(absent.source.document_protection_present);
+        assert_eq!(absent.source.enforcement_value, None);
+
+        let no_declaration = parse_protection("<w:settings/>");
+        assert_eq!(no_declaration.enforcement, ProtectionEnforcement::Absent);
+        assert!(!no_declaration.source.document_protection_present);
+    }
+
+    #[test]
+    fn protection_models_every_edit_mode_and_formatting_only() {
+        let cases = [
+            ("none", ProtectionEditMode::Unrestricted, None),
+            ("readOnly", ProtectionEditMode::ReadOnly, Some("read-only")),
+            (
+                "comments",
+                ProtectionEditMode::Comments,
+                Some("comments only"),
+            ),
+            (
+                "trackedChanges",
+                ProtectionEditMode::TrackedChanges,
+                Some("tracked changes only"),
+            ),
+            ("forms", ProtectionEditMode::Forms, Some("form fields only")),
+        ];
+        for (value, expected_mode, expected_label) in cases {
+            let protection = parse_protection(&format!(
+                r#"<w:settings><w:documentProtection w:enforcement="1" w:edit="{value}"/></w:settings>"#
+            ));
+            assert_eq!(protection.edit_mode, Some(expected_mode), "{value}");
+            assert_eq!(protection.label(), expected_label, "{value}");
+            assert_eq!(protection.source.edit_value.as_deref(), Some(value));
+        }
+
+        for value in ["1", "true", "on"] {
+            let protection = parse_protection(&format!(
+                r#"<w:settings><w:documentProtection w:enforcement="1" w:formatting="{value}"/></w:settings>"#
+            ));
+            assert!(protection.formatting_locked, "{value}");
+            assert_eq!(protection.label(), Some("formatting locked"));
+        }
+        let unlocked = parse_protection(
+            r#"<w:settings><w:documentProtection w:enforcement="1" w:formatting="off"/></w:settings>"#,
+        );
+        assert!(!unlocked.formatting_locked);
+    }
+
+    #[test]
+    fn write_protection_is_retained_as_advisory_metadata() {
+        let protection = parse_protection(
+            r#"<w:settings><w:documentProtection w:edit="readOnly" w:enforcement="0"/><w:writeProtection w:recommended="true"/></w:settings>"#,
+        );
+        assert!(!protection.is_enforced());
+        assert!(protection.advisory_write_protection);
+        assert!(protection.source.write_protection_present);
+        assert_eq!(
+            protection.source.write_recommended_value.as_deref(),
+            Some("true")
+        );
+        assert_eq!(protection.label(), Some("read-only (recommended)"));
+    }
+
+    #[test]
+    fn watermarks_decode_text_and_follow_section_header_inheritance() {
+        let document = r#"<?xml version="1.0"?><w:document xmlns:w="w" xmlns:r="r"><w:body>
+            <w:p><w:pPr><w:sectPr><w:headerReference w:type="default" r:id="rIdHeader"/></w:sectPr></w:pPr><w:r><w:t>Section one</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Section two</w:t></w:r></w:p><w:sectPr/>
+            </w:body></w:document>"#;
+        let rels =
+            r#"<Relationships><Relationship Id="rIdHeader" Target="header1.xml"/></Relationships>"#;
+        let header = r#"<w:hdr xmlns:w="w" xmlns:v="v"><w:p><w:r><w:pict>
+            <v:shape id="PowerPlusWaterMarkObject"><v:textpath string="CONFIDENTIAL &amp; DRAFT &#x2014; &#65;"/></v:shape>
+            </w:pict></w:r></w:p></w:hdr>"#;
+        let bytes = make_metadata_docx(document, None, Some(rels), &[("header1.xml", header)]);
+        let pkg = load_package(&bytes).expect("load");
+        let watermarks = pkg.watermarks();
+        assert_eq!(watermarks.len(), 2);
+        assert_eq!(
+            watermarks[0].kind,
+            WatermarkKind::Text("CONFIDENTIAL & DRAFT — A".to_string())
+        );
+        assert_eq!(watermarks[0].header.section_index, 0);
+        assert_eq!(watermarks[0].header.variant, HeaderVariant::Default);
+        assert!(!watermarks[0].header.inherited);
+        assert_eq!(watermarks[0].header.relationship_id, "rIdHeader");
+        assert_eq!(watermarks[0].header.part_name, "word/header1.xml");
+        assert_eq!(watermarks[1].header.section_index, 1);
+        assert!(watermarks[1].header.inherited);
+        assert_eq!(
+            pkg.watermark_label().as_deref(),
+            Some("CONFIDENTIAL & DRAFT — A")
+        );
+
+        // An orphan header part is metadata, not an applied document watermark.
+        let orphan = make_metadata_docx(BODY, None, None, &[("header1.xml", header)]);
+        assert!(load_package(&orphan).unwrap().watermarks().is_empty());
+    }
+
+    #[test]
+    fn watermark_header_variants_and_picture_fallback_are_structured() {
+        let document = r#"<w:document xmlns:w="w" xmlns:r="r"><w:body><w:p/><w:sectPr>
+            <w:headerReference w:type="default" r:id="rDefault"/>
+            <w:headerReference w:type="first" r:id="rFirst"/>
+            <w:headerReference w:type="even" r:id="rEven"/><w:titlePg/>
+            </w:sectPr></w:body></w:document>"#;
+        let settings = r#"<w:settings><w:evenAndOddHeaders w:val="on"/></w:settings>"#;
+        let rels = r#"<Relationships>
+            <Relationship Id="rDefault" Target="header1.xml"/>
+            <Relationship Id="rFirst" Target="header2.xml"/>
+            <Relationship Id="rEven" Target="header3.xml"/>
+            </Relationships>"#;
+        let text = |value: &str| {
+            format!(
+                r#"<w:hdr xmlns:w="w" xmlns:v="v"><v:shape id="PowerPlusWaterMarkObject"><v:textpath string="{value}"/></v:shape></w:hdr>"#
+            )
+        };
+        let default = text("DEFAULT");
+        let first = text("FIRST");
+        let picture = r#"<w:hdr xmlns:w="w" xmlns:v="v"><v:shape id="PowerPlusWaterMarkObject42"><v:imagedata r:id="rImage"/></v:shape></w:hdr>"#;
+        let bytes = make_metadata_docx(
+            document,
+            Some(settings),
+            Some(rels),
+            &[
+                ("header1.xml", &default),
+                ("header2.xml", &first),
+                ("header3.xml", picture),
+            ],
+        );
+        let pkg = load_package(&bytes).unwrap();
+        let watermarks = pkg.watermarks();
+        assert_eq!(watermarks.len(), 3);
+        assert!(watermarks.iter().any(|w| {
+            w.header.variant == HeaderVariant::Default
+                && w.kind == WatermarkKind::Text("DEFAULT".to_string())
+        }));
+        assert!(watermarks.iter().any(|w| {
+            w.header.variant == HeaderVariant::First
+                && w.kind == WatermarkKind::Text("FIRST".to_string())
+        }));
+        assert!(watermarks.iter().any(|w| {
+            w.header.variant == HeaderVariant::Even && w.kind == WatermarkKind::Picture
+        }));
+
+        assert_eq!(
+            watermark_kinds(r#"<v:shape id="PowerPlusWaterMarkObject"><v:textpath/></v:shape>"#),
+            vec![WatermarkKind::Unknown]
+        );
+        let only_picture = make_metadata_docx(
+            document,
+            Some(settings),
+            Some(rels),
+            &[
+                ("header1.xml", picture),
+                ("header2.xml", picture),
+                ("header3.xml", picture),
+            ],
+        );
+        assert_eq!(
+            load_package(&only_picture)
+                .unwrap()
+                .watermark_label()
+                .as_deref(),
+            Some("picture (preview unavailable)")
+        );
+    }
+
+    #[test]
+    fn surfaces_structured_metadata_and_page_borders() {
         let document = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
             <w:p><w:r><w:t>Body</w:t></w:r></w:p>\
             <w:sectPr><w:pgBorders w:offsetFrom=\"page\"><w:top w:val=\"single\"/></w:pgBorders>\
             <w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:body></w:document>";
         let settings = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"x\">\
             <w:documentProtection w:edit=\"readOnly\" w:enforcement=\"1\"/></w:settings>";
-        let header = "<?xml version=\"1.0\"?><w:hdr xmlns:w=\"x\" xmlns:v=\"y\"><w:p><w:r><w:pict>\
-            <v:shape id=\"PowerPlusWaterMarkObject\"><v:textpath string=\"CONFIDENTIAL &amp; DRAFT\"/>\
-            </v:shape></w:pict></w:r></w:p></w:hdr>";
-        let ct = r#"<?xml version="1.0"?><Types/>"#;
-        let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
-        let bytes = write_zip(&[
-            ("[Content_Types].xml".into(), ct.into()),
-            ("_rels/.rels".into(), rels.into()),
-            ("word/document.xml".into(), document.into()),
-            ("word/styles.xml".into(), "<w:styles/>".into()),
-            ("word/settings.xml".into(), settings.into()),
-            ("word/header1.xml".into(), header.into()),
-        ]);
+        let bytes = make_metadata_docx(document, Some(settings), None, &[]);
         let pkg = load_package(&bytes).expect("load");
-        assert_eq!(pkg.protection().as_deref(), Some("read-only"));
-        assert_eq!(pkg.watermark().as_deref(), Some("CONFIDENTIAL & DRAFT"));
+        assert_eq!(
+            pkg.protection().edit_mode,
+            Some(ProtectionEditMode::ReadOnly)
+        );
+        assert_eq!(pkg.protection_label(), Some("read-only"));
         assert!(pkg.has_page_borders());
 
-        // An unprotected, plain doc surfaces nothing.
         let plain = load_package(&make_docx(BODY)).expect("load");
-        assert!(plain.protection().is_none());
-        assert!(plain.watermark().is_none());
+        assert_eq!(plain.protection(), Protection::default());
+        assert_eq!(plain.protection_label(), None);
+        assert!(plain.watermarks().is_empty());
+        assert_eq!(plain.watermark_label(), None);
         assert!(!plain.has_page_borders());
     }
 
