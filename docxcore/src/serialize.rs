@@ -517,6 +517,13 @@ fn write_table(s: &mut String, t: &Table) {
         esc_attr(value, s);
         s.push('"');
     }
+    for (name, value) in &t.markup_compatibility_attributes {
+        s.push(' ');
+        s.push_str(name);
+        s.push_str("=\"");
+        esc_attr(value, s);
+        s.push('"');
+    }
     s.push('>');
     // tblPr is the first tbl child; preserved verbatim when present.
     if let Some(raw) = &t.raw_tblpr {
@@ -888,6 +895,7 @@ mod tests {
                 raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
             }],
             namespace_declarations: vec![],
+            markup_compatibility_attributes: vec![],
             row_boundaries: vec![],
             raw_tblpr: Some(
                 "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
@@ -1594,6 +1602,27 @@ mod tests {
     }
 
     #[test]
+    fn truncated_unknown_table_children_are_not_emitted_as_raw_xml() {
+        let inside_control = format!(
+            "<w:document><w:body><w:tbl><w:sdt><w:sdtContent>{}<w:customXml>",
+            row_xml("visible")
+        );
+        let parsed = parse_document_xml(&inside_control, &Relationships::default());
+        let saved = document_to_xml(&parsed);
+        assert!(!saved.contains("<w:customXml>"));
+        assert!(saved.contains("</w:sdtContent></w:sdt></w:tbl>"));
+        assert_eq!(
+            parse_document_xml(&saved, &Relationships::default()).plain_text(),
+            "visible\n"
+        );
+
+        let table_child = "<w:document><w:body><w:tbl><w:customXml>";
+        let saved = document_to_xml(&parse_document_xml(table_child, &Relationships::default()));
+        assert!(!saved.contains("<w:customXml>"));
+        assert!(saved.contains("<w:tbl></w:tbl>"));
+    }
+
+    #[test]
     fn nested_sdt_in_truncated_tail_does_not_mask_missing_outer_close() {
         let open = "<w:sdt><w:sdtPr><w:alias w:val=\"outer\"/></w:sdtPr><w:sdtContent>";
         let source = format!(
@@ -1617,9 +1646,9 @@ mod tests {
 
     #[test]
     fn row_control_keeps_namespaces_inherited_from_body_and_table() {
-        let open = "<w:sdt mc:Ignorable=\"w15\"><w:sdtPr><mc:AlternateContent><mc:Choice Requires=\"w15\"><w:alias w:val=\"choice\"/></mc:Choice><mc:Fallback/></mc:AlternateContent><ux:bodyProperty/><tv:tableProperty/></w:sdtPr><w:sdtContent>";
+        let open = "<w:sdt><w:sdtPr><mc:AlternateContent><mc:Choice Requires=\"w15\"><w:alias w:val=\"choice\"/></mc:Choice><mc:Fallback/></mc:AlternateContent><ux:bodyProperty/><tv:tableProperty/></w:sdtPr><w:sdtContent>";
         let source = format!(
-            "<w:document xmlns:w=\"{W_NS}\"><w:body xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" xmlns:ux=\"urn:body\"><w:tbl xmlns:tv=\"urn:table\">{open}{}</w:sdtContent></w:sdt></w:tbl></w:body></w:document>",
+            "<w:document xmlns:w=\"{W_NS}\"><w:body xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" xmlns:ux=\"urn:body\" mc:Ignorable=\"ux w15\"><w:tbl xmlns:tv=\"urn:table\" mc:Ignorable=\"tv\" mc:PreserveElements=\"tv:tableProperty\">{open}{}</w:sdtContent></w:sdt></w:tbl></w:body></w:document>",
             row_xml("visible")
         );
         let parsed = parse_document_xml(&source, &Relationships::default());
@@ -1635,10 +1664,20 @@ mod tests {
                 ("xmlns:tv".to_string(), "urn:table".to_string()),
             ]
         );
+        assert_eq!(
+            table.markup_compatibility_attributes,
+            vec![
+                ("mc:Ignorable".to_string(), "ux w15 tv".to_string()),
+                (
+                    "mc:PreserveElements".to_string(),
+                    "tv:tableProperty".to_string()
+                ),
+            ]
+        );
 
         let saved = document_to_xml(&parsed);
         assert!(saved.contains(&format!(
-            "<w:tbl xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" xmlns:ux=\"urn:body\" xmlns:tv=\"urn:table\">"
+            "<w:tbl xmlns:mc=\"{MC_NS}\" xmlns:w15=\"{W15_NS}\" xmlns:ux=\"urn:body\" xmlns:tv=\"urn:table\" mc:Ignorable=\"ux w15 tv\" mc:PreserveElements=\"tv:tableProperty\">"
         )));
         assert!(saved.contains(open), "captured control properties changed");
         assert_eq!(
@@ -1730,5 +1769,38 @@ mod tests {
             panic!("expected table");
         };
         assert_eq!(table.row_control_owners(), Ok(vec![vec![0]]));
+    }
+
+    #[test]
+    fn malformed_rows_after_self_closing_content_are_recovered_without_panic() {
+        let source = table_xml(&format!(
+            "<w:sdt><w:sdtContent/>{}</w:sdt>",
+            row_xml("direct")
+        ));
+        let parsed = parse_document_xml(&source, &Relationships::default());
+        assert_eq!(parsed.plain_text(), "direct\n");
+        let saved = document_to_xml(&parsed);
+        assert!(saved.contains("<w:sdtContent><w:tr>"));
+        assert!(saved.contains("</w:tr></w:sdtContent></w:sdt>"));
+        let reparsed = parse_document_xml(&saved, &Relationships::default());
+        let Block::Table(table) = &reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0]]));
+
+        let nested_source = table_xml(&format!(
+            "<w:sdt><w:sdtContent><w:sdt><w:sdtContent/>{}</w:sdt></w:sdtContent></w:sdt>",
+            row_xml("nested")
+        ));
+        let nested = parse_document_xml(&nested_source, &Relationships::default());
+        assert_eq!(nested.plain_text(), "nested\n");
+        let nested_saved = document_to_xml(&nested);
+        assert_eq!(nested_saved.matches("<w:sdtContent>").count(), 2);
+        assert_eq!(nested_saved.matches("</w:sdtContent>").count(), 2);
+        let nested_reparsed = parse_document_xml(&nested_saved, &Relationships::default());
+        let Block::Table(table) = &nested_reparsed.body[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.row_control_owners(), Ok(vec![vec![0, 1]]));
     }
 }

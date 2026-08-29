@@ -582,6 +582,11 @@ pub struct Table {
     /// guaranteed at reconstructed ancestors. The serializer redeclares them
     /// on `w:tbl` because document and body ancestors are rebuilt during save.
     pub namespace_declarations: Vec<(String, String)>,
+    /// Effective markup-compatibility attributes inherited from reconstructed
+    /// ancestors such as `w:body`, or declared on `w:tbl` itself. Values with
+    /// the same expanded name are token-unioned by the loader and redeclared on
+    /// `w:tbl` so preserved extension markup keeps its MCE semantics.
+    pub markup_compatibility_attributes: Vec<(String, String)>,
     /// Invisible row-level content-control boundaries and unknown table
     /// children, ordered by `at` and then by vector position.
     ///

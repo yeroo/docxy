@@ -462,6 +462,7 @@ mod win {
                     })
                     .collect(),
                 namespace_declarations: vec![],
+                markup_compatibility_attributes: vec![],
                 row_boundaries: vec![],
                 raw_tblpr: Some(TBLPR.to_string()),
             };

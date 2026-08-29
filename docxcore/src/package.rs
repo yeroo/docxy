@@ -2021,10 +2021,11 @@ mod tests {
     fn package_keeps_body_scoped_mc_namespaces_used_only_by_row_metadata() {
         let document = "<?xml version=\"1.0\"?><w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body \
             xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" \
-            xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\"><w:tbl>\
-            <w:sdt mc:Ignorable=\"w15\"><w:sdtPr><mc:AlternateContent>\
+            xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" \
+            xmlns:ux=\"urn:body-extension\" mc:Ignorable=\"w15 ux\"><w:tbl>\
+            <w:sdt><w:sdtPr><mc:AlternateContent>\
             <mc:Choice Requires=\"w15\"><w:alias w:val=\"choice\"/></mc:Choice>\
-            <mc:Fallback/></mc:AlternateContent></w:sdtPr><w:sdtContent>\
+            <mc:Fallback/></mc:AlternateContent><ux:property/></w:sdtPr><w:sdtContent>\
             <w:tr><w:tc><w:p><w:r><w:t>visible</w:t></w:r></w:p></w:tc></w:tr>\
             </w:sdtContent></w:sdt></w:tbl></w:body></w:document>";
         let package = load_package(&make_docx(document)).expect("load body-scoped namespaces");
@@ -2033,10 +2034,11 @@ mod tests {
         let xml = String::from_utf8_lossy(reloaded.part("word/document.xml").unwrap());
 
         assert!(xml.contains(
-            "<w:tbl xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\">"
+            "<w:tbl xmlns:mc=\"http://schemas.openxmlformats.org/markup-compatibility/2006\" xmlns:w15=\"http://schemas.microsoft.com/office/word/2012/wordml\" xmlns:ux=\"urn:body-extension\" mc:Ignorable=\"w15 ux\">"
         ));
         assert!(xml.contains("<mc:AlternateContent>"));
-        assert!(xml.contains("mc:Ignorable=\"w15\""));
+        assert!(xml.contains("<ux:property/>"));
+        assert!(xml.contains("mc:Ignorable=\"w15 ux\""));
         assert_eq!(reloaded.document.plain_text(), "visible\n");
     }
 

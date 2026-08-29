@@ -1293,6 +1293,41 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
     }));
 }
 
+fn reconstructed_markup_compatibility_attrs(p: &XmlParser<'_>) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for scoped in p
+        .markup_compatibility_attrs()
+        .iter()
+        // Package saving retains the original w:document attributes, while
+        // w:body and w:tbl are reconstructed from the semantic model.
+        .filter(|scoped| scoped.element_name != "w:document")
+    {
+        let name = scoped.attr.name;
+        let local_name = name.split_once(':').map_or(name, |(_, local)| local);
+        let mut value = String::new();
+        XmlParser::append_decoded(scoped.attr.value, &mut value);
+
+        if let Some((_, existing)) = merged.iter_mut().find(|(existing_name, _)| {
+            existing_name
+                .split_once(':')
+                .map_or(existing_name.as_str(), |(_, local)| local)
+                == local_name
+        }) {
+            for token in value.split_whitespace() {
+                if !existing.split_whitespace().any(|item| item == token) {
+                    if !existing.is_empty() {
+                        existing.push(' ');
+                    }
+                    existing.push_str(token);
+                }
+            }
+        } else {
+            merged.push((name.to_string(), value));
+        }
+    }
+    merged
+}
+
 fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
     // Raw row-control properties can reference namespace prefixes declared on
     // w:document, w:body, or w:tbl. Those ancestors are reconstructed on save,
@@ -1310,8 +1345,10 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
             (attr.name.to_string(), value)
         })
         .collect();
+    let markup_compatibility_attributes = reconstructed_markup_compatibility_attrs(p);
     let mut table = Table {
         namespace_declarations,
+        markup_compatibility_attributes,
         ..Default::default()
     };
     loop {
@@ -1338,11 +1375,12 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
                 // is also the recovery path for unknown children around SDTs.
                 _ => {
                     let start = p.start_pos();
-                    p.skip_element();
-                    table.row_boundaries.push(TableRowBoundary::raw(
-                        table.rows.len(),
-                        p.raw_slice(start, p.pos()),
-                    ));
+                    if p.skip_element_complete() {
+                        table.row_boundaries.push(TableRowBoundary::raw(
+                            table.rows.len(),
+                            p.raw_slice(start, p.pos()),
+                        ));
+                    }
                 }
             },
             Event::End | Event::Eof => break,
@@ -1372,7 +1410,10 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
     let mut in_content = false;
     // Start of a suffix not yet captured. Normally this is the `<` of
     // `</w:sdtContent>` and remains pending until the outer `</w:sdt>`.
+    // The bool records whether the pending suffix begins with an explicit
+    // `</w:sdtContent>` tag. A self-closing `<w:sdtContent/>` has no such tag.
     let mut tail_start = None;
+    let mut content_start_was_empty = false;
     // A content close encountered before a later visible child. Recovery moves
     // that exact tag after the child so serialization repairs the wrapper
     // instead of emitting the close twice around an out-of-content row.
@@ -1382,12 +1423,14 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
         let event_start = p.pos();
         match p.next() {
             Event::Start if !opened && p.name() == "w:sdtContent" => {
+                let content_start = p.raw_slice(p.start_pos(), p.pos());
                 table.row_boundaries.push(TableRowBoundary::sdt_open(
                     table.rows.len(),
                     p.raw_slice(sdt_start, p.pos()),
                 ));
                 opened = true;
                 in_content = true;
+                content_start_was_empty = content_start.trim_end().ends_with("/>");
             }
             // A row or nested SDT directly under w:sdt is malformed (the
             // w:sdtContent wrapper is absent), but keeping it visible is safer
@@ -1426,11 +1469,12 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                 }
                 _ => {
                     let start = p.start_pos();
-                    p.skip_element();
-                    table.row_boundaries.push(TableRowBoundary::raw(
-                        table.rows.len(),
-                        p.raw_slice(start, p.pos()),
-                    ));
+                    if p.skip_element_complete() {
+                        table.row_boundaries.push(TableRowBoundary::raw(
+                            table.rows.len(),
+                            p.raw_slice(start, p.pos()),
+                        ));
+                    }
                 }
             },
             Event::Start => {
@@ -1439,14 +1483,23 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                 // recovered child while retaining intervening metadata at its
                 // row gap, then resume parsing the repaired content sequence.
                 if p.name() == "w:tr" || p.name() == "w:sdt" {
-                    if let Some(start) = tail_start.take() {
+                    if let Some((start, has_explicit_content_close)) = tail_start.take() {
                         let pending = p.raw_slice(start, event_start);
-                        let close_end = pending
-                            .find('>')
-                            .expect("parsed w:sdtContent close has a tag terminator")
-                            + 1;
-                        deferred_content_close = Some(pending[..close_end].to_string());
-                        let metadata = pending[close_end..].trim();
+                        let metadata_start = if has_explicit_content_close {
+                            if let Some(close_end) = pending.find('>').map(|offset| offset + 1) {
+                                deferred_content_close = Some(pending[..close_end].to_string());
+                                close_end
+                            } else {
+                                // An End event normally proves the close tag is
+                                // complete. If parser state is inconsistent,
+                                // drop the unsafe fragment instead of panicking
+                                // or preserving malformed raw XML.
+                                pending.len()
+                            }
+                        } else {
+                            0
+                        };
+                        let metadata = pending[metadata_start..].trim();
                         if !metadata.is_empty() {
                             table
                                 .row_boundaries
@@ -1464,18 +1517,19 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                         return true;
                     }
                 } else {
-                    tail_start.get_or_insert(event_start);
+                    tail_start.get_or_insert((event_start, false));
                     p.skip_element();
                 }
             }
             Event::End if p.name() == "w:sdtContent" && opened && in_content => {
                 in_content = false;
-                tail_start = Some(event_start);
+                tail_start = Some((event_start, !content_start_was_empty));
+                content_start_was_empty = false;
                 deferred_content_close = None;
             }
             Event::End if p.name() == "w:sdt" => {
                 if opened {
-                    let start = tail_start.unwrap_or(event_start);
+                    let start = tail_start.map_or(event_start, |(start, _)| start);
                     let mut raw = deferred_content_close.take().unwrap_or_default();
                     raw.push_str(p.raw_slice(start, p.pos()));
                     table
@@ -1494,7 +1548,7 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                     let mut raw = deferred_content_close.take().unwrap_or_default();
                     raw.push_str(
                         tail_start
-                            .map(|start| p.raw_slice(start, event_start))
+                            .map(|(start, _)| p.raw_slice(start, event_start))
                             .unwrap_or(""),
                     );
                     table
@@ -1517,7 +1571,7 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
                     let mut raw = deferred_content_close.take().unwrap_or_default();
                     raw.push_str(
                         tail_start
-                            .map(|start| p.raw_slice(start, p.pos()))
+                            .map(|(start, _)| p.raw_slice(start, p.pos()))
                             .unwrap_or(""),
                     );
                     table
