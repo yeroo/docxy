@@ -1296,17 +1296,14 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
 fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
     // Raw row-control properties can reference namespace prefixes declared on
     // w:document, w:body, or w:tbl. Those ancestors are reconstructed on save,
-    // so carry every nonstandard in-scope binding with the table and redeclare
-    // it there. The serializer already guarantees the standard bindings.
+    // so carry every in-scope binding that the serializer does not guarantee
+    // unconditionally and redeclare it there. In particular, `mc`/`w15` may be
+    // used only by preserved markup or QName-valued attributes, which cannot be
+    // inferred from a search for `w15:` elements.
     let namespace_declarations = p
         .namespace_attrs()
         .iter()
-        .filter(|attr| {
-            !matches!(
-                attr.name,
-                "xmlns:w" | "xmlns:r" | "xmlns:m" | "xmlns:mc" | "xmlns:w15"
-            )
-        })
+        .filter(|attr| !matches!(attr.name, "xmlns:w" | "xmlns:r" | "xmlns:m"))
         .map(|attr| {
             let mut value = String::new();
             XmlParser::append_decoded(attr.value, &mut value);
