@@ -1,7 +1,9 @@
-use docxcore::load::{Relationships, parse_document_xml};
+use docxcore::load::{Relationships, parse_document_xml, parse_rels_xml};
 use docxcore::model::{
     Block, Inline, PropertyScope, RevisionCategory, RevisionKind, RevisionTarget,
+    UnsupportedRevisionKind,
 };
+use docxcore::package::{load_package, new_package, save_package};
 use docxcore::review::{MalformedRevisionReason, RevisionOutcome};
 use docxcore::serialize::document_to_xml;
 
@@ -325,4 +327,383 @@ fn outcomes_remain_in_document_order_for_nested_and_adjacent_revisions() {
         ]
     );
     assert_eq!(document.plain_text(), "y\n");
+}
+
+#[test]
+fn trailing_section_change_is_actionable_and_round_trips_once() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p><w:r><w:t>x</w:t></w:r></w:p>",
+            "<w:sectPr><w:pgSz w:w=\"15840\"/><w:sectPrChange w:id=\"70\">",
+            "<w:sectPr><w:pgSz w:w=\"12240\"/></w:sectPr></w:sectPrChange></w:sectPr>",
+            "</w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+
+    let original = parse(&xml);
+    assert!(matches!(
+        original.revisions()[0].category,
+        RevisionCategory::Property(PropertyScope::Section)
+    ));
+
+    let mut accepted = original.clone();
+    let accepted_target = target_with_id(&accepted, "70");
+    assert!(accepted.accept_revision(accepted_target).is_applied());
+    let accepted_xml = document_to_xml(&accepted);
+    assert!(accepted_xml.contains("w:w=\"15840\""));
+    assert!(!accepted_xml.contains("sectPrChange"));
+    assert_eq!(accepted_xml.matches("<w:sectPr").count(), 1);
+
+    let mut rejected = original;
+    let rejected_target = target_with_id(&rejected, "70");
+    assert!(rejected.reject_revision(rejected_target).is_applied());
+    let rejected_xml = document_to_xml(&rejected);
+    assert!(rejected_xml.contains("w:w=\"12240\""));
+    assert!(!rejected_xml.contains("w:w=\"15840\""));
+    assert_eq!(rejected_xml.matches("<w:sectPr").count(), 1);
+
+    let package = new_package(rejected);
+    let reloaded = load_package(&save_package(&package)).expect("reload package");
+    assert_eq!(
+        document_to_xml(&reloaded.document)
+            .matches("<w:sectPr")
+            .count(),
+        1
+    );
+    assert!(reloaded.document.revisions().is_empty());
+}
+
+#[test]
+fn external_hyperlink_keeps_and_reviews_nested_revision_content() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"urn:rels\"><w:body><w:p>",
+            "<w:hyperlink r:id=\"rId7\" w:history=\"1\"><w:ins w:id=\"71\" w:author=\"Ada\">",
+            "<w:r><w:t>linked</w:t></w:r></w:ins><w:fldSimple w:instr=\" PAGE \"/>",
+            "</w:hyperlink></w:p></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let rels = parse_rels_xml(
+        "<Relationships><Relationship Id=\"rId7\" Target=\"https://example.test/\" TargetMode=\"External\"/></Relationships>",
+    );
+    let mut document = parse_document_xml(&xml, &rels);
+    assert_eq!(document.plain_text(), "linked\n");
+    let untouched = document_to_xml(&document);
+    assert!(untouched.contains("w:history=\"1\""));
+    assert!(untouched.contains("<w:ins w:id=\"71\""));
+    assert!(untouched.contains("w:fldSimple"));
+
+    let target = target_with_id(&document, "71");
+    assert!(document.accept_revision(target).is_applied());
+    let saved = document_to_xml(&document);
+    assert!(saved.contains("<w:hyperlink r:id=\"rId7\" w:history=\"1\""));
+    assert!(saved.contains("linked"));
+    assert!(saved.contains("w:fldSimple"));
+    assert!(!saved.contains("<w:ins"));
+}
+
+#[test]
+fn reviewed_external_hyperlink_keeps_unknown_attributes_after_two_roundtrips() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"urn:rels\"><w:body><w:p>",
+            "<w:hyperlink r:id=\"rId7\" w:history=\"1\" w:tooltip=\"tip\" w:tgtFrame=\"_blank\">",
+            "<w:ins w:id=\"710\"><w:r><w:t>linked</w:t></w:r></w:ins>",
+            "</w:hyperlink></w:p></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let rels = parse_rels_xml(
+        "<Relationships><Relationship Id=\"rId7\" Target=\"https://example.test/\" TargetMode=\"External\"/></Relationships>",
+    );
+    let mut document = parse_document_xml(&xml, &rels);
+    assert!(
+        document
+            .accept_revision(target_with_id(&document, "710"))
+            .is_applied()
+    );
+
+    let once = document_to_xml(&document);
+    let reloaded = parse_document_xml(&once, &rels);
+    let twice = document_to_xml(&reloaded);
+    assert!(twice.contains("w:history=\"1\""), "{twice}");
+    assert!(twice.contains("w:tooltip=\"tip\""), "{twice}");
+    assert!(twice.contains("w:tgtFrame=\"_blank\""), "{twice}");
+    assert!(twice.contains("<w:hyperlink r:id=\"rId7\""), "{twice}");
+    assert!(twice.contains("linked"), "{twice}");
+}
+
+#[test]
+fn preserved_self_closing_hyperlink_rebuilds_as_balanced_xml() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\" xmlns:r=\"urn:rels\"><w:body><w:p>",
+            "<w:hyperlink r:id=\"rId7\" w:history=\"1\"/>",
+            "</w:p></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let rels = parse_rels_xml(
+        "<Relationships><Relationship Id=\"rId7\" Target=\"https://example.test/\" TargetMode=\"External\"/></Relationships>",
+    );
+
+    let once = document_to_xml(&parse_document_xml(&xml, &rels));
+    assert!(
+        once.contains("<w:hyperlink r:id=\"rId7\" w:history=\"1\"></w:hyperlink>"),
+        "{once}"
+    );
+    assert!(!once.contains("/></w:hyperlink>"), "{once}");
+
+    let twice = document_to_xml(&parse_document_xml(&once, &rels));
+    assert!(twice.contains("w:history=\"1\""), "{twice}");
+    assert!(!twice.contains("/></w:hyperlink>"), "{twice}");
+}
+
+#[test]
+fn split_toc_hyperlink_preserves_opener_attributes_on_each_segment() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p>",
+            "<w:hyperlink w:anchor=\"_Toc1\" w:history=\"1\" w:tooltip=\"toc\">",
+            "<w:r><w:t>Intro</w:t></w:r><w:r><w:tab/></w:r><w:r><w:t>9</w:t></w:r>",
+            "</w:hyperlink></w:p></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+
+    let document = parse(&xml);
+    assert_eq!(document.plain_text(), "Intro\t9\n");
+    let once = document_to_xml(&document);
+    assert_eq!(once.matches("w:history=\"1\"").count(), 2, "{once}");
+    assert_eq!(once.matches("w:tooltip=\"toc\"").count(), 2, "{once}");
+    assert!(once.contains("<w:tab/>"), "{once}");
+
+    let twice = document_to_xml(&parse(&once));
+    assert_eq!(twice.matches("w:history=\"1\"").count(), 2, "{twice}");
+    assert_eq!(twice.matches("w:tooltip=\"toc\"").count(), 2, "{twice}");
+    assert!(twice.contains("<w:tab/>"), "{twice}");
+}
+
+#[test]
+fn internal_anchor_hyperlink_keeps_nested_revision_inside_the_link() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p>",
+            "<w:hyperlink w:anchor=\"target\" w:history=\"1\"><w:ins w:id=\"711\">",
+            "<w:r><w:t>jump</w:t></w:r></w:ins></w:hyperlink>",
+            "</w:p></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let mut document = parse(&xml);
+    let untouched = document_to_xml(&document);
+    assert!(untouched.contains("<w:hyperlink w:anchor=\"target\""));
+    assert!(untouched.contains("<w:ins w:id=\"711\""));
+
+    assert!(
+        document
+            .accept_revision(target_with_id(&document, "711"))
+            .is_applied()
+    );
+    let accepted = document_to_xml(&document);
+    assert!(accepted.contains("<w:hyperlink w:anchor=\"target\""));
+    assert!(accepted.contains("w:history=\"1\""));
+    assert!(accepted.contains("jump"));
+    assert!(!accepted.contains("<w:ins"));
+
+    let twice = document_to_xml(&parse(&accepted));
+    assert!(twice.contains("<w:hyperlink w:anchor=\"target\""));
+    assert!(twice.contains("w:history=\"1\""));
+    assert!(twice.contains("jump"));
+}
+
+#[test]
+fn destructive_outer_action_refuses_to_drop_nested_unsupported_revision() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p>",
+            "<w:ins w:id=\"72\"><w:moveFromRangeStart w:id=\"73\"/>",
+            "<w:r><w:t>kept</w:t></w:r></w:ins>",
+            "</w:p></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let mut document = parse(&xml);
+    let before = document_to_xml(&document);
+    let outcome = document.reject_revision(target_with_id(&document, "72"));
+    assert!(matches!(
+        outcome,
+        RevisionOutcome::Unsupported {
+            kind: UnsupportedRevisionKind::MoveFromRangeStart,
+            ..
+        }
+    ));
+    assert_eq!(document_to_xml(&document), before);
+}
+
+#[test]
+fn cell_revisions_are_enumerated_as_unsupported_and_preserved() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:tbl><w:tr><w:tc><w:tcPr>",
+            "<w:cellIns w:id=\"74\"/><w:cellDel w:id=\"75\"/><w:cellMerge w:id=\"76\"/>",
+            "</w:tcPr><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let mut document = parse(&xml);
+    let kinds = document
+        .revisions()
+        .iter()
+        .map(|address| address.category.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::CellInsert),
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::CellDelete),
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::CellMerge),
+        ]
+    );
+    let outcome = document.accept_revision(target_with_id(&document, "75"));
+    assert!(matches!(
+        outcome,
+        RevisionOutcome::Unsupported {
+            kind: UnsupportedRevisionKind::CellDelete,
+            ..
+        }
+    ));
+    let saved = document_to_xml(&document);
+    assert!(saved.contains("cellIns") && saved.contains("cellDel") && saved.contains("cellMerge"));
+}
+
+#[test]
+fn rejecting_cell_properties_preserves_sibling_cell_revision_records() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:tbl><w:tr><w:tc><w:tcPr>",
+            "<w:shd w:fill=\"CURRENT\"/><w:cellIns w:id=\"740\"/>",
+            "<w:tcPrChange w:id=\"741\"><w:tcPr><w:shd w:fill=\"PRIOR\"/></w:tcPr></w:tcPrChange>",
+            "</w:tcPr><w:p/></w:tc></w:tr></w:tbl></w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let mut document = parse(&xml);
+    assert!(
+        document
+            .reject_revision(target_with_id(&document, "741"))
+            .is_applied()
+    );
+    let saved = document_to_xml(&document);
+    assert!(saved.contains("w:fill=\"PRIOR\""), "{saved}");
+    assert!(!saved.contains("w:fill=\"CURRENT\""), "{saved}");
+    assert!(saved.contains("<w:cellIns w:id=\"740\""), "{saved}");
+    assert!(!saved.contains("tcPrChange"), "{saved}");
+
+    let reparsed = parse(&saved);
+    let remaining = reparsed.revisions();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].metadata.id.as_deref(), Some("740"));
+    assert!(matches!(
+        remaining[0].category,
+        RevisionCategory::Unsupported(UnsupportedRevisionKind::CellInsert)
+    ));
+}
+
+#[test]
+fn every_inline_unsupported_revision_tag_maps_to_its_public_kind() {
+    let cases = [
+        ("moveFrom", UnsupportedRevisionKind::MoveFrom),
+        ("moveTo", UnsupportedRevisionKind::MoveTo),
+        (
+            "moveFromRangeStart",
+            UnsupportedRevisionKind::MoveFromRangeStart,
+        ),
+        (
+            "moveFromRangeEnd",
+            UnsupportedRevisionKind::MoveFromRangeEnd,
+        ),
+        (
+            "moveToRangeStart",
+            UnsupportedRevisionKind::MoveToRangeStart,
+        ),
+        ("moveToRangeEnd", UnsupportedRevisionKind::MoveToRangeEnd),
+        (
+            "customXmlInsRangeStart",
+            UnsupportedRevisionKind::CustomXmlInsRangeStart,
+        ),
+        (
+            "customXmlInsRangeEnd",
+            UnsupportedRevisionKind::CustomXmlInsRangeEnd,
+        ),
+        (
+            "customXmlDelRangeStart",
+            UnsupportedRevisionKind::CustomXmlDelRangeStart,
+        ),
+        (
+            "customXmlDelRangeEnd",
+            UnsupportedRevisionKind::CustomXmlDelRangeEnd,
+        ),
+        (
+            "customXmlMoveFromRangeStart",
+            UnsupportedRevisionKind::CustomXmlMoveFromRangeStart,
+        ),
+        (
+            "customXmlMoveFromRangeEnd",
+            UnsupportedRevisionKind::CustomXmlMoveFromRangeEnd,
+        ),
+        (
+            "customXmlMoveToRangeStart",
+            UnsupportedRevisionKind::CustomXmlMoveToRangeStart,
+        ),
+        (
+            "customXmlMoveToRangeEnd",
+            UnsupportedRevisionKind::CustomXmlMoveToRangeEnd,
+        ),
+        ("conflictIns", UnsupportedRevisionKind::ConflictInsert),
+        ("conflictDel", UnsupportedRevisionKind::ConflictDelete),
+    ];
+
+    for (index, (tag, expected)) in cases.into_iter().enumerate() {
+        let xml = format!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body><w:p><w:{tag} w:id=\"{index}\"/></w:p></w:body></w:document>"
+        );
+        let document = parse(&xml);
+        assert_eq!(
+            document.revisions()[0].category,
+            RevisionCategory::Unsupported(expected),
+            "{tag}"
+        );
+    }
+}
+
+#[test]
+fn rejecting_absent_property_snapshots_clears_every_container_scope() {
+    let xml = format!(
+        concat!(
+            "<w:document xmlns:w=\"{W_NS}\"><w:body>",
+            "<w:p><w:pPr><w:pStyle w:val=\"Now\"/><w:pPrChange w:id=\"80\"/></w:pPr><w:r><w:t>p</w:t></w:r></w:p>",
+            "<w:tbl><w:tblPr><w:tblStyle w:val=\"Now\"/><w:tblPrChange w:id=\"81\"/></w:tblPr>",
+            "<w:tr><w:trPr><w:tblHeader/><w:trPrChange w:id=\"82\"/></w:trPr>",
+            "<w:tc><w:tcPr><w:shd w:fill=\"00FF00\"/><w:tcPrChange w:id=\"83\"/></w:tcPr><w:p/></w:tc>",
+            "</w:tr></w:tbl>",
+            "<w:sectPr><w:pgSz w:w=\"15840\"/><w:sectPrChange w:id=\"84\"/></w:sectPr>",
+            "</w:body></w:document>"
+        ),
+        W_NS = W_NS
+    );
+    let mut document = parse(&xml);
+    let outcomes = document.reject_all_revisions();
+    assert_eq!(outcomes.len(), 5);
+    assert!(outcomes.iter().all(RevisionOutcome::is_applied));
+    let saved = document_to_xml(&document);
+    assert!(!saved.contains("PrChange"));
+    assert!(!saved.contains("w:pStyle"));
+    assert!(!saved.contains("w:tblStyle"));
+    assert!(!saved.contains("w:tblHeader"));
+    assert!(!saved.contains("w:shd"));
+    assert!(!saved.contains("w:pgSz"));
+    assert!(saved.contains("<w:sectPr/>"));
 }

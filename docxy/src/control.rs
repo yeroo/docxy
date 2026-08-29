@@ -181,7 +181,10 @@ fn path_info(app: &App) -> Json {
         ("path", Json::Str(app.path.clone())),
         ("format", Json::Str(fmt.to_string())),
         ("modified", Json::Bool(app.modified)),
-        ("blocks", Json::Num(app.editor.doc.body.len() as f64)),
+        (
+            "blocks",
+            Json::Num(app.editor.doc.content_block_count() as f64),
+        ),
     ];
     // Only present when the package actually carries the state — an
     // unprotected, unwatermarked document must not gain these keys at all.
@@ -209,7 +212,7 @@ fn outline(app: &App) -> Json {
 }
 
 fn read(app: &App, args: &Json) -> Result<Json, String> {
-    let n = app.editor.doc.body.len();
+    let n = app.editor.doc.content_block_count();
     let (start, end) = range_args(args, n)?;
     let blocks = agent::read(&app.editor.doc, start, end)?;
     let joined = blocks
@@ -680,7 +683,10 @@ fn replace_range(app: &mut App, args: &Json) -> Result<Json, String> {
     finish_edit(app);
     Ok(Json::obj(vec![
         ("replaced", Json::Num(replaced as f64)),
-        ("total", Json::Num(app.editor.doc.body.len() as f64)),
+        (
+            "total",
+            Json::Num(app.editor.doc.content_block_count() as f64),
+        ),
     ]))
 }
 
@@ -700,7 +706,7 @@ fn insert(app: &mut App, args: &Json) -> Result<Json, String> {
     finish_edit(app);
     Ok(Json::obj(vec![(
         "total",
-        Json::Num(app.editor.doc.body.len() as f64),
+        Json::Num(app.editor.doc.content_block_count() as f64),
     )]))
 }
 
@@ -715,7 +721,7 @@ fn append(app: &mut App, args: &Json) -> Result<Json, String> {
     finish_edit(app);
     Ok(Json::obj(vec![(
         "total",
-        Json::Num(app.editor.doc.body.len() as f64),
+        Json::Num(app.editor.doc.content_block_count() as f64),
     )]))
 }
 
@@ -762,7 +768,7 @@ fn markdown_flag(args: &Json) -> bool {
 /// comments.
 fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
     let mut blocks = agent::parse_markdown_blocks(text)?;
-    if blocks_carry_formatting(&blocks) {
+    if agent::blocks_carry_formatting(&blocks) {
         app.authorize_mutation(MutationKind::Formatting)
             .map_err(|denial| denial.control_error())?;
     }
@@ -790,43 +796,6 @@ fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, Stri
     }
 
     Ok(blocks)
-}
-
-/// Markdown is a transport syntax, not a single mutation class. Plain parsed
-/// blocks remain a structure/content edit, while styles, numbering, or direct
-/// run/paragraph properties additionally require formatting authorization.
-fn blocks_carry_formatting(blocks: &[Block]) -> bool {
-    fn inline_carries_formatting(inline: &docxcore::model::Inline) -> bool {
-        use docxcore::model::{Inline, RunProps};
-        match inline {
-            Inline::Run(run) => run.props != RunProps::default(),
-            Inline::Hyperlink(link) => link.runs.iter().any(|run| run.props != RunProps::default()),
-            Inline::Tab(props) => *props != RunProps::default(),
-            Inline::TextBox { blocks, .. } => blocks_carry_formatting(blocks),
-            Inline::Revision { content, .. } => content.iter().any(inline_carries_formatting),
-            Inline::Break(_)
-            | Inline::SmartArt { .. }
-            | Inline::Chart { .. }
-            | Inline::Equation { .. }
-            | Inline::Field { .. }
-            | Inline::UnsupportedRevision { .. }
-            | Inline::FootnoteRef { .. }
-            | Inline::Raw(_) => false,
-        }
-    }
-
-    blocks.iter().any(|block| match block {
-        Block::Paragraph(paragraph) => {
-            paragraph.props != Default::default()
-                || paragraph.content.iter().any(inline_carries_formatting)
-        }
-        Block::Table(table) => table.rows.iter().any(|row| {
-            row.cells
-                .iter()
-                .any(|cell| blocks_carry_formatting(&cell.blocks))
-        }),
-        Block::Raw(_) => false,
-    })
 }
 
 /// `doc.replace-all`: replace every occurrence of `query` with `text` across
@@ -1151,7 +1120,10 @@ mod tests {
     }
 
     fn paras(app: &App) -> Vec<String> {
-        app.editor.doc.body.iter().map(|b| b.plain_text()).collect()
+        app.editor.doc.body[..app.editor.doc.content_block_count()]
+            .iter()
+            .map(|b| b.plain_text())
+            .collect()
     }
 
     fn args(pairs: Vec<(&str, Json)>) -> Json {
@@ -1404,7 +1376,7 @@ mod tests {
     #[test]
     fn markdown_insert_round_trips_table_list_and_link() {
         let mut app = app_with(&["Existing"]);
-        let at = app.editor.doc.body.len();
+        let at = app.editor.doc.content_block_count();
         let md = "# Notes\n\n- item one\n- item two\n\n\
                    | A | B |\n| --- | --- |\n| 1 | 2 |\n\n\
                    See [docs](https://example.com).";

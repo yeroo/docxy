@@ -1029,9 +1029,9 @@ function buildSequenceSvg(geo) {
    *  editing is entirely unaffected. */
   function userCmd(str) {
     if (MD_MODE && MD_HIDDEN_OPS.has(str)) return;
-    cmd(str);
+    const view = cmd(str);
     const op = str.split('\t', 1)[0];
-    if (MUTATING.has(op)) {
+    if (MUTATING.has(op) && view.commandApplied === true) {
       vscode.postMessage({ type: 'edit' });
     }
   }

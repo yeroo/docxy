@@ -80,7 +80,7 @@ pub struct Run {
     pub props: RunProps,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hyperlink {
     /// Resolved target URL (external link) if present.
     pub target: Option<String>,
@@ -90,6 +90,37 @@ pub struct Hyperlink {
     /// unchanged (the `.rels` part itself is preserved verbatim).
     pub rel_id: Option<String>,
     pub runs: Vec<Run>,
+    /// Full child sequence for hyperlinks that contain revisions or other
+    /// non-run markup. Simple editable links continue to use `runs`.
+    pub content: Vec<Inline>,
+    /// Original complete hyperlink XML for byte-faithful untouched saves.
+    pub raw: Option<String>,
+    /// Set when a review action changes a descendant of `content`.
+    #[doc(hidden)]
+    pub content_changed: bool,
+}
+
+impl Hyperlink {
+    /// Visible runs in source order, including runs nested in revision wrappers.
+    pub fn visible_runs(&self) -> Vec<&Run> {
+        fn collect<'a>(content: &'a [Inline], out: &mut Vec<&'a Run>) {
+            for inline in content {
+                match inline {
+                    Inline::Run(run) => out.push(run),
+                    Inline::Hyperlink(link) => {
+                        out.extend(link.runs.iter());
+                        collect(&link.content, out);
+                    }
+                    Inline::Revision { content, .. } => collect(content, out),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut runs = self.runs.iter().collect::<Vec<_>>();
+        collect(&self.content, &mut runs);
+        runs
+    }
 }
 
 /// The kind of an in-line break (`w:br`/`w:cr`).
@@ -330,6 +361,14 @@ pub enum UnsupportedRevisionKind {
     Other(String),
 }
 
+/// A recognized unsupported record retained inside a property container whose
+/// raw XML remains authoritative for serialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedPropertyRevision {
+    pub kind: UnsupportedRevisionKind,
+    pub metadata: RevisionMetadata,
+}
+
 /// Reviewable and reportable revision categories in one document-order list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RevisionCategory {
@@ -359,6 +398,9 @@ impl Inline {
     pub fn text(&self) -> String {
         match self {
             Inline::Run(r) => r.text.clone(),
+            Inline::Hyperlink(h) if !h.content.is_empty() => {
+                h.content.iter().map(Inline::text).collect()
+            }
             Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.as_str()).collect(),
             Inline::Tab(_) => "\t".to_string(),
             Inline::Break(_) => "\n".to_string(),
@@ -680,6 +722,10 @@ pub struct Cell {
     /// instead of regenerating tcPr from the model. `None` for a new cell.
     pub raw_tcpr: Option<String>,
     pub property_change: Option<PropertyChange>,
+    /// Recognized `w:cellIns`/`w:cellDel`/`w:cellMerge` records retained in
+    /// `raw_tcpr`, but modeled separately so review can enumerate and reject
+    /// actions against them explicitly.
+    pub unsupported_revisions: Vec<UnsupportedPropertyRevision>,
 }
 
 impl Default for Cell {
@@ -690,6 +736,7 @@ impl Default for Cell {
             blocks: Vec::new(),
             raw_tcpr: None,
             property_change: None,
+            unsupported_revisions: Vec::new(),
         }
     }
 }
@@ -918,10 +965,20 @@ impl Table {
     }
 }
 
+/// Body-level trailing section properties. Unlike paragraph-nested section
+/// breaks, this node describes the document's final section.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SectionProperties {
+    /// Current `w:sectPr` container with its `w:sectPrChange` separated.
+    pub raw: String,
+    pub property_change: Option<PropertyChange>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Paragraph(Paragraph),
     Table(Table),
+    SectionProperties(SectionProperties),
     /// Verbatim XML for block-level content we don't model (content controls,
     /// etc.), preserved for lossless save.
     Raw(String),
@@ -930,7 +987,7 @@ pub enum Block {
 impl Block {
     pub fn plain_text(&self) -> String {
         match self {
-            Block::Raw(_) => String::new(),
+            Block::Raw(_) | Block::SectionProperties(_) => String::new(),
             Block::Paragraph(p) => p.plain_text(),
             Block::Table(t) => {
                 let mut s = String::new();
@@ -961,12 +1018,39 @@ pub struct Document {
 }
 
 impl Document {
+    /// Number of top-level content blocks exposed through editor and agent
+    /// block coordinates. A body-level `w:sectPr` is modeled as a trailing
+    /// sentinel so its revision can be reviewed, but it is not a visible or
+    /// editable document block.
+    pub fn content_block_count(&self) -> usize {
+        self.body
+            .iter()
+            .position(|block| matches!(block, Block::SectionProperties(_)))
+            .unwrap_or(self.body.len())
+    }
+
+    /// The body-level properties for the document's final section, when the
+    /// source document supplied an explicit `w:sectPr`.
+    pub fn trailing_section_properties(&self) -> Option<&SectionProperties> {
+        self.body.iter().rev().find_map(|block| match block {
+            Block::SectionProperties(section) => Some(section),
+            _ => None,
+        })
+    }
+
+    pub fn trailing_section_properties_mut(&mut self) -> Option<&mut SectionProperties> {
+        self.body.iter_mut().rev().find_map(|block| match block {
+            Block::SectionProperties(section) => Some(section),
+            _ => None,
+        })
+    }
+
     /// Concatenated visible text, one block per line — handy for tests/sanity.
     pub fn plain_text(&self) -> String {
         let mut s = String::new();
         for b in &self.body {
             s.push_str(&b.plain_text());
-            if !matches!(b, Block::Table(_)) {
+            if !matches!(b, Block::Table(_) | Block::SectionProperties(_)) {
                 s.push('\n');
             }
         }
@@ -985,8 +1069,9 @@ impl Document {
             .unwrap_or(0)
             .saturating_add(1)
             .max(1);
+        let mut seen = std::collections::HashSet::new();
         for block in &mut self.body {
-            assign_block_revision_targets(block, &mut next);
+            assign_block_revision_targets(block, &mut next, &mut seen);
         }
     }
 
@@ -1008,46 +1093,68 @@ impl Document {
     }
 }
 
-fn assign_metadata_target(metadata: &mut RevisionMetadata, next: &mut u64) {
-    if !metadata.target.is_assigned() {
+fn assign_metadata_target(
+    metadata: &mut RevisionMetadata,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
+    if !metadata.target.is_assigned() || !seen.insert(metadata.target) {
         metadata.target = RevisionTarget(*next);
         *next = next.saturating_add(1);
+        seen.insert(metadata.target);
     }
 }
 
-fn assign_property_target(change: &mut Option<PropertyChange>, next: &mut u64) {
+fn assign_property_target(
+    change: &mut Option<PropertyChange>,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
     if let Some(change) = change {
-        assign_metadata_target(&mut change.metadata, next);
+        assign_metadata_target(&mut change.metadata, next, seen);
     }
 }
 
-fn assign_run_props_target(props: &mut RunProps, next: &mut u64) {
-    assign_property_target(&mut props.property_change, next);
+fn assign_run_props_target(
+    props: &mut RunProps,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
+    assign_property_target(&mut props.property_change, next, seen);
 }
 
-fn assign_inline_revision_targets(inline: &mut Inline, next: &mut u64) {
+fn assign_inline_revision_targets(
+    inline: &mut Inline,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
     match inline {
-        Inline::Run(run) => assign_run_props_target(&mut run.props, next),
+        Inline::Run(run) => assign_run_props_target(&mut run.props, next, seen),
         Inline::Hyperlink(link) => {
             for run in &mut link.runs {
-                assign_run_props_target(&mut run.props, next);
+                assign_run_props_target(&mut run.props, next, seen);
+            }
+            for child in &mut link.content {
+                assign_inline_revision_targets(child, next, seen);
             }
         }
-        Inline::Tab(props) => assign_run_props_target(props, next),
+        Inline::Tab(props) => assign_run_props_target(props, next, seen),
         Inline::TextBox { blocks, .. } => {
             for block in blocks {
-                assign_block_revision_targets(block, next);
+                assign_block_revision_targets(block, next, seen);
             }
         }
         Inline::Revision {
             metadata, content, ..
         } => {
-            assign_metadata_target(metadata, next);
+            assign_metadata_target(metadata, next, seen);
             for child in content {
-                assign_inline_revision_targets(child, next);
+                assign_inline_revision_targets(child, next, seen);
             }
         }
-        Inline::UnsupportedRevision { metadata, .. } => assign_metadata_target(metadata, next),
+        Inline::UnsupportedRevision { metadata, .. } => {
+            assign_metadata_target(metadata, next, seen)
+        }
         Inline::Break(_)
         | Inline::SmartArt { .. }
         | Inline::Chart { .. }
@@ -1058,27 +1165,37 @@ fn assign_inline_revision_targets(inline: &mut Inline, next: &mut u64) {
     }
 }
 
-fn assign_block_revision_targets(block: &mut Block, next: &mut u64) {
+fn assign_block_revision_targets(
+    block: &mut Block,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
     match block {
         Block::Paragraph(paragraph) => {
             // sectPr precedes pPrChange in CT_PPr schema order.
-            assign_property_target(&mut paragraph.props.section_property_change, next);
-            assign_property_target(&mut paragraph.props.property_change, next);
+            assign_property_target(&mut paragraph.props.section_property_change, next, seen);
+            assign_property_target(&mut paragraph.props.property_change, next, seen);
             for inline in &mut paragraph.content {
-                assign_inline_revision_targets(inline, next);
+                assign_inline_revision_targets(inline, next, seen);
             }
         }
         Block::Table(table) => {
-            assign_property_target(&mut table.property_change, next);
+            assign_property_target(&mut table.property_change, next, seen);
             for row in &mut table.rows {
-                assign_property_target(&mut row.property_change, next);
+                assign_property_target(&mut row.property_change, next, seen);
                 for cell in &mut row.cells {
-                    assign_property_target(&mut cell.property_change, next);
+                    assign_property_target(&mut cell.property_change, next, seen);
+                    for revision in &mut cell.unsupported_revisions {
+                        assign_metadata_target(&mut revision.metadata, next, seen);
+                    }
                     for block in &mut cell.blocks {
-                        assign_block_revision_targets(block, next);
+                        assign_block_revision_targets(block, next, seen);
                     }
                 }
             }
+        }
+        Block::SectionProperties(section) => {
+            assign_property_target(&mut section.property_change, next, seen);
         }
         Block::Raw(_) => {}
     }
@@ -1138,6 +1255,9 @@ fn collect_inline_revisions(
         Inline::Hyperlink(link) => {
             for run in &link.runs {
                 collect_run_props_revisions(&run.props, parent, depth, out);
+            }
+            for child in &link.content {
+                collect_inline_revisions(child, parent, depth, out);
             }
         }
         Inline::Tab(props) => collect_run_props_revisions(props, parent, depth, out),
@@ -1201,11 +1321,23 @@ fn collect_block_revisions(
                 collect_property_revision(&row.property_change, parent, depth, out);
                 for cell in &row.cells {
                     collect_property_revision(&cell.property_change, parent, depth, out);
+                    for revision in &cell.unsupported_revisions {
+                        push_revision_address(
+                            &revision.metadata,
+                            RevisionCategory::Unsupported(revision.kind.clone()),
+                            parent,
+                            depth,
+                            out,
+                        );
+                    }
                     for block in &cell.blocks {
                         collect_block_revisions(block, parent, depth, out);
                     }
                 }
             }
+        }
+        Block::SectionProperties(section) => {
+            collect_property_revision(&section.property_change, parent, depth, out);
         }
         Block::Raw(_) => {}
     }

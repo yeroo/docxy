@@ -40,6 +40,7 @@ pub mod notes;
 pub mod numbering;
 pub mod omath;
 pub mod package;
+pub mod protection;
 pub mod render;
 pub mod review;
 pub mod serialize;

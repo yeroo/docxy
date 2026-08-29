@@ -128,7 +128,7 @@ saves.)*
 Open the sample `.docx` **and** `.xlsx` in tabs first.
 
 - [ ] **C1 Tool discovery** — In Copilot agent mode (or `claude mcp` list), the
-  `offxy` server exposes **56 tools** (`docxy_*` + `xlsxy_*`). Ask the agent to
+  `offxy` server exposes **64 tools** (`docxy_*` + `xlsxy_*`). Ask the agent to
   "list your offxy tools" and confirm the count/names.
 - [ ] **C2 Instance discovery** — Ask the agent to run `docxy_list` /
   `xlsxy_list`. Each open tab appears as a `docxy-vscode-…` / `xlsxy-vscode-…`
@@ -164,6 +164,14 @@ Open the sample `.docx` **and** `.xlsx` in tabs first.
 - [ ] **D7 Large CJK/emoji read** — Put a lot of non-ASCII text (Cyrillic/CJK/
   emoji) in a doc; `docxy_read` through the agent round-trips it intact (no
   `�` replacement characters — this exercises the split-UTF-8 fix).
+- [ ] **D8 Tracked-change review + undo** — Open a document containing an
+  insertion, deletion, property change, and unsupported move marker. Use
+  `docxy_revisions`, next/previous, and accept/reject from the agent. Supported
+  actions repaint the tab, light the dirty dot, and one Ctrl+Z restores the
+  exact prior document; the unsupported record returns a structured no-op.
+- [ ] **D9 Protected review denial** — Repeat an accept call on an enforced
+  read-only document. The tab stays clean and unchanged and the reply is the
+  same `protection_denied:read_only` error as the terminal surface.
 
 ---
 

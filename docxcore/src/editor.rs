@@ -465,6 +465,7 @@ impl Editor {
             *last = new_idx;
         }
         self.caret.offset = 0;
+        self.doc.initialize_revision_targets();
     }
 
     /// Word-style autoformat: if the current paragraph's whole text is three or
@@ -976,6 +977,7 @@ impl Editor {
                 p.content.extend(tail);
                 self.caret.offset = off + ins_len;
             }
+            self.doc.initialize_revision_targets();
             return;
         }
 
@@ -1016,6 +1018,7 @@ impl Editor {
             *l = placed.0;
         }
         self.caret.offset = placed.1;
+        self.doc.initialize_revision_targets();
     }
 
     // ---- formatting ----
@@ -1060,6 +1063,7 @@ impl Editor {
                 map_prop_range(&mut p.content, *s, *e, &f);
             }
         }
+        self.doc.initialize_revision_targets();
     }
 
     /// Grow (or shrink) the font size of the selection by `delta` half-points,
@@ -1122,6 +1126,7 @@ impl Editor {
                 map_text_range(&mut p.content, *s, *e, &*f);
             }
         }
+        self.doc.initialize_revision_targets();
     }
 
     /// Paths of the paragraphs touched by the selection (or the caret's paragraph).
@@ -1357,7 +1362,7 @@ impl Editor {
                             }
                         }
                     }
-                    Block::Raw(_) => {}
+                    Block::SectionProperties(_) | Block::Raw(_) => {}
                 }
             }
         }
@@ -1429,6 +1434,7 @@ impl Editor {
                 set_prop_range(&mut p.content, *s, *e, set, value);
             }
         }
+        self.doc.initialize_revision_targets();
     }
 
     // ---- find / replace ----
@@ -1643,7 +1649,7 @@ fn first_paragraph_span(body: &[Block], prefix: &mut Vec<usize>) -> Option<(Care
         let found = match block {
             Block::Paragraph(paragraph) => Some(paragraph_span(prefix, paragraph)),
             Block::Table(table) => first_table_paragraph_span(table, prefix),
-            Block::Raw(_) => None,
+            Block::SectionProperties(_) | Block::Raw(_) => None,
         };
         prefix.pop();
         if found.is_some() {
@@ -1722,6 +1728,18 @@ fn collect_block_revision_positions(
                         let cell_span = forced_span(&forced)
                             .or_else(|| first_paragraph_span(&cell.blocks, prefix));
                         property_position(&cell.property_change, cell_span, positions);
+                        for unsupported in &cell.unsupported_revisions {
+                            let Some((start, end)) = forced_span(&forced)
+                                .or_else(|| first_paragraph_span(&cell.blocks, prefix))
+                            else {
+                                continue;
+                            };
+                            positions.push(RevisionPosition {
+                                target: unsupported.metadata.target,
+                                start,
+                                end,
+                            });
+                        }
                         collect_block_revision_positions(
                             &cell.blocks,
                             prefix,
@@ -1732,6 +1750,11 @@ fn collect_block_revision_positions(
                     }
                     prefix.pop();
                 }
+            }
+            Block::SectionProperties(section) => {
+                let span =
+                    forced_span(&forced).or_else(|| first_paragraph_span(body, &mut Vec::new()));
+                property_position(&section.property_change, span, positions);
             }
             Block::Raw(_) => {}
         }
@@ -1777,6 +1800,12 @@ fn collect_inline_revision_positions(
                     property_position(&run.props.property_change, Some((start, end)), positions);
                     run_offset += run.text.chars().count();
                 }
+                collect_inline_revision_positions(
+                    &link.content,
+                    path,
+                    Some(point.clone()),
+                    positions,
+                );
             }
             Inline::Tab(props) => {
                 let end = if forced.is_some() {
@@ -1954,7 +1983,7 @@ fn collect_paths(body: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usiz
                     }
                 }
             }
-            Block::Raw(_) => {}
+            Block::SectionProperties(_) | Block::Raw(_) => {}
         }
         prefix.pop();
     }
@@ -2024,6 +2053,9 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                         anchor: h.anchor.clone(),
                         rel_id: h.rel_id.clone(),
                         runs,
+                        content: Vec::new(),
+                        raw: None,
+                        content_changed: false,
                     }));
                 }
             }
@@ -3266,6 +3298,29 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn partial_edit_rekeys_cloned_property_revision_targets() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="90"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr><w:t>abcd</w:t></w:r></w:p></w:body></w:document>"#;
+        let document = crate::load::parse_document_xml(xml, &Default::default());
+        let mut editor = Editor::new(document);
+        editor.anchor = Some(Caret::top(0, 1));
+        editor.caret = Caret::top(0, 3);
+        editor.toggle_bold();
+
+        let revisions = editor.doc.revisions();
+        let unique = revisions
+            .iter()
+            .map(|revision| revision.target)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), revisions.len());
+        assert!(revisions.iter().all(|revision| revision.target.0 != 0));
+
+        let outcomes = editor.reject_all_revisions();
+        assert_eq!(outcomes.len(), revisions.len());
+        assert!(outcomes.iter().all(RevisionOutcome::is_applied));
+        assert!(editor.doc.revisions().is_empty());
     }
 
     #[test]

@@ -59,7 +59,7 @@ fn embed_in_block(pkg: &mut Package, block: &mut Block, images: &[MermaidImage])
                 }
             }
         }
-        Block::Raw(_) => {}
+        Block::SectionProperties(_) | Block::Raw(_) => {}
     }
 }
 

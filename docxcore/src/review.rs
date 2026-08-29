@@ -3,7 +3,7 @@
 use crate::model::{
     Block, Cell, Document, Inline, ParProps, PropertyScope, PropertySnapshot, PropertyState,
     RevisionAddress, RevisionCategory, RevisionDisplayCues, RevisionKind, RevisionTarget, Row,
-    RunProps, UnsupportedRevisionKind, VMerge,
+    RunProps, SectionProperties, UnsupportedRevisionKind, VMerge,
 };
 use crate::xml::{Event, XmlParser};
 
@@ -95,10 +95,37 @@ impl Document {
         action: RevisionAction,
     ) -> RevisionOutcome {
         self.initialize_revision_targets();
-        let Some(address) = self.revision(target) else {
+        let addresses = self.revisions();
+        let Some(address) = addresses.iter().find(|address| address.target == target) else {
             return RevisionOutcome::Stale { target, action };
         };
-        if let RevisionCategory::Unsupported(kind) = address.category {
+        if let RevisionCategory::Unsupported(kind) = &address.category {
+            return RevisionOutcome::Unsupported {
+                target,
+                action,
+                kind: kind.clone(),
+            };
+        }
+        let discards_content = matches!(
+            (&address.category, action),
+            (
+                RevisionCategory::Inline(RevisionKind::Insert),
+                RevisionAction::Reject
+            ) | (
+                RevisionCategory::Inline(RevisionKind::Delete),
+                RevisionAction::Accept
+            )
+        );
+        if discards_content
+            && let Some(kind) = addresses
+                .iter()
+                .skip(address.ordinal + 1)
+                .take_while(|candidate| candidate.depth > address.depth)
+                .find_map(|candidate| match &candidate.category {
+                    RevisionCategory::Unsupported(kind) => Some(kind.clone()),
+                    _ => None,
+                })
+        {
             return RevisionOutcome::Unsupported {
                 target,
                 action,
@@ -140,36 +167,14 @@ impl Document {
 }
 
 fn revision_postorder(addresses: &[RevisionAddress]) -> Vec<(usize, RevisionTarget)> {
-    fn visit(
-        address: &RevisionAddress,
-        addresses: &[RevisionAddress],
-        visited: &mut [bool],
-        out: &mut Vec<(usize, RevisionTarget)>,
-    ) {
-        if visited[address.ordinal] {
-            return;
-        }
-        visited[address.ordinal] = true;
-        for child in addresses
-            .iter()
-            .filter(|candidate| candidate.parent == Some(address.target))
-        {
-            visit(child, addresses, visited, out);
-        }
-        out.push((address.ordinal, address.target));
-    }
-
-    let mut out = Vec::with_capacity(addresses.len());
-    let mut visited = vec![false; addresses.len()];
-    for address in addresses.iter().filter(|address| address.parent.is_none()) {
-        visit(address, addresses, &mut visited, &mut out);
-    }
-    // Be deterministic even for a manually constructed graph with a missing or
-    // cyclic parent target.
-    for address in addresses {
-        visit(address, addresses, &mut visited, &mut out);
-    }
-    out
+    // `Document::revisions` is pre-order, so reversing it guarantees every
+    // descendant is transformed before its ancestor. Original ordinals are
+    // retained and used to restore report order after the actions run.
+    addresses
+        .iter()
+        .rev()
+        .map(|address| (address.ordinal, address.target))
+        .collect()
 }
 
 fn transform_blocks(
@@ -202,6 +207,9 @@ fn transform_blocks(
                     }
                     found
                 }
+            }
+            Block::SectionProperties(section) => {
+                transform_trailing_section_props(section, target, action)
             }
             Block::Raw(_) => None,
         };
@@ -291,7 +299,11 @@ fn transform_inline(
                     return Some(result);
                 }
             }
-            None
+            let result = transform_inlines(&mut link.content, target, action);
+            if matches!(result, Some(Ok(_))) {
+                link.content_changed = true;
+            }
+            result
         }
         Inline::Tab(props) => transform_run_props(props, target, action),
         Inline::TextBox { blocks, .. } => transform_blocks(blocks, target, action),
@@ -451,6 +463,49 @@ fn transform_section_props(
     Some(Ok(RevisionCategory::Property(PropertyScope::Section)))
 }
 
+fn transform_trailing_section_props(
+    section: &mut SectionProperties,
+    target: RevisionTarget,
+    action: RevisionAction,
+) -> Option<TransformResult> {
+    let change = section.property_change.as_ref()?;
+    if change.metadata.target != target {
+        return None;
+    }
+    if change.scope != PropertyScope::Section {
+        return Some(Err(MalformedRevisionReason::PropertyScopeMismatch {
+            expected: PropertyScope::Section,
+            actual: change.scope,
+        }));
+    }
+    if action == RevisionAction::Accept {
+        section.property_change = None;
+        return Some(Ok(RevisionCategory::Property(PropertyScope::Section)));
+    }
+
+    section.raw = match change.previous.clone() {
+        // The body must retain a final section-property container even when
+        // the previous state had no explicit properties.
+        PropertySnapshot::Absent => "<w:sectPr/>".to_string(),
+        PropertySnapshot::Malformed(_) => {
+            return Some(Err(MalformedRevisionReason::PropertySnapshot {
+                scope: PropertyScope::Section,
+            }));
+        }
+        PropertySnapshot::Present(PropertyState::Section(previous)) => previous,
+        PropertySnapshot::Present(other) => {
+            return Some(Err(
+                MalformedRevisionReason::PropertySnapshotScopeMismatch {
+                    expected: PropertyScope::Section,
+                    actual: other.scope(),
+                },
+            ));
+        }
+    };
+    section.property_change = None;
+    Some(Ok(RevisionCategory::Property(PropertyScope::Section)))
+}
+
 fn transform_table_props(
     raw_props: &mut Option<String>,
     property_change: &mut Option<crate::model::PropertyChange>,
@@ -569,9 +624,69 @@ fn transform_cell_props(
             ));
         }
     };
-    apply_cell_property_xml(cell, previous);
+    let unsupported_xml = cell_unsupported_revision_xml(cell);
+    apply_cell_property_xml(cell, merge_cell_revision_xml(previous, &unsupported_xml));
     cell.property_change = None;
     Some(Ok(RevisionCategory::Property(PropertyScope::TableCell)))
+}
+
+fn cell_unsupported_revision_xml(cell: &Cell) -> Vec<String> {
+    let Some(raw) = cell.raw_tcpr.as_deref() else {
+        return Vec::new();
+    };
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name().rsplit(':').next() != Some("tcPr") {
+        return Vec::new();
+    }
+    let mut revisions = Vec::new();
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let start = parser.start_pos();
+                let preserve = matches!(
+                    parser.name().rsplit(':').next(),
+                    Some("cellIns" | "cellDel" | "cellMerge")
+                );
+                parser.skip_element();
+                if preserve {
+                    revisions.push(parser.raw_slice(start, parser.pos()).to_string());
+                }
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    revisions
+}
+
+fn merge_cell_revision_xml(previous: Option<String>, revisions: &[String]) -> Option<String> {
+    if revisions.is_empty() {
+        return previous;
+    }
+    let missing = |xml: &str| {
+        revisions
+            .iter()
+            .filter(|revision| !xml.contains(revision.as_str()))
+            .cloned()
+            .collect::<String>()
+    };
+    match previous {
+        Some(mut xml) => {
+            let additions = missing(&xml);
+            if additions.is_empty() {
+                return Some(xml);
+            }
+            if let Some(close) = xml.rfind("</") {
+                xml.insert_str(close, &additions);
+            } else if let Some(self_close) = xml.rfind("/>") {
+                xml.replace_range(self_close..self_close + 2, ">");
+                xml.push_str(&additions);
+                xml.push_str("</w:tcPr>");
+            }
+            Some(xml)
+        }
+        None => Some(format!("<w:tcPr>{}</w:tcPr>", revisions.concat())),
+    }
 }
 
 fn replace_row_property_xml(raw_props: &mut Vec<String>, previous: Option<String>) {
@@ -677,6 +792,9 @@ fn strip_revision_cue(inline: &mut Inline, kind: RevisionKind, normalize_deleted
         Inline::Hyperlink(link) => {
             for run in &mut link.runs {
                 strip(&mut run.props);
+            }
+            for child in &mut link.content {
+                strip_revision_cue(child, kind, normalize_deleted);
             }
         }
         Inline::Tab(props) => strip(props),

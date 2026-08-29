@@ -1177,7 +1177,12 @@ impl App {
             selection,
             styles: self.styles.clone(),
             list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
-            page: self.pkg.page_geom(),
+            page: self
+                .editor
+                .doc
+                .trailing_section_properties()
+                .map(|section| PageGeom::from_sect_pr(&section.raw))
+                .unwrap_or_else(|| self.pkg.page_geom()),
             // While editing a header/footer the editor *is* that surface, so the
             // banner/margin copy is suppressed (no duplicate header).
             headers: if self.hf_edit.is_some() {
@@ -3229,6 +3234,7 @@ impl App {
                         text: url,
                         props: RunProps::default(),
                     }],
+                    ..Hyperlink::default()
                 });
                 self.editor.paste(&Clip {
                     paras: vec![vec![link]],
@@ -3307,6 +3313,7 @@ impl App {
             blocks: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
             raw_tcpr: None,
             property_change: None,
+            unsupported_revisions: Vec::new(),
         };
         let mk_row = || Row {
             cells: (0..cols).map(|_| mk_cell()).collect(),
@@ -5961,7 +5968,7 @@ fn block_has_bookmark(b: &Block, needle: &str) -> bool {
                 .iter()
                 .any(|c| c.blocks.iter().any(|bb| block_has_bookmark(bb, needle)))
         }),
-        Block::Raw(_) => false,
+        Block::SectionProperties(_) | Block::Raw(_) => false,
     }
 }
 
@@ -6180,7 +6187,7 @@ fn clip_has_formatting(clip: &Clip) -> bool {
                     .iter()
                     .any(|cell| blocks_have_formatting(&cell.blocks))
             }),
-            Block::Raw(_) => false,
+            Block::SectionProperties(_) | Block::Raw(_) => false,
         })
     }
 
@@ -9506,6 +9513,7 @@ mod tests {
                 text: "link".to_string(),
                 props: RunProps::default(),
             }],
+            ..Hyperlink::default()
         });
         let body = vec![Block::Paragraph(MPara {
             props: ParProps::default(),
@@ -9539,6 +9547,7 @@ mod tests {
                 text: "link".to_string(),
                 props: RunProps::default(),
             }],
+            ..Hyperlink::default()
         });
         Document {
             body: vec![Block::Paragraph(MPara {

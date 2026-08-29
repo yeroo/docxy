@@ -700,7 +700,7 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
 `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
 `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create` (33
-total; docxy's 23 + xlsxy's 33 = **56 tools** total across both apps).
+total; docxy's 31 + xlsxy's 33 = **64 tools** total across both apps).
 Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):

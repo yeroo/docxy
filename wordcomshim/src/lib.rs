@@ -263,6 +263,21 @@ mod win {
             }
         }
 
+        /// The final body-level `w:sectPr` is a model sentinel, not editable
+        /// content. Keep every COM-created block immediately before it.
+        fn push_content_block(&mut self, block: Block) {
+            let at = self.pkg.document.content_block_count();
+            self.pkg.document.body.insert(at, block);
+        }
+
+        fn current_paragraph_mut(&mut self) -> Option<&mut Paragraph> {
+            let at = self.pkg.document.content_block_count().checked_sub(1)?;
+            match self.pkg.document.body.get_mut(at) {
+                Some(Block::Paragraph(paragraph)) => Some(paragraph),
+                _ => None,
+            }
+        }
+
         /// Set the current paragraph style from a name ("Heading 1", "Normal").
         /// For a heading we DEFINE the built-in style in styles.xml (via
         /// `ensure_styles`), so Word shows it semantically as "Heading N" with
@@ -296,7 +311,7 @@ mod win {
             // empty (freshly started), retag it so `Style=x : TypeText` styles
             // this paragraph, not just the next one.
             let (style_id, heading) = (self.cur_style.clone(), self.cur_heading);
-            if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+            if let Some(p) = self.current_paragraph_mut() {
                 if p.content.is_empty() {
                     p.props.style_id = style_id;
                     p.props.heading_level = heading;
@@ -312,7 +327,7 @@ mod win {
                 Some(b) => {
                     let id = self.pkg.ensure_list(b);
                     self.cur_list = Some(id);
-                    if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+                    if let Some(p) = self.current_paragraph_mut() {
                         p.props.num_id = Some(id);
                         p.props.ilvl = 0;
                     }
@@ -340,18 +355,18 @@ mod win {
         /// Type text at the end, honoring embedded paragraph marks (\r / \n), in
         /// the current character format.
         fn type_text(&mut self, s: &str) {
-            if !matches!(self.pkg.document.body.last(), Some(Block::Paragraph(_))) {
+            if self.current_paragraph_mut().is_none() {
                 let p = self.new_para();
-                self.pkg.document.body.push(Block::Paragraph(p));
+                self.push_content_block(Block::Paragraph(p));
             }
             for (i, seg) in split_paragraphs(s).into_iter().enumerate() {
                 if i > 0 {
                     let p = self.new_para();
-                    self.pkg.document.body.push(Block::Paragraph(p));
+                    self.push_content_block(Block::Paragraph(p));
                 }
                 if !seg.is_empty() {
                     let run = self.cur_run(&seg);
-                    if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+                    if let Some(p) = self.current_paragraph_mut() {
                         p.content.push(run);
                     }
                 }
@@ -361,17 +376,17 @@ mod win {
 
         fn type_paragraph(&mut self) {
             let p = self.new_para();
-            self.pkg.document.body.push(Block::Paragraph(p));
+            self.push_content_block(Block::Paragraph(p));
             self.saved = false;
         }
 
         /// Insert a page/column/line break inline at the end.
         fn insert_break(&mut self, kind: BreakKind) {
-            if !matches!(self.pkg.document.body.last(), Some(Block::Paragraph(_))) {
+            if self.current_paragraph_mut().is_none() {
                 let p = self.new_para();
-                self.pkg.document.body.push(Block::Paragraph(p));
+                self.push_content_block(Block::Paragraph(p));
             }
-            if let Some(Block::Paragraph(p)) = self.pkg.document.body.last_mut() {
+            if let Some(p) = self.current_paragraph_mut() {
                 p.content.push(Inline::Break(kind));
             }
             self.saved = false;
@@ -453,6 +468,7 @@ mod win {
                 blocks: vec![Block::Paragraph(Paragraph::default())],
                 raw_tcpr: None,
                 property_change: None,
+                unsupported_revisions: vec![],
             };
             let table = Table {
                 grid: vec![0; cols],
@@ -469,7 +485,7 @@ mod win {
                 raw_tblpr: Some(TBLPR.to_string()),
                 property_change: None,
             };
-            self.pkg.document.body.push(Block::Table(table));
+            self.push_content_block(Block::Table(table));
             self.saved = false;
             self.table_count()
         }
@@ -2076,6 +2092,61 @@ mod win {
                 }
                 Ok(())
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn state_with_section_sentinel() -> DocState {
+            let mut state = DocState::new();
+            state.pkg.document.body = vec![
+                Block::Paragraph(Paragraph::default()),
+                Block::SectionProperties(docxcore::model::SectionProperties {
+                    raw: "<w:sectPr/>".to_string(),
+                    property_change: None,
+                }),
+            ];
+            state
+        }
+
+        #[test]
+        fn end_of_document_com_mutations_stay_before_section_properties() {
+            let mut state = state_with_section_sentinel();
+
+            state.set_style("Heading 1");
+            state.apply_list(Some(true));
+            state.type_text("one");
+            state.type_paragraph();
+            state.insert_break(BreakKind::Page);
+            state.add_table(1, 1);
+            // A table is not a text insertion point; TypeText should create a
+            // following paragraph, still before the section sentinel.
+            state.type_text("after table");
+
+            assert_eq!(state.pkg.document.content_block_count(), 4);
+            assert!(matches!(
+                state.pkg.document.body.last(),
+                Some(Block::SectionProperties(_))
+            ));
+            assert!(matches!(state.pkg.document.body[2], Block::Table(_)));
+            assert_eq!(state.pkg.document.body[3].plain_text(), "after table");
+
+            let Block::Paragraph(first) = &state.pkg.document.body[0] else {
+                panic!("first content block should remain a paragraph")
+            };
+            assert_eq!(first.props.style_id.as_deref(), Some("Heading1"));
+            assert!(first.props.num_id.is_some());
+            assert_eq!(first.plain_text(), "one");
+
+            let Block::Paragraph(second) = &state.pkg.document.body[1] else {
+                panic!("second content block should be a paragraph")
+            };
+            assert!(matches!(
+                second.content.as_slice(),
+                [Inline::Break(BreakKind::Page)]
+            ));
         }
     }
 }

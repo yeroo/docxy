@@ -3,17 +3,16 @@
 //! The save strategy that keeps documents from being corrupted: keep **every**
 //! original ZIP part byte-for-byte, and on save rewrite only `word/document.xml`
 //! from the [`Document`] model. The trailing section properties (`w:sectPr`,
-//! which carry page size/margins/orientation) are captured verbatim and
-//! re-inserted, so page geometry survives a round-trip even though it isn't
-//! modeled.
+//! which carry page size/margins/orientation and tracked property changes) are
+//! modeled and round-tripped.
 //!
 //! Known limitations (documented, not silent): body content other than
-//! paragraphs/tables and the final `sectPr` — e.g. bookmarks, mid-document
+//! paragraphs/tables — e.g. bookmarks, mid-document
 //! section breaks, comments anchors — is not reconstructed by the serializer and
 //! is dropped on save. Full raw-node preservation is a later refinement.
 
 use crate::load::{LoadError, parse_document_xml, parse_rels_xml};
-use crate::model::Document;
+use crate::model::{Block, Document, PropertyScope, SectionProperties};
 use crate::serialize::document_to_xml;
 use crate::xml::{Event, XmlParser};
 use crate::zip::ZipArchive;
@@ -635,12 +634,40 @@ impl Package {
     /// The captured trailing section properties (`w:sectPr`) XML, which carries
     /// the header/footer references and page geometry.
     pub fn sect_pr(&self) -> &str {
-        &self.sect_pr
+        self.document
+            .trailing_section_properties()
+            .map(|section| section.raw.as_str())
+            .unwrap_or(&self.sect_pr)
     }
 
     /// Replace the trailing section properties (e.g. to change page orientation).
     pub fn set_sect_pr(&mut self, xml: String) {
+        let (raw, property_change) =
+            crate::load::split_property_change_container(&xml, PropertyScope::Section);
+        let section = SectionProperties {
+            raw,
+            property_change,
+        };
+        if let Some(current) = self.document.trailing_section_properties_mut() {
+            *current = section;
+        } else {
+            self.document.body.push(Block::SectionProperties(section));
+        }
         self.sect_pr = xml;
+    }
+
+    fn set_current_sect_pr_raw(&mut self, raw: String) {
+        if let Some(section) = self.document.trailing_section_properties_mut() {
+            section.raw = raw.clone();
+        } else {
+            self.document
+                .body
+                .push(Block::SectionProperties(SectionProperties {
+                    raw: raw.clone(),
+                    property_change: None,
+                }));
+        }
+        self.sect_pr = raw;
     }
 
     /// Structured protection state from the document's related settings part.
@@ -703,12 +730,14 @@ impl Package {
             .iter()
             .filter_map(|block| match block {
                 crate::model::Block::Paragraph(p) => p.props.section_break.as_deref(),
-                crate::model::Block::Table(_) | crate::model::Block::Raw(_) => None,
+                crate::model::Block::Table(_)
+                | crate::model::Block::SectionProperties(_)
+                | crate::model::Block::Raw(_) => None,
             })
             .collect();
         // The trailing body sectPr describes the final section. Even an empty
         // value represents the one implicit section of a document without sectPr.
-        sections.push(&self.sect_pr);
+        sections.push(self.sect_pr());
 
         #[derive(Clone)]
         struct AppliedHeader {
@@ -781,7 +810,7 @@ impl Package {
     /// Whether the document defines page borders (`w:pgBorders` in any section).
     /// Surfaced as an indicator; a terminal doesn't draw the page frame itself.
     pub fn has_page_borders(&self) -> bool {
-        self.sect_pr.contains("<w:pgBorders")
+        self.sect_pr().contains("<w:pgBorders")
             || self.document.body.iter().any(|b| {
                 matches!(b, crate::model::Block::Paragraph(p)
                     if p.props.section_break.as_deref().is_some_and(|s| s.contains("<w:pgBorders")))
@@ -866,13 +895,14 @@ impl Package {
 
         // Section reference (must be among the first children of sectPr).
         let reference = format!("<w:{kind}Reference w:type=\"{hf_type}\" r:id=\"{rid}\"/>");
-        self.sect_pr = inject_sect_child(&self.sect_pr, &reference);
+        let section = inject_sect_child(self.sect_pr(), &reference);
+        self.set_current_sect_pr_raw(section);
         Some(part_name)
     }
 
     /// Whether the section has a distinct first-page header/footer (`<w:titlePg/>`).
     pub fn has_title_pg(&self) -> bool {
-        self.sect_pr.contains("<w:titlePg")
+        self.sect_pr().contains("<w:titlePg")
     }
 
     /// Toggle a distinct first-page header/footer (`<w:titlePg/>` in the section).
@@ -883,9 +913,11 @@ impl Package {
         }
         if on {
             // titlePg belongs near the end of CT_SectPr, so append before the close.
-            self.sect_pr = append_sect_child(&self.sect_pr, "<w:titlePg/>");
+            let section = append_sect_child(self.sect_pr(), "<w:titlePg/>");
+            self.set_current_sect_pr_raw(section);
         } else {
-            self.sect_pr = remove_element(&self.sect_pr, "w:titlePg");
+            let section = remove_element(self.sect_pr(), "w:titlePg");
+            self.set_current_sect_pr_raw(section);
         }
     }
 
@@ -1018,7 +1050,7 @@ impl Package {
     /// column layout round-trips and Word lays it out in columns.
     pub fn set_columns(&mut self, num: i32) {
         let num = num.max(1);
-        let mut s = std::mem::take(&mut self.sect_pr);
+        let mut s = self.sect_pr().to_string();
         s = remove_element(&s, "w:cols");
         let child = if num <= 1 {
             "<w:cols w:space=\"720\"/>".to_string()
@@ -1027,7 +1059,7 @@ impl Package {
         };
         // `w:cols` follows `w:pgMar` in CT_SectPr; place it just after when present.
         s = insert_after_element(&s, "w:pgMar", &child);
-        self.sect_pr = s;
+        self.set_current_sect_pr_raw(s);
     }
 
     /// Add a new `word/media/imageN.<ext>` part (e.g. a mermaid-rendered PNG/SVG),
@@ -1102,13 +1134,13 @@ impl Package {
 
     /// Page size/margins from the captured (final) `sectPr` (US Letter default).
     pub fn page_geom(&self) -> crate::model::PageGeom {
-        crate::model::PageGeom::from_sect_pr(&self.sect_pr)
+        crate::model::PageGeom::from_sect_pr(self.sect_pr())
     }
 
     /// Set the page margins (twips) in the body section's `w:pgMar`, preserving
     /// any header/footer/gutter attributes. Creates the element if absent.
     pub fn set_page_margins(&mut self, top: i32, right: i32, bottom: i32, left: i32) {
-        let mut s = std::mem::take(&mut self.sect_pr);
+        let mut s = self.sect_pr().to_string();
         if !s.contains("<w:pgMar") {
             let mar = format!(
                 "<w:pgMar w:top=\"{top}\" w:right=\"{right}\" w:bottom=\"{bottom}\" w:left=\"{left}\" w:header=\"720\" w:footer=\"720\" w:gutter=\"0\"/>"
@@ -1124,7 +1156,7 @@ impl Package {
                 s = set_pgmar_attr(&s, k, v);
             }
         }
-        self.sect_pr = s;
+        self.set_current_sect_pr_raw(s);
     }
 
     /// Add a `<w:comment>` to `comments.xml`, creating the part + relationship +
@@ -1822,7 +1854,7 @@ pub fn save_package(pkg: &Package) -> Vec<u8> {
             &xml[body_pos..]
         );
     }
-    if !pkg.sect_pr.is_empty() {
+    if document.trailing_section_properties().is_none() && !pkg.sect_pr.is_empty() {
         xml = xml.replacen("</w:body>", &format!("{}</w:body>", pkg.sect_pr), 1);
     }
     parts[pkg.doc_index].1 = xml.into_bytes();
@@ -1981,7 +2013,7 @@ fn collect_unlinked_externals<'a>(
                     }
                 }
             }
-            Block::Raw(_) => {}
+            Block::SectionProperties(_) | Block::Raw(_) => {}
         }
     }
 }
@@ -2795,8 +2827,8 @@ mod tests {
     fn roundtrip_preserves_model_parts_and_sectpr() {
         let docx = make_docx(BODY);
         let pkg1 = load_package(&docx).expect("load");
-        // model captured both paragraphs
-        assert_eq!(pkg1.document.body.len(), 2);
+        // The model captures both paragraphs plus the trailing section properties.
+        assert_eq!(pkg1.document.body.len(), 3);
 
         let saved = save_package(&pkg1);
         let pkg2 = load_package(&saved).expect("reload saved");
@@ -3008,6 +3040,7 @@ mod tests {
                 text: "docs".to_string(),
                 ..Run::default()
             }],
+            ..Hyperlink::default()
         });
         let pkg = new_package(Document {
             body: vec![Block::Paragraph(Paragraph {

@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **New: imported DOCX tracked changes are reviewable everywhere.** The TUI,
+  wasm control bridge, VS Code tabs, and MCP server can list and navigate
+  revisions and accept/reject one or all supported changes with structured
+  stale/unsupported/malformed outcomes. Actions use the native undo stack,
+  honor document protection before mutation, survive save/reload, and preserve
+  unsupported move/custom records. Eight `docxy_*` review tools grow the
+  combined Offxy surface from 56 to **64 tools** (31 docxy + 33 xlsxy).
 - **New: a WYSIWYG editor for Markdown files** (`offxy.markdownEditor`,
   opt-in via **Reopen Editor With → Docxy Markdown** — `.md` still opens as
   plain text by default). Reuses the Word editor's rendering/editing engine:

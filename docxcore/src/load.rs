@@ -703,8 +703,17 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
                 // pages, TOC, …) — unwrap and parse its content so it's visible.
                 // The control wrapper itself is not reconstructed on save.
                 "w:sdt" => parse_sdt_block(p, rels, &mut blocks),
-                // sectPr is preserved by the package layer; don't duplicate it.
-                "w:sectPr" => p.skip_element(),
+                "w:sectPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    let raw = p.raw_slice(start, p.pos());
+                    let (current, property_change) =
+                        split_property_change_container(raw, PropertyScope::Section);
+                    blocks.push(Block::SectionProperties(SectionProperties {
+                        raw: current,
+                        property_change,
+                    }));
+                }
                 // Block-level OMML math: a paragraph holding the text equation.
                 "m:oMathPara" | "m:oMath" => {
                     let start = p.start_pos();
@@ -1025,7 +1034,7 @@ fn parse_present_property_snapshot(raw: &str, scope: PropertyScope) -> Option<Pr
 /// Remove the first direct `*PrChange` child from a raw current-property
 /// container and model it separately. Other raw children and whitespace keep
 /// their exact relative positions.
-fn split_property_change_container(
+pub(crate) fn split_property_change_container(
     raw: &str,
     scope: PropertyScope,
 ) -> (String, Option<PropertyChange>) {
@@ -1096,6 +1105,38 @@ fn parse_raw_or_unsupported_revision(p: &mut XmlParser, out: &mut Vec<Inline>) {
     }
 }
 
+fn unsupported_cell_revisions(raw: &str) -> Vec<UnsupportedPropertyRevision> {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != "w:tcPr" {
+        return Vec::new();
+    }
+    let mut revisions = Vec::new();
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let kind = unsupported_revision_kind(parser.name()).filter(|kind| {
+                    matches!(
+                        kind,
+                        UnsupportedRevisionKind::CellInsert
+                            | UnsupportedRevisionKind::CellDelete
+                            | UnsupportedRevisionKind::CellMerge
+                    )
+                });
+                if let Some(kind) = kind {
+                    let metadata = parse_revision_metadata(&parser);
+                    parser.skip_element();
+                    revisions.push(UnsupportedPropertyRevision { kind, metadata });
+                } else {
+                    parser.skip_element();
+                }
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    revisions
+}
+
 /// Bake a tracked-change display cue into a run tree: strikethrough for a
 /// deletion, underline for an insertion (Word's markup convention).
 fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
@@ -1121,6 +1162,9 @@ fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
         Inline::Hyperlink(h) => {
             for r in &mut h.runs {
                 apply(&mut r.props);
+            }
+            for child in &mut h.content {
+                mark_revision(child, kind);
             }
         }
         Inline::Revision { content, .. } => {
@@ -1491,11 +1535,16 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
     }
 }
 
-/// Parse a `<w:hyperlink>`, pushing into `out`. An **external** link (resolvable
-/// `r:id` target) is kept as a clickable [`Inline::Hyperlink`]; an internal
-/// anchor (TOC entries, cross-references) is **unwrapped** so its inline content
-/// — including tabs — renders normally (the link itself isn't actionable here).
+/// Parse a `<w:hyperlink>`, pushing into `out`. External links and internal
+/// anchors with complex children stay as one lossless [`Inline::Hyperlink`].
+/// Simple internal TOC links are split around tabs/breaks so leader stops keep
+/// rendering while each run segment remains navigable.
 fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let raw_start = p.start_pos();
+    let preserve_opener = p
+        .attrs()
+        .iter()
+        .any(|attr| !matches!(attr.name, "r:id" | "w:anchor"));
     let rid = decode_attr(p.attr("r:id"));
     let anchor_attr = decode_attr(p.attr("w:anchor"));
     let target = if rid.is_empty() {
@@ -1514,6 +1563,41 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
         if let Some(anchor) = anchor {
             let mut inner = Vec::new();
             parse_inlines_into(p, rels, &mut inner);
+            let raw = p.raw_slice(raw_start, p.pos()).to_string();
+            if inner
+                .iter()
+                .any(|inline| !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(_)))
+            {
+                out.push(Inline::Hyperlink(Hyperlink {
+                    target: None,
+                    anchor: Some(anchor),
+                    rel_id,
+                    runs: Vec::new(),
+                    content: inner,
+                    raw: Some(raw),
+                    content_changed: false,
+                }));
+                return;
+            }
+            if inner.iter().all(|inline| matches!(inline, Inline::Run(_))) {
+                let runs = inner
+                    .into_iter()
+                    .map(|inline| match inline {
+                        Inline::Run(run) => run,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                out.push(Inline::Hyperlink(Hyperlink {
+                    target: None,
+                    anchor: Some(anchor),
+                    rel_id,
+                    runs,
+                    content: Vec::new(),
+                    raw: preserve_opener.then_some(raw),
+                    content_changed: preserve_opener,
+                }));
+                return;
+            }
             let mut runs: Vec<Run> = Vec::new();
             for it in inner {
                 match it {
@@ -1525,6 +1609,9 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
                                 anchor: Some(anchor.clone()),
                                 rel_id: rel_id.clone(),
                                 runs: std::mem::take(&mut runs),
+                                content: Vec::new(),
+                                raw: preserve_opener.then(|| raw.clone()),
+                                content_changed: preserve_opener,
                             }));
                         }
                         out.push(other);
@@ -1537,6 +1624,9 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
                     anchor: Some(anchor),
                     rel_id,
                     runs,
+                    content: Vec::new(),
+                    raw: preserve_opener.then_some(raw),
+                    content_changed: preserve_opener,
                 }));
             }
         } else {
@@ -1545,30 +1635,35 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
         return;
     }
 
-    let mut runs = Vec::new();
-    loop {
-        match p.next() {
-            Event::Start => match p.name() {
-                "w:r" => {
-                    let mut tmp = Vec::new();
-                    parse_run(p, &mut tmp);
-                    for it in tmp {
-                        if let Inline::Run(r) = it {
-                            runs.push(r);
-                        }
-                    }
-                }
-                _ => p.skip_element(),
-            },
-            Event::End | Event::Eof => break,
-            Event::Text => {}
-        }
-    }
+    let mut content = Vec::new();
+    parse_inlines_into(p, rels, &mut content);
+    let raw = p.raw_slice(raw_start, p.pos()).to_string();
+    let simple = content
+        .iter()
+        .all(|inline| matches!(inline, Inline::Run(_)));
+    let runs = if simple {
+        content
+            .drain(..)
+            .map(|inline| match inline {
+                Inline::Run(run) => run,
+                _ => unreachable!(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     out.push(Inline::Hyperlink(Hyperlink {
         target,
         anchor,
         rel_id,
         runs,
+        content,
+        // Complex links use the complete raw wrapper until a descendant review
+        // action changes them. Simple links rebuild editable runs immediately,
+        // but retain the raw opener so non-modeled hyperlink attributes survive
+        // repeated save/reload cycles.
+        raw: (!simple || preserve_opener).then_some(raw),
+        content_changed: simple && preserve_opener,
     }));
 }
 
@@ -2002,6 +2097,7 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
                     let start = p.start_pos();
                     let has_extra = parse_tcpr(p, &mut cell);
                     let raw = p.raw_slice(start, p.pos());
+                    cell.unsupported_revisions = unsupported_cell_revisions(raw);
                     let (current, change) =
                         split_property_change_container(raw, PropertyScope::TableCell);
                     if has_extra || change.is_some() {

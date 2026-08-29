@@ -26,8 +26,9 @@ but not understood/shown · **MISSING** = dropped or never parsed.
 
 `save_package` **regenerates `word/document.xml` from the semantic model**
 (`package.rs:557`) and keeps every *other* part byte-for-byte. Whole unmodeled
-elements (bookmarks, `w:ins`, `w:sym`, drawings, fields) survive because the
-loader captures them as opaque `Raw` nodes. But any **property child of a
+elements (bookmarks, `w:sym`, drawings, fields) survive because the loader
+captures them as opaque `Raw` nodes. Tracked-change wrappers are now modeled
+separately. But any **property child of a
 modeled element** — `pPr`, `rPr`, `tblPr`, `trPr`, `tcPr` — that isn't in the
 parser's whitelist is **silently dropped on save, even when the user never
 touched that paragraph.** This one architectural fact is the root cause of the
@@ -90,7 +91,7 @@ the status indicator but does not paint page overlays.
 |---|-----|--------------|---------|--------|----------|
 | **D1** | **Table / cell / paragraph *properties* dropped on save** — `tblPr`, `trPr`, most of `tcPr`, `w:shd`, `w:pBdr` sides, widths, `vAlign`, `w:spacing`, `outlineLvl` | tables **47** + shading **21** + ParaPr | MISSING (lost on save) | round-trip + render | **Critical** (silent data loss) |
 | **D2** | **Footnotes & endnotes** — `footnotes.xml`/`endnotes.xml` never read; reference run emitted empty → **anchor lost on save**, part orphaned | 9 + 5 = **14** | MISSING | load + render markers + panel | High |
-| **D3** | **Tracked changes** — `w:ins`/`w:del` become opaque `Raw`, so inserted text is **invisible** and deletions vanish; no accept/reject | **22** | PRESERVED-but-hidden | model + render + accept/reject | High |
+| **D3** | **Tracked changes** — imported inline and property revisions are modeled, rendered, navigable, and accept/reject review is undoable; unsupported records remain lossless and reportable. New edits are not automatically tracked | **22** | REVIEWABLE | authoring (deferred) | Low |
 | **D4** | **Content controls** — block, inline, and table-row `w:sdt` wrappers and arbitrary properties round-trip while their content remains visible/editable; authoring and form UX are not exposed | **27** | PRESERVED + editable payload | property/form UI (deferred) | Low |
 | **D5** | **Symbols** (`w:sym`) — preserved but glyph never rendered → symbol chars invisible | **11** | PRESERVED-but-hidden | map to Unicode/font glyph | Medium |
 | **D6** | **Internal links & bookmarks** — anchor hyperlinks unwrapped to plain text; bookmarks round-trip but aren't navigation targets | bookmarks **30**, hyperlinks 28 | DISPLAY (inert) | clickable in-doc nav | Medium |
@@ -212,11 +213,12 @@ Parse `footnotes.xml`/`endnotes.xml`, keep the reference marker on save (fixes
 the orphaned-part bug), render superscript markers + a notes panel (mirror the
 comments UI). Touch: new `docxcore::notes`, `load.rs:794-801`, render + app.
 
-**Phase D-3 — Tracked changes _(High; 22 files)_**
-Model `w:ins`/`w:del`/`delText` (+ `rPrChange`/`pPrChange`); render insertions
-(underline/color) and deletions (strikethrough); add accept/reject in a Review
-tab. Removes the "text is invisible" trap. Touch: `model.rs`, `load.rs:537-543`,
-`render.rs`, app.
+**Phase D-3 — Tracked changes _(completed review surface; 22 files)_**
+`w:ins`/`w:del`/`delText` and run/paragraph/table/row/cell/section property
+changes are modeled and rendered. The Review ribbon and control/MCP routes
+navigate and accept/reject supported records with native undo, structured
+outcomes, and package round-trip coverage. Unsupported move/custom records are
+enumerated and preserved. Automatically tracking new edits remains deferred.
 
 **Phase D-4 — Visibility fixes _(Medium; symbols 11 + RTL 6 + internal nav 30)_**
 Render `w:sym` glyphs (symbol-font → Unicode map); visually reorder RTL runs;

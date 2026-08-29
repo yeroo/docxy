@@ -11,9 +11,10 @@
 //!   document modified, requesting a repaint) after a mutating verb,
 //! - save/reload/open and anything else that touches the filesystem.
 //!
-//! Addressing is by **top-level block index** (position in `doc.body`): a
-//! paragraph or table. [`read`] / [`outline`] report each block's `kind`, so a
-//! caller knows which indices are paragraphs (the ones the edit verbs accept).
+//! Addressing is by **top-level content-block index** (position before the
+//! trailing body-level section-properties sentinel): a paragraph or table.
+//! [`read`] / [`outline`] report each block's `kind`, so a caller knows which
+//! indices are paragraphs (the ones the edit verbs accept).
 
 use crate::editor::{Caret, Clip, Editor, Match};
 use crate::model::{Align, Block, Document, Inline, ParProps, RunProps};
@@ -57,7 +58,7 @@ pub fn outline(doc: &Document) -> Vec<Heading> {
 /// The blocks in `[start..=end]`, inclusive. Validates the range against the
 /// document's block count.
 pub fn read(doc: &Document, start: usize, end: usize) -> Result<Vec<BlockInfo>, String> {
-    let n = doc.body.len();
+    let n = doc.content_block_count();
     bounds(start, end, n)?;
     let mut out = Vec::new();
     for i in start..=end {
@@ -81,8 +82,8 @@ pub fn read(doc: &Document, start: usize, end: usize) -> Result<Vec<BlockInfo>, 
 /// [`Document::plain_text`]; `chars` counts everything in that same text
 /// except the block-separator newlines `plain_text` inserts, so it's a visible
 /// character count rather than a byte count. `paragraphs` counts only
-/// paragraph-kind top-level blocks; `blocks` is the raw body length (so it
-/// also includes tables/raw blocks that `paragraphs` excludes).
+/// paragraph-kind top-level blocks; `blocks` counts public content blocks (so
+/// it includes tables/raw blocks but excludes the trailing section sentinel).
 pub fn stats(doc: &Document) -> (usize, usize, usize, usize) {
     let text = doc.plain_text();
     let words = text.split_whitespace().count();
@@ -92,7 +93,7 @@ pub fn stats(doc: &Document) -> (usize, usize, usize, usize) {
         .iter()
         .filter(|b| matches!(b, Block::Paragraph(_)))
         .count();
-    let blocks = doc.body.len();
+    let blocks = doc.content_block_count();
     (words, chars, paragraphs, blocks)
 }
 
@@ -134,7 +135,7 @@ pub fn replace_range(
     end: usize,
     text: &str,
 ) -> Result<(usize, usize), String> {
-    let n = ed.doc.body.len();
+    let n = ed.doc.content_block_count();
     bounds(start, end, n)?;
     require_para(&ed.doc.body, start)?;
     require_para(&ed.doc.body, end)?;
@@ -153,10 +154,10 @@ pub fn replace_range(
 }
 
 /// Insert `text` (newline-split into one or more paragraphs) before block
-/// `at`, or at the document end if `at == doc.body.len()` (equivalent to
+/// `at`, or at the document end if `at == doc.content_block_count()` (equivalent to
 /// [`append`]).
 pub fn insert(ed: &mut Editor, at: usize, text: &str) -> Result<(), String> {
-    let n = ed.doc.body.len();
+    let n = ed.doc.content_block_count();
     if at > n {
         return Err(format!("'at' {at} out of bounds (0..={n})"));
     }
@@ -273,6 +274,46 @@ pub fn referenced_numbering_kinds(blocks: &[Block]) -> (bool, bool) {
     (needs_bullet, needs_decimal)
 }
 
+/// Whether parsed Markdown blocks carry formatting in addition to their
+/// structural/text payload. Control hosts use this after parsing and before
+/// mutating package parts so formatting-only protection cannot be bypassed by
+/// sending formatted content through a structure verb.
+pub fn blocks_carry_formatting(blocks: &[Block]) -> bool {
+    fn inline_carries_formatting(inline: &Inline) -> bool {
+        match inline {
+            Inline::Run(run) => run.props != RunProps::default(),
+            Inline::Hyperlink(link) => {
+                link.runs.iter().any(|run| run.props != RunProps::default())
+                    || link.content.iter().any(inline_carries_formatting)
+            }
+            Inline::Tab(props) => *props != RunProps::default(),
+            Inline::TextBox { blocks, .. } => blocks_carry_formatting(blocks),
+            Inline::Revision { content, .. } => content.iter().any(inline_carries_formatting),
+            Inline::Break(_)
+            | Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::Equation { .. }
+            | Inline::Field { .. }
+            | Inline::UnsupportedRevision { .. }
+            | Inline::FootnoteRef { .. }
+            | Inline::Raw(_) => false,
+        }
+    }
+
+    blocks.iter().any(|block| match block {
+        Block::Paragraph(paragraph) => {
+            paragraph.props != Default::default()
+                || paragraph.content.iter().any(inline_carries_formatting)
+        }
+        Block::Table(table) => table.rows.iter().any(|row| {
+            row.cells
+                .iter()
+                .any(|cell| blocks_carry_formatting(&cell.blocks))
+        }),
+        Block::SectionProperties(_) | Block::Raw(_) => false,
+    })
+}
+
 /// Overwrite `ed.doc.body[start..start + blocks.len()]` in place with `blocks`.
 /// Used right after a placeholder [`Editor::paste`] has already opened up
 /// exactly that many paragraph slots (and taken the call's one checkpoint): a
@@ -288,7 +329,7 @@ fn overwrite_blocks(ed: &mut Editor, start: usize, blocks: Vec<Block>) {
 }
 
 /// Validate that `at` is a splice position [`insert_blocks`] (or plain-text
-/// [`insert`]) can use: `0..=doc.body.len()`, and — unless `at` is the
+/// [`insert`]) can use: `0..=doc.content_block_count()`, and — unless `at` is the
 /// document-end/append case — that block `at` is itself a paragraph.
 ///
 /// Pure (no mutation, doesn't even need a live `Editor`): a caller that must
@@ -302,7 +343,7 @@ fn overwrite_blocks(ed: &mut Editor, start: usize, blocks: Vec<Block>) {
 /// kind before content (e.g. "empty markdown") — so a caller pre-validating
 /// this way never diverges from what the verb itself would reject.
 pub fn validate_insert_at(doc: &Document, at: usize) -> Result<(), String> {
-    let n = doc.body.len();
+    let n = doc.content_block_count();
     if at > n {
         return Err(format!("'at' {at} out of bounds (0..={n})"));
     }
@@ -313,7 +354,7 @@ pub fn validate_insert_at(doc: &Document, at: usize) -> Result<(), String> {
 }
 
 /// Insert `blocks` before block `at` (or at the document end if
-/// `at == doc.body.len()`, equivalent to [`append_blocks`]) — the block-splice
+/// `at == doc.content_block_count()`, equivalent to [`append_blocks`]) — the block-splice
 /// counterpart to [`insert`]. Pastes a placeholder clip of `blocks.len() + 1`
 /// empty paragraphs at the head of block `at` (the trailing empty entry pushes
 /// the original paragraph down intact, exactly as `insert`'s `"{text}\n"`
@@ -329,7 +370,7 @@ pub fn insert_blocks(ed: &mut Editor, at: usize, blocks: Vec<Block>) -> Result<(
     if blocks.is_empty() {
         return Err("empty markdown".to_string());
     }
-    let n = ed.doc.body.len();
+    let n = ed.doc.content_block_count();
     if at == n {
         append_blocks(ed, blocks);
         return Ok(());
@@ -356,7 +397,7 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
     if blocks.is_empty() {
         return;
     }
-    let start = ed.doc.body.len();
+    let start = ed.doc.content_block_count();
     let count = blocks.len();
     ed.anchor = None;
     ed.move_doc_end();
@@ -372,7 +413,7 @@ pub fn append_blocks(ed: &mut Editor, blocks: Vec<Block>) {
 /// [`validate_insert_at`] (see its doc comment) — bounds/paragraph-kind
 /// first, matching `replace_range_blocks`'s own check order.
 pub fn validate_replace_range(doc: &Document, start: usize, end: usize) -> Result<(), String> {
-    let n = doc.body.len();
+    let n = doc.content_block_count();
     bounds(start, end, n)?;
     require_para(&doc.body, start)?;
     require_para(&doc.body, end)?;
@@ -700,7 +741,7 @@ pub fn format_range(
     end: usize,
     patch: &RunPatch,
 ) -> Result<usize, String> {
-    let n = ed.doc.body.len();
+    let n = ed.doc.content_block_count();
     bounds(start, end, n)?;
     require_para(&ed.doc.body, start)?;
     require_para(&ed.doc.body, end)?;
@@ -747,7 +788,7 @@ pub fn validate_set_style_range(
     style: Option<&str>,
     align: Option<Align>,
 ) -> Result<(), String> {
-    let n = doc.body.len();
+    let n = doc.content_block_count();
     bounds(start, end, n)?;
     require_para(&doc.body, start)?;
     require_para(&doc.body, end)?;
@@ -810,6 +851,7 @@ pub fn block_kind(b: &Block) -> &'static str {
     match b {
         Block::Paragraph(_) => "paragraph",
         Block::Table(_) => "table",
+        Block::SectionProperties(_) => "section-properties",
         Block::Raw(_) => "raw",
     }
 }
@@ -838,7 +880,9 @@ pub fn bounds(start: usize, end: usize, n: usize) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Document, Inline, ParProps, Paragraph, Run, RunProps, Table};
+    use crate::model::{
+        Document, Inline, ParProps, Paragraph, Run, RunProps, SectionProperties, Table,
+    };
 
     /// A document of simple text paragraphs (same fixture shape as
     /// `docxy/src/control.rs`'s `doc_with`).
@@ -859,7 +903,10 @@ mod tests {
     }
 
     fn paras(doc: &Document) -> Vec<String> {
-        doc.body.iter().map(|b| b.plain_text()).collect()
+        doc.body[..doc.content_block_count()]
+            .iter()
+            .map(|b| b.plain_text())
+            .collect()
     }
 
     /// A paragraph with one run per `(text, bold)` pair — used to build
@@ -1028,6 +1075,35 @@ mod tests {
         assert!(ed.undo());
         assert_eq!(paras(&ed.doc), vec!["existing"]);
         assert!(!ed.undo());
+    }
+
+    #[test]
+    fn public_block_coordinates_keep_trailing_section_properties_out_of_splices() {
+        let mut doc = doc_with(&["existing"]);
+        doc.body
+            .push(Block::SectionProperties(SectionProperties::default()));
+        let mut ed = Editor::new(doc);
+
+        assert_eq!(ed.doc.content_block_count(), 1);
+        append_blocks(&mut ed, parse_markdown_blocks("## Heading").unwrap());
+        assert_eq!(ed.doc.content_block_count(), 2);
+        assert_eq!(paras(&ed.doc), vec!["existing", "Heading"]);
+        assert!(matches!(
+            ed.doc.body.last(),
+            Some(Block::SectionProperties(_))
+        ));
+        assert_eq!(stats(&ed.doc).3, 2);
+        assert_eq!(
+            crate::markdown::to_markdown(&ed.doc),
+            "existing\n\n## Heading\n"
+        );
+
+        assert!(ed.undo());
+        assert_eq!(ed.doc.content_block_count(), 1);
+        assert!(matches!(
+            ed.doc.body.last(),
+            Some(Block::SectionProperties(_))
+        ));
     }
 
     #[test]

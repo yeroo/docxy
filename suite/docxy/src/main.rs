@@ -10174,6 +10174,8 @@ impl Docxy {
             v_merge: docxcore::model::VMerge::None,
             blocks: vec![Block::Paragraph(Paragraph::default())],
             raw_tcpr: None,
+            property_change: None,
+            unsupported_revisions: vec![],
         }
     }
 
@@ -10199,6 +10201,7 @@ impl Docxy {
                 let new = docxcore::model::Row {
                     cells: (0..ncols).map(|_| Self::empty_cell()).collect(),
                     raw_props: vec![],
+                    property_change: None,
                 };
                 let inserted = table.insert_row(at, new);
                 debug_assert!(inserted);
@@ -10310,10 +10313,13 @@ impl Docxy {
             v_merge: VMerge::None,
             blocks: vec![Block::Paragraph(Paragraph::default())],
             raw_tcpr: None,
+            property_change: None,
+            unsupported_revisions: vec![],
         };
         let mk_row = || Row {
             cells: (0..cols).map(|_| mk_cell()).collect(),
             raw_props: vec![],
+            property_change: None,
         };
         let table = Table {
             grid: vec![col_w; cols],
@@ -10322,6 +10328,7 @@ impl Docxy {
             markup_compatibility_attributes: vec![],
             row_boundaries: vec![],
             raw_tblpr: Some(TBLPR.to_string()),
+            property_change: None,
         };
         let idx = self.active;
         if let Some(t) = self.tabs.get_mut(idx) {
@@ -13183,6 +13190,7 @@ fn block_height_est(b: &Block, content_w: f32) -> f32 {
                 }
         }
         Block::Table(t) => t.rows.len() as f32 * 30.0 + 8.0,
+        Block::SectionProperties(_) => 0.0,
         Block::Raw(_) => 0.0,
     }
 }
@@ -13750,6 +13758,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
             )
         }
         Block::Table(t) => table_el(t, &path, ctx),
+        Block::SectionProperties(_) => div().h(px(0.)).into_any_element(),
         Block::Raw(_) => div().h(px(0.)).into_any_element(),
     }
 }

@@ -3,8 +3,8 @@
 //! This is a *semantic* serializer: it re-emits the structure and properties we
 //! model (paragraphs, runs + rPr, tables, lists, hyperlinks). It is designed so
 //! that `parse_document_xml(document_to_xml(&doc)) == doc` for everything we
-//! model — see the round-trip tests. Body content we do not model (e.g.
-//! `sectPr`, bookmarks) is preserved separately by the package layer, not here.
+//! model — see the round-trip tests. Unknown body content remains raw, while the
+//! body-level final `sectPr` is modeled so its revision can be reviewed.
 
 use crate::model::*;
 use crate::xml::{Event, XmlParser};
@@ -128,6 +128,11 @@ fn write_block(s: &mut String, block: &Block) {
     match block {
         Block::Paragraph(p) => write_paragraph(s, p),
         Block::Table(t) => write_table(s, t),
+        Block::SectionProperties(section) => s.push_str(&with_property_change(
+            &section.raw,
+            "w:sectPr",
+            section.property_change.as_ref(),
+        )),
         Block::Raw(raw) => s.push_str(raw),
     }
 }
@@ -506,6 +511,38 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
             BreakKind::Column => s.push_str("<w:r><w:br w:type=\"column\"/></w:r>"),
         },
         Inline::Hyperlink(h) => {
+            if let Some(raw) = &h.raw
+                && !h.content_changed
+            {
+                s.push_str(raw);
+                return;
+            }
+            if let Some(raw) = &h.raw {
+                let mut parser = XmlParser::new(raw);
+                if parser.next() == Event::Start && parser.name() == "w:hyperlink" {
+                    let opening = &raw[..parser.pos()];
+                    if opening.trim_end().ends_with("/>") {
+                        if let Some(slash) = opening.rfind("/>") {
+                            s.push_str(&opening[..slash]);
+                            s.push('>');
+                        } else {
+                            s.push_str(opening);
+                        }
+                    } else {
+                        s.push_str(opening);
+                    }
+                } else {
+                    s.push_str("<w:hyperlink>");
+                }
+                for run in &h.runs {
+                    write_run(s, run, text_kind);
+                }
+                for item in &h.content {
+                    write_inline_with_text_kind(s, item, text_kind);
+                }
+                s.push_str("</w:hyperlink>");
+                return;
+            }
             s.push_str("<w:hyperlink");
             if let Some(id) = &h.rel_id {
                 s.push_str(" r:id=\"");
@@ -520,6 +557,9 @@ fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunText
             s.push('>');
             for r in &h.runs {
                 write_run(s, r, text_kind);
+            }
+            for item in &h.content {
+                write_inline_with_text_kind(s, item, text_kind);
             }
             s.push_str("</w:hyperlink>");
         }
@@ -1724,6 +1764,7 @@ mod tests {
                 text: "click".to_string(),
                 props: RunProps::default(),
             }],
+            ..Hyperlink::default()
         });
         let d = Document {
             body: vec![para(ParProps::default(), vec![h])],

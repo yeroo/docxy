@@ -330,6 +330,7 @@ fn build() -> Document {
                     text: "github.com/yeroo/docxy".into(),
                     props: RunProps::default(),
                 }],
+                ..Hyperlink::default()
             }),
         ],
     ));
