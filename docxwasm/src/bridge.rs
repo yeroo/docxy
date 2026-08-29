@@ -2395,7 +2395,7 @@ mod tests {
         // the same core.rs surface docxy's `doc.path` uses, so `doc.blocks`
         // (which feeds the tab's `doc.path` composition) must mirror it.
         let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x" xmlns:r="r"><w:body><w:p/><w:sectPr><w:headerReference w:type="default" r:id="rIdHeader"/></w:sectPr></w:body></w:document>"#;
-        let settings_xml = r#"<?xml version="1.0"?><w:settings xmlns:w="x"><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#;
+        let settings_xml = r#"<?xml version="1.0"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#;
         let header_xml = r#"<?xml version="1.0"?><w:hdr xmlns:v="y"><w:p><v:shape id="PowerPlusWaterMarkObject"><v:textpath string="CONFIDENTIAL"/></v:shape></w:p></w:hdr>"#;
         let ct = r#"<?xml version="1.0"?><Types/>"#;
         let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;

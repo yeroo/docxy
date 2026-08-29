@@ -236,6 +236,65 @@ fn local_name(name: &str) -> &str {
     name.rsplit_once(':').map_or(name, |(_, local)| local)
 }
 
+const WORDPROCESSINGML_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+const STRICT_WORDPROCESSINGML_NS: &str = "http://purl.oclc.org/ooxml/wordprocessingml/main";
+
+fn namespace_scope(
+    parser: &XmlParser<'_>,
+    parent: Option<&[(String, String)]>,
+) -> Vec<(String, String)> {
+    let mut scope = parent.unwrap_or_default().to_vec();
+    for attr in parser.attrs() {
+        let prefix = if attr.name == "xmlns" {
+            Some("")
+        } else {
+            attr.name.strip_prefix("xmlns:")
+        };
+        let Some(prefix) = prefix else {
+            continue;
+        };
+        let value = decode_xml_entities(attr.value);
+        if let Some((_, bound)) = scope.iter_mut().find(|(bound, _)| bound == prefix) {
+            *bound = value;
+        } else {
+            scope.push((prefix.to_string(), value));
+        }
+    }
+    scope
+}
+
+fn wordprocessingml_name(name: &str, namespaces: &[(String, String)], attribute: bool) -> bool {
+    let prefix = name.split_once(':').map(|(prefix, _)| prefix);
+    let lookup = |prefix: &str| {
+        namespaces
+            .iter()
+            .rev()
+            .find(|(bound, _)| bound == prefix)
+            .map(|(_, uri)| uri.as_str())
+    };
+    let namespace = match prefix {
+        Some(prefix) => lookup(prefix),
+        None if attribute => None,
+        None => lookup(""),
+    };
+    namespace.is_some_and(|uri| matches!(uri, WORDPROCESSINGML_NS | STRICT_WORDPROCESSINGML_NS))
+        || matches!(prefix, Some("w")) && namespace.is_none()
+}
+
+fn decoded_wordprocessingml_attr(
+    parser: &XmlParser<'_>,
+    namespaces: &[(String, String)],
+    name: &str,
+) -> Option<String> {
+    parser
+        .attrs()
+        .iter()
+        .find(|attr| {
+            local_name(attr.name) == name && wordprocessingml_name(attr.name, namespaces, true)
+        })
+        .map(|attr| decode_xml_entities(attr.value))
+}
+
 fn decoded_attr_by_local(parser: &XmlParser<'_>, name: &str) -> Option<String> {
     parser
         .attrs()
@@ -256,59 +315,98 @@ fn parse_protection(xml: &str) -> Protection {
     let mut protection = Protection::default();
     protection.source.settings_part_present = true;
     let mut parser = XmlParser::new(xml);
+    let mut namespace_stack = Vec::<Vec<(String, String)>>::new();
     loop {
         match parser.next() {
-            Event::Start if local_name(parser.name()) == "documentProtection" => {
-                protection.source.document_protection_present = true;
-                let enforcement = decoded_attr_by_local(&parser, "enforcement");
-                let edit = decoded_attr_by_local(&parser, "edit");
-                let formatting = decoded_attr_by_local(&parser, "formatting");
-                let parsed_enforcement = enforcement.as_deref().map(parse_ooxml_bool);
-                let parsed_formatting = formatting.as_deref().map(parse_ooxml_bool);
+            Event::Start => {
+                let scope = namespace_scope(&parser, namespace_stack.last().map(Vec::as_slice));
+                namespace_stack.push(scope);
+                let namespaces = namespace_stack.last().expect("scope was just pushed");
 
-                protection.enforcement = match parsed_enforcement {
-                    None => ProtectionEnforcement::Absent,
-                    Some(Some(false)) => ProtectionEnforcement::Disabled,
-                    Some(Some(true) | None) => ProtectionEnforcement::Enforced,
-                };
-                protection.edit_mode = edit.as_deref().map(|value| match value {
-                    "none" => ProtectionEditMode::Unrestricted,
-                    "readOnly" => ProtectionEditMode::ReadOnly,
-                    "comments" => ProtectionEditMode::Comments,
-                    "trackedChanges" => ProtectionEditMode::TrackedChanges,
-                    "forms" => ProtectionEditMode::Forms,
-                    other => ProtectionEditMode::Unknown(other.to_string()),
-                });
-                protection.formatting_locked = parsed_formatting == Some(Some(true));
-                if parsed_enforcement == Some(None) {
-                    protection.edit_mode = Some(ProtectionEditMode::Unknown(
-                        "invalid enforcement value".to_string(),
-                    ));
-                } else if parsed_enforcement == Some(Some(true)) && parsed_formatting == Some(None)
+                if local_name(parser.name()) == "documentProtection"
+                    && wordprocessingml_name(parser.name(), namespaces, false)
                 {
-                    protection.edit_mode = Some(ProtectionEditMode::Unknown(
-                        "invalid formatting value".to_string(),
-                    ));
+                    protection.source.document_protection_present = true;
+                    let enforcement =
+                        decoded_wordprocessingml_attr(&parser, namespaces, "enforcement");
+                    let edit = decoded_wordprocessingml_attr(&parser, namespaces, "edit");
+                    let formatting =
+                        decoded_wordprocessingml_attr(&parser, namespaces, "formatting");
+                    let parsed_enforcement = enforcement.as_deref().map(parse_ooxml_bool);
+                    let parsed_formatting = formatting.as_deref().map(parse_ooxml_bool);
+
+                    let next_enforcement = match parsed_enforcement {
+                        None => ProtectionEnforcement::Absent,
+                        Some(Some(false)) => ProtectionEnforcement::Disabled,
+                        Some(Some(true) | None) => ProtectionEnforcement::Enforced,
+                    };
+                    let mut next_edit_mode = edit.as_deref().map(|value| match value {
+                        "none" => ProtectionEditMode::Unrestricted,
+                        "readOnly" => ProtectionEditMode::ReadOnly,
+                        "comments" => ProtectionEditMode::Comments,
+                        "trackedChanges" => ProtectionEditMode::TrackedChanges,
+                        "forms" => ProtectionEditMode::Forms,
+                        other => ProtectionEditMode::Unknown(other.to_string()),
+                    });
+                    let next_formatting_locked = parsed_formatting == Some(Some(true));
+                    if parsed_enforcement == Some(None) {
+                        next_edit_mode = Some(ProtectionEditMode::Unknown(
+                            "invalid enforcement value".to_string(),
+                        ));
+                    } else if parsed_enforcement == Some(Some(true))
+                        && parsed_formatting == Some(None)
+                    {
+                        next_edit_mode = Some(ProtectionEditMode::Unknown(
+                            "invalid formatting value".to_string(),
+                        ));
+                    }
+
+                    let already_enforced =
+                        protection.enforcement == ProtectionEnforcement::Enforced;
+                    let next_is_enforced = next_enforcement == ProtectionEnforcement::Enforced;
+                    if already_enforced && next_is_enforced {
+                        if protection.edit_mode != next_edit_mode
+                            || protection.formatting_locked != next_formatting_locked
+                        {
+                            protection.edit_mode = Some(ProtectionEditMode::Unknown(
+                                "conflicting documentProtection declarations".to_string(),
+                            ));
+                            protection.formatting_locked |= next_formatting_locked;
+                        }
+                    } else if !already_enforced || next_is_enforced {
+                        protection.enforcement = next_enforcement;
+                        protection.edit_mode = next_edit_mode;
+                        protection.formatting_locked = next_formatting_locked;
+                        protection.source.enforcement_value = enforcement;
+                        protection.source.edit_value = edit;
+                        protection.source.formatting_value = formatting;
+                    }
+                } else if local_name(parser.name()) == "writeProtection"
+                    && wordprocessingml_name(parser.name(), namespaces, false)
+                {
+                    protection.source.write_protection_present = true;
+                    let recommended =
+                        decoded_wordprocessingml_attr(&parser, namespaces, "recommended");
+                    let credential_present = parser.attrs().iter().any(|attr| {
+                        matches!(local_name(attr.name), "password" | "hash" | "hashValue")
+                            && wordprocessingml_name(attr.name, namespaces, true)
+                            && !attr.value.is_empty()
+                    });
+                    protection.enforced_write_protection |= credential_present;
+                    protection.advisory_write_protection = !protection.enforced_write_protection
+                        && (protection.advisory_write_protection
+                            || recommended
+                                .as_deref()
+                                .and_then(parse_ooxml_bool)
+                                .unwrap_or(false));
+                    if recommended.is_some() {
+                        protection.source.write_recommended_value = recommended;
+                    }
+                    protection.source.write_credential_present |= credential_present;
                 }
-                protection.source.enforcement_value = enforcement;
-                protection.source.edit_value = edit;
-                protection.source.formatting_value = formatting;
             }
-            Event::Start if local_name(parser.name()) == "writeProtection" => {
-                protection.source.write_protection_present = true;
-                let recommended = decoded_attr_by_local(&parser, "recommended");
-                let credential_present = parser.attrs().iter().any(|attr| {
-                    matches!(local_name(attr.name), "password" | "hash" | "hashValue")
-                        && !attr.value.is_empty()
-                });
-                protection.enforced_write_protection = credential_present;
-                protection.advisory_write_protection = !credential_present
-                    && recommended
-                        .as_deref()
-                        .and_then(parse_ooxml_bool)
-                        .unwrap_or(false);
-                protection.source.write_recommended_value = recommended;
-                protection.source.write_credential_present = credential_present;
+            Event::End => {
+                namespace_stack.pop();
             }
             Event::Eof => break,
             _ => {}
@@ -2123,6 +2221,55 @@ mod tests {
     }
 
     #[test]
+    fn protection_uses_wordprocessingml_namespaces_and_cannot_be_downgraded() {
+        let protection = parse_protection(
+            r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    xmlns:ext="urn:example-extension">
+                <w:documentProtection w:edit="readOnly" w:enforcement="1"/>
+                <ext:documentProtection ext:edit="none" ext:enforcement="0"/>
+                <w:writeProtection w:password="ABCD"/>
+                <ext:writeProtection ext:recommended="false"/>
+            </w:settings>"#,
+        );
+        assert!(protection.is_enforced());
+        assert_eq!(protection.edit_mode, Some(ProtectionEditMode::ReadOnly));
+        assert!(protection.enforced_write_protection);
+
+        let spoofed_attributes = parse_protection(
+            r#"<w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                    xmlns:ext="urn:example-extension">
+                <w:documentProtection ext:edit="none" ext:enforcement="0"
+                    w:edit="comments" w:enforcement="1"/>
+            </w:settings>"#,
+        );
+        assert!(spoofed_attributes.is_enforced());
+        assert_eq!(
+            spoofed_attributes.edit_mode,
+            Some(ProtectionEditMode::Comments)
+        );
+
+        let alternate_prefix = parse_protection(
+            r#"<x:settings xmlns:x="http://purl.oclc.org/ooxml/wordprocessingml/main">
+                <x:documentProtection x:edit="readOnly" x:enforcement="true"/>
+            </x:settings>"#,
+        );
+        assert!(alternate_prefix.is_enforced());
+        assert_eq!(
+            alternate_prefix.edit_mode,
+            Some(ProtectionEditMode::ReadOnly)
+        );
+
+        let duplicate = parse_protection(
+            r#"<w:settings>
+                <w:documentProtection w:edit="readOnly" w:enforcement="1"/>
+                <w:documentProtection w:edit="none" w:enforcement="0"/>
+            </w:settings>"#,
+        );
+        assert!(duplicate.is_enforced());
+        assert_eq!(duplicate.edit_mode, Some(ProtectionEditMode::ReadOnly));
+    }
+
+    #[test]
     fn protection_resolves_a_nonstandard_related_settings_part_and_fails_closed_if_missing() {
         let rels = r#"<Relationships><Relationship Id="rIdSettings" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="metadata/settings2.xml"/></Relationships>"#;
         let bytes = make_metadata_docx(BODY, None, Some(rels), &[]);
@@ -2328,7 +2475,7 @@ mod tests {
             <w:p><w:r><w:t>Body</w:t></w:r></w:p>\
             <w:sectPr><w:pgBorders w:offsetFrom=\"page\"><w:top w:val=\"single\"/></w:pgBorders>\
             <w:pgSz w:w=\"11906\" w:h=\"16838\"/></w:sectPr></w:body></w:document>";
-        let settings = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"x\">\
+        let settings = "<?xml version=\"1.0\"?><w:settings xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\">\
             <w:documentProtection w:edit=\"readOnly\" w:enforcement=\"1\"/></w:settings>";
         let bytes = make_metadata_docx(document, Some(settings), None, &[]);
         let pkg = load_package(&bytes).expect("load");
