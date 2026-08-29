@@ -15,8 +15,12 @@ mod backstage;
 mod control;
 mod mcp;
 mod metafile;
+mod protection;
 mod ribbon;
 mod skill;
+#[cfg(test)]
+mod test_fixtures;
+mod watermark;
 
 use std::collections::HashMap;
 use std::io;
@@ -37,10 +41,13 @@ use docxcore::model::{
     Table, VMerge,
 };
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
-use docxcore::package::{Package, load_package, new_markdown_package, new_package, save_package};
+use docxcore::package::{
+    Package, Protection, load_package, new_markdown_package, new_package, save_package,
+    save_package_preserving_document,
+};
 use docxcore::render::{
     Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
-    Span as DocSpan, Style as DocStyle, render_with_images,
+    Span as DocSpan, Style as DocStyle, render_with_images, render_with_page_layout,
 };
 use docxcore::serialize::blocks_to_xml;
 use docxcore::styles::{StyleSheet, parse_styles_xml};
@@ -781,10 +788,12 @@ struct App {
     /// Set when the File ▸ Exit item is chosen, so the event loop quits.
     quit_requested: bool,
     status: Option<String>,
-    /// Document-level notices surfaced on open (protection state, watermark text,
-    /// page borders) — Word features docxy shows but doesn't render/enforce.
-    doc_protection: Option<String>,
-    doc_watermark: Option<String>,
+    /// Structured document-protection policy metadata. Display text is derived
+    /// from its compatibility label; authorization never compares UI strings.
+    doc_protection: Protection,
+    /// Structured page/header-scoped watermark state used by both the TUI
+    /// overlay renderer and compatibility status labels.
+    watermark_state: watermark::State,
     doc_page_borders: bool,
     scroll: usize,
     viewport_h: usize,
@@ -900,6 +909,9 @@ struct App {
     maps: Vec<LineMap>,
     /// Where each embedded image's placeholder box sits (for pixel overlay).
     images: Vec<ImageBox>,
+    /// Page-view-only labels painted after document rendering. They are kept
+    /// outside `lines` and `maps`, so they cannot become editable or selectable.
+    watermark_overlays: Vec<watermark::Overlay>,
     /// document.xml relationships (rId → media target).
     rels: Relationships,
     /// Terminal graphics capability (kitty/iTerm2/Sixel/half-block); None = no overlay.
@@ -911,7 +923,7 @@ struct App {
 }
 
 impl App {
-    fn new(mut pkg: Package, path: &str, vim: bool) -> Self {
+    fn new(pkg: Package, path: &str, vim: bool) -> Self {
         let styles = pkg
             .part("word/styles.xml")
             .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
@@ -932,17 +944,17 @@ impl App {
         let headers = parts("headerReference");
         let footers = parts("footerReference");
         let title_page = flag_on(pkg.sect_pr(), "titlePg");
-        let even_odd = pkg
-            .part("word/settings.xml")
-            .map(|b| flag_on(std::str::from_utf8(b).unwrap_or(""), "evenAndOddHeaders"))
-            .unwrap_or(false);
+        let even_odd = pkg.has_even_odd();
         let header_part = hf_part_name(&pkg, &rels, "headerReference");
         let footer_part = hf_part_name(&pkg, &rels, "footerReference");
         let comments = docxcore::comments::parse_comments(&pkg);
         let notes = docxcore::notes::parse_notes(&pkg);
+        let doc_protection = pkg.protection();
         // Recompute fields that depend on the clock / document properties (DATE,
         // TIME, AUTHOR, CREATEDATE, …) so they show a live value like Word does,
-        // rather than the value last cached in the file.
+        // rather than the value last cached in the file. This is a content
+        // mutation, so protected modes that disallow content keep the cached
+        // result both on screen and on save.
         let field_ctx = docxcore::field::FieldContext {
             now: local_now(),
             props: pkg
@@ -954,11 +966,12 @@ impl App {
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_default(),
         };
-        docxcore::field::recompute(&mut pkg.document, &field_ctx);
-        let doc_protection = pkg.protection();
-        let doc_watermark = pkg.watermark();
+        let mut doc = pkg.document.clone();
+        if protection::authorize(&doc_protection, protection::MutationKind::Content).is_ok() {
+            docxcore::field::recompute(&mut doc, &field_ctx);
+        }
+        let watermark_state = watermark::State::from_package(&pkg);
         let doc_page_borders = pkg.has_page_borders();
-        let doc = std::mem::take(&mut pkg.document);
         App {
             pkg,
             editor: Editor::new(doc),
@@ -992,7 +1005,7 @@ impl App {
             quit_requested: false,
             status: None,
             doc_protection,
-            doc_watermark,
+            watermark_state,
             doc_page_borders,
             scroll: 0,
             viewport_h: 1,
@@ -1065,6 +1078,7 @@ impl App {
             lines: Vec::new(),
             maps: Vec::new(),
             images: Vec::new(),
+            watermark_overlays: Vec::new(),
             rels,
             picker: None,
             img_cache: HashMap::new(),
@@ -1159,7 +1173,10 @@ impl App {
                     ribbon::Focus::Tab(i) if self.ribbon.tab_label(i) == Some("File") => {
                         self.open_backstage();
                     }
-                    ribbon::Focus::Tab(_) => self.ribbon_focus = self.ribbon.enter_body(),
+                    ribbon::Focus::Tab(_) => {
+                        self.ribbon_focus = self.ribbon.enter_body();
+                        self.dirty = true;
+                    }
                     ribbon::Focus::Button(_) => {
                         if let Some((act, _)) = self.ribbon.focus_act(self.ribbon_focus) {
                             self.run_act(act);
@@ -1167,7 +1184,6 @@ impl App {
                     }
                     ribbon::Focus::None => {}
                 }
-                self.dirty = true;
                 Some(false)
             }
             _ => None,
@@ -1219,6 +1235,11 @@ impl App {
     /// Run a ribbon command, mapping it to the matching editor operation.
     fn run_act(&mut self, act: ribbon::Act) {
         use ribbon::Act::*;
+        if let Some(mutation) = Self::ribbon_mutation_kind(act) {
+            if !self.mutation_allowed(mutation) {
+                return;
+            }
+        }
         match act {
             Cut => self.do_cut(),
             Copy => self.do_copy(),
@@ -1597,6 +1618,11 @@ impl App {
             });
             (f, self.format)
         };
+        if target != self.format
+            && !self.mutation_allowed(protection::MutationKind::PackageMetadata)
+        {
+            return;
+        }
         fname = fname.trim().to_string();
         let path = dir.join(&fname);
         let path_str = path.to_string_lossy().into_owned();
@@ -1612,8 +1638,14 @@ impl App {
                 (md.into_bytes(), pkg)
             }
             DocFormat::Docx => {
-                self.pkg.document = self.current_document();
-                (save_package(&self.pkg), self.pkg.clone())
+                let bytes = if self.format == DocFormat::Docx && !self.modified {
+                    save_package_preserving_document(&self.pkg)
+                } else {
+                    self.pkg.document = self.current_document();
+                    save_package(&self.pkg)
+                };
+                let pkg = load_package(&bytes).unwrap_or_else(|_| self.pkg.clone());
+                (bytes, pkg)
             }
         };
         match std::fs::write(&path, &bytes) {
@@ -1784,10 +1816,7 @@ impl App {
         self.headers = parts("headerReference");
         self.footers = parts("footerReference");
         self.title_page = flag_on(pkg.sect_pr(), "titlePg");
-        self.even_odd = pkg
-            .part("word/settings.xml")
-            .map(|b| flag_on(std::str::from_utf8(b).unwrap_or(""), "evenAndOddHeaders"))
-            .unwrap_or(false);
+        self.even_odd = pkg.has_even_odd();
         self.header_part = hf_part_name(&pkg, &rels, "headerReference");
         self.footer_part = hf_part_name(&pkg, &rels, "footerReference");
         self.comments = docxcore::comments::parse_comments(&pkg);
@@ -1797,7 +1826,7 @@ impl App {
         self.comment_sel = 0;
         self.comment_active = false;
         self.doc_protection = pkg.protection();
-        self.doc_watermark = pkg.watermark();
+        self.watermark_state = watermark::State::from_package(&pkg);
         self.doc_page_borders = pkg.has_page_borders();
         let doc = std::mem::take(&mut pkg.document);
         self.pkg = pkg;
@@ -1819,14 +1848,32 @@ impl App {
         self.dirty = true;
     }
 
+    /// Refresh watermark labels/scopes after a live header or section change.
+    /// Use a temporary package view containing the current editor body when
+    /// resolving section headers; `pkg.document` is the last saved baseline.
+    fn refresh_watermark_state(&mut self) {
+        let mut live = self.pkg.clone();
+        live.document = self.editor.doc.clone();
+        self.watermark_state = watermark::State::from_package(&live);
+    }
+
+    fn refresh_watermark_state_if_needed(&mut self) {
+        if !self
+            .watermark_state
+            .matches_document_sections(&self.editor.doc)
+        {
+            self.refresh_watermark_state();
+        }
+    }
+
     /// A compact status-line suffix for document-level notices (protection,
     /// watermark, page borders) — empty when the document has none.
     fn doc_notice(&self) -> String {
         let mut parts = Vec::new();
-        if let Some(p) = &self.doc_protection {
+        if let Some(p) = self.doc_protection.label() {
             parts.push(format!("Protected: {p}"));
         }
-        if let Some(w) = &self.doc_watermark {
+        if let Some(w) = self.watermark_state.label() {
             parts.push(format!("Watermark: {w}"));
         }
         if self.doc_page_borders {
@@ -1836,6 +1883,67 @@ impl App {
             String::new()
         } else {
             format!("  ·  {}", parts.join(" · "))
+        }
+    }
+
+    /// The single App-level authorization decision used by interactive,
+    /// control, and MCP mutation routes.
+    fn authorize_mutation(
+        &self,
+        mutation: protection::MutationKind,
+    ) -> Result<(), protection::ProtectionDenial> {
+        protection::authorize(&self.doc_protection, mutation)
+    }
+
+    /// Check a requested interactive mutation before it reaches the editor,
+    /// history, package, comments, or save-state implementation. A denial only
+    /// replaces the transient status message; document state stays untouched.
+    fn mutation_allowed(&mut self, mutation: protection::MutationKind) -> bool {
+        match self.authorize_mutation(mutation) {
+            Ok(()) => true,
+            Err(denial) => {
+                self.status = Some(denial.tui_status());
+                false
+            }
+        }
+    }
+
+    /// Mutating ribbon actions that execute immediately. Actions which only
+    /// open a dialog are authorized by the dialog's commit method instead.
+    fn ribbon_mutation_kind(act: ribbon::Act) -> Option<protection::MutationKind> {
+        use protection::MutationKind;
+        use ribbon::Act::*;
+        match act {
+            PageBreak | InsertTable => Some(MutationKind::Structure),
+            PageNumber | ChangeCase => Some(MutationKind::Content),
+            Sort => Some(MutationKind::Structure),
+            HorizontalLine | Columns | Hyphenation | Bold | Italic | Underline | Strike
+            | Subscript | Superscript | GrowFont | ShrinkFont | ClearFormatting
+            | IncreaseIndent | DecreaseIndent | FirstLineIndent | HangingIndent | AlignLeft
+            | AlignCenter | AlignRight | Justify | ApplyStyle(_) => Some(MutationKind::Formatting),
+            _ => None,
+        }
+    }
+
+    /// Classify direct body/header/footer keys after all modal and Vim routes
+    /// have had a chance to consume them.
+    fn body_key_mutation_kind(key: &KeyEvent) -> Option<protection::MutationKind> {
+        use protection::MutationKind;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('f') if alt => None,
+            KeyCode::Char(' ') if ctrl && shift => Some(MutationKind::Content),
+            KeyCode::Char(
+                'b' | 'i' | 'u' | ']' | '[' | '=' | '+' | ' ' | 'm' | 'l' | 'e' | 'r' | 'j',
+            ) if ctrl => Some(MutationKind::Formatting),
+            KeyCode::Char('z' | 'y') if ctrl => Some(MutationKind::Content),
+            KeyCode::F(3) if shift => Some(MutationKind::Content),
+            KeyCode::Char(_) if !ctrl => Some(MutationKind::Content),
+            KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => Some(MutationKind::Structure),
+            KeyCode::Tab => Some(MutationKind::Content),
+            _ => None,
         }
     }
 
@@ -1865,12 +1973,22 @@ impl App {
     /// Commit the new comment: wrap the selection in markers, add it to comments.xml
     /// and the live panel.
     fn commit_comment(&mut self) {
-        let text = self.comment_input.take().unwrap_or_default();
-        if text.trim().is_empty() {
+        if self
+            .comment_input
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            self.comment_input = None;
             self.status = Some("Comment cancelled (empty)".to_string());
             self.dirty = true;
             return;
         }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
+            return;
+        }
+        let text = self.comment_input.take().unwrap_or_default();
         let quoted = self.editor.selection_text();
         let id = self.next_comment_id();
         if !self.editor.add_comment(&id.to_string()) {
@@ -1921,6 +2039,9 @@ impl App {
             self.dirty = true;
             return;
         }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
+            return;
+        }
         let idx = self.comment_sel.min(self.comments.len() - 1);
         let c = self.comments.remove(idx);
         self.editor.remove_comment_markers(&c.id);
@@ -1938,21 +2059,23 @@ impl App {
             KeyCode::Esc => {
                 self.comment_input = None;
                 self.status = Some("Comment cancelled".to_string());
+                self.dirty = true;
             }
             KeyCode::Enter => self.commit_comment(),
             KeyCode::Backspace => {
                 if let Some(s) = self.comment_input.as_mut() {
                     s.pop();
                 }
+                self.dirty = true;
             }
             KeyCode::Char(c) => {
                 if let Some(s) = self.comment_input.as_mut() {
                     s.push(c);
                 }
+                self.dirty = true;
             }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -2203,8 +2326,11 @@ impl App {
     fn ensure_rendered(&mut self, width: u16) {
         if self.dirty || width != self.rendered_width {
             let opts = self.options(width);
-            let (mut lines, mut maps, mut images, _mmd) =
-                render_with_images(&self.editor.doc, &opts);
+            let rendered = render_with_page_layout(&self.editor.doc, &opts);
+            let mut lines = rendered.lines;
+            let mut maps = rendered.maps;
+            let mut images = rendered.images;
+            let pages = rendered.pages;
             // While editing a header/footer, show the rest of the page (the parked
             // document body) dimmed and read-only below/above the editable surface,
             // the way Word greys out the body. The body's caret maps are dropped so
@@ -2252,9 +2378,15 @@ impl App {
                     maps = nm;
                 }
             }
+            let watermark_overlays = if self.hf_edit.is_none() {
+                watermark::layout(&self.watermark_state, &pages, &lines, &images)
+            } else {
+                Vec::new()
+            };
             self.lines = lines;
             self.maps = maps;
             self.images = images;
+            self.watermark_overlays = watermark_overlays;
             self.rendered_width = width;
             self.dirty = false;
         }
@@ -2446,11 +2578,21 @@ impl App {
         self.modified = true;
         self.dirty = true;
         self.status = None;
+        // The editable body lives outside `pkg`. Any successful body edit can
+        // remove, restore, or move a paragraph carrying `w:sectPr`, so refresh
+        // the page/header scope before the next overlay layout. Header/footer
+        // edits use a temporary editor and refresh when that part is committed.
+        if self.hf_edit.is_none() {
+            self.refresh_watermark_state_if_needed();
+        }
     }
 
     /// Enter focus-editing of the default header (or footer): park the body
     /// editor and point the main editor at the header/footer document.
     fn enter_hf_edit(&mut self, is_header: bool) {
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
@@ -2516,8 +2658,13 @@ impl App {
             return;
         };
         let edited = std::mem::replace(&mut self.editor, hf.body);
-        if commit {
-            let blocks = edited.doc.body;
+        let blocks = edited.doc.body;
+        let changed = if hf.is_header {
+            self.headers.default.as_ref() != &blocks
+        } else {
+            self.footers.default.as_ref() != &blocks
+        };
+        if commit && changed {
             let rc = Rc::new(blocks.clone());
             if hf.is_header {
                 self.headers.default = rc;
@@ -2530,6 +2677,7 @@ impl App {
                 let new_xml = splice_hf(&orig, &blocks, tag);
                 self.pkg.set_part(&hf.part, new_xml.into_bytes());
             }
+            self.refresh_watermark_state();
             self.modified = true;
         }
         self.page_view = hf.saved_page_view;
@@ -2541,6 +2689,9 @@ impl App {
     /// given orientation. (Works cleanly when the caret is in the final section.)
     fn insert_section(&mut self, landscape: bool) {
         if self.hf_edit.is_some() {
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
             return;
         }
         let current = self.pkg.sect_pr().to_string();
@@ -2555,6 +2706,7 @@ impl App {
             return;
         }
         self.pkg.set_sect_pr(orient_sectpr(&current, landscape));
+        self.refresh_watermark_state();
         self.modified = true;
         self.dirty = true;
         let o = if landscape { "landscape" } else { "portrait" };
@@ -2572,12 +2724,21 @@ impl App {
         let bytes = match self.format {
             DocFormat::Markdown => self.current_markdown().into_bytes(),
             DocFormat::Docx => {
-                self.pkg.document = self.editor.doc.clone();
-                save_package(&self.pkg)
+                if self.modified {
+                    self.pkg.document = self.editor.doc.clone();
+                    save_package(&self.pkg)
+                } else {
+                    save_package_preserving_document(&self.pkg)
+                }
             }
         };
         match std::fs::write(&path, &bytes) {
             Ok(()) => {
+                if self.format == DocFormat::Docx {
+                    if let Ok(pkg) = load_package(&bytes) {
+                        self.pkg = pkg;
+                    }
+                }
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", path, bytes.len()));
             }
@@ -2690,6 +2851,9 @@ impl App {
     }
 
     fn do_cut(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Structure) {
+            return;
+        }
         if let Some(c) = self.editor.cut() {
             let text = c.to_text();
             self.clipboard = Some(c);
@@ -2701,18 +2865,39 @@ impl App {
 
     fn do_paste(&mut self) {
         let os_text = self.os_get();
-        let clip = match os_text {
+        let (clip, keeps_source_formatting) = match os_text {
             // Our own content is still on the clipboard -> paste with full styling.
-            Some(t) if Some(&t) == self.clip_text.as_ref() => self.clipboard.clone(),
+            Some(t) if Some(&t) == self.clip_text.as_ref() => (self.clipboard.clone(), true),
             // External text -> paste as plain.
-            Some(t) => Some(Clip::from_text(&t)),
+            Some(t) => (Some(Clip::from_text(&t)), false),
             // OS clipboard unavailable -> fall back to the internal clip.
-            None => self.clipboard.clone(),
+            None => (self.clipboard.clone(), true),
         };
         if let Some(c) = clip {
+            if !self.paste_allowed(
+                protection::MutationKind::Content,
+                &c,
+                keeps_source_formatting,
+            ) {
+                return;
+            }
             self.editor.paste(&c);
             self.after_edit();
         }
+    }
+
+    /// Authorize the semantic insertion plus any formatting carried by a rich
+    /// internal clip before a paste path moves the caret or changes the editor.
+    fn paste_allowed(
+        &mut self,
+        mutation: protection::MutationKind,
+        clip: &Clip,
+        keeps_source_formatting: bool,
+    ) -> bool {
+        self.mutation_allowed(mutation)
+            && (!keeps_source_formatting
+                || !clip_has_formatting(clip)
+                || self.mutation_allowed(protection::MutationKind::Formatting))
     }
 
     /// Open the Paste Special dialog, offering the paste formats that make sense
@@ -2764,6 +2949,25 @@ impl App {
 
     /// Carry out the highlighted Paste Special option and close the dialog.
     fn apply_paste_special(&mut self) {
+        let selection = self.paste_special.as_ref().and_then(|paste| {
+            paste
+                .opts
+                .get(paste.sel)
+                .copied()
+                .map(|selected| (selected, paste.rich.clone()))
+        });
+        let Some((selected, rich)) = selection else {
+            return;
+        };
+        let authorization_clip = rich.as_ref().filter(|_| selected == PasteOpt::KeepSource);
+        let plain = Clip::default();
+        if !self.paste_allowed(
+            protection::MutationKind::Content,
+            authorization_clip.unwrap_or(&plain),
+            authorization_clip.is_some(),
+        ) {
+            return;
+        }
         let Some(ps) = self.paste_special.take() else {
             return;
         };
@@ -2806,15 +3010,19 @@ impl App {
         match key.code {
             KeyCode::Up | KeyCode::BackTab => {
                 ps.sel = ps.sel.saturating_sub(1);
+                self.dirty = true;
             }
             KeyCode::Down | KeyCode::Tab => {
                 ps.sel = (ps.sel + 1).min(ps.opts.len().saturating_sub(1));
+                self.dirty = true;
             }
             KeyCode::Enter => self.apply_paste_special(),
-            KeyCode::Esc => self.paste_special = None,
+            KeyCode::Esc => {
+                self.paste_special = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -2832,8 +3040,8 @@ impl App {
             self.apply_paste_special();
         } else if self.ps_btns[1].contains(p) {
             self.paste_special = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     /// The computed value of `kind`, with a fresh clock for date/time fields.
@@ -2902,6 +3110,9 @@ impl App {
     }
 
     fn apply_insert_field(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
         let Some(d) = self.insert_field.take() else {
             return;
         };
@@ -2921,13 +3132,21 @@ impl App {
             return false;
         };
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(FieldKind::ALL.len() - 1),
+            KeyCode::Up | KeyCode::BackTab => {
+                d.sel = d.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                d.sel = (d.sel + 1).min(FieldKind::ALL.len() - 1);
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_insert_field(),
-            KeyCode::Esc => self.insert_field = None,
+            KeyCode::Esc => {
+                self.insert_field = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -2944,8 +3163,8 @@ impl App {
             self.apply_insert_field();
         } else if self.if_btns[1].contains(p) {
             self.insert_field = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     // ---- Paragraph dialog (precise indent) ----
@@ -2968,6 +3187,9 @@ impl App {
     }
 
     fn apply_para_dialog(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         let Some(d) = self.para_dialog.take() else {
             return;
         };
@@ -2981,15 +3203,29 @@ impl App {
             return false;
         };
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(ParagraphDialog::ROWS - 1),
-            KeyCode::Left => d.adjust(-1),
-            KeyCode::Right => d.adjust(1),
+            KeyCode::Up | KeyCode::BackTab => {
+                d.sel = d.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                d.sel = (d.sel + 1).min(ParagraphDialog::ROWS - 1);
+                self.dirty = true;
+            }
+            KeyCode::Left => {
+                d.adjust(-1);
+                self.dirty = true;
+            }
+            KeyCode::Right => {
+                d.adjust(1);
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_para_dialog(),
-            KeyCode::Esc => self.para_dialog = None,
+            KeyCode::Esc => {
+                self.para_dialog = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -3006,8 +3242,8 @@ impl App {
             self.apply_para_dialog();
         } else if self.pd_btns[1].contains(p) {
             self.para_dialog = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     // ---- Apply-Styles dialog ----
@@ -3033,6 +3269,9 @@ impl App {
     }
 
     fn apply_styles_dialog(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         let Some(d) = self.styles_dialog.take() else {
             return;
         };
@@ -3049,15 +3288,29 @@ impl App {
         };
         let n = d.items.len();
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => d.sel = d.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => d.sel = (d.sel + 1).min(n.saturating_sub(1)),
-            KeyCode::Home => d.sel = 0,
-            KeyCode::End => d.sel = n.saturating_sub(1),
+            KeyCode::Up | KeyCode::BackTab => {
+                d.sel = d.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                d.sel = (d.sel + 1).min(n.saturating_sub(1));
+                self.dirty = true;
+            }
+            KeyCode::Home => {
+                d.sel = 0;
+                self.dirty = true;
+            }
+            KeyCode::End => {
+                d.sel = n.saturating_sub(1);
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_styles_dialog(),
-            KeyCode::Esc => self.styles_dialog = None,
+            KeyCode::Esc => {
+                self.styles_dialog = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -3075,8 +3328,8 @@ impl App {
             self.apply_styles_dialog();
         } else if self.sd_btns[1].contains(p) {
             self.styles_dialog = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     /// Re-read numbering.xml from the package (after a list is created/changed).
@@ -3091,6 +3344,9 @@ impl App {
 
     /// Toggle a bullet/numbered list on the selected paragraphs.
     fn apply_list(&mut self, bullet: bool) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         let num_id = self.pkg.ensure_list(bullet);
         if self.editor.all_in_list(num_id) {
             self.editor.set_list(None);
@@ -3112,6 +3368,9 @@ impl App {
 
     /// Toggle a bottom paragraph border on the selected paragraphs.
     fn toggle_para_border(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         use docxcore::model::{BorderKind, ParBorders};
         let has = self.editor.caret_para_props().borders.bottom.is_some();
         let new = if has {
@@ -3151,6 +3410,17 @@ impl App {
     }
 
     fn apply_picker(&mut self) {
+        let Some(kind) = self.font_picker.as_ref().map(|p| p.kind) else {
+            return;
+        };
+        let mutation = if matches!(kind, PickerKind::Symbol | PickerKind::Equation) {
+            protection::MutationKind::Content
+        } else {
+            protection::MutationKind::Formatting
+        };
+        if !self.mutation_allowed(mutation) {
+            return;
+        }
         let Some(p) = self.font_picker.take() else {
             return;
         };
@@ -3188,13 +3458,21 @@ impl App {
         };
         let n = p.kind.items().len();
         match key.code {
-            KeyCode::Up | KeyCode::BackTab => p.sel = p.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Up | KeyCode::BackTab => {
+                p.sel = p.sel.saturating_sub(1);
+                self.dirty = true;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                p.sel = (p.sel + 1).min(n.saturating_sub(1));
+                self.dirty = true;
+            }
             KeyCode::Enter => self.apply_picker(),
-            KeyCode::Esc => self.font_picker = None,
+            KeyCode::Esc => {
+                self.font_picker = None;
+                self.dirty = true;
+            }
             _ => {}
         }
-        self.dirty = true;
         false
     }
 
@@ -3211,8 +3489,8 @@ impl App {
             self.apply_picker();
         } else if self.fp_btns[1].contains(pos) {
             self.font_picker = None;
+            self.dirty = true;
         }
-        self.dirty = true;
     }
 
     /// The hyperlink target at a given document line and column, if any.
@@ -3293,7 +3571,6 @@ impl App {
             }
             ribbon::Hit::Button(act) => {
                 self.run_act(act);
-                self.dirty = true;
             }
             ribbon::Hit::Outside => {}
         }
@@ -3639,6 +3916,9 @@ impl App {
                     .as_ref()
                     .map(|f| (f.query.clone(), f.replacement.clone()))
                 {
+                    if !self.mutation_allowed(protection::MutationKind::Content) {
+                        return false;
+                    }
                     let n = self.editor.replace_all(&q, &repl, false);
                     self.modified = true;
                     self.status = Some(format!("Replaced {n}"));
@@ -3652,6 +3932,9 @@ impl App {
                     .map(|f| f.replacement.is_some())
                     .unwrap_or(false);
                 if is_replace {
+                    if !self.mutation_allowed(protection::MutationKind::Content) {
+                        return false;
+                    }
                     let repl = self
                         .find
                         .as_ref()
@@ -3766,6 +4049,9 @@ impl App {
     }
 
     fn vim_apply_op(&mut self, op: char, linewise: bool) {
+        if matches!(op, 'd' | 'c') && !self.mutation_allowed(protection::MutationKind::Structure) {
+            return;
+        }
         // Charwise visual selection is inclusive of the char under the cursor.
         if !linewise && self.vim_mode() == Some(VimMode::Visual) {
             if let Some((lo, hi)) = self.editor.selection_range() {
@@ -3809,8 +4095,13 @@ impl App {
     }
 
     fn vim_handle_motion(&mut self, motion: char) {
-        let count = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
         let op = self.vim.as_ref().and_then(|v| v.pending_op);
+        if matches!(op, Some('d' | 'c'))
+            && !self.mutation_allowed(protection::MutationKind::Structure)
+        {
+            return;
+        }
+        let count = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
         if let Some(op) = op {
             self.vim_operator_motion(op, motion, count);
             if let Some(v) = &mut self.vim {
@@ -3826,6 +4117,14 @@ impl App {
             return;
         };
         let linewise = self.vim.as_ref().map(|v| v.linewise_clip).unwrap_or(false);
+        let mutation = if linewise {
+            protection::MutationKind::Structure
+        } else {
+            protection::MutationKind::Content
+        };
+        if !self.paste_allowed(mutation, &c, true) {
+            return;
+        }
         if linewise {
             if before {
                 self.editor.move_home();
@@ -3862,13 +4161,19 @@ impl App {
 
     fn vim_char(&mut self, c: char, ctrl: bool) {
         if ctrl && c == 'r' {
-            let n = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
-            for _ in 0..n {
-                if self.editor.redo() {
-                    self.modified = true;
-                }
+            if !self.mutation_allowed(protection::MutationKind::Content) {
+                return;
             }
-            self.dirty = true;
+            let n = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
+            let mut changed = false;
+            for _ in 0..n {
+                changed |= self.editor.redo();
+            }
+            if changed {
+                self.after_edit();
+            } else {
+                self.dirty = true;
+            }
             return;
         }
         let mode = self.vim.as_ref().unwrap().mode;
@@ -3908,6 +4213,11 @@ impl App {
             }
             let same = self.vim.as_ref().unwrap().pending_op == Some(c);
             if same {
+                if matches!(c, 'd' | 'c')
+                    && !self.mutation_allowed(protection::MutationKind::Structure)
+                {
+                    return;
+                }
                 let count = self.vim.as_mut().unwrap().take_count();
                 self.editor.select_lines(count);
                 self.vim_apply_op(c, true);
@@ -3945,12 +4255,18 @@ impl App {
                 self.vim_enter_insert();
             }
             'o' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 self.editor.move_end();
                 self.editor.insert_newline();
                 self.after_edit();
                 self.vim_enter_insert();
             }
             'O' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 self.editor.move_home();
                 self.editor.insert_newline();
                 self.move_vert(false);
@@ -3958,6 +4274,9 @@ impl App {
                 self.vim_enter_insert();
             }
             'x' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 let n = self.vim.as_mut().unwrap().take_count();
                 for _ in 0..n {
                     self.editor.delete_forward();
@@ -3965,6 +4284,9 @@ impl App {
                 self.after_edit();
             }
             'D' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 let s = self.editor.caret.clone();
                 self.editor.move_end();
                 self.editor.anchor = Some(s);
@@ -3975,13 +4297,19 @@ impl App {
             'p' => self.vim_paste(false),
             'P' => self.vim_paste(true),
             'u' => {
-                let n = self.vim.as_mut().unwrap().take_count();
-                for _ in 0..n {
-                    if self.editor.undo() {
-                        self.modified = true;
-                    }
+                if !self.mutation_allowed(protection::MutationKind::Content) {
+                    return;
                 }
-                self.dirty = true;
+                let n = self.vim.as_mut().unwrap().take_count();
+                let mut changed = false;
+                for _ in 0..n {
+                    changed |= self.editor.undo();
+                }
+                if changed {
+                    self.after_edit();
+                } else {
+                    self.dirty = true;
+                }
             }
             'v' => {
                 let cur = self.editor.caret.clone();
@@ -4166,6 +4494,11 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if let Some(mutation) = Self::body_key_mutation_kind(&key) {
+            if !self.mutation_allowed(mutation) {
+                return false;
+            }
+        }
         match key.code {
             // Esc clears a selection but never quits — use Ctrl+Q to quit.
             KeyCode::Esc => {
@@ -4257,16 +4590,12 @@ impl App {
             }
             KeyCode::Char('z') if ctrl => {
                 if self.editor.undo() {
-                    self.modified = true;
-                    self.dirty = true;
-                    self.status = None;
+                    self.after_edit();
                 }
             }
             KeyCode::Char('y') if ctrl => {
                 if self.editor.redo() {
-                    self.modified = true;
-                    self.dirty = true;
-                    self.status = None;
+                    self.after_edit();
                 }
             }
             KeyCode::Char(c) if !ctrl => {
@@ -4275,7 +4604,10 @@ impl App {
             }
             KeyCode::Enter => {
                 // "---" / "===" / "___" … on a line becomes a horizontal rule.
-                if self.editor.hrule_autoformat() {
+                let formatting_allowed = self
+                    .authorize_mutation(protection::MutationKind::Formatting)
+                    .is_ok();
+                if formatting_allowed && self.editor.hrule_autoformat() {
                     self.status = Some("Inserted horizontal line".to_string());
                 } else {
                     self.editor.insert_newline();
@@ -4618,6 +4950,11 @@ impl App {
         }
         f.render_widget(para, content);
 
+        // Paint watermarks as a final, muted screen layer. Because these labels
+        // never enter `lines` or `maps`, clicks, the caret, selection, copy,
+        // export, and saved OOXML continue to see only real document content.
+        self.draw_watermark_overlays(f, content);
+
         // The comments panel, slid in from the right as the canvas scrolls.
         if comments_aside {
             let h = self.comments_hscroll as u16;
@@ -4751,7 +5088,11 @@ impl App {
                     )
                 };
                 match &self.status {
-                    Some(msg) => format!(" {m} {dirty_mark}{}  │ {msg}", self.path),
+                    Some(msg) => format!(
+                        " {m} {dirty_mark}{}  │ {msg}{}",
+                        self.path,
+                        self.doc_notice()
+                    ),
                     None => format!(
                         " {m}  │ {dirty_mark}{}  ln {cr} col {cc}{pending}{}",
                         self.path,
@@ -4761,7 +5102,7 @@ impl App {
             }
         } else {
             match &self.status {
-                Some(msg) => format!("{left} │ {msg}"),
+                Some(msg) => format!("{left} │ {msg}{}", self.doc_notice()),
                 None => format!(
                     "{left}│ Ctrl-S save · Ctrl-F find · Ctrl-Q quit{}",
                     self.doc_notice()
@@ -4788,6 +5129,44 @@ impl App {
         }
         if self.font_picker.is_some() {
             self.draw_picker(f, f.area());
+        }
+    }
+
+    fn draw_watermark_overlays(&self, f: &mut Frame, content: Rect) {
+        if !self.page_view || content.width == 0 || content.height == 0 {
+            return;
+        }
+        let style = Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM);
+        let hscroll = self.doc_hscroll as usize;
+        let buf = f.buffer_mut();
+        for overlay in &self.watermark_overlays {
+            let Some(view_row) = overlay.row.checked_sub(self.scroll) else {
+                continue;
+            };
+            if view_row >= content.height as usize {
+                continue;
+            }
+
+            let (view_col, text) = if overlay.col >= hscroll {
+                (overlay.col - hscroll, overlay.text.clone())
+            } else {
+                let (gap, suffix) =
+                    watermark::suffix_after_cols(&overlay.text, hscroll - overlay.col);
+                (gap, suffix)
+            };
+            if text.is_empty() || view_col >= content.width as usize {
+                continue;
+            }
+            let max_width = content.width as usize - view_col;
+            buf.set_stringn(
+                content.x + view_col as u16,
+                content.y + view_row as u16,
+                text,
+                max_width,
+                style,
+            );
         }
     }
 
@@ -5540,6 +5919,44 @@ fn looks_like_url(s: &str) -> bool {
             || t.starts_with("www."))
 }
 
+/// Whether an internal clip would carry direct character formatting into the
+/// destination rather than merely inserting content in the caret's style.
+fn clip_has_formatting(clip: &Clip) -> bool {
+    fn blocks_have_formatting(blocks: &[Block]) -> bool {
+        blocks.iter().any(|block| match block {
+            Block::Paragraph(paragraph) => {
+                paragraph.props != Default::default()
+                    || paragraph.content.iter().any(inline_has_formatting)
+            }
+            Block::Table(table) => table.rows.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .any(|cell| blocks_have_formatting(&cell.blocks))
+            }),
+            Block::Raw(_) => false,
+        })
+    }
+
+    fn inline_has_formatting(inline: &Inline) -> bool {
+        match inline {
+            Inline::Run(run) => run.props != RunProps::default(),
+            Inline::Hyperlink(link) => link.runs.iter().any(|run| run.props != RunProps::default()),
+            Inline::Tab(props) => *props != RunProps::default(),
+            Inline::Revision { content, .. } => content.iter().any(inline_has_formatting),
+            Inline::TextBox { blocks, .. } => blocks_have_formatting(blocks),
+            Inline::Break(_)
+            | Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::Equation { .. }
+            | Inline::Field { .. }
+            | Inline::FootnoteRef { .. }
+            | Inline::Raw(_) => false,
+        }
+    }
+
+    clip.paras.iter().flatten().any(inline_has_formatting)
+}
+
 /// Open a URL with the OS default handler — **without a shell** (the URL is
 /// passed as a direct argument), and only after [`safe_url`] has approved it.
 fn open_url(url: &str) {
@@ -5916,7 +6333,10 @@ mod tests {
     use docxcore::model::{
         Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, Run, RunProps,
     };
-    use docxcore::package::new_package;
+    use docxcore::package::{
+        HeaderVariant, ProtectionEditMode, ProtectionEnforcement, Watermark, WatermarkHeader,
+        WatermarkKind, new_package,
+    };
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -6138,19 +6558,428 @@ mod tests {
     }
 
     #[test]
+    fn page_layout_reports_multi_page_section_scope() {
+        let first = MPara {
+            props: ParProps {
+                section_break: Some("<w:sectPr/>".to_string()),
+                ..ParProps::default()
+            },
+            content: vec![
+                Inline::Run(Run {
+                    text: "first page".to_string(),
+                    props: RunProps::default(),
+                }),
+                Inline::Break(BreakKind::Page),
+                Inline::Run(Run {
+                    text: "second page".to_string(),
+                    props: RunProps::default(),
+                }),
+            ],
+        };
+        let second = MPara {
+            props: ParProps::default(),
+            content: vec![Inline::Run(Run {
+                text: "second section".to_string(),
+                props: RunProps::default(),
+            })],
+        };
+        let doc = Document {
+            body: vec![Block::Paragraph(first), Block::Paragraph(second)],
+        };
+        let opts = RenderOptions {
+            width: 80,
+            page_view: true,
+            ..RenderOptions::default()
+        };
+
+        let rendered = render_with_page_layout(&doc, &opts);
+        let (lines, maps, pages) = (rendered.lines, rendered.maps, rendered.pages);
+
+        assert_eq!(lines.len(), maps.len());
+        assert_eq!(pages.len(), 3, "expected two pages then one: {pages:?}");
+        assert_eq!(
+            pages
+                .iter()
+                .map(|page| (
+                    page.section_index,
+                    page.section_page_index,
+                    page.document_page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+        );
+        assert!(pages.iter().all(|page| {
+            page.rows >= 3 && page.cols >= 3 && page.row + page.rows <= lines.len()
+        }));
+    }
+
+    #[test]
+    fn page_watermark_is_visible_but_absent_from_document_and_interaction_state() {
+        let mut app = app_with(&["body text"]);
+        app.watermark_state = watermark::State::new(
+            vec![Watermark {
+                kind: WatermarkKind::Text("機密 SECRET".to_string()),
+                header: WatermarkHeader {
+                    section_index: 0,
+                    variant: HeaderVariant::Default,
+                    relationship_id: "rIdWatermark".to_string(),
+                    part_name: "word/header1.xml".to_string(),
+                    inherited: false,
+                },
+            }],
+            vec![false],
+            false,
+        );
+        app.page_view = true;
+        app.light_page = true;
+        app.dirty = true;
+        let document_before = app.editor.doc.clone();
+
+        let mut term = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        term.draw(|frame| app.draw(frame)).unwrap();
+
+        let screen = format!("{:?}", term.backend().buffer());
+        assert!(
+            screen.contains("[Watermark: 機密 SECRET]"),
+            "watermark overlay missing from page view: {screen}"
+        );
+        assert!(
+            app.lines
+                .iter()
+                .all(|line| !line.plain().contains("機密 SECRET")),
+            "overlay text must not enter rendered document lines"
+        );
+        assert_eq!(app.editor.doc, document_before);
+        assert!(app.maps.iter().any(LineMap::is_editable));
+        assert!(
+            app.maps
+                .iter()
+                .flat_map(|map| &map.segs)
+                .all(|seg| seg.path.first() == Some(&0)),
+            "overlay must not add a caret/hit-testing segment"
+        );
+
+        app.editor.select_all();
+        app.do_copy();
+        assert_eq!(app.clip_text.as_deref(), Some("body text"));
+
+        app.page_view = false;
+        app.dirty = true;
+        app.ensure_rendered(99);
+        assert!(app.watermark_overlays.is_empty());
+        assert!(
+            app.lines
+                .iter()
+                .all(|line| !line.plain().contains("機密 SECRET"))
+        );
+    }
+
+    #[test]
+    fn watermark_renderer_handles_tiny_viewports_and_plain_documents() {
+        let mut plain = app_with(&["plain"]);
+        plain.page_view = true;
+        plain.dirty = true;
+        plain.ensure_rendered(7);
+        assert!(plain.watermark_overlays.is_empty());
+
+        let mut app = app_with(&["body"]);
+        app.watermark_state = watermark::State::new(
+            vec![Watermark {
+                kind: WatermarkKind::Text("超長い機密透かし".to_string()),
+                header: WatermarkHeader {
+                    section_index: 0,
+                    variant: HeaderVariant::Default,
+                    relationship_id: "rIdWatermark".to_string(),
+                    part_name: "word/header1.xml".to_string(),
+                    inherited: false,
+                },
+            }],
+            vec![false],
+            false,
+        );
+        app.page_view = true;
+        app.dirty = true;
+        let mut term = Terminal::new(TestBackend::new(8, 4)).unwrap();
+
+        term.draw(|frame| app.draw(frame)).unwrap();
+
+        assert!(!app.watermark_overlays.is_empty());
+        assert_eq!(term.backend().buffer().area.width, 8);
+        assert_eq!(term.backend().buffer().area.height, 4);
+    }
+
+    #[test]
+    fn package_watermark_fixtures_drive_overlay_state_and_sandboxed_capture() {
+        use crate::test_fixtures::WatermarkFixture;
+
+        let mut text = App::new(
+            WatermarkFixture::Text.package(),
+            "text-watermark.docx",
+            false,
+        );
+        text.os_clip = None;
+        text.page_view = true;
+        text.light_page = true;
+        text.dirty = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        terminal.draw(|frame| text.draw(frame)).unwrap();
+        let capture = format!("{:?}", terminal.backend().buffer());
+
+        assert!(capture.contains("[Watermark: CONFIDENTIAL & REVIEW]"));
+        assert!(capture.contains("Fixture body"));
+        assert_eq!(text.watermark_overlays.len(), 1);
+        assert!(
+            text.lines
+                .iter()
+                .all(|line| !line.plain().contains("CONFIDENTIAL & REVIEW"))
+        );
+        text.editor.select_all();
+        text.do_copy();
+        assert_eq!(text.clip_text.as_deref(), Some("Fixture body"));
+
+        // The TestBackend capture is deterministic and sandboxed under target;
+        // it gives manual evidence without OCR or a golden-image dependency.
+        let artifact_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-artifacts/docxy");
+        std::fs::create_dir_all(&artifact_dir).expect("create watermark artifact directory");
+        let artifact = artifact_dir.join("watermark-page-view.txt");
+        std::fs::write(&artifact, &capture).expect("write watermark page-view capture");
+        eprintln!("wrote {}", artifact.display());
+
+        let mut picture = App::new(
+            WatermarkFixture::Picture.package(),
+            "picture-watermark.docx",
+            false,
+        );
+        picture.page_view = true;
+        picture.dirty = true;
+        picture.ensure_rendered(99);
+        assert_eq!(picture.watermark_overlays.len(), 1);
+        assert!(
+            picture.watermark_overlays[0]
+                .text
+                .contains("picture preview unavailable")
+        );
+
+        let mut inherited = App::new(
+            WatermarkFixture::InheritedText.package(),
+            "inherited-watermark.docx",
+            false,
+        );
+        inherited.page_view = true;
+        inherited.dirty = true;
+        inherited.ensure_rendered(99);
+        assert_eq!(inherited.watermark_overlays.len(), 2);
+        assert!(
+            inherited
+                .watermark_overlays
+                .iter()
+                .all(|overlay| overlay.text.contains("INHERITED DRAFT"))
+        );
+    }
+
+    #[test]
     fn doc_notice_reports_surfaced_features() {
         let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
         let mut app = App::new(new_package(Document { body }), "a.docx", false);
         // A plain document shows nothing.
         assert_eq!(app.doc_notice(), "");
         // Each surfaced feature appears in the notice.
-        app.doc_protection = Some("read-only".to_string());
-        app.doc_watermark = Some("CONFIDENTIAL".to_string());
+        app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
+        app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::ReadOnly);
+        app.watermark_state = watermark::State::new(
+            vec![Watermark {
+                kind: WatermarkKind::Text("CONFIDENTIAL".to_string()),
+                header: WatermarkHeader {
+                    section_index: 0,
+                    variant: HeaderVariant::Default,
+                    relationship_id: "rIdWatermark".to_string(),
+                    part_name: "word/header1.xml".to_string(),
+                    inherited: false,
+                },
+            }],
+            vec![false],
+            false,
+        );
         app.doc_page_borders = true;
         let n = app.doc_notice();
         assert!(n.contains("Protected: read-only"), "{n}");
         assert!(n.contains("Watermark: CONFIDENTIAL"), "{n}");
         assert!(n.contains("Page border"), "{n}");
+    }
+
+    #[test]
+    fn transient_status_does_not_hide_advisory_protection_notice() {
+        let mut app = App::new(
+            crate::test_fixtures::ProtectionFixture::Advisory.package(),
+            "advisory.docx",
+            false,
+        );
+        app.status = Some("opened advisory.docx".to_string());
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = format!("{:?}", terminal.backend().buffer());
+        assert!(screen.contains("opened advisory.docx"), "{screen}");
+        assert!(
+            screen.contains("Protected: read-only (recommended)"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn watermark_scope_refreshes_after_section_edit_and_undo() {
+        let mut app = App::new(
+            crate::test_fixtures::WatermarkFixture::InheritedText.package(),
+            "inherited.docx",
+            false,
+        );
+        assert_eq!(app.watermark_state.mark_count(), 2);
+
+        assert!(app.editor.set_caret_section_break(None));
+        app.after_edit();
+        assert_eq!(app.watermark_state.mark_count(), 0);
+
+        assert!(app.editor.undo());
+        app.after_edit();
+        assert_eq!(app.watermark_state.mark_count(), 2);
+    }
+
+    #[test]
+    fn vim_history_refreshes_watermark_section_scope() {
+        let mut app = App::new(
+            crate::test_fixtures::WatermarkFixture::InheritedText.package(),
+            "inherited.docx",
+            false,
+        );
+        app.vim = Some(VimState::new());
+        assert_eq!(app.watermark_state.mark_count(), 2);
+
+        assert!(app.editor.set_caret_section_break(None));
+        app.after_edit();
+        assert_eq!(app.watermark_state.mark_count(), 0);
+
+        app.on_key(key(KeyCode::Char('u')));
+        assert_eq!(app.watermark_state.mark_count(), 2);
+
+        app.on_key(ctrl(KeyCode::Char('r')));
+        assert_eq!(app.watermark_state.mark_count(), 0);
+    }
+
+    #[test]
+    fn denied_ribbon_keyboard_and_mouse_actions_preserve_renderer_state() {
+        let mut app = app_with(&["format me"]);
+        app.editor.select_all();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        app.ribbon_open = true;
+
+        let bold_index = (0..128)
+            .find(|&index| {
+                matches!(
+                    app.ribbon.focus_act(ribbon::Focus::Button(index)),
+                    Some((ribbon::Act::Bold, _))
+                )
+            })
+            .expect("Bold ribbon button");
+        app.ribbon_focus = ribbon::Focus::Button(bold_index);
+        app.dirty = false;
+        app.status = None;
+        app.ribbon_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("formatting is locked"))
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let (x, y) = (0..ribbon::EXPANDED_H)
+            .flat_map(|y| (0..140).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                matches!(
+                    app.ribbon.hit(x, y, true),
+                    ribbon::Hit::Button(ribbon::Act::Bold)
+                )
+            })
+            .expect("Bold ribbon hit target");
+        app.dirty = false;
+        app.status = None;
+        app.ribbon_click(x, y);
+        assert!(!app.dirty);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("formatting is locked"))
+        );
+    }
+
+    #[test]
+    fn denied_dialog_keyboard_and_mouse_commits_preserve_renderer_state() {
+        let mut app = app_with(&["format me"]);
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+
+        app.open_para_dialog();
+        app.dirty = false;
+        app.status = None;
+        app.para_dialog_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert!(app.para_dialog.is_some());
+
+        app.pd_btns[0] = Rect::new(3, 3, 4, 1);
+        app.dirty = false;
+        app.status = None;
+        app.para_dialog_mouse(3, 3);
+        assert!(!app.dirty);
+        assert!(app.para_dialog.is_some());
+
+        app.editor.select_all();
+        app.open_picker(PickerKind::FontColor);
+        app.fp_btns[0] = Rect::new(5, 5, 4, 1);
+        app.dirty = false;
+        app.status = None;
+        app.picker_mouse(5, 5);
+        assert!(!app.dirty);
+        assert!(app.font_picker.is_some());
+
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        app.insert_field = Some(InsertFieldDialog { sel: 0 });
+        app.dirty = false;
+        app.status = None;
+        app.insert_field_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert!(app.insert_field.is_some());
+
+        app.comment_input = Some("note".to_string());
+        app.dirty = false;
+        app.status = None;
+        app.comment_input_key(key(KeyCode::Enter));
+        assert!(!app.dirty);
+        assert_eq!(app.comment_input.as_deref(), Some("note"));
+    }
+
+    #[test]
+    fn app_authorization_uses_structured_protection_not_the_display_label() {
+        let body = vec![Block::Paragraph(docxcore::model::Paragraph::default())];
+        let mut app = App::new(new_package(Document { body }), "a.docx", false);
+        app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
+        app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::Comments);
+
+        assert_eq!(
+            app.authorize_mutation(protection::MutationKind::Comment),
+            Ok(())
+        );
+        let denial = app
+            .authorize_mutation(protection::MutationKind::Content)
+            .unwrap_err();
+        assert_eq!(denial.code(), "comments_only");
+        assert_eq!(
+            denial.control_error(),
+            "protection_denied:comments_only: only comment edits are allowed"
+        );
+        assert_eq!(
+            denial.tui_status(),
+            "Edit blocked: only comment edits are allowed."
+        );
     }
 
     #[test]
@@ -6298,6 +7127,551 @@ mod tests {
         let mut app = App::new(new_package(Document { body }), "test.docx", false);
         app.os_clip = None; // don't touch the real OS clipboard in tests
         app
+    }
+
+    fn fixture_app(fixture: crate::test_fixtures::ProtectionFixture) -> App {
+        let mut app = App::new(
+            fixture.package(),
+            &format!("{}.docx", fixture.name()),
+            false,
+        );
+        app.os_clip = None;
+        app
+    }
+
+    fn fixture_package_snapshot(app: &App) -> Vec<(String, Vec<u8>)> {
+        app.pkg
+            .part_names()
+            .into_iter()
+            .map(|name| (name.to_string(), app.pkg.part(name).unwrap().to_vec()))
+            .collect()
+    }
+
+    fn protect(app: &mut App, mode: ProtectionEditMode, formatting_locked: bool) {
+        app.doc_protection = Protection {
+            enforcement: ProtectionEnforcement::Enforced,
+            edit_mode: Some(mode),
+            formatting_locked,
+            ..Protection::default()
+        };
+    }
+
+    fn unprotect(app: &mut App) {
+        app.doc_protection = Protection::default();
+    }
+
+    #[test]
+    fn denied_keys_preserve_document_history_package_and_save_state() {
+        let mut app = app_with(&["alpha"]);
+        app.editor.move_end();
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(first_line(&app), "alpha");
+
+        // Treat the current undo state as saved, with a pending redo. A rejected
+        // key must not dirty it, alter package metadata, or clear that redo.
+        app.modified = false;
+        app.dirty = false;
+        let doc = app.editor.doc.clone();
+        let caret = app.editor.caret.clone();
+        let sect_pr = app.pkg.sect_pr().to_string();
+        let settings = app.pkg.part("word/settings.xml").map(|part| part.to_vec());
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.editor.doc, doc);
+        assert_eq!(app.editor.caret, caret);
+        assert_eq!(app.pkg.sect_pr(), sect_pr);
+        assert_eq!(
+            app.pkg.part("word/settings.xml").map(|part| part.to_vec()),
+            settings
+        );
+        assert!(!app.modified, "denial must not change save state");
+        assert!(!app.dirty, "denial must not invalidate document layout");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: the document is protected read-only.")
+        );
+
+        unprotect(&mut app);
+        assert!(app.editor.redo(), "denial cleared the existing redo entry");
+        assert_eq!(first_line(&app), "alphab");
+
+        let mut clean = app_with(&["clean"]);
+        protect(&mut clean, ProtectionEditMode::ReadOnly, false);
+        clean.on_key(key(KeyCode::Enter));
+        unprotect(&mut clean);
+        assert!(!clean.editor.undo(), "denial pushed an undo checkpoint");
+    }
+
+    #[test]
+    fn protection_package_fixtures_drive_tui_policy_status_and_history() {
+        use crate::test_fixtures::ProtectionFixture;
+
+        let denied = [
+            (
+                ProtectionFixture::ReadOnly,
+                "Edit blocked: the document is protected read-only.",
+            ),
+            (
+                ProtectionFixture::PasswordWrite,
+                "Edit blocked: the document is protected read-only.",
+            ),
+            (
+                ProtectionFixture::Forms,
+                "Edit blocked: form-fields-only editing is not supported; use Word to edit form fields.",
+            ),
+            (
+                ProtectionFixture::TrackedChanges,
+                "Edit blocked: tracked-only editing is not supported; use Word to create tracked changes.",
+            ),
+            (
+                ProtectionFixture::Unknown,
+                "Edit blocked: the document uses unsupported protection mode 'producerSpecific'.",
+            ),
+        ];
+        for (fixture, expected_status) in denied {
+            let mut app = fixture_app(fixture);
+            let fixture_protection = app.doc_protection.clone();
+
+            // Seed a redo entry while temporarily unrestricted. The fixture's
+            // denied attempt must neither push history nor clear that entry.
+            app.doc_protection = Protection::default();
+            app.editor.move_end();
+            app.on_key(key(KeyCode::Char('!')));
+            app.on_key(ctrl(KeyCode::Char('z')));
+            app.doc_protection = fixture_protection;
+            app.modified = false;
+            app.dirty = false;
+            app.status = None;
+
+            let document = app.editor.doc.clone();
+            let caret = app.editor.caret.clone();
+            let package = fixture_package_snapshot(&app);
+            app.on_key(key(KeyCode::Char('X')));
+
+            assert_eq!(app.editor.doc, document, "{fixture:?}");
+            assert_eq!(app.editor.caret, caret, "{fixture:?}");
+            assert_eq!(fixture_package_snapshot(&app), package, "{fixture:?}");
+            assert!(!app.modified, "{fixture:?} changed save state");
+            assert!(!app.dirty, "{fixture:?} dirtied layout state");
+            assert_eq!(app.status.as_deref(), Some(expected_status));
+
+            app.doc_protection = Protection::default();
+            assert!(app.editor.redo(), "{fixture:?} cleared pending redo");
+        }
+
+        let mut comments = fixture_app(ProtectionFixture::Comments);
+        comments.editor.select_all();
+        comments.run_act(ribbon::Act::NewComment);
+        for c in "fixture note".chars() {
+            comments.on_key(key(KeyCode::Char(c)));
+        }
+        comments.on_key(key(KeyCode::Enter));
+        assert_eq!(comments.comments.len(), 1);
+        assert!(comments.pkg.part("word/comments.xml").is_some());
+        comments.modified = false;
+        comments.dirty = false;
+        let commented = comments.editor.doc.clone();
+        comments.on_key(key(KeyCode::Char('X')));
+        assert_eq!(comments.editor.doc, commented);
+        assert!(!comments.modified);
+        assert!(!comments.dirty);
+        assert_eq!(
+            comments.status.as_deref(),
+            Some("Edit blocked: only comment edits are allowed.")
+        );
+
+        let mut formatting = fixture_app(ProtectionFixture::FormattingOnly);
+        formatting.editor.select_all();
+        formatting.dirty = false;
+        let unformatted = formatting.editor.doc.clone();
+        formatting.on_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(formatting.editor.doc, unformatted);
+        assert!(!formatting.modified);
+        assert!(!formatting.dirty);
+        assert_eq!(
+            formatting.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+        let mut formatting_content = fixture_app(ProtectionFixture::FormattingOnly);
+        formatting_content.editor.move_end();
+        formatting_content.on_key(key(KeyCode::Char('!')));
+        assert_eq!(first_line(&formatting_content), "Fixture body!");
+        assert!(formatting_content.modified);
+
+        for fixture in [ProtectionFixture::Unrestricted, ProtectionFixture::Advisory] {
+            let mut app = fixture_app(fixture);
+            if fixture == ProtectionFixture::Advisory {
+                assert!(
+                    app.doc_notice()
+                        .contains("Protected: read-only (recommended)")
+                );
+            }
+            app.editor.move_end();
+            app.on_key(key(KeyCode::Char('!')));
+            assert_eq!(first_line(&app), "Fixture body!", "{fixture:?}");
+            assert!(app.modified, "{fixture:?}");
+        }
+    }
+
+    #[test]
+    fn tui_save_preserves_protection_and_watermark_fixture_metadata() {
+        use crate::test_fixtures::{ProtectionFixture, WatermarkFixture};
+
+        let fixtures = ProtectionFixture::ALL
+            .into_iter()
+            .map(|fixture| (fixture.name(), fixture.package()))
+            .chain(
+                WatermarkFixture::ALL
+                    .into_iter()
+                    .map(|fixture| (fixture.name(), fixture.package())),
+            );
+        for (name, package) in fixtures {
+            let expected_protection = package.protection();
+            let expected_watermarks = package.watermarks();
+            let expected_document_xml = package
+                .part("word/document.xml")
+                .expect("fixture main document")
+                .to_vec();
+            let preserved = package
+                .part_names()
+                .into_iter()
+                .filter(|part| *part != "word/document.xml")
+                .map(|part| (part.to_string(), package.part(part).unwrap().to_vec()))
+                .collect::<Vec<_>>();
+            let path =
+                std::env::temp_dir().join(format!("docxy-{name}-{}-save.docx", std::process::id()));
+            let mut app = App::new(package, &path.to_string_lossy(), false);
+            app.save();
+            assert!(!app.modified, "{name}");
+
+            let bytes = std::fs::read(&path).expect("read saved fixture");
+            std::fs::remove_file(&path).expect("remove saved fixture");
+            let reloaded = load_package(&bytes).expect("reload TUI-saved fixture");
+            assert_eq!(reloaded.protection(), expected_protection, "{name}");
+            assert_eq!(reloaded.watermarks(), expected_watermarks, "{name}");
+            assert_eq!(
+                reloaded.part("word/document.xml"),
+                Some(expected_document_xml.as_slice()),
+                "{name}: untouched saves must preserve the main document verbatim"
+            );
+            for (part, expected) in &preserved {
+                assert_eq!(
+                    reloaded.part(part),
+                    Some(expected.as_slice()),
+                    "{name}:{part}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn protected_load_does_not_recompute_cached_field_content() {
+        use crate::test_fixtures::ProtectionFixture;
+
+        let field_document = Document {
+            body: vec![Block::Paragraph(docxcore::model::Paragraph {
+                props: Default::default(),
+                content: vec![Inline::Field {
+                    raw: r#"<w:fldSimple w:instr="= 2+2"><w:r><w:t>OLD</w:t></w:r></w:fldSimple>"#
+                        .to_string(),
+                    text: "OLD".to_string(),
+                }],
+            })],
+        };
+        let mut protected = ProtectionFixture::ReadOnly.package();
+        protected.document = field_document.clone();
+        let protected_app = App::new(protected, "protected.docx", false);
+        assert_eq!(protected_app.editor.doc, field_document);
+
+        let mut unrestricted = ProtectionFixture::Unrestricted.package();
+        unrestricted.document = field_document;
+        let unrestricted_app = App::new(unrestricted, "unrestricted.docx", false);
+        assert_eq!(first_line(&unrestricted_app), "4");
+    }
+
+    #[test]
+    fn protected_documents_keep_navigation_selection_copy_and_find_available() {
+        let mut app = app_with(&["alpha beta"]);
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        let doc = app.editor.doc.clone();
+
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.editor.caret.offset, 1);
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert!(app.editor.has_selection());
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.status.as_deref(), Some("Copied"));
+        app.on_key(ctrl(KeyCode::Char('f')));
+        assert!(app.find.is_some());
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(!app.find.as_ref().unwrap().matches.is_empty());
+        assert!(app.current_markdown().contains("alpha beta"));
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pdf = std::env::temp_dir().join(format!("docxy-protected-export-{nonce}.pdf"));
+        app.write_pdf(pdf.clone());
+        assert!(std::fs::metadata(&pdf).unwrap().len() > 0);
+        std::fs::remove_file(pdf).unwrap();
+        assert_eq!(app.editor.doc, doc);
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn formatting_lock_gates_ribbon_and_dialog_commits_but_allows_content() {
+        let mut app = app_with(&["format me"]);
+        app.editor.select_all();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        let doc = app.editor.doc.clone();
+        let numbering = app.pkg.part("word/numbering.xml").map(|part| part.to_vec());
+
+        app.run_act(ribbon::Act::Bold);
+        app.run_act(ribbon::Act::Bullets);
+        assert_eq!(app.editor.doc, doc);
+        assert_eq!(
+            app.pkg.part("word/numbering.xml").map(|part| part.to_vec()),
+            numbering,
+            "a denied list must not create numbering metadata"
+        );
+        assert!(!app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+
+        app.run_act(ribbon::Act::ParagraphDialog);
+        assert!(app.para_dialog.is_some());
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            app.para_dialog.is_some(),
+            "denial must not consume the dialog"
+        );
+        assert_eq!(app.editor.doc, doc);
+        app.on_key(key(KeyCode::Esc));
+
+        // A content-insertion dialog remains usable under formatting-only
+        // protection.
+        app.run_act(ribbon::Act::InsertField);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.modified);
+        assert!(app.editor.doc.body.iter().any(|block| matches!(block,
+            Block::Paragraph(p) if p.content.iter().any(|inline| matches!(inline, Inline::Field { .. }))
+        )));
+    }
+
+    #[test]
+    fn formatting_lock_allows_structural_paragraph_sorting() {
+        let mut app = app_with(&["zebra", "alpha"]);
+        app.editor.select_all();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+
+        app.run_act(ribbon::Act::Sort);
+
+        let paragraphs = app
+            .editor
+            .doc
+            .body
+            .iter()
+            .map(Block::plain_text)
+            .collect::<Vec<_>>();
+        assert_eq!(paragraphs, ["alpha", "zebra"]);
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn formatting_lock_skips_hrule_autoformat_but_keeps_newline_editing() {
+        let mut app = app_with(&["---"]);
+        app.editor.move_end();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.editor.doc.body.len(), 2);
+        assert_eq!(first_line(&app), "---");
+        assert!(
+            matches!(&app.editor.doc.body[0], Block::Paragraph(p) if p.props.borders.bottom.is_none())
+        );
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn comments_only_allows_comment_commits_and_denies_unrelated_edits() {
+        let mut app = app_with(&["review me"]);
+        protect(&mut app, ProtectionEditMode::Comments, false);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::NewComment);
+        for c in "note".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.comments.len(), 1);
+        assert!(app.pkg.part("word/comments.xml").is_some());
+        assert!(app.modified);
+
+        app.modified = false;
+        let commented = app.editor.doc.clone();
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.editor.doc, commented);
+        assert!(!app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: only comment edits are allowed.")
+        );
+    }
+
+    #[test]
+    fn vim_operators_are_gated_before_motion_and_allowed_by_formatting_only_mode() {
+        let mut denied = vim_app(&["abc"]);
+        denied.editor.move_home();
+        protect(&mut denied, ProtectionEditMode::ReadOnly, false);
+        let doc = denied.editor.doc.clone();
+        let caret = denied.editor.caret.clone();
+        denied.dirty = false;
+        denied.on_key(key(KeyCode::Char('x')));
+        assert_eq!(denied.editor.doc, doc);
+        assert_eq!(denied.editor.caret, caret);
+        assert!(!denied.modified);
+        assert!(!denied.dirty);
+
+        denied.on_key(key(KeyCode::Char('d')));
+        denied.on_key(key(KeyCode::Char('l')));
+        assert_eq!(denied.editor.doc, doc);
+        assert_eq!(
+            denied.editor.caret, caret,
+            "denied operator moved the caret"
+        );
+
+        let mut allowed = vim_app(&["abc"]);
+        allowed.editor.move_home();
+        protect(&mut allowed, ProtectionEditMode::Unrestricted, true);
+        allowed.on_key(key(KeyCode::Char('x')));
+        assert_eq!(first_line(&allowed), "bc");
+        assert!(allowed.modified);
+    }
+
+    #[test]
+    fn formatting_lock_denies_rich_vim_pastes_before_moving_the_caret() {
+        let bold_run = Run {
+            text: "rich".to_string(),
+            props: RunProps {
+                bold: true,
+                ..RunProps::default()
+            },
+        };
+        let mut charwise = vim_app(&["dest"]);
+        charwise.clipboard = Some(Clip {
+            paras: vec![vec![Inline::Run(bold_run.clone())]],
+        });
+        protect(&mut charwise, ProtectionEditMode::Unrestricted, true);
+        let charwise_doc = charwise.editor.doc.clone();
+        let charwise_caret = charwise.editor.caret.clone();
+
+        charwise.on_key(key(KeyCode::Char('p')));
+
+        assert_eq!(charwise.editor.doc, charwise_doc);
+        assert_eq!(charwise.editor.caret, charwise_caret);
+        assert!(!charwise.modified);
+        assert_eq!(
+            charwise.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+
+        let mut linewise = vim_app(&["dest"]);
+        linewise.clipboard = Some(Clip {
+            paras: vec![vec![Inline::TextBox {
+                raw: String::new(),
+                blocks: vec![Block::Paragraph(docxcore::model::Paragraph {
+                    props: Default::default(),
+                    content: vec![Inline::Run(bold_run)],
+                })],
+            }]],
+        });
+        linewise.vim.as_mut().unwrap().linewise_clip = true;
+        protect(&mut linewise, ProtectionEditMode::Unrestricted, true);
+        let linewise_doc = linewise.editor.doc.clone();
+        let linewise_caret = linewise.editor.caret.clone();
+
+        linewise.on_key(key(KeyCode::Char('P')));
+
+        assert_eq!(linewise.editor.doc, linewise_doc);
+        assert_eq!(linewise.editor.caret, linewise_caret);
+        assert!(!linewise.modified);
+        assert_eq!(
+            linewise.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+    }
+
+    #[test]
+    fn header_edits_are_denied_before_part_creation_and_allowed_when_conforming() {
+        let mut denied = app_with(&["body"]);
+        protect(&mut denied, ProtectionEditMode::ReadOnly, false);
+        let sect_pr = denied.pkg.sect_pr().to_string();
+        denied.run_act(ribbon::Act::EditHeader);
+        assert!(denied.hf_edit.is_none());
+        assert!(denied.header_part.is_none());
+        assert_eq!(denied.pkg.sect_pr(), sect_pr);
+        assert!(!denied.modified);
+
+        let mut allowed = app_with(&["body"]);
+        protect(&mut allowed, ProtectionEditMode::Unrestricted, true);
+        allowed.run_act(ribbon::Act::EditHeader);
+        assert!(allowed.hf_edit.is_some());
+        allowed.on_key(key(KeyCode::Char('H')));
+        allowed.editor.select_all();
+        allowed.on_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(first_line(&allowed), "H");
+        assert!(!run0(&allowed).props.bold);
+        allowed.on_key(key(KeyCode::F(6)));
+        assert!(allowed.hf_edit.is_none());
+        let part = allowed.header_part.as_deref().expect("header part created");
+        let xml = String::from_utf8_lossy(allowed.pkg.part(part).unwrap());
+        assert!(xml.contains(">H<"), "header edit was not committed: {xml}");
+
+        // Re-entering only to attempt a denied formatting change must not
+        // rewrite the part or mark the file modified on exit.
+        let part = part.to_string();
+        let before = allowed.pkg.part(&part).unwrap().to_vec();
+        allowed.modified = false;
+        allowed.run_act(ribbon::Act::EditHeader);
+        allowed.editor.select_all();
+        allowed.on_key(ctrl(KeyCode::Char('b')));
+        allowed.on_key(key(KeyCode::F(6)));
+        assert!(!allowed.modified);
+        assert_eq!(allowed.pkg.part(&part).unwrap(), before);
+    }
+
+    #[test]
+    fn protected_find_replace_and_cross_format_save_as_are_rejected_preflight() {
+        let mut app = app_with(&["x y x"]);
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('Z')));
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(first_line(&app), "x y x");
+        assert!(!app.modified);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("docxy-protected-save-as-{nonce}"));
+        let target = dir.join("blocked.md");
+        app.commit_save_as(dir, "blocked.md".to_string());
+        assert!(!target.exists(), "denied Save As wrote an output file");
+        assert_eq!(app.path, "test.docx");
+        assert_eq!(app.format, DocFormat::Docx);
+        assert!(!app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: the document is protected read-only.")
+        );
     }
 
     #[test]
@@ -7254,6 +8628,38 @@ mod tests {
         assert!(app.paste_special.is_none(), "dialog closes after pasting");
         assert!(app.modified);
         assert!(para_text(&app, 0).starts_with("hi"), "text was inserted");
+    }
+
+    #[test]
+    fn formatting_lock_blocks_rich_paste_but_allows_plain_internal_text() {
+        let mut app = app_with(&["dest"]);
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        app.os_clip = None;
+        app.clipboard = Some(Clip {
+            paras: vec![vec![Inline::Run(Run {
+                text: "rich".to_string(),
+                props: RunProps {
+                    bold: true,
+                    ..RunProps::default()
+                },
+            })]],
+        });
+        let before = app.editor.doc.clone();
+
+        app.do_paste();
+
+        assert_eq!(app.editor.doc, before);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+        assert!(!app.modified);
+
+        app.clipboard = Some(Clip::from_text("plain"));
+        app.status = None;
+        app.do_paste();
+        assert!(app.modified);
+        assert!(para_text(&app, 0).starts_with("plain"));
     }
 
     #[test]

@@ -1452,7 +1452,6 @@ fn parse_sdt_rows(p: &mut XmlParser, rels: &Relationships, table: &mut Table) ->
     // that exact tag after the child so serialization repairs the wrapper
     // instead of emitting the close twice around an out-of-content row.
     let mut deferred_content_close = None;
-
     loop {
         let event_start = p.pos();
         match p.next() {

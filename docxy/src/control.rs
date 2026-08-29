@@ -36,7 +36,7 @@
 //! | `doc.format` | `{start, end?, patch}` | `{formatted}` — one undo checkpoint; `patch` keys: `bold`/`italic`/`underline`/`strike`/`color`/`highlight`/`font`/`size` (≥1 required), set-to-value semantics |
 //! | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — one undo checkpoint; ≥1 of `style`/`align` required |
 
-use crate::{App, DocFormat};
+use crate::{App, DocFormat, protection::MutationKind};
 use ctlcore::json::Json;
 use docxcore::agent;
 use docxcore::export::{PdfOptions, to_pdf};
@@ -55,10 +55,31 @@ pub fn instance_name() -> String {
     ctlcore::instance_name("docxy")
 }
 
+/// Classify control verbs that mutate the protected document. This is the only
+/// control/MCP route table for protection: MCP tools forward to these exact
+/// verbs and therefore inherit the authorization check in [`dispatch`].
+///
+/// Persistence, export, and document-lifecycle verbs deliberately return
+/// `None`. They do not create a new edit in the protected document; saving only
+/// persists edits that were authorized when they were made.
+pub(crate) fn mutation_kind_for_verb(verb: &str) -> Option<MutationKind> {
+    Some(match verb {
+        "doc.replace-range" | "doc.insert" | "doc.append" => MutationKind::Structure,
+        "doc.replace-all" | "doc.undo" | "doc.redo" => MutationKind::Content,
+        "doc.format" | "doc.set-style" => MutationKind::Formatting,
+        _ => return None,
+    })
+}
+
 /// Route one control verb against the live document, returning the JSON result
 /// or an error message. Mutating verbs set `modified`; every verb requests a
 /// repaint so pane B reflects the change immediately.
 pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> {
+    if let Some(mutation) = mutation_kind_for_verb(verb) {
+        app.authorize_mutation(mutation)
+            .map_err(|denial| denial.control_error())?;
+    }
+
     let out = match verb {
         "doc.path" => Ok(path_info(app)),
         "doc.outline" => Ok(outline(app)),
@@ -141,11 +162,11 @@ fn path_info(app: &App) -> Json {
     ];
     // Only present when the package actually carries the state — an
     // unprotected, unwatermarked document must not gain these keys at all.
-    if let Some(p) = &app.doc_protection {
-        fields.push(("protection", Json::Str(p.clone())));
+    if let Some(p) = app.doc_protection.label() {
+        fields.push(("protection", Json::Str(p.to_string())));
     }
-    if let Some(w) = &app.doc_watermark {
-        fields.push(("watermark", Json::Str(w.clone())));
+    if let Some(w) = app.watermark_state.label() {
+        fields.push(("watermark", Json::Str(w)));
     }
     Json::obj(fields)
 }
@@ -459,6 +480,10 @@ fn markdown_flag(args: &Json) -> bool {
 /// comments.
 fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, String> {
     let mut blocks = agent::parse_markdown_blocks(text)?;
+    if blocks_carry_formatting(&blocks) {
+        app.authorize_mutation(MutationKind::Formatting)
+            .map_err(|denial| denial.control_error())?;
+    }
 
     let (needs_bullet, needs_decimal) = agent::referenced_numbering_kinds(&blocks);
     if needs_bullet || needs_decimal {
@@ -483,6 +508,42 @@ fn prepare_markdown_blocks(app: &mut App, text: &str) -> Result<Vec<Block>, Stri
     }
 
     Ok(blocks)
+}
+
+/// Markdown is a transport syntax, not a single mutation class. Plain parsed
+/// blocks remain a structure/content edit, while styles, numbering, or direct
+/// run/paragraph properties additionally require formatting authorization.
+fn blocks_carry_formatting(blocks: &[Block]) -> bool {
+    fn inline_carries_formatting(inline: &docxcore::model::Inline) -> bool {
+        use docxcore::model::{Inline, RunProps};
+        match inline {
+            Inline::Run(run) => run.props != RunProps::default(),
+            Inline::Hyperlink(link) => link.runs.iter().any(|run| run.props != RunProps::default()),
+            Inline::Tab(props) => *props != RunProps::default(),
+            Inline::TextBox { blocks, .. } => blocks_carry_formatting(blocks),
+            Inline::Revision { content, .. } => content.iter().any(inline_carries_formatting),
+            Inline::Break(_)
+            | Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::Equation { .. }
+            | Inline::Field { .. }
+            | Inline::FootnoteRef { .. }
+            | Inline::Raw(_) => false,
+        }
+    }
+
+    blocks.iter().any(|block| match block {
+        Block::Paragraph(paragraph) => {
+            paragraph.props != Default::default()
+                || paragraph.content.iter().any(inline_carries_formatting)
+        }
+        Block::Table(table) => table.rows.iter().any(|row| {
+            row.cells
+                .iter()
+                .any(|cell| blocks_carry_formatting(&cell.blocks))
+        }),
+        Block::Raw(_) => false,
+    })
 }
 
 /// `doc.replace-all`: replace every occurrence of `query` with `text` across
@@ -684,6 +745,7 @@ fn finish_edit(app: &mut App) {
     app.editor.clamp();
     app.modified = true;
     app.dirty = true;
+    app.refresh_watermark_state_if_needed();
 }
 
 /// Resolve an optional block range from `{start, end}` or `{range:"a..b"}`,
@@ -731,7 +793,9 @@ fn parse_range_str(s: &str) -> Result<(Option<usize>, Option<usize>), String> {
 mod tests {
     use super::*;
     use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps};
-    use docxcore::package::{load_package, new_package, save_package};
+    use docxcore::package::{
+        ProtectionEditMode, ProtectionEnforcement, load_package, new_package, save_package,
+    };
 
     /// A document of simple text paragraphs.
     fn doc_with(paras: &[&str]) -> Document {
@@ -760,6 +824,26 @@ mod tests {
 
     fn args(pairs: Vec<(&str, Json)>) -> Json {
         Json::obj(pairs)
+    }
+
+    fn protect(app: &mut App, mode: ProtectionEditMode, formatting_locked: bool) {
+        app.doc_protection.enforcement = ProtectionEnforcement::Enforced;
+        app.doc_protection.edit_mode = Some(mode);
+        app.doc_protection.formatting_locked = formatting_locked;
+    }
+
+    fn package_snapshot(app: &App) -> (Vec<(String, Vec<u8>)>, String, Document) {
+        let parts = app
+            .pkg
+            .part_names()
+            .into_iter()
+            .map(|name| (name.to_string(), app.pkg.part(name).unwrap().to_vec()))
+            .collect();
+        (
+            parts,
+            app.pkg.sect_pr().to_string(),
+            app.pkg.document.clone(),
+        )
     }
 
     #[test]
@@ -1170,6 +1254,41 @@ mod tests {
     }
 
     #[test]
+    fn formatting_lock_rejects_formatted_markdown_before_package_mutation() {
+        let mut app = app_with(&["A"]);
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        let document = app.editor.doc.clone();
+        let package = package_snapshot(&app);
+
+        let error = dispatch(
+            &mut app,
+            "doc.insert",
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("# Heading\n\n- item".to_string())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        )
+        .unwrap_err();
+
+        assert!(error.starts_with("protection_denied:formatting_locked:"));
+        assert_eq!(app.editor.doc, document);
+        assert_eq!(package_snapshot(&app), package);
+        assert!(!app.modified);
+
+        let result = dispatch(
+            &mut app,
+            "doc.insert",
+            &args(vec![
+                ("at", Json::Num(0.0)),
+                ("text", Json::Str("plain".to_string())),
+                ("markdown", Json::Bool(true)),
+            ]),
+        );
+        assert!(result.is_ok(), "plain Markdown is only a structure edit");
+    }
+
+    #[test]
     fn markdown_heading_into_a_fresh_package_ensures_heading1_and_persists_it() {
         let mut app = app_with(&["Existing"]);
         let styles_before =
@@ -1433,12 +1552,414 @@ mod tests {
 
     #[test]
     fn path_reports_protection_and_watermark_when_set() {
-        let mut app = app_with(&["x"]);
-        app.doc_protection = Some("read-only".to_string());
-        app.doc_watermark = Some("CONFIDENTIAL".to_string());
+        let mut app = App::new(
+            crate::test_fixtures::WatermarkFixture::Text.package(),
+            "watermark.docx",
+            false,
+        );
+        app.doc_protection.enforcement = docxcore::package::ProtectionEnforcement::Enforced;
+        app.doc_protection.edit_mode = Some(docxcore::package::ProtectionEditMode::ReadOnly);
         let r = path_info(&app);
         assert_eq!(r.get_str("protection"), Some("read-only"));
-        assert_eq!(r.get_str("watermark"), Some("CONFIDENTIAL"));
+        assert_eq!(r.get_str("watermark"), Some("CONFIDENTIAL & REVIEW"));
+    }
+
+    #[test]
+    fn control_mutation_classification_covers_every_mutating_dispatch_verb() {
+        use MutationKind::{Content, Formatting, Structure};
+
+        let mutating = [
+            ("doc.replace-range", Structure),
+            ("doc.insert", Structure),
+            ("doc.append", Structure),
+            ("doc.replace-all", Content),
+            ("doc.undo", Content),
+            ("doc.redo", Content),
+            ("doc.format", Formatting),
+            ("doc.set-style", Formatting),
+        ];
+        for (verb, expected) in mutating {
+            assert_eq!(mutation_kind_for_verb(verb), Some(expected), "{verb}");
+        }
+
+        for verb in [
+            "doc.path",
+            "doc.outline",
+            "doc.read",
+            "doc.find",
+            "doc.export",
+            "doc.comments",
+            "doc.notes",
+            "doc.header",
+            "doc.footer",
+            "doc.metadata",
+            "doc.stats",
+            "doc.export-pdf",
+            "doc.save",
+            "doc.reload",
+            "doc.open",
+        ] {
+            assert_eq!(mutation_kind_for_verb(verb), None, "{verb}");
+        }
+    }
+
+    #[test]
+    fn dispatch_denies_every_mutating_verb_before_document_package_or_history_changes() {
+        let cases = [
+            (
+                "doc.replace-range",
+                args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("text", Json::Str("X".into())),
+                ]),
+            ),
+            (
+                "doc.insert",
+                args(vec![
+                    ("at", Json::Num(0.0)),
+                    ("text", Json::Str("X".into())),
+                ]),
+            ),
+            ("doc.append", args(vec![("text", Json::Str("X".into()))])),
+            (
+                "doc.replace-all",
+                args(vec![
+                    ("query", Json::Str("A".into())),
+                    ("text", Json::Str("X".into())),
+                ]),
+            ),
+            (
+                "doc.format",
+                args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+                ]),
+            ),
+            (
+                "doc.set-style",
+                args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("align", Json::Str("center".into())),
+                ]),
+            ),
+            ("doc.undo", Json::Null),
+            ("doc.redo", Json::Null),
+        ];
+
+        for (verb, verb_args) in cases {
+            let mut app = app_with(&["A"]);
+            let (replaced, _) = agent::replace_all(&mut app.editor, "A", "B", true);
+            assert_eq!(replaced, 1);
+            assert!(app.editor.undo(), "test setup needs a pending redo");
+            app.modified = false;
+            app.dirty = false;
+            protect(&mut app, ProtectionEditMode::ReadOnly, false);
+
+            let document = app.editor.doc.clone();
+            let caret = app.editor.caret.clone();
+            let anchor = app.editor.anchor.clone();
+            let package = package_snapshot(&app);
+            let error = dispatch(&mut app, verb, &verb_args).unwrap_err();
+
+            assert_eq!(
+                error, "protection_denied:read_only: the document is protected read-only",
+                "{verb}"
+            );
+            assert_eq!(app.editor.doc, document, "{verb} changed the document");
+            assert_eq!(app.editor.caret, caret, "{verb} changed the caret");
+            assert_eq!(app.editor.anchor, anchor, "{verb} changed selection");
+            assert_eq!(
+                package_snapshot(&app),
+                package,
+                "{verb} changed the package"
+            );
+            assert!(!app.modified, "{verb} changed save state");
+            assert!(!app.dirty, "{verb} dirtied renderer state");
+
+            app.doc_protection = Default::default();
+            assert!(app.editor.redo(), "{verb} cleared the pending redo");
+            assert_eq!(paras(&app), vec!["B"]);
+        }
+
+        let mut clean = app_with(&["clean"]);
+        protect(&mut clean, ProtectionEditMode::ReadOnly, false);
+        let error = dispatch(
+            &mut clean,
+            "doc.append",
+            &args(vec![("text", Json::Str("blocked".into()))]),
+        )
+        .unwrap_err();
+        assert!(error.starts_with("protection_denied:read_only:"));
+        clean.doc_protection = Default::default();
+        assert!(!clean.editor.undo(), "a denial pushed an undo checkpoint");
+    }
+
+    #[test]
+    fn dispatch_applies_the_policy_matrix_to_each_routed_mutation_class() {
+        let mut content = app_with(&["A"]);
+        protect(&mut content, ProtectionEditMode::Unrestricted, true);
+        dispatch(
+            &mut content,
+            "doc.replace-all",
+            &args(vec![
+                ("query", Json::Str("A".into())),
+                ("text", Json::Str("content".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(paras(&content), vec!["content"]);
+
+        let mut structure = app_with(&["A"]);
+        protect(&mut structure, ProtectionEditMode::Unrestricted, true);
+        dispatch(
+            &mut structure,
+            "doc.append",
+            &args(vec![("text", Json::Str("structure".into()))]),
+        )
+        .unwrap();
+        assert_eq!(paras(&structure), vec!["A", "structure"]);
+
+        let mut formatting = app_with(&["A"]);
+        protect(&mut formatting, ProtectionEditMode::Unrestricted, true);
+        let error = dispatch(
+            &mut formatting,
+            "doc.format",
+            &args(vec![
+                ("start", Json::Num(0.0)),
+                ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+            ]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "protection_denied:formatting_locked: document formatting is locked"
+        );
+        assert_eq!(run_bold_flags(&formatting, 0), vec![false]);
+
+        let mut comments_only = app_with(&["A"]);
+        protect(&mut comments_only, ProtectionEditMode::Comments, false);
+        let error = dispatch(
+            &mut comments_only,
+            "doc.append",
+            &args(vec![("text", Json::Str("blocked".into()))]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "protection_denied:comments_only: only comment edits are allowed"
+        );
+    }
+
+    #[test]
+    fn package_fixtures_drive_control_policy_errors_and_denial_invariants() {
+        use crate::test_fixtures::ProtectionFixture;
+
+        let cases = [
+            (ProtectionFixture::Unrestricted, None, None, None),
+            (
+                ProtectionFixture::ReadOnly,
+                Some("read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+            ),
+            (
+                ProtectionFixture::Comments,
+                Some("comments only"),
+                Some("protection_denied:comments_only: only comment edits are allowed"),
+                Some("protection_denied:comments_only: only comment edits are allowed"),
+            ),
+            (
+                ProtectionFixture::Forms,
+                Some("form fields only"),
+                Some(
+                    "protection_denied:forms_unsupported: form-fields-only editing is not supported; use Word to edit form fields",
+                ),
+                Some(
+                    "protection_denied:forms_unsupported: form-fields-only editing is not supported; use Word to edit form fields",
+                ),
+            ),
+            (
+                ProtectionFixture::TrackedChanges,
+                Some("tracked changes only"),
+                Some(
+                    "protection_denied:tracked_changes_unsupported: tracked-only editing is not supported; use Word to create tracked changes",
+                ),
+                Some(
+                    "protection_denied:tracked_changes_unsupported: tracked-only editing is not supported; use Word to create tracked changes",
+                ),
+            ),
+            (
+                ProtectionFixture::FormattingOnly,
+                Some("formatting locked"),
+                None,
+                Some("protection_denied:formatting_locked: document formatting is locked"),
+            ),
+            (
+                ProtectionFixture::Advisory,
+                Some("read-only (recommended)"),
+                None,
+                None,
+            ),
+            (
+                ProtectionFixture::PasswordWrite,
+                Some("read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+            ),
+            (
+                ProtectionFixture::Unknown,
+                Some("restricted editing"),
+                Some(
+                    "protection_denied:unsupported_mode: the document uses unsupported protection mode 'producerSpecific'",
+                ),
+                Some(
+                    "protection_denied:unsupported_mode: the document uses unsupported protection mode 'producerSpecific'",
+                ),
+            ),
+        ];
+
+        for (fixture, expected_label, structure_error, formatting_error) in cases {
+            let mut path_app = App::new(
+                fixture.package(),
+                &format!("{}.docx", fixture.name()),
+                false,
+            );
+            let path = dispatch(&mut path_app, "doc.path", &Json::Null).unwrap();
+            assert_eq!(path.get_str("protection"), expected_label, "{fixture:?}");
+
+            let mut structure = App::new(
+                fixture.package(),
+                &format!("{}.docx", fixture.name()),
+                false,
+            );
+            structure.dirty = false;
+            let structure_document = structure.editor.doc.clone();
+            let structure_caret = structure.editor.caret.clone();
+            let structure_package = package_snapshot(&structure);
+            let structure_result = dispatch(
+                &mut structure,
+                "doc.append",
+                &args(vec![("text", Json::Str("control append".into()))]),
+            );
+            match structure_error {
+                Some(expected) => {
+                    assert_eq!(structure_result.unwrap_err(), expected, "{fixture:?}");
+                    assert_eq!(structure.editor.doc, structure_document, "{fixture:?}");
+                    assert_eq!(structure.editor.caret, structure_caret, "{fixture:?}");
+                    assert_eq!(
+                        package_snapshot(&structure),
+                        structure_package,
+                        "{fixture:?}"
+                    );
+                    assert!(!structure.modified, "{fixture:?}");
+                    assert!(!structure.dirty, "{fixture:?}");
+                    structure.doc_protection = Default::default();
+                    assert!(
+                        !structure.editor.undo(),
+                        "{fixture:?} denial pushed history"
+                    );
+                }
+                None => {
+                    structure_result.unwrap();
+                    assert_eq!(paras(&structure), vec!["Fixture body", "control append"]);
+                    assert!(structure.modified, "{fixture:?}");
+                    assert!(structure.dirty, "{fixture:?}");
+                }
+            }
+
+            let mut formatting = App::new(
+                fixture.package(),
+                &format!("{}.docx", fixture.name()),
+                false,
+            );
+            formatting.dirty = false;
+            let formatting_document = formatting.editor.doc.clone();
+            let formatting_package = package_snapshot(&formatting);
+            let formatting_result = dispatch(
+                &mut formatting,
+                "doc.format",
+                &args(vec![
+                    ("start", Json::Num(0.0)),
+                    ("patch", Json::obj(vec![("bold", Json::Bool(true))])),
+                ]),
+            );
+            match formatting_error {
+                Some(expected) => {
+                    assert_eq!(formatting_result.unwrap_err(), expected, "{fixture:?}");
+                    assert_eq!(formatting.editor.doc, formatting_document, "{fixture:?}");
+                    assert_eq!(
+                        package_snapshot(&formatting),
+                        formatting_package,
+                        "{fixture:?}"
+                    );
+                    assert!(!formatting.modified, "{fixture:?}");
+                    assert!(!formatting.dirty, "{fixture:?}");
+                    formatting.doc_protection = Default::default();
+                    assert!(
+                        !formatting.editor.undo(),
+                        "{fixture:?} denial pushed history"
+                    );
+                }
+                None => {
+                    formatting_result.unwrap();
+                    assert_eq!(run_bold_flags(&formatting, 0), vec![true]);
+                    assert!(formatting.modified, "{fixture:?}");
+                    assert!(formatting.dirty, "{fixture:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_errors_keep_protection_argument_and_unsupported_failures_distinct() {
+        let mut protected = app_with(&["A"]);
+        protect(&mut protected, ProtectionEditMode::ReadOnly, false);
+        let denial = dispatch(&mut protected, "doc.insert", &Json::Null).unwrap_err();
+        assert!(denial.starts_with("protection_denied:read_only:"));
+
+        let mut unprotected = app_with(&["A"]);
+        let invalid = dispatch(&mut unprotected, "doc.insert", &Json::Null).unwrap_err();
+        assert_eq!(invalid, "doc.insert needs an 'at' index");
+        assert!(!invalid.starts_with("protection_denied:"));
+
+        let unsupported = dispatch(&mut unprotected, "doc.frobnicate", &Json::Null).unwrap_err();
+        assert_eq!(unsupported, "unknown verb 'doc.frobnicate'");
+        assert!(!unsupported.starts_with("protection_denied:"));
+    }
+
+    #[test]
+    fn protected_dispatch_keeps_read_only_verbs_available() {
+        let mut app = app_with(&["Alpha beta"]);
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        let document = app.editor.doc.clone();
+        let package = package_snapshot(&app);
+
+        let cases = [
+            ("doc.path", Json::Null),
+            ("doc.outline", Json::Null),
+            ("doc.read", Json::Null),
+            ("doc.find", args(vec![("query", Json::Str("Alpha".into()))])),
+            (
+                "doc.export",
+                args(vec![("format", Json::Str("text".into()))]),
+            ),
+            ("doc.comments", Json::Null),
+            ("doc.notes", Json::Null),
+            ("doc.header", Json::Null),
+            ("doc.footer", Json::Null),
+            ("doc.metadata", Json::Null),
+            ("doc.stats", Json::Null),
+        ];
+        for (verb, verb_args) in cases {
+            assert!(
+                dispatch(&mut app, verb, &verb_args).is_ok(),
+                "protected read verb {verb} was unavailable"
+            );
+        }
+
+        assert_eq!(app.editor.doc, document);
+        assert_eq!(package_snapshot(&app), package);
+        assert!(!app.modified);
     }
 
     #[test]

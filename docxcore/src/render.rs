@@ -333,6 +333,37 @@ pub struct MermaidBox {
     pub source: String,
 }
 
+/// Geometry and document scope of one page produced by print-layout rendering.
+///
+/// This is deliberately separate from [`LineMap`]: page decorations such as a
+/// terminal watermark can use it without becoming editable text or affecting
+/// caret, selection, copy, or hit-testing coordinates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageBox {
+    /// Zero-based section index in document order.
+    pub section_index: usize,
+    /// Zero-based page index within the section.
+    pub section_page_index: usize,
+    /// Zero-based page index across the rendered document.
+    pub document_page_index: usize,
+    /// Top row and left column of the page border in rendered cells.
+    pub row: usize,
+    pub col: usize,
+    /// Page dimensions including the border, excluding the inter-page gap.
+    pub rows: usize,
+    pub cols: usize,
+}
+
+/// Complete terminal render state, including print-layout page geometry.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageRender {
+    pub lines: Vec<Line>,
+    pub maps: Vec<LineMap>,
+    pub images: Vec<ImageBox>,
+    pub mermaid: Vec<MermaidBox>,
+    pub pages: Vec<PageBox>,
+}
+
 /// The relationship id of an embedded image from its raw run XML — DrawingML
 /// `<a:blip r:embed="..">` or VML `<v:imagedata r:id="..">`.
 fn embed_rid(raw: &str) -> Option<String> {
@@ -356,6 +387,18 @@ pub fn render_with_images(
     doc: &Document,
     opts: &RenderOptions,
 ) -> (Vec<Line>, Vec<LineMap>, Vec<ImageBox>, Vec<MermaidBox>) {
+    let rendered = render_with_page_layout(doc, opts);
+    (
+        rendered.lines,
+        rendered.maps,
+        rendered.images,
+        rendered.mermaid,
+    )
+}
+
+/// Like [`render_with_images`], plus page-box geometry and section/page indexes.
+/// Continuous view returns no page boxes.
+pub fn render_with_page_layout(doc: &Document, opts: &RenderOptions) -> PageRender {
     if !opts.page_view {
         let w = opts.width.max(8);
         let mut images = Vec::new();
@@ -421,7 +464,13 @@ pub fn render_with_images(
             mermaid.append(&mut foot_mmd);
         }
         let (lines, maps) = out.into_iter().unzip();
-        return (lines, maps, images, mermaid);
+        return PageRender {
+            lines,
+            maps,
+            images,
+            mermaid,
+            pages: Vec::new(),
+        };
     }
 
     // Print layout: split the body into sections (each `section_break` paragraph
@@ -432,7 +481,48 @@ pub fn render_with_images(
     let mut out: Vec<(Line, LineMap)> = Vec::new();
     let mut images: Vec<ImageBox> = Vec::new();
     let mut mermaid: Vec<MermaidBox> = Vec::new();
-    for (start, end, geom, col_tw) in sections(doc, opts.page) {
+    let mut page_boxes: Vec<PageBox> = Vec::new();
+    let mut document_page_index = 0usize;
+    let mut previous_section: Option<(usize, PageGeom, usize, Option<PageParity>)> = None;
+    for (section_index, section) in sections(doc, opts.page).into_iter().enumerate() {
+        if let Some((previous_index, previous_geom, previous_pages, parity)) =
+            previous_section.as_mut()
+            && parity.is_some_and(|parity| parity.needs_blank_before(document_page_index + 1))
+        {
+            let mut blank_images = Vec::new();
+            let mut blank_mermaid = Vec::new();
+            let (blank, mut blank_boxes) = paginate(
+                Vec::new(),
+                opts,
+                *previous_geom,
+                &mut blank_images,
+                &mut blank_mermaid,
+                &pl,
+                PageScope {
+                    section_index: *previous_index,
+                    section_page_offset: *previous_pages,
+                    document_page_offset: document_page_index,
+                },
+            );
+            let base = out.len();
+            for page in &mut blank_boxes {
+                page.row += base;
+            }
+            let added = blank_boxes.len();
+            out.extend(blank);
+            page_boxes.extend(blank_boxes);
+            document_page_index += added;
+            *previous_pages += added;
+        }
+
+        let RenderSection {
+            start,
+            end,
+            geom,
+            col_tw,
+            parity_after,
+            ..
+        } = section;
         let m = page_metrics(opts.width, geom);
         let content_width = m.content_cols;
         let ncols = geom.cols.max(1) as usize;
@@ -495,7 +585,19 @@ pub fn render_with_images(
             rebase(&mut p);
             p
         };
-        let pages = paginate(pairs, opts, geom, &mut sec_imgs, &mut sec_mmd, &pl);
+        let (pages, mut section_boxes) = paginate(
+            pairs,
+            opts,
+            geom,
+            &mut sec_imgs,
+            &mut sec_mmd,
+            &pl,
+            PageScope {
+                section_index,
+                section_page_offset: 0,
+                document_page_offset: document_page_index,
+            },
+        );
         let base = out.len();
         for ib in &mut sec_imgs {
             ib.row += base;
@@ -503,12 +605,25 @@ pub fn render_with_images(
         for mb in &mut sec_mmd {
             mb.row += base;
         }
+        for page in &mut section_boxes {
+            page.row += base;
+        }
+        let section_pages = section_boxes.len();
+        document_page_index += section_pages;
         out.extend(pages);
         images.extend(sec_imgs);
         mermaid.extend(sec_mmd);
+        page_boxes.extend(section_boxes);
+        previous_section = Some((section_index, geom, section_pages, parity_after));
     }
     let (lines, maps) = out.into_iter().unzip();
-    (lines, maps, images, mermaid)
+    PageRender {
+        lines,
+        maps,
+        images,
+        mermaid,
+        pages: page_boxes,
+    }
 }
 
 /// A copy of `opts` with path-keyed inputs (selection, list markers) rebased to a
@@ -541,29 +656,90 @@ fn section_opts(opts: &RenderOptions, start: usize, end: usize) -> RenderOptions
     so
 }
 
-/// Body block ranges per section `(start, end_exclusive, geometry)`. A paragraph
-/// carrying a `section_break` ends a section (using that break's geometry); the
-/// remaining content forms the final section (using the trailing `sectPr`).
-fn sections(doc: &Document, last: PageGeom) -> Vec<(usize, usize, PageGeom, Vec<u32>)> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageParity {
+    Odd,
+    Even,
+}
+
+impl PageParity {
+    fn needs_blank_before(self, next_page_number: usize) -> bool {
+        match self {
+            Self::Odd => next_page_number.is_multiple_of(2),
+            Self::Even => !next_page_number.is_multiple_of(2),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RenderSection {
+    start: usize,
+    end: usize,
+    geom: PageGeom,
+    col_tw: Vec<u32>,
+    /// `oddPage`/`evenPage` on this section's `sectPr` constrains the physical
+    /// page on which the following section begins.
+    parity_after: Option<PageParity>,
+    starts_page_after: bool,
+}
+
+fn section_start_type(sect: &str) -> Option<String> {
+    let start = sect.find("<w:type")?;
+    let end = sect[start..]
+        .find('>')
+        .map(|offset| start + offset)
+        .unwrap_or(sect.len());
+    crate::load::xml_attr_value(&sect[start..end], "w:val")
+}
+
+fn section_start_parity(section_type: Option<&str>) -> Option<PageParity> {
+    match section_type? {
+        "oddPage" => Some(PageParity::Odd),
+        "evenPage" => Some(PageParity::Even),
+        _ => None,
+    }
+}
+
+/// Body block ranges per section. A paragraph carrying a `section_break` ends a
+/// section (using that break's geometry); the remaining content forms the final
+/// section (using the trailing `sectPr`). An empty trailing section still owns a
+/// page after a page-starting break, so it must not disappear from page view.
+fn sections(doc: &Document, last: PageGeom) -> Vec<RenderSection> {
     let mut out = Vec::new();
     let mut start = 0;
     for (i, b) in doc.body.iter().enumerate() {
         if let Block::Paragraph(p) = b {
             if let Some(sect) = &p.props.section_break {
-                out.push((
+                let section_type = section_start_type(sect);
+                out.push(RenderSection {
                     start,
-                    i + 1,
-                    PageGeom::from_sect_pr(sect),
-                    column_widths(sect),
-                ));
+                    end: i + 1,
+                    geom: PageGeom::from_sect_pr(sect),
+                    col_tw: column_widths(sect),
+                    parity_after: section_start_parity(section_type.as_deref()),
+                    starts_page_after: !matches!(
+                        section_type.as_deref(),
+                        Some("continuous" | "nextColumn")
+                    ),
+                });
                 start = i + 1;
             }
         }
     }
-    if start < doc.body.len() || out.is_empty() {
-        // The final section's raw sectPr isn't threaded here, so it falls back to
-        // even columns (the common case for a trailing single-column section).
-        out.push((start, doc.body.len(), last, Vec::new()));
+    // The final section's raw sectPr isn't threaded here, so it falls back to
+    // even columns (the common case for a trailing single-column section).
+    if start < doc.body.len()
+        || out.is_empty()
+        || out.last().is_some_and(|section| section.starts_page_after)
+    {
+        out.push(RenderSection {
+            start,
+            end: doc.body.len(),
+            geom: last,
+            col_tw: Vec::new(),
+            parity_after: None,
+            starts_page_after: false,
+        });
     }
     out
 }
@@ -2706,6 +2882,13 @@ fn flow_columns(
     out
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PageScope {
+    section_index: usize,
+    section_page_offset: usize,
+    document_page_offset: usize,
+}
+
 fn paginate(
     pairs: Vec<(Line, LineMap)>,
     opts: &RenderOptions,
@@ -2713,7 +2896,8 @@ fn paginate(
     images: &mut Vec<ImageBox>,
     mermaid: &mut Vec<MermaidBox>,
     pl: &PageLines,
-) -> Vec<(Line, LineMap)> {
+    scope: PageScope,
+) -> (Vec<(Line, LineMap)>, Vec<PageBox>) {
     let m = page_metrics(opts.width, geom);
     let inner_w = m.content_cols + m.ml + m.mr;
     let pad = |n: usize| " ".repeat(n);
@@ -2822,6 +3006,7 @@ fn paginate(
     };
 
     let mut out: Vec<(Line, LineMap)> = Vec::new();
+    let mut page_boxes = Vec::with_capacity(total_pages);
     let mut new_row = vec![usize::MAX; total_in];
     let mut it = items.into_iter().peekable();
     // A table border carried over from the previous page (the table was split):
@@ -2833,9 +3018,11 @@ fn paginate(
         ('┌', '┐', '└', '┘')
     };
     for page in 0..total_pages {
+        let page_row = out.len();
         out.push(border(tl, tr));
         // Top margin, with this page's header drawn into it.
-        let header = pl.header(page);
+        let section_page = scope.section_page_offset + page;
+        let header = pl.header(section_page);
         for r in 0..m.mt {
             match header.get(r) {
                 Some(hl) => out.push(frame_line(hl)),
@@ -2885,7 +3072,7 @@ fn paginate(
             out.push(margin_row(None)); // pad the page to full height
         }
         // Bottom margin: footer at the top of it, page number on the last row.
-        let footer = pl.footer(page);
+        let footer = pl.footer(section_page);
         let pageno = format!("Page {} of {total_pages}", page + 1);
         let last = m.mb.saturating_sub(1);
         for r in 0..m.mb {
@@ -2898,6 +3085,15 @@ fn paginate(
             }
         }
         out.push(border(bl, br));
+        page_boxes.push(PageBox {
+            section_index: scope.section_index,
+            section_page_index: section_page,
+            document_page_index: scope.document_page_offset + page,
+            row: page_row,
+            col: m.center,
+            rows: out.len() - page_row,
+            cols: inner_w + 2,
+        });
         out.push((Line { spans: Vec::new() }, LineMap::default())); // gap between pages
     }
 
@@ -2965,7 +3161,7 @@ fn paginate(
         }
     }
     *mermaid = placed_mmd;
-    out
+    (out, page_boxes)
 }
 
 #[cfg(test)]
@@ -4445,6 +4641,58 @@ mod tests {
     }
 
     #[test]
+    fn print_layout_preserves_section_start_parity_and_empty_final_sections() {
+        let break_para = |section_type: Option<&str>| {
+            let section_type = section_type
+                .map(|value| format!(r#"<w:type w:val="{value}"/>"#))
+                .unwrap_or_default();
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    section_break: Some(format!("<w:sectPr>{section_type}</w:sectPr>")),
+                    ..ParProps::default()
+                },
+                content: vec![run("section one", RunProps::default())],
+            })
+        };
+        let mut o = opts(60);
+        o.page_view = true;
+
+        let odd = render_with_page_layout(
+            &doc(vec![
+                break_para(Some("oddPage")),
+                para(vec![run("section two", RunProps::default())]),
+            ]),
+            &o,
+        );
+        assert_eq!(odd.pages.len(), 3, "oddPage needs an intervening page");
+        assert_eq!(
+            odd.pages
+                .iter()
+                .map(|page| (
+                    page.section_index,
+                    page.section_page_index,
+                    page.document_page_index
+                ))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 0), (0, 1, 1), (1, 0, 2)]
+        );
+
+        let even = render_with_page_layout(
+            &doc(vec![
+                break_para(Some("evenPage")),
+                para(vec![run("section two", RunProps::default())]),
+            ]),
+            &o,
+        );
+        assert_eq!(even.pages.len(), 2, "page 2 already has even parity");
+
+        let empty_final = render_with_page_layout(&doc(vec![break_para(None)]), &o);
+        assert_eq!(empty_final.pages.len(), 2);
+        assert_eq!(empty_final.pages[1].section_index, 1);
+        assert_eq!(empty_final.pages[1].document_page_index, 1);
+    }
+
+    #[test]
     fn print_layout_uses_first_and_even_header_variants() {
         // With titlePg + evenAndOdd: page 1 = first, page 2 = even, page 3 = default.
         let body: Vec<Block> = (0..120)
@@ -4634,7 +4882,19 @@ mod tests {
             bordered: false,
             label: String::new(),
         }];
-        paginate(image_pairs(n), &o, geom, &mut imgs, &mut Vec::new(), &pl);
+        paginate(
+            image_pairs(n),
+            &o,
+            geom,
+            &mut imgs,
+            &mut Vec::new(),
+            &pl,
+            PageScope {
+                section_index: 0,
+                section_page_offset: 0,
+                document_page_offset: 0,
+            },
+        );
 
         assert!(imgs.len() >= 2, "tall image should be cut across pages");
         assert!(imgs.iter().all(|i| i.rid == "r" && i.full_rows == n));
@@ -4681,7 +4941,19 @@ mod tests {
             bordered: false,
             label: String::new(),
         }];
-        paginate(pairs, &o, geom, &mut imgs, &mut Vec::new(), &pl);
+        paginate(
+            pairs,
+            &o,
+            geom,
+            &mut imgs,
+            &mut Vec::new(),
+            &pl,
+            PageScope {
+                section_index: 0,
+                section_page_offset: 0,
+                document_page_offset: 0,
+            },
+        );
 
         // Kept whole (one slice) rather than cut at the page boundary.
         assert_eq!(imgs.len(), 1, "image should not be split: {imgs:?}");

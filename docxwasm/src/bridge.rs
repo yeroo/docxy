@@ -670,11 +670,11 @@ impl Session {
         out.push_str(&self.editor.doc.body.len().to_string());
         out.push_str(",\"modified\":");
         out.push_str(if self.dirty { "true" } else { "false" });
-        if let Some(p) = self.pkg.protection() {
+        if let Some(p) = self.pkg.protection_label() {
             out.push_str(",\"protection\":");
-            json::push_str(&mut out, &p);
+            json::push_str(&mut out, p);
         }
-        if let Some(w) = self.pkg.watermark() {
+        if let Some(w) = self.pkg.watermark_label() {
             out.push_str(",\"watermark\":");
             json::push_str(&mut out, &w);
         }
@@ -2394,16 +2394,17 @@ mod tests {
         // both read straight off `Package::protection`/`Package::watermark` —
         // the same core.rs surface docxy's `doc.path` uses, so `doc.blocks`
         // (which feeds the tab's `doc.path` composition) must mirror it.
-        let document_xml =
-            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body><w:p/></w:body></w:document>";
-        let settings_xml = r#"<?xml version="1.0"?><w:settings xmlns:w="x"><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#;
-        let header_xml = r#"<?xml version="1.0"?><w:hdr xmlns:v="y"><w:p><v:textpath string="CONFIDENTIAL"/></w:p></w:hdr>"#;
+        let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x" xmlns:r="r"><w:body><w:p/><w:sectPr><w:headerReference w:type="default" r:id="rIdHeader"/></w:sectPr></w:body></w:document>"#;
+        let settings_xml = r#"<?xml version="1.0"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:documentProtection w:edit="readOnly" w:enforcement="1"/></w:settings>"#;
+        let header_xml = r#"<?xml version="1.0"?><w:hdr xmlns:v="y"><w:p><v:shape id="PowerPlusWaterMarkObject"><v:textpath string="CONFIDENTIAL"/></v:shape></w:p></w:hdr>"#;
         let ct = r#"<?xml version="1.0"?><Types/>"#;
         let rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        let doc_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rIdHeader" Target="header1.xml"/></Relationships>"#;
         let bytes = docxcore::zipwrite::write_zip(&[
             ("[Content_Types].xml".into(), ct.into()),
             ("_rels/.rels".into(), rels.into()),
             ("word/document.xml".into(), document_xml.into()),
+            ("word/_rels/document.xml.rels".into(), doc_rels.into()),
             ("word/styles.xml".into(), "<w:styles/>".into()),
             ("word/settings.xml".into(), settings_xml.into()),
             ("word/header1.xml".into(), header_xml.into()),

@@ -754,6 +754,40 @@ mod tests {
     }
 
     #[test]
+    fn mutating_mcp_tools_forward_to_control_authorized_verbs() {
+        use crate::protection::MutationKind::{Content, Formatting, Structure};
+
+        let expected = [
+            ("docxy_replace_range", Structure),
+            ("docxy_insert", Structure),
+            ("docxy_append", Structure),
+            ("docxy_replace_all", Content),
+            ("docxy_undo", Content),
+            ("docxy_redo", Content),
+            ("docxy_format", Formatting),
+            ("docxy_set_style", Formatting),
+        ];
+        for &(tool, mutation) in &expected {
+            let verb = verb_for(tool).unwrap();
+            assert_eq!(
+                control::mutation_kind_for_verb(verb),
+                Some(mutation),
+                "{tool} must forward through the control authorization gate"
+            );
+        }
+
+        for (tool, verb) in VERB_TABLE {
+            if !expected.iter().any(|(mutating, _)| mutating == tool) {
+                assert_eq!(
+                    control::mutation_kind_for_verb(verb),
+                    None,
+                    "read/persistence MCP tool {tool} was unexpectedly gated"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn list_running_shape_is_stable() {
         // With no docxy running (or no ctl dir), the list is present and empty-ish.
         let v = do_tool("docxy_list", &Json::obj(vec![])).unwrap();
