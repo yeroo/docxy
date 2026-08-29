@@ -73,7 +73,9 @@ fn decode_xml_part(bytes: &[u8]) -> Option<Cow<'_, str>> {
 ///
 /// Keeping an absent value distinct from an explicit false value preserves the
 /// source information needed to explain why a protection declaration is not
-/// being applied. Both states are non-enforcing per OOXML.
+/// being applied. Both states are non-enforcing per OOXML; an unrecognized
+/// present value is represented as enforced with an unknown mode so policy can
+/// fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProtectionEnforcement {
     #[default]
@@ -243,7 +245,7 @@ fn decoded_attr_by_local(parser: &XmlParser<'_>, name: &str) -> Option<String> {
 }
 
 fn parse_ooxml_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
+    match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "on" => Some(true),
         "0" | "false" | "off" => Some(false),
         _ => None,
@@ -261,13 +263,13 @@ fn parse_protection(xml: &str) -> Protection {
                 let enforcement = decoded_attr_by_local(&parser, "enforcement");
                 let edit = decoded_attr_by_local(&parser, "edit");
                 let formatting = decoded_attr_by_local(&parser, "formatting");
+                let parsed_enforcement = enforcement.as_deref().map(parse_ooxml_bool);
+                let parsed_formatting = formatting.as_deref().map(parse_ooxml_bool);
 
-                protection.enforcement = match enforcement.as_deref() {
+                protection.enforcement = match parsed_enforcement {
                     None => ProtectionEnforcement::Absent,
-                    Some(value) if parse_ooxml_bool(value) == Some(true) => {
-                        ProtectionEnforcement::Enforced
-                    }
-                    Some(_) => ProtectionEnforcement::Disabled,
+                    Some(Some(false)) => ProtectionEnforcement::Disabled,
+                    Some(Some(true) | None) => ProtectionEnforcement::Enforced,
                 };
                 protection.edit_mode = edit.as_deref().map(|value| match value {
                     "none" => ProtectionEditMode::Unrestricted,
@@ -277,10 +279,17 @@ fn parse_protection(xml: &str) -> Protection {
                     "forms" => ProtectionEditMode::Forms,
                     other => ProtectionEditMode::Unknown(other.to_string()),
                 });
-                protection.formatting_locked = formatting
-                    .as_deref()
-                    .and_then(parse_ooxml_bool)
-                    .unwrap_or(false);
+                protection.formatting_locked = parsed_formatting == Some(Some(true));
+                if parsed_enforcement == Some(None) {
+                    protection.edit_mode = Some(ProtectionEditMode::Unknown(
+                        "invalid enforcement value".to_string(),
+                    ));
+                } else if parsed_enforcement == Some(Some(true)) && parsed_formatting == Some(None)
+                {
+                    protection.edit_mode = Some(ProtectionEditMode::Unknown(
+                        "invalid formatting value".to_string(),
+                    ));
+                }
                 protection.source.enforcement_value = enforcement;
                 protection.source.edit_value = edit;
                 protection.source.formatting_value = formatting;
@@ -1963,7 +1972,7 @@ mod tests {
 
     #[test]
     fn protection_boolean_lexical_forms_and_enforcement_defaults() {
-        for value in ["1", "true", "on", "TRUE", "ON"] {
+        for value in ["1", "true", "on", "TRUE", "ON", " true ", "\tON\r\n"] {
             let protection = parse_protection(&format!(
                 r#"<w:settings><w:documentProtection w:edit="readOnly" w:enforcement="{value}"/></w:settings>"#
             ));
@@ -1985,6 +1994,24 @@ mod tests {
             );
             assert!(!protection.is_enforced(), "{value}");
             assert_eq!(protection.label(), None, "{value}");
+        }
+
+        for value in ["", "maybe", "2"] {
+            let protection = parse_protection(&format!(
+                r#"<w:settings><w:documentProtection w:edit="readOnly" w:enforcement="{value}"/></w:settings>"#
+            ));
+            assert_eq!(
+                protection.enforcement,
+                ProtectionEnforcement::Enforced,
+                "{value}"
+            );
+            assert!(protection.is_enforced(), "{value}");
+            assert!(matches!(
+                protection.edit_mode,
+                Some(ProtectionEditMode::Unknown(ref reason))
+                    if reason == "invalid enforcement value"
+            ));
+            assert_eq!(protection.label(), Some("restricted editing"), "{value}");
         }
 
         let absent = parse_protection(
@@ -2027,7 +2054,7 @@ mod tests {
             assert_eq!(protection.source.edit_value.as_deref(), Some(value));
         }
 
-        for value in ["1", "true", "on"] {
+        for value in ["1", "true", "on", " true "] {
             let protection = parse_protection(&format!(
                 r#"<w:settings><w:documentProtection w:enforcement="1" w:formatting="{value}"/></w:settings>"#
             ));
@@ -2038,6 +2065,18 @@ mod tests {
             r#"<w:settings><w:documentProtection w:enforcement="1" w:formatting="off"/></w:settings>"#,
         );
         assert!(!unlocked.formatting_locked);
+
+        let invalid = parse_protection(
+            r#"<w:settings><w:documentProtection w:enforcement="1" w:formatting="maybe"/></w:settings>"#,
+        );
+        assert!(invalid.is_enforced());
+        assert!(!invalid.formatting_locked);
+        assert!(matches!(
+            invalid.edit_mode,
+            Some(ProtectionEditMode::Unknown(ref reason))
+                if reason == "invalid formatting value"
+        ));
+        assert_eq!(invalid.label(), Some("restricted editing"));
     }
 
     #[test]
