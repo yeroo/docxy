@@ -1222,6 +1222,11 @@ impl App {
     /// Run a ribbon command, mapping it to the matching editor operation.
     fn run_act(&mut self, act: ribbon::Act) {
         use ribbon::Act::*;
+        if let Some(mutation) = Self::ribbon_mutation_kind(act) {
+            if !self.mutation_allowed(mutation) {
+                return;
+            }
+        }
         match act {
             Cut => self.do_cut(),
             Copy => self.do_copy(),
@@ -1600,6 +1605,11 @@ impl App {
             });
             (f, self.format)
         };
+        if target != self.format
+            && !self.mutation_allowed(protection::MutationKind::PackageMetadata)
+        {
+            return;
+        }
         fname = fname.trim().to_string();
         let path = dir.join(&fname);
         let path_str = path.to_string_lossy().into_owned();
@@ -1844,15 +1854,68 @@ impl App {
 
     /// The single App-level authorization decision used by interactive,
     /// control, and MCP mutation routes.
-    // Task 2 defines the policy boundary; Tasks 3 and 4 attach every route to
-    // it. Keep the boundary explicit in the interim without accepting a build
-    // warning for the deliberately staged call sites.
-    #[allow(dead_code)]
     fn authorize_mutation(
         &self,
         mutation: protection::MutationKind,
     ) -> Result<(), protection::ProtectionDenial> {
         protection::authorize(&self.doc_protection, mutation)
+    }
+
+    /// Check a requested interactive mutation before it reaches the editor,
+    /// history, package, comments, or save-state implementation. A denial only
+    /// replaces the transient status message; document state stays untouched.
+    fn mutation_allowed(&mut self, mutation: protection::MutationKind) -> bool {
+        match self.authorize_mutation(mutation) {
+            Ok(()) => true,
+            Err(denial) => {
+                self.status = Some(denial.tui_status());
+                false
+            }
+        }
+    }
+
+    /// Mutating ribbon actions that execute immediately. Actions which only
+    /// open a dialog are authorized by the dialog's commit method instead.
+    fn ribbon_mutation_kind(act: ribbon::Act) -> Option<protection::MutationKind> {
+        use protection::MutationKind;
+        use ribbon::Act::*;
+        match act {
+            Cut | PageBreak | InsertTable => Some(MutationKind::Structure),
+            Paste | PageNumber | ChangeCase => Some(MutationKind::Content),
+            HorizontalLine | Columns | Hyphenation | Bold | Italic | Underline | Strike
+            | Subscript | Superscript | GrowFont | ShrinkFont | ClearFormatting | Bullets
+            | Numbering | IncreaseIndent | DecreaseIndent | FirstLineIndent | HangingIndent
+            | Sort | ParaBorders | AlignLeft | AlignCenter | AlignRight | Justify
+            | ApplyStyle(_) => Some(MutationKind::Formatting),
+            DeleteComment => Some(MutationKind::Comment),
+            EditHeader | EditFooter => Some(MutationKind::Content),
+            _ => None,
+        }
+    }
+
+    /// Classify direct body/header/footer keys after all modal and Vim routes
+    /// have had a chance to consume them.
+    fn body_key_mutation_kind(key: &KeyEvent) -> Option<protection::MutationKind> {
+        use protection::MutationKind;
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('f') if alt => None,
+            KeyCode::Char('x') if ctrl => Some(MutationKind::Structure),
+            KeyCode::Char('v') if ctrl && !alt => Some(MutationKind::Content),
+            KeyCode::Char(' ') if ctrl && shift => Some(MutationKind::Content),
+            KeyCode::Char(
+                'b' | 'i' | 'u' | ']' | '[' | '=' | '+' | ' ' | 'm' | 'l' | 'e' | 'r' | 'j',
+            ) if ctrl => Some(MutationKind::Formatting),
+            KeyCode::Char('z' | 'y') if ctrl => Some(MutationKind::Content),
+            KeyCode::F(3) if shift => Some(MutationKind::Content),
+            KeyCode::Char(_) if !ctrl => Some(MutationKind::Content),
+            KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete => Some(MutationKind::Structure),
+            KeyCode::Tab => Some(MutationKind::Content),
+            KeyCode::F(8) => Some(MutationKind::Formatting),
+            _ => None,
+        }
     }
 
     /// The comments review side panel: each comment's author/date, the quoted
@@ -1881,12 +1944,22 @@ impl App {
     /// Commit the new comment: wrap the selection in markers, add it to comments.xml
     /// and the live panel.
     fn commit_comment(&mut self) {
-        let text = self.comment_input.take().unwrap_or_default();
-        if text.trim().is_empty() {
+        if self
+            .comment_input
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
+        {
+            self.comment_input = None;
             self.status = Some("Comment cancelled (empty)".to_string());
             self.dirty = true;
             return;
         }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
+            return;
+        }
+        let text = self.comment_input.take().unwrap_or_default();
         let quoted = self.editor.selection_text();
         let id = self.next_comment_id();
         if !self.editor.add_comment(&id.to_string()) {
@@ -1935,6 +2008,9 @@ impl App {
         if self.comments.is_empty() {
             self.status = Some("No comments to delete".to_string());
             self.dirty = true;
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Comment) {
             return;
         }
         let idx = self.comment_sel.min(self.comments.len() - 1);
@@ -2467,6 +2543,9 @@ impl App {
     /// Enter focus-editing of the default header (or footer): park the body
     /// editor and point the main editor at the header/footer document.
     fn enter_hf_edit(&mut self, is_header: bool) {
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
@@ -2532,8 +2611,13 @@ impl App {
             return;
         };
         let edited = std::mem::replace(&mut self.editor, hf.body);
-        if commit {
-            let blocks = edited.doc.body;
+        let blocks = edited.doc.body;
+        let changed = if hf.is_header {
+            self.headers.default.as_ref() != &blocks
+        } else {
+            self.footers.default.as_ref() != &blocks
+        };
+        if commit && changed {
             let rc = Rc::new(blocks.clone());
             if hf.is_header {
                 self.headers.default = rc;
@@ -2557,6 +2641,9 @@ impl App {
     /// given orientation. (Works cleanly when the caret is in the final section.)
     fn insert_section(&mut self, landscape: bool) {
         if self.hf_edit.is_some() {
+            return;
+        }
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
             return;
         }
         let current = self.pkg.sect_pr().to_string();
@@ -2706,6 +2793,9 @@ impl App {
     }
 
     fn do_cut(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Structure) {
+            return;
+        }
         if let Some(c) = self.editor.cut() {
             let text = c.to_text();
             self.clipboard = Some(c);
@@ -2726,6 +2816,9 @@ impl App {
             None => self.clipboard.clone(),
         };
         if let Some(c) = clip {
+            if !self.mutation_allowed(protection::MutationKind::Content) {
+                return;
+            }
             self.editor.paste(&c);
             self.after_edit();
         }
@@ -2780,6 +2873,9 @@ impl App {
 
     /// Carry out the highlighted Paste Special option and close the dialog.
     fn apply_paste_special(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
         let Some(ps) = self.paste_special.take() else {
             return;
         };
@@ -2864,6 +2960,9 @@ impl App {
     /// Insert a bordered `rows`×`cols` table just after the caret's block, with
     /// the caret landing in the first cell.
     fn insert_table(&mut self, rows: usize, cols: usize) {
+        if !self.mutation_allowed(protection::MutationKind::Structure) {
+            return;
+        }
         const TBLPR: &str = "<w:tblPr><w:tblW w:w=\"0\" w:type=\"auto\"/><w:tblBorders>\
 <w:top w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
 <w:left w:val=\"single\" w:sz=\"4\" w:space=\"0\" w:color=\"auto\"/>\
@@ -2915,6 +3014,9 @@ impl App {
     }
 
     fn apply_insert_field(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Content) {
+            return;
+        }
         let Some(d) = self.insert_field.take() else {
             return;
         };
@@ -2981,6 +3083,9 @@ impl App {
     }
 
     fn apply_para_dialog(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         let Some(d) = self.para_dialog.take() else {
             return;
         };
@@ -3046,6 +3151,9 @@ impl App {
     }
 
     fn apply_styles_dialog(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         let Some(d) = self.styles_dialog.take() else {
             return;
         };
@@ -3104,6 +3212,9 @@ impl App {
 
     /// Toggle a bullet/numbered list on the selected paragraphs.
     fn apply_list(&mut self, bullet: bool) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         let num_id = self.pkg.ensure_list(bullet);
         if self.editor.all_in_list(num_id) {
             self.editor.set_list(None);
@@ -3125,6 +3236,9 @@ impl App {
 
     /// Toggle a bottom paragraph border on the selected paragraphs.
     fn toggle_para_border(&mut self) {
+        if !self.mutation_allowed(protection::MutationKind::Formatting) {
+            return;
+        }
         use docxcore::model::{BorderKind, ParBorders};
         let has = self.editor.caret_para_props().borders.bottom.is_some();
         let new = if has {
@@ -3164,6 +3278,17 @@ impl App {
     }
 
     fn apply_picker(&mut self) {
+        let Some(kind) = self.font_picker.as_ref().map(|p| p.kind) else {
+            return;
+        };
+        let mutation = if matches!(kind, PickerKind::Symbol | PickerKind::Equation) {
+            protection::MutationKind::Content
+        } else {
+            protection::MutationKind::Formatting
+        };
+        if !self.mutation_allowed(mutation) {
+            return;
+        }
         let Some(p) = self.font_picker.take() else {
             return;
         };
@@ -3652,6 +3777,9 @@ impl App {
                     .as_ref()
                     .map(|f| (f.query.clone(), f.replacement.clone()))
                 {
+                    if !self.mutation_allowed(protection::MutationKind::Content) {
+                        return false;
+                    }
                     let n = self.editor.replace_all(&q, &repl, false);
                     self.modified = true;
                     self.status = Some(format!("Replaced {n}"));
@@ -3665,6 +3793,9 @@ impl App {
                     .map(|f| f.replacement.is_some())
                     .unwrap_or(false);
                 if is_replace {
+                    if !self.mutation_allowed(protection::MutationKind::Content) {
+                        return false;
+                    }
                     let repl = self
                         .find
                         .as_ref()
@@ -3779,6 +3910,9 @@ impl App {
     }
 
     fn vim_apply_op(&mut self, op: char, linewise: bool) {
+        if matches!(op, 'd' | 'c') && !self.mutation_allowed(protection::MutationKind::Structure) {
+            return;
+        }
         // Charwise visual selection is inclusive of the char under the cursor.
         if !linewise && self.vim_mode() == Some(VimMode::Visual) {
             if let Some((lo, hi)) = self.editor.selection_range() {
@@ -3822,8 +3956,13 @@ impl App {
     }
 
     fn vim_handle_motion(&mut self, motion: char) {
-        let count = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
         let op = self.vim.as_ref().and_then(|v| v.pending_op);
+        if matches!(op, Some('d' | 'c'))
+            && !self.mutation_allowed(protection::MutationKind::Structure)
+        {
+            return;
+        }
+        let count = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
         if let Some(op) = op {
             self.vim_operator_motion(op, motion, count);
             if let Some(v) = &mut self.vim {
@@ -3839,6 +3978,14 @@ impl App {
             return;
         };
         let linewise = self.vim.as_ref().map(|v| v.linewise_clip).unwrap_or(false);
+        let mutation = if linewise {
+            protection::MutationKind::Structure
+        } else {
+            protection::MutationKind::Content
+        };
+        if !self.mutation_allowed(mutation) {
+            return;
+        }
         if linewise {
             if before {
                 self.editor.move_home();
@@ -3875,6 +4022,9 @@ impl App {
 
     fn vim_char(&mut self, c: char, ctrl: bool) {
         if ctrl && c == 'r' {
+            if !self.mutation_allowed(protection::MutationKind::Content) {
+                return;
+            }
             let n = self.vim.as_mut().map(|v| v.take_count()).unwrap_or(1);
             for _ in 0..n {
                 if self.editor.redo() {
@@ -3921,6 +4071,11 @@ impl App {
             }
             let same = self.vim.as_ref().unwrap().pending_op == Some(c);
             if same {
+                if matches!(c, 'd' | 'c')
+                    && !self.mutation_allowed(protection::MutationKind::Structure)
+                {
+                    return;
+                }
                 let count = self.vim.as_mut().unwrap().take_count();
                 self.editor.select_lines(count);
                 self.vim_apply_op(c, true);
@@ -3958,12 +4113,18 @@ impl App {
                 self.vim_enter_insert();
             }
             'o' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 self.editor.move_end();
                 self.editor.insert_newline();
                 self.after_edit();
                 self.vim_enter_insert();
             }
             'O' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 self.editor.move_home();
                 self.editor.insert_newline();
                 self.move_vert(false);
@@ -3971,6 +4132,9 @@ impl App {
                 self.vim_enter_insert();
             }
             'x' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 let n = self.vim.as_mut().unwrap().take_count();
                 for _ in 0..n {
                     self.editor.delete_forward();
@@ -3978,6 +4142,9 @@ impl App {
                 self.after_edit();
             }
             'D' => {
+                if !self.mutation_allowed(protection::MutationKind::Structure) {
+                    return;
+                }
                 let s = self.editor.caret.clone();
                 self.editor.move_end();
                 self.editor.anchor = Some(s);
@@ -3988,6 +4155,9 @@ impl App {
             'p' => self.vim_paste(false),
             'P' => self.vim_paste(true),
             'u' => {
+                if !self.mutation_allowed(protection::MutationKind::Content) {
+                    return;
+                }
                 let n = self.vim.as_mut().unwrap().take_count();
                 for _ in 0..n {
                     if self.editor.undo() {
@@ -4179,6 +4349,11 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if let Some(mutation) = Self::body_key_mutation_kind(&key) {
+            if !self.mutation_allowed(mutation) {
+                return false;
+            }
+        }
         match key.code {
             // Esc clears a selection but never quits — use Ctrl+Q to quit.
             KeyCode::Esc => {
@@ -4288,7 +4463,10 @@ impl App {
             }
             KeyCode::Enter => {
                 // "---" / "===" / "___" … on a line becomes a horizontal rule.
-                if self.editor.hrule_autoformat() {
+                let formatting_allowed = self
+                    .authorize_mutation(protection::MutationKind::Formatting)
+                    .is_ok();
+                if formatting_allowed && self.editor.hrule_autoformat() {
                     self.status = Some("Inserted horizontal line".to_string());
                 } else {
                     self.editor.insert_newline();
@@ -5929,7 +6107,7 @@ mod tests {
     use docxcore::model::{
         Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, Run, RunProps,
     };
-    use docxcore::package::new_package;
+    use docxcore::package::{ProtectionEditMode, ProtectionEnforcement, new_package};
     use ratatui::backend::TestBackend;
 
     #[test]
@@ -6337,6 +6515,274 @@ mod tests {
         let mut app = App::new(new_package(Document { body }), "test.docx", false);
         app.os_clip = None; // don't touch the real OS clipboard in tests
         app
+    }
+
+    fn protect(app: &mut App, mode: ProtectionEditMode, formatting_locked: bool) {
+        app.doc_protection = Protection {
+            enforcement: ProtectionEnforcement::Enforced,
+            edit_mode: Some(mode),
+            formatting_locked,
+            ..Protection::default()
+        };
+    }
+
+    fn unprotect(app: &mut App) {
+        app.doc_protection = Protection::default();
+    }
+
+    #[test]
+    fn denied_keys_preserve_document_history_package_and_save_state() {
+        let mut app = app_with(&["alpha"]);
+        app.editor.move_end();
+        app.on_key(key(KeyCode::Char('b')));
+        app.on_key(ctrl(KeyCode::Char('z')));
+        assert_eq!(first_line(&app), "alpha");
+
+        // Treat the current undo state as saved, with a pending redo. A rejected
+        // key must not dirty it, alter package metadata, or clear that redo.
+        app.modified = false;
+        app.dirty = false;
+        let doc = app.editor.doc.clone();
+        let caret = app.editor.caret.clone();
+        let sect_pr = app.pkg.sect_pr().to_string();
+        let settings = app.pkg.part("word/settings.xml").map(|part| part.to_vec());
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.editor.doc, doc);
+        assert_eq!(app.editor.caret, caret);
+        assert_eq!(app.pkg.sect_pr(), sect_pr);
+        assert_eq!(
+            app.pkg.part("word/settings.xml").map(|part| part.to_vec()),
+            settings
+        );
+        assert!(!app.modified, "denial must not change save state");
+        assert!(!app.dirty, "denial must not invalidate document layout");
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: the document is protected read-only.")
+        );
+
+        unprotect(&mut app);
+        assert!(app.editor.redo(), "denial cleared the existing redo entry");
+        assert_eq!(first_line(&app), "alphab");
+
+        let mut clean = app_with(&["clean"]);
+        protect(&mut clean, ProtectionEditMode::ReadOnly, false);
+        clean.on_key(key(KeyCode::Enter));
+        unprotect(&mut clean);
+        assert!(!clean.editor.undo(), "denial pushed an undo checkpoint");
+    }
+
+    #[test]
+    fn protected_documents_keep_navigation_selection_copy_and_find_available() {
+        let mut app = app_with(&["alpha beta"]);
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        let doc = app.editor.doc.clone();
+
+        app.editor.move_home();
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.editor.caret.offset, 1);
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert!(app.editor.has_selection());
+        app.on_key(ctrl(KeyCode::Char('c')));
+        assert_eq!(app.status.as_deref(), Some("Copied"));
+        app.on_key(ctrl(KeyCode::Char('f')));
+        assert!(app.find.is_some());
+        app.on_key(key(KeyCode::Char('a')));
+        assert!(!app.find.as_ref().unwrap().matches.is_empty());
+        assert!(app.current_markdown().contains("alpha beta"));
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pdf = std::env::temp_dir().join(format!("docxy-protected-export-{nonce}.pdf"));
+        app.write_pdf(pdf.clone());
+        assert!(std::fs::metadata(&pdf).unwrap().len() > 0);
+        std::fs::remove_file(pdf).unwrap();
+        assert_eq!(app.editor.doc, doc);
+        assert!(!app.modified);
+    }
+
+    #[test]
+    fn formatting_lock_gates_ribbon_and_dialog_commits_but_allows_content() {
+        let mut app = app_with(&["format me"]);
+        app.editor.select_all();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+        let doc = app.editor.doc.clone();
+        let numbering = app.pkg.part("word/numbering.xml").map(|part| part.to_vec());
+
+        app.run_act(ribbon::Act::Bold);
+        app.run_act(ribbon::Act::Bullets);
+        assert_eq!(app.editor.doc, doc);
+        assert_eq!(
+            app.pkg.part("word/numbering.xml").map(|part| part.to_vec()),
+            numbering,
+            "a denied list must not create numbering metadata"
+        );
+        assert!(!app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: document formatting is locked.")
+        );
+
+        app.run_act(ribbon::Act::ParagraphDialog);
+        assert!(app.para_dialog.is_some());
+        app.on_key(key(KeyCode::Enter));
+        assert!(
+            app.para_dialog.is_some(),
+            "denial must not consume the dialog"
+        );
+        assert_eq!(app.editor.doc, doc);
+        app.on_key(key(KeyCode::Esc));
+
+        // A content-insertion dialog remains usable under formatting-only
+        // protection.
+        app.run_act(ribbon::Act::InsertField);
+        app.on_key(key(KeyCode::Enter));
+        assert!(app.modified);
+        assert!(app.editor.doc.body.iter().any(|block| matches!(block,
+            Block::Paragraph(p) if p.content.iter().any(|inline| matches!(inline, Inline::Field { .. }))
+        )));
+    }
+
+    #[test]
+    fn formatting_lock_skips_hrule_autoformat_but_keeps_newline_editing() {
+        let mut app = app_with(&["---"]);
+        app.editor.move_end();
+        protect(&mut app, ProtectionEditMode::Unrestricted, true);
+
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.editor.doc.body.len(), 2);
+        assert_eq!(first_line(&app), "---");
+        assert!(
+            matches!(&app.editor.doc.body[0], Block::Paragraph(p) if p.props.borders.bottom.is_none())
+        );
+        assert!(app.modified);
+    }
+
+    #[test]
+    fn comments_only_allows_comment_commits_and_denies_unrelated_edits() {
+        let mut app = app_with(&["review me"]);
+        protect(&mut app, ProtectionEditMode::Comments, false);
+        app.editor.select_all();
+        app.run_act(ribbon::Act::NewComment);
+        for c in "note".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(app.comments.len(), 1);
+        assert!(app.pkg.part("word/comments.xml").is_some());
+        assert!(app.modified);
+
+        app.modified = false;
+        let commented = app.editor.doc.clone();
+        app.on_key(key(KeyCode::Char('X')));
+        assert_eq!(app.editor.doc, commented);
+        assert!(!app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: only comment edits are allowed.")
+        );
+    }
+
+    #[test]
+    fn vim_operators_are_gated_before_motion_and_allowed_by_formatting_only_mode() {
+        let mut denied = vim_app(&["abc"]);
+        denied.editor.move_home();
+        protect(&mut denied, ProtectionEditMode::ReadOnly, false);
+        let doc = denied.editor.doc.clone();
+        let caret = denied.editor.caret.clone();
+        denied.dirty = false;
+        denied.on_key(key(KeyCode::Char('x')));
+        assert_eq!(denied.editor.doc, doc);
+        assert_eq!(denied.editor.caret, caret);
+        assert!(!denied.modified);
+        assert!(!denied.dirty);
+
+        denied.on_key(key(KeyCode::Char('d')));
+        denied.on_key(key(KeyCode::Char('l')));
+        assert_eq!(denied.editor.doc, doc);
+        assert_eq!(
+            denied.editor.caret, caret,
+            "denied operator moved the caret"
+        );
+
+        let mut allowed = vim_app(&["abc"]);
+        allowed.editor.move_home();
+        protect(&mut allowed, ProtectionEditMode::Unrestricted, true);
+        allowed.on_key(key(KeyCode::Char('x')));
+        assert_eq!(first_line(&allowed), "bc");
+        assert!(allowed.modified);
+    }
+
+    #[test]
+    fn header_edits_are_denied_before_part_creation_and_allowed_when_conforming() {
+        let mut denied = app_with(&["body"]);
+        protect(&mut denied, ProtectionEditMode::ReadOnly, false);
+        let sect_pr = denied.pkg.sect_pr().to_string();
+        denied.run_act(ribbon::Act::EditHeader);
+        assert!(denied.hf_edit.is_none());
+        assert!(denied.header_part.is_none());
+        assert_eq!(denied.pkg.sect_pr(), sect_pr);
+        assert!(!denied.modified);
+
+        let mut allowed = app_with(&["body"]);
+        protect(&mut allowed, ProtectionEditMode::Unrestricted, true);
+        allowed.run_act(ribbon::Act::EditHeader);
+        assert!(allowed.hf_edit.is_some());
+        allowed.on_key(key(KeyCode::Char('H')));
+        allowed.editor.select_all();
+        allowed.on_key(ctrl(KeyCode::Char('b')));
+        assert_eq!(first_line(&allowed), "H");
+        assert!(!run0(&allowed).props.bold);
+        allowed.on_key(key(KeyCode::F(6)));
+        assert!(allowed.hf_edit.is_none());
+        let part = allowed.header_part.as_deref().expect("header part created");
+        let xml = String::from_utf8_lossy(allowed.pkg.part(part).unwrap());
+        assert!(xml.contains(">H<"), "header edit was not committed: {xml}");
+
+        // Re-entering only to attempt a denied formatting change must not
+        // rewrite the part or mark the file modified on exit.
+        let part = part.to_string();
+        let before = allowed.pkg.part(&part).unwrap().to_vec();
+        allowed.modified = false;
+        allowed.run_act(ribbon::Act::EditHeader);
+        allowed.editor.select_all();
+        allowed.on_key(ctrl(KeyCode::Char('b')));
+        allowed.on_key(key(KeyCode::F(6)));
+        assert!(!allowed.modified);
+        assert_eq!(allowed.pkg.part(&part).unwrap(), before);
+    }
+
+    #[test]
+    fn protected_find_replace_and_cross_format_save_as_are_rejected_preflight() {
+        let mut app = app_with(&["x y x"]);
+        protect(&mut app, ProtectionEditMode::ReadOnly, false);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Char('Z')));
+        app.on_key(ctrl(KeyCode::Char('a')));
+        assert_eq!(first_line(&app), "x y x");
+        assert!(!app.modified);
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("docxy-protected-save-as-{nonce}"));
+        let target = dir.join("blocked.md");
+        app.commit_save_as(dir, "blocked.md".to_string());
+        assert!(!target.exists(), "denied Save As wrote an output file");
+        assert_eq!(app.path, "test.docx");
+        assert_eq!(app.format, DocFormat::Docx);
+        assert!(!app.modified);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Edit blocked: the document is protected read-only.")
+        );
     }
 
     #[test]

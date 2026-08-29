@@ -9,9 +9,6 @@ use docxcore::package::{Protection, ProtectionEditMode};
 
 /// The semantic effect of a DOCX mutation, independent of the UI/control route
 /// that requested it.
-// Tasks 3 and 4 attach the interactive and control routes. Until then, the
-// policy-matrix tests are the only constructors for some classes.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MutationKind {
     Content,

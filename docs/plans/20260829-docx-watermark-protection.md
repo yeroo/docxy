@@ -68,15 +68,15 @@ Keep advisory write protection distinct from enforced restrictions.
 
 ### Task 3: Gate all interactive mutation paths
 
-- [ ] route typing, deletion, cut/paste, replace, formatting, insertions, table
+- [x] route typing, deletion, cut/paste, replace, formatting, insertions, table
       operations, comments, header/footer edits, dialogs, ribbon actions, and Vim
       operators through the central authorization decision
-- [ ] ensure a denied edit neither calls editor mutation methods nor pushes undo,
+- [x] ensure a denied edit neither calls editor mutation methods nor pushes undo,
       clears redo, changes dirty state, or partially updates package parts
-- [ ] keep navigation, selection, copy, find, export, and inspection available
+- [x] keep navigation, selection, copy, find, export, and inspection available
       under every protection mode
-- [ ] add key/ribbon/Vim/dialog tests for allowed and denied representative paths
-- [ ] run `cargo test -p docxy` before Task 4
+- [x] add key/ribbon/Vim/dialog tests for allowed and denied representative paths
+- [x] run `cargo test -p docxy` before Task 4
 
 ### Task 4: Gate control and MCP mutations consistently
 
