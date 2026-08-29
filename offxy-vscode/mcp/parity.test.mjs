@@ -52,8 +52,8 @@ function main() {
   assert.ok(Array.isArray(expected), `${SNAPSHOT_PATH} must be a JSON array`);
   assert.equal(
     expected.length,
-    56,
-    'the committed snapshot is expected to carry the wave-3 56-tool surface; if a tool ' +
+    64,
+    'the committed snapshot is expected to carry the tracked-review 64-tool surface; if a tool ' +
       'was deliberately added/removed, regenerate the snapshot (see the header comment) ' +
       'rather than editing this number blindly',
   );

@@ -17,13 +17,18 @@
 use std::rc::Rc;
 
 use docxcore::agent;
-use docxcore::editor::{Caret, Clip, Editor};
+use docxcore::editor::{Caret, Clip, Editor, RevisionLocation};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_rels_xml};
-use docxcore::model::{Align, Block, Inline};
+use docxcore::model::{
+    Align, Block, Inline, PropertyScope, RevisionCategory, RevisionKind, RevisionTarget,
+    UnsupportedRevisionKind,
+};
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
+use docxcore::protection::{MutationKind, authorize};
 use docxcore::render::{self, Color, ImageBox, LineMap, RenderOptions};
+use docxcore::review::{MalformedRevisionReason, RevisionAction, RevisionOutcome};
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 
 use crate::json;
@@ -69,6 +74,34 @@ pub struct Session {
     /// Caret maps from the most recent render, used to resolve clicks and
     /// vertical movement (both are screen-position → model-offset lookups).
     maps: Vec<LineMap>,
+}
+
+fn ctl_mutation_kind(verb: &str) -> Option<MutationKind> {
+    Some(match verb {
+        "doc.replace-range" | "doc.insert" | "doc.append" => MutationKind::Structure,
+        "doc.replace-all"
+        | "doc.undo"
+        | "doc.redo"
+        | "doc.revision-accept"
+        | "doc.revision-reject"
+        | "doc.revisions-accept-all"
+        | "doc.revisions-reject-all" => MutationKind::Content,
+        "doc.format" | "doc.set-style" => MutationKind::Formatting,
+        _ => return None,
+    })
+}
+
+/// Classify webview commands before they reach the editor. Navigation and
+/// clipboard-only commands return `None`; every command that can mutate the
+/// live document is authorized through the same core policy as ctl/MCP.
+fn dispatch_mutation_kind(op: &str) -> Option<MutationKind> {
+    Some(match op {
+        "bold" | "italic" | "underline" | "strike" | "heading" | "list" | "align" | "indent"
+        | "fontsize" | "color" => MutationKind::Formatting,
+        "insert" | "newline" | "backspace" | "delete" | "undo" | "redo" | "paste" | "replace"
+        | "cut" => MutationKind::Content,
+        _ => return None,
+    })
 }
 
 impl Session {
@@ -124,7 +157,12 @@ impl Session {
             selection: self.editor.selection_spans(),
             styles: self.styles.clone(),
             list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
-            page: self.pkg.page_geom(),
+            page: self
+                .editor
+                .doc
+                .trailing_section_properties()
+                .map(|section| docxcore::model::PageGeom::from_sect_pr(&section.raw))
+                .unwrap_or_else(|| self.pkg.page_geom()),
             headers: Default::default(),
             footers: Default::default(),
             title_page: false,
@@ -136,6 +174,22 @@ impl Session {
     /// set, carries text the host should place on the OS clipboard (from a copy
     /// or cut command).
     pub fn view_json(&mut self, copied: Option<&str>) -> String {
+        self.view_json_with_command(copied, None)
+    }
+
+    /// Render the fresh view returned by [`Session::dispatch`], including
+    /// whether the command actually applied a mutation. Interactive hosts use
+    /// this signal to avoid registering dirty/undo state for protection
+    /// denials and other no-op commands.
+    pub fn command_view_json(&mut self, copied: Option<&str>, applied: bool) -> String {
+        self.view_json_with_command(copied, Some(applied))
+    }
+
+    fn view_json_with_command(
+        &mut self,
+        copied: Option<&str>,
+        command_applied: Option<bool>,
+    ) -> String {
         let opts = self.options();
         let (lines, maps, images, mermaid) = render::render_with_images(&self.editor.doc, &opts);
         let (cl, cc) = caret_screen(&maps, &self.editor.caret);
@@ -262,6 +316,10 @@ impl Session {
             out.push_str(",\"copied\":");
             json::push_str(&mut out, t);
         }
+        if let Some(applied) = command_applied {
+            out.push_str(",\"commandApplied\":");
+            out.push_str(if applied { "true" } else { "false" });
+        }
         out.push('}');
         out
     }
@@ -271,13 +329,19 @@ impl Session {
         caret_screen(&self.maps, &self.editor.caret)
     }
 
-    /// Apply one tab-delimited command. Returns `Some(text)` when the host should
-    /// copy `text` to the OS clipboard (copy/cut); sets the dirty flag on any
-    /// mutating command.
-    pub fn dispatch(&mut self, cmd: &str) -> Option<String> {
+    /// Apply one tab-delimited command. The tuple contains optional clipboard
+    /// text (copy/cut) and whether a mutation actually applied. The latter is
+    /// false for protection denials, navigation/clipboard-only commands, and
+    /// detected no-ops so a host does not create a false dirty/undo event.
+    pub fn dispatch(&mut self, cmd: &str) -> (Option<String>, bool) {
         let mut it = cmd.splitn(2, '\t');
         let op = it.next().unwrap_or("");
         let rest = it.next().unwrap_or("");
+        if let Some(mutation) = dispatch_mutation_kind(op)
+            && authorize(&self.pkg.protection(), mutation).is_err()
+        {
+            return (None, false);
+        }
         let mut copied = None;
         let mut mutated = true; // default; navigation ops flip this to false
 
@@ -312,12 +376,8 @@ impl Session {
                 self.editor
                     .set_color((!hex.is_empty()).then(|| hex.to_string()));
             }
-            "undo" => {
-                self.editor.undo();
-            }
-            "redo" => {
-                self.editor.redo();
-            }
+            "undo" => mutated = self.editor.undo(),
+            "redo" => mutated = self.editor.redo(),
             "paste" => self.editor.paste(&Clip::from_text(rest)),
             "replace" => {
                 let mut p = rest.splitn(2, '\t');
@@ -371,7 +431,7 @@ impl Session {
         if mutated {
             self.dirty = true;
         }
-        copied
+        (copied, mutated)
     }
 
     // ---- agent control surface (`docx_ctl`) --------------------------------
@@ -397,6 +457,11 @@ impl Session {
         let verb = req.get_str("verb").unwrap_or("");
         let no_args = json::Json::Null;
         let args = req.get("args").unwrap_or(&no_args);
+        if let Some(mutation) = ctl_mutation_kind(verb)
+            && let Err(denial) = authorize(&self.pkg.protection(), mutation)
+        {
+            return ctl_err(&denial.control_error());
+        }
         let result = match verb {
             "doc.outline" => Ok(self.ctl_outline()),
             "doc.read" => self.ctl_read(args),
@@ -415,6 +480,14 @@ impl Session {
             "doc.footer" => Ok(self.ctl_header_footer("footerReference")),
             "doc.metadata" => Ok(self.ctl_metadata()),
             "doc.stats" => Ok(self.ctl_stats()),
+            "doc.revisions" => Ok(self.ctl_revisions()),
+            "doc.revision-current" => Ok(self.ctl_revision_current()),
+            "doc.revision-next" => Ok(self.ctl_navigate_revision(false)),
+            "doc.revision-previous" => Ok(self.ctl_navigate_revision(true)),
+            "doc.revision-accept" => self.ctl_review_revision(args, RevisionAction::Accept),
+            "doc.revision-reject" => self.ctl_review_revision(args, RevisionAction::Reject),
+            "doc.revisions-accept-all" => Ok(self.ctl_review_all_revisions(RevisionAction::Accept)),
+            "doc.revisions-reject-all" => Ok(self.ctl_review_all_revisions(RevisionAction::Reject)),
             "doc.replace-all" => self.ctl_replace_all(args),
             "doc.format" => self.ctl_format(args),
             "doc.set-style" => self.ctl_set_style(args),
@@ -450,7 +523,7 @@ impl Session {
 
     /// `{start?, end?, range?}` -> `{total, start, end, text, blocks:[…]}`
     fn ctl_read(&self, args: &json::Json) -> Result<String, String> {
-        let n = self.editor.doc.body.len();
+        let n = self.editor.doc.content_block_count();
         let (start, end) = ctl_range_args(args, n)?;
         let blocks = agent::read(&self.editor.doc, start, end)?;
         let joined = blocks
@@ -569,7 +642,7 @@ impl Session {
         let mut out = String::from("{\"replaced\":");
         out.push_str(&replaced.to_string());
         out.push_str(",\"total\":");
-        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push_str(&self.editor.doc.content_block_count().to_string());
         out.push_str(",\"undoSteps\":");
         out.push_str(&undo_steps.to_string());
         out.push('}');
@@ -593,7 +666,7 @@ impl Session {
         }
         self.finish_ctl_edit();
         let mut out = String::from("{\"total\":");
-        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push_str(&self.editor.doc.content_block_count().to_string());
         out.push('}');
         Ok(out)
     }
@@ -612,7 +685,7 @@ impl Session {
         }
         self.finish_ctl_edit();
         let mut out = String::from("{\"total\":");
-        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push_str(&self.editor.doc.content_block_count().to_string());
         out.push('}');
         Ok(out)
     }
@@ -634,6 +707,10 @@ impl Session {
     /// mutation behind (`ctl_insert`/`ctl_replace_range` both do this).
     fn prepare_markdown_blocks(&mut self, text: &str) -> Result<Vec<Block>, String> {
         let mut blocks = agent::parse_markdown_blocks(text)?;
+        if agent::blocks_carry_formatting(&blocks) {
+            authorize(&self.pkg.protection(), MutationKind::Formatting)
+                .map_err(|denial| denial.control_error())?;
+        }
 
         let (needs_bullet, needs_decimal) = agent::referenced_numbering_kinds(&blocks);
         if needs_bullet || needs_decimal {
@@ -667,7 +744,7 @@ impl Session {
     /// surface in this wave (mirrors docxy control.rs's `path_info`).
     fn ctl_blocks(&self) -> String {
         let mut out = String::from("{\"total\":");
-        out.push_str(&self.editor.doc.body.len().to_string());
+        out.push_str(&self.editor.doc.content_block_count().to_string());
         out.push_str(",\"modified\":");
         out.push_str(if self.dirty { "true" } else { "false" });
         if let Some(p) = self.pkg.protection_label() {
@@ -846,6 +923,109 @@ impl Session {
         format!(
             "{{\"words\":{words},\"chars\":{chars},\"paragraphs\":{paragraphs},\"blocks\":{blocks}}}"
         )
+    }
+
+    fn ctl_revisions(&self) -> String {
+        let locations = self.editor.revision_locations();
+        let current = self
+            .editor
+            .current_revision()
+            .map(|location| location.address.target);
+        let mut out = format!("{{\"count\":{},\"revisions\":[", locations.len());
+        for (index, location) in locations.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_revision_location(&mut out, location, current == Some(location.address.target));
+        }
+        out.push_str("]}");
+        out
+    }
+
+    fn ctl_revision_current(&self) -> String {
+        self.ctl_revision_selection(self.editor.current_revision())
+    }
+
+    fn ctl_navigate_revision(&mut self, previous: bool) -> String {
+        let location = if previous {
+            self.editor.previous_revision()
+        } else {
+            self.editor.next_revision()
+        };
+        self.ctl_revision_selection(location)
+    }
+
+    fn ctl_revision_selection(&self, location: Option<RevisionLocation>) -> String {
+        let count = self.editor.revision_locations().len();
+        let mut out = format!("{{\"count\":{count},\"revision\":");
+        match location {
+            Some(location) => push_revision_location(&mut out, &location, true),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        out
+    }
+
+    fn ctl_review_revision(
+        &mut self,
+        args: &json::Json,
+        action: RevisionAction,
+    ) -> Result<String, String> {
+        let raw = args
+            .get_str("revision")
+            .ok_or("revision action needs a 'revision' stable target string")?;
+        let value = raw
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| format!("bad revision target '{raw}'"))?;
+        let outcome = match action {
+            RevisionAction::Accept => self.editor.accept_revision(RevisionTarget(value)),
+            RevisionAction::Reject => self.editor.reject_revision(RevisionTarget(value)),
+        };
+        let applied = outcome.is_applied();
+        if applied {
+            self.finish_ctl_edit();
+        }
+        let mut out = String::new();
+        push_revision_outcome(&mut out, &outcome);
+        out.pop();
+        out.push_str(if applied {
+            ",\"undoSteps\":1}"
+        } else {
+            ",\"undoSteps\":0}"
+        });
+        Ok(out)
+    }
+
+    fn ctl_review_all_revisions(&mut self, action: RevisionAction) -> String {
+        let outcomes = match action {
+            RevisionAction::Accept => self.editor.accept_all_revisions(),
+            RevisionAction::Reject => self.editor.reject_all_revisions(),
+        };
+        let applied = outcomes
+            .iter()
+            .filter(|outcome| outcome.is_applied())
+            .count();
+        if applied > 0 {
+            self.finish_ctl_edit();
+        }
+        let mut out = format!(
+            "{{\"total\":{},\"applied\":{applied},\"outcomes\":[",
+            outcomes.len()
+        );
+        for (index, outcome) in outcomes.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            push_revision_outcome(&mut out, outcome);
+        }
+        out.push_str(if applied > 0 {
+            "],\"undoSteps\":1}"
+        } else {
+            "],\"undoSteps\":0}"
+        });
+        out
     }
 
     /// `{query, text, case_sensitive?}` -> `{replaced, undoSteps}`.
@@ -1200,6 +1380,184 @@ fn parse_mermaid_images(
         .collect()
 }
 
+fn property_scope_name(scope: PropertyScope) -> &'static str {
+    match scope {
+        PropertyScope::Run => "run properties",
+        PropertyScope::Paragraph => "paragraph properties",
+        PropertyScope::Table => "table properties",
+        PropertyScope::TableRow => "row properties",
+        PropertyScope::TableCell => "cell properties",
+        PropertyScope::Section => "section properties",
+    }
+}
+
+fn unsupported_revision_name(kind: &UnsupportedRevisionKind) -> String {
+    use UnsupportedRevisionKind::*;
+    match kind {
+        MoveFrom => "move-from".to_string(),
+        MoveTo => "move-to".to_string(),
+        MoveFromRangeStart => "move-from range start".to_string(),
+        MoveFromRangeEnd => "move-from range end".to_string(),
+        MoveToRangeStart => "move-to range start".to_string(),
+        MoveToRangeEnd => "move-to range end".to_string(),
+        CustomXmlInsRangeStart => "custom-XML insertion range start".to_string(),
+        CustomXmlInsRangeEnd => "custom-XML insertion range end".to_string(),
+        CustomXmlDelRangeStart => "custom-XML deletion range start".to_string(),
+        CustomXmlDelRangeEnd => "custom-XML deletion range end".to_string(),
+        CustomXmlMoveFromRangeStart => "custom-XML move-from range start".to_string(),
+        CustomXmlMoveFromRangeEnd => "custom-XML move-from range end".to_string(),
+        CustomXmlMoveToRangeStart => "custom-XML move-to range start".to_string(),
+        CustomXmlMoveToRangeEnd => "custom-XML move-to range end".to_string(),
+        CellInsert => "cell insertion".to_string(),
+        CellDelete => "cell deletion".to_string(),
+        CellMerge => "cell merge".to_string(),
+        ConflictInsert => "conflict insertion".to_string(),
+        ConflictDelete => "conflict deletion".to_string(),
+        Other(name) => name.clone(),
+    }
+}
+
+fn revision_category_name(category: &RevisionCategory) -> String {
+    match category {
+        RevisionCategory::Inline(RevisionKind::Insert) => "insertion".to_string(),
+        RevisionCategory::Inline(RevisionKind::Delete) => "deletion".to_string(),
+        RevisionCategory::Property(scope) => property_scope_name(*scope).to_string(),
+        RevisionCategory::Unsupported(kind) => {
+            format!("unsupported {}", unsupported_revision_name(kind))
+        }
+    }
+}
+
+fn push_string_field(out: &mut String, key: &str, value: &str) {
+    out.push_str(",\"");
+    out.push_str(key);
+    out.push_str("\":");
+    json::push_str(out, value);
+}
+
+fn push_caret(out: &mut String, caret: &Caret) {
+    out.push_str("{\"path\":[");
+    for (index, part) in caret.path.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&part.to_string());
+    }
+    out.push_str("],\"offset\":");
+    out.push_str(&caret.offset.to_string());
+    out.push('}');
+}
+
+fn push_revision_location(out: &mut String, location: &RevisionLocation, current: bool) {
+    let address = &location.address;
+    out.push_str("{\"revision\":");
+    json::push_str(out, &address.target.0.to_string());
+    out.push_str(",\"ordinal\":");
+    out.push_str(&(address.ordinal + 1).to_string());
+    out.push_str(",\"depth\":");
+    out.push_str(&address.depth.to_string());
+    push_string_field(out, "kind", &revision_category_name(&address.category));
+    out.push_str(",\"supported\":");
+    out.push_str(
+        if matches!(&address.category, RevisionCategory::Unsupported(_)) {
+            "false"
+        } else {
+            "true"
+        },
+    );
+    out.push_str(",\"current\":");
+    out.push_str(if current { "true" } else { "false" });
+    out.push_str(",\"start\":");
+    push_caret(out, &location.start);
+    out.push_str(",\"end\":");
+    push_caret(out, &location.end);
+    if let Some(parent) = address.parent {
+        push_string_field(out, "parent", &parent.0.to_string());
+    }
+    match &address.category {
+        RevisionCategory::Inline(_) => {}
+        RevisionCategory::Property(scope) => {
+            push_string_field(out, "scope", property_scope_name(*scope));
+        }
+        RevisionCategory::Unsupported(kind) => {
+            push_string_field(out, "unsupported_kind", &unsupported_revision_name(kind));
+        }
+    }
+    if let Some(id) = address.metadata.id.as_deref() {
+        push_string_field(out, "id", id);
+    }
+    if let Some(author) = address.metadata.author.as_deref() {
+        push_string_field(out, "author", author);
+    }
+    if let Some(date) = address.metadata.date.as_deref() {
+        push_string_field(out, "date", date);
+    }
+    out.push('}');
+}
+
+fn action_name(action: RevisionAction) -> &'static str {
+    match action {
+        RevisionAction::Accept => "accept",
+        RevisionAction::Reject => "reject",
+    }
+}
+
+fn push_revision_outcome(out: &mut String, outcome: &RevisionOutcome) {
+    let (target, action) = match outcome {
+        RevisionOutcome::Applied { target, action, .. }
+        | RevisionOutcome::Stale { target, action }
+        | RevisionOutcome::Unsupported { target, action, .. }
+        | RevisionOutcome::Malformed { target, action, .. } => (*target, *action),
+    };
+    out.push_str("{\"status\":");
+    json::push_str(
+        out,
+        if matches!(outcome, RevisionOutcome::Applied { .. }) {
+            "applied"
+        } else {
+            "error"
+        },
+    );
+    push_string_field(out, "revision", &target.0.to_string());
+    push_string_field(out, "action", action_name(action));
+    match outcome {
+        RevisionOutcome::Applied { category, .. } => {
+            push_string_field(out, "kind", &revision_category_name(category));
+        }
+        RevisionOutcome::Stale { .. } => {
+            out.push_str(",\"error\":{\"code\":\"stale_revision\",\"message\":");
+            json::push_str(out, "the stable revision target no longer exists");
+            out.push('}');
+        }
+        RevisionOutcome::Unsupported { kind, .. } => {
+            out.push_str(",\"error\":{\"code\":\"unsupported_revision\",\"kind\":");
+            json::push_str(out, &unsupported_revision_name(kind));
+            out.push_str(",\"message\":");
+            json::push_str(
+                out,
+                "this revision kind is preserved but cannot be acted on",
+            );
+            out.push('}');
+        }
+        RevisionOutcome::Malformed { reason, .. } => {
+            out.push_str(",\"error\":{\"code\":\"malformed_revision\",\"message\":");
+            json::push_str(out, "the revision cannot be transformed safely");
+            match reason {
+                MalformedRevisionReason::PropertyScopeMismatch { expected, actual }
+                | MalformedRevisionReason::PropertySnapshotScopeMismatch { expected, actual } => {
+                    push_string_field(out, "expected_scope", property_scope_name(*expected));
+                    push_string_field(out, "actual_scope", property_scope_name(*actual));
+                }
+                MalformedRevisionReason::PropertySnapshot { scope } => {
+                    push_string_field(out, "scope", property_scope_name(*scope));
+                }
+            }
+            out.push('}');
+        }
+    }
+    out.push('}');
+}
+
 /// Splice `"ok":true` into a ctl verb's result object string (`{…}`),
 /// completing the success envelope. Handles the genuinely-empty-object case
 /// (`doc.metadata` on a package with no set properties returns `"{}"`) so the
@@ -1323,7 +1681,7 @@ fn block_has_bookmark(b: &Block, needle: &str) -> bool {
                 .iter()
                 .any(|c| c.blocks.iter().any(|bb| block_has_bookmark(bb, needle)))
         }),
-        Block::Raw(_) => false,
+        Block::SectionProperties(_) | Block::Raw(_) => false,
     }
 }
 
@@ -1419,6 +1777,46 @@ mod tests {
         );
         let doc = docxcore::load::parse_document_xml(&xml, &Default::default());
         save_package(&new_package(doc))
+    }
+
+    fn sample_revision_docx() -> Vec<u8> {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+            <w:body><w:p>
+                <w:ins w:id="61" w:author="Ada" w:date="2026-08-29T10:00:00Z"><w:r><w:t>new</w:t></w:r></w:ins>
+                <w:moveFromRangeStart w:id="62" w:author="Grace"/>
+                <w:del w:id="63" w:author="Linus"><w:r><w:delText>old</w:delText></w:r></w:del>
+            </w:p></w:body></w:document>"#;
+        let doc = docxcore::load::parse_document_xml(xml, &Default::default());
+        save_package(&new_package(doc))
+    }
+
+    fn protected_revision_docx(edit_mode: &str, formatting_locked: bool) -> Vec<u8> {
+        let document_xml = r#"<?xml version="1.0"?><w:document xmlns:w="x"><w:body><w:p><w:ins w:id="61"><w:r><w:t>new</w:t></w:r></w:ins></w:p></w:body></w:document>"#;
+        let document_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/settings" Target="settings.xml"/></Relationships>"#;
+        let formatting = if formatting_locked {
+            r#" w:formatting="1""#
+        } else {
+            ""
+        };
+        let settings_xml = format!(
+            r#"<?xml version="1.0"?><w:settings xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:documentProtection w:edit="{edit_mode}" w:enforcement="1"{formatting}/></w:settings>"#
+        );
+        let root_rels = r#"<?xml version="1.0"?><Relationships><Relationship Id="rId1" Target="word/document.xml"/></Relationships>"#;
+        docxcore::zipwrite::write_zip(&[
+            ("[Content_Types].xml".into(), b"<Types/>".to_vec()),
+            ("_rels/.rels".into(), root_rels.as_bytes().to_vec()),
+            ("word/document.xml".into(), document_xml.as_bytes().to_vec()),
+            (
+                "word/_rels/document.xml.rels".into(),
+                document_rels.as_bytes().to_vec(),
+            ),
+            ("word/settings.xml".into(), settings_xml.into_bytes()),
+            ("word/styles.xml".into(), b"<w:styles/>".to_vec()),
+        ])
+    }
+
+    fn read_only_revision_docx() -> Vec<u8> {
+        protected_revision_docx("readOnly", false)
     }
 
     #[test]
@@ -1546,8 +1944,9 @@ mod tests {
         let bytes = sample_docx("pick me");
         let mut s = Session::open(&bytes).expect("open");
         s.dispatch("selectall");
-        let copied = s.dispatch("copy");
+        let (copied, applied) = s.dispatch("copy");
         assert_eq!(copied.as_deref(), Some("pick me"));
+        assert!(!applied, "copy must not report a document mutation");
         assert!(!s.is_dirty(), "copy must not dirty the document");
     }
 
@@ -1977,6 +2376,200 @@ mod tests {
     }
 
     #[test]
+    fn ctl_revision_navigation_and_actions_match_the_terminal_contract() {
+        let mut s = Session::open(&sample_revision_docx()).expect("open");
+        let list = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(list.contains("\"count\":3"), "{list}");
+        assert!(list.contains("\"revision\":\"1\""), "{list}");
+        assert!(list.contains("\"kind\":\"insertion\""), "{list}");
+        assert!(list.contains("\"id\":\"61\""), "{list}");
+        assert!(list.contains("\"author\":\"Ada\""), "{list}");
+
+        let next = s.ctl(r#"{"verb":"doc.revision-next","args":{}}"#);
+        assert!(next.contains("\"revision\":\"2\""), "{next}");
+        assert!(
+            next.contains("\"unsupported_kind\":\"move-from range start\""),
+            "{next}"
+        );
+
+        let accepted = s.ctl(r#"{"verb":"doc.revision-accept","args":{"revision":"1"}}"#);
+        assert!(accepted.contains("\"status\":\"applied\""), "{accepted}");
+        assert!(accepted.contains("\"undoSteps\":1"), "{accepted}");
+        assert!(s.is_dirty());
+
+        let stale = s.ctl(r#"{"verb":"doc.revision-reject","args":{"revision":"999"}}"#);
+        assert!(stale.contains("\"code\":\"stale_revision\""), "{stale}");
+        assert!(stale.contains("\"undoSteps\":0"), "{stale}");
+
+        let unsupported = s.ctl(r#"{"verb":"doc.revision-accept","args":{"revision":"2"}}"#);
+        assert!(
+            unsupported.contains("\"code\":\"unsupported_revision\""),
+            "{unsupported}"
+        );
+        assert!(unsupported.contains("\"undoSteps\":0"), "{unsupported}");
+
+        let undo = s.ctl(r#"{"verb":"doc.undo","args":{}}"#);
+        assert!(undo.contains("\"done\":true"), "{undo}");
+        let restored = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(restored.contains("\"count\":3"), "{restored}");
+    }
+
+    #[test]
+    fn ctl_revision_replies_have_structured_json_fields() {
+        let mut session = Session::open(&sample_revision_docx()).expect("open");
+        let list = json::Json::parse(&session.ctl(r#"{"verb":"doc.revisions","args":{}}"#))
+            .expect("valid revision-list JSON");
+        assert_eq!(list.get("ok").and_then(json::Json::as_bool), Some(true));
+        assert_eq!(list.get("count").and_then(json::Json::as_usize), Some(3));
+        let json::Json::Arr(revisions) = list.get("revisions").expect("revisions") else {
+            panic!("revisions must be an array")
+        };
+        assert_eq!(revisions.len(), 3);
+        assert_eq!(revisions[0].get_str("revision"), Some("1"));
+        assert_eq!(revisions[0].get_str("kind"), Some("insertion"));
+
+        let applied = json::Json::parse(
+            &session.ctl(r#"{"verb":"doc.revision-accept","args":{"revision":"1"}}"#),
+        )
+        .expect("valid action JSON");
+        assert_eq!(applied.get("ok").and_then(json::Json::as_bool), Some(true));
+        assert_eq!(applied.get_str("status"), Some("applied"));
+        assert_eq!(
+            applied.get("undoSteps").and_then(json::Json::as_usize),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn ctl_enforces_read_only_protection_for_every_mutating_route() {
+        let mut session = Session::open(&read_only_revision_docx()).expect("open");
+        let before = doc_text(&mut session);
+        let requests = [
+            r#"{"verb":"doc.replace-range","args":{"start":0,"text":"x"}}"#,
+            r#"{"verb":"doc.insert","args":{"at":0,"text":"x"}}"#,
+            r#"{"verb":"doc.append","args":{"text":"x"}}"#,
+            r#"{"verb":"doc.replace-all","args":{"query":"new","text":"x"}}"#,
+            r#"{"verb":"doc.undo","args":{}}"#,
+            r#"{"verb":"doc.redo","args":{}}"#,
+            r#"{"verb":"doc.revision-accept","args":{"revision":"1"}}"#,
+            r#"{"verb":"doc.revision-reject","args":{"revision":"1"}}"#,
+            r#"{"verb":"doc.revisions-accept-all","args":{}}"#,
+            r#"{"verb":"doc.revisions-reject-all","args":{}}"#,
+            r#"{"verb":"doc.format","args":{"start":0,"patch":{"bold":true}}}"#,
+            r#"{"verb":"doc.set-style","args":{"start":0,"style":"Heading1"}}"#,
+        ];
+        for request in requests {
+            let reply = session.ctl(request);
+            let parsed = json::Json::parse(&reply).expect("valid denial JSON");
+            assert_eq!(
+                parsed.get("ok").and_then(json::Json::as_bool),
+                Some(false),
+                "{request}: {reply}"
+            );
+            assert_eq!(
+                parsed.get_str("error"),
+                Some("protection_denied:read_only: the document is protected read-only"),
+                "{request}"
+            );
+        }
+        assert_eq!(doc_text(&mut session), before);
+        assert!(!session.is_dirty());
+    }
+
+    #[test]
+    fn interactive_dispatch_enforces_protection_before_editor_or_dirty_state() {
+        let mut read_only = Session::open(&read_only_revision_docx()).expect("open");
+        let original = read_only.editor.doc.clone();
+        for command in [
+            "insert\tx",
+            "newline",
+            "backspace",
+            "delete",
+            "bold",
+            "heading\t1",
+            "list\tbullet",
+            "undo",
+            "redo",
+            "paste\tx",
+            "replace\tnew\tx",
+            "cut",
+        ] {
+            let (copied, applied) = read_only.dispatch(command);
+            assert!(!applied, "protected command reported applied: {command}");
+            let view = read_only.command_view_json(copied.as_deref(), applied);
+            assert!(
+                view.contains("\"commandApplied\":false"),
+                "{command}: {view}"
+            );
+            assert_eq!(read_only.editor.doc, original, "{command}");
+            assert!(!read_only.is_dirty(), "{command}");
+        }
+
+        let mut formatting_only =
+            Session::open(&protected_revision_docx("none", true)).expect("open");
+        formatting_only.dispatch("selectall");
+        let before_format = formatting_only.editor.doc.clone();
+        let (copied, applied) = formatting_only.dispatch("bold");
+        assert!(!applied);
+        assert!(
+            formatting_only
+                .command_view_json(copied.as_deref(), applied)
+                .contains("\"commandApplied\":false")
+        );
+        assert_eq!(formatting_only.editor.doc, before_format);
+        assert!(!formatting_only.is_dirty());
+
+        let (copied, applied) = formatting_only.dispatch("insert\tx");
+        assert!(applied);
+        assert!(
+            formatting_only
+                .command_view_json(copied.as_deref(), applied)
+                .contains("\"commandApplied\":true")
+        );
+        assert_ne!(formatting_only.editor.doc, before_format);
+        assert!(formatting_only.is_dirty());
+    }
+
+    #[test]
+    fn ctl_formatted_markdown_cannot_bypass_formatting_only_protection() {
+        let mut session = Session::open(&protected_revision_docx("none", true)).expect("open");
+        let before_doc = session.editor.doc.clone();
+        let before_package = save_package(&session.pkg);
+        let denied =
+            session.ctl(r##"{"verb":"doc.append","args":{"text":"# Heading","markdown":true}}"##);
+        assert!(
+            denied.contains("protection_denied:formatting_locked"),
+            "{denied}"
+        );
+        assert_eq!(session.editor.doc, before_doc);
+        assert_eq!(save_package(&session.pkg), before_package);
+        assert!(!session.is_dirty());
+
+        let allowed =
+            session.ctl(r#"{"verb":"doc.append","args":{"text":"plain","markdown":true}}"#);
+        assert!(allowed.contains("\"ok\":true"), "{allowed}");
+        assert!(session.is_dirty());
+    }
+
+    #[test]
+    fn ctl_revision_all_is_one_wasm_undo_checkpoint_with_structured_skips() {
+        let mut s = Session::open(&sample_revision_docx()).expect("open");
+        let result = s.ctl(r#"{"verb":"doc.revisions-reject-all","args":{}}"#);
+        assert!(result.contains("\"total\":3"), "{result}");
+        assert!(result.contains("\"applied\":2"), "{result}");
+        assert!(
+            result.contains("\"code\":\"unsupported_revision\""),
+            "{result}"
+        );
+        assert!(result.contains("\"undoSteps\":1"), "{result}");
+        let remaining = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(remaining.contains("\"count\":1"), "{remaining}");
+        s.ctl(r#"{"verb":"doc.undo","args":{}}"#);
+        let restored = s.ctl(r#"{"verb":"doc.revisions","args":{}}"#);
+        assert!(restored.contains("\"count\":3"), "{restored}");
+    }
+
+    #[test]
     fn ctl_comments_notes_header_footer_empty_shape_on_plain_fixture() {
         let mut s = Session::open(&sample_docx("x")).expect("open");
         let c = s.ctl(r#"{"verb":"doc.comments","args":{}}"#);
@@ -2137,7 +2730,7 @@ mod tests {
         );
         assert_eq!(doc_text(&mut s), before);
         // No checkpoint was pushed, so there is nothing to undo.
-        assert_eq!(s.dispatch("undo"), None);
+        assert_eq!(s.dispatch("undo"), (None, false));
         assert_eq!(doc_text(&mut s), before);
     }
 
@@ -2311,7 +2904,7 @@ mod tests {
         assert_eq!(s.is_dirty(), was_dirty, "an errored splice must not dirty");
         assert_eq!(doc_text(&mut s), before);
         // Nothing was checkpointed.
-        assert_eq!(s.dispatch("undo"), None);
+        assert_eq!(s.dispatch("undo"), (None, false));
         assert_eq!(doc_text(&mut s), before);
     }
 

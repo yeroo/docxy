@@ -47,9 +47,31 @@ pub struct RunProps {
     /// Character style id (`w:rStyle`).
     pub style_id: Option<String>,
     /// Verbatim XML of `w:rPr` children we don't model (character spacing
-    /// `w:spacing`/`w:kern`, `w:lang`, `w:shd`, `w:effect`, …), preserved so save
-    /// doesn't drop them. Re-emitted at the end of `w:rPr`.
+    /// `w:spacing`/`w:kern`, `w:lang`, `w:shd`, `w:effect`, …), plus explicit-off
+    /// toggles that must remain distinct from an absent/style-derived value.
+    /// Preserved children are re-emitted in schema order.
     pub raw_props: Vec<String>,
+    /// A tracked `w:rPrChange`, when present. The owning `RunProps` is the
+    /// current state; `previous` on the change retains the prior snapshot.
+    pub property_change: Option<PropertyChange>,
+    /// Display-only formatting contributed by enclosing revision wrappers.
+    ///
+    /// The public formatting fields remain the effective render state. These
+    /// counters remember whether underline/strike was added solely for review
+    /// display so accepting or rejecting a wrapper never removes genuine direct
+    /// formatting. They are not serialized as document properties.
+    #[doc(hidden)]
+    pub revision_cues: RevisionDisplayCues,
+}
+
+/// Provenance for the underline/strike cues used to render tracked changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[doc(hidden)]
+pub struct RevisionDisplayCues {
+    pub insertions: u32,
+    pub deletions: u32,
+    pub underline_added: bool,
+    pub strike_added: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -58,7 +80,7 @@ pub struct Run {
     pub props: RunProps,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Hyperlink {
     /// Resolved target URL (external link) if present.
     pub target: Option<String>,
@@ -68,6 +90,37 @@ pub struct Hyperlink {
     /// unchanged (the `.rels` part itself is preserved verbatim).
     pub rel_id: Option<String>,
     pub runs: Vec<Run>,
+    /// Full child sequence for hyperlinks that contain revisions or other
+    /// non-run markup. Simple editable links continue to use `runs`.
+    pub content: Vec<Inline>,
+    /// Original complete hyperlink XML for byte-faithful untouched saves.
+    pub raw: Option<String>,
+    /// Set when a review action changes a descendant of `content`.
+    #[doc(hidden)]
+    pub content_changed: bool,
+}
+
+impl Hyperlink {
+    /// Visible runs in source order, including runs nested in revision wrappers.
+    pub fn visible_runs(&self) -> Vec<&Run> {
+        fn collect<'a>(content: &'a [Inline], out: &mut Vec<&'a Run>) {
+            for inline in content {
+                match inline {
+                    Inline::Run(run) => out.push(run),
+                    Inline::Hyperlink(link) => {
+                        out.extend(link.runs.iter());
+                        collect(&link.content, out);
+                    }
+                    Inline::Revision { content, .. } => collect(content, out),
+                    _ => {}
+                }
+            }
+        }
+
+        let mut runs = self.runs.iter().collect::<Vec<_>>();
+        collect(&self.content, &mut runs);
+        runs
+    }
 }
 
 /// The kind of an in-line break (`w:br`/`w:cr`).
@@ -136,8 +189,22 @@ pub enum Inline {
     /// through) so it renders visibly instead of vanishing into opaque `Raw`.
     Revision {
         kind: RevisionKind,
+        metadata: RevisionMetadata,
         raw: String,
         content: Vec<Inline>,
+        /// Set after an action changes a descendant. Untouched wrappers continue
+        /// to serialize from `raw`; changed wrappers rebuild only their content.
+        #[doc(hidden)]
+        content_changed: bool,
+    },
+    /// A recognized but deliberately unsupported revision record (move ranges,
+    /// custom-XML ranges, and table-cell revision records). Keeping it distinct
+    /// from generic raw XML lets review commands report it instead of silently
+    /// treating it as ordinary content.
+    UnsupportedRevision {
+        kind: UnsupportedRevisionKind,
+        metadata: RevisionMetadata,
+        raw: String,
     },
     /// A footnote / endnote reference (`<w:footnoteReference>` /
     /// `<w:endnoteReference>`). `id` is the note id (also its display number for
@@ -164,11 +231,176 @@ pub enum RevisionKind {
     Delete,
 }
 
+/// Stable, document-local identity for a revision node.
+///
+/// Zero means "not assigned yet". Loaders call
+/// [`Document::initialize_revision_targets`] after building the tree. The value
+/// then lives on the node, so removing or unwrapping an earlier revision does
+/// not invalidate targets held by the editor or automation layer. Cloning a
+/// document preserves these identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct RevisionTarget(pub u64);
+
+impl RevisionTarget {
+    pub fn is_assigned(self) -> bool {
+        self.0 != 0
+    }
+}
+
+/// Common `CT_TrackChange` metadata. Values remain strings because producer
+/// files can contain non-numeric ids and non-normalized dates. Unknown
+/// attributes are decoded for inspection while the owning node's `raw` XML is
+/// retained for byte-faithful serialization.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RevisionMetadata {
+    pub target: RevisionTarget,
+    pub id: Option<String>,
+    pub author: Option<String>,
+    pub date: Option<String>,
+    pub unknown_attributes: Vec<(String, String)>,
+}
+
+/// Property containers for which WordprocessingML defines a `*PrChange` child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PropertyScope {
+    #[default]
+    Run,
+    Paragraph,
+    Table,
+    TableRow,
+    TableCell,
+    Section,
+}
+
+/// The parsed prior-property payload captured from a `*PrChange` record.
+///
+/// Run and paragraph properties use the same semantic types as their current
+/// owners. Table, row, cell, and section properties are not otherwise expanded
+/// by the editable model, so their scoped property container remains exact XML.
+/// In every case [`PropertyChange::raw`] retains the complete change wrapper,
+/// including producer-specific metadata and children.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum PropertySnapshot {
+    /// A present, structurally valid prior property container.
+    Present(PropertyState),
+    /// The change record had no prior property container.
+    #[default]
+    Absent,
+    /// Source intended to carry a snapshot but was structurally malformed.
+    Malformed(String),
+}
+
+/// Scope-typed state held by [`PropertySnapshot::Present`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PropertyState {
+    Run(Box<RunProps>),
+    Paragraph(Box<ParProps>),
+    Table(String),
+    TableRow(String),
+    TableCell(String),
+    Section(String),
+}
+
+impl PropertyState {
+    pub fn scope(&self) -> PropertyScope {
+        match self {
+            PropertyState::Run(_) => PropertyScope::Run,
+            PropertyState::Paragraph(_) => PropertyScope::Paragraph,
+            PropertyState::Table(_) => PropertyScope::Table,
+            PropertyState::TableRow(_) => PropertyScope::TableRow,
+            PropertyState::TableCell(_) => PropertyScope::TableCell,
+            PropertyState::Section(_) => PropertyScope::Section,
+        }
+    }
+
+    /// Exact XML for scopes whose current state is also stored as raw XML.
+    pub fn raw_xml(&self) -> Option<&str> {
+        match self {
+            PropertyState::Table(raw)
+            | PropertyState::TableRow(raw)
+            | PropertyState::TableCell(raw)
+            | PropertyState::Section(raw) => Some(raw),
+            PropertyState::Run(_) | PropertyState::Paragraph(_) => None,
+        }
+    }
+}
+
+/// A tracked property change attached to its current property owner.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PropertyChange {
+    pub scope: PropertyScope,
+    pub metadata: RevisionMetadata,
+    /// Verbatim `*PrChange` element, including unknown attributes/children.
+    pub raw: String,
+    pub previous: PropertySnapshot,
+}
+
+/// Recognized revision markup that is outside the supported accept/reject set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnsupportedRevisionKind {
+    MoveFrom,
+    MoveTo,
+    MoveFromRangeStart,
+    MoveFromRangeEnd,
+    MoveToRangeStart,
+    MoveToRangeEnd,
+    CustomXmlInsRangeStart,
+    CustomXmlInsRangeEnd,
+    CustomXmlDelRangeStart,
+    CustomXmlDelRangeEnd,
+    CustomXmlMoveFromRangeStart,
+    CustomXmlMoveFromRangeEnd,
+    CustomXmlMoveToRangeStart,
+    CustomXmlMoveToRangeEnd,
+    CellInsert,
+    CellDelete,
+    CellMerge,
+    ConflictInsert,
+    ConflictDelete,
+    /// Future or producer-specific revision markup classified by a caller.
+    Other(String),
+}
+
+/// A recognized unsupported record retained inside a property container whose
+/// raw XML remains authoritative for serialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsupportedPropertyRevision {
+    pub kind: UnsupportedRevisionKind,
+    pub metadata: RevisionMetadata,
+}
+
+/// Reviewable and reportable revision categories in one document-order list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RevisionCategory {
+    Inline(RevisionKind),
+    Property(PropertyScope),
+    Unsupported(UnsupportedRevisionKind),
+}
+
+/// A current document-order view of a stable revision target.
+///
+/// `ordinal` is recalculated on every enumeration and is display-only. Actions
+/// resolve `target`, never a cached ordinal or a flat block index. `parent`
+/// records wrapper nesting; outer revisions precede their descendants in source
+/// order, while transforms can use `depth` to process innermost targets first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionAddress {
+    pub target: RevisionTarget,
+    pub ordinal: usize,
+    pub parent: Option<RevisionTarget>,
+    pub depth: usize,
+    pub category: RevisionCategory,
+    pub metadata: RevisionMetadata,
+}
+
 impl Inline {
     /// The visible text this inline contributes (tabs/breaks as whitespace).
     pub fn text(&self) -> String {
         match self {
             Inline::Run(r) => r.text.clone(),
+            Inline::Hyperlink(h) if !h.content.is_empty() => {
+                h.content.iter().map(Inline::text).collect()
+            }
             Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.as_str()).collect(),
             Inline::Tab(_) => "\t".to_string(),
             Inline::Break(_) => "\n".to_string(),
@@ -182,6 +414,7 @@ impl Inline {
                 .collect::<Vec<_>>()
                 .join("\n"),
             Inline::Revision { content, .. } => content.iter().map(|i| i.text()).collect(),
+            Inline::UnsupportedRevision { .. } => String::new(),
             Inline::FootnoteRef { id, .. } => id.to_string(),
             Inline::Raw(_) => String::new(),
         }
@@ -225,9 +458,14 @@ pub struct ParProps {
     /// All-`None` means no `w:spacing` element is emitted.
     pub spacing: Spacing,
     /// Verbatim XML of `w:pPr` children we don't model (shading `w:shd`,
-    /// `w:keepNext`, `w:outlineLvl`, …), preserved so save doesn't
-    /// silently drop them. Re-emitted in `w:pPr` in document order.
+    /// `w:keepNext`, `w:outlineLvl`, …), plus explicit default/off values such as
+    /// direct-left `w:jc` and disabled `w:bidi`. Preserved so save does not
+    /// confuse a direct override with style inheritance.
     pub raw_props: Vec<String>,
+    /// A tracked `w:pPrChange`; the remaining fields are the current state.
+    pub property_change: Option<PropertyChange>,
+    /// A `w:sectPrChange` nested in this paragraph's section-break properties.
+    pub section_property_change: Option<PropertyChange>,
 }
 
 /// Paragraph spacing (`w:spacing`). Every CT_Spacing attribute is modeled so a
@@ -483,6 +721,11 @@ pub struct Cell {
     /// also parsed out of it for rendering; when present it is re-emitted as-is
     /// instead of regenerating tcPr from the model. `None` for a new cell.
     pub raw_tcpr: Option<String>,
+    pub property_change: Option<PropertyChange>,
+    /// Recognized `w:cellIns`/`w:cellDel`/`w:cellMerge` records retained in
+    /// `raw_tcpr`, but modeled separately so review can enumerate and reject
+    /// actions against them explicitly.
+    pub unsupported_revisions: Vec<UnsupportedPropertyRevision>,
 }
 
 impl Default for Cell {
@@ -492,6 +735,8 @@ impl Default for Cell {
             v_merge: VMerge::None,
             blocks: Vec::new(),
             raw_tcpr: None,
+            property_change: None,
+            unsupported_revisions: Vec::new(),
         }
     }
 }
@@ -504,6 +749,7 @@ pub struct Row {
     /// inside the row; recognized boundaries are re-emitted immediately outside
     /// the first/last wrapped row.
     pub raw_props: Vec<String>,
+    pub property_change: Option<PropertyChange>,
 }
 
 /// An invisible table child anchored at the gap before `rows[at]` (or after the
@@ -607,6 +853,7 @@ pub struct Table {
     /// The table's entire `w:tblPr` verbatim (borders, shading, width, style,
     /// look, layout), preserved so save round-trips table formatting.
     pub raw_tblpr: Option<String>,
+    pub property_change: Option<PropertyChange>,
 }
 
 impl Table {
@@ -718,10 +965,20 @@ impl Table {
     }
 }
 
+/// Body-level trailing section properties. Unlike paragraph-nested section
+/// breaks, this node describes the document's final section.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SectionProperties {
+    /// Current `w:sectPr` container with its `w:sectPrChange` separated.
+    pub raw: String,
+    pub property_change: Option<PropertyChange>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Block {
     Paragraph(Paragraph),
     Table(Table),
+    SectionProperties(SectionProperties),
     /// Verbatim XML for block-level content we don't model (content controls,
     /// etc.), preserved for lossless save.
     Raw(String),
@@ -730,7 +987,7 @@ pub enum Block {
 impl Block {
     pub fn plain_text(&self) -> String {
         match self {
-            Block::Raw(_) => String::new(),
+            Block::Raw(_) | Block::SectionProperties(_) => String::new(),
             Block::Paragraph(p) => p.plain_text(),
             Block::Table(t) => {
                 let mut s = String::new();
@@ -761,16 +1018,328 @@ pub struct Document {
 }
 
 impl Document {
+    /// Number of top-level content blocks exposed through editor and agent
+    /// block coordinates. A body-level `w:sectPr` is modeled as a trailing
+    /// sentinel so its revision can be reviewed, but it is not a visible or
+    /// editable document block.
+    pub fn content_block_count(&self) -> usize {
+        self.body
+            .iter()
+            .position(|block| matches!(block, Block::SectionProperties(_)))
+            .unwrap_or(self.body.len())
+    }
+
+    /// The body-level properties for the document's final section, when the
+    /// source document supplied an explicit `w:sectPr`.
+    pub fn trailing_section_properties(&self) -> Option<&SectionProperties> {
+        self.body.iter().rev().find_map(|block| match block {
+            Block::SectionProperties(section) => Some(section),
+            _ => None,
+        })
+    }
+
+    pub fn trailing_section_properties_mut(&mut self) -> Option<&mut SectionProperties> {
+        self.body.iter_mut().rev().find_map(|block| match block {
+            Block::SectionProperties(section) => Some(section),
+            _ => None,
+        })
+    }
+
     /// Concatenated visible text, one block per line — handy for tests/sanity.
     pub fn plain_text(&self) -> String {
         let mut s = String::new();
         for b in &self.body {
             s.push_str(&b.plain_text());
-            if !matches!(b, Block::Table(_)) {
+            if !matches!(b, Block::Table(_) | Block::SectionProperties(_)) {
                 s.push('\n');
             }
         }
         s
+    }
+
+    /// Assign identities to newly parsed or manually-created revision nodes.
+    /// Existing nonzero identities are never renumbered, which is the stability
+    /// guarantee needed when an earlier action changes document layout.
+    pub fn initialize_revision_targets(&mut self) {
+        let mut next = self
+            .revisions()
+            .into_iter()
+            .map(|address| address.target.0)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let mut seen = std::collections::HashSet::new();
+        for block in &mut self.body {
+            assign_block_revision_targets(block, &mut next, &mut seen);
+        }
+    }
+
+    /// Enumerate modeled and recognized-unsupported revisions in current source
+    /// order. Addresses contain stable node identities, not structural paths.
+    pub fn revisions(&self) -> Vec<RevisionAddress> {
+        let mut out = Vec::new();
+        for block in &self.body {
+            collect_block_revisions(block, None, 0, &mut out);
+        }
+        out
+    }
+
+    /// Resolve a stable target against the current tree after intervening edits.
+    pub fn revision(&self, target: RevisionTarget) -> Option<RevisionAddress> {
+        self.revisions()
+            .into_iter()
+            .find(|address| address.target == target)
+    }
+}
+
+fn assign_metadata_target(
+    metadata: &mut RevisionMetadata,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
+    if !metadata.target.is_assigned() || !seen.insert(metadata.target) {
+        metadata.target = RevisionTarget(*next);
+        *next = next.saturating_add(1);
+        seen.insert(metadata.target);
+    }
+}
+
+fn assign_property_target(
+    change: &mut Option<PropertyChange>,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
+    if let Some(change) = change {
+        assign_metadata_target(&mut change.metadata, next, seen);
+    }
+}
+
+fn assign_run_props_target(
+    props: &mut RunProps,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
+    assign_property_target(&mut props.property_change, next, seen);
+}
+
+fn assign_inline_revision_targets(
+    inline: &mut Inline,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
+    match inline {
+        Inline::Run(run) => assign_run_props_target(&mut run.props, next, seen),
+        Inline::Hyperlink(link) => {
+            for run in &mut link.runs {
+                assign_run_props_target(&mut run.props, next, seen);
+            }
+            for child in &mut link.content {
+                assign_inline_revision_targets(child, next, seen);
+            }
+        }
+        Inline::Tab(props) => assign_run_props_target(props, next, seen),
+        Inline::TextBox { blocks, .. } => {
+            for block in blocks {
+                assign_block_revision_targets(block, next, seen);
+            }
+        }
+        Inline::Revision {
+            metadata, content, ..
+        } => {
+            assign_metadata_target(metadata, next, seen);
+            for child in content {
+                assign_inline_revision_targets(child, next, seen);
+            }
+        }
+        Inline::UnsupportedRevision { metadata, .. } => {
+            assign_metadata_target(metadata, next, seen)
+        }
+        Inline::Break(_)
+        | Inline::SmartArt { .. }
+        | Inline::Chart { .. }
+        | Inline::Equation { .. }
+        | Inline::Field { .. }
+        | Inline::FootnoteRef { .. }
+        | Inline::Raw(_) => {}
+    }
+}
+
+fn assign_block_revision_targets(
+    block: &mut Block,
+    next: &mut u64,
+    seen: &mut std::collections::HashSet<RevisionTarget>,
+) {
+    match block {
+        Block::Paragraph(paragraph) => {
+            // sectPr precedes pPrChange in CT_PPr schema order.
+            assign_property_target(&mut paragraph.props.section_property_change, next, seen);
+            assign_property_target(&mut paragraph.props.property_change, next, seen);
+            for inline in &mut paragraph.content {
+                assign_inline_revision_targets(inline, next, seen);
+            }
+        }
+        Block::Table(table) => {
+            assign_property_target(&mut table.property_change, next, seen);
+            for row in &mut table.rows {
+                assign_property_target(&mut row.property_change, next, seen);
+                for cell in &mut row.cells {
+                    assign_property_target(&mut cell.property_change, next, seen);
+                    for revision in &mut cell.unsupported_revisions {
+                        assign_metadata_target(&mut revision.metadata, next, seen);
+                    }
+                    for block in &mut cell.blocks {
+                        assign_block_revision_targets(block, next, seen);
+                    }
+                }
+            }
+        }
+        Block::SectionProperties(section) => {
+            assign_property_target(&mut section.property_change, next, seen);
+        }
+        Block::Raw(_) => {}
+    }
+}
+
+fn push_revision_address(
+    metadata: &RevisionMetadata,
+    category: RevisionCategory,
+    parent: Option<RevisionTarget>,
+    depth: usize,
+    out: &mut Vec<RevisionAddress>,
+) {
+    out.push(RevisionAddress {
+        target: metadata.target,
+        ordinal: out.len(),
+        parent,
+        depth,
+        category,
+        metadata: metadata.clone(),
+    });
+}
+
+fn collect_property_revision(
+    change: &Option<PropertyChange>,
+    parent: Option<RevisionTarget>,
+    depth: usize,
+    out: &mut Vec<RevisionAddress>,
+) {
+    if let Some(change) = change {
+        push_revision_address(
+            &change.metadata,
+            RevisionCategory::Property(change.scope),
+            parent,
+            depth,
+            out,
+        );
+    }
+}
+
+fn collect_run_props_revisions(
+    props: &RunProps,
+    parent: Option<RevisionTarget>,
+    depth: usize,
+    out: &mut Vec<RevisionAddress>,
+) {
+    collect_property_revision(&props.property_change, parent, depth, out);
+}
+
+fn collect_inline_revisions(
+    inline: &Inline,
+    parent: Option<RevisionTarget>,
+    depth: usize,
+    out: &mut Vec<RevisionAddress>,
+) {
+    match inline {
+        Inline::Run(run) => collect_run_props_revisions(&run.props, parent, depth, out),
+        Inline::Hyperlink(link) => {
+            for run in &link.runs {
+                collect_run_props_revisions(&run.props, parent, depth, out);
+            }
+            for child in &link.content {
+                collect_inline_revisions(child, parent, depth, out);
+            }
+        }
+        Inline::Tab(props) => collect_run_props_revisions(props, parent, depth, out),
+        Inline::TextBox { blocks, .. } => {
+            for block in blocks {
+                collect_block_revisions(block, parent, depth, out);
+            }
+        }
+        Inline::Revision {
+            kind,
+            metadata,
+            content,
+            ..
+        } => {
+            push_revision_address(
+                metadata,
+                RevisionCategory::Inline(*kind),
+                parent,
+                depth,
+                out,
+            );
+            let child_parent = Some(metadata.target);
+            for child in content {
+                collect_inline_revisions(child, child_parent, depth + 1, out);
+            }
+        }
+        Inline::UnsupportedRevision { kind, metadata, .. } => push_revision_address(
+            metadata,
+            RevisionCategory::Unsupported(kind.clone()),
+            parent,
+            depth,
+            out,
+        ),
+        Inline::Break(_)
+        | Inline::SmartArt { .. }
+        | Inline::Chart { .. }
+        | Inline::Equation { .. }
+        | Inline::Field { .. }
+        | Inline::FootnoteRef { .. }
+        | Inline::Raw(_) => {}
+    }
+}
+
+fn collect_block_revisions(
+    block: &Block,
+    parent: Option<RevisionTarget>,
+    depth: usize,
+    out: &mut Vec<RevisionAddress>,
+) {
+    match block {
+        Block::Paragraph(paragraph) => {
+            collect_property_revision(&paragraph.props.section_property_change, parent, depth, out);
+            collect_property_revision(&paragraph.props.property_change, parent, depth, out);
+            for inline in &paragraph.content {
+                collect_inline_revisions(inline, parent, depth, out);
+            }
+        }
+        Block::Table(table) => {
+            collect_property_revision(&table.property_change, parent, depth, out);
+            for row in &table.rows {
+                collect_property_revision(&row.property_change, parent, depth, out);
+                for cell in &row.cells {
+                    collect_property_revision(&cell.property_change, parent, depth, out);
+                    for revision in &cell.unsupported_revisions {
+                        push_revision_address(
+                            &revision.metadata,
+                            RevisionCategory::Unsupported(revision.kind.clone()),
+                            parent,
+                            depth,
+                            out,
+                        );
+                    }
+                    for block in &cell.blocks {
+                        collect_block_revisions(block, parent, depth, out);
+                    }
+                }
+            }
+        }
+        Block::SectionProperties(section) => {
+            collect_property_revision(&section.property_change, parent, depth, out);
+        }
+        Block::Raw(_) => {}
     }
 }
 
@@ -999,5 +1568,238 @@ mod tests {
             unclosed.validate_row_boundaries(),
             Err(TableRowBoundaryError::UnclosedOpen { .. })
         ));
+    }
+
+    fn revision_inline(kind: RevisionKind, id: Option<&str>, content: Vec<Inline>) -> Inline {
+        Inline::Revision {
+            kind,
+            metadata: RevisionMetadata {
+                id: id.map(str::to_string),
+                ..RevisionMetadata::default()
+            },
+            raw: format!("<w:{:?}/>", kind),
+            content,
+            content_changed: false,
+        }
+    }
+
+    fn property_change(scope: PropertyScope, prior: &str) -> Option<PropertyChange> {
+        let state = match scope {
+            PropertyScope::Run => PropertyState::Run(Box::default()),
+            PropertyScope::Paragraph => PropertyState::Paragraph(Box::default()),
+            PropertyScope::Table => PropertyState::Table(prior.to_string()),
+            PropertyScope::TableRow => PropertyState::TableRow(prior.to_string()),
+            PropertyScope::TableCell => PropertyState::TableCell(prior.to_string()),
+            PropertyScope::Section => PropertyState::Section(prior.to_string()),
+        };
+        Some(PropertyChange {
+            scope,
+            metadata: RevisionMetadata::default(),
+            raw: format!("<{scope:?}Change>{prior}</{scope:?}Change>"),
+            previous: PropertySnapshot::Present(state),
+        })
+    }
+
+    #[test]
+    fn inline_revision_metadata_nesting_and_clone_are_structural() {
+        let inner = revision_inline(
+            RevisionKind::Delete,
+            None,
+            vec![Inline::Run(Run {
+                text: "old".to_string(),
+                ..Run::default()
+            })],
+        );
+        let mut outer_metadata = RevisionMetadata {
+            id: Some("7".to_string()),
+            author: Some("Ada".to_string()),
+            date: Some("2026-08-29T10:30:00Z".to_string()),
+            unknown_attributes: vec![("w16du:dateUtc".to_string(), "raw-date".to_string())],
+            ..RevisionMetadata::default()
+        };
+        // Targets are deliberately absent until the complete document tree can
+        // assign them in deterministic source order.
+        assert!(!outer_metadata.target.is_assigned());
+        let outer = Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: std::mem::take(&mut outer_metadata),
+            raw: "<w:ins w:id=\"7\" w:future=\"kept\">...</w:ins>".to_string(),
+            content: vec![inner],
+            content_changed: false,
+        };
+        let mut document = Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![outer],
+                ..Paragraph::default()
+            })],
+        };
+
+        document.initialize_revision_targets();
+        let revisions = document.revisions();
+        assert_eq!(revisions.len(), 2);
+        assert_eq!(
+            revisions[0].category,
+            RevisionCategory::Inline(RevisionKind::Insert)
+        );
+        assert_eq!(revisions[0].parent, None);
+        assert_eq!(revisions[0].depth, 0);
+        assert_eq!(revisions[0].metadata.author.as_deref(), Some("Ada"));
+        assert_eq!(
+            revisions[0].metadata.date.as_deref(),
+            Some("2026-08-29T10:30:00Z")
+        );
+        assert_eq!(
+            revisions[0].metadata.unknown_attributes[0].0,
+            "w16du:dateUtc"
+        );
+        assert_eq!(
+            revisions[1].category,
+            RevisionCategory::Inline(RevisionKind::Delete)
+        );
+        assert_eq!(revisions[1].parent, Some(revisions[0].target));
+        assert_eq!(revisions[1].depth, 1);
+        assert!(revisions[1].metadata.id.is_none());
+        assert_eq!(document.clone(), document, "clone changed revision data");
+    }
+
+    #[test]
+    fn every_property_scope_has_current_owner_and_prior_snapshot() {
+        let run = Inline::Run(Run {
+            text: "cell".to_string(),
+            props: RunProps {
+                property_change: property_change(PropertyScope::Run, "<w:rPr><w:b/></w:rPr>"),
+                ..RunProps::default()
+            },
+        });
+        let paragraph = Block::Paragraph(Paragraph {
+            props: ParProps {
+                property_change: property_change(
+                    PropertyScope::Paragraph,
+                    "<w:pPr><w:jc w:val=\"left\"/></w:pPr>",
+                ),
+                section_property_change: property_change(
+                    PropertyScope::Section,
+                    "<w:sectPr><w:pgSz w:w=\"12240\"/></w:sectPr>",
+                ),
+                ..ParProps::default()
+            },
+            content: vec![run],
+        });
+        let mut document = Document {
+            body: vec![Block::Table(Table {
+                property_change: property_change(
+                    PropertyScope::Table,
+                    "<w:tblPr><w:tblStyle w:val=\"Old\"/></w:tblPr>",
+                ),
+                rows: vec![Row {
+                    property_change: property_change(
+                        PropertyScope::TableRow,
+                        "<w:trPr><w:tblHeader/></w:trPr>",
+                    ),
+                    cells: vec![Cell {
+                        property_change: property_change(
+                            PropertyScope::TableCell,
+                            "<w:tcPr><w:shd w:fill=\"FFFF00\"/></w:tcPr>",
+                        ),
+                        blocks: vec![paragraph],
+                        ..Cell::default()
+                    }],
+                    ..Row::default()
+                }],
+                ..Table::default()
+            })],
+        };
+
+        document.initialize_revision_targets();
+        let revisions = document.revisions();
+        let scopes = revisions
+            .iter()
+            .map(|revision| match revision.category {
+                RevisionCategory::Property(scope) => scope,
+                _ => panic!("unexpected non-property revision"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scopes,
+            vec![
+                PropertyScope::Table,
+                PropertyScope::TableRow,
+                PropertyScope::TableCell,
+                PropertyScope::Section,
+                PropertyScope::Paragraph,
+                PropertyScope::Run,
+            ]
+        );
+        assert!(
+            revisions
+                .iter()
+                .all(|revision| revision.target.is_assigned())
+        );
+        let cloned = document.clone();
+        assert_eq!(cloned.revisions(), revisions);
+        assert_eq!(cloned, document);
+    }
+
+    #[test]
+    fn stable_target_resolves_after_an_earlier_revision_disappears() {
+        let mut document = Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![
+                    revision_inline(RevisionKind::Insert, Some("1"), Vec::new()),
+                    revision_inline(RevisionKind::Delete, Some("2"), Vec::new()),
+                ],
+                ..Paragraph::default()
+            })],
+        };
+        document.initialize_revision_targets();
+        let target = document.revisions()[1].target;
+
+        let Block::Paragraph(paragraph) = &mut document.body[0] else {
+            unreachable!()
+        };
+        paragraph.content.remove(0);
+
+        let resolved = document
+            .revision(target)
+            .expect("stable target survives reindex");
+        assert_eq!(resolved.ordinal, 0);
+        assert_eq!(resolved.metadata.id.as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn missing_metadata_and_unknown_revision_kind_remain_reportable() {
+        let raw = "<w:futureRevision data=\"opaque\"><w:payload/></w:futureRevision>";
+        let mut document = Document {
+            body: vec![Block::Paragraph(Paragraph {
+                content: vec![Inline::UnsupportedRevision {
+                    kind: UnsupportedRevisionKind::Other("w:futureRevision".to_string()),
+                    metadata: RevisionMetadata::default(),
+                    raw: raw.to_string(),
+                }],
+                ..Paragraph::default()
+            })],
+        };
+        document.initialize_revision_targets();
+
+        let address = &document.revisions()[0];
+        assert_eq!(
+            address.category,
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::Other(
+                "w:futureRevision".to_string()
+            ))
+        );
+        assert!(address.metadata.id.is_none());
+        assert!(address.metadata.author.is_none());
+        let Block::Paragraph(paragraph) = &document.body[0] else {
+            unreachable!()
+        };
+        let Inline::UnsupportedRevision {
+            raw: cloned_raw, ..
+        } = &paragraph.content[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(cloned_raw, raw);
+        assert_eq!(document.clone(), document);
     }
 }

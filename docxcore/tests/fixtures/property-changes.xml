@@ -1,0 +1,81 @@
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="CurrentParagraph"/>
+        <w:keepNext/>
+        <w:sectPr>
+          <w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/>
+          <w:sectPrChange w:id="16" w:author="Section Author" w:producer="section-metadata">
+            <w:sectPr><w:pgSz w:w="11906" w:h="16838"/><w:vendorSect w:val="kept"/></w:sectPr>
+            <w:vendorChange w:val="kept"/>
+          </w:sectPrChange>
+        </w:sectPr>
+        <w:pPrChange w:id="12" w:author="Paragraph Author" w:producer="paragraph-metadata">
+          <w:pPr>
+            <w:pStyle w:val="PreviousParagraph"/>
+            <w:keepLines/>
+            <w:bidi w:val="0"/>
+            <w:jc w:val="right"/>
+          </w:pPr>
+          <w:vendorChange w:val="kept"/>
+        </w:pPrChange>
+      </w:pPr>
+      <w:r>
+        <w:rPr>
+          <w:rStyle w:val="CurrentCharacter"/>
+          <w:b w:val="false"/>
+          <w:i/>
+          <w:lang w:val="en-US"/>
+          <w:rPrChange w:id="11" w:author="Run &amp; Author" w:date="2026-08-29T10:00:00Z" w:producer="run-metadata">
+            <w:rPr>
+              <w:rStyle w:val="PreviousCharacter"/>
+              <w:b/>
+              <w:i w:val="off"/>
+              <w:u/>
+              <w:lang w:val="fr-FR"/>
+            </w:rPr>
+            <w:vendorChange w:val="kept"/>
+          </w:rPrChange>
+        </w:rPr>
+        <w:t>properties</w:t>
+      </w:r>
+    </w:p>
+    <w:p>
+      <w:r><w:rPr><w:rPrChange w:id="17"/></w:rPr><w:t>absent</w:t></w:r>
+      <w:r><w:rPr><w:rPrChange w:id="18"><w:notRPr/></w:rPrChange></w:rPr><w:t>malformed</w:t></w:r>
+      <w:r><w:rPr><w:rPrChange w:id="19"><w:rPr/></w:rPrChange></w:rPr><w:t>empty</w:t></w:r>
+    </w:p>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblStyle w:val="CurrentTable"/>
+        <w:shd w:fill="ABCDEF"/>
+        <w:tblPrChange w:id="13" w:author="Table Author" w:producer="table-metadata">
+          <w:tblPr><w:tblStyle w:val="PreviousTable"/><w:tblLayout w:type="fixed"/></w:tblPr>
+          <w:vendorChange w:val="kept"/>
+        </w:tblPrChange>
+      </w:tblPr>
+      <w:tblGrid><w:gridCol w:w="2400"/></w:tblGrid>
+      <w:tr>
+        <w:trPr>
+          <w:tblHeader/>
+          <w:trPrChange w:id="14" w:author="Row Author" w:producer="row-metadata">
+            <w:trPr><w:cantSplit/><w:trHeight w:val="480"/></w:trPr>
+            <w:vendorChange w:val="kept"/>
+          </w:trPrChange>
+        </w:trPr>
+        <w:tc>
+          <w:tcPr>
+            <w:gridSpan w:val="2"/>
+            <w:shd w:fill="00FF00"/>
+            <w:tcPrChange w:id="15" w:author="Cell Author" w:producer="cell-metadata">
+              <w:tcPr><w:gridSpan w:val="1"/><w:shd w:fill="FFFF00"/></w:tcPr>
+              <w:vendorChange w:val="kept"/>
+            </w:tcPrChange>
+          </w:tcPr>
+          <w:p><w:r><w:t>cell</w:t></w:r></w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+  </w:body>
+</w:document>

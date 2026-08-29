@@ -21,6 +21,7 @@ fn main() -> std::io::Result<()> {
                 p.props.style_id, p.props.heading_level, p.props.num_id
             ),
             Block::Table(t) => format!("Table {}x{}", t.rows.len(), t.grid.len()),
+            Block::SectionProperties(_) => "SectionProperties".into(),
             Block::Raw(_) => "Raw".into(),
         };
         let text = b.plain_text();

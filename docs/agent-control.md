@@ -84,6 +84,11 @@ One JSON object per line; one reply line per request:
 | `doc.undo` / `doc.redo` | — | `{done}` (`false` = nothing to undo/redo) |
 | `doc.format` | `{start, end?, patch}` | `{formatted}` — block count; ONE undo checkpoint over the whole range |
 | `doc.set-style` | `{start, end?, style?, align?}` | `{styled}` — block count; ONE undo checkpoint |
+| `doc.revisions` | — | `{count,revisions:[…]}` in document order, including stable target, kind, metadata, support state, nesting, and editor-safe locations |
+| `doc.revision-current` | — | `{count,revision}` for the navigation selection or change at the caret; `revision:null` when none |
+| `doc.revision-next` / `doc.revision-previous` | — | `{count,revision}` after selecting the wrapping next/previous change |
+| `doc.revision-accept` / `doc.revision-reject` | `{revision}` | structured applied/stale/unsupported/malformed outcome |
+| `doc.revisions-accept-all` / `doc.revisions-reject-all` | — | `{total,applied,outcomes:[…]}` from one undoable transaction |
 
 Notes:
 
@@ -139,7 +144,9 @@ same checks and do not maintain a second policy table:
 
 The current mutating control/MCP operations cover Structure
 (`doc.replace-range`, `doc.insert`, `doc.append`), Content (`doc.replace-all`,
-`doc.undo`, `doc.redo`), and Formatting (`doc.format`, `doc.set-style`). There
+`doc.undo`, `doc.redo`, `doc.revision-accept`, `doc.revision-reject`,
+`doc.revisions-accept-all`, `doc.revisions-reject-all`), and Formatting
+(`doc.format`, `doc.set-style`). There
 is no comment-writing control verb yet, so comments-only protection denies all
 current automation edits even though comment mutations in the TUI are allowed.
 Markdown control/MCP inserts that carry styles, numbering, or direct run
@@ -175,6 +182,39 @@ fallback. The status fields above remain available to control/MCP clients; the
 overlay itself is visual TUI state and is not returned as document content.
 The exhaustive route mapping is maintained in
 [`docx-mutation-inventory.md`](docx-mutation-inventory.md).
+
+### Tracked-change review
+
+`doc.revisions` is the discovery call for review automation. Its `revision`
+values are document-local stable ids encoded as strings; pass one unchanged to
+`doc.revision-accept` or `doc.revision-reject`. Each entry reports `ordinal`,
+`depth`, `kind`, `supported`, `current`, `start`, and `end`, with `parent`,
+`scope`, `unsupported_kind`, `id`, `author`, and `date` when applicable.
+Navigation wraps and updates the live editor's review selection; it does not
+edit the document or create an undo entry.
+
+Supported kinds are insertions, deletions, and property changes in run,
+paragraph, table, row, cell, and section scopes. Accepting an insertion keeps
+its content; rejecting it removes the content. Accepting a deletion removes its
+content; rejecting it restores ordinary content. Accepting a property change
+keeps current properties, while rejecting restores the prior snapshot. Nested
+bulk changes are transformed innermost-first and reported in their original
+document order. See [`docx-revision-inventory.md`](docx-revision-inventory.md)
+for the complete fidelity and exclusion contract.
+
+A successful single action is one undo step. An all-action applies every
+supported initial target as one undo step and returns a per-target outcome;
+unsupported or malformed records remain untouched. Applied results have
+`status:"applied"`, `revision`, `action`, and `kind`. No-op results use
+`status:"error"` and a structured `error.code`: `stale_revision`,
+`unsupported_revision`, or `malformed_revision`. Refresh `doc.revisions` after
+an action instead of reusing a removed target.
+
+Review actions use the central Content mutation policy. In particular,
+enforced tracked-changes-only protection does not grant permission to make
+ordinary untracked edits or to accept/reject imported changes; those requests
+fail with `protection_denied:tracked_changes_unsupported`. Reads and review
+navigation remain available.
 
 ### Markdown-formatted writes
 
@@ -300,7 +340,10 @@ Tools: `docxy_list`, `docxy_new`, `docxy_status`, `docxy_outline`, `docxy_read`,
 `docxy_save`, `docxy_export`, `docxy_export_pdf`, `docxy_comments`,
 `docxy_notes`, `docxy_header`, `docxy_footer`, `docxy_metadata`, `docxy_stats`,
 `docxy_replace_all`, `docxy_undo`, `docxy_redo`, `docxy_format`,
-`docxy_set_style` (23 total). Each edit
+`docxy_set_style`, `docxy_revisions`, `docxy_revision_current`,
+`docxy_revision_next`, `docxy_revision_previous`, `docxy_revision_accept`,
+`docxy_revision_reject`, `docxy_revisions_accept_all`, and
+`docxy_revisions_reject_all` (31 total). Each edit
 tool maps to the matching verb — except `docxy_new`, which composes a file
 create with a `doc.open` — and results come back as JSON text. When several
 docxy editors are open, pass `target` (a substring of the instance/pane id) to
@@ -657,7 +700,7 @@ MCP: `claude mcp add xlsxy -- xlsxy --mcp` → `xlsxy_list`, `xlsxy_new`,
 `xlsxy_row_insert`, `xlsxy_row_delete`, `xlsxy_col_insert`,
 `xlsxy_col_delete`, `xlsxy_eval`, `xlsxy_stats`, `xlsxy_charts`,
 `xlsxy_pivots`, `xlsxy_format`, `xlsxy_col_width`, `xlsxy_pivot_create` (33
-total; docxy's 23 + xlsxy's 33 = **56 tools** total across both apps).
+total; docxy's 31 + xlsxy's 33 = **64 tools** total across both apps).
 Skill: `xlsxy install skill`.
 
 **yppxy** (project schedule; tasks addressed by UID, durations like `3d`/`4h`):

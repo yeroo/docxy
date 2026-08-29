@@ -707,7 +707,8 @@ fn section_start_parity(section_type: Option<&str>) -> Option<PageParity> {
 fn sections(doc: &Document, last: PageGeom) -> Vec<RenderSection> {
     let mut out = Vec::new();
     let mut start = 0;
-    for (i, b) in doc.body.iter().enumerate() {
+    let content_end = doc.content_block_count();
+    for (i, b) in doc.body[..content_end].iter().enumerate() {
         if let Block::Paragraph(p) = b {
             if let Some(sect) = &p.props.section_break {
                 let section_type = section_start_type(sect);
@@ -728,13 +729,13 @@ fn sections(doc: &Document, last: PageGeom) -> Vec<RenderSection> {
     }
     // The final section's raw sectPr isn't threaded here, so it falls back to
     // even columns (the common case for a trailing single-column section).
-    if start < doc.body.len()
+    if start < content_end
         || out.is_empty()
         || out.last().is_some_and(|section| section.starts_page_after)
     {
         out.push(RenderSection {
             start,
-            end: doc.body.len(),
+            end: content_end,
             geom: last,
             col_tw: Vec::new(),
             parity_after: None,
@@ -908,6 +909,7 @@ fn render_blocks(
                 absorb(&mut out, sub, sub_imgs, images, sub_mmd, mermaid);
             }
             Block::Table(t) => out.extend(render_table(t, &path, width, opts)),
+            Block::SectionProperties(_) => {}
             // Content-control wrapper boundaries carry no visible payload; only
             // real embedded content (drawings, objects, …) gets a placeholder.
             Block::Raw(raw) if crate::load::is_sdt_boundary(raw) => {}
@@ -1044,7 +1046,13 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
     for it in &content[(from + 1).min(content.len())..] {
         match it {
             Inline::Run(r) => w += str_width(&r.text),
-            Inline::Hyperlink(h) => w += h.runs.iter().map(|r| str_width(&r.text)).sum::<usize>(),
+            Inline::Hyperlink(h) => {
+                w += h
+                    .visible_runs()
+                    .iter()
+                    .map(|r| str_width(&r.text))
+                    .sum::<usize>()
+            }
             Inline::Tab(_) | Inline::Break(_) => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::Field { text, .. } => w += str_width(text),
@@ -1056,6 +1064,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
             | Inline::Equation { .. }
+            | Inline::UnsupportedRevision { .. }
             | Inline::Raw(_) => {}
         }
     }
@@ -1188,7 +1197,7 @@ fn flatten_para(
                     .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
                     .unwrap_or_default();
                 let rc: Rc<str> = Rc::from(target.as_str());
-                for run in &h.runs {
+                for run in h.visible_runs() {
                     let eff = opts.styles.effective_run(
                         para.props.style_id.as_deref(),
                         run.props.style_id.as_deref(),
@@ -1402,6 +1411,7 @@ fn flatten_para(
                     block: Some(idx),
                 });
             }
+            Inline::UnsupportedRevision { .. } => {}
         }
     }
     if inv {
@@ -3958,6 +3968,7 @@ mod tests {
                 text: "link".to_string(),
                 props: RunProps::default(),
             }],
+            ..Hyperlink::default()
         });
         let d = doc(vec![para(vec![h])]);
         let lines = render(&d, &opts(40));

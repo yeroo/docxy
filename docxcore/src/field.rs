@@ -908,7 +908,7 @@ pub fn recompute(doc: &mut crate::model::Document, ctx: &FieldContext) {
                         }
                     }
                 }
-                Block::Raw(_) => {}
+                Block::SectionProperties(_) | Block::Raw(_) => {}
             }
         }
     }

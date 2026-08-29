@@ -125,7 +125,7 @@ impl<'a> Layout<'a> {
             match block {
                 Block::Paragraph(p) => self.paragraph(p),
                 Block::Table(t) => self.table(t),
-                Block::Raw(_) => {}
+                Block::SectionProperties(_) | Block::Raw(_) => {}
             }
         }
         self.pages.push(std::mem::take(&mut self.cur));
@@ -292,7 +292,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
                     .unwrap_or_default();
                 let rc: Rc<str> = Rc::from(target.as_str());
-                for run in &h.runs {
+                for run in h.visible_runs() {
                     let eff =
                         styles.effective_run(pstyle, run.props.style_id.as_deref(), &run.props);
                     let font = font_index(eff.bold || heading, eff.italic);
@@ -377,7 +377,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     segs.push(Vec::new());
                 }
             }
-            Inline::Raw(_) => {}
+            Inline::UnsupportedRevision { .. } | Inline::Raw(_) => {}
         }
     }
     segs
@@ -681,6 +681,7 @@ mod tests {
                 text: "site".to_string(),
                 props: RunProps::default(),
             }],
+            ..Hyperlink::default()
         });
         let d = doc(vec![para(vec![h])]);
         let text = s(&to_pdf(&d, &PdfOptions::default()));

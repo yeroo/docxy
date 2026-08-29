@@ -69,6 +69,13 @@ pub enum Act {
     /// Add a comment on the selection / delete the selected comment.
     NewComment,
     DeleteComment,
+    /// Navigate and act on imported tracked changes.
+    PrevRevision,
+    NextRevision,
+    AcceptRevision,
+    RejectRevision,
+    AcceptAllRevisions,
+    RejectAllRevisions,
     /// Toggle the footnotes/endnotes side panel.
     ToggleNotes,
     // View tab
@@ -405,7 +412,7 @@ fn styles_groups() -> Vec<Group> {
     }]
 }
 
-/// The Review tab's groups (Comments / Tracking).
+/// The Review tab's groups (Comments / Tracking / Changes).
 /// The Insert tab's groups (Pages / Symbols).
 fn insert_groups() -> Vec<Group> {
     use Act::*;
@@ -527,6 +534,56 @@ fn review_groups() -> Vec<Group> {
                     Todo("Display for Review"),
                     "Display for review",
                 )],
+            ],
+        },
+        Group {
+            title: "Changes",
+            width: 36,
+            rows: [
+                vec![
+                    btn(
+                        "‹ Change",
+                        8,
+                        PrevRevision,
+                        "Previous tracked change (Alt+Shift+Left)",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "Change ›",
+                        8,
+                        NextRevision,
+                        "Next tracked change (Alt+Shift+Right)",
+                    ),
+                    Seg::Gap("  "),
+                    btn(
+                        "✓ Accept",
+                        8,
+                        AcceptRevision,
+                        "Accept current change (Alt+Shift+A)",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "✗ Reject",
+                        8,
+                        RejectRevision,
+                        "Reject current change (Alt+Shift+R)",
+                    ),
+                ],
+                vec![
+                    btn(
+                        "Accept All",
+                        10,
+                        AcceptAllRevisions,
+                        "Accept all tracked changes (confirmation required)",
+                    ),
+                    Seg::Gap(" "),
+                    btn(
+                        "Reject All",
+                        10,
+                        RejectAllRevisions,
+                        "Reject all tracked changes (confirmation required)",
+                    ),
+                ],
             ],
         },
     ]

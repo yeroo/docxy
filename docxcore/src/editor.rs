@@ -10,6 +10,7 @@
 //! paragraphs in the same container, so editing never escapes a table cell.
 
 use crate::model::*;
+use crate::review::{RevisionAction, RevisionOutcome};
 
 /// A path into the document tree (to a paragraph) plus a character offset.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -37,6 +38,31 @@ pub struct Match {
     pub path: Vec<usize>,
     pub start: usize,
     pub end: usize,
+}
+
+/// A revision together with the valid editor caret range used to review it.
+///
+/// Inline wrappers are non-editable and therefore use a collapsed range at
+/// their boundary. Property changes use the paragraph or run range whose
+/// properties they affect. The stable target in [`RevisionAddress`] remains
+/// the action identity; the carets are recalculated after every edit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionLocation {
+    pub address: RevisionAddress,
+    pub start: Caret,
+    pub end: Caret,
+}
+
+impl RevisionLocation {
+    pub fn contains(&self, caret: &Caret) -> bool {
+        if self.start.path != caret.path || self.end.path != caret.path {
+            return false;
+        }
+        if self.start == self.end {
+            return *caret == self.start;
+        }
+        self.start.offset <= caret.offset && caret.offset <= self.end.offset
+    }
 }
 
 /// Clipboard contents: styled inline content, one entry per (partial) paragraph.
@@ -102,6 +128,8 @@ enum EditKind {
 struct Snapshot {
     doc: Document,
     caret: Caret,
+    anchor: Option<Caret>,
+    review_target: Option<RevisionTarget>,
 }
 
 const UNDO_CAP: usize = 500;
@@ -115,10 +143,12 @@ pub struct Editor {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
     last: EditKind,
+    review_target: Option<RevisionTarget>,
 }
 
 impl Editor {
-    pub fn new(doc: Document) -> Self {
+    pub fn new(mut doc: Document) -> Self {
+        doc.initialize_revision_targets();
         let path = first_paragraph_path(&doc.body).unwrap_or_else(|| vec![0]);
         Editor {
             doc,
@@ -127,7 +157,25 @@ impl Editor {
             undo: Vec::new(),
             redo: Vec::new(),
             last: EditKind::None,
+            review_target: None,
         }
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            doc: self.doc.clone(),
+            caret: self.caret.clone(),
+            anchor: self.anchor.clone(),
+            review_target: self.review_target,
+        }
+    }
+
+    fn push_undo(&mut self, snapshot: Snapshot) {
+        self.undo.push(snapshot);
+        if self.undo.len() > UNDO_CAP {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
     }
 
     fn cur_len(&self) -> usize {
@@ -138,26 +186,18 @@ impl Editor {
 
     fn checkpoint(&mut self, kind: EditKind) {
         if self.last != kind || kind == EditKind::Structural {
-            self.undo.push(Snapshot {
-                doc: self.doc.clone(),
-                caret: self.caret.clone(),
-            });
-            if self.undo.len() > UNDO_CAP {
-                self.undo.remove(0);
-            }
-            self.redo.clear();
+            self.push_undo(self.snapshot());
         }
         self.last = kind;
     }
 
     pub fn undo(&mut self) -> bool {
         if let Some(prev) = self.undo.pop() {
-            self.redo.push(Snapshot {
-                doc: self.doc.clone(),
-                caret: self.caret.clone(),
-            });
+            self.redo.push(self.snapshot());
             self.doc = prev.doc;
             self.caret = prev.caret;
+            self.anchor = prev.anchor;
+            self.review_target = prev.review_target;
             self.last = EditKind::None;
             true
         } else {
@@ -167,17 +207,206 @@ impl Editor {
 
     pub fn redo(&mut self) -> bool {
         if let Some(next) = self.redo.pop() {
-            self.undo.push(Snapshot {
-                doc: self.doc.clone(),
-                caret: self.caret.clone(),
-            });
+            self.undo.push(self.snapshot());
             self.doc = next.doc;
             self.caret = next.caret;
+            self.anchor = next.anchor;
+            self.review_target = next.review_target;
             self.last = EditKind::None;
             true
         } else {
             false
         }
+    }
+
+    // ---- tracked-change review ----
+
+    /// Enumerate current revisions in source order with editor-safe locations.
+    pub fn revision_locations(&self) -> Vec<RevisionLocation> {
+        let addresses = self.doc.revisions();
+        let positions = collect_revision_positions(&self.doc.body);
+        let fallback = first_paragraph_path(&self.doc.body).map(|path| Caret { path, offset: 0 });
+
+        addresses
+            .into_iter()
+            .filter_map(|address| {
+                let position = positions
+                    .iter()
+                    .find(|position| position.target == address.target)
+                    .cloned()
+                    .or_else(|| {
+                        fallback.as_ref().map(|caret| RevisionPosition {
+                            target: address.target,
+                            start: caret.clone(),
+                            end: caret.clone(),
+                        })
+                    })?;
+                Some(RevisionLocation {
+                    address,
+                    start: position.start,
+                    end: position.end,
+                })
+            })
+            .collect()
+    }
+
+    /// The selected revision, or the first revision whose range contains the
+    /// caret when navigation has not selected a specific target.
+    pub fn current_revision(&self) -> Option<RevisionLocation> {
+        let locations = self.revision_locations();
+        if let Some(target) = self.review_target {
+            if let Some(location) = locations
+                .iter()
+                .find(|location| location.address.target == target)
+                .filter(|location| location.contains(&self.caret))
+            {
+                return Some(location.clone());
+            }
+        }
+        locations
+            .into_iter()
+            .find(|location| location.contains(&self.caret))
+    }
+
+    /// Select a stable revision target and move the caret to its review range.
+    pub fn select_revision(&mut self, target: RevisionTarget) -> Option<RevisionLocation> {
+        let location = self
+            .revision_locations()
+            .into_iter()
+            .find(|location| location.address.target == target)?;
+        self.caret = location.start.clone();
+        self.anchor = None;
+        self.review_target = Some(target);
+        self.last = EditKind::None;
+        Some(location)
+    }
+
+    /// Move to the next revision in source order, wrapping at the document end.
+    pub fn next_revision(&mut self) -> Option<RevisionLocation> {
+        self.navigate_revision(false)
+    }
+
+    /// Move to the previous revision in source order, wrapping at the start.
+    pub fn previous_revision(&mut self) -> Option<RevisionLocation> {
+        self.navigate_revision(true)
+    }
+
+    fn navigate_revision(&mut self, reverse: bool) -> Option<RevisionLocation> {
+        let locations = self.revision_locations();
+        if locations.is_empty() {
+            self.review_target = None;
+            return None;
+        }
+        let paths = all_paragraph_paths(&self.doc.body);
+        let key = |caret: &Caret| {
+            (
+                paths
+                    .iter()
+                    .position(|path| *path == caret.path)
+                    .unwrap_or(usize::MAX),
+                caret.offset,
+            )
+        };
+        let current = self
+            .review_target
+            .and_then(|target| {
+                locations.iter().position(|location| {
+                    location.address.target == target && location.contains(&self.caret)
+                })
+            })
+            .or_else(|| {
+                locations
+                    .iter()
+                    .position(|location| location.contains(&self.caret))
+            });
+        let index = if let Some(current) = current {
+            if reverse {
+                current.checked_sub(1).unwrap_or(locations.len() - 1)
+            } else {
+                (current + 1) % locations.len()
+            }
+        } else {
+            let caret_key = key(&self.caret);
+            if reverse {
+                locations
+                    .iter()
+                    .rposition(|location| key(&location.start) < caret_key)
+                    .unwrap_or(locations.len() - 1)
+            } else {
+                locations
+                    .iter()
+                    .position(|location| key(&location.start) > caret_key)
+                    .unwrap_or(0)
+            }
+        };
+        let location = locations[index].clone();
+        self.caret = location.start.clone();
+        self.anchor = None;
+        self.review_target = Some(location.address.target);
+        self.last = EditKind::None;
+        Some(location)
+    }
+
+    /// Accept one stable revision as one native undo transaction.
+    pub fn accept_revision(&mut self, target: RevisionTarget) -> RevisionOutcome {
+        self.apply_revision_action(target, RevisionAction::Accept)
+    }
+
+    /// Reject one stable revision as one native undo transaction.
+    pub fn reject_revision(&mut self, target: RevisionTarget) -> RevisionOutcome {
+        self.apply_revision_action(target, RevisionAction::Reject)
+    }
+
+    /// Accept the revision selected by navigation or located at the caret.
+    pub fn accept_current_revision(&mut self) -> Option<RevisionOutcome> {
+        let target = self.current_revision()?.address.target;
+        Some(self.accept_revision(target))
+    }
+
+    /// Reject the revision selected by navigation or located at the caret.
+    pub fn reject_current_revision(&mut self) -> Option<RevisionOutcome> {
+        let target = self.current_revision()?.address.target;
+        Some(self.reject_revision(target))
+    }
+
+    /// Accept all current revisions as one native undo transaction.
+    pub fn accept_all_revisions(&mut self) -> Vec<RevisionOutcome> {
+        self.apply_all_revision_actions(RevisionAction::Accept)
+    }
+
+    /// Reject all current revisions as one native undo transaction.
+    pub fn reject_all_revisions(&mut self) -> Vec<RevisionOutcome> {
+        self.apply_all_revision_actions(RevisionAction::Reject)
+    }
+
+    fn apply_revision_action(
+        &mut self,
+        target: RevisionTarget,
+        action: RevisionAction,
+    ) -> RevisionOutcome {
+        let before = self.snapshot();
+        let outcome = self.doc.apply_revision_action(target, action);
+        self.finish_review_transaction(before);
+        outcome
+    }
+
+    fn apply_all_revision_actions(&mut self, action: RevisionAction) -> Vec<RevisionOutcome> {
+        let before = self.snapshot();
+        let outcomes = match action {
+            RevisionAction::Accept => self.doc.accept_all_revisions(),
+            RevisionAction::Reject => self.doc.reject_all_revisions(),
+        };
+        self.finish_review_transaction(before);
+        outcomes
+    }
+
+    fn finish_review_transaction(&mut self, before: Snapshot) {
+        if self.doc == before.doc {
+            return;
+        }
+        self.push_undo(before);
+        self.last = EditKind::None;
+        self.clamp();
     }
 
     pub fn insert_char(&mut self, ch: char) {
@@ -236,6 +465,7 @@ impl Editor {
             *last = new_idx;
         }
         self.caret.offset = 0;
+        self.doc.initialize_revision_targets();
     }
 
     /// Word-style autoformat: if the current paragraph's whole text is three or
@@ -540,15 +770,15 @@ impl Editor {
 
     /// Clamp the caret to a valid position.
     pub fn clamp(&mut self) {
-        if resolve_para(&self.doc.body, &self.caret.path).is_none() {
-            if let Some(p) = first_paragraph_path(&self.doc.body) {
-                self.caret.path = p;
-            }
-            self.caret.offset = 0;
+        clamp_caret(&self.doc.body, &mut self.caret);
+        if let Some(anchor) = &mut self.anchor {
+            clamp_caret(&self.doc.body, anchor);
         }
-        let len = self.cur_len();
-        if self.caret.offset > len {
-            self.caret.offset = len;
+        if self
+            .review_target
+            .is_some_and(|target| self.doc.revision(target).is_none())
+        {
+            self.review_target = None;
         }
     }
 
@@ -747,6 +977,7 @@ impl Editor {
                 p.content.extend(tail);
                 self.caret.offset = off + ins_len;
             }
+            self.doc.initialize_revision_targets();
             return;
         }
 
@@ -787,6 +1018,7 @@ impl Editor {
             *l = placed.0;
         }
         self.caret.offset = placed.1;
+        self.doc.initialize_revision_targets();
     }
 
     // ---- formatting ----
@@ -831,6 +1063,7 @@ impl Editor {
                 map_prop_range(&mut p.content, *s, *e, &f);
             }
         }
+        self.doc.initialize_revision_targets();
     }
 
     /// Grow (or shrink) the font size of the selection by `delta` half-points,
@@ -893,6 +1126,7 @@ impl Editor {
                 map_text_range(&mut p.content, *s, *e, &*f);
             }
         }
+        self.doc.initialize_revision_targets();
     }
 
     /// Paths of the paragraphs touched by the selection (or the caret's paragraph).
@@ -1128,7 +1362,7 @@ impl Editor {
                             }
                         }
                     }
-                    Block::Raw(_) => {}
+                    Block::SectionProperties(_) | Block::Raw(_) => {}
                 }
             }
         }
@@ -1200,6 +1434,7 @@ impl Editor {
                 set_prop_range(&mut p.content, *s, *e, set, value);
             }
         }
+        self.doc.initialize_revision_targets();
     }
 
     // ---- find / replace ----
@@ -1368,6 +1603,275 @@ impl Editor {
 
 // ---- tree navigation ----
 
+#[derive(Clone)]
+struct RevisionPosition {
+    target: RevisionTarget,
+    start: Caret,
+    end: Caret,
+}
+
+fn collect_revision_positions(body: &[Block]) -> Vec<RevisionPosition> {
+    let mut positions = Vec::new();
+    let mut prefix = Vec::new();
+    collect_block_revision_positions(body, &mut prefix, None, &mut positions);
+    positions
+}
+
+fn property_position(
+    change: &Option<PropertyChange>,
+    span: Option<(Caret, Caret)>,
+    positions: &mut Vec<RevisionPosition>,
+) {
+    let (Some(change), Some((start, end))) = (change, span) else {
+        return;
+    };
+    positions.push(RevisionPosition {
+        target: change.metadata.target,
+        start,
+        end,
+    });
+}
+
+fn paragraph_span(path: &[usize], paragraph: &Paragraph) -> (Caret, Caret) {
+    (
+        Caret::at(path.to_vec(), 0),
+        Caret::at(path.to_vec(), para_text_len(paragraph)),
+    )
+}
+
+fn forced_span(caret: &Option<Caret>) -> Option<(Caret, Caret)> {
+    caret.as_ref().map(|caret| (caret.clone(), caret.clone()))
+}
+
+fn first_paragraph_span(body: &[Block], prefix: &mut Vec<usize>) -> Option<(Caret, Caret)> {
+    for (index, block) in body.iter().enumerate() {
+        prefix.push(index);
+        let found = match block {
+            Block::Paragraph(paragraph) => Some(paragraph_span(prefix, paragraph)),
+            Block::Table(table) => first_table_paragraph_span(table, prefix),
+            Block::SectionProperties(_) | Block::Raw(_) => None,
+        };
+        prefix.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+fn first_table_paragraph_span(
+    table: &Table,
+    table_path: &mut Vec<usize>,
+) -> Option<(Caret, Caret)> {
+    for (row_index, row) in table.rows.iter().enumerate() {
+        for (cell_index, cell) in row.cells.iter().enumerate() {
+            table_path.push(row_index);
+            table_path.push(cell_index);
+            let found = first_paragraph_span(&cell.blocks, table_path);
+            table_path.pop();
+            table_path.pop();
+            if found.is_some() {
+                return found;
+            }
+        }
+    }
+    None
+}
+
+fn first_row_paragraph_span(row: &Row, row_path: &mut Vec<usize>) -> Option<(Caret, Caret)> {
+    for (cell_index, cell) in row.cells.iter().enumerate() {
+        row_path.push(cell_index);
+        let found = first_paragraph_span(&cell.blocks, row_path);
+        row_path.pop();
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+fn collect_block_revision_positions(
+    body: &[Block],
+    prefix: &mut Vec<usize>,
+    forced: Option<Caret>,
+    positions: &mut Vec<RevisionPosition>,
+) {
+    for (block_index, block) in body.iter().enumerate() {
+        prefix.push(block_index);
+        match block {
+            Block::Paragraph(paragraph) => {
+                let span = forced_span(&forced).or_else(|| Some(paragraph_span(prefix, paragraph)));
+                property_position(
+                    &paragraph.props.section_property_change,
+                    span.clone(),
+                    positions,
+                );
+                property_position(&paragraph.props.property_change, span, positions);
+                collect_inline_revision_positions(
+                    &paragraph.content,
+                    prefix,
+                    forced.clone(),
+                    positions,
+                );
+            }
+            Block::Table(table) => {
+                let table_span =
+                    forced_span(&forced).or_else(|| first_table_paragraph_span(table, prefix));
+                property_position(&table.property_change, table_span, positions);
+                for (row_index, row) in table.rows.iter().enumerate() {
+                    prefix.push(row_index);
+                    let row_span =
+                        forced_span(&forced).or_else(|| first_row_paragraph_span(row, prefix));
+                    property_position(&row.property_change, row_span, positions);
+                    for (cell_index, cell) in row.cells.iter().enumerate() {
+                        prefix.push(cell_index);
+                        let cell_span = forced_span(&forced)
+                            .or_else(|| first_paragraph_span(&cell.blocks, prefix));
+                        property_position(&cell.property_change, cell_span, positions);
+                        for unsupported in &cell.unsupported_revisions {
+                            let Some((start, end)) = forced_span(&forced)
+                                .or_else(|| first_paragraph_span(&cell.blocks, prefix))
+                            else {
+                                continue;
+                            };
+                            positions.push(RevisionPosition {
+                                target: unsupported.metadata.target,
+                                start,
+                                end,
+                            });
+                        }
+                        collect_block_revision_positions(
+                            &cell.blocks,
+                            prefix,
+                            forced.clone(),
+                            positions,
+                        );
+                        prefix.pop();
+                    }
+                    prefix.pop();
+                }
+            }
+            Block::SectionProperties(section) => {
+                let span =
+                    forced_span(&forced).or_else(|| first_paragraph_span(body, &mut Vec::new()));
+                property_position(&section.property_change, span, positions);
+            }
+            Block::Raw(_) => {}
+        }
+        prefix.pop();
+    }
+}
+
+fn collect_inline_revision_positions(
+    content: &[Inline],
+    path: &mut Vec<usize>,
+    forced: Option<Caret>,
+    positions: &mut Vec<RevisionPosition>,
+) {
+    let mut offset = 0;
+    for (inline_index, inline) in content.iter().enumerate() {
+        let point = forced
+            .clone()
+            .unwrap_or_else(|| Caret::at(path.clone(), offset));
+        match inline {
+            Inline::Run(run) => {
+                let end = if forced.is_some() {
+                    point.clone()
+                } else {
+                    Caret::at(path.clone(), offset + run.text.chars().count())
+                };
+                property_position(
+                    &run.props.property_change,
+                    Some((point.clone(), end)),
+                    positions,
+                );
+            }
+            Inline::Hyperlink(link) => {
+                let mut run_offset = offset;
+                for run in &link.runs {
+                    let start = forced
+                        .clone()
+                        .unwrap_or_else(|| Caret::at(path.clone(), run_offset));
+                    let end = if forced.is_some() {
+                        start.clone()
+                    } else {
+                        Caret::at(path.clone(), run_offset + run.text.chars().count())
+                    };
+                    property_position(&run.props.property_change, Some((start, end)), positions);
+                    run_offset += run.text.chars().count();
+                }
+                collect_inline_revision_positions(
+                    &link.content,
+                    path,
+                    Some(point.clone()),
+                    positions,
+                );
+            }
+            Inline::Tab(props) => {
+                let end = if forced.is_some() {
+                    point.clone()
+                } else {
+                    Caret::at(path.clone(), offset + 1)
+                };
+                property_position(
+                    &props.property_change,
+                    Some((point.clone(), end)),
+                    positions,
+                );
+            }
+            Inline::TextBox { blocks, .. } => {
+                if forced.is_some() {
+                    collect_block_revision_positions(blocks, path, Some(point.clone()), positions);
+                } else {
+                    path.push(inline_index);
+                    collect_block_revision_positions(blocks, path, None, positions);
+                    path.pop();
+                }
+            }
+            Inline::Revision {
+                metadata, content, ..
+            } => {
+                positions.push(RevisionPosition {
+                    target: metadata.target,
+                    start: point.clone(),
+                    end: point.clone(),
+                });
+                collect_inline_revision_positions(content, path, Some(point.clone()), positions);
+            }
+            Inline::UnsupportedRevision { metadata, .. } => {
+                positions.push(RevisionPosition {
+                    target: metadata.target,
+                    start: point.clone(),
+                    end: point.clone(),
+                });
+            }
+            Inline::Break(_)
+            | Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::Equation { .. }
+            | Inline::Field { .. }
+            | Inline::FootnoteRef { .. }
+            | Inline::Raw(_) => {}
+        }
+        if forced.is_none() {
+            offset += inline_len(inline);
+        }
+    }
+}
+
+fn clamp_caret(body: &[Block], caret: &mut Caret) {
+    if resolve_para(body, &caret.path).is_none() {
+        if let Some(path) = first_paragraph_path(body) {
+            caret.path = path;
+        }
+        caret.offset = 0;
+    }
+    let len = resolve_para(body, &caret.path)
+        .map(para_text_len)
+        .unwrap_or(0);
+    caret.offset = caret.offset.min(len);
+}
+
 fn para_text_len(p: &Paragraph) -> usize {
     p.content.iter().map(inline_len).sum()
 }
@@ -1479,7 +1983,7 @@ fn collect_paths(body: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usiz
                     }
                 }
             }
-            Block::Raw(_) => {}
+            Block::SectionProperties(_) | Block::Raw(_) => {}
         }
         prefix.pop();
     }
@@ -1499,6 +2003,7 @@ fn inline_len(i: &Inline) -> usize {
         | Inline::Field { .. }
         | Inline::TextBox { .. }
         | Inline::Revision { .. }
+        | Inline::UnsupportedRevision { .. }
         | Inline::FootnoteRef { .. }
         | Inline::Raw(_) => 0,
     }
@@ -1548,6 +2053,9 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                         anchor: h.anchor.clone(),
                         rel_id: h.rel_id.clone(),
                         runs,
+                        content: Vec::new(),
+                        raw: None,
+                        content_changed: false,
                     }));
                 }
             }
@@ -1574,10 +2082,27 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 raw: raw.clone(),
                 blocks: blocks.clone(),
             }),
-            Inline::Revision { kind, raw, content } => out.push(Inline::Revision {
+            Inline::Revision {
+                kind,
+                metadata,
+                raw,
+                content,
+                content_changed,
+            } => out.push(Inline::Revision {
                 kind: *kind,
+                metadata: metadata.clone(),
                 raw: raw.clone(),
                 content: content.clone(),
+                content_changed: *content_changed,
+            }),
+            Inline::UnsupportedRevision {
+                kind,
+                metadata,
+                raw,
+            } => out.push(Inline::UnsupportedRevision {
+                kind: kind.clone(),
+                metadata: metadata.clone(),
+                raw: raw.clone(),
             }),
             Inline::FootnoteRef { id, endnote, raw } => out.push(Inline::FootnoteRef {
                 id: *id,
@@ -1669,6 +2194,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Revision { .. }
+                | Inline::UnsupportedRevision { .. }
                 | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     if local == 0 {
@@ -1746,6 +2272,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Revision { .. }
+                | Inline::UnsupportedRevision { .. }
                 | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     content.remove(i);
@@ -1823,6 +2350,7 @@ fn range_all_have(
             | Inline::Field { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
+            | Inline::UnsupportedRevision { .. }
             | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => {} // zero-length
         }
@@ -2770,6 +3298,29 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn partial_edit_rekeys_cloned_property_revision_targets() {
+        let xml = r#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:rPr><w:b/><w:rPrChange w:id="90"><w:rPr><w:i/></w:rPr></w:rPrChange></w:rPr><w:t>abcd</w:t></w:r></w:p></w:body></w:document>"#;
+        let document = crate::load::parse_document_xml(xml, &Default::default());
+        let mut editor = Editor::new(document);
+        editor.anchor = Some(Caret::top(0, 1));
+        editor.caret = Caret::top(0, 3);
+        editor.toggle_bold();
+
+        let revisions = editor.doc.revisions();
+        let unique = revisions
+            .iter()
+            .map(|revision| revision.target)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), revisions.len());
+        assert!(revisions.iter().all(|revision| revision.target.0 != 0));
+
+        let outcomes = editor.reject_all_revisions();
+        assert_eq!(outcomes.len(), revisions.len());
+        assert!(outcomes.iter().all(RevisionOutcome::is_applied));
+        assert!(editor.doc.revisions().is_empty());
     }
 
     #[test]

@@ -53,7 +53,7 @@ pub fn to_markdown_with(doc: &Document, markers: &HashMap<Vec<usize>, String>) -
     let mut prev_list: Option<i32> = None;
     let mut prev_any = false;
     let mut i = 0;
-    while i < doc.body.len() {
+    while i < doc.content_block_count() {
         let b = &doc.body[i];
         // A run of "SourceCode" paragraphs becomes one fenced code block.
         if matches!(b, Block::Paragraph(p) if is_source_code(p)) {
@@ -88,7 +88,7 @@ pub fn to_markdown_with(doc: &Document, markers: &HashMap<Vec<usize>, String>) -
                 para_to_md(p, markers.get(&vec![i]).map(String::as_str), &mut out)
             }
             Block::Table(t) => table_to_md(t, &mut out),
-            Block::Raw(_) => {
+            Block::SectionProperties(_) | Block::Raw(_) => {
                 i += 1;
                 continue;
             }
@@ -249,11 +249,14 @@ fn inlines_to_md(content: &[Inline]) -> String {
         match inl {
             Inline::Run(r) => s.push_str(&run_to_md(&r.text, &r.props)),
             Inline::Hyperlink(h) => {
-                let inner: String = h
-                    .runs
-                    .iter()
-                    .map(|r| run_to_md(&r.text, &r.props))
-                    .collect();
+                let inner: String = if h.content.is_empty() {
+                    h.runs
+                        .iter()
+                        .map(|r| run_to_md(&r.text, &r.props))
+                        .collect()
+                } else {
+                    inlines_to_md(&h.content)
+                };
                 let url = h
                     .target
                     .clone()
@@ -291,7 +294,10 @@ fn inlines_to_md(content: &[Inline]) -> String {
                 let p = if *endnote { "e" } else { "" };
                 s.push_str(&format!("[^{p}{id}]"))
             }
-            Inline::Chart { .. } | Inline::TextBox { .. } | Inline::Raw(_) => {}
+            Inline::Chart { .. }
+            | Inline::TextBox { .. }
+            | Inline::UnsupportedRevision { .. }
+            | Inline::Raw(_) => {}
         }
     }
     s
@@ -814,6 +820,9 @@ fn parse_inlines(s: &str) -> Vec<Inline> {
                             ..RunProps::default()
                         },
                     }],
+                    content: Vec::new(),
+                    raw: None,
+                    content_changed: false,
                 }));
                 i += adv;
                 continue;

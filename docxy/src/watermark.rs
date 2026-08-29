@@ -45,7 +45,7 @@ impl State {
             .iter()
             .filter_map(|block| match block {
                 Block::Paragraph(p) => p.props.section_break.as_deref(),
-                Block::Table(_) | Block::Raw(_) => None,
+                Block::Table(_) | Block::SectionProperties(_) | Block::Raw(_) => None,
             })
             .map(str::to_string)
             .collect::<Vec<_>>();
@@ -84,7 +84,7 @@ impl State {
             .map(String::as_str)
             .eq(document.body.iter().filter_map(|block| match block {
                 Block::Paragraph(paragraph) => paragraph.props.section_break.as_deref(),
-                Block::Table(_) | Block::Raw(_) => None,
+                Block::Table(_) | Block::SectionProperties(_) | Block::Raw(_) => None,
             }))
     }
 

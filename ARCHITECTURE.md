@@ -31,8 +31,10 @@ world. Page geometry is optional pseudographics, not a pixel-accurate page.
 - Reproducing Word's exact *on-screen* fonts/sizes **in the terminal** — the TUI
   is a reduced, theme-quantized view by design. (Fidelity lives in the PDF
   output, §7b, not the terminal.)
-- Tracked changes, comments, footnotes/endnotes editing, fields recalculation,
-  embedded OLE objects (these are *preserved* on save, just not *edited*).
+- Automatically recording new edits as tracked revisions, editing form fields,
+  and embedded OLE objects. Imported tracked changes are modeled, rendered,
+  navigable, and accept/reject review actions are undoable; unsupported record
+  kinds remain preserved and explicitly reported.
 - Mail-merge, macros.
 
 ---

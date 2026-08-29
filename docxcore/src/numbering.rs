@@ -304,7 +304,7 @@ fn walk(
                     }
                 }
             }
-            Block::Raw(_) => {}
+            Block::SectionProperties(_) | Block::Raw(_) => {}
         }
         prefix.pop();
     }

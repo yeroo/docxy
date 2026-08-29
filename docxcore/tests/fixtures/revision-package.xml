@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document
+    xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    xmlns:ux="urn:docxy:revision-fixture">
+  <w:body>
+    <w:p>
+      <w:pPr>
+        <w:pStyle w:val="CurrentParagraph"/>
+        <w:sectPr>
+          <w:pgSz w:w="16838" w:h="11906" w:orient="landscape"/>
+          <w:sectPrChange w:id="106" w:author="Section Reviewer" w:date="2026-08-29T09:06:00Z" ux:producer="fixture-section">
+            <w:sectPr><w:pgSz w:w="11906" w:h="16838"/><ux:prior ux:name="portrait"/></w:sectPr>
+            <ux:audit ux:ticket="DOCX-106"/>
+          </w:sectPrChange>
+        </w:sectPr>
+        <w:pPrChange w:id="105" w:author="Paragraph Reviewer" w:date="2026-08-29T09:05:00Z" ux:producer="fixture-paragraph">
+          <w:pPr><w:pStyle w:val="PreviousParagraph"/><w:jc w:val="right"/><ux:prior ux:name="paragraph"/></w:pPr>
+          <ux:audit ux:ticket="DOCX-105"/>
+        </w:pPrChange>
+      </w:pPr>
+      <w:commentRangeStart w:id="0"/>
+      <w:r><w:t xml:space="preserve">Start </w:t></w:r>
+      <w:ins w:id="100" w:author="Ada Reviewer" w:date="2026-08-29T09:00:00Z" ux:session="outer-insert">
+        <w:r>
+          <w:rPr>
+            <w:b/>
+            <w:rPrChange w:id="101" w:author="Run Reviewer" w:date="2026-08-29T09:01:00Z" ux:producer="fixture-run">
+              <w:rPr><w:i/><ux:prior ux:name="run"/></w:rPr>
+              <ux:audit ux:ticket="DOCX-101"/>
+            </w:rPrChange>
+          </w:rPr>
+          <w:t xml:space="preserve">new </w:t>
+        </w:r>
+        <w:del w:id="102" w:author="Nested Reviewer" w:date="2026-08-29T09:02:00Z" ux:session="nested-delete">
+          <w:r><w:delText xml:space="preserve">nested old </w:delText></w:r>
+        </w:del>
+        <w:sdt>
+          <w:sdtPr><w:tag w:val="review-control"/><ux:controlData ux:val="kept"/></w:sdtPr>
+          <w:sdtContent><w:r><w:t xml:space="preserve">controlled </w:t></w:r></w:sdtContent>
+        </w:sdt>
+      </w:ins>
+      <w:del w:id="103" w:author="Delete Reviewer" w:date="2026-08-29T09:03:00Z" ux:session="outer-delete">
+        <w:r><w:delText xml:space="preserve">removed </w:delText></w:r>
+      </w:del>
+      <w:r><w:t>End</w:t></w:r>
+      <w:commentRangeEnd w:id="0"/>
+      <w:r><w:commentReference w:id="0"/></w:r>
+      <w:moveFromRangeStart w:id="199" w:author="Move Reviewer" ux:reason="unsupported-move"/>
+      <w:customXmlInsRangeStart w:id="198" w:author="Custom Reviewer" ux:reason="unsupported-custom"/>
+    </w:p>
+    <w:tbl>
+      <w:tblPr>
+        <w:tblStyle w:val="CurrentTable"/>
+        <w:shd w:fill="ABCDEF"/>
+        <w:tblPrChange w:id="110" w:author="Table Reviewer" w:date="2026-08-29T09:10:00Z" ux:producer="fixture-table">
+          <w:tblPr><w:tblStyle w:val="PreviousTable"/><w:tblLayout w:type="fixed"/><ux:prior ux:name="table"/></w:tblPr>
+          <ux:audit ux:ticket="DOCX-110"/>
+        </w:tblPrChange>
+      </w:tblPr>
+      <w:tblGrid><w:gridCol w:w="2400"/><w:gridCol w:w="2400"/></w:tblGrid>
+      <w:tr>
+        <w:trPr>
+          <w:tblHeader/>
+          <w:trPrChange w:id="111" w:author="Row Reviewer" w:date="2026-08-29T09:11:00Z" ux:producer="fixture-row">
+            <w:trPr><w:cantSplit/><ux:prior ux:name="row"/></w:trPr>
+            <ux:audit ux:ticket="DOCX-111"/>
+          </w:trPrChange>
+        </w:trPr>
+        <w:tc>
+          <w:tcPr>
+            <w:gridSpan w:val="2"/>
+            <w:shd w:fill="00FF00"/>
+            <w:tcPrChange w:id="112" w:author="Cell Reviewer" w:date="2026-08-29T09:12:00Z" ux:producer="fixture-cell">
+              <w:tcPr><w:gridSpan w:val="1"/><w:shd w:fill="FFFF00"/><ux:prior ux:name="cell"/></w:tcPr>
+              <ux:audit ux:ticket="DOCX-112"/>
+            </w:tcPrChange>
+          </w:tcPr>
+          <w:p>
+            <w:r><w:t xml:space="preserve">Cell </w:t></w:r>
+            <w:sdt>
+              <w:sdtPr><w:tag w:val="cell-control"/><ux:controlData ux:val="cell-kept"/></w:sdtPr>
+              <w:sdtContent><w:r><w:t xml:space="preserve">controlled </w:t></w:r></w:sdtContent>
+            </w:sdt>
+            <w:ins w:id="113" w:author="Cell Insert Reviewer" w:date="2026-08-29T09:13:00Z" ux:session="cell-insert">
+              <w:r><w:t>cell new</w:t></w:r>
+            </w:ins>
+          </w:p>
+        </w:tc>
+      </w:tr>
+    </w:tbl>
+    <w:p><w:r><w:t>Tail</w:t></w:r></w:p>
+    <w:sectPr><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440"/></w:sectPr>
+  </w:body>
+</w:document>

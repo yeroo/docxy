@@ -54,6 +54,14 @@ pub(crate) fn verb_for(name: &str) -> Option<&'static str> {
         "docxy_redo" => "doc.redo",
         "docxy_format" => "doc.format",
         "docxy_set_style" => "doc.set-style",
+        "docxy_revisions" => "doc.revisions",
+        "docxy_revision_current" => "doc.revision-current",
+        "docxy_revision_next" => "doc.revision-next",
+        "docxy_revision_previous" => "doc.revision-previous",
+        "docxy_revision_accept" => "doc.revision-accept",
+        "docxy_revision_reject" => "doc.revision-reject",
+        "docxy_revisions_accept_all" => "doc.revisions-accept-all",
+        "docxy_revisions_reject_all" => "doc.revisions-reject-all",
         _ => return None,
     })
 }
@@ -412,6 +420,66 @@ fn tool_defs() -> Json {
             ],
             &["start"],
         ),
+        tool(
+            "docxy_revisions",
+            "List tracked changes in document order with stable revision ids, kinds, metadata, and editor-safe locations.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_revision_current",
+            "Return the tracked change currently selected by review navigation or located at the caret.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_revision_next",
+            "Select and return the next tracked change, wrapping at the end of the document.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_revision_previous",
+            "Select and return the previous tracked change, wrapping at the start of the document.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_revision_accept",
+            "Accept one tracked change by its stable revision id. Undoable; returns a structured stale, unsupported, or malformed outcome.",
+            vec![
+                (
+                    "revision",
+                    prop("string", "Stable revision id returned by docxy_revisions."),
+                ),
+                target(),
+            ],
+            &["revision"],
+        ),
+        tool(
+            "docxy_revision_reject",
+            "Reject one tracked change by its stable revision id. Undoable; returns a structured stale, unsupported, or malformed outcome.",
+            vec![
+                (
+                    "revision",
+                    prop("string", "Stable revision id returned by docxy_revisions."),
+                ),
+                target(),
+            ],
+            &["revision"],
+        ),
+        tool(
+            "docxy_revisions_accept_all",
+            "Accept every supported tracked change as one undoable transaction and return each structured outcome.",
+            vec![target()],
+            &[],
+        ),
+        tool(
+            "docxy_revisions_reject_all",
+            "Reject every supported tracked change as one undoable transaction and return each structured outcome.",
+            vec![target()],
+            &[],
+        ),
     ])
 }
 
@@ -508,6 +576,15 @@ mod tests {
             // Wave-3: appended last, same relative order everywhere.
             "docxy_format",
             "docxy_set_style",
+            // Tracked-change review tools.
+            "docxy_revisions",
+            "docxy_revision_current",
+            "docxy_revision_next",
+            "docxy_revision_previous",
+            "docxy_revision_accept",
+            "docxy_revision_reject",
+            "docxy_revisions_accept_all",
+            "docxy_revisions_reject_all",
         ];
         let save_pos = names.iter().position(|n| *n == "docxy_save").unwrap();
         assert_eq!(
@@ -551,6 +628,14 @@ mod tests {
         assert_eq!(required_of("docxy_redo"), "[]");
         assert_eq!(required_of("docxy_format"), "[\"start\",\"patch\"]");
         assert_eq!(required_of("docxy_set_style"), "[\"start\"]");
+        assert_eq!(required_of("docxy_revisions"), "[]");
+        assert_eq!(required_of("docxy_revision_current"), "[]");
+        assert_eq!(required_of("docxy_revision_next"), "[]");
+        assert_eq!(required_of("docxy_revision_previous"), "[]");
+        assert_eq!(required_of("docxy_revision_accept"), "[\"revision\"]");
+        assert_eq!(required_of("docxy_revision_reject"), "[\"revision\"]");
+        assert_eq!(required_of("docxy_revisions_accept_all"), "[]");
+        assert_eq!(required_of("docxy_revisions_reject_all"), "[]");
     }
 
     /// Wave-2: `docxy_insert`/`docxy_replace_range`/`docxy_append` gain an
@@ -708,6 +793,14 @@ mod tests {
         ("docxy_redo", "doc.redo"),
         ("docxy_format", "doc.format"),
         ("docxy_set_style", "doc.set-style"),
+        ("docxy_revisions", "doc.revisions"),
+        ("docxy_revision_current", "doc.revision-current"),
+        ("docxy_revision_next", "doc.revision-next"),
+        ("docxy_revision_previous", "doc.revision-previous"),
+        ("docxy_revision_accept", "doc.revision-accept"),
+        ("docxy_revision_reject", "doc.revision-reject"),
+        ("docxy_revisions_accept_all", "doc.revisions-accept-all"),
+        ("docxy_revisions_reject_all", "doc.revisions-reject-all"),
     ];
     /// Tools handled specially in `do_tool` (not simple verb forwards), so
     /// `verb_for` deliberately returns `None` for them.
@@ -766,6 +859,10 @@ mod tests {
             ("docxy_redo", Content),
             ("docxy_format", Formatting),
             ("docxy_set_style", Formatting),
+            ("docxy_revision_accept", Content),
+            ("docxy_revision_reject", Content),
+            ("docxy_revisions_accept_all", Content),
+            ("docxy_revisions_reject_all", Content),
         ];
         for &(tool, mutation) in &expected {
             let verb = verb_for(tool).unwrap();

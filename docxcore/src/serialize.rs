@@ -3,8 +3,8 @@
 //! This is a *semantic* serializer: it re-emits the structure and properties we
 //! model (paragraphs, runs + rPr, tables, lists, hyperlinks). It is designed so
 //! that `parse_document_xml(document_to_xml(&doc)) == doc` for everything we
-//! model — see the round-trip tests. Body content we do not model (e.g.
-//! `sectPr`, bookmarks) is preserved separately by the package layer, not here.
+//! model — see the round-trip tests. Unknown body content remains raw, while the
+//! body-level final `sectPr` is modeled so its revision can be reviewed.
 
 use crate::model::*;
 use crate::xml::{Event, XmlParser};
@@ -128,6 +128,11 @@ fn write_block(s: &mut String, block: &Block) {
     match block {
         Block::Paragraph(p) => write_paragraph(s, p),
         Block::Table(t) => write_table(s, t),
+        Block::SectionProperties(section) => s.push_str(&with_property_change(
+            &section.raw,
+            "w:sectPr",
+            section.property_change.as_ref(),
+        )),
         Block::Raw(raw) => s.push_str(raw),
     }
 }
@@ -185,10 +190,13 @@ fn ppr_rank(local: &str) -> u32 {
         "sectPr",
         "pPrChange",
     ];
+    if local == "pPrChange" {
+        return u32::MAX;
+    }
     ORDER
         .iter()
         .position(|&e| e == local)
-        .map_or(u32::MAX, |i| i as u32)
+        .map_or(u32::MAX - 1, |i| i as u32)
 }
 
 /// The local element name of a serialized child (`"<w:spacing …/>"` → `spacing`),
@@ -203,6 +211,55 @@ fn local_name(raw: &str) -> &str {
         .unwrap_or(rest.len());
     let name = &rest[..end];
     name.rsplit(':').next().unwrap_or(name)
+}
+
+/// Append a tracked-property record as the final child of its current property
+/// container. Every `*PrChange` is last in the corresponding CT_*Pr schema.
+/// Parsed containers have already had this child separated by the loader; the
+/// containment check is a guard for manually-constructed legacy model values.
+fn with_property_change(
+    raw: &str,
+    container_name: &str,
+    change: Option<&PropertyChange>,
+) -> String {
+    let Some(change) = change else {
+        return raw.to_string();
+    };
+    if raw.contains(&change.raw) {
+        return raw.to_string();
+    }
+
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != container_name {
+        return format!("<{container_name}>{}</{container_name}>", change.raw);
+    }
+    let opening_end = parser.pos();
+    let opening = &raw[..opening_end];
+    if opening.trim_end().ends_with("/>") {
+        let Some(slash) = opening.rfind("/>") else {
+            return raw.to_string();
+        };
+        let mut out =
+            String::with_capacity(raw.len() + change.raw.len() + container_name.len() + 2);
+        out.push_str(&raw[..slash]);
+        out.push('>');
+        out.push_str(&change.raw);
+        out.push_str("</");
+        out.push_str(container_name);
+        out.push('>');
+        out.push_str(&raw[opening_end..]);
+        return out;
+    }
+
+    let close = format!("</{container_name}>");
+    let Some(close_at) = raw.rfind(&close) else {
+        return raw.to_string();
+    };
+    let mut out = String::with_capacity(raw.len() + change.raw.len());
+    out.push_str(&raw[..close_at]);
+    out.push_str(&change.raw);
+    out.push_str(&raw[close_at..]);
+    out
 }
 
 fn write_ppr(s: &mut String, props: &ParProps) {
@@ -224,7 +281,9 @@ fn write_ppr(s: &mut String, props: &ParProps) {
         || props.first_line != 0
         || !props.spacing.is_empty()
         || !props.tabs.is_empty()
-        || !props.raw_props.is_empty();
+        || !props.raw_props.is_empty()
+        || props.property_change.is_some()
+        || props.section_property_change.is_some();
     if !has_any {
         return;
     }
@@ -397,10 +456,27 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     // Preserved unmodeled pPr children (paragraph-mark `w:rPr`, `outlineLvl`,
     // shading, spacing, …), each ranked by its own element name.
     for raw in &props.raw_props {
-        parts.push((ppr_rank(local_name(raw)), raw.clone()));
+        let name = local_name(raw);
+        let superseded = matches!(name, "jc" if props.align != Align::Left)
+            || matches!(name, "bidi" if props.rtl)
+            || matches!(name, "pPrChange" if props.property_change.is_some());
+        if !superseded {
+            parts.push((ppr_rank(name), raw.clone()));
+        }
     }
     if let Some(sect) = &props.section_break {
-        parts.push((ppr_rank("sectPr"), sect.clone()));
+        parts.push((
+            ppr_rank("sectPr"),
+            with_property_change(sect, "w:sectPr", props.section_property_change.as_ref()),
+        ));
+    } else if let Some(change) = &props.section_property_change {
+        parts.push((
+            ppr_rank("sectPr"),
+            format!("<w:sectPr>{}</w:sectPr>", change.raw),
+        ));
+    }
+    if let Some(change) = &props.property_change {
+        parts.push((ppr_rank("pPrChange"), change.raw.clone()));
     }
 
     parts.sort_by_key(|(rank, _)| *rank);
@@ -411,9 +487,19 @@ fn write_ppr(s: &mut String, props: &ParProps) {
     s.push_str("</w:pPr>");
 }
 
+#[derive(Clone, Copy)]
+enum RunTextKind {
+    Normal,
+    Deleted,
+}
+
 fn write_inline(s: &mut String, item: &Inline) {
+    write_inline_with_text_kind(s, item, RunTextKind::Normal);
+}
+
+fn write_inline_with_text_kind(s: &mut String, item: &Inline, text_kind: RunTextKind) {
     match item {
-        Inline::Run(r) => write_run(s, r),
+        Inline::Run(r) => write_run(s, r, text_kind),
         Inline::Tab(props) => {
             s.push_str("<w:r>");
             write_rpr(s, props);
@@ -425,6 +511,38 @@ fn write_inline(s: &mut String, item: &Inline) {
             BreakKind::Column => s.push_str("<w:r><w:br w:type=\"column\"/></w:r>"),
         },
         Inline::Hyperlink(h) => {
+            if let Some(raw) = &h.raw
+                && !h.content_changed
+            {
+                s.push_str(raw);
+                return;
+            }
+            if let Some(raw) = &h.raw {
+                let mut parser = XmlParser::new(raw);
+                if parser.next() == Event::Start && parser.name() == "w:hyperlink" {
+                    let opening = &raw[..parser.pos()];
+                    if opening.trim_end().ends_with("/>") {
+                        if let Some(slash) = opening.rfind("/>") {
+                            s.push_str(&opening[..slash]);
+                            s.push('>');
+                        } else {
+                            s.push_str(opening);
+                        }
+                    } else {
+                        s.push_str(opening);
+                    }
+                } else {
+                    s.push_str("<w:hyperlink>");
+                }
+                for run in &h.runs {
+                    write_run(s, run, text_kind);
+                }
+                for item in &h.content {
+                    write_inline_with_text_kind(s, item, text_kind);
+                }
+                s.push_str("</w:hyperlink>");
+                return;
+            }
             s.push_str("<w:hyperlink");
             if let Some(id) = &h.rel_id {
                 s.push_str(" r:id=\"");
@@ -438,7 +556,10 @@ fn write_inline(s: &mut String, item: &Inline) {
             }
             s.push('>');
             for r in &h.runs {
-                write_run(s, r);
+                write_run(s, r, text_kind);
+            }
+            for item in &h.content {
+                write_inline_with_text_kind(s, item, text_kind);
             }
             s.push_str("</w:hyperlink>");
         }
@@ -446,9 +567,23 @@ fn write_inline(s: &mut String, item: &Inline) {
         Inline::Chart { raw, .. } => s.push_str(raw),
         Inline::Equation { raw, .. } => s.push_str(raw),
         Inline::Field { raw, .. } => s.push_str(raw),
-        // Tracked change: re-emit the original <w:ins>/<w:del> verbatim (the
-        // display `content` is not serialized).
-        Inline::Revision { raw, .. } => s.push_str(raw),
+        // Untouched tracked changes remain byte-faithful. If a descendant was
+        // acted on, retain the exact wrapper start tag/metadata and rebuild only
+        // its inline payload so the nested action survives save/reload.
+        Inline::Revision {
+            kind,
+            raw,
+            content,
+            content_changed,
+            ..
+        } => {
+            if *content_changed {
+                write_changed_revision(s, *kind, raw, content);
+            } else {
+                s.push_str(raw);
+            }
+        }
+        Inline::UnsupportedRevision { raw, .. } => s.push_str(raw),
         // Footnote/endnote reference: re-emit the original reference run verbatim.
         Inline::FootnoteRef { raw, .. } => s.push_str(raw),
         Inline::TextBox { raw, blocks } => {
@@ -468,19 +603,115 @@ fn write_inline(s: &mut String, item: &Inline) {
     }
 }
 
-fn write_run(s: &mut String, r: &Run) {
+fn write_changed_revision(s: &mut String, kind: RevisionKind, raw: &str, content: &[Inline]) {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start {
+        s.push_str(raw);
+        return;
+    }
+    let name = parser.name().to_string();
+    let opening_end = parser.pos();
+    let opening = &raw[..opening_end];
+    if opening.trim_end().ends_with("/>") {
+        if let Some(slash) = opening.rfind("/>") {
+            s.push_str(&opening[..slash]);
+            s.push('>');
+        } else {
+            s.push_str(opening);
+        }
+    } else {
+        s.push_str(opening);
+    }
+
+    let text_kind = match kind {
+        RevisionKind::Insert => RunTextKind::Normal,
+        RevisionKind::Delete => RunTextKind::Deleted,
+    };
+    for item in content {
+        write_inline_with_text_kind(s, item, text_kind);
+    }
+    s.push_str("</");
+    s.push_str(&name);
+    s.push('>');
+}
+
+fn write_run(s: &mut String, r: &Run, text_kind: RunTextKind) {
     s.push_str("<w:r>");
     write_rpr(s, &r.props);
-    s.push_str("<w:t xml:space=\"preserve\">");
+    match text_kind {
+        RunTextKind::Normal => s.push_str("<w:t xml:space=\"preserve\">"),
+        RunTextKind::Deleted => s.push_str("<w:delText xml:space=\"preserve\">"),
+    }
     esc_text(&r.text, s);
-    s.push_str("</w:t></w:r>");
+    match text_kind {
+        RunTextKind::Normal => s.push_str("</w:t></w:r>"),
+        RunTextKind::Deleted => s.push_str("</w:delText></w:r>"),
+    }
+}
+
+fn rpr_rank(local: &str) -> u32 {
+    const ORDER: [&str; 41] = [
+        "rStyle",
+        "rFonts",
+        "b",
+        "bCs",
+        "i",
+        "iCs",
+        "caps",
+        "smallCaps",
+        "strike",
+        "dstrike",
+        "outline",
+        "shadow",
+        "emboss",
+        "imprint",
+        "noProof",
+        "snapToGrid",
+        "vanish",
+        "webHidden",
+        "color",
+        "spacing",
+        "w",
+        "kern",
+        "position",
+        "sz",
+        "szCs",
+        "highlight",
+        "u",
+        "effect",
+        "bdr",
+        "shd",
+        "fitText",
+        "vertAlign",
+        "rtl",
+        "cs",
+        "em",
+        "lang",
+        "eastAsianLayout",
+        "specVanish",
+        "oMath",
+        "rPrChange",
+        "ins",
+    ];
+    if local == "rPrChange" {
+        return u32::MAX;
+    }
+    ORDER
+        .iter()
+        .position(|&element| element == local)
+        .map_or(u32::MAX - 1, |index| index as u32)
 }
 
 fn write_rpr(s: &mut String, p: &RunProps) {
+    // Revision underline/strike are renderer cues, never direct OOXML
+    // properties. Preserve a genuine direct value, but omit a cue that was
+    // introduced only by an enclosing insertion/deletion wrapper.
+    let underline = p.underline && !p.revision_cues.underline_added;
+    let strike = p.strike && !p.revision_cues.strike_added;
     let has_any = p.bold
         || p.italic
-        || p.underline
-        || p.strike
+        || underline
+        || strike
         || p.code
         || p.caps
         || p.small_caps
@@ -491,11 +722,12 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         || p.size_half_pts.is_some()
         || p.font.is_some()
         || p.style_id.is_some()
-        || !p.raw_props.is_empty();
+        || !p.raw_props.is_empty()
+        || p.property_change.is_some();
     if !has_any {
         return;
     }
-    s.push_str("<w:rPr>");
+    let mut parts: Vec<(u32, String)> = Vec::new();
     // Inline code carries the "Code" character style unless a more specific
     // character style is already set (which then implies the code styling).
     let rstyle = p
@@ -503,57 +735,92 @@ fn write_rpr(s: &mut String, p: &RunProps) {
         .as_deref()
         .or(if p.code { Some("Code") } else { None });
     if let Some(st) = rstyle {
-        s.push_str("<w:rStyle w:val=\"");
-        esc_attr(st, s);
-        s.push_str("\"/>");
+        let mut xml = String::from("<w:rStyle w:val=\"");
+        esc_attr(st, &mut xml);
+        xml.push_str("\"/>");
+        parts.push((rpr_rank("rStyle"), xml));
     }
     if let Some(f) = &p.font {
-        s.push_str("<w:rFonts w:ascii=\"");
-        esc_attr(f, s);
-        s.push_str("\"/>");
+        let mut xml = String::from("<w:rFonts w:ascii=\"");
+        esc_attr(f, &mut xml);
+        xml.push_str("\"/>");
+        parts.push((rpr_rank("rFonts"), xml));
     }
     if p.bold {
-        s.push_str("<w:b/>");
+        parts.push((rpr_rank("b"), "<w:b/>".to_string()));
     }
     if p.italic {
-        s.push_str("<w:i/>");
+        parts.push((rpr_rank("i"), "<w:i/>".to_string()));
     }
     if p.caps {
-        s.push_str("<w:caps/>");
+        parts.push((rpr_rank("caps"), "<w:caps/>".to_string()));
     }
     if p.small_caps {
-        s.push_str("<w:smallCaps/>");
+        parts.push((rpr_rank("smallCaps"), "<w:smallCaps/>".to_string()));
     }
-    if p.strike {
-        s.push_str("<w:strike/>");
+    if strike {
+        parts.push((rpr_rank("strike"), "<w:strike/>".to_string()));
     }
     if p.vanish {
-        s.push_str("<w:vanish/>");
+        parts.push((rpr_rank("vanish"), "<w:vanish/>".to_string()));
     }
     if let Some(c) = &p.color {
-        s.push_str("<w:color w:val=\"");
-        esc_attr(c, s);
-        s.push_str("\"/>");
+        let mut xml = String::from("<w:color w:val=\"");
+        esc_attr(c, &mut xml);
+        xml.push_str("\"/>");
+        parts.push((rpr_rank("color"), xml));
     }
     if let Some(sz) = p.size_half_pts {
-        s.push_str(&format!("<w:sz w:val=\"{sz}\"/>"));
+        parts.push((rpr_rank("sz"), format!("<w:sz w:val=\"{sz}\"/>")));
     }
     if let Some(h) = &p.highlight {
-        s.push_str("<w:highlight w:val=\"");
-        esc_attr(h, s);
-        s.push_str("\"/>");
+        let mut xml = String::from("<w:highlight w:val=\"");
+        esc_attr(h, &mut xml);
+        xml.push_str("\"/>");
+        parts.push((rpr_rank("highlight"), xml));
     }
-    if p.underline {
-        s.push_str("<w:u w:val=\"single\"/>");
+    if underline {
+        parts.push((rpr_rank("u"), "<w:u w:val=\"single\"/>".to_string()));
     }
     match p.vert_align {
         VertAlign::Baseline => {}
-        VertAlign::Superscript => s.push_str("<w:vertAlign w:val=\"superscript\"/>"),
-        VertAlign::Subscript => s.push_str("<w:vertAlign w:val=\"subscript\"/>"),
+        VertAlign::Superscript => parts.push((
+            rpr_rank("vertAlign"),
+            "<w:vertAlign w:val=\"superscript\"/>".to_string(),
+        )),
+        VertAlign::Subscript => parts.push((
+            rpr_rank("vertAlign"),
+            "<w:vertAlign w:val=\"subscript\"/>".to_string(),
+        )),
     }
-    // Preserved unmodeled rPr children (character spacing, kern, lang, shd, …).
+    // Explicit-off toggles are retained as raw children so they remain distinct
+    // from absent/style-derived values. A later direct edit to the same primary
+    // property wins without emitting a contradictory duplicate.
     for raw in &p.raw_props {
-        s.push_str(raw);
+        let name = local_name(raw);
+        let superseded = matches!(name, "b" if p.bold)
+            || matches!(name, "i" if p.italic)
+            || matches!(name, "caps" if p.caps)
+            || matches!(name, "smallCaps" if p.small_caps)
+            || matches!(name, "strike" if strike)
+            || matches!(name, "vanish" if p.vanish)
+            || matches!(name, "color" if p.color.is_some())
+            || matches!(name, "sz" if p.size_half_pts.is_some())
+            || matches!(name, "highlight" if p.highlight.is_some())
+            || matches!(name, "u" if underline)
+            || matches!(name, "vertAlign" if p.vert_align != VertAlign::Baseline)
+            || matches!(name, "rPrChange" if p.property_change.is_some());
+        if !superseded {
+            parts.push((rpr_rank(name), raw.clone()));
+        }
+    }
+    if let Some(change) = &p.property_change {
+        parts.push((rpr_rank("rPrChange"), change.raw.clone()));
+    }
+    parts.sort_by_key(|(rank, _)| *rank);
+    s.push_str("<w:rPr>");
+    for (_, xml) in parts {
+        s.push_str(&xml);
     }
     s.push_str("</w:rPr>");
 }
@@ -577,7 +844,13 @@ fn write_table(s: &mut String, t: &Table) {
     s.push('>');
     // tblPr is the first tbl child; preserved verbatim when present.
     if let Some(raw) = &t.raw_tblpr {
-        s.push_str(raw);
+        s.push_str(&with_property_change(
+            raw,
+            "w:tblPr",
+            t.property_change.as_ref(),
+        ));
+    } else if let Some(change) = &t.property_change {
+        s.push_str(&format!("<w:tblPr>{}</w:tblPr>", change.raw));
     }
     if !t.grid.is_empty() {
         s.push_str("<w:tblGrid>");
@@ -867,8 +1140,23 @@ fn write_sdt_close(s: &mut String, raw: &str, content_needs_close: bool) {
 fn write_row(s: &mut String, row: &Row) {
     s.push_str("<w:tr>");
     // trPr / tblPrEx precede the cells; preserved verbatim.
+    let mut wrote_change = false;
     for raw in &row.raw_props {
-        s.push_str(raw);
+        if local_name(raw) == "trPr" {
+            s.push_str(&with_property_change(
+                raw,
+                "w:trPr",
+                row.property_change.as_ref(),
+            ));
+            wrote_change = row.property_change.is_some();
+        } else {
+            s.push_str(raw);
+        }
+    }
+    if !wrote_change {
+        if let Some(change) = &row.property_change {
+            s.push_str(&format!("<w:trPr>{}</w:trPr>", change.raw));
+        }
     }
     for cell in &row.cells {
         write_cell(s, cell);
@@ -881,7 +1169,11 @@ fn write_cell(s: &mut String, cell: &Cell) {
     if let Some(raw) = &cell.raw_tcpr {
         // The original tcPr (already carries gridSpan/vMerge) — re-emit as-is so
         // borders/shading/width/vAlign survive.
-        s.push_str(raw);
+        s.push_str(&with_property_change(
+            raw,
+            "w:tcPr",
+            cell.property_change.as_ref(),
+        ));
     } else if cell.grid_span > 1 || cell.v_merge != VMerge::None {
         // A cell created in-editor: synthesize tcPr from the model.
         s.push_str("<w:tcPr>");
@@ -893,7 +1185,12 @@ fn write_cell(s: &mut String, cell: &Cell) {
             VMerge::Restart => s.push_str("<w:vMerge w:val=\"restart\"/>"),
             VMerge::Continue => s.push_str("<w:vMerge/>"),
         }
+        if let Some(change) = &cell.property_change {
+            s.push_str(&change.raw);
+        }
         s.push_str("</w:tcPr>");
+    } else if let Some(change) = &cell.property_change {
+        s.push_str(&format!("<w:tcPr>{}</w:tcPr>", change.raw));
     }
     if cell.blocks.is_empty() {
         // A table cell must contain at least one block to be valid OOXML.
@@ -1000,6 +1297,7 @@ mod tests {
             rows: vec![Row {
                 cells: vec![cell],
                 raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
+                property_change: None,
             }],
             namespace_declarations: vec![],
             markup_compatibility_attributes: vec![],
@@ -1008,6 +1306,7 @@ mod tests {
                 "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
                     .to_string(),
             ),
+            property_change: None,
         };
         let d = Document {
             body: vec![para(ppr, vec![]), Block::Table(table)],
@@ -1465,6 +1764,7 @@ mod tests {
                 text: "click".to_string(),
                 props: RunProps::default(),
             }],
+            ..Hyperlink::default()
         });
         let d = Document {
             body: vec![para(ParProps::default(), vec![h])],

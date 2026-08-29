@@ -40,6 +40,7 @@ part, and adding a comment is Comment even though it also adds body anchors.
 | Insert ribbon/dialogs | table, page break, section break | Structure |
 | Document layout | columns, hyphenation, section orientation | Formatting |
 | Review | commit new comment and delete comment | Comment |
+| Review | accept/reject current or confirmed accept/reject all tracked changes | Content |
 | Header/footer | typing, deletion, formatting, paste, and committing the edited part | same Content, Structure, or Formatting class as the body operation |
 | Vim insert mode | typing, newline, deletion, paste | Content or Structure as above |
 | Vim normal/visual mode | `x`, `d`, `c`, `D`, `dd`, paste, `o`/`O`, undo, redo | Content or Structure as above |
@@ -74,6 +75,8 @@ open, navigation, and cancel paths are non-mutating.
 | `doc.format` | Formatting |
 | `doc.set-style` | Formatting |
 | `doc.undo`, `doc.redo` | Content |
+| `doc.revision-accept`, `doc.revision-reject` | Content |
+| `doc.revisions-accept-all`, `doc.revisions-reject-all` | Content |
 
 The Markdown forms of replace/insert/append keep their Structure requirement and
 add a Formatting requirement when parsed blocks carry styles, numbering, or
@@ -81,7 +84,10 @@ direct formatting. All other current control verbs
 are read, export, persistence, or document-lifecycle operations. MCP has no
 independent mutation implementation: `docxy_replace_range`, `docxy_insert`,
 `docxy_append`, `docxy_replace_all`, `docxy_format`, `docxy_set_style`,
-`docxy_undo`, and `docxy_redo` map one-to-one to the control verbs above.
+`docxy_undo`, `docxy_redo`, `docxy_revision_accept`, `docxy_revision_reject`,
+`docxy_revisions_accept_all`, and `docxy_revisions_reject_all` map one-to-one
+to the control verbs above. Revision listing/current/previous/next are
+non-mutating navigation and inspection routes.
 
 ## Authorization matrix
 

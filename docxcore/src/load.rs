@@ -550,7 +550,9 @@ pub fn parse_document_xml(xml: &str, rels: &Relationships) -> Document {
             _ => {}
         }
     }
-    Document { body }
+    let mut document = Document { body };
+    document.initialize_revision_targets();
+    document
 }
 
 /// Parse a header (`word/headerN.xml`) or footer (`word/footerN.xml`) part into
@@ -701,8 +703,17 @@ fn parse_blocks_until_end(p: &mut XmlParser, rels: &Relationships) -> Vec<Block>
                 // pages, TOC, …) — unwrap and parse its content so it's visible.
                 // The control wrapper itself is not reconstructed on save.
                 "w:sdt" => parse_sdt_block(p, rels, &mut blocks),
-                // sectPr is preserved by the package layer; don't duplicate it.
-                "w:sectPr" => p.skip_element(),
+                "w:sectPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    let raw = p.raw_slice(start, p.pos());
+                    let (current, property_change) =
+                        split_property_change_container(raw, PropertyScope::Section);
+                    blocks.push(Block::SectionProperties(SectionProperties {
+                        raw: current,
+                        property_change,
+                    }));
+                }
                 // Block-level OMML math: a paragraph holding the text equation.
                 "m:oMathPara" | "m:oMath" => {
                     let start = p.start_pos();
@@ -779,13 +790,7 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                         latex: None,
                     });
                 }
-                _ => {
-                    // Unmodeled inline content (bookmarks, fields): preserve raw.
-                    let start = p.start_pos();
-                    p.skip_element();
-                    para.content
-                        .push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
-                }
+                _ => parse_raw_or_unsupported_revision(p, &mut para.content),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -873,11 +878,7 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                 "w:fldSimple" => parse_fld_simple(p, rels, out),
                 "w:smartTag" => parse_inlines_into(p, rels, out),
                 "w:sdt" => parse_inline_sdt(p, rels, out),
-                _ => {
-                    let start = p.start_pos();
-                    p.skip_element();
-                    out.push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
-                }
+                _ => parse_raw_or_unsupported_revision(p, out),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -890,6 +891,7 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
 /// is marked struck-through and inserted content underlined, so both are visible
 /// and distinguishable. The `content` is display-only — save re-emits `raw`.
 fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -> Inline {
+    let metadata = parse_revision_metadata(p);
     let start = p.start_pos();
     let mut content = Vec::new();
     parse_inlines_into(p, rels, &mut content);
@@ -897,15 +899,262 @@ fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -
     for inl in &mut content {
         mark_revision(inl, kind);
     }
-    Inline::Revision { kind, raw, content }
+    Inline::Revision {
+        kind,
+        metadata,
+        raw,
+        content,
+        content_changed: false,
+    }
+}
+
+fn parse_revision_metadata(p: &XmlParser) -> RevisionMetadata {
+    let mut metadata = RevisionMetadata::default();
+    for attr in p.attrs() {
+        let value = decode_attr(attr.value);
+        match attr.name {
+            "w:id" => metadata.id = Some(value),
+            "w:author" => metadata.author = Some(value),
+            "w:date" => metadata.date = Some(value),
+            _ => metadata
+                .unknown_attributes
+                .push((attr.name.to_string(), value)),
+        }
+    }
+    metadata
+}
+
+fn property_element_names(scope: PropertyScope) -> (&'static str, &'static str) {
+    match scope {
+        PropertyScope::Run => ("w:rPrChange", "w:rPr"),
+        PropertyScope::Paragraph => ("w:pPrChange", "w:pPr"),
+        PropertyScope::Table => ("w:tblPrChange", "w:tblPr"),
+        PropertyScope::TableRow => ("w:trPrChange", "w:trPr"),
+        PropertyScope::TableCell => ("w:tcPrChange", "w:tcPr"),
+        PropertyScope::Section => ("w:sectPrChange", "w:sectPr"),
+    }
+}
+
+/// Parse a complete `*PrChange` wrapper while retaining its exact XML. Unknown
+/// wrapper children do not make an otherwise valid prior snapshot unusable.
+fn parse_property_change(p: &mut XmlParser, scope: PropertyScope) -> PropertyChange {
+    let metadata = parse_revision_metadata(p);
+    let start = p.start_pos();
+    let complete = p.skip_element_complete();
+    let raw = p.raw_slice(start, p.pos()).to_string();
+    let previous = if complete {
+        parse_property_snapshot(&raw, scope)
+    } else {
+        PropertySnapshot::Malformed(raw.clone())
+    };
+    PropertyChange {
+        scope,
+        metadata,
+        raw,
+        previous,
+    }
+}
+
+fn parse_property_snapshot(raw: &str, scope: PropertyScope) -> PropertySnapshot {
+    let (_, snapshot_name) = property_element_names(scope);
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start {
+        return PropertySnapshot::Malformed(raw.to_string());
+    }
+
+    let mut snapshot = None;
+    let mut saw_other_content = false;
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let start = parser.start_pos();
+                let is_snapshot = parser.name() == snapshot_name;
+                let complete = parser.skip_element_complete();
+                if is_snapshot {
+                    if snapshot.is_some() || !complete {
+                        return PropertySnapshot::Malformed(raw.to_string());
+                    }
+                    snapshot = Some(parser.raw_slice(start, parser.pos()).to_string());
+                } else {
+                    saw_other_content = true;
+                }
+            }
+            Event::Text => {
+                if !parser.text().trim().is_empty() {
+                    saw_other_content = true;
+                }
+            }
+            Event::End => break,
+            Event::Eof => return PropertySnapshot::Malformed(raw.to_string()),
+        }
+    }
+
+    match snapshot {
+        Some(snapshot) => parse_present_property_snapshot(&snapshot, scope).map_or_else(
+            || PropertySnapshot::Malformed(snapshot),
+            PropertySnapshot::Present,
+        ),
+        None if saw_other_content => PropertySnapshot::Malformed(raw.to_string()),
+        None => PropertySnapshot::Absent,
+    }
+}
+
+fn parse_present_property_snapshot(raw: &str, scope: PropertyScope) -> Option<PropertyState> {
+    let (_, expected_name) = property_element_names(scope);
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != expected_name {
+        return None;
+    }
+    Some(match scope {
+        PropertyScope::Run => {
+            let mut props = RunProps::default();
+            parse_rpr(&mut parser, &mut props);
+            // A prior snapshot cannot itself own the current change record.
+            props.property_change = None;
+            PropertyState::Run(Box::new(props))
+        }
+        PropertyScope::Paragraph => {
+            let mut props = ParProps::default();
+            parse_ppr(&mut parser, &mut props);
+            props.property_change = None;
+            if props.heading_level.is_none() {
+                if let Some(style_id) = &props.style_id {
+                    props.heading_level = heading_level(style_id);
+                }
+            }
+            PropertyState::Paragraph(Box::new(props))
+        }
+        PropertyScope::Table => PropertyState::Table(raw.to_string()),
+        PropertyScope::TableRow => PropertyState::TableRow(raw.to_string()),
+        PropertyScope::TableCell => PropertyState::TableCell(raw.to_string()),
+        PropertyScope::Section => PropertyState::Section(raw.to_string()),
+    })
+}
+
+/// Remove the first direct `*PrChange` child from a raw current-property
+/// container and model it separately. Other raw children and whitespace keep
+/// their exact relative positions.
+pub(crate) fn split_property_change_container(
+    raw: &str,
+    scope: PropertyScope,
+) -> (String, Option<PropertyChange>) {
+    let (change_name, _) = property_element_names(scope);
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start {
+        return (raw.to_string(), None);
+    }
+
+    loop {
+        match parser.next() {
+            Event::Start if parser.name() == change_name => {
+                let start = parser.start_pos();
+                let change = parse_property_change(&mut parser, scope);
+                let end = parser.pos();
+                let mut current = String::with_capacity(raw.len() - (end - start));
+                current.push_str(&raw[..start]);
+                current.push_str(&raw[end..]);
+                return (current, Some(change));
+            }
+            Event::Start => parser.skip_element(),
+            Event::End | Event::Eof => return (raw.to_string(), None),
+            Event::Text => {}
+        }
+    }
+}
+
+fn unsupported_revision_kind(name: &str) -> Option<UnsupportedRevisionKind> {
+    Some(match name {
+        "w:moveFrom" => UnsupportedRevisionKind::MoveFrom,
+        "w:moveTo" => UnsupportedRevisionKind::MoveTo,
+        "w:moveFromRangeStart" => UnsupportedRevisionKind::MoveFromRangeStart,
+        "w:moveFromRangeEnd" => UnsupportedRevisionKind::MoveFromRangeEnd,
+        "w:moveToRangeStart" => UnsupportedRevisionKind::MoveToRangeStart,
+        "w:moveToRangeEnd" => UnsupportedRevisionKind::MoveToRangeEnd,
+        "w:customXmlInsRangeStart" => UnsupportedRevisionKind::CustomXmlInsRangeStart,
+        "w:customXmlInsRangeEnd" => UnsupportedRevisionKind::CustomXmlInsRangeEnd,
+        "w:customXmlDelRangeStart" => UnsupportedRevisionKind::CustomXmlDelRangeStart,
+        "w:customXmlDelRangeEnd" => UnsupportedRevisionKind::CustomXmlDelRangeEnd,
+        "w:customXmlMoveFromRangeStart" => UnsupportedRevisionKind::CustomXmlMoveFromRangeStart,
+        "w:customXmlMoveFromRangeEnd" => UnsupportedRevisionKind::CustomXmlMoveFromRangeEnd,
+        "w:customXmlMoveToRangeStart" => UnsupportedRevisionKind::CustomXmlMoveToRangeStart,
+        "w:customXmlMoveToRangeEnd" => UnsupportedRevisionKind::CustomXmlMoveToRangeEnd,
+        "w:cellIns" => UnsupportedRevisionKind::CellInsert,
+        "w:cellDel" => UnsupportedRevisionKind::CellDelete,
+        "w:cellMerge" => UnsupportedRevisionKind::CellMerge,
+        "w:conflictIns" => UnsupportedRevisionKind::ConflictInsert,
+        "w:conflictDel" => UnsupportedRevisionKind::ConflictDelete,
+        _ => return None,
+    })
+}
+
+/// Preserve ordinary unknown inline XML as `Raw`, but classify known revision
+/// records so review enumeration can return an explicit unsupported result.
+fn parse_raw_or_unsupported_revision(p: &mut XmlParser, out: &mut Vec<Inline>) {
+    let kind = unsupported_revision_kind(p.name());
+    let metadata = kind.as_ref().map(|_| parse_revision_metadata(p));
+    let start = p.start_pos();
+    p.skip_element();
+    let raw = p.raw_slice(start, p.pos()).to_string();
+    match (kind, metadata) {
+        (Some(kind), Some(metadata)) => out.push(Inline::UnsupportedRevision {
+            kind,
+            metadata,
+            raw,
+        }),
+        _ => out.push(Inline::Raw(raw)),
+    }
+}
+
+fn unsupported_cell_revisions(raw: &str) -> Vec<UnsupportedPropertyRevision> {
+    let mut parser = XmlParser::new(raw);
+    if parser.next() != Event::Start || parser.name() != "w:tcPr" {
+        return Vec::new();
+    }
+    let mut revisions = Vec::new();
+    loop {
+        match parser.next() {
+            Event::Start => {
+                let kind = unsupported_revision_kind(parser.name()).filter(|kind| {
+                    matches!(
+                        kind,
+                        UnsupportedRevisionKind::CellInsert
+                            | UnsupportedRevisionKind::CellDelete
+                            | UnsupportedRevisionKind::CellMerge
+                    )
+                });
+                if let Some(kind) = kind {
+                    let metadata = parse_revision_metadata(&parser);
+                    parser.skip_element();
+                    revisions.push(UnsupportedPropertyRevision { kind, metadata });
+                } else {
+                    parser.skip_element();
+                }
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    revisions
 }
 
 /// Bake a tracked-change display cue into a run tree: strikethrough for a
 /// deletion, underline for an insertion (Word's markup convention).
 fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
     let apply = |props: &mut RunProps| match kind {
-        RevisionKind::Delete => props.strike = true,
-        RevisionKind::Insert => props.underline = true,
+        RevisionKind::Delete => {
+            if props.revision_cues.deletions == 0 && !props.strike {
+                props.strike = true;
+                props.revision_cues.strike_added = true;
+            }
+            props.revision_cues.deletions = props.revision_cues.deletions.saturating_add(1);
+        }
+        RevisionKind::Insert => {
+            if props.revision_cues.insertions == 0 && !props.underline {
+                props.underline = true;
+                props.revision_cues.underline_added = true;
+            }
+            props.revision_cues.insertions = props.revision_cues.insertions.saturating_add(1);
+        }
     };
     match inl {
         Inline::Run(r) => apply(&mut r.props),
@@ -913,6 +1162,9 @@ fn mark_revision(inl: &mut Inline, kind: RevisionKind) {
         Inline::Hyperlink(h) => {
             for r in &mut h.runs {
                 apply(&mut r.props);
+            }
+            for child in &mut h.content {
+                mark_revision(child, kind);
             }
         }
         Inline::Revision { content, .. } => {
@@ -953,12 +1205,26 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     p.skip_element();
                 }
                 "w:jc" => {
+                    let start = p.start_pos();
                     props.align = map_align(p.attr("w:val"));
                     p.skip_element();
+                    // Explicit left is distinct from no direct value: it can
+                    // override a centered/right paragraph style.
+                    if props.align == Align::Left {
+                        props
+                            .raw_props
+                            .push(p.raw_slice(start, p.pos()).to_string());
+                    }
                 }
                 "w:bidi" => {
+                    let start = p.start_pos();
                     props.rtl = toggle_on(p.attr("w:val"));
                     p.skip_element();
+                    if !props.rtl {
+                        props
+                            .raw_props
+                            .push(p.raw_slice(start, p.pos()).to_string());
+                    }
                 }
                 "w:numPr" => parse_numpr(p, props),
                 "w:tabs" => parse_tab_stops(p, &mut props.tabs),
@@ -993,10 +1259,19 @@ fn parse_ppr(p: &mut XmlParser, props: &mut ParProps) {
                     p.skip_element();
                 }
                 "w:sectPr" => {
-                    // A mid-document section break — preserve it verbatim.
+                    // A mid-document section break. Its current properties stay
+                    // exact XML while a tracked prior snapshot is actionable.
                     let start = p.start_pos();
                     p.skip_element();
-                    props.section_break = Some(p.raw_slice(start, p.pos()).to_string());
+                    let raw = p.raw_slice(start, p.pos());
+                    let (current, change) =
+                        split_property_change_container(raw, PropertyScope::Section);
+                    props.section_break = Some(current);
+                    props.section_property_change = change;
+                }
+                "w:pPrChange" => {
+                    props.property_change =
+                        Some(parse_property_change(p, PropertyScope::Paragraph));
                 }
                 "w:framePr" => {
                     props.frame = Some(FramePr {
@@ -1130,6 +1405,7 @@ fn parse_run(p: &mut XmlParser, out: &mut Vec<Inline>) -> bool {
                 | "w:object"
                 | "w:fldChar"
                 | "w:instrText"
+                | "w:delInstrText"
                 | "w:sym"
                 | "w:commentReference"
                 | "w:footnoteReference"
@@ -1156,13 +1432,50 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                 let start = p.start_pos();
                 let mut modeled = true;
                 match name {
-                    "w:b" | "w:bCs" => props.bold = toggle_on(val),
-                    "w:i" | "w:iCs" => props.italic = toggle_on(val),
-                    "w:u" => props.underline = toggle_on(val),
-                    "w:strike" | "w:dstrike" => props.strike = toggle_on(val),
-                    "w:caps" => props.caps = toggle_on(val),
-                    "w:smallCaps" => props.small_caps = toggle_on(val),
-                    "w:vanish" | "w:webHidden" => props.vanish = toggle_on(val),
+                    "w:b" => {
+                        props.bold = toggle_on(val);
+                        modeled = props.bold;
+                    }
+                    "w:bCs" => {
+                        props.bold = toggle_on(val);
+                        modeled = false;
+                    }
+                    "w:i" => {
+                        props.italic = toggle_on(val);
+                        modeled = props.italic;
+                    }
+                    "w:iCs" => {
+                        props.italic = toggle_on(val);
+                        modeled = false;
+                    }
+                    "w:u" => {
+                        props.underline = toggle_on(val);
+                        modeled = props.underline;
+                    }
+                    "w:strike" => {
+                        props.strike = toggle_on(val);
+                        modeled = props.strike;
+                    }
+                    "w:dstrike" => {
+                        props.strike = toggle_on(val);
+                        modeled = false;
+                    }
+                    "w:caps" => {
+                        props.caps = toggle_on(val);
+                        modeled = props.caps;
+                    }
+                    "w:smallCaps" => {
+                        props.small_caps = toggle_on(val);
+                        modeled = props.small_caps;
+                    }
+                    "w:vanish" => {
+                        props.vanish = toggle_on(val);
+                        modeled = props.vanish;
+                    }
+                    "w:webHidden" => {
+                        props.vanish = toggle_on(val);
+                        modeled = false;
+                    }
                     "w:vertAlign" => {
                         props.vert_align = match val {
                             "superscript" => VertAlign::Superscript,
@@ -1199,6 +1512,10 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                             props.code = true;
                         }
                     }
+                    "w:rPrChange" => {
+                        props.property_change = Some(parse_property_change(p, PropertyScope::Run));
+                        continue;
+                    }
                     // `w:rStyle` with an empty val, or anything else we don't
                     // model, is preserved verbatim (character spacing, kern,
                     // lang, shd, effect, …) so save doesn't drop it.
@@ -1218,11 +1535,16 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
     }
 }
 
-/// Parse a `<w:hyperlink>`, pushing into `out`. An **external** link (resolvable
-/// `r:id` target) is kept as a clickable [`Inline::Hyperlink`]; an internal
-/// anchor (TOC entries, cross-references) is **unwrapped** so its inline content
-/// — including tabs — renders normally (the link itself isn't actionable here).
+/// Parse a `<w:hyperlink>`, pushing into `out`. External links and internal
+/// anchors with complex children stay as one lossless [`Inline::Hyperlink`].
+/// Simple internal TOC links are split around tabs/breaks so leader stops keep
+/// rendering while each run segment remains navigable.
 fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inline>) {
+    let raw_start = p.start_pos();
+    let preserve_opener = p
+        .attrs()
+        .iter()
+        .any(|attr| !matches!(attr.name, "r:id" | "w:anchor"));
     let rid = decode_attr(p.attr("r:id"));
     let anchor_attr = decode_attr(p.attr("w:anchor"));
     let target = if rid.is_empty() {
@@ -1241,6 +1563,41 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
         if let Some(anchor) = anchor {
             let mut inner = Vec::new();
             parse_inlines_into(p, rels, &mut inner);
+            let raw = p.raw_slice(raw_start, p.pos()).to_string();
+            if inner
+                .iter()
+                .any(|inline| !matches!(inline, Inline::Run(_) | Inline::Tab(_) | Inline::Break(_)))
+            {
+                out.push(Inline::Hyperlink(Hyperlink {
+                    target: None,
+                    anchor: Some(anchor),
+                    rel_id,
+                    runs: Vec::new(),
+                    content: inner,
+                    raw: Some(raw),
+                    content_changed: false,
+                }));
+                return;
+            }
+            if inner.iter().all(|inline| matches!(inline, Inline::Run(_))) {
+                let runs = inner
+                    .into_iter()
+                    .map(|inline| match inline {
+                        Inline::Run(run) => run,
+                        _ => unreachable!(),
+                    })
+                    .collect();
+                out.push(Inline::Hyperlink(Hyperlink {
+                    target: None,
+                    anchor: Some(anchor),
+                    rel_id,
+                    runs,
+                    content: Vec::new(),
+                    raw: preserve_opener.then_some(raw),
+                    content_changed: preserve_opener,
+                }));
+                return;
+            }
             let mut runs: Vec<Run> = Vec::new();
             for it in inner {
                 match it {
@@ -1252,6 +1609,9 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
                                 anchor: Some(anchor.clone()),
                                 rel_id: rel_id.clone(),
                                 runs: std::mem::take(&mut runs),
+                                content: Vec::new(),
+                                raw: preserve_opener.then(|| raw.clone()),
+                                content_changed: preserve_opener,
                             }));
                         }
                         out.push(other);
@@ -1264,6 +1624,9 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
                     anchor: Some(anchor),
                     rel_id,
                     runs,
+                    content: Vec::new(),
+                    raw: preserve_opener.then_some(raw),
+                    content_changed: preserve_opener,
                 }));
             }
         } else {
@@ -1272,30 +1635,35 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
         return;
     }
 
-    let mut runs = Vec::new();
-    loop {
-        match p.next() {
-            Event::Start => match p.name() {
-                "w:r" => {
-                    let mut tmp = Vec::new();
-                    parse_run(p, &mut tmp);
-                    for it in tmp {
-                        if let Inline::Run(r) = it {
-                            runs.push(r);
-                        }
-                    }
-                }
-                _ => p.skip_element(),
-            },
-            Event::End | Event::Eof => break,
-            Event::Text => {}
-        }
-    }
+    let mut content = Vec::new();
+    parse_inlines_into(p, rels, &mut content);
+    let raw = p.raw_slice(raw_start, p.pos()).to_string();
+    let simple = content
+        .iter()
+        .all(|inline| matches!(inline, Inline::Run(_)));
+    let runs = if simple {
+        content
+            .drain(..)
+            .map(|inline| match inline {
+                Inline::Run(run) => run,
+                _ => unreachable!(),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     out.push(Inline::Hyperlink(Hyperlink {
         target,
         anchor,
         rel_id,
         runs,
+        content,
+        // Complex links use the complete raw wrapper until a descendant review
+        // action changes them. Simple links rebuild editable runs immediately,
+        // but retain the raw opener so non-modeled hyperlink attributes survive
+        // repeated save/reload cycles.
+        raw: (!simple || preserve_opener).then_some(raw),
+        content_changed: simple && preserve_opener,
     }));
 }
 
@@ -1401,7 +1769,11 @@ fn parse_table(p: &mut XmlParser, rels: &Relationships) -> Table {
                 "w:tblPr" => {
                     let start = p.start_pos();
                     p.skip_element();
-                    table.raw_tblpr = Some(p.raw_slice(start, p.pos()).to_string());
+                    let raw = p.raw_slice(start, p.pos());
+                    let (current, change) =
+                        split_property_change_container(raw, PropertyScope::Table);
+                    table.raw_tblpr = Some(current);
+                    table.property_change = change;
                 }
                 // Preserve unmodeled table children at the row gap where they
                 // occurred. Besides being lossless for extension markup, this
@@ -1660,7 +2032,13 @@ fn parse_tblgrid(p: &mut XmlParser, grid: &mut Vec<u32>) {
 
 fn parse_row(p: &mut XmlParser, rels: &Relationships) -> Row {
     let mut row = Row::default();
-    parse_cells_into(p, rels, &mut row.cells, &mut row.raw_props);
+    parse_cells_into(
+        p,
+        rels,
+        &mut row.cells,
+        &mut row.raw_props,
+        &mut row.property_change,
+    );
     row
 }
 
@@ -1672,16 +2050,26 @@ fn parse_cells_into(
     rels: &Relationships,
     cells: &mut Vec<Cell>,
     raw: &mut Vec<String>,
+    property_change: &mut Option<PropertyChange>,
 ) {
     loop {
         match p.next() {
             Event::Start => match p.name() {
                 "w:tc" => cells.push(parse_cell(p, rels)),
-                "w:trPr" | "w:tblPrEx" => capture_element(p, raw),
+                "w:trPr" => {
+                    let start = p.start_pos();
+                    p.skip_element();
+                    let property_xml = p.raw_slice(start, p.pos());
+                    let (current, change) =
+                        split_property_change_container(property_xml, PropertyScope::TableRow);
+                    raw.push(current);
+                    *property_change = change;
+                }
+                "w:tblPrEx" => capture_element(p, raw),
                 "w:sdt" => loop {
                     match p.next() {
                         Event::Start if p.name() == "w:sdtContent" => {
-                            parse_cells_into(p, rels, cells, raw)
+                            parse_cells_into(p, rels, cells, raw, property_change)
                         }
                         Event::Start => p.skip_element(),
                         Event::End | Event::Eof => break,
@@ -1708,9 +2096,14 @@ fn parse_cell(p: &mut XmlParser, rels: &Relationships) -> Cell {
                 "w:tcPr" => {
                     let start = p.start_pos();
                     let has_extra = parse_tcpr(p, &mut cell);
-                    if has_extra {
-                        cell.raw_tcpr = Some(p.raw_slice(start, p.pos()).to_string());
+                    let raw = p.raw_slice(start, p.pos());
+                    cell.unsupported_revisions = unsupported_cell_revisions(raw);
+                    let (current, change) =
+                        split_property_change_container(raw, PropertyScope::TableCell);
+                    if has_extra || change.is_some() {
+                        cell.raw_tcpr = Some(current);
                     }
+                    cell.property_change = change;
                 }
                 "w:p" => cell.blocks.push(Block::Paragraph(parse_paragraph(p, rels))),
                 "w:tbl" => cell.blocks.push(Block::Table(parse_table(p, rels))),
@@ -1782,6 +2175,67 @@ mod tests {
 
     fn doc(xml: &str) -> Document {
         parse_document_xml(xml, &Relationships::default())
+    }
+
+    #[test]
+    fn revisions_parse_metadata_nesting_and_unsupported_records() {
+        let xml = "<w:document><w:body><w:p>\
+            <w:ins w:id=\"9\" w:author=\"A &amp; B\" w:date=\"2026-08-29T12:00:00Z\" w16du:dateUtc=\"future\">\
+              <w:r><w:t>new</w:t></w:r>\
+              <w:del><w:r><w:delText>old</w:delText></w:r></w:del>\
+            </w:ins>\
+            <w:moveFromRangeStart w:id=\"11\" w:name=\"moved\"/>\
+            <w:customXmlDelRangeEnd w:id=\"12\"/>\
+            </w:p></w:body></w:document>";
+        let document = doc(xml);
+        let revisions = document.revisions();
+
+        assert_eq!(revisions.len(), 4);
+        assert_eq!(
+            revisions[0].category,
+            RevisionCategory::Inline(RevisionKind::Insert)
+        );
+        assert_eq!(revisions[0].metadata.id.as_deref(), Some("9"));
+        assert_eq!(revisions[0].metadata.author.as_deref(), Some("A & B"));
+        assert_eq!(
+            revisions[0].metadata.date.as_deref(),
+            Some("2026-08-29T12:00:00Z")
+        );
+        assert_eq!(
+            revisions[0].metadata.unknown_attributes,
+            vec![("w16du:dateUtc".to_string(), "future".to_string())]
+        );
+        assert_eq!(
+            revisions[1].category,
+            RevisionCategory::Inline(RevisionKind::Delete)
+        );
+        assert_eq!(revisions[1].parent, Some(revisions[0].target));
+        assert_eq!(revisions[1].depth, 1);
+        assert!(revisions[1].metadata.id.is_none());
+        assert_eq!(
+            revisions[2].category,
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::MoveFromRangeStart)
+        );
+        assert_eq!(revisions[2].metadata.id.as_deref(), Some("11"));
+        assert_eq!(
+            revisions[2].metadata.unknown_attributes,
+            vec![("w:name".to_string(), "moved".to_string())]
+        );
+        assert_eq!(
+            revisions[3].category,
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::CustomXmlDelRangeEnd)
+        );
+        assert!(
+            revisions
+                .iter()
+                .all(|revision| revision.target.is_assigned())
+        );
+        assert_eq!(document.clone(), document);
+
+        let saved = crate::serialize::document_to_xml(&document);
+        assert!(saved.contains("w16du:dateUtc=\"future\""));
+        assert!(saved.contains("<w:moveFromRangeStart w:id=\"11\" w:name=\"moved\"/>"));
+        assert!(saved.contains("<w:customXmlDelRangeEnd w:id=\"12\"/>"));
     }
 
     /// The populated-content case for [`parse_header_footer`], the shape

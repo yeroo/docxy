@@ -132,7 +132,9 @@ pub extern "C" fn docx_render(handle: u32) -> *mut u8 {
 
 /// Apply one tab-delimited command (see [`bridge::Session::dispatch`]) and
 /// return the fresh JSON view. If the command produced clipboard text (copy /
-/// cut), the view carries it in a `"copied"` field.
+/// cut), the view carries it in a `"copied"` field. Every command response
+/// also carries `"commandApplied"`, which interactive hosts use to avoid
+/// registering dirty/undo state for protection denials and other no-ops.
 ///
 /// # Safety
 /// `ptr`/`len` must describe a live host allocation of the command string.
@@ -140,8 +142,8 @@ pub extern "C" fn docx_render(handle: u32) -> *mut u8 {
 pub unsafe extern "C" fn docx_cmd(handle: u32, ptr: *const u8, len: usize) -> *mut u8 {
     let cmd = String::from_utf8_lossy(unsafe { input(ptr, len) }).into_owned();
     with_session(handle, |s| {
-        let copied = s.dispatch(&cmd);
-        s.view_json(copied.as_deref()).into_bytes()
+        let (copied, applied) = s.dispatch(&cmd);
+        s.command_view_json(copied.as_deref(), applied).into_bytes()
     })
 }
 

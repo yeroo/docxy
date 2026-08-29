@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:comments xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:ux="urn:docxy:revision-fixture">
+  <w:comment w:id="0" w:author="Fixture Commenter" w:initials="FC" w:date="2026-08-29T09:30:00Z" ux:ticket="DOCX-COMMENT">
+    <w:p><w:r><w:t>Review the tracked passage and its nested changes.</w:t></w:r></w:p>
+  </w:comment>
+</w:comments>
