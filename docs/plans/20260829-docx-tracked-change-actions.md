@@ -74,14 +74,14 @@ schema-valid OOXML.
 
 ### Task 4: Integrate review operations with editor history
 
-- [ ] expose revision enumeration/navigation at the editor layer and keep caret,
+- [x] expose revision enumeration/navigation at the editor layer and keep caret,
       anchor, table paths, and viewport valid after content disappears or unwraps
-- [ ] make each current/all action a single undoable transaction with exact redo
-- [ ] ensure normal edits next to an untouched revision do not accidentally
+- [x] make each current/all action a single undoable transaction with exact redo
+- [x] ensure normal edits next to an untouched revision do not accidentally
       consume, delete, or rewrite the wrapper
-- [ ] add editor tests for caret boundaries, selections, undo/redo, mixed blocks,
+- [x] add editor tests for caret boundaries, selections, undo/redo, mixed blocks,
       and no-op/unsupported actions
-- [ ] run `cargo test -p docxcore` before Task 5
+- [x] run `cargo test -p docxcore` before Task 5
 
 ### Task 5: Add TUI Review actions and automation verbs
 
