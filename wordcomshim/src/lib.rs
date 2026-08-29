@@ -452,6 +452,7 @@ mod win {
                 v_merge: VMerge::default(),
                 blocks: vec![Block::Paragraph(Paragraph::default())],
                 raw_tcpr: None,
+                property_change: None,
             };
             let table = Table {
                 grid: vec![0; cols],
@@ -459,12 +460,14 @@ mod win {
                     .map(|_| Row {
                         cells: (0..cols).map(|_| cell()).collect(),
                         raw_props: vec![],
+                        property_change: None,
                     })
                     .collect(),
                 namespace_declarations: vec![],
                 markup_compatibility_attributes: vec![],
                 row_boundaries: vec![],
                 raw_tblpr: Some(TBLPR.to_string()),
+                property_change: None,
             };
             self.pkg.document.body.push(Block::Table(table));
             self.saved = false;

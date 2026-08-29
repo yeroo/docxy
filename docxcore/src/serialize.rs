@@ -449,6 +449,7 @@ fn write_inline(s: &mut String, item: &Inline) {
         // Tracked change: re-emit the original <w:ins>/<w:del> verbatim (the
         // display `content` is not serialized).
         Inline::Revision { raw, .. } => s.push_str(raw),
+        Inline::UnsupportedRevision { raw, .. } => s.push_str(raw),
         // Footnote/endnote reference: re-emit the original reference run verbatim.
         Inline::FootnoteRef { raw, .. } => s.push_str(raw),
         Inline::TextBox { raw, blocks } => {
@@ -1000,6 +1001,7 @@ mod tests {
             rows: vec![Row {
                 cells: vec![cell],
                 raw_props: vec!["<w:trPr><w:trHeight w:val=\"300\"/></w:trPr>".to_string()],
+                property_change: None,
             }],
             namespace_declarations: vec![],
             markup_compatibility_attributes: vec![],
@@ -1008,6 +1010,7 @@ mod tests {
                 "<w:tblPr><w:tblBorders><w:top w:val=\"single\" w:sz=\"4\"/></w:tblBorders></w:tblPr>"
                     .to_string(),
             ),
+            property_change: None,
         };
         let d = Document {
             body: vec![para(ppr, vec![]), Block::Table(table)],

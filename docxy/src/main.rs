@@ -3070,10 +3070,12 @@ impl App {
             v_merge: VMerge::None,
             blocks: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
             raw_tcpr: None,
+            property_change: None,
         };
         let mk_row = || Row {
             cells: (0..cols).map(|_| mk_cell()).collect(),
             raw_props: vec![],
+            property_change: None,
         };
         let table = Table {
             grid: vec![col_w; cols],
@@ -3082,6 +3084,7 @@ impl App {
             markup_compatibility_attributes: vec![],
             row_boundaries: vec![],
             raw_tblpr: Some(TBLPR.to_string()),
+            property_change: None,
         };
         let body = &mut self.editor.doc.body;
         let at = self
@@ -5949,6 +5952,7 @@ fn clip_has_formatting(clip: &Clip) -> bool {
             | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::Field { .. }
+            | Inline::UnsupportedRevision { .. }
             | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => false,
         }

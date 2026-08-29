@@ -1499,6 +1499,7 @@ fn inline_len(i: &Inline) -> usize {
         | Inline::Field { .. }
         | Inline::TextBox { .. }
         | Inline::Revision { .. }
+        | Inline::UnsupportedRevision { .. }
         | Inline::FootnoteRef { .. }
         | Inline::Raw(_) => 0,
     }
@@ -1574,10 +1575,25 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                 raw: raw.clone(),
                 blocks: blocks.clone(),
             }),
-            Inline::Revision { kind, raw, content } => out.push(Inline::Revision {
+            Inline::Revision {
+                kind,
+                metadata,
+                raw,
+                content,
+            } => out.push(Inline::Revision {
                 kind: *kind,
+                metadata: metadata.clone(),
                 raw: raw.clone(),
                 content: content.clone(),
+            }),
+            Inline::UnsupportedRevision {
+                kind,
+                metadata,
+                raw,
+            } => out.push(Inline::UnsupportedRevision {
+                kind: kind.clone(),
+                metadata: metadata.clone(),
+                raw: raw.clone(),
             }),
             Inline::FootnoteRef { id, endnote, raw } => out.push(Inline::FootnoteRef {
                 id: *id,
@@ -1669,6 +1685,7 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Revision { .. }
+                | Inline::UnsupportedRevision { .. }
                 | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     if local == 0 {
@@ -1746,6 +1763,7 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                 | Inline::Field { .. }
                 | Inline::TextBox { .. }
                 | Inline::Revision { .. }
+                | Inline::UnsupportedRevision { .. }
                 | Inline::FootnoteRef { .. }
                 | Inline::Raw(_) => {
                     content.remove(i);
@@ -1823,6 +1841,7 @@ fn range_all_have(
             | Inline::Field { .. }
             | Inline::TextBox { .. }
             | Inline::Revision { .. }
+            | Inline::UnsupportedRevision { .. }
             | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => {} // zero-length
         }

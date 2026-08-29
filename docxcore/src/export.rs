@@ -377,7 +377,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Ve
                     segs.push(Vec::new());
                 }
             }
-            Inline::Raw(_) => {}
+            Inline::UnsupportedRevision { .. } | Inline::Raw(_) => {}
         }
     }
     segs

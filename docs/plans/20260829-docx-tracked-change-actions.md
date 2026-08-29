@@ -36,16 +36,16 @@ schema-valid OOXML.
 
 ### Task 1: Inventory and model revisions as actionable data
 
-- [ ] catalogue supported WordprocessingML revision forms in existing fixtures
+- [x] catalogue supported WordprocessingML revision forms in existing fixtures
       and distinguish inline content revisions, property-change children, and
       unsupported move/custom records
-- [ ] extend revision metadata/model nodes so identity, author/date, nesting,
+- [x] extend revision metadata/model nodes so identity, author/date, nesting,
       prior property snapshots, and unknown XML survive parsing and cloning
-- [ ] define stable document-order revision addressing that does not depend on a
+- [x] define stable document-order revision addressing that does not depend on a
       stale flat block index after an action
-- [ ] add model tests for insert/delete, nested revisions, every property scope,
+- [x] add model tests for insert/delete, nested revisions, every property scope,
       missing metadata, and unknown revision kinds
-- [ ] run `cargo test -p docxcore` before Task 2
+- [x] run `cargo test -p docxcore` before Task 2
 
 ### Task 2: Parse and serialize property-change semantics
 
@@ -114,4 +114,3 @@ schema-valid OOXML.
 - [ ] record final test counts and fixture/evidence paths in this plan
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*
-

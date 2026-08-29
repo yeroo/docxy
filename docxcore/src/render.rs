@@ -1056,6 +1056,7 @@ fn following_inline_width(content: &[Inline], from: usize) -> usize {
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
             | Inline::Equation { .. }
+            | Inline::UnsupportedRevision { .. }
             | Inline::Raw(_) => {}
         }
     }
@@ -1402,6 +1403,7 @@ fn flatten_para(
                     block: Some(idx),
                 });
             }
+            Inline::UnsupportedRevision { .. } => {}
         }
     }
     if inv {

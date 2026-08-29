@@ -550,7 +550,9 @@ pub fn parse_document_xml(xml: &str, rels: &Relationships) -> Document {
             _ => {}
         }
     }
-    Document { body }
+    let mut document = Document { body };
+    document.initialize_revision_targets();
+    document
 }
 
 /// Parse a header (`word/headerN.xml`) or footer (`word/footerN.xml`) part into
@@ -779,13 +781,7 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
                         latex: None,
                     });
                 }
-                _ => {
-                    // Unmodeled inline content (bookmarks, fields): preserve raw.
-                    let start = p.start_pos();
-                    p.skip_element();
-                    para.content
-                        .push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
-                }
+                _ => parse_raw_or_unsupported_revision(p, &mut para.content),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -873,11 +869,7 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
                 "w:fldSimple" => parse_fld_simple(p, rels, out),
                 "w:smartTag" => parse_inlines_into(p, rels, out),
                 "w:sdt" => parse_inline_sdt(p, rels, out),
-                _ => {
-                    let start = p.start_pos();
-                    p.skip_element();
-                    out.push(Inline::Raw(p.raw_slice(start, p.pos()).to_string()));
-                }
+                _ => parse_raw_or_unsupported_revision(p, out),
             },
             Event::End | Event::Eof => break,
             Event::Text => {}
@@ -890,6 +882,7 @@ fn parse_inlines_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<Inl
 /// is marked struck-through and inserted content underlined, so both are visible
 /// and distinguishable. The `content` is display-only — save re-emits `raw`.
 fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -> Inline {
+    let metadata = parse_revision_metadata(p);
     let start = p.start_pos();
     let mut content = Vec::new();
     parse_inlines_into(p, rels, &mut content);
@@ -897,7 +890,71 @@ fn parse_revision(p: &mut XmlParser, rels: &Relationships, kind: RevisionKind) -
     for inl in &mut content {
         mark_revision(inl, kind);
     }
-    Inline::Revision { kind, raw, content }
+    Inline::Revision {
+        kind,
+        metadata,
+        raw,
+        content,
+    }
+}
+
+fn parse_revision_metadata(p: &XmlParser) -> RevisionMetadata {
+    let mut metadata = RevisionMetadata::default();
+    for attr in p.attrs() {
+        let value = decode_attr(attr.value);
+        match attr.name {
+            "w:id" => metadata.id = Some(value),
+            "w:author" => metadata.author = Some(value),
+            "w:date" => metadata.date = Some(value),
+            _ => metadata
+                .unknown_attributes
+                .push((attr.name.to_string(), value)),
+        }
+    }
+    metadata
+}
+
+fn unsupported_revision_kind(name: &str) -> Option<UnsupportedRevisionKind> {
+    Some(match name {
+        "w:moveFrom" => UnsupportedRevisionKind::MoveFrom,
+        "w:moveTo" => UnsupportedRevisionKind::MoveTo,
+        "w:moveFromRangeStart" => UnsupportedRevisionKind::MoveFromRangeStart,
+        "w:moveFromRangeEnd" => UnsupportedRevisionKind::MoveFromRangeEnd,
+        "w:moveToRangeStart" => UnsupportedRevisionKind::MoveToRangeStart,
+        "w:moveToRangeEnd" => UnsupportedRevisionKind::MoveToRangeEnd,
+        "w:customXmlInsRangeStart" => UnsupportedRevisionKind::CustomXmlInsRangeStart,
+        "w:customXmlInsRangeEnd" => UnsupportedRevisionKind::CustomXmlInsRangeEnd,
+        "w:customXmlDelRangeStart" => UnsupportedRevisionKind::CustomXmlDelRangeStart,
+        "w:customXmlDelRangeEnd" => UnsupportedRevisionKind::CustomXmlDelRangeEnd,
+        "w:customXmlMoveFromRangeStart" => UnsupportedRevisionKind::CustomXmlMoveFromRangeStart,
+        "w:customXmlMoveFromRangeEnd" => UnsupportedRevisionKind::CustomXmlMoveFromRangeEnd,
+        "w:customXmlMoveToRangeStart" => UnsupportedRevisionKind::CustomXmlMoveToRangeStart,
+        "w:customXmlMoveToRangeEnd" => UnsupportedRevisionKind::CustomXmlMoveToRangeEnd,
+        "w:cellIns" => UnsupportedRevisionKind::CellInsert,
+        "w:cellDel" => UnsupportedRevisionKind::CellDelete,
+        "w:cellMerge" => UnsupportedRevisionKind::CellMerge,
+        "w:conflictIns" => UnsupportedRevisionKind::ConflictInsert,
+        "w:conflictDel" => UnsupportedRevisionKind::ConflictDelete,
+        _ => return None,
+    })
+}
+
+/// Preserve ordinary unknown inline XML as `Raw`, but classify known revision
+/// records so review enumeration can return an explicit unsupported result.
+fn parse_raw_or_unsupported_revision(p: &mut XmlParser, out: &mut Vec<Inline>) {
+    let kind = unsupported_revision_kind(p.name());
+    let metadata = kind.as_ref().map(|_| parse_revision_metadata(p));
+    let start = p.start_pos();
+    p.skip_element();
+    let raw = p.raw_slice(start, p.pos()).to_string();
+    match (kind, metadata) {
+        (Some(kind), Some(metadata)) => out.push(Inline::UnsupportedRevision {
+            kind,
+            metadata,
+            raw,
+        }),
+        _ => out.push(Inline::Raw(raw)),
+    }
 }
 
 /// Bake a tracked-change display cue into a run tree: strikethrough for a
@@ -1782,6 +1839,67 @@ mod tests {
 
     fn doc(xml: &str) -> Document {
         parse_document_xml(xml, &Relationships::default())
+    }
+
+    #[test]
+    fn revisions_parse_metadata_nesting_and_unsupported_records() {
+        let xml = "<w:document><w:body><w:p>\
+            <w:ins w:id=\"9\" w:author=\"A &amp; B\" w:date=\"2026-08-29T12:00:00Z\" w16du:dateUtc=\"future\">\
+              <w:r><w:t>new</w:t></w:r>\
+              <w:del><w:r><w:delText>old</w:delText></w:r></w:del>\
+            </w:ins>\
+            <w:moveFromRangeStart w:id=\"11\" w:name=\"moved\"/>\
+            <w:customXmlDelRangeEnd w:id=\"12\"/>\
+            </w:p></w:body></w:document>";
+        let document = doc(xml);
+        let revisions = document.revisions();
+
+        assert_eq!(revisions.len(), 4);
+        assert_eq!(
+            revisions[0].category,
+            RevisionCategory::Inline(RevisionKind::Insert)
+        );
+        assert_eq!(revisions[0].metadata.id.as_deref(), Some("9"));
+        assert_eq!(revisions[0].metadata.author.as_deref(), Some("A & B"));
+        assert_eq!(
+            revisions[0].metadata.date.as_deref(),
+            Some("2026-08-29T12:00:00Z")
+        );
+        assert_eq!(
+            revisions[0].metadata.unknown_attributes,
+            vec![("w16du:dateUtc".to_string(), "future".to_string())]
+        );
+        assert_eq!(
+            revisions[1].category,
+            RevisionCategory::Inline(RevisionKind::Delete)
+        );
+        assert_eq!(revisions[1].parent, Some(revisions[0].target));
+        assert_eq!(revisions[1].depth, 1);
+        assert!(revisions[1].metadata.id.is_none());
+        assert_eq!(
+            revisions[2].category,
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::MoveFromRangeStart)
+        );
+        assert_eq!(revisions[2].metadata.id.as_deref(), Some("11"));
+        assert_eq!(
+            revisions[2].metadata.unknown_attributes,
+            vec![("w:name".to_string(), "moved".to_string())]
+        );
+        assert_eq!(
+            revisions[3].category,
+            RevisionCategory::Unsupported(UnsupportedRevisionKind::CustomXmlDelRangeEnd)
+        );
+        assert!(
+            revisions
+                .iter()
+                .all(|revision| revision.target.is_assigned())
+        );
+        assert_eq!(document.clone(), document);
+
+        let saved = crate::serialize::document_to_xml(&document);
+        assert!(saved.contains("w16du:dateUtc=\"future\""));
+        assert!(saved.contains("<w:moveFromRangeStart w:id=\"11\" w:name=\"moved\"/>"));
+        assert!(saved.contains("<w:customXmlDelRangeEnd w:id=\"12\"/>"));
     }
 
     /// The populated-content case for [`parse_header_footer`], the shape

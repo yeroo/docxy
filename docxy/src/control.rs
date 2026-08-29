@@ -527,6 +527,7 @@ fn blocks_carry_formatting(blocks: &[Block]) -> bool {
             | Inline::Chart { .. }
             | Inline::Equation { .. }
             | Inline::Field { .. }
+            | Inline::UnsupportedRevision { .. }
             | Inline::FootnoteRef { .. }
             | Inline::Raw(_) => false,
         }

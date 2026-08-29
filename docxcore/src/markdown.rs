@@ -291,7 +291,10 @@ fn inlines_to_md(content: &[Inline]) -> String {
                 let p = if *endnote { "e" } else { "" };
                 s.push_str(&format!("[^{p}{id}]"))
             }
-            Inline::Chart { .. } | Inline::TextBox { .. } | Inline::Raw(_) => {}
+            Inline::Chart { .. }
+            | Inline::TextBox { .. }
+            | Inline::UnsupportedRevision { .. }
+            | Inline::Raw(_) => {}
         }
     }
     s
