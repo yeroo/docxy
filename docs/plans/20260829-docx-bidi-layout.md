@@ -160,8 +160,26 @@ Task 5 notes:
 
 ### Task 6: [Final] Document bidi behavior and limits
 
-- [ ] update DOCX support/rendering docs with direction precedence, navigation
+- [x] update DOCX support/rendering docs with direction precedence, navigation
       semantics, dependency rationale, shaping limitation, and evidence paths
-- [ ] record final test counts and deliberate deferrals in this plan
+- [x] record final test counts and deliberate deferrals in this plan
+
+Task 6 notes:
+
+- Updated `README.md`, `ARCHITECTURE.md`, and `GAP-ANALYSIS.md` to document the
+  supported terminal bidi contract: paragraph `w:bidi`, style-inherited
+  direction, resolved `w:rtl`, Unicode bidi controls, visual navigation through
+  `LineMap`, logical copy/export/API offsets, and `unicode-bidi` living only in
+  `docxy` so `docxcore` remains std-only.
+- Documented representative evidence paths:
+  `target/test-artifacts/docxy/bidi-non-page-view.txt` and
+  `target/test-artifacts/docxy/bidi-page-view.txt`.
+- Final validation on 2026-08-30: `cargo test` passed 2522 tests with 0 failed
+  and 1 ignored across 57 result groups; `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check`, and `git diff --check` passed.
+- Deliberate deferrals: complex-script shaping, fallback-font selection, exact
+  Word line breaking, and parsed OOXML directional-container layout overrides
+  for `w:dir`/`w:bdo`. Those are separate from the completed UBA reordering and
+  terminal cell-mapping contract.
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*

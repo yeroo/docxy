@@ -59,6 +59,10 @@ docxy assets/sample.docx
   cells — navigate and type directly into cells.
 - **Styles** resolved from `styles.xml`; **lists** numbered from `numbering.xml`;
   headings, indents, alignment, tab stops, and horizontal rules.
+- **Bidirectional DOCX layout** for Hebrew, Arabic, and mixed LTR/RTL text:
+  paragraph `w:bidi`, run `w:rtl`, style-inherited direction, and Unicode bidi
+  controls render in visual order while editing, copy/export, and save offsets
+  remain logical.
 - **Lossless save** — unmodeled parts are preserved exactly.
 - **Find & replace**, full **clipboard** (syncs with the OS clipboard),
   **selection + formatting**, word navigation, and **show-invisibles**.
