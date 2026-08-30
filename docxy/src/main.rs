@@ -48,7 +48,7 @@ use docxcore::package::{
     save_package_preserving_document,
 };
 use docxcore::render::{
-    Color as DocColor, ImageBox, Line as DocLine, LineMap, PageParts, RenderOptions,
+    Color as DocColor, ImageBox, Line as DocLine, LineCaret, LineMap, PageParts, RenderOptions,
     Span as DocSpan, Style as DocStyle, render_with_images, render_with_page_layout,
 };
 use docxcore::review::{RevisionAction, RevisionOutcome};
@@ -971,8 +971,11 @@ struct App {
     hf_edit: Option<HfEdit>,
     vim: Option<VimState>,
     pending_link: Option<String>,
-    /// (caret, visual row) hint to disambiguate wrap boundaries during j/k.
-    vrow_hint: Option<(Caret, usize)>,
+    /// (caret, visual row, visual column) hint to disambiguate soft-wrap and
+    /// bidi-run boundaries that share one logical offset.
+    visual_hint: Option<(Caret, usize, usize)>,
+    /// Desired visual column preserved across repeated vertical movement.
+    vertical_col_hint: Option<usize>,
     /// When true, `draw` scrolls to keep the caret visible. Cleared while the
     /// user drives the viewport directly (wheel scroll, drag-select).
     follow_caret: bool,
@@ -1145,7 +1148,8 @@ impl App {
             hf_edit: None,
             vim: if vim { Some(VimState::new()) } else { None },
             pending_link: None,
-            vrow_hint: None,
+            visual_hint: None,
+            vertical_col_hint: None,
             follow_caret: true,
             drag_from: None,
             lines: Vec::new(),
@@ -2775,43 +2779,114 @@ impl App {
     fn caret_screen(&self) -> Option<(usize, usize)> {
         let c = &self.editor.caret;
         // A caret offset at a soft-wrap boundary matches two adjacent lines (the
-        // end of one, the start of the next). Collect every match; if a vertical
-        // hint points at one of them (and is still valid for this caret), trust
-        // it so up/down movement doesn't stick at the boundary. Otherwise resolve
-        // to the last (lower) line, matching how a fresh caret reads.
+        // end of one, the start of the next). Bidi run boundaries can also put
+        // multiple logical stops on one terminal column. Collect every match; if
+        // a visual hint points at one of them (and is still valid for this caret),
+        // trust it so movement continues from the intended screen position.
+        // Otherwise resolve to the last (lower) line, matching how a fresh caret
+        // reads.
         let mut matches: Vec<(usize, usize)> = Vec::new();
+        let hint = self
+            .visual_hint
+            .as_ref()
+            .filter(|(hint_caret, _, _)| hint_caret == c);
         for (i, m) in self.maps.iter().enumerate() {
-            if let Some(seg) = m.seg_for(&c.path, c.offset) {
-                matches.push((i, seg.col_for_offset(c.offset).unwrap_or(seg.col0)));
+            let preferred_col = hint.and_then(|(_, row, col)| (*row == i).then_some(*col));
+            if let Some(col) = m.col_for_caret(&c.path, c.offset, preferred_col) {
+                matches.push((i, col));
             }
         }
-        if let Some((hint_caret, hint_row)) = &self.vrow_hint {
-            if hint_caret == c {
-                if let Some(m) = matches.iter().find(|(r, _)| r == hint_row) {
-                    return Some(*m);
-                }
+        if let Some((_, hint_row, _)) = hint {
+            if let Some(m) = matches.iter().find(|(r, _)| r == hint_row) {
+                return Some(*m);
             }
         }
         matches.last().copied()
+    }
+
+    fn clear_visual_hint(&mut self) {
+        self.visual_hint = None;
+        self.vertical_col_hint = None;
+    }
+
+    fn set_visual_hint(&mut self, row: usize, col: usize) {
+        self.visual_hint = Some((self.editor.caret.clone(), row, col));
+    }
+
+    fn set_visual_caret(&mut self, row: usize, caret: LineCaret) {
+        self.editor.set_caret(Caret::at(caret.path, caret.offset));
+        self.set_visual_hint(row, caret.col);
+    }
+
+    fn move_visual_horiz(&mut self, right: bool) {
+        let Some((row, col)) = self.caret_screen() else {
+            self.clear_visual_hint();
+            if right {
+                self.editor.move_right();
+            } else {
+                self.editor.move_left();
+            }
+            return;
+        };
+        let cur = self.editor.caret.clone();
+        if let Some(caret) = self
+            .maps
+            .get(row)
+            .and_then(|map| map.visual_neighbor(&cur.path, cur.offset, Some(col), right))
+        {
+            self.set_visual_caret(row, caret);
+            self.vertical_col_hint = None;
+            return;
+        }
+
+        let rows: Box<dyn Iterator<Item = usize>> = if right {
+            Box::new(row + 1..self.maps.len())
+        } else {
+            Box::new((0..row).rev())
+        };
+        for r in rows {
+            let edge = self.maps[r].edge_caret(!right);
+            if let Some(caret) = edge {
+                self.set_visual_caret(r, caret);
+                self.vertical_col_hint = None;
+                return;
+            }
+        }
+        self.vertical_col_hint = None;
+    }
+
+    fn move_visual_line_edge(&mut self, right: bool) {
+        let Some((row, _)) = self.caret_screen() else {
+            self.clear_visual_hint();
+            if right {
+                self.editor.move_end();
+            } else {
+                self.editor.move_home();
+            }
+            return;
+        };
+        if let Some(caret) = self.maps.get(row).and_then(|map| map.edge_caret(right)) {
+            self.set_visual_caret(row, caret);
+            self.vertical_col_hint = None;
+        }
     }
 
     fn move_vert(&mut self, down: bool) {
         let Some((row, col)) = self.caret_screen() else {
             return;
         };
+        let target_col = self.vertical_col_hint.unwrap_or(col);
         let rows: Box<dyn Iterator<Item = usize>> = if down {
             Box::new(row + 1..self.maps.len())
         } else {
             Box::new((0..row).rev())
         };
         for r in rows {
-            if let Some(seg) = self.maps[r].nearest_seg(col) {
-                let off = seg.offset_for_col(col);
-                self.editor.caret = Caret::at(seg.path.clone(), off);
-                self.editor.clamp();
-                // Pin the caret to the row we navigated to so caret_screen
-                // reports it there even when its offset sits on a wrap boundary.
-                self.vrow_hint = Some((self.editor.caret.clone(), r));
+            if let Some(caret) = self.maps[r].nearest_caret(target_col) {
+                self.set_visual_caret(r, caret);
+                // Keep using the original desired column for a run of Up/Down
+                // keys even when a short or reordered line snaps the caret.
+                self.vertical_col_hint = Some(target_col);
                 return;
             }
         }
@@ -2821,6 +2896,7 @@ impl App {
         self.modified = true;
         self.dirty = true;
         self.status = None;
+        self.clear_visual_hint();
         // The editable body lives outside `pkg`. Any successful body edit can
         // remove, restore, or move a paragraph carrying `w:sectPr`, so refresh
         // the page/header scope before the next overlay layout. Header/footer
@@ -3343,8 +3419,8 @@ impl App {
         let pos = (at + 1).min(body.len());
         body.insert(pos, Block::Table(table));
         self.editor.clear_selection();
-        self.editor.caret = Caret::at(vec![pos, 0, 0, 0], 0);
-        self.editor.clamp();
+        self.editor.set_caret(Caret::at(vec![pos, 0, 0, 0], 0));
+        self.clear_visual_hint();
     }
 
     fn build_field(&self, kind: FieldKind) -> Inline {
@@ -3795,14 +3871,14 @@ impl App {
         self.scroll = (row * max / span).min(max);
         self.follow_caret = false;
         self.drag_from = None; // this is a scrollbar drag, not a text selection
+        self.clear_visual_hint();
         true
     }
 
     /// The caret at a screen position, if it lands on editable text.
-    fn click_caret(&self, row: usize, col: usize) -> Option<Caret> {
+    fn click_caret(&self, row: usize, col: usize) -> Option<LineCaret> {
         let doc_line = self.scroll + row;
-        let seg = self.maps.get(doc_line)?.nearest_seg(col)?;
-        Some(Caret::at(seg.path.clone(), seg.offset_for_col(col)))
+        self.maps.get(doc_line)?.nearest_caret(col)
     }
 
     fn ribbon_click(&mut self, x: u16, y: u16) {
@@ -3969,9 +4045,9 @@ impl App {
                 // Position the caret at the click and remember it as the anchor
                 // for a possible drag-select.
                 if let Some(c) = self.click_caret(row, col) {
-                    self.editor.caret = c.clone();
+                    self.set_visual_caret(doc_line, c);
                     self.editor.clear_selection();
-                    self.drag_from = Some(c);
+                    self.drag_from = Some(self.editor.caret.clone());
                     self.dirty = true;
                 }
                 // A clicked link: an internal `#anchor` jumps to its bookmark; an
@@ -4001,7 +4077,7 @@ impl App {
                     if self.editor.anchor.is_none() {
                         self.editor.anchor = self.drag_from.clone();
                     }
-                    self.editor.caret = c;
+                    self.set_visual_caret(self.scroll + clamped, c);
                     self.dirty = true;
                 }
                 // Auto-scroll when dragging at the top/bottom edge.
@@ -4107,6 +4183,7 @@ impl App {
         if let Some(m) = matches.get(idx) {
             let m = m.clone();
             self.editor.select_match(&m);
+            self.clear_visual_hint();
         } else {
             self.editor.clear_selection();
         }
@@ -4280,16 +4357,28 @@ impl App {
         };
         for _ in 0..n {
             match motion {
-                'h' => self.editor.move_left(),
-                'l' => self.editor.move_right(),
+                'h' => self.move_visual_horiz(false),
+                'l' => self.move_visual_horiz(true),
                 'j' => self.move_vert(true),
                 'k' => self.move_vert(false),
-                'w' => self.editor.move_word_right(),
-                'b' => self.editor.move_word_left(),
-                'e' => self.editor.move_word_end(),
-                '0' | '^' => self.editor.move_home(),
-                '$' => self.editor.move_end(),
-                'G' => self.editor.move_doc_end(),
+                'w' => {
+                    self.clear_visual_hint();
+                    self.editor.move_word_right();
+                }
+                'b' => {
+                    self.clear_visual_hint();
+                    self.editor.move_word_left();
+                }
+                'e' => {
+                    self.clear_visual_hint();
+                    self.editor.move_word_end();
+                }
+                '0' | '^' => self.move_visual_line_edge(false),
+                '$' => self.move_visual_line_edge(true),
+                'G' => {
+                    self.clear_visual_hint();
+                    self.editor.move_doc_end();
+                }
                 _ => {}
             }
         }
@@ -4304,8 +4393,8 @@ impl App {
         if !linewise && self.vim_mode() == Some(VimMode::Visual) {
             if let Some((lo, hi)) = self.editor.selection_range() {
                 self.editor.anchor = Some(lo);
-                self.editor.caret = hi;
-                self.editor.move_right();
+                self.editor.set_caret(hi);
+                self.move_visual_horiz(true);
             }
         }
         match op {
@@ -4318,7 +4407,8 @@ impl App {
             'y' => {
                 let c = self.editor.copy();
                 if let Some((lo, _)) = self.editor.selection_range() {
-                    self.editor.caret = lo;
+                    self.editor.set_caret(lo);
+                    self.clear_visual_hint();
                 }
                 self.editor.clear_selection();
                 self.set_clip(c, linewise);
@@ -4403,6 +4493,7 @@ impl App {
         }
         if let Some(m) = self.editor.find_next(&q, false, reverse) {
             self.editor.select_match(&m);
+            self.clear_visual_hint();
             self.dirty = true;
         }
     }
@@ -4438,6 +4529,7 @@ impl App {
         if c == 'g' {
             let pg = self.vim.as_ref().unwrap().pending_g;
             if pg {
+                self.clear_visual_hint();
                 self.editor.move_doc_start();
                 if let Some(v) = &mut self.vim {
                     v.pending_g = false;
@@ -4491,21 +4583,22 @@ impl App {
         match c {
             'i' => self.vim_enter_insert(),
             'a' => {
-                self.editor.move_right();
+                self.move_visual_horiz(true);
                 self.vim_enter_insert();
             }
             'A' => {
-                self.editor.move_end();
+                self.move_visual_line_edge(true);
                 self.vim_enter_insert();
             }
             'I' => {
-                self.editor.move_home();
+                self.move_visual_line_edge(false);
                 self.vim_enter_insert();
             }
             'o' => {
                 if !self.mutation_allowed(protection::MutationKind::Structure) {
                     return;
                 }
+                self.clear_visual_hint();
                 self.editor.move_end();
                 self.editor.insert_newline();
                 self.after_edit();
@@ -4515,6 +4608,7 @@ impl App {
                 if !self.mutation_allowed(protection::MutationKind::Structure) {
                     return;
                 }
+                self.clear_visual_hint();
                 self.editor.move_home();
                 self.editor.insert_newline();
                 self.move_vert(false);
@@ -4536,7 +4630,7 @@ impl App {
                     return;
                 }
                 let s = self.editor.caret.clone();
-                self.editor.move_end();
+                self.move_visual_line_edge(true);
                 self.editor.anchor = Some(s);
                 let c = self.editor.cut();
                 self.set_clip(c, false);
@@ -4594,8 +4688,8 @@ impl App {
             KeyCode::Right => self.vim_handle_motion('l'),
             KeyCode::Up => self.vim_handle_motion('k'),
             KeyCode::Down => self.vim_handle_motion('j'),
-            KeyCode::Home => self.editor.move_home(),
-            KeyCode::End => self.editor.move_end(),
+            KeyCode::Home => self.vim_handle_motion('0'),
+            KeyCode::End => self.vim_handle_motion('$'),
             _ => {}
         }
         false
@@ -4885,29 +4979,31 @@ impl App {
             KeyCode::Left => {
                 self.editor.extend_selection(shift);
                 if ctrl {
+                    self.clear_visual_hint();
                     self.editor.move_word_left();
                 } else {
-                    self.editor.move_left();
+                    self.move_visual_horiz(false);
                 }
                 self.dirty = true;
             }
             KeyCode::Right => {
                 self.editor.extend_selection(shift);
                 if ctrl {
+                    self.clear_visual_hint();
                     self.editor.move_word_right();
                 } else {
-                    self.editor.move_right();
+                    self.move_visual_horiz(true);
                 }
                 self.dirty = true;
             }
             KeyCode::Home => {
                 self.editor.extend_selection(shift);
-                self.editor.move_home();
+                self.move_visual_line_edge(false);
                 self.dirty = true;
             }
             KeyCode::End => {
                 self.editor.extend_selection(shift);
-                self.editor.move_end();
+                self.move_visual_line_edge(true);
                 self.dirty = true;
             }
             KeyCode::Up => {
@@ -7576,6 +7672,18 @@ mod tests {
         app
     }
 
+    fn app_with_blocks(body: Vec<Block>) -> App {
+        let mut app = App::new(new_package(Document { body }), "test.docx", false);
+        app.os_clip = None;
+        app
+    }
+
+    fn rtl_app(text: &str) -> App {
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        app_with_blocks(vec![bidi_para_with(rtl, vec![bidi_run(text)])])
+    }
+
     fn app_with_revisions() -> App {
         let metadata = |id: &str, author: &str| RevisionMetadata {
             id: Some(id.to_string()),
@@ -9390,6 +9498,167 @@ mod tests {
                 .expect("selection must be preserved"),
             "a drag/release over the ribbon must not touch the document selection"
         );
+    }
+
+    #[test]
+    fn visual_right_uses_line_map_for_mixed_numeric_bidi_text() {
+        let mut app = app_with(&["abc 123 אבג"]);
+        app.ensure_rendered(40);
+        app.viewport_h = 10;
+
+        for _ in 0..8 {
+            let (row, col) = app.caret_screen().expect("caret on screen");
+            let cur = app.editor.caret.clone();
+            let expected = app.maps[row]
+                .visual_neighbor(&cur.path, cur.offset, Some(col), true)
+                .expect("next visual stop");
+
+            app.on_key(key(KeyCode::Right));
+
+            assert_eq!(
+                app.editor.caret,
+                Caret::at(expected.path.clone(), expected.offset)
+            );
+            assert_eq!(app.caret_screen(), Some((row, expected.col)));
+        }
+    }
+
+    #[test]
+    fn visual_arrows_follow_rtl_paragraph_direction() {
+        let mut app = rtl_app("אבג");
+        app.ensure_rendered(20);
+        app.viewport_h = 10;
+
+        let start = app.caret_screen().expect("caret on screen");
+        let right_edge = app.maps[0].edge_caret(true).expect("right edge");
+        assert_eq!(right_edge.offset, 0);
+        assert_eq!(start, (0, right_edge.col));
+
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.editor.caret.offset, 0);
+        assert_eq!(app.caret_screen(), Some(start));
+
+        app.on_key(key(KeyCode::Left));
+        let leftward = app.caret_screen().expect("caret on screen");
+        assert_eq!(app.editor.caret.offset, 1);
+        assert!(leftward.1 < start.1);
+
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.editor.caret.offset, 0);
+        assert_eq!(app.caret_screen(), Some(start));
+    }
+
+    #[test]
+    fn visual_arrows_skip_combining_marks_and_respect_wide_cells() {
+        let mut app = app_with(&["a\u{0301}哈b"]);
+        app.ensure_rendered(20);
+        app.viewport_h = 10;
+
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.editor.caret.offset, 2);
+        assert_eq!(app.caret_screen(), Some((0, 1)));
+
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.editor.caret.offset, 3);
+        assert_eq!(app.caret_screen(), Some((0, 3)));
+
+        let mut selected = app_with(&["a\u{0301}哈b"]);
+        selected.ensure_rendered(20);
+        selected.viewport_h = 10;
+        selected.on_key(shift(KeyCode::Right));
+        assert_eq!(selected.editor.selection_text(), "a\u{0301}");
+    }
+
+    #[test]
+    fn visual_home_end_stop_at_wrapped_line_edges() {
+        let mut app = app_with(&["alpha beta gamma delta"]);
+        app.ensure_rendered(8);
+        app.viewport_h = 10;
+        let row = 1;
+        let left = app.maps[row].edge_caret(false).expect("line left edge");
+        let right = app.maps[row].edge_caret(true).expect("line right edge");
+        assert_ne!(left.offset, 0, "test must land on a wrapped line");
+
+        app.set_visual_caret(row, right.clone());
+        app.on_key(key(KeyCode::Home));
+        assert_eq!(app.editor.caret, Caret::at(left.path.clone(), left.offset));
+        assert_eq!(app.caret_screen(), Some((row, left.col)));
+
+        app.on_key(key(KeyCode::End));
+        assert_eq!(app.editor.caret, Caret::at(right.path, right.offset));
+        assert_eq!(app.caret_screen(), Some((row, right.col)));
+    }
+
+    #[test]
+    fn vertical_movement_preserves_desired_visual_column() {
+        let mut app = app_with(&["abcdef", "x", "abcdef"]);
+        app.ensure_rendered(20);
+        app.viewport_h = 10;
+        app.editor.set_caret(Caret::at(vec![0], 5));
+        app.clear_visual_hint();
+        assert_eq!(app.caret_screen(), Some((0, 5)));
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.editor.caret, Caret::at(vec![1], 1));
+        assert_eq!(app.caret_screen(), Some((1, 1)));
+
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.editor.caret, Caret::at(vec![2], 5));
+        assert_eq!(app.caret_screen(), Some((2, 5)));
+    }
+
+    #[test]
+    fn rtl_mouse_drag_selects_logical_text_through_visual_map() {
+        let mut app = rtl_app("שלום");
+        app.ensure_rendered(20);
+        app.viewport_h = 10;
+        let right = app.maps[0].edge_caret(true).expect("right edge");
+        let left = app.maps[0].edge_caret(false).expect("left edge");
+
+        app.on_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            right.col as u16,
+            0,
+        ));
+        assert_eq!(app.editor.caret.offset, 0);
+
+        app.on_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            left.col as u16,
+            0,
+        ));
+        assert_eq!(app.editor.caret.offset, 4);
+        assert_eq!(app.editor.selection_text(), "שלום");
+    }
+
+    #[test]
+    fn bidi_selection_paint_skips_padding_and_controls() {
+        let text = "ab \u{202e}cd\u{202c} אב";
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let doc = bidi_doc(vec![bidi_para_with(rtl, vec![bidi_run(text)])]);
+        let mut opts = bidi_opts(20);
+        opts.selection = vec![(vec![0], 0, text.chars().count())];
+
+        let line = docxcore::render::render(&doc, &opts)
+            .into_iter()
+            .next()
+            .expect("rendered line");
+        let plain = line.plain();
+        let highlighted: String = line
+            .spans
+            .iter()
+            .filter(|span| span.style.highlight)
+            .map(|span| span.text.as_str())
+            .collect();
+
+        assert!(plain.starts_with(' '), "test needs right-alignment padding");
+        assert!(!highlighted.starts_with(' '));
+        assert!(!plain.contains('\u{202e}'));
+        assert!(!plain.contains('\u{202c}'));
+        assert!(!highlighted.contains('\u{202e}'));
+        assert!(!highlighted.contains('\u{202c}'));
+        assert_eq!(highlighted, plain.trim_start());
     }
 
     #[test]

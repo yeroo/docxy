@@ -758,6 +758,12 @@ impl Editor {
         }
     }
 
+    pub fn set_caret(&mut self, caret: Caret) {
+        self.last = EditKind::None;
+        self.caret = caret;
+        self.clamp();
+    }
+
     pub fn move_home(&mut self) {
         self.last = EditKind::None;
         self.caret.offset = 0;

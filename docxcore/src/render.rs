@@ -132,6 +132,23 @@ impl Line {
     }
 }
 
+/// One logical caret stop on an editable visual line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LineCaretStop {
+    /// Model char offset for this caret stop.
+    pub offset: usize,
+    /// Display column relative to the owning [`LineSeg::col0`].
+    pub col: usize,
+}
+
+/// One absolute caret stop on an editable visual line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineCaret {
+    pub path: Vec<usize>,
+    pub offset: usize,
+    pub col: usize,
+}
+
 /// One editable region on a visual line, tied to a paragraph path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LineSeg {
@@ -144,6 +161,11 @@ pub struct LineSeg {
     /// `cols[k]` = column offset (relative to `col0`) of the k-th char; the last
     /// entry is just past the final char.
     pub cols: Vec<usize>,
+    /// Visual-order caret stops derived from the bidi projection. Adjacent
+    /// clusters may share a terminal column at directional boundaries, so entries
+    /// are ordered by visual traversal, not by logical offset. Interior offsets
+    /// inside a grapheme cluster or zero-width control are omitted.
+    pub visual: Vec<LineCaretStop>,
 }
 
 impl LineSeg {
@@ -154,24 +176,84 @@ impl LineSeg {
         self.path == path && offset >= self.start && offset <= self.start + self.nchars()
     }
     pub fn col_for_offset(&self, offset: usize) -> Option<usize> {
+        self.col_for_offset_near(offset, None)
+    }
+    pub fn col_for_offset_near(
+        &self,
+        offset: usize,
+        preferred_col: Option<usize>,
+    ) -> Option<usize> {
         if offset < self.start {
             return None;
         }
-        self.cols.get(offset - self.start).map(|c| self.col0 + c)
+        let mut candidates: Vec<usize> = self
+            .visual_positions()
+            .into_iter()
+            .filter(|caret| caret.offset == offset)
+            .map(|caret| caret.col)
+            .collect();
+        if candidates.is_empty() {
+            if let Some(col) = self.cols.get(offset - self.start).map(|c| self.col0 + c) {
+                candidates.push(col);
+            }
+        }
+        match preferred_col {
+            Some(preferred) => candidates
+                .into_iter()
+                .min_by_key(|col| col.abs_diff(preferred)),
+            None => candidates.into_iter().next(),
+        }
     }
     /// Nearest model offset for an absolute screen column.
     pub fn offset_for_col(&self, col: usize) -> usize {
-        let rel = col.saturating_sub(self.col0);
+        if let Some(caret) = self.hit_for_col(col) {
+            return caret.offset;
+        }
         let mut best = 0usize;
         let mut best_d = usize::MAX;
         for (i, &c) in self.cols.iter().enumerate() {
-            let d = c.abs_diff(rel);
+            let d = (self.col0 + c).abs_diff(col);
             if d < best_d {
                 best_d = d;
                 best = i;
             }
         }
         self.start + best
+    }
+    pub fn hit_for_col(&self, col: usize) -> Option<LineCaret> {
+        self.visual_positions()
+            .into_iter()
+            .min_by_key(|caret| caret.col.abs_diff(col))
+    }
+    pub fn visual_positions(&self) -> Vec<LineCaret> {
+        let stops = if self.visual.is_empty() {
+            self.legacy_visual_stops()
+        } else {
+            self.visual.clone()
+        };
+        stops
+            .into_iter()
+            .map(|stop| LineCaret {
+                path: self.path.clone(),
+                offset: stop.offset,
+                col: self.col0 + stop.col,
+            })
+            .collect()
+    }
+    fn legacy_visual_stops(&self) -> Vec<LineCaretStop> {
+        let mut stops = Vec::new();
+        for (i, &col) in self.cols.iter().enumerate() {
+            let stop = LineCaretStop {
+                offset: self.start + i,
+                col,
+            };
+            if stops.last() == Some(&stop) {
+                continue;
+            }
+            stops.push(stop);
+        }
+        stops.sort_by_key(|stop| stop.col);
+        stops
     }
     /// Column span [first, last] this segment occupies on screen.
     pub fn col_range(&self) -> (usize, usize) {
@@ -222,6 +304,80 @@ impl LineMap {
     /// The segment containing the caret (path + offset), if any.
     pub fn seg_for(&self, path: &[usize], offset: usize) -> Option<&LineSeg> {
         self.segs.iter().find(|s| s.contains(path, offset))
+    }
+    pub fn col_for_caret(
+        &self,
+        path: &[usize],
+        offset: usize,
+        preferred_col: Option<usize>,
+    ) -> Option<usize> {
+        let mut candidates: Vec<usize> = self
+            .segs
+            .iter()
+            .filter(|seg| seg.contains(path, offset))
+            .filter_map(|seg| seg.col_for_offset_near(offset, preferred_col))
+            .collect();
+        match preferred_col {
+            Some(preferred) => candidates
+                .into_iter()
+                .min_by_key(|col| col.abs_diff(preferred)),
+            None => candidates.drain(..).next(),
+        }
+    }
+    pub fn nearest_caret(&self, col: usize) -> Option<LineCaret> {
+        self.visual_positions()
+            .into_iter()
+            .min_by_key(|caret| caret.col.abs_diff(col))
+    }
+    pub fn visual_neighbor(
+        &self,
+        path: &[usize],
+        offset: usize,
+        preferred_col: Option<usize>,
+        right: bool,
+    ) -> Option<LineCaret> {
+        let stops = self.visual_positions();
+        let current = stops
+            .iter()
+            .enumerate()
+            .filter(|(_, caret)| caret.path == path && caret.offset == offset)
+            .min_by_key(|(_, caret)| {
+                preferred_col
+                    .map(|col| caret.col.abs_diff(col))
+                    .unwrap_or(0)
+            })
+            .map(|(idx, _)| idx);
+        if let Some(idx) = current {
+            let next = if right {
+                idx.checked_add(1)?
+            } else {
+                idx.checked_sub(1)?
+            };
+            return stops.get(next).cloned();
+        }
+
+        let col = self.col_for_caret(path, offset, preferred_col)?;
+        if right {
+            stops.into_iter().find(|caret| caret.col > col)
+        } else {
+            stops.into_iter().rev().find(|caret| caret.col < col)
+        }
+    }
+    pub fn edge_caret(&self, right: bool) -> Option<LineCaret> {
+        if right {
+            self.visual_positions().into_iter().last()
+        } else {
+            self.visual_positions().into_iter().next()
+        }
+    }
+    pub fn visual_positions(&self) -> Vec<LineCaret> {
+        let mut stops: Vec<LineCaret> = self
+            .segs
+            .iter()
+            .flat_map(LineSeg::visual_positions)
+            .collect();
+        stops.sort_by_key(|caret| caret.col);
+        stops
     }
     /// The editable segment nearest the given column (for vertical movement).
     pub fn nearest_seg(&self, col: usize) -> Option<&LineSeg> {
@@ -1618,6 +1774,7 @@ struct ProjectedLine {
     width: usize,
     start: usize,
     cols: Vec<usize>,
+    visual: Vec<LineCaretStop>,
     glyph_cells: Vec<Option<std::ops::Range<usize>>>,
 }
 
@@ -1626,7 +1783,7 @@ fn project_line(
     base: BidiBaseDirection,
     projector: Option<&dyn BidiProjector>,
 ) -> ProjectedLine {
-    let visual = if let Some(projector) = projector {
+    let visual_line = if let Some(projector) = projector {
         let input: Vec<BidiInputGlyph> = glyphs
             .iter()
             .map(|g| BidiInputGlyph {
@@ -1641,14 +1798,16 @@ fn project_line(
         identity_visual_line(glyphs)
     };
 
-    let spans = projected_spans(glyphs, &visual);
-    let glyph_cells = projected_glyph_cells(glyphs, &visual);
-    let (start, cols) = projected_extent(&visual);
+    let spans = projected_spans(glyphs, &visual_line);
+    let glyph_cells = projected_glyph_cells(glyphs, &visual_line);
+    let (start, cols) = projected_extent(&visual_line);
+    let visual = projected_caret_stops(&visual_line);
     ProjectedLine {
         spans,
-        width: visual.width,
+        width: visual_line.width,
         start,
         cols,
+        visual,
         glyph_cells,
     }
 }
@@ -1788,6 +1947,40 @@ fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
         })
         .collect();
     (start, cols)
+}
+
+fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
+    let mut stops = Vec::new();
+    for cluster in &visual.clusters {
+        let Some(logical) = &cluster.logical else {
+            continue;
+        };
+        if cluster.cells.start == cluster.cells.end {
+            continue;
+        }
+        let (left_offset, right_offset) = if cluster.level % 2 == 1 {
+            (logical.end, logical.start)
+        } else {
+            (logical.start, logical.end)
+        };
+        stops.push(LineCaretStop {
+            offset: left_offset,
+            col: cluster.cells.start,
+        });
+        stops.push(LineCaretStop {
+            offset: right_offset,
+            col: cluster.cells.end,
+        });
+    }
+
+    let mut compacted = Vec::new();
+    for stop in stops {
+        if compacted.last() == Some(&stop) {
+            continue;
+        }
+        compacted.push(stop);
+    }
+    compacted
 }
 
 fn prefix_glyphs(prefix: &str) -> Vec<Glyph> {
@@ -1952,11 +2145,20 @@ fn render_paragraph(
                 .iter()
                 .map(|col| col.saturating_sub(line_start_col))
                 .collect();
+            let visual = projected
+                .visual
+                .iter()
+                .map(|stop| LineCaretStop {
+                    offset: stop.offset,
+                    col: stop.col.saturating_sub(line_start_col),
+                })
+                .collect();
             let lseg = LineSeg {
                 path: path.to_vec(),
                 start: projected.start,
                 col0: prefix_cols,
                 cols,
+                visual,
             };
             // Place any inline images sitting on this line and reserve the rows
             // their pixels extend below the text baseline.
@@ -3467,6 +3669,7 @@ mod tests {
                 start: 0,
                 col0: 0,
                 cols: vec![0, 1],
+                visual: Vec::new(),
             });
             (line, map)
         };
@@ -3498,6 +3701,7 @@ mod tests {
                     start: 0,
                     col0: 0,
                     cols: vec![0, 1],
+                    visual: Vec::new(),
                 }),
             )
         };

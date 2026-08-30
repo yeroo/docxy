@@ -106,16 +106,27 @@ Task 1 notes:
 
 ### Task 4: Route navigation, selection, and mouse input through the map
 
-- [ ] update caret drawing, left/right visual movement, Home/End, vertical desired
+- [x] update caret drawing, left/right visual movement, Home/End, vertical desired
       column, selection painting, mouse click, and drag selection to use the same
       projection rather than duplicate index arithmetic
-- [ ] retain logical word/document operations, copy order, undo/redo, and control
+- [x] retain logical word/document operations, copy order, undo/redo, and control
       API offsets; document where visual arrow movement crosses bidi runs
-- [ ] ensure selections spanning several directional runs paint every visual cell
+- [x] ensure selections spanning several directional runs paint every visual cell
       once and do not include padding or control characters
-- [ ] add key/mouse tests for both paragraph directions, boundaries, wrapping,
+- [x] add key/mouse tests for both paragraph directions, boundaries, wrapping,
       wide/combining glyphs, and mixed numeric text
-- [ ] run `cargo test -p docxy` before Task 5
+- [x] run `cargo test -p docxy` before Task 5
+
+Task 4 notes:
+
+- `LineMap::visual_positions` is now the shared caret/hit-test surface for the
+  TUI. Visual Left/Right, Home/End, vertical movement, clicks, and drag selection
+  use its projected cell stops; logical Ctrl-word/document movement, copy/export,
+  undo/redo, and control API offsets remain unchanged.
+- At a bidi run boundary, two logical caret stops can share one terminal column.
+  The TUI stores a visual row/column hint so repeated movement continues from the
+  user's visible edge; a visual arrow may therefore cross the logical run boundary
+  before the cursor cell visibly changes.
 
 ### Task 5: Add regression fixtures and live evidence
 
