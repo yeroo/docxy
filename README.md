@@ -59,10 +59,10 @@ docxy assets/sample.docx
   cells — navigate and type directly into cells.
 - **Styles** resolved from `styles.xml`; **lists** numbered from `numbering.xml`;
   headings, indents, alignment, tab stops, and horizontal rules.
-- **Bidirectional DOCX layout** for Hebrew, Arabic, and mixed LTR/RTL text:
-  paragraph `w:bidi`, run `w:rtl`, style-inherited direction, and Unicode bidi
-  controls render in visual order while editing, copy/export, and save offsets
-  remain logical.
+- **Bidirectional DOCX layout** in the terminal editor for Hebrew, Arabic, and
+  mixed LTR/RTL text: paragraph `w:bidi`, run `w:rtl`, style-inherited
+  direction, and Unicode bidi controls render in visual order while editing,
+  copy/export, and save offsets remain logical.
 - **Lossless save** — unmodeled parts are preserved exactly.
 - **Find & replace**, full **clipboard** (syncs with the OS clipboard),
   **selection + formatting**, word navigation, and **show-invisibles**.
@@ -315,6 +315,11 @@ The architecture — the wasm ABIs, the host ↔ webview split, and how VS Code'
 edit events stay in lockstep with each engine's own undo stack — is written up
 in [VSCODE.md](VSCODE.md).
 
+Bidi note: terminal `docxy` injects Unicode bidi projection for DOCX lines. The
+wasm-backed Offxy editors currently use `docxcore`'s identity render path, so
+Hebrew, Arabic, and mixed-direction DOCX text remains logical-order there until
+a wasm projector is added.
+
 ## Offxy in JetBrains IDEs — native, no webview
 
 The [`offxy-jetbrains`](offxy-jetbrains) plugin brings the Word **and Excel**
@@ -331,6 +336,9 @@ clipboard, one-transaction-one-undo. Every open tab advertises on the same
 [agent control surface](docs/agent-control.md) the terminal apps use, so
 Claude Code and Junie can read and edit it live. See
 [offxy-jetbrains/README.md](offxy-jetbrains/README.md).
+
+Bidi note: the JetBrains plugin uses the same wasm DOCX bridge as Offxy for VS
+Code, so DOCX bidi projection is not yet applied in IDE editor tabs.
 
 ## Install
 
@@ -373,6 +381,9 @@ README will meet (`CONTRIBUTING.md` lists the rest):
   DEFLATE, XML pull parser) shared by every engine.
 - **`docxcore`** — the WordprocessingML engine (document model, rendering,
   and the from-scratch PDF writer). No third-party dependencies.
+  Embedders constructing `docxcore::render::RenderOptions` directly should set
+  `bidi: None` for identity visual order or provide an `Rc<dyn BidiProjector>`
+  when the host supplies Unicode bidi projection.
 - **`gridcore`** — the SpreadsheetML engine (workbook model, formula
   parser/evaluator, dependency-graph recalculation, lossless xlsx I/O).
 - **`projcore`** — the project-scheduling engine (task/calendar model, MSPDI
@@ -380,8 +391,8 @@ README will meet (`CONTRIBUTING.md` lists the rest):
   native `.yppx` OPC package). `std`-only, on top of `opccore`.
 - **`mppread`** — `std`-only reader for the OLE2 Compound File container of
   legacy binary `.mpp`/`.doc`/`.xls` files (MS-CFB).
-- **`docxy`** — the document TUI (ratatui), clipboard (arboard), and image
-  rendering (ratatui-image).
+- **`docxy`** — the document TUI (ratatui), Unicode bidi projection
+  (`unicode-bidi`), clipboard (arboard), and image rendering (ratatui-image).
 - **`xlsxy`** — the spreadsheet TUI (ratatui + arboard).
 - **`yppxy`** — the project-scheduler TUI with a live terminal Gantt chart
   (ratatui).

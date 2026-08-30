@@ -104,6 +104,12 @@ pub struct Span {
     pub link: Option<String>,
 }
 
+impl Span {
+    pub fn width(&self) -> usize {
+        str_width(&self.text)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Line {
     pub spans: Vec<Span>,
@@ -111,7 +117,7 @@ pub struct Line {
 
 impl Line {
     pub fn width(&self) -> usize {
-        self.spans.iter().map(|s| str_width(&s.text)).sum()
+        self.spans.iter().map(Span::width).sum()
     }
     pub fn plain(&self) -> String {
         self.spans.iter().map(|s| s.text.as_str()).collect()
@@ -226,34 +232,15 @@ impl LineSeg {
             .min_by_key(|caret| caret.col.abs_diff(col))
     }
     pub fn visual_positions(&self) -> Vec<LineCaret> {
-        let stops = if self.visual.is_empty() {
-            self.legacy_visual_stops()
-        } else {
-            self.visual.clone()
-        };
-        stops
-            .into_iter()
+        self.visual
+            .iter()
+            .cloned()
             .map(|stop| LineCaret {
                 path: self.path.clone(),
                 offset: stop.offset,
                 col: self.col0 + stop.col,
             })
             .collect()
-    }
-    fn legacy_visual_stops(&self) -> Vec<LineCaretStop> {
-        let mut stops = Vec::new();
-        for (i, &col) in self.cols.iter().enumerate() {
-            let stop = LineCaretStop {
-                offset: self.start + i,
-                col,
-            };
-            if stops.last() == Some(&stop) {
-                continue;
-            }
-            stops.push(stop);
-        }
-        stops.sort_by_key(|stop| stop.col);
-        stops
     }
     /// Column span [first, last] this segment occupies on screen.
     pub fn col_range(&self) -> (usize, usize) {
@@ -1882,7 +1869,7 @@ struct LogicalExtent {
     cells: std::ops::Range<usize>,
 }
 
-fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
+fn projected_logical_extents(visual: &BidiVisualLine) -> Vec<LogicalExtent> {
     let mut extents: Vec<LogicalExtent> = Vec::new();
     for cluster in &visual.clusters {
         let Some(logical) = &cluster.logical else {
@@ -1903,7 +1890,11 @@ fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
             });
         }
     }
+    extents
+}
 
+fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
+    let mut extents = projected_logical_extents(visual);
     if extents.is_empty() {
         return (0, vec![0]);
     }
@@ -1951,25 +1942,24 @@ fn projected_extent(visual: &BidiVisualLine) -> (usize, Vec<usize>) {
 
 fn projected_caret_stops(visual: &BidiVisualLine) -> Vec<LineCaretStop> {
     let mut stops = Vec::new();
-    for cluster in &visual.clusters {
-        let Some(logical) = &cluster.logical else {
-            continue;
-        };
-        if cluster.cells.start == cluster.cells.end {
+    let mut extents = projected_logical_extents(visual);
+    extents.sort_by_key(|extent| extent.cells.start);
+    for extent in extents {
+        if extent.cells.start == extent.cells.end {
             continue;
         }
-        let (left_offset, right_offset) = if cluster.level % 2 == 1 {
-            (logical.end, logical.start)
+        let (left_offset, right_offset) = if extent.level % 2 == 1 {
+            (extent.end, extent.start)
         } else {
-            (logical.start, logical.end)
+            (extent.start, extent.end)
         };
         stops.push(LineCaretStop {
             offset: left_offset,
-            col: cluster.cells.start,
+            col: extent.cells.start,
         });
         stops.push(LineCaretStop {
             offset: right_offset,
-            col: cluster.cells.end,
+            col: extent.cells.end,
         });
     }
 
@@ -2137,7 +2127,11 @@ fn render_paragraph(
             if lead > 0 {
                 line.spans.push(Line::text_span(" ".repeat(lead)));
             }
-            let line_start_col = projected.cols.iter().copied().min().unwrap_or(0);
+            let line_start_col = if projected.visual.is_empty() {
+                projected.width
+            } else {
+                projected.cols.iter().copied().min().unwrap_or(0)
+            };
             line.spans.extend(projected.spans.clone());
             let prefix_cols = lead + line_start_col;
             let cols = projected
@@ -2145,7 +2139,7 @@ fn render_paragraph(
                 .iter()
                 .map(|col| col.saturating_sub(line_start_col))
                 .collect();
-            let visual = projected
+            let mut visual: Vec<LineCaretStop> = projected
                 .visual
                 .iter()
                 .map(|stop| LineCaretStop {
@@ -2153,6 +2147,12 @@ fn render_paragraph(
                     col: stop.col.saturating_sub(line_start_col),
                 })
                 .collect();
+            if visual.is_empty() {
+                visual.push(LineCaretStop {
+                    offset: projected.start,
+                    col: 0,
+                });
+            }
             let lseg = LineSeg {
                 path: path.to_vec(),
                 start: projected.start,
@@ -3669,7 +3669,10 @@ mod tests {
                 start: 0,
                 col0: 0,
                 cols: vec![0, 1],
-                visual: Vec::new(),
+                visual: vec![
+                    LineCaretStop { offset: 0, col: 0 },
+                    LineCaretStop { offset: 1, col: 1 },
+                ],
             });
             (line, map)
         };
@@ -3701,7 +3704,10 @@ mod tests {
                     start: 0,
                     col0: 0,
                     cols: vec![0, 1],
-                    visual: Vec::new(),
+                    visual: vec![
+                        LineCaretStop { offset: 0, col: 0 },
+                        LineCaretStop { offset: 1, col: 1 },
+                    ],
                 }),
             )
         };
@@ -4236,6 +4242,27 @@ mod tests {
             "underlined tab should fill with underlined spaces: {:?}",
             lines[0].spans
         );
+    }
+
+    #[test]
+    fn tab_caret_map_exposes_only_logical_tab_edges() {
+        let p = Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: vec![
+                run("a", RunProps::default()),
+                Inline::Tab(RunProps::default()),
+                run("b", RunProps::default()),
+            ],
+        });
+        let (lines, maps) = render_mapped(&doc(vec![p]), &opts(20));
+        assert_eq!(lines[0].plain(), "a       b");
+
+        let stops: Vec<(usize, usize)> = maps[0]
+            .visual_positions()
+            .into_iter()
+            .map(|caret| (caret.offset, caret.col))
+            .collect();
+        assert_eq!(stops, vec![(0, 0), (1, 1), (2, 8), (3, 9)]);
     }
 
     #[test]
@@ -5267,6 +5294,40 @@ mod tests {
     }
 
     #[test]
+    fn empty_prefixed_paragraph_maps_caret_after_prefix() {
+        let mut list = Paragraph {
+            props: ParProps::default(),
+            content: Vec::new(),
+        };
+        list.props.num_id = Some(1);
+        let (lines, maps) = render_mapped(&doc(vec![Block::Paragraph(list)]), &opts(20));
+        assert_eq!(lines[0].plain(), "• ");
+        let s = seg(&maps[0]);
+        assert_eq!(s.nchars(), 0);
+        assert_eq!(s.col_for_offset(0), Some(2));
+        assert_eq!(s.offset_for_col(2), 0);
+        assert_eq!(
+            maps[0].nearest_caret(2),
+            Some(LineCaret {
+                path: vec![0],
+                offset: 0,
+                col: 2,
+            })
+        );
+
+        let mut indented = Paragraph {
+            props: ParProps::default(),
+            content: Vec::new(),
+        };
+        indented.props.indent = 240;
+        let (_lines, maps) = render_mapped(&doc(vec![Block::Paragraph(indented)]), &opts(20));
+        let s = seg(&maps[0]);
+        assert_eq!(s.nchars(), 0);
+        assert_eq!(s.col_for_offset(0), Some(2));
+        assert_eq!(maps[0].edge_caret(false).map(|caret| caret.col), Some(2));
+    }
+
+    #[test]
     fn map_handles_empty_paragraph() {
         let d = doc(vec![Block::Paragraph(Paragraph::default())]);
         let (_lines, maps) = render_mapped(&d, &opts(20));
@@ -5274,6 +5335,14 @@ mod tests {
         assert_eq!(s.path, vec![0]);
         assert_eq!(s.nchars(), 0);
         assert_eq!(s.col_for_offset(0), Some(0));
+        assert_eq!(
+            maps[0].nearest_caret(0),
+            Some(LineCaret {
+                path: vec![0],
+                offset: 0,
+                col: 0,
+            })
+        );
     }
 
     #[test]

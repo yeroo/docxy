@@ -168,6 +168,11 @@ fetches each rid once, sniffs the format, and paints a data-URI `<img>` over the
 placeholder box (raster + SVG); vector WMF/EMF, which browsers can't decode, fall
 back to a labeled box — exactly the terminal app's fallback.
 
+Bidi note: terminal `docxy` passes a Unicode bidi projector into `docxcore`.
+The wasm bridge currently passes `bidi: None`, so Hebrew, Arabic, and
+mixed-direction DOCX lines remain logical-order in `offxy.docxEditor` until a
+wasm projector is added.
+
 **Markdown ⇄ docx** conversion runs the *same wasm in the extension host*
 (Node instantiates `docxwasm` too), via stateless exports `docx_from_markdown`
 and `docx_to_md` — so **Convert Markdown to Word** (right-click a `.md`) and

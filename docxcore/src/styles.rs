@@ -150,13 +150,6 @@ impl StyleSheet {
         Align::Left
     }
 
-    /// Effective paragraph direction: direct `w:bidi` wins; an explicit direct
-    /// off value captured in `raw_props` blocks style inheritance.
-    pub fn effective_rtl(&self, para_style: Option<&str>, direct: &ParProps) -> bool {
-        self.paragraph_rtl_override(para_style, direct)
-            .unwrap_or(false)
-    }
-
     /// Explicit or inherited paragraph direction, if OOXML provides one.
     /// `None` means layout should infer the bidi base direction from content.
     pub fn paragraph_rtl_override(
@@ -626,16 +619,25 @@ mod tests {
         let xml = r#"<w:styles>
             <w:style w:styleId="Base"><w:pPr><w:bidi/></w:pPr></w:style>
             <w:style w:styleId="Derived"><w:basedOn w:val="Base"/><w:pPr><w:bidi w:val="0"/></w:pPr></w:style>
-            </w:styles>"#;
+        </w:styles>"#;
         let ss = parse_styles_xml(xml);
         let mut direct = ParProps::default();
-        assert!(ss.effective_rtl(Some("Base"), &direct));
-        assert!(!ss.effective_rtl(Some("Derived"), &direct));
+        assert_eq!(ss.paragraph_rtl_override(Some("Base"), &direct), Some(true));
+        assert_eq!(
+            ss.paragraph_rtl_override(Some("Derived"), &direct),
+            Some(false)
+        );
         direct.rtl = true;
-        assert!(ss.effective_rtl(Some("Derived"), &direct));
+        assert_eq!(
+            ss.paragraph_rtl_override(Some("Derived"), &direct),
+            Some(true)
+        );
         direct.rtl = false;
         direct.raw_props = vec!["<w:bidi w:val=\"0\"/>".to_string()];
-        assert!(!ss.effective_rtl(Some("Base"), &direct));
+        assert_eq!(
+            ss.paragraph_rtl_override(Some("Base"), &direct),
+            Some(false)
+        );
     }
 
     #[test]

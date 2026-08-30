@@ -3822,7 +3822,7 @@ impl App {
         let line = self.lines.get(doc_line)?;
         let mut cum = 0usize;
         for span in &line.spans {
-            let w = span.text.chars().count();
+            let w = span.width();
             if col < cum + w {
                 return span.link.clone();
             }
@@ -6964,6 +6964,7 @@ mod tests {
                 &["abc 123 גבא, def?"],
             ),
             (BidiFixture::ExplicitRunOverride, &["בא", "cba"]),
+            (BidiFixture::StyleDerived, &["םולש", "בא", "12"]),
             (BidiFixture::List, &["טירפ", "123"]),
             (BidiFixture::Table, &["cell 45 גבא", "םולש"]),
             (BidiFixture::Header, &["body גבא"]),
@@ -9625,21 +9626,28 @@ mod tests {
         let mut app = app_with(&["abc 123 אבג"]);
         app.ensure_rendered(40);
         app.viewport_h = 10;
+        assert_eq!(app.lines[0].plain(), "abc 123 גבא");
+        assert_eq!(app.caret_screen(), Some((0, 0)));
 
-        for _ in 0..8 {
-            let (row, col) = app.caret_screen().expect("caret on screen");
-            let cur = app.editor.caret.clone();
-            let expected = app.maps[row]
-                .visual_neighbor(&cur.path, cur.offset, Some(col), true)
-                .expect("next visual stop");
-
+        let expected = [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (4, 4),
+            (5, 5),
+            (6, 6),
+            (7, 7),
+            (8, 8),
+            (11, 8),
+            (10, 9),
+            (9, 10),
+            (8, 11),
+        ];
+        for (offset, col) in expected {
             app.on_key(key(KeyCode::Right));
 
-            assert_eq!(
-                app.editor.caret,
-                Caret::at(expected.path.clone(), expected.offset)
-            );
-            assert_eq!(app.caret_screen(), Some((row, expected.col)));
+            assert_eq!(app.editor.caret, Caret::at(vec![0], offset));
+            assert_eq!(app.caret_screen(), Some((0, col)));
         }
     }
 
@@ -10101,6 +10109,78 @@ mod tests {
         app.ensure_rendered(40);
         assert_eq!(app.link_at(0, 1).as_deref(), Some("https://x.test/")); // over "link"
         assert_eq!(app.link_at(0, 20), None); // past the text
+    }
+
+    #[test]
+    fn link_at_uses_rendered_cell_width() {
+        let h = Inline::Hyperlink(Hyperlink {
+            target: Some("https://wide.test/".to_string()),
+            runs: vec![Run {
+                text: "哈".to_string(),
+                props: RunProps::default(),
+            }],
+            ..Hyperlink::default()
+        });
+        let body = vec![Block::Paragraph(MPara {
+            props: ParProps::default(),
+            content: vec![
+                h,
+                Inline::Run(Run {
+                    text: "x".to_string(),
+                    props: RunProps::default(),
+                }),
+            ],
+        })];
+        let mut app = App::new(new_package(Document { body }), "wide.docx", false);
+        app.os_clip = None;
+        app.ensure_rendered(40);
+
+        assert_eq!(app.lines[0].plain(), "哈x");
+        assert_eq!(app.link_at(0, 0).as_deref(), Some("https://wide.test/"));
+        assert_eq!(app.link_at(0, 1).as_deref(), Some("https://wide.test/"));
+        assert_eq!(app.link_at(0, 2), None);
+    }
+
+    #[test]
+    fn link_at_follows_bidi_visual_columns() {
+        let h = Inline::Hyperlink(Hyperlink {
+            target: Some("https://rtl.test/".to_string()),
+            runs: vec![Run {
+                text: "אב".to_string(),
+                props: RunProps::default(),
+            }],
+            ..Hyperlink::default()
+        });
+        let mut rtl = ParProps::default();
+        rtl.rtl = true;
+        let body = vec![Block::Paragraph(MPara {
+            props: rtl,
+            content: vec![
+                Inline::Run(Run {
+                    text: "x ".to_string(),
+                    props: RunProps::default(),
+                }),
+                h,
+                Inline::Run(Run {
+                    text: " z".to_string(),
+                    props: RunProps::default(),
+                }),
+            ],
+        })];
+        let mut app = App::new(new_package(Document { body }), "rtl-link.docx", false);
+        app.os_clip = None;
+        app.ensure_rendered(40);
+
+        let visual = app.lines[0].plain();
+        let link_col = visual
+            .chars()
+            .position(|ch| ch == 'ב')
+            .unwrap_or_else(|| panic!("missing visual RTL link text: {visual:?}"));
+        assert_eq!(
+            app.link_at(0, link_col).as_deref(),
+            Some("https://rtl.test/")
+        );
+        assert_eq!(app.link_at(0, 0), None);
     }
 
     #[test]

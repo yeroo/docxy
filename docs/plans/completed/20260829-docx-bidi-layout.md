@@ -174,7 +174,7 @@ Task 6 notes:
 - Documented representative evidence paths:
   `target/test-artifacts/docxy/bidi-non-page-view.txt` and
   `target/test-artifacts/docxy/bidi-page-view.txt`.
-- Final validation on 2026-08-30: `cargo test` passed 2522 tests with 0 failed
+- Final validation on 2026-08-30: `cargo test` passed 2526 tests with 0 failed
   and 1 ignored across 57 result groups; `cargo clippy --all-targets -- -D warnings`,
   `cargo fmt --check`, and `git diff --check` passed.
 - Deliberate deferrals: complex-script shaping, fallback-font selection, exact

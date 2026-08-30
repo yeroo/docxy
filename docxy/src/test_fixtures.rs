@@ -148,6 +148,7 @@ pub(crate) enum BidiFixture {
     Arabic,
     MixedLatinNumbersNeutrals,
     ExplicitRunOverride,
+    StyleDerived,
     List,
     Table,
     Header,
@@ -155,11 +156,12 @@ pub(crate) enum BidiFixture {
 }
 
 impl BidiFixture {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::Hebrew,
         Self::Arabic,
         Self::MixedLatinNumbersNeutrals,
         Self::ExplicitRunOverride,
+        Self::StyleDerived,
         Self::List,
         Self::Table,
         Self::Header,
@@ -172,6 +174,7 @@ impl BidiFixture {
             Self::Arabic => "bidi-arabic",
             Self::MixedLatinNumbersNeutrals => "bidi-mixed-latin-numbers-neutrals",
             Self::ExplicitRunOverride => "bidi-explicit-run-override",
+            Self::StyleDerived => "bidi-style-derived",
             Self::List => "bidi-list",
             Self::Table => "bidi-table",
             Self::Header => "bidi-header",
@@ -223,6 +226,17 @@ impl BidiFixture {
                     "<w:p><w:r><w:t>A </w:t></w:r><w:r><w:rPr><w:rtl/></w:rPr><w:t>אב 12</w:t></w:r><w:r><w:t> </w:t></w:r><w:r><w:t>RLO \u{202e}abc\u{202c}</w:t></w:r></w:p>",
                     None,
                 ),
+                &settings,
+                &empty_document_relationships(),
+                &[],
+            ),
+            Self::StyleDerived => package_bytes_with_styles(
+                self.name(),
+                &bidi_document(
+                    r#"<w:p><w:pPr><w:pStyle w:val="BidiPara"/></w:pPr><w:r><w:t>שלום</w:t></w:r></w:p><w:p><w:r><w:t>A </w:t></w:r><w:r><w:rPr><w:rStyle w:val="RtlRun"/></w:rPr><w:t>אב 12</w:t></w:r></w:p>"#,
+                    None,
+                ),
+                &bidi_styles_xml(),
                 &settings,
                 &empty_document_relationships(),
                 &[],
@@ -288,6 +302,7 @@ impl BidiFixture {
             Self::Arabic => "مرحبا 123.",
             Self::MixedLatinNumbersNeutrals => "abc 123 אבג, def?",
             Self::ExplicitRunOverride => "A אב 12 RLO \u{202e}abc\u{202c}",
+            Self::StyleDerived => "שלום\nA אב 12",
             Self::List => "פריט 123",
             Self::Table => "cell אבג 45\tשלום",
             Self::Header => "body אבג",
@@ -300,6 +315,10 @@ impl BidiFixture {
             Self::Hebrew | Self::Arabic => &["<w:bidi/>"],
             Self::MixedLatinNumbersNeutrals => &[],
             Self::ExplicitRunOverride => &["<w:rtl/>", "\u{202e}", "\u{202c}"],
+            Self::StyleDerived => &[
+                r#"<w:pStyle w:val="BidiPara"/>"#,
+                r#"<w:rStyle w:val="RtlRun"/>"#,
+            ],
             Self::List => &["<w:bidi/>", "<w:numPr>"],
             Self::Table => &["<w:tbl>", "<w:bidi/>"],
             Self::Header => &["<w:headerReference w:type=\"default\" r:id=\"rIdHeader\"/>"],
@@ -311,6 +330,10 @@ impl BidiFixture {
         match self {
             Self::Header => &[("word/header1.xml", "<w:bidi/>")],
             Self::List => &[("word/numbering.xml", "<w:numbering")],
+            Self::StyleDerived => &[
+                ("word/styles.xml", "<w:bidi/>"),
+                ("word/styles.xml", "<w:rtl/>"),
+            ],
             _ => &[],
         }
     }
@@ -332,6 +355,12 @@ fn bidi_document(body: &str, sect_pr: Option<&str>) -> String {
 fn numbering_xml() -> String {
     format!(
         r#"<w:numbering xmlns:w="{W}"><w:abstractNum w:abstractNumId="0"><w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl></w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#
+    )
+}
+
+fn bidi_styles_xml() -> String {
+    format!(
+        r#"<w:styles xmlns:w="{W}"><w:style w:type="paragraph" w:styleId="BidiPara"><w:name w:val="Bidi Para"/><w:pPr><w:bidi/></w:pPr></w:style><w:style w:type="character" w:styleId="RtlRun"><w:name w:val="RTL Run"/><w:rPr><w:rtl/></w:rPr></w:style></w:styles>"#
     )
 }
 
@@ -390,9 +419,51 @@ fn package_bytes(
     package_bytes_with_extra(name, document, settings, document_rels, headers, &[])
 }
 
+fn package_bytes_with_styles(
+    name: &str,
+    document: &str,
+    styles: &str,
+    settings: &str,
+    document_rels: &str,
+    headers: &[(&str, String)],
+) -> Vec<u8> {
+    package_bytes_with_styles_extra(
+        name,
+        document,
+        styles,
+        settings,
+        document_rels,
+        headers,
+        &[],
+    )
+}
+
 fn package_bytes_with_extra(
     name: &str,
     document: &str,
+    settings: &str,
+    document_rels: &str,
+    headers: &[(&str, String)],
+    extra_parts: &[(&str, &str, String)],
+) -> Vec<u8> {
+    let styles = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="{W}"/>"#
+    );
+    package_bytes_with_styles_extra(
+        name,
+        document,
+        &styles,
+        settings,
+        document_rels,
+        headers,
+        extra_parts,
+    )
+}
+
+fn package_bytes_with_styles_extra(
+    name: &str,
+    document: &str,
+    styles: &str,
     settings: &str,
     document_rels: &str,
     headers: &[(&str, String)],
@@ -418,9 +489,6 @@ fn package_bytes_with_extra(
     let root_rels = format!(
         r#"<?xml version="1.0"?><Relationships xmlns="{PR}"><Relationship Id="rId1" Type="{R}/officeDocument" Target="word/document.xml"/></Relationships>"#
     );
-    let styles = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="{W}"/>"#
-    );
     let evidence = format!(r#"<?xml version="1.0"?><fixture name="{name}"/>"#);
     let mut parts = vec![
         (
@@ -436,7 +504,7 @@ fn package_bytes_with_extra(
             "word/_rels/document.xml.rels".to_string(),
             document_rels.as_bytes().to_vec(),
         ),
-        ("word/styles.xml".to_string(), styles.into_bytes()),
+        ("word/styles.xml".to_string(), styles.as_bytes().to_vec()),
         (
             "word/settings.xml".to_string(),
             settings.as_bytes().to_vec(),
@@ -540,6 +608,18 @@ mod tests {
             "explicit run-level rtl was not modeled"
         );
         assert!(paragraph.plain_text().contains('\u{202e}'));
+
+        let styled = BidiFixture::StyleDerived.package();
+        let Block::Paragraph(paragraph) = &styled.document.body[0] else {
+            panic!("style-derived fixture starts with a paragraph");
+        };
+        assert_eq!(paragraph.props.style_id.as_deref(), Some("BidiPara"));
+        let Block::Paragraph(paragraph) = &styled.document.body[1] else {
+            panic!("style-derived fixture has a second paragraph");
+        };
+        assert!(paragraph.content.iter().any(|inline| {
+            matches!(inline, Inline::Run(run) if run.props.style_id.as_deref() == Some("RtlRun"))
+        }));
 
         let list = BidiFixture::List.package();
         let Block::Paragraph(paragraph) = &list.document.body[0] else {
