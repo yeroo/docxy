@@ -6943,6 +6943,126 @@ mod tests {
         assert!(lines[2].spans.iter().any(|span| span.style.strike));
     }
 
+    fn rendered_text(app: &mut App, width: u16) -> String {
+        app.ensure_rendered(width);
+        app.lines
+            .iter()
+            .map(|line| line.plain())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn bidi_docx_fixtures_render_visually_and_copy_logically() {
+        use crate::test_fixtures::BidiFixture;
+
+        let cases: &[(BidiFixture, &[&str])] = &[
+            (BidiFixture::Hebrew, &["םולש"]),
+            (BidiFixture::Arabic, &["ابحرم", "123"]),
+            (
+                BidiFixture::MixedLatinNumbersNeutrals,
+                &["abc 123 גבא, def?"],
+            ),
+            (BidiFixture::ExplicitRunOverride, &["בא", "cba"]),
+            (BidiFixture::List, &["טירפ", "123"]),
+            (BidiFixture::Table, &["cell 45 גבא", "םולש"]),
+            (BidiFixture::Header, &["body גבא"]),
+            (BidiFixture::TrackedRevisions, &["שדח", "ןשי", "123", "45"]),
+        ];
+
+        for (fixture, visual_fragments) in cases {
+            let mut app = App::new(fixture.package(), fixture.name(), false);
+            app.os_clip = None;
+            let visual = rendered_text(&mut app, 80);
+            for fragment in *visual_fragments {
+                assert!(
+                    visual.contains(fragment),
+                    "{} rendered without expected visual fragment {fragment:?}: {visual}",
+                    fixture.name()
+                );
+            }
+            assert!(!visual.contains('\u{202e}'), "RLO leaked into visual text");
+            assert!(!visual.contains('\u{202c}'), "PDF leaked into visual text");
+
+            let plain_export = app.editor.doc.plain_text();
+            for token in fixture.logical_text().split_whitespace() {
+                assert!(
+                    plain_export.contains(token),
+                    "{} text export lost logical token {token:?}: {plain_export:?}",
+                    fixture.name()
+                );
+            }
+
+            app.editor.select_all();
+            app.do_copy();
+            let copied = app.clip_text.as_deref().unwrap_or("");
+            if *fixture != BidiFixture::TrackedRevisions {
+                for token in fixture.logical_text().split_whitespace() {
+                    assert!(
+                        copied.contains(token),
+                        "{} copy lost logical token {token:?}: {copied:?}",
+                        fixture.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bidi_docx_fixtures_save_reload_with_same_visual_output() {
+        use crate::test_fixtures::BidiFixture;
+
+        for fixture in BidiFixture::ALL {
+            let mut original = App::new(fixture.package(), fixture.name(), false);
+            original.os_clip = None;
+            let before = rendered_text(&mut original, 80);
+            let saved = save_package(&original.pkg);
+            let package = load_package(&saved)
+                .unwrap_or_else(|error| panic!("reload {}: {error:?}", fixture.name()));
+            let mut reloaded = App::new(package, fixture.name(), false);
+            reloaded.os_clip = None;
+            let after = rendered_text(&mut reloaded, 80);
+
+            assert_eq!(after, before, "{}", fixture.name());
+        }
+    }
+
+    #[test]
+    fn bidi_fixture_render_evidence_captures_page_and_non_page_views() {
+        use crate::test_fixtures::BidiFixture;
+
+        let artifact_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-artifacts/docxy");
+        std::fs::create_dir_all(&artifact_dir).expect("create bidi artifact directory");
+
+        let mut non_page = App::new(
+            BidiFixture::MixedLatinNumbersNeutrals.package(),
+            "bidi-mixed.docx",
+            false,
+        );
+        non_page.os_clip = None;
+        let non_page_capture = rendered_text(&mut non_page, 80);
+        assert!(non_page_capture.contains("abc 123 גבא, def?"));
+        let non_page_artifact = artifact_dir.join("bidi-non-page-view.txt");
+        std::fs::write(&non_page_artifact, &non_page_capture)
+            .expect("write bidi non-page view capture");
+        eprintln!("wrote {}", non_page_artifact.display());
+
+        let mut page = App::new(BidiFixture::Header.package(), "bidi-header.docx", false);
+        page.os_clip = None;
+        page.page_view = true;
+        page.light_page = true;
+        page.dirty = true;
+        let mut terminal = Terminal::new(TestBackend::new(100, 70)).unwrap();
+        terminal.draw(|frame| page.draw(frame)).unwrap();
+        let page_capture = format!("{:?}", terminal.backend().buffer());
+        assert!(page_capture.contains("body גבא"), "{page_capture}");
+        assert!(page_capture.contains("תרתוכ"), "{page_capture}");
+        let page_artifact = artifact_dir.join("bidi-page-view.txt");
+        std::fs::write(&page_artifact, &page_capture).expect("write bidi page-view capture");
+        eprintln!("wrote {}", page_artifact.display());
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }

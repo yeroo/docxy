@@ -130,14 +130,33 @@ Task 4 notes:
 
 ### Task 5: Add regression fixtures and live evidence
 
-- [ ] add minimal DOCX fixtures for Hebrew, Arabic, mixed Latin/numbers/neutrals,
+- [x] add minimal DOCX fixtures for Hebrew, Arabic, mixed Latin/numbers/neutrals,
       explicit run overrides, lists, tables, headers, and tracked revisions
-- [ ] verify visual projection, logical copy/export, save/reload, and unchanged XML
+- [x] verify visual projection, logical copy/export, save/reload, and unchanged XML
       direction properties
-- [ ] capture representative page and non-page views with the existing UI harness
+- [x] capture representative page and non-page views with the existing UI harness
       if possible without adding OCR/golden-image infrastructure
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --check`, and `git diff --check`
+
+Task 5 notes:
+
+- Added source-defined in-memory DOCX package fixtures in `docxy/src/test_fixtures.rs`
+  for Hebrew, Arabic, mixed Latin/numbers/neutrals, explicit `w:rtl` plus
+  Unicode override controls, lists, tables, headers, and tracked revisions.
+- Added package-level tests for modeled direction inputs and save/reload
+  preservation of `w:bidi`, `w:rtl`, numbering, header, and revision markup.
+- Added app-renderer tests in `docxy/src/main.rs` proving visual-order output,
+  logical plain-text export, editable-range logical copy, stable save/reload
+  rendering, and hidden Unicode bidi controls.
+- Captured deterministic representative evidence with the existing ratatui
+  `TestBackend` path at `target/test-artifacts/docxy/bidi-non-page-view.txt`
+  and `target/test-artifacts/docxy/bidi-page-view.txt`; no OCR or golden-image
+  infrastructure was added.
+- `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check`, and `git diff --check` pass on the final tree. A small
+  existing clippy cleanup in `docxcore/src/styles.rs` was required for the
+  current toolchain.
 
 ### Task 6: [Final] Document bidi behavior and limits
 

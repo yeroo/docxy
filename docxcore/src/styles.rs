@@ -204,9 +204,7 @@ impl StyleSheet {
         if !seen.insert(id.to_string()) {
             return None;
         }
-        let Some(def) = self.styles.get(id) else {
-            return None;
-        };
+        let def = self.styles.get(id)?;
         let base = def.based_on.as_ref().and_then(|b| self.fold_rtl(b, seen));
         def.rtl.or(base)
     }
