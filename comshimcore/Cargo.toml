@@ -14,7 +14,7 @@ workspace = true
 
 # Windows-only; an empty crate elsewhere so the workspace still builds on Linux CI.
 [target.'cfg(windows)'.dependencies]
-windows-core = "0.58"
+windows-core = "0.62"
 windows = { version = "0.58", features = [
     "implement",
     "Win32_Foundation",
