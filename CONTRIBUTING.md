@@ -69,7 +69,8 @@ The root workspace is twenty-one crates. Layered bottom-up, at its core:
   rendering, and the PDF writer) on top of `opccore`.
 - **`gridcore`** — pure, `std`-only XLSX engine (workbook model, lossless
   I/O, and the formula/recalculation engine) on top of `opccore`.
-- **`docxy`** — the `.docx` terminal UI (ratatui), clipboard, image rendering.
+- **`docxy`** — the `.docx` terminal UI (ratatui), Unicode bidi projection,
+  clipboard, image rendering.
 - **`xlsxy`** — the `.xlsx` terminal UI.
 
 The rest follow the same shape — a pure core plus its front end: `projcore` /
@@ -126,6 +127,9 @@ run stored under `target/criterion`). A quick smoke run:
 - Format with `cargo fmt` (rustfmt defaults); keep `clippy` clean.
 - Keep the **`*core` crates dependency-free** — runtime crates (ratatui,
   clipboard, image, …) belong only in the `docxy`/`xlsxy` frontends.
+- Keep DOCX bidi projection on that same boundary: `docxcore` exposes
+  `RenderOptions::bidi`/`BidiProjector`, while `docxy` owns the `unicode-bidi`
+  dependency and passes the projector for terminal rendering.
 - Keep changes focused; one logical change per pull request.
 - If you change behavior, describe it in the PR (and update the README if it is
   user-facing).

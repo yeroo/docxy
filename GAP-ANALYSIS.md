@@ -43,7 +43,8 @@ editable, creatable), **sections** (multi-section, landscape, page geometry),
 **multi-column** newspaper layout, **images** (raster + WMF/EMF via GDI, inline
 & floating), **charts** (text bar/pie), **text boxes** (editable), **math**
 (OMML → Unicode; LaTeX authoring), **comments** (add/delete/show), **simple
-fields**, and **external hyperlinks**.
+fields**, **external hyperlinks**, and **bidirectional DOCX layout** (UBA visual
+order for `w:bidi`, resolved `w:rtl`, Unicode controls, logical copy/export).
 
 ### Document protection and watermark guarantees
 
@@ -95,7 +96,7 @@ the status indicator but does not paint page overlays.
 | **D4** | **Content controls** — block, inline, and table-row `w:sdt` wrappers and arbitrary properties round-trip while their content remains visible/editable; authoring and form UX are not exposed | **27** | PRESERVED + editable payload | property/form UI (deferred) | Low |
 | **D5** | **Symbols** (`w:sym`) — preserved but glyph never rendered → symbol chars invisible | **11** | PRESERVED-but-hidden | map to Unicode/font glyph | Medium |
 | **D6** | **Internal links & bookmarks** — anchor hyperlinks unwrapped to plain text; bookmarks round-trip but aren't navigation targets | bookmarks **30**, hyperlinks 28 | DISPLAY (inert) | clickable in-doc nav | Medium |
-| **D7** | **RTL / bidi** — `w:bidi` flag round-trips but text isn't visually reversed; run-level `w:rtl` dropped | **6** | DISPLAY (LTR only) | visual reorder | Low-Med |
+| **D7** | **RTL / bidi** — `w:bidi`, style-inherited direction, resolved `w:rtl`, and Unicode controls render in UBA visual order while copy/export stay logical; `w:dir`/`w:bdo` containers and complex-script shaping remain deferred | **6** | SUPPORTED (terminal UBA) | shaping/container polish | Low |
 | **D8** | **Page borders** — preserved byte-faithful and surfaced by a status indicator, but not drawn on the page | 3 | PRESERVED | render | Low |
 | — | **Encrypted docx** — detected and refused | 2 | MISSING (rejected) | out of scope (needs crypto) | — |
 
@@ -220,9 +221,11 @@ navigate and accept/reject supported records with native undo, structured
 outcomes, and package round-trip coverage. Unsupported move/custom records are
 enumerated and preserved. Automatically tracking new edits remains deferred.
 
-**Phase D-4 — Visibility fixes _(Medium; symbols 11 + RTL 6 + internal nav 30)_**
-Render `w:sym` glyphs (symbol-font → Unicode map); visually reorder RTL runs;
-make internal hyperlinks/bookmarks navigable (jump to anchor).
+**Phase D-4 — Visibility fixes _(Medium; symbols 11 + internal nav 30)_**
+Render `w:sym` glyphs (symbol-font → Unicode map) and make internal
+hyperlinks/bookmarks navigable (jump to anchor). RTL/bidi visual layout is
+complete for the supported terminal contract; remaining work is complex-script
+shaping and OOXML directional-container polish.
 
 **Phase D-5 — Structure preservation & inert features _(Lower)_**
 `w:sdt` wrapper reconstruction is complete for block, inline, and row-level

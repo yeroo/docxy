@@ -167,6 +167,7 @@ impl Session {
             footers: Default::default(),
             title_page: false,
             even_odd: false,
+            bidi: None,
         }
     }
 

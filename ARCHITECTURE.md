@@ -56,6 +56,10 @@ world. Page geometry is optional pseudographics, not a pixel-accurate page.
   Kitty, iTerm2, or Sixel — with a Unicode half-block fallback and a text
   placeholder as the floor (see §7a). This is a *capability*, gated behind
   detection; it never breaks terminals that lack graphics.
+- **Bidi projection:** `unicode-bidi` is used only by `docxy` to project wrapped
+  DOCX lines through the Unicode Bidirectional Algorithm. `docxcore` exposes the
+  render hook and keeps text storage, copy/export, and automation offsets
+  logical without taking a third-party dependency.
 - No other runtime dependencies if avoidable. Keep the tree small and auditable.
 
 ---
@@ -235,6 +239,25 @@ lines), which makes it snapshot-testable.
   tabs, `↵` for line breaks, in a dim color.
 - **Headings/styles:** style id drives emphasis (e.g. Heading 1 → bold + accent
   color + spacing). Lists render bullets/numbers from `numbering`.
+- **Bidirectional DOCX text:** `docxy` passes a UBA projector into
+  `RenderOptions`; `docxcore` wraps logical lines and emits glyph metadata
+  without depending on UBA. Each soft-wrapped line is reordered independently
+  after wrapping. Base direction precedence is direct paragraph `w:bidi` on/off,
+  then paragraph style inheritance, then first strong character, then LTR. Run
+  direction comes from resolved direct/style/default `w:rtl`; explicit Unicode
+  bidi controls in the text are honored and hidden as zero-width controls.
+  Directional container elements such as `w:dir` and `w:bdo` are not yet modeled
+  as layout overrides.
+- **Bidi navigation:** `LineMap` stores projected visual caret stops. Left/right,
+  Home/End, vertical movement, clicks, and drags hit-test through that map; word
+  movement, document movement, copy/export, undo/redo, and automation offsets
+  remain logical. At directional boundaries two logical stops can share a
+  terminal column, so the app keeps a visual row/column hint to continue
+  movement from the visible edge.
+- **Bidi rendering limits:** the TUI does UBA reordering and terminal-cell
+  placement only. It deliberately does not shape complex scripts, choose fallback
+  fonts, or match Word's exact line breaking; Arabic joining, ligatures, and
+  font fallback are left to the terminal/font stack.
 - **Width correctness:** use Unicode width (wide CJK = 2 cells, zero-width marks
   = 0) so wrapping and tables line up.
 
@@ -365,6 +388,7 @@ scriptable without a terminal).
 | Create/view/update `.docx` | `docxcore::{template,load,save}` + editor |
 | Select styles | `ui::style_picker` + apply-style op |
 | Show invisible symbols | `render::invisibles` + `F3` |
+| Bidirectional DOCX layout | `docxy::bidi` + `RenderOptions::bidi` + `LineMap` |
 | Images (kitty/ghostty/sixel…) | `render::image` + `ratatui-image` (§7a) |
 | Print / export to PDF | `docxcore::export` (standard-14 fonts) + `--pdf` / `:export pdf` (§7b) |
 
@@ -411,6 +435,11 @@ signed-release pipeline as the other repos.
   semantically equal and that `document.xml` is well-formed and OPC-valid.
 - **Render snapshots:** fixed-width render of fixture docs compared to golden
   text (with toggles on/off).
+- **Bidi regression evidence:** source-defined DOCX fixtures cover Hebrew,
+  Arabic, mixed Latin/numbers/neutrals, run `w:rtl`, Unicode bidi controls,
+  lists, tables, headers, and tracked revisions. The renderer evidence capture
+  writes `target/test-artifacts/docxy/bidi-non-page-view.txt` and
+  `target/test-artifacts/docxy/bidi-page-view.txt`.
 - **Edit-op property tests:** every op's inverse restores the prior model.
 - **PDF golden tests:** deterministic PDF bytes for fixture docs; structural
   checks (valid xref/trailer, expected page count, embedded font references).
@@ -430,7 +459,9 @@ signed-release pipeline as the other repos.
 - **Graphics-in-TUI compositing:** pixel images over a repainting cell grid can
   smear on scroll/resize; rely on `ratatui-image`'s stateful widget and keep
   images block-level (§7a).
-- **Bidi / complex scripts:** out of scope initially; render LTR.
+- **Complex scripts beyond bidi:** UBA visual order is supported in the TUI, but
+  shaping, fallback-font selection, and exact Word line breaking are still out of
+  scope for the terminal renderer.
 - **Large documents:** lazy layout / viewport-only rendering if needed.
 - **Shared `docxcore`:** extracting it cleanly from rust365 without disturbing
   that shipped tool — do it behind tests, keep rust365's behavior byte-identical.

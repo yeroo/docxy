@@ -30,6 +30,11 @@ IntelliJ editor over a live, **editable** `Document`:
   regenerates only what you changed and preserves everything else
   byte-for-byte.
 
+Bidi note: terminal `docxy` applies Unicode bidi projection for DOCX lines. The
+JetBrains plugin currently uses `docxwasm` with `bidi: None`, so Hebrew, Arabic,
+and mixed-direction DOCX text remains logical-order until a wasm projector is
+added.
+
 ## The spreadsheet editor
 
 `.xlsx` opens in a **virtualized native grid** over gridwasm's windowed

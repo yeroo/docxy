@@ -13,6 +13,11 @@ terminal apps. For each format, the *entire* pipeline — parse → render → e
 → **lossless save** — runs in the webview as a small `.wasm`. There is no
 JavaScript docx/xlsx library, no server, and no external process.
 
+Bidi note: terminal `docxy` applies Unicode bidi projection for DOCX lines. The
+wasm-backed Offxy editor currently uses `docxcore`'s identity render path, so
+Hebrew, Arabic, and mixed-direction DOCX text remains logical-order until a wasm
+projector is added.
+
 ## Why it's different
 
 Most `.docx`/`.xlsx` extensions either only *view* (read-only preview) or

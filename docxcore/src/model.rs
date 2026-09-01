@@ -35,6 +35,9 @@ pub struct RunProps {
     pub small_caps: bool,
     /// Hidden text (`w:vanish` / `w:webHidden`).
     pub vanish: bool,
+    /// Run-level right-to-left text direction (`w:rtl`). The visual layout
+    /// layer consumes this as a UBA run hint while editor offsets stay logical.
+    pub rtl: bool,
     pub vert_align: VertAlign,
     /// Hex `RRGGBB` (uppercased), if an explicit non-auto color was set.
     pub color: Option<String>,

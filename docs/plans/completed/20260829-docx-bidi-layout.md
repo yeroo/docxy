@@ -35,72 +35,151 @@ and wide glyphs in visual order with correct caret, selection, and mouse mapping
 
 ### Task 1: Specify bidi inputs and choose the layout dependency
 
-- [ ] inventory paragraph/run direction data, current wrapping/cell-width logic,
+- [x] inventory paragraph/run direction data, current wrapping/cell-width logic,
       caret/selection mapping, mouse hit testing, tables, and page-view paths
-- [ ] select a maintained UBA implementation compatible with Rust 1.88 and the
+- [x] select a maintained UBA implementation compatible with Rust 1.88 and the
       repository's licensing/dependency policy; add it only to the appropriate UI
       crate and record why it is needed
-- [ ] structure run-level RTL/override data currently hidden in raw run properties
+- [x] structure run-level RTL/override data currently hidden in raw run properties
       without breaking lossless serialization
-- [ ] define base-direction and override precedence for OOXML and Unicode controls
-- [ ] add loader/model tests for paragraph and run direction round-trips
-- [ ] run `cargo test -p docxcore` before Task 2
+- [x] define base-direction and override precedence for OOXML and Unicode controls
+- [x] add loader/model tests for paragraph and run direction round-trips
+- [x] run `cargo test -p docxcore` before Task 2
+
+Task 1 notes:
+
+- Direction inputs: direct paragraph `w:bidi` is modeled as `ParProps.rtl`;
+  direct run `w:rtl` is modeled as `RunProps.rtl`; explicit-off `w:bidi` and
+  `w:rtl` stay in `raw_props` so absence, style inheritance, and direct off
+  remain distinguishable for save and layout. `styles.xml` now resolves
+  run-level `w:rtl` and paragraph-style `w:bidi` through `StyleSheet`.
+- Current rendering inventory: `docxcore/src/render.rs` flattens logical inlines
+  in `flatten_para`, measures with `char_width`/`str_width`/`glyph_w`, wraps in
+  `wrap_glyphs`, and derives editable columns in `glyph_extent`/`LineMap`.
+  `w:bidi` was only a right-alignment cue; no UBA projection exists yet.
+- Mapping inventory: docxy keeps editor offsets logical. `docxy/src/main.rs`
+  consumes `LineMap` in `caret_screen`, `move_vert`, `click_caret`, `link_at`,
+  mouse drag selection, and keyboard selection extension; table rendering shifts
+  cell maps in `render_table`; page view frames/paginates body maps and drops
+  header/footer maps so body clicks do not collide with repeated page chrome.
+- Dependency decision: use `unicode-bidi` 0.3.18 in `docxy` only. `cargo info`
+  reports license `MIT OR Apache-2.0` and `rust-version` 1.47.0, which is
+  compatible with the workspace MIT license and Rust 1.88 MSRV while preserving
+  the std-only `docxcore` boundary.
+- Base-direction precedence for layout: direct paragraph `w:bidi` on wins;
+  direct paragraph `w:bidi` off blocks style inheritance; otherwise paragraph
+  style chain `w:bidi` applies; otherwise infer from the line's first strong
+  directional character with LTR as the no-strong fallback.
+- Run-direction precedence for layout: Unicode bidi controls remain in logical
+  text and are interpreted by the UBA implementation; OOXML directional
+  containers such as `w:bdo`/`w:dir`, when parsed by the projection layer, create
+  explicit override/embedding ranges; direct run `w:rtl` wins over run style or
+  document defaults; run style/default `w:rtl` wins over paragraph base for that
+  run. Editor storage, copy/export, undo/redo, and public control offsets remain
+  logical.
 
 ### Task 2: Build a reusable visual-line projection
 
-- [ ] create a pure layout type mapping logical text/run offsets to visual glyph
+- [x] create a pure layout type mapping logical text/run offsets to visual glyph
       clusters and terminal cell spans for one wrapped line
-- [ ] apply UBA levels/reordering before cell placement while keeping style,
+- [x] apply UBA levels/reordering before cell placement while keeping style,
       hyperlink, field, revision, and source-offset ownership attached to clusters
-- [ ] handle combining marks, emoji sequences supported by the existing width
+- [x] handle combining marks, emoji sequences supported by the existing width
       policy, zero-width controls, tabs, and wide characters without invalid maps
-- [ ] expose visual-to-logical hit testing plus logical caret-leading/trailing
+- [x] expose visual-to-logical hit testing plus logical caret-leading/trailing
       positions with documented boundary behavior
-- [ ] add table-driven tests from standard bidi examples and focused mixed-script
+- [x] add table-driven tests from standard bidi examples and focused mixed-script
       terminal-width cases
-- [ ] run `cargo test -p docxy` before Task 3
+- [x] run `cargo test -p docxy` before Task 3
 
 ### Task 3: Integrate bidi with wrapping and alignment
 
-- [ ] make line wrapping produce logical ranges and a visual projection per line,
+- [x] make line wrapping produce logical ranges and a visual projection per line,
       with paragraph base direction applied independently after each wrap
-- [ ] align RTL and explicitly aligned paragraphs without double-reversing or
+- [x] align RTL and explicitly aligned paragraphs without double-reversing or
       treating right alignment as reordering
-- [ ] integrate projections in ordinary paragraphs, list labels, table cells,
+- [x] integrate projections in ordinary paragraphs, list labels, table cells,
       headers/footers, page view, fields, hyperlinks, and revision display spans
-- [ ] preserve clipping, scrolling, tiny viewport, and horizontal offset behavior
-- [ ] add renderer-state tests for wrapped LTR/RTL/mixed text in body and tables
-- [ ] run `cargo test -p docxy` before Task 4
+- [x] preserve clipping, scrolling, tiny viewport, and horizontal offset behavior
+- [x] add renderer-state tests for wrapped LTR/RTL/mixed text in body and tables
+- [x] run `cargo test -p docxy` before Task 4
 
 ### Task 4: Route navigation, selection, and mouse input through the map
 
-- [ ] update caret drawing, left/right visual movement, Home/End, vertical desired
+- [x] update caret drawing, left/right visual movement, Home/End, vertical desired
       column, selection painting, mouse click, and drag selection to use the same
       projection rather than duplicate index arithmetic
-- [ ] retain logical word/document operations, copy order, undo/redo, and control
+- [x] retain logical word/document operations, copy order, undo/redo, and control
       API offsets; document where visual arrow movement crosses bidi runs
-- [ ] ensure selections spanning several directional runs paint every visual cell
+- [x] ensure selections spanning several directional runs paint every visual cell
       once and do not include padding or control characters
-- [ ] add key/mouse tests for both paragraph directions, boundaries, wrapping,
+- [x] add key/mouse tests for both paragraph directions, boundaries, wrapping,
       wide/combining glyphs, and mixed numeric text
-- [ ] run `cargo test -p docxy` before Task 5
+- [x] run `cargo test -p docxy` before Task 5
+
+Task 4 notes:
+
+- `LineMap::visual_positions` is now the shared caret/hit-test surface for the
+  TUI. Visual Left/Right, Home/End, vertical movement, clicks, and drag selection
+  use its projected cell stops; logical Ctrl-word/document movement, copy/export,
+  undo/redo, and control API offsets remain unchanged.
+- At a bidi run boundary, two logical caret stops can share one terminal column.
+  The TUI stores a visual row/column hint so repeated movement continues from the
+  user's visible edge; a visual arrow may therefore cross the logical run boundary
+  before the cursor cell visibly changes.
 
 ### Task 5: Add regression fixtures and live evidence
 
-- [ ] add minimal DOCX fixtures for Hebrew, Arabic, mixed Latin/numbers/neutrals,
+- [x] add minimal DOCX fixtures for Hebrew, Arabic, mixed Latin/numbers/neutrals,
       explicit run overrides, lists, tables, headers, and tracked revisions
-- [ ] verify visual projection, logical copy/export, save/reload, and unchanged XML
+- [x] verify visual projection, logical copy/export, save/reload, and unchanged XML
       direction properties
-- [ ] capture representative page and non-page views with the existing UI harness
+- [x] capture representative page and non-page views with the existing UI harness
       if possible without adding OCR/golden-image infrastructure
-- [ ] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+- [x] run `cargo test`, `cargo clippy --all-targets -- -D warnings`,
       `cargo fmt --check`, and `git diff --check`
+
+Task 5 notes:
+
+- Added source-defined in-memory DOCX package fixtures in `docxy/src/test_fixtures.rs`
+  for Hebrew, Arabic, mixed Latin/numbers/neutrals, explicit `w:rtl` plus
+  Unicode override controls, lists, tables, headers, and tracked revisions.
+- Added package-level tests for modeled direction inputs and save/reload
+  preservation of `w:bidi`, `w:rtl`, numbering, header, and revision markup.
+- Added app-renderer tests in `docxy/src/main.rs` proving visual-order output,
+  logical plain-text export, editable-range logical copy, stable save/reload
+  rendering, and hidden Unicode bidi controls.
+- Captured deterministic representative evidence with the existing ratatui
+  `TestBackend` path at `target/test-artifacts/docxy/bidi-non-page-view.txt`
+  and `target/test-artifacts/docxy/bidi-page-view.txt`; no OCR or golden-image
+  infrastructure was added.
+- `cargo test`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check`, and `git diff --check` pass on the final tree. A small
+  existing clippy cleanup in `docxcore/src/styles.rs` was required for the
+  current toolchain.
 
 ### Task 6: [Final] Document bidi behavior and limits
 
-- [ ] update DOCX support/rendering docs with direction precedence, navigation
+- [x] update DOCX support/rendering docs with direction precedence, navigation
       semantics, dependency rationale, shaping limitation, and evidence paths
-- [ ] record final test counts and deliberate deferrals in this plan
+- [x] record final test counts and deliberate deferrals in this plan
+
+Task 6 notes:
+
+- Updated `README.md`, `ARCHITECTURE.md`, and `GAP-ANALYSIS.md` to document the
+  supported terminal bidi contract: paragraph `w:bidi`, style-inherited
+  direction, resolved `w:rtl`, Unicode bidi controls, visual navigation through
+  `LineMap`, logical copy/export/API offsets, and `unicode-bidi` living only in
+  `docxy` so `docxcore` remains std-only.
+- Documented representative evidence paths:
+  `target/test-artifacts/docxy/bidi-non-page-view.txt` and
+  `target/test-artifacts/docxy/bidi-page-view.txt`.
+- Final validation on 2026-08-30: `cargo test` passed 2526 tests with 0 failed
+  and 1 ignored across 57 result groups; `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check`, and `git diff --check` passed.
+- Deliberate deferrals: complex-script shaping, fallback-font selection, exact
+  Word line breaking, and parsed OOXML directional-container layout overrides
+  for `w:dir`/`w:bdo`. Those are separate from the completed UBA reordering and
+  terminal cell-mapping contract.
 
 *Note: Ralphex moves a completed plan to `docs/plans/completed/`.*
-

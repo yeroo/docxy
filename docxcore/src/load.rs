@@ -1476,6 +1476,10 @@ fn parse_rpr(p: &mut XmlParser, props: &mut RunProps) {
                         props.vanish = toggle_on(val);
                         modeled = false;
                     }
+                    "w:rtl" => {
+                        props.rtl = toggle_on(val);
+                        modeled = props.rtl;
+                    }
                     "w:vertAlign" => {
                         props.vert_align = match val {
                             "superscript" => VertAlign::Superscript,
@@ -2945,16 +2949,58 @@ mod tests {
 
     #[test]
     fn rtl_flags_round_trip() {
-        // Paragraph bidi + run-level rtl (the latter via rPr raw_props) survive.
+        // Paragraph bidi + run-level rtl survive as structured direction input.
         let xml = "<w:document><w:body>\
                    <w:p><w:pPr><w:bidi/></w:pPr>\
                    <w:r><w:rPr><w:rtl/></w:rPr><w:t>שלום</w:t></w:r></w:p>\
                    </w:body></w:document>";
         let d = doc(xml);
         assert!(first_para(&d).props.rtl, "paragraph bidi not modeled");
+        let Inline::Run(run) = &first_para(&d).content[0] else {
+            panic!("paragraph contains a run")
+        };
+        assert!(run.props.rtl, "run rtl not modeled");
         let out = crate::serialize::document_to_xml(&d);
         assert!(out.contains("<w:bidi/>"), "paragraph bidi lost on save");
         assert!(out.contains("<w:rtl/>"), "run-level rtl lost on save");
+    }
+
+    #[test]
+    fn explicit_run_rtl_off_stays_raw() {
+        let xml = "<w:document><w:body>\
+                   <w:p><w:r><w:rPr><w:rtl w:val=\"0\"/></w:rPr><w:t>x</w:t></w:r></w:p>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        let Inline::Run(run) = &first_para(&d).content[0] else {
+            panic!("paragraph contains a run")
+        };
+        assert!(!run.props.rtl);
+        assert!(
+            run.props
+                .raw_props
+                .iter()
+                .any(|raw| raw.contains("<w:rtl w:val=\"0\""))
+        );
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:rtl w:val=\"0\"/>"));
+    }
+
+    #[test]
+    fn run_rtl_property_change_snapshot_is_semantic() {
+        let xml = "<w:document><w:body>\
+                   <w:p><w:r><w:rPr><w:rPrChange w:id=\"42\"><w:rPr><w:rtl/></w:rPr></w:rPrChange></w:rPr><w:t>x</w:t></w:r></w:p>\
+                   </w:body></w:document>";
+        let d = doc(xml);
+        let Inline::Run(run) = &first_para(&d).content[0] else {
+            panic!("paragraph contains a run")
+        };
+        let change = run.props.property_change.as_ref().unwrap();
+        let PropertySnapshot::Present(PropertyState::Run(previous)) = &change.previous else {
+            panic!("run prior state is semantic")
+        };
+        assert!(previous.rtl, "prior run rtl not modeled");
+        let out = crate::serialize::document_to_xml(&d);
+        assert!(out.contains("<w:rPr><w:rtl/></w:rPr>"));
     }
 
     #[test]
