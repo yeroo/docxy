@@ -248,6 +248,9 @@ impl Editor {
         for t in &mut self.proj.tasks {
             t.predecessors.retain(|p| p.uid != uid);
         }
+        // Fourth intentional fix in the Editor extraction: the old TUI left
+        // dangling assignments, which attached to a new task if its UID was reused.
+        self.proj.assignments.retain(|a| a.task_uid != uid);
         self.changed();
         Ok(())
     }
@@ -819,6 +822,38 @@ mod tests {
         ed.indent(2, i32::MIN).unwrap();
         assert_eq!(ed.project().tasks[1].outline_level, 1);
         assert!(!ed.project().tasks[0].summary);
+    }
+
+    #[test]
+    fn deleting_a_task_removes_assignments_before_its_uid_is_reused() {
+        let mut ed = editor();
+        ed.assign_resource(1, "Alice").unwrap();
+        ed.assign_resource(2, "Alice").unwrap();
+        ed.toggle_level();
+        let before = ed.project().clone();
+        assert!(ed.disp_start(2).unwrap() > ed.disp_start(1).unwrap());
+
+        ed.delete_task(2).unwrap();
+        assert!(ed.project().assignments.iter().all(|a| a.task_uid != 2));
+        assert_eq!(ed.project().assignments.len(), 1);
+        assert_eq!(ed.project().resources, before.resources);
+        assert_schedule(&ed);
+
+        let at = ed.add_task(None, "Replacement", 480).unwrap();
+        let uid = ed.project().tasks[at].uid;
+        assert_eq!(uid, 2, "the highest deleted UID is reused");
+        assert!(ed.project().assignments.iter().all(|a| a.task_uid != uid));
+        assert_eq!(ed.disp_start(uid), ed.disp_start(1));
+        assert_schedule(&ed);
+
+        assert!(ed.undo()); // remove the replacement task
+        assert!(ed.undo()); // restore the deleted task and its assignment
+        assert_eq!(ed.project(), &before);
+        assert!(ed.disp_start(2).unwrap() > ed.disp_start(1).unwrap());
+        assert_schedule(&ed);
+        assert!(ed.redo());
+        assert!(ed.project().assignments.iter().all(|a| a.task_uid != 2));
+        assert_schedule(&ed);
     }
 
     #[test]
