@@ -39,12 +39,20 @@ Built bottom-up, each a pure module:
 | `model` | the pure domain: `Task`, `Predecessor`, `Resource`, `Assignment`, `Calendar`, `Project`; `LinkType`/`ConstraintType` with MSPDI's integer codes pinned once |
 | `mspdi` | read **and** write MS Project's MSPDI XML — the interop bridge |
 | `schedule` | the CPM engine + resource leveling |
+| `editor` | shared editing, selection, dirty tracking, undo/redo, and live scheduling |
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`) |
 
 The model is **pure input** — the scheduler never mutates it; it returns a
 separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
 `stored_*` and used as an **oracle** for the scheduler.
+
+`projcore::editor::Editor` owns the editable project, its 100-entry undo history,
+selection, dirty flag, computed schedule and optional leveling overlay. Validated
+edits snapshot once and reschedule; rejected edits preserve the whole session.
+`yppxy` supplies the keys, status messages and file I/O, and its project control
+verbs use the same Editor through `dispatch_editor`. Opening or creating a project
+clears history while retaining the find query and leveling preference.
 
 ## The scheduling model
 
