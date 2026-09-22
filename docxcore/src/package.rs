@@ -48,20 +48,20 @@ fn decode_xml_part(bytes: &[u8]) -> Option<Cow<'_, str>> {
     };
 
     if let Some((encoded, little_endian)) = utf16 {
-        let mut chunks = encoded.chunks_exact(2);
-        let units = chunks
-            .by_ref()
-            .map(|pair| {
+        let (pairs, remainder) = encoded.as_chunks::<2>();
+        if !remainder.is_empty() {
+            return None;
+        }
+        let units = pairs
+            .iter()
+            .map(|&pair| {
                 if little_endian {
-                    u16::from_le_bytes([pair[0], pair[1]])
+                    u16::from_le_bytes(pair)
                 } else {
-                    u16::from_be_bytes([pair[0], pair[1]])
+                    u16::from_be_bytes(pair)
                 }
             })
             .collect::<Vec<_>>();
-        if !chunks.remainder().is_empty() {
-            return None;
-        }
         return String::from_utf16(&units).ok().map(Cow::Owned);
     }
 

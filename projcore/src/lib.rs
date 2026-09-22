@@ -5,6 +5,7 @@
 //! this targets project schedules: the domain of Microsoft Project.
 //!
 //! Layers:
+//! - [`editor`] — shared editing, selection, undo/redo and live scheduling.
 //! - [`datetime`] — a `std`-only civil wall-clock instant.
 //! - [`model`] — the pure domain model (tasks, links, resources, calendars).
 //! - [`mspdi`] — reader for MS Project's documented open XML interchange
@@ -16,6 +17,7 @@
 //!   project-scheduling analog of `.docx`/`.xlsx`.
 
 pub mod datetime;
+pub mod editor;
 pub mod gantt;
 pub mod model;
 pub mod mspdi;

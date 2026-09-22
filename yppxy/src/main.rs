@@ -30,8 +30,9 @@ use backstage::BackstageHost as _;
 use ribbon::{Act, Ribbon};
 
 use projcore::datetime::DateTime;
-use projcore::model::{Assignment, ConstraintType, LinkType, Predecessor, Project, Resource, Task};
-use projcore::schedule::{Leveled, Schedule, level, schedule};
+use projcore::editor::{AssignOutcome, Editor, FindOutcome, constraint_hint, parse_duration};
+use projcore::model::{ConstraintType, LinkType, Predecessor, Project, Task};
+use projcore::schedule::{Schedule, schedule};
 use projcore::{gantt, mspdi, yppx};
 
 use ratatui::backend::CrosstermBackend;
@@ -404,14 +405,10 @@ struct Prompt {
 }
 
 struct App {
-    proj: Project,
+    ed: Editor,
     path: Option<String>,
-    dirty: bool,
-    sel: usize,   // selected task index
     top: usize,   // first visible task row
     hscroll: i64, // gantt horizontal scroll in days from project start
-    sched: Schedule,
-    base_day: i64, // day-number of project start (gantt column origin)
     prompt: Option<Prompt>,
     status: String,
     quit: bool,
@@ -428,14 +425,8 @@ struct App {
     start_screen: bool,
     /// The shared centered start card (item list, selection, click rects).
     start: backstage::Start,
-    // undo/redo, find, vim
-    undo: Vec<Project>,
-    redo: Vec<Project>,
-    find_query: String,
+    // vim mode
     vim: bool,
-    // resource leveling overlay
-    leveled: bool,
-    level: Option<Leveled>,
     // geometry recorded during draw for mouse hit-testing
     list_y0: u16,     // absolute y of the first task row
     list_left_w: u16, // width of the task pane (left of the gantt)
@@ -447,15 +438,11 @@ const RIBBON_H: u16 = 7; // tab strip (1) + body (6: border, 2 rows, separator, 
 impl App {
     fn new(proj: Project, path: Option<String>, vim: bool) -> App {
         let start_screen = path.is_none();
-        let mut app = App {
-            proj,
+        App {
+            ed: Editor::new(proj),
             path,
-            dirty: false,
-            sel: 0,
             top: 0,
             hscroll: 0,
-            sched: empty_schedule(),
-            base_day: 0,
             prompt: None,
             status: String::new(),
             quit: false,
@@ -486,50 +473,26 @@ impl App {
             list_y0: 0,
             list_left_w: 0,
             gantt_x0: 0,
-            undo: Vec::new(),
-            redo: Vec::new(),
-            find_query: String::new(),
             vim,
-            leveled: false,
-            level: None,
-        };
-        app.reschedule();
-        app
-    }
-
-    /// Push the current project onto the undo stack before a mutation.
-    fn snapshot(&mut self) {
-        self.undo.push(self.proj.clone());
-        if self.undo.len() > 100 {
-            self.undo.remove(0);
         }
-        self.redo.clear();
     }
 
     fn undo(&mut self) {
-        if let Some(prev) = self.undo.pop() {
-            self.redo.push(std::mem::replace(&mut self.proj, prev));
-            self.after_history();
-            self.status = "Undo".into();
+        self.status = if self.ed.undo() {
+            "Undo"
         } else {
-            self.status = "Nothing to undo".into();
+            "Nothing to undo"
         }
+        .into();
     }
 
     fn redo(&mut self) {
-        if let Some(next) = self.redo.pop() {
-            self.undo.push(std::mem::replace(&mut self.proj, next));
-            self.after_history();
-            self.status = "Redo".into();
+        self.status = if self.ed.redo() {
+            "Redo"
         } else {
-            self.status = "Nothing to redo".into();
+            "Nothing to redo"
         }
-    }
-
-    fn after_history(&mut self) {
-        self.dirty = true;
-        self.sel = self.sel.min(self.proj.tasks.len().saturating_sub(1));
-        self.reschedule();
+        .into();
     }
 
     fn open_backstage(&mut self) {
@@ -558,7 +521,7 @@ impl App {
     /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
     fn request_exit(&mut self) {
         self.backstage = None;
-        let prompt = if self.dirty {
+        let prompt = if self.ed.dirty() {
             "Exit yppxy? Unsaved changes will be lost."
         } else {
             "Exit yppxy?"
@@ -603,18 +566,10 @@ impl App {
     }
 
     fn toggle_milestone(&mut self) {
-        if self.sel < self.proj.tasks.len() {
-            self.snapshot();
-            let t = &mut self.proj.tasks[self.sel];
-            if t.duration_min == 0 {
-                t.duration_min = 480;
-                t.milestone = false;
-            } else {
-                t.duration_min = 0;
-                t.milestone = true;
+        if let Some(uid) = self.ed.selected_uid() {
+            if let Err(message) = self.ed.toggle_milestone(uid) {
+                self.status = message;
             }
-            self.mark_dirty();
-            self.reschedule();
         }
     }
 
@@ -626,155 +581,55 @@ impl App {
     /// Find the next task whose name contains `query` (case-insensitive),
     /// searching from just after the current selection and wrapping around.
     fn find(&mut self, query: &str) {
-        let q = query.trim().to_lowercase();
-        if !q.is_empty() {
-            self.find_query = q;
-        }
-        if self.find_query.is_empty() || self.proj.tasks.is_empty() {
-            return;
-        }
-        let n = self.proj.tasks.len();
-        for step in 1..=n {
-            let i = (self.sel + step) % n;
-            if self.proj.tasks[i]
-                .name
-                .to_lowercase()
-                .contains(&self.find_query)
-            {
-                self.sel = i;
-                self.status = format!("Found '{}'  (F3 next)", self.find_query);
-                return;
+        match self.ed.find(query) {
+            FindOutcome::Inactive => {}
+            FindOutcome::Found(_) => {
+                self.status = format!("Found '{}'  (F3 next)", self.ed.find_query())
+            }
+            FindOutcome::NotFound => {
+                self.status = format!("No task matching '{}'", self.ed.find_query())
             }
         }
-        self.status = format!("No task matching '{}'", self.find_query);
     }
 
     /// Set a date constraint on the selected task from text like
     /// `SNET 2026-03-05`, `MSO 2026-03-05`, or `none` / `asap`.
     fn set_constraint(&mut self, text: &str) {
-        if self.sel >= self.proj.tasks.len() {
-            return;
+        if let Some(uid) = self.ed.selected_uid() {
+            self.status = match self.ed.set_constraint(uid, text) {
+                Ok(()) => format!(
+                    "Constraint set: {}",
+                    text.split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_ascii_uppercase()
+                ),
+                Err(message) => message,
+            };
         }
-        let mut it = text.split_whitespace();
-        let kind = it.next().unwrap_or("").to_ascii_lowercase();
-        let ctype = match kind.as_str() {
-            "none" | "asap" => ConstraintType::AsSoonAsPossible,
-            "alap" => ConstraintType::AsLateAsPossible,
-            "snet" => ConstraintType::StartNoEarlierThan,
-            "snlt" => ConstraintType::StartNoLaterThan,
-            "fnet" => ConstraintType::FinishNoEarlierThan,
-            "fnlt" => ConstraintType::FinishNoLaterThan,
-            "mso" => ConstraintType::MustStartOn,
-            "mfo" => ConstraintType::MustFinishOn,
-            _ => {
-                self.status =
-                    "Constraint: TYPE [date] — SNET/SNLT/FNET/FNLT/MSO/MFO/ALAP/none".into();
-                return;
-            }
-        };
-        // Constraints other than ASAP/ALAP need a date.
-        let needs_date = !matches!(
-            ctype,
-            ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible
-        );
-        let date = it.next().and_then(DateTime::parse_mspdi);
-        if needs_date && date.is_none() {
-            self.status = format!(
-                "{} needs a date, e.g. {kind} 2026-03-05",
-                kind.to_uppercase()
-            );
-            return;
-        }
-        self.snapshot();
-        let t = &mut self.proj.tasks[self.sel];
-        t.constraint = ctype;
-        t.constraint_date = if needs_date { date } else { None };
-        self.mark_dirty();
-        self.reschedule();
-        self.status = format!("Constraint set: {}", kind.to_uppercase());
     }
 
     /// Assign a resource (by name, created on first use) to the selected task.
     /// An empty name clears the task's assignments.
     fn assign_resource(&mut self, name: &str) {
-        if self.sel >= self.proj.tasks.len() {
+        let Some(uid) = self.ed.selected_uid() else {
             return;
-        }
-        let name = name.trim().to_string();
-        let task_uid = self.proj.tasks[self.sel].uid;
-
-        if name.is_empty() {
-            if self.proj.assignments.iter().any(|a| a.task_uid == task_uid) {
-                self.snapshot();
-                self.proj.assignments.retain(|a| a.task_uid != task_uid);
-                self.mark_dirty();
-                self.status = "Cleared the task's resources".into();
+        };
+        let name = name.trim();
+        match self.ed.assign_resource(uid, name) {
+            Ok(AssignOutcome::Assigned) => self.status = format!("Assigned {name}"),
+            Ok(AssignOutcome::Cleared) => self.status = "Cleared the task's resources".into(),
+            Ok(AssignOutcome::AlreadyAssigned) => {
+                self.status = format!("{name} is already assigned")
             }
-            return;
+            Ok(AssignOutcome::NothingToClear) => {}
+            Err(message) => self.status = message,
         }
-
-        let existing = self
-            .proj
-            .resources
-            .iter()
-            .find(|r| r.name.eq_ignore_ascii_case(&name))
-            .map(|r| r.uid);
-        if let Some(rid) = existing {
-            if self
-                .proj
-                .assignments
-                .iter()
-                .any(|a| a.task_uid == task_uid && a.resource_uid == rid)
-            {
-                self.status = format!("{name} is already assigned");
-                return;
-            }
-        }
-        // A real change will happen — take a single snapshot.
-        self.snapshot();
-        let rid = existing.unwrap_or_else(|| {
-            let uid = self.proj.resources.iter().map(|r| r.uid).max().unwrap_or(0) + 1;
-            let id = self.proj.resources.len() as i32 + 1;
-            self.proj.resources.push(Resource {
-                uid,
-                id,
-                name: name.clone(),
-                is_work: true,
-                max_units: 1.0,
-                calendar_uid: None,
-            });
-            uid
-        });
-        let auid = self
-            .proj
-            .assignments
-            .iter()
-            .map(|a| a.uid)
-            .max()
-            .unwrap_or(0)
-            + 1;
-        let work = self.proj.tasks[self.sel].duration_min;
-        self.proj.assignments.push(Assignment {
-            uid: auid,
-            task_uid,
-            resource_uid: rid,
-            units: 1.0,
-            work_min: work,
-        });
-        self.mark_dirty();
-        self.status = format!("Assigned {name}");
     }
 
     /// Snapshot the current computed schedule as the baseline (the saved plan).
     fn set_baseline(&mut self) {
-        self.snapshot();
-        for t in &mut self.proj.tasks {
-            if let Some(r) = self.sched.get(t.uid) {
-                t.baseline_start = Some(r.early_start);
-                t.baseline_finish = Some(r.early_finish);
-            }
-        }
-        self.mark_dirty();
+        self.ed.set_baseline();
         self.status = "Baseline set — variance now shows in the header".into();
     }
 
@@ -783,7 +638,7 @@ impl App {
         match cmd.trim() {
             "w" => self.save(),
             "q" => {
-                if self.dirty {
+                if self.ed.dirty() {
                     self.status = "Unsaved changes — :q! to force, or :wq to save".into();
                 } else {
                     self.quit = true;
@@ -792,7 +647,7 @@ impl App {
             "q!" => self.quit = true,
             "wq" | "x" => {
                 self.save();
-                if !self.dirty {
+                if !self.ed.dirty() {
                     self.quit = true;
                 }
             }
@@ -826,7 +681,7 @@ impl App {
             Act::Indent => self.indent(1),
             Act::Outdent => self.indent(-1),
             Act::Rename => {
-                if let Some(t) = self.proj.tasks.get(self.sel) {
+                if let Some(t) = self.ed.project().tasks.get(self.ed.sel()) {
                     self.prompt = Some(Prompt {
                         kind: PromptKind::Rename,
                         label: "Rename".into(),
@@ -850,9 +705,10 @@ impl App {
             }
             Act::Constraint => {
                 let cur = self
-                    .proj
+                    .ed
+                    .project()
                     .tasks
-                    .get(self.sel)
+                    .get(self.ed.sel())
                     .map(constraint_hint)
                     .unwrap_or_default();
                 self.prompt = Some(Prompt {
@@ -888,167 +744,88 @@ impl App {
         }
     }
 
-    fn reschedule(&mut self) {
-        self.recompute_summaries();
-        self.sched = schedule(&self.proj);
-        self.base_day = self.sched.project_start.day_number();
-        self.level = if self.leveled {
-            Some(level(&self.proj))
-        } else {
-            None
-        };
-    }
-
     fn toggle_level(&mut self) {
-        self.leveled = !self.leveled;
-        self.reschedule();
-        self.status = if self.leveled {
-            "Resource leveling ON — bars delayed to fit resource capacity".into()
+        self.ed.toggle_level();
+        self.status = if self.ed.leveled() {
+            "Resource leveling ON — bars delayed to fit resource capacity"
         } else {
-            "Resource leveling OFF".into()
-        };
+            "Resource leveling OFF"
+        }
+        .into();
     }
 
     /// Displayed start of a task: leveled if leveling is on, else CPM early start.
     fn disp_start(&self, uid: i32) -> Option<DateTime> {
-        match &self.level {
-            Some(lv) => lv.start(uid),
-            None => self.sched.get(uid).map(|r| r.early_start),
-        }
+        self.ed.disp_start(uid)
     }
 
     fn disp_finish(&self, uid: i32) -> Option<DateTime> {
-        match &self.level {
-            Some(lv) => lv.finish(uid),
-            None => self.sched.get(uid).map(|r| r.early_finish),
-        }
-    }
-
-    /// A task is a summary when the row directly below it is deeper in the
-    /// outline. Recomputed after any structural edit so rollups stay correct.
-    fn recompute_summaries(&mut self) {
-        let levels: Vec<u32> = self.proj.tasks.iter().map(|t| t.outline_level).collect();
-        for (i, t) in self.proj.tasks.iter_mut().enumerate() {
-            t.summary = levels.get(i + 1).is_some_and(|&nl| nl > levels[i]);
-        }
-    }
-
-    fn mark_dirty(&mut self) {
-        self.dirty = true;
+        self.ed.disp_finish(uid)
     }
 
     // ---- edits ----
 
     fn add_task(&mut self) {
-        self.snapshot();
-        let level = self
-            .proj
-            .tasks
-            .get(self.sel)
-            .map(|t| t.outline_level)
-            .unwrap_or(1);
-        let uid = self.proj.tasks.iter().map(|t| t.uid).max().unwrap_or(0) + 1;
-        let at = (self.sel + 1).min(self.proj.tasks.len());
-        self.proj.tasks.insert(
-            at,
-            Task {
-                uid,
-                id: uid,
-                name: "New task".into(),
-                outline_level: level,
-                duration_min: 480,
-                ..Task::default()
-            },
-        );
-        self.sel = at;
-        self.mark_dirty();
-        self.reschedule();
+        match self.ed.add_task(self.ed.selected_uid(), "New task", 480) {
+            Ok(at) => self.ed.select(at),
+            Err(message) => self.status = message,
+        }
     }
 
     fn delete_task(&mut self) {
-        if self.proj.tasks.is_empty() {
-            return;
+        if let Some(uid) = self.ed.selected_uid() {
+            if let Err(message) = self.ed.delete_task(uid) {
+                self.status = message;
+            }
         }
-        self.snapshot();
-        let uid = self.proj.tasks[self.sel].uid;
-        self.proj.tasks.remove(self.sel);
-        // Drop dangling predecessor links to the removed task.
-        for t in &mut self.proj.tasks {
-            t.predecessors.retain(|p| p.uid != uid);
-        }
-        if self.sel >= self.proj.tasks.len() {
-            self.sel = self.proj.tasks.len().saturating_sub(1);
-        }
-        self.mark_dirty();
-        self.reschedule();
     }
 
     fn indent(&mut self, delta: i32) {
-        if self.sel < self.proj.tasks.len() {
-            self.snapshot();
-            let t = &mut self.proj.tasks[self.sel];
-            t.outline_level = (t.outline_level as i32 + delta).clamp(1, 20) as u32;
-            self.mark_dirty();
-            self.reschedule();
+        if let Some(uid) = self.ed.selected_uid() {
+            if let Err(message) = self.ed.indent(uid, delta) {
+                self.status = message;
+            }
         }
     }
 
     fn set_duration(&mut self, text: &str) {
-        if let Some(min) = parse_duration(text, &self.proj) {
-            if self.sel < self.proj.tasks.len() {
-                self.snapshot();
-                let t = &mut self.proj.tasks[self.sel];
-                t.duration_min = min;
-                t.milestone = min == 0;
-                self.mark_dirty();
-                self.reschedule();
+        // Keep invalid-input feedback even when there is no selected row.
+        if let Some(uid) = self.ed.selected_uid() {
+            if let Err(message) = self.ed.set_duration(uid, text) {
+                self.status = message;
             }
-        } else {
+        } else if parse_duration(text, self.ed.project()).is_none() {
             self.status = format!("Couldn't read duration '{text}' (try 3d, 4h, 2w)");
         }
     }
 
     fn rename(&mut self, text: &str) {
-        if self.sel < self.proj.tasks.len() {
-            self.snapshot();
-            self.proj.tasks[self.sel].name = text.to_string();
-            self.mark_dirty();
+        if let Some(uid) = self.ed.selected_uid() {
+            if let Err(message) = self.ed.rename(uid, text) {
+                self.status = message;
+            }
         }
     }
 
     fn add_predecessor(&mut self, text: &str) {
-        let Ok(uid) = text.trim().parse::<i32>() else {
+        let Ok(pred) = text.trim().parse::<i32>() else {
             self.status = "Predecessor must be a task ID (number)".into();
             return;
         };
-        let self_uid = self.proj.tasks[self.sel].uid;
-        if uid == self_uid || !self.proj.tasks.iter().any(|t| t.uid == uid) {
-            self.status = format!("No other task with ID {uid}");
+        let Some(uid) = self.ed.selected_uid() else {
+            self.status = "No task selected".into();
             return;
+        };
+        if let Err(message) = self.ed.add_predecessor(uid, pred, LinkType::FinishStart, 0) {
+            self.status = message;
         }
-        if self.proj.tasks[self.sel]
-            .predecessors
-            .iter()
-            .any(|p| p.uid == uid)
-        {
-            self.status = format!("Already depends on {uid}");
-            return;
-        }
-        self.snapshot();
-        self.proj.tasks[self.sel].predecessors.push(Predecessor {
-            uid,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        });
-        self.mark_dirty();
-        self.reschedule();
     }
 
     fn save(&mut self) {
         match self.path.clone() {
-            Some(p) => match save_to(&self.proj, &p) {
+            Some(p) => match save_to(self.ed.project(), &p) {
                 Ok(()) => {
-                    self.dirty = false;
+                    self.ed.mark_saved();
                     self.status = format!("Saved {p}");
                 }
                 Err(e) => self.status = format!("Save failed: {e}"),
@@ -1069,7 +846,10 @@ impl App {
             .as_deref()
             .map(|p| format!("{}.md", p.rsplit_once('.').map(|(a, _)| a).unwrap_or(p)))
             .unwrap_or_else(|| "schedule.md".into());
-        match std::fs::write(&out, gantt::to_markdown(&self.proj, &self.sched)) {
+        match std::fs::write(
+            &out,
+            gantt::to_markdown(self.ed.project(), self.ed.schedule()),
+        ) {
             Ok(()) => self.status = format!("Exported Gantt to {out}"),
             Err(e) => self.status = format!("Export failed: {e}"),
         }
@@ -1079,20 +859,17 @@ impl App {
     fn open_file(&mut self, path: &str) {
         match load(path) {
             Ok(p) => {
-                self.proj = p;
+                self.ed.replace_project(p);
                 self.path = Some(path.to_string());
-                self.dirty = false;
-                self.sel = 0;
                 self.top = 0;
                 self.hscroll = 0;
                 self.backstage = None;
                 self.start_screen = false;
-                self.reschedule();
                 let is_mpp = path.to_ascii_lowercase().ends_with(".mpp");
-                self.status = if is_mpp && !self.proj.tasks.is_empty() {
+                self.status = if is_mpp && !self.ed.project().tasks.is_empty() {
                     format!(
                         "Opened {path} — {} task names decoded (.mpp dates/links pending)",
-                        self.proj.tasks.len()
+                        self.ed.project().tasks.len()
                     )
                 } else if is_mpp {
                     format!("Opened {path} — .mpp metadata only (no task table found)")
@@ -1108,13 +885,10 @@ impl App {
     /// binding. Shared by the File ▸ New backstage item and the welcome
     /// screen's "New schedule" choice.
     fn new_schedule(&mut self) {
-        self.proj = new_project();
+        self.ed.replace_project(new_project());
         self.path = None;
-        self.dirty = false;
-        self.sel = 0;
         self.top = 0;
         self.hscroll = 0;
-        self.reschedule();
         self.status = "New schedule".into();
     }
 
@@ -1273,7 +1047,7 @@ impl backstage::BackstageHost for App {
     }
 
     fn info_lines(&self) -> Vec<Line<'static>> {
-        project_preview(&self.proj, &self.sched)
+        project_preview(self.ed.project(), self.ed.schedule())
             .into_iter()
             .map(Line::from)
             .collect()
@@ -1282,27 +1056,6 @@ impl backstage::BackstageHost for App {
     fn accent(&self) -> Color {
         Color::Yellow
     }
-}
-
-fn empty_schedule() -> Schedule {
-    // A placeholder replaced immediately by reschedule().
-    schedule(&Project::default())
-}
-
-/// Parse a duration like `3`, `3d`, `4h`, `2w` into working minutes.
-fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
-    let t = text.trim().to_lowercase();
-    let (num, unit) = t
-        .strip_suffix(['d', 'h', 'w', 'm'])
-        .map(|n| (n, t.chars().last().unwrap()))
-        .unwrap_or((t.as_str(), 'd'));
-    let v: f64 = num.trim().parse().ok()?;
-    Some(match unit {
-        'h' => (v * 60.0).round() as i64,
-        'w' => proj.days_to_minutes(v * (proj.hours_per_week / proj.hours_per_day)),
-        'm' => v.round() as i64,
-        _ => proj.days_to_minutes(v),
-    })
 }
 
 // ---- TUI loop ---------------------------------------------------------------
@@ -1366,7 +1119,7 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
 
     let res = loop {
         // Keep the terminal window title in sync: [* ]yppxy - filename.
-        let want = window_title(&app.path, app.dirty);
+        let want = window_title(&app.path, app.ed.dirty());
         if want != title {
             let _ = execute!(terminal.backend_mut(), SetTitle(&want));
             title = want;
@@ -1458,15 +1211,15 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         MouseEventKind::ScrollDown => {
             if x >= app.gantt_x0 {
                 app.hscroll += 2;
-            } else if app.sel + 1 < app.proj.tasks.len() {
-                app.sel += 1;
+            } else if app.ed.sel() + 1 < app.ed.project().tasks.len() {
+                app.ed.select(app.ed.sel() + 1);
             }
         }
         MouseEventKind::ScrollUp => {
             if x >= app.gantt_x0 {
                 app.hscroll -= 2;
             } else {
-                app.sel = app.sel.saturating_sub(1);
+                app.ed.select(app.ed.sel().saturating_sub(1));
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1492,8 +1245,8 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
             // Click a task row to select it.
             if x < app.list_left_w && y >= app.list_y0 {
                 let idx = app.top + (y - app.list_y0) as usize;
-                if idx < app.proj.tasks.len() {
-                    app.sel = idx;
+                if idx < app.ed.project().tasks.len() {
+                    app.ed.select(idx);
                 }
             }
         }
@@ -1592,14 +1345,16 @@ fn on_key(app: &mut App, k: KeyEvent) {
         // Any quit key opens the shared confirm (which warns about unsaved
         // changes) — consistent with Ctrl+Q and the other apps.
         KeyCode::Char('q') | KeyCode::Char('Q') => app.request_exit(),
-        KeyCode::Up | KeyCode::Char('k') => app.sel = app.sel.saturating_sub(1),
+        KeyCode::Up | KeyCode::Char('k') => app.ed.select(app.ed.sel().saturating_sub(1)),
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.sel + 1 < app.proj.tasks.len() {
-                app.sel += 1;
+            if app.ed.sel() + 1 < app.ed.project().tasks.len() {
+                app.ed.select(app.ed.sel() + 1);
             }
         }
-        KeyCode::Home | KeyCode::Char('g') => app.sel = 0,
-        KeyCode::End | KeyCode::Char('G') => app.sel = app.proj.tasks.len().saturating_sub(1),
+        KeyCode::Home | KeyCode::Char('g') => app.ed.select(0),
+        KeyCode::End | KeyCode::Char('G') => app
+            .ed
+            .select(app.ed.project().tasks.len().saturating_sub(1)),
         KeyCode::Left | KeyCode::Char('h') => app.hscroll -= 1,
         KeyCode::Right | KeyCode::Char('l') => app.hscroll += 1,
         KeyCode::Char('n') | KeyCode::Insert => app.add_task(),
@@ -1607,7 +1362,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Tab | KeyCode::Char('>') => app.indent(1),
         KeyCode::BackTab | KeyCode::Char('<') => app.indent(-1),
         KeyCode::Enter | KeyCode::F(2) => {
-            if let Some(t) = app.proj.tasks.get(app.sel) {
+            if let Some(t) = app.ed.project().tasks.get(app.ed.sel()) {
                 app.prompt = Some(Prompt {
                     kind: PromptKind::Rename,
                     label: "Rename".into(),
@@ -1631,9 +1386,10 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('c') => {
             let cur = app
-                .proj
+                .ed
+                .project()
                 .tasks
-                .get(app.sel)
+                .get(app.ed.sel())
                 .map(constraint_hint)
                 .unwrap_or_default();
             app.prompt = Some(Prompt {
@@ -1781,7 +1537,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.light {
         toggles.push(Act::ThemeToggle);
     }
-    if app.leveled {
+    if app.ed.leveled() {
         toggles.push(Act::Level);
     }
     app.ribbon.set_toggles(toggles);
@@ -1807,33 +1563,34 @@ fn draw(f: &mut Frame, app: &mut App) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let fin = app.sched.project_finish.parts();
+    let fin = app.ed.schedule().project_finish.parts();
     let crit = app
-        .proj
+        .ed
+        .project()
         .tasks
         .iter()
-        .filter(|t| app.sched.get(t.uid).is_some_and(|r| r.critical) && !t.summary)
+        .filter(|t| app.ed.schedule().get(t.uid).is_some_and(|r| r.critical) && !t.summary)
         .count();
-    let name = if app.proj.name.is_empty() {
+    let name = if app.ed.project().name.is_empty() {
         "Untitled"
     } else {
-        &app.proj.name
+        &app.ed.project().name
     };
     let title = format!(
         " {name}{}   finish {:04}-{:02}-{:02}   {} task(s), {crit} critical ",
-        if app.dirty { " *" } else { "" },
+        if app.ed.dirty() { " *" } else { "" },
         fin.year,
         fin.month,
         fin.day,
-        app.proj.tasks.len(),
+        app.ed.project().tasks.len(),
     );
     let mut spans = vec![Span::styled(
         title,
         Style::default().add_modifier(Modifier::BOLD),
     )];
     // Baseline variance for the selected task.
-    if let Some(t) = app.proj.tasks.get(app.sel) {
-        if let (Some(bf), Some(r)) = (t.baseline_finish, app.sched.get(t.uid)) {
+    if let Some(t) = app.ed.project().tasks.get(app.ed.sel()) {
+        if let (Some(bf), Some(r)) = (t.baseline_finish, app.ed.schedule().get(t.uid)) {
             let delta = r.early_finish.day_number() - bf.day_number();
             let (label, color) = match delta.cmp(&0) {
                 std::cmp::Ordering::Greater => (format!("▲ {delta}d late"), CRIT),
@@ -1846,7 +1603,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
         // Resources assigned to the selected task.
-        let res = task_resources(&app.proj, t.uid);
+        let res = task_resources(app.ed.project(), t.uid);
         if !res.is_empty() {
             spans.push(Span::styled(
                 format!("· 👤 {} ", res.join(", ")),
@@ -1872,13 +1629,13 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
 
     // visible task rows (inner height minus borders and the column-header row)
     let inner_h = left.height.saturating_sub(3) as usize; // 2 border + 1 header
-    if app.sel < app.top {
-        app.top = app.sel;
-    } else if inner_h > 0 && app.sel >= app.top + inner_h {
-        app.top = app.sel + 1 - inner_h;
+    if app.ed.sel() < app.top {
+        app.top = app.ed.sel();
+    } else if inner_h > 0 && app.ed.sel() >= app.top + inner_h {
+        app.top = app.ed.sel() + 1 - inner_h;
     }
     let visible = inner_h.max(1);
-    let end = (app.top + visible).min(app.proj.tasks.len());
+    let end = (app.top + visible).min(app.ed.project().tasks.len());
 
     // ---- left: task table ----
     let mut left_lines: Vec<Line> = Vec::new();
@@ -1887,8 +1644,8 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     )));
     for i in app.top..end {
-        let t = &app.proj.tasks[i];
-        let r = app.sched.get(t.uid);
+        let t = &app.ed.project().tasks[i];
+        let r = app.ed.schedule().get(t.uid);
         let indent = "  ".repeat((t.outline_level.saturating_sub(1)) as usize);
         let bullet = if t.summary {
             "▾ "
@@ -1897,7 +1654,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         } else {
             "• "
         };
-        let res = task_resources(&app.proj, t.uid);
+        let res = task_resources(app.ed.project(), t.uid);
         let base = format!("{indent}{bullet}{}", t.name);
         let full = if res.is_empty() {
             base
@@ -1912,10 +1669,10 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         } else if t.is_milestone() {
             "—".to_string()
         } else {
-            fmt_days(app.proj.minutes_to_days(t.duration_min))
+            fmt_days(app.ed.project().minutes_to_days(t.duration_min))
         };
         let slack = r
-            .map(|r| fmt_days(app.proj.minutes_to_days(r.total_slack_min.max(0))))
+            .map(|r| fmt_days(app.ed.project().minutes_to_days(r.total_slack_min.max(0))))
             .unwrap_or_else(|| "?".into());
         let crit = r.is_some_and(|r| r.critical);
         let mut style = Style::default();
@@ -1931,7 +1688,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(format!(" {dur:>5}"), Style::default().fg(Color::Gray)),
             Span::styled(format!(" {slack:>6}"), Style::default().fg(Color::DarkGray)),
         ]);
-        if i == app.sel {
+        if i == app.ed.sel() {
             line.style = Style::default().bg(app.sel_bg());
         }
         left_lines.push(line);
@@ -1943,36 +1700,40 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
 
     // ---- right: gantt ----
     let gw = right.width.saturating_sub(2) as usize; // inner width
-    let start = app.sched.project_start.parts();
+    let start = app.ed.schedule().project_start.parts();
     let mut right_lines: Vec<Line> = Vec::new();
-    right_lines.push(build_scale(gw, app.hscroll, app.base_day));
+    right_lines.push(build_scale(
+        gw,
+        app.hscroll,
+        app.ed.schedule().project_start.day_number(),
+    ));
     for i in app.top..end {
-        let t = &app.proj.tasks[i];
-        let crit = app.sched.get(t.uid).is_some_and(|r| r.critical);
+        let t = &app.ed.project().tasks[i];
+        let crit = app.ed.schedule().get(t.uid).is_some_and(|r| r.critical);
         let s_day = app
             .disp_start(t.uid)
-            .map(|d| d.day_number() - app.base_day)
+            .map(|d| d.day_number() - app.ed.schedule().project_start.day_number())
             .unwrap_or(i64::MAX);
         let e_day = app
             .disp_finish(t.uid)
-            .map(|d| d.day_number() - app.base_day)
+            .map(|d| d.day_number() - app.ed.schedule().project_start.day_number())
             .unwrap_or(i64::MIN);
         let mut line = build_gantt_row(
             gw,
             app.hscroll,
-            app.base_day,
+            app.ed.schedule().project_start.day_number(),
             s_day,
             e_day,
             crit,
             t.summary,
             t.is_milestone(),
         );
-        if i == app.sel {
+        if i == app.ed.sel() {
             line.style = Style::default().bg(app.sel_bg());
         }
         right_lines.push(line);
     }
-    let lev = if app.leveled { " · leveled" } else { "" };
+    let lev = if app.ed.leveled() { " · leveled" } else { "" };
     let gtitle = format!(
         " Gantt — from {:04}-{:02}-{:02} (◀ ▶ scroll){lev} ",
         start.year, start.month, start.day
@@ -2124,27 +1885,6 @@ fn task_resources(proj: &Project, uid: i32) -> Vec<String> {
         .collect()
 }
 
-/// Prefill text for the constraint prompt from a task's current constraint.
-fn constraint_hint(t: &Task) -> String {
-    let code = match t.constraint {
-        ConstraintType::AsSoonAsPossible => return String::new(),
-        ConstraintType::AsLateAsPossible => "ALAP",
-        ConstraintType::StartNoEarlierThan => "SNET",
-        ConstraintType::StartNoLaterThan => "SNLT",
-        ConstraintType::FinishNoEarlierThan => "FNET",
-        ConstraintType::FinishNoLaterThan => "FNLT",
-        ConstraintType::MustStartOn => "MSO",
-        ConstraintType::MustFinishOn => "MFO",
-    };
-    match t.constraint_date {
-        Some(d) => {
-            let p = d.parts();
-            format!("{code} {:04}-{:02}-{:02}", p.year, p.month, p.day)
-        }
-        None => code.to_string(),
-    }
-}
-
 fn fmt_days(days: f64) -> String {
     if (days.round() - days).abs() < 1e-9 {
         format!("{}d", days.round() as i64)
@@ -2204,11 +1944,146 @@ mod tests {
         let mut app = App::new(new_project(), None, false);
         app.add_task(); // second task at level 1
         // Make the second task a child of the first.
-        app.sel = 1;
+        app.ed.select(1);
         app.indent(1);
-        app.recompute_summaries();
-        assert!(app.proj.tasks[0].summary); // parent became a summary
-        assert!(!app.proj.tasks[1].summary);
+        assert!(app.ed.project().tasks[0].summary); // parent became a summary
+        assert!(!app.ed.project().tasks[1].summary);
+    }
+
+    fn app_with_history_and_preferences() -> App {
+        let mut app = App::new(new_project(), Some("old.yppx".into()), false);
+        app.toggle_level();
+        app.find(" NEW ");
+        app.add_task();
+        app.rename("Renamed");
+        app.undo();
+        assert!(app.ed.dirty());
+        assert!(app.ed.undo_depth() > 0 && app.ed.redo_depth() > 0);
+        app
+    }
+
+    fn assert_replaced_session(app: &App) {
+        assert!(app.ed.leveled());
+        assert_eq!(app.ed.find_query(), "new");
+        assert!(!app.ed.dirty());
+        assert_eq!(
+            (app.ed.sel(), app.ed.undo_depth(), app.ed.redo_depth()),
+            (0, 0, 0)
+        );
+        assert_eq!(app.ed.project().tasks.len(), 1);
+    }
+
+    #[test]
+    fn open_resets_history_and_retains_leveling_and_find() {
+        let mut app = app_with_history_and_preferences();
+        let path =
+            std::env::temp_dir().join(format!("yppxy-editor-open-{}.yppx", std::process::id()));
+        let path_str = path.to_str().unwrap();
+        let mut proj = new_project();
+        proj.tasks[0].name = "Opened task".into();
+        save_to(&proj, path_str).unwrap();
+        app.open_file(path_str);
+        std::fs::remove_file(&path).unwrap();
+        assert_replaced_session(&app);
+        assert_eq!(app.ed.project().tasks[0].name, "Opened task");
+        assert_eq!(app.path.as_deref(), Some(path_str));
+        assert_eq!(app.status, format!("Opened {path_str}"));
+        app.undo();
+        assert_eq!(app.status, "Nothing to undo");
+        assert_eq!(app.ed.project().tasks[0].name, "Opened task");
+    }
+
+    #[test]
+    fn new_resets_history_and_retains_leveling_and_find() {
+        let mut app = app_with_history_and_preferences();
+        app.new_schedule();
+        assert_replaced_session(&app);
+        assert!(app.path.is_none());
+        assert_eq!(app.status, "New schedule");
+    }
+
+    #[test]
+    fn failed_open_preserves_the_editor_session() {
+        let mut app = app_with_history_and_preferences();
+        let proj = app.ed.project().clone();
+        let history = (app.ed.undo_depth(), app.ed.redo_depth());
+        let selection = app.ed.sel();
+        let dates: Vec<_> = proj
+            .tasks
+            .iter()
+            .map(|t| {
+                (
+                    t.uid,
+                    *app.ed.schedule().get(t.uid).unwrap(),
+                    app.disp_start(t.uid),
+                    app.disp_finish(t.uid),
+                )
+            })
+            .collect();
+        app.open_file("/nonexistent/yppxy/editor-test/missing.yppx");
+        assert!(app.status.starts_with("Open failed:"));
+        assert_eq!(app.ed.project(), &proj);
+        assert_eq!((app.ed.undo_depth(), app.ed.redo_depth()), history);
+        assert_eq!(app.ed.sel(), selection);
+        assert!(app.ed.leveled() && app.ed.dirty());
+        assert_eq!(app.ed.find_query(), "new");
+        assert_eq!(app.path.as_deref(), Some("old.yppx"));
+        for (uid, result, start, finish) in dates {
+            assert_eq!(app.ed.schedule().get(uid), Some(&result));
+            assert_eq!(app.disp_start(uid), start);
+            assert_eq!(app.disp_finish(uid), finish);
+        }
+        app.redo();
+        assert_eq!(app.ed.project().tasks[1].name, "Renamed");
+    }
+
+    #[test]
+    fn prompted_edits_keep_status_messages() {
+        let mut app = App::new(new_project(), None, false);
+        app.status = "unchanged".into();
+        app.find("");
+        assert_eq!(app.status, "unchanged");
+        app.find(" NEW ");
+        assert_eq!(app.status, "Found 'new'  (F3 next)");
+        app.find("");
+        assert_eq!(app.status, "Found 'new'  (F3 next)");
+        app.find("missing");
+        assert_eq!(app.status, "No task matching 'missing'");
+        app.set_duration("banana");
+        assert_eq!(
+            app.status,
+            "Couldn't read duration 'banana' (try 3d, 4h, 2w)"
+        );
+        app.add_predecessor("abc");
+        assert_eq!(app.status, "Predecessor must be a task ID (number)");
+        app.add_predecessor("1");
+        assert_eq!(app.status, "No other task with ID 1");
+        app.add_predecessor("999");
+        assert_eq!(app.status, "No other task with ID 999");
+        app.add_task();
+        app.add_predecessor("1");
+        app.add_predecessor("1");
+        assert_eq!(app.status, "Already depends on 1");
+        app.set_constraint("none");
+        assert_eq!(app.status, "Constraint set: NONE");
+        app.set_constraint("asap");
+        assert_eq!(app.status, "Constraint set: ASAP");
+        app.set_constraint("mso");
+        assert_eq!(app.status, "MSO needs a date, e.g. mso 2026-03-05");
+        app.assign_resource(" Alice ");
+        assert_eq!(app.status, "Assigned Alice");
+        app.assign_resource("alice");
+        assert_eq!(app.status, "alice is already assigned");
+        app.assign_resource("");
+        assert_eq!(app.status, "Cleared the task's resources");
+        app.status = "unchanged".into();
+        app.assign_resource("");
+        assert_eq!(app.status, "unchanged");
+        app.ed.replace_project(Project::default());
+        app.find("new");
+        assert_eq!(app.status, "unchanged");
+        app.add_predecessor("1");
+        assert_eq!(app.status, "No task selected");
     }
 
     #[test]
@@ -2325,20 +2200,20 @@ mod tests {
     #[test]
     fn undo_redo_restores_tasks() {
         let mut app = App::new(new_project(), None, false);
-        assert_eq!(app.proj.tasks.len(), 1);
+        assert_eq!(app.ed.project().tasks.len(), 1);
         app.add_task();
         app.add_task();
-        assert_eq!(app.proj.tasks.len(), 3);
+        assert_eq!(app.ed.project().tasks.len(), 3);
         app.undo();
-        assert_eq!(app.proj.tasks.len(), 2);
+        assert_eq!(app.ed.project().tasks.len(), 2);
         app.undo();
-        assert_eq!(app.proj.tasks.len(), 1);
+        assert_eq!(app.ed.project().tasks.len(), 1);
         app.redo();
-        assert_eq!(app.proj.tasks.len(), 2);
+        assert_eq!(app.ed.project().tasks.len(), 2);
         // a fresh edit clears the redo stack
         app.add_task();
         app.redo();
-        assert_eq!(app.proj.tasks.len(), 3);
+        assert_eq!(app.ed.project().tasks.len(), 3);
     }
 
     #[test]
@@ -2363,12 +2238,12 @@ mod tests {
         });
         let mut app = App::new(proj, None, false);
         app.find("charlie");
-        assert_eq!(app.sel, 2);
+        assert_eq!(app.ed.sel(), 2);
         // F3-style repeat from the end wraps back to Alpha (no more Charlie)
         app.find("");
-        assert_eq!(app.sel, 2); // only one Charlie → stays
+        assert_eq!(app.ed.sel(), 2); // only one Charlie → stays
         app.find("a"); // matches Alpha/Bravo/Charlie — next after sel 2 wraps to 0
-        assert_eq!(app.sel, 0);
+        assert_eq!(app.ed.sel(), 0);
     }
 
     #[test]
@@ -2392,7 +2267,11 @@ mod tests {
     fn constraint_snet_delays_start() {
         let mut app = App::new(new_project(), None, false); // anchor Mon 2026-01-05
         app.set_constraint("SNET 2026-01-08"); // Thursday
-        let r = app.sched.get(app.proj.tasks[0].uid).unwrap();
+        let r = app
+            .ed
+            .schedule()
+            .get(app.ed.project().tasks[0].uid)
+            .unwrap();
         assert_eq!(r.early_start.parts().day, 8);
     }
 
@@ -2400,11 +2279,15 @@ mod tests {
     fn baseline_captures_plan_and_variance_shows() {
         let mut app = App::new(new_project(), None, false);
         app.set_baseline();
-        let bf = app.proj.tasks[0]
+        let bf = app.ed.project().tasks[0]
             .baseline_finish
             .expect("baseline captured");
         app.set_duration("5d"); // extend past the baseline
-        let r = app.sched.get(app.proj.tasks[0].uid).unwrap();
+        let r = app
+            .ed
+            .schedule()
+            .get(app.ed.project().tasks[0].uid)
+            .unwrap();
         assert!(
             r.early_finish.day_number() > bf.day_number(),
             "finish should slip past baseline"
@@ -2415,25 +2298,25 @@ mod tests {
     fn assign_resource_creates_and_round_trips() {
         let mut app = App::new(new_project(), None, false);
         app.assign_resource("Alice");
-        assert_eq!(app.proj.resources.len(), 1);
-        assert_eq!(app.proj.assignments.len(), 1);
+        assert_eq!(app.ed.project().resources.len(), 1);
+        assert_eq!(app.ed.project().assignments.len(), 1);
         // assigning the same resource again is a no-op
         app.assign_resource("alice");
-        assert_eq!(app.proj.assignments.len(), 1);
+        assert_eq!(app.ed.project().assignments.len(), 1);
         app.assign_resource("Bob");
-        assert_eq!(app.proj.resources.len(), 2);
-        let names = task_resources(&app.proj, app.proj.tasks[0].uid);
+        assert_eq!(app.ed.project().resources.len(), 2);
+        let names = task_resources(app.ed.project(), app.ed.project().tasks[0].uid);
         assert_eq!(names, vec!["Alice".to_string(), "Bob".to_string()]);
 
         // resources/assignments survive a MSPDI round-trip
-        let xml = mspdi::write_mspdi(&app.proj);
+        let xml = mspdi::write_mspdi(app.ed.project());
         let back = mspdi::read_mspdi(&xml).unwrap();
         assert_eq!(task_resources(&back, back.tasks[0].uid), names);
 
         // clearing removes the task's assignments (resources remain defined)
         app.assign_resource("");
-        assert!(app.proj.assignments.is_empty());
-        assert_eq!(app.proj.resources.len(), 2);
+        assert!(app.ed.project().assignments.is_empty());
+        assert_eq!(app.ed.project().resources.len(), 2);
     }
 
     #[test]
@@ -2448,9 +2331,9 @@ mod tests {
             ..Task::default()
         });
         let mut app = App::new(proj, None, false);
-        app.sel = 0;
+        app.ed.select(0);
         app.assign_resource("Alice");
-        app.sel = 1;
+        app.ed.select(1);
         app.assign_resource("Alice");
         // unleveled: both start the same day
         assert_eq!(
@@ -2508,20 +2391,26 @@ mod tests {
     fn add_and_delete_keep_schedule_consistent() {
         let mut app = App::new(new_project(), None, false);
         app.add_task();
-        app.sel = 1;
+        app.ed.select(1);
         app.add_predecessor("1"); // depend on task 1
-        assert_eq!(app.proj.tasks[1].predecessors.len(), 1);
+        assert_eq!(app.ed.project().tasks[1].predecessors.len(), 1);
         // deleting task 1 drops the dangling link
-        app.sel = 0;
+        app.ed.select(0);
         app.delete_task();
-        assert!(app.proj.tasks.iter().all(|t| t.predecessors.is_empty()));
+        assert!(
+            app.ed
+                .project()
+                .tasks
+                .iter()
+                .all(|t| t.predecessors.is_empty())
+        );
     }
 
     #[test]
     fn ctrl_q_opens_the_exit_confirmation() {
         let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
         app.add_task();
-        assert!(app.dirty);
+        assert!(app.ed.dirty());
         // Ctrl+Q does not quit outright — it opens the Yes/No modal.
         on_key(
             &mut app,
