@@ -10,6 +10,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod harness;
+mod project;
+use project::*;
 
 use std::path::PathBuf;
 
@@ -90,6 +92,7 @@ fn qat_btn(
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum Kind {
+    Project,
     Docx,
     Xlsx,
     Look,
@@ -98,6 +101,7 @@ enum Kind {
 impl Kind {
     fn glyph(self) -> &'static str {
         match self {
+            Kind::Project => "\u{1F4C5}",
             Kind::Docx => "\u{1F4C4}",
             Kind::Xlsx => "\u{1F4CA}",
             Kind::Look => "\u{2709}",
@@ -137,8 +141,9 @@ struct PersistTab {
     path: Option<String>,
     #[serde(default)]
     dirty: bool,
-    /// Hot-exit sidecar `.docx` holding this tab's current (possibly unsaved)
-    /// content. Restored in preference to `path` so edits survive a restart.
+    /// Hot-exit sidecar holding this tab's current (possibly unsaved) content,
+    /// in the format matching its kind: `.docx`, `.xlsx`, or `.yppx`.
+    /// Restored in preference to `path` so edits survive a restart.
     #[serde(default)]
     hot: Option<String>,
     #[serde(default)]
@@ -207,6 +212,7 @@ enum RibbonTab {
 // ---- runtime ---------------------------------------------------------------
 
 enum Surface {
+    Project(ProjectView),
     Doc(Editor),
     Sheet(SheetView),
     Placeholder,
@@ -1441,10 +1447,14 @@ fn sheet_bytes(v: &SheetView) -> Vec<u8> {
     }
 }
 
-/// Build a tab by loading `path` from disk — an .xlsx spreadsheet or a
-/// Word/Markdown document, dispatched on the extension. Shared by the Open
-/// dialog and command-line file arguments.
+/// Build a tab by loading `path` from disk — an .xlsx spreadsheet, a
+/// Word/Markdown document, or a .yppx/.xml/.mpp project schedule, dispatched on
+/// the extension (.xml opens as Project). Shared by the Open dialog and
+/// command-line file arguments.
 fn tab_from_path(path: &PathBuf) -> DocTab {
+    if is_project_path(path) {
+        return project_tab_from_path(path);
+    }
     let title: SharedString = file_name(path).into();
     if path
         .extension()
@@ -3738,6 +3748,7 @@ fn build_surface(
                 "untitled".into(),
             ),
         },
+        Kind::Project => unreachable!("project tabs restore via restore_project_tab"),
         Kind::Xlsx => match path {
             Some(p) => {
                 let (surface, status) = sheet_from_path(p);
@@ -3761,8 +3772,8 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "Untitled.docx".into())
 }
 
-/// Directory holding the hot-exit sidecars — one `.docx` per open Doc tab, kept in
-/// sync on each persist so unsaved edits survive a restart.
+/// Directory holding hot-exit sidecars (`.docx`, `.xlsx`, or `.yppx` by tab kind),
+/// kept in sync on each persist so unsaved edits survive a restart.
 fn hot_dir() -> PathBuf {
     config_root().join("docxy").join("hot")
 }
@@ -3819,6 +3830,107 @@ fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> 
     docxcore::package::save_package(&pkg)
 }
 
+fn restore_tab(t: &PersistTab) -> DocTab {
+    if t.kind == Kind::Project {
+        return restore_project_tab(t);
+    }
+    let path = t.path.as_ref().map(PathBuf::from);
+    // Prefer the hot-exit sidecar (current, possibly unsaved content); fall
+    // back to the real file on disk, then to an empty doc.
+    let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
+    let mut tab = match (t.kind, &hot) {
+        (Kind::Docx, Some(hp)) => {
+            let mut l = doc_from_path(hp);
+            l.status = if t.dirty {
+                "unsaved — restored".into()
+            } else {
+                "loaded".into()
+            };
+            l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
+        }
+        // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
+        // keep the original on-disk `path` (so Save still targets the real
+        // file; a never-saved sheet keeps path=None → Save prompts Save As).
+        (Kind::Xlsx, Some(hp)) => {
+            let (surface, _) = sheet_from_path(hp);
+            let status = if t.dirty {
+                "unsaved — restored"
+            } else {
+                "loaded"
+            };
+            DocTab {
+                kind: Kind::Xlsx,
+                title: t.title.clone().into(),
+                path,
+                surface,
+                dirty: t.dirty,
+                status: status.into(),
+                comments: vec![],
+                pkg: None,
+                notes: vec![],
+                markdown: false,
+                hf_edit: None,
+            }
+        }
+        _ => {
+            let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
+            let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
+            DocTab {
+                kind: t.kind,
+                title: t.title.clone().into(),
+                path,
+                surface,
+                dirty: t.dirty,
+                status,
+                comments,
+                pkg,
+                notes,
+                markdown,
+                hf_edit: None,
+            }
+        }
+    };
+    // The hot sidecar is always .docx; restore the Markdown flag from session.
+    tab.markdown = t.markdown || tab.markdown;
+    tab
+}
+
+fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
+    // Write the tab's live content to a sidecar so unsaved edits are
+    // held across a restart (closing never loses work). Docs → .docx,
+    // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
+    // Missing or unreadable project sidecars use restore_project_tab's recovery policy.
+    let hot = match &t.surface {
+        Surface::Doc(ed) => {
+            let p = hd.join(format!("tab-{i}.docx"));
+            std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref()))
+                .ok()
+                .map(|_| p.display().to_string())
+        }
+        Surface::Sheet(v) => {
+            let p = hd.join(format!("tab-{i}.xlsx"));
+            std::fs::write(&p, sheet_bytes(v))
+                .ok()
+                .map(|_| p.display().to_string())
+        }
+        Surface::Project(v) => {
+            let p = hd.join(format!("tab-{i}.yppx"));
+            std::fs::write(&p, projcore::yppx::write_yppx(v.ed.project()))
+                .ok()
+                .map(|_| p.display().to_string())
+        }
+        Surface::Placeholder => None,
+    };
+    PersistTab {
+        kind: t.kind,
+        title: t.title.to_string(),
+        path: t.path.as_ref().map(|p| p.display().to_string()),
+        dirty: t.dirty,
+        hot,
+        markdown: t.markdown,
+    }
+}
+
 impl Docxy {
     fn new(cx: &mut Context<Self>) -> Self {
         let session: Session = std::fs::read(session_path())
@@ -3828,66 +3940,7 @@ impl Docxy {
 
         let mut tabs = Vec::new();
         for t in &session.tabs {
-            let path = t.path.as_ref().map(PathBuf::from);
-            // Prefer the hot-exit sidecar (current, possibly unsaved content); fall
-            // back to the real file on disk, then to an empty doc.
-            let hot = t.hot.as_ref().map(PathBuf::from).filter(|p| p.exists());
-            let mut tab = match (t.kind, &hot) {
-                (Kind::Docx, Some(hp)) => {
-                    let mut l = doc_from_path(hp);
-                    l.status = if t.dirty {
-                        "unsaved — restored".into()
-                    } else {
-                        "loaded".into()
-                    };
-                    l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
-                }
-                // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
-                // keep the original on-disk `path` (so Save still targets the real
-                // file; a never-saved sheet keeps path=None → Save prompts Save As).
-                (Kind::Xlsx, Some(hp)) => {
-                    let (surface, _) = sheet_from_path(hp);
-                    let status = if t.dirty {
-                        "unsaved — restored"
-                    } else {
-                        "loaded"
-                    };
-                    DocTab {
-                        kind: Kind::Xlsx,
-                        title: t.title.clone().into(),
-                        path,
-                        surface,
-                        dirty: t.dirty,
-                        status: status.into(),
-                        comments: vec![],
-                        pkg: None,
-                        notes: vec![],
-                        markdown: false,
-                        hf_edit: None,
-                    }
-                }
-                _ => {
-                    let (surface, comments, notes, pkg, status) =
-                        build_surface(t.kind, path.as_ref());
-                    let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
-                    DocTab {
-                        kind: t.kind,
-                        title: t.title.clone().into(),
-                        path,
-                        surface,
-                        dirty: t.dirty,
-                        status,
-                        comments,
-                        pkg,
-                        notes,
-                        markdown,
-                        hf_edit: None,
-                    }
-                }
-            };
-            // The hot sidecar is always .docx; restore the Markdown flag from session.
-            tab.markdown = t.markdown || tab.markdown;
-            tabs.push(tab);
+            tabs.push(restore_tab(t));
         }
         if tabs.is_empty() {
             tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
@@ -3984,34 +4037,7 @@ impl Docxy {
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| {
-                // Write the tab's live content to a sidecar so unsaved edits are
-                // held across a restart (closing never loses work). Docs → .docx,
-                // spreadsheets → .xlsx; both are restored in preference to `path`.
-                let hot = match &t.surface {
-                    Surface::Doc(ed) => {
-                        let p = hd.join(format!("tab-{i}.docx"));
-                        std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref()))
-                            .ok()
-                            .map(|_| p.display().to_string())
-                    }
-                    Surface::Sheet(v) => {
-                        let p = hd.join(format!("tab-{i}.xlsx"));
-                        std::fs::write(&p, sheet_bytes(v))
-                            .ok()
-                            .map(|_| p.display().to_string())
-                    }
-                    Surface::Placeholder => None,
-                };
-                PersistTab {
-                    kind: t.kind,
-                    title: t.title.to_string(),
-                    path: t.path.as_ref().map(|p| p.display().to_string()),
-                    dirty: t.dirty,
-                    hot,
-                    markdown: t.markdown,
-                }
-            })
+            .map(|(i, t)| persist_tab(&hd, i, t))
             .collect();
         let session = Session {
             tabs,
@@ -4041,17 +4067,9 @@ impl Docxy {
     }
 
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
-        let (title, surface): (SharedString, Surface) = match kind {
-            Kind::Docx => (
-                "Untitled.docx".into(),
-                Surface::Doc(Editor::new(empty_doc())),
-            ),
-            Kind::Xlsx => ("Untitled.xlsx".into(), new_sheet_surface()),
-            Kind::Look => ("Inbox".into(), Surface::Placeholder),
-        };
-        self.tabs.push(DocTab {
+        let new_tab = |title: &str, surface| DocTab {
             kind,
-            title,
+            title: title.to_owned().into(),
             path: None,
             surface,
             dirty: false,
@@ -4061,6 +4079,12 @@ impl Docxy {
             notes: vec![],
             markdown: false,
             hf_edit: None,
+        };
+        self.tabs.push(match kind {
+            Kind::Project => new_project_tab(),
+            Kind::Docx => new_tab("Untitled.docx", Surface::Doc(Editor::new(empty_doc()))),
+            Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
+            Kind::Look => new_tab("Inbox", Surface::Placeholder),
         });
         self.active = self.tabs.len() - 1;
         self.backstage = false;
@@ -6351,6 +6375,62 @@ impl Docxy {
         }
         self.mark_sheet_dirty();
         cx.notify();
+    }
+
+    fn active_is_project(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.kind == Kind::Project)
+    }
+
+    fn save_project(
+        &mut self,
+        explicit_save_as: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let decision = save_decision(tab, self.harness.is_some(), explicit_save_as);
+        match decision {
+            SaveDecision::InPlace(path) => {
+                finish_project_save(&mut self.tabs[self.active], Some(&path))
+            }
+            SaveDecision::Dialog { suggested } => {
+                let target = rfd::FileDialog::new()
+                    .add_filter("Project schedule", &["yppx"])
+                    .add_filter("MSPDI", &["xml"])
+                    .set_file_name(suggested)
+                    .save_file();
+                finish_project_save(&mut self.tabs[self.active], target.as_deref());
+            }
+            SaveDecision::RefuseHarness(message) => self.tabs[self.active].status = message.into(),
+            SaveDecision::Unsaveable => {
+                self.tabs[self.active].status =
+                    "This project could not be loaded and cannot be saved".into()
+            }
+        }
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+    }
+
+    fn project_key(&mut self, key: &str, ctrl: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if ctrl && key == "s" {
+            return self.save_active(window, cx);
+        }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Surface::Project(v) = &mut tab.surface else {
+            return;
+        };
+        if v.key(key, ctrl) {
+            tab.dirty = v.ed.dirty();
+            cx.notify();
+        }
     }
 
     fn active_is_sheet(&self) -> bool {
@@ -9555,6 +9635,9 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_is_project() {
+            return self.save_project(false, window, cx);
+        }
         // A spreadsheet tab: commit any open cell edit, then write .xlsx.
         if self.active_is_sheet() {
             if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
@@ -9658,6 +9741,9 @@ impl Docxy {
     }
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_is_project() {
+            return self.save_project(true, window, cx);
+        }
         let start = self
             .tabs
             .get(self.active)
@@ -9682,7 +9768,11 @@ impl Docxy {
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = rfd::FileDialog::new()
-            .add_filter("All supported", &["docx", "md", "markdown", "xlsx"])
+            .add_filter(
+                "All supported",
+                &["docx", "md", "markdown", "xlsx", "yppx", "xml", "mpp"],
+            )
+            .add_filter("Project schedule", &["yppx", "xml", "mpp"])
             .add_filter("Word or Markdown", &["docx", "md", "markdown"])
             .add_filter("Excel workbook", &["xlsx"])
             .pick_file()
@@ -11834,6 +11924,9 @@ impl Docxy {
         // cell editing, recalc) — nothing routes to a text editor.
         if self.active_is_sheet() {
             return self.sheet_key(ev, ctrl, shift, key.as_str(), window, cx);
+        }
+        if self.active_is_project() {
+            return self.project_key(key.as_str(), ctrl, window, cx);
         }
         // In header/footer edit mode, Esc returns to the document body.
         if key == "escape" && self.hf_active() {
@@ -16530,6 +16623,14 @@ impl Docxy {
                         ))
                         .child(card(
                             cx,
+                            "new-project-card",
+                            Kind::Project.glyph(),
+                            "Project",
+                            "Blank schedule",
+                            Kind::Project,
+                        ))
+                        .child(card(
+                            cx,
                             "new-mail-card",
                             Kind::Look.glyph(),
                             "Mail",
@@ -16749,9 +16850,10 @@ impl Render for Docxy {
                     .when(active, |d| d.bg(tab_active).text_color(fg))
                     .when(!active, |d| d.text_color(dim))
                     .child(SharedString::from(format!(
-                        "{} {}{}",
+                        "{} {}{}{}",
                         tb.kind.glyph(),
                         tb.title,
+                        if is_imported(tb) { " · imported" } else { "" },
                         mark
                     )))
                     .child(
@@ -17278,6 +17380,7 @@ impl Render for Docxy {
                     cx,
                 )
                 .into_any_element(),
+                Surface::Project(v) => project_el(v, self.active, pal, cx).into_any_element(),
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex()
@@ -20594,6 +20697,10 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
             "mail list + reading pane (mailcore) lands here next",
         ),
         Kind::Docx => ("docxy", ""),
+        Kind::Project => (
+            "Project",
+            "The schedule could not be loaded; see the status below.",
+        ),
     };
     v_flex()
         .flex_1()

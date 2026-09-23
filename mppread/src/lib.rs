@@ -11,13 +11,13 @@
 //! - [`mpp`] — [`mpp::read_mpp`] pulls a `.mpp`'s metadata (title, author,
 //!   company, dates) plus its stream directory.
 //!
-//! Interpreting the *undocumented*, version-specific task/resource var-data
-//! blocks into a `projcore` project is a later layer; this crate is the exact,
-//! documented foundation it will stand on.
+//! - [`project`] — convert decoded metadata, task dates, outline levels and
+//!   predecessor links into a `projcore` project for the terminal and suite hosts.
 
 pub mod cfb;
 pub mod mpp;
 pub mod oleps;
+pub mod project;
 pub mod vardata;
 pub mod varmeta;
 

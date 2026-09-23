@@ -25,6 +25,8 @@ gpui-component.workspace = true
 gpui-component-assets.workspace = true
 docxcore = { path = "../../docxcore" }
 gridcore = { path = "../../gridcore" }
+projcore = { path = "../../projcore" }
+mppread = { path = "../../mppread" }
 # The loopback-JSON control server the opt-in UI test harness (--harness) runs on;
 # the same crate the terminal editors are driven through.
 ctlcore = { path = "../../ctlcore" }

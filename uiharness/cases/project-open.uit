@@ -1,0 +1,6 @@
+test project tab opens an MSPDI schedule
+  open ../fixtures/schedule.xml
+  assert title is schedule.xml
+  assert status is loaded — 3 tasks
+  assert dirty is false
+  shot window

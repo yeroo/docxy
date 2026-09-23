@@ -1127,11 +1127,9 @@ pub fn dispatch(
             Done::ok(Json::obj(out))
         }
 
-        // Read the selection and everything keyed to it, changing nothing.
-        "selection" => {
-            sheet(app)?;
-            Done::ok(state(app))
-        }
+        // State assertions include tab metadata for every surface; spreadsheet
+        // selection fields are added by state() only when a sheet is active.
+        "selection" => Done::ok(state(app)),
 
         // Persist and go. The reply is written first (see the pump).
         "quit" => {
