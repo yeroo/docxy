@@ -323,6 +323,44 @@ fn hot_exit_round_trips_dirty_clean_untitled_and_imported_sessions() {
 }
 
 #[test]
+fn hot_exit_commits_all_valid_buffers_and_preserves_models_on_invalid_input() {
+    let dir = Scratch::new();
+    let mut tabs: Vec<_> = (0..3)
+        .map(|_| project_tab_from_path(&corpus("11-resource-assignment.xml")))
+        .collect();
+    for (tab, name) in tabs[..2]
+        .iter_mut()
+        .zip(["Pending active", "Pending inactive"])
+    {
+        view_mut(tab).open_cell(Some(name)).unwrap();
+    }
+    view_mut(&mut tabs[2]).col = 2;
+    view_mut(&mut tabs[2]).open_cell(Some("invalid")).unwrap();
+    let invalid_model = view(&tabs[2]).ed.project().clone();
+    commit_project_cells_for_exit(&mut tabs);
+    for (i, tab) in tabs.iter().enumerate() {
+        let saved = persist_tab(&dir.0, i, tab);
+        let restored = restore_project_tab(&saved);
+        assert_eq!(view(&restored).ed.project(), view(tab).ed.project());
+        if i < 2 {
+            assert!(view(tab).cell.is_none());
+            assert!(restored.dirty);
+            assert_eq!(
+                view(&restored).ed.project().tasks[0].name,
+                if i == 0 {
+                    "Pending active"
+                } else {
+                    "Pending inactive"
+                }
+            );
+        } else {
+            assert_eq!(view(&restored).ed.project(), &invalid_model);
+            assert_eq!(view(tab).cell.as_ref().unwrap().buf, "invalid");
+        }
+    }
+}
+
+#[test]
 fn recovery_reports_lost_content_for_every_unavailable_sidecar_case() {
     let dir = Scratch::new();
     let orig = original(&dir);

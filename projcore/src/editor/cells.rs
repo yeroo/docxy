@@ -94,7 +94,6 @@ impl Editor {
         let i = self.index(uid)?;
         // Stage every allocation before touching the project or history, including ID exhaustion.
         let mut resources = self.proj.resources.clone();
-        let mut next_rid = resources.iter().map(|r| r.uid).max().unwrap_or(0);
         let mut next_aid = self
             .proj
             .assignments
@@ -104,28 +103,7 @@ impl Editor {
             .unwrap_or(0);
         let mut wanted = Vec::new();
         for name in names.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let rid = if let Some(r) = resources.iter().find(|r| r.name.eq_ignore_ascii_case(name))
-            {
-                r.uid
-            } else {
-                next_rid = next_rid.checked_add(1).ok_or("No resource IDs available")?;
-                let id = resources
-                    .iter()
-                    .map(|r| r.id)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or("No resource IDs available")?;
-                resources.push(Resource {
-                    uid: next_rid,
-                    id,
-                    name: name.into(),
-                    is_work: true,
-                    max_units: 1.0,
-                    calendar_uid: None,
-                });
-                next_rid
-            };
+            let rid = find_or_stage_resource(&mut resources, name)?;
             if !wanted.contains(&rid) {
                 wanted.push(rid);
             }
@@ -143,16 +121,12 @@ impl Editor {
         let mut assignments = self.proj.assignments.clone();
         assignments.retain(|a| a.task_uid != uid || wanted.contains(&a.resource_uid));
         for rid in wanted.into_iter().filter(|rid| !old.contains(rid)) {
-            next_aid = next_aid
-                .checked_add(1)
-                .ok_or("No assignment IDs available")?;
-            assignments.push(Assignment {
-                uid: next_aid,
-                task_uid: uid,
-                resource_uid: rid,
-                units: 1.0,
-                work_min: self.proj.tasks[i].duration_min,
-            });
+            assignments.push(new_assignment(
+                &mut next_aid,
+                uid,
+                rid,
+                self.proj.tasks[i].duration_min,
+            )?);
         }
         self.snapshot();
         self.proj.resources = resources;

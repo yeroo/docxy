@@ -138,3 +138,24 @@ test long unicode cell editing keeps the caret usable
   key tab
   assert cell B2 is bcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz🙂z
   assert cell is Duration
+
+test hidden document find does not intercept project Tab
+  open ../fixtures/basic.docx
+  key ctrl+f
+  open ../fixtures/gantt-summary.xml
+  assert cell is Name
+  key tab
+  assert cell is Duration
+  key shift+tab
+  assert cell is Name
+  key down
+  type From hidden find
+  key tab
+  assert cell B2 is From hidden find
+  assert cell_edit is none
+  assert cell is Duration
+  type 2d
+  key shift+tab
+  assert cell C2 is 2d
+  assert cell_edit is none
+  assert cell is Name

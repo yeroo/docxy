@@ -11823,6 +11823,13 @@ impl Docxy {
         if self.project_prompt_open() {
             return;
         }
+        // Document Find can remain open while its tab is inactive.
+        if self.active_is_project() {
+            if self.keytips == KeyTip::Off && !self.backstage {
+                self.project_tab_key(false, window, cx);
+            }
+            return;
+        }
         // While the find bar is open, Tab switches between the query and replace
         // fields.
         if self.find_open {
@@ -11862,9 +11869,6 @@ impl Docxy {
             self.chart_hand_back(cx);
             return self.sheet_commit(0, 1, cx);
         }
-        if self.active_is_project() {
-            return self.project_tab_key(false, window, cx);
-        }
         self.with_editor(window, cx, |e| e.insert_tab());
         self.scroll_to_caret();
     }
@@ -11872,6 +11876,13 @@ impl Docxy {
     /// Shift+Tab decreases the paragraph indent (Word's outdent).
     fn shift_tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.project_prompt_open() {
+            return;
+        }
+        // Document Find can remain open while its tab is inactive.
+        if self.active_is_project() {
+            if self.keytips == KeyTip::Off && !self.backstage {
+                self.project_tab_key(true, window, cx);
+            }
             return;
         }
         if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
@@ -11890,9 +11901,6 @@ impl Docxy {
             }
             self.chart_hand_back(cx);
             return self.sheet_commit(0, -1, cx);
-        }
-        if self.active_is_project() {
-            return self.project_tab_key(true, window, cx);
         }
         self.with_editor(window, cx, |e| e.change_indent(-720));
     }
@@ -20906,6 +20914,7 @@ fn main() {
             let on_close = view.clone();
             window.on_window_should_close(cx, move |_window, cx| {
                 on_close.update(cx, |this, _| {
+                    commit_project_cells_for_exit(&mut this.tabs);
                     this.persist();
                     // ⚠️ Not in a harness instance — the same modal-loop trap as
                     // `open_args`, and here it would wedge the shutdown the

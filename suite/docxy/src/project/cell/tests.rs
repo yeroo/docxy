@@ -50,7 +50,12 @@ fn navigation_scrolls_and_all_printable_shortcuts_start_an_edit() {
     let mut t = tab();
     assert_eq!(v(&t).col, 1);
     for c in ["n", "x", "d", "p", "c", "a", "b", "L", "λ"] {
-        edit(&mut t, 1, c);
+        let modifiers = Modifiers {
+            shift: c == "L",
+            ..Modifiers::default()
+        };
+        let key_name = c.to_lowercase();
+        assert!(project_input(&mut t, &key_name, Some(c), modifiers).is_none());
         assert_eq!(v(&t).cell.as_ref().unwrap().buf, c);
         key(&mut t, "escape");
         assert!(!t.dirty);
@@ -133,6 +138,29 @@ fn no_op_date_duration_and_milestone_keep_history_and_redo() {
     vm(&mut t).ed.select(0);
     key(&mut t, "f2");
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "0");
+}
+
+#[test]
+fn reentering_an_existing_constraint_does_not_claim_a_change() {
+    let mut t = tab();
+    vm(&mut t).ed.set_constraint(20, "SNET 2026-03-06").unwrap();
+    vm(&mut t)
+        .ed
+        .add_predecessor(10, 20, LinkType::FinishStart, 0)
+        .unwrap();
+    vm(&mut t).ed.set_constraint(10, "SNET 2026-03-05").unwrap();
+    assert_eq!(
+        project_row(&v(&t).ed, v(&t).ed.project().task(10).unwrap())[3],
+        "2026-03-09"
+    );
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    t.status = "unchanged".into();
+    edit(&mut t, 3, "2026-03-05");
+    key(&mut t, "enter");
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    assert_eq!(t.status, "unchanged");
 }
 
 #[test]

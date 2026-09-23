@@ -146,7 +146,6 @@ impl ProjectView {
             1 => self.ed.rename(uid, &cell.buf)?,
             2 => {
                 let min = parse_duration(&cell.buf, self.ed.project())
-                    .filter(|m| *m >= 0)
                     .ok_or("Invalid duration (try 3d, 4h, 2w)")?;
                 self.ed.set_duration_min(uid, min)?;
             }
@@ -161,11 +160,15 @@ impl ProjectView {
                     )
                 };
                 let previous = task.constraint;
+                let changed = (previous, task.constraint_date) != (kind, Some(date));
                 self.ed.set_constraint_typed(uid, kind, Some(date))?;
+                if !changed {
+                    return Ok(None);
+                }
                 return Ok(Some(format!(
                     "Constraint set: {} (was {})",
-                    constraint_code(kind),
-                    constraint_code(previous)
+                    kind.abbrev(),
+                    previous.abbrev()
                 )));
             }
             5 => {
@@ -182,16 +185,11 @@ impl ProjectView {
     }
 }
 
-fn constraint_code(c: ConstraintType) -> &'static str {
-    match c {
-        ConstraintType::AsSoonAsPossible => "ASAP",
-        ConstraintType::AsLateAsPossible => "ALAP",
-        ConstraintType::MustStartOn => "MSO",
-        ConstraintType::MustFinishOn => "MFO",
-        ConstraintType::StartNoEarlierThan => "SNET",
-        ConstraintType::StartNoLaterThan => "SNLT",
-        ConstraintType::FinishNoEarlierThan => "FNET",
-        ConstraintType::FinishNoLaterThan => "FNLT",
+/// Close-time persistence saves every valid Project buffer, including inactive tabs.
+/// Invalid buffers leave the last committed model available for hot-exit recovery.
+pub(crate) fn commit_project_cells_for_exit(tabs: &mut [DocTab]) {
+    for tab in tabs {
+        let _ = commit_project_cell(tab);
     }
 }
 

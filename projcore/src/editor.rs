@@ -322,6 +322,9 @@ impl Editor {
         if patch.level.is_some_and(|lv| !(1..=20).contains(&lv)) {
             return Err("'level' must be 1..=20".into());
         }
+        if patch.duration_min.is_some_and(|min| min < 0) {
+            return Err("Duration must not be negative".into());
+        }
         if patch.duration_min.is_some() {
             self.validate_cell_horizon(uid, patch.duration_min, None)?;
         }
@@ -410,59 +413,27 @@ impl Editor {
             self.changed();
             return Ok(AssignOutcome::Cleared);
         }
-        let existing = self
+        let mut resources = self.proj.resources.clone();
+        let rid = find_or_stage_resource(&mut resources, name)?;
+        if self
             .proj
-            .resources
+            .assignments
             .iter()
-            .find(|r| r.name.eq_ignore_ascii_case(name))
-            .map(|r| r.uid);
-        if existing.is_some_and(|rid| {
-            self.proj
-                .assignments
-                .iter()
-                .any(|a| a.task_uid == uid && a.resource_uid == rid)
-        }) {
+            .any(|a| a.task_uid == uid && a.resource_uid == rid)
+        {
             return Ok(AssignOutcome::AlreadyAssigned);
         }
-        let rid = match existing {
-            Some(rid) => rid,
-            None => self
-                .proj
-                .resources
-                .iter()
-                .map(|r| r.uid)
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or("No resource IDs available")?,
-        };
-        let auid = self
+        let mut next_aid = self
             .proj
             .assignments
             .iter()
             .map(|a| a.uid)
             .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("No assignment IDs available")?;
+            .unwrap_or(0);
+        let assignment = new_assignment(&mut next_aid, uid, rid, self.proj.tasks[i].duration_min)?;
         self.snapshot();
-        if existing.is_none() {
-            self.proj.resources.push(Resource {
-                uid: rid,
-                id: self.proj.resources.len() as i32 + 1,
-                name: name.into(),
-                is_work: true,
-                max_units: 1.0,
-                calendar_uid: None,
-            });
-        }
-        self.proj.assignments.push(Assignment {
-            uid: auid,
-            task_uid: uid,
-            resource_uid: rid,
-            units: 1.0,
-            work_min: self.proj.tasks[i].duration_min,
-        });
+        self.proj.resources = resources;
+        self.proj.assignments.push(assignment);
         self.changed();
         Ok(AssignOutcome::Assigned)
     }
@@ -487,6 +458,54 @@ impl Editor {
         };
         self.set_duration_min(uid, min)
     }
+}
+
+/// Both assignment entry points stage resources before taking an undo snapshot.
+fn find_or_stage_resource(resources: &mut Vec<Resource>, name: &str) -> Result<i32, String> {
+    if let Some(resource) = resources.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+        return Ok(resource.uid);
+    }
+    let uid = resources
+        .iter()
+        .map(|r| r.uid)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("No resource IDs available")?;
+    let id = resources
+        .iter()
+        .map(|r| r.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("No resource IDs available")?;
+    resources.push(Resource {
+        uid,
+        id,
+        name: name.into(),
+        is_work: true,
+        max_units: 1.0,
+        calendar_uid: None,
+    });
+    Ok(uid)
+}
+
+fn new_assignment(
+    next_uid: &mut i32,
+    task_uid: i32,
+    resource_uid: i32,
+    work_min: i64,
+) -> Result<Assignment, String> {
+    *next_uid = next_uid
+        .checked_add(1)
+        .ok_or("No assignment IDs available")?;
+    Ok(Assignment {
+        uid: *next_uid,
+        task_uid,
+        resource_uid,
+        units: 1.0,
+        work_min,
+    })
 }
 
 fn recompute_summaries(proj: &mut Project) {
@@ -552,16 +571,10 @@ pub fn parse_constraint(text: &str) -> Result<(ConstraintType, Option<DateTime>)
 
 /// Prompt prefill; ASAP intentionally uses an empty string.
 pub fn constraint_hint(t: &Task) -> String {
-    let code = match t.constraint {
-        ConstraintType::AsSoonAsPossible => return String::new(),
-        ConstraintType::AsLateAsPossible => "ALAP",
-        ConstraintType::StartNoEarlierThan => "SNET",
-        ConstraintType::StartNoLaterThan => "SNLT",
-        ConstraintType::FinishNoEarlierThan => "FNET",
-        ConstraintType::FinishNoLaterThan => "FNLT",
-        ConstraintType::MustStartOn => "MSO",
-        ConstraintType::MustFinishOn => "MFO",
-    };
+    if t.constraint == ConstraintType::AsSoonAsPossible {
+        return String::new();
+    }
+    let code = t.constraint.abbrev();
     match t.constraint_date {
         Some(d) => {
             let p = d.parts();

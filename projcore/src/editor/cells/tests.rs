@@ -157,6 +157,89 @@ fn aggregate_duration_and_lag_overflow_reject_before_snapshot() {
 }
 
 #[test]
+fn negative_duration_rejection_is_atomic_for_all_update_entry_points() {
+    let mut ed = editor();
+    ed.rename(10, "temporary").unwrap();
+    ed.undo();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    assert!(ed.set_duration(10, "-3d").is_err());
+    assert!(ed.set_duration_min(10, -1).is_err());
+    assert!(
+        ed.update_task(
+            10,
+            TaskPatch {
+                name: Some("must not rename".into()),
+                duration_min: Some(-1),
+                ..TaskPatch::default()
+            }
+        )
+        .is_err()
+    );
+    unchanged(&ed, &before, (0, 1, false));
+    // Lead/negative lag remains valid and is independent of duration validation.
+    ed.set_predecessors(10, parse_predecessors("2FS-1h", ed.project()).unwrap())
+        .unwrap();
+}
+
+#[test]
+fn assignment_entry_points_share_sparse_id_allocation_and_preflight() {
+    let mut base = editor();
+    base.assign_resource(10, "Alice").unwrap();
+    base.proj.resources[0].id = 90;
+    base.proj.resources[0].uid = 40;
+    base.proj.assignments[0].resource_uid = 40;
+    let mut single = Editor::new(base.project().clone());
+    let mut replace = Editor::new(base.project().clone());
+    single.assign_resource(10, "Bob").unwrap();
+    replace
+        .set_resources(10, &["Alice".into(), "Bob".into()])
+        .unwrap();
+    assert_eq!(single.project(), replace.project());
+    assert_eq!(
+        (
+            single.project().resources[1].id,
+            single.project().resources[1].uid
+        ),
+        (91, 41)
+    );
+    for resource_ids in [true, false] {
+        let mut ed = editor();
+        ed.assign_resource(10, "Alice").unwrap();
+        if resource_ids {
+            ed.proj.resources[0].id = i32::MAX;
+        } else {
+            ed.proj.assignments[0].uid = i32::MAX;
+        }
+        ed.mark_saved();
+        let before = ed.project().clone();
+        assert!(ed.assign_resource(10, "Bob").is_err());
+        unchanged(&ed, &before, (1, 0, false));
+        assert!(ed.set_resources(10, &["Bob".into()]).is_err());
+        unchanged(&ed, &before, (1, 0, false));
+    }
+}
+
+#[test]
+fn constraint_abbreviations_match_all_constraint_codes_and_hints() {
+    for (code, expected) in ["ASAP", "ALAP", "MSO", "MFO", "SNET", "SNLT", "FNET", "FNLT"]
+        .into_iter()
+        .enumerate()
+    {
+        let constraint = ConstraintType::from_code(code as i64).unwrap();
+        assert_eq!(constraint.abbrev(), expected);
+        let task = Task {
+            constraint,
+            ..Task::default()
+        };
+        assert_eq!(
+            constraint_hint(&task),
+            if code == 0 { "" } else { expected }
+        );
+    }
+}
+
+#[test]
 fn exact_duration_format_preserves_minutes_beyond_float_integer_precision() {
     let p = untitled_project();
     for min in [0, 1, -1, 9_007_199_254_740_993, i64::MAX, i64::MIN] {

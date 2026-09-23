@@ -246,6 +246,8 @@ State keys, as the app reports them after every driving verb:
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `selected_task`, `tasks`, `bar_<id>` | Project: selected task index (zero-based), task count, and each task's bar geometry by displayed ID |
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name, and `none` or the filename of the last successful Gantt export |
+| `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
+| `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Schedule`, `View`, `Home`, etc.) |
 
 Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
@@ -253,21 +255,42 @@ from the timeline scale origin, or `none` when the task has no schedule result.
 Kinds are `critical`, `on-track`, `summary`, and `milestone`. These state keys
 cover every task, including those outside the visible timeline.
 
-Project editing uses `n`/Insert to add, `x`/Delete to delete, Enter/F2 to
-rename, `d` for duration, `p` for predecessor **displayed ID**, `c` for a
-constraint, `a` for a resource, `b` for baseline, and Shift+L for leveling.
+Project cells use Enter/F2 or a double-click to edit the current value; typing
+any printable character replaces it. Left/Right move between columns;
+Up/Down/Home/End move between rows. Tab/Shift+Tab move between columns.
+Insert/Delete add/delete tasks, Alt+Shift+Right/Left indent/outdent,
+Alt+Right/Left pan the Gantt, and Ctrl+Shift+L toggles leveling. Former bare-letter
+commands (`n x d p c a b L`) now type into cells. Duration, predecessor, constraint,
+resource, baseline, and Rename commands remain on the ribbon; ribbon Rename
+still opens a Name prompt. Predecessors in cells use **displayed IDs**.
 Ctrl+F opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo,
 Ctrl+S saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export.
 Project ribbon KeyTips are File/Task/Schedule/View = F/T/S/W after Alt or F10.
+
+An open cell editor owns input before prompts and KeyTips. Enter commits and
+moves down, Tab/Shift+Tab commit and move right/left, and Escape cancels.
+Left/Right/Home/End move the caret; Backspace/Delete remove characters.
+Invalid input retains the buffer and selection. ID and summary Duration/Start/Finish
+cells are read-only. Ctrl+S commits before saving; other Control, Alt, and
+platform-modified events do not edit an open cell buffer. Clicking another cell
+or Gantt row and running ribbon commands commit first and stop on invalid input.
+Switching tabs preserves pending cell edits. On window close, valid pending
+Project edits are committed before hot-exit persistence; invalid buffers are
+discarded on exit while their last committed project state is still saved.
 
 An open Project prompt owns input before KeyTips: Enter commits, Escape cancels,
 Backspace removes one character, and printable text appends. Tab/Shift+Tab do
 nothing while it is open. Control, Alt, and platform-modified prompt events are
 ignored (including modified Enter/Escape/Backspace); no AltGr input is supported.
-Outside prompts only the listed Ctrl chords are handled; other modified Project
-edits and navigation are ignored. Changing tasks, documents, or commands cancels
-the prompt. The `project-invalid`, `project-ribbon`, and `ribbon-kinds` cases
-exercise these routes, including Word/Sheet strip switching.
+Outside editors and prompts, the Ctrl and Alt chords listed above are handled;
+other Control/Alt/platform chords are ignored. Changing tasks, documents, or commands
+cancels the prompt. The `project-cells`, `project-invalid`, `project-ribbon`, and
+`ribbon-kinds` cases exercise these routes, including Word/Sheet strip switching.
+
+`assert cell is Duration` checks the Project column state, while
+`assert cell C2 is 3d` reads the value displayed at that entry-table cell.
+Project A1 references use row positions and columns A through G (ID through
+Resource Names), rather than task IDs.
 
 `nothing` is how a script writes "this key is null" (`assert chart_sel is
 nothing`); `null` and `none` read the same, and `empty` matches an empty string.
@@ -293,7 +316,7 @@ view dirty, so when its reply goes out the frame that shows what it did has not
 been laid out yet; the driver reads the frame counter, sends its verbs, then
 waits for `rect` to report a higher one before capturing.
 
-**A region that is only partly on screen is refused, except for Project bars.** Both
+**A partly visible region is refused, except for Project bars and cells.** Both
 sides of the crop enforce this, because a half-visible edge is the one failure
 mode a pixel assertion cannot notice by itself: the picture is a perfectly good
 picture, the probe reads a perfectly good line, and the verdict is about the
@@ -311,12 +334,17 @@ wrong pixels.
   reporting the same geometry as half a dozen more failures. The same goes for a
   region too small to read an edge of at all.
 
-Project `bar:<id>` regions are the exception: long bars commonly extend beyond
+Project `bar:<id>` regions are one exception: long bars commonly extend beyond
 the timeline, so the app returns their visible part, clipped to the timeline
 viewport in both axes. An entirely outside bar or a task row that is not rendered
 is refused. A screenshot of a clipped bar records that visible part; its crop
 edge may be the pane edge, not the bar's actual edge. Use a fully visible bar for
 a border assertion. Window-edge clipping still follows the harness rule above.
+
+Project `cell:B3` regions likewise return the visible part of one entry-table
+cell, clipped to the table pane in both axes. Entirely hidden or unrendered cells
+are refused, as are Project cell ranges. Use a fully visible cell for a border
+assertion: a clipped crop edge can be the table pane edge instead of the cell border.
 
 ### Colours
 
