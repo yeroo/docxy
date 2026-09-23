@@ -141,8 +141,9 @@ struct PersistTab {
     path: Option<String>,
     #[serde(default)]
     dirty: bool,
-    /// Hot-exit sidecar `.docx` holding this tab's current (possibly unsaved)
-    /// content. Restored in preference to `path` so edits survive a restart.
+    /// Hot-exit sidecar holding this tab's current (possibly unsaved) content,
+    /// in the format matching its kind: `.docx`, `.xlsx`, or `.yppx`.
+    /// Restored in preference to `path` so edits survive a restart.
     #[serde(default)]
     hot: Option<String>,
     #[serde(default)]
@@ -1446,9 +1447,10 @@ fn sheet_bytes(v: &SheetView) -> Vec<u8> {
     }
 }
 
-/// Build a tab by loading `path` from disk — an .xlsx spreadsheet or a
-/// Word/Markdown document, dispatched on the extension. Shared by the Open
-/// dialog and command-line file arguments.
+/// Build a tab by loading `path` from disk — an .xlsx spreadsheet, a
+/// Word/Markdown document, or a .yppx/.xml/.mpp project schedule, dispatched on
+/// the extension (.xml opens as Project). Shared by the Open dialog and
+/// command-line file arguments.
 fn tab_from_path(path: &PathBuf) -> DocTab {
     if is_project_path(path) {
         return project_tab_from_path(path);
@@ -3746,13 +3748,7 @@ fn build_surface(
                 "untitled".into(),
             ),
         },
-        Kind::Project => {
-            let tab = match path {
-                Some(p) => project_tab_from_path(p),
-                None => new_project_tab(),
-            };
-            (tab.surface, vec![], vec![], None, tab.status)
-        }
+        Kind::Project => unreachable!("project tabs restore via restore_project_tab"),
         Kind::Xlsx => match path {
             Some(p) => {
                 let (surface, status) = sheet_from_path(p);
@@ -3776,8 +3772,8 @@ fn file_name(path: &std::path::Path) -> String {
         .unwrap_or_else(|| "Untitled.docx".into())
 }
 
-/// Directory holding the hot-exit sidecars — one `.docx` per open Doc tab, kept in
-/// sync on each persist so unsaved edits survive a restart.
+/// Directory holding hot-exit sidecars (`.docx`, `.xlsx`, or `.yppx` by tab kind),
+/// kept in sync on each persist so unsaved edits survive a restart.
 fn hot_dir() -> PathBuf {
     config_root().join("docxy").join("hot")
 }
@@ -3902,7 +3898,8 @@ fn restore_tab(t: &PersistTab) -> DocTab {
 fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     // Write the tab's live content to a sidecar so unsaved edits are
     // held across a restart (closing never loses work). Docs → .docx,
-    // spreadsheets → .xlsx; both are restored in preference to `path`.
+    // spreadsheets → .xlsx, projects → .yppx; restored in preference to `path`.
+    // Missing or unreadable project sidecars use restore_project_tab's recovery policy.
     let hot = match &t.surface {
         Surface::Doc(ed) => {
             let p = hd.join(format!("tab-{i}.docx"));
@@ -4070,32 +4067,25 @@ impl Docxy {
     }
 
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
-        if kind == Kind::Project {
-            self.tabs.push(new_project_tab());
-        } else {
-            let (title, surface): (SharedString, Surface) = match kind {
-                Kind::Docx => (
-                    "Untitled.docx".into(),
-                    Surface::Doc(Editor::new(empty_doc())),
-                ),
-                Kind::Xlsx => ("Untitled.xlsx".into(), new_sheet_surface()),
-                Kind::Project => unreachable!(),
-                Kind::Look => ("Inbox".into(), Surface::Placeholder),
-            };
-            self.tabs.push(DocTab {
-                kind,
-                title,
-                path: None,
-                surface,
-                dirty: false,
-                status: "new".into(),
-                comments: vec![],
-                pkg: None,
-                notes: vec![],
-                markdown: false,
-                hf_edit: None,
-            });
-        }
+        let new_tab = |title: &str, surface| DocTab {
+            kind,
+            title: title.to_owned().into(),
+            path: None,
+            surface,
+            dirty: false,
+            status: "new".into(),
+            comments: vec![],
+            pkg: None,
+            notes: vec![],
+            markdown: false,
+            hf_edit: None,
+        };
+        self.tabs.push(match kind {
+            Kind::Project => new_project_tab(),
+            Kind::Docx => new_tab("Untitled.docx", Surface::Doc(Editor::new(empty_doc()))),
+            Kind::Xlsx => new_tab("Untitled.xlsx", new_sheet_surface()),
+            Kind::Look => new_tab("Inbox", Surface::Placeholder),
+        });
         self.active = self.tabs.len() - 1;
         self.backstage = false;
         self.bs_new = false;
@@ -6439,7 +6429,6 @@ impl Docxy {
         };
         if v.key(key, ctrl) {
             tab.dirty = v.ed.dirty();
-            self.persist();
             cx.notify();
         }
     }
@@ -16864,7 +16853,7 @@ impl Render for Docxy {
                         "{} {}{}{}",
                         tb.kind.glyph(),
                         tb.title,
-                        if is_imported(tb) { " — imported" } else { "" },
+                        if is_imported(tb) { " · imported" } else { "" },
                         mark
                     )))
                     .child(

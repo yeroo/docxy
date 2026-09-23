@@ -251,14 +251,15 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
                 }
             }
         }
-    } else if t.dirty {
-        "no sidecar recorded"
     } else {
+        "no sidecar recorded"
+    };
+    if !t.dirty {
         return match path {
             Some(path) => project_tab_from_path(&path),
             None => new_project_tab(),
         };
-    };
+    }
     let (surface, status) = match path.as_deref() {
         Some(orig) => match project_from_path(orig) {
             Ok(p) => (

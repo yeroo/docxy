@@ -334,6 +334,31 @@ fn recovery_reports_lost_content_for_every_unavailable_sidecar_case() {
         (Some(corrupt.as_path()), "sidecar unreadable"),
     ] {
         for path in [Some(orig.as_path()), Some(missing_orig.as_path()), None] {
+            let clean = restore_tab(&persisted(path, hot, false));
+            assert!(!clean.dirty);
+            assert!(!clean.status.contains("unsaved edits lost"));
+            assert_eq!(clean.path.as_deref(), path);
+            match path {
+                Some(p) if p == orig => {
+                    assert!(!view(&clean).ed.dirty());
+                    assert!(clean.status.starts_with("loaded"));
+                    assert_eq!(view(&clean).ed.project().tasks[0].name, "Build");
+                }
+                Some(_) => {
+                    assert!(matches!(clean.surface, Surface::Placeholder));
+                    assert!(clean.status.starts_with("project load error:"));
+                    assert_eq!(
+                        save_decision(&clean, false, false),
+                        SaveDecision::Unsaveable
+                    );
+                }
+                None => {
+                    assert!(!view(&clean).ed.dirty());
+                    assert!(view(&clean).ed.project().tasks.is_empty());
+                    assert_eq!(clean.title.as_ref(), "Untitled.yppx");
+                    assert_eq!(clean.status.as_ref(), "new project");
+                }
+            }
             let tab = restore_tab(&persisted(path, hot, true));
             assert!(!tab.dirty);
             assert!(tab.status.starts_with(reason), "{}", tab.status);
