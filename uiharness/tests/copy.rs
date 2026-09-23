@@ -38,7 +38,28 @@ fn copied_fixture_keeps_its_name_and_isolated_sidecars_never_touch_the_original(
     let copy = copy_fixture(&source, &sandbox, "Export isolated").unwrap();
     assert_eq!(copy, sandbox.join("export-isolated/gantt-summary.xml"));
     assert_eq!(std::fs::read(&copy).unwrap(), original);
-    assert!(copy_fixture(&source, &sandbox, "Export isolated").is_err());
+    assert_eq!(
+        copy_fixture(&source, &sandbox, "Export isolated").unwrap_err(),
+        format!(
+            "open copy: {} already exists; use a fresh --sandbox",
+            copy.display()
+        )
+    );
+    assert_eq!(std::fs::read(&copy).unwrap(), original);
+    let missing = sandbox.join("missing.xml");
+    let err = copy_fixture(&missing, &sandbox, "Missing input").unwrap_err();
+    assert!(
+        err.starts_with(&format!("open copy: read {}:", missing.display())),
+        "{err}"
+    );
+    let err = copy_fixture(&source, &copy, "Blocked directory").unwrap_err();
+    assert!(
+        err.starts_with(&format!(
+            "open copy: create directory {}:",
+            copy.join("blocked-directory").display()
+        )),
+        "{err}"
+    );
     let output = copy.with_extension("md");
     std::fs::write(&output, "# Gantt export\n").unwrap();
     std::fs::write(&copy, "edited schedule").unwrap();

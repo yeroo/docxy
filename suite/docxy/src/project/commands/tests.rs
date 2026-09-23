@@ -39,6 +39,86 @@ fn commit(t: &mut DocTab, act: ProjectAct, text: &str) {
     commit_prompt(t, p);
 }
 
+fn take_reveal(t: &DocTab) -> Option<usize> {
+    v(t).scroll
+        .0
+        .borrow_mut()
+        .deferred_scroll_to_item
+        .take()
+        .map(|request| request.item_index)
+}
+
+#[test]
+fn completion_reveals_selection_changes_without_disturbing_other_inputs() {
+    use ProjectAct::*;
+    let mut t = tab();
+    for act in ProjectAct::RIBBON
+        .iter()
+        .copied()
+        .filter(|a| !matches!(a, AddTask | DeleteTask))
+    {
+        apply_project_act(&mut t, act);
+        assert_eq!(take_reveal(&t), None, "{act:?}");
+    }
+    vm(&mut t).cancel_prompt();
+    for (key, modifiers) in [
+        ("right", Modifiers::default()),
+        (
+            "right",
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        ),
+        ("q", Modifiers::default()),
+        (
+            "down",
+            Modifiers {
+                alt: true,
+                ..Modifiers::default()
+            },
+        ),
+    ] {
+        project_input(&mut t, key, None, modifiers);
+        assert_eq!(take_reveal(&t), None, "{key}");
+    }
+    project_input(&mut t, "home", None, Modifiers::default());
+    assert_eq!(take_reveal(&t), Some(0));
+    let old_uid = v(&t).ed.selected_uid();
+    apply_project_act(&mut t, DeleteTask);
+    assert_eq!(v(&t).ed.sel(), 0);
+    assert_ne!(v(&t).ed.selected_uid(), old_uid);
+    assert_eq!(take_reveal(&t), Some(0));
+    for act in [Undo, Redo, AddTask] {
+        apply_project_act(&mut t, act);
+        assert_eq!(take_reveal(&t), Some(v(&t).ed.sel()), "{act:?}");
+    }
+    apply_project_act(&mut t, Find);
+    project_input(&mut t, "n", Some("New task"), Modifiers::default());
+    assert_eq!(take_reveal(&t), None);
+    project_input(&mut t, "enter", None, Modifiers::default());
+    assert_eq!(take_reveal(&t), Some(v(&t).ed.sel()));
+    apply_project_act(&mut t, FindNext);
+    assert_eq!(
+        take_reveal(&t),
+        Some(v(&t).ed.sel()),
+        "repeat search reveals even the same row"
+    );
+}
+
+#[test]
+fn baseline_on_an_empty_project_preserves_status_dirtiness_and_history() {
+    let mut t = new_project_tab();
+    let before = v(&t).ed.project().clone();
+    let status = t.status.clone();
+    apply_project_act(&mut t, ProjectAct::Baseline);
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(t.status, status);
+    assert!(!t.dirty && !v(&t).ed.dirty());
+    assert_eq!((v(&t).ed.undo_depth(), v(&t).ed.redo_depth()), (0, 0));
+    assert_eq!(take_reveal(&t), None);
+}
+
 #[test]
 fn ribbon_inventory_keys_tips_and_assets_are_complete() {
     let r = project_ribbon();
@@ -84,6 +164,20 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
 
 #[test]
 fn ribbon_context_survives_valid_switches_only() {
+    for kind in [Kind::Project, Kind::Docx, Kind::Xlsx] {
+        assert_eq!(
+            ribbon_for(kind)
+                .tabs
+                .iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>(),
+            ribbon_tab_set(kind)
+                .iter()
+                .skip(1)
+                .map(|(_, name, _)| *name)
+                .collect::<Vec<_>>()
+        );
+    }
     assert_eq!(
         ribbon_tab_set(Kind::Project)
             .iter()

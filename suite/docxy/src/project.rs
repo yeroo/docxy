@@ -51,9 +51,9 @@ impl ProjectView {
             .clamp(0., (self.scale.width() - self.gantt_w).max(0.));
     }
 
-    /// Shared by the key handler and tests; empty history must preserve restored dirtiness.
-    pub fn key(&mut self, key: &str, ctrl: bool, shift: bool) -> bool {
-        if !ctrl && matches!(key, "left" | "right") {
+    /// Navigation and horizontal scrolling only; command completion owns row reveal.
+    pub fn key(&mut self, key: &str, shift: bool) -> bool {
+        if matches!(key, "left" | "right") {
             let sign = if key == "left" { -1. } else { 1. };
             if shift {
                 self.table_x += sign * 80.;
@@ -63,30 +63,14 @@ impl ProjectView {
             self.clamp_offsets();
             return true;
         }
-        if ctrl {
-            match key {
-                "z" => {
-                    self.ed.undo();
-                }
-                "y" => {
-                    self.ed.redo();
-                }
-                _ => return false,
-            }
-        } else {
-            let index = match key {
-                "up" => self.ed.sel().saturating_sub(1),
-                "down" => self.ed.sel().saturating_add(1),
-                "home" => 0,
-                "end" => self.ed.project().tasks.len().saturating_sub(1),
-                _ => return false,
-            };
-            self.ed.select(index);
-        }
-        if !self.ed.project().tasks.is_empty() {
-            self.scroll
-                .scroll_to_item(self.ed.sel(), ScrollStrategy::Nearest);
-        }
+        let index = match key {
+            "up" => self.ed.sel().saturating_sub(1),
+            "down" => self.ed.sel().saturating_add(1),
+            "home" => 0,
+            "end" => self.ed.project().tasks.len().saturating_sub(1),
+            _ => return false,
+        };
+        self.ed.select(index);
         true
     }
 }

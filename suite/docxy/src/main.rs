@@ -12624,6 +12624,14 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
     ])
 }
 
+fn ribbon_for(kind: Kind) -> rs::Ribbon<Act> {
+    if kind == Kind::Project {
+        project_ribbon()
+    } else {
+        docxy_ribbon()
+    }
+}
+
 fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'static str)] {
     use RibbonTab::*;
     if kind == Kind::Project {
@@ -14163,11 +14171,7 @@ impl Docxy {
                     self.bs_new = false;
                     return cx.notify();
                 }
-                let ribbon = if self.active_is_project() {
-                    project_ribbon()
-                } else {
-                    docxy_ribbon()
-                };
+                let ribbon = ribbon_for(self.ribbon_kind());
                 if let Some(i) = ribbon
                     .tabs
                     .iter()
@@ -14184,11 +14188,7 @@ impl Docxy {
                 cx.notify();
             }
             KeyTip::Commands => {
-                let ribbon = if self.active_is_project() {
-                    project_ribbon()
-                } else {
-                    docxy_ribbon()
-                };
+                let ribbon = ribbon_for(self.ribbon_kind());
                 let table = table_tab();
                 let tab = if self.ribbon_tab == RibbonTab::Table {
                     &table
@@ -14333,11 +14333,7 @@ impl Docxy {
     /// are dropped first, then the lowest-`priority` groups collapse into an
     /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
     fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ribbon = if self.active_is_project() {
-            project_ribbon()
-        } else {
-            docxy_ribbon()
-        };
+        let ribbon = ribbon_for(self.ribbon_kind());
         let ctx_tab = table_tab();
         let tab = if self.ribbon_tab == RibbonTab::Table {
             &ctx_tab

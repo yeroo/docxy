@@ -44,6 +44,6 @@ test project find reveals a distant row and F3 wraps
   assert selected_name is Task 100
   assert status is Found 'Task 100'  (F3 next)
   shot bar:100
-  key home f3
+  key f3
   assert selected_task is 99
   shot bar:100

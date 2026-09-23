@@ -1,4 +1,4 @@
-//! Project commands and prompt policy, independent of a window.
+//! Project commands and prompt policy: pure DocTab functions first, window host glue last.
 use super::*;
 use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
 
@@ -359,7 +359,7 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
     }
 }
 
-/// Returns window-dependent commands to the host. Every input route uses this modifier gate.
+/// Handles prompts/navigation and returns mapped acts for host dispatch, using one modifier gate.
 pub(crate) fn project_input(
     tab: &mut DocTab,
     key: &str,
@@ -395,7 +395,10 @@ pub(crate) fn project_input(
         return Some(act);
     }
     if !m.control && !m.alt && !m.platform {
-        v.key(key, false, m.shift);
+        let before = (v.ed.sel(), v.ed.selected_uid());
+        v.key(key, m.shift);
+        let changed = before != (v.ed.sel(), v.ed.selected_uid());
+        complete_project(tab, changed);
     }
     None
 }
@@ -475,13 +478,14 @@ pub(crate) fn commit_prompt(tab: &mut DocTab, prompt: ProjectPrompt) {
         Ok(Some(status)) | Err(status) => tab.status = status.into(),
         Ok(None) => {}
     }
-    complete_project(tab);
+    complete_project(tab, true);
 }
 
-pub(crate) fn complete_project(tab: &mut DocTab) {
+/// Sync dirty state; reveal only when the caller requested selection visibility.
+pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
     if let Surface::Project(v) = &mut tab.surface {
         tab.dirty = v.ed.dirty();
-        if !v.ed.project().tasks.is_empty() {
+        if reveal && !v.ed.project().tasks.is_empty() {
             v.scroll.scroll_to_item(v.ed.sel(), ScrollStrategy::Nearest);
         }
     }
@@ -523,9 +527,11 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 }
             }
             Baseline => {
-                v.ed.set_baseline();
-                status =
-                    Some("Baseline set — baseline bars now show under the current bars".into());
+                if !v.ed.project().tasks.is_empty() {
+                    v.ed.set_baseline();
+                    status =
+                        Some("Baseline set — baseline bars now show under the current bars".into());
+                }
             }
             Level => {
                 v.ed.toggle_level();
@@ -561,10 +567,10 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             }
             FindNext => status = find_status(&mut v.ed, ""),
             ScrollLeft => {
-                v.key("left", false, false);
+                v.key("left", false);
             }
             ScrollRight => {
-                v.key("right", false, false);
+                v.key("right", false);
             }
             GoToStart => v.gantt_x = 0.,
             Save | SaveAs | ExportGantt | Theme => {} // window-dependent host actions
@@ -580,7 +586,10 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     if matches!(act, Indent | Outdent) {
         indent_project(tab, if act == Indent { 1 } else { -1 });
     }
-    complete_project(tab);
+    complete_project(
+        tab,
+        matches!(act, AddTask | DeleteTask | FindNext | Undo | Redo),
+    );
 }
 
 #[derive(Debug, PartialEq)]
@@ -677,12 +686,6 @@ impl Docxy {
             v.cancel_prompt();
         }
     }
-    fn project_after(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            complete_project(tab);
-        }
-        self.refocus(window, cx);
-    }
     pub(crate) fn project_act(
         &mut self,
         act: ProjectAct,
@@ -715,7 +718,7 @@ impl Docxy {
                 }
             }
         }
-        self.project_after(window, cx);
+        self.refocus(window, cx);
     }
     pub(crate) fn project_key(
         &mut self,
@@ -737,7 +740,7 @@ impl Docxy {
         ) {
             return self.project_act(act, window, cx);
         }
-        self.project_after(window, cx);
+        self.refocus(window, cx);
     }
     pub(crate) fn project_prompt_bar(
         &self,

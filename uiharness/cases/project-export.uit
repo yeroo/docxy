@@ -6,7 +6,15 @@ test project export uses a sandbox copy
   assert exported is gantt-summary.md
   assert title is gantt-summary.xml
   assert dirty is false
-  key b ctrl+e
+  key alt f
+  shot window
+
+test dirty project export uses a fresh sandbox copy
+  open copy:../fixtures/gantt-summary.xml
+  assert exported is none
+  key b
+  assert dirty is true
+  key ctrl+e
   assert exported is gantt-summary.md
   assert dirty is true
   key ctrl+z

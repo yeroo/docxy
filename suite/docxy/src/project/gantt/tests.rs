@@ -103,13 +103,13 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
     v.layout(1180.);
     assert_eq!(v.table_w, 590.);
-    assert!(v.key("right", false, false));
+    assert!(v.key("right", false));
     assert_eq!(v.gantt_x, DAY_W);
-    assert!(v.key("right", false, true));
+    assert!(v.key("right", true));
     assert_eq!(v.table_x, 80.);
     for _ in 0..500 {
-        v.key("right", false, false);
-        v.key("right", false, true);
+        v.key("right", false);
+        v.key("right", true);
     }
     assert_eq!(v.table_x, TABLE_W - 590.);
     assert_eq!(v.gantt_w, 584.);
@@ -120,8 +120,8 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
     v.layout(2000.);
     assert_eq!((v.table_x, v.gantt_x), (0., 0.));
     for _ in 0..10 {
-        v.key("left", false, true);
-        v.key("left", false, false);
+        v.key("left", true);
+        v.key("left", false);
     }
     assert_eq!((v.table_x, v.gantt_x), (0., 0.));
     for (width, table) in [(460., 320.), (800., 400.), (1180., 590.), (2000., 908.)] {

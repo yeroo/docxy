@@ -651,16 +651,35 @@ fn shown(s: &str) -> String {
 /// Preserve the basename for titles and exports; never replace an existing copy.
 pub fn copy_fixture(source: &Path, sandbox: &Path, case: &str) -> Result<PathBuf, String> {
     let dir = sandbox.join(crate::run::slug(case));
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let name = source.file_name().ok_or("fixture has no file name")?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("open copy: create directory {}: {e}", dir.display()))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("open copy: source {} has no file name", source.display()))?;
     let target = dir.join(name);
-    let mut input = std::fs::File::open(source).map_err(|e| e.to_string())?;
+    let mut input = std::fs::File::open(source)
+        .map_err(|e| format!("open copy: read {}: {e}", source.display()))?;
     let mut output = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&target)
-        .map_err(|e| e.to_string())?;
-    std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "open copy: {} already exists; use a fresh --sandbox",
+                    target.display()
+                )
+            } else {
+                format!("open copy: create {}: {e}", target.display())
+            }
+        })?;
+    std::io::copy(&mut input, &mut output).map_err(|e| {
+        format!(
+            "open copy: copy {} to {}: {e}",
+            source.display(),
+            target.display()
+        )
+    })?;
     Ok(target)
 }
 
