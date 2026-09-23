@@ -4,11 +4,11 @@ test gantt indent outdent undo and redo reschedule
   assert dirty is false
   key down
   assert selected_task is 1
-  key tab
+  key alt+shift+right
   assert bar_1 is summary 0-3
   assert dirty is true
   shot gantt
-  key shift+tab
+  key alt+shift+left
   assert bar_1 is on-track 0-0
   key ctrl+z
   assert bar_1 is summary 0-3

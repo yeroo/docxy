@@ -1,19 +1,19 @@
 test project invalid prompts preserve the schedule
   open ../fixtures/gantt-summary.xml
-  key down d
+  key down alt t d
   type banana
   key enter
   assert prompt is none
   assert status is Couldn't read duration 'banana' (try 3d, 4h, 2w)
   assert dirty is false
   assert bar_2 is on-track 0-0
-  key p
+  key alt s p
   type 999
   key enter
   assert status is No other task with ID 999
   assert dirty is false
   assert bar_2 is on-track 0-0
-  key c
+  key alt s c
   key backspace backspace backspace backspace
   type mso
   key enter
@@ -23,7 +23,7 @@ test project invalid prompts preserve the schedule
   key ctrl+alt+z alt+down ctrl+n
   assert selected_task is 1
   assert tasks is 3
-  key d
+  key alt t d
   type 3d
   key ctrl+enter alt+escape ctrl+backspace tab shift+tab f10
   assert prompt is duration:3d

@@ -1,15 +1,15 @@
 test project control edits share the live editor and undo stack
   open copy:../fixtures/gantt-summary.xml
   key down f2
-  assert prompt is rename:Task 2
+  assert cell_edit is Task 2
   call task.list {}
   call task.get {"uid":2}
   call find {"query":"Task"}
   call proj.path {}
-  assert prompt is rename:Task 2
+  assert cell_edit is Task 2
   assert dirty is false
   call task.set {"uid":2,"duration":"3d","name":"Agent 2"}
-  assert prompt is none
+  assert cell_edit is none
   assert selected_name is Agent 2
   assert dirty is true
   assert bar_2 is on-track 0-2
