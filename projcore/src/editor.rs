@@ -10,6 +10,11 @@ use crate::schedule::{Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
 
+mod cells;
+pub use cells::{
+    day_finish, format_duration_exact, format_predecessors, parse_cell_date, parse_predecessors,
+};
+
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {
     DateTime::from_ymd_hm(2026, 1, 5, 8, 0)
@@ -317,6 +322,18 @@ impl Editor {
         if patch.level.is_some_and(|lv| !(1..=20).contains(&lv)) {
             return Err("'level' must be 1..=20".into());
         }
+        if patch.duration_min.is_some() {
+            self.validate_cell_horizon(uid, patch.duration_min, None)?;
+        }
+        let t = &self.proj.tasks[i];
+        if patch.name.as_ref().is_none_or(|name| *name == t.name)
+            && patch
+                .duration_min
+                .is_none_or(|min| min == t.duration_min && (min == 0) == t.milestone)
+            && patch.level.is_none_or(|lv| lv == t.outline_level)
+        {
+            return Ok(());
+        }
         self.snapshot();
         let t = &mut self.proj.tasks[i];
         if let Some(name) = patch.name {
@@ -377,13 +394,8 @@ impl Editor {
     }
 
     pub fn set_constraint(&mut self, uid: i32, text: &str) -> Result<(), String> {
-        let i = self.index(uid)?;
         let (constraint, constraint_date) = parse_constraint(text)?;
-        self.snapshot();
-        self.proj.tasks[i].constraint = constraint;
-        self.proj.tasks[i].constraint_date = constraint_date;
-        self.changed();
-        Ok(())
+        self.set_constraint_typed(uid, constraint, constraint_date)
     }
 
     pub fn assign_resource(&mut self, uid: i32, name: &str) -> Result<AssignOutcome, String> {
@@ -491,13 +503,22 @@ pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
         .strip_suffix(['d', 'h', 'w', 'm'])
         .map(|n| (n, t.chars().last().unwrap()))
         .unwrap_or((t.as_str(), 'd'));
+    // Exact minute literals must not lose integer precision through f64.
+    if unit == 'm' {
+        if let Ok(minutes) = num.trim().parse::<i64>() {
+            return Some(minutes);
+        }
+    }
     let v: f64 = num.trim().parse().ok()?;
-    Some(match unit {
-        'h' => (v * 60.0).round() as i64,
-        'w' => proj.days_to_minutes(v * (proj.hours_per_week / proj.hours_per_day)),
-        'm' => v.round() as i64,
-        _ => proj.days_to_minutes(v),
-    })
+    let minutes = match unit {
+        'h' => v * 60.0,
+        'w' => v * proj.hours_per_week * 60.0,
+        'm' => v,
+        _ => v * proj.hours_per_day * 60.0,
+    }
+    .round();
+    (minutes.is_finite() && minutes > i64::MIN as f64 && minutes < i64::MAX as f64)
+        .then_some(minutes as i64)
 }
 
 /// Parse `TYPE [date]`, retaining the TUI's input and rejection conventions.
