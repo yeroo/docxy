@@ -1,6 +1,6 @@
 [package]
 name = "mppread"
-description = "Dependency-free reader for the OLE2 Compound File Binary (CFB) container used by legacy .doc/.xls/.mpp files; the first layer of MS Project .mpp import."
+description = "Reader for legacy Office CFB containers and MS Project .mpp import into projcore."
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -15,4 +15,5 @@ categories = ["parser-implementations"]
 workspace = true
 
 [dependencies]
-# Intentionally std-only — the CFB container is a pure byte format.
+# std-only plus our project model; the CFB parser itself remains independent.
+projcore = { version = "0.1.0", path = "../projcore" }

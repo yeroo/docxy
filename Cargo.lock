@@ -908,6 +908,9 @@ dependencies = [
 [[package]]
 name = "mppread"
 version = "0.1.0"
+dependencies = [
+ "projcore",
+]
 
 [[package]]
 name = "num-traits"

@@ -10,6 +10,20 @@ use crate::schedule::{Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
 
+/// A fixed Monday anchor, shared by new schedules and undated imports.
+pub fn default_anchor() -> DateTime {
+    DateTime::from_ymd_hm(2026, 1, 5, 8, 0)
+}
+
+/// A new empty project. Hosts may add a starter task for their own UI.
+pub fn untitled_project() -> Project {
+    Project {
+        name: "Untitled".into(),
+        start_date: Some(default_anchor()),
+        ..Project::default()
+    }
+}
+
 /// Fields updated atomically by an agent's `task.set` command.
 #[derive(Default)]
 pub struct TaskPatch {
@@ -48,7 +62,12 @@ pub struct Editor {
 }
 
 impl Editor {
-    pub fn new(mut proj: Project) -> Self {
+    pub fn new(proj: Project) -> Self {
+        Self::restored(proj, false)
+    }
+
+    /// Restore saved session content and its dirty flag, with empty edit history.
+    pub fn restored(mut proj: Project, dirty: bool) -> Self {
         recompute_summaries(&mut proj);
         let sched = schedule(&proj);
         Self {
@@ -56,7 +75,7 @@ impl Editor {
             sel: 0,
             undo: Vec::new(),
             redo: Vec::new(),
-            dirty: false,
+            dirty,
             sched,
             leveled: false,
             level: None,
@@ -535,6 +554,29 @@ pub fn constraint_hint(t: &Task) -> String {
 mod tests {
     use super::*;
     use crate::schedule::TaskResult;
+
+    #[test]
+    fn restored_dirty_state_survives_empty_history() {
+        for dirty in [false, true] {
+            let mut ed = Editor::restored(untitled_project(), dirty);
+            assert_eq!(ed.dirty(), dirty);
+            assert_eq!((ed.undo_depth(), ed.redo_depth()), (0, 0));
+            assert!(!ed.undo());
+            assert!(!ed.redo());
+            assert_eq!(ed.dirty(), dirty);
+            ed.mark_saved();
+            assert!(!ed.dirty());
+            assert_schedule(&ed);
+        }
+    }
+
+    #[test]
+    fn untitled_project_has_shared_anchor_and_no_tasks() {
+        let p = untitled_project();
+        assert!(p.tasks.is_empty());
+        assert_eq!(p.name, "Untitled");
+        assert_eq!(p.start_date, Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)));
+    }
 
     fn editor() -> Editor {
         Editor::new(Project {

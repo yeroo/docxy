@@ -19,6 +19,21 @@ use opccore::xml::{Event, XmlParser};
 /// Parse an MSPDI document into a [`Project`].
 pub fn read_mspdi(xml: &str) -> Result<Project, String> {
     let mut p = XmlParser::new(xml);
+    // Check the document kind before interpreting fields. This is deliberately
+    // a root check, not full XML well-formedness validation.
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "Project" => break,
+            Event::Start => {
+                return Err(format!(
+                    "not an MSPDI document: root element is <{}>, expected <Project>",
+                    p.name()
+                ));
+            }
+            Event::Eof => return Err("not an MSPDI document: expected <Project> root".into()),
+            _ => {}
+        }
+    }
     let mut proj = Project {
         calendars: Vec::new(),
         ..Project::default()
@@ -682,6 +697,16 @@ fn fmt_f(x: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requires_project_root_but_allows_empty_projects() {
+        for xml in ["", "hello", "<foo/>", "<foo><Project/></foo>"] {
+            assert!(read_mspdi(xml).is_err(), "{xml}");
+        }
+        for xml in ["<Project/>", "<?xml version=\"1.0\"?><Project/>"] {
+            assert!(read_mspdi(xml).unwrap().tasks.is_empty());
+        }
+    }
 
     #[test]
     fn iso_durations() {
