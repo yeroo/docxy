@@ -55,9 +55,9 @@ use crate::probe::{
 };
 use std::path::Path;
 
-/// The colours the grid draws its outlines in, by the name a test would use.
+/// The colours used by grid outlines and Gantt bars, by the name a test would use.
 ///
-/// These mirror constants in `suite/docxy/src/main.rs` — `BRAND`, and the chart
+/// These mirror constants in `suite/docxy/src/main.rs` — `BRAND`, `GANTT_CRIT`, and the chart
 /// slot colours `CHART_VALUES_COLOR` / `CHART_CATEGORIES_COLOR` /
 /// `CHART_NAME_COLOR` — named rather than cited by line, because the names are
 /// what `the_named_colours_are_the_grids_own` looks up and a line number here
@@ -71,6 +71,8 @@ pub const NAMED_COLORS: &[(&str, u32)] = &[
     // The brand teal: the selection ring, and the pointed range's dashes.
     ("teal", 0x2AA79B),
     ("brand", 0x2AA79B),
+    // The Gantt critical-path bar (GANTT_CRIT).
+    ("amber", 0xD9642C),
     // A selected chart's source areas: Excel's own mapping.
     ("blue", 0x4472C4),
     ("purple", 0x7030A0),
@@ -192,7 +194,7 @@ impl BorderExpect {
 }
 
 /// The region names that are not cell references, for an error message.
-const REGION_WORDS: &str = "window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0";
+const REGION_WORDS: &str = "window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3";
 
 /// `A1` and `A1:C5` are written bare in a test; anything with a `:` head the
 /// app knows, or one of its bare names, is passed through untouched.
@@ -654,6 +656,8 @@ mod tests {
         };
         let by = |n: &str| NAMED_COLORS.iter().find(|(k, _)| *k == n).unwrap().1;
         assert_eq!(by("teal"), app("BRAND"));
+        assert_eq!(by("amber"), app("GANTT_CRIT"));
+        assert_eq!(parse_color("amber").unwrap(), rgb(app("GANTT_CRIT")));
         assert_eq!(by("brand"), by("teal"));
         assert_eq!(by("blue"), app("CHART_VALUES_COLOR"));
         assert_eq!(by("purple"), app("CHART_CATEGORIES_COLOR"));

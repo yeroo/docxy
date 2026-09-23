@@ -1340,6 +1340,9 @@ impl Pal {
     }
 }
 
+const GANTT_CRIT: u32 = 0xD9642C;
+const GANTT_MILESTONE: u32 = 0xB482DC;
+const GANTT_SUMMARY: u32 = 0x96A0AC;
 const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
 const LINK: u32 = 0x2f6fdb;
 const FILE_FG: u32 = 0xffffff;
@@ -5392,6 +5395,7 @@ impl Docxy {
                 origin: point(px(0.), px(0.)),
                 size: window.viewport_size(),
             }),
+            Region::Gantt | Region::Bar(_) => self.project_region_bounds(region),
             Region::Grid => self.grid_bounds(),
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
             Region::ChartPanel => self
@@ -6417,7 +6421,21 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
-    fn project_key(&mut self, key: &str, ctrl: bool, window: &mut Window, cx: &mut Context<Self>) {
+    fn project_indent(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            indent_project(tab, delta);
+        }
+        self.refocus(window, cx);
+    }
+
+    fn project_key(
+        &mut self,
+        key: &str,
+        ctrl: bool,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if ctrl && key == "s" {
             return self.save_active(window, cx);
         }
@@ -6427,7 +6445,7 @@ impl Docxy {
         let Surface::Project(v) = &mut tab.surface else {
             return;
         };
-        if v.key(key, ctrl) {
+        if v.key(key, ctrl, shift) {
             tab.dirty = v.ed.dirty();
             cx.notify();
         }
@@ -11855,6 +11873,9 @@ impl Docxy {
             self.chart_hand_back(cx);
             return self.sheet_commit(0, 1, cx);
         }
+        if self.active_is_project() {
+            return self.project_indent(1, window, cx);
+        }
         self.with_editor(window, cx, |e| e.insert_tab());
         self.scroll_to_caret();
     }
@@ -11877,6 +11898,9 @@ impl Docxy {
             }
             self.chart_hand_back(cx);
             return self.sheet_commit(0, -1, cx);
+        }
+        if self.active_is_project() {
+            return self.project_indent(-1, window, cx);
         }
         self.with_editor(window, cx, |e| e.change_indent(-720));
     }
@@ -11926,7 +11950,7 @@ impl Docxy {
             return self.sheet_key(ev, ctrl, shift, key.as_str(), window, cx);
         }
         if self.active_is_project() {
-            return self.project_key(key.as_str(), ctrl, window, cx);
+            return self.project_key(key.as_str(), ctrl, shift, window, cx);
         }
         // In header/footer edit mode, Esc returns to the document body.
         if key == "escape" && self.hf_active() {
@@ -16791,6 +16815,9 @@ impl Render for Docxy {
             self.focused = true;
         }
 
+        if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
+            v.layout(f32::from(window.viewport_size().width));
+        }
         // Spreadsheet horizontal scroll: reconcile the column offset so the
         // selected column stays visible, and remember the grid width for sheet_el.
         let sheet_grid_w = if self.active_is_sheet() {
@@ -17380,7 +17407,9 @@ impl Render for Docxy {
                     cx,
                 )
                 .into_any_element(),
-                Surface::Project(v) => project_el(v, self.active, pal, cx).into_any_element(),
+                Surface::Project(v) => {
+                    project_el(v, self.active, pal, &self.probes, cx).into_any_element()
+                }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim).into_any_element(),
             },
             None => v_flex()

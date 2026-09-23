@@ -1,0 +1,6 @@
+test gantt summary spans its children
+  open ../fixtures/gantt-summary.xml
+  assert bar_1 is summary 0-3
+  assert bar_2 is on-track 0-0
+  assert bar_3 is critical 0-3
+  shot gantt

@@ -1,24 +1,62 @@
-//! Project tab: file/session policy and a read-only view over the shared editor.
+//! Project tab: file/session policy and the Gantt view over the shared editor.
 use super::*;
 use projcore::editor::{Editor as ProjectEditor, untitled_project};
 use projcore::{LinkType, Project, Task, mspdi, yppx};
 use std::path::Path;
+mod gantt;
+pub(super) use gantt::*;
 
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
     pub scroll: UniformListScrollHandle,
+    pub table_x: f32,
+    pub gantt_x: f32,
+    pub table_w: f32,
+    pub gantt_w: f32,
+    pub scale: GanttScale,
 }
 
 impl ProjectView {
     fn new(project: Project, dirty: bool) -> Self {
+        let ed = ProjectEditor::restored(project, dirty);
+        let scale = gantt_scale(&ed);
         Self {
-            ed: ProjectEditor::restored(project, dirty),
+            ed,
             scroll: UniformListScrollHandle::new(),
+            table_x: 0.,
+            gantt_x: 0.,
+            table_w: 590.,
+            gantt_w: 590. - GANTT_INSET,
+            scale,
         }
     }
 
+    pub fn layout(&mut self, width: f32) {
+        self.scale = gantt_scale(&self.ed);
+        self.table_w = table_pane_width(width);
+        self.gantt_w = (width - self.table_w - GANTT_INSET).max(0.);
+        self.clamp_offsets();
+    }
+
+    fn clamp_offsets(&mut self) {
+        self.table_x = self.table_x.clamp(0., (TABLE_W - self.table_w).max(0.));
+        self.gantt_x = self
+            .gantt_x
+            .clamp(0., (self.scale.width() - self.gantt_w).max(0.));
+    }
+
     /// Shared by the key handler and tests; empty history must preserve restored dirtiness.
-    pub fn key(&mut self, key: &str, ctrl: bool) -> bool {
+    pub fn key(&mut self, key: &str, ctrl: bool, shift: bool) -> bool {
+        if !ctrl && matches!(key, "left" | "right") {
+            let sign = if key == "left" { -1. } else { 1. };
+            if shift {
+                self.table_x += sign * 80.;
+            } else {
+                self.gantt_x += sign * DAY_W;
+            }
+            self.clamp_offsets();
+            return true;
+        }
         if ctrl {
             match key {
                 "z" => {
@@ -45,6 +83,88 @@ impl ProjectView {
         }
         true
     }
+}
+
+/// Avoid an Editor snapshot when an outline limit makes this a no-op.
+pub(super) fn indent_project(tab: &mut DocTab, delta: i32) {
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    let Some(uid) = v.ed.selected_uid() else {
+        return;
+    };
+    let level = v.ed.project().task(uid).unwrap().outline_level;
+    if (i64::from(level) + i64::from(delta)).clamp(1, 20) == i64::from(level) {
+        return;
+    }
+    if let Err(e) = v.ed.indent(uid, delta) {
+        tab.status = e.into();
+    }
+    tab.dirty = v.ed.dirty();
+}
+
+impl Docxy {
+    pub(super) fn project_region_bounds(
+        &self,
+        region: harness::Region,
+    ) -> Result<Bounds<Pixels>, String> {
+        let Some(Surface::Project(v)) = self.tabs.get(self.active).map(|t| &t.surface) else {
+            return Err("the active tab is not a loaded Project".into());
+        };
+        let probes = self.probes.borrow();
+        project_region(v, &probes, region)
+    }
+}
+
+fn project_region(
+    v: &ProjectView,
+    probes: &Probes,
+    region: harness::Region,
+) -> Result<Bounds<Pixels>, String> {
+    let body = probes
+        .get("project-body")
+        .ok_or("the Project body has not been laid out")?;
+    let viewport = gantt_viewport(body, v.table_w).ok_or("the Gantt viewport is empty")?;
+    match region {
+        harness::Region::Gantt => Ok(viewport),
+        harness::Region::Bar(id) => {
+            let task =
+                v.ed.project()
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == id)
+                    .ok_or_else(|| format!("no task with ID {id}"))?;
+            if gantt_bar(&v.ed, task, v.scale).is_none() {
+                return Err(format!("task {id} has no schedule result"));
+            }
+            let bar = probes
+                .get(&format!("bar:{id}"))
+                .ok_or_else(|| format!("task {id} row is not rendered (scrolled out of view)"))?;
+            intersect(bar, viewport)
+                .ok_or_else(|| format!("task {id} bar is outside the Gantt viewport"))
+        }
+        _ => Err("not a Project region".into()),
+    }
+}
+
+pub(super) fn project_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Json)> {
+    use ctlcore::json::Json;
+    let scale = gantt_scale(&v.ed);
+    let mut entries = vec![
+        ("selected_task".into(), Json::Num(v.ed.sel() as f64)),
+        ("tasks".into(), Json::Num(v.ed.project().tasks.len() as f64)),
+    ];
+    entries.extend(v.ed.project().tasks.iter().map(|t| {
+        (
+            format!("bar_{}", t.id),
+            Json::Str(
+                gantt_bar(&v.ed, t, scale)
+                    .map(GanttBar::state)
+                    .unwrap_or_else(|| "none".into()),
+            ),
+        )
+    }));
+    entries
 }
 
 fn ext_is(path: &Path, extension: &str) -> bool {
@@ -361,6 +481,19 @@ fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
 
 const ROW_H: f32 = 28.;
 const WIDTHS: [f32; 7] = [48., 240., 80., 100., 100., 150., 190.];
+const TABLE_W: f32 = sum_widths();
+/// Includes the divider, leaving space between clipped table text and the chart.
+const GANTT_INSET: f32 = 6.;
+
+const fn sum_widths() -> f32 {
+    let mut total = 0.;
+    let mut i = 0;
+    while i < WIDTHS.len() {
+        total += WIDTHS[i];
+        i += 1;
+    }
+    total
+}
 
 fn row_cells(values: [String; 7], indent: f32) -> impl IntoElement {
     h_flex()
@@ -378,87 +511,159 @@ fn row_cells(values: [String; 7], indent: f32) -> impl IntoElement {
         }))
 }
 
+fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement {
+    div()
+        .relative()
+        .w(px(width))
+        .h(px(ROW_H))
+        .flex_none()
+        .overflow_hidden()
+        .child(div().absolute().left(px(-offset)).top_0().child(content))
+}
+
+fn timeline_pane(width: f32, offset: f32, pal: Pal, content: impl IntoElement) -> impl IntoElement {
+    h_flex()
+        .w(px(width + GANTT_INSET))
+        .h(px(ROW_H))
+        .flex_none()
+        .child(
+            div()
+                .w(px(GANTT_INSET))
+                .h_full()
+                .flex_none()
+                .border_l(px(1.))
+                .border_color(pal.border),
+        )
+        .child(pane(width, offset, content))
+}
+
 pub(super) fn project_el(
     view: &ProjectView,
     index: usize,
     pal: Pal,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
     let count = view.ed.project().tasks.len();
-    let table = v_flex()
-        .w(px(WIDTHS.iter().sum()))
-        .flex_shrink_0()
+    let (table_w, gantt_w, table_x, gantt_x, scale) = (
+        view.table_w,
+        view.gantt_w,
+        view.table_x,
+        view.gantt_x,
+        view.scale,
+    );
+    let row_probes = probes.clone();
+    v_flex()
+        .flex_1()
         .h_full()
+        .min_w_0()
         .min_h_0()
+        .overflow_hidden()
         .text_color(pal.fg)
         .text_size(px(12.))
         .child(
-            div()
+            h_flex()
+                .h(px(ROW_H))
+                .flex_none()
                 .bg(pal.panel)
                 .font_weight(FontWeight::BOLD)
-                .child(row_cells(
-                    [
-                        "ID",
-                        "Name",
-                        "Duration",
-                        "Start",
-                        "Finish",
-                        "Predecessors",
-                        "Resource Names",
-                    ]
-                    .map(str::to_string),
-                    0.,
+                .child(pane(
+                    table_w,
+                    table_x,
+                    row_cells(
+                        [
+                            "ID",
+                            "Name",
+                            "Duration",
+                            "Start",
+                            "Finish",
+                            "Predecessors",
+                            "Resource Names",
+                        ]
+                        .map(str::to_string),
+                        0.,
+                    ),
+                ))
+                .child(timeline_pane(
+                    gantt_w,
+                    gantt_x,
+                    pal,
+                    gantt_header(scale, gantt_x, gantt_w, pal),
                 )),
         )
         .when(count == 0, |d| {
             d.child(div().p_4().text_color(pal.dim).child("No tasks"))
         })
         .child(
-            uniform_list(
-                ("project-rows", index),
-                count,
-                cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                    let Some(Surface::Project(v)) = this.tabs.get(index).map(|t| &t.surface) else {
-                        return vec![];
-                    };
-                    range
-                        .filter_map(|i| {
-                            v.ed.project().tasks.get(i).map(|task| {
-                                let indent =
-                                    task.outline_level.saturating_sub(1).min(20) as f32 * 12.;
-                                div()
-                                    .id(("project-row", i))
-                                    .h(px(ROW_H))
-                                    .cursor_pointer()
-                                    .when(task.summary, |d| d.font_weight(FontWeight::BOLD))
-                                    .when(i == v.ed.sel(), |d| d.bg(pal.sel))
-                                    .child(row_cells(project_row(&v.ed, task), indent))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        if let Some(Surface::Project(v)) =
-                                            this.tabs.get_mut(index).map(|t| &mut t.surface)
-                                        {
-                                            v.ed.select(i);
-                                        }
-                                        this.refocus(window, cx);
-                                    }))
-                            })
-                        })
-                        .collect::<Vec<_>>()
-                }),
-            )
-            .track_scroll(&view.scroll)
-            .flex_1()
-            .min_h_0(),
-        );
-    div()
-        .id(("project-table", index))
-        .flex()
-        .flex_1()
-        .h_full()
-        .min_w_0()
-        .min_h_0()
-        .overflow_x_scroll()
-        .child(table)
+            div()
+                .relative()
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .overflow_hidden()
+                .child(probe(probes, "project-body"))
+                .child(
+                    uniform_list(
+                        ("project-rows", index),
+                        count,
+                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                            let Some(Surface::Project(v)) =
+                                this.tabs.get(index).map(|t| &t.surface)
+                            else {
+                                return vec![];
+                            };
+                            range
+                                .filter_map(|i| {
+                                    v.ed.project().tasks.get(i).map(|task| {
+                                        let indent = task.outline_level.saturating_sub(1).min(20)
+                                            as f32
+                                            * 12.;
+                                        h_flex()
+                                            .id(("project-row", i))
+                                            .h(px(ROW_H))
+                                            .w_full()
+                                            .cursor_pointer()
+                                            .when(task.summary, |d| d.font_weight(FontWeight::BOLD))
+                                            .when(i == v.ed.sel(), |d| d.bg(pal.sel))
+                                            .child(pane(
+                                                table_w,
+                                                table_x,
+                                                row_cells(project_row(&v.ed, task), indent),
+                                            ))
+                                            .child(timeline_pane(
+                                                gantt_w,
+                                                gantt_x,
+                                                pal,
+                                                gantt_strip(
+                                                    gantt_bar(&v.ed, task, scale),
+                                                    task.id,
+                                                    scale,
+                                                    gantt_x,
+                                                    gantt_w,
+                                                    pal,
+                                                    &row_probes,
+                                                ),
+                                            ))
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                if let Some(Surface::Project(v)) =
+                                                    this.tabs.get_mut(index).map(|t| &mut t.surface)
+                                                {
+                                                    v.ed.select(i);
+                                                }
+                                                this.refocus(window, cx);
+                                            }))
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        }),
+                    )
+                    .track_scroll(&view.scroll)
+                    .flex_1()
+                    .h_full()
+                    .min_h_0(),
+                ),
+        )
 }
 
 #[cfg(test)]

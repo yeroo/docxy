@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+<Name>Gantt empty</Name><StartDate>2026-01-05T08:00:00</StartDate>
+<MinutesPerDay>480</MinutesPerDay><MinutesPerWeek>2400</MinutesPerWeek>
+<Tasks></Tasks>
+</Project>

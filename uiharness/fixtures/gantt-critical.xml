@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+<Name>Gantt critical</Name><StartDate>2026-01-05T08:00:00</StartDate>
+<MinutesPerDay>480</MinutesPerDay><MinutesPerWeek>2400</MinutesPerWeek>
+<Tasks><Task><UID>1</UID><ID>1</ID><Name>Task 1</Name><OutlineLevel>1</OutlineLevel><Duration>PT8H0M0S</Duration><Milestone>0</Milestone></Task><Task><UID>2</UID><ID>2</ID><Name>Task 2</Name><OutlineLevel>1</OutlineLevel><Duration>PT16H0M0S</Duration><Milestone>0</Milestone><PredecessorLink><PredecessorUID>1</PredecessorUID><Type>1</Type></PredecessorLink></Task></Tasks>
+</Project>

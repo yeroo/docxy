@@ -1,0 +1,5 @@
+test gantt milestone is a diamond
+  open ../fixtures/gantt-milestone.xml
+  assert bar_3 is milestone 2-2
+  shot bar:3
+  shot gantt
