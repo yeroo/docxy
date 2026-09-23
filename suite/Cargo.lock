@@ -1557,6 +1557,7 @@ dependencies = [
  "gridcore",
  "mppread",
  "projcore",
+ "projctl",
  "rfd",
  "ribbonspec",
  "rust-embed",
@@ -4990,6 +4991,14 @@ name = "projcore"
 version = "0.1.0"
 dependencies = [
  "opccore",
+]
+
+[[package]]
+name = "projctl"
+version = "0.1.0"
+dependencies = [
+ "ctlcore",
+ "projcore",
 ]
 
 [[package]]

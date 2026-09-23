@@ -1124,6 +1124,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "projctl"
+version = "0.1.0"
+dependencies = [
+ "ctlcore",
+ "projcore",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2149,6 +2157,7 @@ dependencies = [
  "ctlcore",
  "mppread",
  "projcore",
+ "projctl",
  "ratatui",
  "ribboncore",
  "unicode-width 0.2.0",

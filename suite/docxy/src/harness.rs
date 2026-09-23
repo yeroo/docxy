@@ -23,12 +23,12 @@
 //!    `ctlcore::config_ctl_dir`, which does its own `APPDATA` lookup and could
 //!    put the socket in a different sandbox from the session state.
 //!
-//! Without the flag none of this runs: no listener, no discovery file, and the
-//! real config root, exactly as before.
+//! Without the flag the separate Project-only control server runs instead;
+//! harness verbs and its UI dialog overrides remain disabled.
 
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
-use gpui::{App, AsyncWindowContext, Context, Entity, KeyDownEvent, Keystroke, Task, Window};
+use gpui::{App, AsyncWindowContext, Context, Entity, KeyDownEvent, Keystroke, Window};
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -272,14 +272,6 @@ pub fn start(root: &Path) -> std::io::Result<(ctlcore::Server, Receiver<ctlcore:
     ctlcore::serve(&control_dir(root), &instance_name())
 }
 
-/// The live harness, parked on the app so it lives as long as the window.
-/// Dropping either field ends something: the server's `Drop` removes the
-/// discovery file, and dropping a gpui `Task` cancels the pump.
-pub struct Harness {
-    _server: ctlcore::Server,
-    _pump: Task<()>,
-}
-
 /// Bring the harness up on `view`: drain requests on the window's foreground
 /// task, apply each one to the app, and answer it.
 pub fn attach(
@@ -325,7 +317,7 @@ pub fn attach(
         }
     });
     view.update(cx, |this, _| {
-        this.harness = Some(Harness {
+        this.harness = Some(crate::control::ControlLink {
             _server: server,
             _pump: pump,
         })
@@ -1172,7 +1164,10 @@ pub fn dispatch(
             })
         }
 
-        other => Err(format!("unknown verb '{other}'")),
+        other => match app.dispatch_project(other, args, window, cx) {
+            Some(result) => result.and_then(Done::ok),
+            None => Err(format!("unknown verb '{other}'")),
+        },
     }
 }
 

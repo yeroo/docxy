@@ -19,6 +19,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+projctl = { path = "../../projctl" }
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui-component.workspace = true

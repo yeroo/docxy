@@ -320,7 +320,7 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
     }
 }
 
-fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
+pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
     let result = match &tab.surface {
         Surface::Project(v) => write_project(&v.ed, target),
         _ => Err("This project could not be loaded and cannot be saved".into()),
