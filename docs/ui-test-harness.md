@@ -102,7 +102,7 @@ an argument.
 ## Writing a case
 
 A script (`*.uit`) is plain text. `#` starts a comment, with two exceptions:
-inside `type`, whose text is taken verbatim, because `#` is a character a
+inside `type` and `call`, whose payloads are taken verbatim, because `#` is a character a
 spreadsheet test has every reason to type; and inside a **border** assertion
 (`assert border …` / `assert no border …`), where a `#` followed by exactly six
 hex digits is a colour (see [Colours](#colours)) rather than a comment — so
@@ -126,6 +126,7 @@ cold start, and every accepted and rejected form is a unit test.
 |---|---|
 | `open <path>` | the file, resolved **against the script's own directory** — never the working directory. A file the app could not read is an ERROR, not a silent green step: the loaders substitute an empty document and record the reason in `status`, so the step reads the status back and stops the case there |
 | `open copy:<path>` | copy that fixture to `<sandbox>/<case-slug>/<original filename>` and open the copy; refuses an existing destination. Use this for saves and exports so their outputs stay in the run sandbox and the original fixture stays untouched |
+| `call <verb> <json-object>` | send a raw control request, including Project verbs such as `call task.set {"uid":2,"duration":"3d"}`. JSON is parsed before launch and retained verbatim, including quoted `#`; trailing comments are not allowed. Non-object/invalid JSON is a script error; a refused request is an `ERROR` with the server message |
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
 | `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |

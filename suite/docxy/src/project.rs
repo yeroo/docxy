@@ -38,9 +38,13 @@ impl ProjectView {
     }
 
     pub fn layout(&mut self, width: f32) {
-        self.scale = gantt_scale(&self.ed);
         self.table_w = table_pane_width(width);
         self.gantt_w = (width - self.table_w - GANTT_INSET).max(0.);
+        self.refresh_schedule_layout();
+    }
+
+    pub fn refresh_schedule_layout(&mut self) {
+        self.scale = gantt_scale(&self.ed);
         self.clamp_offsets();
     }
 
@@ -320,7 +324,7 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
     }
 }
 
-fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
+pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
     let result = match &tab.surface {
         Surface::Project(v) => write_project(&v.ed, target),
         _ => Err("This project could not be loaded and cannot be saved".into()),

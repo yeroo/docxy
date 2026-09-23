@@ -213,6 +213,7 @@ impl<'a> Runner<'a> {
             evidence: None,
         };
         match &step.action {
+            Action::Call { verb, args } => self.verb(out, verb, args.clone()),
             Action::Open(path) | Action::OpenCopy(path) => {
                 let full = self.base.join(path);
                 if !full.is_file() {

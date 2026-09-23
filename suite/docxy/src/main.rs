@@ -9,6 +9,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod control;
 mod harness;
 mod project;
 use project::*;
@@ -1091,10 +1092,10 @@ struct Docxy {
     // While this is None the bar keeps following the selection, which is what
     // these bars did before they grew a range field.
     bar_range: Option<String>,
-    // The UI test harness's control server and its request pump, parked here so
-    // they live as long as the window. `None` on every normal launch — the
-    // harness is opt-in per process (`--harness`) and starts nothing otherwise.
-    harness: Option<harness::Harness>,
+    // The opt-in UI harness server and pump, kept alive with the window.
+    harness: Option<control::ControlLink>,
+    // The normal Project-only server and pump; absent in harness mode.
+    control: Option<control::ControlLink>,
     // Measured bounds of the regions the harness's `rect` verb can name, written
     // by `probe` elements during layout. Costs one out-of-flow zero-paint element
     // per probed region per frame, harness or not — the alternative, gating them
@@ -4030,6 +4031,7 @@ impl Docxy {
             bar_field: None,
             bar_range: None,
             harness: None,
+            control: None,
             probes: Default::default(),
             frame: 0,
         }
@@ -20846,7 +20848,13 @@ fn main() {
             }
         }
     } else {
-        None
+        match harness::start(&config_root()) {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                eprintln!("docxy: Project control unavailable: {e}");
+                None
+            }
+        }
     };
     gpui_platform::application().with_assets(DocxyAssets).run(move |cx: &mut App| {
         gpui_component::init(cx);
@@ -20867,10 +20875,14 @@ fn main() {
         let startup_files = cli_files.clone();
         cx.open_window(options, move |window, cx| {
             let view = cx.new(Docxy::new);
-            // In harness mode, start draining control requests as soon as the
-            // view exists, so a driver can connect the moment the window is up.
+            // Attach only the selected mode's server. Normal Project control
+            // never enables harness verbs or changes the UI's dialog policy.
             if let Some((server, rx)) = ctl {
-                harness::attach(&view, server, rx, window, cx);
+                if want_harness {
+                    harness::attach(&view, server, rx, window, cx);
+                } else {
+                    control::attach(&view, server, rx, window, cx);
+                }
             }
             // Open any command-line files on top of the restored session.
             if !startup_files.is_empty() {

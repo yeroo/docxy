@@ -15,6 +15,65 @@ This page documents docxy's verbs in full; xlsxy and yppxy follow the same
 pattern with their own verbs (see "The other editors" below and each editor's
 `SKILL.md` via `<app> install skill`).
 
+## Desktop suite: Project tabs
+
+The desktop `suite` serves Project control automatically on normal startup,
+using the same `ctlcore` protocol and the shared `projctl` editor verbs as
+`yppxy`. Startup continues if the listener cannot be created. Word and Sheet
+control verbs are not exposed by this server.
+
+Discovery is `<config root>/suite/ctl/suite-<id>.json`, with `<id>` taken from
+`AGWINTERM_SESSION_ID` or the process ID. The config root is `DOCXY_CONFIG_DIR`
+when set and non-empty, otherwise the OS config directory (normally
+`%APPDATA%` on Windows). The override moves both control discovery and session
+state. In `--harness` mode only the isolated harness server runs; it also
+accepts the Project verbs. Normal control does not expose harness operations
+such as `open`, `key`, `type`, or `quit`.
+
+Every verb except `proj.open` accepts optional `tab`: an absolute zero-based
+index among **all** tabs, or a case-insensitive substring of a Project tab's
+title/path. Omit it to use the active tab. Ambiguous strings, empty strings,
+invalid indices, non-Project targets, and failed-load placeholders are errors.
+Explicit targets do not activate that tab. Task/link arguments use stable
+**UIDs**, as reported by `task.list`, not the table's displayed IDs.
+
+Supported verbs are `proj.path`, `task.list`, `task.get`, `task.set`, `task.add`,
+`task.del`, `link.add`, `link.del`, `find`, `proj.save`, `proj.reload`, and
+`proj.open`, with the yppxy argument/result shapes. `proj.path` additionally
+reports `tab` and `imported`. Reads and rejected edits leave selection, prompts,
+history and scroll unchanged. Successful edits use the live editor's undo
+stack, reschedule, cancel only the target's prompt and repaint.
+
+File handling differs from the TUI:
+
+- `proj.save {"path"?: "..."}` never opens a dialog. Without a path it saves
+  `.yppx`/`.xml` in place; imported `.mpp` and untitled projects require a path.
+  Explicit paths accept `.yppx`/`.xml`, add `.yppx` when extensionless, and
+  reject `.mpp`. Failed saves preserve binding, dirty flags and history.
+  Refusal/validation failures leave source bytes untouched; in-place writes
+  retain the suite's existing risk of partial output on a mid-write I/O error.
+- `proj.reload` discards dirty content only after a successful load from its
+  current path. Failure preserves the entire tab. Untitled tabs cannot reload.
+- `proj.open {"path":"..."}` does not accept `tab`. It validates a Project
+  file before changing anything, focuses a loaded same-path tab without
+  replacing unsaved content, recovers a same-path placeholder when loading now
+  succeeds, or appends a new tab. Activation uses the normal tab lifecycle.
+
+For example, the repository's CLI sends raw control requests (PowerShell;
+use your explicit config root in place of `$env:APPDATA` when overridden):
+
+```powershell
+target/debug/uiharness.exe --ctl "$env:APPDATA/suite/ctl" call proj.path '{}'
+target/debug/uiharness.exe --ctl "$env:APPDATA/suite/ctl" call task.list '{"tab":"schedule.xml"}'
+target/debug/uiharness.exe --ctl "$env:APPDATA/suite/ctl" call task.set '{"tab":"schedule.xml","uid":2,"duration":"3d"}'
+```
+
+Add `--instance suite-<id>` when several suite processes are running. The
+equivalent Rust client resolves with
+`ctlcore::client::resolve_target(&ctl_dir, "suite", Some("<id>"))`, then calls
+`client.call("task.list", Json::obj(vec![]))`. `yppxy --mcp` still discovers
+only yppxy instances; a suite MCP bridge and skill are outside this step.
+
 ## Two panes in one agwinterm session
 
 A session holds up to two panes via a split. From the Claude pane:

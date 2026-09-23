@@ -20,6 +20,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+projctl = { version = "0.1.0", path = "../projctl" }
 # The agent control surface (loopback-TCP + newline-JSON), used to drive the
 # live schedule from a sibling agwinterm pane.
 ctlcore = { version = "0.5.0", path = "../ctlcore" }

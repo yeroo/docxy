@@ -1,0 +1,28 @@
+test project control edits share the live editor and undo stack
+  open copy:../fixtures/gantt-summary.xml
+  key down f2
+  assert prompt is rename:Task 2
+  call task.list {}
+  call task.get {"uid":2}
+  call find {"query":"Task"}
+  call proj.path {}
+  assert prompt is rename:Task 2
+  assert dirty is false
+  call task.set {"uid":2,"duration":"3d","name":"Agent 2"}
+  assert prompt is none
+  assert selected_name is Agent 2
+  assert dirty is true
+  assert bar_2 is on-track 0-2
+  call link.add {"uid":2,"pred":3}
+  assert bar_2 is critical 4-8
+  key ctrl+z
+  assert bar_2 is on-track 0-2
+  call task.add {"name":"Agent task","duration":"2d"}
+  assert tasks is 4
+  key ctrl+z
+  assert tasks is 3
+  key ctrl+y
+  assert tasks is 4
+  call proj.save {}
+  assert dirty is false
+  shot window

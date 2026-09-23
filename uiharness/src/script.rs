@@ -38,6 +38,8 @@
 //! | Step | Drives |
 //! |---|---|
 //! | `open <path>` | the file, resolved against the script's own directory |
+//! | `open copy:<path>` | a private copy of that file in the run directory |
+//! | `call <verb> <json-object>` | a verb with its verbatim JSON payload, parsed before launch |
 //! | `click <cell> [shift] [double]` | the cell's click handler |
 //! | `drag <from> -> <to>` | press, one move per cell crossed, release |
 //! | `type <text>` | one key event per character |
@@ -67,6 +69,7 @@
 //! regression got through.
 
 use crate::expect::{BorderExpect, parse_border};
+use ctlcore::json::Json;
 
 /// One parsed script.
 #[derive(Debug, Clone, PartialEq)]
@@ -101,6 +104,11 @@ pub enum Action {
     Open(String),
     /// Copy a fixture into the run sandbox before opening it.
     OpenCopy(String),
+    /// Raw control request with an object payload, parsed before launch.
+    Call {
+        verb: String,
+        args: Json,
+    },
     Click {
         cell: String,
         shift: bool,
@@ -176,7 +184,7 @@ fn err(line: usize, message: impl Into<String>) -> ScriptError {
 
 /// The steps a script may use, for an error message.
 const STEP_WORDS: &str =
-    "open, click, drag, type, key, select chart, focus, snapshot, shot, assert";
+    "open, call, click, drag, type, key, select chart, focus, snapshot, shot, assert";
 
 /// The first case name two of `scripts` share, as a message naming both files.
 ///
@@ -220,16 +228,16 @@ pub fn duplicate_case(scripts: &[(String, &Script)]) -> Option<String> {
 /// Parse a whole script.
 ///
 /// Pure. Blank lines are skipped and a `#` starts a comment to end of line,
-/// except inside a `type` step (whose text is verbatim) and a six-digit colour
+/// except inside `type`/`call` steps (whose payloads are verbatim) and a six-digit colour
 /// in a border assertion such as `#2f6fdb`.
 pub fn parse_script(text: &str) -> Result<Script, ScriptError> {
     let mut cases: Vec<Case> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
         let line = i + 1;
         let (head, rest) = split_word(raw.trim());
-        // `type` keeps its comment; everything else loses it. Decided from the
+        // `type` and `call` keep their payloads verbatim. Decided from the
         // first word, before trimming, so the rule is one place.
-        let verbatim = head.eq_ignore_ascii_case("type");
+        let verbatim = head.eq_ignore_ascii_case("type") || head.eq_ignore_ascii_case("call");
         // A colour can only appear in a *border* assertion, so that is the only
         // place `#rrggbb` outranks a comment. Narrower than "any assert": the
         // other forms take a value that is prose, so `assert range is A1:C5
@@ -305,6 +313,21 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
     let lower = head.to_ascii_lowercase();
     let rest_trim = rest.trim();
     match lower.as_str() {
+        "call" => {
+            let (verb, payload) = split_word(rest_trim);
+            if verb.is_empty() {
+                return Err(err(line, "'call' needs a verb and a JSON object"));
+            }
+            let args =
+                Json::parse(payload).map_err(|e| err(line, format!("invalid call JSON: {e}")))?;
+            if !matches!(args, Json::Obj(_)) {
+                return Err(err(line, "'call' args must be a JSON object"));
+            }
+            Ok(Action::Call {
+                verb: verb.into(),
+                args,
+            })
+        }
         "open" => {
             if rest_trim.is_empty() {
                 return Err(err(line, "'open' needs a path"));
