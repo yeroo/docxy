@@ -5,6 +5,8 @@ use projcore::{LinkType, Project, Task, mspdi, yppx};
 use std::path::Path;
 mod gantt;
 pub(super) use gantt::*;
+mod commands;
+pub(super) use commands::*;
 
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
@@ -14,6 +16,8 @@ pub(super) struct ProjectView {
     pub table_w: f32,
     pub gantt_w: f32,
     pub scale: GanttScale,
+    pub prompt: Option<ProjectPrompt>,
+    pub exported: Option<String>,
 }
 
 impl ProjectView {
@@ -28,6 +32,8 @@ impl ProjectView {
             table_w: 590.,
             gantt_w: 590. - GANTT_INSET,
             scale,
+            prompt: None,
+            exported: None,
         }
     }
 
@@ -45,9 +51,9 @@ impl ProjectView {
             .clamp(0., (self.scale.width() - self.gantt_w).max(0.));
     }
 
-    /// Shared by the key handler and tests; empty history must preserve restored dirtiness.
-    pub fn key(&mut self, key: &str, ctrl: bool, shift: bool) -> bool {
-        if !ctrl && matches!(key, "left" | "right") {
+    /// Navigation and horizontal scrolling only; command completion owns row reveal.
+    pub fn key(&mut self, key: &str, shift: bool) -> bool {
+        if matches!(key, "left" | "right") {
             let sign = if key == "left" { -1. } else { 1. };
             if shift {
                 self.table_x += sign * 80.;
@@ -57,30 +63,14 @@ impl ProjectView {
             self.clamp_offsets();
             return true;
         }
-        if ctrl {
-            match key {
-                "z" => {
-                    self.ed.undo();
-                }
-                "y" => {
-                    self.ed.redo();
-                }
-                _ => return false,
-            }
-        } else {
-            let index = match key {
-                "up" => self.ed.sel().saturating_sub(1),
-                "down" => self.ed.sel().saturating_add(1),
-                "home" => 0,
-                "end" => self.ed.project().tasks.len().saturating_sub(1),
-                _ => return false,
-            };
-            self.ed.select(index);
-        }
-        if !self.ed.project().tasks.is_empty() {
-            self.scroll
-                .scroll_to_item(self.ed.sel(), ScrollStrategy::Nearest);
-        }
+        let index = match key {
+            "up" => self.ed.sel().saturating_sub(1),
+            "down" => self.ed.sel().saturating_add(1),
+            "home" => 0,
+            "end" => self.ed.project().tasks.len().saturating_sub(1),
+            _ => return false,
+        };
+        self.ed.select(index);
         true
     }
 }
@@ -153,6 +143,29 @@ pub(super) fn project_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Json
     let mut entries = vec![
         ("selected_task".into(), Json::Num(v.ed.sel() as f64)),
         ("tasks".into(), Json::Num(v.ed.project().tasks.len() as f64)),
+        (
+            "prompt".into(),
+            Json::Str(
+                v.prompt
+                    .as_ref()
+                    .map(|p| format!("{}:{}", p.kind.name(), p.buf))
+                    .unwrap_or_else(|| "none".into()),
+            ),
+        ),
+        (
+            "selected_name".into(),
+            Json::Str(
+                v.ed.project()
+                    .tasks
+                    .get(v.ed.sel())
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "exported".into(),
+            Json::Str(v.exported.clone().unwrap_or_else(|| "none".into())),
+        ),
     ];
     entries.extend(v.ed.project().tasks.iter().map(|t| {
         (
@@ -649,7 +662,7 @@ pub(super) fn project_el(
                                                 if let Some(Surface::Project(v)) =
                                                     this.tabs.get_mut(index).map(|t| &mut t.surface)
                                                 {
-                                                    v.ed.select(i);
+                                                    v.select_row(i);
                                                 }
                                                 this.refocus(window, cx);
                                             }))

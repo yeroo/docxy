@@ -145,15 +145,22 @@ pub struct Runner<'a> {
     /// this rather than the working directory, so `uiharness run` from anywhere
     /// opens the same file.
     base: PathBuf,
+    sandbox: PathBuf,
     opts: ProbeOpts,
 }
 
 impl<'a> Runner<'a> {
-    pub fn new(driver: &'a Driver, run: &'a Run, base: impl Into<PathBuf>) -> Runner<'a> {
+    pub fn new(
+        driver: &'a Driver,
+        run: &'a Run,
+        base: impl Into<PathBuf>,
+        sandbox: impl Into<PathBuf>,
+    ) -> Runner<'a> {
         Runner {
             driver,
             run,
             base: base.into(),
+            sandbox: sandbox.into(),
             opts: ProbeOpts::default(),
         }
     }
@@ -206,11 +213,19 @@ impl<'a> Runner<'a> {
             evidence: None,
         };
         match &step.action {
-            Action::Open(path) => {
+            Action::Open(path) | Action::OpenCopy(path) => {
                 let full = self.base.join(path);
                 if !full.is_file() {
                     return err(out, format!("no such file: {}", full.display()));
                 }
+                let full = if matches!(step.action, Action::OpenCopy(_)) {
+                    match copy_fixture(&full, &self.sandbox, case) {
+                        Ok(copy) => copy,
+                        Err(e) => return err(out, e),
+                    }
+                } else {
+                    full
+                };
                 // Canonicalized, so the app resolves the same file this side
                 // checked rather than one relative to its own directory.
                 let full = full.canonicalize().unwrap_or(full);
@@ -631,6 +646,41 @@ fn shown(s: &str) -> String {
     } else {
         format!("'{s}'")
     }
+}
+
+/// Preserve the basename for titles and exports; never replace an existing copy.
+pub fn copy_fixture(source: &Path, sandbox: &Path, case: &str) -> Result<PathBuf, String> {
+    let dir = sandbox.join(crate::run::slug(case));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("open copy: create directory {}: {e}", dir.display()))?;
+    let name = source
+        .file_name()
+        .ok_or_else(|| format!("open copy: source {} has no file name", source.display()))?;
+    let target = dir.join(name);
+    let mut input = std::fs::File::open(source)
+        .map_err(|e| format!("open copy: read {}: {e}", source.display()))?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "open copy: {} already exists; use a fresh --sandbox",
+                    target.display()
+                )
+            } else {
+                format!("open copy: create {}: {e}", target.display())
+            }
+        })?;
+    std::io::copy(&mut input, &mut output).map_err(|e| {
+        format!(
+            "open copy: copy {} to {}: {e}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    Ok(target)
 }
 
 #[cfg(test)]

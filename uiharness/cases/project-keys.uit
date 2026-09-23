@@ -1,0 +1,49 @@
+test project editing keys and prompts
+  open ../fixtures/gantt-summary.xml
+  key n
+  assert tasks is 4
+  assert selected_name is New task
+  key x
+  assert tasks is 3
+  key home down f2
+  assert prompt is rename:Task 2
+  type renamed
+  key enter
+  assert selected_name is Task 2renamed
+  assert dirty is true
+  key d
+  type 3d
+  key enter
+  assert bar_2 is on-track 0-2
+  key p
+  type 3
+  key enter
+  assert bar_2 is critical 4-8
+  key c
+  key backspace backspace backspace backspace
+  type SNET 2026-01-19
+  key enter
+  assert status is Constraint set: SNET
+  assert bar_2 is critical 14-16
+  key a
+  type Alice
+  key enter
+  assert status is Assigned Alice
+  key b
+  assert status is Baseline set — baseline bars now show under the current bars
+  key shift+l
+  assert status is Resource leveling ON — bars delayed to fit resource capacity
+  shot window
+
+test project find reveals a distant row and F3 wraps
+  open ../fixtures/gantt-scroll.xml
+  key ctrl+f
+  type Task 100
+  key enter
+  assert selected_task is 99
+  assert selected_name is Task 100
+  assert status is Found 'Task 100'  (F3 next)
+  shot bar:100
+  key f3
+  assert selected_task is 99
+  shot bar:100
