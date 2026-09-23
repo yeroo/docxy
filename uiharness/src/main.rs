@@ -379,7 +379,7 @@ fn run_scripts(a: &Args) -> Result<String, String> {
     let mut all_passed = true;
     for (path, base, script) in &scripts {
         out.push_str(&format!("{}\n", path.display()));
-        let outcome = uiharness::Runner::new(&driver, &run, base).run_script(script);
+        let outcome = uiharness::Runner::new(&driver, &run, base, &sandbox).run_script(script);
         all_passed &= outcome.passed();
         out.push_str(&outcome.report());
     }

@@ -49,7 +49,7 @@ fn every_opened_file_is_the_harnesss_own_and_is_there() {
         let mut opened = 0;
         for case in &script.cases {
             for step in &case.steps {
-                let Action::Open(rel) = &step.action else {
+                let (Action::Open(rel) | Action::OpenCopy(rel)) = &step.action else {
                     continue;
                 };
                 opened += 1;

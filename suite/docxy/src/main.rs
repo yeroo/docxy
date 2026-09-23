@@ -201,6 +201,8 @@ fn session_path() -> PathBuf {
 
 #[derive(Clone, Copy, PartialEq)]
 enum RibbonTab {
+    Task,
+    Schedule,
     Home,
     Insert,
     Review,
@@ -4070,6 +4072,7 @@ impl Docxy {
     }
 
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
+        self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
             kind,
             title: title.to_owned().into(),
@@ -5009,6 +5012,7 @@ impl Docxy {
     /// draw a focused border and a caret while every keystroke went to the bar
     /// — and a drag on the grid rewrote (and committed) the CHART's range.
     fn typing_bars_close(&mut self) {
+        self.project_prompt_cancel();
         self.bar_close();
         self.sheet_comment_edit = None;
         self.sheet_filter_edit = None;
@@ -6419,36 +6423,6 @@ impl Docxy {
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
-    }
-
-    fn project_indent(&mut self, delta: i32, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            indent_project(tab, delta);
-        }
-        self.refocus(window, cx);
-    }
-
-    fn project_key(
-        &mut self,
-        key: &str,
-        ctrl: bool,
-        shift: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if ctrl && key == "s" {
-            return self.save_active(window, cx);
-        }
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let Surface::Project(v) = &mut tab.surface else {
-            return;
-        };
-        if v.key(key, ctrl, shift) {
-            tab.dirty = v.ed.dirty();
-            cx.notify();
-        }
     }
 
     fn active_is_sheet(&self) -> bool {
@@ -9327,6 +9301,7 @@ impl Docxy {
     }
 
     fn select_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.project_prompt_cancel();
         if i < self.tabs.len() {
             self.active = i;
             // Same reason as `select_sheet`: these all index the document we
@@ -9338,6 +9313,7 @@ impl Docxy {
     }
 
     fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.project_prompt_cancel();
         if i >= self.tabs.len() {
             return;
         }
@@ -9810,6 +9786,7 @@ impl Docxy {
     /// focused rather than duplicated; if that tab has unsaved changes, ask
     /// before reloading it from disk.
     fn open_args(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        self.project_prompt_cancel();
         let canon =
             |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let mut changed = false;
@@ -11834,6 +11811,9 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_prompt_open() {
+            return;
+        }
         // While the find bar is open, Tab switches between the query and replace
         // fields.
         if self.find_open {
@@ -11874,7 +11854,7 @@ impl Docxy {
             return self.sheet_commit(0, 1, cx);
         }
         if self.active_is_project() {
-            return self.project_indent(1, window, cx);
+            return self.project_act(ProjectAct::Indent, window, cx);
         }
         self.with_editor(window, cx, |e| e.insert_tab());
         self.scroll_to_caret();
@@ -11882,6 +11862,9 @@ impl Docxy {
 
     /// Shift+Tab decreases the paragraph indent (Word's outdent).
     fn shift_tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_prompt_open() {
+            return;
+        }
         if self.keytips != KeyTip::Off || self.find_open || self.comment_open || self.backstage {
             return;
         }
@@ -11900,12 +11883,15 @@ impl Docxy {
             return self.sheet_commit(0, -1, cx);
         }
         if self.active_is_project() {
-            return self.project_indent(-1, window, cx);
+            return self.project_act(ProjectAct::Outdent, window, cx);
         }
         self.with_editor(window, cx, |e| e.change_indent(-720));
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.project_prompt_open() {
+            return self.project_key(ev, window, cx);
+        }
         let m = &ev.keystroke.modifiers;
         let ctrl = m.control || m.platform;
         let shift = m.shift;
@@ -11950,7 +11936,7 @@ impl Docxy {
             return self.sheet_key(ev, ctrl, shift, key.as_str(), window, cx);
         }
         if self.active_is_project() {
-            return self.project_key(key.as_str(), ctrl, shift, window, cx);
+            return self.project_key(ev, window, cx);
         }
         // In header/footer edit mode, Esc returns to the document body.
         if key == "escape" && self.hf_active() {
@@ -12201,6 +12187,7 @@ fn no(mut f: impl FnMut()) -> bool {
 
 #[derive(Clone, Copy)]
 enum Act {
+    Project(ProjectAct),
     Bold,
     Italic,
     Underline,
@@ -12637,13 +12624,52 @@ fn docxy_ribbon() -> rs::Ribbon<Act> {
     ])
 }
 
-fn ribbon_tab_index(t: RibbonTab) -> usize {
-    match t {
-        RibbonTab::Home => 0,
-        RibbonTab::Insert => 1,
-        RibbonTab::Review => 2,
-        RibbonTab::View => 3,
-        RibbonTab::Table => 0, // handled specially (see ribbon_body / table_tab)
+fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'static str)] {
+    use RibbonTab::*;
+    if kind == Kind::Project {
+        &[
+            (None, "File", "F"),
+            (Some(Task), "Task", "T"),
+            (Some(Schedule), "Schedule", "S"),
+            (Some(View), "View", "W"),
+        ]
+    } else {
+        &[
+            (None, "File", "F"),
+            (Some(Home), "Home", "H"),
+            (Some(Insert), "Insert", "N"),
+            (Some(Review), "Review", "R"),
+            (Some(View), "View", "W"),
+        ]
+    }
+}
+fn valid_ribbon_tab(kind: Kind, tab: RibbonTab, in_table: bool) -> RibbonTab {
+    if ribbon_tab_set(kind).iter().any(|(t, _, _)| *t == Some(tab))
+        || (kind == Kind::Docx && tab == RibbonTab::Table && in_table)
+    {
+        tab
+    } else if kind == Kind::Project {
+        RibbonTab::Task
+    } else {
+        RibbonTab::Home
+    }
+}
+fn ribbon_tab_index(t: RibbonTab, kind: Kind) -> usize {
+    ribbon_tab_set(kind)
+        .iter()
+        .skip(1)
+        .position(|(tab, _, _)| *tab == Some(t))
+        .unwrap_or(0)
+}
+fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
+    match tab {
+        RibbonTab::Home => "Home",
+        RibbonTab::Insert => "Insert",
+        RibbonTab::Review => "Review",
+        RibbonTab::View => "View",
+        RibbonTab::Table => "Table",
+        RibbonTab::Task => "Task",
+        RibbonTab::Schedule => "Schedule",
     }
 }
 
@@ -13884,7 +13910,7 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
 
 impl Docxy {
     fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
-        let names = ["File", "Home", "Insert", "Review", "View"];
+        let names = ribbon_tab_set(self.ribbon_kind());
         let mut strip = h_flex()
             .w_full()
             .items_end()
@@ -13892,17 +13918,9 @@ impl Docxy {
             .px_2()
             .pt_1()
             .bg(panel);
-        for (i, name) in names.iter().enumerate() {
-            let is_file = i == 0;
-            let this_tab = match i {
-                1 => Some(RibbonTab::Home),
-                2 => Some(RibbonTab::Insert),
-                3 => Some(RibbonTab::Review),
-                4 => Some(RibbonTab::View),
-                _ => None,
-            };
+        for (i, (this_tab, name, tab_key)) in names.iter().copied().enumerate() {
+            let is_file = this_tab.is_none();
             let active = !self.backstage && this_tab == Some(self.ribbon_tab);
-            let tab_key = ["F", "H", "N", "R", "W"][i];
             let show_kt = self.keytips == KeyTip::Tabs;
             strip = strip.child(
                 div()
@@ -13926,10 +13944,11 @@ impl Docxy {
                             .border_color(rgb(BRAND))
                     })
                     .when(!active && !is_file, |d| d.text_color(fg))
-                    .child(*name)
+                    .child(name)
                     .when(show_kt, |d| d.child(keytip_badge(tab_key)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if is_file {
+                            this.project_prompt_cancel();
                             this.backstage = true;
                             this.bs_new = false;
                             cx.notify();
@@ -14139,22 +14158,22 @@ impl Docxy {
             KeyTip::Tabs => {
                 if c.eq_ignore_ascii_case("F") {
                     self.keytips = KeyTip::Off;
+                    self.project_prompt_cancel();
                     self.backstage = true;
                     self.bs_new = false;
                     return cx.notify();
                 }
-                let ribbon = docxy_ribbon();
+                let ribbon = if self.active_is_project() {
+                    project_ribbon()
+                } else {
+                    docxy_ribbon()
+                };
                 if let Some(i) = ribbon
                     .tabs
                     .iter()
                     .position(|t| t.key_tip.eq_ignore_ascii_case(c))
                 {
-                    self.ribbon_tab = match i {
-                        0 => RibbonTab::Home,
-                        1 => RibbonTab::Insert,
-                        2 => RibbonTab::Review,
-                        _ => RibbonTab::View,
-                    };
+                    self.ribbon_tab = ribbon_tab_set(self.ribbon_kind())[i + 1].0.unwrap();
                     self.keytips = KeyTip::Commands;
                 } else if c.eq_ignore_ascii_case("T") && self.caret_table().is_some() {
                     self.ribbon_tab = RibbonTab::Table;
@@ -14165,12 +14184,16 @@ impl Docxy {
                 cx.notify();
             }
             KeyTip::Commands => {
-                let ribbon = docxy_ribbon();
+                let ribbon = if self.active_is_project() {
+                    project_ribbon()
+                } else {
+                    docxy_ribbon()
+                };
                 let table = table_tab();
                 let tab = if self.ribbon_tab == RibbonTab::Table {
                     &table
                 } else {
-                    &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)]
+                    &ribbon.tabs[ribbon_tab_index(self.ribbon_tab, self.ribbon_kind())]
                 };
                 let act = tab_keytip_cmd(tab, c);
                 self.keytips = KeyTip::Off;
@@ -14187,6 +14210,7 @@ impl Docxy {
     fn dispatch(&mut self, act: Act, window: &mut Window, cx: &mut Context<Self>) {
         use Act::*;
         match act {
+            Project(p) => self.project_act(p, window, cx),
             Cut => self.do_copy(true, window, cx),
             Copy => self.do_copy(false, window, cx),
             Paste => self.do_paste(window, cx),
@@ -14293,12 +14317,13 @@ impl Docxy {
                 Title => e.set_para_style(Some("Title")),
                 Subtitle => e.set_para_style(Some("Subtitle")),
                 ClearFmt => e.clear_run_formatting(),
-                Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find | FontColor
-                | Highlight | FontName | FontSize | NewComment | ShowHide | ToggleComments
-                | ToggleNav | DarkMode | AutoHideRibbon | InsertField | PageBreak | ToggleNotes
-                | InsertTable | InsertSymbol | InsertEquation | LineSpacing | EditHeader
-                | EditFooter | PageNumber | Columns | Hyphenation | RowAbove | RowBelow
-                | ColLeft | ColRight | DelRow | DelCol | DelTable | PrintLayout | ToggleRuler => {}
+                Project(_) | Cut | Copy | Paste | LaunchFont | LaunchParagraph | Find
+                | FontColor | Highlight | FontName | FontSize | NewComment | ShowHide
+                | ToggleComments | ToggleNav | DarkMode | AutoHideRibbon | InsertField
+                | PageBreak | ToggleNotes | InsertTable | InsertSymbol | InsertEquation
+                | LineSpacing | EditHeader | EditFooter | PageNumber | Columns | Hyphenation
+                | RowAbove | RowBelow | ColLeft | ColRight | DelRow | DelCol | DelTable
+                | PrintLayout | ToggleRuler => {}
             }),
         }
     }
@@ -14308,12 +14333,16 @@ impl Docxy {
     /// are dropped first, then the lowest-`priority` groups collapse into an
     /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
     fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ribbon = docxy_ribbon();
+        let ribbon = if self.active_is_project() {
+            project_ribbon()
+        } else {
+            docxy_ribbon()
+        };
         let ctx_tab = table_tab();
         let tab = if self.ribbon_tab == RibbonTab::Table {
             &ctx_tab
         } else {
-            &ribbon.tabs[ribbon_tab_index(self.ribbon_tab)]
+            &ribbon.tabs[ribbon_tab_index(self.ribbon_tab, self.ribbon_kind())]
         };
         let avail = (width - 28.0).max(120.0);
 
@@ -16427,6 +16456,10 @@ impl Docxy {
         let rp = doc.map(|ed| ed.caret_props());
         let pp = doc.map(|ed| ed.caret_para_props());
         match act {
+            Project(ProjectAct::Level) => self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.ed.leveled())),
             Bold => rp.is_some_and(|p| p.bold),
             Italic => rp.is_some_and(|p| p.italic),
             Underline => rp.is_some_and(|p| p.underline),
@@ -16577,6 +16610,11 @@ impl Docxy {
             .child(rail_item(cx, "bs-saveas", "Save As\u{2026}", |t, w, cx| {
                 t.save_as(w, cx)
             }))
+            .when(self.active_is_project(), |d| {
+                d.child(rail_item(cx, "bs-export", "Export…", |t, w, cx| {
+                    t.project_act(ProjectAct::ExportGantt, w, cx)
+                }))
+            })
             .child(rail_item(cx, "bs-close", "Close", |t, w, cx| {
                 let a = t.active;
                 t.backstage = false;
@@ -16711,6 +16749,21 @@ impl Docxy {
                         .child(cur_title),
                 )
                 .child(div().text_size(px(12.)).text_color(dim).child(cur_path))
+                .when_some(
+                    active.and_then(|t| match &t.surface {
+                        Surface::Project(v) => Some(project_info_lines(&v.ed)),
+                        _ => None,
+                    }),
+                    |d, lines| {
+                        d.child(
+                            v_flex()
+                                .gap_1()
+                                .text_color(fg)
+                                .child("Info")
+                                .children(lines.into_iter().map(|line| div().child(line))),
+                        )
+                    },
+                )
                 .child(
                     div()
                         .text_size(px(13.))
@@ -16932,6 +16985,9 @@ impl Render for Docxy {
                             "Undo (Ctrl+Z)",
                             pal,
                             cx.listener(|this, _, window, cx| {
+                                if this.active_is_project() {
+                                    return this.project_act(ProjectAct::Undo, window, cx);
+                                }
                                 this.with_editor(window, cx, |e| {
                                     e.undo();
                                 })
@@ -16943,6 +16999,9 @@ impl Render for Docxy {
                             "Redo (Ctrl+Y)",
                             pal,
                             cx.listener(|this, _, window, cx| {
+                                if this.active_is_project() {
+                                    return this.project_act(ProjectAct::Redo, window, cx);
+                                }
                                 this.with_editor(window, cx, |e| {
                                     e.redo();
                                 })
@@ -16988,18 +17047,23 @@ impl Render for Docxy {
             Some(Surface::Doc(_))
         );
         // The contextual Table tab is only valid while the caret is in a table.
-        if self.ribbon_tab == RibbonTab::Table && self.caret_table().is_none() {
-            self.ribbon_tab = RibbonTab::Home;
-        }
+        self.ribbon_tab = valid_ribbon_tab(
+            self.ribbon_kind(),
+            self.ribbon_tab,
+            self.caret_table().is_some(),
+        );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);
-        let ribbon_body = (!self.ribbon_min && (is_doc || self.active_is_sheet())).then(|| {
-            if is_doc {
+        let ribbon_body = (!self.ribbon_min
+            && (is_doc || self.active_is_sheet() || self.active_is_project()))
+        .then(|| {
+            if is_doc || self.active_is_project() {
                 self.ribbon_body(vw, pal, cx)
             } else {
                 self.sheet_ribbon_body(pal, cx)
             }
         });
+        let project_prompt = self.project_prompt_bar(pal, cx);
         let find_bar = (is_doc && self.find_open).then(|| self.find_bar(pal, cx));
         let picker_bar = (is_doc)
             .then_some(self.picker)
@@ -17488,6 +17552,8 @@ impl Render for Docxy {
             .child(div().flex_1())
             .child(if self.active_is_sheet() {
                 "type or F2 to edit · Enter/Tab to move · =formula · Ctrl+S save"
+            } else if self.active_is_project() {
+                "n add · x del · Enter rename · d dur · p link · c constraint · a assign · b baseline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
             } else {
                 "type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S"
             })
@@ -17598,6 +17664,7 @@ impl Render for Docxy {
             .when_some(sheet_ttc, |d, c| d.child(c))
             .when_some(sheet_sort, |d, c| d.child(c))
             .when_some(sheet_rowh, |d, c| d.child(c))
+            .when_some(project_prompt, |d, c| d.child(c))
             .when_some(comment_bar, |d, c| d.child(c))
             .when_some(hf_bar, |d, b| d.child(b))
             .when_some(ruler, |d, r| d.child(r))

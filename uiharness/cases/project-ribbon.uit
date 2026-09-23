@@ -1,0 +1,25 @@
+test project ribbon KeyTips dispatch and cancel prompts
+  open ../fixtures/gantt-summary.xml
+  key alt t
+  assert ribbon_tab is Task
+  key n
+  assert tasks is 4
+  assert selected_name is New task
+  assert dirty is true
+  key alt s
+  assert ribbon_tab is Schedule
+  key p
+  assert prompt is predecessor:
+  type 1
+  shot window
+  key escape
+  assert prompt is none
+  key alt s l
+  assert status is Resource leveling ON — bars delayed to fit resource capacity
+  key alt s e
+  assert status is Rescheduled (automatic on every edit)
+  key alt t r
+  assert prompt is rename:New task
+  open ../fixtures/gantt-summary.xml
+  assert prompt is none
+  assert selected_name is Task 1

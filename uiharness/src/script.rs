@@ -99,6 +99,8 @@ pub enum Action {
     /// script's directory, so a case cannot be made to depend on the working
     /// directory it was run from.
     Open(String),
+    /// Copy a fixture into the run sandbox before opening it.
+    OpenCopy(String),
     Click {
         cell: String,
         shift: bool,
@@ -307,7 +309,15 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
             if rest_trim.is_empty() {
                 return Err(err(line, "'open' needs a path"));
             }
-            Ok(Action::Open(unquote(rest_trim).to_string()))
+            let path = unquote(rest_trim);
+            if let Some(path) = path.strip_prefix("copy:") {
+                if path.is_empty() {
+                    return Err(err(line, "'open copy:' needs a path"));
+                }
+                Ok(Action::OpenCopy(path.into()))
+            } else {
+                Ok(Action::Open(path.into()))
+            }
         }
 
         "click" => {

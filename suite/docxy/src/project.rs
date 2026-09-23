@@ -5,6 +5,8 @@ use projcore::{LinkType, Project, Task, mspdi, yppx};
 use std::path::Path;
 mod gantt;
 pub(super) use gantt::*;
+mod commands;
+pub(super) use commands::*;
 
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
@@ -14,6 +16,8 @@ pub(super) struct ProjectView {
     pub table_w: f32,
     pub gantt_w: f32,
     pub scale: GanttScale,
+    pub prompt: Option<ProjectPrompt>,
+    pub exported: Option<String>,
 }
 
 impl ProjectView {
@@ -28,6 +32,8 @@ impl ProjectView {
             table_w: 590.,
             gantt_w: 590. - GANTT_INSET,
             scale,
+            prompt: None,
+            exported: None,
         }
     }
 
@@ -153,6 +159,29 @@ pub(super) fn project_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Json
     let mut entries = vec![
         ("selected_task".into(), Json::Num(v.ed.sel() as f64)),
         ("tasks".into(), Json::Num(v.ed.project().tasks.len() as f64)),
+        (
+            "prompt".into(),
+            Json::Str(
+                v.prompt
+                    .as_ref()
+                    .map(|p| format!("{}:{}", p.kind.name(), p.buf))
+                    .unwrap_or_else(|| "none".into()),
+            ),
+        ),
+        (
+            "selected_name".into(),
+            Json::Str(
+                v.ed.project()
+                    .tasks
+                    .get(v.ed.sel())
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "exported".into(),
+            Json::Str(v.exported.clone().unwrap_or_else(|| "none".into())),
+        ),
     ];
     entries.extend(v.ed.project().tasks.iter().map(|t| {
         (
@@ -649,7 +678,7 @@ pub(super) fn project_el(
                                                 if let Some(Surface::Project(v)) =
                                                     this.tabs.get_mut(index).map(|t| &mut t.surface)
                                                 {
-                                                    v.ed.select(i);
+                                                    v.select_row(i);
                                                 }
                                                 this.refocus(window, cx);
                                             }))

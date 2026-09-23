@@ -1,0 +1,17 @@
+test ribbon tabs follow the active document kind
+  open ../fixtures/gantt-summary.xml
+  key alt t escape escape
+  assert ribbon_tab is Task
+  open ../fixtures/basic.xlsx
+  assert ribbon_tab is Home
+  key alt n escape escape
+  assert ribbon_tab is Insert
+  open ../fixtures/basic.docx
+  key alt n escape escape
+  assert ribbon_tab is Insert
+  open ../fixtures/gantt-summary.xml
+  assert ribbon_tab is Task
+  key alt w escape escape
+  assert ribbon_tab is View
+  open ../fixtures/basic.docx
+  assert ribbon_tab is View

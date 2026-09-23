@@ -1,0 +1,16 @@
+test project export uses a sandbox copy
+  open copy:../fixtures/gantt-summary.xml
+  assert title is gantt-summary.xml
+  assert dirty is false
+  key ctrl+e
+  assert exported is gantt-summary.md
+  assert title is gantt-summary.xml
+  assert dirty is false
+  key b ctrl+e
+  assert exported is gantt-summary.md
+  assert dirty is true
+  key ctrl+z
+  assert status is Undo
+  assert dirty is true
+  key alt f
+  shot window

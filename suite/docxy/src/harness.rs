@@ -470,6 +470,7 @@ const NAMED_KEYS: &[&str] = &[
     "right",
     "space",
     "menu",
+    "alt",
 ];
 
 /// Parse a key spec — `enter`, `ctrl+c`, `shift+down`, `ctrl+shift+z`, `A` —
@@ -860,6 +861,17 @@ fn load_failure(app: &crate::Docxy) -> Option<String> {
 fn state(app: &crate::Docxy) -> Json {
     let mut out = vec![
         ("tab", Json::Num(app.active as f64)),
+        (
+            "ribbon_tab",
+            Json::Str(
+                crate::ribbon_tab_name(crate::valid_ribbon_tab(
+                    app.ribbon_kind(),
+                    app.ribbon_tab,
+                    app.caret_table().is_some(),
+                ))
+                .into(),
+            ),
+        ),
         (
             "title",
             Json::Str(
@@ -1661,6 +1673,8 @@ mod tests {
         assert_eq!(stroke("Escape").key, "escape"); // case is not significant
         assert_eq!(stroke("f2").key, "f2");
         assert_eq!(stroke("pagedown").key, "pagedown");
+        assert_eq!(stroke("alt").key, "alt");
+        assert_eq!(stroke("alt").key_char, None);
         // Space is the named key that does type something.
         assert_eq!(stroke("space").key_char.as_deref(), Some(" "));
     }

@@ -125,10 +125,11 @@ cold start, and every accepted and rejected form is a unit test.
 | Step | Drives |
 |---|---|
 | `open <path>` | the file, resolved **against the script's own directory** — never the working directory. A file the app could not read is an ERROR, not a silent green step: the loaders substitute an empty document and record the reason in `status`, so the step reads the status back and stops the case there |
+| `open copy:<path>` | copy that fixture to `<sandbox>/<case-slug>/<original filename>` and open the copy; refuses an existing destination. Use this for saves and exports so their outputs stay in the run sandbox and the original fixture stays untouched |
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
 | `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
-| `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `f2`, `ctrl+c`, `shift+down`, … (`tab` and `shift+tab` go through the app's bound *action*, which is where gpui sends them — see below) |
+| `key <k> [k…]` | those keys, in order: `escape`, `enter`, `tab`, `up`, `alt`, `f2`, `ctrl+c`, `shift+down`, … (`tab` and `shift+tab` go through the app's bound *action*, which is where gpui sends them — see below) |
 | `select chart <n>` | the press on a chart card, counting from 0 |
 | `focus <field>` | the click on a reference field |
 | `snapshot <range>` | remembers those cells, for a later `assert cells unchanged` |
@@ -191,6 +192,9 @@ UIHARNESS_REGEN_FIXTURE=1 cargo test -p uiharness --test fixture
 Nothing in the harness reads a user document, which is the point of the fixture
 living under the harness's own directory.
 
+`basic.docx` is a copy of the repository's blank Word template
+(`offxy-vscode/mcp/templates/blank.docx`) for the cross-kind ribbon smoke case.
+
 Every verb goes in through **the same entry point the pointer or keyboard
 would**. A verb that reached past a handler into the state it maintains could
 pass while the handler under test was broken — the one way this harness could be
@@ -240,11 +244,29 @@ State keys, as the app reports them after every driving verb:
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
 | `selected_task`, `tasks`, `bar_<id>` | Project: selected task index (zero-based), task count, and each task's bar geometry by displayed ID |
+| `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name, and `none` or the filename of the last successful Gantt export |
+| `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Schedule`, `View`, `Home`, etc.) |
 
 Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
 from the timeline scale origin, or `none` when the task has no schedule result.
 Kinds are `critical`, `on-track`, `summary`, and `milestone`. These state keys
 cover every task, including those outside the visible timeline.
+
+Project editing uses `n`/Insert to add, `x`/Delete to delete, Enter/F2 to
+rename, `d` for duration, `p` for predecessor **displayed ID**, `c` for a
+constraint, `a` for a resource, `b` for baseline, and Shift+L for leveling.
+Ctrl+F opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo,
+Ctrl+S saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export.
+Project ribbon KeyTips are File/Task/Schedule/View = F/T/S/W after Alt or F10.
+
+An open Project prompt owns input before KeyTips: Enter commits, Escape cancels,
+Backspace removes one character, and printable text appends. Tab/Shift+Tab do
+nothing while it is open. Control, Alt, and platform-modified prompt events are
+ignored (including modified Enter/Escape/Backspace); no AltGr input is supported.
+Outside prompts only the listed Ctrl chords are handled; other modified Project
+edits and navigation are ignored. Changing tasks, documents, or commands cancels
+the prompt. The `project-invalid`, `project-ribbon`, and `ribbon-kinds` cases
+exercise these routes, including Word/Sheet strip switching.
 
 `nothing` is how a script writes "this key is null" (`assert chart_sel is
 nothing`); `null` and `none` read the same, and `empty` matches an empty string.
@@ -450,5 +472,5 @@ harness end to end is exercised by running it.
 ## Not covered
 
 - **CI.** It needs a desktop session for `PrintWindow`.
-- **The Doc and Mail tabs.** The verbs are the sheet UI's, which is where the
-  regressions have been.
+- **Doc and Mail editing.** Word ribbon navigation has cross-kind smoke coverage;
+  document editing gestures are not harness verbs.
