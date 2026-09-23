@@ -64,7 +64,7 @@ options for run:
   --keep                        leave the instance running after the script ends
 
 regions:
-  window  grid  chart-panel  cell:B3  cell:A1:C5  chart:0
+  window  grid  chart-panel  cell:B3  cell:A1:C5  chart:0  gantt  bar:3
 ";
 
 fn main() -> ExitCode {

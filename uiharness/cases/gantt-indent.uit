@@ -1,0 +1,17 @@
+test gantt indent outdent undo and redo reschedule
+  open ../fixtures/gantt-indent.xml
+  assert bar_1 is on-track 0-0
+  assert dirty is false
+  key down
+  assert selected_task is 1
+  key tab
+  assert bar_1 is summary 0-3
+  assert dirty is true
+  shot gantt
+  key shift+tab
+  assert bar_1 is on-track 0-0
+  key ctrl+z
+  assert bar_1 is summary 0-3
+  key ctrl+y
+  assert bar_1 is on-track 0-0
+  shot gantt

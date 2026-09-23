@@ -623,6 +623,10 @@ pub enum Region {
     Cells(u32, u32, u32, u32),
     /// A chart card on the sheet, by index — the same index `select-chart` uses.
     Chart(usize),
+    /// Visible Project timeline body, excluding its date header.
+    Gantt,
+    /// Visible part of a task bar, addressed by displayed task ID.
+    Bar(i32),
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
@@ -640,7 +644,8 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "window" if arg.is_none() => Ok(Region::Window),
         "grid" if arg.is_none() => Ok(Region::Grid),
         "chart-panel" if arg.is_none() => Ok(Region::ChartPanel),
-        "window" | "grid" | "chart-panel" => {
+        "gantt" if arg.is_none() => Ok(Region::Gantt),
+        "window" | "grid" | "chart-panel" | "gantt" => {
             Err(format!("'{head}' does not take an argument; use '{head}'"))
         }
         "cell" | "cells" => {
@@ -653,6 +658,15 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             let (r, c) = parse_cell(a)?;
             Ok(Region::Cells(r, c, r, c))
         }
+        "bar" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'bar' needs a task ID, e.g. bar:3")?;
+            let id = a
+                .parse::<i32>()
+                .map_err(|_| format!("'{a}' is not a task ID"))?;
+            Ok(Region::Bar(id))
+        }
         "chart" => {
             let a = arg
                 .filter(|a| !a.is_empty())
@@ -663,7 +677,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0)"
+            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3)"
         )),
     }
 }
@@ -677,6 +691,8 @@ pub fn region_name(region: Region) -> String {
         Region::ChartPanel => "chart-panel".into(),
         Region::Cells(r0, c0, r1, c1) => format!("cell:{}", a1_range((r0, c0, r1, c1))),
         Region::Chart(i) => format!("chart:{i}"),
+        Region::Gantt => "gantt".into(),
+        Region::Bar(id) => format!("bar:{id}"),
     }
 }
 
@@ -907,7 +923,11 @@ fn state(app: &crate::Docxy) -> Json {
         ("range_preview", str_or_null(ov.range_preview.map(a1_range))),
         ("sel_hidden", Json::Bool(ov.sel_hidden)),
     ]);
-    Json::Obj(out.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+    let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    if let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface) {
+        out.extend(crate::project_state(v));
+    }
+    Json::Obj(out)
 }
 
 // ---- the verb table -------------------------------------------------------
@@ -1924,12 +1944,17 @@ mod tests {
             Region::Cells(2, 1, 2, 1),
             Region::Cells(0, 0, 4, 2),
             Region::Chart(3),
+            Region::Gantt,
+            Region::Bar(3),
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }
         // A one-cell region prints as the cell, not as a degenerate range.
         assert_eq!(region_name(Region::Cells(2, 1, 2, 1)), "cell:B3");
         assert_eq!(region_name(Region::Cells(0, 0, 4, 2)), "cell:A1:C5");
+        assert!(parse_region("gantt:1").is_err());
+        assert!(parse_region("bar:abc").is_err());
+        assert!(parse_region("bar:").is_err());
     }
 
     // ---- logical rect -> physical screen pixels ----

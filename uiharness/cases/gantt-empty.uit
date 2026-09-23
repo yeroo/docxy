@@ -1,0 +1,9 @@
+test empty gantt indent is a no-op
+  open ../fixtures/gantt-empty.xml
+  assert tasks is 0
+  assert dirty is false
+  key tab shift+tab ctrl+z ctrl+y
+  assert dirty is false
+  assert tasks is 0
+  assert status is loaded — 0 tasks
+  shot window

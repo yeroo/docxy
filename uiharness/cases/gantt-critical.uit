@@ -1,0 +1,8 @@
+test gantt critical bar uses amber
+  open ../fixtures/gantt-critical.xml
+  assert tasks is 2
+  assert bar_1 is critical 0-0
+  assert bar_2 is critical 1-2
+  assert border bar:2 solid amber
+  shot gantt
+  shot window

@@ -535,7 +535,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), Scri
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-const REGION_WORDS: &str = "window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0";
+const REGION_WORDS: &str = "window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).
@@ -551,7 +551,7 @@ pub fn validate_region(name: &str) -> Result<String, String> {
         None => (full.as_str(), None),
     };
     match head.to_ascii_lowercase().as_str() {
-        "window" | "grid" | "chart-panel" => {
+        "window" | "grid" | "chart-panel" | "gantt" => {
             if arg.is_some() {
                 return Err(format!("'{head}' takes no argument"));
             }
@@ -570,6 +570,14 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                     validate_cell(a)?;
                 }
             }
+            Ok(full.clone())
+        }
+        "bar" => {
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'bar' needs a task ID, e.g. bar:3")?;
+            a.parse::<i32>()
+                .map_err(|_| format!("'{a}' is not a task ID"))?;
             Ok(full.clone())
         }
         "chart" => {
@@ -1208,9 +1216,13 @@ test Smoke-Case
             ("A1:C5", "cell:A1:C5"),
             ("cell:A1:C5", "cell:A1:C5"),
             ("chart:0", "chart:0"),
+            ("gantt", "gantt"),
+            ("bar:3", "bar:3"),
         ] {
             assert_eq!(validate_region(written).unwrap(), normalized, "{written}");
         }
+        assert!(validate_region("bar:abc").is_err());
+        assert!(validate_region("gantt:1").is_err());
         assert!(validate_region("grid:1").is_err(), "grid takes no argument");
     }
 }

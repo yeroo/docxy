@@ -310,7 +310,7 @@ fn hot_exit_round_trips_dirty_clean_untitled_and_imported_sessions() {
         assert_eq!(view(&restored).ed.project(), view(&tab).ed.project());
         assert_eq!(view(&restored).ed.undo_depth(), 0);
         for key in ["z", "y"] {
-            assert!(view_mut(&mut restored).key(key, true));
+            assert!(view_mut(&mut restored).key(key, true, false));
             assert_eq!(view(&restored).ed.dirty(), dirty);
         }
         if is_imported(&tab) {
@@ -470,7 +470,7 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
 fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
     let mut t = new_project_tab();
     for key in ["up", "down", "home", "end"] {
-        assert!(view_mut(&mut t).key(key, false));
+        assert!(view_mut(&mut t).key(key, false, false));
         assert_eq!(view(&t).ed.sel(), 0);
     }
     for i in 0..100 {
@@ -486,9 +486,9 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
         ("home", 0),
         ("up", 0),
     ] {
-        assert!(view_mut(&mut t).key(key, false));
+        assert!(view_mut(&mut t).key(key, false, false));
         assert_eq!(view(&t).ed.sel(), selected);
     }
     assert!(view(&t).ed.dirty());
-    assert!(!view_mut(&mut t).key("d", false));
+    assert!(!view_mut(&mut t).key("d", false, false));
 }

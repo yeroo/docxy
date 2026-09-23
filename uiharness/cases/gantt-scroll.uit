@@ -1,0 +1,14 @@
+test gantt panes stay aligned while scrolling
+  open ../fixtures/gantt-scroll.xml
+  key end
+  assert selected_task is 99
+  assert bar_100 is critical 0-81
+  shot window
+  key right right right right shift+right shift+right
+  assert border bar:100 solid amber
+  shot window
+  key home
+  assert selected_task is 0
+  key left left left left shift+left shift+left
+  shot bar:1
+  shot window
