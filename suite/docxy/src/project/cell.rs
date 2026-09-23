@@ -23,6 +23,7 @@ pub(crate) struct CellEdit {
     pub buf: String,
     /// UTF-8 byte boundary.
     pub caret: usize,
+    pub last_error: Option<String>,
 }
 
 impl CellEdit {
@@ -116,6 +117,7 @@ impl ProjectView {
         };
         let buf = typed.map(str::to_owned).unwrap_or_else(|| initial.clone());
         self.cell = Some(CellEdit {
+            last_error: None,
             uid: task.uid,
             col: self.col,
             initial,
@@ -203,14 +205,19 @@ pub(crate) fn commit_project_cell(tab: &mut DocTab) -> bool {
     }
     match v.commit_cell_value() {
         Ok(status) => {
-            v.cell = None;
+            let last_error = v.cell.take().and_then(|cell| cell.last_error);
             if let Some(status) = status {
                 tab.status = status.into();
+            } else if last_error.as_deref() == Some(tab.status.as_ref()) {
+                tab.status = "Ready".into();
             }
             complete_project(tab, false);
             true
         }
         Err(status) => {
+            if let Some(cell) = &mut v.cell {
+                cell.last_error = Some(status.clone());
+            }
             tab.status = status.into();
             false
         }

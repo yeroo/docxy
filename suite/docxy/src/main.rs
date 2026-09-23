@@ -11826,6 +11826,8 @@ impl Docxy {
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
             if self.keytips == KeyTip::Off && !self.backstage {
+                self.mini_bar = None;
+                self.context_menu = None;
                 self.project_tab_key(false, window, cx);
             }
             return;
@@ -11881,6 +11883,8 @@ impl Docxy {
         // Document Find can remain open while its tab is inactive.
         if self.active_is_project() {
             if self.keytips == KeyTip::Off && !self.backstage {
+                self.mini_bar = None;
+                self.context_menu = None;
                 self.project_tab_key(true, window, cx);
             }
             return;

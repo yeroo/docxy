@@ -164,6 +164,52 @@ fn reentering_an_existing_constraint_does_not_claim_a_change() {
 }
 
 #[test]
+fn correcting_a_failed_commit_clears_only_that_editors_error() {
+    for (col, invalid, corrected) in [
+        (2, "banana", "2d"),
+        (2, "banana", "1d"),
+        (3, "bad date", "2026-03-05"),
+    ] {
+        let mut t = tab();
+        edit(&mut t, col, invalid);
+        key(&mut t, "enter");
+        let error = t.status.clone();
+        assert_eq!(
+            v(&t).cell.as_ref().unwrap().last_error.as_deref(),
+            Some(error.as_ref())
+        );
+        key(&mut t, "home");
+        for _ in invalid.chars() {
+            key(&mut t, "delete");
+        }
+        project_input(&mut t, "text", Some(corrected), Modifiers::default());
+        key(&mut t, "enter");
+        assert!(v(&t).cell.is_none());
+        assert_ne!(t.status, error);
+        assert_eq!(
+            t.status.as_ref(),
+            if col == 3 {
+                "Constraint set: SNET (was ASAP)"
+            } else {
+                "Ready"
+            }
+        );
+        if corrected == "1d" {
+            assert!(!t.dirty);
+            assert_eq!(v(&t).ed.undo_depth(), 0);
+        }
+    }
+    let mut t = tab();
+    edit(&mut t, 2, "banana");
+    key(&mut t, "enter");
+    t.status = "New unrelated status".into();
+    vm(&mut t).cell.as_mut().unwrap().buf = "2d".into();
+    vm(&mut t).cell.as_mut().unwrap().caret = 2;
+    key(&mut t, "enter");
+    assert_eq!(t.status, "New unrelated status");
+}
+
+#[test]
 fn invalid_inputs_and_click_away_preserve_everything() {
     for (col, text) in [
         (2, "NaN"),
@@ -272,6 +318,7 @@ fn save_commits_a_cell_and_invalid_input_never_reaches_disk() {
 #[test]
 fn caret_edits_utf8_and_long_buffer_window_tracks_it() {
     let mut c = CellEdit {
+        last_error: None,
         uid: 1,
         col: 1,
         initial: String::new(),

@@ -144,6 +144,7 @@ test hidden document find does not intercept project Tab
   key ctrl+f
   open ../fixtures/gantt-summary.xml
   assert cell is Name
+
   key tab
   assert cell is Duration
   key shift+tab
@@ -159,3 +160,16 @@ test hidden document find does not intercept project Tab
   assert cell C2 is 2d
   assert cell_edit is none
   assert cell is Name
+
+test corrected duration clears its validation error
+  open ../fixtures/gantt-summary.xml
+  click C2
+  type banana
+  key enter
+  assert status is Invalid duration (try 3d, 4h, 2w)
+  key home delete delete delete delete delete delete
+  type 2d
+  key enter
+  assert cell_edit is none
+  assert cell C2 is 2d
+  assert status is Ready

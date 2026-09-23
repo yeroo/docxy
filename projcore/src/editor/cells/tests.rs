@@ -163,6 +163,8 @@ fn negative_duration_rejection_is_atomic_for_all_update_entry_points() {
     ed.undo();
     ed.mark_saved();
     let before = ed.project().clone();
+    assert!(ed.add_task(None, "must not append", -1440).is_err());
+    assert!(ed.add_task(Some(10), "must not insert", -1).is_err());
     assert!(ed.set_duration(10, "-3d").is_err());
     assert!(ed.set_duration_min(10, -1).is_err());
     assert!(
@@ -180,6 +182,53 @@ fn negative_duration_rejection_is_atomic_for_all_update_entry_points() {
     // Lead/negative lag remains valid and is independent of duration validation.
     ed.set_predecessors(10, parse_predecessors("2FS-1h", ed.project()).unwrap())
         .unwrap();
+}
+
+#[test]
+fn duplicate_resource_names_preserve_the_assigned_identity_or_reject_ambiguity() {
+    let mut ed = editor();
+    ed.assign_resource(20, "Alice").unwrap();
+    ed.assign_resource(10, "Second Alice").unwrap();
+    ed.proj.resources[1].name = "ALICE".into();
+    ed.proj.assignments[1].units = 0.5;
+    ed.proj.assignments[1].work_min = 123;
+    let retained = ed.proj.assignments[1];
+    let before = ed.project().clone();
+    let depth = ed.undo_depth();
+    ed.set_resources(10, &["Alice".into(), "Bob".into()])
+        .unwrap();
+    assert!(ed.proj.assignments.contains(&retained));
+    assert!(
+        !ed.proj
+            .assignments
+            .iter()
+            .any(|a| a.task_uid == 10 && a.resource_uid == 1)
+    );
+    assert_eq!(ed.undo_depth(), depth + 1);
+    ed.undo();
+    ed.mark_saved();
+    unchanged(&ed, &before, (depth, 1, false));
+    // No assigned match: both Alices are ambiguous, even after staging another name.
+    assert!(
+        ed.set_resources(30, &["Staged".into(), "alice".into()])
+            .unwrap_err()
+            .contains("ambiguous")
+    );
+    unchanged(&ed, &before, (depth, 1, false));
+    // One assigned match wins even for a name-only no-op, preserving redo.
+    ed.set_resources(10, &["alice".into()]).unwrap();
+    unchanged(&ed, &before, (depth, 1, false));
+    // assign_resource retains its existing first-match behavior; two assigned matches
+    // cannot be distinguished by the list syntax and must also be rejected.
+    ed.assign_resource(10, "Alice").unwrap();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert!(
+        ed.set_resources(10, &["Alice".into(), "Bob".into()])
+            .unwrap_err()
+            .contains("ambiguous")
+    );
+    unchanged(&ed, &before, history);
 }
 
 #[test]

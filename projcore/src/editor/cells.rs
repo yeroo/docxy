@@ -90,6 +90,7 @@ impl Editor {
     }
 
     /// Replace membership while preserving allocation data for retained resources.
+    /// Prefer an already assigned namesake; otherwise duplicate names are ambiguous.
     pub fn set_resources(&mut self, uid: i32, names: &[String]) -> Result<(), String> {
         let i = self.index(uid)?;
         // Stage every allocation before touching the project or history, including ID exhaustion.
@@ -103,7 +104,26 @@ impl Editor {
             .unwrap_or(0);
         let mut wanted = Vec::new();
         for name in names.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            let rid = find_or_stage_resource(&mut resources, name)?;
+            let matches: Vec<_> = resources
+                .iter()
+                .filter(|r| r.name.eq_ignore_ascii_case(name))
+                .map(|r| r.uid)
+                .collect();
+            let assigned: Vec<_> = matches
+                .iter()
+                .copied()
+                .filter(|rid| {
+                    self.proj
+                        .assignments
+                        .iter()
+                        .any(|a| a.task_uid == uid && a.resource_uid == *rid)
+                })
+                .collect();
+            let rid = match assigned.as_slice() {
+                [rid] => *rid,
+                [] if matches.len() <= 1 => find_or_stage_resource(&mut resources, name)?,
+                _ => return Err(format!("Resource name '{name}' is ambiguous")),
+            };
             if !wanted.contains(&rid) {
                 wanted.push(rid);
             }

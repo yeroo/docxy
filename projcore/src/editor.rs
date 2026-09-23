@@ -230,6 +230,7 @@ impl Editor {
         name: &str,
         duration_min: i64,
     ) -> Result<usize, String> {
+        validate_duration(duration_min)?;
         let at = match after {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
@@ -322,8 +323,8 @@ impl Editor {
         if patch.level.is_some_and(|lv| !(1..=20).contains(&lv)) {
             return Err("'level' must be 1..=20".into());
         }
-        if patch.duration_min.is_some_and(|min| min < 0) {
-            return Err("Duration must not be negative".into());
+        if let Some(min) = patch.duration_min {
+            validate_duration(min)?;
         }
         if patch.duration_min.is_some() {
             self.validate_cell_horizon(uid, patch.duration_min, None)?;
@@ -458,6 +459,14 @@ impl Editor {
         };
         self.set_duration_min(uid, min)
     }
+}
+
+/// Task creation and updates share the same non-negative duration rule.
+fn validate_duration(minutes: i64) -> Result<(), String> {
+    if minutes < 0 {
+        return Err("Duration must not be negative".into());
+    }
+    Ok(())
 }
 
 /// Both assignment entry points stage resources before taking an undo snapshot.
