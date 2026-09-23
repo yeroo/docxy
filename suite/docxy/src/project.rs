@@ -7,6 +7,8 @@ mod gantt;
 pub(super) use gantt::*;
 mod commands;
 pub(super) use commands::*;
+mod cell;
+pub(super) use cell::*;
 
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
@@ -17,6 +19,8 @@ pub(super) struct ProjectView {
     pub gantt_w: f32,
     pub scale: GanttScale,
     pub prompt: Option<ProjectPrompt>,
+    pub col: usize,
+    pub cell: Option<CellEdit>,
     pub exported: Option<String>,
 }
 
@@ -33,6 +37,8 @@ impl ProjectView {
             gantt_w: 590. - GANTT_INSET,
             scale,
             prompt: None,
+            col: 1,
+            cell: None,
             exported: None,
         }
     }
@@ -41,6 +47,7 @@ impl ProjectView {
         self.table_w = table_pane_width(width);
         self.gantt_w = (width - self.table_w - GANTT_INSET).max(0.);
         self.refresh_schedule_layout();
+        self.reveal_col();
     }
 
     pub fn refresh_schedule_layout(&mut self) {
@@ -57,14 +64,14 @@ impl ProjectView {
 
     /// Navigation and horizontal scrolling only; command completion owns row reveal.
     pub fn key(&mut self, key: &str, shift: bool) -> bool {
-        if matches!(key, "left" | "right") {
-            let sign = if key == "left" { -1. } else { 1. };
-            if shift {
-                self.table_x += sign * 80.;
+        if matches!(key, "left" | "right" | "tab") {
+            let left = key == "left" || (key == "tab" && shift);
+            self.col = if left {
+                self.col.saturating_sub(1)
             } else {
-                self.gantt_x += sign * DAY_W;
-            }
-            self.clamp_offsets();
+                (self.col + 1).min(6)
+            };
+            self.reveal_col();
             return true;
         }
         let index = match key {
@@ -76,6 +83,11 @@ impl ProjectView {
         };
         self.ed.select(index);
         true
+    }
+
+    pub fn pan_gantt(&mut self, right: bool) {
+        self.gantt_x += if right { DAY_W } else { -DAY_W };
+        self.clamp_offsets();
     }
 }
 
@@ -120,6 +132,29 @@ fn project_region(
         .ok_or("the Project body has not been laid out")?;
     let viewport = gantt_viewport(body, v.table_w).ok_or("the Gantt viewport is empty")?;
     match region {
+        harness::Region::Cells(r0, c0, r1, c1) => {
+            if r0 != r1 || c0 != c1 || c0 >= 7 {
+                return Err("Project regions address one entry-table cell".into());
+            }
+            let task =
+                v.ed.project()
+                    .tasks
+                    .get(r0 as usize)
+                    .ok_or("No task at this row")?;
+            let cell = probes
+                .get(&format!("project-cell:{}:{c0}", task.id))
+                .ok_or("Project cell is not rendered")?;
+            // The absolute probe fills the padding box; include the cell's 1px border.
+            let cell = Bounds {
+                origin: cell.origin - point(px(1.), px(1.)),
+                size: cell.size + size(px(2.), px(2.)),
+            };
+            let table = Bounds {
+                origin: body.origin,
+                size: size(px(v.table_w), body.size.height),
+            };
+            intersect(cell, table).ok_or("Project cell is outside the table viewport".into())
+        }
         harness::Region::Gantt => Ok(viewport),
         harness::Region::Bar(id) => {
             let task =
@@ -181,6 +216,9 @@ pub(super) fn project_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Json
             ),
         )
     }));
+    entries.extend(project_cell_state(v));
+    entries.push(("undo_depth".into(), Json::Num(v.ed.undo_depth() as f64)));
+    entries.push(("redo_depth".into(), Json::Num(v.ed.redo_depth() as f64)));
     entries
 }
 
@@ -325,6 +363,9 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
 }
 
 pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
+    if !commit_project_cell(tab) {
+        return Err(tab.status.to_string());
+    }
     let result = match &tab.surface {
         Surface::Project(v) => write_project(&v.ed, target),
         _ => Err("This project could not be loaded and cannot be saved".into()),
@@ -443,36 +484,9 @@ fn date(dt: Option<projcore::DateTime>) -> String {
     .unwrap_or_else(|| "—".into())
 }
 
-fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
+pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
     let project = ed.project();
-    let predecessors = task
-        .predecessors
-        .iter()
-        .map(|p| {
-            let id = project
-                .task(p.uid)
-                .map(|t| t.id.to_string())
-                .unwrap_or_else(|| format!("?{}", p.uid));
-            let kind = match p.link {
-                LinkType::FinishStart if p.lag_min == 0 => "",
-                LinkType::FinishStart => "FS",
-                LinkType::StartStart => "SS",
-                LinkType::FinishFinish => "FF",
-                LinkType::StartFinish => "SF",
-            };
-            let lag = if p.lag_min == 0 {
-                String::new()
-            } else {
-                format!(
-                    "{}{}",
-                    if p.lag_min > 0 { "+" } else { "" },
-                    days(project, p.lag_min)
-                )
-            };
-            format!("{id}{kind}{lag}")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let predecessors = projcore::editor::format_predecessors(task, project);
     let resources = project
         .assignments
         .iter()
@@ -526,6 +540,73 @@ fn row_cells(values: [String; 7], indent: f32) -> impl IntoElement {
                 .when(i == 1, |d| d.pl(px(8. + indent)))
                 .child(value)
         }))
+}
+
+fn editable_row_cells(
+    v: &ProjectView,
+    task: &Task,
+    row: usize,
+    index: usize,
+    indent: f32,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    window: &Window,
+    cx: &mut Context<Docxy>,
+) -> impl IntoElement {
+    h_flex().h(px(ROW_H)).items_center().children(
+        project_row(&v.ed, task)
+            .into_iter()
+            .enumerate()
+            .map(|(col, value)| {
+                let edit = v
+                    .cell
+                    .as_ref()
+                    .filter(|c| c.uid == task.uid && c.col == col);
+                let content = if let Some(edit) = edit {
+                    let measure = Measurer::new(window);
+                    let offset = edit.scroll_x(WIDTHS[col] - 24., |s| {
+                        measure.width(s, 12., task.summary, false)
+                    });
+                    h_flex()
+                        .relative()
+                        .left(px(-offset))
+                        .flex_none()
+                        .items_center()
+                        .child(edit.buf[..edit.caret].to_owned())
+                        .child(div().flex_none().w(px(1.5)).h(px(16.)).bg(hsla_u(BRAND)))
+                        .child(edit.buf[edit.caret..].to_owned())
+                        .into_any_element()
+                } else {
+                    div().child(value).into_any_element()
+                };
+                div()
+                    .id(("project-cell", row * 7 + col))
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .w(px(WIDTHS[col]))
+                    .h(px(ROW_H))
+                    .flex_none()
+                    .px_2()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .border_1()
+                    .border_color(if row == v.ed.sel() && col == v.col {
+                        hsla_u(BRAND)
+                    } else {
+                        hsla(0., 0., 0., 0.)
+                    })
+                    .when(col == 1 && edit.is_none(), |d| d.pl(px(8. + indent)))
+                    .child(probe(probes, format!("project-cell:{}:{col}", task.id)))
+                    .child(content)
+                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                        cx.stop_propagation();
+                        if let Some(tab) = this.tabs.get_mut(index) {
+                            project_cell_click(tab, row, Some(col), ev.click_count() >= 2);
+                        }
+                        this.refocus(window, cx);
+                    }))
+            }),
+    )
 }
 
 fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement {
@@ -624,7 +705,7 @@ pub(super) fn project_el(
                     uniform_list(
                         ("project-rows", index),
                         count,
-                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
                             let Some(Surface::Project(v)) =
                                 this.tabs.get(index).map(|t| &t.surface)
                             else {
@@ -646,7 +727,16 @@ pub(super) fn project_el(
                                             .child(pane(
                                                 table_w,
                                                 table_x,
-                                                row_cells(project_row(&v.ed, task), indent),
+                                                editable_row_cells(
+                                                    v,
+                                                    task,
+                                                    i,
+                                                    index,
+                                                    indent,
+                                                    &row_probes,
+                                                    window,
+                                                    cx,
+                                                ),
                                             ))
                                             .child(timeline_pane(
                                                 gantt_w,
@@ -663,10 +753,8 @@ pub(super) fn project_el(
                                                 ),
                                             ))
                                             .on_click(cx.listener(move |this, _, window, cx| {
-                                                if let Some(Surface::Project(v)) =
-                                                    this.tabs.get_mut(index).map(|t| &mut t.surface)
-                                                {
-                                                    v.select_row(i);
+                                                if let Some(tab) = this.tabs.get_mut(index) {
+                                                    project_cell_click(tab, i, None, false);
                                                 }
                                                 this.refocus(window, cx);
                                             }))

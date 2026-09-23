@@ -84,6 +84,7 @@ fn path_info(tab: &DocTab, index: usize) -> Json {
     };
     fields.push(("tab".into(), Json::Num(index as f64)));
     fields.push(("imported".into(), Json::Bool(is_imported(tab))));
+    fields.extend(project_cell_state(v));
     Json::Obj(fields)
 }
 
@@ -168,6 +169,7 @@ pub(crate) fn project_verb(
                 }
                 if let Surface::Project(v) = &mut tab.surface {
                     v.cancel_prompt();
+                    v.cell = None;
                 }
                 Ok((
                     path_info(tab, index),
@@ -191,6 +193,7 @@ pub(crate) fn project_verb(
                 };
                 v.ed.replace_project(fresh.ed.project().clone());
                 v.cancel_prompt();
+                v.cell = None;
                 v.refresh_schedule_layout();
                 tab.dirty = false;
                 tab.status = loaded.status;
@@ -212,6 +215,7 @@ pub(crate) fn project_verb(
                 if projctl::MUTATING.contains(&verb) {
                     tab.dirty = v.ed.dirty();
                     v.cancel_prompt();
+                    v.cell = None;
                     effect.repaint = true;
                     effect.activity = true;
                 }

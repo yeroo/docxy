@@ -79,7 +79,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "table-insert-row",
                             "Add Task",
                             AddTask,
-                            "n / Insert",
+                            "Insert",
                             "N",
                         )),
                         rs::column(vec![
@@ -88,7 +88,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "table-delete-row",
                                 "Delete",
                                 DeleteTask,
-                                "x / Delete",
+                                "Delete",
                                 "X",
                             ),
                             cmd(
@@ -106,13 +106,20 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     "Outline",
                     70,
                     vec![rs::column(vec![
-                        cmd("pr-indent", "indent-increase", "Indent", Indent, "Tab", "I"),
+                        cmd(
+                            "pr-indent",
+                            "indent-increase",
+                            "Indent",
+                            Indent,
+                            "Alt+Shift+Right",
+                            "I",
+                        ),
                         cmd(
                             "pr-outdent",
                             "indent-decrease",
                             "Outdent",
                             Outdent,
-                            "Shift+Tab",
+                            "Alt+Shift+Left",
                             "O",
                         ),
                     ])],
@@ -121,15 +128,15 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     "Edit",
                     80,
                     vec![rs::column(vec![
+                        cmd("pr-rename", "font-name", "Rename", Rename, "Alt, T, R", "R"),
                         cmd(
-                            "pr-rename",
-                            "font-name",
-                            "Rename",
-                            Rename,
-                            "Enter / F2",
-                            "R",
+                            "pr-duration",
+                            "rule",
+                            "Duration",
+                            Duration,
+                            "Alt, T, D",
+                            "D",
                         ),
-                        cmd("pr-duration", "rule", "Duration", Duration, "d", "D"),
                         cmd("pr-find", "find", "Find", Find, "Ctrl+F / F3 next", "F"),
                     ])],
                 ),
@@ -151,14 +158,14 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     "Dependencies",
                     90,
                     vec![
-                        Control::Large(cmd("pr-link", "copy", "Link", AddLink, "p", "P")),
+                        Control::Large(cmd("pr-link", "copy", "Link", AddLink, "Alt, S, P", "P")),
                         rs::column(vec![
                             cmd(
                                 "pr-constraint",
                                 "print-layout",
                                 "Constraint",
                                 Constraint,
-                                "c",
+                                "Alt, S, C",
                                 "C",
                             ),
                             cmd("pr-recalc", "redo", "Recalculate", Recalc, "Alt, S, E", "E"),
@@ -170,7 +177,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     80,
                     vec![
                         rs::column(vec![
-                            cmd("pr-assign", "comment", "Assign", Assign, "a", "A"),
+                            cmd("pr-assign", "comment", "Assign", Assign, "Alt, S, A", "A"),
                             cmd(
                                 "pr-clear",
                                 "table-delete-row",
@@ -185,7 +192,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "align-left",
                             "Level resources",
                             Level,
-                            "Shift+L",
+                            "Ctrl+Shift+L",
                             "L",
                         )),
                     ],
@@ -198,7 +205,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                         "save",
                         "Set baseline",
                         Baseline,
-                        "b",
+                        "Alt, S, B",
                         "B",
                     ))],
                 ),
@@ -226,7 +233,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "indent-decrease",
                                 "Scroll left",
                                 ScrollLeft,
-                                "Left",
+                                "Alt+Left",
                                 "L",
                             ),
                             cmd(
@@ -234,7 +241,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "indent-increase",
                                 "Scroll right",
                                 ScrollRight,
-                                "Right",
+                                "Alt+Right",
                                 "R",
                             ),
                             cmd(
@@ -331,11 +338,24 @@ impl ProjectView {
 
 pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
     use ProjectAct::*;
-    if m.alt || m.platform {
+    if m.platform {
         return None;
+    }
+    if m.alt {
+        if m.control {
+            return None;
+        }
+        return match (key, m.shift) {
+            ("right", true) => Some(Indent),
+            ("left", true) => Some(Outdent),
+            ("right", false) => Some(ScrollRight),
+            ("left", false) => Some(ScrollLeft),
+            _ => None,
+        };
     }
     if m.control {
         return match key {
+            "l" if m.shift => Some(Level),
             "f" => Some(Find),
             "z" => Some(Undo),
             "y" => Some(Redo),
@@ -345,15 +365,8 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
         };
     }
     match key {
-        "n" | "insert" => Some(AddTask),
-        "x" | "delete" => Some(DeleteTask),
-        "enter" | "f2" => Some(Rename),
-        "d" => Some(Duration),
-        "p" => Some(AddLink),
-        "c" => Some(Constraint),
-        "a" => Some(Assign),
-        "b" => Some(Baseline),
-        "l" if m.shift => Some(Level),
+        "insert" => Some(AddTask),
+        "delete" => Some(DeleteTask),
         "f3" => Some(FindNext),
         _ => None,
     }
@@ -369,6 +382,13 @@ pub(crate) fn project_input(
     let Surface::Project(v) = &mut tab.surface else {
         return None;
     };
+    if v.cell.is_some() {
+        if m.control && !m.alt && !m.platform && key == "s" {
+            return commit_project_cell(tab).then_some(ProjectAct::Save);
+        }
+        project_cell_input(tab, key, text, m);
+        return None;
+    }
     if let Some(mut prompt) = v.prompt.take() {
         if m.control || m.alt || m.platform {
             v.prompt = Some(prompt);
@@ -395,6 +415,15 @@ pub(crate) fn project_input(
         return Some(act);
     }
     if !m.control && !m.alt && !m.platform {
+        let typed = text
+            .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
+            .filter(|s| !s.is_empty());
+        if matches!(key, "enter" | "f2") || typed.is_some() {
+            if let Err(e) = v.open_cell(typed.as_deref()) {
+                tab.status = e.into();
+            }
+            return None;
+        }
         let before = (v.ed.sel(), v.ed.selected_uid());
         v.key(key, m.shift);
         let changed = before != (v.ed.sel(), v.ed.selected_uid());
@@ -492,6 +521,9 @@ pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
 }
 
 pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
+    if !commit_project_cell(tab) {
+        return;
+    }
     use ProjectAct::*;
     let Surface::Project(v) = &mut tab.surface else {
         return;
@@ -567,10 +599,10 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             }
             FindNext => status = find_status(&mut v.ed, ""),
             ScrollLeft => {
-                v.key("left", false);
+                v.pan_gantt(false);
             }
             ScrollRight => {
-                v.key("right", false);
+                v.pan_gantt(true);
             }
             GoToStart => v.gantt_x = 0.,
             Save | SaveAs | ExportGantt | Theme => {} // window-dependent host actions
@@ -681,6 +713,37 @@ impl Docxy {
             .get(self.active)
             .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.prompt.is_some()))
     }
+    pub(crate) fn project_edit_open(&self) -> bool {
+        self.project_prompt_open()
+            || self
+                .tabs
+                .get(self.active)
+                .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.cell.is_some()))
+    }
+    pub(crate) fn commit_active_project_cell(&mut self) -> bool {
+        self.tabs
+            .get_mut(self.active)
+            .is_none_or(commit_project_cell)
+    }
+    pub(crate) fn project_tab_key(
+        &mut self,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            project_input(
+                tab,
+                "tab",
+                None,
+                Modifiers {
+                    shift,
+                    ..Modifiers::default()
+                },
+            );
+        }
+        self.refocus(window, cx);
+    }
     pub(crate) fn project_prompt_cancel(&mut self) {
         if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
             v.cancel_prompt();
@@ -692,6 +755,10 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.commit_active_project_cell() {
+            self.refocus(window, cx);
+            return;
+        }
         self.project_prompt_cancel();
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),

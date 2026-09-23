@@ -162,6 +162,28 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
   imported `.mpp` opens with the real dependency network as well; the only field
   still on the bench is **link lag** (0 throughout the corpus, so unvalidated).
 
+## Desktop suite entry table
+
+The suite's Project tab edits Name, Duration, Start, Finish, Predecessors, and
+Resource Names directly in the selected cell. Enter/F2 or a double-click opens
+the existing value; typing replaces it. Enter commits and moves down, Tab and
+Shift+Tab commit and move between columns, and Escape cancels. Invalid input
+stays open for correction. ID and summary dates/duration are read-only.
+
+Arrow keys move the cell cursor. Insert/Delete add/delete tasks;
+Alt+Shift+Right/Left indent/outdent; Alt+Right/Left pan the Gantt;
+Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find,
+undo/redo, save, and export. The former bare-letter commands are available on
+the ribbon; letters now start cell edits. Ribbon Rename still opens its Name prompt.
+
+Dates use `YYYY-MM-DD`. Start sets SNET; Finish sets FNET at the chosen working
+day's calendar finish (non-working Finish dates are rejected). Predecessors use
+displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated;
+retained assignments keep their units/work, and unknown names create resources.
+An unchanged edit preserves history and existing constraints. Cycles retain the
+engine's existing best-effort scheduling behavior. Names containing commas cannot
+be entered individually through the resource-list syntax.
+
 ## Roadmap
 
 Done: MSPDI read/write · CPM (links · lag · constraints · slack · critical ·

@@ -27,6 +27,30 @@ fn vm(t: &mut DocTab) -> &mut ProjectView {
 fn word() -> DocTab {
     sample_doc().into_tab(Kind::Docx, "Word.docx".into(), None, false)
 }
+
+#[test]
+fn cell_state_is_reported_and_only_successful_agent_changes_cancel_it() {
+    let mut tabs = vec![tab()];
+    vm(&mut tabs[0]).col = 1;
+    vm(&mut tabs[0]).open_cell(Some("Pending")).unwrap();
+    let (info, _) = call(&mut tabs, 0, "proj.path", Json::Null).unwrap();
+    assert_eq!(info.get_str("cell"), Some("Name"));
+    assert_eq!(info.get_str("cell_edit"), Some("Pending"));
+    assert!(call(&mut tabs, 0, "task.del", args(r#"{"uid":999}"#)).is_err());
+    assert_eq!(view(&tabs[0]).cell.as_ref().unwrap().buf, "Pending");
+    call(
+        &mut tabs,
+        0,
+        "task.set",
+        args(r#"{"uid":1,"name":"Agent"}"#),
+    )
+    .unwrap();
+    assert!(view(&tabs[0]).cell.is_none());
+    assert_eq!(view(&tabs[0]).ed.project().task(1).unwrap().name, "Agent");
+    vm(&mut tabs[0]).open_cell(Some("Stale")).unwrap();
+    call(&mut tabs, 0, "proj.reload", Json::Null).unwrap();
+    assert!(view(&tabs[0]).cell.is_none());
+}
 fn scratch() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -200,7 +224,17 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
     assert_eq!(
         fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
         [
-            "path", "modified", "name", "tasks", "start", "finish", "tab", "imported"
+            "path",
+            "modified",
+            "name",
+            "tasks",
+            "start",
+            "finish",
+            "tab",
+            "imported",
+            "cell",
+            "cell_row",
+            "cell_edit"
         ]
     );
 }
@@ -371,8 +405,9 @@ fn reload_commits_only_a_successful_load() {
     assert!(v.table_x > 0. && v.table_x < f32::MAX);
     assert_eq!(v.gantt_x, (v.scale.width() - v.gantt_w).max(0.));
     let offsets = (v.table_x, v.gantt_x);
-    vm(&mut tabs[0]).key("right", true);
+    vm(&mut tabs[0]).col = 6;
     vm(&mut tabs[0]).key("right", false);
+    vm(&mut tabs[0]).pan_gantt(true);
     assert_eq!((view(&tabs[0]).table_x, view(&tabs[0]).gantt_x), offsets);
     tabs[0].path = None;
     let before = snapshot(&tabs[0]);

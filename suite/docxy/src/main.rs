@@ -5403,6 +5403,9 @@ impl Docxy {
             }),
             Region::Gantt | Region::Bar(_) => self.project_region_bounds(region),
             Region::Grid => self.grid_bounds(),
+            Region::Cells(_, _, _, _) if self.active_is_project() => {
+                self.project_region_bounds(region)
+            }
             Region::Cells(r0, c0, r1, c1) => self.cells_bounds((r0, c0), (r1, c1)),
             Region::ChartPanel => self
                 .probes
@@ -6399,6 +6402,10 @@ impl Docxy {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.commit_active_project_cell() {
+            self.refocus(window, cx);
+            return;
+        }
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -11856,7 +11863,7 @@ impl Docxy {
             return self.sheet_commit(0, 1, cx);
         }
         if self.active_is_project() {
-            return self.project_act(ProjectAct::Indent, window, cx);
+            return self.project_tab_key(false, window, cx);
         }
         self.with_editor(window, cx, |e| e.insert_tab());
         self.scroll_to_caret();
@@ -11885,19 +11892,23 @@ impl Docxy {
             return self.sheet_commit(0, -1, cx);
         }
         if self.active_is_project() {
-            return self.project_act(ProjectAct::Outdent, window, cx);
+            return self.project_tab_key(true, window, cx);
         }
         self.with_editor(window, cx, |e| e.change_indent(-720));
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.project_prompt_open() {
+        if self.project_edit_open() && !self.backstage {
             return self.project_key(ev, window, cx);
         }
         let m = &ev.keystroke.modifiers;
         let ctrl = m.control || m.platform;
         let shift = m.shift;
         let key = ev.keystroke.key.clone();
+        if self.active_is_project() && m.alt && !ctrl && matches!(key.as_str(), "left" | "right") {
+            self.keytips = KeyTip::Off;
+            return self.project_key(ev, window, cx);
+        }
         // KeyTips (Alt / F10 access keys): toggle the overlay; while it's showing,
         // letters pick a tab / run a command instead of typing.
         if (key == "alt" || key == "f10") && !ctrl {
@@ -17551,7 +17562,7 @@ impl Render for Docxy {
             .child(if self.active_is_sheet() {
                 "type or F2 to edit · Enter/Tab to move · =formula · Ctrl+S save"
             } else if self.active_is_project() {
-                "n add · x del · Enter rename · d dur · p link · c constraint · a assign · b baseline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
+                "Enter/F2 edit · Tab next cell · Insert/Delete task · Alt+Shift+←/→ outline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
             } else {
                 "type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S"
             })

@@ -205,17 +205,8 @@ fn ribbon_context_survives_valid_switches_only() {
 fn keys_and_whole_route_enforce_modifiers() {
     use ProjectAct::*;
     for (key, act) in [
-        ("n", AddTask),
         ("insert", AddTask),
-        ("x", DeleteTask),
         ("delete", DeleteTask),
-        ("enter", Rename),
-        ("f2", Rename),
-        ("d", Duration),
-        ("p", AddLink),
-        ("c", Constraint),
-        ("a", Assign),
-        ("b", Baseline),
         ("f3", FindNext),
     ] {
         assert_eq!(key_act(key, Modifiers::default()), Some(act));
@@ -243,6 +234,7 @@ fn keys_and_whole_route_enforce_modifiers() {
             "l",
             Modifiers {
                 shift: true,
+                control: true,
                 ..Modifiers::default()
             }
         ),
