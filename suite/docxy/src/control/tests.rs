@@ -67,6 +67,8 @@ struct Snapshot {
     selected: usize,
     prompt: String,
     query: String,
+    leveled: bool,
+    scroll: Point<Pixels>,
     offsets: (f32, f32),
     reveal: Option<usize>,
     path: Option<PathBuf>,
@@ -82,6 +84,8 @@ fn snapshot(t: &DocTab) -> Snapshot {
         selected: v.ed.sel(),
         prompt: format!("{:?}", v.prompt),
         query: v.ed.find_query().into(),
+        leveled: v.ed.leveled(),
+        scroll: v.scroll.0.borrow().base_handle.offset(),
         offsets: (v.table_x, v.gantt_x),
         reveal: v
             .scroll
@@ -323,6 +327,17 @@ fn reload_commits_only_a_successful_load() {
     let original = std::fs::read(&source).unwrap();
     let mut tabs = vec![project_tab_from_path(&source)];
     vm(&mut tabs[0]).ed.rename(1, "unsaved").unwrap();
+    vm(&mut tabs[0]).ed.toggle_level();
+    vm(&mut tabs[0]).ed.find("unsaved");
+    vm(&mut tabs[0]).layout(400.);
+    vm(&mut tabs[0]).table_x = 20.;
+    vm(&mut tabs[0]).gantt_x = 10.;
+    let scroll = view(&tabs[0]).scroll.clone();
+    scroll
+        .0
+        .borrow()
+        .base_handle
+        .set_offset(point(px(0.), px(-24.)));
     tabs[0].dirty = true;
     vm(&mut tabs[0]).open_prompt(PromptKind::Rename);
     let before = snapshot(&tabs[0]);
@@ -338,10 +353,67 @@ fn reload_commits_only_a_successful_load() {
     assert_eq!(view(&tabs[0]).ed.undo_depth(), 0);
     assert!(view(&tabs[0]).prompt.is_none());
     assert_ne!(view(&tabs[0]).ed.project(), &before.project);
+    let after = snapshot(&tabs[0]);
+    assert!(after.leveled);
+    assert_eq!(after.query, before.query);
+    assert_eq!(after.scroll, before.scroll);
+    assert_eq!(after.offsets, before.offsets);
+    assert!(std::rc::Rc::ptr_eq(&scroll.0, &view(&tabs[0]).scroll.0));
+    assert_eq!(
+        after.status,
+        project_tab_from_path(&source).status.to_string()
+    );
+    // A shorter schedule or narrower content clamps stale offsets without replacing the view.
+    vm(&mut tabs[0]).table_x = f32::MAX;
+    vm(&mut tabs[0]).gantt_x = f32::MAX;
+    call(&mut tabs, 0, "proj.reload", Json::Null).unwrap();
+    let v = view(&tabs[0]);
+    assert!(v.table_x > 0. && v.table_x < f32::MAX);
+    assert_eq!(v.gantt_x, (v.scale.width() - v.gantt_w).max(0.));
+    let offsets = (v.table_x, v.gantt_x);
+    vm(&mut tabs[0]).key("right", true);
+    vm(&mut tabs[0]).key("right", false);
+    assert_eq!((view(&tabs[0]).table_x, view(&tabs[0]).gantt_x), offsets);
     tabs[0].path = None;
     let before = snapshot(&tabs[0]);
     assert!(call(&mut tabs, 0, "proj.reload", Json::Null).is_err());
     assert_eq!(snapshot(&tabs[0]), before);
+}
+
+#[test]
+fn request_bridge_stays_asleep_until_arrival_and_reports_disconnect() {
+    use std::future::Future;
+    use std::sync::{Arc, mpsc};
+    use std::task::{Context as TaskContext, Poll, Wake, Waker};
+
+    struct WakeSignal(mpsc::Sender<()>);
+    impl Wake for WakeSignal {
+        fn wake(self: Arc<Self>) {
+            let _ = self.0.send(());
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let pending = async_requests(rx);
+    let (wake_tx, wakes) = mpsc::channel();
+    let waker = Waker::from(Arc::new(WakeSignal(wake_tx)));
+    let mut cx = TaskContext::from_waker(&waker);
+    let mut receive = std::pin::pin!(pending.recv_async());
+    assert!(receive.as_mut().poll(&mut cx).is_pending());
+    assert_eq!(
+        wakes.recv_timeout(Duration::from_secs(2)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    );
+    tx.send(42).unwrap();
+    wakes.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(receive.as_mut().poll(&mut cx), Poll::Ready(Ok(42)));
+    let mut receive = std::pin::pin!(pending.recv_async());
+    assert!(receive.as_mut().poll(&mut cx).is_pending());
+    drop(tx);
+    wakes.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        receive.as_mut().poll(&mut cx),
+        Poll::Ready(Err(flume::RecvError::Disconnected))
+    );
 }
 
 #[test]

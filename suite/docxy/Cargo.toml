@@ -28,9 +28,9 @@ docxcore = { path = "../../docxcore" }
 gridcore = { path = "../../gridcore" }
 projcore = { path = "../../projcore" }
 mppread = { path = "../../mppread" }
-# The loopback-JSON control server the opt-in UI test harness (--harness) runs on;
-# the same crate the terminal editors are driven through.
+# Loopback-JSON control for normal Project tabs and the opt-in UI test harness.
 ctlcore = { path = "../../ctlcore" }
+flume = "0.12"
 ribbonspec = { path = "../../ribbonspec" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

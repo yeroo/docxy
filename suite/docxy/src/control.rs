@@ -1,8 +1,8 @@
-//! Project control policy over live tabs, followed by the normal-mode server pump.
+//! Project control policy over live tabs and the shared control server pump.
 use crate::*;
 use ctlcore::json::Json;
 use std::path::Path;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
 #[derive(Debug, Default, PartialEq)]
@@ -183,7 +183,17 @@ pub(crate) fn project_verb(
                     .as_ref()
                     .ok_or("project has no file path to reload")?;
                 let loaded = loaded_project(path)?;
-                *tab = loaded;
+                let Surface::Project(fresh) = loaded.surface else {
+                    unreachable!()
+                };
+                let Surface::Project(v) = &mut tab.surface else {
+                    unreachable!()
+                };
+                v.ed.replace_project(fresh.ed.project().clone());
+                v.cancel_prompt();
+                v.refresh_schedule_layout();
+                tab.dirty = false;
+                tab.status = loaded.status;
                 Ok((
                     path_info(tab, index),
                     Effect {
@@ -215,6 +225,76 @@ pub(crate) fn project_verb(
 pub(crate) struct ControlLink {
     pub(crate) _server: ctlcore::Server,
     pub(crate) _pump: Task<()>,
+}
+
+/// A reply, with an optional harness-only request to quit after it is sent.
+pub(crate) struct Done {
+    pub result: Json,
+    pub quit: bool,
+}
+
+impl Done {
+    pub(crate) fn ok(result: Json) -> Result<Self, String> {
+        Ok(Self {
+            result,
+            quit: false,
+        })
+    }
+}
+
+/// Block off the UI thread; the foreground receiver wakes only for arrivals or closure.
+fn async_requests<T: Send + 'static>(rx: Receiver<T>) -> flume::Receiver<T> {
+    let (tx, pending) = flume::bounded(1);
+    std::thread::spawn(move || {
+        while let Ok(request) = rx.recv() {
+            if tx.send(request).is_err() {
+                break;
+            }
+        }
+    });
+    pending
+}
+
+type Dispatch =
+    fn(&mut Docxy, &str, &Json, &mut Window, &mut Context<Docxy>) -> Result<Done, String>;
+
+pub(crate) fn attach_with_dispatch(
+    view: &Entity<Docxy>,
+    server: ctlcore::Server,
+    rx: Receiver<ctlcore::Request>,
+    window: &mut Window,
+    cx: &mut App,
+    dispatch: Dispatch,
+) -> ControlLink {
+    let target = view.downgrade();
+    let pending = async_requests(rx);
+    let pump = window.spawn(cx, async move |cx: &mut AsyncWindowContext| {
+        while let Ok(req) = pending.recv_async().await {
+            match target.update_in(cx, |this, window, cx| {
+                dispatch(this, &req.verb, &req.args, window, cx)
+            }) {
+                Ok(Ok(done)) => {
+                    req.reply_ok(done.result);
+                    if done.quit {
+                        // ctlcore's connection thread needs time to put the reply on the wire.
+                        const QUIT_GRACE: Duration = Duration::from_millis(120);
+                        cx.background_executor().timer(QUIT_GRACE).await;
+                        let _ = cx.update(|_, cx| cx.quit());
+                        break;
+                    }
+                }
+                Ok(Err(e)) => req.reply_err(e),
+                Err(e) => {
+                    req.reply_err(format!("the app is gone: {e}"));
+                    break;
+                }
+            }
+        }
+    });
+    ControlLink {
+        _server: server,
+        _pump: pump,
+    }
 }
 
 impl Docxy {
@@ -251,39 +331,19 @@ pub(crate) fn attach(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let target = view.downgrade();
-    let pump = window.spawn(cx, async move |cx: &mut AsyncWindowContext| {
-        loop {
-            match rx.try_recv() {
-                Ok(req) => {
-                    let (verb, args) = (req.verb.clone(), req.args.clone());
-                    match target.update_in(cx, |this, window, cx| {
-                        this.dispatch_project(&verb, &args, window, cx)
-                            .unwrap_or_else(|| Err(format!("unknown verb '{verb}'")))
-                    }) {
-                        Ok(Ok(result)) => req.reply_ok(result),
-                        Ok(Err(e)) => req.reply_err(e),
-                        Err(e) => {
-                            req.reply_err(format!("the app is gone: {e}"));
-                            break;
-                        }
-                    }
-                }
-                Err(TryRecvError::Empty) => {
-                    cx.background_executor()
-                        .timer(Duration::from_millis(8))
-                        .await
-                }
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-    });
-    view.update(cx, |this, _| {
-        this.control = Some(ControlLink {
-            _server: server,
-            _pump: pump,
-        })
-    });
+    let link = attach_with_dispatch(
+        view,
+        server,
+        rx,
+        window,
+        cx,
+        |this, verb, args, window, cx| {
+            this.dispatch_project(verb, args, window, cx)
+                .unwrap_or_else(|| Err(format!("unknown verb '{verb}'")))
+                .and_then(Done::ok)
+        },
+    );
+    view.update(cx, |this, _| this.control = Some(link));
 }
 
 #[cfg(test)]

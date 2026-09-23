@@ -38,6 +38,8 @@
 //! | Step | Drives |
 //! |---|---|
 //! | `open <path>` | the file, resolved against the script's own directory |
+//! | `open copy:<path>` | a private copy of that file in the run directory |
+//! | `call <verb> <json-object>` | a verb with its verbatim JSON payload, parsed before launch |
 //! | `click <cell> [shift] [double]` | the cell's click handler |
 //! | `drag <from> -> <to>` | press, one move per cell crossed, release |
 //! | `type <text>` | one key event per character |

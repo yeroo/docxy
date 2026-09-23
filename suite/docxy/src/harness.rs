@@ -26,14 +26,14 @@
 //! Without the flag the separate Project-only control server runs instead;
 //! harness verbs and its UI dialog overrides remain disabled.
 
+use crate::control::Done;
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
-use gpui::{App, AsyncWindowContext, Context, Entity, KeyDownEvent, Keystroke, Window};
+use gpui::{App, Context, Entity, KeyDownEvent, Keystroke, Window};
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
+use std::sync::mpsc::Receiver;
 
 /// The command-line flag that turns the harness on.
 pub const HARNESS_FLAG: &str = "--harness";
@@ -46,17 +46,6 @@ pub const HARNESS_ENV: &str = "DOCXY_HARNESS";
 /// terminal editor already owns that, and a harness instance is a different
 /// thing to address even though it is the same product.
 const CTL_APP: &str = "suite";
-
-/// How often the pump looks for a queued request. Requests arrive on ctlcore's
-/// own threads, but they may only be *applied* on the app thread, so the pump
-/// polls rather than blocks. 8ms is under a frame at 60Hz — invisible to a test
-/// — and only runs at all in harness mode.
-const POLL: Duration = Duration::from_millis(8);
-
-/// How long `quit` waits after its reply before stopping the app, so the reply
-/// is on the wire first. Long enough for a loopback write, short enough that a
-/// test never notices.
-const QUIT_GRACE: Duration = Duration::from_millis(120);
 
 // ---------------------------------------------------------------------------
 // Command line
@@ -281,70 +270,13 @@ pub fn attach(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let target = view.clone();
-    let pump = window.spawn(cx, async move |cx: &mut AsyncWindowContext| {
-        loop {
-            match rx.try_recv() {
-                Ok(req) => {
-                    let (verb, args) = (req.verb.clone(), req.args.clone());
-                    match target.update_in(cx, |this, window, cx| {
-                        dispatch(this, &verb, &args, window, cx)
-                    }) {
-                        Ok(Ok(done)) => {
-                            let quit = done.quit;
-                            req.reply_ok(done.result);
-                            if quit {
-                                // Answer first, then go. The reply is handed to
-                                // ctlcore's connection thread to write, so
-                                // quitting in the same breath would race that
-                                // write and the driver would see a closed
-                                // socket instead of the ok it asked for.
-                                cx.background_executor().timer(QUIT_GRACE).await;
-                                let _ = cx.update(|_, cx| cx.quit());
-                                break;
-                            }
-                        }
-                        Ok(Err(e)) => req.reply_err(e),
-                        // The window closed between the request arriving and it
-                        // being applied; answer rather than leave a client hung.
-                        Err(e) => req.reply_err(format!("the app is gone: {e}")),
-                    }
-                }
-                Err(TryRecvError::Empty) => cx.background_executor().timer(POLL).await,
-                // The server was dropped: nothing more will arrive.
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-    });
-    view.update(cx, |this, _| {
-        this.harness = Some(crate::control::ControlLink {
-            _server: server,
-            _pump: pump,
-        })
-    });
+    let link = crate::control::attach_with_dispatch(view, server, rx, window, cx, dispatch);
+    view.update(cx, |this, _| this.harness = Some(link));
 }
 
 // ---------------------------------------------------------------------------
 // Verbs
 // ---------------------------------------------------------------------------
-
-/// What a verb did: the reply, and whether the app should stop afterwards.
-///
-/// `quit` is the one verb that outlives its own reply, so it cannot simply
-/// return a `Json` — the pump has to answer the client BEFORE the process goes.
-pub struct Done {
-    pub result: Json,
-    pub quit: bool,
-}
-
-impl Done {
-    fn ok(result: Json) -> Result<Done, String> {
-        Ok(Done {
-            result,
-            quit: false,
-        })
-    }
-}
 
 /// The most cells a `drag` verb walks through. A pointer crosses every cell on
 /// its way, and so does the verb — but a drag across a thousand rows would run

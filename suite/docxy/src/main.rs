@@ -1092,10 +1092,9 @@ struct Docxy {
     // While this is None the bar keeps following the selection, which is what
     // these bars did before they grew a range field.
     bar_range: Option<String>,
-    // The UI test harness's control server and its request pump, parked here so
-    // they live as long as the window. `None` on every normal launch — the
-    // harness is opt-in per process (`--harness`) and starts nothing otherwise.
+    // The opt-in UI harness server and pump, kept alive with the window.
     harness: Option<control::ControlLink>,
+    // The normal Project-only server and pump; absent in harness mode.
     control: Option<control::ControlLink>,
     // Measured bounds of the regions the harness's `rect` verb can name, written
     // by `probe` elements during layout. Costs one out-of-flow zero-paint element
@@ -20849,10 +20848,7 @@ fn main() {
             }
         }
     } else {
-        match ctlcore::serve(
-            &harness::control_dir(&config_root()),
-            &harness::instance_name(),
-        ) {
+        match harness::start(&config_root()) {
             Ok(pair) => Some(pair),
             Err(e) => {
                 eprintln!("docxy: Project control unavailable: {e}");
