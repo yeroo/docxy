@@ -239,6 +239,12 @@ State keys, as the app reports them after every driving verb:
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
+| `selected_task`, `tasks`, `bar_<id>` | Project: selected task index (zero-based), task count, and each task's bar geometry by displayed ID |
+
+Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
+from the timeline scale origin, or `none` when the task has no schedule result.
+Kinds are `critical`, `on-track`, `summary`, and `milestone`. These state keys
+cover every task, including those outside the visible timeline.
 
 `nothing` is how a script writes "this key is null" (`assert chart_sel is
 nothing`); `null` and `none` read the same, and `empty` matches an empty string.
@@ -246,7 +252,9 @@ Comparison is case-insensitive, and `is not` negates.
 
 ### Regions
 
-`window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`. Inside a
+`window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
+`bar:<id>` (for example `bar:3`). `gantt` is the visible Project timeline body,
+excluding its header and divider; `bar:<id>` addresses a task by displayed ID. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 
@@ -262,7 +270,7 @@ view dirty, so when its reply goes out the frame that shows what it did has not
 been laid out yet; the driver reads the frame counter, sends its verbs, then
 waits for `rect` to report a higher one before capturing.
 
-**A region that is only partly on screen is refused, not guessed at.** Both
+**A region that is only partly on screen is refused, except for Project bars.** Both
 sides of the crop enforce this, because a half-visible edge is the one failure
 mode a pixel assertion cannot notice by itself: the picture is a perfectly good
 picture, the probe reads a perfectly good line, and the verdict is about the
@@ -280,10 +288,18 @@ wrong pixels.
   reporting the same geometry as half a dozen more failures. The same goes for a
   region too small to read an edge of at all.
 
+Project `bar:<id>` regions are the exception: long bars commonly extend beyond
+the timeline, so the app returns their visible part, clipped to the timeline
+viewport in both axes. An entirely outside bar or a task row that is not rendered
+is refused. A screenshot of a clipped bar records that visible part; its crop
+edge may be the pane edge, not the bar's actual edge. Use a fully visible bar for
+a border assertion. Window-edge clipping still follows the harness rule above.
+
 ### Colours
 
 `teal`/`brand` (`#2AA79B` — the selection ring and the pointed range's dashes),
 `blue` (`#4472C4`), `purple`, `green`, `white`, `black`, or any `#rrggbb`.
+`amber` (`#D9642C`) is the Project critical-path bar and mirrors `GANTT_CRIT`.
 
 **Name the colour when you mean "no selection here."** An expectation with no
 colour asks "is there *any* line here", measured against the region's own

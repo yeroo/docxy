@@ -2,7 +2,6 @@
 use super::*;
 
 pub(crate) const DAY_W: f32 = 22.;
-pub(crate) const TABLE_W: f32 = 908.;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum BarKind {
@@ -122,23 +121,18 @@ pub(crate) fn table_pane_width(width: f32) -> f32 {
 }
 
 pub(crate) fn intersect(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
-    let x = a.origin.x.max(b.origin.x);
-    let y = a.origin.y.max(b.origin.y);
-    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
-    let bottom = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
-    (right > x && bottom > y).then(|| Bounds {
-        origin: point(x, y),
-        size: size(right - x, bottom - y),
-    })
+    let r = a.intersect(&b);
+    (!r.is_empty()).then_some(r)
 }
 
 pub(crate) fn gantt_viewport(body: Bounds<Pixels>, table_w: f32) -> Option<Bounds<Pixels>> {
+    let chart_x = table_w + GANTT_INSET;
     intersect(
         body,
         Bounds {
-            origin: point(body.origin.x + px(table_w), body.origin.y),
+            origin: point(body.origin.x + px(chart_x), body.origin.y),
             size: size(
-                (body.size.width - px(table_w)).max(px(0.)),
+                (body.size.width - px(chart_x)).max(px(0.)),
                 body.size.height,
             ),
         },

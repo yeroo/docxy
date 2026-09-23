@@ -55,9 +55,9 @@ use crate::probe::{
 };
 use std::path::Path;
 
-/// The colours the grid draws its outlines in, by the name a test would use.
+/// The colours used by grid outlines and Gantt bars, by the name a test would use.
 ///
-/// These mirror constants in `suite/docxy/src/main.rs` — `BRAND`, and the chart
+/// These mirror constants in `suite/docxy/src/main.rs` — `BRAND`, `GANTT_CRIT`, and the chart
 /// slot colours `CHART_VALUES_COLOR` / `CHART_CATEGORIES_COLOR` /
 /// `CHART_NAME_COLOR` — named rather than cited by line, because the names are
 /// what `the_named_colours_are_the_grids_own` looks up and a line number here
@@ -70,8 +70,9 @@ use std::path::Path;
 pub const NAMED_COLORS: &[(&str, u32)] = &[
     // The brand teal: the selection ring, and the pointed range's dashes.
     ("teal", 0x2AA79B),
-    ("amber", 0xD9642C),
     ("brand", 0x2AA79B),
+    // The Gantt critical-path bar (GANTT_CRIT).
+    ("amber", 0xD9642C),
     // A selected chart's source areas: Excel's own mapping.
     ("blue", 0x4472C4),
     ("purple", 0x7030A0),

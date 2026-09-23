@@ -26,7 +26,7 @@ impl ProjectView {
             table_x: 0.,
             gantt_x: 0.,
             table_w: 590.,
-            gantt_w: 590.,
+            gantt_w: 590. - GANTT_INSET,
             scale,
         }
     }
@@ -34,7 +34,7 @@ impl ProjectView {
     pub fn layout(&mut self, width: f32) {
         self.scale = gantt_scale(&self.ed);
         self.table_w = table_pane_width(width);
-        self.gantt_w = (width - self.table_w).max(0.);
+        self.gantt_w = (width - self.table_w - GANTT_INSET).max(0.);
         self.clamp_offsets();
     }
 
@@ -481,6 +481,19 @@ fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
 
 const ROW_H: f32 = 28.;
 const WIDTHS: [f32; 7] = [48., 240., 80., 100., 100., 150., 190.];
+const TABLE_W: f32 = sum_widths();
+/// Includes the divider, leaving space between clipped table text and the chart.
+const GANTT_INSET: f32 = 6.;
+
+const fn sum_widths() -> f32 {
+    let mut total = 0.;
+    let mut i = 0;
+    while i < WIDTHS.len() {
+        total += WIDTHS[i];
+        i += 1;
+    }
+    total
+}
 
 fn row_cells(values: [String; 7], indent: f32) -> impl IntoElement {
     h_flex()
@@ -506,6 +519,22 @@ fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement 
         .flex_none()
         .overflow_hidden()
         .child(div().absolute().left(px(-offset)).top_0().child(content))
+}
+
+fn timeline_pane(width: f32, offset: f32, pal: Pal, content: impl IntoElement) -> impl IntoElement {
+    h_flex()
+        .w(px(width + GANTT_INSET))
+        .h(px(ROW_H))
+        .flex_none()
+        .child(
+            div()
+                .w(px(GANTT_INSET))
+                .h_full()
+                .flex_none()
+                .border_l(px(1.))
+                .border_color(pal.border),
+        )
+        .child(pane(width, offset, content))
 }
 
 pub(super) fn project_el(
@@ -555,9 +584,10 @@ pub(super) fn project_el(
                         0.,
                     ),
                 ))
-                .child(pane(
+                .child(timeline_pane(
                     gantt_w,
                     gantt_x,
+                    pal,
                     gantt_header(scale, gantt_x, gantt_w, pal),
                 )),
         )
@@ -601,9 +631,10 @@ pub(super) fn project_el(
                                                 table_x,
                                                 row_cells(project_row(&v.ed, task), indent),
                                             ))
-                                            .child(pane(
+                                            .child(timeline_pane(
                                                 gantt_w,
                                                 gantt_x,
+                                                pal,
                                                 gantt_strip(
                                                     gantt_bar(&v.ed, task, scale),
                                                     task.id,

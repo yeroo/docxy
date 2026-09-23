@@ -630,7 +630,7 @@ pub enum Region {
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
-/// `cell:A1:C5`, `chart:0`.
+/// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.

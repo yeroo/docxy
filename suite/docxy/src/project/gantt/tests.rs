@@ -112,10 +112,11 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
         v.key("right", false, true);
     }
     assert_eq!(v.table_x, TABLE_W - 590.);
-    assert_eq!(v.gantt_x, v.scale.width() - 590.);
+    assert_eq!(v.gantt_w, 584.);
+    assert_eq!(v.gantt_x, v.scale.width() - 584.);
     v.ed.set_duration(1, "1d").unwrap();
     v.layout(1180.);
-    assert_eq!(v.gantt_x, 70.);
+    assert_eq!(v.gantt_x, 76.);
     v.layout(2000.);
     assert_eq!((v.table_x, v.gantt_x), (0., 0.));
     for _ in 0..10 {
@@ -193,7 +194,7 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
     };
     assert_eq!(
         project_region(&v, &probes, harness::Region::Gantt).unwrap(),
-        rect(410., 80., 400., 400.)
+        rect(416., 80., 394., 400.)
     );
     assert!(
         project_region(&v, &probes, harness::Region::Bar(1))
@@ -210,10 +211,11 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
         .push(("bar:1".into(), rect(400., 75., 40., 14.)));
     assert_eq!(
         project_region(&v, &probes, harness::Region::Bar(1)).unwrap(),
-        rect(410., 80., 30., 9.)
+        rect(416., 80., 24., 9.)
     );
     for r in [
         rect(350., 100., 40., 14.),
+        rect(410., 100., 6., 14.), // divider/inset is outside the chart viewport
         rect(420., 60., 40., 14.),
         rect(420., 480., 40., 14.),
         rect(810., 100., 40., 14.),
