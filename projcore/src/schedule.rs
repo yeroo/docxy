@@ -44,7 +44,9 @@ pub struct TaskResult {
     /// Total slack in working minutes (late − early). ≤ 0 ⇒ critical.
     pub total_slack_min: i64,
     /// Free slack in working minutes (delay possible without moving any
-    /// successor). Precise for FS successors; else equals total slack.
+    /// successor), floored at zero. For leaves, uses the minimum gap to FS
+    /// successors, falling back to total slack when there are no FS successors.
+    /// For summaries, uses total slack floored at zero.
     pub free_slack_min: i64,
     pub critical: bool,
 }

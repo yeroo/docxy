@@ -42,6 +42,26 @@ fn every_file_parses_and_schedules() {
 }
 
 #[test]
+fn summary_fixture_exports_phase_row() {
+    let xml = std::fs::read_to_string(corpus_dir().join("10-summary.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let md = projcore::gantt::to_markdown(&proj, &schedule(&proj));
+    let rows: Vec<_> = md
+        .lines()
+        .filter(|line| line.starts_with("| "))
+        .skip(1)
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "| **Phase** | 2026-03-02 08:00:00 | 2026-03-03 17:00:00 | 2d | 0d | 0d | ✓ |",
+            "| A | 2026-03-02 08:00:00 | 2026-03-02 17:00:00 | 1d | 0d | 0d | ✓ |",
+            "| B | 2026-03-03 08:00:00 | 2026-03-03 17:00:00 | 1d | 0d | 0d | ✓ |",
+        ]
+    );
+}
+
+#[test]
 fn every_corpus_project_has_a_critical_leaf() {
     for path in mspdi_files() {
         let proj = read_mspdi(&std::fs::read_to_string(&path).unwrap()).unwrap();

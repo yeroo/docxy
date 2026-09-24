@@ -1557,7 +1557,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             fmt_days(app.ed.project().minutes_to_days(t.duration_min))
         };
         let slack = r
-            .map(|r| fmt_days(app.ed.project().minutes_to_days(r.total_slack_min.max(0))))
+            .map(|r| fmt_days(app.ed.project().minutes_to_days(r.total_slack_min)))
             .unwrap_or_else(|| "?".into());
         let crit = r.is_some_and(|r| r.critical);
         let mut style = Style::default();
@@ -1808,6 +1808,31 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_grid_reports_negative_total_slack() {
+        use projcore::model::ConstraintType;
+        use ratatui::backend::TestBackend;
+        let mut proj = projcore::mspdi::read_mspdi(include_str!(
+            "../../corpus/mspdi/14-link-sf-before-start.xml"
+        ))
+        .unwrap();
+        proj.tasks[0].name = "Late".into();
+        proj.tasks[0].constraint = ConstraintType::FinishNoLaterThan;
+        proj.tasks[0].constraint_date = Some(DateTime::from_ymd_hm(2026, 2, 26, 17, 0));
+        let mut app = App::new(proj, None, false);
+        assert_eq!(app.ed.schedule().get(1).unwrap().total_slack_min, -480);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (1..45)
+            .map(|x| buf.cell((x, app.list_y0)).unwrap().symbol())
+            .collect();
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["•", "Late", "2d", "-1d"]
+        );
+    }
 
     #[test]
     fn gantt_origin_includes_pre_start_sf_bar() {
