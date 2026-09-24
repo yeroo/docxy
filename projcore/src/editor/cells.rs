@@ -10,7 +10,10 @@ impl Editor {
         duration: Option<i64>,
         predecessors: Option<&[Predecessor]>,
     ) -> Result<(), String> {
-        let mut total = 200_i64 * 480 + 480;
+        // Timeline::build can reach 100 years plus its final guard day. Reserve
+        // that index as well as the scheduler's padding so index + duration/lag
+        // stays representable even when a dated constraint pushes the start out.
+        let mut total = (366_i64 * 100 + 1) * 1440 + 200 * 480 + 480;
         for task in &self.proj.tasks {
             let minutes = if task.uid == uid {
                 duration.unwrap_or(task.duration_min)
@@ -103,7 +106,44 @@ impl Editor {
             .max()
             .unwrap_or(0);
         let mut wanted = Vec::new();
-        for name in names.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for raw in names {
+            // Imported names may contain significant whitespace. Match the raw
+            // token against retained assignments before normalizing user input.
+            let assigned_resources: Vec<_> = resources
+                .iter()
+                .filter(|r| {
+                    self.proj
+                        .assignments
+                        .iter()
+                        .any(|a| a.task_uid == uid && a.resource_uid == r.uid)
+                })
+                .collect();
+            let mut retained: Vec<_> = assigned_resources
+                .iter()
+                .filter(|r| r.name == *raw)
+                .map(|r| r.uid)
+                .collect();
+            if retained.is_empty() {
+                retained = assigned_resources
+                    .iter()
+                    .filter(|r| r.name.eq_ignore_ascii_case(raw))
+                    .map(|r| r.uid)
+                    .collect();
+            }
+            match retained.as_slice() {
+                [rid] => {
+                    if !wanted.contains(rid) {
+                        wanted.push(*rid);
+                    }
+                    continue;
+                }
+                [] => {}
+                _ => return Err(format!("Resource name '{raw}' is ambiguous")),
+            }
+            let name = raw.trim();
+            if name.is_empty() {
+                continue;
+            }
             let matches: Vec<_> = resources
                 .iter()
                 .filter(|r| r.name.eq_ignore_ascii_case(name))

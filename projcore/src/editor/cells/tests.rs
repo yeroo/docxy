@@ -157,6 +157,97 @@ fn aggregate_duration_and_lag_overflow_reject_before_snapshot() {
 }
 
 #[test]
+fn scheduling_range_reserves_room_for_dated_start_indices() {
+    let mut ed = editor();
+    // Keep the old aggregate-only preflight below i64::MAX, so rejection must
+    // come from reserving room for the later start index rather than task sums.
+    for task in &mut ed.proj.tasks {
+        task.duration_min = 0;
+    }
+    ed.set_constraint_typed(
+        10,
+        ConstraintType::StartNoEarlierThan,
+        Some(parse_cell_date("2027-01-04").unwrap()),
+    )
+    .unwrap();
+    ed.rename(10, "temporary").unwrap();
+    ed.undo();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    let minutes = 9_223_372_036_854_679_000;
+    assert!(
+        ed.set_duration(10, "9223372036854679000m")
+            .unwrap_err()
+            .contains("scheduling range")
+    );
+    assert!(ed.set_duration_min(10, minutes).is_err());
+    assert!(
+        ed.update_task(
+            10,
+            TaskPatch {
+                name: Some("must not rename".into()),
+                duration_min: Some(minutes),
+                ..TaskPatch::default()
+            }
+        )
+        .is_err()
+    );
+    for lag_min in [minutes, -minutes] {
+        assert!(
+            ed.set_predecessors(
+                20,
+                vec![Predecessor {
+                    uid: 10,
+                    link: LinkType::FinishStart,
+                    lag_min,
+                }]
+            )
+            .unwrap_err()
+            .contains("scheduling range")
+        );
+    }
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn resource_tokens_preserve_significant_whitespace_and_prefer_exact_assignments() {
+    for (stored, token) in [
+        ("Alice ", "Alice "),
+        (" Alice", " alice"),
+        (" Alice ", " ALICE "),
+    ] {
+        let mut ed = editor();
+        ed.assign_resource(10, "Alice").unwrap();
+        ed.proj.resources[0].name = stored.into();
+        ed.proj.assignments[0].units = 0.5;
+        ed.proj.assignments[0].work_min = 123;
+        let retained = ed.proj.assignments[0];
+        let before = ed.project().clone();
+        let depth = ed.undo_depth();
+        ed.set_resources(10, &[token.into(), " Bob ".into()])
+            .unwrap();
+        assert!(ed.proj.assignments.contains(&retained));
+        assert_eq!(ed.proj.resources.len(), 2);
+        assert_eq!(ed.proj.resources[0].name, stored);
+        assert_eq!(ed.proj.resources[1].name, "Bob");
+        assert_eq!(ed.undo_depth(), depth + 1);
+        ed.undo();
+        ed.mark_saved();
+        ed.set_resources(10, &[token.into()]).unwrap();
+        unchanged(&ed, &before, (depth, 1, false));
+    }
+    let mut ed = editor();
+    ed.set_resources(10, &["Alice".into(), "Second".into()])
+        .unwrap();
+    ed.proj.resources[1].name = "ALICE".into();
+    let retained = ed.proj.assignments.clone();
+    ed.set_resources(10, &["Alice".into(), "ALICE".into(), "Bob".into()])
+        .unwrap();
+    assert!(retained.iter().all(|a| ed.proj.assignments.contains(a)));
+}
+
+#[test]
 fn negative_duration_rejection_is_atomic_for_all_update_entry_points() {
     let mut ed = editor();
     ed.rename(10, "temporary").unwrap();
@@ -219,12 +310,12 @@ fn duplicate_resource_names_preserve_the_assigned_identity_or_reject_ambiguity()
     ed.set_resources(10, &["alice".into()]).unwrap();
     unchanged(&ed, &before, (depth, 1, false));
     // assign_resource retains its existing first-match behavior; two assigned matches
-    // cannot be distinguished by the list syntax and must also be rejected.
+    // with neither spelling an exact match must still be rejected.
     ed.assign_resource(10, "Alice").unwrap();
     let before = ed.project().clone();
     let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
     assert!(
-        ed.set_resources(10, &["Alice".into(), "Bob".into()])
+        ed.set_resources(10, &["alice".into(), "Bob".into()])
             .unwrap_err()
             .contains("ambiguous")
     );
