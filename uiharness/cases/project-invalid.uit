@@ -7,13 +7,13 @@ test project invalid prompts preserve the schedule
   assert status is Couldn't read duration 'banana' (try 3d, 4h, 2w)
   assert dirty is false
   assert bar_2 is on-track 0-0
-  key alt s p
+  key alt t p
   type 999
   key enter
   assert status is No other task with ID 999
   assert dirty is false
   assert bar_2 is on-track 0-0
-  key alt s c
+  key alt t c
   key backspace backspace backspace backspace
   type mso
   key enter

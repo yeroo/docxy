@@ -2,7 +2,7 @@ test empty gantt indent is a no-op
   open ../fixtures/gantt-empty.xml
   assert tasks is 0
   assert dirty is false
-  key alt s b
+  key alt p b
   assert dirty is false
   key tab shift+tab
   assert status is loaded — 0 tasks
