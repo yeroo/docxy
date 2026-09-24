@@ -111,3 +111,29 @@ fn headless_save_never_writes_one_format_under_another_name() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// `--gantt-md` used to win and exit 0 without ever attempting the `--save`.
+#[test]
+fn headless_gantt_md_and_save_together_are_refused() {
+    let dir = std::env::temp_dir().join(format!("yppxy-cli-save-combo-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let gantt = dir.join("g.md");
+    let target = dir.join("out.yppx");
+    let result = Command::new(env!("CARGO_BIN_EXE_yppxy"))
+        .arg("--gantt-md")
+        .arg(&gantt)
+        .arg("--save")
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert_eq!(result.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("--gantt-md and --save cannot be combined"),
+        "{stderr}"
+    );
+    assert!(!gantt.exists());
+    assert!(!target.exists());
+    std::fs::remove_dir_all(dir).unwrap();
+}

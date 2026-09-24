@@ -186,6 +186,11 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         }
         i += 1;
     }
+    // Each headless mode exits after its own output, so a combination would
+    // silently skip one of them.
+    if out.gantt_md.is_some() && out.save.is_some() {
+        return Err("--gantt-md and --save cannot be combined".into());
+    }
     Ok(out)
 }
 
