@@ -324,12 +324,9 @@ impl<'a> Scheduler<'a> {
             .collect();
         let leaf_uids: std::collections::HashSet<i32> =
             leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> = self
-            .proj
-            .tasks
+        let idx_of: HashMap<i32, usize> = leaves
             .iter()
-            .enumerate()
-            .map(|(i, t)| (t.uid, i))
+            .map(|&i| (self.proj.tasks[i].uid, i))
             .collect();
 
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
@@ -658,21 +655,28 @@ fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
 /// Reject files whose leaf tasks cannot be placed on any working time.
 pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
     // Match Scheduler::new's last-wins calendar map and tl's default fallback.
-    let calendars: HashMap<_, _> = proj.calendars.iter().map(|c| (c.uid, c)).collect();
+    let calendars: HashMap<_, _> = proj
+        .calendars
+        .iter()
+        .map(|cal| {
+            let has_work = cal
+                .week
+                .iter()
+                .flat_map(|day| &day.times)
+                .any(|t| t.from < t.to);
+            (cal.uid, (cal, has_work))
+        })
+        .collect();
     for task in proj.tasks.iter().filter(|t| !t.summary) {
         let uid = task.calendar_uid.unwrap_or(proj.default_calendar_uid);
-        let Some(cal) = calendars
+        let Some((cal, has_work)) = calendars
             .get(&uid)
             .or_else(|| calendars.get(&proj.default_calendar_uid))
         else {
             // The scheduler synthesizes Standard when the default is absent.
             continue;
         };
-        if week_pairs(cal)
-            .iter()
-            .flatten()
-            .all(|&(from, to)| from >= to)
-        {
+        if !has_work {
             return Some(format!(
                 "calendar {:?} (UID {}) has no working time; task {:?} (UID {}) cannot be scheduled",
                 cal.name, cal.uid, task.name, task.uid
@@ -751,7 +755,8 @@ fn descendant_leaves(proj: &Project, sidx: usize) -> Vec<i32> {
 
 /// Schedule a project: run the CPM forward and backward passes and return the
 /// computed [`Schedule`].
-/// Leaves with no working time have no result; file readers reject such projects.
+/// Leaves with no working time have no result. Readers reject files containing
+/// such leaves, and structural editor operations validate newly exposed leaves.
 pub fn schedule(proj: &Project) -> Schedule {
     Scheduler::new(proj).run()
 }
@@ -901,16 +906,13 @@ impl Scheduler<'_> {
         }
 
         let leaves: Vec<usize> = (0..self.proj.tasks.len())
-            .filter(|&i| !self.proj.tasks[i].summary && base.get(self.proj.tasks[i].uid).is_some())
+            .filter(|&i| !self.proj.tasks[i].summary && self.tl(&self.proj.tasks[i]).total > 0)
             .collect();
         let leaf_uids: std::collections::HashSet<i32> =
             leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> = self
-            .proj
-            .tasks
+        let idx_of: HashMap<i32, usize> = leaves
             .iter()
-            .enumerate()
-            .map(|(i, t)| (t.uid, i))
+            .map(|&i| (self.proj.tasks[i].uid, i))
             .collect();
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
 
@@ -1092,6 +1094,31 @@ mod tests {
             let engine = Scheduler::new(&proj);
             assert_eq!(engine.tl(&proj.tasks[0]).total == 0, invalid);
             assert_eq!(engine.run().get(1).is_none(), invalid);
+        }
+    }
+
+    #[test]
+    fn duplicate_uid_cannot_resurrect_a_leaf_on_an_empty_calendar() {
+        let valid = task(5, "Valid", 480);
+        let mut invalid = task(5, "Closed", 960);
+        invalid.calendar_uid = Some(3);
+        let mut proj = Project {
+            tasks: vec![valid.clone()],
+            calendars: vec![Calendar::standard(1), closed_calendar(3)],
+            ..Project::default()
+        };
+        let expected = schedule(&proj);
+        for tasks in [vec![valid.clone(), invalid.clone()], vec![invalid, valid]] {
+            proj.tasks = tasks;
+            let actual = schedule(&proj);
+            assert_eq!(actual.get(5), expected.get(5));
+            assert_eq!(actual.project_finish, expected.project_finish);
+            let leveled = level(&proj);
+            assert_eq!(leveled.start(5), Some(expected.get(5).unwrap().early_start));
+            assert_eq!(
+                leveled.finish(5),
+                Some(expected.get(5).unwrap().early_finish)
+            );
         }
     }
 
