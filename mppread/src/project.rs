@@ -44,7 +44,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             let is_summary = levels.get(i + 1).is_some_and(|&nxt| nxt > levels[i]);
             let mut task = Task {
                 uid: t.uid as i32,
-                id: i as i32 + 1,
+                id: t.id as i32,
                 name: t.name.clone(),
                 outline_level: levels[i],
                 summary: is_summary,

@@ -98,7 +98,17 @@ cargo test -p mppread --test oracle_corpus -- --nocapture
 
 The test also checks the 46 generated snapshots under `snapshots/`, including
 the MPP12 match-or-refuse cases. It skips an absent corpus, and checks expected
-file counts when one is present. The external paired corpus has 27 plans.
+file counts when one is present. The external paired corpus has 27 plans. It
+also checks four local row-order cases in `order/` when present: blank rows,
+inserted tasks, inserted hierarchy, and moved rows. Generate them on Windows
+with a licensed Project desktop install and pywin32:
+
+```powershell
+python corpus/tools/gen_mpp_order_cases.py
+```
+
+The generated `.mpp` and `.xml` files stay git-ignored. The generator source is
+kept with the fetch scripts in `corpus/tools/`.
 
 1. Drop a few `.mpp` files here, ideally spanning Project versions and with the
    same schedule saved *both* as `.mpp` and as MSPDI `.xml` (File ▸ Save As ▸
@@ -159,9 +169,11 @@ generated snapshots and 27 paired Project 2021 XML exports. All 46 MPP12
 snapshot files currently return a task-table error; that layout needs its own
 field map before it can be imported.
 
-Plans with blank task rows are currently refused because their short records
-are not represented in the tested layouts. Resources, assignments, calendars,
-baselines, progress, constraints, and custom fields are not imported. MPP9
+Current Project blank rows are identified by their short FixedMeta record and
+omitted, while their row IDs still count toward ID continuity. Superseded task
+records after a move are ignored by their FixedMeta kind. Tasks are emitted in
+row ID order. Resources, assignments, calendars, baselines, progress,
+constraints, and custom fields are not imported. MPP9
 link records in the local samples all have zero lag and LagFormat 7, so nonzero
 legacy lag has no oracle yet. Newest Project links have positive and negative
 lag examples checked against MSPDI.

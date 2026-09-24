@@ -45,10 +45,12 @@ pub struct MppInfo {
     pub streams: Vec<String>,
 }
 
-/// A task decoded from a recognized `.mpp` table. UID 0 is Project's summary
-/// row. Dates use `YYYY-MM-DD HH:MM`; outline levels are the file's WBS depth.
+/// A task decoded from a recognized `.mpp` table. `id` is the visible row
+/// number; `uid` is the stable reference used by predecessor links. UID 0 is
+/// Project's summary row. Dates use `YYYY-MM-DD HH:MM`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MppTask {
+    pub id: u32,
     pub uid: u32,
     pub name: String,
     pub start: Option<String>,

@@ -235,42 +235,65 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
     let fd = read("FixedData")?;
     let vm = read("VarMeta")?;
     let v2 = read("Var2Data")?;
+    if fm.len() >= 16 + 2 * 47 && u32_at(&fm, 16 + 47 + 4) == 16 {
+        let indexed = fixedmeta::current_index(&fm, &fd)?;
+        return decode_current(&cfb, prefix, &fd, &vm, &v2, indexed);
+    }
     let indexed = fixedmeta::index(&fm, &fd)?;
     let uids: HashSet<_> = indexed.iter().map(|(uid, _, _)| *uid).collect();
-    let record_len = indexed.first().map(|x| x.2).unwrap_or(202);
-    if record_len == 264 {
-        return decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids);
-    }
-    let named = names(&vm, &v2, &uids)?;
+    decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)
+}
+
+fn decode_current(
+    cfb: &Cfb,
+    prefix: &str,
+    fd: &[u8],
+    vm: &[u8],
+    v2: &[u8],
+    indexed: Vec<fixedmeta::CurrentRecord>,
+) -> Result<Vec<MppTask>, String> {
+    let uids: HashSet<_> = indexed
+        .iter()
+        .filter(|r| !r.is_null)
+        .map(|r| r.uid)
+        .collect();
+    let named = names(vm, v2, &uids)?;
     let mut out = Vec::new();
-    for (uid, off, len) in indexed {
-        if len != NEWEST.length {
-            return Err(format!("unrecognized task record length {len}"));
+    for row in indexed {
+        if row.is_null {
+            continue;
         }
-        let rec = &fd[off..off + len];
+        if row.len != NEWEST.length {
+            return Err(format!("unrecognized task record length {}", row.len));
+        }
+        let rec = &fd[row.offset..row.offset + row.len];
         let start = decode_timestamp(rec, NEWEST.start);
         let finish = decode_timestamp(rec, NEWEST.finish);
         let level = rec[NEWEST.level] as u32;
         if level > 20 {
-            return Err(format!("invalid outline level {level} for UID {uid}"));
+            return Err(format!("invalid outline level {level} for UID {}", row.uid));
         }
         if start
             .as_ref()
             .zip(finish.as_ref())
             .is_none_or(|(s, f)| s > f)
         {
-            return Err(format!("missing or inverted task dates for UID {uid}"));
+            return Err(format!(
+                "missing or inverted task dates for UID {}",
+                row.uid
+            ));
         }
         out.push(MppTask {
-            uid,
-            name: named[&uid].clone(),
+            id: row.id,
+            uid: row.uid,
+            name: named[&row.uid].clone(),
             start,
             finish,
             outline_level: Some(level),
             predecessors: Vec::new(),
         });
     }
-    links(&cfb, prefix, &mut out, NEWEST_LINK)?;
+    links(cfb, prefix, &mut out, NEWEST_LINK)?;
     Ok(out)
 }
 
@@ -306,6 +329,7 @@ fn decode_legacy(
             ));
         }
         out.push(MppTask {
+            id: i as u32,
             uid: *uid,
             name: named[uid].clone(),
             start,
@@ -354,6 +378,7 @@ mod tests {
         for (i, uid) in [0u32, 1].into_iter().enumerate() {
             let o = 48 + i * 202;
             fd[o..o + 4].copy_from_slice(&uid.to_le_bytes());
+            fd[o + 4..o + 8].copy_from_slice(&uid.to_le_bytes());
             fd[o + 172] = i as u8;
             for d in [0x68, 0x6c] {
                 fd[o + d..o + d + 4].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
@@ -365,6 +390,9 @@ mod tests {
         for (i, off) in [0u32, 16, 32, 48, 250].into_iter().enumerate() {
             let p = 16 + i * 47;
             fm[p + 4..p + 8].copy_from_slice(&off.to_le_bytes());
+            if i < 3 {
+                fm[p..p + 2].copy_from_slice(&4u16.to_le_bytes());
+            }
         }
         let mut vm = vec![0u8; 24];
         vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
@@ -425,9 +453,36 @@ mod tests {
         reject(&s);
     }
     #[test]
+    fn null_rows_are_identified_by_fixedmeta_kind_and_count_for_id_gaps() {
+        let mut s = fixture();
+        s.fd[250..254].copy_from_slice(&2u32.to_le_bytes()); // real B is row 2
+        let mut null = [0u8; 16];
+        null[0..4].copy_from_slice(&4u32.to_le_bytes()); // null UID
+        null[4..8].copy_from_slice(&1u32.to_le_bytes()); // null row ID
+        s.fd.extend_from_slice(&null);
+        s.fm[8..12].copy_from_slice(&6u32.to_le_bytes());
+        s.fm.extend_from_slice(&[0u8; 47]);
+        let p = 16 + 5 * 47;
+        s.fm[p..p + 2].copy_from_slice(&4u16.to_le_bytes());
+        s.fm[p + 4..p + 8].copy_from_slice(&452u32.to_le_bytes());
+        let decoded = decode(&file(&s, true)).unwrap();
+        assert_eq!(
+            decoded.iter().map(|t| (t.id, t.uid)).collect::<Vec<_>>(),
+            [(0, 0), (2, 1)]
+        );
+        s.fm[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
+        reject(&s); // a short record without the null marker is malformed
+        s.fm[p..p + 2].copy_from_slice(&4u16.to_le_bytes());
+        s.fd[452..456].copy_from_slice(&1u32.to_le_bytes());
+        reject(&s); // duplicate null UID is malformed
+        s.fd[452..456].copy_from_slice(&4u32.to_le_bytes());
+        s.fd[456..460].copy_from_slice(&4u32.to_le_bytes());
+        reject(&s); // task IDs must be contiguous even across null rows
+    }
+    #[test]
     fn conversion_preserves_uid_and_uses_summary_name() {
         let mut s = fixture();
-        s.fd[250..254].copy_from_slice(&7u32.to_le_bytes());
+        s.fd[254..258].copy_from_slice(&7u32.to_le_bytes());
         s.vm[36..40].copy_from_slice(&7u32.to_le_bytes());
         let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         assert_eq!(project.name, "A");
@@ -446,10 +501,10 @@ mod tests {
         s.fd[250 + 0x68 + 2..250 + 0x68 + 4].copy_from_slice(&0xffffu16.to_le_bytes());
         reject(&s); // a task with no start date cannot be imported
         let mut s = fixture();
-        s.fd[250..254].copy_from_slice(&0u32.to_le_bytes());
+        s.fd[254..258].copy_from_slice(&0u32.to_le_bytes());
         reject(&s); // duplicate UID
         let mut s = fixture();
-        s.fd[250..254].copy_from_slice(&u32::MAX.to_le_bytes());
+        s.fd[254..258].copy_from_slice(&u32::MAX.to_le_bytes());
         reject(&s); // UID cannot fit projcore
         let mut s = fixture();
         s.vm[24 + 12 + 4..24 + 12 + 8].copy_from_slice(&u32::MAX.to_le_bytes());

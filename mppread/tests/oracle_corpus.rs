@@ -1,6 +1,24 @@
 //! Compare binary task rows with Microsoft Project's XML export of the same plan.
 use std::path::{Path, PathBuf};
 
+fn null_uids(xml: &str) -> std::collections::HashSet<i32> {
+    let mut out = std::collections::HashSet::new();
+    for after_start in xml.split("<Task>").skip(1) {
+        let Some((task, _)) = after_start.split_once("</Task>") else {
+            continue;
+        };
+        if task.contains("<IsNull>1</IsNull>") {
+            let uid = task
+                .split_once("<UID>")
+                .and_then(|(_, s)| s.split_once("</UID>"))
+                .and_then(|(s, _)| s.trim().parse::<i32>().ok())
+                .expect("null MSPDI task UID");
+            out.insert(uid);
+        }
+    }
+    out
+}
+
 fn pairs(dir: &Path, suffix: &str) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -26,7 +44,9 @@ fn pairs(dir: &Path, suffix: &str) -> Vec<(PathBuf, PathBuf)> {
 
 fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
     let bytes = std::fs::read(mpp).unwrap();
-    let oracle = projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+    let xml_text = std::fs::read_to_string(xml).unwrap();
+    let oracle = projcore::mspdi::read_mspdi(&xml_text).unwrap();
+    let nulls = null_uids(&xml_text);
     let decoded = match mppread::mpp::decode_tasks(&bytes) {
         Ok(tasks) => tasks,
         Err(error) if may_refuse => {
@@ -43,7 +63,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
     let expected: Vec<_> = oracle
         .tasks
         .iter()
-        .filter(|t| t.uid != 0 && !t.name.is_empty())
+        .filter(|t| t.uid != 0 && !nulls.contains(&t.uid))
         .collect();
     assert_eq!(
         actual.len(),
@@ -52,6 +72,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         mpp.display()
     );
     for (a, e) in actual.iter().zip(expected) {
+        assert_eq!(a.id as i32, e.id, "{}: uid {} row ID", mpp.display(), e.uid);
         assert_eq!(a.uid as i32, e.uid, "{}: uid", mpp.display());
         assert_eq!(a.name, e.name, "{}: uid {} name", mpp.display(), e.uid);
         assert_eq!(
@@ -97,9 +118,12 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         want.sort();
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
     }
-    assert!(
-        mppread::project::project_from_mpp(&bytes).is_ok(),
-        "{}: decoded import",
+    let imported = mppread::project::project_from_mpp(&bytes)
+        .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
+    assert_eq!(
+        imported.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+        actual.iter().map(|t| t.id as i32).collect::<Vec<_>>(),
+        "{}: imported task IDs",
         mpp.display()
     );
     true
@@ -124,6 +148,14 @@ fn project_2021_oracles() {
             .filter(|(mpp, xml)| check_pair(mpp, xml, true))
             .count();
         eprintln!("MPP12 matched {matched}, refused {}", older.len() - matched);
+    }
+    let order = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/order");
+    if order.exists() {
+        let cases = pairs(&order, "");
+        assert_eq!(cases.len(), 4);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false);
+        }
     }
     if let Ok(paired) = std::env::var("MPP_PAIRED_CORPUS") {
         let dir = Path::new(&paired);
