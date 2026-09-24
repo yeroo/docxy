@@ -213,21 +213,19 @@ fn write_gantt_md(
     )
 }
 
-const SAVE_FORMAT_ERROR: &str = "Project schedules can only be saved as .yppx or .xml (MSPDI)";
-
-fn save_to(proj: &Project, path: &str) -> Result<(), String> {
-    let extension = Path::new(path)
+fn save_to(proj: &Project, path: &str) -> Result<std::path::PathBuf, String> {
+    let path = yppx::save_target(Path::new(path))?;
+    let bytes = if path
         .extension()
         .and_then(|ext| ext.to_str())
-        .unwrap_or("");
-    if extension.eq_ignore_ascii_case("yppx") {
-        write_atomic(Path::new(path), &yppx::write_yppx(proj)).map_err(|e| e.to_string())
-    } else if extension.eq_ignore_ascii_case("xml") {
-        write_atomic(Path::new(path), mspdi::write_mspdi(proj).as_bytes())
-            .map_err(|e| e.to_string())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yppx"))
+    {
+        yppx::write_yppx(proj)
     } else {
-        Err(SAVE_FORMAT_ERROR.into())
-    }
+        mspdi::write_mspdi(proj).into_bytes()
+    };
+    write_atomic(&path, &bytes).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 /// A fresh schedule: one task so the chart has something to show.
@@ -731,15 +729,24 @@ impl App {
         }
     }
 
+    /// Publish the resolved binding and clean state only after a successful save.
+    fn save_to_path(&mut self, path: &str) -> Result<(), String> {
+        let path = save_to(self.ed.project(), path)?
+            .to_string_lossy()
+            .into_owned();
+        self.ed.mark_saved();
+        self.status = format!("Saved {path}");
+        self.path = Some(path);
+        Ok(())
+    }
+
     fn save(&mut self) {
         match self.path.clone() {
-            Some(p) => match save_to(self.ed.project(), &p) {
-                Ok(()) => {
-                    self.ed.mark_saved();
-                    self.status = format!("Saved {p}");
+            Some(p) => {
+                if let Err(e) = self.save_to_path(&p) {
+                    self.status = format!("Save failed: {e}");
                 }
-                Err(e) => self.status = format!("Save failed: {e}"),
-            },
+            }
             None => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::SaveAs,
@@ -873,20 +880,10 @@ impl App {
             self.status = "Save As — type a file name first.".to_string();
             return;
         }
-        let fname = if Path::new(name).extension().is_none() {
-            format!("{name}.yppx")
-        } else {
-            name.to_string()
-        };
-        let path = dir.join(&fname).to_string_lossy().into_owned();
+        let path = dir.join(name).to_string_lossy().into_owned();
         self.backstage = None;
-        match save_to(self.ed.project(), &path) {
-            Ok(()) => {
-                self.ed.mark_saved();
-                self.status = format!("Saved {path}");
-                self.path = Some(path);
-            }
-            Err(e) => self.status = format!("Save failed: {e}"),
+        if let Err(e) = self.save_to_path(&path) {
+            self.status = format!("Save failed: {e}");
         }
     }
 }
@@ -1188,8 +1185,9 @@ fn on_key(app: &mut App, k: KeyEvent) {
                     PromptKind::Assign => app.assign_resource(&text),
                     PromptKind::SaveAs => {
                         if !text.trim().is_empty() {
-                            app.path = Some(text.trim().to_string());
-                            app.save();
+                            if let Err(e) = app.save_to_path(text.trim()) {
+                                app.status = format!("Save failed: {e}");
+                            }
                         }
                     }
                 }
@@ -1845,11 +1843,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn save_as_prompt_retains_binding_on_failure_and_adds_native_extension() {
+        let dir = std::env::temp_dir().join(format!("yppxy-save-prompt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("original.xml");
+        for (label, binding) in [
+            ("untitled", None),
+            ("bound", Some(old.to_string_lossy().into_owned())),
+        ] {
+            let mut app = App::new(new_project(), binding.clone(), false);
+            app.ed.rename(1, "Unsaved change").unwrap();
+            if binding.is_none() {
+                app.save();
+            } else {
+                app.apply_act(Act::SaveAs);
+            }
+            app.prompt.as_mut().unwrap().buf = dir.join("plan.mpp").to_string_lossy().into_owned();
+            on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert_eq!(app.path, binding);
+            assert!(app.ed.dirty());
+            assert!(app.status.contains("Project schedules can only be saved"));
+            assert!(!dir.join("plan.mpp").exists());
+            if binding.is_none() {
+                app.save();
+            } else {
+                app.apply_act(Act::SaveAs);
+            }
+            let target = dir.join(label);
+            app.prompt.as_mut().unwrap().buf = target.to_string_lossy().into_owned();
+            on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let actual = target.with_extension("yppx");
+            assert_eq!(app.path.as_deref(), actual.to_str());
+            assert!(!app.ed.dirty());
+            assert_eq!(
+                load(actual.to_str().unwrap()).unwrap().tasks[0].name,
+                "Unsaved change"
+            );
+            assert!(!target.exists());
+            std::fs::remove_file(actual).unwrap();
+        }
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn project_saves_refuse_mpp_and_other_unsupported_formats() {
+        const SAVE_FORMAT_ERROR: &str =
+            "Project schedules can only be saved as .yppx or .xml (MSPDI)";
         let dir = std::env::temp_dir().join(format!("yppxy-save-formats-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let project = new_project();
-        for name in ["plan.mpp", "plan.MPP", "plan.txt", "plan"] {
+        for name in ["plan.mpp", "plan.MPP", "plan.txt"] {
             let path = dir.join(name);
             std::fs::write(&path, b"original binary schedule").unwrap();
             assert_eq!(
@@ -1865,6 +1908,12 @@ mod tests {
             assert_eq!(load(path.to_str().unwrap()).unwrap(), project);
             std::fs::remove_file(path).unwrap();
         }
+        let extensionless = dir.join("plan");
+        let actual = save_to(&project, extensionless.to_str().unwrap()).unwrap();
+        assert_eq!(actual, extensionless.with_extension("yppx"));
+        assert_eq!(load(actual.to_str().unwrap()).unwrap(), project);
+        assert!(!extensionless.exists());
+        std::fs::remove_file(actual).unwrap();
         let original = dir.join("import.mpp");
         std::fs::write(&original, b"original binary schedule").unwrap();
         let mut app = App::new(project, Some(original.to_str().unwrap().into()), false);

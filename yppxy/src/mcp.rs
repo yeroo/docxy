@@ -203,7 +203,7 @@ fn tool_defs() -> Json {
         ),
         tool(
             "yppxy_save",
-            "Save the open project to its file (or to `path` for save-as).",
+            "Save the open project to its file (or to `path` for save-as). Only .yppx/.xml are writable; extensionless paths gain .yppx.",
             vec![
                 ("path", prop("string", "Optional new file path (save-as).")),
                 target(),

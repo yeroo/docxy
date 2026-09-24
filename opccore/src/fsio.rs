@@ -23,14 +23,14 @@ fn create_temp(
     mut next: impl FnMut() -> u64,
 ) -> io::Result<(TempPath, File)> {
     let parent = parent_dir(dest);
-    let name = dest.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
-    })?;
+    if dest.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "destination has no file name",
+        ));
+    }
     for _ in 0..100 {
-        let mut temp_name = std::ffi::OsString::from(".");
-        temp_name.push(name);
-        temp_name.push(format!(".{}.{}.tmp", std::process::id(), next()));
-        let path = parent.join(temp_name);
+        let path = parent.join(format!(".offxy-{}-{}.tmp", std::process::id(), next()));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -94,14 +94,16 @@ fn write_atomic_with_ownership(
     // Opening without truncate verifies this caller's access, not merely the
     // presence of some write bit. Keep the handle for an ownership fallback.
     let destination = match OpenOptions::new().write(true).open(&dest) {
-        Ok(file) => Some(file),
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            Some((file, metadata))
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
-    let metadata = destination.as_ref().map(File::metadata).transpose()?;
-    if metadata
+    if destination
         .as_ref()
-        .is_some_and(|meta| meta.permissions().readonly())
+        .is_some_and(|(_, meta)| meta.permissions().readonly())
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -109,35 +111,33 @@ fn write_atomic_with_ownership(
         ));
     }
     // Declare the guard before the file so unwinding also closes before cleanup.
-    let (mut temp, mut file) = create_temp(&dest, metadata.is_some(), || {
+    let (mut temp, mut file) = create_temp(&dest, destination.is_some(), || {
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     })?;
     let result = (|| {
         writer(&mut file)?;
-        let replace = if let Some(metadata) = &metadata {
-            let replace = restore(&file, metadata)?;
-            if replace {
+        let fallback = if let Some((destination, metadata)) = destination {
+            if restore(&file, &metadata)? {
                 // chown can clear permission bits, so restore mode afterward.
                 file.set_permissions(metadata.permissions())?;
+                None
+            } else {
+                Some(destination)
             }
-            replace
         } else {
-            true
+            None
         };
         file.sync_all()?;
-        Ok::<_, io::Error>(replace)
+        Ok::<_, io::Error>(fallback)
     })();
     drop(file);
-    if !result? {
+    if let Some(mut destination) = result? {
         let mut source = File::open(&temp.0)?;
-        let mut destination = destination
-            .ok_or_else(|| io::Error::other("ownership fallback needs an existing destination"))?;
         destination.set_len(0)?;
         io::copy(&mut source, &mut destination)?;
         destination.sync_all()?;
         return Ok(());
     }
-    drop(destination);
     fs::rename(&temp.0, &dest)?;
     temp.1 = false;
     #[cfg(unix)]
@@ -512,6 +512,22 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"new");
         assert!(same_file(&path, &alias));
         assert_eq!(dir.count(), 2);
+    }
+
+    #[test]
+    fn long_destination_name_does_not_lengthen_temp_name() {
+        let dir = Dir::new();
+        let name = format!("{}.docx", "x".repeat(245));
+        assert_eq!(name.len(), 250);
+        let path = dir.0.join(name);
+        write_atomic(&path, b"first save").unwrap();
+        write_atomic(&path, b"replacement").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"replacement");
+        assert_eq!(dir.count(), 1);
+        fs::remove_file(&path).unwrap();
+        create_atomic(&path, b"exclusive export").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"exclusive export");
+        assert_eq!(dir.count(), 1);
     }
 
     #[test]
