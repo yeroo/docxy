@@ -1100,19 +1100,11 @@ impl Scheduler<'_> {
                 if t.duration_min == 0 {
                     let mut fs_instant: Option<i64> = None;
                     let mut start_bound = cpm.early_start.minutes();
-                    let mut cpm_fs_driven = false;
                     for p in &t.predecessors {
-                        let (Some(ps), Some(pf), Some(pred_cpm)) =
-                            (start.get(&p.uid), finish.get(&p.uid), base.get(p.uid))
-                        else {
+                        let (Some(ps), Some(pf)) = (start.get(&p.uid), finish.get(&p.uid)) else {
                             continue;
                         };
                         if p.link == LinkType::FinishStart {
-                            cpm_fs_driven |= fs_milestone_instant(
-                                self.tl(t),
-                                pred_cpm.early_finish.minutes(),
-                                p.lag_min,
-                            ) == cpm.early_start.minutes();
                             let instant = fs_milestone_instant(tl, pf.minutes(), p.lag_min);
                             if tl.to_index(instant) == placed {
                                 fs_instant = Some(fs_instant.map_or(instant, |s| s.max(instant)));
@@ -1131,13 +1123,24 @@ impl Scheduler<'_> {
                             }
                         }
                     }
-                    // Retain a shifted start-type CPM driver (including date
-                    // constraints). An FS candidate at the same working index
-                    // must not move it back across the nonworking gap.
-                    if cpm_fs_driven {
-                        if let Some(instant) = fs_instant {
-                            s_abs = instant.max(start_bound);
+                    if matches!(
+                        t.constraint,
+                        ConstraintType::StartNoEarlierThan | ConstraintType::MustStartOn
+                    ) {
+                        if let Some(dates) = self.constraint_dates(
+                            t,
+                            t.predecessors.iter().any(|p| start.contains_key(&p.uid)),
+                        ) {
+                            if tl.to_index(dates.start) == placed {
+                                start_bound = start_bound.max(dates.start);
+                            }
                         }
+                    }
+                    // Leveling can change which link binds. Choose the actual
+                    // leveled FS instant unless a current start-type bound or
+                    // the absolute CPM floor requires a later instant.
+                    if let Some(instant) = fs_instant {
+                        s_abs = instant.max(start_bound);
                     }
                 }
                 let bounds = t
@@ -1412,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn leveling_fs_milestone_preserves_shifted_constraint_driver() {
+    fn leveling_fs_milestone_overtakes_original_constraint_driver() {
         for constraint in [
             ConstraintType::StartNoEarlierThan,
             ConstraintType::MustStartOn,
@@ -1422,14 +1425,38 @@ mod tests {
                 proj.honor_constraints = honor;
                 proj.tasks[2].constraint = constraint;
                 proj.tasks[2].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 3, 8, 0));
-                // Preserve the leveler's inherited delay, including the
-                // morning side selected by the original date constraint.
+                // The unchanged date constraint is now earlier than A's
+                // leveled finish, which selects the milestone's instant.
                 let leveled = level(&proj);
-                let expected = DateTime::from_ymd_hm(2026, 3, 4, 8, 0);
+                let expected = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
                 assert_eq!(leveled.start(2), Some(expected));
                 assert_eq!(leveled.finish(2), Some(expected));
             }
         }
+    }
+
+    #[test]
+    fn leveling_fs_milestone_overtakes_undelayed_ss_driver() {
+        let mut proj = delayed_fs_milestone_project();
+        let q = task(5, "Independent predecessor", 480);
+        let mut r = task(3, "Undelayed start driver", 480);
+        r.predecessors.push(fs(5));
+        proj.tasks.extend([q, r]);
+        proj.tasks[2].predecessors.push(Predecessor {
+            uid: 3,
+            link: LinkType::StartStart,
+            lag_min: 0,
+        });
+        let sched = schedule(&proj);
+        let morning = DateTime::from_ymd_hm(2026, 3, 3, 8, 0);
+        assert_eq!(sched.get(2).unwrap().early_start, morning);
+        let leveled = level(&proj);
+        let evening = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
+        assert_eq!(leveled.start(3), Some(morning));
+        assert_eq!(leveled.finish(1), Some(evening));
+        assert_eq!(leveled.start(2), Some(evening));
+        assert_eq!(leveled.finish(2), Some(evening));
+        assert!(leveled.start(2).unwrap() >= sched.get(2).unwrap().early_start);
     }
 
     #[test]
