@@ -76,6 +76,7 @@ impl Editor {
         if !task.manual {
             return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(day));
         }
+        self.validate_pinned_day(day)?;
         let start = day_start(&self.proj, task, day);
         if task.manual_start == Some(start) && task.manual_finish.is_none() {
             return Ok(());
@@ -85,6 +86,7 @@ impl Editor {
         task.manual_start = Some(start);
         task.manual_finish = None;
         self.changed();
+        self.stamp_pinned_dates(uid);
         Ok(())
     }
 
@@ -94,14 +96,17 @@ impl Editor {
     pub fn set_finish(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
         let task = &self.proj.tasks[i];
-        let finish = day_finish(&self.proj, task, day)?;
         if !task.manual {
+            let finish = day_finish(&self.proj, task, day)?;
             return self.set_constraint_typed(
                 uid,
                 ConstraintType::FinishNoEarlierThan,
                 Some(finish),
             );
         }
+        self.validate_pinned_day(day)?;
+        // Like a typed start, a manual finish may fall on a non-working day.
+        let finish = day_end(&self.proj, task, day);
         let start = match task.pinned_dates() {
             Some((start, _)) => start,
             None => self.disp_start(uid).ok_or("The task has no start")?,
@@ -123,6 +128,19 @@ impl Editor {
         task.manual_duration_min = Some(duration);
         task.milestone = duration == 0;
         self.changed();
+        self.stamp_pinned_dates(uid);
+        Ok(())
+    }
+
+    /// A pinned date must lie within the scheduler's timeline around the
+    /// project start, or its finish could not be derived from it.
+    fn validate_pinned_day(&self, day: DateTime) -> Result<(), String> {
+        let offset = day.minutes() - self.sched.project_start.minutes();
+        if offset.abs() > HORIZON_DAYS * 1440 {
+            return Err(
+                "Date is outside the scheduling range (100 years around the project start)".into(),
+            );
+        }
         Ok(())
     }
 
@@ -400,6 +418,19 @@ fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
         .min()
         .unwrap_or(8 * 60);
     date.start_of_day().add_minutes(i64::from(from))
+}
+
+/// Finish of a typed date: its last working time, or 17:00 on a non-working
+/// day, where a manual task may still finish.
+fn day_end(proj: &Project, task: &Task, date: DateTime) -> DateTime {
+    let to = task_calendar(proj, task).week[date.weekday() as usize]
+        .times
+        .iter()
+        .filter(|s| s.to > s.from)
+        .map(|s| s.to)
+        .max()
+        .unwrap_or(17 * 60);
+    date.start_of_day().add_minutes(i64::from(to))
 }
 
 /// Finish boundary for a typed date, with exactly the scheduler's calendar fallback.

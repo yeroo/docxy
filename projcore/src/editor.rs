@@ -287,6 +287,7 @@ impl Editor {
                 },
             )
         })?;
+        self.stamp_pinned_dates(uid);
         Ok(at)
     }
 
@@ -377,7 +378,27 @@ impl Editor {
             if let Some(lv) = patch.level {
                 t.outline_level = lv;
             }
-        })
+        })?;
+        self.stamp_pinned_dates(uid);
+        Ok(())
+    }
+
+    /// After an edit to a manual task, record its pinned start and scheduled
+    /// finish as the Start/Finish a save writes. Project does not reschedule
+    /// manual tasks on open, so they must agree with ManualStart/Duration.
+    /// Scheduling never reads a pinned task's stored finish, and its stored
+    /// start only when it has no manual start, so this cannot feed back.
+    fn stamp_pinned_dates(&mut self, uid: i32) {
+        let Ok(i) = self.index(uid) else {
+            return;
+        };
+        let Some((start, _)) = self.proj.tasks[i].pinned_dates() else {
+            return;
+        };
+        let finish = self.sched.get(uid).map(|r| r.early_finish);
+        let task = &mut self.proj.tasks[i];
+        task.stored_start = Some(start);
+        task.stored_finish = finish;
     }
 
     pub fn add_predecessor(

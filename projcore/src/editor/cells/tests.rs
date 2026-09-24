@@ -662,3 +662,98 @@ fn typed_dates_on_auto_tasks_still_set_constraints() {
     assert_eq!(task.constraint, ConstraintType::FinishNoEarlierThan);
     assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-08T17:00:00");
 }
+
+/// What a save writes for a task: its Start/Finish and ManualStart.
+fn saved(ed: &Editor, uid: i32) -> (Option<String>, Option<String>, Option<String>) {
+    let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+    let task = back.task(uid).unwrap();
+    (
+        mspdi(task.stored_start),
+        mspdi(task.stored_finish),
+        mspdi(task.manual_start),
+    )
+}
+
+fn assert_saved_consistently(ed: &Editor, uid: i32) {
+    let (start, finish, manual_start) = saved(ed, uid);
+    assert!(manual_start.is_some());
+    assert_eq!(start, manual_start, "Start must equal ManualStart");
+    assert_eq!(
+        finish,
+        mspdi(ed.schedule().get(uid).map(|r| r.early_finish))
+    );
+}
+
+#[test]
+fn edited_manual_tasks_save_start_and_finish_matching_their_pinned_dates() {
+    let mut ed = manual_editor();
+    for task in &mut ed.proj.tasks {
+        // As read from a file: Start/Finish of the original plan.
+        task.stored_start = task.manual_start;
+        task.stored_finish = Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0));
+    }
+    ed.set_start(10, parse_cell_date("2026-01-08").unwrap())
+        .unwrap();
+    assert_saved_consistently(&ed, 10);
+    assert_eq!(saved(&ed, 10).1.unwrap(), "2026-01-08T17:00:00");
+
+    ed.set_finish(20, parse_cell_date("2026-01-07").unwrap())
+        .unwrap();
+    assert_saved_consistently(&ed, 20);
+    assert_eq!(saved(&ed, 20).1.unwrap(), "2026-01-07T17:00:00");
+
+    ed.set_duration(30, "3d").unwrap();
+    assert_saved_consistently(&ed, 30);
+    assert_eq!(saved(&ed, 30).1.unwrap(), "2026-01-07T17:00:00");
+
+    ed.proj.new_tasks_are_manual = true;
+    let at = ed.add_task(None, "new", 480).unwrap();
+    let uid = ed.project().tasks[at].uid;
+    assert_saved_consistently(&ed, uid);
+
+    // Undo returns the file's own dates in the same step.
+    ed.undo();
+    ed.undo();
+    assert_eq!(saved(&ed, 30).1.unwrap(), "2026-01-05T17:00:00");
+}
+
+#[test]
+fn unedited_manual_tasks_save_exactly_what_was_read() {
+    let ed = manual_editor();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(
+        (saved(&ed, 10).0, saved(&ed, 10).1),
+        (mspdi(task.stored_start), mspdi(task.stored_finish))
+    );
+}
+
+#[test]
+fn manual_finish_on_a_non_working_day_is_accepted_like_a_start() {
+    let mut ed = manual_editor();
+    // Saturday 2026-01-10: the day's end defaults to 17:00.
+    ed.set_finish(20, parse_cell_date("2026-01-10").unwrap())
+        .unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(mspdi(task.manual_finish).unwrap(), "2026-01-10T17:00:00");
+    // Monday to Friday is five working days; Saturday adds none.
+    assert_eq!(task.duration_min, 2400);
+    // An auto task's FNET still needs a working day.
+    let mut auto = editor();
+    assert!(
+        auto.set_finish(20, parse_cell_date("2026-01-10").unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn manual_dates_outside_the_scheduling_range_are_rejected() {
+    let mut ed = manual_editor();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    for text in ["2200-01-01", "1026-03-02"] {
+        let day = parse_cell_date(text).unwrap();
+        assert!(ed.set_start(10, day).is_err(), "{text}");
+        assert!(ed.set_finish(10, day).is_err(), "{text}");
+        unchanged(&ed, &before, history);
+    }
+}
