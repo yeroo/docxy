@@ -17,12 +17,16 @@ The owner checked the SF shapes in files 05 and 14 against Microsoft Project
 2021 in [issue #53](https://github.com/yeroo/docxy/issues/53). File 05's B finish
 was corrected from March 3 at 17:00 to March 4 at 08:00, the instant A starts.
 File 14 records Project scheduling the SF successor before the project start.
+File 16 records the 24-hour calendar dates verified against Project 2021 in
+[issue #58](https://github.com/yeroo/docxy/issues/58): a three-day duration
+(24 working hours) finishes exactly one day after its start.
 The other fixtures remain hand-derived expectations, not independently verified
 Project outputs.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
-  off. File 12 adds a second calendar with Saturday working.
+  off. File 12 adds a second calendar with Saturday working; file 16 adds the
+  built-in 24 Hours calendar, working midnight to midnight every day.
 
 ## Files
 
@@ -43,6 +47,7 @@ Project outputs.
 | `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006) |
 | `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
 | `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
+| `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |
 
 See `manifest.json` for machine-readable tags.
 
