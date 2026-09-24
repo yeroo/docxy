@@ -1,8 +1,7 @@
 //! Entry-table edit state and transitions, shared by keyboard, mouse and host actions.
 use super::*;
-use projcore::ConstraintType;
 use projcore::editor::{
-    day_finish, format_duration_exact, parse_cell_date, parse_duration, parse_predecessors,
+    format_duration_exact, parse_cell_date, parse_duration, parse_predecessors,
 };
 
 pub(super) const COLUMNS: [&str; 7] = [
@@ -155,36 +154,25 @@ impl ProjectView {
                 let day = parse_cell_date(&cell.buf)?;
                 // A manual task takes the typed date as its own start or
                 // finish; an auto task gets an SNET/FNET constraint.
-                if task.manual {
-                    if cell.col == 3 {
-                        self.ed.set_start(uid, day)?;
-                    } else {
-                        self.ed.set_finish(uid, day)?;
-                    }
-                    return Ok(None);
-                }
-                let (kind, date) = if cell.col == 3 {
-                    (ConstraintType::StartNoEarlierThan, day)
-                } else {
-                    (
-                        ConstraintType::FinishNoEarlierThan,
-                        day_finish(self.ed.project(), task, day)?,
-                    )
-                };
-                let previous = task.constraint;
-                let changed = (previous, task.constraint_date) != (kind, Some(date));
+                let (manual, previous) = (task.manual, (task.constraint, task.constraint_date));
                 if cell.col == 3 {
                     self.ed.set_start(uid, day)?;
                 } else {
                     self.ed.set_finish(uid, day)?;
                 }
-                if !changed {
+                let task = self
+                    .ed
+                    .project()
+                    .task(uid)
+                    .ok_or("The edited task no longer exists")?;
+                let current = (task.constraint, task.constraint_date);
+                if manual || current == previous {
                     return Ok(None);
                 }
                 return Ok(Some(format!(
                     "Constraint set: {} (was {})",
-                    kind.abbrev(),
-                    previous.abbrev()
+                    current.0.abbrev(),
+                    previous.0.abbrev()
                 )));
             }
             5 => {

@@ -1,5 +1,6 @@
 use super::*;
 use core::prelude::v1::test;
+use projcore::ConstraintType;
 
 fn tab() -> DocTab {
     let p = Project {
@@ -162,6 +163,7 @@ fn typed_dates_move_a_manual_task_without_constraints() {
     edit(&mut t, 4, "2026-01-09");
     key(&mut t, "enter");
     assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert!(!t.status.contains("Constraint"), "{}", t.status);
     let ed = &v(&t).ed;
     let task = ed.project().task(10).unwrap();
     assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
