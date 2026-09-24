@@ -20,6 +20,9 @@ File 14 records Project scheduling the SF successor before the project start.
 File 16 records the 24-hour calendar dates verified against Project 2021 in
 [issue #58](https://github.com/yeroo/docxy/issues/58): a three-day duration
 (24 working hours) finishes exactly one day after its start.
+File 17 records the FNLT conflict verified against Project 2021 in
+[issue #60](https://github.com/yeroo/docxy/issues/60): the constraint takes
+precedence over the FS link, with -5 days total slack on both tasks.
 The other fixtures remain hand-derived expectations, not independently verified
 Project outputs.
 
@@ -48,6 +51,7 @@ Project outputs.
 | `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
 | `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
 | `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |
+| `17-constraint-fnlt-conflict` | FNLT versus FS link | default constraint precedence and -5 days total slack on both tasks |
 
 See `manifest.json` for machine-readable tags.
 

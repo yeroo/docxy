@@ -85,10 +85,16 @@ conventions**. An index that lands exactly on an end-of-day boundary maps to the
 Wednesday 08:00" both come out right.
 
 - **Forward pass** → early start/finish, honoring links + lag, ASAP by default,
-  plus the forward-affecting constraints (MSO/SNET/FNET/MFO).
+  plus SNET/FNET date bounds. With `HonorConstraints` enabled (the default,
+  persisted as MSPDI `HonorConstraints`), MSO/MFO/FNLT/SNLT override conflicting
+  links; with it off, links can delay tasks past those constraint dates.
 - **Backward pass** → late start/finish from the project finish, plus the
   backward-affecting constraints (MFO/FNLT/SNLT/MSO).
-- **Total & free slack**, the **critical** flag (slack ≤ 0), and **summary
+- **Total & free slack**: link conflicts produce negative total slack in both
+  precedence modes. When a constraint moves a task earlier than its links allow,
+  total slack uses the link-driven start. Dates are limited by the timeline
+  horizon; pre-start constraints do not pull unlinked tasks before the project
+  start. Also computed: the **critical** flag (slack ≤ 0) and **summary
   rollup** (a summary's dates derive from its descendants).
 
 Leaf tasks are ordered by a Kahn topological sort of the dependency graph;

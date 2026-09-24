@@ -51,6 +51,7 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Name" => proj.name = text_of(&mut p),
                     "Title" => proj.title = text_of(&mut p),
                     "StartDate" => proj.start_date = DateTime::parse_mspdi(&text_of(&mut p)),
+                    "HonorConstraints" => proj.honor_constraints = bool_of(&mut p),
                     "MinutesPerDay" => minutes_per_day = text_of(&mut p).trim().parse().ok(),
                     "MinutesPerWeek" => minutes_per_week = text_of(&mut p).trim().parse().ok(),
                     // Some emitters use HoursPerDay directly; honor it too.
@@ -603,6 +604,12 @@ pub fn write_mspdi(proj: &Project) -> String {
     if let Some(d) = proj.start_date {
         tag(&mut s, 1, "StartDate", &d.to_mspdi());
     }
+    tag(
+        &mut s,
+        1,
+        "HonorConstraints",
+        if proj.honor_constraints { "1" } else { "0" },
+    );
 
     s.push_str("  <Tasks>\n");
     for t in &proj.tasks {
@@ -816,6 +823,40 @@ fn fmt_f(x: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn honor_constraints_reads_boolean_forms_and_defaults_to_true() {
+        for (value, expected) in [("0", false), ("1", true), ("false", false), ("true", true)] {
+            let xml = format!("<Project><HonorConstraints>{value}</HonorConstraints></Project>");
+            assert_eq!(read_mspdi(&xml).unwrap().honor_constraints, expected);
+        }
+        assert!(read_mspdi("<Project/>").unwrap().honor_constraints);
+    }
+
+    #[test]
+    fn honor_constraints_survives_mspdi_and_native_package_round_trips() {
+        for honor_constraints in [true, false] {
+            let proj = Project {
+                honor_constraints,
+                ..Project::default()
+            };
+            let xml = write_mspdi(&proj);
+            assert!(xml.contains(if honor_constraints {
+                "<HonorConstraints>1</HonorConstraints>"
+            } else {
+                "<HonorConstraints>0</HonorConstraints>"
+            }));
+            assert_eq!(
+                read_mspdi(&xml).unwrap().honor_constraints,
+                honor_constraints
+            );
+            let package = crate::yppx::write_yppx(&proj);
+            assert_eq!(
+                crate::yppx::read_yppx(&package).unwrap().honor_constraints,
+                honor_constraints
+            );
+        }
+    }
 
     fn resource_project(resources: &str) -> Project {
         read_mspdi(&format!(

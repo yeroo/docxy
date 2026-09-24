@@ -373,11 +373,13 @@ mod tests {
             (DateTime::from_ymd_hm(2026, 2, 26, 17, 0), -480, "-1d"),
             (DateTime::from_ymd_hm(2026, 2, 27, 12, 0), -240, "-0.50d"),
         ] {
-            // This linked-task case already computes negative slack in the engine.
+            // Keep link precedence to test integer and fractional negative
+            // slack formatting against the original SF dates.
             let mut proj = crate::mspdi::read_mspdi(include_str!(
                 "../../corpus/mspdi/14-link-sf-before-start.xml"
             ))
             .unwrap();
+            proj.honor_constraints = false;
             proj.tasks[0].name = "Late".into();
             proj.tasks[0].constraint = ConstraintType::FinishNoLaterThan;
             proj.tasks[0].constraint_date = Some(finish);

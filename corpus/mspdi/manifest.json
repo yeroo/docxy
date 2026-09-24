@@ -148,6 +148,16 @@
         "round-trip"
       ],
       "desc": "Project 2021 (#58): three 8-hour duration days finish after 24 continuous hours."
+    },
+    {
+      "file": "17-constraint-fnlt-conflict.xml",
+      "category": "constraint",
+      "tags": [
+        "constraint",
+        "constraint-fnlt",
+        "negative-slack"
+      ],
+      "desc": "Project 2021 (#60): FNLT overrides the FS link; both tasks have -5d total slack."
     }
   ]
 }
