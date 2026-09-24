@@ -9,6 +9,7 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod close;
 mod control;
 mod harness;
 mod project;
@@ -784,6 +785,29 @@ enum StructOp {
 }
 
 impl SheetView {
+    /// Snapshot before a mutation; share the history limit across all edits.
+    fn push_undo(&mut self) {
+        self.undo.push(self.snapshot());
+        if self.undo.len() > 100 {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Commit the cell buffer without moving the selection, including undo/recalc.
+    fn commit_edit(&mut self) -> bool {
+        let Some(buf) = self.editing.take() else {
+            return false;
+        };
+        self.push_undo();
+        let (r, c) = self.sel;
+        let style = self.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+        let cell = parse_cell_input(&buf, style);
+        self.engine
+            .set_cell(&mut self.pkg.workbook, (self.active, r, c), cell);
+        true
+    }
+
     fn sheet(&self) -> &gridcore::sheet::Sheet {
         &self.pkg.workbook.sheets[self
             .active
@@ -4073,6 +4097,12 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    fn set_ask_on_close(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.ask_on_close = on;
+        self.persist();
+        cx.notify();
+    }
+
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
@@ -6484,12 +6514,7 @@ impl Docxy {
     /// each mutating grid operation.
     fn sheet_snapshot(&mut self) {
         if let Some(v) = self.active_sheet_mut() {
-            let snap = v.snapshot();
-            v.undo.push(snap);
-            if v.undo.len() > 100 {
-                v.undo.remove(0);
-            }
-            v.redo.clear();
+            v.push_undo();
         }
     }
 
@@ -6532,20 +6557,7 @@ impl Docxy {
     /// Commit the in-progress edit (if any) into the workbook, recalc, and move
     /// the selection by (dr, dc).
     fn sheet_commit(&mut self, dr: i32, dc: i32, cx: &mut Context<Self>) {
-        let has_edit = self.active_sheet().is_some_and(|v| v.editing.is_some());
-        if has_edit {
-            self.sheet_snapshot();
-        }
-        if let Some(v) = self.active_sheet_mut() {
-            if let Some(buf) = v.editing.take() {
-                let (r, c) = v.sel;
-                let s = v.active;
-                let style = v.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
-                let cell = parse_cell_input(&buf, style);
-                v.engine.set_cell(&mut v.pkg.workbook, (s, r, c), cell);
-            }
-        }
-        if has_edit {
+        if self.active_sheet_mut().is_some_and(SheetView::commit_edit) {
             self.mark_sheet_dirty();
         }
         self.sheet_move(dr, dc, cx);
@@ -9321,23 +9333,6 @@ impl Docxy {
         }
     }
 
-    fn close_tab(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.project_prompt_cancel();
-        if i >= self.tabs.len() {
-            return;
-        }
-        self.tabs.remove(i);
-        if self.active >= self.tabs.len() {
-            self.active = self.tabs.len().saturating_sub(1);
-        } else if i < self.active {
-            self.active -= 1;
-        }
-        // Whatever tab we land on, the state below belonged to another one.
-        self.drop_grid_state();
-        self.persist();
-        self.refocus(window, cx);
-    }
-
     fn active_editor(&mut self) -> Option<&mut Editor> {
         match self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
             Some(Surface::Doc(ed)) => Some(ed),
@@ -9422,34 +9417,49 @@ impl Docxy {
         }
         self.refocus(window, cx);
     }
+}
 
+/// Serialize a tab's open header/footer editor, leaving the edit session open.
+fn flush_hf_tab(tab: &mut DocTab) {
+    let Some(hf) = tab.hf_edit.as_ref() else {
+        return;
+    };
+    let inner = docxcore::serialize::blocks_to_xml(&hf.editor.doc.body);
+    let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
+    );
+    if let Some(pkg) = tab.pkg.as_mut() {
+        pkg.set_part(&hf.part_name, xml.into_bytes());
+    }
+    tab.dirty = true;
+}
+
+/// Leave a tab's header/footer editor, preserving status when none is open.
+fn exit_hf_tab(tab: &mut DocTab) {
+    if tab.hf_edit.is_some() {
+        flush_hf_tab(tab);
+        tab.hf_edit = None;
+        tab.status = "Closed header/footer".into();
+    }
+}
+
+impl Docxy {
     /// Serialize the open header/footer editor back into its package part (called
     /// on exit and before every save) so edits persist. Leaves the session open.
     fn flush_hf(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let Some(hf) = tab.hf_edit.as_ref() else {
-            return;
-        };
-        let inner = docxcore::serialize::blocks_to_xml(&hf.editor.doc.body);
-        let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
-        let xml = format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-             <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
-        );
-        let part_name = hf.part_name.clone();
-        if let Some(pkg) = tab.pkg.as_mut() {
-            pkg.set_part(&part_name, xml.into_bytes());
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            flush_hf_tab(tab);
         }
-        tab.dirty = true;
     }
 
     /// Leave header/footer edit mode, committing edits to the package part.
     fn exit_hf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.flush_hf();
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.hf_edit = None;
+            exit_hf_tab(tab);
+            // The explicit Exit command has always acknowledged the action,
+            // including when the header/footer editor was already closed.
             tab.status = "Closed header/footer".into();
         }
         self.refocus(window, cx);
@@ -9747,6 +9757,16 @@ impl Docxy {
         if self.active_is_project() {
             return self.save_project(true, window, cx);
         }
+        if self.pick_doc_save_target() {
+            self.save_active(window, cx);
+        } else {
+            self.refocus(window, cx);
+        }
+    }
+
+    /// Pick and bind a document Save As destination. The caller owns save,
+    /// cancellation status, and any harness guard against native dialogs.
+    fn pick_doc_save_target(&mut self) -> bool {
         let start = self
             .tabs
             .get(self.active)
@@ -9763,9 +9783,9 @@ impl Docxy {
                 tab.markdown = is_markdown_path(&path);
                 tab.path = Some(path);
             }
-            self.save_active(window, cx);
+            true
         } else {
-            self.refocus(window, cx);
+            false
         }
     }
 
@@ -16637,9 +16657,7 @@ impl Docxy {
                 }))
             })
             .child(rail_item(cx, "bs-close", "Close", |t, w, cx| {
-                let a = t.active;
-                t.backstage = false;
-                t.close_tab(a, w, cx);
+                t.backstage_close(w, cx);
             }));
 
         let pane = if self.bs_new {
@@ -16840,16 +16858,14 @@ impl Docxy {
                         .child(
                             div()
                                 .text_color(fg)
-                                .child("Ask before closing with unsaved changes"),
+                                .child("Ask before closing the window with unsaved changes"),
                         )
                         .on_click(cx.listener(|this, _, _w, cx| {
-                            this.ask_on_close = !this.ask_on_close;
-                            this.persist();
-                            cx.notify();
+                            this.set_ask_on_close(!this.ask_on_close, cx);
                         })),
                 )
                 .child(div().text_size(px(11.)).text_color(dim).child(
-                    "Off: closing is silent — your work is always kept and reopened next launch.",
+                    "Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
                 ))
                 .into_any_element()
         };

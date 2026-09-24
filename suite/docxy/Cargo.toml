@@ -36,7 +36,9 @@ ribbonspec = { path = "../../ribbonspec" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dirs = "5"
-rfd = "0.15"
+# Custom Save / Don't Save / Cancel labels on Windows require v6 controls;
+# GPUI's default windows-manifest feature already selects that assembly.
+rfd = { version = "0.15", features = ["common-controls-v6"] }
 rust-embed = "8"
 
 # Embeds the Windows app icon (assets/docxy.ico) into suite.exe via docxy.rc.
