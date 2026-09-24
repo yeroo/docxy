@@ -82,11 +82,13 @@ python3 corpus/tools/gen_mspdi_corpus.py
 Pure stdlib Python; no external tools. Edit the generator (not the files) to add
 cases, then re-run and confirm `cargo test -p projcore` stays green. A new or
 changed oracle must come from Project: on Windows with Microsoft Project and
-pywin32, run
+pywin32, and with Project closed, run
 
 ```
 python corpus/tools/verify_mspdi_project.py [file.xml ...]
 ```
 
 It exits nonzero on any input-fidelity failure or schedule mismatch, and it
-never writes into `corpus/mspdi/`.
+never writes into `corpus/mspdi/`. If Project is already running it refuses to
+start (exit 2): Project is a single-instance COM server, so the script would
+otherwise attach to your session and close its projects without saving.

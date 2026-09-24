@@ -11,14 +11,18 @@ constraints, calendars) and cannot read the oracle back. Before comparing
 dates, it checks that Project imported those inputs as the file states them
 (input fidelity), so an import problem is not mistaken for a scheduling fact.
 
-Exit status is 1 on any fidelity failure or schedule mismatch, 0 otherwise.
+Exit status is 1 on any fidelity failure or schedule mismatch, 2 if
+Microsoft Project is already running, 0 otherwise.
 The tool never writes into corpus/mspdi/ and never saves in Project.
 
 Usage (from the repo root, Windows):
     python corpus/tools/verify_mspdi_project.py [fixture.xml ...]
 With no arguments it checks every corpus/mspdi/*.xml. Requires Microsoft
-Project desktop and pywin32; not run in CI. Close Project gracefully if a run
-is interrupted; never force-kill WINPROJ.EXE (it wedges COM activation).
+Project desktop and pywin32; not run in CI. Project must not be running: it is
+a single-instance COM server, so the script would attach to your session, hide
+it and close its projects without saving. The script refuses to start instead.
+Close Project gracefully if a run is interrupted; never force-kill WINPROJ.EXE
+(it wedges COM activation).
 """
 
 import glob
@@ -28,6 +32,7 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
+import pywintypes
 import win32com.client as win32
 
 CORPUS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "mspdi")
@@ -108,7 +113,18 @@ def check(app, path, tmpdir):
     with open(copy, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(stripped)
 
-    app.FileOpenEx(copy, True)
+    # With alerts off a failed open can return False instead of raising, and
+    # ActiveProject is then some other project, which must not be touched.
+    # An imported XML opens as an unsaved project named after the file stem.
+    try:
+        before = app.Projects.Count
+        opened = (app.FileOpenEx(copy, True) and app.Projects.Count == before + 1
+                  and app.ActiveProject.Name == os.path.splitext(name)[0])
+    except pywintypes.com_error:
+        opened = False
+    if not opened:
+        print(f"{name}\n  FIDELITY Project did not open the copy")
+        return 1, 0
     try:
         project = app.ActiveProject
         tasks = [t for t in project.Tasks if t is not None]
@@ -161,6 +177,14 @@ def check(app, path, tmpdir):
 def main(argv):
     paths = argv or sorted(glob.glob(os.path.join(CORPUS, "*.xml")))
     paths = [p if os.path.exists(p) else os.path.join(CORPUS, p) for p in paths]
+    try:
+        win32.GetActiveObject("MSProject.Application")
+    except pywintypes.com_error:
+        pass  # not running: Dispatch below starts a private instance
+    else:
+        print("Microsoft Project is already running; close it first. The check would "
+              "attach to that instance and close its projects without saving.")
+        return 2
     app = win32.Dispatch("MSProject.Application")
     fidelity = mismatches = 0
     try:
