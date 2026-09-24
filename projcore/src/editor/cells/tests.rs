@@ -221,12 +221,12 @@ fn scheduling_range_accounts_for_time_before_the_anchor() {
     for day in &mut ed.proj.calendars[0].week {
         day.times = vec![crate::model::WorkingTime { from: 0, to: 1440 }];
     }
-    // Keep a resolved leaf link so this project needs a backward horizon.
+    // Keep an SF leaf link so this project needs a backward horizon.
     ed.set_predecessors(
         20,
         vec![Predecessor {
             uid: 30,
-            link: LinkType::FinishStart,
+            link: LinkType::StartFinish,
             lag_min: 0,
         }],
     )

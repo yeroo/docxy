@@ -201,7 +201,11 @@ fn view_groups() -> Vec<Group> {
                     Seg::Gap(" "),
                     btn("▶", ScrollRight, "Scroll the timeline right (l)"),
                     Seg::Gap("  "),
-                    btn("⇤ Start", GoToStart, "Scroll to the project start"),
+                    btn(
+                        "⇤ Start",
+                        GoToStart,
+                        "Scroll to the earliest task or project start",
+                    ),
                 ],
                 vec![btn(
                     "⭳ Export Markdown",

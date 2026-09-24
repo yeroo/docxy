@@ -29,6 +29,10 @@ use crate::datetime::DateTime;
 use crate::model::{ConstraintType, LinkType, Project, ResourceType, Task};
 use std::collections::HashMap;
 
+/// Maximum calendar days on either side of the scheduling anchor.
+pub(crate) const HORIZON_DAYS: i64 = 366 * 100;
+pub(crate) const HORIZON_PADDING_MIN: i64 = 200 * 480 + 480;
+
 /// Computed schedule for one task.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct TaskResult {
@@ -89,7 +93,7 @@ impl Timeline {
         }
         let mut day = anchor.div_euclid(1440);
         let mut work = 0;
-        for _ in 0..366 * 100 {
+        for _ in 0..HORIZON_DAYS {
             day -= 1;
             let dow = (day + 4).rem_euclid(7) as usize;
             work += week[dow]
@@ -141,7 +145,7 @@ impl Timeline {
                 guard += 1;
             }
             let reached = day * 1440;
-            if (forward_total >= min_total && reached >= min_reach) || guard > 366 * 100 {
+            if (forward_total >= min_total && reached >= min_reach) || guard > HORIZON_DAYS {
                 break;
             }
         }
@@ -227,7 +231,7 @@ impl<'a> Scheduler<'a> {
             .flat_map(|t| &t.predecessors)
             .map(|p| p.lag_min.abs())
             .sum();
-        let min_total = work + lag + 200 * 480 + 480;
+        let min_total = work + lag + HORIZON_PADDING_MIN;
         let far_dates = proj
             .tasks
             .iter()
@@ -251,14 +255,16 @@ impl<'a> Scheduler<'a> {
             .filter_map(|t| t.calendar_uid)
             .chain(std::iter::once(default_cal))
             .collect();
-        let has_leaf_link = proj
-            .tasks
-            .iter()
-            .filter(|t| !t.summary)
-            .any(|t| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid)));
+        let needs_backward_horizon = proj.tasks.iter().filter(|t| !t.summary).any(|t| {
+            t.predecessors.iter().any(|p| {
+                leaf_uids.contains(&p.uid)
+                    && (p.lag_min < 0
+                        || matches!(p.link, LinkType::StartFinish | LinkType::FinishFinish))
+            })
+        });
 
         // Only schedulable calendars affect the horizon. Include the default
-        // fallback, but do not extend backward for projects without leaf links.
+        // fallback. Nonnegative FS/SS links cannot move tasks before the anchor.
         let mut weeks: HashMap<_, _> = proj
             .calendars
             .iter()
@@ -268,7 +274,7 @@ impl<'a> Scheduler<'a> {
         weeks
             .entry(default_cal)
             .or_insert_with(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
-        let origin = if has_leaf_link {
+        let origin = if needs_backward_horizon {
             weeks
                 .values()
                 .map(|week| Timeline::origin(week, raw_anchor, work + lag))
@@ -373,10 +379,12 @@ impl<'a> Scheduler<'a> {
             // Hard constraints (forward-affecting). Snap the constraint date two
             // ways: as a start (next morning) or a finish (this evening).
             if let Some(cd) = t.constraint_date {
-                // Earlier scheduling is link-driven; dated constraints retain
-                // their original anchor floor regardless of timeline origin.
-                let floor = tl.snap(self.anchor);
-                let date = cd.minutes().max(self.anchor);
+                // A satisfied constraint must not undo a link-driven pre-start
+                // date. Bound earlier constraints by that start, not the
+                // arbitrary timeline origin; unlinked tasks keep the anchor.
+                let floor_abs = self.anchor.min(start_abs);
+                let floor = tl.snap(floor_abs);
+                let date = cd.minutes().max(floor_abs);
                 let ds = tl.snap(date);
                 let df = tl.abs_finish(tl.to_index(date)).max(floor);
                 match t.constraint {
@@ -440,8 +448,9 @@ impl<'a> Scheduler<'a> {
             // Hard constraints (backward-affecting).
             let mut late_start_floor = None;
             if let Some(cd) = t.constraint_date {
-                let floor = tl.snap(self.anchor);
-                let date = cd.minutes().max(self.anchor);
+                let floor_abs = self.anchor.min(es_abs[&t.uid]);
+                let floor = tl.snap(floor_abs);
+                let date = cd.minutes().max(floor_abs);
                 let ds = tl.snap(date);
                 let df = tl.abs_finish(tl.to_index(date)).max(floor);
                 match t.constraint {
@@ -464,9 +473,10 @@ impl<'a> Scheduler<'a> {
                 }
             }
             let finish_index = tl.to_index(finish_abs);
-            let (s_abs, f_abs) = if finish_index == ef[&t.uid] {
+            let (s_abs, f_abs) = if finish_abs == ef_abs[&t.uid] {
                 // An SF endpoint (or milestone) can be the morning side of a
-                // gap. Zero float must retain both of its actual early dates.
+                // gap. Preserve it only for an exact bound: an earlier evening
+                // deadline can share its working index and must remain earlier.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
                 let f_abs = tl
@@ -1187,6 +1197,130 @@ mod tests {
                 assert_eq!(before.total_slack_min, 0, "{constraint:?}");
             }
         }
+    }
+
+    #[test]
+    fn satisfied_constraints_preserve_link_driven_pre_start_dates() {
+        let baseline = *schedule(&before_start_project()).get(1).unwrap();
+        for (constraint, date) in [
+            (
+                ConstraintType::StartNoEarlierThan,
+                DateTime::from_ymd_hm(2026, 2, 26, 8, 0),
+            ),
+            (
+                ConstraintType::StartNoEarlierThan,
+                DateTime::from_ymd_hm(2026, 2, 2, 8, 0),
+            ),
+            (
+                ConstraintType::FinishNoEarlierThan,
+                DateTime::from_ymd_hm(2026, 2, 27, 17, 0),
+            ),
+            (
+                ConstraintType::FinishNoEarlierThan,
+                DateTime::from_ymd_hm(2026, 2, 25, 17, 0),
+            ),
+            (
+                ConstraintType::MustFinishOn,
+                DateTime::from_ymd_hm(2026, 2, 27, 17, 0),
+            ),
+        ] {
+            let mut proj = before_start_project();
+            proj.tasks[0].constraint = constraint;
+            proj.tasks[0].constraint_date = Some(date);
+            let sched = schedule(&proj);
+            let a = sched.get(1).unwrap();
+            assert_eq!(a.early_start, baseline.early_start, "{constraint:?}");
+            // MFO retains the specified evening rather than the equivalent SF
+            // morning, following the hard-finish precedence established in v3.
+            let finish = if constraint == ConstraintType::MustFinishOn {
+                date
+            } else {
+                baseline.early_finish
+            };
+            assert_eq!(a.early_finish, finish, "{constraint:?}");
+            assert!(sched.get(2).unwrap().critical, "{constraint:?}");
+            assert_eq!(
+                working_minutes_between(&proj, a.early_start, a.early_finish),
+                960
+            );
+        }
+    }
+
+    #[test]
+    fn linked_task_far_earlier_mso_does_not_depend_on_origin() {
+        let mut proj = before_start_project();
+        proj.tasks[0].constraint = ConstraintType::MustStartOn;
+        proj.tasks[0].constraint_date = Some(DateTime::from_ymd_hm(2026, 2, 2, 8, 0));
+        let before = *schedule(&proj).get(1).unwrap();
+        assert_eq!(before.early_start, DateTime::from_ymd_hm(2026, 2, 26, 8, 0));
+        proj.tasks.push(task(3, "Unrelated", 5 * 480));
+        assert_eq!(*schedule(&proj).get(1).unwrap(), before);
+    }
+
+    #[test]
+    fn pre_start_finish_constraints_preserve_late_dates_and_slack() {
+        let baseline = *schedule(&before_start_project()).get(1).unwrap();
+        assert_eq!(baseline.total_slack_min, 480);
+        for (constraint, date, slack) in [
+            (
+                ConstraintType::FinishNoLaterThan,
+                DateTime::from_ymd_hm(2026, 3, 2, 12, 0),
+                240,
+            ),
+            (
+                ConstraintType::FinishNoLaterThan,
+                DateTime::from_ymd_hm(2026, 3, 2, 17, 0),
+                480,
+            ),
+            (
+                ConstraintType::MustFinishOn,
+                DateTime::from_ymd_hm(2026, 2, 27, 17, 0),
+                0,
+            ),
+        ] {
+            let mut proj = before_start_project();
+            proj.tasks[0].constraint = constraint;
+            proj.tasks[0].constraint_date = Some(date);
+            let sched = schedule(&proj);
+            let a = sched.get(1).unwrap();
+            assert_eq!(a.total_slack_min, slack, "{constraint:?} {date:?}");
+            assert_eq!(a.late_finish, date);
+            assert_eq!(
+                working_minutes_between(&proj, a.late_start, a.late_finish),
+                960
+            );
+            if slack == 480 {
+                assert_eq!(*a, baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn nonnegative_fs_and_ss_links_do_not_extend_the_timeline_backward() {
+        for link in [LinkType::FinishStart, LinkType::StartStart] {
+            for lag_min in [0, 480] {
+                let mut proj = before_start_project();
+                proj.tasks[0].predecessors[0] = Predecessor {
+                    uid: 2,
+                    link,
+                    lag_min,
+                };
+                let engine = Scheduler::new(&proj);
+                assert_eq!(engine.tl(&proj.tasks[0]).segs[0].start, engine.anchor);
+            }
+        }
+    }
+
+    #[test]
+    fn sf_late_finish_preserves_an_earlier_same_index_deadline() {
+        let mut proj = sf_project();
+        let deadline = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
+        proj.tasks[1].constraint = ConstraintType::FinishNoLaterThan;
+        proj.tasks[1].constraint_date = Some(deadline);
+        let sched = schedule(&proj);
+        let b = sched.get(2).unwrap();
+        assert_eq!(b.early_finish, DateTime::from_ymd_hm(2026, 3, 4, 8, 0));
+        assert_eq!(b.late_finish, deadline);
     }
 
     #[test]

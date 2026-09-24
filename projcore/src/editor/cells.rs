@@ -1,6 +1,7 @@
 //! Atomic operations and lossless text interchange for entry-table cells.
 use super::*;
 use crate::model::Calendar;
+use crate::schedule::{HORIZON_DAYS, HORIZON_PADDING_MIN};
 
 impl Editor {
     /// Preflight the scheduler's aggregate working-minute horizon before snapshotting.
@@ -13,7 +14,7 @@ impl Editor {
         // Timelines include up to 100 years before the anchor and 100 years
         // after it, plus the final guard day. Reserve the full index as well as
         // padding so index + duration/lag stays representable for dated starts.
-        let mut total = (2 * 366_i64 * 100 + 1) * 1440 + 200 * 480 + 480;
+        let mut total = (2 * HORIZON_DAYS + 1) * 1440 + HORIZON_PADDING_MIN;
         for task in &self.proj.tasks {
             let minutes = if task.uid == uid {
                 duration.unwrap_or(task.duration_min)
