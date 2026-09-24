@@ -203,6 +203,14 @@ impl Timeline {
         self.segs.last().map(|s| s.end).unwrap_or(0)
     }
 
+    /// Clamp an instant into the span this timeline covers.
+    fn clamp(&self, abs: i64) -> i64 {
+        match (self.segs.first(), self.segs.last()) {
+            (Some(first), Some(last)) => abs.clamp(first.start, last.end),
+            _ => abs,
+        }
+    }
+
     /// Snap an instant forward to the nearest working **start** instant.
     fn snap(&self, abs: i64) -> i64 {
         self.abs_start(self.to_index(abs))
@@ -260,11 +268,32 @@ impl<'a> Scheduler<'a> {
             .sum();
         let min_total = work + lag + HORIZON_PADDING_MIN;
         // A pinned task's duration-derived finish lies past its start; reserve
-        // Standard-calendar wall-clock reach (about 4.2 minutes per working
-        // minute) for it, with the margin below covering sparser calendars.
+        // wall-clock reach for its duration at its own calendar's weekly rate.
+        // A calendar without working time cannot schedule the task at all.
+        let week_minutes = |task: &Task| -> i64 {
+            let uid = task.calendar_uid.unwrap_or(default_cal);
+            let week = proj
+                .calendars
+                .iter()
+                .find(|c| c.uid == uid)
+                .or_else(|| proj.calendars.iter().find(|c| c.uid == default_cal))
+                .map(week_pairs)
+                .unwrap_or_else(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
+            week.iter()
+                .flatten()
+                .map(|&(from, to)| to.saturating_sub(from) as i64)
+                .sum()
+        };
         let pinned_reach = proj.tasks.iter().filter_map(|t| {
-            t.pinned_dates()
-                .map(|(start, _)| start.minutes() + t.duration_min.max(0) * 5)
+            let (start, _) = t.pinned_dates()?;
+            let per_week = week_minutes(t);
+            (per_week > 0).then(|| {
+                let wall = (t.duration_min.max(0) as i128 * 7 * 1440 + per_week as i128 - 1)
+                    / per_week as i128;
+                start
+                    .minutes()
+                    .saturating_add(wall.min(i64::MAX as i128) as i64)
+            })
         });
         let far_dates = proj
             .tasks
@@ -497,10 +526,13 @@ impl<'a> Scheduler<'a> {
             // Only links drive its slack, so a violated link shows as negative
             // total slack and an unlinked task never does.
             if let Some((pinned_start, pinned_finish)) = t.pinned_dates() {
-                let s_abs = pinned_start.minutes();
+                // A date beyond the timeline is clamped into it, leaving room
+                // for the duration, so the finish never precedes the start.
+                let latest = tl.abs_start((tl.total - t.duration_min).max(0));
+                let s_abs = tl.clamp(pinned_start.minutes()).min(latest);
                 let s_idx = tl.to_index(s_abs);
                 let f_abs = match pinned_finish {
-                    Some(finish) => finish.minutes().max(s_abs),
+                    Some(finish) => tl.clamp(finish.minutes()).max(s_abs),
                     None => finish_instant(
                         t,
                         tl,
@@ -3040,7 +3072,7 @@ mod tests {
         DateTime::from_ymd_hm(2026, 3, d, h, 0)
     }
 
-    /// A manually scheduled task pinned at `start` (March 2026, day `d`).
+    /// A manually scheduled task pinned at `start`.
     fn manual(uid: i32, name: &str, duration: i64, start: DateTime) -> Task {
         Task {
             manual: true,
@@ -3121,6 +3153,44 @@ mod tests {
         // Unlinked, it violates nothing: no negative slack from the anchor.
         assert_eq!(s.get(1).unwrap().total_slack_min, 0);
         assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn manual_dates_beyond_the_timeline_keep_finish_after_start() {
+        for start in [
+            DateTime::from_ymd_hm(2200, 1, 1, 8, 0),
+            DateTime::from_ymd_hm(1026, 3, 2, 8, 0),
+        ] {
+            let mut succ = task(2, "S", 480);
+            succ.predecessors.push(fs(1));
+            let s = schedule(&march2(vec![manual(1, "M", 480, start), succ]));
+            let m = s.get(1).unwrap();
+            assert!(m.early_finish > m.early_start, "{start:?}");
+            // The auto successor may run off the timeline end, as any auto
+            // task can, but never finishes before it starts.
+            let succ = s.get(2).unwrap();
+            assert!(succ.early_finish >= succ.early_start, "{start:?}");
+        }
+    }
+
+    #[test]
+    fn long_manual_task_on_a_sparse_calendar_keeps_its_full_duration() {
+        // Mondays only: 480 working minutes a week.
+        let mut mondays = Calendar::standard(2);
+        for day in [2, 3, 4, 5] {
+            mondays.week[day] = DayWorking::default();
+        }
+        // Pinned beyond the working-minute budget after the anchor.
+        let start = DateTime::from_ymd_hm(2031, 3, 3, 8, 0);
+        assert_eq!(start.weekday(), 1);
+        let mut m = manual(1, "M", 40 * 480, start);
+        m.calendar_uid = Some(2);
+        let mut proj = march2(vec![m]);
+        proj.calendars.push(mondays);
+        let s = schedule(&proj);
+        // Forty Mondays: the last is 39 weeks after the first.
+        let finish = start.add_days(39 * 7).with_minute_of_day(17 * 60);
+        assert_eq!(s.get(1).unwrap().early_finish, finish);
     }
 
     #[test]
