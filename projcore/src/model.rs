@@ -111,6 +111,17 @@ pub struct Predecessor {
     pub lag_min: i64,
 }
 
+/// A recorded plan in one MSPDI baseline slot.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Baseline {
+    /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
+    pub number: u8,
+    pub start: Option<DateTime>,
+    pub finish: Option<DateTime>,
+    /// Recorded working minutes; None when Duration was omitted, empty, or invalid.
+    pub duration_min: Option<i64>,
+}
+
 /// A schedulable task (or a summary/milestone).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Task {
@@ -133,13 +144,23 @@ pub struct Task {
     /// elsewhere.
     pub stored_start: Option<DateTime>,
     pub stored_finish: Option<DateTime>,
-    /// Baseline (the saved plan) start/finish, for planned-vs-current variance.
-    /// Set by "Set Baseline"; round-trips through MSPDI's `<Baseline>` element.
-    pub baseline_start: Option<DateTime>,
-    pub baseline_finish: Option<DateTime>,
+    /// Saved plans, sorted by number with at most one record per slot (0..=10).
+    /// Use set_baseline_slot to replace a slot; UI variance uses slot 0.
+    pub baselines: Vec<Baseline>,
 }
 
 impl Task {
+    pub fn baseline(&self, number: u8) -> Option<&Baseline> {
+        self.baselines.iter().find(|b| b.number == number)
+    }
+
+    /// Replace the whole record for a slot, maintaining unique, sorted slots.
+    pub fn set_baseline_slot(&mut self, baseline: Baseline) {
+        self.baselines.retain(|b| b.number != baseline.number);
+        self.baselines.push(baseline);
+        self.baselines.sort_by_key(|b| b.number);
+    }
+
     pub fn is_milestone(&self) -> bool {
         self.milestone || self.duration_min == 0
     }

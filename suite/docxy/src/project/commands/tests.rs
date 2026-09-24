@@ -450,12 +450,10 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
             }
             ClearResources => assert!(after.assignments.is_empty()),
             Milestone => assert!(after.task(2).unwrap().milestone),
-            Baseline => assert!(
-                after
-                    .tasks
-                    .iter()
-                    .all(|t| t.baseline_start.is_some() && t.baseline_finish.is_some())
-            ),
+            Baseline => assert!(after.tasks.iter().all(|t| {
+                t.baseline(0)
+                    .is_some_and(|b| b.start.is_some() && b.finish.is_some())
+            })),
             _ => unreachable!(),
         }
         apply_project_act(&mut t, Undo);

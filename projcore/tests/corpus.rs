@@ -29,7 +29,7 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
     assert!(
-        files.len() >= 14,
+        files.len() >= 15,
         "expected the full seed corpus, got {}",
         files.len()
     );
@@ -219,4 +219,65 @@ fn yppx_package_round_trip_preserves_schedule() {
             }
         }
     }
+}
+
+#[test]
+fn baselines_round_trip_through_mspdi_and_yppx() {
+    let files = mspdi_files();
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "15-baseline-slots.xml")
+    );
+    for path in files {
+        let proj = read_mspdi(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        for (kind, back) in [("MSPDI", xml_back), (".yppx", package_back)] {
+            assert_eq!(back.tasks.len(), proj.tasks.len());
+            for (expected, actual) in proj.tasks.iter().zip(&back.tasks) {
+                assert_eq!(actual.uid, expected.uid);
+                assert_eq!(
+                    actual.baselines,
+                    expected.baselines,
+                    "{}: {kind} task {} baselines changed",
+                    path.display(),
+                    expected.uid
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn baseline_fixture_records_different_plans_and_missing_duration() {
+    use projcore::{Baseline, DateTime};
+    let proj =
+        read_mspdi(&std::fs::read_to_string(corpus_dir().join("15-baseline-slots.xml")).unwrap())
+            .unwrap();
+    let task = &proj.tasks[0];
+    assert_eq!(task.duration_min, 960);
+    assert_eq!(
+        task.baselines,
+        vec![
+            Baseline {
+                number: 0,
+                start: Some(DateTime::from_ymd_hm(2026, 3, 4, 8, 0)),
+                finish: Some(DateTime::from_ymd_hm(2026, 3, 6, 17, 0)),
+                duration_min: Some(1440)
+            },
+            Baseline {
+                number: 1,
+                start: Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
+                finish: Some(DateTime::from_ymd_hm(2026, 3, 13, 17, 0)),
+                duration_min: Some(2400)
+            },
+            Baseline {
+                number: 2,
+                start: Some(DateTime::from_ymd_hm(2026, 3, 16, 8, 0)),
+                finish: Some(DateTime::from_ymd_hm(2026, 3, 17, 17, 0)),
+                duration_min: None
+            },
+        ]
+    );
 }

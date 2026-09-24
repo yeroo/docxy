@@ -1,7 +1,7 @@
 # projcore MSPDI seed corpus
 
 Tiny, single-feature MS Project XML (MSPDI) files used to validate the
-`projcore` CPM scheduler and resource round trips. Each file isolates one feature so a
+`projcore` CPM scheduler, resource and baseline round trips. Each file isolates one feature so a
 failing assertion points at a single code path.
 
 ## Embedded expectations
@@ -42,6 +42,7 @@ Project outputs.
 | `12-calendar-6day` | custom calendar | Saturday working changes the finish |
 | `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006) |
 | `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
+| `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
 
 See `manifest.json` for machine-readable tags.
 

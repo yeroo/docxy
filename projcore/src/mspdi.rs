@@ -159,20 +159,33 @@ fn parse_task(p: &mut XmlParser) -> Task {
     t
 }
 
-/// Parse a task `<Baseline>` element (we keep only Start/Finish).
+/// Parse a task's recorded plan without borrowing values from its current plan.
 fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
+    let mut baseline = Baseline::default();
+    let mut number = Some(0);
     loop {
         match p.next() {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
-                    "Start" => t.baseline_start = DateTime::parse_mspdi(&text_of(p)),
-                    "Finish" => t.baseline_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Number" => {
+                        number = text_of(p).trim().parse::<u8>().ok().filter(|n| *n <= 10);
+                    }
+                    "Start" => baseline.start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Duration" => baseline.duration_min = try_iso8601_to_minutes(&text_of(p)),
                     _ => p.skip_element(),
                 }
             }
             Event::End | Event::Eof => break,
             _ => {}
+        }
+    }
+    if let Some(number) = number {
+        if baseline.start.is_some() || baseline.finish.is_some() || baseline.duration_min.is_some()
+        {
+            baseline.number = number;
+            t.set_baseline_slot(baseline);
         }
     }
 }
@@ -507,6 +520,46 @@ pub fn iso8601_to_minutes(s: &str) -> i64 {
     minutes
 }
 
+/// Parse the supported duration components without treating invalid input as zero.
+/// Baselines need to distinguish a recorded zero from an unavailable duration;
+/// task and assignment imports retain the permissive parser above.
+fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
+    let body = s.trim().strip_prefix('P')?;
+    let mut minutes = 0i64;
+    let mut in_time = false;
+    let mut previous_unit = 0;
+    let mut num = String::new();
+    for c in body.chars() {
+        if c == 'T' && !in_time && num.is_empty() {
+            in_time = true;
+            continue;
+        }
+        if c.is_ascii_digit() || c == '.' {
+            num.push(c);
+            continue;
+        }
+        let (unit, factor) = match c {
+            'D' if !in_time => (1, 1440.0),
+            'H' if in_time => (2, 60.0),
+            'M' if in_time => (3, 1.0),
+            'S' if in_time => (4, 1.0 / 60.0),
+            _ => return None,
+        };
+        if unit <= previous_unit {
+            return None;
+        }
+        let value = (num.parse::<f64>().ok()? * factor).round();
+        // Reject overflow and nonfinite values instead of saturating to invented data.
+        if !(i64::MIN as f64..-(i64::MIN as f64)).contains(&value) {
+            return None;
+        }
+        minutes = minutes.checked_add(value as i64)?;
+        previous_unit = unit;
+        num.clear();
+    }
+    (num.is_empty() && previous_unit > 0 && (!in_time || previous_unit > 1)).then_some(minutes)
+}
+
 // ---- writer -----------------------------------------------------------------
 
 /// Serialize a [`Project`] back to MSPDI XML.
@@ -611,12 +664,20 @@ fn write_task(s: &mut String, t: &Task) {
         tag(s, 4, "LagFormat", "7");
         s.push_str("      </PredecessorLink>\n");
     }
-    if let (Some(bs), Some(bf)) = (t.baseline_start, t.baseline_finish) {
+    let mut baselines: Vec<_> = t.baselines.iter().collect();
+    baselines.sort_by_key(|b| b.number);
+    for baseline in baselines {
         s.push_str("      <Baseline>\n");
-        tag(s, 4, "Number", "0");
-        tag(s, 4, "Start", &bs.to_mspdi());
-        tag(s, 4, "Finish", &bf.to_mspdi());
-        tag(s, 4, "Duration", &min_to_iso(t.duration_min));
+        tag(s, 4, "Number", &baseline.number.to_string());
+        if let Some(start) = baseline.start {
+            tag(s, 4, "Start", &start.to_mspdi());
+        }
+        if let Some(finish) = baseline.finish {
+            tag(s, 4, "Finish", &finish.to_mspdi());
+        }
+        if let Some(duration) = baseline.duration_min {
+            tag(s, 4, "Duration", &min_to_iso(duration));
+        }
         s.push_str("      </Baseline>\n");
     }
     s.push_str("    </Task>\n");
@@ -1117,13 +1178,238 @@ mod tests {
             name: "A".into(),
             outline_level: 1,
             duration_min: 960,
-            baseline_start: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
-            baseline_finish: Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0)),
+            baselines: vec![Baseline {
+                start: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                finish: Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0)),
+                ..Baseline::default()
+            }],
             ..Task::default()
         });
         let back = read_mspdi(&write_mspdi(&proj)).unwrap();
-        assert_eq!(back.tasks[0].baseline_start, proj.tasks[0].baseline_start);
-        assert_eq!(back.tasks[0].baseline_finish, proj.tasks[0].baseline_finish);
+        assert_eq!(back.tasks[0].baselines, proj.tasks[0].baselines);
+    }
+
+    fn project_with_baselines(baselines: &str) -> Project {
+        read_mspdi(&format!("<Project><Tasks><Task><UID>1</UID><Duration>PT16H0M0S</Duration>{baselines}</Task></Tasks></Project>")).unwrap()
+    }
+
+    #[test]
+    fn baseline_slot_and_duration_survive_round_trip() {
+        let proj = project_with_baselines(
+            "<Baseline><Number>1</Number><Start>2026-03-09T08:00:00</Start><Finish>2026-03-13T17:00:00</Finish><Duration>PT40H0M0S</Duration></Baseline>",
+        );
+        assert_eq!(proj.tasks[0].duration_min, 960);
+        let expected = Baseline {
+            number: 1,
+            start: Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
+            finish: Some(DateTime::from_ymd_hm(2026, 3, 13, 17, 0)),
+            duration_min: Some(2400),
+        };
+        assert_eq!(proj.tasks[0].baselines, vec![expected]);
+        let xml = write_mspdi(&proj);
+        let baseline = xml
+            .split("<Baseline>")
+            .nth(1)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            baseline.trim(),
+            "<Number>1</Number>\n        <Start>2026-03-09T08:00:00</Start>\n        <Finish>2026-03-13T17:00:00</Finish>\n        <Duration>PT40H0M0S</Duration>"
+        );
+        assert_eq!(read_mspdi(&xml).unwrap().tasks[0].baselines, vec![expected]);
+    }
+
+    #[test]
+    fn multiple_baseline_slots_round_trip() {
+        let mut proj = project_with_baselines(
+            "<Baseline><Number>1</Number><Start>2026-03-09T08:00:00</Start><Finish>2026-03-13T17:00:00</Finish><Duration>PT40H0M0S</Duration></Baseline><Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start><Finish>2026-03-04T17:00:00</Finish><Duration>PT24H0M0S</Duration></Baseline>",
+        );
+        assert_eq!(
+            proj.tasks[0]
+                .baselines
+                .iter()
+                .map(|b| b.number)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        let expected = proj.tasks[0].baselines.clone();
+        // Public model callers can provide unsorted slots; lookup and output still work.
+        proj.tasks[0].baselines.reverse();
+        assert_eq!(proj.tasks[0].baseline(0), Some(&expected[0]));
+        let xml = write_mspdi(&proj);
+        assert!(xml.find("<Number>0").unwrap() < xml.find("<Number>1").unwrap());
+        assert_eq!(read_mspdi(&xml).unwrap().tasks[0].baselines, expected);
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(back.tasks[0].baselines, expected);
+    }
+
+    #[test]
+    fn partial_baselines_emit_only_recorded_fields() {
+        for field in [
+            "<Start>2026-03-09T08:00:00</Start>",
+            "<Finish>2026-03-13T17:00:00</Finish>",
+            "<Duration>PT0H0M0S</Duration>",
+        ] {
+            let proj =
+                project_with_baselines(&format!("<Baseline><Number>1</Number>{field}</Baseline>"));
+            let xml = write_mspdi(&proj);
+            let baseline = xml
+                .split("<Baseline>")
+                .nth(1)
+                .unwrap()
+                .split("</Baseline>")
+                .next()
+                .unwrap();
+            assert_eq!(
+                baseline.trim(),
+                format!("<Number>1</Number>\n        {field}")
+            );
+            assert_eq!(
+                read_mspdi(&xml).unwrap().tasks[0].baselines,
+                proj.tasks[0].baselines
+            );
+        }
+    }
+
+    #[test]
+    fn fallible_baseline_duration_keeps_valid_values() {
+        for (source, expected) in [
+            ("PT16H0M0S", 960),
+            ("PT0H0M0S", 0),
+            (" PT8H30M0S ", 510),
+            ("PT1.5H", 90),
+            ("P1DT1H", 1500),
+            ("P1D", 1440),
+            ("PT30S", 1),
+        ] {
+            assert_eq!(try_iso8601_to_minutes(source), Some(expected));
+            let proj = project_with_baselines(&format!(
+                "<Baseline><Number>1</Number><Duration>{source}</Duration></Baseline>"
+            ));
+            assert_eq!(
+                proj.tasks[0].baseline(1).unwrap().duration_min,
+                Some(expected)
+            );
+        }
+        for source in [
+            "",
+            "P",
+            "1H",
+            "P1DT",
+            "PT1M1H",
+            "PT1H1H",
+            "PT9999999999999999999999H",
+            "PT-0H",
+            "P-1D",
+            "PT1H-30M",
+            "PT+1H",
+        ] {
+            assert_eq!(try_iso8601_to_minutes(source), None, "{source}");
+        }
+        // The existing task parser deliberately remains permissive.
+        assert_eq!(iso8601_to_minutes("1D"), 1440);
+        assert_eq!(iso8601_to_minutes("PT1Hgarbage"), 60);
+    }
+
+    #[test]
+    fn invalid_baseline_duration_never_fabricates_zero() {
+        for duration in [
+            "<Duration/>",
+            "<Duration>   </Duration>",
+            "<Duration>garbage</Duration>",
+            "<Duration>PT</Duration>",
+            "<Duration>PT1.2.3H</Duration>",
+            "<Duration>PT1Hgarbage</Duration>",
+            "<Duration>PT1H2</Duration>",
+            "<Duration>PT-0H</Duration>",
+        ] {
+            for start in ["", "<Start>2026-03-09T08:00:00</Start>"] {
+                let proj = project_with_baselines(&format!(
+                    "<Baseline><Number>1</Number>{start}{duration}</Baseline>"
+                ));
+                if start.is_empty() {
+                    assert!(proj.tasks[0].baselines.is_empty(), "{duration}");
+                } else {
+                    assert_eq!(
+                        proj.tasks[0].baselines,
+                        vec![Baseline {
+                            number: 1,
+                            start: Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
+                            ..Baseline::default()
+                        }],
+                        "{duration}"
+                    );
+                }
+                let xml = write_mspdi(&proj);
+                // Ignore the task's current Duration when checking baseline output.
+                let baseline = xml.split("<Baseline>").nth(1);
+                assert_eq!(baseline.is_some(), !start.is_empty());
+                if let Some(baseline) = baseline {
+                    assert!(
+                        !baseline
+                            .split("</Baseline>")
+                            .next()
+                            .unwrap()
+                            .contains("<Duration")
+                    );
+                }
+                assert_eq!(
+                    read_mspdi(&xml).unwrap().tasks[0].baselines,
+                    proj.tasks[0].baselines
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn missing_and_empty_baselines_write_no_element() {
+        for source in ["", "<Baseline/>", "<Baseline><Number>1</Number></Baseline>"] {
+            let proj = project_with_baselines(source);
+            assert!(proj.tasks[0].baselines.is_empty());
+            assert!(!write_mspdi(&proj).contains("<Baseline>"));
+        }
+    }
+
+    #[test]
+    fn baseline_numbers_default_only_when_absent() {
+        let original = "<Baseline><Duration>PT8H0M0S</Duration></Baseline>";
+        for number in ["-1", "11", "256", "x", ""] {
+            let proj = project_with_baselines(&format!(
+                "{original}<Baseline><Number>{number}</Number><Duration>PT40H0M0S</Duration></Baseline>"
+            ));
+            assert_eq!(
+                proj.tasks[0].baselines,
+                vec![Baseline {
+                    duration_min: Some(480),
+                    ..Baseline::default()
+                }]
+            );
+        }
+        let proj = project_with_baselines(
+            "<Baseline><Number> 10 </Number><Duration>PT8H0M0S</Duration></Baseline>",
+        );
+        assert_eq!(proj.tasks[0].baseline(10).unwrap().duration_min, Some(480));
+        assert_eq!(
+            read_mspdi(&write_mspdi(&proj)).unwrap().tasks[0].baselines,
+            proj.tasks[0].baselines
+        );
+    }
+
+    #[test]
+    fn duplicate_baseline_replaces_entire_record() {
+        let proj = project_with_baselines(
+            "<Baseline><Number>1</Number><Start>2026-03-09T08:00:00</Start><Duration>PT40H0M0S</Duration></Baseline><Baseline><Number>1</Number><Finish>2026-03-13T17:00:00</Finish></Baseline>",
+        );
+        assert_eq!(
+            proj.tasks[0].baselines,
+            vec![Baseline {
+                number: 1,
+                finish: Some(DateTime::from_ymd_hm(2026, 3, 13, 17, 0)),
+                ..Baseline::default()
+            }]
+        );
     }
 
     #[test]

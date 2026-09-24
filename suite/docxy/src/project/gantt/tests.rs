@@ -50,12 +50,15 @@ fn baseline_extends_both_scale_ends_and_requires_both_dates_for_a_bar() {
     assert_eq!(normal.origin_day, ed.schedule().project_start.day_number());
     assert_eq!(normal.days, 30);
     let mut p = ed.project().clone();
-    p.tasks[0].baseline_start = Some(projcore::DateTime::from_minutes(
-        (normal.origin_day - 10) * 1440,
-    ));
+    p.tasks[0].set_baseline_slot(projcore::Baseline {
+        start: Some(projcore::DateTime::from_minutes(
+            (normal.origin_day - 10) * 1440,
+        )),
+        ..projcore::Baseline::default()
+    });
     let incomplete = ProjectEditor::new(p.clone());
     assert!(bar(&incomplete, 1).baseline.is_none());
-    p.tasks[0].baseline_finish = Some(projcore::DateTime::from_minutes(
+    p.tasks[0].baselines[0].finish = Some(projcore::DateTime::from_minutes(
         (normal.origin_day + 60) * 1440,
     ));
     let ed = ProjectEditor::new(p);
@@ -65,6 +68,26 @@ fn baseline_extends_both_scale_ends_and_requires_both_dates_for_a_bar() {
     assert_eq!(bar(&ed, 1).baseline, Some((0, 70)));
     assert_eq!(bar(&ed, 1).start, 10);
     assert_eq!(bar(&ed, 1).end, 10);
+}
+
+#[test]
+fn slot_one_alone_does_not_show_a_bar_or_extend_the_scale() {
+    let ed = editor(vec![task(1, 1, 1)]);
+    let normal = gantt_scale(&ed);
+    let mut p = ed.project().clone();
+    p.tasks[0].set_baseline_slot(projcore::Baseline {
+        number: 1,
+        start: Some(projcore::DateTime::from_minutes(
+            (normal.origin_day - 10) * 1440,
+        )),
+        finish: Some(projcore::DateTime::from_minutes(
+            (normal.origin_day + 60) * 1440,
+        )),
+        duration_min: Some(2400),
+    });
+    let ed = ProjectEditor::new(p);
+    assert_eq!(gantt_scale(&ed), normal);
+    assert_eq!(bar(&ed, 1).baseline, None);
 }
 
 #[test]

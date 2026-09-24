@@ -6,7 +6,8 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Assignment, ConstraintType, LinkType, Predecessor, Project, Resource, ResourceType, Task,
+    Assignment, Baseline, ConstraintType, LinkType, Predecessor, Project, Resource, ResourceType,
+    Task,
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
@@ -443,11 +444,34 @@ impl Editor {
 
     pub fn set_baseline(&mut self) {
         self.snapshot();
-        for t in &mut self.proj.tasks {
-            if let Some(r) = self.sched.get(t.uid) {
-                t.baseline_start = Some(r.early_start);
-                t.baseline_finish = Some(r.early_finish);
-            }
+        let baselines: Vec<_> = self
+            .proj
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let r = self.sched.get(t.uid)?;
+                Some((
+                    i,
+                    Baseline {
+                        number: 0,
+                        start: Some(r.early_start),
+                        finish: Some(r.early_finish),
+                        duration_min: Some(if t.summary {
+                            crate::schedule::working_minutes_between(
+                                &self.proj,
+                                r.early_start,
+                                r.early_finish,
+                            )
+                        } else {
+                            t.duration_min
+                        }),
+                    },
+                ))
+            })
+            .collect();
+        for (i, baseline) in baselines {
+            self.proj.tasks[i].set_baseline_slot(baseline);
         }
         self.changed();
     }
@@ -640,6 +664,67 @@ mod tests {
         })
     }
 
+    #[test]
+    fn set_baseline_captures_durations_and_preserves_other_slots_and_history() {
+        let saved = Baseline {
+            number: 1,
+            duration_min: Some(2400),
+            ..Baseline::default()
+        };
+        let mut proj = editor().project().clone();
+        proj.tasks = vec![
+            Task {
+                uid: 1,
+                outline_level: 1,
+                duration_min: 99,
+                ..Task::default()
+            },
+            Task {
+                uid: 2,
+                outline_level: 2,
+                duration_min: 960,
+                ..Task::default()
+            },
+            Task {
+                uid: 3,
+                outline_level: 1,
+                duration_min: 0,
+                milestone: true,
+                ..Task::default()
+            },
+        ];
+        for task in &mut proj.tasks {
+            task.set_baseline_slot(saved);
+            task.set_baseline_slot(Baseline {
+                duration_min: Some(60),
+                ..Baseline::default()
+            });
+        }
+        let mut ed = Editor::new(proj);
+        let before = ed.project().clone();
+        ed.set_baseline();
+        assert!(ed.project().tasks[0].summary);
+        assert_eq!(ed.project().tasks[0].duration_min, 99);
+        for (task, expected) in ed.project().tasks.iter().zip([960, 960, 0]) {
+            let baseline = task.baseline(0).unwrap();
+            let r = ed.schedule().get(task.uid).unwrap();
+            assert_eq!(baseline.duration_min, Some(expected));
+            assert_eq!(baseline.start, Some(r.early_start));
+            assert_eq!(baseline.finish, Some(r.early_finish));
+            assert_eq!(task.baseline(1), Some(&saved));
+        }
+        let after = ed.project().clone();
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+        assert!(ed.redo());
+        assert_eq!(ed.project(), &after);
+        ed.set_duration_min(2, 1440).unwrap();
+        assert_eq!(
+            ed.project().tasks[1].baseline(0).unwrap().duration_min,
+            Some(960)
+        );
+    }
+
     fn results(sched: &Schedule) -> Vec<TaskResult> {
         let mut results: Vec<_> = sched.results().copied().collect();
         results.sort_by_key(|r| r.uid);
@@ -745,7 +830,7 @@ mod tests {
             );
         });
         assert_edit(&mut ed, |e| e.set_baseline());
-        let baseline = ed.project().tasks[1].baseline_finish.unwrap();
+        let baseline = ed.project().tasks[1].baseline(0).unwrap().finish.unwrap();
         assert_edit(&mut ed, |e| {
             e.set_duration_min(3, 4800).unwrap();
         });
