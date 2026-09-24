@@ -302,6 +302,21 @@ def build():
                  preds=[(1, FS, 0)], ctype=FNLT, cdate=dt(6, "17:00:00")),
         ])))
 
+    # 18 — Project 2021 places FS milestones at the predecessor's finish (#59).
+    add("18-milestone-after-fs.xml", ["milestone", "link", "link-fs"],
+        "Project 2021 (#59): FS milestones keep the predecessor finish instant.",
+        project("milestone-after-fs", "\n".join([
+            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00")),
+            task(2, "Sign-off", 0, dt(3, "17:00:00"), dt(3, "17:00:00"),
+                 milestone=True, preds=[(1, FS, 0)]),
+            task(3, "Chain A", D, dt(2), dt(2, "17:00:00")),
+            task(4, "M1", 0, dt(2, "17:00:00"), dt(2, "17:00:00"),
+                 milestone=True, preds=[(3, FS, 0)]),
+            task(5, "B", 5 * D, dt(3), dt(9, "17:00:00"), preds=[(4, FS, 0)]),
+            task(6, "M2", 0, dt(9, "17:00:00"), dt(9, "17:00:00"),
+                 milestone=True, preds=[(5, FS, 0)]),
+        ])))
+
     manifest = {
         "anchor": "2026-03-02T08:00:00",
         "calendar": "Standard 8h/day Mon-Fri (08:00-12:00, 13:00-17:00)",

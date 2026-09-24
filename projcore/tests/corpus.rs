@@ -4,7 +4,8 @@
 //!
 //! These are hand-derived expectations. The owner checked the SF shapes in
 //! files 05 and 14 against Project 2021 (issue #53), the 24-hour calendar
-//! in file 16 (issue #58), and the FNLT conflict in file 17 (issue #60);
+//! in file 16 (issue #58), the FNLT conflict in file 17 (issue #60),
+//! and the FS milestone dates in file 18 (issue #59);
 //! the other fixtures have not been independently verified against Project.
 //! Slack invariants below also
 //! check properties that do not depend on the embedded date expectations.
@@ -31,7 +32,7 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
     assert!(
-        files.len() >= 17,
+        files.len() >= 18,
         "expected the full seed corpus, got {}",
         files.len()
     );
