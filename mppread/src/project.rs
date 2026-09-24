@@ -1,12 +1,11 @@
-//! Convert decoded legacy MPP metadata and tasks to a schedulable project.
+//! Convert validated MPP metadata and tasks to a schedulable project.
 
 use projcore::editor::default_anchor;
 use projcore::{ConstraintType, DateTime, LinkType, Predecessor, Project, Task};
 
-/// Build a partial project from a legacy binary `.mpp`. Decodes the documented
-/// metadata (title/author/…), the **task names** (from the VarMeta/Var2Data
-/// container), and — when the fixed-record layout is recognized — each task's
-/// **start/finish** dates from the FixedData records. A decoded task is pinned
+/// Build a project from a structurally recognized `.mpp` task table. Task UID 0
+/// is its project summary and supplies a fallback name, but is not imported as
+/// a task. Each decoded leaf with dates is pinned
 /// with a Must-Start-On constraint at its start and given a duration equal to
 /// the working minutes between its start and finish, so the scheduler reproduces
 /// the real dates; tasks without decoded dates keep a default 1-day duration.
@@ -15,6 +14,8 @@ use projcore::{ConstraintType, DateTime, LinkType, Predecessor, Project, Task};
 /// table. Save As converts it to `.yppx`/MSPDI.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
+    let decoded = crate::mpp::decode_tasks(bytes)
+        .map_err(|e| format!("cannot read the task table of this .mpp ({e})"))?;
     let name = [
         info.title.clone(),
         info.subject.clone(),
@@ -22,13 +23,30 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     ]
     .into_iter()
     .find(|s| !s.is_empty())
-    .unwrap_or_else(|| "Imported project".into());
+    .unwrap_or_else(|| {
+        decoded
+            .iter()
+            .find(|t| t.uid == 0)
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "Imported project".into())
+    });
     let cal_ref = Project::default();
-    let decoded = crate::mpp::tasks(bytes);
+    // MPP9 stores its root at level 1; removing UID 0 shifts its descendants
+    // back one level. Current Project stores UID 0 at level 0 already.
+    let legacy_root = decoded
+        .iter()
+        .find(|t| t.uid == 0)
+        .is_some_and(|t| t.outline_level == Some(1));
+    let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // A task is a summary when the next task sits one WBS level deeper.
     let levels: Vec<u32> = decoded
         .iter()
-        .map(|t| t.outline_level.unwrap_or(1))
+        .map(|t| {
+            t.outline_level
+                .unwrap_or(1)
+                .saturating_sub(u32::from(legacy_root))
+                .max(1)
+        })
         .collect();
     let tasks: Vec<Task> = decoded
         .iter()
@@ -36,7 +54,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         .map(|(i, t)| {
             let is_summary = levels.get(i + 1).is_some_and(|&nxt| nxt > levels[i]);
             let mut task = Task {
-                uid: i as i32 + 1,
+                uid: t.uid as i32,
                 id: i as i32 + 1,
                 name: t.name.clone(),
                 outline_level: levels[i],
@@ -44,15 +62,15 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 duration_min: 480,
                 ..Task::default()
             };
-            // Predecessor links (indices → uids); lag isn't decoded yet.
+            // Binary links identify predecessor tasks by their stable UID.
             task.predecessors = t
                 .predecessors
                 .iter()
                 .filter_map(|p| {
                     Some(Predecessor {
-                        uid: p.pred as i32 + 1,
+                        uid: p.pred_uid as i32,
                         link: LinkType::from_code(p.kind as i64)?,
-                        lag_min: 0,
+                        lag_min: p.lag_min,
                     })
                 })
                 .collect();

@@ -81,6 +81,25 @@ and the metadata property sets (MS-OLEPS).
 
 ## Workflow for adding the task decoder
 
+The importer now uses `mppread::mpp::decode_tasks`, which checks FixedMeta and
+VarMeta counts, task UIDs, keyed UTF-16 names, record lengths, and predecessor
+UIDs before returning rows. It decodes the newest Project task layout and the
+validated MPP9 layout. MPP12 files whose table does not match a known layout
+return an error; the Project tab and `yppxy` report that error instead of
+opening a guessed plan. UID 0 is Project's summary row and is omitted from the
+imported task list.
+
+To compare binary rows with Project's XML exports, run:
+
+```powershell
+$env:MPP_PAIRED_CORPUS='C:/path/to/docxy-project-spec/corpus/paired'
+cargo test -p mppread --test oracle_corpus -- --nocapture
+```
+
+The test also checks the 46 generated snapshots under `snapshots/`, including
+the MPP12 match-or-refuse cases. It skips an absent corpus, and checks expected
+file counts when one is present. The external paired corpus has 27 plans.
+
 1. Drop a few `.mpp` files here, ideally spanning Project versions and with the
    same schedule saved *both* as `.mpp` and as MSPDI `.xml` (File ▸ Save As ▸
    XML). The MSPDI export is the **oracle** — the known-good answer.

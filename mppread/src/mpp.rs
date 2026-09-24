@@ -1,12 +1,8 @@
-//! High-level `.mpp` reading: what can be decoded *exactly* today.
+//! High-level `.mpp` metadata and task reading.
 //!
-//! A `.mpp` file's task/resource data lives in undocumented, version-specific
-//! var-data blocks that only a real-file corpus can validate — that decoder is
-//! a later layer. What is documented, and therefore decodable now, is the
-//! file's **metadata**: the OLE property-set streams every compound file
-//! carries. [`read_mpp`] opens the CFB container, decodes those, and reports the
-//! project's title/author/company/dates plus the raw stream directory — the map
-//! for the eventual task decoder.
+//! [`read_mpp`] reads documented OLE metadata. [`decode_tasks`] validates a
+//! version-specific task table against its counted indexes before exposing task
+//! rows. Unknown layouts return an error instead of a guessed plan.
 
 use crate::cfb::Cfb;
 use crate::oleps;
@@ -49,11 +45,11 @@ pub struct MppInfo {
     pub streams: Vec<String>,
 }
 
-/// A task decoded from a `.mpp`: its name, and — when the fixed-record layout is
-/// recognized — its start and finish (`YYYY-MM-DD HH:MM`), 1-based outline level
-/// (the WBS depth; 1 = top level), and predecessor links.
+/// A task decoded from a recognized `.mpp` table. UID 0 is Project's summary
+/// row. Dates use `YYYY-MM-DD HH:MM`; outline levels are the file's WBS depth.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MppTask {
+    pub uid: u32,
     pub name: String,
     pub start: Option<String>,
     pub finish: Option<String>,
@@ -62,32 +58,34 @@ pub struct MppTask {
     pub predecessors: Vec<MppPred>,
 }
 
-/// A predecessor link: the 0-based **index** of the predecessor task in the same
-/// [`tasks`] slice, and the link kind (MSPDI's code: 0 = FF, 1 = FS, 2 = SF,
-/// 3 = SS). Lag isn't decoded yet (0 in both corpus files); it's always `0`.
+/// A predecessor link with Project's stable UID and MSPDI kind code
+/// (0 = FF, 1 = FS, 2 = SF, 3 = SS). `pred` is kept for the older `tasks` helper.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MppPred {
     pub pred: usize,
+    pub pred_uid: u32,
     pub kind: u8,
+    pub lag_min: i64,
 }
 
-/// Decode the task **names** from a `.mpp`, in task order. Empty if the task
-/// tables aren't present. Reads the documented VarMeta/Var2Data container.
+/// A malformed or unrecognized task table is refused by the importer.
+pub type MppError = String;
+
+/// Decode task rows only when the binary table has a recognized structure.
+pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {
+    crate::taskdecode::decode(bytes)
+}
+
+/// Exploratory, lossy task-name helper. Imports use [`decode_tasks`] instead.
 pub fn task_names(bytes: &[u8]) -> Vec<String> {
     tasks(bytes).into_iter().map(|t| t.name).collect()
 }
 
-/// Decode the tasks (name + start/finish) from a `.mpp`, in task order.
+/// Exploratory, lossy task probe. Imports use [`decode_tasks`] instead.
 ///
-/// Names come from the VarMeta/Var2Data container. Start/Finish come from the
-/// per-task **FixedData** records: the record size and the date field offset are
-/// auto-detected as the layout under which every task's start ≤ finish and the
-/// starts vary — and, when a link table is present, under which the
-/// Finish-to-Start links hold (the tie-breaker that distinguishes the true
-/// Start/Finish pair from a look-alike baseline/actual date field). A strong
-/// self-validating fit that generalizes across MPP9 and MPP12/14 (verified on
-/// real Microsoft Project and ProjectLibre files). If no layout fits, dates are
-/// left `None`. Timestamps use MPXJ's epoch/encoding.
+/// This retains the earlier heuristic scanner for diagnostic examples. It can
+/// return partial or incorrect rows because its date and name fields are not
+/// tied to a validated UID index.
 pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
     let Ok(cfb) = Cfb::open(bytes) else {
         return Vec::new();
@@ -245,7 +243,9 @@ fn decode_links(cons: &[u8], fd: &[u8], rs: usize, tasks: &mut [MppTask]) {
         if p != s && l.kind <= 3 {
             tasks[s].predecessors.push(MppPred {
                 pred: p,
+                pred_uid: l.pred_uid,
                 kind: l.kind as u8,
+                lag_min: 0,
             });
         }
     }
@@ -276,7 +276,11 @@ fn ts_ord(fd: &[u8], o: usize) -> Option<u32> {
 /// only when it clearly applies — at least half the links map in range and ≥90%
 /// are consistent — otherwise this falls back to the plain most-valid pair (so
 /// files with sparse uids, where uid≠position, are unaffected).
-fn detect_date_layout(fd: &[u8], count: usize, links: &[(usize, usize)]) -> Option<(usize, usize)> {
+pub(crate) fn detect_date_layout(
+    fd: &[u8],
+    count: usize,
+    links: &[(usize, usize)],
+) -> Option<(usize, usize)> {
     if count < 3 {
         return None;
     }
@@ -342,7 +346,7 @@ fn detect_date_layout(fd: &[u8], count: usize, links: &[(usize, usize)]) -> Opti
 /// children end and the next sibling returns to a shallower level). Among
 /// columns that qualify, the most tree-like (most pop-ups) wins. `None` when no
 /// column fits — the WBS then stays flat rather than inventing a hierarchy.
-fn detect_outline_column(fd: &[u8], record_size: usize, count: usize) -> Option<usize> {
+pub(crate) fn detect_outline_column(fd: &[u8], record_size: usize, count: usize) -> Option<usize> {
     if count < 3 || record_size == 0 {
         return None;
     }
@@ -681,8 +685,24 @@ mod tests {
         ];
         decode_links(&cons, &fd, rs, &mut tasks);
         assert_eq!(tasks[0].predecessors, vec![]);
-        assert_eq!(tasks[1].predecessors, vec![MppPred { pred: 0, kind: 1 }]);
-        assert_eq!(tasks[2].predecessors, vec![MppPred { pred: 1, kind: 1 }]);
+        assert_eq!(
+            tasks[1].predecessors,
+            vec![MppPred {
+                pred: 0,
+                pred_uid: 10,
+                kind: 1,
+                lag_min: 0
+            }]
+        );
+        assert_eq!(
+            tasks[2].predecessors,
+            vec![MppPred {
+                pred: 1,
+                pred_uid: 20,
+                kind: 1,
+                lag_min: 0
+            }]
+        );
     }
 
     #[test]

@@ -129,3 +129,41 @@ fn decodes_real_mpp_task_names_when_present() {
     }
     eprintln!("real .mpp files validated: {checked}");
 }
+
+#[test]
+fn indexed_legacy_imports_when_present() {
+    for (path, first, date) in [
+        (
+            "corpus/mpp/projectlibre-construction.mpp",
+            "Commercial Construction",
+            "2000-01-04",
+        ),
+        (
+            "corpus/mpp/msproject2003-deployment.mpp",
+            "Microsoft Office Project 2003 Deployment",
+            "2003-09-16",
+        ),
+        (
+            "corpus/mpp/new-product.mpp",
+            "Product #23 Development",
+            "2004-07-20",
+        ),
+    ] {
+        let Ok(bytes) = std::fs::read(corpus(path)) else {
+            continue;
+        };
+        let rows = mppread::mpp::decode_tasks(&bytes).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(rows[0].uid, 0, "{path}");
+        assert_eq!(rows[0].name, first, "{path}");
+        assert_eq!(
+            rows[0].start.as_deref().map(|s| &s[..10]),
+            Some(date),
+            "{path}"
+        );
+        let imported =
+            mppread::project::project_from_mpp(&bytes).unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(imported.tasks.len(), rows.len() - 1, "{path}");
+        assert!(imported.tasks.iter().all(|t| t.uid != 0), "{path}");
+        assert_eq!(imported.tasks[0].outline_level, 1, "{path}");
+    }
+}
