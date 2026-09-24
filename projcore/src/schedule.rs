@@ -652,7 +652,8 @@ fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
     out
 }
 
-/// Reject files whose leaf tasks cannot be placed on any working time.
+/// Reject tasks that have no working time and are leaves either in the stored
+/// schedule or in the outline the editor uses to recompute summary flags.
 pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
     // Match Scheduler::new's last-wins calendar map and tl's default fallback.
     let calendars: HashMap<_, _> = proj
@@ -667,7 +668,10 @@ pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
             (cal.uid, (cal, has_work))
         })
         .collect();
-    for task in proj.tasks.iter().filter(|t| !t.summary) {
+    for (i, task) in proj.tasks.iter().enumerate() {
+        if task.summary && proj.is_outline_summary(i) {
+            continue;
+        }
         let uid = task.calendar_uid.unwrap_or(proj.default_calendar_uid);
         let Some((cal, has_work)) = calendars
             .get(&uid)

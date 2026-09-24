@@ -1184,14 +1184,53 @@ mod tests {
 
     #[test]
     fn empty_calendars_unused_by_leaves_are_accepted() {
+        fn assert_editor_reopens(proj: &Project) {
+            let loaded = read_mspdi(&write_mspdi(proj)).unwrap();
+            let editor = crate::editor::Editor::new(loaded);
+            assert!(read_mspdi(&write_mspdi(editor.project())).is_ok());
+            assert!(crate::yppx::read_yppx(&crate::yppx::write_yppx(editor.project())).is_ok());
+        }
         let mut proj = empty_calendar_project();
-        assert!(read_mspdi(&write_mspdi(&proj)).is_ok());
+        assert_editor_reopens(&proj);
         proj.tasks[0].summary = true;
         proj.tasks[0].calendar_uid = Some(3);
-        assert!(read_mspdi(&write_mspdi(&proj)).is_ok());
+        proj.tasks[1].outline_level = proj.tasks[0].outline_level + 1;
+        assert_editor_reopens(&proj);
         proj.tasks.clear();
         proj.default_calendar_uid = 3;
-        assert!(read_mspdi(&write_mspdi(&proj)).is_ok());
+        assert_editor_reopens(&proj);
+    }
+
+    #[test]
+    fn empty_calendar_rejection_covers_stored_and_outline_leaves() {
+        let mut proj = empty_calendar_project();
+        proj.tasks[0].summary = true;
+        proj.tasks[0].calendar_uid = Some(3);
+        // A sibling at the same level leaves the stored summary childless.
+        assert!(
+            read_mspdi(&write_mspdi(&proj))
+                .unwrap_err()
+                .contains("Closed")
+        );
+        // The last row cannot have children either.
+        proj.tasks.truncate(1);
+        assert!(
+            read_mspdi(&write_mspdi(&proj))
+                .unwrap_err()
+                .contains("Closed")
+        );
+
+        let mut proj = empty_calendar_project();
+        proj.tasks[0].calendar_uid = Some(3);
+        proj.tasks[1].outline_level = proj.tasks[0].outline_level + 1;
+        // Outline children alone are insufficient: raw schedule() still treats
+        // the stored Summary=0 parent as a leaf.
+        assert!(!proj.tasks[0].summary);
+        assert!(
+            read_mspdi(&write_mspdi(&proj))
+                .unwrap_err()
+                .contains("Closed")
+        );
     }
 
     #[test]

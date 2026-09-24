@@ -554,9 +554,8 @@ fn new_assignment(
 }
 
 fn recompute_summaries(proj: &mut Project) {
-    let levels: Vec<u32> = proj.tasks.iter().map(|t| t.outline_level).collect();
-    for (i, t) in proj.tasks.iter_mut().enumerate() {
-        t.summary = levels.get(i + 1).is_some_and(|&nl| nl > levels[i]);
+    for i in 0..proj.tasks.len() {
+        proj.tasks[i].summary = proj.is_outline_summary(i);
     }
 }
 
@@ -889,6 +888,7 @@ mod tests {
     fn accepted_edits_with_unused_empty_calendars_reopen() {
         for empty_default in [false, true] {
             let mut ed = Editor::new(project_with_unused_empty_calendar(empty_default));
+            assert_reopens(&ed);
             ed.rename(2, "Renamed").unwrap();
             assert_reopens(&ed);
             ed.set_duration_min(2, 960).unwrap();

@@ -361,6 +361,15 @@ impl Default for Project {
 }
 
 impl Project {
+    /// Whether this row has outline children, independently of its stored flag.
+    pub(crate) fn is_outline_summary(&self, index: usize) -> bool {
+        self.tasks.get(index).is_some_and(|task| {
+            self.tasks
+                .get(index + 1)
+                .is_some_and(|next| next.outline_level > task.outline_level)
+        })
+    }
+
     /// Working minutes → days, using the project's `hours_per_day` (how MS
     /// Project renders a duration column).
     pub fn minutes_to_days(&self, min: i64) -> f64 {
