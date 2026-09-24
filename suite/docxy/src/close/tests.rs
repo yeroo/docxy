@@ -20,10 +20,12 @@ fn clean_tabs_never_ask_and_dirty_tabs_honor_each_answer() {
     for kind in [Kind::Docx, Kind::Xlsx, Kind::Project] {
         let mut t = tab(kind);
         assert!(!matches!(t.surface, Surface::Placeholder), "{}", t.status);
+        let status = t.status.clone();
         assert_eq!(
             close_step(&mut t, |_| panic!("clean tab asked")),
             CloseStep::Remove
         );
+        assert_eq!(t.status, status);
         for (answer, expected) in [
             (CloseAnswer::Save, CloseStep::Save),
             (CloseAnswer::Discard, CloseStep::Remove),
@@ -31,6 +33,7 @@ fn clean_tabs_never_ask_and_dirty_tabs_honor_each_answer() {
         ] {
             let mut t = tab(kind);
             t.dirty = true;
+            let status = t.status.clone();
             let mut asked = false;
             assert_eq!(
                 close_step(&mut t, |_| {
@@ -40,6 +43,7 @@ fn clean_tabs_never_ask_and_dirty_tabs_honor_each_answer() {
                 expected
             );
             assert!(asked);
+            assert_eq!(t.status, status);
             assert!(t.dirty); // Deciding to save is not a successful save.
         }
         t.dirty = true;

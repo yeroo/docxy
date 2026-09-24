@@ -9417,20 +9417,49 @@ impl Docxy {
         }
         self.refocus(window, cx);
     }
+}
 
+/// Serialize a tab's open header/footer editor, leaving the edit session open.
+fn flush_hf_tab(tab: &mut DocTab) {
+    let Some(hf) = tab.hf_edit.as_ref() else {
+        return;
+    };
+    let inner = docxcore::serialize::blocks_to_xml(&hf.editor.doc.body);
+    let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
+         <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
+    );
+    if let Some(pkg) = tab.pkg.as_mut() {
+        pkg.set_part(&hf.part_name, xml.into_bytes());
+    }
+    tab.dirty = true;
+}
+
+/// Leave a tab's header/footer editor, preserving status when none is open.
+fn exit_hf_tab(tab: &mut DocTab) {
+    if tab.hf_edit.is_some() {
+        flush_hf_tab(tab);
+        tab.hf_edit = None;
+        tab.status = "Closed header/footer".into();
+    }
+}
+
+impl Docxy {
     /// Serialize the open header/footer editor back into its package part (called
     /// on exit and before every save) so edits persist. Leaves the session open.
     fn flush_hf(&mut self) {
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            close::flush_hf_tab(tab);
+            flush_hf_tab(tab);
         }
     }
 
     /// Leave header/footer edit mode, committing edits to the package part.
     fn exit_hf(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.flush_hf();
         if let Some(tab) = self.tabs.get_mut(self.active) {
-            tab.hf_edit = None;
+            exit_hf_tab(tab);
+            // The explicit Exit command has always acknowledged the action,
+            // including when the header/footer editor was already closed.
             tab.status = "Closed header/footer".into();
         }
         self.refocus(window, cx);

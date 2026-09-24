@@ -17,22 +17,6 @@ enum CloseStep {
     Refuse(String),
 }
 
-pub(super) fn flush_hf_tab(tab: &mut DocTab) {
-    let Some(hf) = tab.hf_edit.as_ref() else {
-        return;
-    };
-    let inner = docxcore::serialize::blocks_to_xml(&hf.editor.doc.body);
-    let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
-    let xml = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
-         <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
-    );
-    if let Some(pkg) = tab.pkg.as_mut() {
-        pkg.set_part(&hf.part_name, xml.into_bytes());
-    }
-    tab.dirty = true;
-}
-
 fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
     if !commit_project_cell(tab) {
         // Keep the exact error: Project clears it on correction by comparing
@@ -42,10 +26,7 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
     if let Surface::Sheet(v) = &mut tab.surface {
         tab.dirty |= v.commit_edit();
     }
-    flush_hf_tab(tab);
-    if tab.hf_edit.take().is_some() {
-        tab.status = "Closed header/footer".into();
-    }
+    exit_hf_tab(tab);
     Ok(())
 }
 
