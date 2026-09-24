@@ -785,16 +785,21 @@ enum StructOp {
 }
 
 impl SheetView {
-    /// Commit the cell buffer without moving the selection, including undo/recalc.
-    fn commit_edit(&mut self) -> bool {
-        let Some(buf) = self.editing.take() else {
-            return false;
-        };
+    /// Snapshot before a mutation; share the history limit across all edits.
+    fn push_undo(&mut self) {
         self.undo.push(self.snapshot());
         if self.undo.len() > 100 {
             self.undo.remove(0);
         }
         self.redo.clear();
+    }
+
+    /// Commit the cell buffer without moving the selection, including undo/recalc.
+    fn commit_edit(&mut self) -> bool {
+        let Some(buf) = self.editing.take() else {
+            return false;
+        };
+        self.push_undo();
         let (r, c) = self.sel;
         let style = self.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
         let cell = parse_cell_input(&buf, style);
@@ -4092,6 +4097,12 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
+    fn set_ask_on_close(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.ask_on_close = on;
+        self.persist();
+        cx.notify();
+    }
+
     fn add_tab(&mut self, kind: Kind, window: &mut Window, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
         let new_tab = |title: &str, surface| DocTab {
@@ -6503,12 +6514,7 @@ impl Docxy {
     /// each mutating grid operation.
     fn sheet_snapshot(&mut self) {
         if let Some(v) = self.active_sheet_mut() {
-            let snap = v.snapshot();
-            v.undo.push(snap);
-            if v.undo.len() > 100 {
-                v.undo.remove(0);
-            }
-            v.redo.clear();
+            v.push_undo();
         }
     }
 
@@ -9722,6 +9728,16 @@ impl Docxy {
         if self.active_is_project() {
             return self.save_project(true, window, cx);
         }
+        if self.pick_doc_save_target() {
+            self.save_active(window, cx);
+        } else {
+            self.refocus(window, cx);
+        }
+    }
+
+    /// Pick and bind a document Save As destination. The caller owns save,
+    /// cancellation status, and any harness guard against native dialogs.
+    fn pick_doc_save_target(&mut self) -> bool {
         let start = self
             .tabs
             .get(self.active)
@@ -9738,9 +9754,9 @@ impl Docxy {
                 tab.markdown = is_markdown_path(&path);
                 tab.path = Some(path);
             }
-            self.save_active(window, cx);
+            true
         } else {
-            self.refocus(window, cx);
+            false
         }
     }
 
@@ -16816,9 +16832,7 @@ impl Docxy {
                                 .child("Ask before closing the window with unsaved changes"),
                         )
                         .on_click(cx.listener(|this, _, _w, cx| {
-                            this.ask_on_close = !this.ask_on_close;
-                            this.persist();
-                            cx.notify();
+                            this.set_ask_on_close(!this.ask_on_close, cx);
                         })),
                 )
                 .child(div().text_size(px(11.)).text_color(dim).child(

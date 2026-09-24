@@ -238,6 +238,7 @@ State keys, as the app reports them after every driving verb:
 | Key | |
 |---|---|
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
+| `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
@@ -249,6 +250,13 @@ State keys, as the app reports them after every driving verb:
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Schedule`, `View`, `Home`, etc.) |
+
+Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
+`cancel` are the other answers; omitting the answer refuses a dirty close).
+An optional `index` targets an inactive tab; it defaults to the active tab.
+`call backstage-close {}` calls the Backstage Close handler without supplying
+an answer. `call ask-on-close {"on":true}` uses the same setting handler as
+Settings; closing a dirty single tab always asks regardless of this window setting.
 
 Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
 from the timeline scale origin, or `none` when the task has no schedule result.

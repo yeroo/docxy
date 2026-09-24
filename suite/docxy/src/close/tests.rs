@@ -147,10 +147,12 @@ fn header_and_footer_buffers_are_flushed_before_asking() {
             is_header,
             variant: "default",
         });
+        t.status = "Editing header — press Esc to return to the document".into();
         assert_eq!(
             close_step(&mut t, |t| {
                 assert!(t.dirty);
                 assert!(t.hf_edit.is_none());
+                assert_eq!(t.status.as_ref(), "Closed header/footer");
                 let xml =
                     std::str::from_utf8(t.pkg.as_ref().unwrap().part(&part_name).unwrap()).unwrap();
                 assert!(xml.contains("Pending margin text"));

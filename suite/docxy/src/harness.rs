@@ -919,9 +919,7 @@ pub fn dispatch(
             let Some(Json::Bool(on)) = args.get("on") else {
                 return Err("'on' must be a boolean".into());
             };
-            app.ask_on_close = *on;
-            app.persist();
-            cx.notify();
+            app.set_ask_on_close(*on, cx);
             Done::ok(state(app))
         }
         "ping" => Done::ok(Json::obj(vec![

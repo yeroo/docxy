@@ -43,7 +43,9 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
         tab.dirty |= v.commit_edit();
     }
     flush_hf_tab(tab);
-    tab.hf_edit = None;
+    if tab.hf_edit.take().is_some() {
+        tab.status = "Closed header/footer".into();
+    }
     Ok(())
 }
 
@@ -95,6 +97,7 @@ impl Docxy {
             return;
         }
         self.project_prompt_cancel();
+        let previous_active = self.active;
         let harness = self.harness.is_some();
         let step = close_step(&mut self.tabs[i], |tab| {
             if harness {
@@ -138,6 +141,9 @@ impl Docxy {
             }
         };
         if remove {
+            // Saving temporarily activates the target. A successful close must
+            // preserve the same previous tab as a clean close or Don't Save.
+            self.active = previous_active;
             remove_tab(&mut self.tabs, &mut self.active, i);
             self.drop_grid_state();
         }
@@ -155,18 +161,10 @@ impl Docxy {
                     "this document has never been saved, and a harness instance cannot open the Save As dialog".into();
                 return;
             }
-            let target = rfd::FileDialog::new()
-                .add_filter("Word document", &["docx"])
-                .add_filter("Markdown", &["md", "markdown"])
-                .set_file_name(tab.title.to_string())
-                .save_file();
-            let Some(path) = target else {
+            if !self.pick_doc_save_target() {
                 self.tabs[self.active].status = "save cancelled".into();
                 return;
-            };
-            let tab = &mut self.tabs[self.active];
-            tab.markdown = is_markdown_path(&path);
-            tab.path = Some(path);
+            }
         }
         self.save_active(window, cx);
     }

@@ -38,6 +38,36 @@ test clean removal before at after active and last tab
   assert tabs is 0
   assert tab is 0
 
+test saving inactive last tab preserves first active tab
+  open ../fixtures/basic.docx
+  open ../fixtures/basic.xlsx
+  open copy:../fixtures/gantt-summary.xml
+  click B2
+  type Saved inactive last
+  open ../fixtures/basic.docx
+  assert tab is 0
+  call close-tab {"index":2,"answer":"save"}
+  assert tabs is 2
+  assert tab is 0
+  assert title is basic.docx
+  call close-tab {"index":1}
+  call close-tab {}
+  assert tabs is 0
+
+test saving inactive first tab preserves last active tab
+  open copy:../fixtures/basic.docx
+  type Saved inactive first
+  open ../fixtures/basic.xlsx
+  open ../fixtures/gantt-summary.xml
+  assert tab is 2
+  call close-tab {"index":0,"answer":"save"}
+  assert tabs is 2
+  assert tab is 1
+  assert title is gantt-summary.xml
+  call close-tab {"index":0}
+  call close-tab {}
+  assert tabs is 0
+
 test inactive invalid Project edit refuses and correction clears the error
   open ../fixtures/gantt-summary.xml
   click C2
