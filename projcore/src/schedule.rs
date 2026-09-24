@@ -238,20 +238,45 @@ impl<'a> Scheduler<'a> {
             .unwrap_or(raw_anchor);
         let min_reach = far_dates.max(raw_anchor) + 90 * 1440;
 
-        // Include the fallback calendar in the shared backward horizon too.
+        let leaf_uids: std::collections::HashSet<_> = proj
+            .tasks
+            .iter()
+            .filter(|t| !t.summary)
+            .map(|t| t.uid)
+            .collect();
+        let used_calendars: std::collections::HashSet<_> = proj
+            .tasks
+            .iter()
+            .filter(|t| !t.summary)
+            .filter_map(|t| t.calendar_uid)
+            .chain(std::iter::once(default_cal))
+            .collect();
+        let has_leaf_link = proj
+            .tasks
+            .iter()
+            .filter(|t| !t.summary)
+            .any(|t| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid)));
+
+        // Only schedulable calendars affect the horizon. Include the default
+        // fallback, but do not extend backward for projects without leaf links.
         let mut weeks: HashMap<_, _> = proj
             .calendars
             .iter()
+            .filter(|cal| used_calendars.contains(&cal.uid))
             .map(|cal| (cal.uid, week_pairs(cal)))
             .collect();
         weeks
             .entry(default_cal)
             .or_insert_with(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
-        let origin = weeks
-            .values()
-            .map(|week| Timeline::origin(week, raw_anchor, work + lag))
-            .min()
-            .unwrap_or(raw_anchor);
+        let origin = if has_leaf_link {
+            weeks
+                .values()
+                .map(|week| Timeline::origin(week, raw_anchor, work + lag))
+                .min()
+                .unwrap_or(raw_anchor)
+        } else {
+            raw_anchor
+        };
 
         // Build a timeline per calendar, retaining the full forward horizon.
         let mut timelines = HashMap::new();
@@ -348,16 +373,21 @@ impl<'a> Scheduler<'a> {
             // Hard constraints (forward-affecting). Snap the constraint date two
             // ways: as a start (next morning) or a finish (this evening).
             if let Some(cd) = t.constraint_date {
-                let ds = tl.snap(cd.minutes());
-                let df = tl.abs_finish(tl.to_index(cd.minutes()));
+                // Earlier scheduling is link-driven; dated constraints retain
+                // their original anchor floor regardless of timeline origin.
+                let floor = tl.snap(self.anchor);
+                let date = cd.minutes().max(self.anchor);
+                let ds = tl.snap(date);
+                let df = tl.abs_finish(tl.to_index(date)).max(floor);
                 match t.constraint {
                     ConstraintType::MustStartOn => start_abs = ds,
                     ConstraintType::StartNoEarlierThan => start_abs = start_abs.max(ds),
                     ConstraintType::FinishNoEarlierThan => {
-                        start_abs = start_abs.max(tl.abs_start(tl.to_index(df) - t.duration_min));
+                        start_abs = start_abs
+                            .max(tl.abs_start(tl.to_index(df) - t.duration_min).max(floor));
                     }
                     ConstraintType::MustFinishOn => {
-                        start_abs = tl.abs_start(tl.to_index(df) - t.duration_min);
+                        start_abs = tl.abs_start(tl.to_index(df) - t.duration_min).max(floor);
                     }
                     _ => {}
                 }
@@ -380,46 +410,49 @@ impl<'a> Scheduler<'a> {
         for &i in order.iter().rev() {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
+            // Every task must finish by the project finish, even when an
+            // SS/SF successor only bounds its start.
             let mut finish_abs = project_finish_abs;
             if let Some(list) = succs.get(&t.uid) {
-                if !list.is_empty() {
-                    // Every task must finish by the project finish, even when
-                    // an SS/SF successor only bounds its start.
-                    for &(suid, link, lag) in list {
-                        let sls = ls_abs.get(&suid).copied();
-                        let slf = lf_abs.get(&suid).copied();
-                        let cand = match link {
-                            // this.finish ≤ succ.late_start − lag
-                            LinkType::FinishStart => {
-                                sls.map(|x| tl.abs_finish(tl.to_index(x) - lag))
-                            }
-                            // succ.start ≥ this.start + lag ⇒ bound this.start, then finish
-                            LinkType::StartStart => sls.map(|x| {
-                                let this_start = tl.abs_start(tl.to_index(x) - lag);
-                                tl.abs_finish(tl.to_index(this_start) + t.duration_min)
-                            }),
-                            // this.finish ≤ succ.late_finish − lag
-                            LinkType::FinishFinish => {
-                                slf.map(|x| tl.abs_finish(tl.to_index(x) - lag))
-                            }
-                            LinkType::StartFinish => slf.map(|x| {
-                                let this_start = tl.abs_start(tl.to_index(x) - lag);
-                                tl.abs_finish(tl.to_index(this_start) + t.duration_min)
-                            }),
-                        };
-                        if let Some(c) = cand {
-                            finish_abs = finish_abs.min(c);
-                        }
+                for &(suid, link, lag) in list {
+                    let sls = ls_abs.get(&suid).copied();
+                    let slf = lf_abs.get(&suid).copied();
+                    let cand = match link {
+                        // this.finish ≤ succ.late_start − lag
+                        LinkType::FinishStart => sls.map(|x| tl.abs_finish(tl.to_index(x) - lag)),
+                        // succ.start ≥ this.start + lag ⇒ bound this.start, then finish
+                        LinkType::StartStart => sls.map(|x| {
+                            let this_start = tl.abs_start(tl.to_index(x) - lag);
+                            tl.abs_finish(tl.to_index(this_start) + t.duration_min)
+                        }),
+                        // this.finish ≤ succ.late_finish − lag
+                        LinkType::FinishFinish => slf.map(|x| tl.abs_finish(tl.to_index(x) - lag)),
+                        LinkType::StartFinish => slf.map(|x| {
+                            let this_start = tl.abs_start(tl.to_index(x) - lag);
+                            tl.abs_finish(tl.to_index(this_start) + t.duration_min)
+                        }),
+                    };
+                    if let Some(c) = cand {
+                        finish_abs = finish_abs.min(c);
                     }
                 }
             }
             // Hard constraints (backward-affecting).
+            let mut late_start_floor = None;
             if let Some(cd) = t.constraint_date {
-                let ds = tl.snap(cd.minutes());
-                let df = tl.abs_finish(tl.to_index(cd.minutes()));
+                let floor = tl.snap(self.anchor);
+                let date = cd.minutes().max(self.anchor);
+                let ds = tl.snap(date);
+                let df = tl.abs_finish(tl.to_index(date)).max(floor);
                 match t.constraint {
-                    ConstraintType::MustFinishOn => finish_abs = df,
-                    ConstraintType::FinishNoLaterThan => finish_abs = finish_abs.min(df),
+                    ConstraintType::MustFinishOn => {
+                        finish_abs = df;
+                        late_start_floor = Some(floor);
+                    }
+                    ConstraintType::FinishNoLaterThan if df <= finish_abs => {
+                        finish_abs = df;
+                        late_start_floor = Some(floor);
+                    }
                     ConstraintType::StartNoLaterThan => {
                         finish_abs =
                             finish_abs.min(tl.abs_finish(tl.to_index(ds) + t.duration_min));
@@ -430,11 +463,22 @@ impl<'a> Scheduler<'a> {
                     _ => {}
                 }
             }
-            let f_abs = tl.abs_finish(tl.to_index(finish_abs));
-            let s_abs = if t.duration_min == 0 {
-                f_abs
+            let finish_index = tl.to_index(finish_abs);
+            let (s_abs, f_abs) = if finish_index == ef[&t.uid] {
+                // An SF endpoint (or milestone) can be the morning side of a
+                // gap. Zero float must retain both of its actual early dates.
+                (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                tl.abs_start(tl.to_index(f_abs) - t.duration_min)
+                let f_abs = tl
+                    .abs_finish(finish_index)
+                    .max(late_start_floor.unwrap_or(i64::MIN));
+                let s_abs = if t.duration_min == 0 {
+                    f_abs
+                } else {
+                    tl.abs_start(finish_index - t.duration_min)
+                        .max(late_start_floor.unwrap_or(i64::MIN))
+                };
+                (s_abs, f_abs)
             };
             lf_abs.insert(t.uid, f_abs);
             ls_abs.insert(t.uid, s_abs);
@@ -1092,6 +1136,130 @@ mod tests {
     }
 
     #[test]
+    fn pre_anchor_constraints_do_not_depend_on_unrelated_work() {
+        for constraint in [
+            ConstraintType::MustStartOn,
+            ConstraintType::MustFinishOn,
+            ConstraintType::FinishNoLaterThan,
+            ConstraintType::StartNoLaterThan,
+        ] {
+            for linked in [false, true] {
+                let mut proj = before_start_project();
+                proj.tasks.clear();
+                let mut constrained = task(10, "Constrained", 480);
+                constrained.constraint = constraint;
+                constrained.constraint_date = Some(DateTime::from_ymd_hm(2026, 2, 16, 8, 0));
+                proj.tasks.push(constrained);
+                if linked {
+                    // Keep a backward horizon even after the no-links fast path.
+                    let mut successor = task(12, "SF successor", 480);
+                    successor.predecessors.push(Predecessor {
+                        uid: 11,
+                        link: LinkType::StartFinish,
+                        lag_min: 0,
+                    });
+                    proj.tasks
+                        .extend([task(11, "Anchor milestone", 0), successor]);
+                }
+                let before = *schedule(&proj).get(10).unwrap();
+                proj.tasks.push(task(13, "Unrelated", 5 * 480));
+                let after = *schedule(&proj).get(10).unwrap();
+                assert_eq!(before, after, "{constraint:?}, linked={linked}");
+                let anchor = proj.start_date.unwrap();
+                assert_eq!(before.early_start, anchor, "{constraint:?}");
+                assert_eq!(
+                    before.early_finish,
+                    DateTime::from_ymd_hm(2026, 3, 2, 17, 0)
+                );
+                assert_eq!(before.late_start, anchor, "{constraint:?}");
+                let finish_hour = if matches!(
+                    constraint,
+                    ConstraintType::MustFinishOn | ConstraintType::FinishNoLaterThan
+                ) {
+                    8
+                } else {
+                    17
+                };
+                assert_eq!(
+                    before.late_finish,
+                    DateTime::from_ymd_hm(2026, 3, 2, finish_hour, 0)
+                );
+                assert_eq!(before.total_slack_min, 0, "{constraint:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn unused_sparse_calendar_does_not_extend_default_timeline() {
+        let mut proj = before_start_project();
+        proj.tasks.push(task(3, "Long task", 1000 * 480));
+        let baseline = Scheduler::new(&proj);
+        let tl = baseline.tl(&proj.tasks[0]);
+        let expected = (tl.segs[0].start, tl.segs.len());
+        let mut sparse = Calendar::standard(2);
+        for day in &mut sparse.week {
+            day.times.clear();
+        }
+        sparse.week[1].times.push(WorkingTime {
+            from: 8 * 60,
+            to: 9 * 60,
+        });
+        proj.calendars.push(sparse);
+        let mut summary = task(4, "Unused summary calendar", 0);
+        summary.summary = true;
+        summary.calendar_uid = Some(2);
+        proj.tasks.push(summary);
+        let engine = Scheduler::new(&proj);
+        let tl = engine.tl(&proj.tasks[0]);
+        assert_eq!((tl.segs[0].start, tl.segs.len()), expected);
+    }
+
+    #[test]
+    fn timeline_starts_at_anchor_without_resolved_leaf_links() {
+        for predecessor in [None, Some(999), Some(2)] {
+            let mut proj = before_start_project();
+            proj.tasks[0].predecessors.clear();
+            proj.tasks[1].summary = true;
+            if let Some(uid) = predecessor {
+                proj.tasks[0].predecessors.push(Predecessor {
+                    uid,
+                    link: LinkType::StartFinish,
+                    lag_min: 0,
+                });
+            }
+            let engine = Scheduler::new(&proj);
+            assert_eq!(engine.tl(&proj.tasks[0]).segs[0].start, engine.anchor);
+        }
+    }
+
+    #[test]
+    fn missing_default_calendar_supplies_pre_anchor_work() {
+        let mut proj = before_start_project();
+        proj.calendars.clear();
+        let sched = schedule(&proj);
+        let a = sched.get(1).unwrap();
+        assert_eq!(a.early_start, DateTime::from_ymd_hm(2026, 2, 26, 8, 0));
+        assert_eq!(a.early_finish, proj.start_date.unwrap());
+        assert_eq!(
+            working_minutes_between(&proj, a.early_start, a.early_finish),
+            960
+        );
+    }
+
+    #[test]
+    fn sf_zero_slack_late_dates_preserve_early_instants() {
+        let mut proj = sf_project();
+        proj.tasks[0].duration_min = 0;
+        let sched = schedule(&proj);
+        let b = sched.get(2).unwrap();
+        assert_eq!(b.early_finish, DateTime::from_ymd_hm(2026, 3, 4, 8, 0));
+        assert_eq!(b.early_finish, sched.project_finish);
+        assert_eq!(b.total_slack_min, 0);
+        assert_eq!(b.late_finish, b.early_finish);
+        assert_eq!(b.late_start, b.early_start);
+    }
+
+    #[test]
     fn sparse_calendar_has_work_before_anchor_and_full_forward_horizon() {
         let mut proj = before_start_project();
         let mut cal = Calendar::standard(2);
@@ -1099,7 +1267,7 @@ mod tests {
             cal.week[dow].times.clear();
         }
         proj.tasks[0].calendar_uid = Some(2);
-        // Missing default calendar exercises the Standard fallback origin.
+        // The used Mondays-only calendar determines the shared origin here.
         proj.calendars = vec![cal];
         let engine = Scheduler::new(&proj);
         let tl = engine.tl(&proj.tasks[0]);
