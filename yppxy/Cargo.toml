@@ -20,6 +20,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+dirs = "5"
 opccore = { version = "0.1.0", path = "../opccore" }
 projctl = { version = "0.1.0", path = "../projctl" }
 # The agent control surface (loopback-TCP + newline-JSON), used to drive the
