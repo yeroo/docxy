@@ -92,14 +92,13 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         };
         let name = sanitize(&task.name).unwrap_or_else(|| format!("Task {}", task.uid));
         let name = name.replace('|', "\\|");
-        let (name, duration_min) = if task.summary {
-            (
-                format!("**{name}**"),
-                crate::schedule::working_minutes_between(proj, r.early_start, r.early_finish),
-            )
+        let name = if task.summary {
+            format!("**{name}**")
         } else {
-            (name, task.duration_min)
+            name
         };
+        let duration_min = crate::schedule::task_duration_min(proj, sched, task)
+            .expect("task has a schedule result");
         let dur = duration_str(proj, duration_min);
         let slack = fmt_days(proj.minutes_to_days(r.total_slack_min));
         let free_slack = fmt_days(proj.minutes_to_days(r.free_slack_min));
