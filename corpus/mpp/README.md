@@ -81,6 +81,35 @@ and the metadata property sets (MS-OLEPS).
 
 ## Workflow for adding the task decoder
 
+The importer now uses `mppread::mpp::decode_tasks`, which checks FixedMeta and
+VarMeta counts, task UIDs, keyed UTF-16 names, record lengths, and predecessor
+UIDs before returning rows. It decodes the newest Project task layout and the
+validated MPP9 layout. MPP12 files whose table does not match a known layout
+return an error; the Project tab and `yppxy` report that error instead of
+opening a guessed plan. UID 0 is Project's summary row and is omitted from the
+imported task list.
+
+To compare binary rows with Project's XML exports, run:
+
+```powershell
+$env:MPP_PAIRED_CORPUS='C:/path/to/docxy-project-spec/corpus/paired'
+cargo test -p mppread --test oracle_corpus -- --nocapture
+```
+
+The test also checks the 46 generated snapshots under `snapshots/`, including
+the MPP12 match-or-refuse cases. It skips an absent corpus, and checks expected
+file counts when one is present. The external paired corpus has 27 plans. It
+also checks four local row-order cases in `order/` when present: blank rows,
+inserted tasks, inserted hierarchy, and moved rows. Generate them on Windows
+with a licensed Project desktop install and pywin32:
+
+```powershell
+python corpus/tools/gen_mpp_order_cases.py
+```
+
+The generated `.mpp` and `.xml` files stay git-ignored. The generator source is
+kept with the fetch scripts in `corpus/tools/`.
+
 1. Drop a few `.mpp` files here, ideally spanning Project versions and with the
    same schedule saved *both* as `.mpp` and as MSPDI `.xml` (File ▸ Save As ▸
    XML). The MSPDI export is the **oracle** — the known-good answer.
@@ -96,11 +125,9 @@ and the metadata property sets (MS-OLEPS).
    ```
    cargo run -p mppread --example inspect  -- corpus/mpp/yourfile.mpp TBkndTask/FixedData
    ```
-3. Reverse the fixed/var-data blocks field by field, checking each decoded task
-   date/duration/link against the MSPDI oracle for the same file, until a
-   `corpus/mpp` scoreboard reads green — then wire the decoder into
-   `mppread` and expose `.mpp → projcore::Project` so `yppxy file.mpp` opens
-   the real schedule (today it opens the metadata only).
+3. Compare `decode_tasks` rows to an MSPDI export using the oracle test above.
+   Add a version-specific layout only when the task index, names, dates, levels,
+   and links can be validated; otherwise leave that layout refused.
 
 ## Where to get sample files
 
@@ -119,7 +146,7 @@ Verified working sources (all real OLE2/CFB `.mpp`), spanning Project versions:
 
 - **ProjectLibre samples** (`cyclingzealot/projectlibre-jlam`) — a
   Commercial-Construction plan (MPP9), an MS-Project-2003 deployment plan (MPP9,
-  323 tasks), and the classic *New Product* template (Project 98 / MPP8).
+  323 tasks), and the classic *New Product* template resaved as MPP9.
 - **Software-project coursework** (`saswat3348/Project-Management`) — MPP14.
 - **Azure ML Data Science** (`Azure-Samples/Azure-MachineLearning-DataScience`)
   — an "Advanced Analytics" plan in a newer MPP format.
@@ -134,65 +161,37 @@ curl -sSL -o corpus/mpp/construction.mpp \
   "https://raw.githubusercontent.com/cyclingzealot/projectlibre-jlam/master/openproj_build/resources/samples/Commercial%20construction%20project%20plan.mpp"
 ```
 
-### Known decode gaps (good reverse-engineering targets)
+### Known decode gaps
 
-The current decoder handles MPP9 and MPP12/14 (names, dates, outline, links) —
-including a *New Product* template that Project 98 wrote and a later version
-re-saved as MPP9, which the link oracle (below) now dates correctly, and the
-newest MPP generation (the Azure "Advanced Analytics" plan) for **names and
-dates**. That newest file needed two `VarMeta`/`Var2Data` fixes:
+The importer validates the newest Project 2021 task layout and the MPP9 layout
+used by the three local legacy samples. The newest layout is checked against 46
+generated snapshots and 27 paired Project 2021 XML exports. All 46 MPP12
+snapshot files currently return a task-table error; that layout needs its own
+field map before it can be imported.
 
-- Its `Var2Data` isn't one contiguous run of length-prefixed blocks (gaps +
-  reordering), so the sequential walk stalled at ~1 name. Name blocks are now
-  read *directly at each `VarMeta` offset* — the authoritative index.
-- Its `VarMeta` entry is a third shape (`[field:u16][0x0B40][item:u32]
-  [offset:u32]`, field at offset−8), and a stray one-char marker field shares
-  the constant `0x0B40` slot. The name field is now chosen as the *purest*
-  mostly-multi-char field, so the marker can't merge into it.
+Current Project blank rows are identified by their short FixedMeta record and
+omitted, while their row IDs still count toward ID continuity. Superseded task
+records after a move are ignored by their FixedMeta kind. Tasks are emitted in
+row ID order. Resources, assignments, calendars, baselines, progress,
+constraints, and custom fields are not imported. MPP9
+link records in the local samples all have zero lag and LagFormat 7, so nonzero
+legacy lag has no oracle yet. Newest Project links have positive and negative
+lag examples checked against MSPDI.
 
-Still open on that newest file: its **outline and link tables** use layouts not
-yet reversed (the decoder declines both rather than guessing).
-
-The **link oracle**: a `.mpp` record holds several date-like field pairs
-(Start/Finish, but also baseline/actual/early/late/constraint dates), and more
-than one can satisfy `start ≤ finish`, so that test alone occasionally locks
-onto the wrong pair (the *New Product* file decoded 2011 finishes for a 2004
-plan). When the `TBkndCons` links are present, the decoder now uses them to
-break the tie: the real Start/Finish pair is the one under which the
-Finish-to-Start links hold. It's trusted only when it clearly applies (≥half the
-links map in range, ≥90% consistent), else it falls back to the plain most-valid
-pair — so sparse-uid files (where uid≠row) are unaffected.
+The older `mppread::mpp::tasks` and `task_names` functions remain exploratory
+heuristic probes. They are not used by the importer. Their output may be
+partial or wrong for a file that `decode_tasks` correctly refuses.
 
 ## What already works on a real .mpp
 
-```
-cargo run -p mppread --example streams  -- corpus/mpp/x.mpp                 # metadata + stream map
-cargo run -p mppread --example inspect  -- corpus/mpp/x.mpp                 # full storage-tree paths
-cargo run -p mppread --example inspect  -- corpus/mpp/x.mpp "   1/TBkndTask/Var2Data"          # hex
-cargo run -p mppread --example inspect  -- corpus/mpp/x.mpp "   1/TBkndTask/Var2Data" strings  # task NAMES
-yppxy corpus/mpp/x.mpp                                                       # opens with the .mpp title
-```
-
-The container (CFB), the storage tree, the metadata (property sets), the
-**task names**, and each task's **start/finish dates** decode from real files
-(MPP9 + MPP12/14, auto-detected):
-
-```
-cargo run -p mppread --example tasknames -- corpus/mpp/x.mpp   # names + start/finish
+```sh
+cargo run -p mppread --example streams -- corpus/mpp/x.mpp
+cargo run -p mppread --example inspect -- corpus/mpp/x.mpp
+cargo run -p mppread --example tasknames -- corpus/mpp/x.mpp
+yppxy corpus/mpp/x.mpp --gantt-md out.md
 ```
 
-Dates, **outline levels**, and **predecessor links** come from the per-task
-`FixedData` records and the sibling `TBkndCons` table: the record size and
-date-field offset are auto-detected as the layout under which every task's
-`start ≤ finish` and the starts vary; the outline column is found by MS
-Project's tree rule (depth deepens by ≤1 per row and pops back up at hierarchy
-boundaries); links map task unique-ids to rows via the uid column under which
-the most Finish-to-Start links respect the decoded dates — the same
-self-validating approach as the name decode throughout. So `yppxy
-corpus/mpp/x.mpp` now opens with the real WBS tree, schedule, **and** dependency
-network, not just the metadata.
-
-What remains is link **lag** (0 throughout the corpus, so unvalidated) — best
-reversed against an MSPDI oracle export of a project that uses lead/lag.
-`mppread/tests/real_mpp.rs` locks in the name, date, outline, and link decode
-against local sample files (and skips when they're absent).
+`tasknames` now prints validated `decode_tasks` rows or an error. The terminal
+and suite Project tab use the same validated importer. Task UID 0 supplies a
+fallback project name but does not become a task row. Unsupported task tables
+return an error instead of a guessed schedule.

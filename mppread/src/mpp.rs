@@ -1,12 +1,8 @@
-//! High-level `.mpp` reading: what can be decoded *exactly* today.
+//! High-level `.mpp` metadata and task reading.
 //!
-//! A `.mpp` file's task/resource data lives in undocumented, version-specific
-//! var-data blocks that only a real-file corpus can validate — that decoder is
-//! a later layer. What is documented, and therefore decodable now, is the
-//! file's **metadata**: the OLE property-set streams every compound file
-//! carries. [`read_mpp`] opens the CFB container, decodes those, and reports the
-//! project's title/author/company/dates plus the raw stream directory — the map
-//! for the eventual task decoder.
+//! [`read_mpp`] reads documented OLE metadata. [`decode_tasks`] validates a
+//! version-specific task table against its counted indexes before exposing task
+//! rows. Unknown layouts return an error instead of a guessed plan.
 
 use crate::cfb::Cfb;
 use crate::oleps;
@@ -49,11 +45,13 @@ pub struct MppInfo {
     pub streams: Vec<String>,
 }
 
-/// A task decoded from a `.mpp`: its name, and — when the fixed-record layout is
-/// recognized — its start and finish (`YYYY-MM-DD HH:MM`), 1-based outline level
-/// (the WBS depth; 1 = top level), and predecessor links.
+/// A task decoded from a recognized `.mpp` table. `id` is the visible row
+/// number; `uid` is the stable reference used by predecessor links. UID 0 is
+/// Project's summary row. Dates use `YYYY-MM-DD HH:MM`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MppTask {
+    pub id: u32,
+    pub uid: u32,
     pub name: String,
     pub start: Option<String>,
     pub finish: Option<String>,
@@ -62,32 +60,33 @@ pub struct MppTask {
     pub predecessors: Vec<MppPred>,
 }
 
-/// A predecessor link: the 0-based **index** of the predecessor task in the same
-/// [`tasks`] slice, and the link kind (MSPDI's code: 0 = FF, 1 = FS, 2 = SF,
-/// 3 = SS). Lag isn't decoded yet (0 in both corpus files); it's always `0`.
+/// A predecessor link with Project's stable UID and MSPDI kind code
+/// (0 = FF, 1 = FS, 2 = SF, 3 = SS).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MppPred {
-    pub pred: usize,
+    pub pred_uid: u32,
     pub kind: u8,
+    pub lag_min: i64,
 }
 
-/// Decode the task **names** from a `.mpp`, in task order. Empty if the task
-/// tables aren't present. Reads the documented VarMeta/Var2Data container.
+/// A malformed or unrecognized task table is refused by the importer.
+pub type MppError = String;
+
+/// Decode task rows only when the binary table has a recognized structure.
+pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {
+    crate::taskdecode::decode(bytes)
+}
+
+/// Exploratory, lossy task-name helper. Imports use [`decode_tasks`] instead.
 pub fn task_names(bytes: &[u8]) -> Vec<String> {
     tasks(bytes).into_iter().map(|t| t.name).collect()
 }
 
-/// Decode the tasks (name + start/finish) from a `.mpp`, in task order.
+/// Exploratory, lossy task probe. Imports use [`decode_tasks`] instead.
 ///
-/// Names come from the VarMeta/Var2Data container. Start/Finish come from the
-/// per-task **FixedData** records: the record size and the date field offset are
-/// auto-detected as the layout under which every task's start ≤ finish and the
-/// starts vary — and, when a link table is present, under which the
-/// Finish-to-Start links hold (the tie-breaker that distinguishes the true
-/// Start/Finish pair from a look-alike baseline/actual date field). A strong
-/// self-validating fit that generalizes across MPP9 and MPP12/14 (verified on
-/// real Microsoft Project and ProjectLibre files). If no layout fits, dates are
-/// left `None`. Timestamps use MPXJ's epoch/encoding.
+/// This retains the earlier heuristic scanner for diagnostic examples. It can
+/// return partial or incorrect rows because its date and name fields are not
+/// tied to a validated UID index.
 pub fn tasks(bytes: &[u8]) -> Vec<MppTask> {
     let Ok(cfb) = Cfb::open(bytes) else {
         return Vec::new();
@@ -238,14 +237,18 @@ fn decode_links(cons: &[u8], fd: &[u8], rs: usize, tasks: &mut [MppTask]) {
         return; // no column reproduces the schedule → don't guess
     }
     let map = build(off);
+    for (&uid, &index) in &map {
+        tasks[index].uid = uid;
+    }
     for l in &links {
         let (Some(&p), Some(&s)) = (map.get(&l.pred_uid), map.get(&l.succ_uid)) else {
             continue;
         };
         if p != s && l.kind <= 3 {
             tasks[s].predecessors.push(MppPred {
-                pred: p,
+                pred_uid: l.pred_uid,
                 kind: l.kind as u8,
+                lag_min: 0,
             });
         }
     }
@@ -420,9 +423,11 @@ pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
     Ok(info)
 }
 
-/// Days from the Unix epoch (1970-01-01) to the MS Project epoch (1984-01-01):
-/// 14 years incl. leap days 1972/76/80.
-const MPP_EPOCH_DAYS: i64 = 5113;
+/// Days from the Unix epoch to Project's date epoch (1983-12-31). The current
+/// Project corpus stores day 0x3a86 for 2025-01-06 in its XML export; using
+/// 1984-01-01 here would produce 2025-01-07. Legacy samples likewise shift
+/// from Tuesday starts to Monday starts with this epoch.
+const MPP_EPOCH_DAYS: i64 = 5112;
 
 fn u16le(b: &[u8], o: usize) -> u16 {
     if o + 2 <= b.len() {
@@ -433,7 +438,7 @@ fn u16le(b: &[u8], o: usize) -> u16 {
 }
 
 /// Decode an MPP timestamp at `off`: a 2-byte time (tenths of a minute since
-/// midnight) at `+0` and a 2-byte date (days since 1984-01-01) at `+2`, per
+/// midnight) at `+0` and a 2-byte date (days since 1983-12-31) at `+2`, per
 /// MPXJ's `MPPUtility.getTimestamp`. Returns `None` for the NA marker (0xFFFF
 /// days). Format `YYYY-MM-DD HH:MM`.
 pub fn decode_timestamp(data: &[u8], off: usize) -> Option<String> {
@@ -578,15 +583,15 @@ mod tests {
 
     #[test]
     fn mpp_timestamp_decode() {
-        // days=0, time=4800 tenths-of-min (=8h) → 1984-01-01 08:00
+        // days=0, time=4800 tenths-of-min (=8h) → 1983-12-31 08:00
         assert_eq!(
             decode_timestamp(&[0xC0, 0x12, 0x00, 0x00], 0).as_deref(),
-            Some("1984-01-01 08:00")
+            Some("1983-12-31 08:00")
         );
-        // days=366 → 1985-01-01 (1984 is a leap year)
+        // days=366 → 1984-12-31 (1984 is a leap year)
         assert_eq!(
             decode_timestamp(&[0x00, 0x00, 0x6E, 0x01], 0).as_deref(),
-            Some("1985-01-01 00:00")
+            Some("1984-12-31 00:00")
         );
         // 0xFFFF days is the NA marker
         assert_eq!(decode_timestamp(&[0x00, 0x00, 0xFF, 0xFF], 0), None);
@@ -615,7 +620,7 @@ mod tests {
         // Decode round-trips the first task's dates.
         assert_eq!(
             decode_timestamp(&fd, off).as_deref(),
-            Some("1989-06-23 08:00")
+            Some("1989-06-22 08:00")
         );
     }
 
@@ -681,8 +686,22 @@ mod tests {
         ];
         decode_links(&cons, &fd, rs, &mut tasks);
         assert_eq!(tasks[0].predecessors, vec![]);
-        assert_eq!(tasks[1].predecessors, vec![MppPred { pred: 0, kind: 1 }]);
-        assert_eq!(tasks[2].predecessors, vec![MppPred { pred: 1, kind: 1 }]);
+        assert_eq!(
+            tasks[1].predecessors,
+            vec![MppPred {
+                pred_uid: 10,
+                kind: 1,
+                lag_min: 0
+            }]
+        );
+        assert_eq!(
+            tasks[2].predecessors,
+            vec![MppPred {
+                pred_uid: 20,
+                kind: 1,
+                lag_min: 0
+            }]
+        );
     }
 
     #[test]
