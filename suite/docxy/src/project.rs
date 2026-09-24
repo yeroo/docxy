@@ -492,7 +492,12 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
     [
         task.id.to_string(),
         task.name.clone(),
-        if task.is_milestone() {
+        // Summaries first: their stored duration is stale (and may be 0, which
+        // `is_milestone` would misread), so derive it from the shown dates.
+        if task.summary {
+            ed.disp_duration_min(task.uid)
+                .map_or_else(|| "?".into(), |min| days(project, min))
+        } else if task.is_milestone() {
             "—".into()
         } else {
             days(project, task.duration_min)
