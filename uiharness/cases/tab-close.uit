@@ -1,0 +1,190 @@
+# Run against a fresh harness instance. The optional desktop integration test
+# also reopens the saved copies and verifies failed writes and session.json:
+# cargo test -p uiharness --test tab_close -- --ignored --nocapture
+
+test pathless document Save refuses and Backstage Close uses the guarded handler
+  type Pending untitled edit
+  call backstage-close {}
+  assert tabs is 1
+  assert dirty is true
+  assert status is Unsaved changes: close refused; a harness close needs save, discard or cancel
+  call close-tab {"answer":"save"}
+  assert tabs is 1
+  assert dirty is true
+  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog
+  call close-tab {"answer":"discard"}
+  assert tabs is 0
+
+test clean removal before at after active and last tab
+  open ../fixtures/basic.docx
+  open ../fixtures/basic.xlsx
+  open ../fixtures/gantt-summary.xml
+  open ../fixtures/basic.xlsx
+  assert tab is 1
+  call close-tab {"index":2}
+  assert tabs is 2
+  assert tab is 1
+  open ../fixtures/gantt-summary.xml
+  open ../fixtures/basic.xlsx
+  call close-tab {"index":0}
+  assert tabs is 2
+  assert tab is 0
+  assert title is basic.xlsx
+  call close-tab {}
+  assert tabs is 1
+  assert tab is 0
+  assert title is gantt-summary.xml
+  call close-tab {}
+  assert tabs is 0
+  assert tab is 0
+
+test inactive invalid Project edit refuses and correction clears the error
+  open ../fixtures/gantt-summary.xml
+  click C2
+  type banana
+  open ../fixtures/basic.docx
+  call close-tab {"index":0,"answer":"discard"}
+  assert tabs is 2
+  assert tab is 0
+  assert cell_edit is banana
+  assert status is Invalid duration (try 3d, 4h, 2w)
+  key home delete delete delete delete delete delete
+  type 2d
+  key enter
+  assert cell_edit is none
+  assert status is Ready
+  assert cell C2 is 2d
+  call close-tab {"answer":"discard"}
+  call close-tab {}
+  assert tabs is 0
+
+test inactive valid Project edit commits before Cancel
+  open ../fixtures/gantt-summary.xml
+  click B2
+  type Pending inactive
+  open ../fixtures/basic.docx
+  call close-tab {"index":0,"answer":"cancel"}
+  assert tabs is 2
+  assert tab is 0
+  assert dirty is true
+  assert cell_edit is none
+  assert cell B2 is Pending inactive
+  call close-tab {"answer":"discard"}
+  call close-tab {}
+  assert tabs is 0
+
+test docx answers with window ask true
+  call ask-on-close {"on":true}
+  assert ask_on_close is true
+  open copy:../fixtures/basic.docx
+  type CloseCancelMarker
+  call close-tab {"answer":"cancel"}
+  assert tabs is 1
+  assert dirty is true
+  type CloseSavedMarker
+  call close-tab {"answer":"save"}
+  assert tabs is 0
+  open ../fixtures/basic.docx
+  type CloseDiscardMarker
+  call close-tab {"answer":"discard"}
+  assert tabs is 0
+
+test docx answers with window ask false
+  call ask-on-close {"on":false}
+  assert ask_on_close is false
+  open copy:../fixtures/basic.docx
+  type CloseCancelMarker
+  call close-tab {"answer":"cancel"}
+  assert tabs is 1
+  assert dirty is true
+  type CloseSavedMarker
+  call close-tab {"answer":"save"}
+  assert tabs is 0
+  open ../fixtures/basic.docx
+  type CloseDiscardMarker
+  call close-tab {"answer":"discard"}
+  assert tabs is 0
+
+test xlsx answers with window ask true
+  call ask-on-close {"on":true}
+  assert ask_on_close is true
+  open copy:../fixtures/basic.xlsx
+  click A1
+  type CloseCancelMarker
+  call close-tab {"answer":"cancel"}
+  assert tabs is 1
+  assert dirty is true
+  assert cell A1 is CloseCancelMarker
+  assert editing is false
+  click A1
+  type CloseSavedMarker
+  call close-tab {"answer":"save"}
+  assert tabs is 0
+  open ../fixtures/basic.xlsx
+  click A1
+  type CloseDiscardMarker
+  call close-tab {"answer":"discard"}
+  assert tabs is 0
+
+test xlsx answers with window ask false
+  call ask-on-close {"on":false}
+  assert ask_on_close is false
+  open copy:../fixtures/basic.xlsx
+  click A1
+  type CloseCancelMarker
+  call close-tab {"answer":"cancel"}
+  assert tabs is 1
+  assert dirty is true
+  assert cell A1 is CloseCancelMarker
+  assert editing is false
+  click A1
+  type CloseSavedMarker
+  call close-tab {"answer":"save"}
+  assert tabs is 0
+  open ../fixtures/basic.xlsx
+  click A1
+  type CloseDiscardMarker
+  call close-tab {"answer":"discard"}
+  assert tabs is 0
+
+test project answers with window ask true
+  call ask-on-close {"on":true}
+  assert ask_on_close is true
+  open copy:../fixtures/gantt-summary.xml
+  click B2
+  type CloseCancelMarker
+  call close-tab {"answer":"cancel"}
+  assert tabs is 1
+  assert dirty is true
+  assert cell B2 is CloseCancelMarker
+  assert cell_edit is none
+  click B2
+  type CloseSavedMarker
+  call close-tab {"answer":"save"}
+  assert tabs is 0
+  open ../fixtures/gantt-summary.xml
+  click B2
+  type CloseDiscardMarker
+  call close-tab {"answer":"discard"}
+  assert tabs is 0
+
+test project answers with window ask false
+  call ask-on-close {"on":false}
+  assert ask_on_close is false
+  open copy:../fixtures/gantt-summary.xml
+  click B2
+  type CloseCancelMarker
+  call close-tab {"answer":"cancel"}
+  assert tabs is 1
+  assert dirty is true
+  assert cell B2 is CloseCancelMarker
+  assert cell_edit is none
+  click B2
+  type CloseSavedMarker
+  call close-tab {"answer":"save"}
+  assert tabs is 0
+  open ../fixtures/gantt-summary.xml
+  click B2
+  type CloseDiscardMarker
+  call close-tab {"answer":"discard"}
+  assert tabs is 0

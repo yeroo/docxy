@@ -785,6 +785,8 @@ fn load_failure(app: &crate::Docxy) -> Option<String> {
 fn state(app: &crate::Docxy) -> Json {
     let mut out = vec![
         ("tab", Json::Num(app.active as f64)),
+        ("tabs", Json::Num(app.tabs.len() as f64)),
+        ("ask_on_close", Json::Bool(app.ask_on_close)),
         (
             "ribbon_tab",
             Json::Str(
@@ -887,6 +889,41 @@ pub fn dispatch(
     cx: &mut Context<crate::Docxy>,
 ) -> Result<Done, String> {
     match verb {
+        "close-tab" => {
+            let index = match args.get("index") {
+                Some(_) => arg_usize(args, "index")?,
+                None => app.active,
+            };
+            if index >= app.tabs.len() {
+                return Err(format!("no tab {index}"));
+            }
+            let answer = match args.get("answer") {
+                None => None,
+                Some(Json::Str(value)) => Some(match value.as_str() {
+                    "save" => crate::close::CloseAnswer::Save,
+                    "discard" => crate::close::CloseAnswer::Discard,
+                    "cancel" => crate::close::CloseAnswer::Cancel,
+                    _ => return Err("'answer' must be save, discard or cancel".into()),
+                }),
+                Some(_) => return Err("'answer' must be save, discard or cancel".into()),
+            };
+            app.close_tab_with(index, answer, window, cx);
+            Done::ok(state(app))
+        }
+        // The same handler as the Backstage rail item, not a synthetic click.
+        "backstage-close" => {
+            app.backstage_close(window, cx);
+            Done::ok(state(app))
+        }
+        "ask-on-close" => {
+            let Some(Json::Bool(on)) = args.get("on") else {
+                return Err("'on' must be a boolean".into());
+            };
+            app.ask_on_close = *on;
+            app.persist();
+            cx.notify();
+            Done::ok(state(app))
+        }
         "ping" => Done::ok(Json::obj(vec![
             ("instance", Json::Str(instance_name())),
             ("pid", Json::Num(std::process::id() as f64)),
