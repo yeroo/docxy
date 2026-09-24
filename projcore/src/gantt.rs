@@ -91,6 +91,7 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
             continue;
         };
         let name = sanitize(&task.name).unwrap_or_else(|| format!("Task {}", task.uid));
+        let name = name.replace('|', "\\|");
         let (name, duration_min) = if task.summary {
             (
                 format!("**{name}**"),
@@ -277,7 +278,25 @@ mod tests {
     fn table_rows(md: &str) -> Vec<Vec<&str>> {
         md.lines()
             .filter(|line| line.starts_with("| "))
-            .map(|line| line.trim_matches('|').split('|').map(str::trim).collect())
+            .map(|line| {
+                let boundaries: Vec<_> = line
+                    .match_indices('|')
+                    .filter(|(index, _)| {
+                        line[..*index]
+                            .chars()
+                            .rev()
+                            .take_while(|&c| c == '\\')
+                            .count()
+                            % 2
+                            == 0
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                boundaries
+                    .windows(2)
+                    .map(|pair| line[pair[0] + 1..pair[1]].trim())
+                    .collect()
+            })
             .collect()
     }
 
@@ -404,6 +423,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("A", "0d"), ("B", "0d"), ("C", "2d"), ("D", "0d")]
         );
+    }
+
+    #[test]
+    fn markdown_distinguishes_free_slack_from_total_slack() {
+        // A -> B -> D and C -> D: A has float, but no room before B must move.
+        let mut proj = diamond();
+        proj.tasks[0].duration_min = 480;
+        proj.tasks[1].duration_min = 480;
+        proj.tasks[2].duration_min = 1920;
+        proj.tasks[2].predecessors.clear();
+        let sched = schedule(&proj);
+        let a = sched.get(1).unwrap();
+        assert_eq!((a.total_slack_min, a.free_slack_min), (960, 0));
+        let md = to_markdown(&proj, &sched);
+        assert_eq!(
+            table_rows(&md)[1],
+            [
+                "A",
+                "2026-03-02 08:00:00",
+                "2026-03-02 17:00:00",
+                "1d",
+                "2d",
+                "0d",
+                ""
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_escapes_pipes_in_leaf_and_summary_names() {
+        let mut parent = task(1, "P | Q", 0);
+        parent.summary = true;
+        let mut leaf = task(2, "A | B", 480);
+        leaf.outline_level = 2;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![parent, leaf],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        let md = to_markdown(&proj, &sched);
+        assert_eq!(
+            &table_rows(&md)[1..],
+            [
+                [
+                    r"**P \| Q**",
+                    "2026-03-02 08:00:00",
+                    "2026-03-02 17:00:00",
+                    "1d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+                [
+                    r"A \| B",
+                    "2026-03-02 08:00:00",
+                    "2026-03-02 17:00:00",
+                    "1d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+            ]
+        );
+        // Escaping applies only to table cells, not Mermaid labels.
+        let mermaid = to_mermaid(&proj, &sched);
+        assert!(mermaid.contains("    section P | Q\n"));
+        assert!(mermaid.contains("    A | B :crit, 2026-03-02, 1d\n"));
     }
 
     #[test]
