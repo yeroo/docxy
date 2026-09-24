@@ -144,6 +144,35 @@ mod tests {
     }
 
     #[test]
+    fn resource_rate_text_survives_package() {
+        let huge = format!("1{}", "0".repeat(400));
+        for name in ["StandardRate", "OvertimeRate", "CostPerUse"] {
+            for value in [
+                "9007199254740993",
+                "0.12345678901234567890123456789",
+                &huge,
+                "+5",
+                "-0.50",
+                ".5",
+                "5.",
+                "007",
+            ] {
+                let xml = format!(
+                    "<Project><Resources><Resource><{name}>{value}</{name}></Resource></Resources></Project>"
+                );
+                let project = read_mspdi(&xml).unwrap();
+                let result = read_yppx(&write_yppx(&project)).unwrap();
+                let rate = match name {
+                    "StandardRate" => result.resources[0].standard_rate.as_ref(),
+                    "OvertimeRate" => result.resources[0].overtime_rate.as_ref(),
+                    _ => result.resources[0].cost_per_use.as_ref(),
+                };
+                assert_eq!(rate.map(Rate::as_str), Some(value), "{name}");
+            }
+        }
+    }
+
+    #[test]
     fn rejects_non_package() {
         assert!(read_yppx(b"not a zip at all").is_err());
     }
