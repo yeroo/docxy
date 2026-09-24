@@ -118,7 +118,7 @@ pub struct Baseline {
     pub number: u8,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
-    /// Recorded working minutes; None when the source omitted Duration.
+    /// Recorded working minutes; None when Duration was omitted, empty, or invalid.
     pub duration_min: Option<i64>,
 }
 

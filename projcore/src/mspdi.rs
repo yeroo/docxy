@@ -534,7 +534,7 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
             in_time = true;
             continue;
         }
-        if c.is_ascii_digit() || c == '-' || c == '.' {
+        if c.is_ascii_digit() || c == '.' {
             num.push(c);
             continue;
         }
@@ -1301,6 +1301,10 @@ mod tests {
             "PT1M1H",
             "PT1H1H",
             "PT9999999999999999999999H",
+            "PT-0H",
+            "P-1D",
+            "PT1H-30M",
+            "PT+1H",
         ] {
             assert_eq!(try_iso8601_to_minutes(source), None, "{source}");
         }
@@ -1319,6 +1323,7 @@ mod tests {
             "<Duration>PT1.2.3H</Duration>",
             "<Duration>PT1Hgarbage</Duration>",
             "<Duration>PT1H2</Duration>",
+            "<Duration>PT-0H</Duration>",
         ] {
             for start in ["", "<Start>2026-03-09T08:00:00</Start>"] {
                 let proj = project_with_baselines(&format!(
