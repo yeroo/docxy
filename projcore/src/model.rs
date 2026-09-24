@@ -141,7 +141,8 @@ pub struct Task {
     pub calendar_uid: Option<i32>,
     /// Start/Finish as stored in the source file (Project's own computed
     /// values). Used as an oracle; the scheduler writes its own results
-    /// elsewhere.
+    /// elsewhere. The editor rewrites them for an edited manual task, so a
+    /// save's Start/Finish agree with its pinned dates.
     pub stored_start: Option<DateTime>,
     pub stored_finish: Option<DateTime>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
@@ -174,9 +175,11 @@ impl Task {
     /// scheduler derives it from the start and `duration_min`. The stored
     /// finish is never used: it goes stale as soon as the duration is edited.
     /// `None` for auto tasks and for a manual task with no start at all
-    /// (Project's "TBD" task), which then schedules like an auto task.
+    /// (Project's "TBD" task), which then schedules like an auto task. Also
+    /// `None` for summaries: their dates roll up from their children, and a
+    /// manual summary's own dates are not modeled.
     pub fn pinned_dates(&self) -> Option<(DateTime, Option<DateTime>)> {
-        if !self.manual {
+        if !self.manual || self.summary {
             return None;
         }
         let start = self.manual_start.or(self.stored_start)?;

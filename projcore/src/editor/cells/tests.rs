@@ -757,3 +757,57 @@ fn manual_dates_outside_the_scheduling_range_are_rejected() {
         unchanged(&ed, &before, history);
     }
 }
+
+#[test]
+fn manual_summary_is_not_pinned_and_keeps_its_file_dates() {
+    let mut ed = editor();
+    let file_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    let file_finish = Some(DateTime::from_ymd_hm(2026, 1, 7, 17, 0));
+    {
+        let summary = &mut ed.proj.tasks[0];
+        summary.manual = true;
+        summary.manual_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        summary.stored_start = file_start;
+        summary.stored_finish = file_finish;
+    }
+    ed.proj.tasks[1].outline_level = 2;
+    ed.reschedule();
+    assert!(ed.project().tasks[0].summary);
+    assert_eq!(ed.project().tasks[0].pinned_dates(), None);
+    // The summary rolls up from its child, not from its ManualStart.
+    assert_eq!(
+        mspdi(ed.disp_start(10)).unwrap(),
+        "2026-01-05T08:00:00".to_string()
+    );
+    ed.rename(10, "Phase").unwrap();
+    assert_eq!(
+        (saved(&ed, 10).0, saved(&ed, 10).1),
+        (mspdi(file_start), mspdi(file_finish))
+    );
+}
+
+#[test]
+fn renaming_or_indenting_a_manual_task_keeps_its_file_dates() {
+    let mut ed = manual_editor();
+    // Project's finish includes a holiday projcore does not model.
+    let file_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    let file_finish = Some(DateTime::from_ymd_hm(2026, 1, 6, 17, 0));
+    ed.proj.tasks[1].stored_start = file_start;
+    ed.proj.tasks[1].stored_finish = file_finish;
+    ed.rename(20, "renamed").unwrap();
+    ed.update_task(
+        20,
+        TaskPatch {
+            level: Some(2),
+            ..TaskPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (saved(&ed, 20).0, saved(&ed, 20).1),
+        (mspdi(file_start), mspdi(file_finish))
+    );
+    // A duration edit does restamp.
+    ed.set_duration(20, "2d").unwrap();
+    assert_saved_consistently(&ed, 20);
+}

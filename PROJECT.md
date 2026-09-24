@@ -45,7 +45,10 @@ Built bottom-up, each a pure module:
 
 The model is **pure input** — the scheduler never mutates it; it returns a
 separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
-`stored_*` and used as an **oracle** for the scheduler.
+`stored_*` and used as an **oracle** for the scheduler. The editor rewrites them
+for a manual task whose dates it edits, so a save's `Start`/`Finish` agree with
+its `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
+open).
 
 `projcore::editor::Editor` owns the editable project, its 100-entry undo history,
 selection, dirty flag, computed schedule and optional leveling overlay. Validated
