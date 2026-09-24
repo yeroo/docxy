@@ -269,21 +269,30 @@ impl<'a> Scheduler<'a> {
             .filter_map(|t| t.calendar_uid)
             .chain(std::iter::once(default_cal))
             .collect();
-        let needs_backward_horizon = proj.tasks.iter().filter(|t| !t.summary).any(|t| {
-            (t.constraint_date.is_some()
-                && matches!(
+        let earliest_backward_date = proj
+            .tasks
+            .iter()
+            .filter(|t| !t.summary)
+            .filter(|t| {
+                matches!(
                     t.constraint,
                     ConstraintType::FinishNoLaterThan
                         | ConstraintType::StartNoLaterThan
                         | ConstraintType::MustFinishOn
                         | ConstraintType::MustStartOn
-                ))
-                || t.predecessors.iter().any(|p| {
+                )
+            })
+            .filter_map(|t| t.constraint_date)
+            .map(|date| date.minutes())
+            .min();
+        let needs_backward_horizon = earliest_backward_date.is_some()
+            || proj.tasks.iter().filter(|t| !t.summary).any(|t| {
+                t.predecessors.iter().any(|p| {
                     leaf_uids.contains(&p.uid)
                         && (p.lag_min < 0
                             || matches!(p.link, LinkType::StartFinish | LinkType::FinishFinish))
                 })
-        });
+            });
 
         // Only schedulable calendars affect the horizon. Include the default
         // fallback. Constraints can put late dates before the anchor even when
@@ -298,12 +307,20 @@ impl<'a> Scheduler<'a> {
             .entry(default_cal)
             .or_insert_with(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
         let origin = if needs_backward_horizon {
+            // Late predecessors need the whole work/lag budget before the
+            // earliest backward constraint, even when it predates the anchor.
+            // Keep the absolute cap tied to the project start, not that date.
+            let earliest_origin = (raw_anchor.div_euclid(1440) - HORIZON_DAYS) * 1440;
+            let backward_anchor = earliest_backward_date
+                .unwrap_or(raw_anchor)
+                .min(raw_anchor)
+                .max(earliest_origin);
             // Calendar changes between dependency hops can consume gaps beyond
             // work + lag. Reuse the forward padding as a bounded mitigation;
             // an exact per-hop cross-calendar budget is not modeled here.
             weeks
                 .values()
-                .map(|week| Timeline::origin(week, raw_anchor, min_total))
+                .map(|week| Timeline::origin(week, backward_anchor, min_total).max(earliest_origin))
                 .min()
                 .unwrap_or(raw_anchor)
         } else {
@@ -2004,6 +2021,70 @@ mod tests {
             tasks: vec![task(1, "A", 5 * 480), b],
             ..Project::default()
         }
+    }
+
+    #[test]
+    fn far_earlier_linked_constraints_do_not_depend_on_unrelated_work() {
+        let start = DateTime::from_ymd_hm(2024, 1, 8, 8, 0);
+        let finish = DateTime::from_ymd_hm(2024, 1, 12, 17, 0);
+        for (constraint, date) in [
+            (ConstraintType::FinishNoLaterThan, finish),
+            (ConstraintType::MustStartOn, start),
+        ] {
+            for honor in [true, false] {
+                let mut proj = constraint_conflict(constraint, date, honor);
+                let sched = schedule(&proj);
+                let a = *sched.get(1).unwrap();
+                let b = *sched.get(2).unwrap();
+                assert_eq!(
+                    b.early_start,
+                    if honor {
+                        start
+                    } else {
+                        DateTime::from_ymd_hm(2026, 3, 9, 8, 0)
+                    }
+                );
+                assert_eq!(
+                    b.early_finish,
+                    if honor {
+                        finish
+                    } else {
+                        DateTime::from_ymd_hm(2026, 3, 13, 17, 0)
+                    }
+                );
+                assert_eq!(b.late_start, start);
+                assert_eq!(b.late_finish, finish);
+                assert_eq!(a.late_start, DateTime::from_ymd_hm(2024, 1, 1, 8, 0));
+                assert_eq!(a.late_finish, DateTime::from_ymd_hm(2024, 1, 5, 17, 0));
+                for r in [a, b] {
+                    assert_eq!(r.total_slack_min, -271200);
+                    assert_eq!(
+                        working_minutes_between(&proj, r.late_start, r.late_finish),
+                        2400
+                    );
+                    assert_eq!(
+                        working_minutes_between(&proj, r.early_start, r.early_finish),
+                        2400
+                    );
+                }
+                proj.tasks.push(task(3, "Unrelated", 400 * 480));
+                let with_unrelated = schedule(&proj);
+                assert_eq!(*with_unrelated.get(1).unwrap(), a);
+                assert_eq!(*with_unrelated.get(2).unwrap(), b);
+            }
+        }
+    }
+
+    #[test]
+    fn far_constraint_horizon_remains_bounded_from_project_anchor() {
+        let proj = constraint_conflict(
+            ConstraintType::FinishNoLaterThan,
+            DateTime::from_ymd_hm(1800, 1, 1, 17, 0),
+            true,
+        );
+        let engine = Scheduler::new(&proj);
+        let earliest_day = proj.start_date.unwrap().day_number() - HORIZON_DAYS;
+        assert!(engine.tl(&proj.tasks[1]).segs[0].start >= earliest_day * 1440);
     }
 
     #[test]
