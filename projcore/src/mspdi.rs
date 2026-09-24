@@ -173,7 +173,7 @@ fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
                     }
                     "Start" => baseline.start = DateTime::parse_mspdi(&text_of(p)),
                     "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
-                    "Duration" => baseline.duration_min = Some(iso8601_to_minutes(&text_of(p))),
+                    "Duration" => baseline.duration_min = try_iso8601_to_minutes(&text_of(p)),
                     _ => p.skip_element(),
                 }
             }
@@ -518,6 +518,46 @@ pub fn iso8601_to_minutes(s: &str) -> i64 {
         i += 1;
     }
     minutes
+}
+
+/// Parse the supported duration components without treating invalid input as zero.
+/// Baselines need to distinguish a recorded zero from an unavailable duration;
+/// task and assignment imports retain the permissive parser above.
+fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
+    let body = s.trim().strip_prefix('P')?;
+    let mut minutes = 0i64;
+    let mut in_time = false;
+    let mut previous_unit = 0;
+    let mut num = String::new();
+    for c in body.chars() {
+        if c == 'T' && !in_time && num.is_empty() {
+            in_time = true;
+            continue;
+        }
+        if c.is_ascii_digit() || c == '-' || c == '.' {
+            num.push(c);
+            continue;
+        }
+        let (unit, factor) = match c {
+            'D' if !in_time => (1, 1440.0),
+            'H' if in_time => (2, 60.0),
+            'M' if in_time => (3, 1.0),
+            'S' if in_time => (4, 1.0 / 60.0),
+            _ => return None,
+        };
+        if unit <= previous_unit {
+            return None;
+        }
+        let value = (num.parse::<f64>().ok()? * factor).round();
+        // Reject overflow and nonfinite values instead of saturating to invented data.
+        if !(i64::MIN as f64..-(i64::MIN as f64)).contains(&value) {
+            return None;
+        }
+        minutes = minutes.checked_add(value as i64)?;
+        previous_unit = unit;
+        num.clear();
+    }
+    (num.is_empty() && previous_unit > 0 && (!in_time || previous_unit > 1)).then_some(minutes)
 }
 
 // ---- writer -----------------------------------------------------------------
@@ -1230,6 +1270,91 @@ mod tests {
                 read_mspdi(&xml).unwrap().tasks[0].baselines,
                 proj.tasks[0].baselines
             );
+        }
+    }
+
+    #[test]
+    fn fallible_baseline_duration_keeps_valid_values() {
+        for (source, expected) in [
+            ("PT16H0M0S", 960),
+            ("PT0H0M0S", 0),
+            (" PT8H30M0S ", 510),
+            ("PT1.5H", 90),
+            ("P1DT1H", 1500),
+            ("P1D", 1440),
+            ("PT30S", 1),
+        ] {
+            assert_eq!(try_iso8601_to_minutes(source), Some(expected));
+            let proj = project_with_baselines(&format!(
+                "<Baseline><Number>1</Number><Duration>{source}</Duration></Baseline>"
+            ));
+            assert_eq!(
+                proj.tasks[0].baseline(1).unwrap().duration_min,
+                Some(expected)
+            );
+        }
+        for source in [
+            "",
+            "P",
+            "1H",
+            "P1DT",
+            "PT1M1H",
+            "PT1H1H",
+            "PT9999999999999999999999H",
+        ] {
+            assert_eq!(try_iso8601_to_minutes(source), None, "{source}");
+        }
+        // The existing task parser deliberately remains permissive.
+        assert_eq!(iso8601_to_minutes("1D"), 1440);
+        assert_eq!(iso8601_to_minutes("PT1Hgarbage"), 60);
+    }
+
+    #[test]
+    fn invalid_baseline_duration_never_fabricates_zero() {
+        for duration in [
+            "<Duration/>",
+            "<Duration>   </Duration>",
+            "<Duration>garbage</Duration>",
+            "<Duration>PT</Duration>",
+            "<Duration>PT1.2.3H</Duration>",
+            "<Duration>PT1Hgarbage</Duration>",
+            "<Duration>PT1H2</Duration>",
+        ] {
+            for start in ["", "<Start>2026-03-09T08:00:00</Start>"] {
+                let proj = project_with_baselines(&format!(
+                    "<Baseline><Number>1</Number>{start}{duration}</Baseline>"
+                ));
+                if start.is_empty() {
+                    assert!(proj.tasks[0].baselines.is_empty(), "{duration}");
+                } else {
+                    assert_eq!(
+                        proj.tasks[0].baselines,
+                        vec![Baseline {
+                            number: 1,
+                            start: Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
+                            ..Baseline::default()
+                        }],
+                        "{duration}"
+                    );
+                }
+                let xml = write_mspdi(&proj);
+                // Ignore the task's current Duration when checking baseline output.
+                let baseline = xml.split("<Baseline>").nth(1);
+                assert_eq!(baseline.is_some(), !start.is_empty());
+                if let Some(baseline) = baseline {
+                    assert!(
+                        !baseline
+                            .split("</Baseline>")
+                            .next()
+                            .unwrap()
+                            .contains("<Duration")
+                    );
+                }
+                assert_eq!(
+                    read_mspdi(&xml).unwrap().tasks[0].baselines,
+                    proj.tasks[0].baselines
+                );
+            }
         }
     }
 
