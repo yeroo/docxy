@@ -98,12 +98,14 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(m) => {
             eprintln!("{m}");
-            eprintln!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
+            eprintln!(
+                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]"
+            );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
-        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
+        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]");
         return ExitCode::SUCCESS;
     }
 
