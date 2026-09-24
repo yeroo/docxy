@@ -22,10 +22,11 @@
 //! Leaf tasks schedule via FS/SS/FF/SF links with lag, ASAP by default, honoring
 //! date constraints. By default MSO/MFO/FNLT/SNLT override conflicting links;
 //! disabling HonorConstraints lets the links delay those tasks instead. Both
-//! modes report conflicts as negative total slack. Summary tasks roll up from
-//! their descendants. Resource leveling is separate from CPM. Free slack is
-//! computed precisely for finish-to-start successors
-//! and falls back to total slack otherwise.
+//! modes report link conflicts as negative total slack within the timeline's
+//! bounded horizon. Constraints before the project start do not pull unlinked
+//! tasks before it. Summary tasks roll up from their descendants. Resource
+//! leveling is separate from CPM. Free slack is computed precisely for
+//! finish-to-start successors and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
 use crate::model::{ConstraintType, LinkType, Project, ResourceType, Task};
@@ -217,6 +218,13 @@ struct Scheduler<'a> {
     anchor: i64,
 }
 
+struct ConstraintDates {
+    start: i64,
+    finish: i64,
+    floor: i64,
+    finish_bound: Option<i64>,
+}
+
 impl<'a> Scheduler<'a> {
     fn new(proj: &'a Project) -> Scheduler<'a> {
         // Anchor: explicit project start, else earliest stored start, else a
@@ -329,6 +337,32 @@ impl<'a> Scheduler<'a> {
             .expect("default timeline always present")
     }
 
+    /// Normalize dates identically for CPM and leveling. Only unlinked tasks
+    /// retain the project-start floor; linked tasks can use the full horizon.
+    fn constraint_dates(&self, task: &Task, linked: bool) -> Option<ConstraintDates> {
+        let tl = self.tl(task);
+        let floor = if linked {
+            tl.abs_start(0)
+        } else {
+            tl.snap(self.anchor)
+        };
+        let date = task.constraint_date?.minutes().max(floor);
+        let finish = tl.abs_finish(tl.to_index(date)).max(floor);
+        Some(ConstraintDates {
+            start: tl.snap(date),
+            finish,
+            floor,
+            // Keep an SF morning that already meets the actual deadline,
+            // even when its working index also represents the prior evening.
+            finish_bound: (self.proj.honor_constraints
+                && matches!(
+                    task.constraint,
+                    ConstraintType::MustFinishOn | ConstraintType::FinishNoLaterThan
+                ))
+            .then_some(date.max(finish)),
+        })
+    }
+
     fn run(&self) -> Schedule {
         // Exclude unschedulable leaves before either pass so they cannot affect
         // dependencies, project finish, or summary dates with empty timelines.
@@ -401,15 +435,14 @@ impl<'a> Scheduler<'a> {
             }
             // Snap the constraint date as a start (next morning) or a finish
             // (this evening).
-            if let Some(cd) = t.constraint_date {
-                // A satisfied constraint must not undo a link-driven pre-start
-                // date. Bound earlier constraints by that start, not the
-                // arbitrary timeline origin; unlinked tasks keep the anchor.
-                let floor_abs = self.anchor.min(start_abs);
-                let floor = tl.snap(floor_abs);
-                let date = cd.minutes().max(floor_abs);
-                let ds = tl.snap(date);
-                let df = tl.abs_finish(tl.to_index(date)).max(floor);
+            if let Some(dates) = self.constraint_dates(t, linked_start.is_some()) {
+                let ConstraintDates {
+                    start: ds,
+                    finish: df,
+                    floor,
+                    ..
+                } = dates;
+                finish_bound = dates.finish_bound;
                 match t.constraint {
                     ConstraintType::MustStartOn => {
                         start_abs = if self.proj.honor_constraints {
@@ -438,9 +471,6 @@ impl<'a> Scheduler<'a> {
                             start_abs = start_abs.min(previous_start);
                         } else if !self.proj.honor_constraints {
                             start_abs = start_abs.max(previous_start);
-                        }
-                        if self.proj.honor_constraints {
-                            finish_bound = Some(df);
                         }
                     }
                     ConstraintType::StartNoLaterThan if self.proj.honor_constraints => {
@@ -504,12 +534,13 @@ impl<'a> Scheduler<'a> {
             // Hard constraints (backward-affecting).
             let mut late_start_floor = None;
             let mut hard_finish_bound = false;
-            if let Some(cd) = t.constraint_date {
-                let floor_abs = self.anchor.min(es_abs[&t.uid]);
-                let floor = tl.snap(floor_abs);
-                let date = cd.minutes().max(floor_abs);
-                let ds = tl.snap(date);
-                let df = tl.abs_finish(tl.to_index(date)).max(floor);
+            if let Some(ConstraintDates {
+                start: ds,
+                finish: df,
+                floor,
+                ..
+            }) = self.constraint_dates(t, linked_tasks.contains(&t.uid))
+            {
                 match t.constraint {
                     ConstraintType::MustFinishOn => {
                         finish_abs = df;
@@ -1031,16 +1062,11 @@ impl Scheduler<'_> {
                         s_abs,
                         placed + t.duration_min,
                         bounds,
-                        t.constraint_date
-                            .filter(|_| {
-                                self.proj.honor_constraints
-                                    && matches!(
-                                        t.constraint,
-                                        ConstraintType::MustFinishOn
-                                            | ConstraintType::FinishNoLaterThan
-                                    )
-                            })
-                            .map(|date| date.minutes()),
+                        self.constraint_dates(
+                            t,
+                            t.predecessors.iter().any(|p| start.contains_key(&p.uid)),
+                        )
+                        .and_then(|dates| dates.finish_bound),
                     ),
                 )
             };
@@ -1579,9 +1605,57 @@ mod tests {
         proj.tasks[0].constraint = ConstraintType::MustStartOn;
         proj.tasks[0].constraint_date = Some(DateTime::from_ymd_hm(2026, 2, 2, 8, 0));
         let before = *schedule(&proj).get(1).unwrap();
-        assert_eq!(before.early_start, DateTime::from_ymd_hm(2026, 2, 26, 8, 0));
+        assert_eq!(before.early_start, DateTime::from_ymd_hm(2026, 2, 2, 8, 0));
         proj.tasks.push(task(3, "Unrelated", 5 * 480));
         assert_eq!(*schedule(&proj).get(1).unwrap(), before);
+    }
+
+    #[test]
+    fn linked_no_later_constraints_keep_dates_before_the_link_driven_start() {
+        let expected_start = DateTime::from_ymd_hm(2026, 2, 19, 8, 0);
+        let expected_finish = DateTime::from_ymd_hm(2026, 2, 20, 17, 0);
+        for (constraint, date) in [
+            (ConstraintType::FinishNoLaterThan, expected_finish),
+            (ConstraintType::StartNoLaterThan, expected_start),
+        ] {
+            for honor in [true, false] {
+                let mut proj = before_start_project();
+                let baseline = *schedule(&proj).get(1).unwrap();
+                proj.honor_constraints = honor;
+                proj.tasks[0].constraint = constraint;
+                proj.tasks[0].constraint_date = Some(date);
+                let sched = schedule(&proj);
+                let a = sched.get(1).unwrap();
+                assert_eq!(
+                    a.early_start,
+                    if honor {
+                        expected_start
+                    } else {
+                        baseline.early_start
+                    }
+                );
+                assert_eq!(
+                    a.early_finish,
+                    if honor {
+                        expected_finish
+                    } else {
+                        baseline.early_finish
+                    }
+                );
+                assert_eq!(a.late_start, expected_start);
+                assert_eq!(a.late_finish, expected_finish);
+                assert_eq!(a.total_slack_min, -2400);
+                assert_eq!(sched.get(2).unwrap().total_slack_min, -2400);
+                assert_eq!(
+                    working_minutes_between(&proj, a.early_start, a.early_finish),
+                    960
+                );
+                assert_eq!(
+                    working_minutes_between(&proj, a.late_start, a.late_finish),
+                    960
+                );
+            }
+        }
     }
 
     #[test]
@@ -1857,6 +1931,66 @@ mod tests {
         let leveled = level(&proj);
         assert_eq!(leveled.start(2), leveled.start(1));
         assert_eq!(leveled.start(2), leveled.finish(2));
+    }
+
+    #[test]
+    fn leveling_applies_finish_bounds_after_resource_delay() {
+        // FNLT bounds bracket the delayed SF morning. MFO fixes the CPM finish,
+        // so use its original evening and check its bound after resource delay.
+        for (constraint, day, hour) in [
+            (ConstraintType::FinishNoLaterThan, 5, 17),
+            (ConstraintType::FinishNoLaterThan, 6, 8),
+            (ConstraintType::MustFinishOn, 3, 17),
+        ] {
+            for honor in [true, false] {
+                let mut proj = sf_project();
+                proj.honor_constraints = honor;
+                proj.tasks[1].constraint = constraint;
+                proj.tasks[1].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, day, hour, 0));
+                proj.tasks.insert(0, task(3, "Busy resource", 1920));
+                proj.resources = vec![worker(1, "Shared", 1.0)];
+                proj.assignments = vec![assign(1, 3, 1, 1.0), assign(2, 1, 1, 1.0)];
+                let sched = schedule(&proj);
+                let leveled = level(&proj);
+                assert_eq!(
+                    leveled.start(1),
+                    Some(DateTime::from_ymd_hm(2026, 3, 6, 8, 0))
+                );
+                assert!(leveled.start(2).unwrap() > sched.get(2).unwrap().early_start);
+                assert_eq!(
+                    leveled.finish(2),
+                    Some(if honor && hour == 17 {
+                        DateTime::from_ymd_hm(2026, 3, 5, 17, 0)
+                    } else {
+                        DateTime::from_ymd_hm(2026, 3, 6, 8, 0)
+                    })
+                );
+                assert_eq!(
+                    working_minutes_between(
+                        &proj,
+                        leveled.start(2).unwrap(),
+                        leveled.finish(2).unwrap()
+                    ),
+                    480
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fnlt_keeps_an_sf_morning_that_already_meets_the_deadline() {
+        for honor in [true, false] {
+            let mut proj = sf_project();
+            proj.honor_constraints = honor;
+            let baseline = *schedule(&proj).get(2).unwrap();
+            proj.tasks[1].constraint = ConstraintType::FinishNoLaterThan;
+            proj.tasks[1].constraint_date = Some(baseline.early_finish);
+            let sched = schedule(&proj);
+            let b = sched.get(2).unwrap();
+            assert_eq!(b.early_start, baseline.early_start);
+            assert_eq!(b.early_finish, DateTime::from_ymd_hm(2026, 3, 4, 8, 0));
+            assert_eq!(level(&proj).finish(2), Some(b.early_finish));
+        }
     }
 
     fn constraint_conflict(constraint: ConstraintType, date: DateTime, honor: bool) -> Project {
