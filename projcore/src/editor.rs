@@ -159,7 +159,7 @@ impl Editor {
     /// (leveled when leveling is on) dates. `None` for an unknown or
     /// unscheduled task.
     pub fn disp_duration_min(&self, uid: i32) -> Option<i64> {
-        let task = self.proj.tasks.iter().find(|t| t.uid == uid)?;
+        let task = self.proj.task(uid)?;
         let start = self.disp_start(uid)?;
         let finish = self.disp_finish(uid)?;
         Some(crate::schedule::summary_or_leaf_min(
@@ -480,11 +480,12 @@ impl Editor {
                         number: 0,
                         start: Some(r.early_start),
                         finish: Some(r.early_finish),
-                        duration_min: crate::schedule::task_duration_min(
+                        duration_min: Some(crate::schedule::summary_or_leaf_min(
                             &self.proj,
-                            &self.sched,
                             t,
-                        ),
+                            r.early_start,
+                            r.early_finish,
+                        )),
                     },
                 ))
             })

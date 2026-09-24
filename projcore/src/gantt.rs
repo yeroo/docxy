@@ -97,8 +97,8 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         } else {
             name
         };
-        let duration_min = crate::schedule::task_duration_min(proj, sched, task)
-            .expect("task has a schedule result");
+        let duration_min =
+            crate::schedule::summary_or_leaf_min(proj, task, r.early_start, r.early_finish);
         let dur = duration_str(proj, duration_min);
         let slack = fmt_days(proj.minutes_to_days(r.total_slack_min));
         let free_slack = fmt_days(proj.minutes_to_days(r.free_slack_min));
