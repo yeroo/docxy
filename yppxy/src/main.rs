@@ -14,6 +14,9 @@
 //!   yppxy <in> --gantt-md <out.md>     headless: export a Markdown Gantt chart
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
 
+use opccore::fsio::{export_atomic, write_atomic};
+use std::path::Path;
+
 use std::io;
 use std::process::ExitCode;
 
@@ -119,7 +122,7 @@ fn main() -> ExitCode {
     // Headless modes: do the job and exit, no TUI.
     if let Some(out) = &parsed.gantt_md {
         let s = schedule(&proj);
-        if let Err(e) = std::fs::write(out, gantt::to_markdown(&proj, &s)) {
+        if let Err(e) = write_gantt_md(&proj, &s, parsed.input.as_deref(), out) {
             eprintln!("{out}: {e}");
             return ExitCode::FAILURE;
         }
@@ -197,11 +200,25 @@ fn load(path: &str) -> Result<Project, String> {
     }
 }
 
+fn write_gantt_md(
+    proj: &Project,
+    sched: &Schedule,
+    source: Option<&str>,
+    out: &str,
+) -> std::io::Result<()> {
+    export_atomic(
+        source.map(Path::new),
+        Path::new(out),
+        gantt::to_markdown(proj, sched).as_bytes(),
+    )
+}
+
 fn save_to(proj: &Project, path: &str) -> Result<(), String> {
     if path.ends_with(".yppx") {
-        std::fs::write(path, yppx::write_yppx(proj)).map_err(|e| e.to_string())
+        write_atomic(Path::new(path), &yppx::write_yppx(proj)).map_err(|e| e.to_string())
     } else {
-        std::fs::write(path, mspdi::write_mspdi(proj)).map_err(|e| e.to_string())
+        write_atomic(Path::new(path), mspdi::write_mspdi(proj).as_bytes())
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -731,9 +748,11 @@ impl App {
             .as_deref()
             .map(|p| format!("{}.md", p.rsplit_once('.').map(|(a, _)| a).unwrap_or(p)))
             .unwrap_or_else(|| "schedule.md".into());
-        match std::fs::write(
+        match write_gantt_md(
+            self.ed.project(),
+            self.ed.schedule(),
+            self.path.as_deref(),
             &out,
-            gantt::to_markdown(self.ed.project(), self.ed.schedule()),
         ) {
             Ok(()) => self.status = format!("Exported Gantt to {out}"),
             Err(e) => self.status = format!("Export failed: {e}"),
@@ -1811,6 +1830,38 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_refuse_source_aliases() {
+        let dir = std::env::temp_dir().join(format!("yppxy-export-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("note.xml");
+        let proj = new_project();
+        let original = mspdi::write_mspdi(&proj).into_bytes();
+        std::fs::write(&source, &original).unwrap();
+        assert!(
+            write_gantt_md(
+                &proj,
+                &schedule(&proj),
+                source.to_str(),
+                dir.join("./note.xml").to_str().unwrap()
+            )
+            .is_err()
+        );
+        let md = source.with_extension("md");
+        std::fs::hard_link(&source, &md).unwrap();
+        let mut app = App::new(proj, Some(source.to_str().unwrap().into()), false);
+        app.export_md();
+        assert!(app.status.contains("cannot overwrite"));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read(&md).unwrap(), original);
+        std::fs::remove_file(md).unwrap();
+        app.save();
+        assert!(!app.ed.dirty());
+        assert!(load(source.to_str().unwrap()).is_ok());
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn task_grid_reports_negative_total_slack() {

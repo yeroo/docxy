@@ -943,10 +943,9 @@ fn redo(app: &mut App) -> Json {
 
 /// `doc.export-pdf`: render the live buffer to a PDF at `path` (absolutized
 /// against this process's cwd) and write it — refusing to overwrite an
-/// existing file. Copies the exclusive-create pattern and error-string family
-/// (`already exists:`/`bad path:`/`create failed:`), including the parent-
-/// directory creation step, from `ctlcore::client::new_file` verbatim, since
-/// docxy doesn't depend on `ctlcore`'s fs helpers. Doesn't touch `app.editor`,
+/// existing file. Publishes a synced temporary sibling with exclusive-create
+/// semantics and retains the `already exists:`/`bad path:`/`create failed:`
+/// error family. Doesn't touch `app.editor`,
 /// so it neither marks the document modified nor is part of the undo stack.
 fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
     let path = args
@@ -966,20 +965,14 @@ fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
             ..PdfOptions::default()
         },
     );
-    // create_new: exclusive-create, so a file appearing between the exists
-    // check above and this open errors instead of being truncated.
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&abs)
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("already exists: {}", abs.display())
-            } else {
-                format!("create failed: {e}")
-            }
-        })?;
-    std::io::Write::write_all(&mut f, &pdf).map_err(|e| format!("create failed: {e}"))?;
+    // Publish only a complete, synced PDF, preserving exclusive-create semantics.
+    opccore::fsio::create_atomic(&abs, &pdf).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!("already exists: {}", abs.display())
+        } else {
+            format!("create failed: {e}")
+        }
+    })?;
     Ok(Json::obj(vec![(
         "path",
         Json::Str(abs.display().to_string()),

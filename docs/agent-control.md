@@ -55,8 +55,9 @@ File handling differs from the TUI:
   reject `.mpp`. Saving commits a valid pending cell edit first; invalid cell
   input blocks the write. A subsequent I/O failure preserves the file binding
   and retains the committed edit in memory, including its dirty flag and history.
-  Refusal/validation failures leave source bytes untouched; in-place writes
-  retain the suite's existing risk of partial output on a mid-write I/O error.
+  Saves and exports write and sync a temporary sibling before replacing the
+  destination. A failed write leaves the previous file intact. Exports refuse
+  destinations that identify the source file, including symlinks and hard links.
 - `proj.reload` discards dirty content only after a successful load from its
   current path. Failure preserves the entire tab. Untitled tabs cannot reload.
 - `proj.open {"path":"..."}` does not accept `tab`. It validates a Project

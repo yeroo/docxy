@@ -11,6 +11,9 @@
 //! range selection, ref-translating copy/paste) and a dependency-graph
 //! recalculation on every edit.
 
+use opccore::fsio::{export_atomic, write_atomic};
+use std::path::Path;
+
 use std::io;
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -56,6 +59,16 @@ use ratatui::{Frame, Terminal};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
+
+fn export_csv_headless(pkg: &SheetPackage, source: &str, out: &str) -> io::Result<usize> {
+    let csv = sheet_to_csv(
+        &pkg.workbook.sheets[0],
+        &pkg.workbook.styles,
+        pkg.workbook.date1904,
+    );
+    export_atomic(Some(Path::new(source)), Path::new(out), csv.as_bytes())?;
+    Ok(csv.len())
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -214,7 +227,7 @@ fn main() -> ExitCode {
             );
         }
         let bytes = save_xlsx(&pkg);
-        if let Err(e) = std::fs::write(&out, &bytes) {
+        if let Err(e) = write_atomic(Path::new(&out), &bytes) {
             eprintln!("error: cannot write {out}: {e}");
             return ExitCode::FAILURE;
         }
@@ -223,13 +236,13 @@ fn main() -> ExitCode {
     }
 
     if let Some(out) = parsed.csv_out {
-        let sheet = &pkg.workbook.sheets[0];
-        let csv = sheet_to_csv(sheet, &pkg.workbook.styles, pkg.workbook.date1904);
-        if let Err(e) = std::fs::write(&out, csv.as_bytes()) {
-            eprintln!("error: cannot write {out}: {e}");
-            return ExitCode::FAILURE;
+        match export_csv_headless(&pkg, &path, &out) {
+            Ok(len) => println!("wrote {out} ({len} bytes)"),
+            Err(e) => {
+                eprintln!("error: cannot write {out}: {e}");
+                return ExitCode::FAILURE;
+            }
         }
-        println!("wrote {out} ({} bytes)", csv.len());
         return ExitCode::SUCCESS;
     }
 
@@ -1998,7 +2011,7 @@ impl App {
 
     fn save(&mut self) {
         let bytes = self.package_bytes();
-        match std::fs::write(&self.path, &bytes) {
+        match write_atomic(Path::new(&self.path), &bytes) {
             Ok(()) => {
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
@@ -2860,7 +2873,7 @@ impl App {
             Some((base, _)) => format!("{base}.csv"),
             None => format!("{}.csv", self.path),
         };
-        match std::fs::write(&out, csv.as_bytes()) {
+        match export_atomic(Some(Path::new(&self.path)), Path::new(&out), csv.as_bytes()) {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
@@ -6310,6 +6323,36 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_refuse_source_aliases() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-export-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("note.xlsx");
+        let pkg = new_xlsx();
+        let original = save_xlsx(&pkg);
+        std::fs::write(&source, &original).unwrap();
+        assert!(
+            export_csv_headless(
+                &pkg,
+                source.to_str().unwrap(),
+                dir.join("./note.xlsx").to_str().unwrap()
+            )
+            .is_err()
+        );
+        let csv = source.with_extension("csv");
+        std::fs::hard_link(&source, &csv).unwrap();
+        let mut app = App::new(pkg, source.to_str().unwrap());
+        app.export_csv();
+        assert!(app.status.as_deref().unwrap().contains("cannot overwrite"));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read(&csv).unwrap(), original);
+        std::fs::remove_file(csv).unwrap();
+        app.save();
+        assert!(load_xlsx(&std::fs::read(&source).unwrap()).is_ok());
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn comment_authoring_flow() {

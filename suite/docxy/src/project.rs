@@ -325,7 +325,7 @@ fn write_project(ed: &ProjectEditor, path: &Path) -> Result<(PathBuf, usize), St
     } else {
         mspdi::write_mspdi(ed.project()).into_bytes()
     };
-    std::fs::write(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
+    opccore::fsio::write_atomic(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
     Ok((path, bytes.len()))
 }
 

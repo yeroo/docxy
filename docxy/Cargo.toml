@@ -19,6 +19,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+opccore = { version = "0.1.0", path = "../opccore" }
 # Path + version so `docxy` can be published once `docxcore` is on crates.io.
 docxcore = { version = "0.5.0", path = "../docxcore" }
 # The agent control surface (loopback-TCP + newline-JSON), used to drive the
