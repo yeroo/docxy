@@ -267,44 +267,6 @@ impl<'a> Scheduler<'a> {
             .map(|p| p.lag_min.abs())
             .sum();
         let min_total = work + lag + HORIZON_PADDING_MIN;
-        // A pinned task's duration-derived finish lies past its start; reserve
-        // wall-clock reach for its duration at its own calendar's weekly rate.
-        // A calendar without working time cannot schedule the task at all.
-        let week_minutes = |task: &Task| -> i64 {
-            let uid = task.calendar_uid.unwrap_or(default_cal);
-            let week = proj
-                .calendars
-                .iter()
-                .find(|c| c.uid == uid)
-                .or_else(|| proj.calendars.iter().find(|c| c.uid == default_cal))
-                .map(week_pairs)
-                .unwrap_or_else(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
-            week.iter()
-                .flatten()
-                .map(|&(from, to)| to.saturating_sub(from) as i64)
-                .sum()
-        };
-        let pinned_reach = proj.tasks.iter().filter_map(|t| {
-            let (start, _) = t.pinned_dates()?;
-            let per_week = week_minutes(t);
-            (per_week > 0).then(|| {
-                let wall = (t.duration_min.max(0) as i128 * 7 * 1440 + per_week as i128 - 1)
-                    / per_week as i128;
-                start
-                    .minutes()
-                    .saturating_add(wall.min(i64::MAX as i128) as i64)
-            })
-        });
-        let far_dates = proj
-            .tasks
-            .iter()
-            .flat_map(|t| [t.constraint_date, t.stored_finish, t.manual_finish])
-            .flatten()
-            .map(|d| d.minutes())
-            .chain(pinned_reach)
-            .max()
-            .unwrap_or(raw_anchor);
-        let min_reach = far_dates.max(raw_anchor) + 90 * 1440;
 
         let leaf_uids: std::collections::HashSet<_> = proj
             .tasks
@@ -365,6 +327,39 @@ impl<'a> Scheduler<'a> {
         weeks
             .entry(default_cal)
             .or_insert_with(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
+
+        // A pinned task's duration-derived finish lies past its start; reserve
+        // wall-clock reach for its duration at its calendar's weekly rate,
+        // resolved exactly as `tl()` resolves it. A calendar without working
+        // time cannot schedule the task at all.
+        let pinned_reach = proj.tasks.iter().filter_map(|t| {
+            let (start, _) = t.pinned_dates()?;
+            let week = weeks
+                .get(&t.calendar_uid.unwrap_or(default_cal))
+                .or_else(|| weeks.get(&default_cal))?;
+            let per_week: i64 = week
+                .iter()
+                .flatten()
+                .map(|&(from, to)| to.saturating_sub(from) as i64)
+                .sum();
+            (per_week > 0).then(|| {
+                let wall = (t.duration_min.max(0) as i128 * 7 * 1440 + per_week as i128 - 1)
+                    / per_week as i128;
+                start
+                    .minutes()
+                    .saturating_add(wall.min(i64::MAX as i128) as i64)
+            })
+        });
+        let far_dates = proj
+            .tasks
+            .iter()
+            .flat_map(|t| [t.constraint_date, t.stored_finish, t.manual_finish])
+            .flatten()
+            .map(|d| d.minutes())
+            .chain(pinned_reach)
+            .max()
+            .unwrap_or(raw_anchor);
+        let min_reach = far_dates.max(raw_anchor) + 90 * 1440;
         let origin = if needs_backward_horizon {
             // Late predecessors need the whole work/lag budget before the
             // earliest backward constraint, even when it predates the anchor.
@@ -3166,6 +3161,10 @@ mod tests {
             let s = schedule(&march2(vec![manual(1, "M", 480, start), succ]));
             let m = s.get(1).unwrap();
             assert!(m.early_finish > m.early_start, "{start:?}");
+            // Clamped into the timeline, a one-day task stays about a day
+            // long rather than spanning the gap back to the real timeline.
+            let span = m.early_finish.minutes() - m.early_start.minutes();
+            assert!(span <= 4 * 1440, "{start:?}: {span} minutes");
             // The auto successor may run off the timeline end, as any auto
             // task can, but never finishes before it starts.
             let succ = s.get(2).unwrap();
