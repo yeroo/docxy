@@ -88,6 +88,9 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
         proj.calendars
             .push(Calendar::standard(proj.default_calendar_uid));
     }
+    if let Some(error) = crate::schedule::calendar_error(&proj) {
+        return Err(error);
+    }
     Ok(proj)
 }
 
@@ -444,8 +447,8 @@ fn parse_working_time(p: &mut XmlParser) -> Option<WorkingTime> {
         }
     }
     let (from, mut to) = (from?, to?);
-    // Project encodes a shift ending at midnight as 00:00; treat as end-of-day.
-    if to == 0 && from != 0 {
+    // Project encodes end-of-day as 00:00, including a full midnight-to-midnight day.
+    if to == 0 {
         to = 1440;
     }
     (to > from).then_some(WorkingTime { from, to })
@@ -1146,6 +1149,141 @@ mod tests {
         assert_eq!(cal.name, "Std");
         assert_eq!(cal.week[1].minutes(), 480); // Monday (DayType 2) = 8h
         assert!(!cal.week[0].working()); // Sunday (DayType 1) off
+    }
+
+    fn empty_calendar_project() -> Project {
+        let mut proj = read_mspdi(MINIMAL).unwrap();
+        proj.calendars.push(Calendar {
+            uid: 3,
+            name: "Closed".into(),
+            week: Default::default(),
+        });
+        proj
+    }
+
+    #[test]
+    fn used_empty_calendar_is_rejected_including_default_fallback() {
+        for calendar_uid in [Some(3), None, Some(999)] {
+            let mut proj = empty_calendar_project();
+            proj.default_calendar_uid = 3;
+            proj.tasks[0].calendar_uid = calendar_uid;
+            let error = read_mspdi(&write_mspdi(&proj)).unwrap_err();
+            assert_eq!(
+                error,
+                "calendar \"Closed\" (UID 3) has no working time; task \"A & B\" (UID 1) cannot be scheduled"
+            );
+        }
+        let mut proj = empty_calendar_project();
+        proj.tasks[0].calendar_uid = Some(3);
+        assert!(
+            read_mspdi(&write_mspdi(&proj))
+                .unwrap_err()
+                .contains("Closed")
+        );
+    }
+
+    #[test]
+    fn empty_calendars_unused_by_leaves_are_accepted() {
+        fn assert_editor_reopens(proj: &Project) {
+            let loaded = read_mspdi(&write_mspdi(proj)).unwrap();
+            let editor = crate::editor::Editor::new(loaded);
+            assert!(read_mspdi(&write_mspdi(editor.project())).is_ok());
+            assert!(crate::yppx::read_yppx(&crate::yppx::write_yppx(editor.project())).is_ok());
+        }
+        let mut proj = empty_calendar_project();
+        assert_editor_reopens(&proj);
+        proj.tasks[0].summary = true;
+        proj.tasks[0].calendar_uid = Some(3);
+        proj.tasks[1].outline_level = proj.tasks[0].outline_level + 1;
+        assert_editor_reopens(&proj);
+        proj.tasks.clear();
+        proj.default_calendar_uid = 3;
+        assert_editor_reopens(&proj);
+    }
+
+    #[test]
+    fn empty_calendar_rejection_covers_stored_and_outline_leaves() {
+        let mut proj = empty_calendar_project();
+        proj.tasks[0].summary = true;
+        proj.tasks[0].calendar_uid = Some(3);
+        // A sibling at the same level leaves the stored summary childless.
+        assert!(
+            read_mspdi(&write_mspdi(&proj))
+                .unwrap_err()
+                .contains("Closed")
+        );
+        // The last row cannot have children either.
+        proj.tasks.truncate(1);
+        assert!(
+            read_mspdi(&write_mspdi(&proj))
+                .unwrap_err()
+                .contains("Closed")
+        );
+
+        let mut proj = empty_calendar_project();
+        proj.tasks[0].calendar_uid = Some(3);
+        proj.tasks[1].outline_level = proj.tasks[0].outline_level + 1;
+        // Outline children alone are insufficient: raw schedule() still treats
+        // the stored Summary=0 parent as a leaf.
+        assert!(!proj.tasks[0].summary);
+        assert!(
+            read_mspdi(&write_mspdi(&proj))
+                .unwrap_err()
+                .contains("Closed")
+        );
+    }
+
+    #[test]
+    fn working_time_midnight_and_inverted_shifts() {
+        for (from, to, expected) in [
+            (
+                "00:00:00",
+                "00:00:00",
+                Some(WorkingTime { from: 0, to: 1440 }),
+            ),
+            (
+                "16:00:00",
+                "00:00:00",
+                Some(WorkingTime {
+                    from: 960,
+                    to: 1440,
+                }),
+            ),
+            (
+                "08:00:00",
+                "17:00:00",
+                Some(WorkingTime {
+                    from: 480,
+                    to: 1020,
+                }),
+            ),
+            ("10:00:00", "09:00:00", None),
+        ] {
+            let xml = format!(
+                "<WorkingTime><FromTime>{from}</FromTime><ToTime>{to}</ToTime></WorkingTime>"
+            );
+            let mut parser = XmlParser::new(&xml);
+            assert_eq!(parser.next(), Event::Start);
+            assert_eq!(parse_working_time(&mut parser), expected, "{from} -> {to}");
+        }
+    }
+
+    #[test]
+    fn twenty_four_hour_calendar_round_trips() {
+        let mut proj = Project::default();
+        for day in &mut proj.calendars[0].week {
+            day.times = vec![WorkingTime { from: 0, to: 1440 }];
+        }
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<FromTime>00:00:00</FromTime>"));
+        assert!(xml.contains("<ToTime>00:00:00</ToTime>"));
+        assert_eq!(read_mspdi(&xml).unwrap().calendars, proj.calendars);
+        assert_eq!(
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj))
+                .unwrap()
+                .calendars,
+            proj.calendars
+        );
     }
 
     #[test]

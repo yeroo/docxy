@@ -113,4 +113,13 @@ mod tests {
     fn rejects_non_package() {
         assert!(read_yppx(b"not a zip at all").is_err());
     }
+
+    #[test]
+    fn rejects_task_on_empty_calendar() {
+        let mut proj = sample();
+        proj.calendars[0].week = Default::default();
+        let error = read_yppx(&write_yppx(&proj)).unwrap_err();
+        assert!(error.contains("calendar \"Standard\" (UID 1) has no working time"));
+        assert!(error.contains("task \"Design & build\" (UID 1) cannot be scheduled"));
+    }
 }

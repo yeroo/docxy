@@ -182,6 +182,20 @@ impl Editor {
         self.reschedule();
     }
 
+    /// Validate newly created/exposed leaves before touching history or UI state.
+    fn edit_structure(&mut self, edit: impl FnOnce(&mut Project)) -> Result<(), String> {
+        let mut next = self.proj.clone();
+        edit(&mut next);
+        recompute_summaries(&mut next);
+        if let Some(error) = crate::schedule::calendar_error(&next) {
+            return Err(error);
+        }
+        self.snapshot();
+        self.proj = next;
+        self.changed();
+        Ok(())
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(prev) = self.undo.pop() else {
             return false;
@@ -252,44 +266,41 @@ impl Editor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("No task IDs available")?;
-        self.snapshot();
-        self.proj.tasks.insert(
-            at,
-            Task {
-                uid,
-                id: uid,
-                name: name.into(),
-                outline_level,
-                duration_min,
-                milestone: duration_min == 0,
-                ..Task::default()
-            },
-        );
-        self.changed();
+        self.edit_structure(|proj| {
+            proj.tasks.insert(
+                at,
+                Task {
+                    uid,
+                    id: uid,
+                    name: name.into(),
+                    outline_level,
+                    duration_min,
+                    milestone: duration_min == 0,
+                    ..Task::default()
+                },
+            )
+        })?;
         Ok(at)
     }
 
     pub fn delete_task(&mut self, uid: i32) -> Result<(), String> {
         let i = self.index(uid)?;
-        self.snapshot();
-        self.proj.tasks.remove(i);
-        for t in &mut self.proj.tasks {
-            t.predecessors.retain(|p| p.uid != uid);
-        }
-        // Fourth intentional fix in the Editor extraction: the old TUI left
-        // dangling assignments, which attached to a new task if its UID was reused.
-        self.proj.assignments.retain(|a| a.task_uid != uid);
-        self.changed();
-        Ok(())
+        self.edit_structure(|proj| {
+            proj.tasks.remove(i);
+            for t in &mut proj.tasks {
+                t.predecessors.retain(|p| p.uid != uid);
+            }
+            // Remove assignments as well, so they cannot attach to a reused UID.
+            proj.assignments.retain(|a| a.task_uid != uid);
+        })
     }
 
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
         let i = self.index(uid)?;
-        self.snapshot();
-        let t = &mut self.proj.tasks[i];
-        t.outline_level = (i64::from(t.outline_level) + i64::from(delta)).clamp(1, 20) as u32;
-        self.changed();
-        Ok(())
+        self.edit_structure(|proj| {
+            let t = &mut proj.tasks[i];
+            t.outline_level = (i64::from(t.outline_level) + i64::from(delta)).clamp(1, 20) as u32;
+        })
     }
 
     pub fn rename(&mut self, uid: i32, name: &str) -> Result<(), String> {
@@ -341,20 +352,19 @@ impl Editor {
         {
             return Ok(());
         }
-        self.snapshot();
-        let t = &mut self.proj.tasks[i];
-        if let Some(name) = patch.name {
-            t.name = name;
-        }
-        if let Some(min) = patch.duration_min {
-            t.duration_min = min;
-            t.milestone = min == 0;
-        }
-        if let Some(lv) = patch.level {
-            t.outline_level = lv;
-        }
-        self.changed();
-        Ok(())
+        self.edit_structure(|proj| {
+            let t = &mut proj.tasks[i];
+            if let Some(name) = patch.name {
+                t.name = name;
+            }
+            if let Some(min) = patch.duration_min {
+                t.duration_min = min;
+                t.milestone = min == 0;
+            }
+            if let Some(lv) = patch.level {
+                t.outline_level = lv;
+            }
+        })
     }
 
     pub fn add_predecessor(
@@ -544,9 +554,8 @@ fn new_assignment(
 }
 
 fn recompute_summaries(proj: &mut Project) {
-    let levels: Vec<u32> = proj.tasks.iter().map(|t| t.outline_level).collect();
-    for (i, t) in proj.tasks.iter_mut().enumerate() {
-        t.summary = levels.get(i + 1).is_some_and(|&nl| nl > levels[i]);
+    for i in 0..proj.tasks.len() {
+        proj.tasks[i].summary = proj.is_outline_summary(i);
     }
 }
 
@@ -775,6 +784,130 @@ mod tests {
         for (uid, start, finish) in dates {
             assert_eq!(ed.disp_start(uid), start);
             assert_eq!(ed.disp_finish(uid), finish);
+        }
+    }
+
+    fn project_with_unused_empty_calendar(empty_default: bool) -> Project {
+        let mut proj = untitled_project();
+        proj.calendars.push(crate::model::Calendar {
+            uid: 3,
+            name: "Closed".into(),
+            week: Default::default(),
+        });
+        proj.tasks = vec![
+            Task {
+                uid: 1,
+                name: "Phase".into(),
+                outline_level: 1,
+                summary: true,
+                calendar_uid: Some(3),
+                ..Task::default()
+            },
+            Task {
+                uid: 2,
+                name: "Build".into(),
+                outline_level: 2,
+                calendar_uid: Some(1),
+                duration_min: 480,
+                ..Task::default()
+            },
+        ];
+        if empty_default {
+            proj.default_calendar_uid = 3;
+        }
+        // Exercise the same acceptance path used when opening a file.
+        crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(&proj)).unwrap()
+    }
+
+    fn assert_reopens(ed: &Editor) {
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        assert_eq!(
+            crate::mspdi::read_mspdi(&xml).unwrap().tasks,
+            ed.project().tasks
+        );
+        assert_eq!(
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(ed.project()))
+                .unwrap()
+                .tasks,
+            ed.project().tasks
+        );
+    }
+
+    #[test]
+    fn structural_calendar_rejections_preserve_all_editor_state() {
+        for empty_default in [false, true] {
+            let mut ed = Editor::new(project_with_unused_empty_calendar(empty_default));
+            ed.toggle_level();
+            ed.select(1);
+            ed.find("Build");
+            for i in 0..=UNDO_CAP {
+                ed.rename(2, &format!("Build {i}")).unwrap();
+            }
+            // Cover rejection with a full undo stack, then with a redo branch.
+            for has_redo in [false, true] {
+                if has_redo {
+                    assert!(ed.undo());
+                }
+                ed.mark_saved();
+                assert_unchanged(&mut ed, |ed| {
+                    assert!(ed.delete_task(2).unwrap_err().contains("Closed"));
+                    assert!(ed.indent(2, -1).unwrap_err().contains("Closed"));
+                    assert!(ed.indent(1, 1).unwrap_err().contains("Closed"));
+                    assert!(
+                        ed.update_task(
+                            2,
+                            TaskPatch {
+                                name: Some("Must not rename".into()),
+                                level: Some(1),
+                                ..TaskPatch::default()
+                            }
+                        )
+                        .unwrap_err()
+                        .contains("Closed")
+                    );
+                    // Inserting after the parent exposes it as a leaf, too.
+                    assert!(
+                        ed.add_task(Some(1), "Inserted", 480)
+                            .unwrap_err()
+                            .contains("Closed")
+                    );
+                    if empty_default {
+                        assert!(
+                            ed.add_task(None, "Appended", 480)
+                                .unwrap_err()
+                                .contains("Closed")
+                        );
+                    }
+                });
+                assert_reopens(&ed);
+            }
+        }
+    }
+
+    #[test]
+    fn accepted_edits_with_unused_empty_calendars_reopen() {
+        for empty_default in [false, true] {
+            let mut ed = Editor::new(project_with_unused_empty_calendar(empty_default));
+            assert_reopens(&ed);
+            ed.rename(2, "Renamed").unwrap();
+            assert_reopens(&ed);
+            ed.set_duration_min(2, 960).unwrap();
+            assert_reopens(&ed);
+            ed.indent(2, 1).unwrap();
+            assert_reopens(&ed);
+            ed.set_baseline();
+            assert_reopens(&ed);
+            assert!(ed.undo());
+            assert_reopens(&ed);
+            assert!(ed.redo());
+            assert_reopens(&ed);
+            // Removing the empty-calendar parent leaves a valid-calendar task.
+            ed.delete_task(1).unwrap();
+            assert_reopens(&ed);
+            if !empty_default {
+                ed.add_task(None, "New task", 480).unwrap();
+                assert_reopens(&ed);
+            }
         }
     }
 

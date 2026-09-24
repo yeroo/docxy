@@ -3,7 +3,8 @@
 //! file (`corpus/mspdi/*.xml`, produced by `corpus/tools/gen_mspdi_corpus.py`).
 //!
 //! These are hand-derived expectations. The owner checked the SF shapes in
-//! files 05 and 14 against Project 2021 (issue #53); the other fixtures have not
+//! files 05 and 14 against Project 2021 (issue #53), and the 24-hour calendar
+//! in file 16 (issue #58); the other fixtures have not
 //! been independently verified against Project. Slack invariants below also
 //! check properties that do not depend on the embedded date expectations.
 
@@ -29,7 +30,7 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
     assert!(
-        files.len() >= 15,
+        files.len() >= 16,
         "expected the full seed corpus, got {}",
         files.len()
     );
@@ -130,12 +131,24 @@ fn resources_round_trip_through_mspdi_and_yppx() {
         let proj = read_mspdi(&xml).unwrap();
         let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
         assert_eq!(
+            xml_back.calendars,
+            proj.calendars,
+            "{}: MSPDI calendars changed",
+            path.display()
+        );
+        assert_eq!(
             xml_back.resources,
             proj.resources,
             "{}: MSPDI resources changed",
             path.display()
         );
         let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        assert_eq!(
+            package_back.calendars,
+            proj.calendars,
+            "{}: .yppx calendars changed",
+            path.display()
+        );
         assert_eq!(
             package_back.resources,
             proj.resources,

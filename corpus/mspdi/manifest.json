@@ -138,6 +138,16 @@
         "round-trip"
       ],
       "desc": "Distinct baseline slots and recorded durations, including an omitted Duration."
+    },
+    {
+      "file": "16-24-hour-calendar.xml",
+      "category": "calendar",
+      "tags": [
+        "calendar",
+        "calendar-24hour",
+        "round-trip"
+      ],
+      "desc": "Project 2021 (#58): three 8-hour duration days finish after 24 continuous hours."
     }
   ]
 }

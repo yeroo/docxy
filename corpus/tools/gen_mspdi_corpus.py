@@ -5,7 +5,8 @@ Unlike the xlsx corpus, there is no free high-fidelity oracle for project
 scheduling (MS Project is the reference implementation and isn't scriptable
 here). Each file embeds hand-derived Start/Finish expectations for a standard
 8h/day Mon-Fri calendar anchored at Monday 2026-03-02 08:00. The owner checked
-the SF shapes in files 05 and 14 against Project 2021 (issue #53); the other
+the SF shapes in files 05 and 14 against Project 2021 (issue #53), and the
+24-hour calendar in file 16 (issue #58); the other
 expectations have not been independently verified against Project.
 `projcore/tests/corpus.rs` reads
 each file, runs the CPM scheduler, and asserts the computed dates match the
@@ -279,6 +280,17 @@ def build():
                 baselines=[(0, dt(4), dt(6, "17:00:00"), 3 * D),
                            (1, dt(9), dt(13, "17:00:00"), 5 * D),
                            (2, dt(16), dt(17, "17:00:00"), None)])))
+
+    # 16 — Project's full working day is encoded midnight to midnight (#58).
+    full_days = "\n".join(weekday(day, True, [("00:00:00", "00:00:00")])
+                          for day in range(1, 8))
+    full_calendar = ("  <Calendar><UID>3</UID><Name>24 Hours</Name>"
+                     "<IsBaseCalendar>1</IsBaseCalendar><WeekDays>\n"
+                     + full_days + "\n</WeekDays></Calendar>")
+    add("16-24-hour-calendar.xml", ["calendar", "calendar-24hour", "round-trip"],
+        "Project 2021 (#58): three 8-hour duration days finish after 24 continuous hours.",
+        project("24-hour-calendar", task(1, "Build", 3 * D, dt(2), dt(3), calendar=3),
+                calendars=[standard_calendar(), full_calendar]))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

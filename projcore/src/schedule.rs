@@ -294,7 +294,7 @@ impl<'a> Scheduler<'a> {
         let mut anchor = raw_anchor;
         for (uid, week) in weeks {
             let tl = Timeline::build(&week, origin, raw_anchor, min_total, min_reach);
-            if uid == default_cal {
+            if uid == default_cal && tl.total > 0 {
                 anchor = tl.snap(raw_anchor);
             }
             timelines.insert(uid, tl);
@@ -317,18 +317,16 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&self) -> Schedule {
-        // Leaf tasks are the schedulable units; summaries roll up afterward.
+        // Exclude unschedulable leaves before either pass so they cannot affect
+        // dependencies, project finish, or summary dates with empty timelines.
         let leaves: Vec<usize> = (0..self.proj.tasks.len())
-            .filter(|&i| !self.proj.tasks[i].summary)
+            .filter(|&i| !self.proj.tasks[i].summary && self.tl(&self.proj.tasks[i]).total > 0)
             .collect();
         let leaf_uids: std::collections::HashSet<i32> =
             leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> = self
-            .proj
-            .tasks
+        let idx_of: HashMap<i32, usize> = leaves
             .iter()
-            .enumerate()
-            .map(|(i, t)| (t.uid, i))
+            .map(|&i| (self.proj.tasks[i].uid, i))
             .collect();
 
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
@@ -654,6 +652,44 @@ fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
     out
 }
 
+/// Reject tasks that have no working time and are leaves either in the stored
+/// schedule or in the outline the editor uses to recompute summary flags.
+pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
+    // Match Scheduler::new's last-wins calendar map and tl's default fallback.
+    let calendars: HashMap<_, _> = proj
+        .calendars
+        .iter()
+        .map(|cal| {
+            let has_work = cal
+                .week
+                .iter()
+                .flat_map(|day| &day.times)
+                .any(|t| t.from < t.to);
+            (cal.uid, (cal, has_work))
+        })
+        .collect();
+    for (i, task) in proj.tasks.iter().enumerate() {
+        if task.summary && proj.is_outline_summary(i) {
+            continue;
+        }
+        let uid = task.calendar_uid.unwrap_or(proj.default_calendar_uid);
+        let Some((cal, has_work)) = calendars
+            .get(&uid)
+            .or_else(|| calendars.get(&proj.default_calendar_uid))
+        else {
+            // The scheduler synthesizes Standard when the default is absent.
+            continue;
+        };
+        if !has_work {
+            return Some(format!(
+                "calendar {:?} (UID {}) has no working time; task {:?} (UID {}) cannot be scheduled",
+                cal.name, cal.uid, task.name, task.uid
+            ));
+        }
+    }
+    None
+}
+
 /// Kahn topological sort of leaf tasks by predecessor links; on a cycle, the
 /// remaining tasks are appended in input order (best effort).
 fn topo_order(
@@ -723,6 +759,8 @@ fn descendant_leaves(proj: &Project, sidx: usize) -> Vec<i32> {
 
 /// Schedule a project: run the CPM forward and backward passes and return the
 /// computed [`Schedule`].
+/// Leaves with no working time have no result. Readers reject files containing
+/// such leaves, and structural editor operations validate newly exposed leaves.
 pub fn schedule(proj: &Project) -> Schedule {
     Scheduler::new(proj).run()
 }
@@ -772,6 +810,7 @@ impl Leveled {
 /// default calendar's working-minute space; resource occupation is the task's
 /// wall-clock span. It only ever moves tasks *later*. Multi-calendar leveling
 /// and task splitting are out of scope.
+/// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
     Scheduler::new(proj).level()
 }
@@ -862,17 +901,22 @@ impl Scheduler<'_> {
             .get(&self.default_cal)
             .expect("default timeline present");
 
+        if tl.total == 0 {
+            return Leveled {
+                start: base.results().map(|r| (r.uid, r.early_start)).collect(),
+                finish: base.results().map(|r| (r.uid, r.early_finish)).collect(),
+                project_finish: base.project_finish,
+            };
+        }
+
         let leaves: Vec<usize> = (0..self.proj.tasks.len())
-            .filter(|&i| !self.proj.tasks[i].summary)
+            .filter(|&i| !self.proj.tasks[i].summary && self.tl(&self.proj.tasks[i]).total > 0)
             .collect();
         let leaf_uids: std::collections::HashSet<i32> =
             leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> = self
-            .proj
-            .tasks
+        let idx_of: HashMap<i32, usize> = leaves
             .iter()
-            .enumerate()
-            .map(|(i, t)| (t.uid, i))
+            .map(|&i| (self.proj.tasks[i].uid, i))
             .collect();
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
 
@@ -991,6 +1035,203 @@ mod tests {
             link: LinkType::FinishStart,
             lag_min: 0,
         }
+    }
+
+    fn closed_calendar(uid: i32) -> Calendar {
+        Calendar {
+            uid,
+            name: "Closed".into(),
+            week: Default::default(),
+        }
+    }
+
+    #[test]
+    fn twenty_four_hour_calendar_matches_project() {
+        let mut cal = Calendar::standard(3);
+        cal.name = "24 Hours".into();
+        for day in &mut cal.week {
+            day.times = vec![WorkingTime { from: 0, to: 1440 }];
+        }
+        let mut build = task(1, "Build", 3 * 480);
+        build.calendar_uid = Some(3);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![build],
+            calendars: vec![Calendar::standard(1), cal],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        let result = sched.get(1).unwrap();
+        assert_eq!(result.early_start.to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(result.early_finish.to_mspdi(), "2026-03-03T08:00:00");
+    }
+
+    #[test]
+    fn calendar_validation_matches_scheduler_resolution() {
+        let cases = [
+            (Some(999), vec![closed_calendar(1)], true),
+            (Some(999), vec![closed_calendar(3)], false),
+            (Some(3), vec![closed_calendar(3)], true),
+            (None, vec![], false),
+            (
+                Some(3),
+                vec![closed_calendar(3), Calendar::standard(3)],
+                false,
+            ),
+            (
+                Some(3),
+                vec![Calendar::standard(3), closed_calendar(3)],
+                true,
+            ),
+            (None, vec![closed_calendar(1), Calendar::standard(1)], false),
+            (None, vec![Calendar::standard(1), closed_calendar(1)], true),
+        ];
+        for (uid, calendars, invalid) in cases {
+            let mut build = task(1, "Build", 480);
+            build.calendar_uid = uid;
+            let proj = Project {
+                tasks: vec![build],
+                calendars,
+                ..Project::default()
+            };
+            assert_eq!(calendar_error(&proj).is_some(), invalid);
+            let engine = Scheduler::new(&proj);
+            assert_eq!(engine.tl(&proj.tasks[0]).total == 0, invalid);
+            assert_eq!(engine.run().get(1).is_none(), invalid);
+        }
+    }
+
+    #[test]
+    fn duplicate_uid_cannot_resurrect_a_leaf_on_an_empty_calendar() {
+        let valid = task(5, "Valid", 480);
+        let mut invalid = task(5, "Closed", 960);
+        invalid.calendar_uid = Some(3);
+        let mut proj = Project {
+            tasks: vec![valid.clone()],
+            calendars: vec![Calendar::standard(1), closed_calendar(3)],
+            ..Project::default()
+        };
+        let expected = schedule(&proj);
+        for tasks in [vec![valid.clone(), invalid.clone()], vec![invalid, valid]] {
+            proj.tasks = tasks;
+            let actual = schedule(&proj);
+            assert_eq!(actual.get(5), expected.get(5));
+            assert_eq!(actual.project_finish, expected.project_finish);
+            let leveled = level(&proj);
+            assert_eq!(leveled.start(5), Some(expected.get(5).unwrap().early_start));
+            assert_eq!(
+                leveled.finish(5),
+                Some(expected.get(5).unwrap().early_finish)
+            );
+        }
+    }
+
+    #[test]
+    fn empty_calendar_leaves_do_not_affect_dependencies_or_summaries() {
+        let mut summary = task(10, "Phase", 0);
+        summary.summary = true;
+        let mut invalid = task(2, "Closed", 480);
+        invalid.calendar_uid = Some(3);
+        invalid.predecessors.push(fs(1));
+        let mut successor = task(4, "After closed", 480);
+        // Also exercise the backward-horizon path with an unresolved SF link.
+        successor.predecessors.push(Predecessor {
+            uid: 2,
+            link: LinkType::StartFinish,
+            lag_min: -60,
+        });
+        let mut proj = Project {
+            tasks: vec![summary, task(1, "Valid", 480), invalid, successor],
+            calendars: vec![Calendar::standard(1), closed_calendar(3)],
+            ..Project::default()
+        };
+        for t in &mut proj.tasks[1..] {
+            t.outline_level = 2;
+        }
+        let actual = schedule(&proj);
+        let leveled = level(&proj);
+        assert!(actual.get(2).is_none());
+        assert!(leveled.start(2).is_none());
+        assert!(leveled.finish(2).is_none());
+        proj.tasks.retain(|t| t.uid != 2);
+        for t in &mut proj.tasks {
+            t.predecessors.retain(|p| p.uid != 2);
+        }
+        let expected = schedule(&proj);
+        let expected_leveled = level(&proj);
+        assert_eq!(actual.project_start, expected.project_start);
+        assert_eq!(actual.project_finish, expected.project_finish);
+        for uid in [1, 4, 10] {
+            assert_eq!(actual.get(uid), expected.get(uid));
+            assert_eq!(leveled.start(uid), expected_leveled.start(uid));
+            assert_eq!(leveled.finish(uid), expected_leveled.finish(uid));
+        }
+    }
+
+    #[test]
+    fn empty_default_preserves_anchor_with_no_schedulable_leaves() {
+        let anchor = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        for tasks in [
+            vec![],
+            vec![task(1, "Closed", 480)],
+            vec![Task {
+                summary: true,
+                ..task(1, "Summary", 0)
+            }],
+        ] {
+            let proj = Project {
+                start_date: Some(anchor),
+                tasks,
+                calendars: vec![closed_calendar(1)],
+                ..Project::default()
+            };
+            let sched = schedule(&proj);
+            assert_eq!(sched.results().count(), 0);
+            assert_eq!(sched.project_start, anchor);
+            assert_eq!(sched.project_finish, anchor);
+            assert_eq!(level(&proj).project_finish, anchor);
+        }
+    }
+
+    #[test]
+    fn unused_empty_default_loads_and_leveling_preserves_cpm() {
+        let anchor = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        let mut summary = task(10, "Phase", 0);
+        summary.summary = true;
+        let mut proj = Project {
+            start_date: Some(anchor),
+            calendars: vec![closed_calendar(1), Calendar::standard(3)],
+            tasks: vec![summary, task(1, "A", 480), task(2, "B", 480)],
+            resources: vec![Resource {
+                uid: 1,
+                max_units: 1.0,
+                ..Resource::default()
+            }],
+            ..Project::default()
+        };
+        for t in &mut proj.tasks[1..] {
+            t.calendar_uid = Some(3);
+            t.outline_level = 2;
+            proj.assignments.push(Assignment {
+                uid: t.uid,
+                task_uid: t.uid,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 480,
+            });
+        }
+        let proj = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(&proj)).unwrap();
+        let sched = schedule(&proj);
+        assert_eq!(sched.project_start, anchor);
+        let leveled = level(&proj);
+        for uid in [1, 2, 10] {
+            let r = sched.get(uid).unwrap();
+            assert_eq!(r.early_start, anchor);
+            assert_eq!(r.early_finish, DateTime::from_ymd_hm(2026, 3, 2, 17, 0));
+            assert_eq!(leveled.start(uid), Some(r.early_start));
+            assert_eq!(leveled.finish(uid), Some(r.early_finish));
+        }
+        assert_eq!(leveled.project_finish, sched.project_finish);
     }
 
     #[test]
