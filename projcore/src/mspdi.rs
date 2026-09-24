@@ -222,9 +222,10 @@ fn parse_resources(p: &mut XmlParser, out: &mut Vec<Resource>) {
 fn parse_resource(p: &mut XmlParser) -> Resource {
     let mut r = Resource {
         max_units: 1.0,
-        is_work: true,
         ..Resource::default()
     };
+    let mut type_code = None;
+    let mut is_cost = false;
     loop {
         match p.next() {
             Event::Start => {
@@ -233,8 +234,17 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "UID" => r.uid = int_of(p) as i32,
                     "ID" => r.id = int_of(p) as i32,
                     "Name" => r.name = text_of(p),
-                    "Type" => r.is_work = int_of(p) == 1,
+                    "Type" => type_code = Some(int_of(p)),
+                    "IsCostResource" => is_cost = bool_of(p),
+                    "Initials" => r.initials = Some(text_of(p)),
+                    "MaterialLabel" => r.material_label = Some(text_of(p)),
+                    "Code" => r.code = Some(text_of(p)),
+                    "Group" => r.group = Some(text_of(p)),
                     "MaxUnits" => r.max_units = float_of(p),
+                    "AccrueAt" => r.accrue_at = AccrueAt::from_code(int_of(p)),
+                    "StandardRate" => r.standard_rate = Some(float_of(p)),
+                    "OvertimeRate" => r.overtime_rate = Some(float_of(p)),
+                    "CostPerUse" => r.cost_per_use = Some(float_of(p)),
                     "CalendarUID" => r.calendar_uid = Some(int_of(p) as i32),
                     _ => p.skip_element(),
                 }
@@ -243,6 +253,15 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
             _ => {}
         }
     }
+    // Resolve after all children so the flag can precede or follow Type.
+    // Missing/unknown Type defaults to Work; Type 2 is a lenient Cost import.
+    r.kind = if type_code == Some(0) && is_cost {
+        ResourceType::Cost
+    } else {
+        type_code
+            .and_then(ResourceType::from_code)
+            .unwrap_or(ResourceType::Work)
+    };
     r
 }
 
@@ -599,10 +618,37 @@ fn write_resource(s: &mut String, r: &Resource) {
     tag(s, 3, "UID", &r.uid.to_string());
     tag(s, 3, "ID", &r.id.to_string());
     tag(s, 3, "Name", &r.name);
-    tag(s, 3, "Type", if r.is_work { "1" } else { "0" });
+    tag(s, 3, "Type", &r.kind.code().to_string());
+    // Keep the relative sequence from Microsoft's Resource XSD, including
+    // IsCostResource after CalendarUID (Type itself only permits 0 and 1).
+    for (name, value) in [
+        ("Initials", &r.initials),
+        ("MaterialLabel", &r.material_label),
+        ("Code", &r.code),
+        ("Group", &r.group),
+    ] {
+        if let Some(value) = value {
+            tag(s, 3, name, value);
+        }
+    }
     tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
+    if let Some(accrue_at) = r.accrue_at {
+        tag(s, 3, "AccrueAt", &accrue_at.code().to_string());
+    }
+    for (name, value) in [
+        ("StandardRate", r.standard_rate),
+        ("OvertimeRate", r.overtime_rate),
+        ("CostPerUse", r.cost_per_use),
+    ] {
+        if let Some(value) = value {
+            tag(s, 3, name, &value.to_string());
+        }
+    }
     if let Some(c) = r.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
+    }
+    if r.kind == ResourceType::Cost {
+        tag(s, 3, "IsCostResource", "1");
     }
     s.push_str("    </Resource>\n");
 }
@@ -697,6 +743,223 @@ fn fmt_f(x: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn resource_project(resources: &str) -> Project {
+        read_mspdi(&format!(
+            "<Project><Resources>{resources}</Resources></Project>"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn resource_fields_and_legacy_cost_type_survive_save() {
+        let proj = resource_project(
+            "<Resource><UID>1</UID><ID>1</ID><Name>Alice</Name><Type>1</Type><MaxUnits>1</MaxUnits>
+              <Initials>A</Initials><Group>Eng</Group><Code>C7</Code>
+              <StandardRate>50</StandardRate><OvertimeRate>75</OvertimeRate>
+              <CostPerUse>10</CostPerUse><AccrueAt>3</AccrueAt></Resource>
+             <Resource><UID>2</UID><ID>2</ID><Name>Licence</Name><Type>2</Type><MaxUnits>1</MaxUnits></Resource>
+             <Resource><UID>3</UID><ID>3</ID><Name>Concrete</Name><Type>0</Type>
+              <MaterialLabel>tonnes</MaterialLabel><MaxUnits>1</MaxUnits></Resource>",
+        );
+        assert_eq!(
+            proj.resources[0],
+            Resource {
+                uid: 1,
+                id: 1,
+                name: "Alice".into(),
+                kind: ResourceType::Work,
+                initials: Some("A".into()),
+                group: Some("Eng".into()),
+                code: Some("C7".into()),
+                standard_rate: Some(50.0),
+                overtime_rate: Some(75.0),
+                cost_per_use: Some(10.0),
+                accrue_at: Some(AccrueAt::Prorated),
+                max_units: 1.0,
+                ..Resource::default()
+            }
+        );
+        assert_eq!(proj.resources[1].kind, ResourceType::Cost);
+        assert_eq!(proj.resources[2].kind, ResourceType::Material);
+        assert_eq!(proj.resources[2].material_label.as_deref(), Some("tonnes"));
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<Initials>A</Initials>",
+            "<Group>Eng</Group>",
+            "<Code>C7</Code>",
+            "<StandardRate>50</StandardRate>",
+            "<OvertimeRate>75</OvertimeRate>",
+            "<CostPerUse>10</CostPerUse>",
+            "<AccrueAt>3</AccrueAt>",
+            "<MaterialLabel>tonnes</MaterialLabel>",
+            "<IsCostResource>1</IsCostResource>",
+        ] {
+            assert!(xml.contains(element), "missing {element}");
+        }
+        assert!(!xml.contains("<Type>2</Type>"));
+        assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+    }
+
+    #[test]
+    fn resource_type_and_cost_flag_are_encoded_together() {
+        use ResourceType::*;
+        for (children, expected) in [
+            ("<Type>0</Type>", Material),
+            ("<Type>1</Type>", Work),
+            ("<Type>2</Type>", Cost),
+            ("<Type>0</Type><IsCostResource>1</IsCostResource>", Cost),
+            ("<IsCostResource>true</IsCostResource><Type>0</Type>", Cost),
+            (
+                "<Type>0</Type><IsCostResource>false</IsCostResource>",
+                Material,
+            ),
+            ("<Type>0</Type><IsCostResource>0</IsCostResource>", Material),
+            ("<Type>1</Type><IsCostResource>1</IsCostResource>", Work),
+            ("", Work),
+            ("<IsCostResource>1</IsCostResource>", Work),
+            ("<Type>7</Type>", Work),
+        ] {
+            let proj = resource_project(&format!("<Resource>{children}</Resource>"));
+            assert_eq!(proj.resources[0].kind, expected, "{children}");
+            let mut xml = String::new();
+            write_resource(&mut xml, &proj.resources[0]);
+            let type_code = if expected == Work { 1 } else { 0 };
+            assert!(xml.contains(&format!("<Type>{type_code}</Type>")), "{xml}");
+            assert_eq!(
+                xml.contains("<IsCostResource>1</IsCostResource>"),
+                expected == Cost
+            );
+            assert_eq!(resource_project(&xml).resources, proj.resources);
+        }
+    }
+
+    #[test]
+    fn optional_resource_fields_preserve_empty_zero_and_escaped_values() {
+        let proj = resource_project(
+            "<Resource><Initials></Initials><MaterialLabel/>
+             <Code>R&amp;D &lt;x&gt;</Code><Group>R&amp;D &lt;x&gt;</Group>
+             <StandardRate>0</StandardRate><OvertimeRate>12.5</OvertimeRate>
+             <CostPerUse>100000000000000000000</CostPerUse></Resource>",
+        );
+        let r = &proj.resources[0];
+        assert_eq!(r.initials.as_deref(), Some(""));
+        assert_eq!(r.material_label.as_deref(), Some(""));
+        assert_eq!(r.code.as_deref(), Some("R&D <x>"));
+        assert_eq!(r.group.as_deref(), Some("R&D <x>"));
+        assert_eq!(r.standard_rate, Some(0.0));
+        assert_eq!(r.overtime_rate, Some(12.5));
+        assert_eq!(r.cost_per_use, Some(1e20));
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<Initials></Initials>",
+            "<MaterialLabel></MaterialLabel>",
+            "<Code>R&amp;D &lt;x&gt;</Code>",
+            "<Group>R&amp;D &lt;x&gt;</Group>",
+            "<StandardRate>0</StandardRate>",
+            "<OvertimeRate>12.5</OvertimeRate>",
+            "<CostPerUse>100000000000000000000</CostPerUse>",
+        ] {
+            assert!(xml.contains(element), "missing {element}");
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+    }
+
+    #[test]
+    fn resource_accrual_preserves_every_schema_value() {
+        for (code, expected) in [
+            (1, AccrueAt::Start),
+            (2, AccrueAt::End),
+            (3, AccrueAt::Prorated),
+            (4, AccrueAt::Invalid),
+        ] {
+            let proj =
+                resource_project(&format!("<Resource><AccrueAt>{code}</AccrueAt></Resource>"));
+            assert_eq!(proj.resources[0].accrue_at, Some(expected));
+            let xml = write_mspdi(&proj);
+            assert!(xml.contains(&format!("<AccrueAt>{code}</AccrueAt>")));
+            assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+        }
+        for code in [0, 9] {
+            let proj =
+                resource_project(&format!("<Resource><AccrueAt>{code}</AccrueAt></Resource>"));
+            assert_eq!(proj.resources[0].accrue_at, None);
+            assert!(!write_mspdi(&proj).contains("<AccrueAt>"));
+        }
+    }
+
+    #[test]
+    fn absent_resource_fields_stay_absent() {
+        let proj = resource_project(
+            "<Resource><UID>1</UID><ID>1</ID><Name>Alice</Name><Type>1</Type><MaxUnits>1</MaxUnits></Resource>",
+        );
+        let mut xml = String::new();
+        write_resource(&mut xml, &proj.resources[0]);
+        assert_eq!(
+            xml,
+            concat!(
+                "    <Resource>\n",
+                "      <UID>1</UID>\n",
+                "      <ID>1</ID>\n",
+                "      <Name>Alice</Name>\n",
+                "      <Type>1</Type>\n",
+                "      <MaxUnits>1</MaxUnits>\n",
+                "    </Resource>\n",
+            )
+        );
+    }
+
+    #[test]
+    fn resource_children_follow_schema_sequence() {
+        // Microsoft: XML Schema for the Resources Element (Project 2016).
+        // https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-resources-element
+        let r = Resource {
+            kind: ResourceType::Cost,
+            initials: Some("A".into()),
+            material_label: Some("unit".into()),
+            code: Some("C7".into()),
+            group: Some("Eng".into()),
+            accrue_at: Some(AccrueAt::End),
+            standard_rate: Some(50.0),
+            overtime_rate: Some(75.0),
+            cost_per_use: Some(10.0),
+            calendar_uid: Some(1),
+            ..Resource::default()
+        };
+        let mut xml = String::new();
+        write_resource(&mut xml, &r);
+        let mut parser = XmlParser::new(&xml);
+        let mut names = Vec::new();
+        loop {
+            match parser.next() {
+                Event::Start => names.push(parser.name().to_string()),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            names,
+            [
+                "Resource",
+                "UID",
+                "ID",
+                "Name",
+                "Type",
+                "Initials",
+                "MaterialLabel",
+                "Code",
+                "Group",
+                "MaxUnits",
+                "AccrueAt",
+                "StandardRate",
+                "OvertimeRate",
+                "CostPerUse",
+                "CalendarUID",
+                "IsCostResource"
+            ]
+        );
+        assert_eq!(resource_project(&xml).resources, vec![r]);
+    }
 
     #[test]
     fn requires_project_root_but_allows_empty_projects() {

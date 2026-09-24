@@ -145,16 +145,85 @@ impl Task {
     }
 }
 
-/// A resource (person, equipment, or material).
+/// Resource kind. MSPDI encodes Cost using Type 0 plus IsCostResource.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ResourceType {
+    Material,
+    #[default]
+    Work,
+    Cost,
+}
+
+impl ResourceType {
+    /// Read a Type code, accepting the nonstandard code 2 for Cost.
+    pub fn from_code(code: i64) -> Option<Self> {
+        Some(match code {
+            0 => Self::Material,
+            1 => Self::Work,
+            2 => Self::Cost,
+            _ => return None,
+        })
+    }
+
+    /// Schema Type code. Cost additionally requires IsCostResource = true;
+    /// this code alone cannot distinguish Cost from Material.
+    pub fn code(self) -> i64 {
+        match self {
+            Self::Material | Self::Cost => 0,
+            Self::Work => 1,
+        }
+    }
+}
+
+/// When resource costs accrue, including the schema's explicit Invalid value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AccrueAt {
+    Start,
+    End,
+    Prorated,
+    Invalid,
+}
+
+impl AccrueAt {
+    pub fn from_code(code: i64) -> Option<Self> {
+        Some(match code {
+            1 => Self::Start,
+            2 => Self::End,
+            3 => Self::Prorated,
+            4 => Self::Invalid,
+            _ => return None,
+        })
+    }
+
+    pub fn code(self) -> i64 {
+        match self {
+            Self::Start => 1,
+            Self::End => 2,
+            Self::Prorated => 3,
+            Self::Invalid => 4,
+        }
+    }
+}
+
+/// A resource (person, equipment, material, or cost).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Resource {
     pub uid: i32,
     pub id: i32,
     pub name: String,
-    /// MSPDI Type: 1 = Work (people/equipment), 0 = Material. We keep the flag.
-    pub is_work: bool,
+    pub kind: ResourceType,
+    /// Optional source fields retain the distinction between absent and empty.
+    pub initials: Option<String>,
+    pub material_label: Option<String>,
+    pub code: Option<String>,
+    pub group: Option<String>,
     /// Availability, e.g. 1.0 = 100%.
     pub max_units: f64,
+    pub accrue_at: Option<AccrueAt>,
+    /// Stored rates only; the scheduler does not calculate costs.
+    pub standard_rate: Option<f64>,
+    pub overtime_rate: Option<f64>,
+    pub cost_per_use: Option<f64>,
     pub calendar_uid: Option<i32>,
 }
 

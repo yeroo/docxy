@@ -26,7 +26,7 @@
 //! and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
-use crate::model::{ConstraintType, LinkType, Project, Task};
+use crate::model::{ConstraintType, LinkType, Project, ResourceType, Task};
 use std::collections::HashMap;
 
 /// Computed schedule for one task.
@@ -733,7 +733,7 @@ impl Scheduler<'_> {
         // Work-resource capacities and per-task assignments.
         let mut caps: HashMap<i32, f64> = HashMap::new();
         for r in &self.proj.resources {
-            if r.is_work {
+            if r.kind == ResourceType::Work {
                 caps.insert(r.uid, if r.max_units > 0.0 { r.max_units } else { 1.0 });
             }
         }
@@ -858,9 +858,9 @@ mod tests {
             uid,
             id: uid,
             name: name.into(),
-            is_work: true,
+            kind: ResourceType::Work,
             max_units: units,
-            calendar_uid: None,
+            ..Resource::default()
         }
     }
     fn assign(uid: i32, task: i32, res: i32, units: f64) -> Assignment {
@@ -870,6 +870,45 @@ mod tests {
             resource_uid: res,
             units,
             work_min: 0,
+        }
+    }
+
+    #[test]
+    fn leveling_only_work_resources_constrain_capacity() {
+        for kind in [
+            ResourceType::Work,
+            ResourceType::Material,
+            ResourceType::Cost,
+        ] {
+            let proj = Project {
+                start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                tasks: vec![task(1, "A", 960), task(2, "B", 960)],
+                resources: vec![Resource {
+                    kind,
+                    ..worker(1, "Shared", 1.0)
+                }],
+                assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+                ..Project::default()
+            };
+            let cpm = schedule(&proj);
+            let leveled = level(&proj);
+            assert_eq!(leveled.start(1), Some(cpm.get(1).unwrap().early_start));
+            assert_eq!(leveled.finish(1), Some(cpm.get(1).unwrap().early_finish));
+            if kind == ResourceType::Work {
+                assert_eq!(leveled.start(2).unwrap().to_mspdi(), "2026-03-04T08:00:00");
+                assert_eq!(leveled.finish(2).unwrap().to_mspdi(), "2026-03-05T17:00:00");
+            } else {
+                assert_eq!(
+                    leveled.start(2),
+                    Some(cpm.get(2).unwrap().early_start),
+                    "{kind:?}"
+                );
+                assert_eq!(
+                    leveled.finish(2),
+                    Some(cpm.get(2).unwrap().early_finish),
+                    "{kind:?}"
+                );
+            }
         }
     }
 
