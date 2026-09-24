@@ -811,3 +811,25 @@ fn renaming_or_indenting_a_manual_task_keeps_its_file_dates() {
     ed.set_duration(20, "2d").unwrap();
     assert_saved_consistently(&ed, 20);
 }
+
+#[test]
+fn repeating_a_manual_tasks_duration_keeps_its_pinned_finish() {
+    let mut ed = manual_editor();
+    let before = ed.project().task(10).unwrap().clone();
+    assert!(before.manual_finish.is_some());
+    let saved_before = saved(&ed, 10);
+    // As projctl's task.set sends it: a rename plus the current duration.
+    ed.update_task(
+        10,
+        TaskPatch {
+            name: Some("renamed".into()),
+            duration_min: Some(before.duration_min),
+            ..TaskPatch::default()
+        },
+    )
+    .unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.manual_finish, before.manual_finish);
+    assert_eq!(task.manual_duration_min, before.manual_duration_min);
+    assert_eq!(saved(&ed, 10), saved_before);
+}

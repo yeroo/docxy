@@ -141,8 +141,9 @@ pub struct Task {
     pub calendar_uid: Option<i32>,
     /// Start/Finish as stored in the source file (Project's own computed
     /// values). Used as an oracle; the scheduler writes its own results
-    /// elsewhere. The editor rewrites them for an edited manual task, so a
-    /// save's Start/Finish agree with its pinned dates.
+    /// elsewhere. The editor rewrites them for a manual task whose dates it
+    /// edits (start, finish or duration), so a save's Start/Finish agree
+    /// with its pinned dates.
     pub stored_start: Option<DateTime>,
     pub stored_finish: Option<DateTime>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).

@@ -369,9 +369,10 @@ impl Editor {
             if let Some(min) = patch.duration_min {
                 t.duration_min = min;
                 t.milestone = min == 0;
-                // A manual task keeps its start; its finish follows the new
-                // duration instead of staying pinned.
-                if t.manual {
+                // A manual task keeps its start; its finish follows a new
+                // duration instead of staying pinned. Repeating the current
+                // duration keeps a pinned finish.
+                if t.manual && duration_changed {
                     t.manual_duration_min = Some(min);
                     t.manual_finish = None;
                 }
