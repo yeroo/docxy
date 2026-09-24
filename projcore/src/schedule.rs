@@ -10,11 +10,11 @@
 //! Wall-clock scheduling is awkward because 5pm Friday + 1 working hour is 9am
 //! Monday. We tame it by mapping each calendar to a **working-minute timeline**:
 //! a monotonic function from an instant to "working minutes elapsed since the
-//! project anchor" (`to_index`) and its inverse (`abs_start`/`abs_finish`).
+//! timeline origin" (`to_index`) and its inverse (`abs_start`/`abs_finish`).
 //! Once in index space, "finish = start + duration",
 //! "successor = predecessor + lag", and slack are all plain integer arithmetic;
 //! we only convert back to a [`DateTime`] at the end. Each distinct calendar
-//! gets its own timeline anchored at the same absolute project start, so
+//! gets its own timeline with a shared origin before the project start, so
 //! cross-calendar dependencies still compare correctly in wall-clock space.
 //!
 //! ## Scope (v1)
@@ -72,8 +72,8 @@ struct Seg {
     end: i64,   // absolute minute, exclusive
 }
 
-/// A single calendar's working time, anchored at the project start, expressed as
-/// a run of absolute working-minute segments with cumulative offsets.
+/// A single calendar's working time, including time before the project start,
+/// expressed as absolute working-minute segments with cumulative offsets.
 struct Timeline {
     segs: Vec<Seg>,
     cum: Vec<i64>, // cum[i] = working minutes before segs[i]
@@ -81,11 +81,34 @@ struct Timeline {
 }
 
 impl Timeline {
+    /// Reserve enough whole working days before the anchor for linked tasks
+    /// with leads or finish-driven starts. Empty calendars need no extension.
+    fn origin(week: &[Vec<(u32, u32)>; 7], anchor: i64, min_before: i64) -> i64 {
+        if min_before <= 0 || week.iter().flatten().all(|&(from, to)| from >= to) {
+            return anchor;
+        }
+        let mut day = anchor.div_euclid(1440);
+        let mut work = 0;
+        for _ in 0..366 * 100 {
+            day -= 1;
+            let dow = (day + 4).rem_euclid(7) as usize;
+            work += week[dow]
+                .iter()
+                .map(|&(from, to)| to.saturating_sub(from) as i64)
+                .sum::<i64>();
+            if work >= min_before {
+                break;
+            }
+        }
+        day * 1440
+    }
+
     /// Build a timeline for `week` (Sun=0..Sat=6 working patterns) starting at
-    /// `anchor_abs`, extended until it covers at least `min_total` working
-    /// minutes and reaches wall-clock minute `min_reach`.
+    /// `origin_abs`, extended until it covers at least `min_total` working
+    /// minutes after `anchor_abs` and reaches wall-clock minute `min_reach`.
     fn build(
         week: &[Vec<(u32, u32)>; 7],
+        origin_abs: i64,
         anchor_abs: i64,
         min_total: i64,
         min_reach: i64,
@@ -93,13 +116,14 @@ impl Timeline {
         let mut segs = Vec::new();
         let mut cum = Vec::new();
         let mut total = 0i64;
-        let mut day = anchor_abs.div_euclid(1440);
-        let anchor_mod = anchor_abs.rem_euclid(1440) as u32;
+        let mut day = origin_abs.div_euclid(1440);
+        let origin_mod = origin_abs.rem_euclid(1440) as u32;
+        let mut forward_total = 0;
         let mut first = true;
         let mut guard = 0;
         loop {
             let dow = (day + 4).rem_euclid(7) as usize;
-            let floor = if first { anchor_mod } else { 0 };
+            let floor = if first { origin_mod } else { 0 };
             first = false;
             for &(from, to) in &week[dow] {
                 let from = from.max(floor);
@@ -109,12 +133,15 @@ impl Timeline {
                     segs.push(Seg { start: s, end: e });
                     cum.push(total);
                     total += e - s;
+                    forward_total += (e - s.max(anchor_abs)).max(0);
                 }
             }
             day += 1;
-            guard += 1;
+            if day * 1440 > anchor_abs {
+                guard += 1;
+            }
             let reached = day * 1440;
-            if (total >= min_total && reached >= min_reach) || guard > 366 * 100 {
+            if (forward_total >= min_total && reached >= min_reach) || guard > 366 * 100 {
                 break;
             }
         }
@@ -137,7 +164,7 @@ impl Timeline {
     }
 
     /// Inverse of [`to_index`] for a **start** instant: the wall-clock instant
-    /// `k` working minutes after the anchor. A `k` on a segment boundary maps to
+    /// `k` working minutes after the origin. A `k` on a segment boundary maps to
     /// the *next* segment's start (the next working morning), not the end of the
     /// gap — a task that starts there starts at 08:00.
     fn abs_start(&self, k: i64) -> i64 {
@@ -211,24 +238,30 @@ impl<'a> Scheduler<'a> {
             .unwrap_or(raw_anchor);
         let min_reach = far_dates.max(raw_anchor) + 90 * 1440;
 
-        // Build a timeline per calendar; ensure the default exists.
+        // Include the fallback calendar in the shared backward horizon too.
+        let mut weeks: HashMap<_, _> = proj
+            .calendars
+            .iter()
+            .map(|cal| (cal.uid, week_pairs(cal)))
+            .collect();
+        weeks
+            .entry(default_cal)
+            .or_insert_with(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
+        let origin = weeks
+            .values()
+            .map(|week| Timeline::origin(week, raw_anchor, work + lag))
+            .min()
+            .unwrap_or(raw_anchor);
+
+        // Build a timeline per calendar, retaining the full forward horizon.
         let mut timelines = HashMap::new();
         let mut anchor = raw_anchor;
-        let mut have_default = false;
-        for cal in &proj.calendars {
-            let week = week_pairs(cal);
-            let tl = Timeline::build(&week, raw_anchor, min_total, min_reach);
-            if cal.uid == default_cal {
+        for (uid, week) in weeks {
+            let tl = Timeline::build(&week, origin, raw_anchor, min_total, min_reach);
+            if uid == default_cal {
                 anchor = tl.snap(raw_anchor);
-                have_default = true;
             }
-            timelines.insert(cal.uid, tl);
-        }
-        if !have_default {
-            let std = crate::model::Calendar::standard(default_cal);
-            let tl = Timeline::build(&week_pairs(&std), raw_anchor, min_total, min_reach);
-            anchor = tl.snap(raw_anchor);
-            timelines.insert(default_cal, tl);
+            timelines.insert(uid, tl);
         }
 
         Scheduler {
@@ -286,7 +319,8 @@ impl<'a> Scheduler<'a> {
         for &i in &order {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
-            let mut start_abs = self.anchor;
+            let mut linked_start: Option<i64> = None;
+            let mut sf_bounds = Vec::new();
             for p in &t.predecessors {
                 let Some(&pf_abs) = ef_abs.get(&p.uid) else {
                     continue;
@@ -302,12 +336,15 @@ impl<'a> Scheduler<'a> {
                         tl.abs_start(tl.to_index(cf) - t.duration_min)
                     }
                     LinkType::StartFinish => {
-                        let cf = tl.abs_finish(tl.to_index(ps_abs) + p.lag_min);
-                        tl.abs_start(tl.to_index(cf) - t.duration_min)
+                        let bound = sf_bound(tl, ps_abs, p.lag_min);
+                        sf_bounds.push(bound);
+                        tl.abs_start(bound.0 - t.duration_min)
                     }
                 };
-                start_abs = start_abs.max(cand);
+                linked_start = Some(linked_start.map_or(cand, |s| s.max(cand)));
             }
+            // Only resolved leaf links may schedule a task before the anchor.
+            let mut start_abs = linked_start.unwrap_or(self.anchor);
             // Hard constraints (forward-affecting). Snap the constraint date two
             // ways: as a start (next morning) or a finish (this evening).
             if let Some(cd) = t.constraint_date {
@@ -328,12 +365,7 @@ impl<'a> Scheduler<'a> {
             let s_abs = tl.snap(start_abs);
             let s_idx = tl.to_index(s_abs);
             let f_idx = s_idx + t.duration_min;
-            // A milestone (zero duration) finishes exactly when it starts.
-            let f_abs = if t.duration_min == 0 {
-                s_abs
-            } else {
-                tl.abs_finish(f_idx)
-            };
+            let f_abs = finish_instant(t, tl, s_abs, f_idx, sf_bounds.into_iter());
             es.insert(t.uid, s_idx);
             ef.insert(t.uid, f_idx);
             es_abs.insert(t.uid, s_abs);
@@ -351,7 +383,8 @@ impl<'a> Scheduler<'a> {
             let mut finish_abs = project_finish_abs;
             if let Some(list) = succs.get(&t.uid) {
                 if !list.is_empty() {
-                    finish_abs = i64::MAX;
+                    // Every task must finish by the project finish, even when
+                    // an SS/SF successor only bounds its start.
                     for &(suid, link, lag) in list {
                         let sls = ls_abs.get(&suid).copied();
                         let slf = lf_abs.get(&suid).copied();
@@ -377,9 +410,6 @@ impl<'a> Scheduler<'a> {
                         if let Some(c) = cand {
                             finish_abs = finish_abs.min(c);
                         }
-                    }
-                    if finish_abs == i64::MAX {
-                        finish_abs = project_finish_abs;
                     }
                 }
             }
@@ -497,6 +527,45 @@ impl<'a> Scheduler<'a> {
     }
 }
 
+/// SF at zero lag preserves the predecessor's actual start, including across
+/// calendars. Nonzero lag uses the successor calendar's working-start mapping.
+fn sf_bound(tl: &Timeline, predecessor_start: i64, lag: i64) -> (i64, i64) {
+    let index = tl.to_index(predecessor_start) + lag;
+    (
+        index,
+        if lag == 0 {
+            predecessor_start
+        } else {
+            tl.abs_start(index)
+        },
+    )
+}
+
+fn finish_instant(
+    task: &Task,
+    tl: &Timeline,
+    start: i64,
+    finish_index: i64,
+    sf_bounds: impl Iterator<Item = (i64, i64)>,
+) -> i64 {
+    if task.duration_min == 0 {
+        return start;
+    }
+    // MFO wins even when the constrained evening and the SF morning share an
+    // index. Comparing candidate starts would also mistake a clamped bound for
+    // a driving link and could erase a positive task's working duration.
+    if task.constraint != ConstraintType::MustFinishOn || task.constraint_date.is_none() {
+        if let Some(instant) = sf_bounds
+            .filter(|&(index, _)| index == finish_index)
+            .map(|(_, instant)| instant)
+            .max()
+        {
+            return instant;
+        }
+    }
+    tl.abs_finish(finish_index)
+}
+
 /// Convert a calendar's weekday patterns into sorted `(from, to)` minute pairs.
 fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
     let mut out: [Vec<(u32, u32)>; 7] = Default::default();
@@ -594,7 +663,7 @@ pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime
         .unwrap_or_else(|| crate::model::Calendar::standard(proj.default_calendar_uid));
     let a = start.minutes().min(finish.minutes());
     let b = start.minutes().max(finish.minutes());
-    let tl = Timeline::build(&week_pairs(&cal), a, (b - a) + 480, b + 1440);
+    let tl = Timeline::build(&week_pairs(&cal), a, a, (b - a) + 480, b + 1440);
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
@@ -773,11 +842,23 @@ impl Scheduler<'_> {
                     .or_default()
                     .push((placed, placed + t.duration_min, *units));
             }
-            let s_abs = tl.abs_start(placed);
-            let f_abs = if t.duration_min == 0 {
-                s_abs
+            let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 {
+                (cpm.early_start.minutes(), cpm.early_finish.minutes())
             } else {
-                tl.abs_finish(placed + t.duration_min)
+                let s_abs = tl.abs_start(placed);
+                let bounds = t
+                    .predecessors
+                    .iter()
+                    .filter(|p| p.link == LinkType::StartFinish)
+                    .filter_map(|p| {
+                        start
+                            .get(&p.uid)
+                            .map(|s| sf_bound(tl, s.minutes(), p.lag_min))
+                    });
+                (
+                    s_abs,
+                    finish_instant(t, tl, s_abs, placed + t.duration_min, bounds),
+                )
             };
             start.insert(t.uid, DateTime::from_minutes(s_abs));
             finish.insert(t.uid, DateTime::from_minutes(f_abs));
@@ -833,6 +914,269 @@ mod tests {
             link: LinkType::FinishStart,
             lag_min: 0,
         }
+    }
+
+    #[test]
+    fn ss_predecessor_finishing_last_is_critical() {
+        let a = task(1, "A", 960);
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(Predecessor {
+            uid: 1,
+            link: LinkType::StartStart,
+            lag_min: 0,
+        });
+        let proj = Project {
+            tasks: vec![a, b],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        let a = sched.get(1).unwrap();
+        assert_eq!(a.early_finish, sched.project_finish);
+        assert_eq!(a.total_slack_min, 0);
+        assert!(a.critical);
+    }
+
+    fn sf_project() -> Project {
+        let mut a = task(1, "A", 960);
+        a.constraint = ConstraintType::StartNoEarlierThan;
+        a.constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 4, 8, 0));
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(Predecessor {
+            uid: 1,
+            link: LinkType::StartFinish,
+            lag_min: 0,
+        });
+        Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a, b],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn sf_finish_preserves_start_instant_and_work_with_lag() {
+        for (lag, start_day, start_hour, finish_day, finish_hour) in [
+            (0, 3, 8, 4, 8),
+            (480, 4, 8, 5, 8),
+            (-480, 2, 8, 3, 8),
+            (120, 3, 10, 4, 10),
+        ] {
+            let mut proj = sf_project();
+            proj.tasks[1].predecessors[0].lag_min = lag;
+            let sched = schedule(&proj);
+            let b = sched.get(2).unwrap();
+            assert_eq!(
+                b.early_start,
+                DateTime::from_ymd_hm(2026, 3, start_day, start_hour, 0)
+            );
+            assert_eq!(
+                b.early_finish,
+                DateTime::from_ymd_hm(2026, 3, finish_day, finish_hour, 0)
+            );
+            assert_eq!(
+                working_minutes_between(&proj, b.early_start, b.early_finish),
+                480
+            );
+        }
+        let sched = schedule(&sf_project());
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 0);
+        assert!(sched.get(1).unwrap().critical);
+        assert_eq!(sched.get(2).unwrap().total_slack_min, 960);
+    }
+
+    #[test]
+    fn sf_tied_fs_driver_and_later_drivers() {
+        let mut proj = sf_project();
+        proj.tasks.push(task(3, "FS driver", 480));
+        proj.tasks[1].predecessors.push(fs(3));
+        let b = *schedule(&proj).get(2).unwrap();
+        assert_eq!(b.early_finish, DateTime::from_ymd_hm(2026, 3, 4, 8, 0));
+        // Reordering tied predecessors must not change the chosen finish.
+        proj.tasks[1].predecessors.reverse();
+        assert_eq!(*schedule(&proj).get(2).unwrap(), b);
+        proj.tasks[2].duration_min = 960;
+        assert_eq!(
+            schedule(&proj).get(2).unwrap().early_finish,
+            DateTime::from_ymd_hm(2026, 3, 4, 17, 0)
+        );
+        let mut proj = sf_project();
+        proj.tasks[1].constraint = ConstraintType::StartNoEarlierThan;
+        proj.tasks[1].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0));
+        assert_eq!(
+            schedule(&proj).get(2).unwrap().early_finish,
+            DateTime::from_ymd_hm(2026, 3, 5, 17, 0)
+        );
+    }
+
+    #[test]
+    fn sf_hard_constraints_override_same_and_different_index_bounds() {
+        for (constraint, day, hour, finish_day) in [
+            (ConstraintType::MustFinishOn, 3, 17, 3),
+            (ConstraintType::MustFinishOn, 2, 17, 2),
+            (ConstraintType::MustStartOn, 2, 8, 2),
+        ] {
+            let mut proj = sf_project();
+            proj.tasks[1].constraint = constraint;
+            proj.tasks[1].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, day, hour, 0));
+            let sched = schedule(&proj);
+            let b = sched.get(2).unwrap();
+            assert_eq!(
+                b.early_finish,
+                DateTime::from_ymd_hm(2026, 3, finish_day, 17, 0)
+            );
+            assert_eq!(
+                working_minutes_between(&proj, b.early_start, b.early_finish),
+                480
+            );
+            assert_eq!(level(&proj).finish(2), Some(b.early_finish));
+        }
+    }
+
+    fn before_start_project() -> Project {
+        let mut a = task(1, "A", 960);
+        a.predecessors.push(Predecessor {
+            uid: 2,
+            link: LinkType::StartFinish,
+            lag_min: 0,
+        });
+        Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a, task(2, "B", 480)],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn sf_can_schedule_before_project_start_without_clamping_work() {
+        let proj = before_start_project();
+        let sched = schedule(&proj);
+        let a = sched.get(1).unwrap();
+        assert_eq!(a.early_start, DateTime::from_ymd_hm(2026, 2, 26, 8, 0));
+        assert_eq!(a.early_finish, proj.start_date.unwrap());
+        assert_eq!(
+            working_minutes_between(&proj, a.early_start, a.early_finish),
+            960
+        );
+        assert_eq!(sched.project_start, proj.start_date.unwrap());
+        assert!(!a.critical);
+        assert!(sched.get(2).unwrap().critical);
+        assert_eq!(sched.get(2).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn fs_lead_can_start_before_anchor() {
+        let mut proj = before_start_project();
+        proj.tasks[0].predecessors[0].link = LinkType::FinishStart;
+        proj.tasks[0].predecessors[0].lag_min = -960;
+        let sched = schedule(&proj);
+        assert_eq!(
+            sched.get(1).unwrap().early_start,
+            DateTime::from_ymd_hm(2026, 2, 27, 8, 0)
+        );
+    }
+
+    #[test]
+    fn unresolved_and_summary_predecessors_keep_anchor_floor() {
+        for summary in [false, true] {
+            let mut proj = before_start_project();
+            if summary {
+                proj.tasks[1].summary = true;
+            } else {
+                proj.tasks.pop();
+            }
+            assert_eq!(
+                schedule(&proj).get(1).unwrap().early_start,
+                proj.start_date.unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_calendar_has_work_before_anchor_and_full_forward_horizon() {
+        let mut proj = before_start_project();
+        let mut cal = Calendar::standard(2);
+        for dow in [0, 2, 3, 4, 5, 6] {
+            cal.week[dow].times.clear();
+        }
+        proj.tasks[0].calendar_uid = Some(2);
+        // Missing default calendar exercises the Standard fallback origin.
+        proj.calendars = vec![cal];
+        let engine = Scheduler::new(&proj);
+        let tl = engine.tl(&proj.tasks[0]);
+        assert!(tl.total - tl.to_index(engine.anchor) >= 1440 + 200 * 480 + 480);
+        let sched = engine.run();
+        let a = sched.get(1).unwrap();
+        assert_eq!(a.early_start, DateTime::from_ymd_hm(2026, 2, 16, 8, 0));
+        assert_eq!(a.early_finish, proj.start_date.unwrap());
+        assert_eq!(
+            tl.to_index(a.early_finish.minutes()) - tl.to_index(a.early_start.minutes()),
+            960
+        );
+    }
+
+    #[test]
+    fn mixed_calendar_sf_preserves_zero_lag_instant_but_milestone_stays_an_instant() {
+        let mut proj = sf_project();
+        let mut sunday = Calendar::standard(2);
+        sunday.week[0] = sunday.week[1].clone();
+        for dow in 1..7 {
+            sunday.week[dow].times.clear();
+        }
+        proj.calendars.push(sunday);
+        proj.tasks[0].calendar_uid = Some(2);
+        proj.tasks[0].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 8, 8, 0));
+        let sched = schedule(&proj);
+        assert_eq!(
+            sched.get(2).unwrap().early_finish,
+            sched.get(1).unwrap().early_start
+        );
+        assert_eq!(
+            sched.get(2).unwrap().early_finish,
+            DateTime::from_ymd_hm(2026, 3, 8, 8, 0)
+        );
+        proj.tasks[1].duration_min = 0;
+        let sched = schedule(&proj);
+        let b = sched.get(2).unwrap();
+        assert_eq!(b.early_start, DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        assert_eq!(b.early_finish, b.early_start);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), leveled.finish(2));
+    }
+
+    #[test]
+    fn leveling_preserves_sf_dates_without_resources_including_before_anchor() {
+        for proj in [sf_project(), before_start_project()] {
+            let sched = schedule(&proj);
+            let leveled = level(&proj);
+            for t in &proj.tasks {
+                let r = sched.get(t.uid).unwrap();
+                assert_eq!(leveled.start(t.uid), Some(r.early_start));
+                assert_eq!(leveled.finish(t.uid), Some(r.early_finish));
+            }
+        }
+    }
+
+    #[test]
+    fn leveling_propagates_sf_finish_instant_after_resource_delay() {
+        let mut proj = sf_project();
+        proj.tasks.insert(0, task(3, "Busy resource", 1920));
+        proj.resources = vec![worker(1, "Shared", 1.0)];
+        proj.assignments = vec![assign(1, 3, 1, 1.0), assign(2, 1, 1, 1.0)];
+        let leveled = level(&proj);
+        assert_eq!(
+            leveled.start(1).unwrap(),
+            DateTime::from_ymd_hm(2026, 3, 6, 8, 0)
+        );
+        assert_eq!(leveled.finish(2), leveled.start(1));
+        assert_eq!(
+            working_minutes_between(&proj, leveled.start(2).unwrap(), leveled.finish(2).unwrap()),
+            480
+        );
+        // The delayed milestone path must also preserve finish == start.
+        proj.tasks[2].duration_min = 0;
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), leveled.start(1));
+        assert_eq!(leveled.start(2), leveled.finish(2));
     }
 
     /// The classic worked example: A(2d)→B(3d), A→C(1d), B→D, C→D.

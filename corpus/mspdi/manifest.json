@@ -119,6 +119,16 @@
         "round-trip"
       ],
       "desc": "Work resource identity and rates, Cost resource, and Material label survive saving."
+    },
+    {
+      "file": "14-link-sf-before-start.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "link-sf",
+        "before-start"
+      ],
+      "desc": "Start-to-finish successor begins before the project start."
     }
   ]
 }

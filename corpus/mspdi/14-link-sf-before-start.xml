@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Project xmlns="http://schemas.microsoft.com/project">
-  <Name>link-sf</Name>
+  <Name>link-sf-before-start</Name>
   <MinutesPerDay>480</MinutesPerDay>
   <MinutesPerWeek>2400</MinutesPerWeek>
   <CalendarUID>1</CalendarUID>
@@ -13,9 +13,12 @@
       <Summary>0</Summary>
       <Milestone>0</Milestone>
       <Duration>PT16H0M0S</Duration><DurationFormat>7</DurationFormat>
-      <Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>
-      <ConstraintType>4</ConstraintType>
-      <ConstraintDate>2026-03-04T08:00:00</ConstraintDate>
+      <Start>2026-02-26T08:00:00</Start><Finish>2026-03-02T08:00:00</Finish>
+      <PredecessorLink>
+        <PredecessorUID>2</PredecessorUID>
+        <Type>2</Type>
+        <LinkLag>0</LinkLag><LagFormat>7</LagFormat>
+      </PredecessorLink>
     </Task>
     <Task>
       <UID>2</UID><ID>2</ID>
@@ -24,12 +27,7 @@
       <Summary>0</Summary>
       <Milestone>0</Milestone>
       <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat>
-      <Start>2026-03-03T08:00:00</Start><Finish>2026-03-04T08:00:00</Finish>
-      <PredecessorLink>
-        <PredecessorUID>1</PredecessorUID>
-        <Type>2</Type>
-        <LinkLag>0</LinkLag><LagFormat>7</LagFormat>
-      </PredecessorLink>
+      <Start>2026-03-02T08:00:00</Start><Finish>2026-03-02T17:00:00</Finish>
     </Task>
   </Tasks>
   <Calendars>

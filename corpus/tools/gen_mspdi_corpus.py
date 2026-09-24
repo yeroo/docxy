@@ -3,9 +3,11 @@
 
 Unlike the xlsx corpus, there is no free high-fidelity oracle for project
 scheduling (MS Project is the reference implementation and isn't scriptable
-here). So each file is made *self-oracling*: it embeds the Start/Finish that
-Project itself would compute, hand-verified against a standard 8h/day Mon-Fri
-calendar anchored at Monday 2026-03-02 08:00. `projcore/tests/corpus.rs` reads
+here). Each file embeds hand-derived Start/Finish expectations for a standard
+8h/day Mon-Fri calendar anchored at Monday 2026-03-02 08:00. The owner checked
+the SF shapes in files 05 and 14 against Project 2021 (issue #53); the other
+expectations have not been independently verified against Project.
+`projcore/tests/corpus.rs` reads
 each file, runs the CPM scheduler, and asserts the computed dates match the
 embedded ones — so the corpus validates the scheduler without needing Project.
 
@@ -137,7 +139,7 @@ CORPUS = []
 
 def add(fname, tags, desc, xml):
     CORPUS.append({"file": fname, "category": tags[0], "tags": tags, "desc": desc})
-    with open(os.path.join(OUT_DIR, fname), "w") as fh:
+    with open(os.path.join(OUT_DIR, fname), "w", encoding="utf-8", newline="\n") as fh:
         fh.write(xml)
 
 
@@ -175,7 +177,7 @@ def build():
     add("05-link-sf.xml", ["link", "link-sf"], "Start-to-finish dependency.",
         project("link-sf", "\n".join([
             task(1, "A", 2 * D, dt(4), dt(5, "17:00:00"), ctype=SNET, cdate=dt(4)),
-            task(2, "B", 1 * D, dt(3), dt(3, "17:00:00"), preds=[(1, SF, 0)]),
+            task(2, "B", 1 * D, dt(3), dt(4), preds=[(1, SF, 0)]),
         ])))
 
     # 06 — FS with +2 day lag (LinkLag is tenths of a minute: 2d = 2*480*10).
@@ -255,13 +257,21 @@ def build():
                 task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00")),
                 resources_xml=rich_res, assignments_xml=asn))
 
+    # 14 — Project 2021 places the SF successor before the project start (#53).
+    add("14-link-sf-before-start.xml", ["link", "link-sf", "before-start"],
+        "Start-to-finish successor begins before the project start.",
+        project("link-sf-before-start", "\n".join([
+            task(1, "A", 2 * D, "2026-02-26T08:00:00", dt(2), preds=[(2, SF, 0)]),
+            task(2, "B", 1 * D, dt(2), dt(2, "17:00:00")),
+        ])))
+
     manifest = {
         "anchor": "2026-03-02T08:00:00",
         "calendar": "Standard 8h/day Mon-Fri (08:00-12:00, 13:00-17:00)",
         "note": "Start/Finish embedded in each file are the CPM oracle.",
         "files": CORPUS,
     }
-    with open(os.path.join(OUT_DIR, "manifest.json"), "w") as fh:
+    with open(os.path.join(OUT_DIR, "manifest.json"), "w", encoding="utf-8", newline="\n") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
 

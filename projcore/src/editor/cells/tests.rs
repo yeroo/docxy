@@ -211,6 +211,30 @@ fn scheduling_range_reserves_room_for_dated_start_indices() {
 }
 
 #[test]
+fn scheduling_range_accounts_for_time_before_the_anchor() {
+    let mut ed = editor();
+    for task in &mut ed.proj.tasks {
+        task.duration_min = 0;
+    }
+    // A continuous calendar can use the entire 100-year backward budget as
+    // well as the forward budget. The old reserve only covered one direction.
+    for day in &mut ed.proj.calendars[0].week {
+        day.times = vec![crate::model::WorkingTime { from: 0, to: 1440 }];
+    }
+    ed.set_constraint_typed(
+        10,
+        ConstraintType::StartNoEarlierThan,
+        Some(parse_cell_date("2027-01-04").unwrap()),
+    )
+    .unwrap();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    let old_reserve = (366_i64 * 100 + 1) * 1440 + 200 * 480 + 480;
+    assert!(ed.set_duration_min(10, i64::MAX - old_reserve).is_err());
+    unchanged(&ed, &before, history);
+}
+
+#[test]
 fn resource_tokens_preserve_significant_whitespace_and_prefer_exact_assignments() {
     for (stored, token) in [
         ("Alice ", "Alice "),

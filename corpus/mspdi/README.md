@@ -4,14 +4,21 @@ Tiny, single-feature MS Project XML (MSPDI) files used to validate the
 `projcore` CPM scheduler and resource round trips. Each file isolates one feature so a
 failing assertion points at a single code path.
 
-## Self-oracling
+## Embedded expectations
 
 There is no free high-fidelity oracle for project scheduling — MS Project is the
 reference implementation and isn't scriptable in CI. So each file embeds the
-`Start`/`Finish` that **Project itself** would compute, hand-verified against a
-standard calendar. `projcore/tests/corpus.rs` reads each file, runs the CPM
-scheduler, and asserts the computed dates equal the embedded ones. The corpus
-therefore validates the scheduler against Project's semantics without Project.
+hand-derived `Start`/`Finish` expectations for a standard calendar.
+`projcore/tests/corpus.rs` reads each file, runs the CPM scheduler, and asserts
+the computed dates equal the embedded ones. It also checks that every project
+has a critical leaf and that its last-finishing leaves have nonpositive slack.
+
+The owner checked the SF shapes in files 05 and 14 against Microsoft Project
+2021 in [issue #53](https://github.com/yeroo/docxy/issues/53). File 05's B finish
+was corrected from March 3 at 17:00 to March 4 at 08:00, the instant A starts.
+File 14 records Project scheduling the SF successor before the project start.
+The other fixtures remain hand-derived expectations, not independently verified
+Project outputs.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
@@ -34,6 +41,7 @@ therefore validates the scheduler against Project's semantics without Project.
 | `11-resource-assignment` | resource + assignment | units × work parsing |
 | `12-calendar-6day` | custom calendar | Saturday working changes the finish |
 | `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006) |
+| `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
 
 See `manifest.json` for machine-readable tags.
 
