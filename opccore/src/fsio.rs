@@ -61,9 +61,13 @@ fn parent_dir(path: &Path) -> &Path {
 /// Write and sync a temporary sibling, then replace the destination.
 /// Existing symlinks are followed (dangling links fail); existing permissions
 /// are preserved. New files use the normal creation permissions (0666 filtered
-/// by umask on Unix); only replacement temps start private. A failure before
-/// replacement leaves the destination intact.
-/// Replacement changes file identity, so other hard links keep the old bytes.
+/// by umask on Unix); only replacement temps start private. Existing files must
+/// be writable by the caller. On Unix, owner/group are preserved: if they cannot
+/// be restored on the temp, the synced bytes are copied into the original file
+/// instead. That ownership-preserving fallback is not atomic and an I/O failure
+/// during copying can leave partial output, matching an ordinary in-place write.
+/// Otherwise failures before replacement leave the destination intact and
+/// replacement changes file identity (other hard links keep the old bytes).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic_with(path, |file| file.write_all(bytes))
 }
@@ -73,38 +77,67 @@ pub fn write_atomic_with(
     path: &Path,
     writer: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
+    write_atomic_with_ownership(path, writer, restore_ownership)
+}
+
+fn write_atomic_with_ownership(
+    path: &Path,
+    writer: impl FnOnce(&mut File) -> io::Result<()>,
+    restore: impl FnOnce(&File, &fs::Metadata) -> io::Result<bool>,
+) -> io::Result<()> {
     let dest = match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => fs::canonicalize(path)?,
         Ok(_) => path.to_path_buf(),
         Err(e) if e.kind() == io::ErrorKind::NotFound => path.to_path_buf(),
         Err(e) => return Err(e),
     };
-    let permissions = match fs::metadata(&dest) {
-        Ok(meta) => {
-            if meta.permissions().readonly() {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "destination is read-only",
-                ));
-            }
-            Some(meta.permissions())
-        }
+    // Opening without truncate verifies this caller's access, not merely the
+    // presence of some write bit. Keep the handle for an ownership fallback.
+    let destination = match OpenOptions::new().write(true).open(&dest) {
+        Ok(file) => Some(file),
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
     };
+    let metadata = destination.as_ref().map(File::metadata).transpose()?;
+    if metadata
+        .as_ref()
+        .is_some_and(|meta| meta.permissions().readonly())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "destination is read-only",
+        ));
+    }
     // Declare the guard before the file so unwinding also closes before cleanup.
-    let (mut temp, mut file) = create_temp(&dest, permissions.is_some(), || {
+    let (mut temp, mut file) = create_temp(&dest, metadata.is_some(), || {
         NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
     })?;
     let result = (|| {
         writer(&mut file)?;
-        if let Some(permissions) = permissions {
-            file.set_permissions(permissions)?;
-        }
-        file.sync_all()
+        let replace = if let Some(metadata) = &metadata {
+            let replace = restore(&file, metadata)?;
+            if replace {
+                // chown can clear permission bits, so restore mode afterward.
+                file.set_permissions(metadata.permissions())?;
+            }
+            replace
+        } else {
+            true
+        };
+        file.sync_all()?;
+        Ok::<_, io::Error>(replace)
     })();
     drop(file);
-    result?;
+    if !result? {
+        let mut source = File::open(&temp.0)?;
+        let mut destination = destination
+            .ok_or_else(|| io::Error::other("ownership fallback needs an existing destination"))?;
+        destination.set_len(0)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+        return Ok(());
+    }
+    drop(destination);
     fs::rename(&temp.0, &dest)?;
     temp.1 = false;
     #[cfg(unix)]
@@ -113,6 +146,26 @@ pub fn write_atomic_with(
         let _ = dir.sync_all();
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn restore_ownership(file: &File, original: &fs::Metadata) -> io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt, fchown};
+    let matches =
+        |meta: &fs::Metadata| meta.uid() == original.uid() && meta.gid() == original.gid();
+    if matches(&file.metadata()?) {
+        return Ok(true);
+    }
+    if fchown(file, Some(original.uid()), Some(original.gid())).is_err() {
+        // An unprivileged owner may still restore a group they belong to.
+        let _ = fchown(file, None, Some(original.gid()));
+    }
+    Ok(matches(&file.metadata()?))
+}
+
+#[cfg(not(unix))]
+fn restore_ownership(_file: &File, _original: &fs::Metadata) -> io::Result<bool> {
+    Ok(true)
 }
 
 /// Publish a new file, refusing any existing destination, even one created
@@ -398,6 +451,67 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             default_mode
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_replacement_preserves_ownership_and_changes_inode() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = Dir::new();
+        let path = dir.file();
+        fs::write(&path, b"old").unwrap();
+        let before = fs::metadata(&path).unwrap();
+        write_atomic(&path, b"new").unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!((after.uid(), after.gid()), (before.uid(), before.gid()));
+        assert_ne!(after.ino(), before.ino());
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(dir.count(), 1);
+    }
+
+    #[test]
+    fn ownership_restore_failure_keeps_original_inode_and_cleans_temp() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        let dir = Dir::new();
+        let path = dir.file();
+        fs::write(&path, b"old bytes longer than replacement").unwrap();
+        let alias = dir.0.join("original-inode");
+        fs::hard_link(&path, &alias).unwrap();
+        #[cfg(unix)]
+        let before = fs::metadata(&path).unwrap();
+        write_atomic_with_ownership(&path, |file| file.write_all(b"new"), |_, _| Ok(false))
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let after = fs::metadata(&path).unwrap();
+            assert_eq!(
+                (after.uid(), after.gid(), after.ino()),
+                (before.uid(), before.gid(), before.ino())
+            );
+        }
+        // A retained hard link identifies the original inode on both platforms,
+        // so the injected fallback can also be exercised on Windows.
+        assert!(same_file(&path, &alias));
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert_eq!(fs::read(&alias).unwrap(), b"new");
+        assert_eq!(dir.count(), 2);
+        // Even when ownership would need a fallback, a failed temp write must
+        // leave the original untouched and never invoke the restore hook.
+        assert!(
+            write_atomic_with_ownership(
+                &path,
+                |file| {
+                    file.write_all(b"partial")?;
+                    Err(io::Error::other("injected write failure"))
+                },
+                |_, _| panic!("must not restore after a failed write")
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        assert!(same_file(&path, &alias));
+        assert_eq!(dir.count(), 2);
     }
 
     #[test]

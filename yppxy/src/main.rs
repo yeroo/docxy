@@ -213,12 +213,20 @@ fn write_gantt_md(
     )
 }
 
+const SAVE_FORMAT_ERROR: &str = "Project schedules can only be saved as .yppx or .xml (MSPDI)";
+
 fn save_to(proj: &Project, path: &str) -> Result<(), String> {
-    if path.ends_with(".yppx") {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("");
+    if extension.eq_ignore_ascii_case("yppx") {
         write_atomic(Path::new(path), &yppx::write_yppx(proj)).map_err(|e| e.to_string())
-    } else {
+    } else if extension.eq_ignore_ascii_case("xml") {
         write_atomic(Path::new(path), mspdi::write_mspdi(proj).as_bytes())
             .map_err(|e| e.to_string())
+    } else {
+        Err(SAVE_FORMAT_ERROR.into())
     }
 }
 
@@ -857,7 +865,7 @@ impl App {
     }
 
     /// Write the project to `dir/name` (defaulting to `.yppx` when the typed
-    /// name carries no known project extension), then make it the current
+    /// name carries no extension), then make it the current
     /// file and close the backstage.
     fn commit_save_as(&mut self, dir: std::path::PathBuf, name: String) {
         let name = name.trim();
@@ -865,16 +873,21 @@ impl App {
             self.status = "Save As — type a file name first.".to_string();
             return;
         }
-        let lower = name.to_ascii_lowercase();
-        let known = [".yppx", ".xml", ".mpp"];
-        let fname = if known.iter().any(|e| lower.ends_with(e)) {
-            name.to_string()
-        } else {
+        let fname = if Path::new(name).extension().is_none() {
             format!("{name}.yppx")
+        } else {
+            name.to_string()
         };
-        self.path = Some(dir.join(&fname).to_string_lossy().into_owned());
+        let path = dir.join(&fname).to_string_lossy().into_owned();
         self.backstage = None;
-        self.save();
+        match save_to(self.ed.project(), &path) {
+            Ok(()) => {
+                self.ed.mark_saved();
+                self.status = format!("Saved {path}");
+                self.path = Some(path);
+            }
+            Err(e) => self.status = format!("Save failed: {e}"),
+        }
     }
 }
 
@@ -1830,6 +1843,56 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_saves_refuse_mpp_and_other_unsupported_formats() {
+        let dir = std::env::temp_dir().join(format!("yppxy-save-formats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let project = new_project();
+        for name in ["plan.mpp", "plan.MPP", "plan.txt", "plan"] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"original binary schedule").unwrap();
+            assert_eq!(
+                save_to(&project, path.to_str().unwrap()).unwrap_err(),
+                SAVE_FORMAT_ERROR
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"original binary schedule");
+            std::fs::remove_file(path).unwrap();
+        }
+        for name in ["plan.yppx", "plan.YPPX", "plan.xml", "plan.XML"] {
+            let path = dir.join(name);
+            save_to(&project, path.to_str().unwrap()).unwrap();
+            assert_eq!(load(path.to_str().unwrap()).unwrap(), project);
+            std::fs::remove_file(path).unwrap();
+        }
+        let original = dir.join("import.mpp");
+        std::fs::write(&original, b"original binary schedule").unwrap();
+        let mut app = App::new(project, Some(original.to_str().unwrap().into()), false);
+        app.ed.rename(1, "Unsaved edit").unwrap();
+        app.save();
+        assert!(app.status.contains(SAVE_FORMAT_ERROR));
+        assert!(app.ed.dirty());
+        app.commit_save_as(dir.clone(), "import.mpp".into());
+        assert!(app.status.contains(SAVE_FORMAT_ERROR));
+        assert_eq!(app.path.as_deref(), original.to_str());
+        assert!(app.ed.dirty());
+        assert_eq!(
+            std::fs::read(&original).unwrap(),
+            b"original binary schedule"
+        );
+        assert!(!dir.join("import.mpp.yppx").exists());
+        app.commit_save_as(dir.clone(), "converted".into());
+        assert!(!app.ed.dirty());
+        let converted = dir.join("converted.yppx");
+        assert_eq!(app.path.as_deref(), converted.to_str());
+        assert_eq!(
+            load(converted.to_str().unwrap()).unwrap().tasks[0].name,
+            "Unsaved edit"
+        );
+        std::fs::remove_file(original).unwrap();
+        std::fs::remove_file(converted).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn exports_refuse_source_aliases() {
