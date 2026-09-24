@@ -651,11 +651,9 @@ pub(crate) fn apply_export(tab: &mut DocTab, target: &Path) -> Result<usize, Str
         let Surface::Project(v) = &tab.surface else {
             return Err("This project could not be loaded and cannot be exported".into());
         };
-        if tab.path.as_deref() == Some(target) {
-            return Err("Export cannot overwrite the source project".into());
-        }
         let bytes = projcore::gantt::to_markdown(v.ed.project(), v.ed.schedule());
-        std::fs::write(target, &bytes).map_err(|e| format!("Export failed: {e}"))?;
+        opccore::fsio::export_atomic(tab.path.as_deref(), target, bytes.as_bytes())
+            .map_err(|e| format!("Export failed: {e}"))?;
         Ok(bytes.len())
     })();
     match &result {

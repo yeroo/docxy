@@ -11,6 +11,9 @@
 //! range selection, ref-translating copy/paste) and a dependency-graph
 //! recalculation on every edit.
 
+use opccore::fsio::export_atomic;
+use std::path::Path;
+
 use std::io;
 use std::process::ExitCode;
 use std::time::SystemTime;
@@ -56,6 +59,40 @@ use ratatui::{Frame, Terminal};
 use ratatui_image::picker::Picker;
 use ratatui_image::protocol::Protocol;
 use ratatui_image::{Image, Resize};
+
+fn export_csv_headless(
+    pkg: &SheetPackage,
+    source: &str,
+    import_source: Option<&str>,
+    out: &str,
+) -> io::Result<usize> {
+    let csv = sheet_to_csv(
+        &pkg.workbook.sheets[0],
+        &pkg.workbook.styles,
+        pkg.workbook.date1904,
+    );
+    export_csv_bytes(source, import_source, out, csv.as_bytes())?;
+    Ok(csv.len())
+}
+
+/// An imported text file stays protected independently of the rebound .xlsx
+/// save path. Either path can identify the destination through a filesystem alias.
+fn export_csv_bytes(
+    source: &str,
+    import_source: Option<&str>,
+    out: &str,
+    bytes: &[u8],
+) -> io::Result<()> {
+    let source = import_source
+        .filter(|import| opccore::fsio::same_file(Path::new(import), Path::new(out)))
+        .unwrap_or(source);
+    export_atomic(Some(Path::new(source)), Path::new(out), bytes)
+}
+
+fn is_delimited(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".csv") || lower.ends_with(".tsv")
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -148,39 +185,27 @@ fn main() -> ExitCode {
         }
     }
 
-    let (pkg, path) = match parsed.inputs.first() {
+    let (pkg, path, import_source) = match parsed.inputs.first() {
         // CSV/TSV imports as a one-sheet workbook (Ctrl-S then writes
         // .xlsx — the path is rebound so a spreadsheet never lands in a
         // text file). The delimiter is sniffed.
-        Some(input)
-            if input.to_ascii_lowercase().ends_with(".csv")
-                || input.to_ascii_lowercase().ends_with(".tsv") =>
-        {
-            match std::fs::read_to_string(input) {
-                Ok(text) => {
-                    let stem = std::path::Path::new(input)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "import".to_string());
-                    let base = &input[..input.len() - 4];
-                    (csv_to_pkg(&text, &stem), format!("{base}.xlsx"))
-                }
-                Err(e) => {
-                    eprintln!("error: cannot read {input}: {e}");
-                    return ExitCode::FAILURE;
-                }
+        Some(input) if is_delimited(input) => match load_workbook(input) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                eprintln!("error: cannot read {input}: {e}");
+                return ExitCode::FAILURE;
             }
-        }
+        },
         Some(input) => match std::fs::read(input) {
             Ok(data) => match load_xlsx(&data) {
-                Ok(pkg) => (pkg, input.clone()),
+                Ok(pkg) => (pkg, input.clone(), None),
                 Err(e) => {
                     eprintln!("error: {input}: {e}");
                     return ExitCode::FAILURE;
                 }
             },
             // A nonexistent .xlsx path opens a new workbook bound to it.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => (new_xlsx(), input.clone()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (new_xlsx(), input.clone(), None),
             Err(e) => {
                 eprintln!("error: cannot read {input}: {e}");
                 return ExitCode::FAILURE;
@@ -191,7 +216,7 @@ fn main() -> ExitCode {
                 eprintln!("error: headless modes (--recalc/--csv) require an input file");
                 return ExitCode::from(2);
             }
-            (new_xlsx(), "untitled.xlsx".to_string())
+            (new_xlsx(), "untitled.xlsx".to_string(), None)
         }
     };
 
@@ -214,7 +239,13 @@ fn main() -> ExitCode {
             );
         }
         let bytes = save_xlsx(&pkg);
-        if let Err(e) = std::fs::write(&out, &bytes) {
+        // Recalculation is an in-place save for .xlsx, but a conversion for
+        // CSV/TSV input. Never replace the imported text file with an XLSX.
+        if let Err(e) = export_atomic(
+            import_source.as_deref().map(Path::new),
+            Path::new(&out),
+            &bytes,
+        ) {
             eprintln!("error: cannot write {out}: {e}");
             return ExitCode::FAILURE;
         }
@@ -223,18 +254,18 @@ fn main() -> ExitCode {
     }
 
     if let Some(out) = parsed.csv_out {
-        let sheet = &pkg.workbook.sheets[0];
-        let csv = sheet_to_csv(sheet, &pkg.workbook.styles, pkg.workbook.date1904);
-        if let Err(e) = std::fs::write(&out, csv.as_bytes()) {
-            eprintln!("error: cannot write {out}: {e}");
-            return ExitCode::FAILURE;
+        match export_csv_headless(&pkg, &path, import_source.as_deref(), &out) {
+            Ok(len) => println!("wrote {out} ({len} bytes)"),
+            Err(e) => {
+                eprintln!("error: cannot write {out}: {e}");
+                return ExitCode::FAILURE;
+            }
         }
-        println!("wrote {out} ({} bytes)", csv.len());
         return ExitCode::SUCCESS;
     }
 
     let welcome = parsed.inputs.is_empty();
-    match run_tui(pkg, &path, welcome, parsed.vim) {
+    match run_tui(pkg, &path, import_source, welcome, parsed.vim) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -244,21 +275,24 @@ fn main() -> ExitCode {
 }
 
 /// Load a workbook from disk (`.xlsx`, or `.csv`/`.tsv` imported as one sheet),
-/// returning the package and the path it should save back to.
-fn load_workbook(path: &str) -> Result<(SheetPackage, String), String> {
-    let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".csv") || lower.ends_with(".tsv") {
+/// returning the package, its save path, and any original CSV/TSV import path.
+fn load_workbook(path: &str) -> Result<(SheetPackage, String, Option<String>), String> {
+    if is_delimited(path) {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
         let stem = std::path::Path::new(path)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "import".to_string());
         let base = &path[..path.len() - 4];
-        Ok((csv_to_pkg(&text, &stem), format!("{base}.xlsx")))
+        Ok((
+            csv_to_pkg(&text, &stem),
+            format!("{base}.xlsx"),
+            Some(path.to_string()),
+        ))
     } else {
         let data = std::fs::read(path).map_err(|e| e.to_string())?;
         let pkg = load_xlsx(&data).map_err(|e| e.to_string())?;
-        Ok((pkg, path.to_string()))
+        Ok((pkg, path.to_string(), None))
     }
 }
 
@@ -417,7 +451,7 @@ fn iso_now() -> String {
 /// Render the first sheet of a workbook (or a CSV) as preview text lines,
 /// bounded so a huge file can't stall the browser.
 fn preview_lines(path: &str, width: usize) -> Vec<String> {
-    let (pkg, _) = match load_workbook(path) {
+    let (pkg, _, _) = match load_workbook(path) {
         Ok(x) => x,
         Err(e) => return vec![format!("(cannot preview: {e})")],
     };
@@ -861,6 +895,7 @@ struct App {
     pkg: SheetPackage,
     engine: Engine,
     path: String,
+    import_source: Option<String>,
     sheet: usize,
     cur: (u32, u32),
     anchor: Option<(u32, u32)>,
@@ -946,6 +981,7 @@ impl App {
             pkg,
             engine,
             path: path.to_string(),
+            import_source: None,
             sheet: 0,
             cur: (0, 0),
             anchor: None,
@@ -1997,13 +2033,35 @@ impl App {
     }
 
     fn save(&mut self) {
+        self.save_current();
+    }
+
+    fn save_current(&mut self) -> bool {
         let bytes = self.package_bytes();
-        match std::fs::write(&self.path, &bytes) {
+        match export_atomic(
+            self.import_source.as_deref().map(Path::new),
+            Path::new(&self.path),
+            &bytes,
+        ) {
             Ok(()) => {
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
+                true
             }
-            Err(e) => self.status = Some(format!("save failed: {e}")),
+            Err(e) => {
+                self.status = Some(format!("save failed: {e}"));
+                false
+            }
+        }
+    }
+
+    fn save_as(&mut self, path: String) {
+        let previous = std::mem::replace(&mut self.path, path);
+        if self.save_current() {
+            self.import_source = None;
+        } else {
+            // A failed Save As must retain protection for the imported file.
+            self.path = previous;
         }
     }
 
@@ -2793,7 +2851,7 @@ impl App {
     /// Replace the whole editing session with a freshly loaded workbook.
     fn open_workbook(&mut self, path: &str) {
         match load_workbook(path) {
-            Ok((pkg, p)) => {
+            Ok((pkg, p, import_source)) => {
                 let (rels, meas) = pkg
                     .part(MODEL_PART)
                     .map(|b| parse_model_part(&String::from_utf8_lossy(b)))
@@ -2805,6 +2863,7 @@ impl App {
                 self.engine = engine;
                 self.pkg = pkg;
                 self.path = p;
+                self.import_source = import_source;
                 self.model_rels = rels;
                 self.model_measures = meas;
                 self.comments = comments;
@@ -2827,6 +2886,7 @@ impl App {
         self.engine = engine;
         self.pkg = pkg;
         self.path = "untitled.xlsx".to_string();
+        self.import_source = None;
         self.model_rels = Vec::new();
         self.model_measures = Vec::new();
         self.comments = Vec::new();
@@ -2860,7 +2920,12 @@ impl App {
             Some((base, _)) => format!("{base}.csv"),
             None => format!("{}.csv", self.path),
         };
-        match std::fs::write(&out, csv.as_bytes()) {
+        match export_csv_bytes(
+            &self.path,
+            self.import_source.as_deref(),
+            &out,
+            csv.as_bytes(),
+        ) {
             Ok(()) => self.status = Some(format!("Exported {out} ({} bytes)", csv.len())),
             Err(e) => self.status = Some(format!("Export failed: {e}")),
         }
@@ -3020,9 +3085,8 @@ impl App {
             format!("{name}.xlsx")
         };
         let path = dir.join(&fname);
-        self.path = path.to_string_lossy().into_owned();
         self.backstage = None;
-        self.save();
+        self.save_as(path.to_string_lossy().into_owned());
     }
 
     // --- welcome / start screen ----------------------------------------------
@@ -4151,8 +4215,7 @@ impl App {
             PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
-                    self.path = text;
-                    self.save();
+                    self.save_as(text);
                 }
             }
             PromptKind::RenameSheet => {
@@ -6177,7 +6240,13 @@ fn open_url(url: &str) {
 // Terminal shell
 // ---------------------------------------------------------------------------
 
-fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Result<()> {
+fn run_tui(
+    pkg: SheetPackage,
+    path: &str,
+    import_source: Option<String>,
+    welcome: bool,
+    vim: bool,
+) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -6192,6 +6261,7 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new(pkg, path);
+    app.import_source = import_source;
     app.load_view_prefs();
     if vim {
         app.vim = Some(VimState {
@@ -6310,6 +6380,83 @@ fn run_tui(pkg: SheetPackage, path: &str, welcome: bool, vim: bool) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_csv_stays_protected_until_successful_save_as_or_new() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-import-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("import.csv");
+        let bytes = b"first;second\n1;2\n";
+        std::fs::write(&source, bytes).unwrap();
+        let mut app = App::new(new_xlsx(), "untitled.xlsx");
+        app.open_workbook(source.to_str().unwrap());
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        let binding = source.with_extension("xlsx");
+        assert_eq!(Path::new(&app.path), binding);
+        app.export_csv();
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Export failed: cannot overwrite the source document")
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        app.open_workbook(dir.join("missing.xlsx").to_str().unwrap());
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        app.save();
+        assert!(load_xlsx(&std::fs::read(&binding).unwrap()).is_ok());
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        app.export_csv();
+        assert!(app.status.as_deref().unwrap().contains("cannot overwrite"));
+        app.commit_save_as(dir.clone(), "./import.csv".into());
+        assert_eq!(Path::new(&app.path), binding);
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        app.commit_save_as(dir.join("missing-parent"), "failed.xlsx".into());
+        assert_eq!(app.import_source.as_deref(), source.to_str());
+        assert_eq!(Path::new(&app.path), binding);
+        app.commit_save_as(dir.clone(), "converted.xlsx".into());
+        assert!(app.import_source.is_none());
+        assert_eq!(std::fs::read(&source).unwrap(), bytes);
+        app.open_workbook(source.to_str().unwrap());
+        app.new_workbook();
+        assert!(app.import_source.is_none());
+        app.open_workbook(source.to_str().unwrap());
+        app.open_workbook(binding.to_str().unwrap());
+        assert!(app.import_source.is_none());
+        for file in [source, binding, dir.join("converted.xlsx")] {
+            std::fs::remove_file(file).unwrap();
+        }
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn exports_refuse_source_aliases() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-export-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("note.xlsx");
+        let pkg = new_xlsx();
+        let original = save_xlsx(&pkg);
+        std::fs::write(&source, &original).unwrap();
+        assert!(
+            export_csv_headless(
+                &pkg,
+                source.to_str().unwrap(),
+                None,
+                dir.join("./note.xlsx").to_str().unwrap()
+            )
+            .is_err()
+        );
+        let csv = source.with_extension("csv");
+        std::fs::hard_link(&source, &csv).unwrap();
+        let mut app = App::new(pkg, source.to_str().unwrap());
+        app.export_csv();
+        assert!(app.status.as_deref().unwrap().contains("cannot overwrite"));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read(&csv).unwrap(), original);
+        std::fs::remove_file(csv).unwrap();
+        app.save();
+        assert!(load_xlsx(&std::fs::read(&source).unwrap()).is_ok());
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn comment_authoring_flow() {

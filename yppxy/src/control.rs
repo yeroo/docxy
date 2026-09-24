@@ -23,7 +23,7 @@
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
 //! | `link.del` | `{uid, pred}` | the updated task |
 //! | `find` | `{query}` | `{count, tasks:[…]}` |
-//! | `proj.save` | `{path?}` | `{path, …}` |
+//! | `proj.save` | `{path?}` (.yppx/.xml only; extensionless adds .yppx) | `{path, …}` with the actual saved path |
 //! | `proj.reload` | — | `{path, …}` |
 //! | `proj.open` | `{path}` | `{path, …}` |
 
@@ -36,15 +36,13 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     let out = match verb {
         "proj.path" => Ok(path_info(app)),
         "proj.save" => {
-            if let Some(p) = args.get_str("path") {
-                app.path = Some(p.to_string());
-            }
-            let Some(p) = app.path.clone() else {
-                return Err("project has no file path yet — pass {\"path\": …}".into());
-            };
-            crate::save_to(app.ed.project(), &p).map_err(|e| format!("save failed: {e}"))?;
-            app.ed.mark_saved();
-            app.status = format!("Saved {p}");
+            let p = args
+                .get_str("path")
+                .map(str::to_string)
+                .or_else(|| app.path.clone())
+                .ok_or("project has no file path yet — pass {\"path\": …}")?;
+            app.save_to_path(&p)
+                .map_err(|e| format!("save failed: {e}"))?;
             Ok(path_info(app))
         }
         "proj.reload" => {
@@ -101,6 +99,59 @@ mod tests {
         .as_i64()
         .unwrap()
     }
+    #[test]
+    fn save_rebinds_only_after_success_and_reports_resolved_target() {
+        let dir = std::env::temp_dir().join(format!("yppxy-control-save-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.ed.rename(1, "Unsaved change").unwrap();
+        let before = dispatch(&mut a, "proj.path", &Json::Null).unwrap();
+        for name in ["plan.mpp", "missing/plan.xml"] {
+            let path = dir.join(name);
+            assert!(
+                dispatch(
+                    &mut a,
+                    "proj.save",
+                    &Json::obj(vec![(
+                        "path",
+                        Json::Str(path.to_string_lossy().into_owned())
+                    )])
+                )
+                .is_err()
+            );
+            assert_eq!(dispatch(&mut a, "proj.path", &Json::Null).unwrap(), before);
+            assert!(!path.exists());
+        }
+        let path = dir.join("plan");
+        let result = dispatch(
+            &mut a,
+            "proj.save",
+            &Json::obj(vec![(
+                "path",
+                Json::Str(path.to_string_lossy().into_owned()),
+            )]),
+        )
+        .unwrap();
+        let actual = path.with_extension("yppx");
+        assert_eq!(result.get_str("path"), actual.to_str());
+        assert_eq!(a.path.as_deref(), actual.to_str());
+        assert!(!a.ed.dirty());
+        assert_eq!(
+            crate::load(actual.to_str().unwrap()).unwrap().tasks[0].name,
+            "Unsaved change"
+        );
+        assert!(!path.exists());
+        // Subsequent pathless saves use the resolved, valid binding.
+        a.ed.rename(1, "Next change").unwrap();
+        dispatch(&mut a, "proj.save", &Json::Null).unwrap();
+        assert_eq!(
+            crate::load(actual.to_str().unwrap()).unwrap().tasks[0].name,
+            "Next change"
+        );
+        std::fs::remove_file(actual).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     #[test]
     fn path_reports_project_shape() {
         let a = app();

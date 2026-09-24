@@ -23,6 +23,9 @@ mod skill;
 mod test_fixtures;
 mod watermark;
 
+use opccore::fsio::{export_atomic, write_atomic};
+use std::path::Path;
+
 use std::collections::HashMap;
 use std::io;
 use std::process::ExitCode;
@@ -223,53 +226,22 @@ fn main() -> ExitCode {
         }
     };
 
-    if let Some(out) = parsed.pdf_out {
-        let styles = pkg
-            .part("word/styles.xml")
-            .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
-            .unwrap_or_default();
-        let pdf = to_pdf(
-            &pkg.document,
-            &PdfOptions {
-                styles: Rc::new(styles),
-                ..PdfOptions::default()
-            },
-        );
-        if let Err(e) = std::fs::write(&out, &pdf) {
-            eprintln!("error: cannot write {out}: {e}");
-            return ExitCode::FAILURE;
-        }
-        println!("wrote {out} ({} bytes)", pdf.len());
-        return ExitCode::SUCCESS;
-    }
-
-    // Headless format conversion: `--md` renders the document to Markdown,
-    // `--docx` writes it as a Word package. Either way `pkg` already holds the
-    // document parsed from the input (Markdown opened via `new_markdown_package`,
-    // `.docx` via `load_package`), so conversion is just re-serialization.
-    if let Some(out) = parsed.md_out {
-        let numbering = pkg
-            .part("word/numbering.xml")
-            .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
-            .unwrap_or_default();
-        let markers = compute_markers(&pkg.document, &numbering);
-        let md = to_markdown_with(&pkg.document, &markers);
-        if let Err(e) = std::fs::write(&out, md.as_bytes()) {
-            eprintln!("error: cannot write {out}: {e}");
-            return ExitCode::FAILURE;
-        }
-        println!("wrote {out} ({} bytes)", md.len());
-        return ExitCode::SUCCESS;
-    }
-
-    if let Some(out) = parsed.docx_out {
-        let bytes = save_package(&pkg);
-        if let Err(e) = std::fs::write(&out, &bytes) {
-            eprintln!("error: cannot write {out}: {e}");
-            return ExitCode::FAILURE;
-        }
-        println!("wrote {out} ({} bytes)", bytes.len());
-        return ExitCode::SUCCESS;
+    let conversion = parsed
+        .pdf_out
+        .map(|out| (HeadlessFormat::Pdf, out))
+        .or_else(|| parsed.md_out.map(|out| (HeadlessFormat::Markdown, out)))
+        .or_else(|| parsed.docx_out.map(|out| (HeadlessFormat::Docx, out)));
+    if let Some((kind, out)) = conversion {
+        return match convert_headless(&pkg, &input, &out, kind) {
+            Ok(len) => {
+                println!("wrote {out} ({len} bytes)");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: cannot write {out}: {e}");
+                ExitCode::FAILURE
+            }
+        };
     }
 
     match run_tui(pkg, &input, format, parsed.vim, start) {
@@ -279,6 +251,47 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum HeadlessFormat {
+    Pdf,
+    Markdown,
+    Docx,
+}
+
+fn convert_headless(
+    pkg: &Package,
+    source: &str,
+    out: &str,
+    kind: HeadlessFormat,
+) -> io::Result<usize> {
+    let bytes = match kind {
+        HeadlessFormat::Pdf => {
+            let styles = pkg
+                .part("word/styles.xml")
+                .map(|b| parse_styles_xml(std::str::from_utf8(b).unwrap_or("")))
+                .unwrap_or_default();
+            to_pdf(
+                &pkg.document,
+                &PdfOptions {
+                    styles: Rc::new(styles),
+                    ..PdfOptions::default()
+                },
+            )
+        }
+        HeadlessFormat::Markdown => {
+            let numbering = pkg
+                .part("word/numbering.xml")
+                .map(|b| parse_numbering_xml(std::str::from_utf8(b).unwrap_or("")))
+                .unwrap_or_default();
+            let markers = compute_markers(&pkg.document, &numbering);
+            to_markdown_with(&pkg.document, &markers).into_bytes()
+        }
+        HeadlessFormat::Docx => save_package(pkg),
+    };
+    export_atomic(Some(Path::new(source)), Path::new(out), &bytes)?;
+    Ok(bytes.len())
 }
 
 fn print_usage() {
@@ -1889,7 +1902,7 @@ impl App {
                 (bytes, pkg)
             }
         };
-        match std::fs::write(&path, &bytes) {
+        match write_atomic(Path::new(&path), &bytes) {
             Ok(()) => {
                 let n = bytes.len();
                 self.load_package_state(pkg, path_str.clone());
@@ -2033,7 +2046,7 @@ impl App {
                 ..PdfOptions::default()
             },
         );
-        self.status = match std::fs::write(&out, &pdf) {
+        self.status = match export_atomic(Some(Path::new(&self.path)), &out, &pdf) {
             Ok(()) => Some(format!("exported {}", out.display())),
             Err(e) => Some(format!("export failed: {e}")),
         };
@@ -3051,7 +3064,7 @@ impl App {
                 }
             }
         };
-        match std::fs::write(&path, &bytes) {
+        match write_atomic(Path::new(&path), &bytes) {
             Ok(()) => {
                 if self.format == DocFormat::Docx {
                     if let Ok(pkg) = load_package(&bytes) {
@@ -6684,6 +6697,50 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exports_refuse_source_aliases() {
+        let dir = std::env::temp_dir().join(format!("docxy-export-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("note.docx");
+        let mut app = app_with(&["keep this document"]);
+        let pkg = new_package(app.editor.doc.clone());
+        let original = save_package(&pkg);
+        std::fs::write(&source, &original).unwrap();
+        let alias = dir.join("./note.docx");
+        for kind in [
+            HeadlessFormat::Pdf,
+            HeadlessFormat::Markdown,
+            HeadlessFormat::Docx,
+        ] {
+            assert!(
+                convert_headless(
+                    &pkg,
+                    source.to_str().unwrap(),
+                    alias.to_str().unwrap(),
+                    kind
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&source).unwrap(), original);
+        }
+        let pdf = source.with_extension("pdf");
+        std::fs::hard_link(&source, &pdf).unwrap();
+        app.path = source.to_str().unwrap().into();
+        app.export_pdf();
+        assert!(app.confirm.is_some());
+        app.on_key(key(KeyCode::Char('y')));
+        assert!(app.status.as_deref().unwrap().contains("cannot overwrite"));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        assert_eq!(std::fs::read(&pdf).unwrap(), original);
+        std::fs::remove_file(pdf).unwrap();
+        // The same source remains a valid save destination.
+        app.save();
+        assert!(load_package(&std::fs::read(&source).unwrap()).is_ok());
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
     use docxcore::model::{
         Block, Document, Hyperlink, Inline, ParProps, Paragraph as MPara, RevisionMetadata, Run,
         RunProps,

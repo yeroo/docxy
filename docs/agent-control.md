@@ -55,8 +55,12 @@ File handling differs from the TUI:
   reject `.mpp`. Saving commits a valid pending cell edit first; invalid cell
   input blocks the write. A subsequent I/O failure preserves the file binding
   and retains the committed edit in memory, including its dirty flag and history.
-  Refusal/validation failures leave source bytes untouched; in-place writes
-  retain the suite's existing risk of partial output on a mid-write I/O error.
+  Saves and exports normally write and sync a temporary sibling before replacing
+  the destination. A failed temporary write leaves the previous file intact. On
+  Unix, if the original owner/group cannot be restored on the temp, the synced
+  bytes are written back into the original file to preserve ownership; an I/O
+  failure during that fallback can leave partial output. Exports refuse
+  destinations that identify the source file, including symlinks and hard links.
 - `proj.reload` discards dirty content only after a successful load from its
   current path. Failure preserves the entire tab. Untitled tabs cannot reload.
 - `proj.open {"path":"..."}` does not accept `tab`. It validates a Project
@@ -76,8 +80,23 @@ target/debug/uiharness.exe --ctl "$env:APPDATA/suite/ctl" call task.set '{"tab":
 Add `--instance suite-<id>` when several suite processes are running. The
 equivalent Rust client resolves with
 `ctlcore::client::resolve_target(&ctl_dir, "suite", Some("<id>"))`, then calls
-`client.call("task.list", Json::obj(vec![]))`. `yppxy --mcp` still discovers
-only yppxy instances; a suite MCP bridge and skill are outside this step.
+`client.call("task.list", Json::obj(vec![]))`.
+
+MCP clients can reach these Project tabs through `yppxy --mcp` using the existing
+`yppxy_*` tools. `yppxy_list` combines live `yppxy-*` instances from yppxy's
+control directory and live `suite-*` instances from the suite's control directory;
+rows include `app` (`yppxy` or `suite`). With one live instance it is selected
+automatically. With several, pass `target`, an instance/pane-id substring; ambiguity
+is checked across both applications. An absent discovery directory is ignored.
+Set `DOCXY_CONFIG_DIR` in the MCP process too if the suite uses that override.
+The suite directory uses the OS config directory (or `.` if unavailable) otherwise.
+
+Every instance-addressed `yppxy_*` tool accepts optional `tab` with the suite
+selector rules above. For example, `yppxy_tasks` with
+`{"target":"suite-","tab":"schedule.xml"}` reads that live Project tab, and
+`yppxy_set` with `{"target":"suite-","tab":2,"uid":7,"duration":"3d"}` edits
+UID 7 in tab 2. Passing `tab` to a standalone yppxy instance is an error.
+The bridge does not add Word/Sheet tools or a suite skill.
 
 ## Two panes in one agwinterm session
 

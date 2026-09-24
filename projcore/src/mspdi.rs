@@ -38,6 +38,7 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
         calendars: Vec::new(),
         ..Project::default()
     };
+    let mut task_uids = Vec::new();
     let mut minutes_per_day: Option<f64> = None;
     let mut minutes_per_week: Option<f64> = None;
 
@@ -65,7 +66,7 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                             proj.default_calendar_uid = u;
                         }
                     }
-                    "Tasks" => parse_tasks(&mut p, &mut proj.tasks),
+                    "Tasks" => parse_tasks(&mut p, &mut proj.tasks, &mut task_uids),
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
                     "Calendars" => parse_calendars(&mut p, &mut proj.calendars),
@@ -78,6 +79,8 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
             _ => {}
         }
     }
+
+    normalize_task_uids(&mut proj.tasks, &task_uids)?;
 
     if let Some(m) = minutes_per_day {
         proj.hours_per_day = m / 60.0;
@@ -110,12 +113,46 @@ fn text_of(p: &mut XmlParser) -> String {
     s
 }
 
-fn parse_tasks(p: &mut XmlParser, out: &mut Vec<Task>) {
+/// Reject ambiguous explicit IDs before allocating missing ones in file order.
+/// Only task UIDs change: IDs, predecessor links and assignments remain intact.
+fn normalize_task_uids(tasks: &mut [Task], uids: &[Option<i32>]) -> Result<(), String> {
+    let mut explicit = std::collections::HashMap::new();
+    let mut max_uid = uids.iter().flatten().copied().max().unwrap_or(0);
+    for (index, uid) in uids.iter().enumerate() {
+        if let Some(uid) = uid {
+            if let Some(previous) = explicit.insert(*uid, index) {
+                return Err(format!(
+                    "duplicate task UID {uid}: {:?} and {:?}",
+                    tasks[previous].name, tasks[index].name
+                ));
+            }
+        }
+    }
+    for (task, uid) in tasks.iter_mut().zip(uids) {
+        task.uid = match uid {
+            Some(uid) => *uid,
+            None => {
+                max_uid = max_uid.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "cannot allocate task UID for {:?}: i32 UID space exhausted",
+                        task.name
+                    )
+                })?;
+                max_uid
+            }
+        };
+    }
+    Ok(())
+}
+
+fn parse_tasks(p: &mut XmlParser, out: &mut Vec<Task>, uids: &mut Vec<Option<i32>>) {
     loop {
         match p.next() {
             Event::Start => {
                 if p.name() == "Task" {
-                    out.push(parse_task(p));
+                    let (task, uid) = parse_task(p);
+                    out.push(task);
+                    uids.push(uid);
                 } else {
                     p.skip_element();
                 }
@@ -126,14 +163,15 @@ fn parse_tasks(p: &mut XmlParser, out: &mut Vec<Task>) {
     }
 }
 
-fn parse_task(p: &mut XmlParser) -> Task {
+fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
     let mut t = Task::default();
+    let mut uid = None;
     loop {
         match p.next() {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
-                    "UID" => t.uid = int_of(p) as i32,
+                    "UID" => uid = text_of(p).trim().parse::<i32>().ok(),
                     "ID" => t.id = int_of(p) as i32,
                     "Name" => t.name = text_of(p),
                     "OutlineLevel" => t.outline_level = int_of(p) as u32,
@@ -160,7 +198,7 @@ fn parse_task(p: &mut XmlParser) -> Task {
             _ => {}
         }
     }
-    t
+    (t, uid)
 }
 
 /// Parse a task's recorded plan without borrowing values from its current plan.
@@ -823,6 +861,83 @@ fn fmt_f(x: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn uid_xml(tasks: &str) -> String {
+        format!("<Project><Tasks>{tasks}</Tasks></Project>")
+    }
+
+    #[test]
+    fn missing_uids_are_fresh_and_explicit_references_are_unchanged() {
+        let xml = r#"<Project><Tasks>
+          <Task><ID>1</ID><Name>Missing</Name></Task>
+          <Task><UID>invalid</UID><ID>2</ID><Name>Invalid</Name></Task>
+          <Task><UID>2147483648</UID><ID>3</ID><Name>Out of range</Name></Task>
+          <Task><UID>0</UID><ID>4</ID><Name>Summary</Name></Task>
+          <Task><UID>40</UID><ID>5</ID><Name>Explicit</Name>
+            <PredecessorLink><PredecessorUID>0</PredecessorUID><Type>1</Type></PredecessorLink>
+          </Task>
+        </Tasks><Assignments><Assignment><UID>7</UID><TaskUID>40</TaskUID><ResourceUID>3</ResourceUID></Assignment></Assignments></Project>"#;
+        let project = read_mspdi(xml).unwrap();
+        assert_eq!(
+            project.tasks.iter().map(|t| t.uid).collect::<Vec<_>>(),
+            [41, 42, 43, 0, 40]
+        );
+        assert_eq!(
+            project.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5]
+        );
+        assert_eq!(project.tasks[4].predecessors[0].uid, 0);
+        assert_eq!(project.assignments[0].task_uid, 40);
+        assert_eq!(read_mspdi(&write_mspdi(&project)).unwrap(), project);
+        let package = opccore::zipwrite::write_zip(&[(
+            crate::yppx::MAIN_PART.into(),
+            xml.as_bytes().to_vec(),
+        )]);
+        assert_eq!(crate::yppx::read_yppx(&package).unwrap(), project);
+        let missing_only = read_mspdi(&uid_xml("<Task/><Task/>")).unwrap();
+        assert_eq!(
+            missing_only.tasks.iter().map(|t| t.uid).collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+
+    #[test]
+    fn duplicate_explicit_uids_name_both_tasks_including_zero() {
+        for uid in [0, 7] {
+            let xml = uid_xml(&format!(
+                "<Task><UID>{uid}</UID><Name>A</Name></Task><Task><UID>{uid}</UID><Name>B</Name></Task>"
+            ));
+            let error = format!("duplicate task UID {uid}: \"A\" and \"B\"");
+            assert_eq!(read_mspdi(&xml).unwrap_err(), error);
+            let package =
+                opccore::zipwrite::write_zip(&[(crate::yppx::MAIN_PART.into(), xml.into_bytes())]);
+            assert_eq!(crate::yppx::read_yppx(&package).unwrap_err(), error);
+        }
+    }
+
+    #[test]
+    fn uid_allocation_checks_exhaustion_only_when_needed() {
+        let negative = read_mspdi(&uid_xml("<Task><UID>-4</UID></Task><Task/>")).unwrap();
+        assert_eq!(negative.tasks[1].uid, -3);
+        let max = "<Task><UID>2147483647</UID></Task>";
+        assert_eq!(read_mspdi(&uid_xml(max)).unwrap().tasks[0].uid, i32::MAX);
+        let error =
+            read_mspdi(&uid_xml(&format!("{max}<Task><Name>Missing</Name></Task>"))).unwrap_err();
+        assert!(error.contains("UID space exhausted") && error.contains("Missing"));
+        let near = "<Task><UID>2147483646</UID></Task>";
+        assert_eq!(
+            read_mspdi(&uid_xml(&format!("{near}<Task/>")))
+                .unwrap()
+                .tasks[1]
+                .uid,
+            i32::MAX
+        );
+        assert!(
+            read_mspdi(&uid_xml(&format!("{near}<Task/><Task/>")))
+                .unwrap_err()
+                .contains("UID space exhausted")
+        );
+    }
 
     #[test]
     fn honor_constraints_reads_boolean_forms_and_defaults_to_true() {

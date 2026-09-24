@@ -535,6 +535,15 @@ fn export_decisions_and_io_preserve_the_project_binding_and_history() {
     );
     assert_eq!(v(&t).exported.as_deref(), Some("source.md"));
     assert!(apply_export(&mut t, &source).is_err());
+    assert!(apply_export(&mut t, &dir.join("./source.xml")).is_err());
+    let alias = dir.join("source-alias.md");
+    std::fs::hard_link(&source, &alias).unwrap();
+    assert!(apply_export(&mut t, &alias).is_err());
+    assert_eq!(std::fs::read(&alias).unwrap(), source_bytes);
+    std::fs::remove_file(alias).unwrap();
+    assert!(apply_export(&mut t, &dir).is_err());
+    assert!(t.status.contains("Export failed"));
+
     assert!(apply_export(&mut t, &source.join("bad.md")).is_err());
     finish_project_export(&mut t, None);
     assert_eq!(v(&t).ed.project(), &before);

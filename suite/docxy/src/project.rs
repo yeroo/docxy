@@ -309,13 +309,7 @@ pub(super) fn new_project_tab() -> DocTab {
 }
 
 fn save_target(path: &Path) -> Result<PathBuf, String> {
-    if path.extension().is_none() {
-        Ok(path.with_extension("yppx"))
-    } else if ext_is(path, "yppx") || ext_is(path, "xml") {
-        Ok(path.into())
-    } else {
-        Err("Project schedules can only be saved as .yppx or .xml (MSPDI)".into())
-    }
+    yppx::save_target(path)
 }
 
 fn write_project(ed: &ProjectEditor, path: &Path) -> Result<(PathBuf, usize), String> {
@@ -325,7 +319,7 @@ fn write_project(ed: &ProjectEditor, path: &Path) -> Result<(PathBuf, usize), St
     } else {
         mspdi::write_mspdi(ed.project()).into_bytes()
     };
-    std::fs::write(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
+    opccore::fsio::write_atomic(&path, &bytes).map_err(|e| format!("save failed: {e}"))?;
     Ok((path, bytes.len()))
 }
 

@@ -1557,6 +1557,7 @@ dependencies = [
  "gpui_platform",
  "gridcore",
  "mppread",
+ "opccore",
  "projcore",
  "projctl",
  "rfd",

@@ -15,6 +15,7 @@ use crate::model::Project;
 use crate::mspdi::{read_mspdi, write_mspdi};
 use opccore::zip::ZipArchive;
 use opccore::zipwrite::write_zip;
+use std::path::{Path, PathBuf};
 
 /// The single package-relationship content-type map. `xml` parts default to the
 /// project content type; the main part lives at `/project.xml`.
@@ -27,6 +28,22 @@ const CONTENT_TYPES: &str = concat!(
 
 /// Name of the main document part inside the package.
 pub const MAIN_PART: &str = "project.xml";
+
+/// Resolve a project save destination for both the terminal editor and suite.
+/// Extensionless names become `.yppx`; only `.yppx` and `.xml` are writable.
+pub fn save_target(path: &Path) -> Result<PathBuf, String> {
+    if path.extension().is_none() {
+        Ok(path.with_extension("yppx"))
+    } else if path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("yppx") || ext.eq_ignore_ascii_case("xml"))
+    {
+        Ok(path.to_path_buf())
+    } else {
+        Err("Project schedules can only be saved as .yppx or .xml (MSPDI)".into())
+    }
+}
 
 /// Serialize a [`Project`] into a `.yppx` package (bytes of a ZIP container).
 pub fn write_yppx(proj: &Project) -> Vec<u8> {
@@ -55,6 +72,23 @@ mod tests {
     use super::*;
     use crate::datetime::DateTime;
     use crate::model::*;
+
+    #[test]
+    fn save_targets_add_native_extension_and_reject_lossy_formats() {
+        assert_eq!(
+            save_target(Path::new("dir/plan")).unwrap(),
+            PathBuf::from("dir/plan.yppx")
+        );
+        for name in ["plan.yppx", "plan.YPPX", "plan.xml", "plan.XML"] {
+            assert_eq!(save_target(Path::new(name)).unwrap(), PathBuf::from(name));
+        }
+        for name in ["plan.mpp", "plan.MPP", "plan.txt", "plan."] {
+            assert_eq!(
+                save_target(Path::new(name)).unwrap_err(),
+                "Project schedules can only be saved as .yppx or .xml (MSPDI)"
+            );
+        }
+    }
 
     fn sample() -> Project {
         let mut a = Task {

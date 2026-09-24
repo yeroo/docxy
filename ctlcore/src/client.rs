@@ -125,49 +125,84 @@ impl Client {
     }
 }
 
-/// The running instances of `app` (discovery files under `dir` whose instance
-/// name starts with `<app>-` and whose server accepts a connection), as a JSON
-/// tool result: `{"running":[{instance,port,pid},…]}`.
-pub fn list_running(dir: &Path, app: &str) -> Json {
-    let prefix = format!("{app}-");
-    let running = discover_live(dir)
+/// A discovery directory and the application prefix to select within it.
+#[derive(Clone, Copy)]
+pub struct Source<'a> {
+    pub dir: &'a Path,
+    pub app: &'a str,
+}
+
+fn candidates<'a>(sources: &[Source<'a>]) -> Vec<(Instance, &'a str)> {
+    let mut found = Vec::new();
+    for source in sources {
+        let prefix = format!("{}-", source.app);
+        for instance in discover(source.dir) {
+            if instance.instance.starts_with(&prefix) && instance.is_live() {
+                found.push((instance, source.app));
+            }
+        }
+    }
+    found.sort_by(|(a, _), (b, _)| a.instance.cmp(&b.instance));
+    found
+}
+
+/// List live instances across discovery sources. Rows include `app` to
+/// distinguish applications that accept the same control verbs.
+pub fn list_running_in(sources: &[Source<'_>]) -> Json {
+    let running = candidates(sources)
         .into_iter()
-        .filter(|i| i.instance.starts_with(&prefix))
-        .map(|i| {
+        .map(|(i, app)| {
             Json::obj(vec![
                 ("instance", Json::Str(i.instance)),
                 ("port", Json::Num(i.port as f64)),
                 ("pid", Json::Num(i.pid as f64)),
+                ("app", Json::Str(app.to_string())),
             ])
         })
         .collect();
     Json::obj(vec![("running", Json::Arr(running))])
 }
 
-/// Find the single `app` instance to act on: the only one running, or the one
-/// selected by a `target` substring of its instance/pane id.
-pub fn resolve_target(dir: &Path, app: &str, target: Option<&str>) -> Result<Client, String> {
-    let prefix = format!("{app}-");
-    let mut live: Vec<_> = discover_live(dir)
-        .into_iter()
-        .filter(|i| i.instance.starts_with(&prefix))
-        .collect();
+/// The running instances of `app`, as `{"running":[{instance,port,pid,app},…]}`.
+pub fn list_running(dir: &Path, app: &str) -> Json {
+    list_running_in(&[Source { dir, app }])
+}
+
+/// Resolve one live instance over the combined candidate set, optionally
+/// filtered by an instance/pane-id substring. Returns its client and app name.
+pub fn resolve_target_in<'a>(
+    sources: &[Source<'a>],
+    target: Option<&str>,
+) -> Result<(Client, &'a str), String> {
+    let mut live = candidates(sources);
     if let Some(target) = target {
-        live.retain(|i| i.instance.contains(target));
+        live.retain(|(i, _)| i.instance.contains(target));
     }
+    let apps = sources.iter().map(|s| s.app).collect::<Vec<_>>().join("/");
     match live.len() {
         0 => Err(format!(
-            "no running {app} found — open a document in a {app} pane first"
+            "no running {apps} found — open a document in a {apps} pane first"
         )),
-        1 => Ok(live.remove(0).client()),
+        1 => {
+            let (instance, app) = live.remove(0);
+            Ok((instance.client(), app))
+        }
         _ => {
-            let names: Vec<&str> = live.iter().map(|i| i.instance.as_str()).collect();
+            let names = live
+                .iter()
+                .map(|(i, _)| i.instance.as_str())
+                .collect::<Vec<_>>();
             Err(format!(
-                "several {app} instances are running ({}); pass \"target\" with a distinguishing substring (e.g. the pane id)",
+                "several {apps} instances are running ({}); pass \"target\" with a distinguishing substring (e.g. the pane id)",
                 names.join(", ")
             ))
         }
     }
+}
+
+/// Find the single running `app`, optionally filtered by a `target` substring.
+pub fn resolve_target(dir: &Path, app: &str, target: Option<&str>) -> Result<Client, String> {
+    resolve_target_in(&[Source { dir, app }], target).map(|(client, _)| client)
 }
 
 /// Like [`resolve_target`], but for tools that can proceed without any
@@ -268,6 +303,59 @@ pub fn new_file(
 mod tests {
     use super::*;
     use crate::serve;
+
+    #[test]
+    fn combined_sources_list_resolve_and_report_ambiguity() {
+        let root = std::env::temp_dir().join(format!("ctlcore-combined-{}", std::process::id()));
+        let a = root.join("yppxy");
+        let b = root.join("suite");
+        let sources = [
+            Source {
+                dir: &a,
+                app: "yppxy",
+            },
+            Source {
+                dir: &b,
+                app: "suite",
+            },
+        ];
+        assert!(resolve_target_in(&sources, None).is_err());
+        let (suite, _suite_rx) = serve(&b, "suite-left").unwrap();
+        let (client, app) = resolve_target_in(&sources, None).unwrap();
+        assert_eq!(app, "suite");
+        assert_eq!(client.instance().instance, "suite-left");
+        let (yppxy, _yppxy_rx) = serve(&a, "yppxy-right").unwrap();
+        let (unrelated, _unrelated_rx) = serve(&a, "docxy-other").unwrap();
+        // A discovery record whose port has closed must not become a candidate.
+        let closed = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        std::fs::write(
+            a.join("dead.json"),
+            format!(r#"{{"instance":"yppxy-dead","port":{port},"token":"x","pid":1}}"#),
+        )
+        .unwrap();
+        let list = list_running_in(&sources);
+        let rows = list.get("running").unwrap().as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].get_str("app"), Some("suite"));
+        assert_eq!(rows[1].get_str("app"), Some("yppxy"));
+        let error = resolve_target_in(&sources, None).err().unwrap();
+        assert!(
+            error.contains("suite-left")
+                && error.contains("yppxy-right")
+                && error.contains("pass \"target\"")
+        );
+        for (target, app) in [("left", "suite"), ("right", "yppxy")] {
+            assert_eq!(resolve_target_in(&sources, Some(target)).unwrap().1, app);
+        }
+        assert!(resolve_target_in(&sources, Some("missing")).is_err());
+        drop((suite, yppxy, unrelated));
+        std::fs::remove_file(a.join("dead.json")).unwrap();
+        std::fs::remove_dir(a).unwrap();
+        std::fs::remove_dir(b).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
 
     #[test]
     fn discovers_and_calls_a_live_server() {

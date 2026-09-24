@@ -19,6 +19,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+opccore = { version = "0.1.0", path = "../../opccore" }
 projctl = { path = "../../projctl" }
 gpui.workspace = true
 gpui_platform.workspace = true

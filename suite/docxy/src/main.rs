@@ -3909,19 +3909,19 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     let hot = match &t.surface {
         Surface::Doc(ed) => {
             let p = hd.join(format!("tab-{i}.docx"));
-            std::fs::write(&p, doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref()))
+            opccore::fsio::write_atomic(&p, &doc_to_docx(&ed.doc, &t.comments, t.pkg.as_ref()))
                 .ok()
                 .map(|_| p.display().to_string())
         }
         Surface::Sheet(v) => {
             let p = hd.join(format!("tab-{i}.xlsx"));
-            std::fs::write(&p, sheet_bytes(v))
+            opccore::fsio::write_atomic(&p, &sheet_bytes(v))
                 .ok()
                 .map(|_| p.display().to_string())
         }
         Surface::Project(v) => {
             let p = hd.join(format!("tab-{i}.yppx"));
-            std::fs::write(&p, projcore::yppx::write_yppx(v.ed.project()))
+            opccore::fsio::write_atomic(&p, &projcore::yppx::write_yppx(v.ed.project()))
                 .ok()
                 .map(|_| p.display().to_string())
         }
@@ -9666,7 +9666,7 @@ impl Docxy {
                 .unwrap_or_default()
                 .join(tab.title.to_string())
         });
-        match std::fs::write(&path, &bytes) {
+        match opccore::fsio::write_atomic(&path, &bytes) {
             Ok(()) => {
                 tab.title = file_name(&path).into();
                 tab.path = Some(path.clone());
@@ -9725,7 +9725,7 @@ impl Docxy {
                 }
             },
         };
-        let written = std::fs::write(&path, &bytes);
+        let written = opccore::fsio::write_atomic(&path, &bytes);
         if let Some(tab) = self.tabs.get_mut(self.active) {
             match written {
                 Ok(()) => {
