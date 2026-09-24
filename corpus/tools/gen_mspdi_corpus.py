@@ -7,8 +7,8 @@ here). Each file embeds hand-derived Start/Finish expectations for a standard
 8h/day Mon-Fri calendar anchored at Monday 2026-03-02 08:00. The owner checked
 the SF shapes in files 05 and 14 against Project 2021 (issue #53), the
 24-hour calendar in file 16 (issue #58), and the FNLT conflict in file 17
-(issue #60); the other expectations have not been independently verified
-against Project.
+(issue #60); the other expectations, including the manual tasks in file 19,
+have not been independently verified against Project.
 `projcore/tests/corpus.rs` reads
 each file, runs the CPM scheduler, and asserts the computed dates match the
 embedded ones — so the corpus validates the scheduler without needing Project.
@@ -41,20 +41,31 @@ def iso(minutes):
 
 def task(uid, name, dur_min, start, finish, *, oid=None, outline=1,
          summary=False, milestone=False, preds=(), ctype=None, cdate=None,
-         calendar=None, baselines=()):
+         calendar=None, baselines=(), manual=None, manual_start=None,
+         manual_finish=None, manual_duration=None):
     """One <Task>. `preds` is a list of (uid, type_code, lag_tenths_of_min).
-    `start`/`finish` are the embedded oracle values (MSPDI datetime strings)."""
+    `start`/`finish` are the embedded oracle values (MSPDI datetime strings).
+    `manual` (0/1) and the manual_* fields are written only when given."""
     oid = uid if oid is None else oid
     lines = [
         "    <Task>",
         f"      <UID>{uid}</UID><ID>{oid}</ID>",
         f"      <Name>{name}</Name>",
+    ]
+    if manual is not None:
+        lines.append(f"      <Manual>{manual}</Manual>")
+    lines += [
         f"      <OutlineLevel>{outline}</OutlineLevel>",
         f"      <Summary>{1 if summary else 0}</Summary>",
         f"      <Milestone>{1 if milestone else 0}</Milestone>",
         f"      <Duration>{iso(dur_min)}</Duration><DurationFormat>7</DurationFormat>",
         f"      <Start>{start}</Start><Finish>{finish}</Finish>",
     ]
+    for tag, value in [("ManualStart", manual_start), ("ManualFinish", manual_finish),
+                       ("ManualDuration",
+                        iso(manual_duration) if manual_duration is not None else None)]:
+        if value is not None:
+            lines.append(f"      <{tag}>{value}</{tag}>")
     if ctype is not None:
         lines.append(f"      <ConstraintType>{ctype}</ConstraintType>")
         if cdate is not None:
@@ -113,7 +124,7 @@ def standard_calendar(uid=1, name="Standard", saturday=False):
 
 
 def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
-            calendars=None):
+            calendars=None, new_tasks_are_manual=None):
     calendars = calendars or [standard_calendar()]
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -123,6 +134,10 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
         "  <MinutesPerWeek>2400</MinutesPerWeek>",
         "  <CalendarUID>1</CalendarUID>",
         f"  <StartDate>2026-03-02T08:00:00</StartDate>",
+    ]
+    if new_tasks_are_manual is not None:
+        parts.append(f"  <NewTasksAreManual>{new_tasks_are_manual}</NewTasksAreManual>")
+    parts += [
         "  <Tasks>",
         tasks_xml,
         "  </Tasks>",
@@ -316,6 +331,23 @@ def build():
             task(6, "M2", 0, dt(9, "17:00:00"), dt(9, "17:00:00"),
                  milestone=True, preds=[(5, FS, 0)]),
         ])))
+
+    # 19 — manually scheduled tasks (#77) stay at their pinned dates: one pinned
+    # before its FS link allows (the link wants Thu 5), one pinned after it
+    # (Mon 9), and an auto successor that follows the pinned finish.
+    add("19-manual-tasks.xml", ["manual", "link", "link-fs", "summary", "round-trip"],
+        "Manual tasks keep their pinned dates; an auto successor follows them.",
+        project("manual-tasks", "\n".join([
+            task(1, "Phase", 9 * D, dt(2), dt(12, "17:00:00"), summary=True, manual=0),
+            task(2, "Design", 3 * D, dt(2), dt(4, "17:00:00"), outline=2, manual=0),
+            task(3, "Review", D, dt(3), dt(3, "17:00:00"), outline=2,
+                 preds=[(2, FS, 0)], manual=1, manual_start=dt(3), manual_duration=D),
+            task(4, "Vendor", 2 * D, dt(9), dt(10, "17:00:00"), outline=2,
+                 preds=[(2, FS, 0)], manual=1, manual_start=dt(9),
+                 manual_finish=dt(10, "17:00:00"), manual_duration=2 * D),
+            task(5, "Build", 2 * D, dt(11), dt(12, "17:00:00"), outline=2,
+                 preds=[(4, FS, 0)], manual=0),
+        ]), new_tasks_are_manual=1))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

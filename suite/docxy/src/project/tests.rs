@@ -112,7 +112,7 @@ fn every_mspdi_fixture_opens_and_matches_its_date_oracle() {
         .map(|e| e.unwrap().path())
         .filter(|p| ext_is(p, "xml"))
         .collect();
-    assert_eq!(paths.len(), 17);
+    assert_eq!(paths.len(), 19);
     for path in paths {
         let tab = tab_from_path(&path);
         assert!(tab.status.starts_with("loaded"), "{}", tab.status);

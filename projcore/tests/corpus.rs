@@ -6,7 +6,8 @@
 //! files 05 and 14 against Project 2021 (issue #53), the 24-hour calendar
 //! in file 16 (issue #58), the FNLT conflict in file 17 (issue #60),
 //! and the FS milestone dates in file 18 (issue #59);
-//! the other fixtures have not been independently verified against Project.
+//! the other fixtures, including the manual tasks in file 19 (issue #77),
+//! have not been independently verified against Project.
 //! Slack invariants below also
 //! check properties that do not depend on the embedded date expectations.
 
@@ -275,6 +276,84 @@ fn baselines_round_trip_through_mspdi_and_yppx() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn manual_task_mode_and_dates_survive_mspdi_and_yppx() {
+    let files = mspdi_files();
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "19-manual-tasks.xml")
+    );
+    for path in files {
+        let proj = read_mspdi(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        for (kind, back) in [("MSPDI", xml_back), (".yppx", package_back)] {
+            assert_eq!(
+                back.new_tasks_are_manual,
+                proj.new_tasks_are_manual,
+                "{}: {kind} NewTasksAreManual changed",
+                path.display()
+            );
+            assert_eq!(back.tasks.len(), proj.tasks.len());
+            for (expected, actual) in proj.tasks.iter().zip(&back.tasks) {
+                assert_eq!(
+                    (
+                        actual.manual,
+                        actual.manual_start,
+                        actual.manual_finish,
+                        actual.manual_duration_min
+                    ),
+                    (
+                        expected.manual,
+                        expected.manual_start,
+                        expected.manual_finish,
+                        expected.manual_duration_min
+                    ),
+                    "{}: {kind} task {} manual fields changed",
+                    path.display(),
+                    expected.uid
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn manual_fixture_pins_tasks_and_flags_the_violated_link() {
+    use projcore::DateTime;
+    let proj =
+        read_mspdi(&std::fs::read_to_string(corpus_dir().join("19-manual-tasks.xml")).unwrap())
+            .unwrap();
+    assert!(proj.new_tasks_are_manual);
+    let manual: Vec<_> = proj
+        .tasks
+        .iter()
+        .filter(|t| t.manual)
+        .map(|t| t.uid)
+        .collect();
+    assert_eq!(manual, vec![3, 4]);
+    let review = proj.task(3).unwrap();
+    assert_eq!(
+        review.manual_start,
+        Some(DateTime::from_ymd_hm(2026, 3, 3, 8, 0))
+    );
+    assert_eq!(review.manual_duration_min, Some(480));
+    let sched = schedule(&proj);
+    // Design finishes Wednesday; Review is pinned on Tuesday, two days early.
+    assert_eq!(sched.get(3).unwrap().total_slack_min, -960);
+    // Vendor, pinned after the link allows, drives Build and the finish.
+    assert_eq!(sched.get(4).unwrap().total_slack_min, 0);
+    // Leveling (no resources) keeps every pinned date.
+    let leveled = level(&proj);
+    for uid in [3, 4] {
+        assert_eq!(
+            leveled.start(uid),
+            Some(sched.get(uid).unwrap().early_start)
+        );
     }
 }
 

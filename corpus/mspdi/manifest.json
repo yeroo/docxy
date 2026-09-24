@@ -168,6 +168,18 @@
         "link-fs"
       ],
       "desc": "Project 2021 (#59): FS milestones keep the predecessor finish instant."
+    },
+    {
+      "file": "19-manual-tasks.xml",
+      "category": "manual",
+      "tags": [
+        "manual",
+        "link",
+        "link-fs",
+        "summary",
+        "round-trip"
+      ],
+      "desc": "Manual tasks keep their pinned dates; an auto successor follows them."
     }
   ]
 }
