@@ -965,7 +965,9 @@ fn export_pdf(app: &App, args: &Json) -> Result<Json, String> {
             ..PdfOptions::default()
         },
     );
-    // Publish only a complete, synced PDF, preserving exclusive-create semantics.
+    // Publish a synced PDF with exclusive-create semantics. Filesystems without
+    // hard links fall back to exclusive creation and copying (which can leave a
+    // partial new file on an I/O failure, as the original export did).
     opccore::fsio::create_atomic(&abs, &pdf).map_err(|e| {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
             format!("already exists: {}", abs.display())

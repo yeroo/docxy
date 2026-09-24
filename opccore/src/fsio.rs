@@ -27,7 +27,14 @@ fn create_temp(dest: &Path, mut next: impl FnMut() -> u64) -> io::Result<(TempPa
         temp_name.push(name);
         temp_name.push(format!(".{}.{}.tmp", std::process::id(), next()));
         let path = parent.join(temp_name);
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
             Ok(file) => return Ok((TempPath(path, true), file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -98,9 +105,11 @@ pub fn write_atomic_with(
     Ok(())
 }
 
-/// Atomically publish a new file, refusing any existing destination, even one
-/// created during the write. Uses a hard link to the synced temporary sibling;
-/// filesystems without hard-link support return an error without partial output.
+/// Publish a new file, refusing any existing destination, even one created
+/// during the write. Publication uses an atomic hard link to a synced sibling.
+/// If linking is unavailable, falls back to exclusive creation and copying the
+/// completed bytes. That fallback preserves existing files but can leave a
+/// partial new destination on an I/O failure, like a normal exclusive write.
 pub fn create_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     create_atomic_with(path, |file| file.write_all(bytes))
 }
@@ -109,12 +118,30 @@ fn create_atomic_with(
     path: &Path,
     writer: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> io::Result<()> {
+    create_atomic_with_link(path, writer, |source, dest| fs::hard_link(source, dest))
+}
+
+fn create_atomic_with_link(
+    path: &Path,
+    writer: impl FnOnce(&mut File) -> io::Result<()>,
+    link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let (temp, mut file) = create_temp(path, || NEXT_TEMP.fetch_add(1, Ordering::Relaxed))?;
     let result = writer(&mut file).and_then(|()| file.sync_all());
     drop(file);
     result?;
     // hard_link never replaces an existing path, unlike rename on Unix.
-    fs::hard_link(&temp.0, path)?;
+    if let Err(error) = link(&temp.0, path) {
+        if error.kind() == io::ErrorKind::AlreadyExists {
+            return Err(error);
+        }
+        // FAT/exFAT and some network shares cannot link. Keep the old exclusive
+        // creation behavior there; a racing destination must still be refused.
+        let mut source = File::open(&temp.0)?;
+        let mut destination = OpenOptions::new().write(true).create_new(true).open(path)?;
+        io::copy(&mut source, &mut destination)?;
+        destination.sync_all()?;
+    }
     drop(temp);
     #[cfg(unix)]
     if let Ok(dir) = File::open(parent_dir(path)) {
@@ -128,7 +155,7 @@ pub fn export_atomic(source: Option<&Path>, dest: &Path, bytes: &[u8]) -> io::Re
     if source.is_some_and(|source| same_file(source, dest)) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Export cannot overwrite the source document",
+            "cannot overwrite the source document",
         ));
     }
     write_atomic(dest, bytes)
@@ -273,6 +300,62 @@ mod tests {
     }
 
     #[test]
+    fn exclusive_creation_falls_back_without_links_but_never_overwrites() {
+        let dir = Dir::new();
+        let path = dir.file();
+        create_atomic_with_link(
+            &path,
+            |f| f.write_all(b"complete PDF"),
+            |_, _| Err(io::Error::new(io::ErrorKind::Unsupported, "no hard links")),
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"complete PDF");
+        assert_eq!(dir.count(), 1);
+        fs::remove_file(&path).unwrap();
+        for kind in [io::ErrorKind::Unsupported, io::ErrorKind::AlreadyExists] {
+            let error = create_atomic_with_link(
+                &path,
+                |f| f.write_all(b"ours"),
+                |_, dest| {
+                    fs::write(dest, b"racing writer")?;
+                    Err(io::Error::new(kind, "injected link failure"))
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read(&path).unwrap(), b"racing writer");
+            assert_eq!(dir.count(), 1);
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn temporary_document_is_private_while_writer_runs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new();
+        let path = dir.file();
+        for existing_mode in [None, Some(0o600), Some(0o644)] {
+            if let Some(mode) = existing_mode {
+                fs::write(&path, b"old").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            write_atomic_with(&path, |file| {
+                // The descriptor exposes the temp's permissions before any bytes
+                // are written, including for an existing public destination.
+                assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+                file.write_all(b"private while writing")
+            })
+            .unwrap();
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                existing_mode.unwrap_or(0o600)
+            );
+            fs::remove_file(&path).unwrap();
+        }
+    }
+
+    #[test]
     fn readonly_destination_is_preserved() {
         let dir = Dir::new();
         let path = dir.file();
@@ -306,7 +389,12 @@ mod tests {
         assert!(!same_file(&dir.0.join("missing"), &path));
         #[cfg(windows)]
         assert!(same_file(&path, &dir.0.join("DOCUMENT")));
-        assert!(export_atomic(Some(&path), &link, b"bad").is_err());
+        assert_eq!(
+            export_atomic(Some(&path), &link, b"bad")
+                .unwrap_err()
+                .to_string(),
+            "cannot overwrite the source document"
+        );
         assert_eq!(fs::read(&path).unwrap(), b"source");
         assert_eq!(fs::read(&link).unwrap(), b"source");
         export_atomic(Some(&path), &other, b"export").unwrap();
