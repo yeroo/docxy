@@ -23,6 +23,11 @@ File 16 records the 24-hour calendar dates verified against Project 2021 in
 File 17 records the FNLT conflict verified against Project 2021 in
 [issue #60](https://github.com/yeroo/docxy/issues/60): the constraint takes
 precedence over the FS link, with -5 days total slack on both tasks.
+File 18 records the FS milestone dates verified against Project 2021 in
+[issue #59](https://github.com/yeroo/docxy/issues/59): zero-duration successors
+keep the predecessor's finish instant. Only zero-lag links were verified;
+for nonzero lag the scheduler uses the finish side of the successor calendar's
+working-time boundary, which remains unverified against Project.
 The other fixtures remain hand-derived expectations, not independently verified
 Project outputs.
 
@@ -52,6 +57,7 @@ Project outputs.
 | `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
 | `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |
 | `17-constraint-fnlt-conflict` | FNLT versus FS link | default constraint precedence and -5 days total slack on both tasks |
+| `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
 
 See `manifest.json` for machine-readable tags.
 

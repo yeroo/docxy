@@ -158,6 +158,16 @@
         "negative-slack"
       ],
       "desc": "Project 2021 (#60): FNLT overrides the FS link; both tasks have -5d total slack."
+    },
+    {
+      "file": "18-milestone-after-fs.xml",
+      "category": "milestone",
+      "tags": [
+        "milestone",
+        "link",
+        "link-fs"
+      ],
+      "desc": "Project 2021 (#59): FS milestones keep the predecessor finish instant."
     }
   ]
 }

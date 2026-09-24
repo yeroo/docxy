@@ -431,6 +431,7 @@ impl<'a> Scheduler<'a> {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
             let mut linked_start: Option<i64> = None;
+            let mut fs_milestone_start: Option<i64> = None;
             let mut sf_bounds = Vec::new();
             for p in &t.predecessors {
                 let Some(&pf_abs) = ef_abs.get(&p.uid) else {
@@ -440,6 +441,12 @@ impl<'a> Scheduler<'a> {
                     continue;
                 };
                 let cand = match p.link {
+                    LinkType::FinishStart if t.duration_min == 0 => {
+                        let instant = fs_milestone_instant(tl, pf_abs, p.lag_min);
+                        fs_milestone_start =
+                            Some(fs_milestone_start.map_or(instant, |s| s.max(instant)));
+                        instant
+                    }
                     LinkType::FinishStart => tl.abs_start(tl.to_index(pf_abs) + p.lag_min),
                     LinkType::StartStart => tl.abs_start(tl.to_index(ps_abs) + p.lag_min),
                     LinkType::FinishFinish => {
@@ -513,7 +520,13 @@ impl<'a> Scheduler<'a> {
                     driven_start = start_abs;
                 }
             }
-            let s_abs = tl.snap(start_abs);
+            // A binding FS milestone occupies the finish instant, even in a
+            // nonworking gap. Later start-type links/constraints still snap.
+            let s_abs = if fs_milestone_start == Some(start_abs) {
+                start_abs
+            } else {
+                tl.snap(start_abs)
+            };
             let s_idx = tl.to_index(s_abs);
             let f_idx = s_idx + t.duration_min;
             let f_abs = finish_instant(t, tl, s_abs, f_idx, sf_bounds.into_iter(), finish_bound);
@@ -704,6 +717,17 @@ impl<'a> Scheduler<'a> {
             min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
         }
         min_gap
+    }
+}
+
+/// Zero-lag FS milestones preserve the actual finish, including across
+/// calendars and SF morning endpoints. Nonzero lag uses the finish side of
+/// the successor's calendar; only zero lag is verified against Project (#59).
+fn fs_milestone_instant(tl: &Timeline, predecessor_finish: i64, lag: i64) -> i64 {
+    if lag == 0 {
+        predecessor_finish
+    } else {
+        tl.abs_finish(tl.to_index(predecessor_finish) + lag)
     }
 }
 
@@ -1072,7 +1096,41 @@ impl Scheduler<'_> {
             let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 {
                 (cpm.early_start.minutes(), cpm.early_finish.minutes())
             } else {
-                let s_abs = tl.abs_start(placed);
+                let mut s_abs = tl.abs_start(placed);
+                if t.duration_min == 0 {
+                    let mut fs_instant: Option<i64> = None;
+                    let mut start_bound = cpm.early_start.minutes();
+                    for p in &t.predecessors {
+                        let (Some(ps), Some(pf)) = (start.get(&p.uid), finish.get(&p.uid)) else {
+                            continue;
+                        };
+                        if p.link == LinkType::FinishStart {
+                            let instant = fs_milestone_instant(tl, pf.minutes(), p.lag_min);
+                            if tl.to_index(instant) == placed {
+                                fs_instant = Some(fs_instant.map_or(instant, |s| s.max(instant)));
+                            }
+                        } else {
+                            // SS/SF use the predecessor's start; FF its finish.
+                            // Zero-duration successors map all three to starts.
+                            let endpoint = if p.link == LinkType::FinishFinish {
+                                pf
+                            } else {
+                                ps
+                            };
+                            let index = tl.to_index(endpoint.minutes()) + p.lag_min;
+                            if index == placed {
+                                start_bound = start_bound.max(tl.abs_start(index));
+                            }
+                        }
+                    }
+                    // Leveling can change which link binds. Choose the actual
+                    // leveled FS instant unless a current non-FS bound or the
+                    // absolute CPM floor requires a later instant. That floor
+                    // already carries the task's SNET/MSO start bounds.
+                    if let Some(instant) = fs_instant {
+                        s_abs = instant.max(start_bound);
+                    }
+                }
                 let bounds = t
                     .predecessors
                     .iter()
@@ -1152,6 +1210,265 @@ mod tests {
             link: LinkType::FinishStart,
             lag_min: 0,
         }
+    }
+
+    fn fs_milestone_project(duration: i64) -> Project {
+        let mut milestone = task(2, "Sign-off", 0);
+        milestone.predecessors.push(fs(1));
+        Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "A", duration), milestone],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn fs_milestone_lands_at_predecessor_finish_instant() {
+        for (duration, day, hour) in [(960, 3, 17), (240, 2, 12), (2400, 6, 17)] {
+            let proj = fs_milestone_project(duration);
+            let sched = schedule(&proj);
+            let milestone = sched.get(2).unwrap();
+            let expected = DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+            assert_eq!(milestone.early_start, expected);
+            assert_eq!(milestone.early_finish, expected);
+            assert_eq!(milestone.late_start, expected);
+            assert_eq!(milestone.late_finish, expected);
+            assert_eq!(milestone.total_slack_min, 0);
+            assert_eq!(milestone.free_slack_min, 0);
+            assert!(milestone.critical);
+            let leveled = level(&proj);
+            assert_eq!(leveled.start(2), Some(expected));
+            assert_eq!(leveled.finish(2), Some(expected));
+        }
+    }
+
+    #[test]
+    fn fs_milestone_chain_matches_project() {
+        let mut proj = fs_milestone_project(480);
+        let mut b = task(3, "B", 2400);
+        b.predecessors.push(fs(2));
+        let mut m2 = task(4, "M2", 0);
+        m2.predecessors.push(fs(3));
+        proj.tasks.extend([b, m2]);
+        let sched = schedule(&proj);
+        let leveled = level(&proj);
+        for (uid, start, finish) in [
+            (2, "2026-03-02T17:00:00", "2026-03-02T17:00:00"),
+            (3, "2026-03-03T08:00:00", "2026-03-09T17:00:00"),
+            (4, "2026-03-09T17:00:00", "2026-03-09T17:00:00"),
+        ] {
+            let result = sched.get(uid).unwrap();
+            assert_eq!(result.early_start.to_mspdi(), start);
+            assert_eq!(result.early_finish.to_mspdi(), finish);
+            assert_eq!(result.total_slack_min, 0);
+            assert!(result.critical);
+            assert_eq!(result.late_start, result.early_start);
+            assert_eq!(result.late_finish, result.early_finish);
+            assert_eq!(leveled.start(uid), Some(result.early_start));
+            assert_eq!(leveled.finish(uid), Some(result.early_finish));
+        }
+    }
+
+    #[test]
+    fn fs_milestone_with_later_start_driver_stays_morning() {
+        let morning = DateTime::from_ymd_hm(2026, 3, 4, 8, 0);
+        for constraint in [
+            ConstraintType::StartNoEarlierThan,
+            ConstraintType::MustStartOn,
+        ] {
+            for honor in [false, true] {
+                let mut proj = fs_milestone_project(960);
+                proj.honor_constraints = honor;
+                proj.tasks[1].constraint = constraint;
+                proj.tasks[1].constraint_date = Some(morning);
+                let sched = schedule(&proj);
+                assert_eq!(sched.get(2).unwrap().early_start, morning);
+                assert_eq!(sched.get(2).unwrap().early_finish, morning);
+                assert_eq!(level(&proj).start(2), Some(morning));
+            }
+        }
+        let mut proj = fs_milestone_project(960);
+        let mut r = task(3, "Start driver", 480);
+        r.predecessors.push(fs(1));
+        proj.tasks[1].predecessors.push(Predecessor {
+            uid: 3,
+            link: LinkType::StartStart,
+            lag_min: 0,
+        });
+        proj.tasks.push(r);
+        let sched = schedule(&proj);
+        assert_eq!(sched.get(2).unwrap().early_start, morning);
+        assert_eq!(sched.get(2).unwrap().early_finish, morning);
+    }
+
+    #[test]
+    fn fs_milestone_takes_latest_fs_instant() {
+        for reverse in [false, true] {
+            let mut proj = fs_milestone_project(240);
+            proj.tasks.push(task(3, "Later finish", 960));
+            proj.tasks[1].predecessors.push(fs(3));
+            if reverse {
+                proj.tasks[1].predecessors.reverse();
+            }
+            let sched = schedule(&proj);
+            assert_eq!(
+                sched.get(2).unwrap().early_start,
+                sched.get(3).unwrap().early_finish
+            );
+            assert_eq!(
+                sched.get(2).unwrap().early_finish,
+                sched.get(3).unwrap().early_finish
+            );
+        }
+    }
+
+    #[test]
+    fn fs_milestone_zero_lag_keeps_sf_preserved_morning_finish() {
+        let mut proj = sf_project();
+        let mut milestone = task(3, "Sign-off", 0);
+        milestone.predecessors.push(fs(2));
+        proj.tasks.push(milestone);
+        let sched = schedule(&proj);
+        let expected = DateTime::from_ymd_hm(2026, 3, 4, 8, 0);
+        assert_eq!(sched.get(2).unwrap().early_finish, expected);
+        assert_eq!(sched.get(3).unwrap().early_start, expected);
+        assert_eq!(sched.get(3).unwrap().early_finish, expected);
+        proj.tasks.insert(0, task(4, "Busy resource", 1920));
+        proj.resources = vec![worker(1, "Shared", 1.0)];
+        proj.assignments = vec![assign(1, 4, 1, 1.0), assign(2, 1, 1, 1.0)];
+        let leveled = level(&proj);
+        let delayed = DateTime::from_ymd_hm(2026, 3, 6, 8, 0);
+        assert_eq!(leveled.finish(2), Some(delayed));
+        assert_eq!(leveled.start(3), Some(delayed));
+        assert_eq!(leveled.finish(3), Some(delayed));
+    }
+
+    #[test]
+    fn fs_milestone_cross_calendar_keeps_predecessor_instant() {
+        let mut proj = fs_milestone_project(960);
+        let mut shorter = Calendar::standard(2);
+        for day in &mut shorter.week {
+            if !day.times.is_empty() {
+                day.times = vec![WorkingTime {
+                    from: 9 * 60,
+                    to: 16 * 60,
+                }];
+            }
+        }
+        proj.calendars.push(shorter);
+        proj.tasks[1].calendar_uid = Some(2);
+        let sched = schedule(&proj);
+        let expected = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
+        assert_eq!(sched.get(2).unwrap().early_start, expected);
+        assert_eq!(sched.get(2).unwrap().early_finish, expected);
+        assert_eq!(level(&proj).start(2), Some(expected));
+    }
+
+    #[test]
+    fn fs_milestone_with_lag() {
+        // Only zero lag has been checked against Project; nonzero lag uses
+        // the finish side of the successor calendar's working-time boundary.
+        for (lag, day) in [(480, 4), (-480, 2)] {
+            let mut proj = fs_milestone_project(960);
+            proj.tasks[1].predecessors[0].lag_min = lag;
+            let sched = schedule(&proj);
+            let expected = DateTime::from_ymd_hm(2026, 3, day, 17, 0);
+            assert_eq!(sched.get(2).unwrap().early_start, expected);
+            assert_eq!(sched.get(2).unwrap().early_finish, expected);
+        }
+    }
+
+    fn delayed_fs_milestone_project() -> Project {
+        let mut proj = fs_milestone_project(480);
+        proj.tasks.insert(0, task(4, "Busy resource", 480));
+        proj.resources = vec![worker(1, "Shared", 1.0)];
+        proj.assignments = vec![assign(1, 4, 1, 1.0), assign(2, 1, 1, 1.0)];
+        proj
+    }
+
+    #[test]
+    fn leveling_delayed_fs_milestone_lands_at_leveled_finish() {
+        for (lag, day) in [(0, 3), (480, 4), (-480, 2)] {
+            let mut proj = delayed_fs_milestone_project();
+            proj.tasks[2].predecessors[0].lag_min = lag;
+            let leveled = level(&proj);
+            let expected = DateTime::from_ymd_hm(2026, 3, day, 17, 0);
+            assert_eq!(
+                leveled.finish(1),
+                Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0))
+            );
+            assert_eq!(leveled.start(2), Some(expected));
+            assert_eq!(leveled.finish(2), Some(expected));
+        }
+    }
+
+    #[test]
+    fn leveling_fs_milestone_overtakes_original_constraint_driver() {
+        for constraint in [
+            ConstraintType::StartNoEarlierThan,
+            ConstraintType::MustStartOn,
+        ] {
+            for honor in [false, true] {
+                let mut proj = delayed_fs_milestone_project();
+                proj.honor_constraints = honor;
+                proj.tasks[2].constraint = constraint;
+                proj.tasks[2].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 3, 8, 0));
+                // The unchanged date constraint is now earlier than A's
+                // leveled finish, which selects the milestone's instant.
+                let leveled = level(&proj);
+                let expected = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
+                assert_eq!(leveled.start(2), Some(expected));
+                assert_eq!(leveled.finish(2), Some(expected));
+            }
+        }
+    }
+
+    #[test]
+    fn leveling_fs_milestone_overtakes_undelayed_ss_driver() {
+        let mut proj = delayed_fs_milestone_project();
+        let q = task(5, "Independent predecessor", 480);
+        let mut r = task(3, "Undelayed start driver", 480);
+        r.predecessors.push(fs(5));
+        proj.tasks.extend([q, r]);
+        proj.tasks[2].predecessors.push(Predecessor {
+            uid: 3,
+            link: LinkType::StartStart,
+            lag_min: 0,
+        });
+        let sched = schedule(&proj);
+        let morning = DateTime::from_ymd_hm(2026, 3, 3, 8, 0);
+        assert_eq!(sched.get(2).unwrap().early_start, morning);
+        let leveled = level(&proj);
+        let evening = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
+        assert_eq!(leveled.start(3), Some(morning));
+        assert_eq!(leveled.finish(1), Some(evening));
+        assert_eq!(leveled.start(2), Some(evening));
+        assert_eq!(leveled.finish(2), Some(evening));
+        assert!(leveled.start(2).unwrap() >= sched.get(2).unwrap().early_start);
+    }
+
+    #[test]
+    fn leveling_fs_milestone_respects_later_ss_driver() {
+        let mut proj = delayed_fs_milestone_project();
+        let mut r = task(3, "Start driver", 480);
+        r.predecessors.push(fs(1));
+        proj.tasks.push(r);
+        proj.tasks[2].predecessors.push(Predecessor {
+            uid: 3,
+            link: LinkType::StartStart,
+            lag_min: 0,
+        });
+        let sched = schedule(&proj);
+        assert_eq!(
+            sched.get(2).unwrap().early_start,
+            DateTime::from_ymd_hm(2026, 3, 3, 8, 0)
+        );
+        let leveled = level(&proj);
+        let expected = DateTime::from_ymd_hm(2026, 3, 4, 8, 0);
+        assert_eq!(leveled.start(3), Some(expected));
+        assert_eq!(leveled.start(2), Some(expected));
+        assert_eq!(leveled.finish(2), Some(expected));
+        assert!(leveled.start(2).unwrap() >= sched.get(2).unwrap().early_start);
     }
 
     fn closed_calendar(uid: i32) -> Calendar {
