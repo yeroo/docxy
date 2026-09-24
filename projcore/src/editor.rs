@@ -5,7 +5,9 @@
 //! messages; [`Editor::mark_saved`] acknowledges a successful save.
 
 use crate::datetime::DateTime;
-use crate::model::{Assignment, ConstraintType, LinkType, Predecessor, Project, Resource, Task};
+use crate::model::{
+    Assignment, ConstraintType, LinkType, Predecessor, Project, Resource, ResourceType, Task,
+};
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
@@ -492,9 +494,9 @@ fn find_or_stage_resource(resources: &mut Vec<Resource>, name: &str) -> Result<i
         uid,
         id,
         name: name.into(),
-        is_work: true,
+        kind: ResourceType::Work,
         max_units: 1.0,
-        calendar_uid: None,
+        ..Resource::default()
     });
     Ok(uid)
 }

@@ -109,6 +109,16 @@
         "calendar-6day"
       ],
       "desc": "Custom 6-day calendar (Saturday working) shortens the schedule."
+    },
+    {
+      "file": "13-resource-fields.xml",
+      "category": "resource",
+      "tags": [
+        "resource",
+        "resource-fields",
+        "round-trip"
+      ],
+      "desc": "Work resource identity and rates, Cost resource, and Material label survive saving."
     }
   ]
 }

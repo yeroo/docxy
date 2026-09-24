@@ -6,7 +6,7 @@
 //! compute, this test validates the scheduler against Project's semantics
 //! without needing Project installed.
 
-use projcore::mspdi::read_mspdi;
+use projcore::mspdi::{read_mspdi, write_mspdi};
 use projcore::schedule::schedule;
 use projcore::yppx::{read_yppx, write_yppx};
 
@@ -28,7 +28,7 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
     assert!(
-        files.len() >= 12,
+        files.len() >= 13,
         "expected the full seed corpus, got {}",
         files.len()
     );
@@ -37,6 +37,34 @@ fn every_file_parses_and_schedules() {
         let proj = read_mspdi(&xml).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert!(!proj.tasks.is_empty(), "{}: no tasks", path.display());
         let _ = schedule(&proj); // must not panic
+    }
+}
+
+#[test]
+fn resources_round_trip_through_mspdi_and_yppx() {
+    let files = mspdi_files();
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "13-resource-fields.xml")
+    );
+    for path in files {
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let proj = read_mspdi(&xml).unwrap();
+        let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        assert_eq!(
+            xml_back.resources,
+            proj.resources,
+            "{}: MSPDI resources changed",
+            path.display()
+        );
+        let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        assert_eq!(
+            package_back.resources,
+            proj.resources,
+            "{}: .yppx resources changed",
+            path.display()
+        );
     }
 }
 
