@@ -293,7 +293,7 @@ struct App {
     ed: Editor,
     path: Option<String>,
     top: usize,   // first visible task row
-    hscroll: i64, // gantt horizontal scroll in days from project start
+    hscroll: i64, // gantt horizontal scroll in days from the earliest displayed start
     prompt: Option<Prompt>,
     status: String,
     quit: bool,
@@ -1585,28 +1585,25 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
 
     // ---- right: gantt ----
     let gw = right.width.saturating_sub(2) as usize; // inner width
-    let start = app.ed.schedule().project_start.parts();
+    let origin = gantt_origin_day(app);
+    let start = DateTime::from_minutes(origin * 1440).parts();
     let mut right_lines: Vec<Line> = Vec::new();
-    right_lines.push(build_scale(
-        gw,
-        app.hscroll,
-        app.ed.schedule().project_start.day_number(),
-    ));
+    right_lines.push(build_scale(gw, app.hscroll, origin));
     for i in app.top..end {
         let t = &app.ed.project().tasks[i];
         let crit = app.ed.schedule().get(t.uid).is_some_and(|r| r.critical);
         let s_day = app
             .disp_start(t.uid)
-            .map(|d| d.day_number() - app.ed.schedule().project_start.day_number())
+            .map(|d| d.day_number() - origin)
             .unwrap_or(i64::MAX);
         let e_day = app
             .disp_finish(t.uid)
-            .map(|d| d.day_number() - app.ed.schedule().project_start.day_number())
+            .map(|d| d.day_number() - origin)
             .unwrap_or(i64::MIN);
         let mut line = build_gantt_row(
             gw,
             app.hscroll,
-            app.ed.schedule().project_start.day_number(),
+            origin,
             s_day,
             e_day,
             crit,
@@ -1627,6 +1624,17 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         Paragraph::new(right_lines).block(Block::default().borders(Borders::ALL).title(gtitle)),
         right,
     );
+}
+
+/// Include linked tasks that schedule before the nominal project start.
+fn gantt_origin_day(app: &App) -> i64 {
+    app.ed
+        .project()
+        .tasks
+        .iter()
+        .filter_map(|t| app.disp_start(t.uid))
+        .map(|d| d.day_number())
+        .fold(app.ed.schedule().project_start.day_number(), i64::min)
 }
 
 /// The date scale row: a `m/d` tick at the start of each week within view.
@@ -1653,7 +1661,7 @@ fn build_scale(width: usize, hscroll: i64, base_day: i64) -> Line<'static> {
 }
 
 /// One task's bar across the visible day columns. `s_day`/`e_day` are day
-/// offsets from the gantt origin (the project start day).
+/// offsets from the gantt origin (the earliest displayed or project start day).
 #[allow(clippy::too_many_arguments)]
 fn build_gantt_row(
     width: usize,
@@ -1800,6 +1808,36 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gantt_origin_includes_pre_start_sf_bar() {
+        let proj = projcore::mspdi::read_mspdi(include_str!(
+            "../../corpus/mspdi/14-link-sf-before-start.xml"
+        ))
+        .unwrap();
+        let app = App::new(proj, None, false);
+        let origin = gantt_origin_day(&app);
+        assert_eq!(
+            origin,
+            DateTime::from_ymd_hm(2026, 2, 26, 8, 0).day_number()
+        );
+        let row = build_gantt_row(
+            10,
+            0,
+            origin,
+            app.disp_start(1).unwrap().day_number() - origin,
+            app.disp_finish(1).unwrap().day_number() - origin,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(row.spans[0].content, "█");
+        let app = App::new(new_project(), None, false);
+        assert_eq!(
+            gantt_origin_day(&app),
+            app.ed.schedule().project_start.day_number()
+        );
+    }
 
     #[test]
     fn fresh_tui_project_keeps_its_starter_task() {
