@@ -17,7 +17,11 @@ impl Drop for TempPath {
     }
 }
 
-fn create_temp(dest: &Path, mut next: impl FnMut() -> u64) -> io::Result<(TempPath, File)> {
+fn create_temp(
+    dest: &Path,
+    private: bool,
+    mut next: impl FnMut() -> u64,
+) -> io::Result<(TempPath, File)> {
     let parent = parent_dir(dest);
     let name = dest.file_name().ok_or_else(|| {
         io::Error::new(io::ErrorKind::InvalidInput, "destination has no file name")
@@ -30,10 +34,12 @@ fn create_temp(dest: &Path, mut next: impl FnMut() -> u64) -> io::Result<(TempPa
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
-        {
+        if private {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
+        #[cfg(not(unix))]
+        let _ = private;
         match options.open(&path) {
             Ok(file) => return Ok((TempPath(path, true), file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -54,7 +60,9 @@ fn parent_dir(path: &Path) -> &Path {
 
 /// Write and sync a temporary sibling, then replace the destination.
 /// Existing symlinks are followed (dangling links fail); existing permissions
-/// are preserved. A failure before replacement leaves the destination intact.
+/// are preserved. New files use the normal creation permissions (0666 filtered
+/// by umask on Unix); only replacement temps start private. A failure before
+/// replacement leaves the destination intact.
 /// Replacement changes file identity, so other hard links keep the old bytes.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic_with(path, |file| file.write_all(bytes))
@@ -85,7 +93,9 @@ pub fn write_atomic_with(
         Err(e) => return Err(e),
     };
     // Declare the guard before the file so unwinding also closes before cleanup.
-    let (mut temp, mut file) = create_temp(&dest, || NEXT_TEMP.fetch_add(1, Ordering::Relaxed))?;
+    let (mut temp, mut file) = create_temp(&dest, permissions.is_some(), || {
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    })?;
     let result = (|| {
         writer(&mut file)?;
         if let Some(permissions) = permissions {
@@ -126,7 +136,7 @@ fn create_atomic_with_link(
     writer: impl FnOnce(&mut File) -> io::Result<()>,
     link: impl FnOnce(&Path, &Path) -> io::Result<()>,
 ) -> io::Result<()> {
-    let (temp, mut file) = create_temp(path, || NEXT_TEMP.fetch_add(1, Ordering::Relaxed))?;
+    let (temp, mut file) = create_temp(path, false, || NEXT_TEMP.fetch_add(1, Ordering::Relaxed))?;
     let result = writer(&mut file).and_then(|()| file.sync_all());
     drop(file);
     result?;
@@ -331,28 +341,63 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn temporary_document_is_private_while_writer_runs() {
+    fn new_files_use_default_permissions_and_replacement_temps_are_private() {
         use std::os::unix::fs::PermissionsExt;
         let dir = Dir::new();
         let path = dir.file();
+        // Do not assume a particular umask or change the process-global umask.
+        let probe = dir.0.join("mode-probe");
+        let default_mode = File::create(&probe)
+            .unwrap()
+            .metadata()
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        fs::remove_file(probe).unwrap();
         for existing_mode in [None, Some(0o600), Some(0o644)] {
             if let Some(mode) = existing_mode {
                 fs::write(&path, b"old").unwrap();
                 fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
             }
             write_atomic_with(&path, |file| {
-                // The descriptor exposes the temp's permissions before any bytes
-                // are written, including for an existing public destination.
-                assert_eq!(file.metadata()?.permissions().mode() & 0o777, 0o600);
+                // Existing content stays private during replacement. With no
+                // destination, use the same mode as ordinary file creation.
+                let temporary_mode = if existing_mode.is_some() {
+                    default_mode & 0o600
+                } else {
+                    default_mode
+                };
+                assert_eq!(
+                    file.metadata()?.permissions().mode() & 0o777,
+                    temporary_mode
+                );
                 file.write_all(b"private while writing")
             })
             .unwrap();
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                existing_mode.unwrap_or(0o600)
+                existing_mode.unwrap_or(default_mode)
             );
             fs::remove_file(&path).unwrap();
         }
+        // Both exclusive-publication paths must also keep ordinary creation modes.
+        create_atomic(&path, b"linked").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            default_mode
+        );
+        fs::remove_file(&path).unwrap();
+        create_atomic_with_link(
+            &path,
+            |f| f.write_all(b"fallback"),
+            |_, _| Err(io::Error::new(io::ErrorKind::Unsupported, "no hard links")),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            default_mode
+        );
     }
 
     #[test]
@@ -405,9 +450,9 @@ mod tests {
     fn skips_stale_temp_collision() {
         let dir = Dir::new();
         let mut counter = 0;
-        let (first, file) = create_temp(&dir.file(), || 0).unwrap();
+        let (first, file) = create_temp(&dir.file(), false, || 0).unwrap();
         drop(file);
-        let (second, file) = create_temp(&dir.file(), || {
+        let (second, file) = create_temp(&dir.file(), false, || {
             let n = counter;
             counter += 1;
             n
