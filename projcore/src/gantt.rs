@@ -8,6 +8,8 @@
 //! tasks becoming chart sections. For a standard Mon–Fri calendar the block
 //! carries `excludes weekends` so the bars skip non-working days the way the
 //! schedule does.
+//! The accompanying table includes bold summary rows with rolled-up dates and
+//! working durations, signed total slack, and the scheduler's free slack.
 //!
 //! [Mermaid `gantt`]: https://mermaid.js.org/syntax/gantt.html
 
@@ -70,8 +72,9 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
 }
 
 /// Render a full Markdown document: a heading, the fenced Mermaid chart, and a
-/// task table (start, finish, duration, slack, critical) as a text fallback for
-/// viewers that don't render Mermaid.
+/// task table (start, finish, duration, total/free slack, critical) as a text
+/// fallback for viewers that don't render Mermaid. Summary names are bold and
+/// their durations span the rolled-up dates under the project's default calendar.
 pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
     let heading = sanitize(&proj.title)
         .or_else(|| sanitize(&proj.name))
@@ -81,25 +84,33 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         to_mermaid(proj, sched)
     );
 
-    out.push_str("| Task | Start | Finish | Duration | Total slack | Critical |\n");
-    out.push_str("|------|-------|--------|----------|-------------|----------|\n");
+    out.push_str("| Task | Start | Finish | Duration | Total slack | Free slack | Critical |\n");
+    out.push_str("|------|-------|--------|----------|-------------|------------|----------|\n");
     for task in &proj.tasks {
-        if task.summary {
-            continue;
-        }
         let Some(r) = sched.get(task.uid) else {
             continue;
         };
         let name = sanitize(&task.name).unwrap_or_else(|| format!("Task {}", task.uid));
-        let dur = duration_str(proj, task.duration_min);
-        let slack = fmt_days(proj.minutes_to_days(r.total_slack_min.max(0)));
+        let name = name.replace('|', "\\|");
+        let (name, duration_min) = if task.summary {
+            (
+                format!("**{name}**"),
+                crate::schedule::working_minutes_between(proj, r.early_start, r.early_finish),
+            )
+        } else {
+            (name, task.duration_min)
+        };
+        let dur = duration_str(proj, duration_min);
+        let slack = fmt_days(proj.minutes_to_days(r.total_slack_min));
+        let free_slack = fmt_days(proj.minutes_to_days(r.free_slack_min));
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
             name,
             r.early_start.to_mspdi().replace('T', " "),
             r.early_finish.to_mspdi().replace('T', " "),
             dur,
             slack,
+            free_slack,
             if r.critical { "✓" } else { "" },
         ));
     }
@@ -262,6 +273,224 @@ mod tests {
         assert!(md.contains("```mermaid\ngantt"));
         assert!(md.contains("| Task | Start | Finish |"));
         assert!(md.contains("2026-03-02 08:00:00"));
+    }
+
+    fn table_rows(md: &str) -> Vec<Vec<&str>> {
+        md.lines()
+            .filter(|line| line.starts_with("| "))
+            .map(|line| {
+                let boundaries: Vec<_> = line
+                    .match_indices('|')
+                    .filter(|(index, _)| {
+                        line[..*index]
+                            .chars()
+                            .rev()
+                            .take_while(|&c| c == '\\')
+                            .count()
+                            % 2
+                            == 0
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                boundaries
+                    .windows(2)
+                    .map(|pair| line[pair[0] + 1..pair[1]].trim())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn markdown_includes_summary_rows() {
+        let mut parent = task(1, "P", 1); // Deliberately stale stored duration.
+        parent.summary = true;
+        let mut a = task(2, "A", 1440);
+        a.outline_level = 2;
+        let mut nested = task(3, "Nested", 1);
+        nested.summary = true;
+        nested.outline_level = 2;
+        let mut b = task(4, "B", 480);
+        b.outline_level = 3;
+        b.predecessors.push(Predecessor {
+            uid: 2,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        });
+        let mut empty = task(5, "Empty", 1);
+        empty.summary = true;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0)),
+            tasks: vec![parent, a, nested, b, empty],
+            ..Project::default()
+        };
+        let md = to_markdown(&proj, &schedule(&proj));
+        assert_eq!(
+            &table_rows(&md)[1..],
+            [
+                [
+                    "**P**",
+                    "2026-03-05 08:00:00",
+                    "2026-03-10 17:00:00",
+                    "4d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+                [
+                    "A",
+                    "2026-03-05 08:00:00",
+                    "2026-03-09 17:00:00",
+                    "3d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+                [
+                    "**Nested**",
+                    "2026-03-10 08:00:00",
+                    "2026-03-10 17:00:00",
+                    "1d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+                [
+                    "B",
+                    "2026-03-10 08:00:00",
+                    "2026-03-10 17:00:00",
+                    "1d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_reports_negative_total_slack() {
+        for (finish, minutes, expected) in [
+            (DateTime::from_ymd_hm(2026, 2, 26, 17, 0), -480, "-1d"),
+            (DateTime::from_ymd_hm(2026, 2, 27, 12, 0), -240, "-0.50d"),
+        ] {
+            // This linked-task case already computes negative slack in the engine.
+            let mut proj = crate::mspdi::read_mspdi(include_str!(
+                "../../corpus/mspdi/14-link-sf-before-start.xml"
+            ))
+            .unwrap();
+            proj.tasks[0].name = "Late".into();
+            proj.tasks[0].constraint = ConstraintType::FinishNoLaterThan;
+            proj.tasks[0].constraint_date = Some(finish);
+            let sched = schedule(&proj);
+            assert_eq!(sched.get(1).unwrap().total_slack_min, minutes);
+            let md = to_markdown(&proj, &sched);
+            assert_eq!(
+                table_rows(&md)[1],
+                [
+                    "Late",
+                    "2026-02-26 08:00:00",
+                    "2026-03-02 08:00:00",
+                    "2d",
+                    expected,
+                    "0d",
+                    "✓"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn markdown_reports_free_slack() {
+        let proj = diamond();
+        let md = to_markdown(&proj, &schedule(&proj));
+        let rows = table_rows(&md);
+        assert_eq!(
+            rows[0],
+            [
+                "Task",
+                "Start",
+                "Finish",
+                "Duration",
+                "Total slack",
+                "Free slack",
+                "Critical"
+            ]
+        );
+        assert_eq!(
+            rows[1..]
+                .iter()
+                .map(|row| (row[0], row[5]))
+                .collect::<Vec<_>>(),
+            [("A", "0d"), ("B", "0d"), ("C", "2d"), ("D", "0d")]
+        );
+    }
+
+    #[test]
+    fn markdown_distinguishes_free_slack_from_total_slack() {
+        // A -> B -> D and C -> D: A has float, but no room before B must move.
+        let mut proj = diamond();
+        proj.tasks[0].duration_min = 480;
+        proj.tasks[1].duration_min = 480;
+        proj.tasks[2].duration_min = 1920;
+        proj.tasks[2].predecessors.clear();
+        let sched = schedule(&proj);
+        let a = sched.get(1).unwrap();
+        assert_eq!((a.total_slack_min, a.free_slack_min), (960, 0));
+        let md = to_markdown(&proj, &sched);
+        assert_eq!(
+            table_rows(&md)[1],
+            [
+                "A",
+                "2026-03-02 08:00:00",
+                "2026-03-02 17:00:00",
+                "1d",
+                "2d",
+                "0d",
+                ""
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_escapes_pipes_in_leaf_and_summary_names() {
+        let mut parent = task(1, "P | Q", 0);
+        parent.summary = true;
+        let mut leaf = task(2, "A | B", 480);
+        leaf.outline_level = 2;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![parent, leaf],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        let md = to_markdown(&proj, &sched);
+        assert_eq!(
+            &table_rows(&md)[1..],
+            [
+                [
+                    r"**P \| Q**",
+                    "2026-03-02 08:00:00",
+                    "2026-03-02 17:00:00",
+                    "1d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+                [
+                    r"A \| B",
+                    "2026-03-02 08:00:00",
+                    "2026-03-02 17:00:00",
+                    "1d",
+                    "0d",
+                    "0d",
+                    "✓"
+                ],
+            ]
+        );
+        // Escaping applies only to table cells, not Mermaid labels.
+        let mermaid = to_mermaid(&proj, &sched);
+        assert!(mermaid.contains("    section P | Q\n"));
+        assert!(mermaid.contains("    A | B :crit, 2026-03-02, 1d\n"));
     }
 
     #[test]
