@@ -701,7 +701,14 @@ impl<'a> Scheduler<'a> {
             let l_f = lf_abs[&t.uid];
             // A constraint can move the scheduled start ahead of what its
             // links permit; preserve that conflict instead of reporting zero.
-            let total = tl.to_index(l_s) - tl.to_index(e_s).max(driven_es[&t.uid]);
+            let (early, driven) = (tl.to_index(e_s), driven_es[&t.uid]);
+            let mut total = tl.to_index(l_s) - early.max(driven);
+            // A manual task pinned before its link-driven start violates the
+            // link: report at least that gap as negative slack, even off the
+            // critical path.
+            if t.pinned_dates().is_some() && driven > early {
+                total = total.min(early - driven);
+            }
             let free = self.free_slack(t, tl, &es_abs, &succs);
             results.insert(
                 t.uid,
@@ -3064,14 +3071,23 @@ mod tests {
             dates(&s, 2),
             ("2026-03-02T08:00:00".into(), "2026-03-02T17:00:00".into())
         );
-        // The link wants Thursday; the task stays Monday and the late finish is
-        // the project finish (Wednesday), so the violation is -1 day of slack.
-        assert_eq!(s.get(2).unwrap().total_slack_min, -480);
+        // The link wants Thursday; the task stays Monday: -3 days of slack.
+        assert_eq!(s.get(2).unwrap().total_slack_min, -1440);
         // Its predecessor's late dates fall before the project start and stay
         // finite: P must finish by M's late start.
         let p = s.get(1).unwrap();
         assert_eq!(p.late_start.to_mspdi(), "2026-02-27T08:00:00");
         assert_eq!(p.total_slack_min, -480);
+    }
+
+    #[test]
+    fn violated_link_off_the_critical_path_still_shows_negative_slack() {
+        let mut m = manual(2, "M", 480, at(3, 8));
+        m.predecessors.push(fs(1));
+        let s = schedule(&march2(vec![task(1, "P", 1440), m, task(3, "Long", 4800)]));
+        // The link wants Thursday the 5th; pinned on Tuesday the 3rd.
+        assert_eq!(s.get(2).unwrap().total_slack_min, -960);
+        assert!(s.get(2).unwrap().critical);
     }
 
     #[test]
