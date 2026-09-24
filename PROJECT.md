@@ -103,13 +103,15 @@ cycles fall back to input order.
 ### Verification
 
 There's no free high-fidelity oracle for scheduling (Project isn't scriptable in
-CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds a dozen tiny
-one-feature MSPDI files, each embedding the `Start`/`Finish` that Project itself
-would compute (hand-verified against a standard 8h/day Mon–Fri calendar).
-`projcore/tests/corpus.rs` reads each file, runs the scheduler, and asserts the
-computed dates match — and also runs each file through **MSPDI → `.yppx` →
-back** to prove the writer and OPC container are lossless. Regenerate with
-`python3 corpus/tools/gen_mspdi_corpus.py`.
+CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds eighteen tiny
+one-feature MSPDI files, each embedding every task's `Start`/`Finish`,
+`TotalSlack` and `Critical` as Microsoft Project 2021 computes them.
+`corpus/tools/verify_mspdi_project.py` checked every value against Project
+over COM (#74), with the oracle elements removed from the copy Project
+schedules. `projcore/tests/corpus.rs` reads each file, runs the scheduler, and
+asserts the computed dates, slack and critical flags match — and also runs each
+file through **MSPDI → `.yppx` → back** to prove the writer and OPC container
+are lossless. Regenerate with `python3 corpus/tools/gen_mspdi_corpus.py`.
 
 ## Resource leveling
 
