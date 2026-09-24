@@ -204,7 +204,9 @@ fn session_path() -> PathBuf {
 #[derive(Clone, Copy, PartialEq)]
 enum RibbonTab {
     Task,
-    Schedule,
+    Resource,
+    Report,
+    Project,
     Home,
     Insert,
     Review,
@@ -12683,7 +12685,9 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
         &[
             (None, "File", "F"),
             (Some(Task), "Task", "T"),
-            (Some(Schedule), "Schedule", "S"),
+            (Some(Resource), "Resource", "U"),
+            (Some(Report), "Report", "R"),
+            (Some(Project), "Project", "P"),
             (Some(View), "View", "W"),
         ]
     } else {
@@ -12722,7 +12726,9 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
         RibbonTab::View => "View",
         RibbonTab::Table => "Table",
         RibbonTab::Task => "Task",
-        RibbonTab::Schedule => "Schedule",
+        RibbonTab::Resource => "Resource",
+        RibbonTab::Report => "Report",
+        RibbonTab::Project => "Project",
     }
 }
 
@@ -16497,7 +16503,7 @@ impl Docxy {
         let rp = doc.map(|ed| ed.caret_props());
         let pp = doc.map(|ed| ed.caret_para_props());
         match act {
-            Project(ProjectAct::Level) => self
+            Project(ProjectAct::LevelAll) => self
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.ed.leveled())),
