@@ -226,6 +226,49 @@ impl AccrueAt {
     }
 }
 
+/// A resource rate stored as valid `xsd:decimal` text.
+///
+/// Keeping its source spelling preserves precision and forms such as `+5` or
+/// `007` through MSPDI and `.yppx` saves.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Rate(String);
+
+impl Rate {
+    /// Parse a decimal rate, retaining valid decimal text after trimming.
+    /// Finite float syntax accepted by older readers is converted to decimal.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
+        let mut parts = unsigned.split('.');
+        let whole = parts.next()?;
+        let fraction = parts.next();
+        let decimal = match fraction {
+            None => !whole.is_empty() && whole.bytes().all(|byte| byte.is_ascii_digit()),
+            Some(fraction) => {
+                parts.next().is_none()
+                    && (!whole.is_empty() || !fraction.is_empty())
+                    && whole.bytes().all(|byte| byte.is_ascii_digit())
+                    && fraction.bytes().all(|byte| byte.is_ascii_digit())
+            }
+        };
+        if decimal {
+            Some(Self(text.to_owned()))
+        } else {
+            Self::from_f64(text.parse().ok()?)
+        }
+    }
+
+    /// Convert a finite float to decimal text; nonfinite values have no rate.
+    pub fn from_f64(value: f64) -> Option<Self> {
+        value.is_finite().then(|| Self(value.to_string()))
+    }
+
+    /// Return the decimal text written to MSPDI.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// A resource (person, equipment, material, or cost).
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Resource {
@@ -242,9 +285,9 @@ pub struct Resource {
     pub max_units: f64,
     pub accrue_at: Option<AccrueAt>,
     /// Stored rates only; the scheduler does not calculate costs.
-    pub standard_rate: Option<f64>,
-    pub overtime_rate: Option<f64>,
-    pub cost_per_use: Option<f64>,
+    pub standard_rate: Option<Rate>,
+    pub overtime_rate: Option<Rate>,
+    pub cost_per_use: Option<Rate>,
     pub calendar_uid: Option<i32>,
 }
 
@@ -404,6 +447,41 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_keeps_decimal_text_and_normalizes_finite_float_syntax() {
+        for text in [
+            "9007199254740993",
+            "0.12345678901234567890123456789",
+            "+5",
+            "-0.50",
+            ".5",
+            "5.",
+            "007",
+        ] {
+            assert_eq!(Rate::parse(&format!(" {text} ")).unwrap().as_str(), text);
+        }
+        let huge = format!("1{}", "0".repeat(400));
+        assert_eq!(Rate::parse(&huge).unwrap().as_str(), huge);
+        for (source, expected) in [("1e3", "1000"), ("1.5E2", "150")] {
+            assert_eq!(Rate::parse(source).unwrap().as_str(), expected);
+        }
+        for text in ["", ".", "+", "abc", "NaN", "inf", "-infinity", "1e999"] {
+            assert_eq!(Rate::parse(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn rate_from_f64_accepts_only_finite_values() {
+        assert_eq!(
+            Rate::from_f64(1e20).unwrap().as_str(),
+            "100000000000000000000"
+        );
+        assert_eq!(Rate::from_f64(-0.0).unwrap().as_str(), "-0");
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(Rate::from_f64(value), None);
+        }
+    }
 
     #[test]
     fn link_constraint_codes_round_trip() {

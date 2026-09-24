@@ -504,12 +504,8 @@ fn float_of(p: &mut XmlParser) -> f64 {
 }
 
 /// Invalid optional rates stay absent; nonfinite floats are not XML decimals.
-fn rate_of(p: &mut XmlParser) -> Option<f64> {
-    text_of(p)
-        .trim()
-        .parse::<f64>()
-        .ok()
-        .filter(|value| value.is_finite())
+fn rate_of(p: &mut XmlParser) -> Option<Rate> {
+    Rate::parse(&text_of(p))
 }
 
 fn bool_of(p: &mut XmlParser) -> bool {
@@ -754,12 +750,12 @@ fn write_resource(s: &mut String, r: &Resource) {
         tag(s, 3, "AccrueAt", &accrue_at.code().to_string());
     }
     for (name, value) in [
-        ("StandardRate", r.standard_rate),
-        ("OvertimeRate", r.overtime_rate),
-        ("CostPerUse", r.cost_per_use),
+        ("StandardRate", &r.standard_rate),
+        ("OvertimeRate", &r.overtime_rate),
+        ("CostPerUse", &r.cost_per_use),
     ] {
         if let Some(value) = value {
-            tag(s, 3, name, &value.to_string());
+            tag(s, 3, name, value.as_str());
         }
     }
     if let Some(c) = r.calendar_uid {
@@ -1001,9 +997,9 @@ mod tests {
                 initials: Some("A".into()),
                 group: Some("Eng".into()),
                 code: Some("C7".into()),
-                standard_rate: Some(50.0),
-                overtime_rate: Some(75.0),
-                cost_per_use: Some(10.0),
+                standard_rate: Rate::parse("50"),
+                overtime_rate: Rate::parse("75"),
+                cost_per_use: Rate::parse("10"),
                 accrue_at: Some(AccrueAt::Prorated),
                 max_units: 1.0,
                 ..Resource::default()
@@ -1083,12 +1079,52 @@ mod tests {
                 let proj = resource_project(&format!("<Resource>{element}</Resource>"));
                 let r = &proj.resources[0];
                 assert_eq!(
-                    (r.standard_rate, r.overtime_rate, r.cost_per_use),
-                    (None, None, None),
+                    (&r.standard_rate, &r.overtime_rate, &r.cost_per_use),
+                    (&None, &None, &None),
                     "{element}"
                 );
                 let xml = write_mspdi(&proj);
                 assert!(!xml.contains(&format!("<{name}>")), "{xml}");
+                assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+            }
+        }
+    }
+
+    #[test]
+    fn resource_rates_round_trip_as_text() {
+        let huge = format!("1{}", "0".repeat(400));
+        let values = [
+            "9007199254740993",
+            "0.12345678901234567890123456789",
+            &huge,
+            "+5",
+            "-0.50",
+            ".5",
+            "5.",
+            "007",
+        ];
+        for name in ["StandardRate", "OvertimeRate", "CostPerUse"] {
+            for value in values {
+                let proj =
+                    resource_project(&format!("<Resource><{name}> {value} </{name}></Resource>"));
+                let rate = match name {
+                    "StandardRate" => proj.resources[0].standard_rate.as_ref(),
+                    "OvertimeRate" => proj.resources[0].overtime_rate.as_ref(),
+                    _ => proj.resources[0].cost_per_use.as_ref(),
+                };
+                assert_eq!(rate.map(Rate::as_str), Some(value), "{name}");
+                let xml = write_mspdi(&proj);
+                assert!(xml.contains(&format!("<{name}>{value}</{name}>")), "{xml}");
+                assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+            }
+            for (source, expected) in [("1e3", "1000"), ("1.5E2", "150")] {
+                let proj =
+                    resource_project(&format!("<Resource><{name}>{source}</{name}></Resource>"));
+                let xml = write_mspdi(&proj);
+                assert!(
+                    xml.contains(&format!("<{name}>{expected}</{name}>")),
+                    "{xml}"
+                );
                 assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
             }
         }
@@ -1107,9 +1143,12 @@ mod tests {
         assert_eq!(r.material_label.as_deref(), Some(""));
         assert_eq!(r.code.as_deref(), Some("R&D <x>"));
         assert_eq!(r.group.as_deref(), Some("R&D <x>"));
-        assert_eq!(r.standard_rate, Some(0.0));
-        assert_eq!(r.overtime_rate, Some(12.5));
-        assert_eq!(r.cost_per_use, Some(1e20));
+        assert_eq!(r.standard_rate.as_ref().map(Rate::as_str), Some("0"));
+        assert_eq!(r.overtime_rate.as_ref().map(Rate::as_str), Some("12.5"));
+        assert_eq!(
+            r.cost_per_use.as_ref().map(Rate::as_str),
+            Some("100000000000000000000")
+        );
         let xml = write_mspdi(&proj);
         for element in [
             "<Initials></Initials>",
@@ -1180,9 +1219,9 @@ mod tests {
             code: Some("C7".into()),
             group: Some("Eng".into()),
             accrue_at: Some(AccrueAt::End),
-            standard_rate: Some(50.0),
-            overtime_rate: Some(75.0),
-            cost_per_use: Some(10.0),
+            standard_rate: Rate::parse("50"),
+            overtime_rate: Rate::parse("75"),
+            cost_per_use: Rate::parse("10"),
             calendar_uid: Some(1),
             ..Resource::default()
         };
