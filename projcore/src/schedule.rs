@@ -1123,22 +1123,10 @@ impl Scheduler<'_> {
                             }
                         }
                     }
-                    if matches!(
-                        t.constraint,
-                        ConstraintType::StartNoEarlierThan | ConstraintType::MustStartOn
-                    ) {
-                        if let Some(dates) = self.constraint_dates(
-                            t,
-                            t.predecessors.iter().any(|p| start.contains_key(&p.uid)),
-                        ) {
-                            if tl.to_index(dates.start) == placed {
-                                start_bound = start_bound.max(dates.start);
-                            }
-                        }
-                    }
                     // Leveling can change which link binds. Choose the actual
-                    // leveled FS instant unless a current start-type bound or
-                    // the absolute CPM floor requires a later instant.
+                    // leveled FS instant unless a current non-FS bound or the
+                    // absolute CPM floor requires a later instant. That floor
+                    // already carries the task's SNET/MSO start bounds.
                     if let Some(instant) = fs_instant {
                         s_abs = instant.max(start_bound);
                     }
