@@ -238,6 +238,23 @@ def build():
                 calendars=[standard_calendar(1),
                            standard_calendar(2, "SixDay", saturday=True)]))
 
+    # 13 — resource identity/rates and all three kinds survive saving (#52).
+    rich_res = (
+        "    <Resource><UID>1</UID><ID>1</ID><Name>Alice</Name><Type>1</Type>"
+        "<Initials>A</Initials><Code>C7</Code><Group>Eng</Group><MaxUnits>1</MaxUnits>"
+        "<AccrueAt>3</AccrueAt><StandardRate>50</StandardRate>"
+        "<OvertimeRate>75</OvertimeRate><CostPerUse>10</CostPerUse></Resource>\n"
+        "    <Resource><UID>2</UID><ID>2</ID><Name>Licence</Name><Type>0</Type>"
+        "<MaxUnits>1</MaxUnits><IsCostResource>1</IsCostResource></Resource>\n"
+        "    <Resource><UID>3</UID><ID>3</ID><Name>Concrete</Name><Type>0</Type>"
+        "<MaterialLabel>tonnes</MaterialLabel><MaxUnits>1</MaxUnits></Resource>"
+    )
+    add("13-resource-fields.xml", ["resource", "resource-fields", "round-trip"],
+        "Work resource identity and rates, Cost resource, and Material label survive saving.",
+        project("resource-fields",
+                task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00")),
+                resources_xml=rich_res, assignments_xml=asn))
+
     manifest = {
         "anchor": "2026-03-02T08:00:00",
         "calendar": "Standard 8h/day Mon-Fri (08:00-12:00, 13:00-17:00)",

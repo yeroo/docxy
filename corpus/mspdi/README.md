@@ -1,7 +1,7 @@
 # projcore MSPDI seed corpus
 
 Tiny, single-feature MS Project XML (MSPDI) files used to validate the
-`projcore` CPM scheduler. Each file isolates exactly one scheduling feature so a
+`projcore` CPM scheduler and resource round trips. Each file isolates one feature so a
 failing assertion points at a single code path.
 
 ## Self-oracling
@@ -33,6 +33,7 @@ therefore validates the scheduler against Project's semantics without Project.
 | `10-summary` | outline rollup | summary derives from children |
 | `11-resource-assignment` | resource + assignment | units × work parsing |
 | `12-calendar-6day` | custom calendar | Saturday working changes the finish |
+| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006) |
 
 See `manifest.json` for machine-readable tags.
 
