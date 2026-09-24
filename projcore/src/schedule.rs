@@ -222,6 +222,7 @@ struct ConstraintDates {
     start: i64,
     finish: i64,
     floor: i64,
+    late_floor: Option<i64>,
     finish_bound: Option<i64>,
 }
 
@@ -269,10 +270,10 @@ impl<'a> Scheduler<'a> {
             .filter_map(|t| t.calendar_uid)
             .chain(std::iter::once(default_cal))
             .collect();
-        let earliest_backward_date = proj
+        let backward_constraints = proj
             .tasks
             .iter()
-            .filter(|t| !t.summary)
+            .filter(|t| !t.summary && t.constraint_date.is_some())
             .filter(|t| {
                 matches!(
                     t.constraint,
@@ -281,11 +282,16 @@ impl<'a> Scheduler<'a> {
                         | ConstraintType::MustFinishOn
                         | ConstraintType::MustStartOn
                 )
-            })
+            });
+        let has_backward_constraints = backward_constraints.clone().next().is_some();
+        // An unlinked deadline is floored at the anchor. Its raw date must not
+        // add an unused prefix to every calendar's timeline.
+        let earliest_backward_date = backward_constraints
+            .filter(|t| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid)))
             .filter_map(|t| t.constraint_date)
             .map(|date| date.minutes())
             .min();
-        let needs_backward_horizon = earliest_backward_date.is_some()
+        let needs_backward_horizon = has_backward_constraints
             || proj.tasks.iter().filter(|t| !t.summary).any(|t| {
                 t.predecessors.iter().any(|p| {
                     leaf_uids.contains(&p.uid)
@@ -295,8 +301,8 @@ impl<'a> Scheduler<'a> {
             });
 
         // Only schedulable calendars affect the horizon. Include the default
-        // fallback. Constraints can put late dates before the anchor even when
-        // nonnegative FS/SS links keep scheduled dates at or after it.
+        // fallback. Constraints may put late dates before the anchor and, when
+        // honored on linked tasks, scheduled dates as well.
         let mut weeks: HashMap<_, _> = proj
             .calendars
             .iter()
@@ -363,12 +369,17 @@ impl<'a> Scheduler<'a> {
         } else {
             tl.snap(self.anchor)
         };
-        let date = task.constraint_date?.minutes().max(floor);
+        let raw_date = task.constraint_date?.minutes();
+        let date = raw_date.max(floor);
         let finish = tl.abs_finish(tl.to_index(date)).max(floor);
         Some(ConstraintDates {
             start: tl.snap(date),
             finish,
             floor,
+            // Preserve the legacy pre-start floor only when the unlinked
+            // deadline itself was clamped. A post-start deadline can require
+            // a pre-start late window to expose the task's negative slack.
+            late_floor: (!linked && raw_date < floor).then_some(floor),
             // Keep an SF morning that already meets the actual deadline,
             // even when its working index also represents the prior evening.
             finish_bound: (self.proj.honor_constraints
@@ -554,7 +565,7 @@ impl<'a> Scheduler<'a> {
             if let Some(ConstraintDates {
                 start: ds,
                 finish: df,
-                floor,
+                late_floor,
                 ..
             }) = self.constraint_dates(t, linked_tasks.contains(&t.uid))
             {
@@ -562,12 +573,12 @@ impl<'a> Scheduler<'a> {
                     ConstraintType::MustFinishOn => {
                         finish_abs = df;
                         hard_finish_bound = true;
-                        late_start_floor = (!linked_tasks.contains(&t.uid)).then_some(floor);
+                        late_start_floor = late_floor;
                     }
                     ConstraintType::FinishNoLaterThan if df <= finish_abs => {
                         finish_abs = df;
                         hard_finish_bound = true;
-                        late_start_floor = (!linked_tasks.contains(&t.uid)).then_some(floor);
+                        late_start_floor = late_floor;
                     }
                     ConstraintType::StartNoLaterThan => {
                         let bound = tl.abs_finish(tl.to_index(ds) + t.duration_min);
@@ -2020,6 +2031,61 @@ mod tests {
             honor_constraints: honor,
             tasks: vec![task(1, "A", 5 * 480), b],
             ..Project::default()
+        }
+    }
+
+    #[test]
+    fn unlinked_stale_deadline_keeps_the_anchor_based_horizon() {
+        // The SF link already needs an anchor-based backward budget, making
+        // origins directly comparable when the unlinked task's date is absent.
+        let mut proj = before_start_project();
+        let mut unlinked = task(3, "Old template deadline", 480);
+        unlinked.constraint = ConstraintType::FinishNoLaterThan;
+        proj.tasks.push(unlinked);
+        let baseline_engine = Scheduler::new(&proj);
+        let baseline_origin = baseline_engine.tl(&proj.tasks[2]).segs[0].start;
+        let baseline = baseline_engine.run();
+        proj.tasks[2].constraint_date = Some(DateTime::from_ymd_hm(1900, 1, 1, 17, 0));
+        let engine = Scheduler::new(&proj);
+        assert_eq!(engine.tl(&proj.tasks[2]).segs[0].start, baseline_origin);
+        let sched = engine.run();
+        for uid in [1, 2, 3] {
+            let before = baseline.get(uid).unwrap();
+            let after = sched.get(uid).unwrap();
+            assert_eq!(after.early_start, before.early_start);
+            assert_eq!(after.early_finish, before.early_finish);
+            assert_eq!(after.total_slack_min, before.total_slack_min);
+        }
+        // The existing pre-anchor contract still floors this deadline's late
+        // dates at the anchor; it cannot pull the unlinked task into 1900.
+        let unlinked = sched.get(3).unwrap();
+        assert_eq!(unlinked.late_start, proj.start_date.unwrap());
+        assert_eq!(unlinked.late_finish, proj.start_date.unwrap());
+    }
+
+    #[test]
+    fn unlinked_post_start_finish_conflict_preserves_negative_slack_and_late_duration() {
+        for constraint in [
+            ConstraintType::FinishNoLaterThan,
+            ConstraintType::MustFinishOn,
+        ] {
+            for honor in [true, false] {
+                let deadline = DateTime::from_ymd_hm(2026, 3, 4, 17, 0);
+                let mut proj = constraint_conflict(constraint, deadline, honor);
+                proj.tasks.remove(0);
+                proj.tasks[0].predecessors.clear();
+                let sched = schedule(&proj);
+                let r = sched.get(2).unwrap();
+                assert_eq!(r.early_start, proj.start_date.unwrap());
+                assert_eq!(r.early_finish, DateTime::from_ymd_hm(2026, 3, 6, 17, 0));
+                assert_eq!(r.late_finish, deadline);
+                assert_eq!(r.late_start, DateTime::from_ymd_hm(2026, 2, 26, 8, 0));
+                assert_eq!(r.total_slack_min, -960);
+                assert_eq!(
+                    working_minutes_between(&proj, r.late_start, r.late_finish),
+                    2400
+                );
+            }
         }
     }
 
