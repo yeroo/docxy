@@ -228,12 +228,24 @@ struct ConstraintDates {
 
 impl<'a> Scheduler<'a> {
     fn new(proj: &'a Project) -> Scheduler<'a> {
-        // Anchor: explicit project start, else earliest stored start, else a
-        // fixed Monday, snapped to the default calendar's first working instant.
+        // Anchor: explicit project start, else earliest stored or pinned start,
+        // else a fixed Monday, snapped to the default calendar's first working
+        // instant.
         let default_cal = proj.default_calendar_uid;
+        let pinned_starts = proj
+            .tasks
+            .iter()
+            .filter(|t| !t.summary)
+            .filter_map(|t| t.pinned_dates().map(|(start, _)| start.minutes()));
         let raw_anchor = proj
             .start_date
-            .or_else(|| proj.tasks.iter().filter_map(|t| t.stored_start).min())
+            .or_else(|| {
+                proj.tasks
+                    .iter()
+                    .flat_map(|t| [t.stored_start, t.pinned_dates().map(|(start, _)| start)])
+                    .flatten()
+                    .min()
+            })
             .unwrap_or_else(|| DateTime::from_ymd_hm(2020, 1, 6, 8, 0))
             .minutes();
 
@@ -247,12 +259,20 @@ impl<'a> Scheduler<'a> {
             .map(|p| p.lag_min.abs())
             .sum();
         let min_total = work + lag + HORIZON_PADDING_MIN;
+        // A pinned task's duration-derived finish lies past its start; reserve
+        // Standard-calendar wall-clock reach (about 4.2 minutes per working
+        // minute) for it, with the margin below covering sparser calendars.
+        let pinned_reach = proj.tasks.iter().filter_map(|t| {
+            t.pinned_dates()
+                .map(|(start, _)| start.minutes() + t.duration_min.max(0) * 5)
+        });
         let far_dates = proj
             .tasks
             .iter()
-            .flat_map(|t| [t.constraint_date, t.stored_finish])
+            .flat_map(|t| [t.constraint_date, t.stored_finish, t.manual_finish])
             .flatten()
             .map(|d| d.minutes())
+            .chain(pinned_reach)
             .max()
             .unwrap_or(raw_anchor);
         let min_reach = far_dates.max(raw_anchor) + 90 * 1440;
@@ -286,12 +306,16 @@ impl<'a> Scheduler<'a> {
         let has_backward_constraints = backward_constraints.clone().next().is_some();
         // An unlinked deadline is floored at the anchor. Its raw date must not
         // add an unused prefix to every calendar's timeline.
+        // A pinned start can precede the anchor, and a violated link into it
+        // puts its predecessors' late dates earlier still.
         let earliest_backward_date = backward_constraints
             .filter(|t| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid)))
             .filter_map(|t| t.constraint_date)
             .map(|date| date.minutes())
+            .chain(pinned_starts.clone())
             .min();
         let needs_backward_horizon = has_backward_constraints
+            || pinned_starts.clone().next().is_some()
             || proj.tasks.iter().filter(|t| !t.summary).any(|t| {
                 t.predecessors.iter().any(|p| {
                     leaf_uids.contains(&p.uid)
@@ -468,6 +492,31 @@ impl<'a> Scheduler<'a> {
             if linked_start.is_some() {
                 linked_tasks.insert(t.uid);
             }
+            // A manual task stays where the user put it: links and constraints
+            // never move it. Its start is kept unsnapped, as Project keeps it.
+            // Only links drive its slack, so a violated link shows as negative
+            // total slack and an unlinked task never does.
+            if let Some((pinned_start, pinned_finish)) = t.pinned_dates() {
+                let s_abs = pinned_start.minutes();
+                let s_idx = tl.to_index(s_abs);
+                let f_abs = match pinned_finish {
+                    Some(finish) => finish.minutes().max(s_abs),
+                    None => finish_instant(
+                        t,
+                        tl,
+                        s_abs,
+                        s_idx + t.duration_min,
+                        std::iter::empty(),
+                        None,
+                    ),
+                };
+                driven_es.insert(t.uid, tl.to_index(linked_start.unwrap_or(s_abs)));
+                es.insert(t.uid, s_idx);
+                ef.insert(t.uid, tl.to_index(f_abs));
+                es_abs.insert(t.uid, s_abs);
+                ef_abs.insert(t.uid, f_abs);
+                continue;
+            }
             // Snap the constraint date as a start (next morning) or a finish
             // (this evening).
             if let Some(dates) = self.constraint_dates(t, linked_start.is_some()) {
@@ -545,6 +594,14 @@ impl<'a> Scheduler<'a> {
         for &i in order.iter().rev() {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
+            // A manual task's working span comes from its pinned dates, which
+            // need not match its duration, and its constraints are ignored.
+            let pinned = t.pinned_dates().is_some();
+            let span = if pinned {
+                ef[&t.uid] - es[&t.uid]
+            } else {
+                t.duration_min
+            };
             // Every task must finish by the project finish, even when an
             // SS/SF successor only bounds its start.
             let mut finish_abs = project_finish_abs;
@@ -558,13 +615,13 @@ impl<'a> Scheduler<'a> {
                         // succ.start ≥ this.start + lag ⇒ bound this.start, then finish
                         LinkType::StartStart => sls.map(|x| {
                             let this_start = tl.abs_start(tl.to_index(x) - lag);
-                            tl.abs_finish(tl.to_index(this_start) + t.duration_min)
+                            tl.abs_finish(tl.to_index(this_start) + span)
                         }),
                         // this.finish ≤ succ.late_finish − lag
                         LinkType::FinishFinish => slf.map(|x| tl.abs_finish(tl.to_index(x) - lag)),
                         LinkType::StartFinish => slf.map(|x| {
                             let this_start = tl.abs_start(tl.to_index(x) - lag);
-                            tl.abs_finish(tl.to_index(this_start) + t.duration_min)
+                            tl.abs_finish(tl.to_index(this_start) + span)
                         }),
                     };
                     if let Some(c) = cand {
@@ -580,7 +637,9 @@ impl<'a> Scheduler<'a> {
                 finish: df,
                 late_floor,
                 ..
-            }) = self.constraint_dates(t, linked_tasks.contains(&t.uid))
+            }) = self
+                .constraint_dates(t, linked_tasks.contains(&t.uid))
+                .filter(|_| !pinned)
             {
                 match t.constraint {
                     ConstraintType::MustFinishOn => {
@@ -619,10 +678,10 @@ impl<'a> Scheduler<'a> {
                 let f_abs = tl
                     .abs_finish(finish_index)
                     .max(late_start_floor.unwrap_or(i64::MIN));
-                let s_abs = if t.duration_min == 0 {
+                let s_abs = if span == 0 {
                     f_abs
                 } else {
-                    tl.abs_start(finish_index - t.duration_min)
+                    tl.abs_start(finish_index - span)
                         .max(late_start_floor.unwrap_or(i64::MIN))
                 };
                 (s_abs, f_abs)
@@ -1072,9 +1131,34 @@ impl Scheduler<'_> {
         let mut start: HashMap<i32, DateTime> = HashMap::new();
         let mut finish: HashMap<i32, DateTime> = HashMap::new();
 
+        // Manual tasks never move, so book them before placing anything else:
+        // auto tasks earlier in topological order must level around them.
+        for &i in &order {
+            let t = &self.proj.tasks[i];
+            if t.pinned_dates().is_none() {
+                continue;
+            }
+            let cpm = base.get(t.uid).expect("leaf scheduled");
+            let s_idx = tl.to_index(cpm.early_start.minutes());
+            let f_idx = tl.to_index(cpm.early_finish.minutes());
+            for (rid, units) in assign.get(&t.uid).into_iter().flatten() {
+                bookings
+                    .entry(*rid)
+                    .or_default()
+                    .push((s_idx, f_idx, *units));
+            }
+        }
+
         for &i in &order {
             let t = &self.proj.tasks[i];
             let cpm = base.get(t.uid).expect("leaf scheduled");
+            // A manual task keeps its pinned dates and passes no delay on.
+            if t.pinned_dates().is_some() {
+                delay.insert(t.uid, 0);
+                start.insert(t.uid, cpm.early_start);
+                finish.insert(t.uid, cpm.early_finish);
+                continue;
+            }
             let cpm_start_idx = tl.to_index(cpm.early_start.minutes());
             // Preserve every link's gap by inheriting the largest predecessor delay.
             let floor = t
@@ -2933,5 +3017,159 @@ mod tests {
         let r = s.get(1).unwrap();
         assert_eq!(r.early_start.to_mspdi(), "2026-03-02T08:00:00"); // A start
         assert_eq!(r.early_finish.to_mspdi(), "2026-03-03T17:00:00"); // B finish (Tue)
+    }
+
+    fn at(d: u32, h: u32) -> DateTime {
+        DateTime::from_ymd_hm(2026, 3, d, h, 0)
+    }
+
+    /// A manually scheduled task pinned at `start` (March 2026, day `d`).
+    fn manual(uid: i32, name: &str, duration: i64, start: DateTime) -> Task {
+        Task {
+            manual: true,
+            manual_start: Some(start),
+            ..task(uid, name, duration)
+        }
+    }
+
+    fn dates(s: &Schedule, uid: i32) -> (String, String) {
+        let r = s.get(uid).unwrap();
+        (r.early_start.to_mspdi(), r.early_finish.to_mspdi())
+    }
+
+    fn march2(tasks: Vec<Task>) -> Project {
+        Project {
+            start_date: Some(at(2, 8)),
+            tasks,
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn manual_task_is_not_moved_by_a_violated_link() {
+        let mut m = manual(2, "M", 480, at(2, 8));
+        m.predecessors.push(fs(1));
+        let s = schedule(&march2(vec![task(1, "P", 1440), m]));
+        assert_eq!(
+            dates(&s, 2),
+            ("2026-03-02T08:00:00".into(), "2026-03-02T17:00:00".into())
+        );
+        // The link wants Thursday; the task stays Monday and the late finish is
+        // the project finish (Wednesday), so the violation is -1 day of slack.
+        assert_eq!(s.get(2).unwrap().total_slack_min, -480);
+        // Its predecessor's late dates fall before the project start and stay
+        // finite: P must finish by M's late start.
+        let p = s.get(1).unwrap();
+        assert_eq!(p.late_start.to_mspdi(), "2026-02-27T08:00:00");
+        assert_eq!(p.total_slack_min, -480);
+    }
+
+    #[test]
+    fn auto_successor_follows_a_manual_task_pinned_after_its_link() {
+        let mut m = manual(2, "M", 480, at(9, 8));
+        m.predecessors.push(fs(1));
+        let mut succ = task(3, "S", 480);
+        succ.predecessors.push(fs(2));
+        let s = schedule(&march2(vec![task(1, "P", 1440), m, succ]));
+        assert_eq!(dates(&s, 2).0, "2026-03-09T08:00:00");
+        assert_eq!(
+            dates(&s, 3),
+            ("2026-03-10T08:00:00".into(), "2026-03-10T17:00:00".into())
+        );
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+        assert!(s.get(1).unwrap().total_slack_min > 0);
+    }
+
+    #[test]
+    fn manual_task_before_the_project_start_keeps_its_successor_and_slack() {
+        let mut succ = task(2, "S", 480);
+        succ.predecessors.push(fs(1));
+        let proj = Project {
+            start_date: Some(at(9, 8)),
+            tasks: vec![manual(1, "M", 480, at(2, 8)), succ],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(dates(&s, 1).0, "2026-03-02T08:00:00");
+        assert_eq!(dates(&s, 2).0, "2026-03-03T08:00:00");
+        // Unlinked, it violates nothing: no negative slack from the anchor.
+        assert_eq!(s.get(1).unwrap().total_slack_min, 0);
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn manual_task_ignores_a_stale_constraint() {
+        let mut m = manual(2, "M", 480, at(2, 8));
+        m.constraint = ConstraintType::MustStartOn;
+        m.constraint_date = Some(at(16, 8));
+        let s = schedule(&march2(vec![task(1, "A", 2400), m]));
+        assert_eq!(dates(&s, 2).0, "2026-03-02T08:00:00");
+        // Slack comes from the project finish (Friday), not the MSO date.
+        assert_eq!(s.get(2).unwrap().total_slack_min, 1920);
+    }
+
+    #[test]
+    fn manual_start_on_a_weekend_is_kept_and_finishes_by_duration() {
+        let s = schedule(&march2(vec![manual(1, "M", 480, at(7, 8))]));
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-07T08:00:00".into(), "2026-03-09T17:00:00".into())
+        );
+    }
+
+    #[test]
+    fn manual_finish_pins_the_finish_and_stored_finish_never_does() {
+        let mut pinned = manual(1, "Pinned", 480, at(2, 8));
+        pinned.manual_finish = Some(at(4, 17));
+        let mut succ = task(2, "S", 480);
+        succ.predecessors.push(fs(1));
+        // A stale stored finish (the file's value before a duration edit).
+        let mut edited = manual(3, "Edited", 480, at(2, 8));
+        edited.stored_finish = Some(at(6, 17));
+        let long = task(4, "Long", 4800);
+        let s = schedule(&march2(vec![pinned, succ, edited, long]));
+        assert_eq!(dates(&s, 1).1, "2026-03-04T17:00:00");
+        assert_eq!(dates(&s, 2).0, "2026-03-05T08:00:00");
+        assert_eq!(dates(&s, 3).1, "2026-03-02T17:00:00");
+        // Late dates use the pinned three-day span, not the one-day duration:
+        // S must start by Friday the 13th, so the pinned task by Tuesday.
+        let r = s.get(1).unwrap();
+        assert_eq!(r.late_start.to_mspdi(), "2026-03-10T08:00:00");
+        assert_eq!(r.total_slack_min, 6 * 480);
+    }
+
+    #[test]
+    fn manual_task_without_a_start_schedules_like_an_auto_task() {
+        let mut tbd = Task {
+            manual: true,
+            ..task(2, "TBD", 480)
+        };
+        tbd.predecessors.push(fs(1));
+        let s = schedule(&march2(vec![task(1, "P", 480), tbd]));
+        assert_eq!(dates(&s, 2).0, "2026-03-03T08:00:00");
+    }
+
+    #[test]
+    fn leveling_moves_auto_tasks_around_a_manual_one() {
+        let mut proj = march2(vec![task(1, "Auto", 960), manual(2, "M", 960, at(2, 8))]);
+        proj.resources = vec![worker(1, "R", 1.0)];
+        proj.assignments = vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)];
+        let lv = level(&proj);
+        assert_eq!(lv.start(2).unwrap().to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(lv.finish(2).unwrap().to_mspdi(), "2026-03-03T17:00:00");
+        assert_eq!(lv.start(1).unwrap().to_mspdi(), "2026-03-04T08:00:00");
+    }
+
+    #[test]
+    fn leveling_never_moves_a_manual_task_behind_a_delayed_predecessor() {
+        let mut m = manual(3, "M", 480, at(5, 8));
+        m.predecessors.push(fs(2));
+        let mut proj = march2(vec![task(1, "A", 960), task(2, "B", 960), m]);
+        proj.resources = vec![worker(1, "R", 1.0)];
+        proj.assignments = vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)];
+        let lv = level(&proj);
+        // B is leveled behind A to Wednesday-Thursday; M stays on Thursday.
+        assert_eq!(lv.start(2).unwrap().to_mspdi(), "2026-03-04T08:00:00");
+        assert_eq!(lv.start(3).unwrap().to_mspdi(), "2026-03-05T08:00:00");
     }
 }
