@@ -1475,7 +1475,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     )];
     // Baseline variance for the selected task.
     if let Some(t) = app.ed.project().tasks.get(app.ed.sel()) {
-        if let (Some(bf), Some(r)) = (t.baseline_finish, app.ed.schedule().get(t.uid)) {
+        if let (Some(bf), Some(r)) = (
+            t.baseline(0).and_then(|b| b.finish),
+            app.ed.schedule().get(t.uid),
+        ) {
             let delta = r.early_finish.day_number() - bf.day_number();
             let (label, color) = match delta.cmp(&0) {
                 std::cmp::Ordering::Greater => (format!("▲ {delta}d late"), CRIT),
@@ -2240,7 +2243,8 @@ mod tests {
         let mut app = App::new(new_project(), None, false);
         app.set_baseline();
         let bf = app.ed.project().tasks[0]
-            .baseline_finish
+            .baseline(0)
+            .and_then(|b| b.finish)
             .expect("baseline captured");
         app.set_duration("5d"); // extend past the baseline
         let r = app
@@ -2252,6 +2256,34 @@ mod tests {
             r.early_finish.day_number() > bf.day_number(),
             "finish should slip past baseline"
         );
+    }
+
+    #[test]
+    fn header_variance_uses_slot_zero_only() {
+        use ratatui::backend::TestBackend;
+        for number in [0, 1] {
+            let mut proj = new_project();
+            proj.tasks[0].set_baseline_slot(projcore::Baseline {
+                number,
+                finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, 1, 17, 0)),
+                ..projcore::Baseline::default()
+            });
+            let app = App::new(proj, None, false);
+            let mut term = Terminal::new(TestBackend::new(160, 1)).unwrap();
+            term.draw(|f| draw_header(f, f.area(), &app)).unwrap();
+            let text: String = term
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert_eq!(text.contains("d late"), number == 0, "{text}");
+            assert!(
+                !text.contains("d early") && !text.contains("on baseline"),
+                "{text}"
+            );
+        }
     }
 
     #[test]

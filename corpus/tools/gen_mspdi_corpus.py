@@ -39,7 +39,7 @@ def iso(minutes):
 
 def task(uid, name, dur_min, start, finish, *, oid=None, outline=1,
          summary=False, milestone=False, preds=(), ctype=None, cdate=None,
-         calendar=None):
+         calendar=None, baselines=()):
     """One <Task>. `preds` is a list of (uid, type_code, lag_tenths_of_min).
     `start`/`finish` are the embedded oracle values (MSPDI datetime strings)."""
     oid = uid if oid is None else oid
@@ -67,6 +67,13 @@ def task(uid, name, dur_min, start, finish, *, oid=None, outline=1,
             f"        <LinkLag>{lag}</LinkLag><LagFormat>7</LagFormat>",
             "      </PredecessorLink>",
         ]
+    for number, baseline_start, baseline_finish, duration in baselines:
+        lines += ["      <Baseline>", f"        <Number>{number}</Number>"]
+        for tag, value in [("Start", baseline_start), ("Finish", baseline_finish),
+                           ("Duration", iso(duration) if duration is not None else None)]:
+            if value is not None:
+                lines.append(f"        <{tag}>{value}</{tag}>")
+        lines.append("      </Baseline>")
     lines.append("    </Task>")
     return "\n".join(lines)
 
@@ -264,6 +271,14 @@ def build():
             task(1, "A", 2 * D, "2026-02-26T08:00:00", dt(2), preds=[(2, SF, 0)]),
             task(2, "B", 1 * D, dt(2), dt(2, "17:00:00")),
         ])))
+
+    # 15 — recorded baseline plans differ from current task dates/durations (#55).
+    add("15-baseline-slots.xml", ["baseline", "round-trip"],
+        "Distinct baseline slots and recorded durations, including an omitted Duration.",
+        project("baseline-slots", task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"),
+                baselines=[(0, dt(4), dt(6, "17:00:00"), 3 * D),
+                           (1, dt(9), dt(13, "17:00:00"), 5 * D),
+                           (2, dt(16), dt(17, "17:00:00"), None)])))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

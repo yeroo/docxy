@@ -71,13 +71,13 @@ pub(crate) fn gantt_scale(ed: &ProjectEditor) -> GanttScale {
     let mut first = ed.schedule().project_start.day_number();
     let mut last = ed.schedule().project_finish.day_number();
     for t in &ed.project().tasks {
-        for start in [ed.disp_start(t.uid), t.baseline_start]
+        for start in [ed.disp_start(t.uid), t.baseline(0).and_then(|b| b.start)]
             .into_iter()
             .flatten()
         {
             first = first.min(start.day_number());
         }
-        for finish in [ed.disp_finish(t.uid), t.baseline_finish]
+        for finish in [ed.disp_finish(t.uid), t.baseline(0).and_then(|b| b.finish)]
             .into_iter()
             .flatten()
         {
@@ -108,8 +108,8 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
         start: day(start),
         end: day(finish),
         baseline: task
-            .baseline_start
-            .zip(task.baseline_finish)
+            .baseline(0)
+            .and_then(|b| b.start.zip(b.finish))
             .map(|(s, e)| (day(s), day(e))),
         delay: (ed.leveled() && start > result.early_start)
             .then(|| (day(result.early_start), day(start))),

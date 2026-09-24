@@ -129,6 +129,15 @@
         "before-start"
       ],
       "desc": "Start-to-finish successor begins before the project start."
+    },
+    {
+      "file": "15-baseline-slots.xml",
+      "category": "baseline",
+      "tags": [
+        "baseline",
+        "round-trip"
+      ],
+      "desc": "Distinct baseline slots and recorded durations, including an omitted Duration."
     }
   ]
 }
