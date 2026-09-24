@@ -1072,8 +1072,16 @@ mod tests {
     fn invalid_resource_rates_stay_absent_on_save() {
         for name in ["StandardRate", "OvertimeRate", "CostPerUse"] {
             let elements = std::iter::once(format!("<{name}/>")).chain(
-                ["", "abc", "NaN", "inf", "-infinity", "1e999"]
-                    .map(|value| format!("<{name}>{value}</{name}>")),
+                [
+                    "",
+                    "abc",
+                    "NaN",
+                    "inf",
+                    "-infinity",
+                    "1e999",
+                    "&#xA0;5&#xA0;",
+                ]
+                .map(|value| format!("<{name}>{value}</{name}>")),
             );
             for element in elements {
                 let proj = resource_project(&format!("<Resource>{element}</Resource>"));
