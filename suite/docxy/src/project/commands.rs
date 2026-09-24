@@ -202,7 +202,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "align-left",
                             "Level All",
                             LevelAll,
-                            "Alt, U, L",
+                            "Alt, U, L  (Ctrl+Shift+L toggles)",
                             "L",
                         )),
                         rs::column(vec![cmd(

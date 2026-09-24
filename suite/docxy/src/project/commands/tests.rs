@@ -145,6 +145,11 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
                     keys.push(c.key_tip);
                     assert!(!c.tip.title.is_empty() && !c.tip.shortcut.is_empty());
                     assert!(
+                        cmd_tip_text(c).ends_with(c.tip.shortcut),
+                        "{} hover shows its shortcut",
+                        c.label
+                    );
+                    assert!(
                         Path::new(env!("CARGO_MANIFEST_DIR"))
                             .join("assets/icons")
                             .join(format!("{}.svg", c.icon.0))
@@ -268,6 +273,21 @@ fn project_instruction_paths_exist() {
             "{gone:?} is not on Project's ribbon"
         );
     }
+}
+
+#[test]
+fn large_and_small_buttons_show_the_same_tooltip() {
+    let r = project_ribbon();
+    let level_all = r.tabs[1].groups[1].items.iter().find_map(|c| match c {
+        Control::Large(c) if c.label == "Level All" => Some(c),
+        _ => None,
+    });
+    assert_eq!(
+        cmd_tip_text(level_all.expect("Level All is a large button")).as_ref(),
+        "Level All  ·  Alt, U, L  (Ctrl+Shift+L toggles)"
+    );
+    let bare = cmdt("x", "find", "Bare", Act::Project(ProjectAct::Find), "");
+    assert_eq!(cmd_tip_text(&bare).as_ref(), "Bare");
 }
 
 #[test]
