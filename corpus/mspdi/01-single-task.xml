@@ -5,6 +5,7 @@
   <MinutesPerWeek>2400</MinutesPerWeek>
   <CalendarUID>1</CalendarUID>
   <StartDate>2026-03-02T08:00:00</StartDate>
+  <ProjectExternallyEdited>0</ProjectExternallyEdited>
   <Tasks>
     <Task>
       <UID>1</UID><ID>1</ID>

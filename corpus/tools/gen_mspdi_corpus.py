@@ -123,6 +123,10 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
         "  <MinutesPerWeek>2400</MinutesPerWeek>",
         "  <CalendarUID>1</CalendarUID>",
         f"  <StartDate>2026-03-02T08:00:00</StartDate>",
+        # Without this, Project treats the file as externally edited, ignores
+        # <Duration> and rederives it from Start/Finish, which zeroes tasks that
+        # start at the project start (#74).
+        "  <ProjectExternallyEdited>0</ProjectExternallyEdited>",
         "  <Tasks>",
         tasks_xml,
         "  </Tasks>",
