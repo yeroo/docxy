@@ -234,10 +234,11 @@ impl AccrueAt {
 pub struct Rate(String);
 
 impl Rate {
-    /// Parse a decimal rate, retaining valid decimal text after trimming.
+    /// Parse a decimal rate, retaining valid decimal text after trimming XML
+    /// Schema whitespace (space, tab, CR, LF); other Unicode spaces are invalid.
     /// Finite float syntax accepted by older readers is converted to decimal.
     pub fn parse(text: &str) -> Option<Self> {
-        let text = text.trim();
+        let text = text.trim_matches([' ', '\t', '\r', '\n']);
         let unsigned = text.strip_prefix(['+', '-']).unwrap_or(text);
         let mut parts = unsigned.split('.');
         let whole = parts.next()?;
@@ -466,7 +467,20 @@ mod tests {
         for (source, expected) in [("1e3", "1000"), ("1.5E2", "150")] {
             assert_eq!(Rate::parse(source).unwrap().as_str(), expected);
         }
-        for text in ["", ".", "+", "abc", "NaN", "inf", "-infinity", "1e999"] {
+        assert_eq!(Rate::parse("\t\r\n5 \n").unwrap().as_str(), "5");
+        for text in [
+            "",
+            ".",
+            "+",
+            "abc",
+            "NaN",
+            "inf",
+            "-infinity",
+            "1e999",
+            "\u{a0}5\u{a0}",
+            "5\u{2003}",
+            "\u{3000}1e3",
+        ] {
             assert_eq!(Rate::parse(text), None, "{text}");
         }
     }
