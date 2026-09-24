@@ -3,9 +3,10 @@
 //! file (`corpus/mspdi/*.xml`, produced by `corpus/tools/gen_mspdi_corpus.py`).
 //!
 //! These are hand-derived expectations. The owner checked the SF shapes in
-//! files 05 and 14 against Project 2021 (issue #53), and the 24-hour calendar
-//! in file 16 (issue #58); the other fixtures have not
-//! been independently verified against Project. Slack invariants below also
+//! files 05 and 14 against Project 2021 (issue #53), the 24-hour calendar
+//! in file 16 (issue #58), and the FNLT conflict in file 17 (issue #60);
+//! the other fixtures have not been independently verified against Project.
+//! Slack invariants below also
 //! check properties that do not depend on the embedded date expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -30,7 +31,7 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
     assert!(
-        files.len() >= 16,
+        files.len() >= 17,
         "expected the full seed corpus, got {}",
         files.len()
     );
@@ -39,6 +40,20 @@ fn every_file_parses_and_schedules() {
         let proj = read_mspdi(&xml).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
         assert!(!proj.tasks.is_empty(), "{}: no tasks", path.display());
         let _ = schedule(&proj); // must not panic
+    }
+}
+
+#[test]
+fn fnlt_conflict_matches_project_2021_negative_slack() {
+    let xml =
+        std::fs::read_to_string(corpus_dir().join("17-constraint-fnlt-conflict.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    assert!(proj.honor_constraints);
+    let sched = schedule(&proj);
+    for uid in [1, 2] {
+        let r = sched.get(uid).unwrap();
+        assert_eq!(r.total_slack_min, -2400);
+        assert!(r.critical);
     }
 }
 

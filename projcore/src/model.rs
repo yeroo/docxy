@@ -332,6 +332,8 @@ pub struct Project {
     pub name: String,
     pub title: String,
     pub start_date: Option<DateTime>,
+    /// Let date constraints override conflicting links (MSPDI HonorConstraints).
+    pub honor_constraints: bool,
     /// Conversion factor for rendering durations (MSPDI `HoursPerDay`).
     pub hours_per_day: f64,
     pub hours_per_week: f64,
@@ -349,6 +351,7 @@ impl Default for Project {
             name: String::new(),
             title: String::new(),
             start_date: None,
+            honor_constraints: true,
             hours_per_day: 8.0,
             hours_per_week: 40.0,
             default_calendar_uid: 1,

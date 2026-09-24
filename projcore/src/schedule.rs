@@ -20,9 +20,11 @@
 //! ## Scope (v1)
 //!
 //! Leaf tasks schedule via FS/SS/FF/SF links with lag, ASAP by default, honoring
-//! the hard date constraints (MSO/SNET/FNET/MFO forward; MFO/FNLT/SNLT/MSO
-//! backward). Summary tasks roll up from their descendants. Resource leveling is
-//! not modeled. Free slack is computed precisely for finish-to-start successors
+//! date constraints. By default MSO/MFO/FNLT/SNLT override conflicting links;
+//! disabling HonorConstraints lets the links delay those tasks instead. Both
+//! modes report conflicts as negative total slack. Summary tasks roll up from
+//! their descendants. Resource leveling is separate from CPM. Free slack is
+//! computed precisely for finish-to-start successors
 //! and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
@@ -41,7 +43,9 @@ pub struct TaskResult {
     pub early_finish: DateTime,
     pub late_start: DateTime,
     pub late_finish: DateTime,
-    /// Total slack in working minutes (late − early). ≤ 0 ⇒ critical.
+    /// Total slack in working minutes. Late start minus the later of scheduled
+    /// and link-driven start, so overriding a link still exposes the conflict.
+    /// ≤ 0 ⇒ critical.
     pub total_slack_min: i64,
     /// Free slack in working minutes (delay possible without moving any
     /// successor), floored at zero. For leaves, uses the minimum gap to FS
@@ -87,8 +91,8 @@ struct Timeline {
 }
 
 impl Timeline {
-    /// Reserve enough whole working days before the anchor for linked tasks
-    /// with leads or finish-driven starts. Empty calendars need no extension.
+    /// Reserve working days before the anchor for leads, finish-driven starts,
+    /// and late dates under conflicting constraints. Empty calendars need none.
     fn origin(week: &[Vec<(u32, u32)>; 7], anchor: i64, min_before: i64) -> i64 {
         if min_before <= 0 || week.iter().flatten().all(|&(from, to)| from >= to) {
             return anchor;
@@ -258,15 +262,24 @@ impl<'a> Scheduler<'a> {
             .chain(std::iter::once(default_cal))
             .collect();
         let needs_backward_horizon = proj.tasks.iter().filter(|t| !t.summary).any(|t| {
-            t.predecessors.iter().any(|p| {
-                leaf_uids.contains(&p.uid)
-                    && (p.lag_min < 0
-                        || matches!(p.link, LinkType::StartFinish | LinkType::FinishFinish))
-            })
+            (t.constraint_date.is_some()
+                && matches!(
+                    t.constraint,
+                    ConstraintType::FinishNoLaterThan
+                        | ConstraintType::StartNoLaterThan
+                        | ConstraintType::MustFinishOn
+                        | ConstraintType::MustStartOn
+                ))
+                || t.predecessors.iter().any(|p| {
+                    leaf_uids.contains(&p.uid)
+                        && (p.lag_min < 0
+                            || matches!(p.link, LinkType::StartFinish | LinkType::FinishFinish))
+                })
         });
 
         // Only schedulable calendars affect the horizon. Include the default
-        // fallback. Nonnegative FS/SS links cannot move tasks before the anchor.
+        // fallback. Constraints can put late dates before the anchor even when
+        // nonnegative FS/SS links keep scheduled dates at or after it.
         let mut weeks: HashMap<_, _> = proj
             .calendars
             .iter()
@@ -350,6 +363,7 @@ impl<'a> Scheduler<'a> {
         let mut ef: HashMap<i32, i64> = HashMap::new();
         let mut ef_abs: HashMap<i32, i64> = HashMap::new();
         let mut es_abs: HashMap<i32, i64> = HashMap::new();
+        let mut driven_es: HashMap<i32, i64> = HashMap::new();
         let mut linked_tasks = std::collections::HashSet::new();
         for &i in &order {
             let t = &self.proj.tasks[i];
@@ -380,11 +394,13 @@ impl<'a> Scheduler<'a> {
             }
             // Only resolved leaf links may schedule a task before the anchor.
             let mut start_abs = linked_start.unwrap_or(self.anchor);
+            let mut driven_start = start_abs;
+            let mut finish_bound = None;
             if linked_start.is_some() {
                 linked_tasks.insert(t.uid);
             }
-            // Hard constraints (forward-affecting). Snap the constraint date two
-            // ways: as a start (next morning) or a finish (this evening).
+            // Snap the constraint date as a start (next morning) or a finish
+            // (this evening).
             if let Some(cd) = t.constraint_date {
                 // A satisfied constraint must not undo a link-driven pre-start
                 // date. Bound earlier constraints by that start, not the
@@ -395,27 +411,55 @@ impl<'a> Scheduler<'a> {
                 let ds = tl.snap(date);
                 let df = tl.abs_finish(tl.to_index(date)).max(floor);
                 match t.constraint {
-                    ConstraintType::MustStartOn => start_abs = ds,
+                    ConstraintType::MustStartOn => {
+                        start_abs = if self.proj.honor_constraints {
+                            ds
+                        } else {
+                            start_abs.max(ds)
+                        };
+                    }
                     ConstraintType::StartNoEarlierThan => start_abs = start_abs.max(ds),
                     ConstraintType::FinishNoEarlierThan => {
                         start_abs = start_abs
                             .max(tl.abs_start(tl.to_index(df) - t.duration_min).max(floor));
                     }
-                    ConstraintType::MustFinishOn => {
+                    ConstraintType::MustFinishOn | ConstraintType::FinishNoLaterThan
+                        if t.constraint == ConstraintType::MustFinishOn
+                            || self.proj.honor_constraints =>
+                    {
+                        let previous_start = start_abs;
                         start_abs = tl.abs_start(tl.to_index(df) - t.duration_min);
                         // Floor the finish date, not the duration-derived start
                         // of a linked task. Unlinked tasks retain anchor semantics.
                         if linked_start.is_none() {
                             start_abs = start_abs.max(floor);
                         }
+                        if t.constraint == ConstraintType::FinishNoLaterThan {
+                            start_abs = start_abs.min(previous_start);
+                        } else if !self.proj.honor_constraints {
+                            start_abs = start_abs.max(previous_start);
+                        }
+                        if self.proj.honor_constraints {
+                            finish_bound = Some(df);
+                        }
+                    }
+                    ConstraintType::StartNoLaterThan if self.proj.honor_constraints => {
+                        start_abs = start_abs.min(ds);
                     }
                     _ => {}
+                }
+                if matches!(
+                    t.constraint,
+                    ConstraintType::StartNoEarlierThan | ConstraintType::FinishNoEarlierThan
+                ) {
+                    driven_start = start_abs;
                 }
             }
             let s_abs = tl.snap(start_abs);
             let s_idx = tl.to_index(s_abs);
             let f_idx = s_idx + t.duration_min;
-            let f_abs = finish_instant(t, tl, s_abs, f_idx, sf_bounds.into_iter());
+            let f_abs = finish_instant(t, tl, s_abs, f_idx, sf_bounds.into_iter(), finish_bound);
+            driven_es.insert(t.uid, tl.to_index(driven_start));
             es.insert(t.uid, s_idx);
             ef.insert(t.uid, f_idx);
             es_abs.insert(t.uid, s_abs);
@@ -524,7 +568,9 @@ impl<'a> Scheduler<'a> {
             let e_f = ef_abs[&t.uid];
             let l_s = ls_abs[&t.uid];
             let l_f = lf_abs[&t.uid];
-            let total = tl.to_index(l_s) - tl.to_index(e_s);
+            // A constraint can move the scheduled start ahead of what its
+            // links permit; preserve that conflict instead of reporting zero.
+            let total = tl.to_index(l_s) - tl.to_index(e_s).max(driven_es[&t.uid]);
             let free = self.free_slack(t, tl, &es_abs, &succs);
             results.insert(
                 t.uid,
@@ -622,21 +668,22 @@ fn finish_instant(
     start: i64,
     finish_index: i64,
     sf_bounds: impl Iterator<Item = (i64, i64)>,
+    finish_bound: Option<i64>,
 ) -> i64 {
     if task.duration_min == 0 {
         return start;
     }
-    // MFO wins even when the constrained evening and the SF morning share an
-    // index. Comparing candidate starts would also mistake a clamped bound for
-    // a driving link and could erase a positive task's working duration.
-    if task.constraint != ConstraintType::MustFinishOn || task.constraint_date.is_none() {
-        if let Some(instant) = sf_bounds
-            .filter(|&(index, _)| index == finish_index)
-            .map(|(_, instant)| instant)
-            .max()
-        {
-            return instant;
-        }
+    // A constraint's evening can share an index with an SF morning. Only
+    // preserve SF instants allowed by the active finish bound; selecting an
+    // instant never changes the task's working duration.
+    if let Some(instant) = sf_bounds
+        .filter(|&(index, instant)| {
+            index == finish_index && finish_bound.is_none_or(|bound| instant <= bound)
+        })
+        .map(|(_, instant)| instant)
+        .max()
+    {
+        return instant;
     }
     tl.abs_finish(finish_index)
 }
@@ -978,7 +1025,23 @@ impl Scheduler<'_> {
                     });
                 (
                     s_abs,
-                    finish_instant(t, tl, s_abs, placed + t.duration_min, bounds),
+                    finish_instant(
+                        t,
+                        tl,
+                        s_abs,
+                        placed + t.duration_min,
+                        bounds,
+                        t.constraint_date
+                            .filter(|_| {
+                                self.proj.honor_constraints
+                                    && matches!(
+                                        t.constraint,
+                                        ConstraintType::MustFinishOn
+                                            | ConstraintType::FinishNoLaterThan
+                                    )
+                            })
+                            .map(|date| date.minutes()),
+                    ),
                 )
             };
             start.insert(t.uid, DateTime::from_minutes(s_abs));
@@ -1578,6 +1641,7 @@ mod tests {
     #[test]
     fn sf_late_finish_preserves_an_earlier_same_index_deadline() {
         let mut proj = sf_project();
+        proj.honor_constraints = false;
         let deadline = DateTime::from_ymd_hm(2026, 3, 3, 17, 0);
         proj.tasks[1].constraint = ConstraintType::FinishNoLaterThan;
         proj.tasks[1].constraint_date = Some(deadline);
@@ -1687,7 +1751,7 @@ mod tests {
         );
         assert_eq!(a.late_finish, a.early_finish);
         assert_eq!(a.late_start, a.early_start);
-        assert_eq!(a.total_slack_min, 0);
+        assert_eq!(a.total_slack_min, -480);
     }
 
     #[test]
@@ -1793,6 +1857,218 @@ mod tests {
         let leveled = level(&proj);
         assert_eq!(leveled.start(2), leveled.start(1));
         assert_eq!(leveled.start(2), leveled.finish(2));
+    }
+
+    fn constraint_conflict(constraint: ConstraintType, date: DateTime, honor: bool) -> Project {
+        let mut b = task(2, "B", 5 * 480);
+        b.predecessors.push(fs(1));
+        b.constraint = constraint;
+        b.constraint_date = Some(date);
+        Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            honor_constraints: honor,
+            tasks: vec![task(1, "A", 5 * 480), b],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn fnlt_conflict_reports_negative_slack_in_both_precedence_modes() {
+        let deadline = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        assert!(Project::default().honor_constraints);
+        for honor in [true, false] {
+            let proj = constraint_conflict(ConstraintType::FinishNoLaterThan, deadline, honor);
+            let sched = schedule(&proj);
+            let a = sched.get(1).unwrap();
+            let b = sched.get(2).unwrap();
+            assert_eq!(a.early_start, proj.start_date.unwrap());
+            assert_eq!(a.early_finish, deadline);
+            assert_eq!(
+                b.early_start,
+                DateTime::from_ymd_hm(2026, 3, if honor { 2 } else { 9 }, 8, 0)
+            );
+            assert_eq!(
+                b.early_finish,
+                DateTime::from_ymd_hm(2026, 3, if honor { 6 } else { 13 }, 17, 0)
+            );
+            let leveled = level(&proj);
+            for uid in [1, 2] {
+                let r = sched.get(uid).unwrap();
+                assert_eq!(r.total_slack_min, -2400);
+                assert!(r.critical);
+                assert_eq!(
+                    working_minutes_between(&proj, r.early_start, r.early_finish),
+                    2400
+                );
+                assert_eq!(leveled.start(uid), Some(r.early_start));
+                assert_eq!(leveled.finish(uid), Some(r.early_finish));
+            }
+            let md = crate::gantt::to_markdown(&proj, &sched);
+            assert_eq!(
+                md.lines()
+                    .filter(|line| line.starts_with("| A |") || line.starts_with("| B |"))
+                    .filter(|line| line.contains("| -5d |"))
+                    .count(),
+                2,
+                "{md}"
+            );
+        }
+    }
+
+    #[test]
+    fn fnlt_partial_and_satisfied_constraints_preserve_dates_and_slack() {
+        for honor in [true, false] {
+            for (deadline_day, start_day, finish_day, slack) in [
+                (
+                    10,
+                    if honor { 4 } else { 9 },
+                    if honor { 10 } else { 13 },
+                    -1440,
+                ),
+                (13, 9, 13, 0),
+            ] {
+                let proj = constraint_conflict(
+                    ConstraintType::FinishNoLaterThan,
+                    DateTime::from_ymd_hm(2026, 3, deadline_day, 17, 0),
+                    honor,
+                );
+                let sched = schedule(&proj);
+                let b = sched.get(2).unwrap();
+                assert_eq!(
+                    b.early_start,
+                    DateTime::from_ymd_hm(2026, 3, start_day, 8, 0)
+                );
+                assert_eq!(
+                    b.early_finish,
+                    DateTime::from_ymd_hm(2026, 3, finish_day, 17, 0)
+                );
+                for uid in [1, 2] {
+                    assert_eq!(sched.get(uid).unwrap().total_slack_min, slack);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn snlt_conflicting_and_satisfied_dates_in_both_modes() {
+        for honor in [true, false] {
+            for (day, slack) in [(2, -2400), (9, 0)] {
+                let proj = constraint_conflict(
+                    ConstraintType::StartNoLaterThan,
+                    DateTime::from_ymd_hm(2026, 3, day, 8, 0),
+                    honor,
+                );
+                let sched = schedule(&proj);
+                let b = sched.get(2).unwrap();
+                assert_eq!(
+                    b.early_start,
+                    DateTime::from_ymd_hm(2026, 3, if honor { day } else { 9 }, 8, 0)
+                );
+                assert_eq!(
+                    working_minutes_between(&proj, b.early_start, b.early_finish),
+                    2400
+                );
+                for uid in [1, 2] {
+                    assert_eq!(sched.get(uid).unwrap().total_slack_min, slack);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn must_constraints_follow_precedence_and_expose_conflicts() {
+        // Honor-off expectations specify our link-precedence contract; these
+        // values have not been independently verified against Project.
+        for (constraint, day, hour) in [
+            (ConstraintType::MustStartOn, 2, 8),
+            (ConstraintType::MustFinishOn, 6, 17),
+        ] {
+            for honor in [true, false] {
+                let proj = constraint_conflict(
+                    constraint,
+                    DateTime::from_ymd_hm(2026, 3, day, hour, 0),
+                    honor,
+                );
+                let sched = schedule(&proj);
+                let b = sched.get(2).unwrap();
+                assert_eq!(
+                    b.early_start,
+                    DateTime::from_ymd_hm(2026, 3, if honor { 2 } else { 9 }, 8, 0)
+                );
+                assert_eq!(
+                    b.early_finish,
+                    DateTime::from_ymd_hm(2026, 3, if honor { 6 } else { 13 }, 17, 0)
+                );
+                for uid in [1, 2] {
+                    assert_eq!(sched.get(uid).unwrap().total_slack_min, -2400);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fnlt_conflict_propagates_through_chain_without_penalizing_parallel_branch() {
+        for honor in [true, false] {
+            let mut proj = constraint_conflict(
+                ConstraintType::FinishNoLaterThan,
+                DateTime::from_ymd_hm(2026, 3, 13, 17, 0),
+                honor,
+            );
+            proj.tasks[1].constraint = ConstraintType::AsSoonAsPossible;
+            proj.tasks[1].constraint_date = None;
+            let mut c = task(3, "C", 2400);
+            c.predecessors.push(fs(2));
+            c.constraint = ConstraintType::FinishNoLaterThan;
+            c.constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 13, 17, 0));
+            proj.tasks.extend([c, task(4, "Parallel", 480)]);
+            let sched = schedule(&proj);
+            for uid in [1, 2, 3] {
+                assert_eq!(sched.get(uid).unwrap().total_slack_min, -2400);
+            }
+            assert!(sched.get(4).unwrap().total_slack_min >= 0);
+            assert_eq!(
+                sched.get(3).unwrap().early_start,
+                DateTime::from_ymd_hm(2026, 3, if honor { 9 } else { 16 }, 8, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn sf_finish_constraints_compare_wall_clock_instants_in_both_modes() {
+        for constraint in [
+            ConstraintType::FinishNoLaterThan,
+            ConstraintType::MustFinishOn,
+        ] {
+            for honor in [true, false] {
+                let mut proj = sf_project();
+                proj.honor_constraints = honor;
+                proj.tasks[1].constraint = constraint;
+                proj.tasks[1].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0));
+                let sched = schedule(&proj);
+                let b = sched.get(2).unwrap();
+                assert_eq!(
+                    b.early_finish,
+                    if honor {
+                        DateTime::from_ymd_hm(2026, 3, 3, 17, 0)
+                    } else {
+                        DateTime::from_ymd_hm(2026, 3, 4, 8, 0)
+                    }
+                );
+                assert_eq!(
+                    working_minutes_between(&proj, b.early_start, b.early_finish),
+                    480
+                );
+                assert_eq!(level(&proj).finish(2), Some(b.early_finish));
+            }
+        }
+        for honor in [true, false] {
+            let mut proj = sf_project();
+            proj.honor_constraints = honor;
+            let baseline = *schedule(&proj).get(2).unwrap();
+            proj.tasks[1].constraint = ConstraintType::FinishNoLaterThan;
+            proj.tasks[1].constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0));
+            assert_eq!(*schedule(&proj).get(2).unwrap(), baseline);
+        }
     }
 
     /// The classic worked example: A(2d)→B(3d), A→C(1d), B→D, C→D.
