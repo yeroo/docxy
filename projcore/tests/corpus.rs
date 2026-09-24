@@ -1,14 +1,14 @@
 //! Corpus conformance: read every generated MSPDI file, run the CPM scheduler,
-//! and assert the computed Start/Finish match the oracle values embedded in each
-//! file (`corpus/mspdi/*.xml`, produced by `corpus/tools/gen_mspdi_corpus.py`).
+//! and assert the computed Start/Finish, total slack and critical flag match
+//! the oracle values embedded in each file (`corpus/mspdi/*.xml`, produced by
+//! `corpus/tools/gen_mspdi_corpus.py`).
 //!
-//! These are hand-derived expectations. The owner checked the SF shapes in
-//! files 05 and 14 against Project 2021 (issue #53), the 24-hour calendar
-//! in file 16 (issue #58), the FNLT conflict in file 17 (issue #60),
-//! and the FS milestone dates in file 18 (issue #59);
-//! the other fixtures have not been independently verified against Project.
-//! Slack invariants below also
-//! check properties that do not depend on the embedded date expectations.
+//! Every embedded value was checked against Project 2021 by
+//! `corpus/tools/verify_mspdi_project.py` (issue #74), which has Project
+//! schedule a copy of each file with the oracle elements removed. It also
+//! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
+//! 16 (#58), 17 (#60) and 18 (#59). Slack invariants below also check
+//! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
 use projcore::schedule::{level, schedule};
@@ -204,6 +204,60 @@ fn scheduler_matches_embedded_oracle() {
                     t.name
                 );
             }
+        }
+    }
+}
+
+/// Text of the first `<tag>…</tag>` in `xml`, if any.
+fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let start = xml.find(&open)? + open.len();
+    let len = xml[start..].find(&format!("</{tag}>"))?;
+    Some(&xml[start..start + len])
+}
+
+/// Project 2021's TotalSlack (tenths of a minute) and Critical for every task,
+/// read from the raw XML: `read_mspdi` deliberately ignores both.
+fn embedded_slack_oracle(name: &str, xml: &str) -> Vec<(i32, i64, bool)> {
+    xml.split("<Task>")
+        .skip(1)
+        .map(|task| {
+            let field =
+                |tag| element(task, tag).unwrap_or_else(|| panic!("{name}: a task has no <{tag}>"));
+            let uid = field("UID").parse().unwrap();
+            let slack: i64 = field("TotalSlack").parse().unwrap();
+            let critical = match field("Critical") {
+                "0" => false,
+                "1" => true,
+                other => panic!("{name}: task {uid} has <Critical>{other}</Critical>"),
+            };
+            (uid, slack / 10, critical)
+        })
+        .collect()
+}
+
+#[test]
+fn scheduler_matches_embedded_project_slack_and_critical() {
+    for path in mspdi_files() {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let proj = read_mspdi(&xml).unwrap();
+        let sched = schedule(&proj);
+        let oracle = embedded_slack_oracle(&name, &xml);
+        assert_eq!(oracle.len(), proj.tasks.len(), "{name}: task count");
+
+        for (uid, slack_min, critical) in oracle {
+            let r = sched
+                .get(uid)
+                .unwrap_or_else(|| panic!("{name}: task {uid} not scheduled"));
+            assert_eq!(
+                r.total_slack_min, slack_min,
+                "{name}: task {uid} total slack — CPM disagrees with Project"
+            );
+            assert_eq!(
+                r.critical, critical,
+                "{name}: task {uid} critical — CPM disagrees with Project"
+            );
         }
     }
 }

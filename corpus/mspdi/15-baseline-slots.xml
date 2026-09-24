@@ -15,6 +15,7 @@
       <Milestone>0</Milestone>
       <Duration>PT16H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish>
+      <TotalSlack>0</TotalSlack><Critical>1</Critical>
       <Baseline>
         <Number>0</Number>
         <Start>2026-03-04T08:00:00</Start>

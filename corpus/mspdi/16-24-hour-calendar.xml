@@ -15,6 +15,7 @@
       <Milestone>0</Milestone>
       <Duration>PT24H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T08:00:00</Finish>
+      <TotalSlack>0</TotalSlack><Critical>1</Critical>
       <CalendarUID>3</CalendarUID>
     </Task>
   </Tasks>
