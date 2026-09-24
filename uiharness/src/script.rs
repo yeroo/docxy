@@ -514,7 +514,8 @@ fn parse_assertion(text: &str, line: usize) -> Result<Assertion, ScriptError> {
 
     // `cell B2 is 12` / `<key> is [not] <value>`.
     let (subject, rest) = split_word(t);
-    if subject.eq_ignore_ascii_case("cell") {
+    if subject.eq_ignore_ascii_case("cell") && !split_word(rest.trim()).0.eq_ignore_ascii_case("is")
+    {
         let (cell, rest) = split_word(rest.trim());
         let cell = validate_cell(cell).map_err(|e| err(line, e))?;
         let (negated, value) = parse_is(rest, line, t)?;
@@ -856,6 +857,26 @@ test a pointed range dashes
         // The line numbers are the script's own, so a failure can be found.
         assert_eq!(s.cases[0].line, 2);
         assert_eq!(s.cases[0].steps[0].line, 3);
+    }
+
+    #[test]
+    fn cell_state_and_cell_value_assertions_are_unambiguous() {
+        assert_eq!(
+            parse_assertion("cell is Duration", 1).unwrap(),
+            Assertion::State {
+                key: "cell".into(),
+                negated: false,
+                value: "Duration".into()
+            }
+        );
+        assert_eq!(
+            parse_assertion("cell C2 is 3d", 1).unwrap(),
+            Assertion::Cell {
+                cell: "C2".into(),
+                negated: false,
+                value: "3d".into()
+            }
+        );
     }
 
     #[test]

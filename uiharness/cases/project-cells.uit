@@ -1,0 +1,175 @@
+test project cell commits cover every editable column and undo
+  open copy:../fixtures/gantt-summary.xml
+  assert cell is Name
+  key down
+  type Renamed
+  assert cell_edit is Renamed
+  key enter
+  assert selected_task is 2
+  assert cell B2 is Renamed
+  assert undo_depth is 1
+  key ctrl+z
+  assert cell B2 is Task 2
+  key ctrl+y
+  assert cell B2 is Renamed
+  click C2
+  type 2d
+  key tab
+  assert cell C2 is 2d
+  assert cell is Start
+  type 2026-01-08
+  key tab
+  assert cell D2 is 2026-01-08
+  assert cell is Finish
+  type 2026-01-13
+  key tab
+  assert cell E2 is 2026-01-13
+  assert cell is Predecessors
+  type 3SS+2h
+  key tab
+  assert cell F2 is 3SS+2h
+  assert cell is Resource Names
+  type Alice, Bob
+  key shift+tab
+  assert cell G2 is Alice, Bob
+  assert cell is Predecessors
+  assert undo_depth is 6
+  key ctrl+z
+  assert cell G2 is empty
+  key ctrl+y
+  assert cell G2 is Alice, Bob
+  click B2 double
+  assert cell_edit is Renamed
+  type x
+  click B3
+  assert cell B2 is Renamedx
+  assert selected_task is 2
+  assert cell_edit is none
+  key f2
+  type pending
+  key ctrl+s
+  assert cell B3 is Task 3pending
+  assert cell_edit is none
+  assert dirty is false
+  shot window
+
+test project cell invalid edits retain focus and read-only cells stay closed
+  open ../fixtures/gantt-summary.xml
+  click A2 double
+  assert cell_edit is none
+  assert status is ID is read-only
+  click C1 double
+  assert cell_edit is none
+  assert status is Duration is read-only for summary tasks
+  click D1 double
+  assert cell_edit is none
+  click E1 double
+  assert cell_edit is none
+  click C2
+  type banana
+  key enter
+  assert cell_edit is banana
+  assert status is Invalid duration (try 3d, 4h, 2w)
+  click B3 double
+  assert selected_task is 1
+  assert cell is Duration
+  assert cell_edit is banana
+  assert undo_depth is 0
+  assert dirty is false
+  shot window
+  key escape
+  click D2
+  type 2026-02-31
+  key tab
+  assert cell_edit is 2026-02-31
+  assert cell is Start
+  key escape
+  click E2
+  type 2026-01-10
+  key enter
+  assert status is Finish date is a non-working day
+  key escape
+  click F2
+  type 999
+  key enter
+  assert cell_edit is 999
+  assert undo_depth is 0
+  key escape
+  assert dirty is false
+
+test project unchanged edits preserve redo and cell border follows navigation
+  open ../fixtures/gantt-summary.xml
+  click B2 double
+  key enter
+  assert undo_depth is 0
+  assert dirty is false
+  key up
+  type Changed
+  key enter ctrl+z
+  assert redo_depth is 1
+  key up f2 enter
+  assert redo_depth is 1
+  assert undo_depth is 0
+  key up right f2 enter
+  assert redo_depth is 1
+  key up
+  type 8h
+  key enter
+  assert redo_depth is 1
+  assert undo_depth is 0
+  key up tab
+  assert cell is Start
+  assert border cell:D2 solid teal
+  key f2 enter
+  assert redo_depth is 1
+  key ctrl+y
+  assert cell B2 is Changed
+  shot window
+
+test long unicode cell editing keeps the caret usable
+  open ../fixtures/gantt-summary.xml
+  click B2
+  type abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzλ🙂
+  key left backspace
+  assert cell_edit is abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz🙂
+  shot cell:B2
+  key home delete end
+  type z
+  key tab
+  assert cell B2 is bcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz🙂z
+  assert cell is Duration
+
+test hidden document find does not intercept project Tab
+  open ../fixtures/basic.docx
+  key ctrl+f
+  open ../fixtures/gantt-summary.xml
+  assert cell is Name
+
+  key tab
+  assert cell is Duration
+  key shift+tab
+  assert cell is Name
+  key down
+  type From hidden find
+  key tab
+  assert cell B2 is From hidden find
+  assert cell_edit is none
+  assert cell is Duration
+  type 2d
+  key shift+tab
+  assert cell C2 is 2d
+  assert cell_edit is none
+  assert cell is Name
+
+test corrected duration clears its validation error
+  open ../fixtures/gantt-summary.xml
+  click C2
+  type banana
+  key enter
+  assert status is Invalid duration (try 3d, 4h, 2w)
+  key home delete delete delete delete delete delete
+  type 2d
+  key enter
+  assert cell_edit is none
+  assert cell C2 is 2d
+  assert status is Ready

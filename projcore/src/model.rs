@@ -57,6 +57,19 @@ pub enum ConstraintType {
 }
 
 impl ConstraintType {
+    pub fn abbrev(self) -> &'static str {
+        match self {
+            Self::AsSoonAsPossible => "ASAP",
+            Self::AsLateAsPossible => "ALAP",
+            Self::MustStartOn => "MSO",
+            Self::MustFinishOn => "MFO",
+            Self::StartNoEarlierThan => "SNET",
+            Self::StartNoLaterThan => "SNLT",
+            Self::FinishNoEarlierThan => "FNET",
+            Self::FinishNoLaterThan => "FNLT",
+        }
+    }
+
     pub fn from_code(code: i64) -> Option<ConstraintType> {
         use ConstraintType::*;
         Some(match code {

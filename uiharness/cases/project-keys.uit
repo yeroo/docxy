@@ -1,37 +1,37 @@
 test project editing keys and prompts
   open ../fixtures/gantt-summary.xml
-  key n
+  key insert
   assert tasks is 4
   assert selected_name is New task
-  key x
+  key delete
   assert tasks is 3
-  key home down f2
+  key home down alt t r
   assert prompt is rename:Task 2
   type renamed
   key enter
   assert selected_name is Task 2renamed
   assert dirty is true
-  key d
+  key alt t d
   type 3d
   key enter
   assert bar_2 is on-track 0-2
-  key p
+  key alt s p
   type 3
   key enter
   assert bar_2 is critical 4-8
-  key c
+  key alt s c
   key backspace backspace backspace backspace
   type SNET 2026-01-19
   key enter
   assert status is Constraint set: SNET
   assert bar_2 is critical 14-16
-  key a
+  key alt s a
   type Alice
   key enter
   assert status is Assigned Alice
-  key b
+  key alt s b
   assert status is Baseline set — baseline bars now show under the current bars
-  key shift+l
+  key ctrl+shift+l
   assert status is Resource leveling ON — bars delayed to fit resource capacity
   shot window
 

@@ -417,6 +417,28 @@ mod tests {
     }
 
     #[test]
+    fn task_add_rejects_negative_duration_without_changing_editor_state() {
+        let mut ed = app();
+        ed.rename(1, "temporary").unwrap();
+        ed.undo();
+        ed.mark_saved();
+        let before = ed.project().clone();
+        let selected = ed.sel();
+        let args = Json::parse(r#"{"name":"Invalid","duration":"-3d"}"#).unwrap();
+        assert_eq!(
+            dispatch_editor(&mut ed, "task.add", &args)
+                .unwrap()
+                .unwrap_err(),
+            "Duration must not be negative"
+        );
+        assert_eq!(ed.project(), &before);
+        assert_eq!(
+            (ed.undo_depth(), ed.redo_depth(), ed.dirty(), ed.sel()),
+            (0, 1, false, selected)
+        );
+    }
+
+    #[test]
     fn append_without_after_inherits_last_level_and_keeps_selection() {
         let mut a = app();
         a.indent(1, 2).unwrap();

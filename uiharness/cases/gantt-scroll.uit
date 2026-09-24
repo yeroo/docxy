@@ -4,11 +4,11 @@ test gantt panes stay aligned while scrolling
   assert selected_task is 99
   assert bar_100 is critical 0-81
   shot window
-  key right right right right shift+right shift+right
+  key alt+right alt+right alt+right alt+right right right right right right
   shot window
   key home
   assert selected_task is 0
-  key left left left left shift+left shift+left
+  key alt+left alt+left alt+left alt+left left left left left left
   assert border bar:1 solid teal
   shot bar:1
   shot window

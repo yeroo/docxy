@@ -10,6 +10,11 @@ use crate::schedule::{Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
 
+mod cells;
+pub use cells::{
+    day_finish, format_duration_exact, format_predecessors, parse_cell_date, parse_predecessors,
+};
+
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {
     DateTime::from_ymd_hm(2026, 1, 5, 8, 0)
@@ -225,6 +230,7 @@ impl Editor {
         name: &str,
         duration_min: i64,
     ) -> Result<usize, String> {
+        validate_duration(duration_min)?;
         let at = match after {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
@@ -317,6 +323,21 @@ impl Editor {
         if patch.level.is_some_and(|lv| !(1..=20).contains(&lv)) {
             return Err("'level' must be 1..=20".into());
         }
+        if let Some(min) = patch.duration_min {
+            validate_duration(min)?;
+        }
+        if patch.duration_min.is_some() {
+            self.validate_cell_horizon(uid, patch.duration_min, None)?;
+        }
+        let t = &self.proj.tasks[i];
+        if patch.name.as_ref().is_none_or(|name| *name == t.name)
+            && patch
+                .duration_min
+                .is_none_or(|min| min == t.duration_min && (min == 0) == t.milestone)
+            && patch.level.is_none_or(|lv| lv == t.outline_level)
+        {
+            return Ok(());
+        }
         self.snapshot();
         let t = &mut self.proj.tasks[i];
         if let Some(name) = patch.name {
@@ -377,13 +398,8 @@ impl Editor {
     }
 
     pub fn set_constraint(&mut self, uid: i32, text: &str) -> Result<(), String> {
-        let i = self.index(uid)?;
         let (constraint, constraint_date) = parse_constraint(text)?;
-        self.snapshot();
-        self.proj.tasks[i].constraint = constraint;
-        self.proj.tasks[i].constraint_date = constraint_date;
-        self.changed();
-        Ok(())
+        self.set_constraint_typed(uid, constraint, constraint_date)
     }
 
     pub fn assign_resource(&mut self, uid: i32, name: &str) -> Result<AssignOutcome, String> {
@@ -398,59 +414,27 @@ impl Editor {
             self.changed();
             return Ok(AssignOutcome::Cleared);
         }
-        let existing = self
+        let mut resources = self.proj.resources.clone();
+        let rid = find_or_stage_resource(&mut resources, name)?;
+        if self
             .proj
-            .resources
+            .assignments
             .iter()
-            .find(|r| r.name.eq_ignore_ascii_case(name))
-            .map(|r| r.uid);
-        if existing.is_some_and(|rid| {
-            self.proj
-                .assignments
-                .iter()
-                .any(|a| a.task_uid == uid && a.resource_uid == rid)
-        }) {
+            .any(|a| a.task_uid == uid && a.resource_uid == rid)
+        {
             return Ok(AssignOutcome::AlreadyAssigned);
         }
-        let rid = match existing {
-            Some(rid) => rid,
-            None => self
-                .proj
-                .resources
-                .iter()
-                .map(|r| r.uid)
-                .max()
-                .unwrap_or(0)
-                .checked_add(1)
-                .ok_or("No resource IDs available")?,
-        };
-        let auid = self
+        let mut next_aid = self
             .proj
             .assignments
             .iter()
             .map(|a| a.uid)
             .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("No assignment IDs available")?;
+            .unwrap_or(0);
+        let assignment = new_assignment(&mut next_aid, uid, rid, self.proj.tasks[i].duration_min)?;
         self.snapshot();
-        if existing.is_none() {
-            self.proj.resources.push(Resource {
-                uid: rid,
-                id: self.proj.resources.len() as i32 + 1,
-                name: name.into(),
-                is_work: true,
-                max_units: 1.0,
-                calendar_uid: None,
-            });
-        }
-        self.proj.assignments.push(Assignment {
-            uid: auid,
-            task_uid: uid,
-            resource_uid: rid,
-            units: 1.0,
-            work_min: self.proj.tasks[i].duration_min,
-        });
+        self.proj.resources = resources;
+        self.proj.assignments.push(assignment);
         self.changed();
         Ok(AssignOutcome::Assigned)
     }
@@ -477,6 +461,62 @@ impl Editor {
     }
 }
 
+/// Task creation and updates share the same non-negative duration rule.
+fn validate_duration(minutes: i64) -> Result<(), String> {
+    if minutes < 0 {
+        return Err("Duration must not be negative".into());
+    }
+    Ok(())
+}
+
+/// Both assignment entry points stage resources before taking an undo snapshot.
+fn find_or_stage_resource(resources: &mut Vec<Resource>, name: &str) -> Result<i32, String> {
+    if let Some(resource) = resources.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+        return Ok(resource.uid);
+    }
+    let uid = resources
+        .iter()
+        .map(|r| r.uid)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("No resource IDs available")?;
+    let id = resources
+        .iter()
+        .map(|r| r.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or("No resource IDs available")?;
+    resources.push(Resource {
+        uid,
+        id,
+        name: name.into(),
+        is_work: true,
+        max_units: 1.0,
+        calendar_uid: None,
+    });
+    Ok(uid)
+}
+
+fn new_assignment(
+    next_uid: &mut i32,
+    task_uid: i32,
+    resource_uid: i32,
+    work_min: i64,
+) -> Result<Assignment, String> {
+    *next_uid = next_uid
+        .checked_add(1)
+        .ok_or("No assignment IDs available")?;
+    Ok(Assignment {
+        uid: *next_uid,
+        task_uid,
+        resource_uid,
+        units: 1.0,
+        work_min,
+    })
+}
+
 fn recompute_summaries(proj: &mut Project) {
     let levels: Vec<u32> = proj.tasks.iter().map(|t| t.outline_level).collect();
     for (i, t) in proj.tasks.iter_mut().enumerate() {
@@ -491,13 +531,22 @@ pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
         .strip_suffix(['d', 'h', 'w', 'm'])
         .map(|n| (n, t.chars().last().unwrap()))
         .unwrap_or((t.as_str(), 'd'));
+    // Exact minute literals must not lose integer precision through f64.
+    if unit == 'm' {
+        if let Ok(minutes) = num.trim().parse::<i64>() {
+            return Some(minutes);
+        }
+    }
     let v: f64 = num.trim().parse().ok()?;
-    Some(match unit {
-        'h' => (v * 60.0).round() as i64,
-        'w' => proj.days_to_minutes(v * (proj.hours_per_week / proj.hours_per_day)),
-        'm' => v.round() as i64,
-        _ => proj.days_to_minutes(v),
-    })
+    let minutes = match unit {
+        'h' => v * 60.0,
+        'w' => v * proj.hours_per_week * 60.0,
+        'm' => v,
+        _ => v * proj.hours_per_day * 60.0,
+    }
+    .round();
+    (minutes.is_finite() && minutes > i64::MIN as f64 && minutes < i64::MAX as f64)
+        .then_some(minutes as i64)
 }
 
 /// Parse `TYPE [date]`, retaining the TUI's input and rejection conventions.
@@ -531,16 +580,10 @@ pub fn parse_constraint(text: &str) -> Result<(ConstraintType, Option<DateTime>)
 
 /// Prompt prefill; ASAP intentionally uses an empty string.
 pub fn constraint_hint(t: &Task) -> String {
-    let code = match t.constraint {
-        ConstraintType::AsSoonAsPossible => return String::new(),
-        ConstraintType::AsLateAsPossible => "ALAP",
-        ConstraintType::StartNoEarlierThan => "SNET",
-        ConstraintType::StartNoLaterThan => "SNLT",
-        ConstraintType::FinishNoEarlierThan => "FNET",
-        ConstraintType::FinishNoLaterThan => "FNLT",
-        ConstraintType::MustStartOn => "MSO",
-        ConstraintType::MustFinishOn => "MFO",
-    };
+    if t.constraint == ConstraintType::AsSoonAsPossible {
+        return String::new();
+    }
+    let code = t.constraint.abbrev();
     match t.constraint_date {
         Some(d) => {
             let p = d.parts();

@@ -84,6 +84,7 @@ fn path_info(tab: &DocTab, index: usize) -> Json {
     };
     fields.push(("tab".into(), Json::Num(index as f64)));
     fields.push(("imported".into(), Json::Bool(is_imported(tab))));
+    fields.extend(project_cell_state(v));
     Json::Obj(fields)
 }
 
@@ -151,18 +152,26 @@ pub(crate) fn project_verb(
         match verb {
             "proj.path" => Ok((path_info(tab, index), Effect::default())),
             "proj.save" => {
-                let target = match args.get("path") {
-                    Some(Json::Str(path)) if !path.is_empty() => PathBuf::from(path),
-                    Some(_) => return Err("proj.save needs a non-empty 'path' string".into()),
-                    None => match save_decision(tab, true, false) {
-                        SaveDecision::InPlace(path) => path,
-                        _ => {
-                            return Err("pass \"path\" to save this project (.yppx or .xml)".into());
-                        }
-                    },
-                };
                 let old_status = tab.status.clone();
-                if let Err(e) = apply_save(tab, &target) {
+                let save = (|| {
+                    if !commit_project_cell(tab) {
+                        return Err(tab.status.to_string());
+                    }
+                    let target = match args.get("path") {
+                        Some(Json::Str(path)) if !path.is_empty() => PathBuf::from(path),
+                        Some(_) => return Err("proj.save needs a non-empty 'path' string".into()),
+                        None => match save_decision(tab, true, false) {
+                            SaveDecision::InPlace(path) => path,
+                            _ => {
+                                return Err(
+                                    "pass \"path\" to save this project (.yppx or .xml)".into()
+                                );
+                            }
+                        },
+                    };
+                    apply_save(tab, &target)
+                })();
+                if let Err(e) = save {
                     tab.status = old_status;
                     return Err(e);
                 }
@@ -191,6 +200,7 @@ pub(crate) fn project_verb(
                 };
                 v.ed.replace_project(fresh.ed.project().clone());
                 v.cancel_prompt();
+                v.cell = None;
                 v.refresh_schedule_layout();
                 tab.dirty = false;
                 tab.status = loaded.status;
@@ -212,6 +222,7 @@ pub(crate) fn project_verb(
                 if projctl::MUTATING.contains(&verb) {
                     tab.dirty = v.ed.dirty();
                     v.cancel_prompt();
+                    v.cell = None;
                     effect.repaint = true;
                     effect.activity = true;
                 }

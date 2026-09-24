@@ -27,6 +27,30 @@ fn vm(t: &mut DocTab) -> &mut ProjectView {
 fn word() -> DocTab {
     sample_doc().into_tab(Kind::Docx, "Word.docx".into(), None, false)
 }
+
+#[test]
+fn cell_state_is_reported_and_only_successful_agent_changes_cancel_it() {
+    let mut tabs = vec![tab()];
+    vm(&mut tabs[0]).col = 1;
+    vm(&mut tabs[0]).open_cell(Some("Pending")).unwrap();
+    let (info, _) = call(&mut tabs, 0, "proj.path", Json::Null).unwrap();
+    assert_eq!(info.get_str("cell"), Some("Name"));
+    assert_eq!(info.get_str("cell_edit"), Some("Pending"));
+    assert!(call(&mut tabs, 0, "task.del", args(r#"{"uid":999}"#)).is_err());
+    assert_eq!(view(&tabs[0]).cell.as_ref().unwrap().buf, "Pending");
+    call(
+        &mut tabs,
+        0,
+        "task.set",
+        args(r#"{"uid":1,"name":"Agent"}"#),
+    )
+    .unwrap();
+    assert!(view(&tabs[0]).cell.is_none());
+    assert_eq!(view(&tabs[0]).ed.project().task(1).unwrap().name, "Agent");
+    vm(&mut tabs[0]).open_cell(Some("Stale")).unwrap();
+    call(&mut tabs, 0, "proj.reload", Json::Null).unwrap();
+    assert!(view(&tabs[0]).cell.is_none());
+}
 fn scratch() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -200,7 +224,17 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
     assert_eq!(
         fields.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
         [
-            "path", "modified", "name", "tasks", "start", "finish", "tab", "imported"
+            "path",
+            "modified",
+            "name",
+            "tasks",
+            "start",
+            "finish",
+            "tab",
+            "imported",
+            "cell",
+            "cell_row",
+            "cell_edit"
         ]
     );
 }
@@ -265,6 +299,76 @@ fn normal_surface_recognizes_no_harness_verbs_even_without_a_project() {
             call(&mut tabs, 0, verb, Json::Null).unwrap_err(),
             format!("unknown verb '{verb}'")
         );
+    }
+}
+
+#[test]
+fn agent_save_commits_pending_cell_before_destination_validation() {
+    let dir = scratch();
+    for save_args in [
+        Json::Null,
+        args(r#"{"path":""}"#),
+        path_args(&dir.join("bad.mpp")),
+    ] {
+        let mut tabs = vec![word(), tab()];
+        tabs[1].path = None;
+        tabs[1].status = "Existing status".into();
+        vm(&mut tabs[1]).col = 1;
+        vm(&mut tabs[1]).open_cell(Some("Pending name")).unwrap();
+        let before = snapshot(&tabs[1]);
+        let mut fields = match save_args {
+            Json::Obj(fields) => fields,
+            _ => Vec::new(),
+        };
+        fields.push(("tab".into(), Json::Num(1.)));
+        assert!(call(&mut tabs, 0, "proj.save", Json::Obj(fields)).is_err());
+        assert!(view(&tabs[1]).cell.is_none());
+        assert_eq!(
+            view(&tabs[1]).ed.project().task(1).unwrap().name,
+            "Pending name"
+        );
+        assert_eq!(view(&tabs[1]).ed.undo_depth(), before.history.0 + 1);
+        assert!(tabs[1].dirty && view(&tabs[1]).ed.dirty());
+        assert_eq!(tabs[1].status.as_ref(), before.status);
+        assert_eq!(tabs[1].path, before.path);
+        assert_eq!(tabs[1].title.as_ref(), before.title);
+        assert!(matches!(tabs[0].surface, Surface::Doc(_)));
+        // A second pending edit must also reach the bytes written on success.
+        vm(&mut tabs[1]).open_cell(Some("Saved name")).unwrap();
+        let target = dir.join("saved.yppx");
+        call(&mut tabs, 1, "proj.save", path_args(&target)).unwrap();
+        assert!(view(&tabs[1]).cell.is_none());
+        assert!(!tabs[1].dirty && !view(&tabs[1]).ed.dirty());
+        assert_eq!(
+            view(&project_tab_from_path(&target))
+                .ed
+                .project()
+                .task(1)
+                .unwrap()
+                .name,
+            "Saved name"
+        );
+    }
+}
+
+#[test]
+fn agent_save_reports_cell_error_before_missing_or_invalid_destination() {
+    let dir = scratch();
+    let target = dir.join("must-not-save.yppx");
+    for save_args in [Json::Null, args(r#"{"path":123}"#), path_args(&target)] {
+        let mut tabs = vec![tab()];
+        tabs[0].path = None;
+        tabs[0].status = "Existing status".into();
+        vm(&mut tabs[0]).col = 2;
+        vm(&mut tabs[0]).open_cell(Some("bad duration")).unwrap();
+        let before = snapshot(&tabs[0]);
+        assert_eq!(
+            call(&mut tabs, 0, "proj.save", save_args).unwrap_err(),
+            "Invalid duration (try 3d, 4h, 2w)"
+        );
+        assert_eq!(snapshot(&tabs[0]), before);
+        assert_eq!(view(&tabs[0]).cell.as_ref().unwrap().buf, "bad duration");
+        assert!(!target.exists());
     }
 }
 
@@ -371,8 +475,9 @@ fn reload_commits_only_a_successful_load() {
     assert!(v.table_x > 0. && v.table_x < f32::MAX);
     assert_eq!(v.gantt_x, (v.scale.width() - v.gantt_w).max(0.));
     let offsets = (v.table_x, v.gantt_x);
-    vm(&mut tabs[0]).key("right", true);
+    vm(&mut tabs[0]).col = 6;
     vm(&mut tabs[0]).key("right", false);
+    vm(&mut tabs[0]).pan_gantt(true);
     assert_eq!((view(&tabs[0]).table_x, view(&tabs[0]).gantt_x), offsets);
     tabs[0].path = None;
     let before = snapshot(&tabs[0]);

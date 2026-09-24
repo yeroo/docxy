@@ -923,6 +923,18 @@ pub fn dispatch(
         "click-cell" => {
             let cell = cell_arg(args, "cell")?;
             let (shift, dbl) = (arg_flag(args, "shift")?, arg_flag(args, "double")?);
+            if app.active_is_project() {
+                let tab = &mut app.tabs[app.active];
+                let crate::Surface::Project(v) = &tab.surface else {
+                    return Err("Project is not loaded".into());
+                };
+                if cell.0 as usize >= v.ed.project().tasks.len() || cell.1 >= 7 {
+                    return Err("Project cell is outside the entry table".into());
+                }
+                crate::project_cell_click(tab, cell.0 as usize, Some(cell.1 as usize), dbl);
+                app.refocus(window, cx);
+                return Done::ok(state(app));
+            }
             sheet(app)?;
             app.grid_press_cell(cell, cx);
             app.cell_click(cell.0, cell.1, shift, dbl, window, cx);
@@ -1021,6 +1033,25 @@ pub fn dispatch(
         // editor (the formula, or the unformatted literal).
         "cell" => {
             let (r, c) = cell_arg(args, "cell")?;
+            if let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface) {
+                let task =
+                    v.ed.project()
+                        .tasks
+                        .get(r as usize)
+                        .ok_or("No task at this row")?;
+                let values = crate::project_row(&v.ed, task);
+                let text = values
+                    .get(c as usize)
+                    .ok_or("No Project column at this index")?;
+                return Done::ok(Json::obj(vec![
+                    ("cell", Json::Str(a1((r, c)))),
+                    ("row", Json::Num(r as f64)),
+                    ("col", Json::Num(c as f64)),
+                    ("text", Json::Str(text.clone())),
+                    ("value", Json::Str(text.clone())),
+                    ("empty", Json::Bool(text.is_empty())),
+                ]));
+            }
             let v = sheet(app)?;
             let raw = v.edit_string(r, c);
             Done::ok(Json::obj(vec![
@@ -1089,6 +1120,7 @@ pub fn dispatch(
 
         // Persist and go. The reply is written first (see the pump).
         "quit" => {
+            crate::commit_project_cells_for_exit(&mut app.tabs);
             app.persist();
             Ok(Done {
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),

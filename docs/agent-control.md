@@ -40,16 +40,21 @@ Explicit targets do not activate that tab. Task/link arguments use stable
 Supported verbs are `proj.path`, `task.list`, `task.get`, `task.set`, `task.add`,
 `task.del`, `link.add`, `link.del`, `find`, `proj.save`, `proj.reload`, and
 `proj.open`, with the yppxy argument/result shapes. `proj.path` additionally
-reports `tab` and `imported`. Reads and rejected edits leave selection, prompts,
-history and scroll unchanged. Successful edits use the live editor's undo
-stack, reschedule, cancel only the target's prompt and repaint.
+reports `tab`, `imported`, `cell` (active column name), `cell_row` (zero-based row),
+and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
+edits leave selection, prompts, pending cell edits, history and scroll unchanged.
+Successful edits use the live editor's undo stack, reschedule, cancel the target's
+prompt, discard its uncommitted cell edit, and repaint. Successful `proj.reload`
+also discards that tab's pending cell edit.
 
 File handling differs from the TUI:
 
 - `proj.save {"path"?: "..."}` never opens a dialog. Without a path it saves
   `.yppx`/`.xml` in place; imported `.mpp` and untitled projects require a path.
   Explicit paths accept `.yppx`/`.xml`, add `.yppx` when extensionless, and
-  reject `.mpp`. Failed saves preserve binding, dirty flags and history.
+  reject `.mpp`. Saving commits a valid pending cell edit first; invalid cell
+  input blocks the write. A subsequent I/O failure preserves the file binding
+  and retains the committed edit in memory, including its dirty flag and history.
   Refusal/validation failures leave source bytes untouched; in-place writes
   retain the suite's existing risk of partial output on a mid-write I/O error.
 - `proj.reload` discards dirty content only after a successful load from its
