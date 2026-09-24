@@ -127,12 +127,15 @@ fn project_2021_oracles() {
     }
     if let Ok(paired) = std::env::var("MPP_PAIRED_CORPUS") {
         let dir = Path::new(&paired);
-        if dir.exists() {
-            let cases = pairs(dir, "");
-            assert_eq!(cases.len(), 27);
-            for (mpp, xml) in &cases {
-                check_pair(mpp, xml, false);
-            }
+        assert!(
+            dir.is_dir(),
+            "MPP_PAIRED_CORPUS is not a directory: {}",
+            dir.display()
+        );
+        let cases = pairs(dir, "");
+        assert_eq!(cases.len(), 27);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false);
         }
     }
 }

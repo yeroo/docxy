@@ -31,22 +31,11 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .unwrap_or_else(|| "Imported project".into())
     });
     let cal_ref = Project::default();
-    // MPP9 stores its root at level 1; removing UID 0 shifts its descendants
-    // back one level. Current Project stores UID 0 at level 0 already.
-    let legacy_root = decoded
-        .iter()
-        .find(|t| t.uid == 0)
-        .is_some_and(|t| t.outline_level == Some(1));
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // A task is a summary when the next task sits one WBS level deeper.
     let levels: Vec<u32> = decoded
         .iter()
-        .map(|t| {
-            t.outline_level
-                .unwrap_or(1)
-                .saturating_sub(u32::from(legacy_root))
-                .max(1)
-        })
+        .map(|t| t.outline_level.unwrap_or(1))
         .collect();
     let tasks: Vec<Task> = decoded
         .iter()

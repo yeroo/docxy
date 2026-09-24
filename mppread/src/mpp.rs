@@ -59,10 +59,9 @@ pub struct MppTask {
 }
 
 /// A predecessor link with Project's stable UID and MSPDI kind code
-/// (0 = FF, 1 = FS, 2 = SF, 3 = SS). `pred` is kept for the older `tasks` helper.
+/// (0 = FF, 1 = FS, 2 = SF, 3 = SS).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MppPred {
-    pub pred: usize,
     pub pred_uid: u32,
     pub kind: u8,
     pub lag_min: i64,
@@ -236,13 +235,15 @@ fn decode_links(cons: &[u8], fd: &[u8], rs: usize, tasks: &mut [MppTask]) {
         return; // no column reproduces the schedule → don't guess
     }
     let map = build(off);
+    for (&uid, &index) in &map {
+        tasks[index].uid = uid;
+    }
     for l in &links {
         let (Some(&p), Some(&s)) = (map.get(&l.pred_uid), map.get(&l.succ_uid)) else {
             continue;
         };
         if p != s && l.kind <= 3 {
             tasks[s].predecessors.push(MppPred {
-                pred: p,
                 pred_uid: l.pred_uid,
                 kind: l.kind as u8,
                 lag_min: 0,
@@ -424,9 +425,11 @@ pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
     Ok(info)
 }
 
-/// Days from the Unix epoch (1970-01-01) to the MS Project epoch (1984-01-01):
-/// 14 years incl. leap days 1972/76/80.
-const MPP_EPOCH_DAYS: i64 = 5113;
+/// Days from the Unix epoch to Project's date epoch (1983-12-31). The current
+/// Project corpus stores day 0x3a86 for 2025-01-06 in its XML export; using
+/// 1984-01-01 here would produce 2025-01-07. Legacy samples likewise shift
+/// from Tuesday starts to Monday starts with this epoch.
+const MPP_EPOCH_DAYS: i64 = 5112;
 
 fn u16le(b: &[u8], o: usize) -> u16 {
     if o + 2 <= b.len() {
@@ -437,7 +440,7 @@ fn u16le(b: &[u8], o: usize) -> u16 {
 }
 
 /// Decode an MPP timestamp at `off`: a 2-byte time (tenths of a minute since
-/// midnight) at `+0` and a 2-byte date (days since 1984-01-01) at `+2`, per
+/// midnight) at `+0` and a 2-byte date (days since 1983-12-31) at `+2`, per
 /// MPXJ's `MPPUtility.getTimestamp`. Returns `None` for the NA marker (0xFFFF
 /// days). Format `YYYY-MM-DD HH:MM`.
 pub fn decode_timestamp(data: &[u8], off: usize) -> Option<String> {
@@ -582,15 +585,15 @@ mod tests {
 
     #[test]
     fn mpp_timestamp_decode() {
-        // days=0, time=4800 tenths-of-min (=8h) → 1984-01-01 08:00
+        // days=0, time=4800 tenths-of-min (=8h) → 1983-12-31 08:00
         assert_eq!(
             decode_timestamp(&[0xC0, 0x12, 0x00, 0x00], 0).as_deref(),
-            Some("1984-01-01 08:00")
+            Some("1983-12-31 08:00")
         );
-        // days=366 → 1985-01-01 (1984 is a leap year)
+        // days=366 → 1984-12-31 (1984 is a leap year)
         assert_eq!(
             decode_timestamp(&[0x00, 0x00, 0x6E, 0x01], 0).as_deref(),
-            Some("1985-01-01 00:00")
+            Some("1984-12-31 00:00")
         );
         // 0xFFFF days is the NA marker
         assert_eq!(decode_timestamp(&[0x00, 0x00, 0xFF, 0xFF], 0), None);
@@ -619,7 +622,7 @@ mod tests {
         // Decode round-trips the first task's dates.
         assert_eq!(
             decode_timestamp(&fd, off).as_deref(),
-            Some("1989-06-23 08:00")
+            Some("1989-06-22 08:00")
         );
     }
 
@@ -688,7 +691,6 @@ mod tests {
         assert_eq!(
             tasks[1].predecessors,
             vec![MppPred {
-                pred: 0,
                 pred_uid: 10,
                 kind: 1,
                 lag_min: 0
@@ -697,7 +699,6 @@ mod tests {
         assert_eq!(
             tasks[2].predecessors,
             vec![MppPred {
-                pred: 1,
                 pred_uid: 20,
                 kind: 1,
                 lag_min: 0

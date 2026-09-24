@@ -1,8 +1,8 @@
-//! Validated task-table decoding for Project's newest MPP storage.
+//! Validated task-table decoding for current Project and MPP9 storage.
 use crate::{
     cfb::Cfb,
     fixedmeta,
-    mpp::{MppPred, MppTask, decode_timestamp, detect_date_layout, detect_outline_column},
+    mpp::{MppPred, MppTask, decode_timestamp},
 };
 use std::collections::{HashMap, HashSet};
 
@@ -24,17 +24,102 @@ const NEWEST: TaskLayout = TaskLayout {
     finish: 0x6c,
     level: 172,
 };
-fn timestamp(b: &[u8], o: usize) -> Option<String> {
-    let days = u16_at(b, o + 2);
-    if days == 0xffff {
-        return None;
+const LEGACY: TaskLayout = TaskLayout {
+    length: 264,
+    start: 88,
+    finish: 92,
+    level: 40,
+};
+struct LinkLayout {
+    lag: usize,
+    format: usize,
+    formats: &'static [u16],
+}
+const NEWEST_LINK: LinkLayout = LinkLayout {
+    lag: 14,
+    format: 18,
+    formats: &[3, 7],
+};
+// The three MPP9 corpus files have format 7 and zero lag throughout. The
+// +16/+14 positions follow their 20-byte records; nonzero lag has no oracle.
+const LEGACY_LINK: LinkLayout = LinkLayout {
+    lag: 16,
+    format: 14,
+    formats: &[7],
+};
+
+fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Result<(), String> {
+    let cons_path = prefix.replace("TBkndTask/", "TBkndCons/FixedData");
+    let Some(cons) = cfb.read_path(&cons_path) else {
+        return Ok(());
+    };
+    if !cons.len().is_multiple_of(20) {
+        return Err("link record length mismatch".into());
     }
-    // Project's current task table stores a one-based day ordinal. For example,
-    // 03-first-task.mpp stores 0x3a86 while its Project XML export says
-    // 2025-01-06; interpreting that as days since 1984 yields 2025-01-07.
-    let mut value = [b[o], b[o + 1], b[o + 2], b[o + 3]];
-    value[2..4].copy_from_slice(&days.checked_sub(1)?.to_le_bytes());
-    decode_timestamp(&value, 0)
+    let positions: HashMap<_, _> = out.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
+    for rec in cons.chunks_exact(20) {
+        let pred_uid = u32_at(rec, 4);
+        let succ_uid = u32_at(rec, 8);
+        let kind = u16_at(rec, 12);
+        let lag = i32::from_le_bytes(rec[layout.lag..layout.lag + 4].try_into().unwrap());
+        let format = u16_at(rec, layout.format);
+        if !positions.contains_key(&pred_uid) || !positions.contains_key(&succ_uid) {
+            return Err(format!(
+                "link refers to unknown UID {pred_uid} or {succ_uid}"
+            ));
+        }
+        if kind > 3 || !layout.formats.contains(&format) {
+            return Err(format!(
+                "unsupported link type {kind} or LagFormat {format}"
+            ));
+        }
+        let succ = positions[&succ_uid];
+        out[succ].predecessors.push(MppPred {
+            pred_uid,
+            kind: kind as u8,
+            lag_min: (lag as f64 / 10.0).round() as i64,
+        });
+    }
+    Ok(())
+}
+
+fn decode_name(v2: &[u8], off: usize, uid: u32) -> Result<String, String> {
+    let Some(header_end) = off.checked_add(4).filter(|&n| n <= v2.len()) else {
+        return Err(format!("Var2Data offset out of range for UID {uid}"));
+    };
+    let len = u32_at(v2, off) as usize;
+    let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
+        return Err(format!("Var2Data block out of range for UID {uid}"));
+    };
+    let value = &v2[header_end..end];
+    if value.len() < 4 || !value.len().is_multiple_of(2) {
+        return Err(format!("invalid task name block for UID {uid}"));
+    }
+    let units: Vec<u16> = value
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    if *units.last().unwrap() != 0 {
+        return Err(format!("unterminated task name for UID {uid}"));
+    }
+    let name = String::from_utf16(&units[..units.len() - 1])
+        .map_err(|_| format!("invalid UTF-16 task name for UID {uid}"))?;
+    if name.is_empty() || name.chars().any(char::is_control) {
+        return Err(format!("invalid task name for UID {uid}"));
+    }
+    Ok(name)
+}
+
+fn validate_legacy_level(index: usize, uid: u32, level: u32, previous: u32) -> Result<(), String> {
+    if (index == 0 && (uid != 0 || level != 0))
+        || level > 20
+        || (index > 0 && (level == 0 || level > previous + 1))
+    {
+        return Err(format!(
+            "invalid legacy outline level {level} for UID {uid}"
+        ));
+    }
+    Ok(())
 }
 
 fn names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, String>, String> {
@@ -66,27 +151,11 @@ fn names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, Strin
             return Err(format!("Var2Data offset out of range at entry {i}"));
         };
         let len = u32_at(v2, off) as usize;
-        let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
+        let Some(_end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
             return Err(format!("Var2Data block out of range at entry {i}"));
         };
         if key == 0x000e {
-            let value = &v2[header_end..end];
-            if value.len() < 4 || !value.len().is_multiple_of(2) {
-                return Err(format!("invalid task name block for UID {uid}"));
-            }
-            let units: Vec<u16> = value
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .collect();
-            if *units.last().unwrap() != 0 {
-                return Err(format!("unterminated task name for UID {uid}"));
-            }
-            let name = String::from_utf16(&units[..units.len() - 1])
-                .map_err(|_| format!("invalid UTF-16 task name for UID {uid}"))?;
-            if name.is_empty() || name.chars().any(char::is_control) {
-                return Err(format!("invalid task name for UID {uid}"));
-            }
-            names.insert(uid, name);
+            names.insert(uid, decode_name(v2, off, uid)?);
         }
     }
     if names.len() != uids.len() {
@@ -134,9 +203,7 @@ fn legacy_names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32
             if !uids.contains(&uid) {
                 return Err(format!("legacy task name references unknown UID {uid}"));
             }
-            let name = crate::vardata::string_at(v2, off)
-                .ok_or_else(|| format!("invalid legacy task name for UID {uid}"))?;
-            out.insert(uid, name);
+            out.insert(uid, decode_name(v2, off, uid)?);
         }
     }
     if out.len() != uids.len() {
@@ -181,8 +248,8 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
             return Err(format!("unrecognized task record length {len}"));
         }
         let rec = &fd[off..off + len];
-        let start = timestamp(rec, NEWEST.start);
-        let finish = timestamp(rec, NEWEST.finish);
+        let start = decode_timestamp(rec, NEWEST.start);
+        let finish = decode_timestamp(rec, NEWEST.finish);
         let level = rec[NEWEST.level] as u32;
         if level > 20 {
             return Err(format!("invalid outline level {level} for UID {uid}"));
@@ -190,9 +257,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
         if start
             .as_ref()
             .zip(finish.as_ref())
-            .is_some_and(|(s, f)| s > f)
+            .is_none_or(|(s, f)| s > f)
         {
-            return Err(format!("inverted task dates for UID {uid}"));
+            return Err(format!("missing or inverted task dates for UID {uid}"));
         }
         out.push(MppTask {
             uid,
@@ -203,38 +270,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
             predecessors: Vec::new(),
         });
     }
-    let positions: HashMap<_, _> = out.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
-    let cons_path = prefix.replace("TBkndTask/", "TBkndCons/FixedData");
-    if let Some(cons) = cfb.read_path(&cons_path) {
-        if !cons.len().is_multiple_of(20) {
-            return Err("link record length mismatch".into());
-        }
-        for rec in cons.chunks_exact(20) {
-            let pred_uid = u32_at(rec, 4);
-            let succ_uid = u32_at(rec, 8);
-            let kind = u16_at(rec, 12);
-            let lag = i32::from_le_bytes(rec[14..18].try_into().unwrap());
-            let format = u16_at(rec, 18);
-            let Some(&pred) = positions.get(&pred_uid) else {
-                return Err(format!("link to unknown predecessor UID {pred_uid}"));
-            };
-            let Some(&succ) = positions.get(&succ_uid) else {
-                return Err(format!("link to unknown successor UID {succ_uid}"));
-            };
-            if kind > 3 || !matches!(format, 3 | 7) {
-                return Err(format!(
-                    "unsupported link type {kind} or LagFormat {format}"
-                ));
-            }
-            let lag_min = (lag as f64 / 10.0).round() as i64;
-            out[succ].predecessors.push(MppPred {
-                pred,
-                pred_uid,
-                kind: kind as u8,
-                lag_min,
-            });
-        }
-    }
+    links(&cfb, prefix, &mut out, NEWEST_LINK)?;
     Ok(out)
 }
 
@@ -248,72 +284,37 @@ fn decode_legacy(
     uids: &HashSet<u32>,
 ) -> Result<Vec<MppTask>, String> {
     let named = legacy_names(vm, v2, uids)?;
-    let mut packed = Vec::with_capacity(indexed.len() * 264);
-    for (_, off, len) in &indexed {
-        if *len != 264 {
+    let mut out = Vec::new();
+    let mut previous_level = 0u32;
+    for (i, (uid, off, len)) in indexed.iter().enumerate() {
+        if *len != LEGACY.length {
             return Err("legacy task record length mismatch".into());
         }
-        packed.extend_from_slice(&fd[*off..*off + *len]);
-    }
-    let pos: HashMap<_, _> = indexed
-        .iter()
-        .enumerate()
-        .map(|(i, (uid, _, _))| (*uid, i))
-        .collect();
-    let cons_path = prefix.replace("TBkndTask/", "TBkndCons/FixedData");
-    let cons = cfb.read_path(&cons_path).unwrap_or_default();
-    if !cons.len().is_multiple_of(20) {
-        return Err("legacy link record length mismatch".into());
-    }
-    let links: Vec<_> = cons
-        .chunks_exact(20)
-        .filter(|r| u16_at(r, 12) == 1)
-        .filter_map(|r| Some((*pos.get(&u32_at(r, 4))?, *pos.get(&u32_at(r, 8))?)))
-        .collect();
-    let Some((stride, date_off)) = detect_date_layout(&packed, indexed.len(), &links) else {
-        return Err("legacy task dates do not fit an indexed layout".into());
-    };
-    if stride != 264 {
-        return Err(format!(
-            "legacy date layout stride {stride} does not match FixedMeta"
-        ));
-    }
-    let outline = detect_outline_column(&packed, 264, indexed.len());
-    let mut out = Vec::new();
-    for (i, (uid, _, _)) in indexed.iter().enumerate() {
+        let rec = &fd[*off..*off + *len];
+        let level = rec[LEGACY.level] as u32;
+        validate_legacy_level(i, *uid, level, previous_level)?;
+        previous_level = level;
+        let start = decode_timestamp(rec, LEGACY.start);
+        let finish = decode_timestamp(rec, LEGACY.finish);
+        if start
+            .as_ref()
+            .zip(finish.as_ref())
+            .is_none_or(|(s, f)| s > f)
+        {
+            return Err(format!(
+                "missing or inverted legacy task dates for UID {uid}"
+            ));
+        }
         out.push(MppTask {
             uid: *uid,
             name: named[uid].clone(),
-            start: decode_timestamp(&packed, i * 264 + date_off),
-            finish: decode_timestamp(&packed, i * 264 + date_off + 4),
-            outline_level: outline.map(|off| packed[i * 264 + off] as u32 + 1),
+            start,
+            finish,
+            outline_level: Some(level),
             predecessors: Vec::new(),
         });
     }
-    for rec in cons.chunks_exact(20) {
-        let pred_uid = u32_at(rec, 4);
-        let succ_uid = u32_at(rec, 8);
-        let kind = u16_at(rec, 12);
-        let format = u16_at(rec, 14);
-        let lag = i32::from_le_bytes(rec[16..20].try_into().unwrap());
-        let Some(&pred) = pos.get(&pred_uid) else {
-            return Err(format!("legacy link to unknown UID {pred_uid}"));
-        };
-        let Some(&succ) = pos.get(&succ_uid) else {
-            return Err(format!("legacy link to unknown UID {succ_uid}"));
-        };
-        if kind > 3 || !matches!(format, 3 | 7) {
-            return Err(format!(
-                "unsupported legacy link type {kind} or LagFormat {format}"
-            ));
-        }
-        out[succ].predecessors.push(MppPred {
-            pred,
-            pred_uid,
-            kind: kind as u8,
-            lag_min: (lag as f64 / 10.0).round() as i64,
-        });
-    }
+    links(cfb, prefix, &mut out, LEGACY_LINK)?;
     Ok(out)
 }
 
@@ -321,6 +322,22 @@ fn decode_legacy(
 mod tests {
     use super::*;
     use crate::cfb::{Node, write_cfb_tree};
+
+    #[test]
+    fn legacy_accepts_short_non_latin_names_and_flat_children() {
+        let mut block = 6u32.to_le_bytes().to_vec();
+        for unit in "中文".encode_utf16() {
+            block.extend_from_slice(&unit.to_le_bytes());
+        }
+        block.extend_from_slice(&0u16.to_le_bytes());
+        assert_eq!(decode_name(&block, 0, 1).unwrap(), "中文");
+        let mut previous = 0;
+        for (i, level) in [0, 1, 2, 2].into_iter().enumerate() {
+            validate_legacy_level(i, i as u32, level, previous).unwrap();
+            previous = level;
+        }
+        assert!(validate_legacy_level(2, 2, 3, 1).is_err());
+    }
 
     struct Streams {
         fm: Vec<u8>,
@@ -425,6 +442,9 @@ mod tests {
         let mut s = fixture();
         s.v2[4] = 1;
         reject(&s); // binary/control name
+        let mut s = fixture();
+        s.fd[250 + 0x68 + 2..250 + 0x68 + 4].copy_from_slice(&0xffffu16.to_le_bytes());
+        reject(&s); // a task with no start date cannot be imported
         let mut s = fixture();
         s.fd[250..254].copy_from_slice(&0u32.to_le_bytes());
         reject(&s); // duplicate UID

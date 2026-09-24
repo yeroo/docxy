@@ -1,7 +1,4 @@
-//! Decode and list the tasks (name + start/finish) from a `.mpp` file.
-//!
-//! Names come from VarMeta/Var2Data; start/finish are auto-detected from the
-//! per-task FixedData records (left blank when no layout fits).
+//! Decode and list validated task rows from a `.mpp` file.
 //!
 //! Usage:
 //!     cargo run -p mppread --example tasknames -- some.mpp
@@ -15,7 +12,10 @@ fn main() {
         eprintln!("{file}: {e}");
         std::process::exit(1);
     });
-    let tasks = mppread::mpp::tasks(&bytes);
+    let tasks = mppread::mpp::decode_tasks(&bytes).unwrap_or_else(|e| {
+        eprintln!("{file}: {e}");
+        std::process::exit(1);
+    });
     let dated = tasks.iter().filter(|t| t.start.is_some()).count();
     let leveled = tasks.iter().filter(|t| t.outline_level.is_some()).count();
     let links: usize = tasks.iter().map(|t| t.predecessors.len()).sum();
@@ -30,7 +30,7 @@ fn main() {
         let preds: Vec<String> = t
             .predecessors
             .iter()
-            .map(|p| (p.pred + 1).to_string())
+            .map(|p| p.pred_uid.to_string())
             .collect();
         let dep = if preds.is_empty() {
             String::new()
