@@ -266,6 +266,10 @@ impl Editor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("No task IDs available")?;
+        // Follow the plan's own default mode; a manual task starts at the
+        // project start (or the anchor the schedule actually uses).
+        let manual = self.proj.new_tasks_are_manual;
+        let manual_start = manual.then(|| self.proj.start_date.unwrap_or(self.sched.project_start));
         self.edit_structure(|proj| {
             proj.tasks.insert(
                 at,
@@ -276,6 +280,9 @@ impl Editor {
                     outline_level,
                     duration_min,
                     milestone: duration_min == 0,
+                    manual,
+                    manual_start,
+                    manual_duration_min: manual.then_some(duration_min),
                     ..Task::default()
                 },
             )
@@ -360,6 +367,12 @@ impl Editor {
             if let Some(min) = patch.duration_min {
                 t.duration_min = min;
                 t.milestone = min == 0;
+                // A manual task keeps its start; its finish follows the new
+                // duration instead of staying pinned.
+                if t.manual {
+                    t.manual_duration_min = Some(min);
+                    t.manual_finish = None;
+                }
             }
             if let Some(lv) = patch.level {
                 t.outline_level = lv;

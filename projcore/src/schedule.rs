@@ -965,9 +965,19 @@ pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime
         .find(|c| c.uid == proj.default_calendar_uid)
         .cloned()
         .unwrap_or_else(|| crate::model::Calendar::standard(proj.default_calendar_uid));
+    working_minutes_on(&cal, start, finish)
+}
+
+/// Working minutes between two wall-clock instants on one calendar, counted
+/// through the same timeline the scheduler uses.
+pub(crate) fn working_minutes_on(
+    cal: &crate::model::Calendar,
+    start: DateTime,
+    finish: DateTime,
+) -> i64 {
     let a = start.minutes().min(finish.minutes());
     let b = start.minutes().max(finish.minutes());
-    let tl = Timeline::build(&week_pairs(&cal), a, a, (b - a) + 480, b + 1440);
+    let tl = Timeline::build(&week_pairs(cal), a, a, (b - a) + 480, b + 1440);
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
