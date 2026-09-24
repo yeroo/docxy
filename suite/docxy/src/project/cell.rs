@@ -152,18 +152,32 @@ impl ProjectView {
                 self.ed.set_duration_min(uid, min)?;
             }
             3 | 4 => {
-                let date = parse_cell_date(&cell.buf)?;
+                let day = parse_cell_date(&cell.buf)?;
+                // A manual task takes the typed date as its own start or
+                // finish; an auto task gets an SNET/FNET constraint.
+                if task.manual {
+                    if cell.col == 3 {
+                        self.ed.set_start(uid, day)?;
+                    } else {
+                        self.ed.set_finish(uid, day)?;
+                    }
+                    return Ok(None);
+                }
                 let (kind, date) = if cell.col == 3 {
-                    (ConstraintType::StartNoEarlierThan, date)
+                    (ConstraintType::StartNoEarlierThan, day)
                 } else {
                     (
                         ConstraintType::FinishNoEarlierThan,
-                        day_finish(self.ed.project(), task, date)?,
+                        day_finish(self.ed.project(), task, day)?,
                     )
                 };
                 let previous = task.constraint;
                 let changed = (previous, task.constraint_date) != (kind, Some(date));
-                self.ed.set_constraint_typed(uid, kind, Some(date))?;
+                if cell.col == 3 {
+                    self.ed.set_start(uid, day)?;
+                } else {
+                    self.ed.set_finish(uid, day)?;
+                }
                 if !changed {
                     return Ok(None);
                 }

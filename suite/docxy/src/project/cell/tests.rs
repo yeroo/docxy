@@ -141,6 +141,40 @@ fn no_op_date_duration_and_milestone_keep_history_and_redo() {
 }
 
 #[test]
+fn typed_dates_move_a_manual_task_without_constraints() {
+    let mut p = v(&tab()).ed.project().clone();
+    for task in &mut p.tasks {
+        task.manual = true;
+        task.manual_start = p.start_date;
+    }
+    let mut t = project_tab(
+        "test.yppx".into(),
+        None,
+        Surface::Project(ProjectView::new(p, false)),
+        false,
+        "loaded".into(),
+    );
+    let depth = v(&t).ed.undo_depth();
+    // Tab commits and stays on the row; Enter would move down.
+    edit(&mut t, 3, "2026-01-08");
+    key(&mut t, "tab");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    edit(&mut t, 4, "2026-01-09");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    let ed = &v(&t).ed;
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
+    assert_eq!(task.duration_min, 960);
+    let row = project_row(ed, task);
+    assert_eq!(
+        (row[3].as_str(), row[4].as_str()),
+        ("2026-01-08", "2026-01-09")
+    );
+    assert_eq!(ed.undo_depth(), depth + 2);
+}
+
+#[test]
 fn reentering_an_existing_constraint_does_not_claim_a_change() {
     let mut t = tab();
     vm(&mut t).ed.set_constraint(20, "SNET 2026-03-06").unwrap();
