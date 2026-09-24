@@ -17,16 +17,16 @@ pub(crate) enum ProjectAct {
     Recalc,
     Assign,
     ClearResources,
+    LevelAll,
+    ClearLeveling,
     ExportGantt,
     ScrollLeft,
     ScrollRight,
     GoToStart,
-    Theme,
+    Find,
+    // Keyboard/QAT/backstage only; excluded from the ribbon inventory.
     Level,
     Save,
-    SaveAs,
-    Find,
-    // Keyboard/QAT only; excluded from the ribbon inventory.
     Undo,
     Redo,
     FindNext,
@@ -48,18 +48,19 @@ impl ProjectAct {
         Self::Recalc,
         Self::Assign,
         Self::ClearResources,
+        Self::LevelAll,
+        Self::ClearLeveling,
         Self::ExportGantt,
         Self::ScrollLeft,
         Self::ScrollRight,
         Self::GoToStart,
-        Self::Theme,
-        Self::Level,
-        Self::Save,
-        Self::SaveAs,
         Self::Find,
     ];
 }
 
+/// The Project document ribbon. Tabs, groups and command names follow Microsoft
+/// Project so written instructions ("Project tab > Schedule > Set Baseline") can
+/// be followed as they are; docxy-only extras sit in the nearest group.
 pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
     use ProjectAct::*;
     let cmd = |id, icon, label, act, shortcut, key| {
@@ -71,203 +72,226 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
             "T",
             vec![
                 rs::group(
-                    "Tasks",
+                    "Schedule",
                     90,
+                    vec![
+                        rs::column(vec![
+                            cmd(
+                                "pr-indent",
+                                "indent-increase",
+                                "Indent Task",
+                                Indent,
+                                "Alt+Shift+Right",
+                                "I",
+                            ),
+                            cmd(
+                                "pr-outdent",
+                                "indent-decrease",
+                                "Outdent Task",
+                                Outdent,
+                                "Alt+Shift+Left",
+                                "O",
+                            ),
+                        ]),
+                        Control::Large(cmd(
+                            "pr-link",
+                            "copy",
+                            "Link the Selected Tasks",
+                            AddLink,
+                            "Alt, T, P",
+                            "P",
+                        )),
+                    ],
+                ),
+                rs::group(
+                    "Insert",
+                    80,
                     vec![
                         Control::Large(cmd(
                             "pr-add",
                             "table-insert-row",
-                            "Add Task",
+                            "Task",
                             AddTask,
                             "Insert",
                             "N",
                         )),
+                        rs::column(vec![cmd(
+                            "pr-milestone",
+                            "symbol",
+                            "Milestone",
+                            Milestone,
+                            "Alt, T, M",
+                            "M",
+                        )]),
+                    ],
+                ),
+                rs::group(
+                    "Properties",
+                    70,
+                    vec![
+                        Control::Large(cmd(
+                            "pr-constraint",
+                            "print-layout",
+                            "Information",
+                            Constraint,
+                            "Alt, T, C",
+                            "C",
+                        )),
                         rs::column(vec![
+                            cmd("pr-rename", "font-name", "Rename", Rename, "Alt, T, R", "R"),
                             cmd(
-                                "pr-delete",
-                                "table-delete-row",
-                                "Delete",
-                                DeleteTask,
-                                "Delete",
-                                "X",
-                            ),
-                            cmd(
-                                "pr-milestone",
-                                "symbol",
-                                "Milestone",
-                                Milestone,
-                                "Alt, T, M",
-                                "M",
+                                "pr-duration",
+                                "rule",
+                                "Duration",
+                                Duration,
+                                "Alt, T, D",
+                                "D",
                             ),
                         ]),
                     ],
                 ),
                 rs::group(
-                    "Outline",
-                    70,
+                    "Editing",
+                    60,
                     vec![rs::column(vec![
-                        cmd(
-                            "pr-indent",
-                            "indent-increase",
-                            "Indent",
-                            Indent,
-                            "Alt+Shift+Right",
-                            "I",
-                        ),
-                        cmd(
-                            "pr-outdent",
-                            "indent-decrease",
-                            "Outdent",
-                            Outdent,
-                            "Alt+Shift+Left",
-                            "O",
-                        ),
-                    ])],
-                ),
-                rs::group(
-                    "Edit",
-                    80,
-                    vec![rs::column(vec![
-                        cmd("pr-rename", "font-name", "Rename", Rename, "Alt, T, R", "R"),
-                        cmd(
-                            "pr-duration",
-                            "rule",
-                            "Duration",
-                            Duration,
-                            "Alt, T, D",
-                            "D",
-                        ),
                         cmd("pr-find", "find", "Find", Find, "Ctrl+F / F3 next", "F"),
-                    ])],
-                ),
-                rs::group(
-                    "File",
-                    20,
-                    vec![rs::column(vec![
-                        cmd("pr-save", "save", "Save", Save, "Ctrl+S", "S"),
-                        cmd("pr-saveas", "save", "Save As", SaveAs, "Alt, T, A", "A"),
+                        cmd(
+                            "pr-delete",
+                            "table-delete-row",
+                            "Delete Task",
+                            DeleteTask,
+                            "Delete",
+                            "X",
+                        ),
                     ])],
                 ),
             ],
         ),
         rs::tab(
-            "Schedule",
-            "S",
+            "Resource",
+            "U",
             vec![
                 rs::group(
-                    "Dependencies",
+                    "Assignments",
                     90,
                     vec![
-                        Control::Large(cmd("pr-link", "copy", "Link", AddLink, "Alt, S, P", "P")),
-                        rs::column(vec![
-                            cmd(
-                                "pr-constraint",
-                                "print-layout",
-                                "Constraint",
-                                Constraint,
-                                "Alt, S, C",
-                                "C",
-                            ),
-                            cmd("pr-recalc", "redo", "Recalculate", Recalc, "Alt, S, E", "E"),
-                        ]),
+                        Control::Large(cmd(
+                            "pr-assign",
+                            "comment",
+                            "Assign Resources",
+                            Assign,
+                            "Alt, U, A",
+                            "A",
+                        )),
+                        rs::column(vec![cmd(
+                            "pr-clear",
+                            "table-delete-row",
+                            "Clear Resources",
+                            ClearResources,
+                            "Alt, U, R",
+                            "R",
+                        )]),
                     ],
                 ),
                 rs::group(
-                    "Resources",
+                    "Level",
                     80,
                     vec![
-                        rs::column(vec![
-                            cmd("pr-assign", "comment", "Assign", Assign, "Alt, S, A", "A"),
-                            cmd(
-                                "pr-clear",
-                                "table-delete-row",
-                                "Clear resources",
-                                ClearResources,
-                                "Alt, S, R",
-                                "R",
-                            ),
-                        ]),
-                        Control::Toggle(cmd(
-                            "pr-level",
+                        Control::Large(cmd(
+                            "pr-level-all",
                             "align-left",
-                            "Level resources",
-                            Level,
-                            "Ctrl+Shift+L",
+                            "Level All",
+                            LevelAll,
+                            "Alt, U, L  (Ctrl+Shift+L toggles)",
                             "L",
                         )),
+                        rs::column(vec![cmd(
+                            "pr-level-clear",
+                            "table-delete-row",
+                            "Clear Leveling",
+                            ClearLeveling,
+                            "Alt, U, C",
+                            "C",
+                        )]),
                     ],
                 ),
-                rs::group(
-                    "Baseline",
-                    70,
-                    vec![Control::Large(cmd(
+            ],
+        ),
+        rs::tab(
+            "Report",
+            "R",
+            vec![rs::group(
+                "Export",
+                90,
+                vec![Control::Large(cmd(
+                    "pr-export",
+                    "save",
+                    "Export Gantt",
+                    ExportGantt,
+                    "Ctrl+E",
+                    "E",
+                ))],
+            )],
+        ),
+        rs::tab(
+            "Project",
+            "P",
+            vec![rs::group(
+                "Schedule",
+                90,
+                vec![
+                    Control::Large(cmd(
+                        "pr-recalc",
+                        "redo",
+                        "Calculate Project",
+                        Recalc,
+                        "Alt, P, E",
+                        "E",
+                    )),
+                    Control::Large(cmd(
                         "pr-baseline",
                         "save",
-                        "Set baseline",
+                        "Set Baseline",
                         Baseline,
-                        "Alt, S, B",
+                        "Alt, P, B",
                         "B",
-                    ))],
-                ),
-            ],
+                    )),
+                ],
+            )],
         ),
         rs::tab(
             "View",
             "W",
-            vec![
-                rs::group(
-                    "Gantt",
-                    90,
-                    vec![
-                        Control::Large(cmd(
-                            "pr-export",
-                            "save",
-                            "Export Gantt",
-                            ExportGantt,
-                            "Ctrl+E",
-                            "E",
-                        )),
-                        rs::column(vec![
-                            cmd(
-                                "pr-left",
-                                "indent-decrease",
-                                "Scroll left",
-                                ScrollLeft,
-                                "Alt+Left",
-                                "L",
-                            ),
-                            cmd(
-                                "pr-right",
-                                "indent-increase",
-                                "Scroll right",
-                                ScrollRight,
-                                "Alt+Right",
-                                "R",
-                            ),
-                            cmd(
-                                "pr-start",
-                                "indent-decrease",
-                                "Go to start",
-                                GoToStart,
-                                "Alt, W, G",
-                                "G",
-                            ),
-                        ]),
-                    ],
-                ),
-                rs::group(
-                    "Window",
-                    10,
-                    vec![Control::Large(cmd(
-                        "pr-theme",
-                        "case",
-                        "Theme",
-                        Theme,
-                        "Alt, W, T",
-                        "T",
-                    ))],
-                ),
-            ],
+            vec![rs::group(
+                "Zoom",
+                90,
+                vec![rs::column(vec![
+                    cmd(
+                        "pr-left",
+                        "indent-decrease",
+                        "Scroll Left",
+                        ScrollLeft,
+                        "Alt+Left",
+                        "L",
+                    ),
+                    cmd(
+                        "pr-right",
+                        "indent-increase",
+                        "Scroll Right",
+                        ScrollRight,
+                        "Alt+Right",
+                        "R",
+                    ),
+                    cmd(
+                        "pr-start",
+                        "indent-decrease",
+                        "Go to Start",
+                        GoToStart,
+                        "Alt, W, G",
+                        "G",
+                    ),
+                ])],
+            )],
         ),
     ])
 }
@@ -565,8 +589,15 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                         Some("Baseline set — baseline bars now show under the current bars".into());
                 }
             }
-            Level => {
-                v.ed.toggle_level();
+            Level | LevelAll | ClearLeveling => {
+                let want = match act {
+                    LevelAll => true,
+                    ClearLeveling => false,
+                    _ => !v.ed.leveled(),
+                };
+                if v.ed.leveled() != want {
+                    v.ed.toggle_level();
+                }
                 status = Some(
                     if v.ed.leveled() {
                         "Resource leveling ON — bars delayed to fit resource capacity"
@@ -605,7 +636,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 v.pan_gantt(true);
             }
             GoToStart => v.gantt_x = 0.,
-            Save | SaveAs | ExportGantt | Theme => {} // window-dependent host actions
+            Save | ExportGantt => {} // window-dependent host actions
         }
         Ok(())
     })();
@@ -760,8 +791,6 @@ impl Docxy {
         self.project_prompt_cancel();
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),
-            ProjectAct::SaveAs => return self.save_project(true, window, cx),
-            ProjectAct::Theme => return self.cycle_theme(window, cx),
             ProjectAct::ExportGantt => {
                 let Some(tab) = self.tabs.get(self.active) else {
                     return;

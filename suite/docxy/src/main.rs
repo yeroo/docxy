@@ -204,7 +204,9 @@ fn session_path() -> PathBuf {
 #[derive(Clone, Copy, PartialEq)]
 enum RibbonTab {
     Task,
-    Schedule,
+    Resource,
+    Report,
+    Project,
     Home,
     Insert,
     Review,
@@ -12330,6 +12332,17 @@ fn cmdt(
     rs::cmd(id, icon, label, act).tip(label, "", shortcut)
 }
 
+/// Hover text for a ribbon command: its title, then its shortcut when it has one.
+/// Large and small buttons share it so neither hides the shortcut.
+fn cmd_tip_text<A>(cmd: &rs::Cmd<A>) -> SharedString {
+    let tip = cmd.tip;
+    if tip.shortcut.is_empty() {
+        tip.title.into()
+    } else {
+        format!("{}  \u{00b7}  {}", tip.title, tip.shortcut).into()
+    }
+}
+
 fn docxy_ribbon() -> rs::Ribbon<Act> {
     use Act::*;
     rs::Ribbon::new(vec![
@@ -12683,7 +12696,9 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
         &[
             (None, "File", "F"),
             (Some(Task), "Task", "T"),
-            (Some(Schedule), "Schedule", "S"),
+            (Some(Resource), "Resource", "U"),
+            (Some(Report), "Report", "R"),
+            (Some(Project), "Project", "P"),
             (Some(View), "View", "W"),
         ]
     } else {
@@ -12722,7 +12737,9 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
         RibbonTab::View => "View",
         RibbonTab::Table => "Table",
         RibbonTab::Task => "Task",
-        RibbonTab::Schedule => "Schedule",
+        RibbonTab::Resource => "Resource",
+        RibbonTab::Report => "Report",
+        RibbonTab::Project => "Project",
     }
 }
 
@@ -16444,7 +16461,7 @@ impl Docxy {
     fn large_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let act = cmd.act;
         let on = self.act_active(act);
-        let tip: SharedString = cmd.label.into();
+        let tip = cmd_tip_text(cmd);
         let keytip =
             (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
         // Wrap a multi-word label at a word boundary rather than breaking mid-word.
@@ -16497,7 +16514,7 @@ impl Docxy {
         let rp = doc.map(|ed| ed.caret_props());
         let pp = doc.map(|ed| ed.caret_para_props());
         match act {
-            Project(ProjectAct::Level) => self
+            Project(ProjectAct::LevelAll) => self
                 .tabs
                 .get(self.active)
                 .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.ed.leveled())),
@@ -16532,13 +16549,8 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let act = cmd.act;
-        let tip = cmd.tip;
         let on = self.act_active(act);
-        let tip_text: SharedString = if tip.shortcut.is_empty() {
-            tip.title.into()
-        } else {
-            format!("{}  \u{00b7}  {}", tip.title, tip.shortcut).into()
-        };
+        let tip_text = cmd_tip_text(cmd);
         let keytip =
             (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
         div()

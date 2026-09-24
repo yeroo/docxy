@@ -6,17 +6,21 @@ test project ribbon KeyTips dispatch and cancel prompts
   assert tasks is 4
   assert selected_name is New task
   assert dirty is true
-  key alt s
-  assert ribbon_tab is Schedule
+  key alt t
+  assert ribbon_tab is Task
   key p
   assert prompt is predecessor:
   type 1
   shot window
   key escape
   assert prompt is none
-  key alt s l
+  key alt u
+  assert ribbon_tab is Resource
+  key l
   assert status is Resource leveling ON — bars delayed to fit resource capacity
-  key alt s e
+  key alt p
+  assert ribbon_tab is Project
+  key e
   assert status is Rescheduled (automatic on every edit)
   key alt t r
   assert prompt is rename:New task

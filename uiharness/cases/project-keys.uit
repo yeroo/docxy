@@ -15,21 +15,21 @@ test project editing keys and prompts
   type 3d
   key enter
   assert bar_2 is on-track 0-2
-  key alt s p
+  key alt t p
   type 3
   key enter
   assert bar_2 is critical 4-8
-  key alt s c
+  key alt t c
   key backspace backspace backspace backspace
   type SNET 2026-01-19
   key enter
   assert status is Constraint set: SNET
   assert bar_2 is critical 14-16
-  key alt s a
+  key alt u a
   type Alice
   key enter
   assert status is Assigned Alice
-  key alt s b
+  key alt p b
   assert status is Baseline set — baseline bars now show under the current bars
   key ctrl+shift+l
   assert status is Resource leveling ON — bars delayed to fit resource capacity

@@ -124,7 +124,7 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
     let r = project_ribbon();
     assert_eq!(
         r.tabs.iter().map(|t| t.name).collect::<Vec<_>>(),
-        ["Task", "Schedule", "View"]
+        ["Task", "Resource", "Report", "Project", "View"]
     );
     let mut acts = vec![];
     for t in &r.tabs {
@@ -144,6 +144,11 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
                     assert!(!c.key_tip.is_empty() && !keys.contains(&c.key_tip));
                     keys.push(c.key_tip);
                     assert!(!c.tip.title.is_empty() && !c.tip.shortcut.is_empty());
+                    assert!(
+                        cmd_tip_text(c).ends_with(c.tip.shortcut),
+                        "{} hover shows its shortcut",
+                        c.label
+                    );
                     assert!(
                         Path::new(env!("CARGO_MANIFEST_DIR"))
                             .join("assets/icons")
@@ -183,22 +188,124 @@ fn ribbon_context_survives_valid_switches_only() {
             .iter()
             .map(|x| x.1)
             .collect::<Vec<_>>(),
-        ["File", "Task", "Schedule", "View"]
+        ["File", "Task", "Resource", "Report", "Project", "View"]
     );
     assert_eq!(
         ribbon_tab_set(Kind::Project)
             .iter()
             .map(|x| x.2)
             .collect::<Vec<_>>(),
-        ["F", "T", "S", "W"]
+        ["F", "T", "U", "R", "P", "W"]
     );
     assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false) == RibbonTab::View);
     assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false) == RibbonTab::Home);
     assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, true) == RibbonTab::Table);
     assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, false) == RibbonTab::Home);
     assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Table, true) == RibbonTab::Task);
-    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Project), 2);
+    for tab in [RibbonTab::Resource, RibbonTab::Report, RibbonTab::Project] {
+        assert!(valid_ribbon_tab(Kind::Project, tab, false) == tab);
+        assert!(valid_ribbon_tab(Kind::Docx, tab, false) == RibbonTab::Home);
+        assert!(valid_ribbon_tab(Kind::Xlsx, tab, false) == RibbonTab::Home);
+    }
+    assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Home, false) == RibbonTab::Task);
+    assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Project), 4);
+    assert_eq!(ribbon_tab_index(RibbonTab::Project, Kind::Project), 3);
+    assert_eq!(ribbon_tab_name(RibbonTab::Project), "Project");
     assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Docx), 3);
+}
+
+/// The owner's bar for #72: a Microsoft Project instruction written as a ribbon
+/// path (tab > group > command) must be followable as written, by mouse and by
+/// KeyTips.
+#[test]
+fn project_instruction_paths_exist() {
+    use ProjectAct::*;
+    let r = project_ribbon();
+    let mut paths = vec![];
+    for t in &r.tabs {
+        for g in &t.groups {
+            for control in &g.items {
+                let cmds: Vec<_> = match control {
+                    Control::Large(c) | Control::Toggle(c) => vec![c],
+                    Control::Column(c) => c.iter().collect(),
+                    _ => panic!("unexpected control"),
+                };
+                for c in cmds {
+                    paths.push((t.name, g.title, c.label, c.act, c.key_tip));
+                }
+            }
+        }
+    }
+    for (tab, group, label, act) in [
+        ("Task", "Schedule", "Indent Task", Indent),
+        ("Task", "Schedule", "Outdent Task", Outdent),
+        ("Task", "Schedule", "Link the Selected Tasks", AddLink),
+        ("Task", "Insert", "Task", AddTask),
+        ("Task", "Insert", "Milestone", Milestone),
+        ("Task", "Properties", "Information", Constraint),
+        ("Task", "Editing", "Find", Find),
+        ("Resource", "Assignments", "Assign Resources", Assign),
+        ("Resource", "Level", "Level All", LevelAll),
+        ("Resource", "Level", "Clear Leveling", ClearLeveling),
+        ("Report", "Export", "Export Gantt", ExportGantt),
+        ("Project", "Schedule", "Calculate Project", Recalc),
+        ("Project", "Schedule", "Set Baseline", Baseline),
+    ] {
+        let path = format!("{tab} > {group} > {label}");
+        let Some((_, _, _, found, key)) = paths
+            .iter()
+            .find(|p| (p.0, p.1, p.2) == (tab, group, label))
+        else {
+            panic!("missing ribbon path {path}");
+        };
+        assert!(matches!(found, Act::Project(a) if *a == act), "{path}");
+        let t = r.tabs.iter().find(|t| t.name == tab).unwrap();
+        assert!(
+            matches!(tab_keytip_cmd(t, key), Some(Act::Project(a)) if a == act),
+            "{path} KeyTip {key}"
+        );
+    }
+    for gone in [Save, Level] {
+        assert!(
+            !paths
+                .iter()
+                .any(|p| matches!(p.3, Act::Project(a) if a == gone)),
+            "{gone:?} is not on Project's ribbon"
+        );
+    }
+}
+
+#[test]
+fn large_and_small_buttons_show_the_same_tooltip() {
+    let r = project_ribbon();
+    let level_all = r.tabs[1].groups[1].items.iter().find_map(|c| match c {
+        Control::Large(c) if c.label == "Level All" => Some(c),
+        _ => None,
+    });
+    assert_eq!(
+        cmd_tip_text(level_all.expect("Level All is a large button")).as_ref(),
+        "Level All  ·  Alt, U, L  (Ctrl+Shift+L toggles)"
+    );
+    let bare = cmdt("x", "find", "Bare", Act::Project(ProjectAct::Find), "");
+    assert_eq!(cmd_tip_text(&bare).as_ref(), "Bare");
+}
+
+#[test]
+fn level_all_and_clear_leveling_are_idempotent() {
+    let mut t = tab();
+    let on = "Resource leveling ON — bars delayed to fit resource capacity";
+    for (act, leveled, status) in [
+        (ProjectAct::LevelAll, true, on),
+        (ProjectAct::LevelAll, true, on),
+        (ProjectAct::ClearLeveling, false, "Resource leveling OFF"),
+        (ProjectAct::ClearLeveling, false, "Resource leveling OFF"),
+    ] {
+        apply_project_act(&mut t, act);
+        assert_eq!(v(&t).ed.leveled(), leveled, "{act:?}");
+        assert_eq!(t.status.as_ref(), status, "{act:?}");
+    }
+    apply_project_act(&mut t, ProjectAct::Level);
+    assert!(v(&t).ed.leveled(), "Ctrl+Shift+L still toggles");
 }
 
 #[test]

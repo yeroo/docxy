@@ -249,7 +249,7 @@ State keys, as the app reports them after every driving verb:
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name, and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
-| `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Schedule`, `View`, `Home`, etc.) |
+| `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
 
 Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
 `cancel` are the other answers; omitting the answer refuses a dirty close).
@@ -273,7 +273,8 @@ resource, baseline, and Rename commands remain on the ribbon; ribbon Rename
 still opens a Name prompt. Predecessors in cells use **displayed IDs**.
 Ctrl+F opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo,
 Ctrl+S saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export.
-Project ribbon KeyTips are File/Task/Schedule/View = F/T/S/W after Alt or F10.
+Project ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W
+after Alt or F10.
 
 An open cell editor owns input before prompts and KeyTips. Enter commits and
 moves down, Tab/Shift+Tab commit and move right/left, and Escape cancels.
