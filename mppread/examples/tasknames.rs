@@ -23,7 +23,8 @@ fn main() {
         "{file}: {} tasks ({dated} dated, {leveled} outlined, {links} links)",
         tasks.len()
     );
-    for (i, t) in tasks.iter().enumerate() {
+    println!("    ID   UID  Start                Finish               Name / predecessor UIDs");
+    for t in &tasks {
         let start = t.start.as_deref().unwrap_or("");
         let finish = t.finish.as_deref().unwrap_or("");
         let indent = "  ".repeat(t.outline_level.unwrap_or(1).saturating_sub(1) as usize);
@@ -35,14 +36,11 @@ fn main() {
         let dep = if preds.is_empty() {
             String::new()
         } else {
-            format!("  ← {}", preds.join(","))
+            format!("  [pred UID: {}]", preds.join(","))
         };
         println!(
-            "  {:>4}  {:<19}  {:<19}  {indent}{}{dep}",
-            i + 1,
-            start,
-            finish,
-            t.name
+            "  {:>4}  {:>4}  {:<19}  {:<19}  {indent}{}{dep}",
+            t.id, t.uid, start, finish, t.name
         );
     }
 }

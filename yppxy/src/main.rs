@@ -10,7 +10,7 @@
 //! Usage:
 //!   yppxy                              start a new schedule
 //!   yppxy <file.(xml|yppx|mpp)>        open MSPDI XML, a .yppx package, or a
-//!                                      legacy .mpp (metadata only for now)
+//!                                      legacy .mpp (validated task tables)
 //!   yppxy <in> --gantt-md <out.md>     headless: export a Markdown Gantt chart
 //!   yppxy <in> --save <out.(yppx|xml)> headless: convert/save and exit
 
@@ -787,7 +787,7 @@ impl App {
                 let is_mpp = path.to_ascii_lowercase().ends_with(".mpp");
                 self.status = if is_mpp && !self.ed.project().tasks.is_empty() {
                     format!(
-                        "Opened {path} — {} task names decoded (.mpp dates/links pending)",
+                        "Opened {path} — {} .mpp tasks imported",
                         self.ed.project().tasks.len()
                     )
                 } else if is_mpp {

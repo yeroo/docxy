@@ -279,11 +279,7 @@ fn ts_ord(fd: &[u8], o: usize) -> Option<u32> {
 /// only when it clearly applies — at least half the links map in range and ≥90%
 /// are consistent — otherwise this falls back to the plain most-valid pair (so
 /// files with sparse uids, where uid≠position, are unaffected).
-pub(crate) fn detect_date_layout(
-    fd: &[u8],
-    count: usize,
-    links: &[(usize, usize)],
-) -> Option<(usize, usize)> {
+fn detect_date_layout(fd: &[u8], count: usize, links: &[(usize, usize)]) -> Option<(usize, usize)> {
     if count < 3 {
         return None;
     }
@@ -349,7 +345,7 @@ pub(crate) fn detect_date_layout(
 /// children end and the next sibling returns to a shallower level). Among
 /// columns that qualify, the most tree-like (most pop-ups) wins. `None` when no
 /// column fits — the WBS then stays flat rather than inventing a hierarchy.
-pub(crate) fn detect_outline_column(fd: &[u8], record_size: usize, count: usize) -> Option<usize> {
+fn detect_outline_column(fd: &[u8], record_size: usize, count: usize) -> Option<usize> {
     if count < 3 || record_size == 0 {
         return None;
     }

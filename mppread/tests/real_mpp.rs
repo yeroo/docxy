@@ -167,6 +167,25 @@ fn indexed_legacy_imports_when_present() {
         assert_eq!(imported.tasks.len(), rows.len() - 1, "{path}");
         assert!(imported.tasks.iter().all(|t| t.uid != 0), "{path}");
         assert_eq!(imported.tasks[0].outline_level, 1, "{path}");
+        if path.ends_with("new-product.mpp") {
+            assert_eq!(
+                rows[1..3]
+                    .iter()
+                    .map(|t| (t.id, t.uid, t.name.as_str(), t.outline_level))
+                    .collect::<Vec<_>>(),
+                [
+                    (1, 2, "Begin project", Some(1)),
+                    (2, 1, "Design Phase", Some(1)),
+                ]
+            );
+            assert_eq!(
+                imported.tasks[..2]
+                    .iter()
+                    .map(|t| (t.id, t.uid, t.name.as_str(), t.summary))
+                    .collect::<Vec<_>>(),
+                [(1, 2, "Begin project", false), (2, 1, "Design Phase", true)]
+            );
+        }
     }
 }
 

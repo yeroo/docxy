@@ -60,6 +60,9 @@ fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Re
     for rec in cons.chunks_exact(20) {
         let pred_uid = u32_at(rec, 4);
         let succ_uid = u32_at(rec, 8);
+        if pred_uid == 0 || succ_uid == 0 {
+            return Err("link endpoint UID 0 is the project summary".into());
+        }
         let kind = u16_at(rec, 12);
         let lag = i32::from_le_bytes(rec[layout.lag..layout.lag + 4].try_into().unwrap());
         let format = u16_at(rec, layout.format);
@@ -235,13 +238,15 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
     let fd = read("FixedData")?;
     let vm = read("VarMeta")?;
     let v2 = read("Var2Data")?;
-    if fm.len() >= 16 + 2 * 47 && u32_at(&fm, 16 + 47 + 4) == 16 {
-        let indexed = fixedmeta::current_index(&fm, &fd)?;
-        return decode_current(&cfb, prefix, &fd, &vm, &v2, indexed);
+    match fixedmeta::index(&fm, &fd)? {
+        fixedmeta::TaskIndex::Current(indexed) => {
+            decode_current(&cfb, prefix, &fd, &vm, &v2, indexed)
+        }
+        fixedmeta::TaskIndex::Legacy(indexed) => {
+            let uids: HashSet<_> = indexed.iter().map(|r| r.uid).collect();
+            decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)
+        }
     }
-    let indexed = fixedmeta::index(&fm, &fd)?;
-    let uids: HashSet<_> = indexed.iter().map(|(uid, _, _)| *uid).collect();
-    decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)
 }
 
 fn decode_current(
@@ -303,19 +308,20 @@ fn decode_legacy(
     fd: &[u8],
     vm: &[u8],
     v2: &[u8],
-    indexed: Vec<(u32, usize, usize)>,
+    indexed: Vec<fixedmeta::LegacyRecord>,
     uids: &HashSet<u32>,
 ) -> Result<Vec<MppTask>, String> {
     let named = legacy_names(vm, v2, uids)?;
     let mut out = Vec::new();
     let mut previous_level = 0u32;
-    for (i, (uid, off, len)) in indexed.iter().enumerate() {
-        if *len != LEGACY.length {
+    for (i, row) in indexed.iter().enumerate() {
+        if row.len != LEGACY.length {
             return Err("legacy task record length mismatch".into());
         }
-        let rec = &fd[*off..*off + *len];
+        let uid = row.uid;
+        let rec = &fd[row.offset..row.offset + row.len];
         let level = rec[LEGACY.level] as u32;
-        validate_legacy_level(i, *uid, level, previous_level)?;
+        validate_legacy_level(i, uid, level, previous_level)?;
         previous_level = level;
         let start = decode_timestamp(rec, LEGACY.start);
         let finish = decode_timestamp(rec, LEGACY.finish);
@@ -329,9 +335,9 @@ fn decode_legacy(
             ));
         }
         out.push(MppTask {
-            id: i as u32,
-            uid: *uid,
-            name: named[uid].clone(),
+            id: row.id,
+            uid,
+            name: named[&uid].clone(),
             start,
             finish,
             outline_level: Some(level),
@@ -511,7 +517,10 @@ mod tests {
         reject(&s); // bad offset
         let mut s = fixture();
         s.vm[24 + 12 + 4..24 + 12 + 8].copy_from_slice(&1u32.to_le_bytes());
-        reject(&s); // not a block boundary
+        reject(&s); // reading at this mid-block offset gives an invalid length
+        let mut s = fixture();
+        s.fd.truncate(249);
+        reject(&s); // last FixedMeta offset beyond truncated FixedData
         let mut s = fixture();
         s.fm[8..12].copy_from_slice(&6u32.to_le_bytes());
         reject(&s); // count overrun
@@ -524,8 +533,11 @@ mod tests {
         s.cons = link(9, 1, 7);
         reject(&s); // unknown predecessor
         let mut s = fixture();
-        s.cons = link(0, 1, 99);
+        s.cons = link(1, 1, 99);
         reject(&s); // unknown lag format
+        let mut s = fixture();
+        s.cons = link(0, 1, 7);
+        reject(&s); // project summary cannot be a link endpoint
     }
     fn link(pred: u32, succ: u32, format: u16) -> Vec<u8> {
         let mut r = vec![0u8; 20];

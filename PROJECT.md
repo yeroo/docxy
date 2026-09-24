@@ -134,39 +134,14 @@ leveling and task splitting are future work. `yppxy` toggles the overlay with
 - **`.mpp`** — the legacy binary. It's an OLE2 **Compound File** (MS-CFB), which
   `mppread` reads exactly — including the **storage tree**, so nested blocks are
   addressable by path (`read_path("TBkndTask/FixedData")`). Its metadata streams
-  are OLE **property sets** (MS-OLEPS), decoded exactly. The **task names** now
-  decode too, from the `VarMeta`/`Var2Data` block container: each name block is
-  read directly at the offset its VarMeta entry points at (robust to the
-  non-contiguous Var2Data of newer files), the name field-type is auto-detected
-  as the purest mostly-multi-char field (so a stray one-char marker field can't
-  merge into it), and the entry layout auto-detects across MPP9, MPP12/14, and
-  the newest generation — verified on real files
-  from both Microsoft Project and ProjectLibre. Each task's **start/finish**
-  dates decode too, from the per-task `FixedData` records: the record size and
-  date-field offset are auto-detected as the layout under which every task's
-  `start ≤ finish` and the starts vary (a self-validating fit, like the name
-  decode) — with the link table, when present, breaking ties by which date pair
-  makes the Finish-to-Start links hold, so a look-alike baseline/actual field
-  can't win — then the two-byte time / two-byte days-since-1984 fields are read
-  at that offset. The **outline level** (WBS depth) decodes from the same records:
-  its byte column is found by MS Project's tree rule — depth deepens by at most
-  one per row and pops back up at real hierarchy boundaries — a self-validating
-  signature that also rejects look-alike id columns and leaves the WBS flat when
-  no column fits (verified: MPP9 decodes the full tree, the MPP14 sample
-  degrades to flat rather than inventing one). So `yppxy legacy.mpp` opens with
-  the real WBS **and** the real dates: each decoded *leaf* task is pinned with a
-  Must-Start-On constraint and a duration of the working minutes between its
-  start and finish; summary tasks roll their dates up from their children, so
-  the scheduler reproduces Project's own dates. The **predecessor links** decode
-  too, from the sibling `TBkndCons` table (20-byte records of `[link-uid]
-  [pred-uid][succ-uid][kind]`): tasks are referenced by unique id, which isn't
-  always the row position (MPP12/14 uid columns can be sparse), so the per-task
-  uid column is found the self-validating way — the column under which the most
-  Finish-to-Start links satisfy *successor-starts-after-predecessor-finishes*
-  against the already-decoded dates. Links attach only on a strong (≥90%) fit,
-  else the table is left undecoded rather than inventing dependencies. So an
-  imported `.mpp` opens with the real dependency network as well; the only field
-  still on the bench is **link lag** (0 throughout the corpus, so unvalidated).
+  are OLE **property sets** (MS-OLEPS). For recognized MPP9 and current Project
+  task layouts, `mppread` uses counted `FixedMeta` and `VarMeta` records to
+  locate rows and names, then reads dates and outline levels at known offsets.
+  Stored task IDs determine display order; stable UIDs connect predecessor
+  links from `TBkndCons`. An unrecognized layout or malformed row causes an
+  import error. Imported leaves are pinned to decoded starts and durations;
+  summaries roll up from their children. Nonzero link lag still lacks a
+  real-file oracle.
 
 ## Desktop suite entry table
 
@@ -199,12 +174,10 @@ backstage, live Gantt, editing, undo/redo, find, vim mode, themes).
 
 Next, roughly in order:
 
-1. **`.mpp` numeric task decoder** — task **names**, **start/finish dates**,
-   **outline levels**, and **predecessor links** already decode from real files
-   (MPP9 + MPP12/14); the remaining field is link **lag** (unvalidated — 0
-   throughout the corpus). The workflow (sample files in `corpus/mpp/`, map with
-   `inspect`, reverse each block against an MSPDI oracle export) is documented in
-   `corpus/mpp/README.md`.
+1. **Broader `.mpp` support** — recognized MPP9 and current Project task
+   layouts import validated names, dates, outline levels, and predecessor links.
+   Other layouts and nonzero link lag need further oracle-backed work. The
+   corpus workflow is documented in `corpus/mpp/README.md`.
 2. **Richer leveling** — priority-ordered (not just topological), multi-calendar,
    optional task splitting, and a "resource-critical" flag.
 3. **Assignment editing depth** — units/work per assignment, effort-driven
