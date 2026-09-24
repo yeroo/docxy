@@ -234,7 +234,7 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "UID" => r.uid = int_of(p) as i32,
                     "ID" => r.id = int_of(p) as i32,
                     "Name" => r.name = text_of(p),
-                    "Type" => type_code = Some(int_of(p)),
+                    "Type" => type_code = text_of(p).trim().parse::<i64>().ok(),
                     "IsCostResource" => is_cost = bool_of(p),
                     "Initials" => r.initials = Some(text_of(p)),
                     "MaterialLabel" => r.material_label = Some(text_of(p)),
@@ -242,9 +242,9 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "Group" => r.group = Some(text_of(p)),
                     "MaxUnits" => r.max_units = float_of(p),
                     "AccrueAt" => r.accrue_at = AccrueAt::from_code(int_of(p)),
-                    "StandardRate" => r.standard_rate = Some(float_of(p)),
-                    "OvertimeRate" => r.overtime_rate = Some(float_of(p)),
-                    "CostPerUse" => r.cost_per_use = Some(float_of(p)),
+                    "StandardRate" => r.standard_rate = rate_of(p),
+                    "OvertimeRate" => r.overtime_rate = rate_of(p),
+                    "CostPerUse" => r.cost_per_use = rate_of(p),
                     "CalendarUID" => r.calendar_uid = Some(int_of(p) as i32),
                     _ => p.skip_element(),
                 }
@@ -446,6 +446,15 @@ fn int_of(p: &mut XmlParser) -> i64 {
 
 fn float_of(p: &mut XmlParser) -> f64 {
     text_of(p).trim().parse().unwrap_or(0.0)
+}
+
+/// Invalid optional rates stay absent; nonfinite floats are not XML decimals.
+fn rate_of(p: &mut XmlParser) -> Option<f64> {
+    text_of(p)
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
 }
 
 fn bool_of(p: &mut XmlParser) -> bool {
@@ -819,6 +828,15 @@ mod tests {
             ("", Work),
             ("<IsCostResource>1</IsCostResource>", Work),
             ("<Type>7</Type>", Work),
+            ("<Type/>", Work),
+            ("<Type></Type>", Work),
+            ("<Type>1.0</Type>", Work),
+            ("<Type>abc</Type>", Work),
+            ("<Type/><IsCostResource>1</IsCostResource>", Work),
+            (
+                "<Type>abc</Type><IsCostResource>true</IsCostResource>",
+                Work,
+            ),
         ] {
             let proj = resource_project(&format!("<Resource>{children}</Resource>"));
             assert_eq!(proj.resources[0].kind, expected, "{children}");
@@ -831,6 +849,28 @@ mod tests {
                 expected == Cost
             );
             assert_eq!(resource_project(&xml).resources, proj.resources);
+        }
+    }
+
+    #[test]
+    fn invalid_resource_rates_stay_absent_on_save() {
+        for name in ["StandardRate", "OvertimeRate", "CostPerUse"] {
+            let elements = std::iter::once(format!("<{name}/>")).chain(
+                ["", "abc", "NaN", "inf", "-infinity", "1e999"]
+                    .map(|value| format!("<{name}>{value}</{name}>")),
+            );
+            for element in elements {
+                let proj = resource_project(&format!("<Resource>{element}</Resource>"));
+                let r = &proj.resources[0];
+                assert_eq!(
+                    (r.standard_rate, r.overtime_rate, r.cost_per_use),
+                    (None, None, None),
+                    "{element}"
+                );
+                let xml = write_mspdi(&proj);
+                assert!(!xml.contains(&format!("<{name}>")), "{xml}");
+                assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+            }
         }
     }
 
