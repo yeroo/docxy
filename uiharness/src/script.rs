@@ -109,6 +109,12 @@ pub enum Action {
         verb: String,
         args: Json,
     },
+    /// Assert that a control request is refused with a particular message.
+    CallError {
+        verb: String,
+        args: Json,
+        message: String,
+    },
     Click {
         cell: String,
         shift: bool,
@@ -313,8 +319,19 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
     let lower = head.to_ascii_lowercase();
     let rest_trim = rest.trim();
     match lower.as_str() {
-        "call" => {
-            let (verb, payload) = split_word(rest_trim);
+        "call" | "call-error" => {
+            let (request, message) = if lower == "call-error" {
+                let (request, message) = rest_trim
+                    .rsplit_once(" => ")
+                    .ok_or_else(|| err(line, "'call-error' needs '=> <expected message>'"))?;
+                if message.trim().is_empty() {
+                    return Err(err(line, "'call-error' needs an expected message"));
+                }
+                (request, Some(message.trim()))
+            } else {
+                (rest_trim, None)
+            };
+            let (verb, payload) = split_word(request);
             if verb.is_empty() {
                 return Err(err(line, "'call' needs a verb and a JSON object"));
             }
@@ -323,10 +340,17 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
             if !matches!(args, Json::Obj(_)) {
                 return Err(err(line, "'call' args must be a JSON object"));
             }
-            Ok(Action::Call {
-                verb: verb.into(),
-                args,
-            })
+            match message {
+                Some(message) => Ok(Action::CallError {
+                    verb: verb.into(),
+                    args,
+                    message: message.into(),
+                }),
+                None => Ok(Action::Call {
+                    verb: verb.into(),
+                    args,
+                }),
+            }
         }
         "open" => {
             if rest_trim.is_empty() {
@@ -857,6 +881,23 @@ test a pointed range dashes
         // The line numbers are the script's own, so a failure can be found.
         assert_eq!(s.cases[0].line, 2);
         assert_eq!(s.cases[0].steps[0].line, 3);
+    }
+
+    #[test]
+    fn call_error_requires_a_specific_refusal() {
+        let script = parse_script(
+            "test t\n  call-error ribbon-click {\"tab\":\"Home\"} => ribbon is hidden\n",
+        )
+        .unwrap();
+        assert_eq!(
+            script.cases[0].steps[0].action,
+            Action::CallError {
+                verb: "ribbon-click".into(),
+                args: Json::parse("{\"tab\":\"Home\"}").unwrap(),
+                message: "ribbon is hidden".into(),
+            }
+        );
+        assert!(parse_script("test t\n  call-error ribbon-click {}\n").is_err());
     }
 
     #[test]

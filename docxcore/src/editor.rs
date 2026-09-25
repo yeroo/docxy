@@ -2508,39 +2508,50 @@ fn title_case(s: &str) -> String {
     out
 }
 
-/// Run properties at a caret: the run containing the preceding character wins.
-/// If that character is a tab/break or the caret is at the start, use the first
-/// run at or after the caret, including an empty formatted run. Beyond all runs,
-/// retain the last nonempty run's properties.
+/// Run properties that `content_insert` will give a character at this caret.
 fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
-    let mut pos = 0;
-    let mut last = RunProps::default();
-    let mut next = None;
-    for inline in content {
-        let runs: &[Run] = match inline {
-            Inline::Run(r) => std::slice::from_ref(r),
-            Inline::Hyperlink(h) => &h.runs,
-            Inline::Tab(_) | Inline::Break(_) => {
-                pos += 1;
-                continue;
-            }
-            _ => continue,
-        };
-        for r in runs {
-            let len = r.text.chars().count();
-            if offset > pos && offset <= pos + len {
-                return r.props.clone();
-            }
-            if pos >= offset && next.is_none() {
-                next = Some(r.props.clone());
-            }
-            if len > 0 {
-                last = r.props.clone();
-            }
-            pos += len;
+    let mut acc = 0;
+    for (i, inline) in content.iter().enumerate() {
+        let len = inline_len(inline);
+        if offset <= acc + len {
+            let local = offset - acc;
+            return match inline {
+                Inline::Run(r) => r.props.clone(),
+                Inline::Hyperlink(h) => {
+                    let mut run_acc = 0;
+                    h.runs
+                        .iter()
+                        .find(|r| {
+                            let found = local <= run_acc + r.text.chars().count();
+                            run_acc += r.text.chars().count();
+                            found
+                        })
+                        .or_else(|| h.runs.last())
+                        .map(|r| r.props.clone())
+                        .unwrap_or_default()
+                }
+                _ if local == 0 => content
+                    .get(i.wrapping_sub(1))
+                    .and_then(|prev| match prev {
+                        Inline::Run(r) => Some(r.props.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                _ => content
+                    .get(i + 1)
+                    .and_then(|next| match next {
+                        Inline::Run(r) => Some(r.props.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+            };
         }
+        acc += len;
     }
-    next.unwrap_or(last)
+    match content.last() {
+        Some(Inline::Run(r)) => r.props.clone(),
+        _ => RunProps::default(),
+    }
 }
 
 #[cfg(test)]
@@ -2572,7 +2583,7 @@ mod tests {
         assert!(!run_props_at(&with_tab, 0).bold);
         assert!(!run_props_at(&with_tab, 1).bold);
         let with_break = vec![Inline::Break(BreakKind::Line), content[1].clone()];
-        assert!(run_props_at(&with_break, 0).bold);
+        assert!(!run_props_at(&with_break, 0).bold);
         assert!(run_props_at(&with_break, 1).bold);
         let with_empty = vec![
             Inline::Run(Run {
@@ -2585,6 +2596,45 @@ mod tests {
             content[0].clone(),
         ];
         assert!(run_props_at(&with_empty, 0).bold);
+    }
+
+    #[test]
+    fn run_props_at_matches_inserted_character_before_leading_inlines() {
+        let bold = RunProps {
+            bold: true,
+            ..Default::default()
+        };
+        for mut content in [
+            vec![
+                Inline::Tab(RunProps::default()),
+                Inline::Run(Run {
+                    text: "x".into(),
+                    props: bold.clone(),
+                }),
+            ],
+            vec![
+                Inline::Break(BreakKind::Line),
+                Inline::Run(Run {
+                    text: "x".into(),
+                    props: bold.clone(),
+                }),
+            ],
+            vec![
+                Inline::Run(Run {
+                    text: String::new(),
+                    props: bold.clone(),
+                }),
+                Inline::Tab(RunProps::default()),
+            ],
+        ] {
+            let expected = run_props_at(&content, 0);
+            content_insert(&mut content, 0, 'z');
+            let Inline::Run(inserted) = &content[0] else {
+                panic!("inserted character is not in the first run")
+            };
+            assert!(inserted.text.starts_with('z'));
+            assert_eq!(inserted.props, expected);
+        }
     }
 
     fn para(text: &str) -> Block {

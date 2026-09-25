@@ -120,6 +120,13 @@ enum ThemePref {
 }
 
 impl ThemePref {
+    fn resolve(self, appearance: gpui::WindowAppearance) -> ThemeMode {
+        match self {
+            ThemePref::Auto => ThemeMode::from(appearance),
+            ThemePref::Light => ThemeMode::Light,
+            ThemePref::Dark => ThemeMode::Dark,
+        }
+    }
     fn label(self) -> &'static str {
         match self {
             ThemePref::Auto => "\u{25D1} Auto",
@@ -133,6 +140,18 @@ impl ThemePref {
             ThemePref::Light => ThemePref::Dark,
             ThemePref::Dark => ThemePref::Auto,
         }
+    }
+}
+
+/// Style represented by a gallery preview; Normal has no explicit style id.
+fn style_preview_id(preview: &str) -> Option<&'static str> {
+    match preview {
+        "title" => Some("Title"),
+        "subtitle" => Some("Subtitle"),
+        "h1" => Some("Heading1"),
+        "h2" => Some("Heading2"),
+        "h3" => Some("Heading3"),
+        _ => None,
     }
 }
 
@@ -228,7 +247,6 @@ enum BackstageRailAction {
 
 struct BackstageRailItem {
     id: &'static str,
-    label: &'static str,
     display: &'static str,
     action: BackstageRailAction,
     project_only: bool,
@@ -237,49 +255,42 @@ struct BackstageRailItem {
 const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
     BackstageRailItem {
         id: "bs-back",
-        label: "Back",
         display: "← Back",
         action: BackstageRailAction::Back,
         project_only: false,
     },
     BackstageRailItem {
         id: "bs-new",
-        label: "New",
         display: "New",
         action: BackstageRailAction::New,
         project_only: false,
     },
     BackstageRailItem {
         id: "bs-open",
-        label: "Open…",
         display: "Open…",
         action: BackstageRailAction::Open,
         project_only: false,
     },
     BackstageRailItem {
         id: "bs-save",
-        label: "Save",
         display: "Save",
         action: BackstageRailAction::Save,
         project_only: false,
     },
     BackstageRailItem {
         id: "bs-saveas",
-        label: "Save As…",
         display: "Save As…",
         action: BackstageRailAction::SaveAs,
         project_only: false,
     },
     BackstageRailItem {
         id: "bs-export",
-        label: "Export…",
         display: "Export…",
         action: BackstageRailAction::Export,
         project_only: true,
     },
     BackstageRailItem {
         id: "bs-close",
-        label: "Close",
         display: "Close",
         action: BackstageRailAction::Close,
         project_only: false,
@@ -16496,14 +16507,7 @@ impl Docxy {
                     "h3" => (12.0, FontWeight::SEMIBOLD),
                     _ => (11.0, FontWeight::NORMAL),
                 };
-                let style_id = match it.preview {
-                    "title" => Some("Title"),
-                    "subtitle" => Some("Subtitle"),
-                    "h1" => Some("Heading1"),
-                    "h2" => Some("Heading2"),
-                    "h3" => Some("Heading3"),
-                    _ => None,
-                };
+                let style_id = style_preview_id(it.preview);
                 let selected = cur.as_deref() == style_id;
                 div()
                     .id(it.label)
@@ -17020,11 +17024,7 @@ impl Render for Docxy {
             p.last = std::mem::take(&mut p.next);
         }
         // Apply the theme choice (Auto follows the OS appearance).
-        let desired = match self.theme_pref {
-            ThemePref::Auto => ThemeMode::from(window.appearance()),
-            ThemePref::Light => ThemeMode::Light,
-            ThemePref::Dark => ThemeMode::Dark,
-        };
+        let desired = self.theme_pref.resolve(window.appearance());
         if self.applied != Some(desired) {
             Theme::change(desired, Some(window), cx);
             self.applied = Some(desired);

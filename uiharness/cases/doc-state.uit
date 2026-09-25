@@ -42,11 +42,14 @@ test document state follows keys, selections, ribbon commands and backstage
   assert reply.items.0.text is not loaded
   call backstage {"action":"open"}
   assert reply.open is true
-  assert reply.items.0 is Back
+  assert reply.items.0 is "← Back"
+  call-error ribbon-click {"tab":"Home","command":"Bold"} => the ribbon is hidden while File (backstage) is open
+  call-error ribbon-read {} => the ribbon is hidden while File (backstage) is open
   call backstage {"action":"read"}
   assert reply.open is true
   call backstage {"action":"close"}
   assert reply.open is false
+  call ribbon-click {"tab":"Home","command":"Bold"}
 
 test table context follows the caret and exposes Table ribbon
   open ../fixtures/doc-table.docx

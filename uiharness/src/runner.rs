@@ -219,6 +219,21 @@ impl<'a> Runner<'a> {
         };
         match &step.action {
             Action::Call { verb, args } => self.verb(out, verb, args.clone()),
+            Action::CallError {
+                verb,
+                args,
+                message,
+            } => match self.driver.call(verb, args.clone()) {
+                Err(actual) if actual.contains(message) => out,
+                Err(actual) => fail(
+                    out,
+                    format!("expected refusal containing '{message}', got '{actual}'"),
+                ),
+                Ok(_) => fail(
+                    out,
+                    format!("expected '{verb}' to be refused with '{message}', but it succeeded"),
+                ),
+            },
             Action::Open(path) | Action::OpenCopy(path) => {
                 self.last_reply = None;
                 let full = self.base.join(path);

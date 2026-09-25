@@ -769,10 +769,7 @@ struct ViewFlags {
 impl ViewFlags {
     fn live(app: &crate::Docxy, window: &Window) -> Self {
         Self {
-            hf_edit: app
-                .tabs
-                .get(app.active)
-                .is_some_and(|t| t.hf_edit.is_some()),
+            hf_edit: app.hf_active(),
             page: app.page_view,
             marks: app.show_marks,
             ruler: app.show_ruler,
@@ -780,21 +777,8 @@ impl ViewFlags {
             comments: app.show_comments,
             notes: app.show_notes,
             zoom: app.zoom,
-            dark: theme_dark(
-                app.theme_pref,
-                gpui_component::ThemeMode::from(window.appearance())
-                    == gpui_component::ThemeMode::Dark,
-            ),
+            dark: app.theme_pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark,
         }
-    }
-}
-
-/// Resolve the preference for synchronous harness replies, before the next render.
-fn theme_dark(pref: crate::ThemePref, auto_dark: bool) -> bool {
-    match pref {
-        crate::ThemePref::Auto => auto_dark,
-        crate::ThemePref::Light => false,
-        crate::ThemePref::Dark => true,
     }
 }
 
@@ -944,6 +928,9 @@ fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
 
 /// Ribbon verbs address only surfaces that render this ribbon model.
 fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
+    if app.backstage {
+        return Err("the ribbon is hidden while File (backstage) is open".into());
+    }
     match app.tabs.get(app.active).map(|t| &t.surface) {
         Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(()),
         _ => Err("the active tab has no document or Project ribbon".into()),
@@ -983,6 +970,7 @@ struct RibbonCommand {
     tip_body: String,
     key_tip: String,
     act: crate::Act,
+    gallery_preview: Option<&'static str>,
 }
 
 impl RibbonCommand {
@@ -994,9 +982,14 @@ impl RibbonCommand {
             tip_body: cmd.tip.body.into(),
             key_tip: cmd.key_tip.into(),
             act: cmd.act,
+            gallery_preview: None,
         }
     }
-    fn json(&self, checked: &impl Fn(crate::Act) -> bool) -> Json {
+    fn json(&self, checked: &impl Fn(crate::Act) -> bool, current_style: Option<&str>) -> Json {
+        let selected = self.gallery_preview.map_or_else(
+            || checked(self.act),
+            |preview| current_style == crate::style_preview_id(preview),
+        );
         Json::obj(vec![
             ("id", Json::Str(self.id.clone())),
             ("label", Json::Str(self.label.clone())),
@@ -1008,7 +1001,7 @@ impl RibbonCommand {
                 ]),
             ),
             ("key_tip", Json::Str(self.key_tip.clone())),
-            ("checked", Json::Bool(checked(self.act))),
+            ("checked", Json::Bool(selected)),
         ])
     }
 }
@@ -1034,6 +1027,7 @@ fn control_commands(control: &crate::Control<crate::Act>, out: &mut Vec<RibbonCo
             tip_body: g.tip.body.into(),
             key_tip: String::new(),
             act: item.act,
+            gallery_preview: Some(item.preview),
         })),
         Control::Rows(rows) => {
             for cell in rows.iter().flatten() {
@@ -1060,7 +1054,11 @@ fn tab_commands(tab: &crate::rs::Tab<crate::Act>) -> Vec<RibbonCommand> {
 }
 
 /// Groups and controls as the renderer presents one tab.
-fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(crate::Act) -> bool) -> Json {
+fn tab_json(
+    tab: &crate::rs::Tab<crate::Act>,
+    checked: &impl Fn(crate::Act) -> bool,
+    current_style: Option<&str>,
+) -> Json {
     let groups = tab
         .groups
         .iter()
@@ -1084,7 +1082,12 @@ fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(crate::Act) -> b
                 ("launcher", Json::Bool(group.launcher.is_some())),
                 (
                     "commands",
-                    Json::Arr(commands.iter().map(|c| c.json(checked)).collect()),
+                    Json::Arr(
+                        commands
+                            .iter()
+                            .map(|c| c.json(checked, current_style))
+                            .collect(),
+                    ),
                 ),
                 ("galleries", Json::Arr(galleries)),
             ])
@@ -1103,6 +1106,7 @@ fn ribbon_json_for(
     kind: crate::Kind,
     in_table: bool,
     checked: impl Fn(crate::Act) -> bool,
+    current_style: Option<&str>,
 ) -> Json {
     let ribbon = crate::ribbon_for(kind);
     let (_, file_name, file_tip) = crate::ribbon_tab_set(kind)[0];
@@ -1112,9 +1116,14 @@ fn ribbon_json_for(
         ("kind", Json::Str("backstage".into())),
         ("groups", Json::Arr(Vec::new())),
     ])];
-    tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
+    tabs.extend(
+        ribbon
+            .tabs
+            .iter()
+            .map(|t| tab_json(t, &checked, current_style)),
+    );
     if kind == crate::Kind::Docx && in_table {
-        tabs.push(tab_json(&crate::table_tab(), &checked));
+        tabs.push(tab_json(&crate::table_tab(), &checked, current_style));
     }
     let tab_count = tabs.len();
     let qat = crate::QAT_ITEMS
@@ -1144,9 +1153,16 @@ fn ribbon_json_for(
 
 /// Ribbon snapshot using the active tab and live checked states.
 fn ribbon_json(app: &crate::Docxy) -> Json {
-    ribbon_json_for(app.ribbon_kind(), app.caret_table().is_some(), |act| {
-        app.act_active(act)
-    })
+    let current_style = app.tabs.get(app.active).and_then(|tab| match &tab.surface {
+        crate::Surface::Doc(editor) => editor.caret_para_style(),
+        _ => None,
+    });
+    ribbon_json_for(
+        app.ribbon_kind(),
+        app.caret_table().is_some(),
+        |act| app.act_active(act),
+        current_style.as_deref(),
+    )
 }
 
 /// Resolve a currently valid tab name before a synthetic ribbon click.
@@ -1364,11 +1380,7 @@ pub fn dispatch(
         "doc" => Done::ok(doc_state(active_doc(app)?, &ViewFlags::live(app, window))),
         "selection-set" => {
             let (start, end) = (arg_usize(args, "start")?, arg_usize(args, "end")?);
-            if app
-                .tabs
-                .get(app.active)
-                .is_some_and(|t| t.hf_edit.is_some())
-            {
+            if app.hf_active() {
                 return Err("selection-set cannot address the body while a header or footer is being edited".into());
             }
             let ed = app
@@ -1394,7 +1406,7 @@ pub fn dispatch(
                 ("open", Json::Bool(app.backstage)),
                 (
                     "items",
-                    Json::Arr(items.map(|item| Json::Str(item.label.into())).collect()),
+                    Json::Arr(items.map(|item| Json::Str(item.display.into())).collect()),
                 ),
             ]))
         }
@@ -1770,10 +1782,24 @@ mod tests {
 
     #[test]
     fn theme_reply_resolves_preference_without_waiting_for_render() {
-        assert!(theme_dark(crate::ThemePref::Dark, false));
-        assert!(!theme_dark(crate::ThemePref::Light, true));
-        assert!(theme_dark(crate::ThemePref::Auto, true));
-        assert!(!theme_dark(crate::ThemePref::Auto, false));
+        use gpui::WindowAppearance;
+        use gpui_component::ThemeMode;
+        assert_eq!(
+            crate::ThemePref::Dark.resolve(WindowAppearance::Light),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            crate::ThemePref::Light.resolve(WindowAppearance::Dark),
+            ThemeMode::Light
+        );
+        assert_eq!(
+            crate::ThemePref::Auto.resolve(WindowAppearance::Dark),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            crate::ThemePref::Auto.resolve(WindowAppearance::Light),
+            ThemeMode::Light
+        );
     }
 
     #[test]
@@ -2009,8 +2035,13 @@ mod tests {
 
     #[test]
     fn ribbon_reflects_definition_and_checked_state() {
-        let off = ribbon_json_for(crate::Kind::Docx, false, |_| false);
-        let on = ribbon_json_for(crate::Kind::Docx, true, |a| matches!(a, crate::Act::Bold));
+        let off = ribbon_json_for(crate::Kind::Docx, false, |_| false, None);
+        let on = ribbon_json_for(
+            crate::Kind::Docx,
+            true,
+            |a| matches!(a, crate::Act::Bold),
+            None,
+        );
         let tabs = off.get("tabs").unwrap().as_array().unwrap();
         assert_eq!(tabs[0].get_str("name"), Some("File"));
         assert_eq!(tabs[0].get_str("kind"), Some("backstage"));
@@ -2044,6 +2075,38 @@ mod tests {
     }
 
     #[test]
+    fn style_gallery_checked_matches_heading_preview() {
+        let mut props = ParProps::default();
+        props.style_id = Some("Heading1".into());
+        let editor = editor(props, RunProps::default());
+        let current_style = editor.caret_para_style();
+        let ribbon = ribbon_json_for(
+            crate::Kind::Docx,
+            false,
+            |_| false,
+            current_style.as_deref(),
+        );
+        let tabs = ribbon.get("tabs").unwrap().as_array().unwrap();
+        let commands: Vec<&Json> = tabs[1]
+            .get("groups")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g.get("commands").unwrap().as_array().unwrap())
+            .collect();
+        let checked = |label| {
+            commands
+                .iter()
+                .find(|c| c.get_str("label") == Some(label))
+                .unwrap()
+                .get("checked")
+        };
+        assert_eq!(checked("Heading 1"), Some(&Json::Bool(true)));
+        assert_eq!(checked("Normal"), Some(&Json::Bool(false)));
+    }
+
+    #[test]
     fn ribbon_resolver_rejects_ambiguous_labels_and_status_is_live_text() {
         let commands = vec![
             RibbonCommand {
@@ -2053,6 +2116,7 @@ mod tests {
                 tip_body: String::new(),
                 key_tip: String::new(),
                 act: crate::Act::Bold,
+                gallery_preview: None,
             },
             RibbonCommand {
                 id: "two".into(),
@@ -2061,6 +2125,7 @@ mod tests {
                 tip_body: String::new(),
                 key_tip: String::new(),
                 act: crate::Act::Italic,
+                gallery_preview: None,
             },
         ];
         let err = resolve_commands(&commands, "Home", "Same").err().unwrap();

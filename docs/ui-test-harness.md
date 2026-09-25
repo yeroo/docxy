@@ -127,6 +127,7 @@ cold start, and every accepted and rejected form is a unit test.
 | `open <path>` | the file, resolved **against the script's own directory** — never the working directory. A file the app could not read is an ERROR, not a silent green step: the loaders substitute an empty document and record the reason in `status`, so the step reads the status back and stops the case there |
 | `open copy:<path>` | copy that fixture to `<sandbox>/<case-slug>/<original filename>` and open the copy; refuses an existing destination. Use this for saves and exports so their outputs stay in the run sandbox and the original fixture stays untouched |
 | `call <verb> <json-object>` | send a raw control request, including Project verbs such as `call task.set {"uid":2,"duration":"3d"}`. JSON is parsed before launch and retained verbatim, including quoted `#`; trailing comments are not allowed. Non-object/invalid JSON is a script error; a refused request is an `ERROR` with the server message |
+| `call-error <verb> <json-object> => <message>` | require the app to refuse the request with a message containing the given text; a successful request or different refusal fails the step |
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
 | `drag <from> -> <to>` | press, one move per cell crossed, release. `to` and a bare space read the same |
 | `type <text>` | one key event per character. The text is taken verbatim between its ends; the whitespace on either side of it is trimmed, so `type   =SUM(` types `=SUM(` |
@@ -202,6 +203,9 @@ Every verb goes in through **the same entry point the pointer or keyboard
 would**. A verb that reached past a handler into the state it maintains could
 pass while the handler under test was broken — the one way this harness could be
 worse than nothing.
+`selection-set` is a setup exception: it places the caret through the editor API
+because the UI cannot place it by document offset, so it does not test clicking
+or dragging a selection.
 
 ⚠️ **"The same entry point" means the handler, not the hitbox.** A verb calls
 the method a handler calls; it does not synthesize a pointer at a coordinate and
