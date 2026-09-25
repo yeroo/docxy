@@ -43,13 +43,21 @@ keep the predecessor's finish instant. Only zero-lag links were verified;
 for nonzero lag the scheduler uses the finish side of the successor calendar's
 working-time boundary, which remains unverified against Project.
 File 19 pins manually scheduled tasks
-([issue #77](https://github.com/yeroo/docxy/issues/77)) and is the one fixture
-**not** verified against Project 2021: its Start/Finish are what a manual task
+([issue #77](https://github.com/yeroo/docxy/issues/77)) and is **not**
+verified against Project 2021: its Start/Finish are what a manual task
 keeps by definition, but its `TotalSlack`/`Critical` are hand-derived from our
 scheduler, including the violated link (Review, pinned two days before Design
 finishes, gets -2 days). `verify_mspdi_project.py` keeps the tasks this file
 marks `<Manual>1</Manual>` manual, so a Project run can check it.
-File 20 records a missed task Deadline
+File 20 keeps the task fields Project writes that change scheduling
+([issue #80](https://github.com/yeroo/docxy/issues/80)): task type,
+effort-driven, estimated, active, priority, deadline, levelling options,
+display flags, WBS, `GUID`/`CreateDate` and the stored `Work`/`Cost`. Like
+file 19 it is **not** verified against Project 2021, for two reasons: docxy
+still schedules its inactive task (Project would drop it), and its blank row
+(`<IsNull>1</IsNull>`, between two linked tasks under a summary) has a shape
+of our own, because no Project file with a blank row was available.
+File 21 records a missed task Deadline
 ([issue #100](https://github.com/yeroo/docxy/issues/100)): B's deadline is
 five days before its finish, so A and B both carry -5 days total slack and no
 date moves. The file is generated like the others, but its oracle values were
@@ -85,7 +93,8 @@ in the private spec corpus. It was **not** checked by
 | `17-constraint-fnlt-conflict` | FNLT versus FS link | default constraint precedence and -5 days total slack on both tasks |
 | `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
 | `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
-| `20-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
+| `20-task-fields` | stored task fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`; the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
+| `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
 
 See `manifest.json` for machine-readable tags.
 

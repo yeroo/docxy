@@ -61,6 +61,9 @@ def read_fixture(path):
                  for c in root.findall("p:Calendars/p:Calendar", NS)}
     tasks = []
     for t in root.findall("p:Tasks/p:Task", NS):
+        # A blank row (#80) carries no oracle, and COM lists it as None.
+        if text(t, "IsNull") == "1":
+            continue
         cal = text(t, "CalendarUID")
         tasks.append({
             "uid": int(text(t, "UID")),

@@ -177,6 +177,38 @@ fn typed_dates_move_a_manual_task_without_constraints() {
 }
 
 #[test]
+fn a_date_typed_into_a_blank_row_of_a_manual_plan_pins_it() {
+    let mut p = v(&tab()).ed.project().clone();
+    p.new_tasks_are_manual = true;
+    p.tasks[1] = Task {
+        uid: 20,
+        id: 2,
+        is_null: true,
+        ..Task::default()
+    };
+    let mut t = project_tab(
+        "test.yppx".into(),
+        None,
+        Surface::Project(ProjectView::new(p, false)),
+        false,
+        "loaded".into(),
+    );
+    for (col, text) in [(3, "2026-01-08"), (4, "2026-01-09")] {
+        vm(&mut t).ed.select(1);
+        edit(&mut t, col, text);
+        key(&mut t, "enter");
+        assert!(v(&t).cell.is_none(), "{}", t.status);
+        // The row became a manual task: no constraint was set or claimed.
+        assert!(!t.status.contains("Constraint"), "{}", t.status);
+        let ed = &v(&t).ed;
+        let task = ed.project().task(20).unwrap();
+        assert!(task.manual && !task.is_null);
+        assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(project_row(ed, task)[col], text);
+    }
+}
+
+#[test]
 fn reentering_an_existing_constraint_does_not_claim_a_change() {
     let mut t = tab();
     vm(&mut t).ed.set_constraint(20, "SNET 2026-03-06").unwrap();
@@ -413,4 +445,44 @@ fn caret_edits_utf8_and_long_buffer_window_tracks_it() {
     assert_eq!(c.scroll_x(30., measure), 80.);
     c.key("home", None);
     assert_eq!(c.scroll_x(30., measure), 0.);
+}
+
+#[test]
+fn resource_names_cell_shows_and_keeps_partial_units() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    for (uid, name, max_units) in [(1, "Bob", 0.5), (2, "Alice", 1.0)] {
+        p.resources.push(projcore::model::Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            max_units,
+            ..Default::default()
+        });
+    }
+    vm(&mut t).ed.replace_project(p);
+    vm(&mut t)
+        .ed
+        .set_resources(10, &["Bob".into(), "Alice".into()])
+        .unwrap();
+    let row = |t: &DocTab| project_row(&v(t).ed, v(t).ed.project().task(10).unwrap())[6].clone();
+    assert_eq!(row(&t), "Bob[50%], Alice");
+    let depth = v(&t).ed.undo_depth();
+    vm(&mut t).col = 6;
+    key(&mut t, "f2");
+    project_input(&mut t, "text", Some(", Carol"), Modifiers::default());
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "Bob[50%], Alice, Carol");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    let project = v(&t).ed.project();
+    let units: Vec<_> = project
+        .assignments
+        .iter()
+        .filter(|a| a.task_uid == 10)
+        .map(|a| (a.resource_uid, a.units))
+        .collect();
+    assert_eq!(units, [(1, 0.5), (2, 1.0), (3, 1.0)]);
+    assert!(project.resources.iter().all(|r| !r.name.contains('[')));
+    assert_eq!(row(&t), "Bob[50%], Alice, Carol");
 }

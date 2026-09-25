@@ -100,6 +100,33 @@ impl ConstraintType {
     }
 }
 
+/// How a task keeps duration, work and units consistent (MSPDI `Type`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TaskType {
+    FixedUnits,    // 0
+    FixedDuration, // 1
+    FixedWork,     // 2
+}
+
+impl TaskType {
+    pub fn from_code(code: i64) -> Option<TaskType> {
+        Some(match code {
+            0 => TaskType::FixedUnits,
+            1 => TaskType::FixedDuration,
+            2 => TaskType::FixedWork,
+            _ => return None,
+        })
+    }
+
+    pub fn code(self) -> i64 {
+        match self {
+            TaskType::FixedUnits => 0,
+            TaskType::FixedDuration => 1,
+            TaskType::FixedWork => 2,
+        }
+    }
+}
+
 /// One predecessor link on a task.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Predecessor {
@@ -137,9 +164,6 @@ pub struct Task {
     pub predecessors: Vec<Predecessor>,
     pub constraint: ConstraintType,
     pub constraint_date: Option<DateTime>,
-    /// MSPDI `Deadline`: bounds the late finish only, so a missed deadline
-    /// shows as negative total slack. It never moves scheduled dates.
-    pub deadline: Option<DateTime>,
     /// Task-specific calendar UID; falls back to the project calendar.
     pub calendar_uid: Option<i32>,
     /// Start/Finish as stored in the source file (Project's own computed
@@ -160,6 +184,44 @@ pub struct Task {
     pub manual_start: Option<DateTime>,
     pub manual_finish: Option<DateTime>,
     pub manual_duration_min: Option<i64>,
+    /// A blank row (MSPDI `IsNull`): Project keeps it as an entry with a UID
+    /// and ID, but it is not a task. The scheduler and outline ignore it.
+    pub is_null: bool,
+    // Fields below are kept as read so a save writes them back; `None` means
+    // the source had no (valid) value and the save writes none.
+    pub guid: Option<String>,
+    pub create_date: Option<DateTime>,
+    pub wbs: Option<String>,
+    pub task_type: Option<TaskType>,
+    /// `None` reads as active; see [`Task::is_active`]. The scheduler does not
+    /// yet drop inactive tasks.
+    pub active: Option<bool>,
+    pub effort_driven: Option<bool>,
+    /// Duration shown with `?` in Project.
+    pub estimated: Option<bool>,
+    /// Levelling priority, 0..=1000.
+    pub priority: Option<i32>,
+    /// Bounds the late finish only, so a missed deadline shows as negative
+    /// total slack. It never moves scheduled dates.
+    pub deadline: Option<DateTime>,
+    pub level_assignments: Option<bool>,
+    pub leveling_can_split: Option<bool>,
+    /// MSPDI `LevelingDelay`, raw (tenths of a minute), with its display format.
+    pub leveling_delay: Option<i64>,
+    pub leveling_delay_format: Option<i32>,
+    pub ignore_resource_calendar: Option<bool>,
+    pub earned_value_method: Option<i32>,
+    pub recurring: Option<bool>,
+    pub hide_bar: Option<bool>,
+    pub rollup: Option<bool>,
+    pub external_task: Option<bool>,
+    pub is_subproject: Option<bool>,
+    pub is_subproject_read_only: Option<bool>,
+    /// Stored values docxy does not compute: Work (minutes), Cost and
+    /// OverAllocated as Project last calculated them.
+    pub work_min: Option<i64>,
+    pub cost: Option<Rate>,
+    pub over_allocated: Option<bool>,
 }
 
 impl Task {
@@ -188,6 +250,10 @@ impl Task {
         }
         let start = self.manual_start.or(self.stored_start)?;
         Some((start, self.manual_finish))
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.active.unwrap_or(true)
     }
 
     pub fn is_milestone(&self) -> bool {
@@ -444,11 +510,15 @@ impl Default for Project {
 
 impl Project {
     /// Whether this row has outline children, independently of its stored flag.
+    /// Blank rows are outside the outline: one is never a summary, and the
+    /// next non-blank row decides whether the row above it is.
     pub(crate) fn is_outline_summary(&self, index: usize) -> bool {
         self.tasks.get(index).is_some_and(|task| {
-            self.tasks
-                .get(index + 1)
-                .is_some_and(|next| next.outline_level > task.outline_level)
+            !task.is_null
+                && self.tasks[index + 1..]
+                    .iter()
+                    .find(|next| !next.is_null)
+                    .is_some_and(|next| next.outline_level > task.outline_level)
         })
     }
 
@@ -542,6 +612,37 @@ mod tests {
         }
         assert!(LinkType::from_code(4).is_none());
         assert!(ConstraintType::from_code(8).is_none());
+    }
+
+    #[test]
+    fn task_type_codes_round_trip() {
+        for c in 0..=2 {
+            assert_eq!(TaskType::from_code(c).unwrap().code(), c);
+        }
+        assert!(TaskType::from_code(3).is_none());
+        assert!(TaskType::from_code(-1).is_none());
+    }
+
+    #[test]
+    fn blank_rows_are_outside_the_outline() {
+        let row = |outline_level, is_null| Task {
+            outline_level,
+            is_null,
+            ..Task::default()
+        };
+        let proj = Project {
+            // Phase, a blank row, its child, a deeper blank row, a sibling.
+            tasks: vec![
+                row(1, false),
+                row(0, true),
+                row(2, false),
+                row(3, true),
+                row(2, false),
+            ],
+            ..Project::default()
+        };
+        let summaries: Vec<bool> = (0..5).map(|i| proj.is_outline_summary(i)).collect();
+        assert_eq!(summaries, [true, false, false, false, false]);
     }
 
     #[test]

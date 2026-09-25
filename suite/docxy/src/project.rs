@@ -597,16 +597,21 @@ fn date(dt: Option<projcore::DateTime>) -> String {
 }
 
 pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
+    // A blank row (#80) is not a task: Project shows only its ID.
+    if task.is_null {
+        return [
+            task.id.to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ];
+    }
     let project = ed.project();
     let predecessors = projcore::editor::format_predecessors(task, project);
-    let resources = project
-        .assignments
-        .iter()
-        .filter(|a| a.task_uid == task.uid)
-        .filter_map(|a| project.resources.iter().find(|r| r.uid == a.resource_uid))
-        .map(|r| r.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
+    let resources = projcore::editor::format_resource_names(project, task.uid);
     [
         task.id.to_string(),
         task.name.clone(),

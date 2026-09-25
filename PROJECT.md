@@ -116,15 +116,18 @@ cycles fall back to input order.
 ### Verification
 
 There's no free high-fidelity oracle for scheduling (Project isn't scriptable in
-CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds eighteen tiny
+CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds twenty tiny
 one-feature MSPDI files, each embedding every task's `Start`/`Finish`,
-`TotalSlack` and `Critical` as Microsoft Project 2021 computes them.
-`corpus/tools/verify_mspdi_project.py` checked every value against Project
-over COM (#74), with the oracle elements removed from the copy Project
-schedules. `projcore/tests/corpus.rs` reads each file, runs the scheduler, and
-asserts the computed dates, slack and critical flags match — and also runs each
-file through **MSPDI → `.yppx` → back** to prove the writer and OPC container
-are lossless. Regenerate with `python3 corpus/tools/gen_mspdi_corpus.py`.
+`TotalSlack` and `Critical`. In files 01–18 these are the values Microsoft
+Project 2021 computes: `corpus/tools/verify_mspdi_project.py` checked every
+one against Project over COM (#74), with the oracle elements removed from the
+copy Project schedules. Files 19 (manual tasks, #77) and 20 (stored task
+fields and a blank row, #80) are hand-derived from our scheduler and not yet
+verified in Project. Blank rows (`IsNull`) carry no oracle.
+`projcore/tests/corpus.rs` reads each file, runs the scheduler, and asserts the
+computed dates, slack and critical flags match — and also runs each file
+through **MSPDI → `.yppx` → back** to prove the writer and OPC container are
+lossless. Regenerate with `python3 corpus/tools/gen_mspdi_corpus.py`.
 
 ## Resource leveling
 
@@ -180,8 +183,18 @@ On a manual task, Start moves the task to that day's first working time (08:00
 on a non-working day) keeping its duration, and Finish sets its finish at the
 day's last working time (17:00 on a non-working day) and its duration to the
 working time in between; neither adds a constraint. Predecessors use
-displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated;
-retained assignments keep their units/work, and unknown names create resources.
+displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated,
+and unknown names create resources. A new work assignment starts at the
+resource's Max. Units capped at 100%, with work = duration x units; `Name[NN%]`
+sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
+allowed). The cell shows `Name[NN%]` for a work assignment that is not at 100%,
+and deleting the bracket resets it to 100%. In the Resource Names cell, a token
+that names, or equals the shown `Name[NN%]` text of, one of the task's
+assignments keeps that assignment, with exact spellings before case-insensitive
+ones (a token that fits two resources equally well is ambiguous and rejected);
+otherwise an existing resource whose name matches the whole token wins;
+otherwise a name ending in `[...]` must hold valid `NN%` units. Retained
+assignments whose text is unchanged keep their units/work.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
 be entered individually through the resource-list syntax.

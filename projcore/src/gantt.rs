@@ -33,6 +33,10 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
     let mut section: Option<String> = None; // current section name (from summary)
     let mut emitted: Option<String> = None; // last section header written
     for task in &proj.tasks {
+        // A blank row is not a task and never opens a section.
+        if task.is_null {
+            continue;
+        }
         if task.summary {
             // Top-level summaries define sections; deeper ones just group under
             // the enclosing section.
@@ -223,6 +227,22 @@ mod tests {
     }
 
     #[test]
+    fn blank_rows_are_not_rendered() {
+        let mut proj = diamond();
+        let mut blank = task(9, "Ghost", 480);
+        blank.is_null = true;
+        blank.summary = true;
+        blank.outline_level = 0;
+        proj.tasks.insert(2, blank);
+        let s = schedule(&proj);
+        let plain = diamond();
+        let plain_s = schedule(&plain);
+        assert_eq!(to_mermaid(&proj, &s), to_mermaid(&plain, &plain_s));
+        assert_eq!(to_markdown(&proj, &s), to_markdown(&plain, &plain_s));
+        assert!(!to_markdown(&proj, &s).contains("Ghost"));
+    }
+
+    #[test]
     fn mermaid_shapes() {
         let proj = diamond();
         let s = schedule(&proj);
@@ -406,7 +426,7 @@ mod tests {
     #[test]
     fn markdown_reports_a_missed_deadline_as_negative_total_slack() {
         let proj =
-            crate::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-deadline-missed.xml"))
+            crate::mspdi::read_mspdi(include_str!("../../corpus/mspdi/21-deadline-missed.xml"))
                 .unwrap();
         let md = to_markdown(&proj, &schedule(&proj));
         let rows = table_rows(&md);
