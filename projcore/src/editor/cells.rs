@@ -172,6 +172,10 @@ impl Editor {
 
     /// Replace membership while preserving allocation data for retained resources.
     /// Prefer an already assigned namesake; otherwise duplicate names are ambiguous.
+    ///
+    /// Tokens are Resource Names cell text: `Name[NN%]` sets explicit units. The
+    /// cell is WYSIWYG, so a retained assignment changes only when its text does:
+    /// different bracketed units, or a bare work resource that was shown bracketed.
     pub fn set_resources(&mut self, uid: i32, names: &[String]) -> Result<(), String> {
         let i = self.index(uid)?;
         // Stage every allocation before touching the project or history, including ID exhaustion.
@@ -183,67 +187,64 @@ impl Editor {
             .map(|a| a.uid)
             .max()
             .unwrap_or(0);
-        let mut wanted = Vec::new();
+        let mut wanted: Vec<(i32, Option<f64>, &str)> = Vec::new();
         for raw in names {
-            // Imported names may contain significant whitespace. Match the raw
-            // token against retained assignments before normalizing user input.
-            let assigned_resources: Vec<_> = resources
-                .iter()
-                .filter(|r| {
-                    self.proj
-                        .assignments
-                        .iter()
-                        .any(|a| a.task_uid == uid && a.resource_uid == r.uid)
-                })
-                .collect();
-            let mut retained: Vec<_> = assigned_resources
-                .iter()
-                .filter(|r| r.name == *raw)
-                .map(|r| r.uid)
-                .collect();
-            if retained.is_empty() {
-                retained = assigned_resources
-                    .iter()
-                    .filter(|r| r.name.eq_ignore_ascii_case(raw))
-                    .map(|r| r.uid)
-                    .collect();
-            }
-            match retained.as_slice() {
-                [rid] => {
-                    if !wanted.contains(rid) {
-                        wanted.push(*rid);
-                    }
-                    continue;
+            // A whole-token name match wins, so names like `Crew [A%]` are not split.
+            let (rid, units) = match self.match_resource(uid, &resources, raw)? {
+                Some(found) => found,
+                None => {
+                    let (name, units) = parse_resource_token(raw)?;
+                    let matched = match units {
+                        Some(_) => self.match_resource(uid, &resources, name)?.map(|m| m.0),
+                        None => None,
+                    };
+                    let rid = match matched {
+                        Some(rid) => rid,
+                        None if name.trim().is_empty() => continue,
+                        None => find_or_stage_resource(&mut resources, name.trim())?,
+                    };
+                    (rid, units)
                 }
-                [] => {}
-                _ => return Err(format!("Resource name '{raw}' is ambiguous")),
-            }
-            let name = raw.trim();
-            if name.is_empty() {
-                continue;
-            }
-            let matches: Vec<_> = resources
-                .iter()
-                .filter(|r| r.name.eq_ignore_ascii_case(name))
-                .map(|r| r.uid)
-                .collect();
-            let assigned: Vec<_> = matches
-                .iter()
-                .copied()
-                .filter(|rid| {
-                    self.proj
-                        .assignments
-                        .iter()
-                        .any(|a| a.task_uid == uid && a.resource_uid == *rid)
-                })
-                .collect();
-            let rid = match assigned.as_slice() {
-                [rid] => *rid,
-                [] if matches.len() <= 1 => find_or_stage_resource(&mut resources, name)?,
-                _ => return Err(format!("Resource name '{name}' is ambiguous")),
             };
-            if !wanted.contains(&rid) {
-                wanted.push(rid);
+            if !wanted.iter().any(|w| w.0 == rid) {
+                wanted.push((rid, units, raw));
+            }
+        }
+        let duration = self.proj.tasks[i].duration_min;
+        let kind = |rid: i32| resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
+        let mut changed = false;
+        let mut assignments = self.proj.assignments.clone();
+        assignments.retain(|a| {
+            let keep = a.task_uid != uid || wanted.iter().any(|w| w.0 == a.resource_uid);
+            changed |= !keep;
+            keep
+        });
+        // A token speaks for the first assignment of its resource; imported
+        // duplicates on the same task are left as they are.
+        let mut seen = std::collections::HashSet::new();
+        for a in assignments
+            .iter_mut()
+            .filter(|a| a.task_uid == uid && seen.insert(a.resource_uid))
+        {
+            let &(_, explicit, raw) = wanted
+                .iter()
+                .find(|w| w.0 == a.resource_uid)
+                .expect("retained");
+            let units = match explicit {
+                Some(u) if format_units(u) == format_units(a.units) => None,
+                Some(u) => Some(checked_units(u, raw)?),
+                // The cell showed `Name[NN%]` and the user deleted the bracket.
+                None if kind(a.resource_uid) == Some(ResourceType::Work)
+                    && units_bracket(a.units).is_some() =>
+                {
+                    Some(1.0)
+                }
+                None => None,
+            };
+            if let Some(u) = units {
+                a.units = u;
+                a.work_min = work_for(duration, u);
+                changed = true;
             }
         }
         let old: std::collections::HashSet<_> = self
@@ -253,18 +254,16 @@ impl Editor {
             .filter(|a| a.task_uid == uid)
             .map(|a| a.resource_uid)
             .collect();
-        if wanted.len() == old.len() && wanted.iter().all(|r| old.contains(r)) {
-            return Ok(());
+        for &(rid, explicit, raw) in wanted.iter().filter(|w| !old.contains(&w.0)) {
+            let units = match explicit {
+                Some(u) => checked_units(u, raw)?,
+                None => default_units(resources.iter().find(|r| r.uid == rid).expect("staged")),
+            };
+            assignments.push(new_assignment(&mut next_aid, uid, rid, units, duration)?);
+            changed = true;
         }
-        let mut assignments = self.proj.assignments.clone();
-        assignments.retain(|a| a.task_uid != uid || wanted.contains(&a.resource_uid));
-        for rid in wanted.into_iter().filter(|rid| !old.contains(rid)) {
-            assignments.push(new_assignment(
-                &mut next_aid,
-                uid,
-                rid,
-                self.proj.tasks[i].duration_min,
-            )?);
+        if !changed {
+            return Ok(());
         }
         self.snapshot();
         self.proj.resources = resources;
@@ -272,6 +271,128 @@ impl Editor {
         self.changed();
         Ok(())
     }
+
+    /// Resolve a whole token to an existing resource. The task's assignments
+    /// match by name, or by their shown cell text (`Bob[50%]`, which carries the
+    /// assignment's current units), on one exactness ladder: raw, then trimmed,
+    /// then case-insensitive. The first tier with a hit decides; hits on two
+    /// resources are ambiguous. Otherwise a trimmed match among all resources.
+    fn match_resource(
+        &self,
+        uid: i32,
+        resources: &[Resource],
+        raw: &str,
+    ) -> Result<Option<(i32, Option<f64>)>, String> {
+        let name = raw.trim();
+        let ambiguous = || Err(format!("Resource name '{name}' is ambiguous"));
+        let on_task: Vec<_> = self
+            .proj
+            .assignments
+            .iter()
+            .filter(|a| a.task_uid == uid)
+            .filter_map(|a| Some((resources.iter().find(|r| r.uid == a.resource_uid)?, a)))
+            .collect();
+        // Imported names may contain significant whitespace, so the raw token
+        // is tried before it is normalized.
+        for tier in 0..3 {
+            if tier > 0 && name.is_empty() {
+                return Ok(None);
+            }
+            let mut hits: Vec<(i32, Option<f64>)> = Vec::new();
+            for &(r, a) in &on_task {
+                let shown = cell_text(r, a);
+                let (by_name, by_shown) = match tier {
+                    0 => (r.name == raw, shown == raw),
+                    1 => (r.name == name, shown.trim() == name),
+                    _ => (
+                        r.name.eq_ignore_ascii_case(raw) || r.name.eq_ignore_ascii_case(name),
+                        shown.trim().eq_ignore_ascii_case(name),
+                    ),
+                };
+                if !(by_name || by_shown) {
+                    continue;
+                }
+                // A name hit keeps no units; shown text carries the current ones.
+                let units = (!by_name).then_some(a.units);
+                match hits.iter_mut().find(|h| h.0 == r.uid) {
+                    Some(hit) => hit.1 = hit.1.and(units),
+                    None => hits.push((r.uid, units)),
+                }
+            }
+            match hits.as_slice() {
+                [] => {}
+                [hit] => return Ok(Some(*hit)),
+                _ => return ambiguous(),
+            }
+        }
+        let matches: Vec<_> = resources
+            .iter()
+            .filter(|r| r.name.eq_ignore_ascii_case(name))
+            .map(|r| r.uid)
+            .collect();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [rid] => Ok(Some((*rid, None))),
+            _ => ambiguous(),
+        }
+    }
+}
+
+/// Split a Resource Names token `Name[NN%]` into its name and units (`NN/100`).
+/// A token without a trailing bracket is all name. The name keeps its raw
+/// spelling so it resolves like a bare token.
+pub(super) fn parse_resource_token(raw: &str) -> Result<(&str, Option<f64>), String> {
+    let Some((name, inner)) = raw
+        .trim_end()
+        .strip_suffix(']')
+        .and_then(|body| body.rsplit_once('['))
+    else {
+        return Ok((raw, None));
+    };
+    let percent = inner
+        .trim()
+        .strip_suffix('%')
+        .and_then(|n| n.trim_end().parse::<f64>().ok())
+        .filter(|n| n.is_finite());
+    match percent {
+        Some(n) if !name.trim().is_empty() => Ok((name, Some(n / 100.))),
+        _ => Err(format!("Invalid units in '{}'", raw.trim())),
+    }
+}
+
+/// Assignment units as percent text: two decimals, trailing zeros trimmed (`50%`, `33.33%`).
+pub(super) fn format_units(units: f64) -> String {
+    let text = format!("{:.2}", units * 100.);
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    format!("{}%", if text == "-0" { "0" } else { text })
+}
+
+/// The bracket a work assignment shows after its name, or `None` at 100%.
+fn units_bracket(units: f64) -> Option<String> {
+    (units.is_finite() && (units - 1.).abs() > 1e-9).then(|| format!("[{}]", format_units(units)))
+}
+
+/// The task's Resource Names cell, in assignment order: `Bob[50%], Alice`.
+/// Only work resources show their units, as in Project.
+pub fn format_resource_names(proj: &Project, task_uid: i32) -> String {
+    proj.assignments
+        .iter()
+        .filter(|a| a.task_uid == task_uid)
+        .filter_map(|a| {
+            let r = proj.resources.iter().find(|r| r.uid == a.resource_uid)?;
+            Some(cell_text(r, a))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One assignment's Resource Names text; only work resources show their units.
+fn cell_text(r: &Resource, a: &Assignment) -> String {
+    let units = match r.kind {
+        ResourceType::Work => units_bracket(a.units),
+        _ => None,
+    };
+    format!("{}{}", r.name, units.unwrap_or_default())
 }
 
 /// Prefer whole days/hours, falling back to exact minutes (including signed lag).

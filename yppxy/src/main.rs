@@ -34,7 +34,9 @@ use ribbon::{Act, Ribbon};
 
 use mppread::project::project_from_mpp;
 use projcore::datetime::DateTime;
-use projcore::editor::{AssignOutcome, Editor, FindOutcome, constraint_hint, parse_duration};
+use projcore::editor::{
+    AssignOutcome, Editor, FindOutcome, constraint_hint, format_resource_names, parse_duration,
+};
 #[cfg(test)]
 use projcore::model::Predecessor;
 use projcore::model::{LinkType, Project, Task};
@@ -1577,10 +1579,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
         // Resources assigned to the selected task.
-        let res = task_resources(app.ed.project(), t.uid);
+        let res = format_resource_names(app.ed.project(), t.uid);
         if !res.is_empty() {
             spans.push(Span::styled(
-                format!("· 👤 {} ", res.join(", ")),
+                format!("· 👤 {res} "),
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
@@ -2552,6 +2554,24 @@ mod tests {
         app.assign_resource("");
         assert!(app.ed.project().assignments.is_empty());
         assert_eq!(app.ed.project().resources.len(), 2);
+    }
+
+    #[test]
+    fn status_line_shows_partial_units_while_initials_use_plain_names() {
+        let mut proj = new_project();
+        proj.resources.push(projcore::model::Resource {
+            uid: 1,
+            id: 1,
+            name: "Bob".into(),
+            max_units: 0.5,
+            ..Default::default()
+        });
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
+        app.assign_resource("Bob");
+        app.assign_resource("Zed[25%]");
+        let s = buffer_text(&mut app, 110, 24);
+        assert!(s.contains("Bob[50%], Zed[25%]"), "{s}");
+        assert!(s.contains("·BZ"), "{s}");
     }
 
     #[test]
