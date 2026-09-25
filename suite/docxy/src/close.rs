@@ -117,7 +117,7 @@ impl Docxy {
                 false
             }
             CloseStep::Save => {
-                self.save_for_close(window, cx);
+                self.save_active(window, cx);
                 !self.tabs[i].dirty
             }
         };
@@ -130,24 +130,6 @@ impl Docxy {
         }
         self.persist();
         self.refocus(window, cx);
-    }
-
-    fn save_for_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let tab = &self.tabs[self.active];
-        // Normal document Save currently chooses cwd/title for an untitled
-        // document. Close must ask for a destination instead of overwriting it.
-        if matches!(tab.surface, Surface::Doc(_)) && tab.path.is_none() {
-            if self.harness.is_some() {
-                self.tabs[self.active].status =
-                    "this document has never been saved, and a harness instance cannot open the Save As dialog".into();
-                return;
-            }
-            if !self.pick_doc_save_target() {
-                self.tabs[self.active].status = "save cancelled".into();
-                return;
-            }
-        }
-        self.save_active(window, cx);
     }
 }
 

@@ -2,8 +2,12 @@
 # also reopens the saved copies and verifies failed writes and session.json:
 # cargo test -p uiharness --test tab_close -- --ignored --nocapture
 
-test pathless document Save refuses and Backstage Close uses the guarded handler
+test pathless document Ctrl+S and close Save refuse and Backstage Close uses the guarded handler
   type Pending untitled edit
+  key ctrl+s
+  assert tabs is 1
+  assert dirty is true
+  assert status is this document has never been saved, and a harness instance cannot open the Save As dialog
   call backstage-close {}
   assert tabs is 1
   assert dirty is true

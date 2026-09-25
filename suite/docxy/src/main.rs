@@ -9832,10 +9832,33 @@ impl Docxy {
             return self.save_sheet(window, cx);
         }
         self.flush_hf(); // commit any open header/footer edits into the package first
-        let Some(tab) = self.tabs.get_mut(self.active) else {
+        let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        let Surface::Doc(editor) = &tab.surface else {
+        if !matches!(tab.surface, Surface::Doc(_)) {
+            return;
+        }
+        // A never-saved document asks where to go, like a never-saved
+        // workbook, instead of writing `<cwd>/<title>` over whatever is there.
+        match doc_save_target(tab.path.as_deref(), self.harness.is_some()) {
+            DocSaveTarget::InPlace => {}
+            // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
+            // this thread and stops the control pump dead (see `save_sheet`).
+            DocSaveTarget::RefuseHarness => {
+                self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
+                return self.refocus(window, cx);
+            }
+            // The pick binds `tab.path` and, for a `.md` name, `tab.markdown`,
+            // so it has to come before serializing.
+            DocSaveTarget::NeedsDialog => {
+                if !self.pick_doc_save_target() {
+                    self.tabs[self.active].status = "save cancelled".into();
+                    return self.refocus(window, cx);
+                }
+            }
+        }
+        let tab = &mut self.tabs[self.active];
+        let (Surface::Doc(editor), Some(path)) = (&tab.surface, tab.path.clone()) else {
             return;
         };
         // Markdown-backed tabs save as Markdown; everything else as lossless .docx.
@@ -9844,11 +9867,6 @@ impl Docxy {
         } else {
             doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref())
         };
-        let path = tab.path.clone().unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(tab.title.to_string())
-        });
         match opccore::fsio::write_atomic(&path, &bytes) {
             Ok(()) => {
                 tab.title = file_name(&path).into();
@@ -12269,6 +12287,49 @@ impl Docxy {
         }
         self.scroll_to_caret();
         cx.notify();
+    }
+}
+
+/// What a harness instance says when asked to save a never-saved document.
+const DOC_NEVER_SAVED_HARNESS: &str =
+    "this document has never been saved, and a harness instance cannot open the Save As dialog";
+
+/// Where a document Save goes, decided before anything is written.
+#[derive(Debug, PartialEq, Eq)]
+enum DocSaveTarget {
+    /// The tab has a path: overwrite it.
+    InPlace,
+    /// Never saved: ask with the Save As dialog.
+    NeedsDialog,
+    /// Never saved, in a harness instance that must not open a native dialog.
+    RefuseHarness,
+}
+
+fn doc_save_target(path: Option<&std::path::Path>, harness: bool) -> DocSaveTarget {
+    match path {
+        Some(_) => DocSaveTarget::InPlace,
+        None if harness => DocSaveTarget::RefuseHarness,
+        None => DocSaveTarget::NeedsDialog,
+    }
+}
+
+#[cfg(test)]
+mod doc_save_target_tests {
+    use super::{DocSaveTarget, doc_save_target};
+    use std::path::Path;
+
+    #[test]
+    fn a_saved_document_saves_in_place_harness_or_not() {
+        let path = Path::new("report.docx");
+        for harness in [false, true] {
+            assert_eq!(doc_save_target(Some(path), harness), DocSaveTarget::InPlace);
+        }
+    }
+
+    #[test]
+    fn a_never_saved_document_asks_or_refuses_but_never_picks_a_path() {
+        assert_eq!(doc_save_target(None, false), DocSaveTarget::NeedsDialog);
+        assert_eq!(doc_save_target(None, true), DocSaveTarget::RefuseHarness);
     }
 }
 
