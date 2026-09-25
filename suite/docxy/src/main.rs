@@ -13,6 +13,8 @@ mod close;
 mod control;
 mod harness;
 mod project;
+#[cfg(test)]
+mod ribbon_export;
 use project::*;
 
 use std::path::PathBuf;
@@ -12403,7 +12405,7 @@ fn no(mut f: impl FnMut()) -> bool {
 
 // ---- the ribbon, defined once via ribbonspec (shared model) ----------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Act {
     Project(ProjectAct),
     Bold,

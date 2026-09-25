@@ -1,1 +1,1307 @@
-{}
+{
+  "_generated": "From suite/docxy (docxy_ribbon, table_tab, QAT_ITEMS, BACKSTAGE_RAIL, icons, theme). Do not edit; regenerate: UPDATE_RIBBON_SNAPSHOT=1 cargo test --manifest-path suite/Cargo.toml ribbon_export",
+  "format": "docx",
+  "tabs": [
+    {
+      "name": "File",
+      "keyTip": "F",
+      "kind": "backstage"
+    },
+    {
+      "name": "Home",
+      "keyTip": "H",
+      "kind": "ribbon",
+      "groups": [
+        {
+          "title": "Clipboard",
+          "priority": 10,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "paste",
+                "label": "Paste",
+                "icon": "paste",
+                "act": "Paste",
+                "keyTip": "V",
+                "tip": {
+                  "title": "Paste",
+                  "body": "",
+                  "shortcut": "Ctrl+V"
+                }
+              }
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "cut",
+                  "label": "Cut",
+                  "icon": "cut",
+                  "act": "Cut",
+                  "keyTip": "X",
+                  "tip": {
+                    "title": "Cut",
+                    "body": "",
+                    "shortcut": "Ctrl+X"
+                  }
+                },
+                {
+                  "id": "copy",
+                  "label": "Copy",
+                  "icon": "copy",
+                  "act": "Copy",
+                  "keyTip": "C",
+                  "tip": {
+                    "title": "Copy",
+                    "body": "",
+                    "shortcut": "Ctrl+C"
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Font",
+          "priority": 40,
+          "launcher": "LaunchFont",
+          "items": [
+            {
+              "kind": "rows",
+              "rows": [
+                [
+                  {
+                    "kind": "combo",
+                    "cmd": {
+                      "id": "fontname",
+                      "label": "Font",
+                      "icon": "font-name",
+                      "act": "FontName",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Font",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    },
+                    "wide": true
+                  },
+                  {
+                    "kind": "combo",
+                    "cmd": {
+                      "id": "fontsize",
+                      "label": "Font size",
+                      "icon": "font-size",
+                      "act": "FontSize",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Font size",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    },
+                    "wide": false
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "grow",
+                      "label": "Grow font",
+                      "icon": "font-increase",
+                      "act": "Grow",
+                      "keyTip": "G",
+                      "tip": {
+                        "title": "Grow font",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "shrink",
+                      "label": "Shrink font",
+                      "icon": "font-decrease",
+                      "act": "Shrink",
+                      "keyTip": "K",
+                      "tip": {
+                        "title": "Shrink font",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "case",
+                      "label": "Change case",
+                      "icon": "case",
+                      "act": "Case",
+                      "keyTip": "7",
+                      "tip": {
+                        "title": "Change case",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "clearfmt",
+                      "label": "Clear formatting",
+                      "icon": "clear-format",
+                      "act": "ClearFmt",
+                      "keyTip": "E",
+                      "tip": {
+                        "title": "Clear formatting",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ],
+                [
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "b",
+                      "label": "Bold",
+                      "icon": "bold",
+                      "act": "Bold",
+                      "keyTip": "1",
+                      "tip": {
+                        "title": "Bold",
+                        "body": "",
+                        "shortcut": "Ctrl+B"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "i",
+                      "label": "Italic",
+                      "icon": "italic",
+                      "act": "Italic",
+                      "keyTip": "2",
+                      "tip": {
+                        "title": "Italic",
+                        "body": "",
+                        "shortcut": "Ctrl+I"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "u",
+                      "label": "Underline",
+                      "icon": "underline",
+                      "act": "Underline",
+                      "keyTip": "3",
+                      "tip": {
+                        "title": "Underline",
+                        "body": "",
+                        "shortcut": "Ctrl+U"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "s",
+                      "label": "Strikethrough",
+                      "icon": "strikethrough",
+                      "act": "Strike",
+                      "keyTip": "4",
+                      "tip": {
+                        "title": "Strikethrough",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "sub",
+                      "label": "Subscript",
+                      "icon": "subscript",
+                      "act": "Sub",
+                      "keyTip": "5",
+                      "tip": {
+                        "title": "Subscript",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "sup",
+                      "label": "Superscript",
+                      "icon": "superscript",
+                      "act": "Super",
+                      "keyTip": "6",
+                      "tip": {
+                        "title": "Superscript",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "color",
+                      "label": "Font colour",
+                      "icon": "text-color",
+                      "act": "FontColor",
+                      "keyTip": "8",
+                      "tip": {
+                        "title": "Font colour",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "hl",
+                      "label": "Text highlight",
+                      "icon": "highlight",
+                      "act": "Highlight",
+                      "keyTip": "9",
+                      "tip": {
+                        "title": "Text highlight",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Paragraph",
+          "priority": 30,
+          "launcher": "LaunchParagraph",
+          "items": [
+            {
+              "kind": "rows",
+              "rows": [
+                [
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "bullets",
+                      "label": "Bullets",
+                      "icon": "list-bullet",
+                      "act": "Bullets",
+                      "keyTip": "U",
+                      "tip": {
+                        "title": "Bullets",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "numbers",
+                      "label": "Numbering",
+                      "icon": "list-numbered",
+                      "act": "Numbers",
+                      "keyTip": "N",
+                      "tip": {
+                        "title": "Numbering",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "inddec",
+                      "label": "Decrease indent",
+                      "icon": "indent-decrease",
+                      "act": "IndentDec",
+                      "keyTip": "O",
+                      "tip": {
+                        "title": "Decrease indent",
+                        "body": "",
+                        "shortcut": "Ctrl+Shift+M"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "indinc",
+                      "label": "Increase indent",
+                      "icon": "indent-increase",
+                      "act": "IndentInc",
+                      "keyTip": "P",
+                      "tip": {
+                        "title": "Increase indent",
+                        "body": "",
+                        "shortcut": "Ctrl+M"
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "linespacing",
+                      "label": "Line and Paragraph Spacing",
+                      "icon": "line-spacing",
+                      "act": "LineSpacing",
+                      "keyTip": "Y",
+                      "tip": {
+                        "title": "Line and Paragraph Spacing",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "sort",
+                      "label": "Sort",
+                      "icon": "sort",
+                      "act": "Sort",
+                      "keyTip": "S",
+                      "tip": {
+                        "title": "Sort",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "showhide",
+                      "label": "Formatting marks",
+                      "icon": "paragraph",
+                      "act": "ShowHide",
+                      "keyTip": "H",
+                      "tip": {
+                        "title": "Formatting marks",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ],
+                [
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "al",
+                      "label": "Align left",
+                      "icon": "align-left",
+                      "act": "AlignL",
+                      "keyTip": "L",
+                      "tip": {
+                        "title": "Align left",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "ac",
+                      "label": "Center",
+                      "icon": "align-center",
+                      "act": "AlignC",
+                      "keyTip": "A",
+                      "tip": {
+                        "title": "Center",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "ar",
+                      "label": "Align right",
+                      "icon": "align-right",
+                      "act": "AlignR",
+                      "keyTip": "R",
+                      "tip": {
+                        "title": "Align right",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "aj",
+                      "label": "Justify",
+                      "icon": "align-justify",
+                      "act": "AlignJ",
+                      "keyTip": "J",
+                      "tip": {
+                        "title": "Justify",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "borders",
+                      "label": "Bottom border",
+                      "icon": "border-bottom",
+                      "act": "ParaBorders",
+                      "keyTip": "B",
+                      "tip": {
+                        "title": "Bottom border",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Styles",
+          "priority": 35,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "gallery",
+              "id": "styles",
+              "tip": {
+                "title": "",
+                "body": "",
+                "shortcut": ""
+              },
+              "items": [
+                {
+                  "label": "Normal",
+                  "preview": "normal",
+                  "act": "Normal"
+                },
+                {
+                  "label": "No Spacing",
+                  "preview": "normal",
+                  "act": "NoSpacing"
+                },
+                {
+                  "label": "Heading 1",
+                  "preview": "h1",
+                  "act": "H1"
+                },
+                {
+                  "label": "Heading 2",
+                  "preview": "h2",
+                  "act": "H2"
+                },
+                {
+                  "label": "Heading 3",
+                  "preview": "h3",
+                  "act": "H3"
+                },
+                {
+                  "label": "Title",
+                  "preview": "title",
+                  "act": "Title"
+                },
+                {
+                  "label": "Subtitle",
+                  "preview": "subtitle",
+                  "act": "Subtitle"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Editing",
+          "priority": 20,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "find",
+                  "label": "Find & Replace",
+                  "icon": "find",
+                  "act": "Find",
+                  "keyTip": "F",
+                  "tip": {
+                    "title": "Find & Replace",
+                    "body": "",
+                    "shortcut": "Ctrl+F"
+                  }
+                },
+                {
+                  "id": "selall",
+                  "label": "Select all",
+                  "icon": "select-all",
+                  "act": "SelectAll",
+                  "keyTip": "D",
+                  "tip": {
+                    "title": "Select all",
+                    "body": "",
+                    "shortcut": "Ctrl+A"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Insert",
+      "keyTip": "N",
+      "kind": "ribbon",
+      "groups": [
+        {
+          "title": "Pages",
+          "priority": 40,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "pagebreak",
+                "label": "Page Break",
+                "icon": "rule",
+                "act": "PageBreak",
+                "keyTip": "B",
+                "tip": {
+                  "title": "Page Break",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Tables",
+          "priority": 35,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "table",
+                "label": "Table",
+                "icon": "table",
+                "act": "InsertTable",
+                "keyTip": "T",
+                "tip": {
+                  "title": "Table",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Header & Footer",
+          "priority": 34,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "header",
+                "label": "Edit Header",
+                "icon": "header",
+                "act": "EditHeader",
+                "keyTip": "H",
+                "tip": {
+                  "title": "Edit Header",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "footer",
+                "label": "Edit Footer",
+                "icon": "footer",
+                "act": "EditFooter",
+                "keyTip": "O",
+                "tip": {
+                  "title": "Edit Footer",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "pagenum",
+                "label": "Page Number",
+                "icon": "page-number",
+                "act": "PageNumber",
+                "keyTip": "G",
+                "tip": {
+                  "title": "Page Number",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Text",
+          "priority": 30,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "field",
+                "label": "Field",
+                "icon": "case",
+                "act": "InsertField",
+                "keyTip": "Q",
+                "tip": {
+                  "title": "Field",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Symbols",
+          "priority": 20,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "equation",
+                "label": "Equation",
+                "icon": "equation",
+                "act": "InsertEquation",
+                "keyTip": "E",
+                "tip": {
+                  "title": "Equation",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "symbol",
+                "label": "Symbol",
+                "icon": "symbol",
+                "act": "InsertSymbol",
+                "keyTip": "S",
+                "tip": {
+                  "title": "Symbol",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "hr",
+                "label": "Rule",
+                "icon": "rule",
+                "act": "HRule",
+                "keyTip": "L",
+                "tip": {
+                  "title": "Rule",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Layout",
+          "priority": 22,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "columns",
+                "label": "Columns",
+                "icon": "columns",
+                "act": "Columns",
+                "keyTip": "C",
+                "tip": {
+                  "title": "Columns",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "hyphen",
+                "label": "Hyphenation",
+                "icon": "hyphenation",
+                "act": "Hyphenation",
+                "keyTip": "Z",
+                "tip": {
+                  "title": "Hyphenation",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Review",
+      "keyTip": "R",
+      "kind": "ribbon",
+      "groups": [
+        {
+          "title": "Comments",
+          "priority": 40,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "newcomment",
+                "label": "New Comment",
+                "icon": "comment-add",
+                "act": "NewComment",
+                "keyTip": "C",
+                "tip": {
+                  "title": "New Comment",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            },
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "togglecomments",
+                  "label": "Comments pane",
+                  "icon": "comment",
+                  "act": "ToggleComments",
+                  "keyTip": "P",
+                  "tip": {
+                    "title": "Comments pane",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "togglenotes",
+                  "label": "Notes pane",
+                  "icon": "comment",
+                  "act": "ToggleNotes",
+                  "keyTip": "O",
+                  "tip": {
+                    "title": "Notes pane",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Editing",
+          "priority": 30,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "find",
+                  "label": "Find & Replace",
+                  "icon": "find",
+                  "act": "Find",
+                  "keyTip": "F",
+                  "tip": {
+                    "title": "Find & Replace",
+                    "body": "",
+                    "shortcut": "Ctrl+F"
+                  }
+                },
+                {
+                  "id": "selall",
+                  "label": "Select all",
+                  "icon": "select-all",
+                  "act": "SelectAll",
+                  "keyTip": "D",
+                  "tip": {
+                    "title": "Select all",
+                    "body": "",
+                    "shortcut": "Ctrl+A"
+                  }
+                },
+                {
+                  "id": "case",
+                  "label": "Change case",
+                  "icon": "case",
+                  "act": "Case",
+                  "keyTip": "7",
+                  "tip": {
+                    "title": "Change case",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "View",
+      "keyTip": "W",
+      "kind": "ribbon",
+      "groups": [
+        {
+          "title": "Views",
+          "priority": 40,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "large",
+              "cmd": {
+                "id": "printlayout",
+                "label": "Print Layout",
+                "icon": "print-layout",
+                "act": "PrintLayout",
+                "keyTip": "P",
+                "tip": {
+                  "title": "Print Layout",
+                  "body": "",
+                  "shortcut": ""
+                }
+              }
+            }
+          ]
+        },
+        {
+          "title": "Show",
+          "priority": 30,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "ruler",
+                  "label": "Ruler",
+                  "icon": "rule",
+                  "act": "ToggleRuler",
+                  "keyTip": "R",
+                  "tip": {
+                    "title": "Ruler",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "showhide",
+                  "label": "Formatting marks",
+                  "icon": "paragraph",
+                  "act": "ShowHide",
+                  "keyTip": "M",
+                  "tip": {
+                    "title": "Formatting marks",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "nav",
+                  "label": "Navigation",
+                  "icon": "select-all",
+                  "act": "ToggleNav",
+                  "keyTip": "N",
+                  "tip": {
+                    "title": "Navigation",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "viewcomments",
+                  "label": "Comments pane",
+                  "icon": "comment",
+                  "act": "ToggleComments",
+                  "keyTip": "C",
+                  "tip": {
+                    "title": "Comments pane",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Appearance",
+          "priority": 20,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "darkmode",
+                  "label": "Theme",
+                  "icon": "case",
+                  "act": "DarkMode",
+                  "keyTip": "T",
+                  "tip": {
+                    "title": "Theme",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                },
+                {
+                  "id": "autohide",
+                  "label": "Collapse ribbon",
+                  "icon": "rule",
+                  "act": "AutoHideRibbon",
+                  "keyTip": "A",
+                  "tip": {
+                    "title": "Collapse ribbon",
+                    "body": "",
+                    "shortcut": "Ctrl+F1"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "contextual": [
+    {
+      "name": "Table",
+      "keyTip": "T",
+      "context": "table",
+      "groups": [
+        {
+          "title": "Rows & Columns",
+          "priority": 40,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "rows",
+              "rows": [
+                [
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "rowabove",
+                      "label": "Insert row above",
+                      "icon": "table-insert-row",
+                      "act": "RowAbove",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Insert row above",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "colleft",
+                      "label": "Insert column left",
+                      "icon": "table-insert-column",
+                      "act": "ColLeft",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Insert column left",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "delrow",
+                      "label": "Delete row",
+                      "icon": "table-delete-row",
+                      "act": "DelRow",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Delete row",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ],
+                [
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "rowbelow",
+                      "label": "Insert row below",
+                      "icon": "table-insert-row",
+                      "act": "RowBelow",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Insert row below",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "colright",
+                      "label": "Insert column right",
+                      "icon": "table-insert-column",
+                      "act": "ColRight",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Insert column right",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  },
+                  {
+                    "kind": "btn",
+                    "cmd": {
+                      "id": "delcol",
+                      "label": "Delete column",
+                      "icon": "table-delete-column",
+                      "act": "DelCol",
+                      "keyTip": "",
+                      "tip": {
+                        "title": "Delete column",
+                        "body": "",
+                        "shortcut": ""
+                      }
+                    }
+                  }
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "title": "Table",
+          "priority": 20,
+          "launcher": null,
+          "items": [
+            {
+              "kind": "column",
+              "cmds": [
+                {
+                  "id": "deltable",
+                  "label": "Delete table",
+                  "icon": "table-dismiss",
+                  "act": "DelTable",
+                  "keyTip": "",
+                  "tip": {
+                    "title": "Delete table",
+                    "body": "",
+                    "shortcut": ""
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "qat": [
+    {
+      "id": "qat-undo",
+      "icon": "undo",
+      "label": "Undo",
+      "tip": "Undo (Ctrl+Z)",
+      "action": "undo"
+    },
+    {
+      "id": "qat-redo",
+      "icon": "redo",
+      "label": "Redo",
+      "tip": "Redo (Ctrl+Y)",
+      "action": "redo"
+    }
+  ],
+  "backstage": [
+    {
+      "id": "bs-back",
+      "label": "← Back",
+      "action": "back"
+    },
+    {
+      "id": "bs-new",
+      "label": "New",
+      "action": "new"
+    },
+    {
+      "id": "bs-open",
+      "label": "Open…",
+      "action": "open"
+    },
+    {
+      "id": "bs-save",
+      "label": "Save",
+      "action": "save"
+    },
+    {
+      "id": "bs-saveas",
+      "label": "Save As…",
+      "action": "saveAs"
+    },
+    {
+      "id": "bs-close",
+      "label": "Close",
+      "action": "close"
+    }
+  ],
+  "theme": {
+    "brand": "#2aa79b",
+    "onBrand": "#ffffff",
+    "light": {
+      "background": "#ffffff",
+      "foreground": "#0a0a0a",
+      "mutedForeground": "#737373",
+      "border": "#e5e5e5",
+      "secondary": "#e5e5e5",
+      "sidebar": "#fafafa",
+      "tabActive": "#ffffff",
+      "selection": "#55a0fc4d",
+      "titleBar": "#f8f8f8",
+      "titleBarBorder": "#e5e5e5",
+      "statusBar": "#f8f8f8",
+      "statusBarBorder": "#e5e5e5",
+      "popover": "#ffffff",
+      "popoverForeground": "#0a0a0a"
+    },
+    "dark": {
+      "background": "#0a0a0a",
+      "foreground": "#fafafa",
+      "mutedForeground": "#a3a3a3",
+      "border": "#262626",
+      "secondary": "#262626",
+      "sidebar": "#0a0a0a",
+      "tabActive": "#0a0a0a",
+      "selection": "#1d4ed84d",
+      "titleBar": "#171717",
+      "titleBarBorder": "#262626",
+      "statusBar": "#171717",
+      "statusBarBorder": "#262626",
+      "popover": "#0a0a0a",
+      "popoverForeground": "#fafafa"
+    },
+    "canvas": {
+      "light": "#9a9a9a",
+      "dark": "#2b2b2b"
+    },
+    "pageInk": "#202020"
+  },
+  "icons": {
+    "align-center": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M4 4.5C4 4.22386 4.22386 4 4.5 4H15.5C15.7761 4 16 4.22386 16 4.5C16 4.77614 15.7761 5 15.5 5H4.5C4.22386 5 4 4.77614 4 4.5ZM2 9.5C2 9.22386 2.22386 9 2.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H2.5C2.22386 10 2 9.77614 2 9.5ZM6.5 14C6.22386 14 6 14.2239 6 14.5C6 14.7761 6.22386 15 6.5 15H13.5C13.7761 15 14 14.7761 14 14.5C14 14.2239 13.7761 14 13.5 14H6.5Z\" fill=\"#212121\"/>\n</svg>",
+    "align-justify": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M2 4.5C2 4.22386 2.22386 4 2.5 4H17.5C17.7761 4 18 4.22386 18 4.5C18 4.77614 17.7761 5 17.5 5H2.5C2.22386 5 2 4.77614 2 4.5ZM2 9.5C2 9.22386 2.22386 9 2.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H2.5C2.22386 10 2 9.77614 2 9.5ZM2.5 14C2.22386 14 2 14.2239 2 14.5C2 14.7761 2.22386 15 2.5 15H17.5C17.7761 15 18 14.7761 18 14.5C18 14.2239 17.7761 14 17.5 14H2.5Z\" fill=\"#212121\"/>\n</svg>",
+    "align-left": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M2 4.5C2 4.22386 2.22386 4 2.5 4H13.5C13.7761 4 14 4.22386 14 4.5C14 4.77614 13.7761 5 13.5 5H2.5C2.22386 5 2 4.77614 2 4.5ZM2 9.5C2 9.22386 2.22386 9 2.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H2.5C2.22386 10 2 9.77614 2 9.5ZM2.5 14C2.22386 14 2 14.2239 2 14.5C2 14.7761 2.22386 15 2.5 15H11.5C11.7761 15 12 14.7761 12 14.5C12 14.2239 11.7761 14 11.5 14H2.5Z\" fill=\"#212121\"/>\n</svg>",
+    "align-right": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 4.5C6 4.22386 6.22386 4 6.5 4H17.5C17.7761 4 18 4.22386 18 4.5C18 4.77614 17.7761 5 17.5 5H6.5C6.22386 5 6 4.77614 6 4.5ZM2 9.5C2 9.22386 2.22386 9 2.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H2.5C2.22386 10 2 9.77614 2 9.5ZM9.5 14C9.22386 14 9 14.2239 9 14.5C9 14.7761 9.22386 15 9.5 15H17.5C17.7761 15 18 14.7761 18 14.5C18 14.2239 17.7761 14 17.5 14H9.5Z\" fill=\"#212121\"/>\n</svg>",
+    "bold": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.5 4.25C5.5 3.55964 6.05964 3 6.75 3H10.2512C12.654 3 14.25 4.98768 14.25 7C14.25 7.87176 13.9504 8.73837 13.4157 9.44091C14.3205 10.1431 14.9974 11.242 14.9974 12.75C14.9974 15.6133 12.5599 16.9955 10.7531 16.9955H6.75C6.05964 16.9955 5.5 16.4358 5.5 15.7455V4.25ZM8 11V14.4955H10.7531C11.5641 14.4955 12.4974 13.8768 12.4974 12.75C12.4974 11.6212 11.5598 11 10.7531 11H8ZM8 8.5H10.2478C11.1296 8.5 11.75 7.77853 11.75 7C11.75 6.22003 11.1295 5.5 10.2512 5.5H8V8.5Z\" fill=\"#212121\"/>\n</svg>",
+    "border-bottom": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M8.5 3C8.22386 3 8 3.22386 8 3.5C8 3.77614 8.22386 4 8.5 4H11.5C11.7761 4 12 3.77614 12 3.5C12 3.22386 11.7761 3 11.5 3H8.5ZM5.53929 4.05336C4.80477 4.22654 4.2266 4.80468 4.05337 5.53918C4.05203 5.56013 4.04935 5.58119 4.04525 5.60227C3.99256 5.87334 3.72424 6.05433 3.45317 6.00164C3.1821 5.94895 3.00112 5.68063 3.05381 5.40956C3.05857 5.38505 3.06509 5.36128 3.07323 5.33836C3.3266 4.21278 4.21265 3.3267 5.33821 3.07328C5.36118 3.06512 5.385 3.05858 5.40956 3.05381C5.68063 3.00112 5.94895 3.1821 6.00164 3.45317C6.05433 3.72424 5.87334 3.99256 5.60227 4.04525C5.58123 4.04934 5.5602 4.05202 5.53929 4.05336ZM3.07321 14.6616C3.06509 14.6387 3.05857 14.615 3.05381 14.5905C3.00112 14.3194 3.1821 14.0511 3.45317 13.9984C3.72424 13.9457 3.99256 14.1267 4.04525 14.3977C4.04935 14.4188 4.05203 14.4399 4.05337 14.4609C4.26149 15.3433 5.05406 16 6.00001 16H14C14.946 16 15.7385 15.3433 15.9466 14.4609C15.948 14.4399 15.9507 14.4189 15.9548 14.3977C16.0075 14.1267 16.2758 13.9457 16.5468 13.9984C16.8179 14.0511 16.9989 14.3194 16.9462 14.5905C16.9415 14.6149 16.9349 14.6387 16.9268 14.6616C16.6256 16.0001 15.4296 17 14 17H6.00001C4.57049 17 3.3745 16.0001 3.07321 14.6616ZM14.5905 3.05381C14.615 3.05858 14.6388 3.06512 14.6618 3.07328C15.7874 3.3267 16.6734 4.21277 16.9268 5.33832C16.9349 5.36126 16.9414 5.38504 16.9462 5.40956C16.9989 5.68063 16.8179 5.94895 16.5468 6.00164C16.2758 6.05433 16.0075 5.87334 15.9548 5.60227C15.9507 5.5812 15.948 5.56015 15.9466 5.53921C15.7734 4.8047 15.1952 4.22654 14.4607 4.05336C14.4398 4.05202 14.4188 4.04934 14.3977 4.04525C14.1267 3.99256 13.9457 3.72424 13.9984 3.45317C14.0511 3.1821 14.3194 3.00112 14.5905 3.05381ZM16.5 12C16.2239 12 16 11.7761 16 11.5V8.5C16 8.22386 16.2239 8 16.5 8C16.7761 8 17 8.22386 17 8.5V11.5C17 11.7761 16.7761 12 16.5 12ZM3 11.5C3 11.7761 3.22386 12 3.5 12C3.77614 12 4 11.7761 4 11.5V8.5C4 8.22386 3.77614 8 3.5 8C3.22386 8 3 8.22386 3 8.5V11.5Z\" fill=\"#212121\"/>\n</svg>",
+    "case": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M12.5 3.5C12.7761 3.5 13 3.72386 13 4V8.89121C13.5308 8.337 14.2316 8 15 8C16.6569 8 18 9.567 18 11.5C18 13.433 16.6569 15 15 15C14.2316 15 13.5308 14.663 13 14.1088V14.5C13 14.7761 12.7761 15 12.5 15C12.2239 15 12 14.7761 12 14.5V4C12 3.72386 12.2239 3.5 12.5 3.5ZM15 14C15.9655 14 17 13.0309 17 11.5C17 9.96911 15.9655 9 15 9C14.0345 9 13 9.96911 13 11.5C13 13.0309 14.0345 14 15 14ZM6.95657 3.83574C6.8875 3.63714 6.70155 3.50299 6.49131 3.50005C6.28106 3.49711 6.09144 3.62603 6.01685 3.82262L3.29341 11H3.27297V11.0539L2.03266 14.3226C1.93469 14.5808 2.06457 14.8695 2.32275 14.9675C2.58093 15.0654 2.86965 14.9356 2.96761 14.6774L3.98354 12L8.73755 12L9.66425 14.6643C9.75497 14.9251 10.0399 15.063 10.3008 14.9722C10.5616 14.8815 10.6995 14.5966 10.6087 14.3357L6.95657 3.83574ZM4.36298 11L6.46389 5.46323L8.38973 11L4.36298 11Z\" fill=\"#212121\"/>\n</svg>",
+    "clear-format": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.99994 2C6.206 1.99982 6.39106 2.12607 6.46607 2.31799L9.96631 11.2738C10.0668 11.531 9.93982 11.821 9.68262 11.9215C9.42542 12.022 9.13544 11.895 9.03491 11.6378L8.00516 9.00305H4.00814L2.96614 11.6827C2.86607 11.9401 2.5763 12.0676 2.31893 11.9675C2.06156 11.8675 1.93405 11.5777 2.03413 11.3203L5.53436 2.31879C5.60904 2.12675 5.79389 2.00018 5.99994 2ZM6.00156 3.87659L4.39699 8.00305H7.61432L6.00156 3.87659ZM11.5002 2C11.7764 2 12.0002 2.22386 12.0002 2.5V6.02297H12.0038C12.2292 5.61729 12.538 5.29951 12.9301 5.06962C13.3268 4.83974 13.7708 4.72479 14.2621 4.72479C15.1501 4.72479 15.8668 5.0561 16.4122 5.71871C16.9576 6.38132 17.2303 7.26254 17.2303 8.36239C17.2303 8.50371 17.2258 8.64142 17.2169 8.77551L17.1732 8.73175C16.8422 8.40076 16.4416 8.18217 16.0186 8.07574C15.9798 7.4114 15.8022 6.87364 15.4859 6.46245C15.1253 5.99367 14.634 5.75928 14.0119 5.75928C13.4124 5.75928 12.9211 6.00043 12.538 6.48274C12.2467 6.85028 12.0675 7.30585 12.0002 7.84944V8.87809C12.0532 9.30828 12.1756 9.68305 12.3675 10.0024L11.0002 11.3696V2.5C11.0002 2.22386 11.2241 2 11.5002 2ZM9.4391 16.4658C8.85345 15.8802 8.85404 14.93 9.44041 14.3437L14.3439 9.44016C14.9303 8.85379 15.8804 8.8532 16.466 9.43885L18.5614 11.5342C19.147 12.1198 19.1465 13.07 18.5601 13.6563L14.2164 18H16.7473C17.0235 18 17.2473 18.2239 17.2473 18.5C17.2473 18.7761 17.0235 19 16.7473 19H12.6553V18.9988C12.2515 19.0151 11.8425 18.8692 11.5344 18.5611L9.4391 16.4658ZM15.051 10.1473L11.4528 13.7455L14.2547 16.5475L17.853 12.9492C18.0496 12.7526 18.0486 12.4356 17.8543 12.2413L15.7589 10.146C15.5646 9.95166 15.2477 9.9506 15.051 10.1473ZM13.5476 17.2546L10.7457 14.4526L10.1475 15.0508C9.95084 15.2474 9.9519 15.5644 10.1462 15.7587L12.2415 17.854C12.4359 18.0483 12.7528 18.0494 12.9495 17.8527L13.5476 17.2546Z\" fill=\"#212121\"/>\n</svg>",
+    "columns": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"3.5\" y=\"3.5\" width=\"5.5\" height=\"13\" rx=\"1\" stroke=\"#212121\" stroke-width=\"1.3\" fill=\"none\"/>\n<rect x=\"11\" y=\"3.5\" width=\"5.5\" height=\"13\" rx=\"1\" stroke=\"#212121\" stroke-width=\"1.3\" fill=\"none\"/>\n</svg>",
+    "comment": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M10.4809 13.8423H15.4C16.2962 13.8423 17 13.1288 17 12.2764V5.56582C17 4.71348 16.2962 4 15.4 4H4.6C3.70383 4 3 4.71348 3 5.56582V12.2764C3 13.1288 3.70383 13.8423 4.6 13.8423H6.19908L6.2 17L6.20346 16.9997L6.20502 16.9988L10.4809 13.8423ZM6.79895 17.8034C6.35668 18.1298 5.73 18.0406 5.39921 17.6042C5.26989 17.4335 5.2 17.2262 5.2 17.0133L5.19937 14.8423H4.6C3.16406 14.8423 2 13.6935 2 12.2764V5.56582C2 4.14876 3.16406 3 4.6 3H15.4C16.8359 3 18 4.14876 18 5.56582V12.2764C18 13.6935 16.8359 14.8423 15.4 14.8423H10.81L6.79895 17.8034Z\" fill=\"#212121\"/>\n</svg>",
+    "comment-add": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M19 5.5C19 7.98528 16.9853 10 14.5 10C12.0147 10 10 7.98528 10 5.5C10 3.01472 12.0147 1 14.5 1C16.9853 1 19 3.01472 19 5.5ZM15 3.5C15 3.22386 14.7761 3 14.5 3C14.2239 3 14 3.22386 14 3.5V5H12.5C12.2239 5 12 5.22386 12 5.5C12 5.77614 12.2239 6 12.5 6H14V7.5C14 7.77614 14.2239 8 14.5 8C14.7761 8 15 7.77614 15 7.5V6H16.5C16.7761 6 17 5.77614 17 5.5C17 5.22386 16.7761 5 16.5 5H15V3.5ZM17 12.2764V10.4003C17.3578 10.2174 17.6929 9.99647 18 9.74284V12.2764C18 13.6935 16.8359 14.8423 15.4 14.8423H10.81L6.79895 17.8034C6.35668 18.1298 5.73 18.0406 5.39921 17.6042C5.26989 17.4335 5.2 17.2262 5.2 17.0133L5.19937 14.8423H4.6C3.16406 14.8423 2 13.6935 2 12.2764V5.56582C2 4.14876 3.16406 3 4.6 3H9.59971C9.43777 3.31679 9.30564 3.65136 9.20703 4H4.6C3.70383 4 3 4.71348 3 5.56582V12.2764C3 13.1288 3.70383 13.8423 4.6 13.8423H6.19908L6.2 17L6.20346 16.9997L6.20502 16.9988L10.4809 13.8423H15.4C16.2962 13.8423 17 13.1288 17 12.2764Z\" fill=\"#212121\"/>\n</svg>",
+    "copy": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M7 7H5.5C4.67157 7 4 7.67157 4 8.5V14.5C4 15.3284 4.67157 16 5.5 16H9.5C10.1529 16 10.707 15.5823 10.9131 15H11.9502C11.7186 16.1411 10.7095 17 9.5 17H5.5C4.11929 17 3 15.8807 3 14.5V8.5C3 7.11929 4.11929 6 5.5 6H7V7ZM14.5 3C15.8807 3 17 4.11929 17 5.5V11.5C17 12.8807 15.8807 14 14.5 14H10.5C9.11929 14 8 12.8807 8 11.5V5.5C8 4.11929 9.11929 3 10.5 3H14.5ZM10.5 4C9.67157 4 9 4.67157 9 5.5V11.5C9 12.3284 9.67157 13 10.5 13H14.5C15.3284 13 16 12.3284 16 11.5V5.5C16 4.67157 15.3284 4 14.5 4H10.5Z\" fill=\"#212121\"/>\n</svg>",
+    "cut": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.91939 2.22774C5.769 1.99615 5.45933 1.93033 5.22774 2.08072C4.99615 2.23112 4.93033 2.54079 5.08072 2.77238L9.40382 9.42936L7.4809 12.3904C7.04398 12.1419 6.53857 12 6 12C4.34315 12 3 13.3431 3 15C3 16.6569 4.34315 18 6 18C7.65685 18 9 16.6569 9 15C9 14.2446 8.72078 13.5543 8.25991 13.0269L10 10.3474L11.7401 13.0269C11.2792 13.5543 11 14.2446 11 15C11 16.6569 12.3431 18 14 18C15.6569 18 17 16.6569 17 15C17 13.3431 15.6569 12 14 12C13.4614 12 12.956 12.1419 12.5191 12.3904L5.91939 2.22774ZM14 17C12.8954 17 12 16.1046 12 15C12 13.8954 12.8954 13 14 13C15.1046 13 16 13.8954 16 15C16 16.1046 15.1046 17 14 17ZM4 15C4 13.8954 4.89543 13 6 13C7.10457 13 8 13.8954 8 15C8 16.1046 7.10457 17 6 17C4.89543 17 4 16.1046 4 15ZM11.1924 8.51133L10.5962 7.59329L14.0806 2.22774C14.231 1.99615 14.5407 1.93033 14.7723 2.08072C15.0039 2.23112 15.0697 2.54079 14.9193 2.77238L11.1924 8.51133Z\" fill=\"#212121\"/>\n</svg>",
+    "equation": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 4 L11 4 L11 5.4 L7.4 5.4 L7.4 9.2 L10.4 9.2 L10.4 10.6 L7.4 10.6 L7.4 16 L6 16 Z\" fill=\"#212121\"/>\n<line x1=\"12.2\" y1=\"10\" x2=\"16.5\" y2=\"10\" stroke=\"#212121\" stroke-width=\"1.3\" stroke-linecap=\"round\"/>\n</svg>",
+    "find": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.7291 14.4362C12.5924 15.411 11.115 16 9.5 16C5.91015 16 3 13.0899 3 9.5C3 5.91015 5.91015 3 9.5 3C13.0899 3 16 5.91015 16 9.5C16 11.115 15.411 12.5924 14.4361 13.7292L17.8535 17.1465C18.0487 17.3417 18.0487 17.6583 17.8535 17.8536C17.6799 18.0271 17.4105 18.0464 17.2156 17.9114L17.1464 17.8536L13.7291 14.4362ZM13.0196 13.7266C13.276 13.5128 13.5127 13.2761 13.7265 13.0197C14.5216 12.0659 15 10.8388 15 9.5C15 6.46243 12.5376 4 9.5 4C6.46243 4 4 6.46243 4 9.5C4 12.5376 6.46243 15 9.5 15C10.8388 15 12.0658 14.5217 13.0196 13.7266Z\" fill=\"#212121\"/>\n</svg>",
+    "font-decrease": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.1465 2.14645C13.3418 1.95118 13.6584 1.95118 13.8536 2.14645L15.5 3.79288L17.1465 2.14645C17.3417 1.95118 17.6583 1.95118 17.8536 2.14645C18.0488 2.34171 18.0488 2.65829 17.8536 2.85355L15.8536 4.85353C15.6583 5.04879 15.3418 5.04879 15.1465 4.85353L13.1465 2.85355C12.9513 2.65829 12.9513 2.34171 13.1465 2.14645ZM10 3.99998C10.2031 3.99998 10.3859 4.12275 10.4628 4.31066L14.9627 15.3106C15.0673 15.5661 14.9448 15.8581 14.6893 15.9626C14.4337 16.0672 14.1417 15.9448 14.0372 15.6892L12.5001 11.9318V11.9999H7.5002V11.9313L5.96289 15.6892C5.85833 15.9448 5.56639 16.0672 5.31081 15.9626C5.05523 15.8581 4.9328 15.5661 5.03736 15.3106L9.53727 4.31066C9.61414 4.12275 9.79701 3.99998 10 3.99998ZM7.88121 10.9999H12.1189L10 5.8205L7.88121 10.9999Z\" fill=\"#212121\"/>\n</svg>",
+    "font-increase": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.8536 4.85353C13.6584 5.04879 13.3418 5.04879 13.1465 4.85353C12.9513 4.65827 12.9513 4.34169 13.1465 4.14643L15.1465 2.14645C15.3418 1.95118 15.6583 1.95118 15.8536 2.14645L17.8536 4.14643C18.0488 4.34169 18.0488 4.65827 17.8536 4.85353C17.6583 5.04879 17.3417 5.04879 17.1465 4.85353L15.5 3.2071L13.8536 4.85353ZM10 3.99998C9.79701 3.99998 9.61414 4.12275 9.53727 4.31066L5.03736 15.3106C4.9328 15.5661 5.05523 15.8581 5.31081 15.9626C5.56639 16.0672 5.85833 15.9448 5.96289 15.6892L7.5002 11.9313V11.9999H12.5001V11.9318L14.0372 15.6892C14.1417 15.9448 14.4337 16.0672 14.6893 15.9626C14.9448 15.8581 15.0673 15.5661 14.9627 15.3106L10.4628 4.31066C10.3859 4.12275 10.2031 3.99998 10 3.99998ZM10 5.8205L12.1189 10.9999H7.88121L10 5.8205Z\" fill=\"#212121\"/>\n</svg>",
+    "font-name": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6.00059 2C6.2068 2.00001 6.39185 2.12661 6.46658 2.3188L8.89716 8.56965C8.90012 8.57674 8.90291 8.58392 8.90554 8.59118L9.07527 9.0277L8.54852 10.4324L8.09325 9.26151H3.90726L2.96613 11.6812C2.86603 11.9386 2.57625 12.0661 2.31889 11.966C2.06153 11.8659 1.93404 11.5761 2.03414 11.3188L3.09501 8.59113C3.09764 8.58388 3.10043 8.57671 3.10338 8.56961L5.53458 2.31876C5.60932 2.12657 5.79439 1.99999 6.00059 2ZM4.29619 8.26151H7.70441L6.00051 3.87951L4.29619 8.26151ZM12.467 5.32118C12.3927 5.12714 12.2061 4.99928 11.9983 5C11.7906 5.00073 11.6049 5.12988 11.5319 5.32444L7.15357 17L6.50013 17C6.22399 17 6.00013 17.2239 6.00012 17.5C6.00012 17.7761 6.22397 18 6.50011 18L7.49054 18C7.49686 18.0002 7.50316 18.0002 7.50946 18L8.50011 18.0001C8.77625 18.0001 9.00012 17.7762 9.00012 17.5001C9.00013 17.2239 8.77628 17.0001 8.50013 17.0001L8.22156 17.0001L9.34658 14H14.72L15.8687 16.9993L15.5001 16.9993C15.224 16.9993 15.0001 17.2231 15.0001 17.4993C15.0001 17.7754 15.224 17.9993 15.5001 17.9993L17.5001 17.9993C17.7763 17.9993 18.0001 17.7755 18.0001 17.4993C18.0001 17.2232 17.7763 16.9993 17.5001 16.9993L16.9395 16.9993L12.467 5.32118ZM14.337 13H9.72158L12.005 6.91088L14.337 13Z\" fill=\"#212121\"/>\n</svg>",
+    "font-size": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.0001 3.5C13.2086 3.5 13.3951 3.62929 13.4683 3.82444L16.4642 11.8136C16.4671 11.8208 16.4698 11.828 16.4724 11.8354L17.9683 15.8244C18.0653 16.083 17.9343 16.3712 17.6757 16.4682C17.4171 16.5651 17.1289 16.4341 17.032 16.1756L15.6536 12.5H10.3466L8.9683 16.1756C8.89581 16.3689 8.71199 16.4977 8.50557 16.5C8.29914 16.5022 8.11256 16.3774 8.03589 16.1857L6.96162 13.5H4.03865L2.96437 16.1857C2.86181 16.4421 2.57083 16.5668 2.31444 16.4642C2.05805 16.3617 1.93334 16.0707 2.03589 15.8143L3.23157 12.8251C3.23426 12.8179 3.2371 12.8108 3.2401 12.8038L5.03589 8.3143C5.11183 8.12448 5.29568 8 5.50013 8C5.70459 8 5.88844 8.12448 5.96437 8.3143L7.76016 12.8038C7.76316 12.8108 7.76601 12.8179 7.7687 12.8251L8.48509 14.6161L9.52787 11.8354C9.53042 11.8281 9.53314 11.8208 9.53602 11.8136L12.532 3.82444C12.6052 3.62929 12.7917 3.5 13.0001 3.5ZM10.7216 11.5H15.2786L13.0001 5.424L10.7216 11.5ZM6.56162 12.5L5.50013 9.84629L4.43865 12.5H6.56162Z\" fill=\"#212121\"/>\n</svg>",
+    "footer": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"4.5\" y=\"2.5\" width=\"11\" height=\"15\" rx=\"1\" stroke=\"#212121\" stroke-width=\"1.3\" fill=\"none\"/>\n<line x1=\"6.5\" y1=\"5.7\" x2=\"13.5\" y2=\"5.7\" stroke=\"#212121\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n<line x1=\"6.5\" y1=\"8.2\" x2=\"13.5\" y2=\"8.2\" stroke=\"#212121\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n<line x1=\"6.5\" y1=\"10.7\" x2=\"11\" y2=\"10.7\" stroke=\"#212121\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n<rect x=\"6.4\" y=\"13.2\" width=\"7.2\" height=\"2.4\" rx=\"0.7\" fill=\"#212121\"/>\n</svg>",
+    "header": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"4.5\" y=\"2.5\" width=\"11\" height=\"15\" rx=\"1\" stroke=\"#212121\" stroke-width=\"1.3\" fill=\"none\"/>\n<rect x=\"6.4\" y=\"4.4\" width=\"7.2\" height=\"2.4\" rx=\"0.7\" fill=\"#212121\"/>\n<line x1=\"6.5\" y1=\"9.3\" x2=\"13.5\" y2=\"9.3\" stroke=\"#212121\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n<line x1=\"6.5\" y1=\"11.8\" x2=\"13.5\" y2=\"11.8\" stroke=\"#212121\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n<line x1=\"6.5\" y1=\"14.3\" x2=\"11\" y2=\"14.3\" stroke=\"#212121\" stroke-width=\"1\" stroke-linecap=\"round\"/>\n</svg>",
+    "highlight": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3.5 2C3.77614 2 4 2.22386 4 2.5V6.5C4 6.77614 4.22386 7 4.5 7H15.5C15.7761 7 16 6.77614 16 6.5V2.5C16 2.22386 16.2239 2 16.5 2C16.7761 2 17 2.22386 17 2.5V6.5C17 7.15311 16.5826 7.70873 16 7.91465V9C16 10.1046 15.1046 11 14 11V13.0729C14 13.8305 13.572 14.523 12.8944 14.8618L6.72361 17.9472C6.56861 18.0247 6.38454 18.0164 6.23713 17.9253C6.08973 17.8342 6 17.6733 6 17.5V11C4.89543 11 4 10.1046 4 9V7.91465C3.4174 7.70873 3 7.15311 3 6.5V2.5C3 2.22386 3.22386 2 3.5 2ZM5 8V9C5 9.55228 5.44772 10 6 10H14C14.5523 10 15 9.55228 15 9V8H5ZM7 11V16.691L12.4472 13.9674C12.786 13.798 13 13.4517 13 13.0729V11H7Z\" fill=\"#212121\"/>\n</svg>",
+    "hyphenation": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<line x1=\"3.5\" y1=\"10\" x2=\"7\" y2=\"10\" stroke=\"#212121\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n<line x1=\"9\" y1=\"10\" x2=\"12\" y2=\"10\" stroke=\"#212121\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n<circle cx=\"15\" cy=\"10\" r=\"1\" fill=\"#212121\"/>\n<circle cx=\"17.5\" cy=\"10\" r=\"1\" fill=\"#212121\"/>\n</svg>",
+    "indent-decrease": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6.00003 4.5C6.00003 4.22386 6.22389 4 6.50003 4H14.5C14.7762 4 15 4.22386 15 4.5C15 4.77614 14.7762 5 14.5 5H6.50003C6.22389 5 6.00003 4.77614 6.00003 4.5ZM3.56066 7.73226C3.75592 7.537 4.0725 7.537 4.26777 7.73226C4.46303 7.92752 4.46303 8.24411 4.26777 8.43937L3.20711 9.50003L4.26777 10.5607C4.46303 10.756 4.46303 11.0725 4.26777 11.2678C4.0725 11.4631 3.75592 11.4631 3.56066 11.2678L2.14645 9.85358C1.95118 9.65832 1.95118 9.34174 2.14645 9.14648L3.56066 7.73226ZM6.50003 9C6.22389 9 6.00003 9.22386 6.00003 9.5C6.00003 9.77614 6.22389 10 6.50003 10H17.5C17.7762 10 18 9.77614 18 9.5C18 9.22386 17.7762 9 17.5 9H6.50003ZM6.00003 14.5C6.00003 14.2239 6.22389 14 6.50003 14H12.5C12.7762 14 13 14.2239 13 14.5C13 14.7761 12.7762 15 12.5 15H6.50003C6.22389 15 6.00003 14.7761 6.00003 14.5Z\" fill=\"#212121\"/>\n</svg>",
+    "indent-increase": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 4.5C6 4.22386 6.22386 4 6.5 4H14.5C14.7761 4 15 4.22386 15 4.5C15 4.77614 14.7761 5 14.5 5H6.5C6.22386 5 6 4.77614 6 4.5ZM6 9.5C6 9.22386 6.22386 9 6.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H6.5C6.22386 10 6 9.77614 6 9.5ZM6.5 14C6.22386 14 6 14.2239 6 14.5C6 14.7761 6.22386 15 6.5 15H12.5C12.7761 15 13 14.7761 13 14.5C13 14.2239 12.7761 14 12.5 14H6.5ZM2.85355 7.73226C2.65829 7.537 2.34171 7.537 2.14645 7.73226C1.95118 7.92752 1.95118 8.24411 2.14645 8.43937L3.20711 9.50003L2.14645 10.5607C1.95118 10.756 1.95118 11.0725 2.14645 11.2678C2.34171 11.4631 2.65829 11.4631 2.85355 11.2678L4.26777 9.85358C4.46303 9.65832 4.46303 9.34174 4.26777 9.14648L2.85355 7.73226Z\" fill=\"#212121\"/>\n</svg>",
+    "italic": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M16 3C16.2761 3 16.5 3.22386 16.5 3.5C16.5 3.77614 16.2761 4 16 4H12.843L8.227 16H11.5C11.7761 16 12 16.2239 12 16.5C12 16.7761 11.7761 17 11.5 17H4C3.72386 17 3.5 16.7761 3.5 16.5C3.5 16.2239 3.72386 16 4 16H7.156L11.771 4H8.5C8.22386 4 8 3.77614 8 3.5C8 3.22386 8.22386 3 8.5 3H16Z\" fill=\"#212121\"/>\n</svg>",
+    "line-spacing": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"9\" y=\"4.4\" width=\"9\" height=\"1.3\" rx=\"0.65\" fill=\"#212121\"/>\n<rect x=\"9\" y=\"9.35\" width=\"9\" height=\"1.3\" rx=\"0.65\" fill=\"#212121\"/>\n<rect x=\"9\" y=\"14.3\" width=\"9\" height=\"1.3\" rx=\"0.65\" fill=\"#212121\"/>\n<rect x=\"3.45\" y=\"4.2\" width=\"1.1\" height=\"11.6\" fill=\"#212121\"/>\n<path d=\"M4 2.9 L6.1 5.6 L1.9 5.6 Z\" fill=\"#212121\"/>\n<path d=\"M4 17.1 L6.1 14.4 L1.9 14.4 Z\" fill=\"#212121\"/>\n</svg>",
+    "list-bullet": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3 5.5C3.55228 5.5 4 5.05228 4 4.5C4 3.94772 3.55228 3.5 3 3.5C2.44772 3.5 2 3.94772 2 4.5C2 5.05228 2.44772 5.5 3 5.5ZM6 4.5C6 4.22386 6.22386 4 6.5 4H17.5C17.7761 4 18 4.22386 18 4.5C18 4.77614 17.7761 5 17.5 5H6.5C6.22386 5 6 4.77614 6 4.5ZM6 9.5C6 9.22386 6.22386 9 6.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H6.5C6.22386 10 6 9.77614 6 9.5ZM6.5 14C6.22386 14 6 14.2239 6 14.5C6 14.7761 6.22386 15 6.5 15H17.5C17.7761 15 18 14.7761 18 14.5C18 14.2239 17.7761 14 17.5 14H6.5ZM4 14.5C4 15.0523 3.55228 15.5 3 15.5C2.44772 15.5 2 15.0523 2 14.5C2 13.9477 2.44772 13.5 3 13.5C3.55228 13.5 4 13.9477 4 14.5ZM3 10.5C3.55228 10.5 4 10.0523 4 9.5C4 8.94772 3.55228 8.5 3 8.5C2.44772 8.5 2 8.94772 2 9.5C2 10.0523 2.44772 10.5 3 10.5Z\" fill=\"#212121\"/>\n</svg>",
+    "list-numbered": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5.00011 1.49988C5.00011 1.26799 4.84067 1.06653 4.61499 1.01325C4.38621 0.959243 4.15942 1.07477 4.05148 1.27895C4.0295 1.32085 4.00531 1.36162 3.98053 1.40189C3.92681 1.48918 3.8447 1.61249 3.73468 1.75003C3.51178 2.02864 3.19011 2.34586 2.7765 2.55266C2.52951 2.67616 2.4294 2.97649 2.5529 3.22348C2.67639 3.47047 2.97673 3.57058 3.22372 3.44709C3.52353 3.29718 3.78202 3.11079 4.00011 2.9181V5.49988C4.00011 5.77602 4.22397 5.99988 4.50011 5.99988C4.77625 5.99988 5.00011 5.77602 5.00011 5.49988V1.49988ZM2.64642 7.64639C2.45117 7.84166 2.4512 8.15825 2.64647 8.35349C2.84059 8.54758 3.15457 8.54871 3.35008 8.35691L3.35665 8.35089C3.36458 8.34379 3.37911 8.3312 3.39988 8.31488C3.44165 8.28204 3.50709 8.23533 3.59323 8.18792C3.76518 8.09329 4.01033 8.00073 4.31294 7.99988C4.54021 8.00441 4.72387 8.06465 4.83732 8.14866C4.93306 8.21956 5 8.31935 5 8.49997C5 8.70224 4.92979 8.8191 4.78928 8.93618C4.63792 9.06232 4.44136 9.15961 4.17109 9.29339C4.12524 9.31608 4.07662 9.34015 4.0264 9.36526C3.71266 9.52213 3.32368 9.72875 3.02065 10.0621C2.69919 10.4157 2.5 10.8808 2.5 11.5C2.5 11.7761 2.72386 12 3 12H5.49944C5.77558 12 6 11.7761 6 11.5C6 11.2239 5.77614 11 5.5 11H3.58925C3.63458 10.8933 3.69413 10.8079 3.7606 10.7347C3.92632 10.5524 4.16234 10.4153 4.4736 10.2597C4.51206 10.2405 4.55257 10.2206 4.5946 10.2C4.85655 10.0715 5.17854 9.91351 5.42947 9.7044C5.75771 9.43086 6 9.04771 6 8.49997C6 7.99553 5.77725 7.60036 5.43244 7.34502C5.10604 7.10332 4.69985 7.00626 4.32563 6.99995L4.31722 6.99988C3.80459 6.99985 3.39261 7.15689 3.11107 7.31184C2.97006 7.38944 2.85942 7.46775 2.78191 7.52868C2.74303 7.55924 2.71212 7.58572 2.68951 7.60596C2.67819 7.6161 2.66892 7.62471 2.66173 7.63152L2.65251 7.64038L2.64907 7.64375L2.64765 7.64516L2.64642 7.64639ZM2.66173 7.63152L2.64642 7.64639C2.64642 7.64639 2.7471 7.55664 2.66173 7.63152ZM4.25011 14.9999C3.97397 14.9999 3.75011 15.2237 3.75011 15.4999C3.75011 15.776 3.97397 15.9999 4.25011 15.9999C4.5929 15.9999 4.78233 16.0966 4.87775 16.183C4.97201 16.2683 5.01072 16.3743 5.00671 16.4811C4.99946 16.6746 4.82083 16.9999 4.25011 16.9999C3.8376 16.9999 3.62396 16.8982 3.52746 16.8339C3.4769 16.8001 3.44973 16.7709 3.43891 16.7579L3.43482 16.7528C3.30449 16.5231 3.01552 16.4332 2.7765 16.5527C2.52951 16.6762 2.4294 16.9765 2.5529 17.2235L2.55361 17.2249L2.55435 17.2264L2.55594 17.2295L2.55948 17.2362L2.56815 17.252C2.57465 17.2635 2.58262 17.2768 2.59222 17.2917C2.61141 17.3216 2.63716 17.3579 2.67069 17.3981C2.73799 17.4789 2.83582 17.5746 2.97276 17.6659C3.25126 17.8516 3.66262 17.9999 4.25011 17.9999C5.27939 17.9999 5.97576 17.3251 6.00601 16.5186C6.01979 16.1511 5.88798 15.7829 5.60959 15.4999C5.88798 15.2168 6.01979 14.8486 6.00601 14.4811C5.97576 13.6746 5.27939 12.9999 4.25011 12.9999C3.66262 12.9999 3.25126 13.1482 2.97276 13.3339C2.83582 13.4251 2.73799 13.5209 2.67069 13.6017C2.63716 13.6419 2.61141 13.6782 2.59222 13.708C2.58262 13.7229 2.57465 13.7363 2.56815 13.7478L2.55948 13.7635L2.55594 13.7703L2.55435 13.7734L2.55361 13.7748L2.5529 13.7763C2.4294 14.0233 2.52951 14.3236 2.7765 14.4471C3.01552 14.5666 3.30449 14.4767 3.43482 14.2469L3.43891 14.2418C3.44973 14.2289 3.4769 14.1996 3.52746 14.1659C3.62396 14.1016 3.8376 13.9999 4.25011 13.9999C4.82083 13.9999 4.99946 14.3251 5.00671 14.5186C5.01072 14.6254 4.97201 14.7314 4.87775 14.8168C4.78233 14.9032 4.5929 14.9999 4.25011 14.9999ZM3.43482 14.2469L3.43279 14.2497L3.43339 14.2488C3.43339 14.2488 3.43583 14.2449 3.43817 14.2408L3.44223 14.2334L3.44465 14.2287L3.44596 14.2262L3.44698 14.2242C3.44309 14.2319 3.43904 14.2395 3.43482 14.2469ZM8.49976 3.99988C8.22361 3.99988 7.99976 4.22374 7.99976 4.49988C7.99976 4.77602 8.22361 4.99988 8.49976 4.99988H16.4998C16.7759 4.99988 16.9998 4.77602 16.9998 4.49988C16.9998 4.22374 16.7759 3.99988 16.4998 3.99988H8.49976ZM8.49976 8.99988C8.22361 8.99988 7.99976 9.22374 7.99976 9.49988C7.99976 9.77602 8.22361 9.99988 8.49976 9.99988H16.4998C16.7759 9.99988 16.9998 9.77602 16.9998 9.49988C16.9998 9.22374 16.7759 8.99988 16.4998 8.99988H8.49976ZM7.99976 14.4999C7.99976 14.2237 8.22361 13.9999 8.49976 13.9999H16.4998C16.7759 13.9999 16.9998 14.2237 16.9998 14.4999C16.9998 14.776 16.7759 14.9999 16.4998 14.9999H8.49976C8.22361 14.9999 7.99976 14.776 7.99976 14.4999Z\" fill=\"#212121\"/>\n</svg>",
+    "page-number": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<rect x=\"4.5\" y=\"2.5\" width=\"11\" height=\"15\" rx=\"1\" stroke=\"#212121\" stroke-width=\"1.3\" fill=\"none\"/>\n<line x1=\"7.6\" y1=\"8\" x2=\"12.4\" y2=\"8\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"7.6\" y1=\"12\" x2=\"12.4\" y2=\"12\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"9.2\" y1=\"6.4\" x2=\"8.4\" y2=\"13.6\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n<line x1=\"11.6\" y1=\"6.4\" x2=\"10.8\" y2=\"13.6\" stroke=\"#212121\" stroke-width=\"1.2\" stroke-linecap=\"round\"/>\n</svg>",
+    "paragraph": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.5 8C12.1193 8 11 9.11929 11 10.5C11 11.8807 12.1193 13 13.5 13H14V8H13.5ZM14 14H13.5C11.567 14 10 12.433 10 10.5C10 8.567 11.567 7 13.5 7H17.5C17.7761 7 18 7.22386 18 7.5C18 7.77614 17.7761 8 17.5 8H17V17.5C17 17.7761 16.7761 18 16.5 18C16.2239 18 16 17.7761 16 17.5V8H15V17.5C15 17.7761 14.7761 18 14.5 18C14.2239 18 14 17.7761 14 17.5V14ZM2.5 5C2.22386 5 2 5.22386 2 5.5C2 5.77614 2.22386 6 2.5 6H17.5C17.7761 6 18 5.77614 18 5.5C18 5.22386 17.7761 5 17.5 5H2.5ZM9.25606 9H2.5C2.22386 9 2 9.22386 2 9.5C2 9.77614 2.22386 10 2.5 10H9.02746C9.06579 9.65327 9.14352 9.31841 9.25606 9ZM9.75777 13H2.5C2.22386 13 2 13.2239 2 13.5C2 13.7761 2.22386 14 2.5 14H10.6713C10.319 13.7149 10.0106 13.3776 9.75777 13Z\" fill=\"#212121\"/>\n</svg>",
+    "paste": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M4.5 4H6.08535C6.29127 4.5826 6.84689 5 7.5 5H10.5C11.1531 5 11.7087 4.5826 11.9146 4H13.5C13.7761 4 14 4.22386 14 4.5V5.5C14 5.77614 14.2239 6 14.5 6C14.7761 6 15 5.77614 15 5.5V4.5C15 3.67157 14.3284 3 13.5 3H11.9146C11.7087 2.4174 11.1531 2 10.5 2H7.5C6.84689 2 6.29127 2.4174 6.08535 3H4.5C3.67157 3 3 3.67157 3 4.5V16.5C3 17.3284 3.67157 18 4.5 18H7.5C7.77614 18 8 17.7761 8 17.5C8 17.2239 7.77614 17 7.5 17H4.5C4.22386 17 4 16.7761 4 16.5V4.5C4 4.22386 4.22386 4 4.5 4ZM7.5 4C7.22386 4 7 3.77614 7 3.5C7 3.22386 7.22386 3 7.5 3H10.5C10.7761 3 11 3.22386 11 3.5C11 3.77614 10.7761 4 10.5 4H7.5ZM10.5 7C9.67157 7 9 7.67157 9 8.5V16.5C9 17.3284 9.67157 18 10.5 18H15.5C16.3284 18 17 17.3284 17 16.5V8.5C17 7.67157 16.3284 7 15.5 7H10.5ZM10 8.5C10 8.22386 10.2239 8 10.5 8H15.5C15.7761 8 16 8.22386 16 8.5V16.5C16 16.7761 15.7761 17 15.5 17H10.5C10.2239 17 10 16.7761 10 16.5V8.5Z\" fill=\"#212121\"/>\n</svg>",
+    "print-layout": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 2H14C15.1046 2 16 2.89543 16 4L16 16C16 17.1046 15.1046 18 14 18H6C4.89543 18 4 17.1046 4 16V4C4 2.89543 4.89543 2 6 2ZM6 3C5.44772 3 5 3.44772 5 4V16C5 16.5523 5.44772 17 6 17H14C14.5523 17 15 16.5523 15 16L15 4C15 3.44771 14.5523 3 14 3L6 3ZM13 6.5C13 6.74546 12.8231 6.94961 12.5899 6.99194L12.5 7H7.5C7.22386 7 7 6.77614 7 6.5C7 6.25454 7.17688 6.05039 7.41012 6.00806L7.5 6H12.5C12.7761 6 13 6.22386 13 6.5ZM13 10C13 10.2455 12.8231 10.4496 12.5899 10.4919L12.5 10.5H7.5C7.22386 10.5 7 10.2761 7 10C7 9.75454 7.17688 9.55039 7.41012 9.50806L7.5 9.5H12.5C12.7761 9.5 13 9.72386 13 10ZM13 13.5C13 13.7455 12.8231 13.9496 12.5899 13.9919L12.5 14H7.5C7.22386 14 7 13.7761 7 13.5C7 13.2545 7.17688 13.0504 7.41012 13.0081L7.5 13H12.5C12.7761 13 13 13.2239 13 13.5Z\" fill=\"#212121\"/>\n</svg>",
+    "redo": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M15.003 2.5C15.003 2.22386 15.2269 2 15.503 2C15.7792 2 16.003 2.22386 16.003 2.5V7.4C16.003 7.73137 15.7344 8 15.403 8H10.503C10.2269 8 10.003 7.77614 10.003 7.5C10.003 7.22386 10.2269 7 10.503 7H14.097L10.6243 3.98124C8.95706 2.53191 6.43056 2.70858 4.98124 4.37584C3.53191 6.0431 3.70858 8.56959 5.37584 10.0189L13.5477 17.1226C13.7562 17.3038 13.7782 17.6196 13.5971 17.828C13.4159 18.0364 13.1001 18.0585 12.8917 17.8774L4.71978 10.7736C2.63571 8.96197 2.41487 5.80385 4.22653 3.71978C6.03818 1.63571 9.1963 1.41487 11.2804 3.22653L15.003 6.46259V2.5Z\" fill=\"#212121\"/>\n</svg>",
+    "rule": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M2 9.5C2 9.22386 2.22386 9 2.5 9H17.5C17.7761 9 18 9.22386 18 9.5C18 9.77614 17.7761 10 17.5 10H2.5C2.22386 10 2 9.77614 2 9.5Z\" fill=\"#212121\"/>\n</svg>",
+    "select-all": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M12.3293 6.62372C12.5371 6.80556 12.5581 7.12144 12.3763 7.32926L8.87629 11.3293C8.78516 11.4334 8.65495 11.4951 8.51664 11.4997C8.37833 11.5043 8.2443 11.4514 8.14645 11.3536L6.14645 9.35356C5.95118 9.1583 5.95118 8.84172 6.14645 8.64645C6.34171 8.45119 6.65829 8.45119 6.85355 8.64645L8.47565 10.2685L11.6237 6.67075C11.8056 6.46294 12.1214 6.44188 12.3293 6.62372ZM3 6C3 4.34315 4.34315 3 6 3H12C13.6569 3 15 4.34315 15 6V12C15 13.6569 13.6569 15 12 15H6C4.34315 15 3 13.6569 3 12V6ZM6 4C4.89543 4 4 4.89543 4 6V12C4 13.1046 4.89543 14 6 14H12C13.1046 14 14 13.1046 14 12V6C14 4.89543 13.1046 4 12 4H6ZM5.75391 16.0002C6.30322 16.6137 7.10139 16.9998 7.98973 16.9998H12.4897C14.975 16.9998 16.9897 14.9851 16.9897 12.4998V7.99985C16.9897 7.11558 16.6072 6.32067 15.9985 5.77161V11.0002C15.9985 11.1003 15.9955 11.1998 15.9897 11.2985V12.4998C15.9897 14.4328 14.4227 15.9998 12.4897 15.9998H11.0548C11.0361 16.0001 11.0173 16.0002 10.9985 16.0002H5.75391Z\" fill=\"#212121\"/>\n</svg>",
+    "sort": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M2.35355 7.35418L4.99792 4.70981V16.5C4.99792 16.7761 5.22178 17 5.49792 17C5.77407 17 5.99792 16.7761 5.99792 16.5V4.7053L8.64682 7.3542C8.84209 7.54946 9.15867 7.54946 9.35393 7.3542C9.54919 7.15893 9.54919 6.84235 9.35393 6.64709L5.86386 3.15701L5.85387 3.14675C5.81608 3.10895 5.77374 3.07847 5.72861 3.05531C5.65697 3.01841 5.57828 2.99998 5.49959 3L5.49792 3C5.3441 3 5.20649 3.06947 5.11477 3.17874L1.64645 6.64707C1.45118 6.84233 1.45118 7.15891 1.64645 7.35418C1.84171 7.54944 2.15829 7.54944 2.35355 7.35418ZM17.6468 12.6458L15.0025 15.2902L15.0025 3.5C15.0025 3.22386 14.7786 3 14.5025 3C14.2263 3 14.0025 3.22386 14.0025 3.5L14.0025 15.2947L11.3536 12.6458C11.1583 12.4505 10.8417 12.4505 10.6464 12.6458C10.4512 12.8411 10.4512 13.1577 10.6464 13.3529L14.1365 16.843L14.1465 16.8533C14.1843 16.891 14.2266 16.9215 14.2718 16.9447C14.3434 16.9816 14.4221 17 14.5008 17L14.5025 17C14.6563 17 14.7939 16.9305 14.8856 16.8213L18.3539 13.3529C18.5492 13.1577 18.5492 12.8411 18.3539 12.6458C18.1587 12.4506 17.8421 12.4506 17.6468 12.6458Z\" fill=\"#212121\"/>\n</svg>",
+    "strikethrough": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6.52795 4.0264C7.42823 3.40313 8.65353 3 10.0001 3C12.6884 3 14.3259 4.43446 14.9001 5.2C15.0657 5.42091 15.021 5.73431 14.8001 5.9C14.5791 6.06569 14.2657 6.02091 14.1001 5.8C13.6742 5.23221 12.3117 4 10.0001 4C8.84657 4 7.82188 4.34687 7.09716 4.8486C6.35928 5.35944 6.00005 5.9758 6.00005 6.5C6.00005 7.40887 6.43221 7.98368 7.16703 8.43273C7.5285 8.65363 7.95091 8.83593 8.4155 9H6.23017C5.49804 8.43014 5.00005 7.63702 5.00005 6.5C5.00005 5.5242 5.64083 4.64056 6.52795 4.0264ZM16.5 10C16.7761 10 17 10.2239 17 10.5C17 10.7761 16.7761 11 16.5 11H13.7699C14.5021 11.5699 15.0001 12.363 15.0001 13.5C15.0001 14.7277 14.2789 15.6202 13.3235 16.1812C12.3776 16.7366 11.1598 17 10.0001 17C8.87386 17 7.92209 16.8723 7.10718 16.5218C6.27999 16.166 5.63015 15.5965 5.08403 14.7774C4.93085 14.5476 4.99294 14.2372 5.2227 14.084C5.45247 13.9308 5.7629 13.9929 5.91608 14.2226C6.36995 14.9035 6.87636 15.334 7.5023 15.6032C8.14051 15.8777 8.93875 16 10.0001 16C11.0278 16 12.0601 15.7634 12.8172 15.3188C13.5649 14.8798 14.0001 14.2723 14.0001 13.5C14.0001 12.5911 13.5679 12.0163 12.8331 11.5673C12.4716 11.3464 12.0492 11.1641 11.5846 11H3.5C3.22386 11 3 10.7761 3 10.5C3 10.2239 3.22386 10 3.5 10H16.5Z\" fill=\"#212121\"/>\n</svg>",
+    "subscript": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M13.5391 4.12038C13.7488 4.30009 13.7731 4.61574 13.5934 4.8254L9.158 9.99999L13.2432 14.7661C13.056 15.0598 12.9025 15.4038 12.8186 15.8073L8.49946 10.7683L4.16479 15.8254C3.98508 16.0351 3.66943 16.0593 3.45977 15.8796C3.25011 15.6999 3.22583 15.3843 3.40554 15.1746L7.84092 9.99999L3.40556 4.8254C3.22585 4.61574 3.25013 4.30009 3.45979 4.12038C3.66946 3.94067 3.98511 3.96495 4.16482 4.17461L8.49946 9.2317L12.8341 4.17461C13.0138 3.96495 13.3295 3.94067 13.5391 4.12038ZM15.5845 12.0002C15.1194 12.0002 14.7493 12.4212 14.7493 12.8639C14.7493 13.14 14.5254 13.3639 14.2493 13.3639C13.9731 13.3639 13.7493 13.14 13.7493 12.8639C13.7493 11.9429 14.4959 11.0002 15.5845 11.0002C16.2194 11.0002 16.8316 11.2972 17.1744 11.8242C17.5323 12.3743 17.544 13.0913 17.1283 13.799C16.9164 14.1596 16.6257 14.4321 16.3429 14.6554C16.2012 14.7674 16.0552 14.8717 15.9178 14.9687L15.8583 15.0107C15.7405 15.0939 15.6303 15.1717 15.5235 15.252C15.201 15.4948 14.968 15.7183 14.8461 16.0002H16.9422C17.2184 16.0002 17.4422 16.2241 17.4422 16.5002C17.4422 16.7764 17.2184 17.0002 16.9422 17.0002H14.3005C14.2919 17.0002 14.2834 17 14.2749 16.9996C14.2664 17 14.2579 17.0002 14.2493 17.0002C13.9731 17.0002 13.7493 16.7764 13.7493 16.5002C13.7493 15.4633 14.356 14.8791 14.9222 14.453C15.0423 14.3627 15.1665 14.275 15.2837 14.1923L15.3406 14.1521C15.4772 14.0556 15.6041 13.9647 15.7231 13.8706C15.9619 13.6821 16.1441 13.5 16.266 13.2924C16.5179 12.8638 16.4588 12.558 16.3362 12.3695C16.1985 12.1578 15.9207 12.0002 15.5845 12.0002Z\" fill=\"#212121\"/>\n</svg>",
+    "superscript": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M15.5845 3C15.1194 3 14.7493 3.42093 14.7493 3.86364C14.7493 4.13978 14.5254 4.36364 14.2493 4.36364C13.9731 4.36364 13.7493 4.13978 13.7493 3.86364C13.7493 2.9427 14.4959 2 15.5845 2C16.2194 2 16.8316 2.29696 17.1744 2.82395C17.5323 3.3741 17.544 4.09102 17.1283 4.79873C16.9164 5.15937 16.6257 5.43182 16.3429 5.65516C16.2012 5.76712 16.0552 5.87144 15.9178 5.9685L15.8583 6.0105C15.7405 6.09363 15.6302 6.17146 15.5235 6.25179C15.201 6.49452 14.968 6.71805 14.8461 7H16.9422C17.2184 7 17.4422 7.22386 17.4422 7.5C17.4422 7.77614 17.2184 8 16.9422 8H14.3005C14.2919 8 14.2834 7.99978 14.2749 7.99935C14.2664 7.99978 14.2579 8 14.2493 8C13.9731 8 13.7493 7.77614 13.7493 7.5C13.7493 6.46304 14.356 5.87885 14.9222 5.45276C15.0423 5.36241 15.1665 5.27474 15.2837 5.19209L15.3406 5.15188C15.4772 5.0554 15.6041 4.96441 15.7231 4.8704C15.9619 4.68181 16.1441 4.49972 16.266 4.29218C16.5179 3.86353 16.4588 3.55772 16.3362 3.36923C16.1985 3.15758 15.9207 3 15.5845 3ZM12.7926 4.22296C12.8789 4.57407 13.0888 4.87657 13.3736 5.08166L9.1581 9.99978L13.5935 15.1744C13.7732 15.384 13.7489 15.6997 13.5392 15.8794C13.4778 15.9321 13.4073 15.9672 13.3337 15.9853C13.1562 16.029 12.9612 15.9734 12.8341 15.8252L8.49952 10.7681L4.16479 15.8252C3.98508 16.0348 3.66943 16.0591 3.45977 15.8794C3.25011 15.6997 3.22583 15.3841 3.40554 15.1744L7.84092 9.99977L3.40556 4.82518C3.22585 4.61552 3.25013 4.29987 3.45979 4.12015C3.52123 4.0675 3.59176 4.03235 3.66531 4.01426C3.84279 3.97056 4.03782 4.02612 4.16489 4.17437L8.49951 9.23142L12.7926 4.22296Z\" fill=\"#212121\"/>\n</svg>",
+    "symbol": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M4 16 L7 16 C3.5 14 3.2 6 10 6 C16.8 6 16.5 14 13 16 L16 16\" stroke=\"#212121\" stroke-width=\"1.7\" stroke-linecap=\"round\" stroke-linejoin=\"round\" fill=\"none\"/>\n</svg>",
+    "table": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3 5.5C3 4.11929 4.11929 3 5.5 3H14.5C15.8807 3 17 4.11929 17 5.5V14.5C17 15.8807 15.8807 17 14.5 17H5.5C4.11929 17 3 15.8807 3 14.5V5.5ZM4 10.5V14.5C4 15.3284 4.67157 16 5.5 16H9.5V10.5H4ZM9.5 9.5V4H5.5C4.67157 4 4 4.67157 4 5.5V9.5H9.5ZM10.5 10.5V16H14.5C15.3284 16 16 15.3284 16 14.5V10.5H10.5ZM16 9.5V5.5C16 4.67157 15.3284 4 14.5 4H10.5V9.5H16Z\" fill=\"#212121\"/>\n</svg>",
+    "table-delete-column": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M10.5 2.5C10.5 2.22386 10.2761 2 10 2C9.72386 2 9.5 2.22386 9.5 2.5V7.375C9.62722 7.48209 9.74377 7.60252 9.85995 7.72255C9.90648 7.77064 9.95295 7.81866 10 7.86573C10.047 7.81873 10.0934 7.77079 10.1399 7.7228C10.2561 7.60274 10.3728 7.4822 10.5 7.3751V2.5ZM9.5 17.5V12.612C9.62722 12.505 9.74377 12.3845 9.85995 12.2645C9.90648 12.2164 9.95295 12.1684 10 12.1213C10.0471 12.1684 10.0935 12.2163 10.14 12.2644C10.2562 12.3844 10.3728 12.5049 10.5 12.612V17.5C10.5 17.7761 10.2761 18 10 18C9.72386 18 9.5 17.7761 9.5 17.5ZM2 3.5C2 3.22386 2.22386 3 2.5 3H4C5.10457 3 6 3.89543 6 5V15C6 16.1046 5.10457 17 4 17H2.5C2.22386 17 2 16.7761 2 16.5C2 16.2239 2.22386 16 2.5 16H4C4.55228 16 5 15.5523 5 15V13H2.5C2.22386 13 2 12.7761 2 12.5C2 12.2239 2.22386 12 2.5 12H5V8H2.5C2.22386 8 2 7.77614 2 7.5C2 7.22386 2.22386 7 2.5 7H5V5C5 4.44772 4.55228 4 4 4H2.5C2.22386 4 2 3.77614 2 3.5ZM18 3.5C18 3.22386 17.7761 3 17.5 3H16C14.8954 3 14 3.89543 14 5V15C14 16.1046 14.8954 17 16 17H17.5C17.7761 17 18 16.7761 18 16.5C18 16.2239 17.7761 16 17.5 16H16C15.4477 16 15 15.5523 15 15V13H17.5C17.7761 13 18 12.7761 18 12.5C18 12.2239 17.7761 12 17.5 12H15V8H17.5C17.7761 8 18 7.77614 18 7.5C18 7.22386 17.7761 7 17.5 7H15V5C15 4.44772 15.4477 4 16 4H17.5C17.7761 4 18 3.77614 18 3.5ZM11.8536 8.14645C11.6583 7.95118 11.3417 7.95118 11.1464 8.14645L10 9.29289L8.85355 8.14645C8.65829 7.95118 8.34171 7.95118 8.14645 8.14645C7.95118 8.34171 7.95118 8.65829 8.14645 8.85355L9.29289 10L8.14645 11.1464C7.95118 11.3417 7.95118 11.6583 8.14645 11.8536C8.34171 12.0488 8.65829 12.0488 8.85355 11.8536L10 10.7071L11.1464 11.8536C11.3417 12.0488 11.6583 12.0488 11.8536 11.8536C12.0488 11.6583 12.0488 11.3417 11.8536 11.1464L10.7071 10L11.8536 8.85355C12.0488 8.65829 12.0488 8.34171 11.8536 8.14645Z\" fill=\"#212121\"/>\n</svg>",
+    "table-delete-row": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M16.5 2C16.7761 2 17 2.22386 17 2.5V4C17 5.10457 16.1046 6 15 6L5 6C3.89543 6 3 5.10457 3 4L3 2.5C3 2.22386 3.22386 2 3.5 2C3.77614 2 4 2.22386 4 2.5L4 4C4 4.55228 4.44772 5 5 5H7L7 2.5C7 2.22386 7.22386 2 7.5 2C7.77614 2 8 2.22386 8 2.5L8 5L12 5V2.5C12 2.22386 12.2239 2 12.5 2C12.7761 2 13 2.22386 13 2.5V5H15C15.5523 5 16 4.55228 16 4V2.5C16 2.22386 16.2239 2 16.5 2ZM16.5 18C16.7761 18 17 17.7761 17 17.5V16C17 14.8954 16.1046 14 15 14L5 14C3.89543 14 3 14.8954 3 16L3 17.5C3 17.7761 3.22386 18 3.5 18C3.77614 18 4 17.7761 4 17.5V16C4 15.4477 4.44772 15 5 15H7V17.5C7 17.7761 7.22386 18 7.5 18C7.77614 18 8 17.7761 8 17.5V15L12 15V17.5C12 17.7761 12.2239 18 12.5 18C12.7761 18 13 17.7761 13 17.5V15H15C15.5523 15 16 15.4477 16 16V17.5C16 17.7761 16.2239 18 16.5 18ZM17.5 10.5C17.7761 10.5 18 10.2761 18 10C18 9.72386 17.7761 9.5 17.5 9.5H12.6131C12.5074 9.62468 12.3891 9.73922 12.2711 9.8534C12.223 9.89994 12.175 9.94642 12.1279 9.9935C12.175 10.0405 12.2229 10.087 12.271 10.1334C12.3931 10.2516 12.5156 10.3702 12.624 10.5H17.5ZM2.5 9.5H7.38712C7.49281 9.62468 7.61117 9.73923 7.72915 9.85341C7.77723 9.89994 7.82526 9.94642 7.87233 9.9935C7.8253 10.0405 7.77733 10.087 7.7293 10.1334C7.60719 10.2516 7.48468 10.3702 7.37622 10.5H2.5C2.22386 10.5 2 10.2761 2 10C2 9.72386 2.22386 9.5 2.5 9.5ZM11.8536 11.8536C12.0488 11.6583 12.0488 11.3417 11.8536 11.1464L10.7071 10L11.8536 8.85355C12.0488 8.65829 12.0488 8.34171 11.8536 8.14645C11.6583 7.95118 11.3417 7.95118 11.1464 8.14645L10 9.29289L8.85355 8.14645C8.65829 7.95118 8.34171 7.95118 8.14645 8.14645C7.95118 8.34171 7.95118 8.65829 8.14645 8.85355L9.29289 10L8.14645 11.1464C7.95118 11.3417 7.95118 11.6583 8.14645 11.8536C8.34171 12.0488 8.65829 12.0488 8.85355 11.8536L10 10.7071L11.1464 11.8536C11.3417 12.0488 11.6583 12.0488 11.8536 11.8536Z\" fill=\"#212121\"/>\n</svg>",
+    "table-dismiss": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M17 5.5C17 4.11929 15.8807 3 14.5 3H5.5C4.11929 3 3 4.11929 3 5.5V14.5C3 15.8807 4.11929 17 5.5 17H9.59971C9.43777 16.6832 9.30564 16.3486 9.20703 16H8V13H9.20703C9.30564 12.6514 9.43777 12.3168 9.59971 12H8V8H12V9.59971C12.3168 9.43777 12.6514 9.30564 13 9.20703V8H16V9.20703C16.3486 9.30564 16.6832 9.43777 17 9.59971V5.5ZM4 14.5V13H7V16H5.5L5.35554 15.9931C4.59489 15.9204 4 15.2797 4 14.5ZM12 4V7H8V4H12ZM13 4H14.5L14.6445 4.00687C15.4051 4.07955 16 4.7203 16 5.5V7H13V4ZM7 4V7H4V5.5L4.00687 5.35554C4.07955 4.59489 4.7203 4 5.5 4H7ZM7 8V12H4V8H7ZM19 14.5C19 16.9853 16.9853 19 14.5 19C12.0147 19 10 16.9853 10 14.5C10 12.0147 12.0147 10 14.5 10C16.9853 10 19 12.0147 19 14.5ZM15.2071 14.5L16.3536 13.3536C16.5488 13.1583 16.5488 12.8417 16.3536 12.6464C16.1583 12.4512 15.8417 12.4512 15.6464 12.6464L14.5 13.7929L13.3536 12.6464C13.1583 12.4512 12.8417 12.4512 12.6464 12.6464C12.4512 12.8417 12.4512 13.1583 12.6464 13.3536L13.7929 14.5L12.6464 15.6464C12.4512 15.8417 12.4512 16.1583 12.6464 16.3536C12.8417 16.5488 13.1583 16.5488 13.3536 16.3536L14.5 15.2071L15.6464 16.3536C15.8417 16.5488 16.1583 16.5488 16.3536 16.3536C16.5488 16.1583 16.5488 15.8417 16.3536 15.6464L15.2071 14.5Z\" fill=\"#212121\"/>\n</svg>",
+    "table-insert-column": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M4 3.5C4 3.22386 3.77614 3 3.5 3C3.22386 3 3 3.22386 3 3.5V16.5C3 16.7761 3.22386 17 3.5 17C3.77614 17 4 16.7761 4 16.5V3.5ZM17 3.5C17 3.22386 16.7761 3 16.5 3C16.2239 3 16 3.22386 16 3.5V16.5C16 16.7761 16.2239 17 16.5 17C16.7761 17 17 16.7761 17 16.5V3.5ZM9.00065 3C7.89608 3 7.00065 3.89543 7.00065 5L7.00041 15.0003C7.00059 16.1048 7.89596 17 9.00041 17H11.0004C12.1051 17 13.0006 16.1044 13.0004 14.9997L13.0007 5C13.0007 3.89543 12.1052 3 11.0007 3H9.00065ZM8.00006 12L8.00059 8H12.0006L12.0001 12H8.00006ZM12.0007 5V7H8.00065V5C8.00065 4.44772 8.44837 4 9.00065 4H11.0007C11.5529 4 12.0007 4.44772 12.0007 5ZM8.00008 13H12.0001L12.0004 14.9998C12.0005 15.5522 11.5528 16 11.0004 16H9.00041C8.44818 16 8.0005 15.5524 8.00041 15.0002L8.00008 13Z\" fill=\"#212121\"/>\n</svg>",
+    "table-insert-row": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M3.5 16C3.22386 16 3 16.2239 3 16.5C3 16.7761 3.22386 17 3.5 17L16.5 17C16.7761 17 17 16.7761 17 16.5C17 16.2239 16.7761 16 16.5 16L3.5 16ZM3.5 3C3.22386 3 3 3.22386 3 3.5C3 3.77614 3.22386 4 3.5 4L16.5 4C16.7761 4 17 3.77614 17 3.5C17 3.22386 16.7761 3 16.5 3H3.5ZM3 11C3 12.1046 3.89543 13 5 13L15.0003 13.0003C16.1048 13.0001 17 12.1047 17 11.0003V9.00026C17 7.89557 16.1044 7.00008 14.9997 7.00026L5 7.00002C3.89543 7.00002 3 7.89545 3 9.00002V11ZM12 12.0006L8 12.0001V8.00009L12 8.00061V12.0006ZM5 8.00002H7V12H5C4.44772 12 4 11.5523 4 11V9.00002C4 8.44774 4.44772 8.00002 5 8.00002ZM13 12.0006V8.00059L14.9998 8.00026C15.5522 8.00017 16 8.44792 16 9.00026V11.0003C16 11.5525 15.5524 12.0002 15.0002 12.0003L13 12.0006Z\" fill=\"#212121\"/>\n</svg>",
+    "text-color": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M10.4642 2.3143C10.3883 2.12448 10.2045 2 10 2C9.79556 2 9.6117 2.12448 9.53577 2.3143L6.53577 9.8143C6.43322 10.0707 6.55792 10.3617 6.81432 10.4642C7.07071 10.5668 7.36169 10.4421 7.46425 10.1857L8.53707 7.50364H11.4629L12.5358 10.1857C12.6383 10.4421 12.9293 10.5668 13.1857 10.4642C13.4421 10.3617 13.5668 10.0707 13.4642 9.8143L10.4642 2.3143ZM10 3.84629L11.0629 6.50364H8.93707L10 3.84629ZM4.5 12C3.67157 12 3 12.6716 3 13.5V16.5C3 17.3284 3.67157 18 4.5 18H15.5C16.3284 18 17 17.3284 17 16.5V13.5C17 12.6716 16.3284 12 15.5 12H4.5ZM4 13.5C4 13.2239 4.22386 13 4.5 13H15.5C15.7761 13 16 13.2239 16 13.5V16.5C16 16.7761 15.7761 17 15.5 17H4.5C4.22386 17 4 16.7761 4 16.5V13.5Z\" fill=\"#212121\"/>\n</svg>",
+    "underline": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M6 3.5C6 3.22386 5.77614 3 5.5 3C5.22386 3 5 3.22386 5 3.5V9.95455C5 12.7363 7.23385 15 10 15C12.7661 15 15 12.7363 15 9.95455V3.5C15 3.22386 14.7761 3 14.5 3C14.2239 3 14 3.22386 14 3.5V9.95455C14 12.1935 12.2044 14 10 14C7.79559 14 6 12.1935 6 9.95455V3.5ZM5 16.5C5 16.2239 5.22386 16 5.5 16H14.5C14.7761 16 15 16.2239 15 16.5C15 16.7761 14.7761 17 14.5 17H5.5C5.22386 17 5 16.7761 5 16.5Z\" fill=\"#212121\"/>\n</svg>",
+    "undo": "<svg width=\"20\" height=\"20\" viewBox=\"0 0 20 20\" fill=\"none\" xmlns=\"http://www.w3.org/2000/svg\">\n<path d=\"M5 2.5C5 2.22386 4.77614 2 4.5 2C4.22386 2 4 2.22386 4 2.5V7.4C4 7.73137 4.26863 8 4.6 8H9.5C9.77614 8 10 7.77614 10 7.5C10 7.22386 9.77614 7 9.5 7H5.90603L9.37872 3.98124C11.046 2.53191 13.5725 2.70858 15.0218 4.37584C16.4711 6.0431 16.2945 8.56959 14.6272 10.0189L6.45529 17.1226C6.24688 17.3038 6.2248 17.6196 6.40596 17.828C6.58713 18.0364 6.90294 18.0585 7.11135 17.8774L15.2833 10.7736C17.3673 8.96197 17.5882 5.80385 15.7765 3.71978C13.9648 1.63571 10.8067 1.41487 8.72266 3.22653L5 6.46259V2.5Z\" fill=\"#212121\"/>\n</svg>"
+  }
+}
