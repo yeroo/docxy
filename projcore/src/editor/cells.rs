@@ -60,8 +60,7 @@ impl Editor {
         if task.constraint == constraint && task.constraint_date == date {
             return Ok(());
         }
-        self.edit_structure(|proj| {
-            materialize(proj, i);
+        self.edit_row(i, |proj, _| {
             proj.tasks[i].constraint = constraint;
             proj.tasks[i].constraint_date = date;
         })
@@ -81,8 +80,7 @@ impl Editor {
         if task.manual_start == Some(start) && task.manual_finish.is_none() {
             return Ok(());
         }
-        self.edit_structure(|proj| {
-            materialize(proj, i);
+        self.edit_row(i, |proj, _| {
             let task = &mut proj.tasks[i];
             task.manual_start = Some(start);
             task.manual_finish = None;
@@ -121,10 +119,8 @@ impl Editor {
             return Ok(());
         }
         self.validate_cell_horizon(uid, Some(duration), None)?;
-        self.edit_structure(|proj| {
+        self.edit_row(i, |proj, was_blank| {
             // As in update_task, a blank row's default duration is not typed.
-            let was_blank = proj.tasks[i].is_null;
-            materialize(proj, i);
             let task = &mut proj.tasks[i];
             if was_blank || duration != task.duration_min {
                 commit_estimate(task);
@@ -178,8 +174,7 @@ impl Editor {
             return Ok(());
         }
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;
-        self.edit_structure(|proj| {
-            materialize(proj, i);
+        self.edit_row(i, |proj, _| {
             proj.tasks[i].predecessors = predecessors;
         })
     }
@@ -277,11 +272,10 @@ impl Editor {
                 &mut next_aid,
                 uid,
                 rid,
-                materialized(&self.proj, i).duration_min,
+                self.row_as_edited(i).duration_min,
             )?);
         }
-        self.edit_structure(|proj| {
-            materialize(proj, i);
+        self.edit_row(i, |proj, _| {
             proj.resources = resources;
             proj.assignments = assignments;
         })?;

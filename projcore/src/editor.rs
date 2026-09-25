@@ -199,6 +199,35 @@ impl Editor {
             .ok_or_else(|| format!("no task with uid {uid}"))
     }
 
+    /// Where a new manual task starts: the project start, else the anchor
+    /// the schedule actually uses.
+    fn new_task_start(&self) -> DateTime {
+        self.proj.start_date.unwrap_or(self.sched.project_start)
+    }
+
+    /// Row `i` as an edit would make it (see [`materialized`]).
+    fn row_as_edited(&self, i: usize) -> Task {
+        materialized(&self.proj, i, self.new_task_start())
+    }
+
+    /// A structural edit of row `i`. A blank row first becomes a task (see
+    /// [`materialized`]); `edit` learns whether it was blank. A manual task
+    /// made that way gets its dates pinned, as [`Self::add_task`] does.
+    fn edit_row(&mut self, i: usize, edit: impl FnOnce(&mut Project, bool)) -> Result<(), String> {
+        let (was_blank, uid) = (self.proj.tasks[i].is_null, self.proj.tasks[i].uid);
+        let start = self.new_task_start();
+        self.edit_structure(|proj| {
+            if was_blank {
+                proj.tasks[i] = materialized(proj, i, start);
+            }
+            edit(proj, was_blank);
+        })?;
+        if was_blank {
+            self.stamp_pinned_dates(uid);
+        }
+        Ok(())
+    }
+
     fn is_blank(&self, uid: i32) -> bool {
         self.proj.task(uid).is_some_and(|t| t.is_null)
     }
@@ -313,7 +342,7 @@ impl Editor {
         // Follow the plan's own default mode; a manual task starts at the
         // project start (or the anchor the schedule actually uses).
         let manual = self.proj.new_tasks_are_manual;
-        let manual_start = manual.then(|| self.proj.start_date.unwrap_or(self.sched.project_start));
+        let manual_start = manual.then(|| self.new_task_start());
         self.edit_structure(|proj| {
             proj.tasks.insert(
                 at,
@@ -349,8 +378,7 @@ impl Editor {
 
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
         let i = self.index(uid)?;
-        self.edit_structure(|proj| {
-            materialize(proj, i);
+        self.edit_row(i, |proj, _| {
             let t = &mut proj.tasks[i];
             t.outline_level = (i64::from(t.outline_level) + i64::from(delta)).clamp(1, 20) as u32;
         })
@@ -406,11 +434,9 @@ impl Editor {
         {
             return Ok(());
         }
-        self.edit_structure(|proj| {
+        self.edit_row(i, |proj, was_blank| {
             // A blank row's `1 day?` is a default, not a duration the user
             // typed: typing any duration into it commits it.
-            let was_blank = proj.tasks[i].is_null;
-            materialize(proj, i);
             let t = &mut proj.tasks[i];
             if let Some(name) = patch.name {
                 t.name = name;
@@ -482,8 +508,7 @@ impl Editor {
         {
             return Err(format!("Already depends on {pred}"));
         }
-        self.edit_structure(|proj| {
-            materialize(proj, i);
+        self.edit_row(i, |proj, _| {
             proj.tasks[i].predecessors.push(Predecessor {
                 uid: pred,
                 link,
@@ -541,10 +566,9 @@ impl Editor {
             .map(|a| a.uid)
             .max()
             .unwrap_or(0);
-        let work = materialized(&self.proj, i).duration_min;
+        let work = self.row_as_edited(i).duration_min;
         let assignment = new_assignment(&mut next_aid, uid, rid, work)?;
-        self.edit_structure(|proj| {
-            materialize(proj, i);
+        self.edit_row(i, |proj, _| {
             proj.resources = resources;
             proj.assignments.push(assignment);
         })?;
@@ -585,7 +609,7 @@ impl Editor {
     pub fn toggle_milestone(&mut self, uid: i32) -> Result<(), String> {
         let i = self.index(uid)?;
         // A blank row toggles from the duration it gets as a task.
-        let min = if materialized(&self.proj, i).duration_min == 0 {
+        let min = if self.row_as_edited(i).duration_min == 0 {
             480
         } else {
             0
@@ -660,30 +684,49 @@ fn task_level_above(proj: &Project, at: usize) -> u32 {
         .map_or(1, |t| t.outline_level.max(1))
 }
 
+/// The outline level blank row `i` takes when it becomes a task: under a
+/// summary above it, its first subtask's level (so the summary keeps its
+/// children, as in Project); otherwise the level of the task above, at least 1.
+fn blank_row_level(proj: &Project, i: usize) -> u32 {
+    let Some(above) = proj.tasks[..i].iter().rposition(|t| !t.is_null) else {
+        return 1;
+    };
+    let level = if proj.is_outline_summary(above) {
+        // The rows between are blank, so the next task is its first child.
+        proj.tasks[i + 1..]
+            .iter()
+            .find(|t| !t.is_null)
+            .map_or(1, |t| t.outline_level)
+    } else {
+        proj.tasks[above].outline_level
+    };
+    level.max(1)
+}
+
 /// Row `i` as it becomes when edited. Typing into a blank row turns it into a
-/// task, as in Project: it joins the outline at the level of the task above
-/// when it has none, and without a duration it gets Project's new-task
-/// default, `1 day?`, instead of turning into a milestone.
-fn materialized(proj: &Project, i: usize) -> Task {
+/// task, as in Project: it joins the outline where it sits when it has no
+/// level, without a duration it gets Project's new-task default, `1 day?`,
+/// instead of turning into a milestone, and in a plan whose new tasks are
+/// manual it becomes manual at `start`, as [`Editor::add_task`] makes one.
+fn materialized(proj: &Project, i: usize, start: DateTime) -> Task {
     let mut t = proj.tasks[i].clone();
     if t.is_null {
         t.is_null = false;
         if t.outline_level == 0 {
-            t.outline_level = task_level_above(proj, i);
+            t.outline_level = blank_row_level(proj, i);
         }
         if t.duration_min == 0 {
             t.duration_min = proj.days_to_minutes(1.0);
             t.estimated = Some(true);
             t.milestone = false;
         }
+        if proj.new_tasks_are_manual && !t.manual {
+            t.manual = true;
+            t.manual_start = t.manual_start.or(Some(start));
+            t.manual_duration_min = t.manual_duration_min.or(Some(t.duration_min));
+        }
     }
     t
-}
-
-fn materialize(proj: &mut Project, i: usize) {
-    if proj.tasks[i].is_null {
-        proj.tasks[i] = materialized(proj, i);
-    }
 }
 
 /// Typing a duration without `?` commits an estimated one, as in Project.
@@ -1830,6 +1873,93 @@ mod tests {
             ed.set_predecessors(2, added).unwrap_err(),
             "No task with ID 3"
         );
+    }
+
+    #[test]
+    fn a_blank_row_under_a_summary_becomes_its_first_subtask() {
+        let task = |uid, outline_level, is_null| Task {
+            uid,
+            id: uid,
+            name: if is_null {
+                String::new()
+            } else {
+                format!("T{uid}")
+            },
+            outline_level,
+            duration_min: if is_null { 0 } else { 480 },
+            is_null,
+            ..Task::default()
+        };
+        let mut phase = task(1, 1, false);
+        phase.summary = true;
+        let mut ed = Editor::new(Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: vec![
+                phase,
+                task(3, 0, true),
+                task(2, 2, false),
+                task(4, 1, false),
+            ],
+            ..Project::default()
+        });
+        ed.rename(3, "Typed").unwrap();
+        let levels: Vec<_> = ed.project().tasks.iter().map(|t| t.outline_level).collect();
+        assert_eq!(levels, [1, 2, 2, 1]);
+        let summaries: Vec<_> = ed.project().tasks.iter().map(|t| t.summary).collect();
+        assert_eq!(summaries, [true, false, false, false]);
+        // Phase rolls up the typed row: a 2-day subtask sets its finish.
+        ed.set_duration_min(3, 960).unwrap();
+        assert!(ed.project().tasks[0].summary);
+        assert_eq!(
+            ed.schedule().get(1).unwrap().early_finish,
+            DateTime::from_ymd_hm(2026, 1, 6, 17, 0)
+        );
+        // Below a task that is not a summary, the row takes that task's level.
+        let mut ed = blank_row_editor();
+        ed.indent(1, 1).unwrap();
+        ed.rename(3, "Typed").unwrap();
+        assert_eq!(ed.project().tasks[1].outline_level, 2);
+    }
+
+    #[test]
+    fn a_blank_row_in_a_manual_plan_becomes_a_pinned_manual_task() {
+        let mut proj = blank_row_editor().project().clone();
+        proj.new_tasks_are_manual = true;
+        let start = proj.start_date.unwrap();
+        let mut ed = Editor::new(proj);
+        ed.rename(3, "Typed").unwrap();
+        let t = ed.project().tasks[1].clone();
+        assert!(t.manual && !t.is_null);
+        assert_eq!(
+            (t.manual_start, t.manual_duration_min, t.manual_finish),
+            (Some(start), Some(480), None)
+        );
+        let r = *ed.schedule().get(3).unwrap();
+        assert_eq!(r.early_start, start);
+        // Its Start/Finish are stamped as add_task stamps a new manual task.
+        assert_eq!(
+            (t.stored_start, t.stored_finish),
+            (Some(start), Some(r.early_finish))
+        );
+        // Every materializing edit pins it, not only the date edits.
+        for edit in [
+            |ed: &mut Editor| ed.set_constraint(3, "SNET 2026-01-07"),
+            |ed: &mut Editor| ed.add_predecessor(3, 1, LinkType::FinishStart, 0),
+            |ed: &mut Editor| ed.indent(3, 1),
+        ] {
+            let mut proj = blank_row_editor().project().clone();
+            proj.new_tasks_are_manual = true;
+            let mut ed = Editor::new(proj);
+            edit(&mut ed).unwrap();
+            let t = &ed.project().tasks[1];
+            assert!(t.manual);
+            assert_eq!(t.stored_start, Some(start));
+        }
+        // A plan whose new tasks are automatic keeps the row automatic.
+        let mut ed = blank_row_editor();
+        ed.rename(3, "Typed").unwrap();
+        assert!(!ed.project().tasks[1].manual);
+        assert_eq!(ed.project().tasks[1].manual_start, None);
     }
 
     #[test]
