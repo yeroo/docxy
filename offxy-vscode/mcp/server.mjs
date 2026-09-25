@@ -384,7 +384,8 @@ function docxyToolDefs() {
       'docxy_find',
       'Find all occurrences of a query in the live document; returns match positions and the containing paragraph. ' +
         'Only text the editor can edit is searched (not tracked changes, fields, footnote refs, equations, ' +
-        'SmartArt, chart titles); start/end count only that text, so they need not index the returned text.',
+        'SmartArt, chart titles, or links holding such markup, bookmarks or proofing marks); ' +
+        'start/end count only that text, so they need not index the returned text.',
       Object.fromEntries([
         ['query', prop('string', 'Text to search for.')],
         ['case_sensitive', prop('boolean', 'Match case (default false).')],
@@ -486,7 +487,8 @@ function docxyToolDefs() {
       'docxy_replace_all',
       'Replace every occurrence of a query with text across the whole document ' +
         '(case-insensitive unless case_sensitive:true); only text the editor can edit is ' +
-        'replaced (not tracked changes, fields, footnote refs, equations, SmartArt, chart titles). Undoable.',
+        'replaced (not tracked changes, fields, footnote refs, equations, SmartArt, chart titles, ' +
+        'or links holding such markup, bookmarks or proofing marks). Undoable.',
       Object.fromEntries([
         ['query', prop('string', 'Text to search for.')],
         ['text', prop('string', 'Replacement text.')],

@@ -199,7 +199,11 @@ Notes:
   A paragraph's editable text is its runs, simple links, tabs and breaks. Text
   it only shows is not searched or replaced: tracked changes (`w:ins`/`w:del`),
   field results, footnote/endnote references, equations, SmartArt, chart
-  titles, inline text boxes, and links that hold any of these. A match's
+  titles, inline text boxes, and complex links. A link is complex when it
+  holds anything but plain text runs, for example a tracked change, a field, a
+  bookmark or a proofing mark (`w:proofErr`); an external link is also
+  complex when it holds a tab or a break (an anchor link may hold those and
+  stay simple). A match's
   `start`/`end` count only editable text, while `text` is the paragraph's full
   plain text (the form `doc.replace-range` round-trips), which includes the
   rest. So `text[start..end]` is the match only when the paragraph holds

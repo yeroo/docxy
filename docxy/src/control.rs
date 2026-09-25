@@ -265,7 +265,8 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
         // `start`/`end` count only editor-editable text (runs, simple links,
         // tabs, breaks), while `text` is `plain_text()`, which also holds the
         // text of zero-width inlines (tracked changes, fields, footnote refs,
-        // equations, SmartArt, chart titles, text boxes): when the paragraph
+        // equations, SmartArt, chart titles, text boxes, complex links such as
+        // one holding a bookmark or proofing mark): when the paragraph
         // has any, `text[start..end]` need not be the match.
         if m.path.len() == 1 {
             f.push(("block", Json::Num(m.path[0] as f64)));
