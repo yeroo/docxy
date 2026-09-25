@@ -1,0 +1,15 @@
+{
+  "name": "docxy-webapp-tests",
+  "private": true,
+  "description": "Tests for docxy's editable HTML (htmlbundle/web): node unit tests and Playwright browser tests.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test:unit": "node --test test/*.test.mjs",
+    "test:e2e": "playwright test",
+    "test": "node --test test/*.test.mjs && playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

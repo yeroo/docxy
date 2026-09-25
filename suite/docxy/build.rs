@@ -1,9 +1,21 @@
 //! Build script: on Windows, compile `docxy.rc` so the app icon
 //! (`assets/docxy.ico`) is embedded into `suite.exe` — giving it a proper icon
-//! in Explorer, the taskbar, and Alt-Tab.
+//! in Explorer, the taskbar, and Alt-Tab. With the `html-export` feature it
+//! also builds the docxwasm engine that editable-HTML export embeds.
 fn main() {
     println!("cargo:rerun-if-changed=docxy.rc");
     println!("cargo:rerun-if-changed=assets/docxy.ico");
+
+    // With `html-export`, embed the docxwasm engine new editable-HTML bundles
+    // carry (htmlbundle::engine_build; the root workspace is two levels up).
+    if std::env::var_os("CARGO_FEATURE_HTML_EXPORT").is_some() {
+        let manifest = std::path::PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+        let root = manifest.join("..").join("..");
+        let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+        if let Err(e) = htmlbundle::engine_build::prepare_engine(&root, &out) {
+            panic!("html-export: {e}");
+        }
+    }
 
     #[cfg(windows)]
     {

@@ -12,7 +12,10 @@
 mod close;
 mod control;
 mod harness;
+mod html_bundle;
 mod project;
+#[cfg(test)]
+mod ribbon_export;
 use project::*;
 
 use std::path::PathBuf;
@@ -1080,6 +1083,10 @@ struct DocTab {
     /// edit mode): keystrokes/clicks route to this editor instead of the body,
     /// and its blocks are serialized back into the package part on exit/save.
     hf_edit: Option<HfEdit>,
+    /// For a document opened from editable HTML: that bundle's HTML, rewrapped
+    /// around the new package on Save (and on Save As to another .html name),
+    /// so its engine and web UI carry over.
+    bundle_html: Option<String>,
 }
 
 /// Live header/footer edit session: an editor over the parsed header/footer
@@ -1495,6 +1502,7 @@ struct Loaded {
     pkg: Option<Package>,
     markdown: bool,
     status: SharedString,
+    bundle_html: Option<String>,
 }
 
 impl Loaded {
@@ -1506,6 +1514,7 @@ impl Loaded {
             pkg: None,
             markdown: false,
             status: status.into(),
+            bundle_html: None,
         }
     }
     fn into_tab(
@@ -1527,6 +1536,7 @@ impl Loaded {
             notes: self.notes,
             markdown: self.markdown,
             hf_edit: None,
+            bundle_html: self.bundle_html,
         }
     }
 }
@@ -1546,12 +1556,27 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
             pkg: Some(pkg),
             markdown: false,
             status: "loaded".into(),
+            bundle_html: None,
         },
         Err(e) => Loaded::empty(format!("load error: {e:?}")),
     }
 }
 
 fn doc_from_path(path: &PathBuf) -> Loaded {
+    if html_bundle::doc_target(path, false) == html_bundle::DocTarget::Html {
+        return match html_bundle::open(path) {
+            Ok(opened) => {
+                let mut loaded = load_bytes(&opened.docx);
+                loaded.bundle_html = Some(opened.html);
+                loaded.status = match opened.warning {
+                    Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
+                    None => "loaded (editable HTML)".into(),
+                };
+                loaded
+            }
+            Err(e) => Loaded::empty(format!("load error: {e}")),
+        };
+    }
     match std::fs::read(path) {
         Ok(bytes) if is_markdown_path(path) => Loaded {
             doc: docxcore::markdown::from_markdown(&String::from_utf8_lossy(&bytes)),
@@ -1560,6 +1585,7 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
             pkg: None,
             markdown: true,
             status: "loaded (markdown)".into(),
+            bundle_html: None,
         },
         Ok(bytes) => load_bytes(&bytes),
         Err(e) => Loaded::empty(format!("read error: {e}")),
@@ -1612,6 +1638,7 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
             notes: vec![],
             markdown: false,
             hf_edit: None,
+            bundle_html: None,
         }
     } else {
         doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
@@ -3985,7 +4012,9 @@ fn restore_tab(t: &PersistTab) -> DocTab {
             } else {
                 "loaded".into()
             };
-            l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
+            let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
+            tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
+            tab
         }
         // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
         // keep the original on-disk `path` (so Save still targets the real
@@ -4009,7 +4038,13 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 notes: vec![],
                 markdown: false,
                 hf_edit: None,
+                bundle_html: None,
             }
+        }
+        // A document with no sidecar reloads its file, bundle included.
+        (Kind::Docx, None) if path.is_some() => {
+            let l = doc_from_path(path.as_ref().unwrap());
+            l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
         }
         _ => {
             let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
@@ -4026,6 +4061,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 notes,
                 markdown,
                 hf_edit: None,
+                bundle_html: None,
             }
         }
     };
@@ -4285,6 +4321,7 @@ impl Docxy {
             notes: vec![],
             markdown: false,
             hf_edit: None,
+            bundle_html: None,
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -9618,6 +9655,75 @@ fn exit_hf_tab(tab: &mut DocTab) {
     }
 }
 
+/// Write a document tab to `target` (Save As, or the first save of a
+/// never-saved document to a picked path) or, with `None`, to its own file
+/// (refused when it has none). The format
+/// follows the destination: Markdown for a `.md` target (or a Markdown tab
+/// saved in place), an editable-HTML page for any `.html`, Word otherwise.
+///
+/// The tab is rebound (path, Markdown flag, title, held bundle) only after a
+/// successful write, so a refused or failed Save As leaves it saving where it
+/// did. Returns whether the file was written; the tab's status says either way.
+fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
+    let Surface::Doc(editor) = &tab.surface else {
+        return false;
+    };
+    let (path, markdown) = match target {
+        Some(path) => {
+            let markdown = is_markdown_path(&path);
+            (path, markdown)
+        }
+        None => match tab.path.clone() {
+            Some(path) => (path, tab.markdown),
+            // Never-saved documents are given a picked target (#98); there is
+            // no `<cwd>/<title>` fallback to write over.
+            None => {
+                tab.status = "this document has never been saved: use Save As".into();
+                return false;
+            }
+        },
+    };
+    // Markdown-backed tabs save as Markdown, editable-HTML pages rewrap the
+    // bundle the tab holds (or become a new one), everything else is lossless
+    // .docx.
+    let kind = html_bundle::doc_target(&path, markdown);
+    let bytes = match kind {
+        html_bundle::DocTarget::Markdown => {
+            docxcore::markdown::to_markdown(&editor.doc).into_bytes()
+        }
+        html_bundle::DocTarget::Docx => doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref()),
+        html_bundle::DocTarget::Html => {
+            let docx = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
+            match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), &docx) {
+                Ok(page) => page.into_bytes(),
+                Err(e) => {
+                    tab.status = format!("save failed: {e}").into();
+                    return false;
+                }
+            }
+        }
+    };
+    match opccore::fsio::write_atomic(&path, &bytes) {
+        Ok(()) => {
+            tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+            tab.title = file_name(&path).into();
+            tab.markdown = markdown;
+            tab.path = Some(path);
+            tab.dirty = false;
+            // The page just written is the one the next save rewraps.
+            tab.bundle_html = match kind {
+                html_bundle::DocTarget::Html => String::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            true
+        }
+        Err(e) => {
+            tab.status = format!("save failed: {e}").into();
+            false
+        }
+    }
+}
+
 impl Docxy {
     /// Serialize the open header/footer editor back into its package part (called
     /// on exit and before every save) so edits persist. Leaves the session open.
@@ -9831,6 +9937,12 @@ impl Docxy {
             }
             return self.save_sheet(window, cx);
         }
+        self.save_doc(None, window, cx);
+    }
+
+    /// Save the active document tab to `target` (Save As, or the first save of
+    /// an untitled document to a picked path) or to its own file (`None`).
+    fn save_doc(&mut self, target: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_hf(); // commit any open header/footer edits into the package first
         let Some(tab) = self.tabs.get(self.active) else {
             return;
@@ -9840,42 +9952,28 @@ impl Docxy {
         }
         // A never-saved document asks where to go, like a never-saved
         // workbook, instead of writing `<cwd>/<title>` over whatever is there.
-        match doc_save_target(tab.path.as_deref(), self.harness.is_some()) {
-            DocSaveTarget::InPlace => {}
-            // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
-            // this thread and stops the control pump dead (see `save_sheet`).
-            DocSaveTarget::RefuseHarness => {
-                self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
-                return self.refocus(window, cx);
-            }
-            // The pick binds `tab.path` and, for a `.md` name, `tab.markdown`,
-            // so it has to come before serializing.
-            DocSaveTarget::NeedsDialog => {
-                if !self.pick_doc_save_target() {
-                    self.tabs[self.active].status = "save cancelled".into();
+        // The picked path is saved to like Save As: the tab is rebound only
+        // once that write succeeds.
+        let target = match target {
+            Some(target) => Some(target),
+            None => match doc_save_target(tab.path.as_deref(), self.harness.is_some()) {
+                DocSaveTarget::InPlace => None,
+                // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
+                // this thread and stops the control pump dead (see `save_sheet`).
+                DocSaveTarget::RefuseHarness => {
+                    self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
                     return self.refocus(window, cx);
                 }
-            }
-        }
-        let tab = &mut self.tabs[self.active];
-        let (Surface::Doc(editor), Some(path)) = (&tab.surface, tab.path.clone()) else {
-            return;
+                DocSaveTarget::NeedsDialog => match self.pick_doc_save_target() {
+                    Some(picked) => Some(picked),
+                    None => {
+                        self.tabs[self.active].status = "save cancelled".into();
+                        return self.refocus(window, cx);
+                    }
+                },
+            },
         };
-        // Markdown-backed tabs save as Markdown; everything else as lossless .docx.
-        let bytes = if tab.markdown {
-            docxcore::markdown::to_markdown(&editor.doc).into_bytes()
-        } else {
-            doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref())
-        };
-        match opccore::fsio::write_atomic(&path, &bytes) {
-            Ok(()) => {
-                tab.title = file_name(&path).into();
-                tab.path = Some(path.clone());
-                tab.dirty = false;
-                tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
-            }
-            Err(e) => tab.status = format!("save failed: {e}").into(),
-        }
+        save_doc_tab(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
         self.persist();
@@ -9948,46 +10046,50 @@ impl Docxy {
         if self.active_is_project() {
             return self.save_project(true, window, cx);
         }
-        if self.pick_doc_save_target() {
-            self.save_active(window, cx);
-        } else {
-            self.refocus(window, cx);
+        match self.pick_doc_save_target() {
+            Some(target) => self.save_doc(Some(target), window, cx),
+            None => self.refocus(window, cx),
         }
     }
 
-    /// Pick and bind a document Save As destination. The caller owns save,
-    /// cancellation status, and any harness guard against native dialogs.
-    fn pick_doc_save_target(&mut self) -> bool {
+    /// Ask for a document Save As destination. The caller saves to it (the tab
+    /// is rebound only once that save succeeds) and owns the cancellation
+    /// status and any harness guard against native dialogs.
+    fn pick_doc_save_target(&self) -> Option<PathBuf> {
         let start = self
             .tabs
             .get(self.active)
             .map(|t| t.title.to_string())
             .unwrap_or_else(|| "Untitled.docx".into());
-        if let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("Word document", &["docx"])
-            .add_filter("Markdown", &["md", "markdown"])
-            .set_file_name(start)
-            .save_file()
-        {
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                // Choosing a .md name switches the tab to Markdown, and vice-versa.
-                tab.markdown = is_markdown_path(&path);
-                tab.path = Some(path);
-            }
-            true
-        } else {
-            false
+            .add_filter("Markdown", &["md", "markdown"]);
+        // An open bundle can always be saved as one (it rewraps itself); a new
+        // one needs the engine this build may not carry.
+        let from_bundle = self
+            .tabs
+            .get(self.active)
+            .is_some_and(|t| t.bundle_html.is_some());
+        if from_bundle || html_bundle::can_export() {
+            dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
         }
+        // The name is written as picked (the dialog already asked about
+        // overwriting it): any .html name saves a bundle, found by its content
+        // when opened again.
+        dialog.set_file_name(start).save_file()
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(
                 "All supported",
-                &["docx", "md", "markdown", "xlsx", "yppx", "xml", "mpp"],
+                &[
+                    "docx", "md", "markdown", "html", "xlsx", "yppx", "xml", "mpp",
+                ],
             )
             .add_filter("Project schedule", &["yppx", "xml", "mpp"])
             .add_filter("Word or Markdown", &["docx", "md", "markdown"])
+            .add_filter("Editable HTML (*.docx.html)", &["html"])
             .add_filter("Excel workbook", &["xlsx"])
             .pick_file()
         {
@@ -12464,7 +12566,7 @@ fn no(mut f: impl FnMut()) -> bool {
 
 // ---- the ribbon, defined once via ribbonspec (shared model) ----------------
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Act {
     Project(ProjectAct),
     Bold,

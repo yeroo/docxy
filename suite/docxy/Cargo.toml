@@ -26,6 +26,9 @@ gpui_platform.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 docxcore = { path = "../../docxcore" }
+# Editable HTML (*.docx.html): open and re-save bundles always; make new ones
+# with the `html-export` feature (embeds the docxwasm engine, see build.rs).
+htmlbundle = { path = "../../htmlbundle" }
 gridcore = { path = "../../gridcore" }
 projcore = { path = "../../projcore" }
 mppread = { path = "../../mppread" }
@@ -40,6 +43,14 @@ dirs = "5"
 # GPUI's default windows-manifest feature already selects that assembly.
 rfd = { version = "0.15", features = ["common-controls-v6"] }
 rust-embed = "8"
+
+[build-dependencies]
+htmlbundle = { path = "../../htmlbundle" }
+
+[features]
+# Embed the docxwasm engine so Save As "Editable HTML (*.docx.html)" can make
+# new bundles. Needs the wasm32-unknown-unknown target, or DOCXY_HTML_ENGINE.
+html-export = []
 
 # Embeds the Windows app icon (assets/docxy.ico) into suite.exe via docxy.rc.
 [target.'cfg(windows)'.build-dependencies]

@@ -38,8 +38,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
+      # Release binaries embed the docxwasm engine so `docxy --html` and
+      # Save As *.docx.html work (the `html-export` feature; crates.io builds
+      # leave it off).
+      - name: Add the wasm target (html-export)
+        run: rustup target add wasm32-unknown-unknown
+
       - name: Build
-        run: cargo build --release -p docxy -p xlsxy
+        run: cargo build --release -p docxy -p xlsxy --features docxy/html-export
 
       - name: Stage binaries + checksums
         shell: bash
@@ -224,6 +230,9 @@ jobs:
           publish opccore
           publish docxcore
           publish gridcore
+          # docxy depends on htmlbundle (editable HTML). Published crates keep
+          # `html-export` off, so `cargo install docxy` needs no wasm target.
+          publish htmlbundle
           publish docxy
           publish xlsxy
 
@@ -237,6 +246,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -252,10 +263,10 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Build TUI (docxy + xlsxy)
-        run: cargo build --release -p docxy -p xlsxy
+        run: cargo build --release -p docxy -p xlsxy --features docxy/html-export
 
       - name: Build desktop suite (suite.exe)
-        run: cargo build --release --manifest-path suite/Cargo.toml
+        run: cargo build --release --manifest-path suite/Cargo.toml --features html-export
 
       - name: Stage the Office COM shims
         shell: pwsh
@@ -304,6 +315,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -319,10 +332,10 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
       - name: Build TUI (docxy + xlsxy)
-        run: cargo build --release -p docxy -p xlsxy
+        run: cargo build --release -p docxy -p xlsxy --features docxy/html-export
 
       - name: Build desktop suite
-        run: cargo build --release --manifest-path suite/Cargo.toml
+        run: cargo build --release --manifest-path suite/Cargo.toml --features html-export
 
       - name: Package TUI tarball
         run: |

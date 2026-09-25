@@ -380,6 +380,7 @@ fn project_tab(
         notes: vec![],
         markdown: false,
         hf_edit: None,
+        bundle_html: None,
     }
 }
 

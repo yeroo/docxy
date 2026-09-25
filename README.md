@@ -124,7 +124,34 @@ docxy <file> --vim              # open with Vim keybindings
 docxy in.docx  --pdf  out.pdf   # export to PDF
 docxy in.docx  --md   out.md    # convert Word → Markdown
 docxy in.md    --docx out.docx  # convert Markdown → Word
+docxy in.docx  --html in.docx.html  # editable HTML (see below)
 ```
+
+### Editable HTML
+
+`docxy sample.docx --html sample.docx.html` writes **one self-contained HTML
+file** that opens offline in any browser as a docxy editor, with the desktop
+suite's title bar, ribbon, Backstage and page view, in light or dark. It holds
+the original `.docx` untouched, plus the `docxwasm` engine and the page. A
+Content-Security-Policy of `default-src 'none'` means the page makes no network
+requests at all.
+
+- **In the browser**, Save writes the page back with your edits. Chromium saves
+  in place; other browsers download `sample.docx.html`. **Download sample.docx**
+  under File › Save As gives the Word file.
+- **In docxy** (terminal or desktop suite), `sample.docx.html` opens like a
+  `.docx`. Save keeps it editable HTML, and Save As `.docx` writes plain Word.
+  `docxy sample.docx.html --docx out.docx` returns the embedded Word file byte
+  for byte when nobody edited it.
+- If `sample.docx` next to the page has changed since the export, docxy says
+  so. It never overwrites that file.
+
+Making new pages embeds the engine, which the `html-export` feature compiles in.
+Release binaries have it. From source, run
+`cargo build -p docxy --features html-export`, which needs
+`rustup target add wasm32-unknown-unknown`. Opening and re-saving an existing
+page works in any build. Tables, headers and footers, and comments are edited
+in docxy for now: the browser shows those ribbon commands dimmed.
 
 ### Keys
 
@@ -388,6 +415,10 @@ README will meet (`CONTRIBUTING.md` lists the rest):
   native `.yppx` OPC package). `std`-only, on top of `opccore`.
 - **`mppread`** — `std`-only reader for the OLE2 Compound File container of
   legacy binary `.mpp`/`.doc`/`.xls` files (MS-CFB).
+- **`htmlbundle`** — `std`-only packer for editable HTML (`*.docx.html`):
+  wraps a package, the wasm engine and the web UI (`htmlbundle/web/`) into
+  one file and unwraps it again. Browser tests live in `webapp/`
+  (`npm ci && npm test`, Playwright).
 - **`docxy`** — the document TUI (ratatui), Unicode bidi projection
   (`unicode-bidi`), clipboard (arboard), and image rendering (ratatui-image).
 - **`xlsxy`** — the spreadsheet TUI (ratatui + arboard).

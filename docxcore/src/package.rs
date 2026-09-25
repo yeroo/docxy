@@ -602,6 +602,12 @@ pub struct Package {
     pub document: Document,
 }
 
+/// The numbering id (and abstract id) [`Package::ensure_list`] provisions for
+/// the bullet list that list commands toggle. A reserved high id, unlikely to
+/// collide with a document's own lists.
+pub const BULLET_LIST_NUM_ID: i32 = 9990;
+/// The decimal-list counterpart of [`BULLET_LIST_NUM_ID`].
+pub const NUMBER_LIST_NUM_ID: i32 = 9991;
 impl Package {
     /// Resolve the settings part through the main document relationship. The
     /// conventional name remains a compatibility fallback for older fixtures
@@ -1240,8 +1246,9 @@ impl Package {
     }
 
     /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
-    /// its `numId`, creating the part + relationship + content-type if absent. Used
-    /// by the Bullets/Numbering ribbon commands so applied lists render and save.
+    /// its `numId` ([`BULLET_LIST_NUM_ID`] or [`NUMBER_LIST_NUM_ID`]), creating
+    /// the part + relationship + content-type if absent. Used by the
+    /// Bullets/Numbering ribbon commands so applied lists render and save.
     ///
     /// Defines all 9 indent levels (`ilvl` 0..9, [`markdown_list_levels`]) — the
     /// same set [`new_markdown_package`] defines for a fresh markdown package —
@@ -1252,8 +1259,11 @@ impl Package {
     pub fn ensure_list(&mut self, bullet: bool) -> i32 {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        // Reserved high ids, unlikely to collide with a document's own lists.
-        let (num_id, abs_id) = if bullet { (9990, 9990) } else { (9991, 9991) };
+        let (num_id, abs_id) = if bullet {
+            (BULLET_LIST_NUM_ID, BULLET_LIST_NUM_ID)
+        } else {
+            (NUMBER_LIST_NUM_ID, NUMBER_LIST_NUM_ID)
+        };
         let levels = markdown_list_levels(bullet);
         let abstract_xml =
             format!("<w:abstractNum w:abstractNumId=\"{abs_id}\">{levels}</w:abstractNum>");
