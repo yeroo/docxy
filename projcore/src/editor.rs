@@ -154,6 +154,15 @@ impl Editor {
         }
     }
 
+    /// The project finish the displayed dates reach: the leveled finish while
+    /// leveling is on, otherwise the schedule's.
+    pub fn disp_project_finish(&self) -> DateTime {
+        match &self.level {
+            Some(lv) => lv.project_finish,
+            None => self.sched.project_finish,
+        }
+    }
+
     /// The duration shown alongside [`Self::disp_start`]/[`Self::disp_finish`]:
     /// a leaf's own duration, or a summary's working time between its displayed
     /// (leveled when leveling is on) dates. `None` for an unknown or
@@ -1282,6 +1291,28 @@ mod tests {
             ed.disp_start(2),
             Some(ed.schedule().get(2).unwrap().early_start)
         );
+    }
+
+    #[test]
+    fn displayed_project_finish_follows_leveling() {
+        let mut ed = editor();
+        ed.assign_resource(1, "Alice").unwrap();
+        ed.assign_resource(2, "Alice").unwrap();
+        let cpm = ed.schedule().project_finish;
+        assert_eq!(ed.disp_project_finish(), cpm);
+        ed.toggle_level();
+        assert!(
+            ed.disp_project_finish() > cpm,
+            "leveling serialises Alice's tasks"
+        );
+        assert_eq!(ed.disp_project_finish(), level(ed.project()).project_finish);
+        assert_eq!(
+            ed.schedule().project_finish,
+            cpm,
+            "the CPM finish is unchanged"
+        );
+        ed.toggle_level();
+        assert_eq!(ed.disp_project_finish(), cpm);
     }
 
     #[test]
