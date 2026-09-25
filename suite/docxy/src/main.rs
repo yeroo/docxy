@@ -9930,11 +9930,7 @@ impl Docxy {
         if self.active_is_project() {
             return self.save_project(false, window, cx);
         }
-        // A spreadsheet tab: commit any open cell edit, then write .xlsx.
         if self.active_is_sheet() {
-            if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
-                self.sheet_commit(0, 0, cx);
-            }
             return self.save_sheet(false, window, cx);
         }
         self.save_doc(None, window, cx);
@@ -9984,6 +9980,10 @@ impl Docxy {
     /// re-writes into the loaded package), preserving styles and formulas.
     /// `explicit_save_as` always asks where to go, even for a saved workbook.
     fn save_sheet(&mut self, explicit_save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // Commit any open cell edit first, so the decision and the write see it.
+        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+            self.sheet_commit(0, 0, cx);
+        }
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
@@ -10029,9 +10029,6 @@ impl Docxy {
         // A workbook is saved as a workbook, never through the Word/Markdown
         // dialog (#206).
         if self.active_is_sheet() {
-            if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
-                self.sheet_commit(0, 0, cx);
-            }
             return self.save_sheet(true, window, cx);
         }
         match self.pick_doc_save_target() {
@@ -12695,6 +12692,8 @@ mod sheet_save_tests {
             (Some(dir.path("missing-dir/report.xlsx")), "save failed:"),
         ];
         for (target, status) in cases {
+            // Each case must set its own status, not inherit the last one.
+            tab.status = "new".into();
             finish_sheet_save(&mut tab, target.as_deref());
             assert!(
                 tab.status.starts_with(status),
