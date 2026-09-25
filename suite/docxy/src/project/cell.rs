@@ -4,8 +4,20 @@ use projcore::editor::{
     format_duration_exact, parse_cell_date, parse_duration, parse_predecessors,
 };
 
-pub(super) const COLUMNS: [&str; 7] = [
+pub(crate) const COL_ID: usize = 0;
+pub(crate) const COL_MODE: usize = 1;
+pub(crate) const COL_NAME: usize = 2;
+pub(crate) const COL_DURATION: usize = 3;
+pub(crate) const COL_START: usize = 4;
+pub(crate) const COL_FINISH: usize = 5;
+pub(crate) const COL_PREDECESSORS: usize = 6;
+pub(crate) const COL_RESOURCES: usize = 7;
+pub(crate) const COLUMN_COUNT: usize = 8;
+
+/// The entry table's columns, in Project's Gantt Chart order.
+pub(crate) const COLUMNS: [&str; COLUMN_COUNT] = [
     "ID",
+    "Task Mode",
     "Name",
     "Duration",
     "Start",
@@ -91,7 +103,7 @@ impl ProjectView {
             return Ok(());
         }
         let (uid, initial) = if self.on_entry_row() {
-            if self.col == 0 {
+            if self.col == COL_ID {
                 return Err("ID is read-only".into());
             }
             // The entry row is empty until committing it appends a task.
@@ -103,7 +115,7 @@ impl ProjectView {
                 .tasks
                 .get(self.ed.sel())
                 .ok_or("No task selected")?;
-            if self.col == 0 || (task.summary && (2..=4).contains(&self.col)) {
+            if self.col == COL_ID || (task.summary && SUMMARY_READ_ONLY.contains(&self.col)) {
                 return Err(format!(
                     "{} is read-only{}",
                     COLUMNS[self.col],
@@ -114,7 +126,7 @@ impl ProjectView {
                     }
                 ));
             }
-            let initial = if self.col == 2 {
+            let initial = if self.col == COL_DURATION {
                 if task.duration_min == 0 {
                     "0".into()
                 } else {
@@ -162,6 +174,21 @@ impl ProjectView {
     }
 }
 
+/// A summary's dates and duration roll up from its subtasks.
+const SUMMARY_READ_ONLY: std::ops::RangeInclusive<usize> = COL_DURATION..=COL_FINISH;
+
+/// A typed Task Mode: Project's names, or any start of them (`m`, `auto`),
+/// ignoring case. `true` is Manually Scheduled.
+pub(crate) fn parse_task_mode(text: &str) -> Result<bool, String> {
+    let typed = text.trim().to_lowercase();
+    let names = [("manually scheduled", true), ("auto scheduled", false)];
+    names
+        .into_iter()
+        .find(|(name, _)| !typed.is_empty() && name.starts_with(typed.as_str()))
+        .map(|(_, manual)| manual)
+        .ok_or_else(|| "Task Mode is Manually Scheduled or Auto Scheduled (type m or a)".into())
+}
+
 /// Apply a typed cell value to task `uid`; a status line on success.
 fn apply_cell(
     ed: &mut ProjectEditor,
@@ -173,24 +200,25 @@ fn apply_cell(
         .project()
         .task(uid)
         .ok_or("The edited task no longer exists")?;
-    if task.summary && (2..=4).contains(&col) {
+    if task.summary && SUMMARY_READ_ONLY.contains(&col) {
         return Err("Summary dates and duration are read-only".into());
     }
     match col {
-        1 => ed.rename(uid, buf)?,
-        2 => {
+        COL_MODE => ed.set_manual(uid, parse_task_mode(buf)?)?,
+        COL_NAME => ed.rename(uid, buf)?,
+        COL_DURATION => {
             let min =
                 parse_duration(buf, ed.project()).ok_or("Invalid duration (try 3d, 4h, 2w)")?;
             ed.set_duration_min(uid, min)?;
         }
-        3 | 4 => {
+        COL_START | COL_FINISH => {
             let day = parse_cell_date(buf)?;
             // A manual task takes the typed date as its own start or
             // finish; an auto task gets an SNET/FNET constraint. Whether
             // it is manual is read after the edit: typing into a blank
             // row can make it a manual task.
             let previous = (task.constraint, task.constraint_date);
-            if col == 3 {
+            if col == COL_START {
                 ed.set_start(uid, day)?;
             } else {
                 ed.set_finish(uid, day)?;
@@ -209,11 +237,13 @@ fn apply_cell(
                 previous.0.abbrev()
             )));
         }
-        5 => {
+        COL_PREDECESSORS => {
             let predecessors = parse_predecessors(buf, ed.project())?;
             ed.set_predecessors(uid, predecessors)?;
         }
-        6 => ed.set_resources(uid, &buf.split(',').map(str::to_owned).collect::<Vec<_>>())?,
+        COL_RESOURCES => {
+            ed.set_resources(uid, &buf.split(',').map(str::to_owned).collect::<Vec<_>>())?
+        }
         _ => return Err("ID is read-only".into()),
     }
     Ok(None)
@@ -297,7 +327,7 @@ fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double:
         ClickTarget::EntryRow | ClickTarget::Below => v.enter_entry_row(),
     }
     if let Some(col) = col {
-        v.col = col.min(6);
+        v.col = col.min(COLUMN_COUNT - 1);
         v.reveal_col();
     }
     if double && col.is_some() {

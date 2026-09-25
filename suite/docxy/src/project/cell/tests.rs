@@ -49,7 +49,7 @@ fn edit(t: &mut DocTab, col: usize, text: &str) {
 #[test]
 fn navigation_scrolls_and_all_printable_shortcuts_start_an_edit() {
     let mut t = tab();
-    assert_eq!(v(&t).col, 1);
+    assert_eq!(v(&t).col, COL_NAME);
     for c in ["n", "x", "d", "p", "c", "a", "b", "L", "λ"] {
         let modifiers = Modifiers {
             shift: c == "L",
@@ -68,13 +68,13 @@ fn navigation_scrolls_and_all_printable_shortcuts_start_an_edit() {
     for _ in 0..10 {
         key(&mut t, "right");
     }
-    assert_eq!(v(&t).col, 6);
+    assert_eq!(v(&t).col, COL_RESOURCES);
     assert!(v(&t).table_x.get() > 0.);
     assert_eq!(v(&t).gantt_x.get(), 0.);
     for _ in 0..10 {
         key(&mut t, "left");
     }
-    assert_eq!(v(&t).col, 0);
+    assert_eq!(v(&t).col, COL_ID);
     assert_eq!(v(&t).table_x.get(), 0.);
     key(&mut t, "f2");
     assert!(v(&t).cell.is_none());
@@ -84,12 +84,12 @@ fn navigation_scrolls_and_all_printable_shortcuts_start_an_edit() {
 #[test]
 fn all_columns_commit_as_one_step_and_undo_restores_schedule() {
     for (col, text) in [
-        (1, "Renamed"),
-        (2, "2d"),
-        (3, "2026-01-08"),
-        (4, "2026-01-09"),
-        (5, "2SS+2h, 3FF-7m"),
-        (6, "Alice, Bob"),
+        (COL_NAME, "Renamed"),
+        (COL_DURATION, "2d"),
+        (COL_START, "2026-01-08"),
+        (COL_FINISH, "2026-01-09"),
+        (COL_PREDECESSORS, "2SS+2h, 3FF-7m"),
+        (COL_RESOURCES, "Alice, Bob"),
     ] {
         let mut t = tab();
         let before = v(&t).ed.project().clone();
@@ -120,7 +120,7 @@ fn no_op_date_duration_and_milestone_keep_history_and_redo() {
     vm(&mut t).ed.mark_saved();
     t.dirty = false;
     let before = v(&t).ed.project().clone();
-    for col in 1..7 {
+    for col in COL_MODE..COLUMN_COUNT {
         vm(&mut t).ed.select(0);
         vm(&mut t).col = col;
         key(&mut t, "f2");
@@ -130,11 +130,11 @@ fn no_op_date_duration_and_milestone_keep_history_and_redo() {
         assert!(!t.dirty);
     }
     vm(&mut t).ed.select(0);
-    edit(&mut t, 2, "8h");
+    edit(&mut t, COL_DURATION, "8h");
     key(&mut t, "enter");
     assert_eq!(v(&t).ed.undo_depth(), 1);
     vm(&mut t).ed.select(0);
-    edit(&mut t, 2, "0");
+    edit(&mut t, COL_DURATION, "0");
     key(&mut t, "enter");
     vm(&mut t).ed.select(0);
     key(&mut t, "f2");
@@ -157,10 +157,10 @@ fn typed_dates_move_a_manual_task_without_constraints() {
     );
     let depth = v(&t).ed.undo_depth();
     // Tab commits and stays on the row; Enter would move down.
-    edit(&mut t, 3, "2026-01-08");
+    edit(&mut t, COL_START, "2026-01-08");
     key(&mut t, "tab");
     assert!(v(&t).cell.is_none(), "{}", t.status);
-    edit(&mut t, 4, "2026-01-09");
+    edit(&mut t, COL_FINISH, "2026-01-09");
     key(&mut t, "enter");
     assert!(v(&t).cell.is_none(), "{}", t.status);
     assert!(!t.status.contains("Constraint"), "{}", t.status);
@@ -170,7 +170,7 @@ fn typed_dates_move_a_manual_task_without_constraints() {
     assert_eq!(task.duration_min, 960);
     let row = project_row(ed, task);
     assert_eq!(
-        (row[3].as_str(), row[4].as_str()),
+        (row[COL_START].as_str(), row[COL_FINISH].as_str()),
         ("2026-01-08", "2026-01-09")
     );
     assert_eq!(ed.undo_depth(), depth + 2);
@@ -193,7 +193,7 @@ fn a_date_typed_into_a_blank_row_of_a_manual_plan_pins_it() {
         false,
         "loaded".into(),
     );
-    for (col, text) in [(3, "2026-01-08"), (4, "2026-01-09")] {
+    for (col, text) in [(COL_START, "2026-01-08"), (COL_FINISH, "2026-01-09")] {
         vm(&mut t).ed.select(1);
         edit(&mut t, col, text);
         key(&mut t, "enter");
@@ -218,13 +218,13 @@ fn reentering_an_existing_constraint_does_not_claim_a_change() {
         .unwrap();
     vm(&mut t).ed.set_constraint(10, "SNET 2026-03-05").unwrap();
     assert_eq!(
-        project_row(&v(&t).ed, v(&t).ed.project().task(10).unwrap())[3],
+        project_row(&v(&t).ed, v(&t).ed.project().task(10).unwrap())[COL_START],
         "2026-03-09"
     );
     let before = v(&t).ed.project().clone();
     let depth = v(&t).ed.undo_depth();
     t.status = "unchanged".into();
-    edit(&mut t, 3, "2026-03-05");
+    edit(&mut t, COL_START, "2026-03-05");
     key(&mut t, "enter");
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), depth);
@@ -234,9 +234,9 @@ fn reentering_an_existing_constraint_does_not_claim_a_change() {
 #[test]
 fn correcting_a_failed_commit_clears_only_that_editors_error() {
     for (col, invalid, corrected) in [
-        (2, "banana", "2d"),
-        (2, "banana", "1d"),
-        (3, "bad date", "2026-03-05"),
+        (COL_DURATION, "banana", "2d"),
+        (COL_DURATION, "banana", "1d"),
+        (COL_START, "bad date", "2026-03-05"),
     ] {
         let mut t = tab();
         edit(&mut t, col, invalid);
@@ -256,7 +256,7 @@ fn correcting_a_failed_commit_clears_only_that_editors_error() {
         assert_ne!(t.status, error);
         assert_eq!(
             t.status.as_ref(),
-            if col == 3 {
+            if col == COL_START {
                 "Constraint set: SNET (was ASAP)"
             } else {
                 "Ready"
@@ -268,7 +268,7 @@ fn correcting_a_failed_commit_clears_only_that_editors_error() {
         }
     }
     let mut t = tab();
-    edit(&mut t, 2, "banana");
+    edit(&mut t, COL_DURATION, "banana");
     key(&mut t, "enter");
     t.status = "New unrelated status".into();
     vm(&mut t).cell.as_mut().unwrap().buf = "2d".into();
@@ -280,14 +280,14 @@ fn correcting_a_failed_commit_clears_only_that_editors_error() {
 #[test]
 fn invalid_inputs_and_click_away_preserve_everything() {
     for (col, text) in [
-        (2, "NaN"),
-        (2, "-1d"),
-        (2, "1e50d"),
-        (3, "2026-02-31"),
-        (4, "2026-01-10"),
-        (5, "1"),
-        (5, "99"),
-        (5, "2,2"),
+        (COL_DURATION, "NaN"),
+        (COL_DURATION, "-1d"),
+        (COL_DURATION, "1e50d"),
+        (COL_START, "2026-02-31"),
+        (COL_FINISH, "2026-01-10"),
+        (COL_PREDECESSORS, "1"),
+        (COL_PREDECESSORS, "99"),
+        (COL_PREDECESSORS, "2,2"),
     ] {
         let mut t = tab();
         let before = v(&t).ed.project().clone();
@@ -295,7 +295,7 @@ fn invalid_inputs_and_click_away_preserve_everything() {
         key(&mut t, "tab");
         assert_eq!(v(&t).cell.as_ref().unwrap().buf, text);
         assert_eq!(v(&t).col, col);
-        project_cell_click(&mut t, 1, Some(1), true);
+        project_cell_click(&mut t, 1, Some(COL_NAME), true);
         project_cell_click(&mut t, 1, None, false);
         apply_project_act(&mut t, ProjectAct::Rename);
         assert!(!commit_project_cell(&mut t));
@@ -313,14 +313,18 @@ fn invalid_inputs_and_click_away_preserve_everything() {
 fn clicking_below_the_last_task_commits_then_moves_to_the_entry_row() {
     let mut t = tab();
     key(&mut t, "down");
-    edit(&mut t, 1, "Renamed");
+    edit(&mut t, COL_NAME, "Renamed");
     project_below_click(&mut t);
     assert!(v(&t).cell.is_none());
     assert_eq!(v(&t).ed.project().tasks[1].name, "Renamed");
     assert!(v(&t).on_entry_row());
     assert_eq!(v(&t).cursor_row(), 3);
     assert_eq!(v(&t).selected_uid(), None);
-    assert_eq!(v(&t).col, 1, "a click below the entry row keeps the column");
+    assert_eq!(
+        v(&t).col,
+        COL_NAME,
+        "a click below the entry row keeps the column"
+    );
     assert!(t.dirty);
     // With nothing open it only moves the cursor.
     project_below_click(&mut t);
@@ -330,8 +334,8 @@ fn clicking_below_the_last_task_commits_then_moves_to_the_entry_row() {
 
     let mut t = tab();
     let before = v(&t).ed.project().clone();
-    edit(&mut t, 2, "NaN");
-    project_entry_click(&mut t, Some(1), false);
+    edit(&mut t, COL_DURATION, "NaN");
+    project_entry_click(&mut t, Some(COL_NAME), false);
     let status = t.status.clone();
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "NaN");
     assert_eq!(
@@ -340,7 +344,7 @@ fn clicking_below_the_last_task_commits_then_moves_to_the_entry_row() {
     );
     assert_eq!(v(&t).ed.sel(), 0);
     assert!(!v(&t).on_entry_row(), "a failed commit keeps the cursor");
-    assert_eq!(v(&t).col, 2);
+    assert_eq!(v(&t).col, COL_DURATION);
     assert_eq!(v(&t).ed.project(), &before);
     assert!(!t.dirty);
 }
@@ -348,15 +352,15 @@ fn clicking_below_the_last_task_commits_then_moves_to_the_entry_row() {
 #[test]
 fn clicking_prompts_and_tab_share_commit_policy() {
     let mut t = tab();
-    edit(&mut t, 1, "New");
-    project_cell_click(&mut t, 1, Some(2), true);
+    edit(&mut t, COL_NAME, "New");
+    project_cell_click(&mut t, 1, Some(COL_DURATION), true);
     assert_eq!(v(&t).ed.project().tasks[0].name, "New");
-    assert_eq!(v(&t).cell.as_ref().unwrap().col, 2);
+    assert_eq!(v(&t).cell.as_ref().unwrap().col, COL_DURATION);
     key(&mut t, "escape");
-    edit(&mut t, 1, "Next");
+    edit(&mut t, COL_NAME, "Next");
     apply_project_act(&mut t, ProjectAct::Duration);
     assert!(v(&t).cell.is_none() && v(&t).prompt.is_some());
-    project_cell_click(&mut t, 0, Some(1), false);
+    project_cell_click(&mut t, 0, Some(COL_NAME), false);
     assert!(v(&t).prompt.is_none());
     key(&mut t, "f2");
     project_input(
@@ -368,11 +372,11 @@ fn clicking_prompts_and_tab_share_commit_policy() {
             ..Modifiers::default()
         },
     );
-    assert_eq!(v(&t).col, 0);
+    assert_eq!(v(&t).col, COL_MODE);
     assert!(v(&t).cell.is_none());
     key(&mut t, "tab");
-    assert_eq!(v(&t).col, 1);
-    edit(&mut t, 1, "Saved");
+    assert_eq!(v(&t).col, COL_NAME);
+    edit(&mut t, COL_NAME, "Saved");
     assert_eq!(
         project_input(
             &mut t,
@@ -392,7 +396,7 @@ fn clicking_prompts_and_tab_share_commit_policy() {
 fn summary_cells_are_read_only() {
     let mut t = tab();
     vm(&mut t).ed.indent(20, 1).unwrap();
-    for col in 2..=4 {
+    for col in COL_DURATION..=COL_FINISH {
         edit(&mut t, col, "1");
         assert!(v(&t).cell.is_none());
         assert!(t.status.contains("read-only"));
@@ -404,14 +408,14 @@ fn save_commits_a_cell_and_invalid_input_never_reaches_disk() {
     let mut t = tab();
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join(format!("../target/cell-save-{}.yppx", std::process::id()));
-    edit(&mut t, 1, "Saved from cell");
+    edit(&mut t, COL_NAME, "Saved from cell");
     apply_save(&mut t, &path).unwrap();
     assert!(v(&t).cell.is_none());
     assert!(!t.dirty);
     let bytes = std::fs::read(&path).unwrap();
     let saved = project_from_path(&path).unwrap();
     assert_eq!(saved.task(10).unwrap().name, "Saved from cell");
-    edit(&mut t, 2, "invalid");
+    edit(&mut t, COL_DURATION, "invalid");
     assert!(apply_save(&mut t, &path).is_err());
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "invalid");
@@ -424,7 +428,7 @@ fn caret_edits_utf8_and_long_buffer_window_tracks_it() {
     let mut c = CellEdit {
         last_error: None,
         uid: Some(1),
-        col: 1,
+        col: COL_NAME,
         initial: String::new(),
         buf: "aλ🙂z".into(),
         caret: 8,
@@ -468,10 +472,12 @@ fn resource_names_cell_shows_and_keeps_partial_units() {
         .ed
         .set_resources(10, &["Bob".into(), "Alice".into()])
         .unwrap();
-    let row = |t: &DocTab| project_row(&v(t).ed, v(t).ed.project().task(10).unwrap())[6].clone();
+    let row = |t: &DocTab| {
+        project_row(&v(t).ed, v(t).ed.project().task(10).unwrap())[COL_RESOURCES].clone()
+    };
     assert_eq!(row(&t), "Bob[50%], Alice");
     let depth = v(&t).ed.undo_depth();
-    vm(&mut t).col = 6;
+    vm(&mut t).col = COL_RESOURCES;
     key(&mut t, "f2");
     project_input(&mut t, "text", Some(", Carol"), Modifiers::default());
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "Bob[50%], Alice, Carol");
@@ -505,11 +511,11 @@ fn state(t: &DocTab, name: &str) -> ctlcore::json::Json {
 fn typing_into_the_entry_row_appends_one_task_as_one_undo_step() {
     use ctlcore::json::Json;
     let mut t = tab();
-    project_entry_click(&mut t, Some(1), false);
+    project_entry_click(&mut t, Some(COL_NAME), false);
     assert_eq!(state(&t, "cell_row"), Json::Num(3.));
     assert_eq!(state(&t, "selected_task"), Json::Num(3.));
     assert_eq!(state(&t, "selected_name"), Json::Str(String::new()));
-    edit(&mut t, 1, "Design");
+    edit(&mut t, COL_NAME, "Design");
     assert_eq!(v(&t).cell.as_ref().unwrap().uid, None);
     assert_eq!(
         v(&t).ed.project().tasks.len(),
@@ -554,10 +560,10 @@ fn typing_into_the_entry_row_appends_one_task_as_one_undo_step() {
 
 #[test]
 fn tab_after_an_entry_row_commit_stays_on_the_new_task() {
-    for (shift, col) in [(false, 2), (true, 0)] {
+    for (shift, col) in [(false, COL_DURATION), (true, COL_MODE)] {
         let mut t = tab();
-        project_entry_click(&mut t, Some(1), false);
-        edit(&mut t, 1, "Design");
+        project_entry_click(&mut t, Some(COL_NAME), false);
+        edit(&mut t, COL_NAME, "Design");
         project_input(
             &mut t,
             "tab",
@@ -577,11 +583,11 @@ fn tab_after_an_entry_row_commit_stays_on_the_new_task() {
 #[test]
 fn every_column_of_the_entry_row_appends_a_task() {
     for (col, text, check) in [
-        (2, "3d", "duration"),
-        (3, "2026-01-07", "start"),
-        (4, "2026-01-09", "finish"),
-        (5, "1", "predecessors"),
-        (6, "Bob", "resources"),
+        (COL_DURATION, "3d", "duration"),
+        (COL_START, "2026-01-07", "start"),
+        (COL_FINISH, "2026-01-09", "finish"),
+        (COL_PREDECESSORS, "1", "predecessors"),
+        (COL_RESOURCES, "Bob", "resources"),
     ] {
         let mut t = tab();
         project_entry_click(&mut t, Some(col), false);
@@ -593,7 +599,7 @@ fn every_column_of_the_entry_row_appends_a_task() {
         assert_eq!(project_row(ed, new)[col], text, "{check}");
         assert_eq!(ed.undo_depth(), 1, "{check}");
         assert!(v(&t).on_entry_row(), "{check}");
-        if col == 3 {
+        if col == COL_START {
             assert_eq!(t.status.as_ref(), "Constraint set: SNET (was ASAP)");
         }
     }
@@ -603,7 +609,7 @@ fn every_column_of_the_entry_row_appends_a_task() {
 fn an_empty_or_rejected_entry_row_value_appends_nothing() {
     let mut t = tab();
     let before = v(&t).ed.project().clone();
-    project_entry_click(&mut t, Some(1), false);
+    project_entry_click(&mut t, Some(COL_NAME), false);
     // F2 opens an empty edit; committing it unchanged appends nothing.
     key(&mut t, "f2");
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "");
@@ -614,11 +620,16 @@ fn an_empty_or_rejected_entry_row_value_appends_nothing() {
     assert_eq!(v(&t).ed.undo_depth(), 0);
     assert!(!t.dirty);
     // ID stays read-only there too.
-    vm(&mut t).col = 0;
+    vm(&mut t).col = COL_ID;
     project_input(&mut t, "x", Some("x"), Modifiers::default());
     assert!(v(&t).cell.is_none());
     assert_eq!(t.status.as_ref(), "ID is read-only");
-    for (col, text) in [(2, "NaN"), (2, "-1d"), (3, "2026-02-31"), (5, "99")] {
+    for (col, text) in [
+        (COL_DURATION, "NaN"),
+        (COL_DURATION, "-1d"),
+        (COL_START, "2026-02-31"),
+        (COL_PREDECESSORS, "99"),
+    ] {
         project_entry_click(&mut t, Some(col), false);
         edit(&mut t, col, text);
         key(&mut t, "enter");
@@ -659,7 +670,7 @@ fn a_new_plan_takes_its_first_task_from_the_entry_row() {
 fn enter_after_editing_the_last_task_goes_to_the_entry_row() {
     let mut t = tab();
     key(&mut t, "end");
-    edit(&mut t, 1, "Last");
+    edit(&mut t, COL_NAME, "Last");
     key(&mut t, "enter");
     assert_eq!(v(&t).ed.project().tasks[2].name, "Last");
     assert!(v(&t).on_entry_row());
@@ -667,8 +678,8 @@ fn enter_after_editing_the_last_task_goes_to_the_entry_row() {
     // Up goes back to the last task; a click on a task row leaves the entry row.
     key(&mut t, "up");
     assert_eq!(v(&t).cursor_row(), 2);
-    project_entry_click(&mut t, Some(2), false);
-    project_cell_click(&mut t, 0, Some(1), false);
+    project_entry_click(&mut t, Some(COL_DURATION), false);
+    project_cell_click(&mut t, 0, Some(COL_NAME), false);
     assert!(!v(&t).on_entry_row());
     assert_eq!(v(&t).cursor_row(), 0);
 }
@@ -677,13 +688,13 @@ fn enter_after_editing_the_last_task_goes_to_the_entry_row() {
 fn clicking_the_entry_row_while_editing_it_lands_on_the_new_task() {
     // Single click: the clicked cell now belongs to the task the commit made.
     let mut t = tab();
-    project_entry_click(&mut t, Some(1), false);
-    edit(&mut t, 1, "Design");
-    project_entry_click(&mut t, Some(2), false);
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    edit(&mut t, COL_NAME, "Design");
+    project_entry_click(&mut t, Some(COL_DURATION), false);
     assert_eq!(v(&t).ed.project().tasks.len(), 4);
     assert!(!v(&t).on_entry_row());
-    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, 2));
-    edit(&mut t, 2, "3d");
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, COL_DURATION));
+    edit(&mut t, COL_DURATION, "3d");
     key(&mut t, "enter");
     let tasks = &v(&t).ed.project().tasks;
     assert_eq!(tasks.len(), 4, "no second, unnamed task");
@@ -695,26 +706,26 @@ fn clicking_the_entry_row_while_editing_it_lands_on_the_new_task() {
 
     // Double click opens the new task's cell.
     let mut t = tab();
-    project_entry_click(&mut t, Some(1), false);
-    edit(&mut t, 1, "Design");
-    project_entry_click(&mut t, Some(2), true);
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    edit(&mut t, COL_NAME, "Design");
+    project_entry_click(&mut t, Some(COL_DURATION), true);
     let cell = v(&t).cell.as_ref().expect("the double click opens an edit");
     assert_eq!(
         (cell.uid, cell.col),
-        (Some(v(&t).ed.project().tasks[3].uid), 2)
+        (Some(v(&t).ed.project().tasks[3].uid), COL_DURATION)
     );
 
     // Outside a cell of that row (its chart side), too.
     let mut t = tab();
-    project_entry_click(&mut t, Some(1), false);
-    edit(&mut t, 1, "Design");
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    edit(&mut t, COL_NAME, "Design");
     project_entry_click(&mut t, None, false);
-    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, 1));
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, COL_NAME));
 
     // A click below the entry row goes to the new entry row.
     let mut t = tab();
-    project_entry_click(&mut t, Some(1), false);
-    edit(&mut t, 1, "Design");
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    edit(&mut t, COL_NAME, "Design");
     project_below_click(&mut t);
     assert_eq!(v(&t).ed.project().tasks.len(), 4);
     assert!(v(&t).on_entry_row());
@@ -722,9 +733,98 @@ fn clicking_the_entry_row_while_editing_it_lands_on_the_new_task() {
 
     // An empty entry edit appends nothing, so the click stays on the entry row.
     let mut t = tab();
-    project_entry_click(&mut t, Some(1), false);
+    project_entry_click(&mut t, Some(COL_NAME), false);
     key(&mut t, "f2");
-    project_entry_click(&mut t, Some(2), false);
+    project_entry_click(&mut t, Some(COL_DURATION), false);
     assert!(v(&t).on_entry_row());
-    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, 2));
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, COL_DURATION));
+}
+
+// ---- the Task Mode column (#121) ----
+
+#[test]
+fn task_mode_accepts_projects_names_and_their_starts() {
+    for (text, manual) in [
+        ("Manually Scheduled", true),
+        ("m", true),
+        ("MAN", true),
+        (" manually ", true),
+        ("Auto Scheduled", false),
+        ("a", false),
+        ("Auto", false),
+    ] {
+        assert_eq!(parse_task_mode(text), Ok(manual), "{text}");
+    }
+    for text in ["", "  ", "x", "manual mode", "automatic"] {
+        assert!(parse_task_mode(text).is_err(), "{text}");
+    }
+}
+
+#[test]
+fn the_task_mode_cell_shows_and_switches_the_mode_as_one_step() {
+    let mut t = tab();
+    let mode =
+        |t: &DocTab| project_row(&v(t).ed, v(t).ed.project().task(10).unwrap())[COL_MODE].clone();
+    assert_eq!(COLUMNS[COL_MODE], "Task Mode");
+    assert_eq!(mode(&t), "Auto Scheduled");
+    let start = v(&t).ed.disp_start(10);
+    vm(&mut t).col = COL_MODE;
+    key(&mut t, "f2");
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "Auto Scheduled");
+    key(&mut t, "escape");
+    edit(&mut t, COL_MODE, "m");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(mode(&t), "Manually Scheduled");
+    let task = v(&t).ed.project().task(10).unwrap();
+    assert!(task.manual);
+    assert_eq!(task.manual_start, start);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert!(t.dirty);
+    vm(&mut t).ed.select(0);
+    edit(&mut t, COL_MODE, "auto");
+    key(&mut t, "enter");
+    assert_eq!(mode(&t), "Auto Scheduled");
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(mode(&t), "Manually Scheduled");
+}
+
+#[test]
+fn an_invalid_task_mode_keeps_the_edit_open_and_changes_nothing() {
+    let mut t = tab();
+    let before = v(&t).ed.project().clone();
+    edit(&mut t, COL_MODE, "x");
+    key(&mut t, "enter");
+    let cell = v(&t).cell.as_ref().expect("the edit stays open");
+    assert_eq!(cell.buf, "x");
+    assert_eq!(cell.last_error.as_deref(), Some(t.status.as_ref()));
+    assert!(t.status.contains("Task Mode"));
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert!(!t.dirty);
+}
+
+#[test]
+fn a_summary_and_the_entry_row_take_a_task_mode() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(20, 1).unwrap();
+    vm(&mut t).ed.select(0);
+    edit(&mut t, COL_MODE, "m");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    let summary = v(&t).ed.project().task(10).unwrap();
+    assert!(summary.summary && summary.manual);
+    // The entry row appends a task with the typed mode.
+    let mut t = tab();
+    project_entry_click(&mut t, Some(COL_MODE), false);
+    edit(&mut t, COL_MODE, "Manually Scheduled");
+    key(&mut t, "enter");
+    let ed = &v(&t).ed;
+    assert_eq!(ed.project().tasks.len(), 4);
+    assert!(ed.project().tasks[3].manual);
+    assert_eq!(
+        project_row(ed, &ed.project().tasks[3])[COL_MODE],
+        "Manually Scheduled"
+    );
+    assert_eq!(ed.undo_depth(), 1);
 }

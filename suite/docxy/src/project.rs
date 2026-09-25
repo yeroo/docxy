@@ -57,7 +57,7 @@ impl ProjectView {
             gantt_w: 590. - GANTT_INSET - SCROLLBAR_W,
             scale,
             prompt: None,
-            col: 1,
+            col: COL_NAME,
             cell: None,
             entry,
             exported: None,
@@ -167,7 +167,7 @@ impl ProjectView {
             self.col = if left {
                 self.col.saturating_sub(1)
             } else {
-                (self.col + 1).min(6)
+                (self.col + 1).min(COLUMN_COUNT - 1)
             };
             self.reveal_col();
             return true;
@@ -327,7 +327,7 @@ fn project_region(
         gantt_viewport(body, v.table_w, v.gantt_w).ok_or("the Gantt viewport is empty")?;
     match region {
         harness::Region::Cells(r0, c0, r1, c1) => {
-            if r0 != r1 || c0 != c1 || c0 >= 7 {
+            if r0 != r1 || c0 != c1 || c0 as usize >= COLUMN_COUNT {
                 return Err("Project regions address one entry-table cell".into());
             }
             let tasks = &v.ed.project().tasks;
@@ -688,24 +688,28 @@ fn date(dt: Option<projcore::DateTime>) -> String {
     .unwrap_or_else(|| "—".into())
 }
 
-pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
+/// A task's mode as Project's Task Mode column shows it.
+pub(crate) fn task_mode_name(manual: bool) -> &'static str {
+    if manual {
+        "Manually Scheduled"
+    } else {
+        "Auto Scheduled"
+    }
+}
+
+pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_COUNT] {
     // A blank row (#80) is not a task: Project shows only its ID.
     if task.is_null {
-        return [
-            task.id.to_string(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-            String::new(),
-        ];
+        let mut row = <[String; COLUMN_COUNT]>::default();
+        row[COL_ID] = task.id.to_string();
+        return row;
     }
     let project = ed.project();
     let predecessors = projcore::editor::format_predecessors(task, project);
     let resources = projcore::editor::format_resource_names(project, task.uid);
     [
         task.id.to_string(),
+        task_mode_name(task.manual).into(),
         task.name.clone(),
         // Summaries first: their stored duration is stale (and may be 0, which
         // `is_milestone` would misread), so derive it from the shown dates.
@@ -725,7 +729,7 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; 7] {
 }
 
 const ROW_H: f32 = 28.;
-const WIDTHS: [f32; 7] = [48., 240., 80., 100., 100., 150., 190.];
+const WIDTHS: [f32; COLUMN_COUNT] = [48., 130., 240., 80., 100., 100., 150., 190.];
 const TABLE_W: f32 = sum_widths();
 /// Includes the divider, leaving space between clipped table text and the chart.
 const GANTT_INSET: f32 = 6.;
@@ -743,7 +747,7 @@ const fn sum_widths() -> f32 {
     total
 }
 
-fn row_cells(values: [String; 7], indent: f32) -> impl IntoElement {
+fn row_cells(values: [String; COLUMN_COUNT], indent: f32) -> impl IntoElement {
     h_flex()
         .h(px(ROW_H))
         .items_center()
@@ -754,7 +758,7 @@ fn row_cells(values: [String; 7], indent: f32) -> impl IntoElement {
                 .px_2()
                 .overflow_hidden()
                 .whitespace_nowrap()
-                .when(i == 1, |d| d.pl(px(8. + indent)))
+                .when(i == COL_NAME, |d| d.pl(px(8. + indent)))
                 .child(value)
         }))
 }
@@ -796,7 +800,7 @@ fn editable_row_cells(
                 div().child(value).into_any_element()
             };
             div()
-                .id(("project-cell", row * 7 + col))
+                .id(("project-cell", row * COLUMN_COUNT + col))
                 .relative()
                 .flex()
                 .items_center()
@@ -812,7 +816,7 @@ fn editable_row_cells(
                 } else {
                     hsla(0., 0., 0., 0.)
                 })
-                .when(col == 1 && edit.is_none(), |d| d.pl(px(8. + indent)))
+                .when(col == COL_NAME && edit.is_none(), |d| d.pl(px(8. + indent)))
                 .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
                 .child(content)
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
@@ -913,19 +917,7 @@ pub(super) fn project_el(
                         .child(pane(
                             table_w,
                             table_x,
-                            row_cells(
-                                [
-                                    "ID",
-                                    "Name",
-                                    "Duration",
-                                    "Start",
-                                    "Finish",
-                                    "Predecessors",
-                                    "Resource Names",
-                                ]
-                                .map(str::to_string),
-                                0.,
-                            ),
+                            row_cells(COLUMNS.map(str::to_string), 0.),
                         ))
                         .child(chart_pane(
                             gantt_w,

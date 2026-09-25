@@ -273,6 +273,8 @@ folder browser and live preview), a start screen, a light/dark theme toggle
 | a | assign a resource to the task (created on first use; `Name[25%]` sets units; empty clears) |
 | b | set the baseline (planned-vs-current variance in the header) |
 | L | toggle resource leveling (delay bars to fit resource capacity) |
+| m | switch the task between Manually Scheduled (📌, pinned at its current dates) and Auto Scheduled |
+| M | switch the plan's mode for new tasks (the status line's `New Tasks: …`; click it too) |
 | T | toggle the light / dark theme |
 | Ctrl-F · F3 | find task by name · repeat |
 | Ctrl-Z · Ctrl-Y | undo · redo |

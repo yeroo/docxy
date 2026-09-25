@@ -18413,6 +18413,12 @@ impl Render for Docxy {
                         this.refocus(window, cx);
                     }))
             };
+        // Project's status bar names the plan's mode for new tasks; a click
+        // switches it.
+        let new_tasks = match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Project(v)) => Some(v.ed.project().new_tasks_are_manual),
+            _ => None,
+        };
         let status = h_flex()
             .w_full()
             .px_4()
@@ -18421,6 +18427,22 @@ impl Render for Docxy {
             .bg(panel)
             .text_size(px(11.))
             .text_color(dim)
+            .when_some(new_tasks, |d, manual| {
+                d.child(
+                    div()
+                        .id("new-tasks-mode")
+                        .cursor_pointer()
+                        .hover(|d| d.text_color(fg))
+                        .child(SharedString::from(format!(
+                            "New Tasks: {}",
+                            task_mode_name(manual)
+                        )))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.project_act(ProjectAct::NewTasksMode, window, cx)
+                        })),
+                )
+                .child(div().child("·"))
+            })
             .child(
                 self.tabs
                     .get(self.active)

@@ -358,8 +358,9 @@ cancels the prompt. The `project-cells`, `project-invalid`, `project-ribbon`, an
 
 `assert cell is Duration` checks the Project column state, while
 `assert cell C2 is 3d` reads the value displayed at that entry-table cell.
-Project A1 references use row positions and columns A through G (ID through
-Resource Names), rather than task IDs.
+Project A1 references use row positions and columns A through H (ID, Task
+Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), rather than
+task IDs.
 
 `nothing` is how a script writes "this key is null" (`assert chart_sel is
 nothing`); `null` and `none` read the same, and `empty` matches an empty string.

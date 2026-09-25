@@ -129,7 +129,7 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
     v.pan_gantt(true);
     assert_eq!(v.gantt_x.get(), DAY_W);
     assert!(v.key("right", false));
-    assert_eq!(v.col, 2);
+    assert_eq!(v.col, COL_DURATION);
     assert_eq!(v.table_x.get(), 0.);
     for _ in 0..500 {
         v.pan_gantt(true);
@@ -141,14 +141,21 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
     v.ed.set_duration(1, "1d").unwrap();
     v.layout(1180.);
     assert_eq!(v.gantt_x.get(), 92.);
-    v.layout(2000.);
+    // Wide enough for the whole table: nothing left to scroll.
+    v.layout(2. * TABLE_W + 400.);
     assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
     for _ in 0..10 {
         v.pan_gantt(false);
         v.key("left", false);
     }
     assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
-    for (width, table) in [(460., 320.), (800., 400.), (1180., 590.), (2000., 908.)] {
+    for (width, table) in [
+        (460., 320.),
+        (800., 400.),
+        (1180., 590.),
+        (2000., 1000.),
+        (2400., TABLE_W),
+    ] {
         assert_eq!(table_pane_width(width), table);
         assert!(width - table >= 140.);
     }
@@ -214,8 +221,8 @@ fn set_split_moves_the_divider_and_keeps_the_width_invariant() {
 fn a_split_drag_does_not_reveal_the_selected_column() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
     v.layout(1180.);
-    assert_eq!(v.col, 1);
-    // Scroll the Name column (48..288) out of view, then drag the split.
+    assert_eq!(v.col, COL_NAME);
+    // Scroll the Name column (178..418) out of view, then drag the split.
     v.table_x.set(TABLE_W - v.table_w);
     v.set_split(700.);
     // Only clamped to the wider pane's range, not brought back to 48.
@@ -228,7 +235,7 @@ fn a_split_drag_does_not_reveal_the_selected_column() {
     // One that narrows the table pane does.
     v.layout(700.);
     assert_eq!(v.table_w, 630.);
-    assert_eq!(v.table_x.get(), 48.);
+    assert_eq!(v.table_x.get(), 178.);
 }
 
 #[test]
@@ -313,14 +320,14 @@ fn table_and_chart_scrollbars_move_only_their_own_pane() {
 fn a_table_scrollbar_drag_is_not_undone_by_the_next_frame() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
     v.layout(1180.);
-    assert_eq!(v.col, 1);
-    // Drag the Name column (48..288) out of view to the left.
+    assert_eq!(v.col, COL_NAME);
+    // Drag the Name column (178..418) out of view to the left.
     v.table_x.set(TABLE_W - v.table_w);
     v.layout(1180.);
     assert_eq!(v.table_x.get(), TABLE_W - v.table_w);
     // A resize still brings the selected column back.
     v.layout(1000.);
-    assert_eq!(v.table_x.get(), 48.);
+    assert_eq!(v.table_x.get(), 178.);
 }
 
 #[test]
