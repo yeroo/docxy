@@ -9935,7 +9935,7 @@ impl Docxy {
             if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
                 self.sheet_commit(0, 0, cx);
             }
-            return self.save_sheet(window, cx);
+            return self.save_sheet(false, window, cx);
         }
         self.save_doc(None, window, cx);
     }
@@ -9982,58 +9982,38 @@ impl Docxy {
 
     /// Serialize the active spreadsheet back to `.xlsx` (lossless — save_xlsx
     /// re-writes into the loaded package), preserving styles and formulas.
-    fn save_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Serialize first (borrows the sheet), then decide the path so a native
-        // Save-As dialog for a new workbook doesn't clash with the borrow.
-        let (bytes, existing_path, title) = {
-            let Some(tab) = self.tabs.get(self.active) else {
-                return;
-            };
-            let Surface::Sheet(v) = &tab.surface else {
-                return;
-            };
-            (sheet_bytes(v), tab.path.clone(), tab.title.to_string())
+    /// `explicit_save_as` always asks where to go, even for a saved workbook.
+    fn save_sheet(&mut self, explicit_save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
         };
-        // A never-saved workbook asks where to go (Excel-style), instead of
-        // silently dumping into the working directory.
-        let path = match existing_path {
-            Some(p) => p,
+        let decision = sheet_save_decision(
+            tab.path.as_deref(),
+            &tab.title,
+            self.harness.is_some(),
+            explicit_save_as,
+        );
+        match decision {
+            SheetSaveDecision::InPlace(path) => {
+                finish_sheet_save(&mut self.tabs[self.active], Some(&path))
+            }
+            // A never-saved workbook (or Save As) asks where to go,
+            // Excel-style, instead of silently dumping into the working
+            // directory.
+            SheetSaveDecision::Dialog { suggested } => {
+                let target = rfd::FileDialog::new()
+                    .add_filter("Excel workbook", &["xlsx"])
+                    .set_file_name(suggested)
+                    .save_file();
+                finish_sheet_save(&mut self.tabs[self.active], target.as_deref());
+            }
             // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
             // this thread and stops the control pump dead (see `open_args`),
             // and `key ctrl+s` on the untitled workbook reaches here. Refusing
             // in words is the only answer a test can read.
-            None if self.harness.is_some() => {
-                if let Some(tab) = self.tabs.get_mut(self.active) {
-                    tab.status = "this workbook has never been saved, and a \
-                                  harness instance cannot open the Save As dialog"
-                        .into();
-                }
+            SheetSaveDecision::RefuseHarness(message) => {
+                self.tabs[self.active].status = message.into();
                 return self.refocus(window, cx);
-            }
-            None => match rfd::FileDialog::new()
-                .add_filter("Excel workbook", &["xlsx"])
-                .set_file_name(title)
-                .save_file()
-            {
-                Some(p) => p,
-                None => {
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        tab.status = "save cancelled".into();
-                    }
-                    return self.refocus(window, cx);
-                }
-            },
-        };
-        let written = opccore::fsio::write_atomic(&path, &bytes);
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            match written {
-                Ok(()) => {
-                    tab.title = file_name(&path).into();
-                    tab.path = Some(path.clone());
-                    tab.dirty = false;
-                    tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
-                }
-                Err(e) => tab.status = format!("save failed: {e}").into(),
             }
         }
         self.backstage = false;
@@ -10045,6 +10025,14 @@ impl Docxy {
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_is_project() {
             return self.save_project(true, window, cx);
+        }
+        // A workbook is saved as a workbook, never through the Word/Markdown
+        // dialog (#206).
+        if self.active_is_sheet() {
+            if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
+                self.sheet_commit(0, 0, cx);
+            }
+            return self.save_sheet(true, window, cx);
         }
         match self.pick_doc_save_target() {
             Some(target) => self.save_doc(Some(target), window, cx),
@@ -12415,6 +12403,90 @@ fn doc_save_target(path: Option<&std::path::Path>, harness: bool) -> DocSaveTarg
     }
 }
 
+/// What a harness instance says when asked to save a never-saved workbook.
+const SHEET_NEVER_SAVED_HARNESS: &str =
+    "this workbook has never been saved, and a harness instance cannot open the Save As dialog";
+/// What a harness instance says when asked to Save As a workbook.
+const SHEET_SAVE_AS_HARNESS: &str =
+    "This workbook needs Save As, and a harness instance cannot open the Save As dialog";
+
+/// Where a workbook Save goes, decided before any dialog opens.
+#[derive(Debug, PartialEq, Eq)]
+enum SheetSaveDecision {
+    /// Plain Save of a workbook that has a path: overwrite it.
+    InPlace(PathBuf),
+    /// Never saved, or Save As: ask with an Excel-only dialog.
+    Dialog { suggested: String },
+    /// A dialog is needed in a harness instance that must not open one.
+    RefuseHarness(&'static str),
+}
+
+fn sheet_save_decision(
+    path: Option<&std::path::Path>,
+    title: &str,
+    harness: bool,
+    explicit_save_as: bool,
+) -> SheetSaveDecision {
+    if let (Some(path), false) = (path, explicit_save_as) {
+        return SheetSaveDecision::InPlace(path.to_path_buf());
+    }
+    if harness {
+        return SheetSaveDecision::RefuseHarness(if explicit_save_as {
+            SHEET_SAVE_AS_HARNESS
+        } else {
+            SHEET_NEVER_SAVED_HARNESS
+        });
+    }
+    let name = path.unwrap_or_else(|| std::path::Path::new(title));
+    let stem = name.file_stem().unwrap_or_default().to_string_lossy();
+    SheetSaveDecision::Dialog {
+        suggested: format!("{stem}.xlsx"),
+    }
+}
+
+/// The file a workbook is written to for a picked `path`: `.xlsx` is added
+/// when it has no extension, and any other extension is refused, so an xlsx
+/// package never lands under a name that opens as something else.
+fn sheet_save_target(path: &std::path::Path) -> Result<PathBuf, String> {
+    match path.extension() {
+        None => Ok(path.with_extension("xlsx")),
+        Some(ext) if ext.eq_ignore_ascii_case("xlsx") => Ok(path.to_path_buf()),
+        Some(_) => Err("Workbooks can only be saved as .xlsx".into()),
+    }
+}
+
+/// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab
+/// is rebound (title, path, clean) only after a successful write; either way
+/// its status says what happened. The Markdown flag is a document's and is
+/// never touched here.
+fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
+    let Some(target) = target else {
+        tab.status = "save cancelled".into();
+        return;
+    };
+    let Surface::Sheet(v) = &tab.surface else {
+        tab.status = "this tab is not a workbook and cannot be saved as one".into();
+        return;
+    };
+    let path = match sheet_save_target(target) {
+        Ok(path) => path,
+        Err(e) => {
+            tab.status = e.into();
+            return;
+        }
+    };
+    let bytes = sheet_bytes(v);
+    match opccore::fsio::write_atomic(&path, &bytes) {
+        Ok(()) => {
+            tab.title = file_name(&path).into();
+            tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+            tab.path = Some(path);
+            tab.dirty = false;
+        }
+        Err(e) => tab.status = format!("save failed: {e}").into(),
+    }
+}
+
 #[cfg(test)]
 mod doc_save_target_tests {
     use super::{DocSaveTarget, doc_save_target};
@@ -12432,6 +12504,212 @@ mod doc_save_target_tests {
     fn a_never_saved_document_asks_or_refuses_but_never_picks_a_path() {
         assert_eq!(doc_save_target(None, false), DocSaveTarget::NeedsDialog);
         assert_eq!(doc_save_target(None, true), DocSaveTarget::RefuseHarness);
+    }
+}
+
+#[cfg(test)]
+mod sheet_save_tests {
+    use super::{
+        DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SheetSaveDecision, Surface,
+        finish_sheet_save, new_sheet_surface, sheet_bytes, sheet_save_decision, sheet_save_target,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // No runtime environment reads: the suite's config-override test mutates env.
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../target/sheet-save-tests")
+                .join(format!(
+                    "{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// An edited workbook tab. `markdown` is set so a save that touched it
+    /// would show.
+    fn sheet_tab(path: Option<PathBuf>, title: &str) -> DocTab {
+        DocTab {
+            kind: Kind::Xlsx,
+            title: title.to_owned().into(),
+            path,
+            surface: new_sheet_surface(),
+            dirty: true,
+            status: "new".into(),
+            comments: vec![],
+            pkg: None,
+            notes: vec![],
+            markdown: true,
+            hf_edit: None,
+            bundle_html: None,
+        }
+    }
+
+    fn dialog(suggested: &str) -> SheetSaveDecision {
+        SheetSaveDecision::Dialog {
+            suggested: suggested.into(),
+        }
+    }
+
+    #[test]
+    fn save_as_always_asks_with_an_xlsx_name() {
+        let saved = Path::new("/x/report.xlsx");
+        assert_eq!(
+            sheet_save_decision(Some(saved), "report.xlsx", false, true),
+            dialog("report.xlsx")
+        );
+        assert_eq!(
+            sheet_save_decision(None, "Untitled.xlsx", false, true),
+            dialog("Untitled.xlsx")
+        );
+        // The path wins over a title that says something else.
+        assert_eq!(
+            sheet_save_decision(Some(saved), "renamed", false, true),
+            dialog("report.xlsx")
+        );
+    }
+
+    #[test]
+    fn save_as_in_a_harness_refuses_in_words_saved_or_not() {
+        for path in [None, Some(Path::new("/x/report.xlsx"))] {
+            assert_eq!(
+                sheet_save_decision(path, "report.xlsx", true, true),
+                SheetSaveDecision::RefuseHarness(SHEET_SAVE_AS_HARNESS)
+            );
+        }
+        assert_eq!(
+            SHEET_SAVE_AS_HARNESS,
+            "This workbook needs Save As, and a harness instance cannot open the Save As dialog"
+        );
+    }
+
+    #[test]
+    fn plain_save_is_in_place_once_saved_and_asks_or_refuses_before() {
+        let saved = Path::new("/x/report.xlsx");
+        for harness in [false, true] {
+            assert_eq!(
+                sheet_save_decision(Some(saved), "report.xlsx", harness, false),
+                SheetSaveDecision::InPlace(saved.to_path_buf())
+            );
+        }
+        assert_eq!(
+            sheet_save_decision(None, "Untitled.xlsx", false, false),
+            dialog("Untitled.xlsx")
+        );
+        assert_eq!(
+            sheet_save_decision(None, "Untitled.xlsx", true, false),
+            SheetSaveDecision::RefuseHarness(SHEET_NEVER_SAVED_HARNESS)
+        );
+        assert_eq!(
+            SHEET_NEVER_SAVED_HARNESS,
+            "this workbook has never been saved, and a harness instance cannot open the Save As dialog"
+        );
+    }
+
+    #[test]
+    fn save_targets_add_xlsx_and_refuse_other_formats() {
+        assert_eq!(
+            sheet_save_target(Path::new("dir/book")).unwrap(),
+            PathBuf::from("dir/book.xlsx")
+        );
+        for name in ["x.xlsx", "x.XLSX"] {
+            assert_eq!(
+                sheet_save_target(Path::new(name)).unwrap(),
+                PathBuf::from(name)
+            );
+        }
+        for name in ["x.docx", "x.md", "x.", "x.xls"] {
+            assert_eq!(
+                sheet_save_target(Path::new(name)).unwrap_err(),
+                "Workbooks can only be saved as .xlsx"
+            );
+        }
+    }
+
+    #[test]
+    fn a_successful_save_writes_the_workbook_and_rebinds_the_tab() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        let Surface::Sheet(v) = &tab.surface else {
+            unreachable!()
+        };
+        let expected = sheet_bytes(v);
+        let target = dir.path("report.xlsx");
+        finish_sheet_save(&mut tab, Some(&target));
+        assert_eq!(std::fs::read(&target).unwrap(), expected);
+        assert_eq!(tab.path.as_deref(), Some(target.as_path()));
+        assert_eq!(tab.title.as_ref(), "report.xlsx");
+        assert!(!tab.dirty);
+        assert!(
+            tab.markdown,
+            "a workbook save must not touch the Markdown flag"
+        );
+        assert_eq!(
+            tab.status.as_ref(),
+            format!("saved {} bytes → {}", expected.len(), target.display())
+        );
+    }
+
+    #[test]
+    fn an_extensionless_pick_saves_as_xlsx() {
+        let dir = Scratch::new();
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        finish_sheet_save(&mut tab, Some(&dir.path("book")));
+        let written = dir.path("book.xlsx");
+        assert!(written.is_file());
+        assert!(!dir.path("book").exists());
+        assert_eq!(tab.path.as_deref(), Some(written.as_path()));
+        assert_eq!(tab.title.as_ref(), "book.xlsx");
+    }
+
+    #[test]
+    fn cancelled_refused_and_failed_saves_leave_the_tab_bound_where_it_was() {
+        let dir = Scratch::new();
+        let original = dir.path("original.xlsx");
+        let mut tab = sheet_tab(Some(original.clone()), "original.xlsx");
+        let cases = [
+            (None, "save cancelled"),
+            (
+                Some(dir.path("report.docx")),
+                "Workbooks can only be saved as .xlsx",
+            ),
+            (
+                Some(dir.path("notes.md")),
+                "Workbooks can only be saved as .xlsx",
+            ),
+            (Some(dir.path("missing-dir/report.xlsx")), "save failed:"),
+        ];
+        for (target, status) in cases {
+            finish_sheet_save(&mut tab, target.as_deref());
+            assert!(
+                tab.status.starts_with(status),
+                "{target:?}: status {:?}",
+                tab.status
+            );
+            assert_eq!(tab.path.as_deref(), Some(original.as_path()));
+            assert_eq!(tab.title.as_ref(), "original.xlsx");
+            assert!(tab.dirty);
+            assert!(tab.markdown);
+            if let Some(target) = target {
+                assert!(!target.exists(), "{target:?} was written");
+            }
+        }
+        assert!(!original.exists());
     }
 }
 
