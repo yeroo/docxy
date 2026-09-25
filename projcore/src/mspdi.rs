@@ -14,6 +14,7 @@
 
 use crate::datetime::DateTime;
 use crate::model::*;
+use crate::schedule::TaskResult;
 use opccore::xml::{Event, XmlParser};
 
 /// Parse an MSPDI document into a [`Project`].
@@ -196,6 +197,35 @@ fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
                         }
                     }
                     "Baseline" => parse_baseline(p, &mut t),
+                    "IsNull" => t.is_null = bool_of(p),
+                    "GUID" => t.guid = Some(text_of(p)).filter(|g| !g.trim().is_empty()),
+                    "CreateDate" => t.create_date = DateTime::parse_mspdi(&text_of(p)),
+                    "WBS" => t.wbs = Some(text_of(p)),
+                    "Type" => t.task_type = opt_int_of(p).and_then(TaskType::from_code),
+                    "Active" => t.active = opt_bool_of(p),
+                    "EffortDriven" => t.effort_driven = opt_bool_of(p),
+                    "Estimated" => t.estimated = opt_bool_of(p),
+                    "Priority" => {
+                        t.priority = opt_int_of(p)
+                            .filter(|n| (0..=1000).contains(n))
+                            .map(|n| n as i32);
+                    }
+                    "Deadline" => t.deadline = DateTime::parse_mspdi(&text_of(p)),
+                    "LevelAssignments" => t.level_assignments = opt_bool_of(p),
+                    "LevelingCanSplit" => t.leveling_can_split = opt_bool_of(p),
+                    "LevelingDelay" => t.leveling_delay = opt_int_of(p),
+                    "LevelingDelayFormat" => t.leveling_delay_format = opt_i32_of(p),
+                    "IgnoreResourceCalendar" => t.ignore_resource_calendar = opt_bool_of(p),
+                    "EarnedValueMethod" => t.earned_value_method = opt_i32_of(p),
+                    "Recurring" => t.recurring = opt_bool_of(p),
+                    "HideBar" => t.hide_bar = opt_bool_of(p),
+                    "Rollup" => t.rollup = opt_bool_of(p),
+                    "ExternalTask" => t.external_task = opt_bool_of(p),
+                    "IsSubproject" => t.is_subproject = opt_bool_of(p),
+                    "IsSubprojectReadOnly" => t.is_subproject_read_only = opt_bool_of(p),
+                    "Work" => t.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => t.cost = rate_of(p),
+                    "OverAllocated" => t.over_allocated = opt_bool_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -517,6 +547,24 @@ fn bool_of(p: &mut XmlParser) -> bool {
     matches!(text_of(p).trim(), "1" | "true" | "True")
 }
 
+/// An optional flag: anything but an `xsd:boolean` spelling stays absent.
+fn opt_bool_of(p: &mut XmlParser) -> Option<bool> {
+    match text_of(p).trim() {
+        "1" | "true" | "True" => Some(true),
+        "0" | "false" | "False" => Some(false),
+        _ => None,
+    }
+}
+
+/// An optional integer: unparseable text stays absent instead of reading as 0.
+fn opt_int_of(p: &mut XmlParser) -> Option<i64> {
+    text_of(p).trim().parse().ok()
+}
+
+fn opt_i32_of(p: &mut XmlParser) -> Option<i32> {
+    text_of(p).trim().parse().ok()
+}
+
 /// `HH:MM[:SS]` → minute of day, ignoring seconds.
 fn time_to_min(s: &str) -> Option<u32> {
     let mut it = s.trim().split(':');
@@ -614,6 +662,12 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
 /// stamping them back), so a scheduled project exports with dates Project can
 /// display without recalculating.
+///
+/// The computed task fields (`OutlineNumber`, early/late dates, the four
+/// slacks, `Critical`) come from [`crate::schedule::schedule`], never from
+/// values read from a file. Known limit: that schedule ignores calendar
+/// exceptions (#126), so on a plan with holidays these fields can differ from
+/// Project's and from the stored `Start`/`Finish`.
 pub fn write_mspdi(proj: &Project) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
@@ -657,8 +711,14 @@ pub fn write_mspdi(proj: &Project) -> String {
     );
 
     s.push_str("  <Tasks>\n");
-    for t in &proj.tasks {
-        write_task(&mut s, t);
+    let sched = crate::schedule::schedule(proj);
+    let numbers = outline_numbers(&proj.tasks);
+    for (t, number) in proj.tasks.iter().zip(&numbers) {
+        let computed = Computed {
+            outline_number: number.as_deref(),
+            result: sched.get(t.uid).filter(|_| !t.is_null),
+        };
+        write_task(&mut s, t, &computed);
     }
     s.push_str("  </Tasks>\n");
 
@@ -687,39 +747,153 @@ pub fn write_mspdi(proj: &Project) -> String {
     s
 }
 
-fn write_task(s: &mut String, t: &Task) {
+/// The computed values a save writes for one task, from docxy's own schedule.
+struct Computed<'a> {
+    outline_number: Option<&'a str>,
+    result: Option<&'a TaskResult>,
+}
+
+/// Outline numbers (`1`, `1.1`, `2`) in row order; blank rows get none, and
+/// level 0 (the project summary) is `0`. The number has one component per
+/// ancestor, not per level: a row more than one level deeper than the row
+/// above it is numbered one level deeper, as Project would, and a later row
+/// that returns to that slot (at the same level, or at any level between the
+/// parent's and its own) is the next sibling there, so 1, 3, 3 and 1, 3, 2
+/// both number 1, 1.1, 1.2.
+fn outline_numbers(tasks: &[Task]) -> Vec<Option<String>> {
+    // One (outline level, counter) per component of the current number.
+    let mut path: Vec<(u32, u32)> = Vec::new();
+    tasks
+        .iter()
+        .map(|t| {
+            if t.is_null {
+                return None;
+            }
+            let level = t.outline_level;
+            if level == 0 {
+                return Some("0".into());
+            }
+            // Leave every slot at this level or deeper; the shallowest one left
+            // is the slot this row takes, as that slot's next sibling.
+            let mut previous = 0;
+            while path.last().is_some_and(|&(l, _)| l >= level) {
+                previous = path.pop().expect("checked non-empty").1;
+            }
+            path.push((level, previous + 1));
+            Some(
+                path.iter()
+                    .map(|(_, n)| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        })
+        .collect()
+}
+
+fn flag(value: bool) -> &'static str {
+    if value { "1" } else { "0" }
+}
+
+fn opt_flag(s: &mut String, name: &str, value: Option<bool>) {
+    if let Some(value) = value {
+        tag(s, 3, name, flag(value));
+    }
+}
+
+fn opt_date(s: &mut String, name: &str, value: Option<DateTime>) {
+    if let Some(value) = value {
+        tag(s, 3, name, &value.to_mspdi());
+    }
+}
+
+fn opt_text(s: &mut String, name: &str, value: Option<impl ToString>) {
+    if let Some(value) = value {
+        tag(s, 3, name, &value.to_string());
+    }
+}
+
+/// Write one task's children in the MSPDI `Task` sequence (the order Project
+/// 2021 writes them). A blank row writes only what it stores: no computed
+/// fields and none of the elements every task otherwise states.
+fn write_task(s: &mut String, t: &Task, computed: &Computed) {
+    let task = !t.is_null;
     s.push_str("    <Task>\n");
     tag(s, 3, "UID", &t.uid.to_string());
+    opt_text(s, "GUID", t.guid.as_ref());
     tag(s, 3, "ID", &t.id.to_string());
-    tag(s, 3, "Name", &t.name);
-    tag(s, 3, "Manual", if t.manual { "1" } else { "0" });
+    if task || !t.name.is_empty() {
+        tag(s, 3, "Name", &t.name);
+    }
+    opt_flag(s, "Active", t.active);
+    // A blank row states only what it carries: flags when set, a constraint
+    // when not the default. It is never a summary (the outline skips it).
+    if task || t.manual {
+        tag(s, 3, "Manual", flag(t.manual));
+    }
+    opt_text(s, "Type", t.task_type.map(TaskType::code));
+    // Every row states it, as Project writes it.
+    tag(s, 3, "IsNull", flag(t.is_null));
+    opt_date(s, "CreateDate", t.create_date);
+    opt_text(s, "WBS", t.wbs.as_ref());
+    opt_text(s, "OutlineNumber", computed.outline_number);
     tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
-    tag(s, 3, "Summary", if t.summary { "1" } else { "0" });
-    tag(s, 3, "Milestone", if t.milestone { "1" } else { "0" });
-    tag(s, 3, "Duration", &min_to_iso(t.duration_min));
-    tag(s, 3, "DurationFormat", "7");
-    if let Some(d) = t.stored_start {
-        tag(s, 3, "Start", &d.to_mspdi());
+    opt_text(s, "Priority", t.priority);
+    opt_date(s, "Start", t.stored_start);
+    opt_date(s, "Finish", t.stored_finish);
+    if task || t.duration_min != 0 {
+        tag(s, 3, "Duration", &min_to_iso(t.duration_min));
     }
-    if let Some(d) = t.stored_finish {
-        tag(s, 3, "Finish", &d.to_mspdi());
+    opt_date(s, "ManualStart", t.manual_start);
+    opt_date(s, "ManualFinish", t.manual_finish);
+    opt_text(s, "ManualDuration", t.manual_duration_min.map(min_to_iso));
+    if task {
+        tag(s, 3, "DurationFormat", "7");
     }
-    if let Some(d) = t.manual_start {
-        tag(s, 3, "ManualStart", &d.to_mspdi());
+    opt_text(s, "Work", t.work_min.map(min_to_iso));
+    opt_flag(s, "EffortDriven", t.effort_driven);
+    opt_flag(s, "Recurring", t.recurring);
+    opt_flag(s, "OverAllocated", t.over_allocated);
+    opt_flag(s, "Estimated", t.estimated);
+    if task || t.milestone {
+        tag(s, 3, "Milestone", flag(t.milestone));
     }
-    if let Some(d) = t.manual_finish {
-        tag(s, 3, "ManualFinish", &d.to_mspdi());
+    if task {
+        tag(s, 3, "Summary", flag(t.summary));
     }
-    if let Some(min) = t.manual_duration_min {
-        tag(s, 3, "ManualDuration", &min_to_iso(min));
+    opt_flag(s, "Critical", computed.result.map(|r| r.critical));
+    opt_flag(s, "IsSubproject", t.is_subproject);
+    opt_flag(s, "IsSubprojectReadOnly", t.is_subproject_read_only);
+    opt_flag(s, "ExternalTask", t.external_task);
+    if let Some(r) = computed.result {
+        tag(s, 3, "EarlyStart", &r.early_start.to_mspdi());
+        tag(s, 3, "EarlyFinish", &r.early_finish.to_mspdi());
+        tag(s, 3, "LateStart", &r.late_start.to_mspdi());
+        tag(s, 3, "LateFinish", &r.late_finish.to_mspdi());
+        // Slack is working minutes in the model, tenths of a minute in MSPDI.
+        for (name, min) in [
+            ("FreeSlack", r.free_slack_min),
+            ("TotalSlack", r.total_slack_min),
+            ("StartSlack", r.start_slack_min),
+            ("FinishSlack", r.finish_slack_min),
+        ] {
+            tag(s, 3, name, &(min * 10).to_string());
+        }
     }
-    tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
-    if let Some(d) = t.constraint_date {
-        tag(s, 3, "ConstraintDate", &d.to_mspdi());
+    opt_text(s, "Cost", t.cost.as_ref().map(Rate::as_str));
+    if task || t.constraint != ConstraintType::AsSoonAsPossible {
+        tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
     }
-    if let Some(c) = t.calendar_uid {
-        tag(s, 3, "CalendarUID", &c.to_string());
-    }
+    opt_text(s, "CalendarUID", t.calendar_uid);
+    opt_date(s, "ConstraintDate", t.constraint_date);
+    opt_date(s, "Deadline", t.deadline);
+    opt_flag(s, "LevelAssignments", t.level_assignments);
+    opt_flag(s, "LevelingCanSplit", t.leveling_can_split);
+    opt_text(s, "LevelingDelay", t.leveling_delay);
+    opt_text(s, "LevelingDelayFormat", t.leveling_delay_format);
+    opt_flag(s, "IgnoreResourceCalendar", t.ignore_resource_calendar);
+    opt_flag(s, "HideBar", t.hide_bar);
+    opt_flag(s, "Rollup", t.rollup);
+    opt_text(s, "EarnedValueMethod", t.earned_value_method);
     for p in &t.predecessors {
         s.push_str("      <PredecessorLink>\n");
         tag(s, 4, "PredecessorUID", &p.uid.to_string());
@@ -1853,5 +2027,573 @@ mod tests {
         assert_eq!(cal.week[1].minutes(), 480); // Monday still 8h
         assert_eq!(cal.week[1].times.len(), 2); // two shifts preserved
         assert!(!cal.week[0].working() && !cal.week[6].working()); // weekend off
+    }
+
+    // ---- task fields (#80) ----
+
+    fn task_project(tasks: &str) -> Project {
+        read_mspdi(&format!(
+            "<Project><StartDate>2026-03-02T08:00:00</StartDate><Tasks>{tasks}</Tasks></Project>"
+        ))
+        .unwrap()
+    }
+
+    /// Every stored task field #80 keeps, with Project's non-default values.
+    const TASK_FIELDS: &str = "<Task><UID>1</UID>\
+        <GUID>651A2669-EF7E-F111-A0F9-34C93D776CA2</GUID><ID>1</ID><Name>Pour</Name>\
+        <Active>0</Active><Manual>0</Manual><Type>1</Type><IsNull>0</IsNull>\
+        <CreateDate>2026-07-13T23:14:00</CreateDate><WBS>1.2</WBS>\
+        <OutlineNumber>9.9</OutlineNumber><OutlineLevel>1</OutlineLevel><Priority>900</Priority>\
+        <Duration>PT8H0M0S</Duration><Work>PT16H30M0S</Work><EffortDriven>1</EffortDriven>\
+        <Recurring>1</Recurring><OverAllocated>1</OverAllocated><Estimated>1</Estimated>\
+        <IsSubproject>1</IsSubproject><IsSubprojectReadOnly>1</IsSubprojectReadOnly>\
+        <ExternalTask>1</ExternalTask><Cost>1250.50</Cost>\
+        <Deadline>2026-03-20T17:00:00</Deadline><LevelAssignments>0</LevelAssignments>\
+        <LevelingCanSplit>0</LevelingCanSplit><LevelingDelay>4800</LevelingDelay>\
+        <LevelingDelayFormat>7</LevelingDelayFormat><IgnoreResourceCalendar>1</IgnoreResourceCalendar>\
+        <HideBar>1</HideBar><Rollup>1</Rollup><EarnedValueMethod>1</EarnedValueMethod></Task>";
+
+    #[test]
+    fn task_fields_are_read() {
+        let t = &task_project(TASK_FIELDS).tasks[0];
+        assert_eq!(
+            t,
+            &Task {
+                uid: 1,
+                id: 1,
+                name: "Pour".into(),
+                outline_level: 1,
+                duration_min: 480,
+                guid: Some("651A2669-EF7E-F111-A0F9-34C93D776CA2".into()),
+                create_date: Some(DateTime::from_ymd_hm(2026, 7, 13, 23, 14)),
+                wbs: Some("1.2".into()),
+                task_type: Some(TaskType::FixedDuration),
+                active: Some(false),
+                effort_driven: Some(true),
+                estimated: Some(true),
+                priority: Some(900),
+                deadline: Some(DateTime::from_ymd_hm(2026, 3, 20, 17, 0)),
+                level_assignments: Some(false),
+                leveling_can_split: Some(false),
+                leveling_delay: Some(4800),
+                leveling_delay_format: Some(7),
+                ignore_resource_calendar: Some(true),
+                earned_value_method: Some(1),
+                recurring: Some(true),
+                hide_bar: Some(true),
+                rollup: Some(true),
+                external_task: Some(true),
+                is_subproject: Some(true),
+                is_subproject_read_only: Some(true),
+                work_min: Some(990),
+                cost: Rate::parse("1250.50"),
+                over_allocated: Some(true),
+                ..Task::default()
+            }
+        );
+        assert!(!t.is_active());
+    }
+
+    #[test]
+    fn task_fields_survive_mspdi_and_native_package_round_trips() {
+        let proj = task_project(TASK_FIELDS);
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<GUID>651A2669-EF7E-F111-A0F9-34C93D776CA2</GUID>",
+            "<Active>0</Active>",
+            "<Type>1</Type>",
+            "<CreateDate>2026-07-13T23:14:00</CreateDate>",
+            "<WBS>1.2</WBS>",
+            "<Priority>900</Priority>",
+            "<Work>PT16H30M0S</Work>",
+            "<EffortDriven>1</EffortDriven>",
+            "<Recurring>1</Recurring>",
+            "<OverAllocated>1</OverAllocated>",
+            "<Estimated>1</Estimated>",
+            "<IsSubproject>1</IsSubproject>",
+            "<IsSubprojectReadOnly>1</IsSubprojectReadOnly>",
+            "<ExternalTask>1</ExternalTask>",
+            "<Cost>1250.50</Cost>",
+            "<Deadline>2026-03-20T17:00:00</Deadline>",
+            "<LevelAssignments>0</LevelAssignments>",
+            "<LevelingCanSplit>0</LevelingCanSplit>",
+            "<LevelingDelay>4800</LevelingDelay>",
+            "<LevelingDelayFormat>7</LevelingDelayFormat>",
+            "<IgnoreResourceCalendar>1</IgnoreResourceCalendar>",
+            "<HideBar>1</HideBar>",
+            "<Rollup>1</Rollup>",
+            "<EarnedValueMethod>1</EarnedValueMethod>",
+        ] {
+            assert!(xml.contains(element), "missing {element}");
+        }
+        // A task is not a blank row; the stored OutlineNumber is recomputed.
+        assert!(xml.contains("<IsNull>0</IsNull>"));
+        assert!(xml.contains("<OutlineNumber>1</OutlineNumber>"));
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks, proj.tasks);
+    }
+
+    #[test]
+    fn every_task_type_and_flag_value_round_trips() {
+        for code in 0..=2 {
+            let proj = task_project(&format!("<Task><UID>1</UID><Type>{code}</Type></Task>"));
+            assert_eq!(proj.tasks[0].task_type.map(TaskType::code), Some(code));
+            let xml = write_mspdi(&proj);
+            assert!(xml.contains(&format!("<Type>{code}</Type>")));
+            assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        }
+        for (text, value) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            let proj = task_project(&format!(
+                "<Task><UID>1</UID><Active>{text}</Active><Estimated>{text}</Estimated></Task>"
+            ));
+            assert_eq!(proj.tasks[0].active, Some(value));
+            assert_eq!(proj.tasks[0].estimated, Some(value));
+            assert_eq!(read_mspdi(&write_mspdi(&proj)).unwrap().tasks, proj.tasks);
+        }
+    }
+
+    /// Optional task elements #80 keeps. IsNull is not among them: every row
+    /// states it.
+    const NEW_TASK_ELEMENTS: [&str; 24] = [
+        "GUID",
+        "Active",
+        "Type",
+        "CreateDate",
+        "WBS",
+        "Priority",
+        "Work",
+        "EffortDriven",
+        "Recurring",
+        "OverAllocated",
+        "Estimated",
+        "IsSubproject",
+        "IsSubprojectReadOnly",
+        "ExternalTask",
+        "Cost",
+        "Deadline",
+        "LevelAssignments",
+        "LevelingCanSplit",
+        "LevelingDelay",
+        "LevelingDelayFormat",
+        "IgnoreResourceCalendar",
+        "HideBar",
+        "Rollup",
+        "EarnedValueMethod",
+    ];
+
+    /// The `<Tasks>` section of a written file.
+    fn task_xml(xml: &str) -> &str {
+        &xml[xml.find("<Tasks>").unwrap()..xml.find("</Tasks>").unwrap()]
+    }
+
+    #[test]
+    fn absent_task_fields_stay_absent() {
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Name>A</Name><Duration>PT8H0M0S</Duration></Task>",
+        );
+        assert_eq!(
+            proj.tasks[0],
+            Task {
+                uid: 1,
+                id: 1,
+                name: "A".into(),
+                duration_min: 480,
+                ..Task::default()
+            }
+        );
+        let xml = write_mspdi(&proj);
+        for name in NEW_TASK_ELEMENTS {
+            assert!(
+                !task_xml(&xml).contains(&format!("<{name}>")),
+                "{name}: {xml}"
+            );
+        }
+        assert!(xml.contains("<IsNull>0</IsNull>"));
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+    }
+
+    #[test]
+    fn invalid_task_fields_stay_absent() {
+        for element in [
+            "<Type>x</Type>",
+            "<Type>3</Type>",
+            "<Type>-1</Type>",
+            "<Type/>",
+            "<Priority>abc</Priority>",
+            "<Priority>1001</Priority>",
+            "<Priority>-1</Priority>",
+            "<Active>maybe</Active>",
+            "<Active/>",
+            "<Estimated>2</Estimated>",
+            "<EffortDriven>yes</EffortDriven>",
+            "<Deadline>soon</Deadline>",
+            "<CreateDate>NA</CreateDate>",
+            "<Work>banana</Work>",
+            "<Cost>NaN</Cost>",
+            "<LevelingDelay>1.5</LevelingDelay>",
+            "<LevelingDelayFormat>x</LevelingDelayFormat>",
+            "<EarnedValueMethod>x</EarnedValueMethod>",
+            "<GUID></GUID>",
+        ] {
+            let proj = task_project(&format!("<Task><UID>1</UID>{element}</Task>"));
+            assert_eq!(
+                proj.tasks[0],
+                Task {
+                    uid: 1,
+                    ..Task::default()
+                },
+                "{element}"
+            );
+            let xml = write_mspdi(&proj);
+            for name in NEW_TASK_ELEMENTS {
+                assert!(
+                    !task_xml(&xml).contains(&format!("<{name}>")),
+                    "{element}: {xml}"
+                );
+            }
+        }
+        // The Priority range is inclusive.
+        for n in [0, 1000] {
+            let proj = task_project(&format!(
+                "<Task><UID>1</UID><Priority>{n}</Priority></Task>"
+            ));
+            assert_eq!(proj.tasks[0].priority, Some(n));
+        }
+    }
+
+    fn element_names(xml: &str) -> Vec<String> {
+        let mut parser = XmlParser::new(xml);
+        let mut names = Vec::new();
+        loop {
+            match parser.next() {
+                Event::Start => names.push(parser.name().to_string()),
+                Event::Eof => break,
+                _ => {}
+            }
+        }
+        names
+    }
+
+    #[test]
+    fn task_children_follow_schema_sequence() {
+        // The MSPDI Task sequence, as Project 2021 writes it (checked over the
+        // 1569 tasks of a private Project 2021 corpus) and as Microsoft's XML
+        // Schema for the Tasks Element lists it.
+        let mut proj = task_project(TASK_FIELDS);
+        let t = &mut proj.tasks[0];
+        t.manual = true;
+        t.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        t.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 2, 17, 0));
+        t.manual_start = t.stored_start;
+        t.manual_finish = t.stored_finish;
+        t.manual_duration_min = Some(480);
+        t.calendar_uid = Some(1);
+        t.constraint = ConstraintType::StartNoEarlierThan;
+        t.constraint_date = t.stored_start;
+        t.set_baseline_slot(Baseline {
+            number: 0,
+            duration_min: Some(480),
+            ..Baseline::default()
+        });
+        proj.tasks.insert(
+            0,
+            Task {
+                uid: 2,
+                outline_level: 1,
+                duration_min: 480,
+                ..Task::default()
+            },
+        );
+        proj.tasks[1].predecessors.push(Predecessor {
+            uid: 2,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        });
+        let mut xml = String::new();
+        let sched = crate::schedule::schedule(&proj);
+        write_task(
+            &mut xml,
+            &proj.tasks[1],
+            &Computed {
+                outline_number: Some("2"),
+                result: sched.get(1),
+            },
+        );
+        assert_eq!(
+            element_names(&xml),
+            [
+                "Task",
+                "UID",
+                "GUID",
+                "ID",
+                "Name",
+                "Active",
+                "Manual",
+                "Type",
+                "IsNull",
+                "CreateDate",
+                "WBS",
+                "OutlineNumber",
+                "OutlineLevel",
+                "Priority",
+                "Start",
+                "Finish",
+                "Duration",
+                "ManualStart",
+                "ManualFinish",
+                "ManualDuration",
+                "DurationFormat",
+                "Work",
+                "EffortDriven",
+                "Recurring",
+                "OverAllocated",
+                "Estimated",
+                "Milestone",
+                "Summary",
+                "Critical",
+                "IsSubproject",
+                "IsSubprojectReadOnly",
+                "ExternalTask",
+                "EarlyStart",
+                "EarlyFinish",
+                "LateStart",
+                "LateFinish",
+                "FreeSlack",
+                "TotalSlack",
+                "StartSlack",
+                "FinishSlack",
+                "Cost",
+                "ConstraintType",
+                "CalendarUID",
+                "ConstraintDate",
+                "Deadline",
+                "LevelAssignments",
+                "LevelingCanSplit",
+                "LevelingDelay",
+                "LevelingDelayFormat",
+                "IgnoreResourceCalendar",
+                "HideBar",
+                "Rollup",
+                "EarnedValueMethod",
+                "PredecessorLink",
+                "PredecessorUID",
+                "Type",
+                "LinkLag",
+                "LagFormat",
+                "Baseline",
+                "Number",
+                "Duration",
+            ]
+        );
+        // IsNull sits between Type and CreateDate on a blank row.
+        let blank = Task {
+            uid: 3,
+            is_null: true,
+            task_type: Some(TaskType::FixedUnits),
+            create_date: t_date(),
+            ..Task::default()
+        };
+        let mut xml = String::new();
+        write_task(
+            &mut xml,
+            &blank,
+            &Computed {
+                outline_number: None,
+                result: None,
+            },
+        );
+        assert_eq!(
+            element_names(&xml),
+            [
+                "Task",
+                "UID",
+                "ID",
+                "Type",
+                "IsNull",
+                "CreateDate",
+                "OutlineLevel"
+            ]
+        );
+    }
+
+    fn t_date() -> Option<DateTime> {
+        Some(DateTime::from_ymd_hm(2026, 7, 13, 23, 14))
+    }
+
+    /// The text of the first `<name>` in the task with this UID.
+    fn written(xml: &str, uid: i32, name: &str) -> Option<String> {
+        let open = format!("<UID>{uid}</UID>");
+        let task = xml.split("<Task>").find(|t| t.contains(&open))?;
+        let task = &task[..task.find("</Task>")?];
+        let start = task.find(&format!("<{name}>"))? + name.len() + 2;
+        Some(task[start..start + task[start..].find('<')?].to_string())
+    }
+
+    #[test]
+    fn computed_task_fields_come_from_the_schedule_not_the_file() {
+        // B has 16h of free and total slack behind A; the file claims otherwise.
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Name>A</Name><OutlineLevel>1</OutlineLevel>
+               <Duration>PT24H0M0S</Duration></Task>
+             <Task><UID>2</UID><ID>2</ID><Name>B</Name><OutlineLevel>1</OutlineLevel>
+               <Duration>PT8H0M0S</Duration><Critical>1</Critical>
+               <EarlyStart>1999-01-01T08:00:00</EarlyStart><TotalSlack>-999</TotalSlack>
+               <StartSlack>7</StartSlack><OutlineNumber>7.7</OutlineNumber></Task>",
+        );
+        let xml = write_mspdi(&proj);
+        let get =
+            |uid, name| written(&xml, uid, name).unwrap_or_else(|| panic!("{uid} {name}: {xml}"));
+        assert_eq!(get(2, "OutlineNumber"), "2");
+        assert_eq!(get(2, "Critical"), "0");
+        assert_eq!(get(2, "EarlyStart"), "2026-03-02T08:00:00");
+        assert_eq!(get(2, "EarlyFinish"), "2026-03-02T17:00:00");
+        assert_eq!(get(2, "LateStart"), "2026-03-04T08:00:00");
+        assert_eq!(get(2, "LateFinish"), "2026-03-04T17:00:00");
+        // 16 working hours, in tenths of a minute.
+        for name in ["TotalSlack", "FreeSlack", "StartSlack", "FinishSlack"] {
+            assert_eq!(get(2, name), "9600", "{name}");
+        }
+        assert_eq!(get(1, "Critical"), "1");
+        assert_eq!(get(1, "TotalSlack"), "0");
+        assert_eq!(get(1, "OutlineNumber"), "1");
+    }
+
+    #[test]
+    fn outline_numbers_treat_a_jumped_level_as_one_slot() {
+        let rows = |levels: &[u32]| -> Vec<Option<String>> {
+            let tasks: Vec<Task> = levels
+                .iter()
+                .map(|&outline_level| Task {
+                    outline_level,
+                    ..Task::default()
+                })
+                .collect();
+            outline_numbers(&tasks)
+        };
+        let numbers = |ns: &[&str]| -> Vec<Option<String>> {
+            ns.iter().map(|n| Some(n.to_string())).collect()
+        };
+        // A repeated jumped row is the jumped row's sibling.
+        assert_eq!(rows(&[1, 3, 3]), numbers(&["1", "1.1", "1.2"]));
+        // A shallower row after a jump, still under the same parent, takes
+        // the jumped row's slot: its next sibling, not a second "1.1".
+        assert_eq!(rows(&[1, 3, 2]), numbers(&["1", "1.1", "1.2"]));
+        assert_eq!(rows(&[1, 3, 2, 3]), numbers(&["1", "1.1", "1.2", "1.2.1"]));
+        assert_eq!(rows(&[1, 2, 1]), numbers(&["1", "1.1", "2"]));
+        assert_eq!(rows(&[2, 2, 1]), numbers(&["1", "2", "3"]));
+    }
+
+    #[test]
+    fn outline_numbers_follow_levels_and_skip_blank_rows() {
+        let row = |outline_level, is_null| Task {
+            outline_level,
+            is_null,
+            ..Task::default()
+        };
+        let tasks = [
+            row(0, false),
+            row(1, false),
+            row(2, false),
+            row(0, true),
+            row(2, false),
+            row(4, false),
+            row(1, false),
+            row(3, false),
+            row(1, true),
+            row(2, false),
+        ];
+        assert_eq!(
+            outline_numbers(&tasks),
+            [
+                Some("0"),
+                Some("1"),
+                Some("1.1"),
+                None,
+                Some("1.2"),
+                Some("1.2.1"),
+                Some("2"),
+                Some("2.1"),
+                None,
+                Some("2.2"),
+            ]
+            .map(|n| n.map(String::from))
+        );
+    }
+
+    const BLANK_ROW: &str = "<Task><UID>1</UID><ID>1</ID><Name>Phase</Name><OutlineLevel>1</OutlineLevel>
+          <Summary>1</Summary></Task>
+        <Task><UID>2</UID><ID>2</ID><Name>A</Name><OutlineLevel>2</OutlineLevel>
+          <Duration>PT16H0M0S</Duration></Task>
+        <Task><UID>3</UID><ID>3</ID><IsNull>1</IsNull><CreateDate>2026-07-13T23:14:00</CreateDate></Task>
+        <Task><UID>4</UID><ID>4</ID><Name>B</Name><OutlineLevel>2</OutlineLevel>
+          <Duration>PT8H0M0S</Duration>
+          <PredecessorLink><PredecessorUID>2</PredecessorUID><Type>1</Type></PredecessorLink></Task>";
+
+    #[test]
+    fn a_blank_row_keeps_its_mode_constraint_and_milestone_flag() {
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><IsNull>1</IsNull><Manual>1</Manual>
+               <Milestone>1</Milestone><Duration>PT8H0M0S</Duration>
+               <ConstraintType>4</ConstraintType><ConstraintDate>2026-03-04T08:00:00</ConstraintDate>
+               <Summary>0</Summary></Task>",
+        );
+        let t = &proj.tasks[0];
+        assert!(t.is_null && t.manual && t.milestone);
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+        let xml = write_mspdi(&proj);
+        assert_eq!(
+            element_names(task_xml(&xml))
+                .into_iter()
+                .skip(2)
+                .collect::<Vec<_>>(),
+            [
+                "UID",
+                "ID",
+                "Manual",
+                "IsNull",
+                "OutlineLevel",
+                "Duration",
+                "Milestone",
+                "ConstraintType",
+                "ConstraintDate"
+            ]
+        );
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        // Defaults stay unstated on a blank row.
+        let plain = task_project("<Task><UID>1</UID><IsNull>1</IsNull></Task>");
+        let xml = write_mspdi(&plain);
+        for name in ["Manual", "Milestone", "Summary", "ConstraintType"] {
+            assert!(!task_xml(&xml).contains(&format!("<{name}>")), "{name}");
+        }
+    }
+
+    #[test]
+    fn blank_row_round_trips_without_computed_fields() {
+        let proj = task_project(BLANK_ROW);
+        let blank = &proj.tasks[2];
+        assert!(blank.is_null);
+        assert_eq!((blank.uid, blank.id, blank.outline_level), (3, 3, 0));
+        let xml = write_mspdi(&proj);
+        let blank_xml = xml.split("<Task>").nth(3).unwrap();
+        assert_eq!(
+            blank_xml
+                .split("</Task>")
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<String>(),
+            "<UID>3</UID><ID>3</ID><IsNull>1</IsNull>\
+             <CreateDate>2026-07-13T23:14:00</CreateDate><OutlineLevel>0</OutlineLevel>"
+        );
+        // The rows around it keep their outline numbers and results.
+        assert_eq!(written(&xml, 4, "OutlineNumber").as_deref(), Some("1.2"));
+        assert_eq!(
+            written(&xml, 4, "EarlyStart").as_deref(),
+            Some("2026-03-04T08:00:00")
+        );
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks, proj.tasks);
     }
 }

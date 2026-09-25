@@ -154,8 +154,10 @@ impl ProjectView {
             3 | 4 => {
                 let day = parse_cell_date(&cell.buf)?;
                 // A manual task takes the typed date as its own start or
-                // finish; an auto task gets an SNET/FNET constraint.
-                let (manual, previous) = (task.manual, (task.constraint, task.constraint_date));
+                // finish; an auto task gets an SNET/FNET constraint. Whether
+                // it is manual is read after the edit: typing into a blank
+                // row can make it a manual task.
+                let previous = (task.constraint, task.constraint_date);
                 if cell.col == 3 {
                     self.ed.set_start(uid, day)?;
                 } else {
@@ -167,7 +169,7 @@ impl ProjectView {
                     .task(uid)
                     .ok_or("The edited task no longer exists")?;
                 let current = (task.constraint, task.constraint_date);
-                if manual || current == previous {
+                if task.manual || current == previous {
                     return Ok(None);
                 }
                 return Ok(Some(format!(

@@ -60,42 +60,45 @@ impl Editor {
         if task.constraint == constraint && task.constraint_date == date {
             return Ok(());
         }
-        self.snapshot();
-        self.proj.tasks[i].constraint = constraint;
-        self.proj.tasks[i].constraint_date = date;
-        self.changed();
-        Ok(())
+        self.edit_row(i, |proj, _| {
+            proj.tasks[i].constraint = constraint;
+            proj.tasks[i].constraint_date = date;
+        })
     }
 
     /// Set a task's start to a typed day. A manual task moves there, at the
     /// day's first working time, keeping its duration; an auto task gets a
-    /// Start-No-Earlier-Than constraint on that day.
+    /// Start-No-Earlier-Than constraint on that day. A blank row is judged as
+    /// the task the edit makes it (manual in a plan whose new tasks are).
     pub fn set_start(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
-        let task = &self.proj.tasks[i];
+        let blank = self.proj.tasks[i].is_null;
+        let task = &self.row_as_edited(i);
         if !task.manual {
             return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(day));
         }
         self.validate_pinned_day(day)?;
         let start = day_start(&self.proj, task, day);
-        if task.manual_start == Some(start) && task.manual_finish.is_none() {
+        if !blank && task.manual_start == Some(start) && task.manual_finish.is_none() {
             return Ok(());
         }
-        self.snapshot();
-        let task = &mut self.proj.tasks[i];
-        task.manual_start = Some(start);
-        task.manual_finish = None;
-        self.changed();
+        self.edit_row(i, |proj, _| {
+            let task = &mut proj.tasks[i];
+            task.manual_start = Some(start);
+            task.manual_finish = None;
+        })?;
         self.stamp_pinned_dates(uid);
         Ok(())
     }
 
     /// Set a task's finish to a typed day. A manual task keeps its start and
     /// its duration becomes the working time up to the day's last working
-    /// time; an auto task gets a Finish-No-Earlier-Than constraint.
+    /// time; an auto task gets a Finish-No-Earlier-Than constraint. A blank
+    /// row is judged as the task the edit makes it, as in [`Self::set_start`].
     pub fn set_finish(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
-        let task = &self.proj.tasks[i];
+        let blank = self.proj.tasks[i].is_null;
+        let task = &self.row_as_edited(i);
         if !task.manual {
             let finish = day_finish(&self.proj, task, day)?;
             return self.set_constraint_typed(
@@ -116,18 +119,22 @@ impl Editor {
         }
         let calendar = task_calendar(&self.proj, task);
         let duration = crate::schedule::working_minutes_on(&calendar, start, finish);
-        if task.manual_start == Some(start) && task.manual_finish == Some(finish) {
+        if !blank && task.manual_start == Some(start) && task.manual_finish == Some(finish) {
             return Ok(());
         }
         self.validate_cell_horizon(uid, Some(duration), None)?;
-        self.snapshot();
-        let task = &mut self.proj.tasks[i];
-        task.manual_start = Some(start);
-        task.manual_finish = Some(finish);
-        task.duration_min = duration;
-        task.manual_duration_min = Some(duration);
-        task.milestone = duration == 0;
-        self.changed();
+        self.edit_row(i, |proj, was_blank| {
+            // As in update_task, a blank row's default duration is not typed.
+            let task = &mut proj.tasks[i];
+            if was_blank || duration != task.duration_min {
+                commit_estimate(task);
+            }
+            task.manual_start = Some(start);
+            task.manual_finish = Some(finish);
+            task.duration_min = duration;
+            task.manual_duration_min = Some(duration);
+            task.milestone = duration == 0;
+        })?;
         self.stamp_pinned_dates(uid);
         Ok(())
     }
@@ -151,8 +158,15 @@ impl Editor {
     ) -> Result<(), String> {
         let i = self.index(uid)?;
         let mut seen = std::collections::HashSet::new();
+        let current = &self.proj.tasks[i].predecessors;
         for p in &predecessors {
             self.index(p.uid)?;
+            // A link to a blank row the task already has is kept (it shows in
+            // the cell); only a new one is refused.
+            if self.is_blank(p.uid) && !current.iter().any(|c| c.uid == p.uid) {
+                let id = self.proj.task(p.uid).map_or(p.uid, |t| t.id);
+                return Err(format!("No task with ID {id}"));
+            }
             if p.uid == uid {
                 return Err("A task cannot depend on itself".into());
             }
@@ -164,10 +178,9 @@ impl Editor {
             return Ok(());
         }
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;
-        self.snapshot();
-        self.proj.tasks[i].predecessors = predecessors;
-        self.changed();
-        Ok(())
+        self.edit_row(i, |proj, _| {
+            proj.tasks[i].predecessors = predecessors;
+        })
     }
 
     /// Replace membership while preserving allocation data for retained resources.
@@ -210,7 +223,8 @@ impl Editor {
                 wanted.push((rid, units, raw));
             }
         }
-        let duration = self.proj.tasks[i].duration_min;
+        // A blank row is assigned as the task the edit makes it.
+        let duration = self.row_as_edited(i).duration_min;
         let kind = |rid: i32| resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
         let mut changed = false;
         let mut assignments = self.proj.assignments.clone();
@@ -265,10 +279,10 @@ impl Editor {
         if !changed {
             return Ok(());
         }
-        self.snapshot();
-        self.proj.resources = resources;
-        self.proj.assignments = assignments;
-        self.changed();
+        self.edit_row(i, |proj, _| {
+            proj.resources = resources;
+            proj.assignments = assignments;
+        })?;
         Ok(())
     }
 

@@ -54,6 +54,13 @@ pub struct TaskResult {
     /// successors, falling back to total slack when there are no FS successors.
     /// For summaries, uses total slack floored at zero.
     pub free_slack_min: i64,
+    /// Start and finish slack in working minutes (MSPDI `StartSlack` and
+    /// `FinishSlack`). A leaf's start slack is its total slack; its finish
+    /// slack differs by how much longer its late span is than its early span.
+    /// A summary measures late minus early start (finish) on the summary
+    /// calendar.
+    pub start_slack_min: i64,
+    pub finish_slack_min: i64,
     pub critical: bool,
 }
 
@@ -871,13 +878,20 @@ impl<'a> Scheduler<'a> {
             // A constraint can move the scheduled start ahead of what its
             // links permit; preserve that conflict instead of reporting zero.
             let (early, driven) = (tl.to_index(e_s), driven_es[&t.uid]);
-            let mut total = match late_tl.get(&t.uid) {
+            let late = late_tl.get(&t.uid);
+            let mut total = match late {
                 // Unlinked, so nothing but the anchor drives its start.
                 Some(pre) => {
                     debug_assert_eq!(early, driven);
                     pre.to_index(l_s) - pre.to_index(e_s)
                 }
                 None => tl.to_index(l_s) - early.max(driven),
+            };
+            // Late span minus early span, on the timeline `total` used: zero
+            // unless an endpoint lands on a different instant of its index.
+            let span_gap = {
+                let on: &Timeline = late.map_or(tl, |pre| pre);
+                (on.to_index(l_f) - on.to_index(l_s)) - (on.to_index(e_f) - on.to_index(e_s))
             };
             // A manual task pinned before its link-driven start violates the
             // link: report at least that gap as negative slack, even off the
@@ -896,12 +910,15 @@ impl<'a> Scheduler<'a> {
                     late_finish: DateTime::from_minutes(l_f),
                     total_slack_min: total,
                     free_slack_min: free.unwrap_or(total).max(0),
+                    start_slack_min: total,
+                    finish_slack_min: total + span_gap,
                     critical: total <= 0,
                 },
             );
         }
 
         // ---- summary rollup ----
+        let mut summary_cal: Option<Calendar> = None;
         for (i, t) in self.proj.tasks.iter().enumerate() {
             if !t.summary {
                 continue;
@@ -916,6 +933,11 @@ impl<'a> Scheduler<'a> {
             let ls_min = child.iter().map(|r| r.late_start).min().unwrap();
             let lf_max = child.iter().map(|r| r.late_finish).max().unwrap();
             let total = child.iter().map(|r| r.total_slack_min).min().unwrap();
+            let cal = summary_cal.get_or_insert_with(|| summary_calendar(self.proj));
+            let slack = |early: DateTime, late: DateTime| {
+                let gap = working_minutes_on(cal, early, late);
+                if late < early { -gap } else { gap }
+            };
             results.insert(
                 t.uid,
                 TaskResult {
@@ -926,6 +948,8 @@ impl<'a> Scheduler<'a> {
                     late_finish: lf_max,
                     total_slack_min: total,
                     free_slack_min: total.max(0),
+                    start_slack_min: slack(es_min, ls_min),
+                    finish_slack_min: slack(ef_max, lf_max),
                     critical: child.iter().any(|r| r.critical),
                 },
             );
@@ -1069,7 +1093,9 @@ impl<'a> CalendarResolver<'a> {
 
     /// A leaf the scheduler keeps: its resolved calendar has working time.
     fn schedulable(&self, task: &Task) -> bool {
-        !task.summary && self.resolve(task.calendar_uid).is_none_or(has_working_time)
+        !task.summary
+            && !task.is_null
+            && self.resolve(task.calendar_uid).is_none_or(has_working_time)
     }
 }
 
@@ -1078,7 +1104,7 @@ impl<'a> CalendarResolver<'a> {
 pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
     let calendars = CalendarResolver::new(proj);
     for (i, task) in proj.tasks.iter().enumerate() {
-        if task.summary && proj.is_outline_summary(i) {
+        if task.is_null || (task.summary && proj.is_outline_summary(i)) {
             continue;
         }
         let Some(cal) = calendars.resolve(task.calendar_uid) else {
@@ -1172,7 +1198,29 @@ fn descendant_leaves(proj: &Project, sidx: usize, leaves: &[usize]) -> Vec<i32> 
 /// Task UIDs must be unique: results, links and assignments are keyed by UID.
 /// Readers reject duplicates; a code-built project must not contain them.
 pub fn schedule(proj: &Project) -> Schedule {
-    Scheduler::new(proj).run()
+    Scheduler::new(&without_blank_rows(proj)).run()
+}
+
+/// The project the scheduler sees: blank rows (`is_null`) removed, with the
+/// links and assignments that name them. A blank row therefore gets no
+/// result, never bounds a summary, and cannot drive another task.
+fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
+    if !proj.tasks.iter().any(|t| t.is_null) {
+        return std::borrow::Cow::Borrowed(proj);
+    }
+    let blank: std::collections::HashSet<i32> = proj
+        .tasks
+        .iter()
+        .filter(|t| t.is_null)
+        .map(|t| t.uid)
+        .collect();
+    let mut kept = proj.clone();
+    kept.tasks.retain(|t| !t.is_null);
+    for t in &mut kept.tasks {
+        t.predecessors.retain(|p| !blank.contains(&p.uid));
+    }
+    kept.assignments.retain(|a| !blank.contains(&a.task_uid));
+    std::borrow::Cow::Owned(kept)
 }
 
 /// Working minutes between two wall-clock instants under the project's default
@@ -1310,7 +1358,7 @@ impl Leveled {
 /// and task splitting are out of scope.
 /// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
-    Scheduler::new(proj).level()
+    Scheduler::new(&without_blank_rows(proj)).level()
 }
 
 /// Peak concurrent booked load over `[start, end)` (a sweep over interval ends).
@@ -1603,6 +1651,105 @@ mod tests {
             link: LinkType::FinishStart,
             lag_min: 0,
         }
+    }
+
+    /// Phase (summary) over A and B, B after A, then C after B. With
+    /// `blank`, a blank row sits between A and B at outline level 0, claims
+    /// to be a summary, links to A, is linked from B and C, has a resource,
+    /// and uses a calendar with no working time.
+    fn blank_row_project(blank: bool) -> Project {
+        let mut phase = task(1, "Phase", 0);
+        phase.summary = true;
+        let mut a = task(2, "A", 960);
+        a.outline_level = 2;
+        let mut b = task(4, "B", 480);
+        b.outline_level = 2;
+        b.predecessors.push(fs(2));
+        let mut c = task(5, "C", 480);
+        c.predecessors.push(fs(4));
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![phase, a, b, c],
+            resources: vec![Resource {
+                uid: 1,
+                name: "R".into(),
+                max_units: 1.0,
+                ..Resource::default()
+            }],
+            ..Project::default()
+        };
+        if blank {
+            let mut row = task(3, "", 2400);
+            row.outline_level = 0;
+            row.is_null = true;
+            row.summary = true;
+            row.calendar_uid = Some(9);
+            row.predecessors.push(fs(2));
+            proj.tasks.insert(2, row);
+            proj.tasks[3].predecessors.push(fs(3));
+            proj.tasks[4].predecessors.push(fs(3));
+            proj.calendars.push(Calendar {
+                uid: 9,
+                name: "Never".into(),
+                week: Default::default(),
+            });
+            proj.assignments.push(Assignment {
+                uid: 1,
+                task_uid: 3,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 2400,
+            });
+        }
+        proj
+    }
+
+    #[test]
+    fn blank_rows_are_outside_the_schedule() {
+        let (with, without) = (blank_row_project(true), blank_row_project(false));
+        assert_eq!(calendar_error(&with), None);
+        let (sched, plain) = (schedule(&with), schedule(&without));
+        assert!(sched.get(3).is_none());
+        for uid in [1, 2, 4, 5] {
+            assert_eq!(sched.get(uid), plain.get(uid), "task {uid}");
+        }
+        // The summary still spans B, below the blank row.
+        assert_eq!(
+            sched.get(1).unwrap().early_finish,
+            DateTime::from_ymd_hm(2026, 3, 4, 17, 0)
+        );
+        assert_eq!(sched.project_finish, plain.project_finish);
+        let (leveled, plain) = (level(&with), level(&without));
+        assert_eq!(leveled.start(3), None);
+        for uid in [1, 2, 4, 5] {
+            assert_eq!(leveled.start(uid), plain.start(uid), "task {uid}");
+            assert_eq!(leveled.finish(uid), plain.finish(uid), "task {uid}");
+        }
+    }
+
+    #[test]
+    fn start_and_finish_slack() {
+        // A (24h) and, under a summary, B (8h) with 16h of slack.
+        let mut phase = task(2, "Phase", 0);
+        phase.summary = true;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "A", 1440), phase, b],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        for (uid, slack) in [(1, 0), (2, 960), (3, 960)] {
+            let r = sched.get(uid).unwrap();
+            assert_eq!(r.total_slack_min, slack, "task {uid}");
+            assert_eq!(r.start_slack_min, slack, "task {uid}");
+            assert_eq!(r.finish_slack_min, slack, "task {uid}");
+        }
+        // A milestone after an FS link: both endpoints are one instant.
+        let proj = fs_milestone_project(480);
+        let r = *schedule(&proj).get(2).unwrap();
+        assert_eq!((r.start_slack_min, r.finish_slack_min), (0, 0));
     }
 
     fn fs_milestone_project(duration: i64) -> Project {

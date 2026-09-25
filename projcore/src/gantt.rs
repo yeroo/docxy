@@ -33,6 +33,10 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
     let mut section: Option<String> = None; // current section name (from summary)
     let mut emitted: Option<String> = None; // last section header written
     for task in &proj.tasks {
+        // A blank row is not a task and never opens a section.
+        if task.is_null {
+            continue;
+        }
         if task.summary {
             // Top-level summaries define sections; deeper ones just group under
             // the enclosing section.
@@ -220,6 +224,22 @@ mod tests {
             tasks: vec![task(1, "A", 960), b, c, d],
             ..Project::default()
         }
+    }
+
+    #[test]
+    fn blank_rows_are_not_rendered() {
+        let mut proj = diamond();
+        let mut blank = task(9, "Ghost", 480);
+        blank.is_null = true;
+        blank.summary = true;
+        blank.outline_level = 0;
+        proj.tasks.insert(2, blank);
+        let s = schedule(&proj);
+        let plain = diamond();
+        let plain_s = schedule(&plain);
+        assert_eq!(to_mermaid(&proj, &s), to_mermaid(&plain, &plain_s));
+        assert_eq!(to_markdown(&proj, &s), to_markdown(&plain, &plain_s));
+        assert!(!to_markdown(&proj, &s).contains("Ghost"));
     }
 
     #[test]

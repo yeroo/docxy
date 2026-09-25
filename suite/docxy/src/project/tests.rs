@@ -134,7 +134,8 @@ fn every_mspdi_fixture_opens_and_matches_its_date_oracle() {
         let tab = tab_from_path(&path);
         assert!(tab.status.starts_with("loaded"), "{}", tab.status);
         let ed = &view(&tab).ed;
-        for task in &ed.project().tasks {
+        // Blank rows (#80) are not scheduled.
+        for task in ed.project().tasks.iter().filter(|t| !t.is_null) {
             let actual = ed.schedule().get(task.uid).unwrap();
             if let Some(expected) = task.stored_start {
                 assert_eq!(
@@ -521,6 +522,19 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
     });
     let ed = ProjectEditor::new(p);
     assert_eq!(project_row(&ed, ed.project().task(9).unwrap())[5], "?999");
+}
+
+#[test]
+fn a_blank_row_shows_only_its_id() {
+    let xml = std::fs::read_to_string(corpus("20-task-fields.xml")).unwrap();
+    let ed = ProjectEditor::new(mspdi::read_mspdi(&xml).unwrap());
+    let blank = ed.project().task(3).unwrap();
+    assert!(blank.is_null);
+    assert_eq!(project_row(&ed, blank), ["3", "", "", "", "", "", ""]);
+    let pour = project_row(&ed, ed.project().task(4).unwrap());
+    // Pour's link from the blank row is kept but does not drive it.
+    assert_eq!((pour[1].as_str(), pour[5].as_str()), ("Pour", "2, 3"));
+    assert_eq!(pour[3], "2026-03-04");
 }
 
 fn summary_fixture(stored_summary_min: Option<i64>) -> ProjectEditor {

@@ -950,7 +950,12 @@ impl App {
 fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
     let fin = sched.project_finish.parts();
     let start = sched.project_start.parts();
-    let leaves = proj.tasks.iter().filter(|t| !t.summary).count();
+    // Blank rows (#80) are not tasks.
+    let leaves = proj
+        .tasks
+        .iter()
+        .filter(|t| !t.summary && !t.is_null)
+        .count();
     let crit = proj
         .tasks
         .iter()
@@ -974,6 +979,10 @@ fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
         String::new(),
     ];
     for t in proj.tasks.iter().take(16) {
+        if t.is_null {
+            out.push(String::new());
+            continue;
+        }
         let indent = "  ".repeat(t.outline_level.saturating_sub(1) as usize);
         let bullet = if t.summary {
             "▾"
@@ -1621,6 +1630,15 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     )));
     for i in app.top..end {
         let t = &app.ed.project().tasks[i];
+        if t.is_null {
+            // A blank row (#80) is not a task: an empty, still selectable line.
+            let mut line = Line::from(" ");
+            if i == app.ed.sel() {
+                line.style = Style::default().bg(app.sel_bg());
+            }
+            left_lines.push(line);
+            continue;
+        }
         let r = app.ed.schedule().get(t.uid);
         let indent = "  ".repeat((t.outline_level.saturating_sub(1)) as usize);
         let bullet = if t.summary {
@@ -2055,6 +2073,46 @@ mod tests {
             row.split_whitespace().collect::<Vec<_>>(),
             ["▾", "Phase", "4d", "0d"]
         );
+    }
+
+    #[test]
+    fn task_grid_and_gantt_leave_a_blank_row_empty() {
+        use ratatui::backend::TestBackend;
+        let proj =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-task-fields.xml"))
+                .unwrap();
+        assert!(proj.tasks[2].is_null);
+        let mut app = App::new(proj, None, false);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row = |y, xs: std::ops::Range<u16>| -> String {
+            xs.map(|x| buf.cell((x, y)).unwrap().symbol()).collect()
+        };
+        let (above, blank) = (app.list_y0 + 1, app.list_y0 + 2);
+        assert_eq!(
+            row(above, 1..45).split_whitespace().collect::<Vec<_>>(),
+            ["•", "Excavate", "2d", "0d"]
+        );
+        assert_eq!(row(blank, 1..45).trim(), "");
+        // No bar or milestone in the Gantt; weekend shading only.
+        let gantt = row(blank, app.gantt_x0..99);
+        assert!(gantt.chars().all(|c| c == ' ' || c == '·'), "{gantt}");
+    }
+
+    #[test]
+    fn preview_does_not_count_or_draw_a_blank_row() {
+        let proj =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-task-fields.xml"))
+                .unwrap();
+        let sched = projcore::schedule::schedule(&proj);
+        let lines = project_preview(&proj, &sched);
+        assert!(
+            lines.contains(&"Tasks:   3 (2 critical)".to_string()),
+            "{lines:?}"
+        );
+        let rows: Vec<_> = lines.iter().skip(5).map(|l| l.trim()).collect();
+        assert_eq!(rows, ["▾ Phase", "• Excavate", "", "• Pour", "• Inspect"]);
     }
 
     #[test]
