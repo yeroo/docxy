@@ -2622,6 +2622,27 @@ mod tests {
     }
 
     #[test]
+    fn n_on_a_summary_inserts_its_first_child() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.indent(1); // task 2 under task 1
+        app.ed.select(0);
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        let rows: Vec<_> = app
+            .ed
+            .project()
+            .tasks
+            .iter()
+            .map(|t| (t.uid, t.outline_level, t.summary))
+            .collect();
+        assert_eq!(rows, [(1, 1, true), (3, 2, false), (2, 2, false)]);
+        assert_eq!(app.ed.selected_uid(), Some(3));
+    }
+
+    #[test]
     fn deleting_a_summary_asks_first_and_takes_its_subtasks() {
         let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
         app.add_task();
