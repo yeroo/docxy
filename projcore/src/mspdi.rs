@@ -72,9 +72,16 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
                     "Calendars" => parse_calendars(&mut p, &mut proj.calendars),
-                    // An unknown element at this level: consume it whole so its
-                    // children can't be mistaken for header fields.
-                    _ => p.skip_element(),
+                    // Any other leaf is a project option docxy does not model:
+                    // keep its text so a save writes it back. A block with
+                    // child elements (OutlineCodes, ExtendedAttributes, ...) is
+                    // consumed whole so its children can't be mistaken for
+                    // header fields.
+                    _ => {
+                        if let Some(text) = leaf_text_of(&mut p) {
+                            set_option(&mut proj.options, name, text);
+                        }
+                    }
                 }
             }
             Event::Eof => break,
@@ -104,15 +111,40 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
 /// decoding XML entities. Any nested element is skipped whole. Consumes the
 /// element's closing `End`.
 fn text_of(p: &mut XmlParser) -> String {
+    element_text(p).0
+}
+
+/// Like [`text_of`], but `None` when the element has a child element, so a
+/// block is never flattened into the text of its leaves.
+fn leaf_text_of(p: &mut XmlParser) -> Option<String> {
+    let (text, leaf) = element_text(p);
+    leaf.then_some(text)
+}
+
+/// The element's decoded text, and whether it had no child elements.
+fn element_text(p: &mut XmlParser) -> (String, bool) {
     let mut s = String::new();
+    let mut leaf = true;
     loop {
         match p.next() {
             Event::Text => XmlParser::append_decoded(p.text(), &mut s),
-            Event::Start => p.skip_element(),
+            Event::Start => {
+                leaf = false;
+                p.skip_element();
+            }
             Event::End | Event::Eof => break,
         }
     }
-    s
+    (s, leaf)
+}
+
+/// Store an unmodeled project option. A repeated name keeps its first
+/// position and takes the later value, as a reader of the last value would.
+fn set_option(options: &mut Vec<(String, String)>, name: String, text: String) {
+    match options.iter_mut().find(|(n, _)| *n == name) {
+        Some(slot) => slot.1 = text,
+        None => options.push((name, text)),
+    }
 }
 
 /// Reject ambiguous explicit IDs before allocating missing ones in file order.
@@ -656,8 +688,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Serialize a [`Project`] back to MSPDI XML.
 ///
 /// Emits the fields projcore models — enough for MS Project to open the file
-/// and for our own reader to round-trip. Elements outside the model (custom
-/// fields, views, extended attributes) are not preserved: this is a
+/// and for our own reader to round-trip — plus, in [`PROJECT_HEADER`] order,
+/// every project-level option the reader kept verbatim in
+/// [`Project::options`]. Other elements outside the model (custom fields,
+/// views, extended attributes, outline codes) are not preserved: this is a
 /// model-faithful writer, not a byte-faithful one. Each task's stored
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
 /// stamping them back), so a scheduled project exports with dates Project can
@@ -672,43 +706,18 @@ pub fn write_mspdi(proj: &Project) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     s.push_str("<Project xmlns=\"http://schemas.microsoft.com/project\">\n");
-    tag(&mut s, 1, "Name", &proj.name);
-    if !proj.title.is_empty() {
-        tag(&mut s, 1, "Title", &proj.title);
+    for &name in PROJECT_HEADER {
+        if let Some(text) = header_text(proj, name) {
+            tag(&mut s, 1, name, &text);
+        }
     }
-    tag(
-        &mut s,
-        1,
-        "MinutesPerDay",
-        &((proj.hours_per_day * 60.0).round() as i64).to_string(),
-    );
-    tag(
-        &mut s,
-        1,
-        "MinutesPerWeek",
-        &((proj.hours_per_week * 60.0).round() as i64).to_string(),
-    );
-    tag(
-        &mut s,
-        1,
-        "CalendarUID",
-        &proj.default_calendar_uid.to_string(),
-    );
-    if let Some(d) = proj.start_date {
-        tag(&mut s, 1, "StartDate", &d.to_mspdi());
+    // Options the schema does not name (a newer Project's, or another
+    // emitter's) still survive, after the ones it does.
+    for (name, text) in &proj.options {
+        if !PROJECT_HEADER.contains(&name.as_str()) {
+            tag(&mut s, 1, name, text);
+        }
     }
-    tag(
-        &mut s,
-        1,
-        "HonorConstraints",
-        if proj.honor_constraints { "1" } else { "0" },
-    );
-    tag(
-        &mut s,
-        1,
-        "NewTasksAreManual",
-        if proj.new_tasks_are_manual { "1" } else { "0" },
-    );
 
     s.push_str("  <Tasks>\n");
     let sched = crate::schedule::schedule(proj);
@@ -745,6 +754,97 @@ pub fn write_mspdi(proj: &Project) -> String {
 
     s.push_str("</Project>\n");
     s
+}
+
+/// The scalar children of MSPDI's `<Project>`, in the schema's sequence order
+/// (the order Project itself writes them). The writer walks it to place the
+/// modeled fields and the stored options; it never filters what the reader
+/// keeps.
+const PROJECT_HEADER: &[&str] = &[
+    "SaveVersion",
+    "BuildNumber",
+    "Name",
+    "GUID",
+    "Title",
+    "Subject",
+    "Category",
+    "Company",
+    "Manager",
+    "Author",
+    "CreationDate",
+    "Revision",
+    "LastSaved",
+    "ScheduleFromStart",
+    "StartDate",
+    "FinishDate",
+    "FYStartDate",
+    "CriticalSlackLimit",
+    "CurrencyDigits",
+    "CurrencySymbol",
+    "CurrencyCode",
+    "CurrencySymbolPosition",
+    "CalendarUID",
+    "DefaultStartTime",
+    "DefaultFinishTime",
+    "MinutesPerDay",
+    "MinutesPerWeek",
+    "DaysPerMonth",
+    "DefaultTaskType",
+    "DefaultFixedCostAccrual",
+    "DefaultStandardRate",
+    "DefaultOvertimeRate",
+    "DurationFormat",
+    "WorkFormat",
+    "EditableActualCosts",
+    "HonorConstraints",
+    "EarnedValueMethod",
+    "InsertedProjectsLikeSummary",
+    "MultipleCriticalPaths",
+    "NewTasksEffortDriven",
+    "NewTasksEstimated",
+    "SplitsInProgressTasks",
+    "SpreadActualCost",
+    "SpreadPercentComplete",
+    "TaskUpdatesResource",
+    "FiscalYearStart",
+    "WeekStartDay",
+    "MoveCompletedEndsBack",
+    "MoveRemainingStartsBack",
+    "MoveRemainingStartsForward",
+    "MoveCompletedEndsForward",
+    "BaselineForEarnedValue",
+    "AutoAddNewResourcesAndTasks",
+    "StatusDate",
+    "CurrentDate",
+    "MicrosoftProjectServerURL",
+    "Autolink",
+    "NewTaskStartDate",
+    "NewTasksAreManual",
+    "DefaultTaskEVMethod",
+    "ProjectExternallyEdited",
+    "ExtendedCreationDate",
+    "ActualsInSync",
+    "RemoveFileProperties",
+    "AdminProject",
+    "UpdateManuallyScheduledTasksWhenEditingLinks",
+    "KeepTaskOnNearestWorkingTimeWhenMadeAutoScheduled",
+];
+
+/// The text a save writes for one header element: the modeled value (never
+/// `None` for the fields always written), else the option stored verbatim.
+fn header_text(proj: &Project, name: &str) -> Option<String> {
+    let flag = |on: bool| Some(if on { "1" } else { "0" }.to_string());
+    match name {
+        "Name" => Some(proj.name.clone()),
+        "Title" => (!proj.title.is_empty()).then(|| proj.title.clone()),
+        "StartDate" => proj.start_date.map(|d| d.to_mspdi()),
+        "CalendarUID" => Some(proj.default_calendar_uid.to_string()),
+        "MinutesPerDay" => Some(((proj.hours_per_day * 60.0).round() as i64).to_string()),
+        "MinutesPerWeek" => Some(((proj.hours_per_week * 60.0).round() as i64).to_string()),
+        "HonorConstraints" => flag(proj.honor_constraints),
+        "NewTasksAreManual" => flag(proj.new_tasks_are_manual),
+        _ => proj.option(name).map(str::to_string),
+    }
 }
 
 /// The computed values a save writes for one task, from docxy's own schedule.
@@ -2595,5 +2695,205 @@ mod tests {
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
         assert_eq!(package.tasks, proj.tasks);
+    }
+
+    /// The `<Project>` header of a written file: each child up to the first
+    /// collection, as (name, decoded text); a child with children gets "<block>".
+    fn header_of(xml: &str) -> Vec<(String, String)> {
+        let mut p = XmlParser::new(xml);
+        while !(p.next() == Event::Start && p.name() == "Project") {}
+        let mut header = Vec::new();
+        loop {
+            match p.next() {
+                Event::Start if p.name() == "Tasks" => break,
+                Event::Start => {
+                    let name = p.name().to_string();
+                    let text = leaf_text_of(&mut p).unwrap_or_else(|| "<block>".into());
+                    header.push((name, text));
+                }
+                Event::End | Event::Eof => break,
+                Event::Text => {}
+            }
+        }
+        header
+    }
+
+    /// Issue #82's list of the options a save lost, typed out independently of
+    /// `PROJECT_HEADER` so a gap in that table cannot hide here.
+    const ISSUE_82_OPTIONS: &[&str] = &[
+        "ScheduleFromStart",
+        "HonorConstraints",
+        "NewTasksAreManual",
+        "NewTasksEffortDriven",
+        "NewTasksEstimated",
+        "DefaultTaskType",
+        "Autolink",
+        "CriticalSlackLimit",
+        "MultipleCriticalPaths",
+        "DefaultStartTime",
+        "DefaultFinishTime",
+        "DaysPerMonth",
+        "WeekStartDay",
+        "FYStartDate",
+        "FiscalYearStart",
+        "SplitsInProgressTasks",
+        "MoveCompletedEndsBack",
+        "MoveCompletedEndsForward",
+        "MoveRemainingStartsBack",
+        "MoveRemainingStartsForward",
+        "SpreadPercentComplete",
+        "SpreadActualCost",
+        "TaskUpdatesResource",
+        "ActualsInSync",
+        "EditableActualCosts",
+        "EarnedValueMethod",
+        "DefaultTaskEVMethod",
+        "BaselineForEarnedValue",
+        "DefaultFixedCostAccrual",
+        "CurrencySymbol",
+        "CurrencyCode",
+        "CurrencyDigits",
+        "CurrencySymbolPosition",
+        "DurationFormat",
+        "WorkFormat",
+        "CurrentDate",
+        "FinishDate",
+        "Author",
+        "GUID",
+        "CreationDate",
+        "LastSaved",
+        "Revision",
+        "SaveVersion",
+    ];
+
+    /// A header carrying every schema option, in reverse schema order so the
+    /// writer's order cannot come from the input's. Modeled fields get values
+    /// they format back identically; the rest get a value unique to them.
+    fn full_header() -> Vec<(String, String)> {
+        PROJECT_HEADER
+            .iter()
+            .map(|&name| {
+                let text = match name {
+                    "Name" => "Plan".to_string(),
+                    "Title" => "Backward plan".to_string(),
+                    "StartDate" => "2026-03-02T08:00:00".to_string(),
+                    "CalendarUID" => "1".to_string(),
+                    "MinutesPerDay" => "420".to_string(),
+                    "MinutesPerWeek" => "2100".to_string(),
+                    "HonorConstraints" => "0".to_string(),
+                    "NewTasksAreManual" => "1".to_string(),
+                    "ScheduleFromStart" => "0".to_string(),
+                    _ => format!("{name}-value"),
+                };
+                (name.to_string(), text)
+            })
+            .collect()
+    }
+
+    fn header_xml(header: &[(String, String)], extra: &str) -> String {
+        let mut xml = String::from("<Project>");
+        for (name, text) in header.iter().rev() {
+            xml.push_str(&format!("<{name}>{text}</{name}>"));
+        }
+        xml.push_str(extra);
+        xml.push_str("<Tasks/></Project>");
+        xml
+    }
+
+    #[test]
+    fn every_project_option_survives_mspdi_and_yppx_saves_in_schema_order() {
+        let expected = full_header();
+        for name in ISSUE_82_OPTIONS {
+            assert!(expected.iter().any(|(n, _)| n == name), "{name} untested");
+        }
+        let proj = read_mspdi(&header_xml(&expected, "")).unwrap();
+        assert_eq!(proj.option("ScheduleFromStart"), Some("0"));
+        let xml = write_mspdi(&proj);
+        // Every option once, with its text, in schema order.
+        assert_eq!(header_of(&xml), expected);
+        assert!(xml.contains("<ScheduleFromStart>0</ScheduleFromStart>"));
+        // A save stores the options in schema order; the saved file reads back
+        // to the same header.
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(header_of(&write_mspdi(&package)), expected);
+    }
+
+    #[test]
+    fn project_options_keep_xml_specials_and_empty_values() {
+        let proj = read_mspdi(
+            "<Project><Author>A &amp; B</Author><Subject/>\
+             <CurrencySymbol>&lt;€&gt;</CurrencySymbol></Project>",
+        )
+        .unwrap();
+        assert_eq!(proj.option("Author"), Some("A & B"));
+        assert_eq!(proj.option("Subject"), Some(""));
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Author>A &amp; B</Author>"));
+        assert!(xml.contains("<CurrencySymbol>&lt;€&gt;</CurrencySymbol>"));
+        assert!(xml.contains("<Subject></Subject>"));
+        let back = read_mspdi(&xml).unwrap();
+        for name in ["Author", "Subject", "CurrencySymbol"] {
+            assert_eq!(back.option(name), proj.option(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_leaf_options_survive_after_the_schema_ones_and_blocks_do_not() {
+        let proj = read_mspdi(
+            "<Project><ZzFutureOption>7</ZzFutureOption><Author>Me</Author>\
+             <ZzBlock><A>1</A></ZzBlock><ZzRepeat>a</ZzRepeat>\
+             <ExtendedAttributes><ExtendedAttribute><FieldID>1</FieldID>\
+             </ExtendedAttribute></ExtendedAttributes>\
+             <ZzOther>x</ZzOther><ZzRepeat>b</ZzRepeat><Tasks/></Project>",
+        )
+        .unwrap();
+        let xml = write_mspdi(&proj);
+        let header = header_of(&xml);
+        let names: Vec<&str> = header.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Name",
+                "Author",
+                "CalendarUID",
+                "MinutesPerDay",
+                "MinutesPerWeek",
+                "HonorConstraints",
+                "NewTasksAreManual",
+                "ZzFutureOption",
+                "ZzRepeat",
+                "ZzOther",
+            ]
+        );
+        // A repeat keeps its first place and takes the later value.
+        assert_eq!(
+            header[7..],
+            [
+                ("ZzFutureOption".to_string(), "7".to_string()),
+                ("ZzRepeat".to_string(), "b".to_string()),
+                ("ZzOther".to_string(), "x".to_string()),
+            ]
+        );
+        assert!(!xml.contains("ZzBlock") && !xml.contains("<A>") && !xml.contains("FieldID"));
+    }
+
+    #[test]
+    fn absent_project_options_stay_absent() {
+        let proj = read_mspdi("<Project><HoursPerDay>7</HoursPerDay></Project>").unwrap();
+        // HoursPerDay is modeled (written back as MinutesPerDay), not stored.
+        assert!(proj.options.is_empty());
+        let header = header_of(&write_mspdi(&proj));
+        assert_eq!(
+            header,
+            [
+                ("Name", ""),
+                ("CalendarUID", "1"),
+                ("MinutesPerDay", "420"),
+                ("MinutesPerWeek", "2100"),
+                ("HonorConstraints", "1"),
+                ("NewTasksAreManual", "0"),
+            ]
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+        );
     }
 }
