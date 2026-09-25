@@ -64,6 +64,15 @@ impl ProjectView {
         self.clamp_offsets();
     }
 
+    /// The drawn scale: the plan's, widened to the viewport so a short plan's chart still has
+    /// days to its right edge. Scrolling clamps to the plan's own scale, not this one.
+    pub fn chart_scale(&self) -> GanttScale {
+        GanttScale {
+            days: self.scale.days.max((self.gantt_w / DAY_W).ceil() as i64),
+            ..self.scale
+        }
+    }
+
     fn clamp_offsets(&mut self) {
         self.table_x.clamp(TABLE_W, self.table_w);
         self.gantt_x.clamp(self.scale.width(), self.gantt_w);
@@ -257,12 +266,22 @@ fn project_region(
     }
 }
 
-pub(super) fn project_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Json)> {
+/// `body_h` is the last frame's `project-body` height; `None` before the first layout.
+pub(super) fn project_state(
+    v: &ProjectView,
+    body_h: Option<f32>,
+) -> Vec<(String, ctlcore::json::Json)> {
     use ctlcore::json::Json;
     let scale = gantt_scale(&v.ed);
+    let count = v.ed.project().tasks.len();
+    let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
     let mut entries = vec![
         ("selected_task".into(), Json::Num(v.ed.sel() as f64)),
-        ("tasks".into(), Json::Num(v.ed.project().tasks.len() as f64)),
+        ("tasks".into(), Json::Num(count as f64)),
+        (
+            "filler_rows".into(),
+            Json::Num(body_h.map_or(0, |h| filler_rows(h, scroll_y, count)) as f64),
+        ),
         (
             "prompt".into(),
             Json::Str(
@@ -731,7 +750,7 @@ pub(super) fn project_el(
         view.gantt_w,
         view.table_x.get(),
         view.gantt_x.get(),
-        view.scale,
+        view.chart_scale(),
     );
     let (table_bar, chart_bar) = view.pane_scrolls();
     let vbar = harness::region_name(harness::Region::ProjectVbar);
@@ -776,18 +795,24 @@ pub(super) fn project_el(
                 // Above the vertical scrollbar.
                 .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
         )
-        .when(count == 0, |d| {
-            d.child(div().p_4().text_color(pal.dim).child("No tasks"))
-        })
         .child(
             div()
+                .id(("project-body", index))
                 .relative()
                 .flex()
                 .flex_1()
                 .min_h_0()
                 .w_full()
                 .overflow_hidden()
+                .child(body_grid(view, pal))
                 .child(probe(probes, "project-body"))
+                // Rows stop propagation, so only the ruled empty rows land here.
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(tab) = this.tabs.get_mut(index) {
+                        project_blank_click(tab);
+                    }
+                    this.refocus(window, cx);
+                }))
                 .child(
                     uniform_list(
                         ("project-rows", index),
@@ -833,13 +858,12 @@ pub(super) fn project_el(
                                                     gantt_bar(&v.ed, task, scale),
                                                     task.id,
                                                     scale,
-                                                    gantt_x,
-                                                    gantt_w,
                                                     pal,
                                                     &row_probes,
                                                 ),
                                             ))
                                             .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
                                                 if let Some(tab) = this.tabs.get_mut(index) {
                                                     project_cell_click(tab, i, None, false);
                                                 }
@@ -870,7 +894,22 @@ pub(super) fn project_el(
                                 .id(SharedString::from(vbar))
                                 .scrollbar_show(ScrollbarShow::Always),
                         ),
-                ),
+                )
+                .when(count == 0, |d| {
+                    // Over the first ruled row, so the grid runs under it.
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h(px(ROW_H))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .text_color(pal.dim)
+                            .child("No tasks"),
+                    )
+                }),
         )
         // Independent horizontal bars under the table and the chart, as in Project.
         .child(

@@ -256,6 +256,7 @@ State keys, as the app reports them after every driving verb:
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name, and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
+| `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
 
 Dotted keys traverse objects, and numeric components index arrays: `assert
