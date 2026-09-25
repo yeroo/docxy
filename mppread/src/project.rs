@@ -5,10 +5,12 @@ use projcore::{ConstraintType, DateTime, LinkType, Predecessor, Project, Task};
 
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
-/// a task. Each decoded leaf is pinned
+/// a task. Each decoded auto leaf is pinned
 /// with a Must-Start-On constraint at its start and given a duration equal to
 /// the working minutes between its start and finish, so the scheduler reproduces
-/// the real dates.
+/// the real dates. A **manual** leaf keeps its mode and its manual start,
+/// finish and duration instead, which hold it where Project put it without a
+/// constraint; the project's new-task mode comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
 /// rollup come through, and the **predecessor links** decode from the `TBkndCons`
 /// table. Save As converts it to `.yppx`/MSPDI.
@@ -16,6 +18,8 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let decoded = crate::mpp::decode_tasks(bytes)
         .map_err(|e| format!("cannot read the task table of this .mpp ({e})"))?;
+    let new_tasks_are_manual = crate::mpp::decode_new_tasks_are_manual(bytes)
+        .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
     let name = [
         info.title.clone(),
         info.subject.clone(),
@@ -77,10 +81,27 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 .ok_or_else(|| format!("invalid finish date for UID {}", t.uid))?;
             task.stored_start = Some(s);
             task.stored_finish = Some(f);
+            task.manual = t.manual;
+            let manual_date = |d: &Option<String>, what: &str| {
+                d.as_deref()
+                    .map(|d| {
+                        parse_mpp_dt(d)
+                            .ok_or_else(|| format!("invalid manual {what} for UID {}", t.uid))
+                    })
+                    .transpose()
+            };
+            task.manual_start = manual_date(&t.manual_start, "start")?;
+            task.manual_finish = manual_date(&t.manual_finish, "finish")?;
+            task.manual_duration_min = t.manual_duration_min;
             // Pin only leaf tasks; a summary's dates roll up from its
-            // children, so a constraint on it would fight the rollup.
+            // children, so a constraint on it would fight the rollup. A
+            // manual leaf is held by its pinned dates, not a constraint.
             if is_summary {
                 task.duration_min = 0;
+            } else if t.manual {
+                task.duration_min = t
+                    .manual_duration_min
+                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
             } else {
                 task.duration_min = projcore::schedule::working_minutes_between(&cal_ref, s, f);
                 task.constraint = ConstraintType::MustStartOn;
@@ -99,6 +120,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         title: info.title,
         start_date: Some(start),
         tasks,
+        new_tasks_are_manual,
         ..Project::default()
     })
 }

@@ -58,6 +58,14 @@ pub struct MppTask {
     pub outline_level: Option<u32>,
     /// Predecessor links onto this task, when the link table decodes.
     pub predecessors: Vec<MppPred>,
+    /// Manually scheduled. Project 2003 (MPP9) has no manual tasks.
+    pub manual: bool,
+    /// A manual task's pinned dates and duration (working minutes), as
+    /// stored. They are `None` on an auto task: Project keeps stale values
+    /// there and its MSPDI export writes Start/Finish/Duration instead.
+    pub manual_start: Option<String>,
+    pub manual_finish: Option<String>,
+    pub manual_duration_min: Option<i64>,
 }
 
 /// A predecessor link with Project's stable UID and MSPDI kind code
@@ -75,6 +83,15 @@ pub type MppError = String;
 /// Decode task rows only when the binary table has a recognized structure.
 pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {
     crate::taskdecode::decode(bytes)
+}
+
+/// Decode the project's default mode for new tasks (MSPDI
+/// `NewTasksAreManual`). MPP9 predates manual tasks, and a file without a task
+/// table has nothing to default, so both read `false`. Any other layout that
+/// [`decode_tasks`] does not recognize, or a missing or unrecognized value, is
+/// an error.
+pub fn decode_new_tasks_are_manual(bytes: &[u8]) -> Result<bool, MppError> {
+    crate::taskdecode::new_tasks_are_manual(bytes)
 }
 
 /// Exploratory, lossy task-name helper. Imports use [`decode_tasks`] instead.
