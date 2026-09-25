@@ -428,6 +428,19 @@ fn timeline_state_names_the_span_and_follows_leveling() {
     assert_eq!(leveled, Json::Str(project_date(v.ed.disp_project_finish())));
     v.ed.toggle_level();
     assert_eq!(get(&v, "timeline_finish"), unleveled);
+
+    // A manual task pinned before the project start is drawn there, so the
+    // Timeline starts with it rather than at the scheduler's anchor.
+    let mut early = task(1, 1, 1);
+    early.manual = true;
+    early.manual_start = Some(projcore::DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+    let mut p = untitled_project();
+    p.start_date = Some(projcore::DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+    p.tasks = vec![early, task(2, 1, 1)];
+    let v = ProjectView::new(p, false);
+    assert_eq!(project_date(v.ed.schedule().project_start), "Mon 3/9/26");
+    assert_eq!(get(&v, "timeline_start"), Json::Str("Mon 3/2/26".into()));
+    assert_eq!(get(&v, "timeline_finish"), Json::Str("Mon 3/9/26".into()));
 }
 
 #[test]

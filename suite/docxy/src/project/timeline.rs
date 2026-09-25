@@ -91,10 +91,10 @@ pub(crate) struct TimelineRuler {
     pub ticks: Vec<(f32, String)>,
 }
 
-/// The ruler for the plan as displayed: the project start to the displayed
-/// (leveled when leveling is on) finish.
+/// The ruler for the plan as displayed: from the earliest date the Gantt draws
+/// to the latest (leveled when leveling is on).
 pub(crate) fn timeline_ruler(ed: &ProjectEditor, width: f32) -> TimelineRuler {
-    ruler(ed.schedule().project_start, ed.disp_project_finish(), width)
+    ruler(ed.disp_project_start(), ed.disp_project_finish(), width)
 }
 
 /// Days `[start_day, finish_day]` spread over `width` px, ticked in the finest
