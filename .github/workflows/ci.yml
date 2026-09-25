@@ -25,6 +25,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # docxy's `html-export` feature builds the docxwasm engine it embeds.
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux clipboard deps (arboard)
         if: runner.os == 'Linux'
@@ -35,10 +37,12 @@ jobs:
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (html-export)
+        run: cargo clippy -p docxy --all-targets --features html-export -- -D warnings
       - name: Build
-        run: cargo build --workspace --locked
+        run: cargo build --workspace --locked --features docxy/html-export
       - name: Test
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked --features docxy/html-export
 
   msrv:
     name: msrv (1.88)
@@ -103,8 +107,63 @@ jobs:
         run: cargo fmt --all --check --manifest-path suite/Cargo.toml
       - name: Clippy
         run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
+      # Includes ribbon_export: the checked-in ribbon snapshot the editable-HTML
+      # page draws must match the suite's live ribbon.
       - name: Test
         run: cargo test --manifest-path suite/Cargo.toml --locked
+
+  webapp:
+    name: editable HTML (${{ matrix.os }})
+    # The browser half of editable HTML (htmlbundle/web): node unit tests, then
+    # Playwright in Chromium and Firefox against pages exported by a real
+    # docxy. Screenshot baselines (@visual) run on Windows only, where the
+    # document fonts exist; the ubuntu leg runs everything else.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux clipboard deps (arboard)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+      - name: Build docxy with HTML export
+        run: cargo build -p docxy --features html-export --locked
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+      - name: Install
+        working-directory: webapp
+        run: npm ci
+      - name: Install browsers
+        working-directory: webapp
+        run: npx playwright install --with-deps chromium firefox
+      - name: Unit tests
+        working-directory: webapp
+        run: npm run test:unit
+      - name: Browser tests
+        working-directory: webapp
+        env:
+          CI: "1"
+          DOCXY_BIN: ../target/debug/docxy
+        run: npx playwright test
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report-${{ matrix.os }}
+          path: |
+            webapp/playwright-report
+            webapp/test-results
 
   jetbrains:
     name: jetbrains plugin
