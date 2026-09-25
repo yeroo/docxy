@@ -442,7 +442,10 @@ impl Editor {
                 t.name = name;
             }
             if let Some(min) = patch.duration_min {
-                if was_blank || min != t.duration_min {
+                // Against the row as materialized: a blank row's default
+                // `1 day?` (and a manual plan's ManualDuration) is replaced.
+                let changed = was_blank || min != t.duration_min;
+                if changed {
                     commit_estimate(t);
                 }
                 t.duration_min = min;
@@ -450,7 +453,7 @@ impl Editor {
                 // A manual task keeps its start; its finish follows a new
                 // duration instead of staying pinned. Repeating the current
                 // duration keeps a pinned finish.
-                if t.manual && duration_changed {
+                if t.manual && changed {
                     t.manual_duration_min = Some(min);
                     t.manual_finish = None;
                 }
@@ -460,7 +463,8 @@ impl Editor {
             }
         })?;
         // Only a date change restamps: projcore ignores calendar exceptions,
-        // so our finish can differ from the one Project wrote.
+        // so our finish can differ from the one Project wrote. A blank row's
+        // new dates are stamped by edit_row.
         if duration_changed {
             self.stamp_pinned_dates(uid);
         }
@@ -1941,7 +1945,56 @@ mod tests {
             (t.stored_start, t.stored_finish),
             (Some(start), Some(r.early_finish))
         );
-        // Every materializing edit pins it, not only the date edits.
+        // A typed start or finish is the manual task's own date, not an
+        // SNET/FNET constraint, and the schedule puts it on the typed day
+        // (Wednesday; the project starts on Monday the 5th).
+        let manual_plan = || {
+            let mut proj = blank_row_editor().project().clone();
+            proj.new_tasks_are_manual = true;
+            Editor::new(proj)
+        };
+        let wednesday = DateTime::from_ymd_hm(2026, 1, 7, 0, 0);
+        let mut ed = manual_plan();
+        ed.set_start(3, wednesday).unwrap();
+        let t = ed.project().tasks[1].clone();
+        let typed = DateTime::from_ymd_hm(2026, 1, 7, 8, 0);
+        assert!(t.manual && !t.is_null);
+        assert_eq!((t.manual_start, t.manual_finish), (Some(typed), None));
+        assert_eq!(t.constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(ed.schedule().get(3).unwrap().early_start, typed);
+        assert_eq!(t.stored_start, Some(typed));
+        let mut ed = manual_plan();
+        ed.set_finish(3, wednesday).unwrap();
+        let t = ed.project().tasks[1].clone();
+        let end = DateTime::from_ymd_hm(2026, 1, 7, 17, 0);
+        assert!(t.manual && !t.is_null);
+        assert_eq!((t.manual_start, t.manual_finish), (Some(start), Some(end)));
+        assert_eq!((t.duration_min, t.manual_duration_min), (1440, Some(1440)));
+        assert_eq!(t.constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(ed.schedule().get(3).unwrap().early_finish, end);
+        // Typing the project start itself still makes the row a task.
+        let mut ed = manual_plan();
+        ed.set_start(3, DateTime::from_ymd_hm(2026, 1, 5, 0, 0))
+            .unwrap();
+        assert!(!ed.project().tasks[1].is_null);
+        assert_eq!(ed.undo_depth(), 1);
+        // A zero duration or milestone toggle replaces the default ManualDuration.
+        for edit in [
+            |ed: &mut Editor| ed.toggle_milestone(3),
+            |ed: &mut Editor| ed.set_duration_min(3, 0),
+        ] {
+            let mut ed = manual_plan();
+            edit(&mut ed).unwrap();
+            let t = &ed.project().tasks[1];
+            assert_eq!(
+                (t.duration_min, t.manual_duration_min, t.milestone),
+                (0, Some(0), true)
+            );
+            assert_eq!(t.stored_finish, Some(start));
+        }
+        // Every materializing edit pins it, not only the date edits. An
+        // explicit constraint is recorded, but a manual task stays at its
+        // pinned start (the project start), as in Project.
         for edit in [
             |ed: &mut Editor| ed.set_constraint(3, "SNET 2026-01-07"),
             |ed: &mut Editor| ed.add_predecessor(3, 1, LinkType::FinishStart, 0),

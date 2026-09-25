@@ -68,16 +68,18 @@ impl Editor {
 
     /// Set a task's start to a typed day. A manual task moves there, at the
     /// day's first working time, keeping its duration; an auto task gets a
-    /// Start-No-Earlier-Than constraint on that day.
+    /// Start-No-Earlier-Than constraint on that day. A blank row is judged as
+    /// the task the edit makes it (manual in a plan whose new tasks are).
     pub fn set_start(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
-        let task = &self.proj.tasks[i];
+        let blank = self.proj.tasks[i].is_null;
+        let task = &self.row_as_edited(i);
         if !task.manual {
             return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(day));
         }
         self.validate_pinned_day(day)?;
         let start = day_start(&self.proj, task, day);
-        if task.manual_start == Some(start) && task.manual_finish.is_none() {
+        if !blank && task.manual_start == Some(start) && task.manual_finish.is_none() {
             return Ok(());
         }
         self.edit_row(i, |proj, _| {
@@ -91,10 +93,12 @@ impl Editor {
 
     /// Set a task's finish to a typed day. A manual task keeps its start and
     /// its duration becomes the working time up to the day's last working
-    /// time; an auto task gets a Finish-No-Earlier-Than constraint.
+    /// time; an auto task gets a Finish-No-Earlier-Than constraint. A blank
+    /// row is judged as the task the edit makes it, as in [`Self::set_start`].
     pub fn set_finish(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
-        let task = &self.proj.tasks[i];
+        let blank = self.proj.tasks[i].is_null;
+        let task = &self.row_as_edited(i);
         if !task.manual {
             let finish = day_finish(&self.proj, task, day)?;
             return self.set_constraint_typed(
@@ -115,7 +119,7 @@ impl Editor {
         }
         let calendar = task_calendar(&self.proj, task);
         let duration = crate::schedule::working_minutes_on(&calendar, start, finish);
-        if task.manual_start == Some(start) && task.manual_finish == Some(finish) {
+        if !blank && task.manual_start == Some(start) && task.manual_finish == Some(finish) {
             return Ok(());
         }
         self.validate_cell_horizon(uid, Some(duration), None)?;
