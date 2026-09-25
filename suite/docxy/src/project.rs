@@ -12,6 +12,8 @@ mod commands;
 pub(super) use commands::*;
 mod cell;
 pub(super) use cell::*;
+mod timeline;
+pub(super) use timeline::*;
 
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
@@ -25,6 +27,10 @@ pub(super) struct ProjectView {
     pub col: usize,
     pub cell: Option<CellEdit>,
     pub exported: Option<String>,
+    /// The whole pane's width, which the Timeline spans.
+    pub width: f32,
+    /// Whether the Timeline pane is shown: window view state, never saved.
+    pub timeline: bool,
 }
 
 impl ProjectView {
@@ -43,6 +49,8 @@ impl ProjectView {
             col: 1,
             cell: None,
             exported: None,
+            width: 590. + SCROLLBAR_W,
+            timeline: true,
         }
     }
 
@@ -51,6 +59,7 @@ impl ProjectView {
     pub fn layout(&mut self, width: f32) {
         let table_w = table_pane_width(width);
         let resized = table_w != self.table_w;
+        self.width = width;
         self.table_w = table_w;
         self.gantt_w = (width - table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
         self.refresh_schedule_layout();
@@ -207,6 +216,14 @@ fn project_region(
     region: harness::Region,
 ) -> Result<Bounds<Pixels>, String> {
     // The strips are probed under their region names; they need no Gantt viewport.
+    if let harness::Region::ProjectTimeline = region {
+        if !v.timeline {
+            return Err("the Timeline is hidden (View > Split View > Timeline)".into());
+        }
+        return probes
+            .get(&harness::region_name(region))
+            .ok_or_else(|| "the Timeline has not been laid out".into());
+    }
     if let harness::Region::ProjectHbarTable
     | harness::Region::ProjectHbarChart
     | harness::Region::ProjectVbar = region
@@ -317,6 +334,7 @@ pub(super) fn project_state(
         )
     }));
     entries.extend(project_cell_state(v));
+    entries.extend(timeline_state(v));
     entries.push(("undo_depth".into(), Json::Num(v.ed.undo_depth() as f64)));
     entries.push(("redo_depth".into(), Json::Num(v.ed.redo_depth() as f64)));
     entries
@@ -721,7 +739,7 @@ fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement 
         .child(div().absolute().left(px(-offset)).top_0().child(content))
 }
 
-fn timeline_pane(width: f32, offset: f32, pal: Pal, content: impl IntoElement) -> impl IntoElement {
+fn chart_pane(width: f32, offset: f32, pal: Pal, content: impl IntoElement) -> impl IntoElement {
     h_flex()
         .w(px(width + GANTT_INSET))
         .h(px(ROW_H))
@@ -763,6 +781,7 @@ pub(super) fn project_el(
         .overflow_hidden()
         .text_color(pal.fg)
         .text_size(px(12.))
+        .when(view.timeline, |d| d.child(timeline_el(view, pal, probes)))
         .child(
             h_flex()
                 .h(px(ROW_H))
@@ -786,7 +805,7 @@ pub(super) fn project_el(
                         0.,
                     ),
                 ))
-                .child(timeline_pane(
+                .child(chart_pane(
                     gantt_w,
                     gantt_x,
                     pal,
@@ -850,7 +869,7 @@ pub(super) fn project_el(
                                                     cx,
                                                 ),
                                             ))
-                                            .child(timeline_pane(
+                                            .child(chart_pane(
                                                 gantt_w,
                                                 gantt_x,
                                                 pal,

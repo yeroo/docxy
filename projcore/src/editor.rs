@@ -154,6 +154,30 @@ impl Editor {
         }
     }
 
+    /// The earliest displayed date: the project start, or earlier when a task
+    /// is shown before it (a manual task pinned there, or an SF-driven one).
+    pub fn disp_project_start(&self) -> DateTime {
+        self.proj
+            .tasks
+            .iter()
+            .filter_map(|t| self.disp_start(t.uid))
+            .fold(self.sched.project_start, DateTime::min)
+    }
+
+    /// The latest displayed date: the leveled finish while leveling is on,
+    /// otherwise the schedule's, or later when a task is shown after it.
+    pub fn disp_project_finish(&self) -> DateTime {
+        let finish = match &self.level {
+            Some(lv) => lv.project_finish,
+            None => self.sched.project_finish,
+        };
+        self.proj
+            .tasks
+            .iter()
+            .filter_map(|t| self.disp_finish(t.uid))
+            .fold(finish, DateTime::max)
+    }
+
     /// The duration shown alongside [`Self::disp_start`]/[`Self::disp_finish`]:
     /// a leaf's own duration, or a summary's working time between its displayed
     /// (leveled when leveling is on) dates. `None` for an unknown or
@@ -1282,6 +1306,51 @@ mod tests {
             ed.disp_start(2),
             Some(ed.schedule().get(2).unwrap().early_start)
         );
+    }
+
+    #[test]
+    fn displayed_project_span_reaches_a_manual_task_outside_it() {
+        let ed = editor();
+        let (start, finish) = (ed.disp_project_start(), ed.disp_project_finish());
+        assert_eq!(
+            start,
+            ed.schedule().project_start,
+            "an ordinary plan is unchanged"
+        );
+        assert_eq!(finish, ed.schedule().project_finish);
+
+        let mut proj = ed.project().clone();
+        proj.tasks[0].manual = true;
+        proj.tasks[0].manual_start = Some(DateTime::from_ymd_hm(2025, 12, 29, 8, 0));
+        proj.tasks[1].manual = true;
+        proj.tasks[1].manual_start = Some(DateTime::from_ymd_hm(2026, 2, 2, 8, 0));
+        let ed = Editor::new(proj);
+        assert_eq!(ed.disp_project_start(), ed.disp_start(1).unwrap());
+        assert!(ed.disp_project_start() < ed.schedule().project_start);
+        assert_eq!(ed.disp_project_finish(), ed.disp_finish(2).unwrap());
+        assert!(ed.disp_project_finish() >= ed.schedule().project_finish);
+    }
+
+    #[test]
+    fn displayed_project_finish_follows_leveling() {
+        let mut ed = editor();
+        ed.assign_resource(1, "Alice").unwrap();
+        ed.assign_resource(2, "Alice").unwrap();
+        let cpm = ed.schedule().project_finish;
+        assert_eq!(ed.disp_project_finish(), cpm);
+        ed.toggle_level();
+        assert!(
+            ed.disp_project_finish() > cpm,
+            "leveling serialises Alice's tasks"
+        );
+        assert_eq!(ed.disp_project_finish(), level(ed.project()).project_finish);
+        assert_eq!(
+            ed.schedule().project_finish,
+            cpm,
+            "the CPM finish is unchanged"
+        );
+        ed.toggle_level();
+        assert_eq!(ed.disp_project_finish(), cpm);
     }
 
     #[test]

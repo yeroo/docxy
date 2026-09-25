@@ -371,6 +371,79 @@ fn scrollbar_regions_are_their_probed_strips() {
 }
 
 #[test]
+fn the_timeline_region_is_its_probe_while_shown() {
+    let mut v = ProjectView::new(editor(vec![task(1, 2, 1)]).project().clone(), false);
+    v.layout(800.);
+    let mut probes = Probes::default();
+    let region = harness::Region::ProjectTimeline;
+    assert!(
+        project_region(&v, &probes, region)
+            .unwrap_err()
+            .contains("has not been laid out")
+    );
+    probes.last = vec![("project-timeline".into(), rect(0., 60., 800., 84.))];
+    assert_eq!(
+        project_region(&v, &probes, region).unwrap(),
+        rect(0., 60., 800., 84.)
+    );
+    // Hidden, a probe left over from the last shown frame must not answer.
+    v.timeline = false;
+    assert!(
+        project_region(&v, &probes, region)
+            .unwrap_err()
+            .contains("the Timeline is hidden")
+    );
+}
+
+#[test]
+fn timeline_state_names_the_span_and_follows_leveling() {
+    use ctlcore::json::Json;
+    let get = |v: &ProjectView, key: &str| {
+        project_state(v, None)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, j)| j)
+            .unwrap()
+    };
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/mspdi/02-link-fs.xml");
+    let Surface::Project(v) = project_tab_from_path(&path).surface else {
+        unreachable!()
+    };
+    assert_eq!(get(&v, "timeline"), Json::Str("shown".into()));
+    assert_eq!(get(&v, "timeline_start"), Json::Str("Mon 3/2/26".into()));
+    assert_eq!(get(&v, "timeline_finish"), Json::Str("Thu 3/5/26".into()));
+
+    // Two unlinked 1d tasks on one resource: leveling serialises them, so the
+    // finish the bars reach moves a working day later.
+    let mut v = ProjectView::new(
+        editor(vec![task(1, 1, 1), task(2, 1, 1)]).project().clone(),
+        false,
+    );
+    v.ed.assign_resource(1, "Alice").unwrap();
+    v.ed.assign_resource(2, "Alice").unwrap();
+    let unleveled = get(&v, "timeline_finish");
+    v.ed.toggle_level();
+    let leveled = get(&v, "timeline_finish");
+    assert_ne!(leveled, unleveled);
+    assert_eq!(leveled, Json::Str(project_date(v.ed.disp_project_finish())));
+    v.ed.toggle_level();
+    assert_eq!(get(&v, "timeline_finish"), unleveled);
+
+    // A manual task pinned before the project start is drawn there, so the
+    // Timeline starts with it rather than at the scheduler's anchor.
+    let mut early = task(1, 1, 1);
+    early.manual = true;
+    early.manual_start = Some(projcore::DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+    let mut p = untitled_project();
+    p.start_date = Some(projcore::DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+    p.tasks = vec![early, task(2, 1, 1)];
+    let v = ProjectView::new(p, false);
+    assert_eq!(project_date(v.ed.schedule().project_start), "Mon 3/9/26");
+    assert_eq!(get(&v, "timeline_start"), Json::Str("Mon 3/2/26".into()));
+    assert_eq!(get(&v, "timeline_finish"), Json::Str("Mon 3/9/26".into()));
+}
+
+#[test]
 fn harness_state_uses_displayed_ids_and_includes_tasks_outside_the_view() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/mspdi/10-summary.xml");
     let t = project_tab_from_path(&path);

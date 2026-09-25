@@ -1,0 +1,18 @@
+test project timeline shows the plan span and toggles from the View tab
+  open ../fixtures/project-timeline.xml
+  assert timeline is shown
+  assert timeline_start is Mon 3/2/26
+  assert timeline_finish is Thu 3/5/26
+  shot project-timeline
+  shot window
+  key alt w t
+  assert timeline is hidden
+  assert dirty is false
+  shot window
+  key alt w t
+  assert timeline is shown
+  shot project-timeline
+  shot bar:1
+  key alt w
+  shot window
+  key escape

@@ -250,6 +250,7 @@ fn project_instruction_paths_exist() {
         ("Report", "Export", "Export Gantt", ExportGantt),
         ("Project", "Schedule", "Calculate Project", Recalc),
         ("Project", "Schedule", "Set Baseline", Baseline),
+        ("View", "Split View", "Timeline", Timeline),
     ] {
         let path = format!("{tab} > {group} > {label}");
         let Some((_, _, _, found, key)) = paths
@@ -288,6 +289,51 @@ fn large_and_small_buttons_show_the_same_tooltip() {
     );
     let bare = cmdt("x", "find", "Bare", Act::Project(ProjectAct::Find), "");
     assert_eq!(cmd_tip_text(&bare).as_ref(), "Bare");
+}
+
+#[test]
+fn timeline_toggles_the_pane_as_view_state_only() {
+    let mut t = tab();
+    assert!(v(&t).timeline, "a Project opens with its Timeline shown");
+    assert!(project_act_active(v(&t), ProjectAct::Timeline));
+    let before = (
+        t.dirty,
+        v(&t).ed.undo_depth(),
+        v(&t).ed.sel(),
+        v(&t).ed.project().clone(),
+    );
+    for shown in [false, true, false] {
+        apply_project_act(&mut t, ProjectAct::Timeline);
+        assert_eq!(v(&t).timeline, shown);
+        assert_eq!(project_act_active(v(&t), ProjectAct::Timeline), shown);
+        assert_eq!(take_reveal(&t), None);
+        assert_eq!(
+            before,
+            (
+                t.dirty,
+                v(&t).ed.undo_depth(),
+                v(&t).ed.sel(),
+                v(&t).ed.project().clone(),
+            )
+        );
+    }
+    let state = project_state(v(&t), None);
+    assert!(state.contains(&("timeline".into(), ctlcore::json::Json::Str("hidden".into()))));
+}
+
+#[test]
+fn project_act_active_checks_level_all_and_timeline_only() {
+    let mut t = tab();
+    assert!(!project_act_active(v(&t), ProjectAct::LevelAll));
+    apply_project_act(&mut t, ProjectAct::LevelAll);
+    assert!(project_act_active(v(&t), ProjectAct::LevelAll));
+    for act in ProjectAct::RIBBON
+        .iter()
+        .copied()
+        .filter(|a| !matches!(a, ProjectAct::LevelAll | ProjectAct::Timeline))
+    {
+        assert!(!project_act_active(v(&t), act), "{act:?}");
+    }
 }
 
 #[test]

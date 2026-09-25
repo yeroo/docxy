@@ -24,6 +24,7 @@ pub(crate) enum ProjectAct {
     ScrollRight,
     GoToStart,
     Find,
+    Timeline,
     // Keyboard/QAT/backstage only; excluded from the ribbon inventory.
     Level,
     Save,
@@ -55,6 +56,7 @@ impl ProjectAct {
         Self::ScrollRight,
         Self::GoToStart,
         Self::Find,
+        Self::Timeline,
     ];
 }
 
@@ -262,38 +264,61 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
         rs::tab(
             "View",
             "W",
-            vec![rs::group(
-                "Zoom",
-                90,
-                vec![rs::column(vec![
-                    cmd(
-                        "pr-left",
-                        "indent-decrease",
-                        "Scroll Left",
-                        ScrollLeft,
-                        "Alt+Left",
-                        "L",
-                    ),
-                    cmd(
-                        "pr-right",
-                        "indent-increase",
-                        "Scroll Right",
-                        ScrollRight,
-                        "Alt+Right",
-                        "R",
-                    ),
-                    cmd(
-                        "pr-start",
-                        "indent-decrease",
-                        "Go to Start",
-                        GoToStart,
-                        "Alt, W, G",
-                        "G",
-                    ),
-                ])],
-            )],
+            vec![
+                rs::group(
+                    "Split View",
+                    70,
+                    vec![rs::column(vec![cmd(
+                        "pr-timeline",
+                        "rule",
+                        "Timeline",
+                        Timeline,
+                        "Alt, W, T",
+                        "T",
+                    )])],
+                ),
+                rs::group(
+                    "Zoom",
+                    90,
+                    vec![rs::column(vec![
+                        cmd(
+                            "pr-left",
+                            "indent-decrease",
+                            "Scroll Left",
+                            ScrollLeft,
+                            "Alt+Left",
+                            "L",
+                        ),
+                        cmd(
+                            "pr-right",
+                            "indent-increase",
+                            "Scroll Right",
+                            ScrollRight,
+                            "Alt+Right",
+                            "R",
+                        ),
+                        cmd(
+                            "pr-start",
+                            "indent-decrease",
+                            "Go to Start",
+                            GoToStart,
+                            "Alt, W, G",
+                            "G",
+                        ),
+                    ])],
+                ),
+            ],
         ),
     ])
+}
+
+/// A Project command's checked state on the ribbon.
+pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
+    match act {
+        ProjectAct::LevelAll => v.ed.leveled(),
+        ProjectAct::Timeline => v.timeline,
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +661,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 v.pan_gantt(true);
             }
             GoToStart => v.gantt_x.set(0.),
+            Timeline => v.timeline = !v.timeline,
             Save | ExportGantt => {} // window-dependent host actions
         }
         Ok(())
