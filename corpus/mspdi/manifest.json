@@ -180,6 +180,17 @@
         "round-trip"
       ],
       "desc": "Manual tasks keep their pinned dates; an auto successor follows them."
+    },
+    {
+      "file": "20-deadline-missed.xml",
+      "category": "deadline",
+      "tags": [
+        "deadline",
+        "link",
+        "link-fs",
+        "negative-slack"
+      ],
+      "desc": "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack."
     }
   ]
 }

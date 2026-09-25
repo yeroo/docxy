@@ -404,6 +404,37 @@ mod tests {
     }
 
     #[test]
+    fn markdown_reports_a_missed_deadline_as_negative_total_slack() {
+        let proj =
+            crate::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-deadline-missed.xml"))
+                .unwrap();
+        let md = to_markdown(&proj, &schedule(&proj));
+        let rows = table_rows(&md);
+        assert_eq!(
+            rows[1..],
+            [
+                [
+                    "A",
+                    "2026-03-02 08:00:00",
+                    "2026-03-06 17:00:00",
+                    "5d",
+                    "-5d",
+                    "0d",
+                    "✓"
+                ],
+                [
+                    "B",
+                    "2026-03-09 08:00:00",
+                    "2026-03-13 17:00:00",
+                    "5d",
+                    "-5d",
+                    "0d",
+                    "✓"
+                ]
+            ]
+        );
+    }
+    #[test]
     fn markdown_reports_free_slack() {
         let proj = diamond();
         let md = to_markdown(&proj, &schedule(&proj));

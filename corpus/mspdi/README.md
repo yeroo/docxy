@@ -49,6 +49,13 @@ keeps by definition, but its `TotalSlack`/`Critical` are hand-derived from our
 scheduler, including the violated link (Review, pinned two days before Design
 finishes, gets -2 days). `verify_mspdi_project.py` keeps the tasks this file
 marks `<Manual>1</Manual>` manual, so a Project run can check it.
+File 20 records a missed task Deadline
+([issue #100](https://github.com/yeroo/docxy/issues/100)): B's deadline is
+five days before its finish, so A and B both carry -5 days total slack and no
+date moves. It was hand-written, and its oracle is taken from the issue's
+Project 2021 capture of `15-deadline-missed` in the private spec corpus. It was
+**not** checked by `verify_mspdi_project.py`, which does not check the Deadline
+on import.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
@@ -78,6 +85,7 @@ marks `<Manual>1</Manual>` manual, so a Project run can check it.
 | `17-constraint-fnlt-conflict` | FNLT versus FS link | default constraint precedence and -5 days total slack on both tasks |
 | `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
 | `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
+| `20-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
 
 See `manifest.json` for machine-readable tags.
 

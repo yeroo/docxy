@@ -43,12 +43,13 @@ def iso(minutes):
 def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
          outline=1, summary=False, milestone=False, preds=(), ctype=None,
          cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
-         manual_finish=None, manual_duration=None):
+         manual_finish=None, manual_duration=None, deadline=None):
     """One <Task>. `preds` is a list of (uid, type_code, lag_tenths_of_min).
     `start`/`finish` are the embedded oracle values (MSPDI datetime strings);
     `slack` (working minutes) and `critical` are Project's TotalSlack and
     Critical. They are required so a new task cannot omit its oracle.
-    `manual` (0/1) and the manual_* fields are written only when given."""
+    `manual` (0/1) and the manual_* fields are written only when given, as is
+    `deadline` (an MSPDI datetime string)."""
     oid = uid if oid is None else oid
     lines = [
         "    <Task>",
@@ -77,6 +78,8 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
             lines.append(f"      <ConstraintDate>{cdate}</ConstraintDate>")
     if calendar is not None:
         lines.append(f"      <CalendarUID>{calendar}</CalendarUID>")
+    if deadline is not None:
+        lines.append(f"      <Deadline>{deadline}</Deadline>")
     for (puid, ptype, lag) in preds:
         lines += [
             "      <PredecessorLink>",
@@ -364,6 +367,16 @@ def build():
             task(5, "Build", 2 * D, dt(11), dt(12, "17:00:00"), **CRIT, outline=2,
                  preds=[(4, FS, 0)], manual=0),
         ]), new_tasks_are_manual=1))
+
+    # 20 — B misses its Deadline by 5 days. The deadline bounds late finish
+    # only: dates stay put and A and B both get -5d total slack (#100).
+    add("20-deadline-missed.xml", ["deadline", "link", "link-fs", "negative-slack"],
+        "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack.",
+        project("deadline-missed", "\n".join([
+            task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True),
+            task(2, "B", 5 * D, dt(9), dt(13, "17:00:00"), slack=-5 * D, critical=True,
+                 preds=[(1, FS, 0)], deadline=dt(6, "17:00:00")),
+        ])))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

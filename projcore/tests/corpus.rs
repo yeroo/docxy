@@ -9,8 +9,10 @@
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
 //! 16 (#58), 17 (#60) and 18 (#59). The exception is file 19 (issue #77):
 //! its manual-task slack and critical flags are hand-derived from our
-//! scheduler, not yet verified in Project. Slack invariants below also check
-//! properties that do not depend on the embedded expectations.
+//! scheduler, not yet verified in Project. File 20 (issue #100) was
+//! hand-written from the issue's Project 2021 capture, not run through the
+//! script. Slack invariants below also check properties that do not depend on
+//! the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
 use projcore::schedule::{level, schedule};
@@ -57,6 +59,41 @@ fn fnlt_conflict_matches_project_2021_negative_slack() {
         let r = sched.get(uid).unwrap();
         assert_eq!(r.total_slack_min, -2400);
         assert!(r.critical);
+    }
+}
+
+#[test]
+fn missed_deadline_matches_project_2021_negative_slack() {
+    // #100: B's Deadline (Fri 03-06) is five days before it finishes, so B and
+    // A, which drives it, both get -5d total slack; no date moves.
+    let xml = std::fs::read_to_string(corpus_dir().join("20-deadline-missed.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let deadline = proj.tasks[1].deadline;
+    assert_eq!(
+        deadline.map(|d| d.to_mspdi()).as_deref(),
+        Some("2026-03-06T17:00:00")
+    );
+    let mut without = proj.clone();
+    without.tasks[1].deadline = None;
+    let baseline = schedule(&without);
+    // The deadline survives MSPDI and .yppx saves, and so does its slack.
+    let saved = read_mspdi(&write_mspdi(&proj)).unwrap();
+    let packaged = read_yppx(&write_yppx(&proj)).unwrap();
+    for (label, proj) in [("read", &proj), ("mspdi", &saved), ("yppx", &packaged)] {
+        assert_eq!(proj.tasks[1].deadline, deadline, "{label}");
+        let sched = schedule(proj);
+        for uid in [1, 2] {
+            let r = sched.get(uid).unwrap();
+            let base = baseline.get(uid).unwrap();
+            assert_eq!(r.total_slack_min, -2400, "{label} task {uid}");
+            assert_eq!(r.free_slack_min, 0, "{label} task {uid}");
+            assert!(r.critical, "{label} task {uid}");
+            assert_eq!(
+                (r.early_start, r.early_finish),
+                (base.early_start, base.early_finish),
+                "{label} task {uid}"
+            );
+        }
     }
 }
 
