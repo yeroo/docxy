@@ -628,6 +628,8 @@ impl Editor {
                 let a = &mut proj.assignments[k];
                 a.units = u;
                 a.work_min = work_for(duration, u);
+                // Regular work is Work less overtime; a stale value would invent overtime.
+                a.regular_work_min = None;
             })?;
             return Ok(AssignOutcome::Assigned);
         }
