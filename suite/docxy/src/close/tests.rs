@@ -368,3 +368,53 @@ fn window_close_leaves_an_untouched_header_editor_clean_and_its_part_intact() {
     }
     assert!(restored[1].dirty);
 }
+
+/// A sheet whose A1 holds the text "007", with the cell editor opened on it
+/// the way double-click or F2 opens it, and nothing typed.
+fn untouched_text_cell() -> DocTab {
+    let mut t = tab(Kind::Xlsx);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    let active = v.active;
+    v.engine.set_cell(
+        &mut v.pkg.workbook,
+        (active, 0, 0),
+        gridcore::sheet::Cell::text("007"),
+    );
+    v.editing = Some(v.edit_string(0, 0));
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    t
+}
+
+fn a1_is_text_007(t: &DocTab) {
+    let Surface::Sheet(v) = &t.surface else {
+        panic!("{}", t.status)
+    };
+    assert_eq!(
+        v.sheet().cell(0, 0).map(|c| &c.value),
+        Some(&gridcore::sheet::CellValue::Text("007".into()))
+    );
+}
+
+#[test]
+fn window_close_leaves_an_untouched_cell_editor_open_and_the_cell_intact() {
+    let mut tabs = vec![
+        untouched_text_cell(),
+        tab(Kind::Docx),
+        untouched_text_cell(),
+    ];
+    let restored = exit_and_restore(&mut tabs, "untouched-cell");
+    for i in [0, 2] {
+        assert!(!tabs[i].dirty, "{i}");
+        let Surface::Sheet(v) = &tabs[i].surface else {
+            panic!()
+        };
+        assert_eq!(v.editing.as_deref(), Some("007"));
+        assert!(v.undo.is_empty());
+        a1_is_text_007(&tabs[i]);
+        assert!(!restored[i].dirty, "{i}");
+        a1_is_text_007(&restored[i]);
+    }
+}
