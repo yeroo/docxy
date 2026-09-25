@@ -10,14 +10,16 @@
 //! - [`mpp`] — [`mpp::read_mpp`] reads metadata; [`mpp::decode_tasks`] reads
 //!   task tables only after their counted indexes and fields validate.
 //!
-//! - [`project`] — convert decoded metadata, task dates, outline levels and
-//!   predecessor links into a `projcore` project for the terminal and suite hosts.
+//! - [`project`] — convert decoded metadata, task dates, outline levels,
+//!   predecessor links and task modes into a `projcore` project for the
+//!   terminal and suite hosts.
 
 pub mod cfb;
 mod fixedmeta;
 pub mod mpp;
 pub mod oleps;
 pub mod project;
+mod props;
 mod taskdecode;
 pub mod vardata;
 pub mod varmeta;

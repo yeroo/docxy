@@ -71,7 +71,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         "{}: task count",
         mpp.display()
     );
-    for (a, e) in actual.iter().zip(expected) {
+    for (a, e) in actual.iter().zip(&expected) {
         assert_eq!(a.id as i32, e.id, "{}: uid {} row ID", mpp.display(), e.uid);
         assert_eq!(a.uid as i32, e.uid, "{}: uid", mpp.display());
         assert_eq!(a.name, e.name, "{}: uid {} name", mpp.display(), e.uid);
@@ -117,6 +117,44 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         got.sort();
         want.sort();
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
+        let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
+        assert_eq!(a.manual, e.manual, "{}", at("manual"));
+        if e.manual {
+            assert_eq!(
+                a.manual_start.as_deref(),
+                e.manual_start.map(dt).as_deref(),
+                "{}",
+                at("manual start")
+            );
+            assert_eq!(
+                a.manual_finish.as_deref(),
+                e.manual_finish.map(dt).as_deref(),
+                "{}",
+                at("manual finish")
+            );
+            assert_eq!(
+                a.manual_duration_min,
+                e.manual_duration_min,
+                "{}",
+                at("manual duration")
+            );
+        } else {
+            // An auto task's manual fields are not decoded: Project's export
+            // derives them from its Start, Finish and Duration, or omits them.
+            assert_eq!(
+                (&a.manual_start, &a.manual_finish, a.manual_duration_min),
+                (&None, &None, None),
+                "{}",
+                at("auto task manual fields")
+            );
+            assert!(
+                e.manual_start.is_none_or(|d| Some(d) == e.stored_start)
+                    && e.manual_finish.is_none_or(|d| Some(d) == e.stored_finish)
+                    && e.manual_duration_min.is_none_or(|d| d == e.duration_min),
+                "{}",
+                at("oracle derives an auto task's manual fields")
+            );
+        }
     }
     let imported = mppread::project::project_from_mpp(&bytes)
         .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
@@ -124,6 +162,36 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         imported.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
         actual.iter().map(|t| t.id as i32).collect::<Vec<_>>(),
         "{}: imported task IDs",
+        mpp.display()
+    );
+    for (t, e) in imported.tasks.iter().zip(&expected) {
+        assert_eq!(
+            t.manual,
+            e.manual,
+            "{}: uid {} imported mode",
+            mpp.display(),
+            e.uid
+        );
+        if t.manual && !t.summary {
+            assert_eq!(
+                t.duration_min,
+                e.duration_min,
+                "{}: uid {} imported manual duration",
+                mpp.display(),
+                e.uid
+            );
+        }
+    }
+    assert_eq!(
+        mppread::mpp::decode_new_tasks_are_manual(&bytes),
+        Ok(oracle.new_tasks_are_manual),
+        "{}: NewTasksAreManual",
+        mpp.display()
+    );
+    assert_eq!(
+        imported.new_tasks_are_manual,
+        oracle.new_tasks_are_manual,
+        "{}: imported NewTasksAreManual",
         mpp.display()
     );
     true
@@ -152,7 +220,15 @@ fn project_2024_oracles() {
     let order = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/order");
     if order.exists() {
         let cases = pairs(&order, "");
-        assert_eq!(cases.len(), 4);
+        assert_eq!(cases.len(), 5);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false);
+        }
+    }
+    let manual = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/manual");
+    if manual.exists() {
+        let cases = pairs(&manual, "");
+        assert_eq!(cases.len(), 8);
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false);
         }

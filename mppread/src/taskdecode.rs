@@ -24,6 +24,16 @@ const NEWEST: TaskLayout = TaskLayout {
     finish: 0x6c,
     level: 172,
 };
+/// Manual scheduling in the newest layout, found by saving one plan with one
+/// task auto and then manual (corpus/tools/gen_mpp_manual_cases.py). The mode
+/// is a Fixed2Meta flag; the manual start, finish and duration sit in the
+/// task's Fixed2Data record, the duration in tenths of a minute followed by
+/// its MSPDI DurationFormat code.
+const MANUAL_FLAG: (usize, u8) = (8, 0x80);
+const MANUAL_START: usize = 50;
+const MANUAL_FINISH: usize = 54;
+const MANUAL_DURATION: usize = 58;
+const MANUAL_DURATION_FORMAT: usize = 62;
 const LEGACY: TaskLayout = TaskLayout {
     length: 264,
     start: 88,
@@ -221,12 +231,70 @@ fn legacy_names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32
     Ok(out)
 }
 
+/// A manual task's stored start, finish and duration.
+type ManualFields = (Option<String>, Option<String>, Option<i64>);
+
+fn manual_fields(rec: &[u8], uid: u32) -> Result<ManualFields, String> {
+    let start = decode_timestamp(rec, MANUAL_START);
+    let finish = decode_timestamp(rec, MANUAL_FINISH);
+    if start
+        .as_ref()
+        .zip(finish.as_ref())
+        .is_some_and(|(s, f)| s > f)
+    {
+        return Err(format!("inverted manual dates for UID {uid}"));
+    }
+    let raw = u32_at(rec, MANUAL_DURATION);
+    if raw == u32::MAX {
+        return Ok((start, finish, None));
+    }
+    if raw > i32::MAX as u32 {
+        return Err(format!("invalid manual duration for UID {uid}"));
+    }
+    // DurationFormat without its estimated (`?`) bit.
+    let duration = match u16_at(rec, MANUAL_DURATION_FORMAT) & !32 {
+        // Minutes, hours, days, weeks, months, or blank: working time.
+        3 | 5 | 7 | 9 | 11 | 21 => Some(raw as i64 / 10),
+        // Elapsed units have no oracle yet: keep the duration unknown.
+        4 | 6 | 8 | 10 | 12 => None,
+        format => {
+            return Err(format!(
+                "unrecognized manual DurationFormat {format} for UID {uid}"
+            ));
+        }
+    };
+    Ok((start, finish, duration))
+}
+
+/// A validated task table and the project's new-task mode. The mode is kept
+/// as its own result so a bad project option refuses an import but not
+/// [`decode`].
+pub(crate) struct Table {
+    pub tasks: Vec<MppTask>,
+    pub new_tasks_are_manual: Result<bool, String>,
+}
+
 pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
+    decode_table(bytes).map(|table| table.tasks)
+}
+
+/// The project's new-task mode; see [`crate::mpp::decode_new_tasks_are_manual`].
+pub(crate) fn new_tasks_are_manual(bytes: &[u8]) -> Result<bool, String> {
+    decode_table(bytes)?.new_tasks_are_manual
+}
+
+/// Decode the task table. MPP9 predates manual tasks and a file without a
+/// task table has nothing to default, so both have an auto default; the
+/// newest layout reads it from the project Props beside the table.
+pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
     let cfb = Cfb::open(bytes)?;
     let paths = cfb.paths();
     let task_paths: Vec<_> = paths.iter().filter(|p| p.contains("TBkndTask/")).collect();
     if task_paths.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Table {
+            tasks: Vec::new(),
+            new_tasks_are_manual: Ok(false),
+        });
     }
     let Some(meta_path) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) else {
         return Err("partial task stream set: missing FixedMeta".into());
@@ -242,11 +310,26 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
     let v2 = read("Var2Data")?;
     match fixedmeta::index(&fm, &fd)? {
         fixedmeta::TaskIndex::Current(indexed) => {
-            decode_current(&cfb, prefix, &fd, &vm, &v2, indexed)
+            let fixed_count = u32_at(&fm, 8) as usize;
+            let (f2m, f2d) = (read("Fixed2Meta")?, read("Fixed2Data")?);
+            let fixed2 = fixedmeta::current_fixed2(&f2m, &f2d, fixed_count, &indexed)?;
+            let tasks = decode_current(&cfb, prefix, &fd, &vm, &v2, indexed, &fixed2)?;
+            let props = prefix.trim_end_matches("TBkndTask/").to_string() + "Props";
+            let new_tasks_are_manual = cfb
+                .read_path(&props)
+                .ok_or_else(|| "missing project Props stream".to_string())
+                .and_then(|props| crate::props::new_tasks_are_manual(&props));
+            Ok(Table {
+                tasks,
+                new_tasks_are_manual,
+            })
         }
         fixedmeta::TaskIndex::Legacy(indexed) => {
             let uids: HashSet<_> = indexed.iter().map(|r| r.uid).collect();
-            decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)
+            Ok(Table {
+                tasks: decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)?,
+                new_tasks_are_manual: Ok(false),
+            })
         }
     }
 }
@@ -258,6 +341,7 @@ fn decode_current(
     vm: &[u8],
     v2: &[u8],
     indexed: Vec<fixedmeta::CurrentRecord>,
+    fixed2: &[fixedmeta::Fixed2],
 ) -> Result<Vec<MppTask>, String> {
     let uids: HashSet<_> = indexed
         .iter()
@@ -266,7 +350,7 @@ fn decode_current(
         .collect();
     let named = names(vm, v2, &uids)?;
     let mut out = Vec::new();
-    for row in indexed {
+    for (row, fixed2) in indexed.into_iter().zip(fixed2) {
         if row.is_null {
             continue;
         }
@@ -290,6 +374,12 @@ fn decode_current(
                 row.uid
             ));
         }
+        let manual = fixed2.meta[MANUAL_FLAG.0] & MANUAL_FLAG.1 != 0;
+        let (manual_start, manual_finish, manual_duration_min) = if manual {
+            manual_fields(fixed2.data, row.uid)?
+        } else {
+            (None, None, None)
+        };
         out.push(MppTask {
             id: row.id,
             uid: row.uid,
@@ -298,6 +388,10 @@ fn decode_current(
             finish,
             outline_level: Some(level),
             predecessors: Vec::new(),
+            manual,
+            manual_start,
+            manual_finish,
+            manual_duration_min,
         });
     }
     links(cfb, prefix, &mut out, NEWEST_LINK)?;
@@ -344,6 +438,8 @@ fn decode_legacy(
             finish,
             outline_level: Some(level),
             predecessors: Vec::new(),
+            // Project 2003 has no manual scheduling.
+            ..MppTask::default()
         });
     }
     links(cfb, prefix, &mut out, LEGACY_LINK)?;
@@ -377,6 +473,9 @@ mod tests {
         vm: Vec<u8>,
         v2: Vec<u8>,
         cons: Vec<u8>,
+        f2m: Vec<u8>,
+        f2d: Vec<u8>,
+        props: Vec<u8>,
     }
     fn fixture() -> Streams {
         let mut fd = vec![0u8; 452];
@@ -417,19 +516,47 @@ mod tests {
             vm.extend_from_slice(&0x0b40u16.to_le_bytes());
         }
         vm[20..24].copy_from_slice(&(v2.len() as u32).to_le_bytes());
+        let (f2m, f2d) = fixed2_for(&fm);
         Streams {
             fm,
             fd,
             vm,
             v2,
             cons: Vec::new(),
+            f2m,
+            f2d,
+            props: props(&[0, 0]),
         }
+    }
+    /// Fixed2 streams that match `fm`: a GUID and a rising sort key for each
+    /// task entry, nothing for the schema stubs and blank rows.
+    fn fixed2_for(fm: &[u8]) -> (Vec<u8>, Vec<u8>) {
+        let count = (fm.len() - 16) / 47;
+        let mut meta = vec![0u8; 16 + count * 96];
+        meta[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        meta[8..12].copy_from_slice(&(count as u32).to_le_bytes());
+        meta[12..16].copy_from_slice(&((count * 64) as u32).to_le_bytes());
+        let mut data = vec![0u8; count * 64];
+        for i in 0..count {
+            let m = 16 + i * 96;
+            meta[m + 4..m + 8].copy_from_slice(&((i * 64) as u32).to_le_bytes());
+            if i >= 3 && fm[16 + i * 47..16 + i * 47 + 2] == [0, 0] {
+                data[i * 64] = i as u8;
+                data[i * 64 + 16..i * 64 + 24].copy_from_slice(&(i as f64).to_le_bytes());
+            }
+        }
+        (meta, data)
+    }
+    fn props(new_tasks_are_manual: &[u8]) -> Vec<u8> {
+        crate::props::stream(&[(crate::props::NEW_TASKS_ARE_MANUAL, new_tasks_are_manual)])
     }
     fn file(s: &Streams, include_fd: bool) -> Vec<u8> {
         let mut task = vec![
             Node::Stream("FixedMeta", s.fm.clone()),
             Node::Stream("VarMeta", s.vm.clone()),
             Node::Stream("Var2Data", s.v2.clone()),
+            Node::Stream("Fixed2Meta", s.f2m.clone()),
+            Node::Stream("Fixed2Data", s.f2d.clone()),
         ];
         if include_fd {
             task.push(Node::Stream("FixedData", s.fd.clone()));
@@ -437,6 +564,7 @@ mod tests {
         write_cfb_tree(&[Node::Storage(
             "   114",
             vec![
+                Node::Stream("Props", s.props.clone()),
                 Node::Storage("TBkndTask", task),
                 Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
             ],
@@ -473,6 +601,7 @@ mod tests {
         let p = 16 + 5 * 47;
         s.fm[p..p + 2].copy_from_slice(&4u16.to_le_bytes());
         s.fm[p + 4..p + 8].copy_from_slice(&452u32.to_le_bytes());
+        (s.f2m, s.f2d) = fixed2_for(&s.fm);
         let decoded = decode(&file(&s, true)).unwrap();
         assert_eq!(
             decoded.iter().map(|t| (t.id, t.uid)).collect::<Vec<_>>(),
@@ -540,6 +669,146 @@ mod tests {
         let mut s = fixture();
         s.cons = link(0, 1, 7);
         reject(&s); // project summary cannot be a link endpoint
+    }
+    /// Make FixedMeta entry 4 (task B, UID 1) a manual task: 2026-03-02 08:00
+    /// to 2026-03-03 17:00, 16 hours shown in days (DurationFormat 7).
+    fn make_manual(s: &mut Streams) {
+        s.f2m[16 + 4 * 96 + 8] |= 0x80;
+        let r = 4 * 64;
+        s.f2d[r + 50..r + 54].copy_from_slice(&[0xc0, 0x12, 0x2a, 0x3c]);
+        s.f2d[r + 54..r + 58].copy_from_slice(&[0xd8, 0x27, 0x2b, 0x3c]);
+        s.f2d[r + 58..r + 62].copy_from_slice(&9600u32.to_le_bytes());
+        s.f2d[r + 62..r + 64].copy_from_slice(&7u16.to_le_bytes());
+    }
+    #[test]
+    fn manual_mode_and_fields_come_from_the_second_fixed_block() {
+        let mut s = fixture();
+        // Manual bytes on an auto task are stale, not its manual fields.
+        s.f2d[4 * 64 + 50..4 * 64 + 64].fill(0x11);
+        let tasks = decode(&file(&s, true)).unwrap();
+        assert!(!tasks[1].manual);
+        assert_eq!(tasks[1].manual_start, None);
+        assert_eq!(tasks[1].manual_duration_min, None);
+        make_manual(&mut s);
+        let tasks = decode(&file(&s, true)).unwrap();
+        assert!(!tasks[0].manual);
+        let b = &tasks[1];
+        assert!(b.manual);
+        assert_eq!(b.manual_start.as_deref(), Some("2026-03-02 08:00"));
+        assert_eq!(b.manual_finish.as_deref(), Some("2026-03-03 17:00"));
+        assert_eq!(b.manual_duration_min, Some(960));
+        let r = 4 * 64;
+        s.f2d[r + 62..r + 64].copy_from_slice(&39u16.to_le_bytes()); // estimated days
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1].manual_duration_min,
+            Some(960)
+        );
+        s.f2d[r + 62..r + 64].copy_from_slice(&8u16.to_le_bytes()); // elapsed days
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1].manual_duration_min,
+            None
+        );
+        s.f2d[r + 62..r + 64].copy_from_slice(&7u16.to_le_bytes());
+        s.f2d[r + 58..r + 62].fill(0xff); // no stored duration
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1].manual_duration_min,
+            None
+        );
+    }
+    #[test]
+    fn refuses_a_second_fixed_block_that_does_not_match_the_tasks() {
+        let r = 4 * 64;
+        let manual = || {
+            let mut s = fixture();
+            make_manual(&mut s);
+            s
+        };
+        assert!(decode(&file(&manual(), true)).is_ok());
+        let mut s = manual();
+        s.f2d[r + 62..r + 64].copy_from_slice(&2u16.to_le_bytes());
+        reject(&s); // unknown DurationFormat
+        let mut s = manual();
+        s.f2d[r + 54..r + 58].copy_from_slice(&[0xc0, 0x12, 0x29, 0x3c]);
+        reject(&s); // manual finish before manual start
+        let mut s = fixture();
+        s.f2d[r + 16..r + 24].copy_from_slice(&1f64.to_le_bytes());
+        reject(&s); // sort keys out of task ID order: records misaligned
+        let mut s = fixture();
+        s.f2d[r..r + 16].fill(0);
+        reject(&s); // a task record without its GUID
+        let mut s = fixture();
+        s.f2m[8..12].copy_from_slice(&4u32.to_le_bytes());
+        reject(&s); // Fixed2Meta counts a different number of entries
+        let mut s = fixture();
+        s.f2d.truncate(4 * 64);
+        s.f2m[12..16].copy_from_slice(&(4 * 64u32).to_le_bytes());
+        reject(&s); // Fixed2Data shorter than its entries
+        let mut s = fixture();
+        s.f2m[16 + 4 * 96 + 4..16 + 4 * 96 + 8].copy_from_slice(&(3 * 64u32).to_le_bytes());
+        reject(&s); // entry offsets must step by one record
+        let mut s = fixture();
+        s.f2m.clear();
+        reject(&s); // a current layout without Fixed2Meta is partial
+    }
+    #[test]
+    fn reads_the_new_task_default_from_project_props() {
+        let mut s = fixture();
+        assert_eq!(new_tasks_are_manual(&file(&s, true)), Ok(false));
+        s.props = props(&[0xff, 0]);
+        assert_eq!(new_tasks_are_manual(&file(&s, true)), Ok(true));
+        let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert!(project.new_tasks_are_manual);
+        s.props = props(&[1, 1]);
+        assert!(new_tasks_are_manual(&file(&s, true)).is_err());
+        assert!(crate::project::project_from_mpp(&file(&s, true)).is_err());
+        s.props = crate::props::stream(&[]);
+        assert!(new_tasks_are_manual(&file(&s, true)).is_err());
+        // A file without a task table has no default to read.
+        let no_tasks = write_cfb_tree(&[Node::Stream("Props", vec![0u8; 4])]);
+        assert_eq!(new_tasks_are_manual(&no_tasks), Ok(false));
+    }
+    #[test]
+    fn the_default_is_refused_with_a_task_table_that_is_refused() {
+        let s = fixture();
+        // Task streams without FixedMeta are a partial set, not "no table".
+        let partial = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                Node::Stream("Props", s.props.clone()),
+                Node::Storage("TBkndTask", vec![Node::Stream("VarMeta", s.vm.clone())]),
+            ],
+        )]);
+        assert!(decode(&partial).is_err());
+        assert!(new_tasks_are_manual(&partial).is_err());
+        // A readable default beside a refused table is not answered either.
+        let mut s = fixture();
+        s.v2[4] = 1; // control character in a task name
+        assert!(decode(&file(&s, true)).is_err());
+        assert!(new_tasks_are_manual(&file(&s, true)).is_err());
+        let mut s = fixture();
+        s.f2m.clear();
+        assert!(new_tasks_are_manual(&file(&s, true)).is_err());
+    }
+    #[test]
+    fn manual_leaf_imports_pinned_by_its_dates_and_auto_leaf_by_a_constraint() {
+        use projcore::ConstraintType;
+        let mut s = fixture();
+        let auto = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let task = &auto.tasks[0];
+        assert!(!task.manual);
+        assert_eq!(task.constraint, ConstraintType::MustStartOn);
+        assert_eq!(task.pinned_dates(), None);
+        make_manual(&mut s);
+        let manual = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let task = &manual.tasks[0];
+        assert!(task.manual);
+        assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(task.constraint_date, None);
+        assert_eq!(task.duration_min, 960);
+        assert_eq!(task.manual_duration_min, Some(960));
+        let (start, finish) = task.pinned_dates().unwrap();
+        assert_eq!(start.to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(finish.unwrap().to_mspdi(), "2026-03-03T17:00:00");
     }
     fn link(pred: u32, succ: u32, format: u16) -> Vec<u8> {
         let mut r = vec![0u8; 20];
