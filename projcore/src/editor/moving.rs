@@ -37,7 +37,7 @@ impl Editor {
 /// Parse a Move amount: a signed whole number of days (`d`) or weeks (`w`),
 /// as working days. A week is the plan's working days per week, from its
 /// hours per week and per day (MSPDI has no days-per-week field).
-pub fn parse_move(text: &str, proj: &Project) -> Result<i64, String> {
+fn parse_move(text: &str, proj: &Project) -> Result<i64, String> {
     let t = text.trim().to_ascii_lowercase();
     let err = || format!("Couldn't read '{}' (try 1d, 1w, 4w, -1d)", text.trim());
     let (num, per) = if let Some(n) = t.strip_suffix('d') {
