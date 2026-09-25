@@ -191,11 +191,11 @@ impl Editor {
         for raw in names {
             // A whole-token name match wins, so names like `Crew [A%]` are not split.
             let (rid, units) = match self.match_resource(uid, &resources, raw)? {
-                Some(rid) => (rid, None),
+                Some(found) => found,
                 None => {
                     let (name, units) = parse_resource_token(raw)?;
                     let matched = match units {
-                        Some(_) => self.match_resource(uid, &resources, name)?,
+                        Some(_) => self.match_resource(uid, &resources, name)?.map(|m| m.0),
                         None => None,
                     };
                     let rid = match matched {
@@ -267,13 +267,14 @@ impl Editor {
     }
 
     /// Resolve a whole token to an existing resource: a raw, then case-insensitive,
-    /// match among the task's assigned resources, then a trimmed match among all.
+    /// match among the task's assigned resources, then their shown cell text
+    /// (which carries their current units), then a trimmed match among all.
     fn match_resource(
         &self,
         uid: i32,
         resources: &[Resource],
         raw: &str,
-    ) -> Result<Option<i32>, String> {
+    ) -> Result<Option<(i32, Option<f64>)>, String> {
         let is_assigned = |rid: i32| {
             self.proj
                 .assignments
@@ -296,13 +297,32 @@ impl Editor {
                 .collect();
         }
         match retained.as_slice() {
-            [rid] => return Ok(Some(*rid)),
+            [rid] => return Ok(Some((*rid, None))),
             [] => {}
             _ => return Err(format!("Resource name '{raw}' is ambiguous")),
         }
         let name = raw.trim();
         if name.is_empty() {
             return Ok(None);
+        }
+        // `Bob[50%]` names the assigned Bob before a resource literally named so.
+        let shown: Vec<_> = self
+            .proj
+            .assignments
+            .iter()
+            .filter(|a| a.task_uid == uid)
+            .filter_map(|a| {
+                let r = resources.iter().find(|r| r.uid == a.resource_uid)?;
+                let text = cell_text(r, a);
+                text.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then_some((a.resource_uid, Some(a.units)))
+            })
+            .collect();
+        match shown.as_slice() {
+            [found] => return Ok(Some(*found)),
+            [] => {}
+            _ => return Err(format!("Resource name '{name}' is ambiguous")),
         }
         let matches: Vec<_> = resources
             .iter()
@@ -315,7 +335,7 @@ impl Editor {
             .filter(|&rid| is_assigned(rid))
             .collect();
         match (assigned.as_slice(), matches.as_slice()) {
-            ([rid], _) | ([], [rid]) => Ok(Some(*rid)),
+            ([rid], _) | ([], [rid]) => Ok(Some((*rid, None))),
             ([], []) => Ok(None),
             _ => Err(format!("Resource name '{name}' is ambiguous")),
         }
@@ -325,7 +345,7 @@ impl Editor {
 /// Split a Resource Names token `Name[NN%]` into its name and units (`NN/100`).
 /// A token without a trailing bracket is all name. The name keeps its raw
 /// spelling so it resolves like a bare token.
-pub fn parse_resource_token(raw: &str) -> Result<(&str, Option<f64>), String> {
+pub(super) fn parse_resource_token(raw: &str) -> Result<(&str, Option<f64>), String> {
     let Some((name, inner)) = raw
         .trim_end()
         .strip_suffix(']')
@@ -345,7 +365,7 @@ pub fn parse_resource_token(raw: &str) -> Result<(&str, Option<f64>), String> {
 }
 
 /// Assignment units as percent text: two decimals, trailing zeros trimmed (`50%`, `33.33%`).
-pub fn format_units(units: f64) -> String {
+pub(super) fn format_units(units: f64) -> String {
     let text = format!("{:.2}", units * 100.);
     let text = text.trim_end_matches('0').trim_end_matches('.');
     format!("{}%", if text == "-0" { "0" } else { text })
@@ -364,14 +384,19 @@ pub fn format_resource_names(proj: &Project, task_uid: i32) -> String {
         .filter(|a| a.task_uid == task_uid)
         .filter_map(|a| {
             let r = proj.resources.iter().find(|r| r.uid == a.resource_uid)?;
-            let units = match r.kind {
-                ResourceType::Work => units_bracket(a.units),
-                _ => None,
-            };
-            Some(format!("{}{}", r.name, units.unwrap_or_default()))
+            Some(cell_text(r, a))
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// One assignment's Resource Names text; only work resources show their units.
+fn cell_text(r: &Resource, a: &Assignment) -> String {
+    let units = match r.kind {
+        ResourceType::Work => units_bracket(a.units),
+        _ => None,
+    };
+    format!("{}{}", r.name, units.unwrap_or_default())
 }
 
 /// Prefer whole days/hours, falling back to exact minutes (including signed lag).

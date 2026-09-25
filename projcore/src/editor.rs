@@ -15,9 +15,10 @@ const UNDO_CAP: usize = 100;
 
 mod cells;
 pub use cells::{
-    day_finish, format_duration_exact, format_predecessors, format_resource_names, format_units,
-    parse_cell_date, parse_predecessors, parse_resource_token,
+    day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
+    parse_predecessors,
 };
+use cells::{format_units, parse_resource_token};
 
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {

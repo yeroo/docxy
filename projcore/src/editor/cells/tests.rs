@@ -1090,17 +1090,53 @@ fn assign_prompt_takes_units_and_changes_only_different_ones() {
 }
 
 #[test]
-fn partial_units_survive_mspdi_and_level_against_capacity() {
+fn partial_units_survive_mspdi() {
     let mut ed = with_bob(ResourceType::Work, 0.5);
-    ed.proj.tasks[1].duration_min = 960;
     ed.assign_resource(10, "Bob").unwrap();
-    ed.assign_resource(20, "Bob").unwrap();
     let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
     let a = back.assignments.iter().find(|a| a.task_uid == 10).unwrap();
     assert_eq!((a.units, a.work_min), (0.5, 480));
     assert_eq!(format_resource_names(&back, 10), "Bob[50%]");
-    // Each half-time booking fills Bob's 50%, so the second task waits for the first.
-    let leveled = crate::schedule::level(&back);
-    assert_eq!(leveled.start(10).unwrap().to_mspdi(), "2026-01-05T08:00:00");
-    assert_eq!(leveled.start(20).unwrap().to_mspdi(), "2026-01-07T08:00:00");
+}
+
+#[test]
+fn leveling_books_assignments_at_their_units() {
+    let mut ed = with_bob(ResourceType::Work, 1.0);
+    ed.proj.tasks[1].duration_min = 960;
+    ed.set_resources(10, &["Bob[50%]".into()]).unwrap();
+    ed.set_resources(20, &["Bob[50%]".into()]).unwrap();
+    let starts = |ed: &Editor| {
+        let leveled = crate::schedule::level(ed.project());
+        [10, 20].map(|uid| leveled.start(uid).unwrap().to_mspdi())
+    };
+    // Two half-time bookings fit Bob's 100% side by side.
+    assert_eq!(starts(&ed), ["2026-01-05T08:00:00", "2026-01-05T08:00:00"]);
+    // At 100% the second task must wait for the first.
+    ed.set_resources(20, &["Bob".into()]).unwrap();
+    assert_eq!(starts(&ed), ["2026-01-05T08:00:00", "2026-01-07T08:00:00"]);
+}
+
+#[test]
+fn a_literal_bracketed_resource_does_not_steal_the_assigned_cell_text() {
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    ed.set_resources(10, &["Bob".into()]).unwrap();
+    // Older builds created resources like this when `Bob[50%]` was typed.
+    ed.proj.resources.push(Resource {
+        uid: 7,
+        id: 7,
+        name: "Bob[50%]".into(),
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    ed.mark_saved();
+    let before = ed.project().clone();
+    ed.set_resources(10, &["bob[50%] ".into()]).unwrap();
+    unchanged(&ed, &before, (1, 0, false));
+    ed.set_resources(10, &["Bob[50%]".into(), "Carol".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 1), (0.5, 480));
+    assert_eq!(format_resource_names(&ed.proj, 10), "Bob[50%], Carol");
+    // Where Bob is not assigned, the whole name still wins.
+    ed.set_resources(20, &["Bob[50%]".into()]).unwrap();
+    assert_eq!(allocation(&ed, 20, 7), (1.0, 480));
 }
