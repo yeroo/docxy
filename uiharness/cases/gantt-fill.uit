@@ -1,13 +1,19 @@
+# What this checks: the harness reports filler_rows over a laid-out Project body,
+# and the bars still draw with the grid behind them. It does not check the grid's
+# pixels: faint 1px rules and shading are not something `border` can assert
+# honestly. The paint is covered by the geometry unit tests in project/gantt/tests.rs;
+# the shots are for eyeballing.
+#
 # filler_rows reads the last frame's body height, and state asserts do not wait
 # for a frame; the shot does, so it comes first.
-test gantt grid fills the pane below the last task
+test gantt reports ruled filler rows below the last task
   open ../fixtures/gantt-critical.xml
   assert tasks is 2
   shot window
   assert filler_rows is not 0
   assert bar_2 is critical 1-2
   assert border bar:2 solid amber
-test empty gantt is ruled from the top
+test empty gantt reports filler rows from the top
   open ../fixtures/gantt-empty.xml
   assert tasks is 0
   shot window
