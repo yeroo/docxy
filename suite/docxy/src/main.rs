@@ -1095,6 +1095,8 @@ struct DocTab {
     /// `path` names a file this tab could not read. Its content is a
     /// placeholder, so writing it back to that path would destroy the file:
     /// Save refuses, Save As to another path works and clears this (#209).
+    /// Only ever about the file at `path`: an unreadable hot-exit copy
+    /// reopens that file instead of marking the tab.
     load_failed: bool,
 }
 
@@ -4034,29 +4036,51 @@ fn restore_tab(t: &PersistTab) -> DocTab {
     let mut tab = match (t.kind, &hot) {
         (Kind::Docx, Some(hp)) => {
             let mut l = doc_from_path(hp);
-            // The sidecar of a tab whose file failed to load holds only the
-            // placeholder, so the mark carries over. A session written before
-            // the mark existed cannot say, so the file is asked directly;
-            // otherwise its placeholder would come back saveable over it.
-            let file_failed = match t.load_failed {
-                Some(failed) => failed,
-                None => path.as_ref().is_some_and(|p| doc_from_path(p).load_failed),
-            };
-            // A corrupt sidecar is a placeholder too.
-            let copy_failed = l.load_failed;
-            l.load_failed = file_failed || copy_failed;
-            l.status = if copy_failed {
-                "load error: the restored copy of this document could not be read; use Save As to save a new copy".into()
-            } else if file_failed {
-                format!("load error: {DOC_LOAD_FAILED_SAVE}").into()
-            } else if t.dirty {
-                "unsaved — restored".into()
+            if l.load_failed {
+                // The sidecar itself is unreadable, so its content is lost
+                // either way: a tab with a file reopens it exactly as with no
+                // sidecar (the fresh load alone decides the mark); a
+                // never-saved one keeps the placeholder, with no file to
+                // protect.
+                match &path {
+                    Some(p) => {
+                        let mut fresh = doc_from_path(p);
+                        if !fresh.load_failed {
+                            fresh.status = "loaded — the restored copy could not be read, so the file was reopened from disk".into();
+                        }
+                        fresh.into_tab(t.kind, t.title.clone().into(), path, false)
+                    }
+                    None => {
+                        l.load_failed = false;
+                        l.status =
+                            "load error: the restored copy of this document could not be read"
+                                .into();
+                        l.into_tab(t.kind, t.title.clone().into(), None, t.dirty)
+                    }
+                }
             } else {
-                "loaded".into()
-            };
-            let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
-            tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
-            tab
+                // The sidecar of a tab whose file failed to load holds only
+                // the placeholder, so the mark carries over. A session written
+                // before the mark existed cannot say, so a file that is there
+                // is asked directly (a missing one has nothing to lose, and
+                // the sidecar holds real content).
+                l.load_failed = match t.load_failed {
+                    Some(failed) => failed,
+                    None => path
+                        .as_ref()
+                        .is_some_and(|p| p.exists() && doc_from_path(p).load_failed),
+                };
+                l.status = if l.load_failed {
+                    format!("load error: {DOC_LOAD_FAILED_SAVE}").into()
+                } else if t.dirty {
+                    "unsaved — restored".into()
+                } else {
+                    "loaded".into()
+                };
+                let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
+                tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
+                tab
+            }
         }
         // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
         // keep the original on-disk `path` (so Save still targets the real

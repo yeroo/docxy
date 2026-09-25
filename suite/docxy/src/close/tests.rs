@@ -511,31 +511,90 @@ fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
         assert_eq!(save_doc_tab(&mut r, None), !failed, "{}", r.status);
     }
     assert_eq!(std::fs::read(&broken).unwrap(), b"not a zip");
+    // A good tab whose file has since gone missing keeps its content and
+    // saves it back; a missing file has nothing to lose.
+    let gone = dir.join("gone.docx");
+    basic_docx_at(&gone);
+    let mut t = tab_from_path(&gone);
+    t.dirty = true;
+    let text = doc_text(&t);
+    let mut p = persist_tab(&dir, 5, &t);
+    p.load_failed = None;
+    std::fs::remove_file(&gone).unwrap();
+    let mut r = restore_tab(&p);
+    assert!(!r.load_failed, "{}", r.status);
+    assert_eq!(doc_text(&r), text);
+    assert!(save_doc_tab(&mut r, None), "{}", r.status);
+    assert!(!tab_from_path(&gone).load_failed);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-#[test]
-fn a_corrupt_sidecar_restores_marked_and_says_the_copy_failed() {
+fn close_test_dir(tag: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../target/close-tests")
-        .join(format!("{}-load-failed-sidecar", std::process::id()));
+        .join(format!("{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let good = dir.join("good.docx");
+    dir
+}
+
+fn basic_docx_at(path: &std::path::Path) {
     std::fs::copy(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
-        &good,
+        path,
     )
     .unwrap();
-    let before = std::fs::read(&good).unwrap();
-    let mut t = tab_from_path(&good);
-    t.dirty = true;
-    let p = persist_tab(&dir, 0, &t);
-    assert_eq!(p.load_failed, Some(false));
-    std::fs::write(p.hot.as_ref().unwrap(), b"not a zip").unwrap();
+}
+
+fn doc_text(t: &DocTab) -> String {
+    let Surface::Doc(ed) = &t.surface else {
+        panic!("not a document")
+    };
+    docxcore::markdown::to_markdown(&ed.doc)
+}
+
+#[test]
+fn a_corrupt_sidecar_reopens_the_file_from_disk() {
+    let dir = close_test_dir("load-failed-sidecar");
+    let good = dir.join("good.docx");
+    basic_docx_at(&good);
+    let on_disk = doc_text(&tab_from_path(&good));
+    for dirty in [false, true] {
+        let mut t = tab_from_path(&good);
+        t.dirty = dirty;
+        let p = persist_tab(&dir, 0, &t);
+        std::fs::write(p.hot.as_ref().unwrap(), b"not a zip").unwrap();
+        let mut r = restore_tab(&p);
+        assert!(!r.load_failed, "dirty={dirty}: {}", r.status);
+        assert!(!r.dirty);
+        assert!(r.status.starts_with("loaded"), "{}", r.status);
+        assert!(r.status.contains("restored copy"), "{}", r.status);
+        assert_eq!(doc_text(&r), on_disk);
+        // The next exit and restart is an ordinary one.
+        let again = restore_tab(&persist_tab(&dir, 1, &r));
+        assert!(!again.load_failed && again.status.starts_with("loaded"));
+        r.dirty = true;
+        assert!(save_doc_tab(&mut r, None), "{}", r.status);
+        assert!(!tab_from_path(&good).load_failed);
+    }
+    // A file that is itself broken stays marked, by the fresh load.
+    let broken = dir.join("broken.docx");
+    std::fs::write(&broken, b"not a zip").unwrap();
+    let p = persist_tab(&dir, 2, &tab_from_path(&broken));
+    std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
     let mut r = restore_tab(&p);
     assert!(r.load_failed);
-    assert!(r.status.contains("restored copy"), "{}", r.status);
+    assert!(r.status.starts_with("load error"), "{}", r.status);
+    r.dirty = true;
     assert!(!save_doc_tab(&mut r, None));
-    assert_eq!(std::fs::read(&good).unwrap(), before);
+    assert_eq!(std::fs::read(&broken).unwrap(), b"not a zip");
+    // A never-saved document has no file to protect: unmarked, Save asks.
+    let mut t = tab_from_path(&good);
+    t.path = None;
+    let p = persist_tab(&dir, 3, &t);
+    std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
+    let r = restore_tab(&p);
+    assert!(!r.load_failed && r.path.is_none());
+    assert!(r.status.starts_with("load error"), "{}", r.status);
     let _ = std::fs::remove_dir_all(&dir);
 }
