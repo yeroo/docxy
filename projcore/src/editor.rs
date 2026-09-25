@@ -199,6 +199,22 @@ impl Editor {
             .ok_or_else(|| format!("no task with uid {uid}"))
     }
 
+    fn is_blank(&self, uid: i32) -> bool {
+        self.proj.task(uid).is_some_and(|t| t.is_null)
+    }
+
+    /// Before an edit outside [`Self::edit_structure`] turns blank row `i`
+    /// into a task, refuse it if that task could not be scheduled.
+    fn check_materialize(&self, i: usize) -> Result<(), String> {
+        if !self.proj.tasks[i].is_null {
+            return Ok(());
+        }
+        let mut next = self.proj.clone();
+        materialize(&mut next, i);
+        recompute_summaries(&mut next);
+        crate::schedule::calendar_error(&next).map_or(Ok(()), Err)
+    }
+
     fn snapshot(&mut self) {
         self.push_undo(self.proj.clone());
     }
@@ -295,11 +311,7 @@ impl Editor {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
         };
-        let outline_level = at
-            .checked_sub(1)
-            .and_then(|i| self.proj.tasks.get(i))
-            .map(|t| t.outline_level)
-            .unwrap_or(1);
+        let outline_level = task_level_above(&self.proj, at);
         let uid = self
             .proj
             .tasks
@@ -349,6 +361,7 @@ impl Editor {
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
         let i = self.index(uid)?;
         self.edit_structure(|proj| {
+            materialize(proj, i);
             let t = &mut proj.tasks[i];
             t.outline_level = (i64::from(t.outline_level) + i64::from(delta)).clamp(1, 20) as u32;
         })
@@ -405,11 +418,15 @@ impl Editor {
             return Ok(());
         }
         self.edit_structure(|proj| {
+            materialize(proj, i);
             let t = &mut proj.tasks[i];
             if let Some(name) = patch.name {
                 t.name = name;
             }
             if let Some(min) = patch.duration_min {
+                if min != t.duration_min {
+                    commit_estimate(t);
+                }
                 t.duration_min = min;
                 t.milestone = min == 0;
                 // A manual task keeps its start; its finish follows a new
@@ -463,7 +480,7 @@ impl Editor {
         lag_min: i64,
     ) -> Result<(), String> {
         let i = self.index(uid)?;
-        if uid == pred || self.index(pred).is_err() {
+        if uid == pred || self.index(pred).is_err() || self.is_blank(pred) {
             return Err(format!("No other task with ID {pred}"));
         }
         if self.proj.tasks[i]
@@ -473,7 +490,9 @@ impl Editor {
         {
             return Err(format!("Already depends on {pred}"));
         }
+        self.check_materialize(i)?;
         self.snapshot();
+        materialize(&mut self.proj, i);
         self.proj.tasks[i].predecessors.push(Predecessor {
             uid: pred,
             link,
@@ -532,8 +551,11 @@ impl Editor {
             .map(|a| a.uid)
             .max()
             .unwrap_or(0);
-        let assignment = new_assignment(&mut next_aid, uid, rid, self.proj.tasks[i].duration_min)?;
+        let work = materialized(&self.proj, i).duration_min;
+        let assignment = new_assignment(&mut next_aid, uid, rid, work)?;
+        self.check_materialize(i)?;
         self.snapshot();
+        materialize(&mut self.proj, i);
         self.proj.resources = resources;
         self.proj.assignments.push(assignment);
         self.changed();
@@ -573,7 +595,8 @@ impl Editor {
 
     pub fn toggle_milestone(&mut self, uid: i32) -> Result<(), String> {
         let i = self.index(uid)?;
-        let min = if self.proj.tasks[i].duration_min == 0 {
+        // A blank row toggles from the duration it gets as a task.
+        let min = if materialized(&self.proj, i).duration_min == 0 {
             480
         } else {
             0
@@ -636,6 +659,49 @@ fn new_assignment(
         units: 1.0,
         work_min,
     })
+}
+
+/// The outline level a task inserted at row `at` takes: that of the nearest
+/// task above it (blank rows are outside the outline), at least 1.
+fn task_level_above(proj: &Project, at: usize) -> u32 {
+    proj.tasks[..at]
+        .iter()
+        .rev()
+        .find(|t| !t.is_null)
+        .map_or(1, |t| t.outline_level.max(1))
+}
+
+/// Row `i` as it becomes when edited. Typing into a blank row turns it into a
+/// task, as in Project: it joins the outline at the level of the task above
+/// when it has none, and without a duration it gets Project's new-task
+/// default, `1 day?`, instead of turning into a milestone.
+fn materialized(proj: &Project, i: usize) -> Task {
+    let mut t = proj.tasks[i].clone();
+    if t.is_null {
+        t.is_null = false;
+        if t.outline_level == 0 {
+            t.outline_level = task_level_above(proj, i);
+        }
+        if t.duration_min == 0 {
+            t.duration_min = proj.days_to_minutes(1.0);
+            t.estimated = Some(true);
+            t.milestone = false;
+        }
+    }
+    t
+}
+
+fn materialize(proj: &mut Project, i: usize) {
+    if proj.tasks[i].is_null {
+        proj.tasks[i] = materialized(proj, i);
+    }
+}
+
+/// Typing a duration without `?` commits an estimated one, as in Project.
+fn commit_estimate(t: &mut Task) {
+    if t.estimated == Some(true) {
+        t.estimated = Some(false);
+    }
 }
 
 fn recompute_summaries(proj: &mut Project) {
@@ -1587,5 +1653,202 @@ mod tests {
         }
         assert_eq!(constraint_hint(&Task::default()), "");
         assert!(parse_constraint("").is_err());
+    }
+
+    // ---- blank rows and estimates (#80) ----
+
+    /// Task 1, a blank row (UID 3) with no level or duration, then Task 2.
+    fn blank_row_editor() -> Editor {
+        let mut proj = editor().project().clone();
+        proj.tasks.insert(
+            1,
+            Task {
+                uid: 3,
+                id: 2,
+                is_null: true,
+                create_date: Some(DateTime::from_ymd_hm(2026, 1, 2, 9, 0)),
+                ..Task::default()
+            },
+        );
+        proj.tasks[2].id = 3;
+        Editor::new(proj)
+    }
+
+    #[test]
+    fn editing_a_blank_row_makes_it_a_one_day_estimated_task() {
+        let mut ed = blank_row_editor();
+        let before = ed.project().clone();
+        assert!(ed.schedule().get(3).is_none());
+        ed.rename(3, "Typed").unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!(
+            t,
+            &Task {
+                uid: 3,
+                id: 2,
+                name: "Typed".into(),
+                outline_level: 1,
+                duration_min: 480,
+                estimated: Some(true),
+                create_date: before.tasks[1].create_date,
+                ..Task::default()
+            }
+        );
+        assert!(ed.schedule().get(3).is_some());
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        assert!(!xml.contains("<IsNull>"), "{xml}");
+        assert_eq!(
+            &crate::mspdi::read_mspdi(&xml).unwrap().tasks,
+            &ed.project().tasks
+        );
+        // One undo step restores the blank row.
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+        assert!(ed.schedule().get(3).is_none());
+    }
+
+    type Edit = dyn Fn(&mut Editor) -> Result<(), String>;
+
+    #[test]
+    fn every_edit_of_a_blank_row_makes_it_a_task() {
+        let fs1 = Predecessor {
+            uid: 1,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        };
+        let day = DateTime::from_ymd_hm(2026, 1, 7, 0, 0);
+        let edits: Vec<(&str, Box<Edit>)> = vec![
+            ("indent", Box::new(|ed| ed.indent(3, 1))),
+            ("set_duration", Box::new(|ed| ed.set_duration_min(3, 960))),
+            ("toggle_milestone", Box::new(|ed| ed.toggle_milestone(3))),
+            (
+                "set_constraint",
+                Box::new(|ed| ed.set_constraint(3, "SNET 2026-01-07")),
+            ),
+            ("set_start", Box::new(move |ed| ed.set_start(3, day))),
+            ("set_finish", Box::new(move |ed| ed.set_finish(3, day))),
+            (
+                "add_predecessor",
+                Box::new(|ed| ed.add_predecessor(3, 1, LinkType::FinishStart, 0)),
+            ),
+            (
+                "set_predecessors",
+                Box::new(move |ed| ed.set_predecessors(3, vec![fs1])),
+            ),
+            (
+                "assign_resource",
+                Box::new(|ed| ed.assign_resource(3, "Alice").map(|_| ())),
+            ),
+            (
+                "set_resources",
+                Box::new(|ed| ed.set_resources(3, &["Alice".into()])),
+            ),
+        ];
+        for (name, edit) in edits {
+            let mut ed = blank_row_editor();
+            let before = ed.project().clone();
+            edit(&mut ed).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let t = &ed.project().tasks[1];
+            assert!(!t.is_null, "{name}");
+            assert!(t.outline_level >= 1, "{name}");
+            assert!(ed.schedule().get(3).is_some(), "{name}");
+            assert_schedule(&ed);
+            assert_eq!(ed.undo_depth(), 1, "{name}");
+            assert!(ed.undo());
+            assert_eq!(ed.project(), &before, "{name}");
+        }
+        // A typed duration commits the new task's estimate; a milestone has none.
+        let mut ed = blank_row_editor();
+        ed.set_duration_min(3, 960).unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!(
+            (t.duration_min, t.estimated, t.milestone),
+            (960, Some(false), false)
+        );
+        let mut ed = blank_row_editor();
+        ed.toggle_milestone(3).unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!((t.duration_min, t.milestone), (0, true));
+    }
+
+    #[test]
+    fn a_blank_row_is_not_a_predecessor() {
+        let mut ed = blank_row_editor();
+        let before = ed.project().clone();
+        assert_eq!(
+            ed.add_predecessor(2, 3, LinkType::FinishStart, 0)
+                .unwrap_err(),
+            "No other task with ID 3"
+        );
+        let blank = Predecessor {
+            uid: 3,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        };
+        assert_eq!(
+            ed.set_predecessors(2, vec![blank]).unwrap_err(),
+            "No task with ID 2"
+        );
+        assert_eq!(ed.project(), &before);
+        assert_eq!(ed.undo_depth(), 0);
+        assert!(!ed.dirty());
+    }
+
+    #[test]
+    fn a_task_added_below_a_blank_row_takes_the_level_of_the_task_above() {
+        let mut ed = blank_row_editor();
+        ed.indent(1, 1).unwrap(); // Task 1 at level 2
+        let at = ed.add_task(Some(3), "After blank", 480).unwrap();
+        assert_eq!(at, 2);
+        assert_eq!(ed.project().tasks[at].outline_level, 2);
+        // With no task above, the level is 1.
+        let mut ed = blank_row_editor();
+        ed.delete_task(1).unwrap();
+        let at = ed.add_task(Some(3), "First", 480).unwrap();
+        assert_eq!(ed.project().tasks[at].outline_level, 1);
+        assert!(!ed.project().tasks[at - 1].summary);
+    }
+
+    #[test]
+    fn new_tasks_carry_no_imported_task_fields() {
+        let mut ed = editor();
+        let at = ed.add_task(None, "New", 480).unwrap();
+        assert_eq!(
+            ed.project().tasks[at],
+            Task {
+                uid: 3,
+                id: 3,
+                name: "New".into(),
+                outline_level: 1,
+                duration_min: 480,
+                ..Task::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_new_duration_commits_an_estimate() {
+        let mut proj = editor().project().clone();
+        proj.tasks[0].estimated = Some(true);
+        let mut ed = Editor::new(proj);
+        // Retyping the same duration is a no-op (see the follow-up on #80).
+        ed.set_duration_min(1, 480).unwrap();
+        assert_eq!(ed.project().tasks[0].estimated, Some(true));
+        ed.set_duration_min(1, 960).unwrap();
+        assert_eq!(ed.project().tasks[0].estimated, Some(false));
+        // An unset flag stays unset.
+        ed.set_duration_min(2, 960).unwrap();
+        assert_eq!(ed.project().tasks[1].estimated, None);
+        // A manual task's typed finish changes its duration and commits it.
+        let mut proj = editor().project().clone();
+        proj.tasks[0].estimated = Some(true);
+        proj.tasks[0].manual = true;
+        proj.tasks[0].manual_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+        let mut ed = Editor::new(proj);
+        ed.set_finish(1, DateTime::from_ymd_hm(2026, 1, 6, 0, 0))
+            .unwrap();
+        let t = &ed.project().tasks[0];
+        assert_eq!((t.duration_min, t.estimated), (960, Some(false)));
     }
 }

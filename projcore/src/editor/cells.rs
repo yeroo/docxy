@@ -60,7 +60,9 @@ impl Editor {
         if task.constraint == constraint && task.constraint_date == date {
             return Ok(());
         }
+        self.check_materialize(i)?;
         self.snapshot();
+        materialize(&mut self.proj, i);
         self.proj.tasks[i].constraint = constraint;
         self.proj.tasks[i].constraint_date = date;
         self.changed();
@@ -81,7 +83,9 @@ impl Editor {
         if task.manual_start == Some(start) && task.manual_finish.is_none() {
             return Ok(());
         }
+        self.check_materialize(i)?;
         self.snapshot();
+        materialize(&mut self.proj, i);
         let task = &mut self.proj.tasks[i];
         task.manual_start = Some(start);
         task.manual_finish = None;
@@ -120,8 +124,13 @@ impl Editor {
             return Ok(());
         }
         self.validate_cell_horizon(uid, Some(duration), None)?;
+        self.check_materialize(i)?;
         self.snapshot();
+        materialize(&mut self.proj, i);
         let task = &mut self.proj.tasks[i];
+        if duration != task.duration_min {
+            commit_estimate(task);
+        }
         task.manual_start = Some(start);
         task.manual_finish = Some(finish);
         task.duration_min = duration;
@@ -153,6 +162,10 @@ impl Editor {
         let mut seen = std::collections::HashSet::new();
         for p in &predecessors {
             self.index(p.uid)?;
+            if self.is_blank(p.uid) {
+                let id = self.proj.task(p.uid).map_or(p.uid, |t| t.id);
+                return Err(format!("No task with ID {id}"));
+            }
             if p.uid == uid {
                 return Err("A task cannot depend on itself".into());
             }
@@ -164,7 +177,9 @@ impl Editor {
             return Ok(());
         }
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;
+        self.check_materialize(i)?;
         self.snapshot();
+        materialize(&mut self.proj, i);
         self.proj.tasks[i].predecessors = predecessors;
         self.changed();
         Ok(())
@@ -263,10 +278,12 @@ impl Editor {
                 &mut next_aid,
                 uid,
                 rid,
-                self.proj.tasks[i].duration_min,
+                materialized(&self.proj, i).duration_min,
             )?);
         }
+        self.check_materialize(i)?;
         self.snapshot();
+        materialize(&mut self.proj, i);
         self.proj.resources = resources;
         self.proj.assignments = assignments;
         self.changed();
