@@ -201,6 +201,8 @@ pub struct Task {
     pub estimated: Option<bool>,
     /// Levelling priority, 0..=1000.
     pub priority: Option<i32>,
+    /// Bounds the late finish only, so a missed deadline shows as negative
+    /// total slack. It never moves scheduled dates.
     pub deadline: Option<DateTime>,
     pub level_assignments: Option<bool>,
     pub leveling_can_split: Option<bool>,

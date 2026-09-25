@@ -427,6 +427,16 @@ def build():
                                     ("Priority", 500), ("Estimated", 1)] + common),
         ])))
 
+    # 21 — B misses its Deadline by 5 days. The deadline bounds late finish
+    # only: dates stay put and A and B both get -5d total slack (#100).
+    add("21-deadline-missed.xml", ["deadline", "link", "link-fs", "negative-slack"],
+        "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack.",
+        project("deadline-missed", "\n".join([
+            task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True),
+            task(2, "B", 5 * D, dt(9), dt(13, "17:00:00"), slack=-5 * D, critical=True,
+                 preds=[(1, FS, 0)], fields=[("Deadline", dt(6, "17:00:00"))]),
+        ])))
+
     manifest = {
         "anchor": "2026-03-02T08:00:00",
         "calendar": "Standard 8h/day Mon-Fri (08:00-12:00, 13:00-17:00)",
