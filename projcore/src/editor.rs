@@ -19,6 +19,8 @@ pub use cells::{
     parse_predecessors,
 };
 use cells::{format_units, parse_resource_token};
+mod moving;
+pub use moving::parse_move;
 
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {
