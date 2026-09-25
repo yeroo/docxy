@@ -701,10 +701,12 @@ fn deleting_a_summary_asks_first_and_escape_changes_nothing() {
     );
     assert_eq!(v(&t).ed.project(), &before);
 
-    // Typing and backspace do not fill a yes/no prompt.
+    // Typing and backspace do not edit a yes/no prompt's buffer.
     project_input(&mut t, "d", Some("d"), Modifiers::default());
-    project_input(&mut t, "backspace", None, Modifiers::default());
     assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "");
+    vm(&mut t).prompt.as_mut().unwrap().buf = "x".into();
+    project_input(&mut t, "backspace", None, Modifiers::default());
+    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "x");
 
     project_input(&mut t, "escape", None, Modifiers::default());
     assert!(v(&t).prompt.is_none());
