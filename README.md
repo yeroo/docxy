@@ -249,10 +249,12 @@ yppxy plan.yppx --gantt-md out.md # headless: export a Markdown Gantt chart
 yppxy plan.xml  --save out.yppx   # headless: convert to the native package
 ```
 
-Like docxy and xlsxy, yppxy has the same **ribbon** (File · Task · Schedule ·
-View — `F9` to engage), the same **File backstage** (`Alt-F`: New / Open / Info
-/ Save / Save As / Export / Exit with a folder browser and live preview), a
-start screen, a light/dark theme toggle, and mouse support. Try it:
+Like docxy and xlsxy, yppxy has the same **ribbon** — with Microsoft Project's
+tabs, groups and command names (File · Task · Resource · Report · Project ·
+View, e.g. Project › Schedule › Set Baseline; `F9` to engage) — the same **File
+backstage** (`Alt-F`: New / Open / Info / Save / Save As / Export / Exit with a
+folder browser and live preview), a start screen, a light/dark theme toggle
+(the `◐ Theme` button at the right of the tab strip, or `T`), and mouse support. Try it:
 `yppxy corpus/mspdi/10-summary.xml`.
 
 ### Keys
@@ -271,6 +273,7 @@ start screen, a light/dark theme toggle, and mouse support. Try it:
 | a | assign a resource to the task (created on first use; `Name[25%]` sets units; empty clears) |
 | b | set the baseline (planned-vs-current variance in the header) |
 | L | toggle resource leveling (delay bars to fit resource capacity) |
+| T | toggle the light / dark theme |
 | Ctrl-F · F3 | find task by name · repeat |
 | Ctrl-Z · Ctrl-Y | undo · redo |
 | F9 · Alt-F | engage the ribbon · open the File menu |

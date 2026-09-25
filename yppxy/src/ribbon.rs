@@ -8,34 +8,34 @@ use unicode_width::UnicodeWidthStr;
 
 pub use ribboncore::{Dir, Focus, Hit};
 
-/// A ribbon command. `Todo` entries only report "not implemented yet".
+/// A ribbon command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Act {
     // Task
-    AddTask,
-    DeleteTask,
-    Milestone,
     Indent,
     Outdent,
+    AddLink,
+    AddTask,
+    Milestone,
+    Constraint,
     Rename,
     Duration,
-    // Schedule
-    AddLink,
-    Constraint,
-    Baseline,
+    Find,
+    DeleteTask,
+    // Resource
     Assign,
     ClearResources,
-    // View
+    LevelAll,
+    ClearLeveling,
+    // Report
     ExportGantt,
+    // Project
+    CalculateProject,
+    Baseline,
+    // View
     ScrollLeft,
     ScrollRight,
     GoToStart,
-    ThemeToggle,
-    Level,
-    // File group (on the Task tab too)
-    Save,
-    SaveAs,
-    Todo(&'static str),
 }
 
 type Group = ribboncore::Group<Act>;
@@ -54,13 +54,7 @@ pub struct Ribbon(CoreRibbon<Act>);
 
 impl Ribbon {
     pub fn new() -> Ribbon {
-        let tabs = vec!["File", "Task", "Schedule", "View"];
-        let tab_groups = vec![
-            Vec::new(), // File → backstage
-            task_groups(),
-            schedule_groups(),
-            view_groups(),
-        ];
+        let (tabs, tab_groups) = tabs().into_iter().unzip();
         Ribbon(CoreRibbon::new(tabs, tab_groups, 1, ACCENT))
     }
 
@@ -88,19 +82,49 @@ impl std::ops::DerefMut for Ribbon {
 }
 
 // ---- tab definitions --------------------------------------------------------
+//
+// Microsoft Project's tabs, groups and command names, matching the suite's
+// `project_ribbon()` (suite/docxy/src/project/commands.rs), so written Project
+// instructions ("Project › Schedule › Set Baseline") work in both front ends.
+// Save / Save As live in the File backstage (and Ctrl+S); Theme is the
+// tab-strip button (and `T`), like the suite's title-bar button.
+
+/// Every tab with its groups, in ribbon order.
+fn tabs() -> Vec<(&'static str, Vec<Group>)> {
+    vec![
+        ("File", Vec::new()), // File → backstage
+        ("Task", task_groups()),
+        ("Resource", resource_groups()),
+        ("Report", report_groups()),
+        ("Project", project_groups()),
+        ("View", view_groups()),
+    ]
+}
 
 fn task_groups() -> Vec<Group> {
     use Act::*;
     vec![
         Group {
-            title: "Tasks",
-            width: 24,
+            title: "Schedule",
+            width: 29,
             rows: [
                 vec![
-                    btn("＋ Task", AddTask, "Add a task below (n)"),
+                    btn("→ Indent Task", Indent, "Indent — make a subtask (Tab)"),
                     Seg::Gap("  "),
-                    btn("✗ Delete", DeleteTask, "Delete the task (x)"),
+                    btn("← Outdent Task", Outdent, "Outdent (Shift+Tab)"),
                 ],
+                vec![btn(
+                    "🔗 Link the Selected Tasks",
+                    AddLink,
+                    "Add a predecessor by task ID (p)",
+                )],
+            ],
+        },
+        Group {
+            title: "Insert",
+            width: 11,
+            rows: [
+                vec![btn("＋ Task", AddTask, "Add a task below (n)")],
                 vec![btn(
                     "◆ Milestone",
                     Milestone,
@@ -109,120 +133,132 @@ fn task_groups() -> Vec<Group> {
             ],
         },
         Group {
-            title: "Outline",
+            title: "Properties",
             width: 20,
             rows: [
-                vec![btn("→ Indent", Indent, "Indent — make a subtask (Tab)")],
-                vec![btn("← Outdent", Outdent, "Outdent (Shift+Tab)")],
-            ],
-        },
-        Group {
-            title: "Edit",
-            width: 18,
-            rows: [
-                vec![btn("✎ Rename", Rename, "Rename the task (Enter)")],
                 vec![btn(
-                    "⏱ Duration",
-                    Duration,
-                    "Set duration — 3d / 4h / 2w (d)",
+                    "ⓘ Information",
+                    Constraint,
+                    "Set a date constraint — SNET/MSO/… (c)",
                 )],
+                vec![
+                    btn("✎ Rename", Rename, "Rename the task (Enter)"),
+                    Seg::Gap("  "),
+                    btn("⏱ Duration", Duration, "Set duration — 3d / 4h / 2w (d)"),
+                ],
             ],
         },
         Group {
-            title: "File",
-            width: 14,
+            title: "Editing",
+            width: 13,
             rows: [
-                vec![btn("💾 Save", Save, "Save (Ctrl+S)")],
-                vec![btn("Save As…", SaveAs, "Save As")],
+                vec![btn(
+                    "⌕ Find",
+                    Find,
+                    "Find a task by name (Ctrl+F / F3 next)",
+                )],
+                vec![btn("✗ Delete Task", DeleteTask, "Delete the task (x)")],
             ],
         },
     ]
 }
 
-fn schedule_groups() -> Vec<Group> {
+fn resource_groups() -> Vec<Group> {
     use Act::*;
     vec![
         Group {
-            title: "Dependencies",
-            width: 22,
-            rows: [
-                vec![btn("🔗 Link", AddLink, "Add a predecessor by task ID (p)")],
-                vec![btn(
-                    "⛓ Constraint",
-                    Constraint,
-                    "Set a date constraint — SNET/MSO/… (c)",
-                )],
-            ],
-        },
-        Group {
-            title: "Resources",
-            width: 16,
+            title: "Assignments",
+            width: 19,
             rows: [
                 vec![btn(
-                    "👤 Assign",
+                    "👤 Assign Resources",
                     Assign,
                     "Assign a resource to the task (a)",
                 )],
                 vec![btn(
-                    "✗ Clear",
+                    "✗ Clear Resources",
                     ClearResources,
                     "Remove the task's resources",
                 )],
             ],
         },
         Group {
-            title: "Baseline",
-            width: 14,
+            title: "Level",
+            width: 16,
             rows: [
                 vec![btn(
-                    "⚑ Baseline",
-                    Baseline,
-                    "Snapshot the current plan as the baseline (b)",
+                    "⚖ Level All",
+                    LevelAll,
+                    "Delay bars to fit resource capacity (L toggles)",
                 )],
                 vec![btn(
-                    "⟳ Recalc",
-                    Todo("Reschedule"),
-                    "Recompute (automatic on every edit)",
+                    "✗ Clear Leveling",
+                    ClearLeveling,
+                    "Turn resource leveling off (L toggles)",
                 )],
             ],
         },
     ]
 }
 
+fn report_groups() -> Vec<Group> {
+    use Act::*;
+    vec![Group {
+        title: "Export",
+        width: 14,
+        rows: [
+            vec![btn(
+                "⭳ Export Gantt",
+                ExportGantt,
+                "Export a Markdown/Mermaid Gantt (Ctrl+E)",
+            )],
+            Vec::new(),
+        ],
+    }]
+}
+
+fn project_groups() -> Vec<Group> {
+    use Act::*;
+    vec![Group {
+        title: "Schedule",
+        width: 19,
+        rows: [
+            vec![btn(
+                "⟳ Calculate Project",
+                CalculateProject,
+                "Recompute the schedule (automatic on every edit)",
+            )],
+            vec![btn(
+                "⚑ Set Baseline",
+                Baseline,
+                "Snapshot the current plan as the baseline (b)",
+            )],
+        ],
+    }]
+}
+
 fn view_groups() -> Vec<Group> {
     use Act::*;
-    vec![
-        Group {
-            title: "Gantt",
-            width: 26,
-            rows: [
-                vec![
-                    btn("◀", ScrollLeft, "Scroll the timeline left (h)"),
-                    Seg::Gap(" "),
-                    btn("▶", ScrollRight, "Scroll the timeline right (l)"),
-                    Seg::Gap("  "),
-                    btn(
-                        "⇤ Start",
-                        GoToStart,
-                        "Scroll to the earliest task or project start",
-                    ),
-                ],
-                vec![btn(
-                    "⭳ Export Markdown",
-                    ExportGantt,
-                    "Export a Markdown/Mermaid Gantt (Ctrl+E)",
-                )],
+    vec![Group {
+        title: "Zoom",
+        width: 29,
+        rows: [
+            vec![
+                btn("◀ Scroll Left", ScrollLeft, "Scroll the timeline left (h)"),
+                Seg::Gap("  "),
+                btn(
+                    "▶ Scroll Right",
+                    ScrollRight,
+                    "Scroll the timeline right (l)",
+                ),
             ],
-        },
-        Group {
-            title: "Window",
-            width: 16,
-            rows: [
-                vec![btn("◐ Theme", ThemeToggle, "Toggle light / dark theme")],
-                vec![btn("⚖ Level", Level, "Toggle resource leveling (L)")],
-            ],
-        },
-    ]
+            vec![btn(
+                "⇤ Go to Start",
+                GoToStart,
+                "Scroll to the earliest task or project start",
+            )],
+        ],
+    }]
 }
 
 #[cfg(test)]
@@ -239,9 +275,87 @@ mod tests {
             .sum()
     }
 
+    /// The widest tab body before #110 (the old Task tab: 1 + Σ(width + 3)).
+    /// The Project tabs must not make the ribbon any wider than that.
+    const BODY_BUDGET: usize = 89;
+
+    #[test]
+    fn tabs_are_microsoft_projects() {
+        let r = Ribbon::new();
+        let labels: Vec<_> = (0..).map_while(|i| r.tab_label(i)).collect();
+        assert_eq!(
+            labels,
+            ["File", "Task", "Resource", "Report", "Project", "View"]
+        );
+    }
+
+    #[test]
+    fn project_instruction_paths_exist() {
+        use Act::*;
+        // (tab, group, command name, act) — the suite's `project_ribbon()`.
+        let paths = [
+            ("Task", "Schedule", "Indent Task", Indent),
+            ("Task", "Schedule", "Outdent Task", Outdent),
+            ("Task", "Schedule", "Link the Selected Tasks", AddLink),
+            ("Task", "Insert", "Task", AddTask),
+            ("Task", "Insert", "Milestone", Milestone),
+            ("Task", "Properties", "Information", Constraint),
+            ("Task", "Properties", "Rename", Rename),
+            ("Task", "Properties", "Duration", Duration),
+            ("Task", "Editing", "Find", Find),
+            ("Task", "Editing", "Delete Task", DeleteTask),
+            ("Resource", "Assignments", "Assign Resources", Assign),
+            ("Resource", "Assignments", "Clear Resources", ClearResources),
+            ("Resource", "Level", "Level All", LevelAll),
+            ("Resource", "Level", "Clear Leveling", ClearLeveling),
+            ("Report", "Export", "Export Gantt", ExportGantt),
+            ("Project", "Schedule", "Calculate Project", CalculateProject),
+            ("Project", "Schedule", "Set Baseline", Baseline),
+            ("View", "Zoom", "Scroll Left", ScrollLeft),
+            ("View", "Zoom", "Scroll Right", ScrollRight),
+            ("View", "Zoom", "Go to Start", GoToStart),
+        ];
+        let tabs = tabs();
+        for (tab, group, name, act) in paths {
+            let groups = &tabs.iter().find(|(t, _)| *t == tab).unwrap().1;
+            let g = groups
+                .iter()
+                .find(|g| g.title == group)
+                .unwrap_or_else(|| panic!("no group {tab} › {group}"));
+            let found = g.rows.iter().flatten().any(|s| match s {
+                Seg::Btn(b) => b.glyph.ends_with(&format!(" {name}")) && b.act == act,
+                Seg::Gap(_) => false,
+            });
+            assert!(found, "no {tab} › {group} › {name} → {act:?}");
+        }
+        // Nothing else: exactly these groups per tab, and no stray buttons.
+        for (tab, groups) in &tabs {
+            let want: Vec<_> =
+                paths
+                    .iter()
+                    .filter(|p| p.0 == *tab)
+                    .map(|p| p.1)
+                    .fold(Vec::new(), |mut v, g| {
+                        if !v.contains(&g) {
+                            v.push(g);
+                        }
+                        v
+                    });
+            let got: Vec<_> = groups.iter().map(|g| g.title).collect();
+            assert_eq!(got, want, "groups on {tab}");
+            let buttons = groups
+                .iter()
+                .flat_map(|g| g.rows.iter().flatten())
+                .filter(|s| matches!(s, Seg::Btn(_)))
+                .count();
+            let rows = paths.iter().filter(|p| p.0 == *tab).count();
+            assert_eq!(buttons, rows, "buttons on {tab}");
+        }
+    }
+
     #[test]
     fn every_group_is_wide_enough_for_its_content() {
-        for groups in [task_groups(), schedule_groups(), view_groups()] {
+        for (_, groups) in tabs() {
             for g in &groups {
                 for row in &g.rows {
                     assert!(
@@ -253,6 +367,14 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn every_tab_fits_the_width_budget() {
+        for (tab, groups) in tabs() {
+            let body = 1 + groups.iter().map(|g| g.width + 3).sum::<usize>();
+            assert!(body <= BODY_BUDGET, "{tab} body {body} > {BODY_BUDGET}");
         }
     }
 
