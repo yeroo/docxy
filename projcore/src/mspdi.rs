@@ -226,6 +226,24 @@ fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
                     "Work" => t.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => t.cost = rate_of(p),
                     "OverAllocated" => t.over_allocated = opt_bool_of(p),
+                    "PercentComplete" => t.percent_complete = percent_of(p),
+                    "PercentWorkComplete" => t.percent_work_complete = percent_of(p),
+                    "PhysicalPercentComplete" => t.physical_percent_complete = percent_of(p),
+                    "ActualStart" => t.actual_start = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualFinish" => t.actual_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Stop" => t.stop = DateTime::parse_mspdi(&text_of(p)),
+                    "Resume" => t.resume = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualDuration" => t.actual_duration_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingDuration" => {
+                        t.remaining_duration_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ActualWork" => t.actual_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingWork" => t.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "ActualCost" => t.actual_cost = rate_of(p),
+                    "RemainingCost" => t.remaining_cost = rate_of(p),
+                    "StartVariance" => t.start_variance = opt_int_of(p),
+                    "FinishVariance" => t.finish_variance = opt_int_of(p),
+                    "WorkVariance" => t.work_variance = rate_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -387,6 +405,21 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
                     "ResourceUID" => a.resource_uid = int_of(p) as i32,
                     "Units" => a.units = float_of(p),
                     "Work" => a.work_min = iso8601_to_minutes(&text_of(p)),
+                    "PercentWorkComplete" => a.percent_work_complete = percent_of(p),
+                    "ActualStart" => a.actual_start = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualFinish" => a.actual_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Stop" => a.stop = DateTime::parse_mspdi(&text_of(p)),
+                    "Resume" => a.resume = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualWork" => a.actual_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingWork" => a.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "ActualCost" => a.actual_cost = rate_of(p),
+                    "RemainingCost" => a.remaining_cost = rate_of(p),
+                    "StartVariance" => a.start_variance = opt_int_of(p),
+                    "FinishVariance" => a.finish_variance = opt_int_of(p),
+                    "WorkVariance" => a.work_variance = rate_of(p),
+                    "CostVariance" => a.cost_variance = rate_of(p),
+                    // Its Start/Finish/Work/Cost are the recorded plan's, not the assignment's.
+                    "Baseline" => parse_assignment_baseline(p, &mut a),
                     _ => p.skip_element(),
                 }
             }
@@ -395,6 +428,37 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
         }
     }
     a
+}
+
+/// Parse an assignment's recorded plan; the same slot rules as [`parse_baseline`].
+fn parse_assignment_baseline(p: &mut XmlParser, a: &mut Assignment) {
+    let mut baseline = AssignmentBaseline::default();
+    let mut number = Some(0);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "Number" => {
+                        number = text_of(p).trim().parse::<u8>().ok().filter(|n| *n <= 10);
+                    }
+                    "Start" => baseline.start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Work" => baseline.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => baseline.cost = rate_of(p),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    if let Some(number) = number {
+        if baseline != AssignmentBaseline::default() {
+            baseline.number = number;
+            a.set_baseline_slot(baseline);
+        }
+    }
 }
 
 fn parse_calendars(p: &mut XmlParser, out: &mut Vec<Calendar>) {
@@ -557,6 +621,11 @@ fn opt_bool_of(p: &mut XmlParser) -> Option<bool> {
 /// An optional integer: unparseable text stays absent instead of reading as 0.
 fn opt_int_of(p: &mut XmlParser) -> Option<i64> {
     text_of(p).trim().parse().ok()
+}
+
+/// A percentage, 0..=100; anything else stays absent.
+fn percent_of(p: &mut XmlParser) -> Option<u8> {
+    text_of(p).trim().parse().ok().filter(|n| *n <= 100)
 }
 
 fn opt_i32_of(p: &mut XmlParser) -> Option<i32> {
@@ -848,6 +917,8 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 3, "DurationFormat", "7");
     }
     opt_text(s, "Work", t.work_min.map(min_to_iso));
+    opt_date(s, "Stop", t.stop);
+    opt_date(s, "Resume", t.resume);
     opt_flag(s, "EffortDriven", t.effort_driven);
     opt_flag(s, "Recurring", t.recurring);
     opt_flag(s, "OverAllocated", t.over_allocated);
@@ -867,6 +938,15 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 3, "EarlyFinish", &r.early_finish.to_mspdi());
         tag(s, 3, "LateStart", &r.late_start.to_mspdi());
         tag(s, 3, "LateFinish", &r.late_finish.to_mspdi());
+    }
+    opt_text(s, "StartVariance", t.start_variance);
+    opt_text(s, "FinishVariance", t.finish_variance);
+    opt_text(
+        s,
+        "WorkVariance",
+        t.work_variance.as_ref().map(Rate::as_str),
+    );
+    if let Some(r) = computed.result {
         // Slack is working minutes in the model, tenths of a minute in MSPDI.
         for (name, min) in [
             ("FreeSlack", r.free_slack_min),
@@ -877,7 +957,25 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
             tag(s, 3, name, &(min * 10).to_string());
         }
     }
+    opt_text(s, "PercentComplete", t.percent_complete);
+    opt_text(s, "PercentWorkComplete", t.percent_work_complete);
     opt_text(s, "Cost", t.cost.as_ref().map(Rate::as_str));
+    opt_date(s, "ActualStart", t.actual_start);
+    opt_date(s, "ActualFinish", t.actual_finish);
+    opt_text(s, "ActualDuration", t.actual_duration_min.map(min_to_iso));
+    opt_text(s, "ActualCost", t.actual_cost.as_ref().map(Rate::as_str));
+    opt_text(s, "ActualWork", t.actual_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "RemainingDuration",
+        t.remaining_duration_min.map(min_to_iso),
+    );
+    opt_text(
+        s,
+        "RemainingCost",
+        t.remaining_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "RemainingWork", t.remaining_work_min.map(min_to_iso));
     if task || t.constraint != ConstraintType::AsSoonAsPossible {
         tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
     }
@@ -891,6 +989,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_flag(s, "IgnoreResourceCalendar", t.ignore_resource_calendar);
     opt_flag(s, "HideBar", t.hide_bar);
     opt_flag(s, "Rollup", t.rollup);
+    opt_text(s, "PhysicalPercentComplete", t.physical_percent_complete);
     opt_text(s, "EarnedValueMethod", t.earned_value_method);
     for p in &t.predecessors {
         s.push_str("      <PredecessorLink>\n");
@@ -965,8 +1064,51 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     tag(s, 3, "UID", &a.uid.to_string());
     tag(s, 3, "TaskUID", &a.task_uid.to_string());
     tag(s, 3, "ResourceUID", &a.resource_uid.to_string());
+    // Microsoft's Assignment sequence, as Project 2021 writes it.
+    opt_text(s, "PercentWorkComplete", a.percent_work_complete);
+    opt_text(s, "ActualCost", a.actual_cost.as_ref().map(Rate::as_str));
+    opt_date(s, "ActualFinish", a.actual_finish);
+    opt_date(s, "ActualStart", a.actual_start);
+    opt_text(s, "ActualWork", a.actual_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "CostVariance",
+        a.cost_variance.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "FinishVariance", a.finish_variance);
+    opt_text(
+        s,
+        "WorkVariance",
+        a.work_variance.as_ref().map(Rate::as_str),
+    );
+    opt_text(
+        s,
+        "RemainingCost",
+        a.remaining_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "RemainingWork", a.remaining_work_min.map(min_to_iso));
+    opt_date(s, "Stop", a.stop);
+    opt_date(s, "Resume", a.resume);
+    opt_text(s, "StartVariance", a.start_variance);
     tag(s, 3, "Units", &fmt_f(a.units));
     tag(s, 3, "Work", &min_to_iso(a.work_min));
+    for baseline in &a.baselines {
+        s.push_str("      <Baseline>\n");
+        tag(s, 4, "Number", &baseline.number.to_string());
+        if let Some(start) = baseline.start {
+            tag(s, 4, "Start", &start.to_mspdi());
+        }
+        if let Some(finish) = baseline.finish {
+            tag(s, 4, "Finish", &finish.to_mspdi());
+        }
+        if let Some(work) = baseline.work_min {
+            tag(s, 4, "Work", &min_to_iso(work));
+        }
+        if let Some(cost) = &baseline.cost {
+            tag(s, 4, "Cost", cost.as_str());
+        }
+        s.push_str("      </Baseline>\n");
+    }
     s.push_str("    </Assignment>\n");
 }
 
@@ -2277,7 +2419,8 @@ mod tests {
     fn task_children_follow_schema_sequence() {
         // The MSPDI Task sequence, as Project 2021 writes it (checked over the
         // 1569 tasks of a private Project 2021 corpus) and as Microsoft's XML
-        // Schema for the Tasks Element lists it.
+        // Schema for the Tasks Element lists it. That corpus has no task-level
+        // ActualCost or ActualWork; their places are the schema's.
         let mut proj = task_project(TASK_FIELDS);
         let t = &mut proj.tasks[0];
         t.manual = true;
@@ -2294,6 +2437,24 @@ mod tests {
             duration_min: Some(480),
             ..Baseline::default()
         });
+        let progress = task_project(PROGRESS).tasks.remove(0);
+        let t = &mut proj.tasks[0];
+        t.percent_complete = progress.percent_complete;
+        t.percent_work_complete = progress.percent_work_complete;
+        t.physical_percent_complete = progress.physical_percent_complete;
+        t.actual_start = progress.actual_start;
+        t.actual_finish = progress.actual_finish;
+        t.stop = progress.stop;
+        t.resume = progress.resume;
+        t.actual_duration_min = progress.actual_duration_min;
+        t.remaining_duration_min = progress.remaining_duration_min;
+        t.actual_work_min = progress.actual_work_min;
+        t.remaining_work_min = progress.remaining_work_min;
+        t.actual_cost = progress.actual_cost.clone();
+        t.remaining_cost = progress.remaining_cost.clone();
+        t.start_variance = progress.start_variance;
+        t.finish_variance = progress.finish_variance;
+        t.work_variance = progress.work_variance.clone();
         proj.tasks.insert(
             0,
             Task {
@@ -2343,6 +2504,8 @@ mod tests {
                 "ManualDuration",
                 "DurationFormat",
                 "Work",
+                "Stop",
+                "Resume",
                 "EffortDriven",
                 "Recurring",
                 "OverAllocated",
@@ -2357,11 +2520,24 @@ mod tests {
                 "EarlyFinish",
                 "LateStart",
                 "LateFinish",
+                "StartVariance",
+                "FinishVariance",
+                "WorkVariance",
                 "FreeSlack",
                 "TotalSlack",
                 "StartSlack",
                 "FinishSlack",
+                "PercentComplete",
+                "PercentWorkComplete",
                 "Cost",
+                "ActualStart",
+                "ActualFinish",
+                "ActualDuration",
+                "ActualCost",
+                "ActualWork",
+                "RemainingDuration",
+                "RemainingCost",
+                "RemainingWork",
                 "ConstraintType",
                 "CalendarUID",
                 "ConstraintDate",
@@ -2373,6 +2549,7 @@ mod tests {
                 "IgnoreResourceCalendar",
                 "HideBar",
                 "Rollup",
+                "PhysicalPercentComplete",
                 "EarnedValueMethod",
                 "PredecessorLink",
                 "PredecessorUID",
@@ -2593,5 +2770,454 @@ mod tests {
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
         assert_eq!(package.tasks, proj.tasks);
+    }
+
+    /// A tracked task carrying every progress field #81 keeps, in schema order.
+    const PROGRESS: &str = "<Task><UID>1</UID><ID>1</ID><Name>Pour</Name>\
+        <OutlineLevel>1</OutlineLevel><Duration>PT32H0M0S</Duration>\
+        <Stop>2026-03-03T17:00:00</Stop><Resume>2026-03-04T08:00:00</Resume>\
+        <StartVariance>4800</StartVariance><FinishVariance>-4800</FinishVariance>\
+        <WorkVariance>960000.0</WorkVariance>\
+        <PercentComplete>50</PercentComplete><PercentWorkComplete>40</PercentWorkComplete>\
+        <ActualStart>2026-03-02T08:00:00</ActualStart><ActualFinish>2026-03-05T17:00:00</ActualFinish>\
+        <ActualDuration>PT16H0M0S</ActualDuration><ActualCost>800.25</ActualCost>\
+        <ActualWork>PT16H30M0S</ActualWork><RemainingDuration>PT16H0M0S</RemainingDuration>\
+        <RemainingCost>799.75</RemainingCost><RemainingWork>PT15H30M0S</RemainingWork>\
+        <PhysicalPercentComplete>30</PhysicalPercentComplete></Task>";
+
+    /// Task elements #81 keeps.
+    const PROGRESS_TASK_ELEMENTS: [&str; 16] = [
+        "PercentComplete",
+        "PercentWorkComplete",
+        "PhysicalPercentComplete",
+        "ActualStart",
+        "ActualFinish",
+        "ActualDuration",
+        "ActualWork",
+        "ActualCost",
+        "Stop",
+        "Resume",
+        "RemainingDuration",
+        "RemainingWork",
+        "RemainingCost",
+        "StartVariance",
+        "FinishVariance",
+        "WorkVariance",
+    ];
+
+    /// A tracked assignment carrying every progress field #81 keeps, and two baselines.
+    const PROGRESS_ASSIGNMENT: &str = "<Assignment><UID>1</UID><TaskUID>1</TaskUID>\
+        <ResourceUID>1</ResourceUID><PercentWorkComplete>50</PercentWorkComplete>\
+        <ActualCost>400</ActualCost><ActualFinish>2026-03-05T17:00:00</ActualFinish>\
+        <ActualStart>2026-03-02T08:00:00</ActualStart><ActualWork>PT16H0M0S</ActualWork>\
+        <CostVariance>-12.5</CostVariance><FinishVariance>4800</FinishVariance>\
+        <WorkVariance>480000.0</WorkVariance><RemainingCost>400.00</RemainingCost>\
+        <RemainingWork>PT16H0M0S</RemainingWork><Stop>2026-03-03T17:00:00</Stop>\
+        <Resume>2026-03-04T08:00:00</Resume><StartVariance>0</StartVariance>\
+        <Units>1</Units><Work>PT32H0M0S</Work>\
+        <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start>\
+        <Finish>2026-03-05T17:00:00</Finish><Work>PT32H0M0S</Work><Cost>800</Cost></Baseline>\
+        <Baseline><Number>3</Number><Work>PT4H0M0S</Work></Baseline></Assignment>";
+
+    /// Assignment elements #81 keeps.
+    const PROGRESS_ASSIGNMENT_ELEMENTS: [&str; 14] = [
+        "PercentWorkComplete",
+        "ActualCost",
+        "ActualFinish",
+        "ActualStart",
+        "ActualWork",
+        "CostVariance",
+        "FinishVariance",
+        "WorkVariance",
+        "RemainingCost",
+        "RemainingWork",
+        "Stop",
+        "Resume",
+        "StartVariance",
+        "Baseline",
+    ];
+
+    fn assignment_project(assignments: &str) -> Project {
+        read_mspdi(&format!(
+            "<Project><StartDate>2026-03-02T08:00:00</StartDate><Tasks>\
+             <Task><UID>1</UID><ID>1</ID><OutlineLevel>1</OutlineLevel>\
+             <Duration>PT32H0M0S</Duration></Task></Tasks><Resources>\
+             <Resource><UID>1</UID><ID>1</ID><Name>Crew</Name></Resource></Resources>\
+             <Assignments>{assignments}</Assignments></Project>"
+        ))
+        .unwrap()
+    }
+
+    /// The `<Assignments>` section of a written file.
+    fn assignment_xml(xml: &str) -> &str {
+        &xml[xml.find("<Assignments>").unwrap()..xml.find("</Assignments>").unwrap()]
+    }
+
+    fn d(day: u32, hour: u32) -> Option<DateTime> {
+        Some(DateTime::from_ymd_hm(2026, 3, day, hour, 0))
+    }
+
+    #[test]
+    fn progress_fields_are_read() {
+        assert_eq!(
+            task_project(PROGRESS).tasks[0],
+            Task {
+                uid: 1,
+                id: 1,
+                name: "Pour".into(),
+                outline_level: 1,
+                duration_min: 1920,
+                percent_complete: Some(50),
+                percent_work_complete: Some(40),
+                physical_percent_complete: Some(30),
+                actual_start: d(2, 8),
+                actual_finish: d(5, 17),
+                stop: d(3, 17),
+                resume: d(4, 8),
+                actual_duration_min: Some(960),
+                remaining_duration_min: Some(960),
+                actual_work_min: Some(990),
+                remaining_work_min: Some(930),
+                actual_cost: Rate::parse("800.25"),
+                remaining_cost: Rate::parse("799.75"),
+                start_variance: Some(4800),
+                finish_variance: Some(-4800),
+                work_variance: Rate::parse("960000.0"),
+                ..Task::default()
+            }
+        );
+        assert_eq!(
+            assignment_project(PROGRESS_ASSIGNMENT).assignments,
+            [Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 1920,
+                percent_work_complete: Some(50),
+                actual_start: d(2, 8),
+                actual_finish: d(5, 17),
+                stop: d(3, 17),
+                resume: d(4, 8),
+                actual_work_min: Some(960),
+                remaining_work_min: Some(960),
+                actual_cost: Rate::parse("400"),
+                remaining_cost: Rate::parse("400.00"),
+                start_variance: Some(0),
+                finish_variance: Some(4800),
+                work_variance: Rate::parse("480000.0"),
+                cost_variance: Rate::parse("-12.5"),
+                baselines: vec![
+                    AssignmentBaseline {
+                        number: 0,
+                        start: d(2, 8),
+                        finish: d(5, 17),
+                        work_min: Some(1920),
+                        cost: Rate::parse("800"),
+                    },
+                    AssignmentBaseline {
+                        number: 3,
+                        work_min: Some(240),
+                        ..AssignmentBaseline::default()
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn progress_fields_survive_mspdi_and_native_package_round_trips() {
+        let mut proj = assignment_project(PROGRESS_ASSIGNMENT);
+        proj.tasks = task_project(PROGRESS).tasks;
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<PercentComplete>50</PercentComplete>",
+            "<PercentWorkComplete>40</PercentWorkComplete>",
+            "<PhysicalPercentComplete>30</PhysicalPercentComplete>",
+            "<ActualStart>2026-03-02T08:00:00</ActualStart>",
+            "<ActualFinish>2026-03-05T17:00:00</ActualFinish>",
+            "<Stop>2026-03-03T17:00:00</Stop>",
+            "<Resume>2026-03-04T08:00:00</Resume>",
+            "<ActualDuration>PT16H0M0S</ActualDuration>",
+            "<ActualWork>PT16H30M0S</ActualWork>",
+            "<ActualCost>800.25</ActualCost>",
+            "<RemainingDuration>PT16H0M0S</RemainingDuration>",
+            "<RemainingWork>PT15H30M0S</RemainingWork>",
+            "<RemainingCost>799.75</RemainingCost>",
+            "<StartVariance>4800</StartVariance>",
+            "<FinishVariance>-4800</FinishVariance>",
+            "<WorkVariance>960000.0</WorkVariance>",
+        ] {
+            assert!(task_xml(&xml).contains(element), "missing {element}");
+        }
+        for element in [
+            "<PercentWorkComplete>50</PercentWorkComplete>",
+            "<ActualCost>400</ActualCost>",
+            "<ActualWork>PT16H0M0S</ActualWork>",
+            "<CostVariance>-12.5</CostVariance>",
+            "<WorkVariance>480000.0</WorkVariance>",
+            "<RemainingCost>400.00</RemainingCost>",
+            "<StartVariance>0</StartVariance>",
+            "<Cost>800</Cost>",
+        ] {
+            assert!(assignment_xml(&xml).contains(element), "missing {element}");
+        }
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.tasks, proj.tasks);
+        assert_eq!(back.assignments, proj.assignments);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks, proj.tasks);
+        assert_eq!(package.assignments, proj.assignments);
+    }
+
+    #[test]
+    fn progress_durations_round_to_minutes() {
+        // As Project 2021 wrote them in a tracked plan: whole minutes are the
+        // model's unit, so the seconds do not survive a save.
+        let mut proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <ActualWork>PT32H9M36S</ActualWork><RemainingWork>PT15H50M24S</RemainingWork>\
+             </Assignment>",
+        );
+        proj.tasks = task_project(
+            "<Task><UID>1</UID><ActualWork>PT32H9M36S</ActualWork>\
+             <ActualDuration>PT0H0M30S</ActualDuration></Task>",
+        )
+        .tasks;
+        assert_eq!(proj.tasks[0].actual_work_min, Some(1930));
+        assert_eq!(proj.tasks[0].actual_duration_min, Some(1));
+        let a = &proj.assignments[0];
+        assert_eq!(a.actual_work_min, Some(1930));
+        assert_eq!(a.remaining_work_min, Some(950));
+        let xml = write_mspdi(&proj);
+        assert!(task_xml(&xml).contains("<ActualWork>PT32H10M0S</ActualWork>"));
+        assert!(task_xml(&xml).contains("<ActualDuration>PT0H1M0S</ActualDuration>"));
+        assert!(assignment_xml(&xml).contains("<ActualWork>PT32H10M0S</ActualWork>"));
+        assert!(assignment_xml(&xml).contains("<RemainingWork>PT15H50M0S</RemainingWork>"));
+    }
+
+    #[test]
+    fn absent_progress_fields_stay_absent() {
+        let proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <Units>1</Units><Work>PT32H0M0S</Work></Assignment>",
+        );
+        assert_eq!(
+            proj.assignments,
+            [Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 1920,
+                ..Assignment::default()
+            }]
+        );
+        assert_eq!(
+            proj.tasks[0],
+            Task {
+                uid: 1,
+                id: 1,
+                outline_level: 1,
+                duration_min: 1920,
+                ..Task::default()
+            }
+        );
+        let xml = write_mspdi(&proj);
+        for name in PROGRESS_TASK_ELEMENTS {
+            assert!(!task_xml(&xml).contains(&format!("<{name}>")), "{name}");
+        }
+        for name in PROGRESS_ASSIGNMENT_ELEMENTS {
+            assert!(
+                !assignment_xml(&xml).contains(&format!("<{name}>")),
+                "{name}"
+            );
+        }
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.tasks, proj.tasks);
+        assert_eq!(back.assignments, proj.assignments);
+    }
+
+    #[test]
+    fn invalid_progress_fields_stay_absent() {
+        for element in [
+            "<PercentComplete>101</PercentComplete>",
+            "<PercentComplete>-1</PercentComplete>",
+            "<PercentComplete>abc</PercentComplete>",
+            "<PercentComplete/>",
+            "<PercentWorkComplete>50.5</PercentWorkComplete>",
+            "<PhysicalPercentComplete>256</PhysicalPercentComplete>",
+            "<ActualStart>soon</ActualStart>",
+            "<ActualFinish/>",
+            "<Stop>x</Stop>",
+            "<Resume>NA</Resume>",
+            "<ActualDuration>banana</ActualDuration>",
+            "<ActualDuration/>",
+            "<RemainingDuration>PT</RemainingDuration>",
+            "<ActualWork>8h</ActualWork>",
+            "<RemainingWork>-PT8H0M0S</RemainingWork>",
+            "<ActualCost>NaN</ActualCost>",
+            "<RemainingCost>x</RemainingCost>",
+            "<StartVariance>1.5</StartVariance>",
+            "<FinishVariance>x</FinishVariance>",
+            "<WorkVariance>x</WorkVariance>",
+            "<WorkVariance>inf</WorkVariance>",
+        ] {
+            let proj = task_project(&format!("<Task><UID>1</UID>{element}</Task>"));
+            assert_eq!(
+                proj.tasks[0],
+                Task {
+                    uid: 1,
+                    ..Task::default()
+                },
+                "{element}"
+            );
+            let xml = write_mspdi(&proj);
+            for name in PROGRESS_TASK_ELEMENTS {
+                assert!(!task_xml(&xml).contains(&format!("<{name}>")), "{element}");
+            }
+        }
+        for element in [
+            "<PercentWorkComplete>101</PercentWorkComplete>",
+            "<PercentWorkComplete>x</PercentWorkComplete>",
+            "<ActualStart>soon</ActualStart>",
+            "<ActualFinish>x</ActualFinish>",
+            "<Stop/>",
+            "<Resume>x</Resume>",
+            "<ActualWork>banana</ActualWork>",
+            "<RemainingWork>PT8X</RemainingWork>",
+            "<ActualCost>x</ActualCost>",
+            "<RemainingCost>NaN</RemainingCost>",
+            "<StartVariance>x</StartVariance>",
+            "<FinishVariance>2.5</FinishVariance>",
+            "<WorkVariance>x</WorkVariance>",
+            "<CostVariance>x</CostVariance>",
+            "<Baseline><Number>0</Number><Work>x</Work><Cost>x</Cost></Baseline>",
+        ] {
+            let proj = assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 {element}</Assignment>"
+            ));
+            assert_eq!(
+                proj.assignments,
+                [Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    ..Assignment::default()
+                }],
+                "{element}"
+            );
+            let xml = write_mspdi(&proj);
+            for name in PROGRESS_ASSIGNMENT_ELEMENTS {
+                assert!(
+                    !assignment_xml(&xml).contains(&format!("<{name}>")),
+                    "{element}"
+                );
+            }
+        }
+        // The percent range is inclusive.
+        for n in [0, 100] {
+            let proj = task_project(&format!(
+                "<Task><UID>1</UID><PercentComplete>{n}</PercentComplete></Task>"
+            ));
+            assert_eq!(proj.tasks[0].percent_complete, Some(n));
+        }
+    }
+
+    #[test]
+    fn assignment_baselines_round_trip() {
+        let baselines = |xml: &str| {
+            assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 {xml}</Assignment>"
+            ))
+            .assignments
+            .remove(0)
+            .baselines
+        };
+        let work = |number, min| AssignmentBaseline {
+            number,
+            work_min: Some(min),
+            ..AssignmentBaseline::default()
+        };
+        // Slots are sorted; a missing Number is slot 0.
+        assert_eq!(
+            baselines(
+                "<Baseline><Number>10</Number><Work>PT1H0M0S</Work></Baseline>\
+                 <Baseline><Work>PT2H0M0S</Work></Baseline>"
+            ),
+            [work(0, 120), work(10, 60)]
+        );
+        // A duplicate slot replaces the whole record, cost included.
+        assert_eq!(
+            baselines(
+                "<Baseline><Number>1</Number><Work>PT1H0M0S</Work><Cost>5</Cost></Baseline>\
+                 <Baseline><Number>1</Number><Work>PT2H0M0S</Work></Baseline>"
+            ),
+            [work(1, 120)]
+        );
+        // An empty record, and an invalid or out-of-range Number, are dropped.
+        assert_eq!(
+            baselines(
+                "<Baseline><Number>2</Number></Baseline>\
+                 <Baseline><Number>11</Number><Work>PT1H0M0S</Work></Baseline>\
+                 <Baseline><Number>x</Number><Work>PT1H0M0S</Work></Baseline>"
+            ),
+            []
+        );
+        // A recorded zero is kept, not confused with an absent value.
+        assert_eq!(
+            baselines("<Baseline><Number>4</Number><Work>PT0H0M0S</Work></Baseline>"),
+            [work(4, 0)]
+        );
+        let proj = assignment_project(PROGRESS_ASSIGNMENT);
+        let xml = write_mspdi(&proj);
+        assert_eq!(read_mspdi(&xml).unwrap().assignments, proj.assignments);
+    }
+
+    #[test]
+    fn assignment_children_follow_schema_sequence() {
+        // The MSPDI Assignment sequence, as Project 2021 writes it (merged over
+        // the assignments of a private Project 2021 corpus) and as Microsoft's
+        // XML Schema lists it. That corpus has no assignment ActualCost or
+        // Baseline; their places are the schema's.
+        let proj = assignment_project(PROGRESS_ASSIGNMENT);
+        let mut xml = String::new();
+        write_assignment(&mut xml, &proj.assignments[0]);
+        assert_eq!(
+            element_names(&xml),
+            [
+                "Assignment",
+                "UID",
+                "TaskUID",
+                "ResourceUID",
+                "PercentWorkComplete",
+                "ActualCost",
+                "ActualFinish",
+                "ActualStart",
+                "ActualWork",
+                "CostVariance",
+                "FinishVariance",
+                "WorkVariance",
+                "RemainingCost",
+                "RemainingWork",
+                "Stop",
+                "Resume",
+                "StartVariance",
+                "Units",
+                "Work",
+                "Baseline",
+                "Number",
+                "Start",
+                "Finish",
+                "Work",
+                "Cost",
+                "Baseline",
+                "Number",
+                "Work",
+            ]
+        );
     }
 }
