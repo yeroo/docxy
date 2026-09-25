@@ -1168,3 +1168,73 @@ fn a_literal_bracketed_resource_does_not_steal_the_assigned_cell_text() {
         unchanged(&ed, &before, history);
     }
 }
+
+/// Two-day task 10 with the given Work resources (all at Max. Units 100%) and assignments.
+fn on_task_10(resources: &[(i32, &str)], assigned: &[(i32, f64)]) -> Editor {
+    let mut ed = editor();
+    ed.proj.tasks[0].duration_min = 960;
+    for &(uid, name) in resources {
+        ed.proj.resources.push(Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+    }
+    for (k, &(resource_uid, units)) in assigned.iter().enumerate() {
+        ed.proj.assignments.push(Assignment {
+            uid: k as i32 + 1,
+            task_uid: 10,
+            resource_uid,
+            units,
+            work_min: work_for(960, units),
+        });
+    }
+    Editor::new(ed.proj)
+}
+
+fn commit_shown_text(ed: &mut Editor) -> Result<(), String> {
+    let text = format_resource_names(&ed.proj, 10);
+    // The suite splits on commas without trimming, as here.
+    let tokens: Vec<String> = text.split(',').map(str::to_owned).collect();
+    ed.set_resources(10, &tokens)
+}
+
+#[test]
+fn names_and_shown_text_share_one_exactness_ladder() {
+    // Deleting ALICE's bracket, or changing it, never unassigns ALICE via Alice.
+    for (token, units) in [
+        (" ALICE", 1.0),
+        ("ALICE", 1.0),
+        (" ALICE[75%]", 0.75),
+        ("ALICE[75%]", 0.75),
+    ] {
+        let mut ed = on_task_10(&[(1, "Alice"), (2, "ALICE")], &[(1, 1.0), (2, 0.5)]);
+        assert_eq!(format_resource_names(&ed.proj, 10), "Alice, ALICE[50%]");
+        ed.set_resources(10, &["Alice".into(), token.into()])
+            .unwrap();
+        assert_eq!(allocation(&ed, 10, 1), (1.0, 960), "{token}");
+        assert_eq!(
+            allocation(&ed, 10, 2),
+            (units, work_for(960, units)),
+            "{token}"
+        );
+    }
+    // An exact rendering beats a case-insensitive literal name.
+    let mut ed = on_task_10(&[(1, "Bob"), (2, "bob[50%]")], &[(1, 0.5), (2, 1.0)]);
+    assert_eq!(format_resource_names(&ed.proj, 10), "Bob[50%], bob[50%]");
+    let before = ed.project().clone();
+    commit_shown_text(&mut ed).unwrap();
+    unchanged(&ed, &before, (0, 0, false));
+}
+
+#[test]
+fn duplicate_assignments_of_one_resource_survive_an_unchanged_commit() {
+    for units in [[1.0, 0.5], [0.5, 1.0], [0.5, 0.5]] {
+        let mut ed = on_task_10(&[(1, "Bob")], &[(1, units[0]), (1, units[1])]);
+        let before = ed.project().clone();
+        commit_shown_text(&mut ed).unwrap();
+        unchanged(&ed, &before, (0, 0, false));
+    }
+}

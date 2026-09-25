@@ -219,7 +219,13 @@ impl Editor {
             changed |= !keep;
             keep
         });
-        for a in assignments.iter_mut().filter(|a| a.task_uid == uid) {
+        // A token speaks for the first assignment of its resource; imported
+        // duplicates on the same task are left as they are.
+        let mut seen = std::collections::HashSet::new();
+        for a in assignments
+            .iter_mut()
+            .filter(|a| a.task_uid == uid && seen.insert(a.resource_uid))
+        {
             let &(_, explicit, raw) = wanted
                 .iter()
                 .find(|w| w.0 == a.resource_uid)
@@ -266,85 +272,68 @@ impl Editor {
         Ok(())
     }
 
-    /// Resolve a whole token to an existing resource: a raw, then case-insensitive,
-    /// match among the task's assigned resources, then their shown cell text
-    /// (which carries their current units), then a trimmed match among all.
+    /// Resolve a whole token to an existing resource. The task's assignments
+    /// match by name, or by their shown cell text (`Bob[50%]`, which carries the
+    /// assignment's current units), on one exactness ladder: raw, then trimmed,
+    /// then case-insensitive. The first tier with a hit decides; hits on two
+    /// resources are ambiguous. Otherwise a trimmed match among all resources.
     fn match_resource(
         &self,
         uid: i32,
         resources: &[Resource],
         raw: &str,
     ) -> Result<Option<(i32, Option<f64>)>, String> {
-        let is_assigned = |rid: i32| {
-            self.proj
-                .assignments
-                .iter()
-                .any(|a| a.task_uid == uid && a.resource_uid == rid)
-        };
-        // Imported names may contain significant whitespace. Match the raw
-        // token against retained assignments before normalizing user input.
-        let assigned_resources: Vec<_> = resources.iter().filter(|r| is_assigned(r.uid)).collect();
-        let mut retained: Vec<_> = assigned_resources
-            .iter()
-            .filter(|r| r.name == raw)
-            .map(|r| r.uid)
-            .collect();
-        if retained.is_empty() {
-            retained = assigned_resources
-                .iter()
-                .filter(|r| r.name.eq_ignore_ascii_case(raw))
-                .map(|r| r.uid)
-                .collect();
-        }
         let name = raw.trim();
-        // `Bob[50%]` is also the shown text of an assigned Bob. An unassigned
-        // resource literally named so never takes it; an assigned one is ambiguous.
-        let shown_matching = |exact: bool| -> Vec<_> {
-            self.proj
-                .assignments
-                .iter()
-                .filter(|a| a.task_uid == uid && !name.is_empty())
-                .filter_map(|a| {
-                    let r = resources.iter().find(|r| r.uid == a.resource_uid)?;
-                    let text = cell_text(r, a);
-                    let text = text.trim();
-                    (if exact {
-                        text == name
-                    } else {
-                        text.eq_ignore_ascii_case(name)
-                    })
-                    .then_some((a.resource_uid, Some(a.units)))
-                })
-                .collect()
-        };
-        // An exact spelling beats a case-insensitive one, as for names above.
-        let mut shown = shown_matching(true);
-        if shown.is_empty() {
-            shown = shown_matching(false);
-        }
-        match (retained.as_slice(), shown.as_slice()) {
-            ([rid], shown) if shown.iter().all(|s| s.0 == *rid) => return Ok(Some((*rid, None))),
-            ([], [found]) => return Ok(Some(*found)),
-            ([], []) => {}
-            _ => return Err(format!("Resource name '{name}' is ambiguous")),
-        }
-        if name.is_empty() {
-            return Ok(None);
+        let ambiguous = || Err(format!("Resource name '{name}' is ambiguous"));
+        let on_task: Vec<_> = self
+            .proj
+            .assignments
+            .iter()
+            .filter(|a| a.task_uid == uid)
+            .filter_map(|a| Some((resources.iter().find(|r| r.uid == a.resource_uid)?, a)))
+            .collect();
+        // Imported names may contain significant whitespace, so the raw token
+        // is tried before it is normalized.
+        for tier in 0..3 {
+            if tier > 0 && name.is_empty() {
+                return Ok(None);
+            }
+            let mut hits: Vec<(i32, Option<f64>)> = Vec::new();
+            for &(r, a) in &on_task {
+                let shown = cell_text(r, a);
+                let (by_name, by_shown) = match tier {
+                    0 => (r.name == raw, shown == raw),
+                    1 => (r.name == name, shown.trim() == name),
+                    _ => (
+                        r.name.eq_ignore_ascii_case(raw) || r.name.eq_ignore_ascii_case(name),
+                        shown.trim().eq_ignore_ascii_case(name),
+                    ),
+                };
+                if !(by_name || by_shown) {
+                    continue;
+                }
+                // A name hit keeps no units; shown text carries the current ones.
+                let units = (!by_name).then_some(a.units);
+                match hits.iter_mut().find(|h| h.0 == r.uid) {
+                    Some(hit) => hit.1 = hit.1.and(units),
+                    None => hits.push((r.uid, units)),
+                }
+            }
+            match hits.as_slice() {
+                [] => {}
+                [hit] => return Ok(Some(*hit)),
+                _ => return ambiguous(),
+            }
         }
         let matches: Vec<_> = resources
             .iter()
             .filter(|r| r.name.eq_ignore_ascii_case(name))
             .map(|r| r.uid)
             .collect();
-        let assigned: Vec<_> = matches
-            .iter()
-            .copied()
-            .filter(|&rid| is_assigned(rid))
-            .collect();
-        match (assigned.as_slice(), matches.as_slice()) {
-            ([rid], _) | ([], [rid]) => Ok(Some((*rid, None))),
-            ([], []) => Ok(None),
-            _ => Err(format!("Resource name '{name}' is ambiguous")),
+        match matches.as_slice() {
+            [] => Ok(None),
+            [rid] => Ok(Some((*rid, None))),
+            _ => ambiguous(),
         }
     }
 }
