@@ -25,7 +25,10 @@
 //! modes report link conflicts as negative total slack within the timeline's
 //! bounded horizon. Constraints before the project start do not pull unlinked
 //! tasks before it, but a deadline there still reports its miss as negative
-//! slack. Summary tasks roll up from their descendants. Resource
+//! slack. A task's deadline bounds only its late finish, like an FNLT would,
+//! whatever HonorConstraints says: it never moves scheduled dates, and a
+//! missed one shows as negative total slack on the task and its drivers.
+//! Summary tasks roll up from their descendants. Resource
 //! leveling is separate from CPM. Free slack is computed precisely for
 //! finish-to-start successors and falls back to total slack otherwise.
 
@@ -298,14 +301,22 @@ impl<'a> Scheduler<'a> {
             .iter()
             .filter(|t| !t.summary && t.constraint_date.is_some())
             .filter(|t| is_backward(t.constraint));
-        let has_backward_constraints = backward_constraints.clone().next().is_some();
+        // A deadline bounds late dates like a backward constraint does.
+        let deadlines = proj
+            .tasks
+            .iter()
+            .filter(|t| !t.summary && t.deadline.is_some());
+        let has_backward_constraints =
+            backward_constraints.clone().next().is_some() || deadlines.clone().next().is_some();
+        let linked = |t: &&Task| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid));
         // An unlinked deadline is floored at the anchor. Its raw date must not
         // add an unused prefix to every calendar's timeline.
         // A pinned start can precede the anchor, and a violated link into it
         // puts its predecessors' late dates earlier still.
         let earliest_backward_date = backward_constraints
-            .filter(|t| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid)))
+            .filter(linked)
             .filter_map(|t| t.constraint_date)
+            .chain(deadlines.filter(linked).filter_map(|t| t.deadline))
             .map(|date| date.minutes())
             .chain(pinned_starts.clone())
             .min();
@@ -465,23 +476,30 @@ impl<'a> Scheduler<'a> {
             .collect()
     }
 
-    /// Normalize dates identically for CPM and leveling. Only unlinked tasks
+    /// The earliest instant a task's dates may take. Only unlinked tasks
     /// retain the project-start floor; linked tasks can use the full horizon.
-    fn constraint_dates(&self, task: &Task, linked: bool) -> Option<ConstraintDates> {
+    fn date_floor(&self, task: &Task, linked: bool) -> i64 {
         let tl = self.tl(task);
-        let floor = if linked {
+        if linked {
             tl.abs_start(0)
         } else {
             tl.snap(self.anchor)
-        };
+        }
+    }
+
+    /// Normalize dates identically for CPM and leveling, floored as
+    /// [`Self::date_floor`] says.
+    fn constraint_dates(&self, task: &Task, linked: bool) -> Option<ConstraintDates> {
+        let tl = self.tl(task);
+        let floor = self.date_floor(task, linked);
         let raw_date = task.constraint_date?.minutes();
         let date = raw_date.max(floor);
-        let finish = tl.abs_finish(tl.to_index(date)).max(floor);
+        let (finish, milestone) = finish_instants(tl, raw_date, floor);
         Some(ConstraintDates {
             start: tl.snap(date),
             finish,
             floor,
-            milestone: if tl.snap(date) == date { date } else { finish },
+            milestone,
             raw: raw_date,
             // The forward pass keeps the floor; the backward pass measures
             // the raw date on a pre-start timeline (`pre_start_timelines`).
@@ -829,6 +847,22 @@ impl<'a> Scheduler<'a> {
                     _ => {}
                 }
             }
+            // A deadline bounds the late finish like an FNLT, but it is not a
+            // constraint: it applies whatever HonorConstraints says and never
+            // moves scheduled dates. A pre-start window already holds a raw
+            // constraint date earlier than the deadline's project-start floor.
+            if let Some(deadline) = t.deadline.filter(|_| !pinned && pre_start_window.is_none()) {
+                let floor = self.date_floor(t, linked_tasks.contains(&t.uid));
+                let (df, milestone) = finish_instants(tl, deadline.minutes(), floor);
+                if df <= finish_abs {
+                    finish_abs = df;
+                    hard_finish_bound = true;
+                    if span == 0 {
+                        let m = milestone.min(bound_instant);
+                        milestone_late = Some(milestone_late.map_or(m, |late: i64| late.min(m)));
+                    }
+                }
+            }
             let finish_index = tl.to_index(finish_abs);
             let (s_abs, f_abs) = if let Some((pre, s_abs, f_abs)) = pre_start_window {
                 late_tl.insert(t.uid, pre);
@@ -960,6 +994,17 @@ impl<'a> Scheduler<'a> {
         }
         min_gap
     }
+}
+
+/// A finish date's instants on `tl`, floored at `floor`: the evening that
+/// completes its working index, and a milestone's instant, which is the date
+/// itself when it is a working start instant (a morning deadline stays on its
+/// morning), else that evening.
+fn finish_instants(tl: &Timeline, date: i64, floor: i64) -> (i64, i64) {
+    let date = date.max(floor);
+    let finish = tl.abs_finish(tl.to_index(date)).max(floor);
+    let milestone = if tl.snap(date) == date { date } else { finish };
+    (finish, milestone)
 }
 
 /// Constraints that bound a task's late dates.
@@ -4195,5 +4240,211 @@ mod tests {
         let lv = level(&proj);
         assert_eq!(lv.start(10), lv.start(2));
         assert_eq!(lv.finish(10), lv.finish(2));
+    }
+
+    fn dt(day: u32, hour: u32) -> DateTime {
+        DateTime::from_ymd_hm(2026, 3, day, hour, 0)
+    }
+
+    /// A (5d) -> B (5d) FS from Mon 2026-03-02; B finishes Fri 03-13 17:00.
+    fn deadline_chain(deadline: Option<DateTime>, honor: bool) -> Project {
+        let mut b = task(2, "B", 2400);
+        b.predecessors.push(fs(1));
+        b.deadline = deadline;
+        Project {
+            start_date: Some(dt(2, 8)),
+            honor_constraints: honor,
+            tasks: vec![task(1, "A", 2400), b],
+            ..Project::default()
+        }
+    }
+
+    fn early_dates(sched: &Schedule, uid: i32) -> (DateTime, DateTime) {
+        let r = sched.get(uid).unwrap();
+        (r.early_start, r.early_finish)
+    }
+
+    #[test]
+    fn missed_deadline_gives_task_and_its_driver_negative_slack() {
+        // #100: Project 2021 reports -5d total slack and 0 free slack on both.
+        for honor in [true, false] {
+            let baseline = schedule(&deadline_chain(None, honor));
+            let sched = schedule(&deadline_chain(Some(dt(6, 17)), honor));
+            for uid in [1, 2] {
+                let r = sched.get(uid).unwrap();
+                assert_eq!(r.total_slack_min, -2400, "task {uid} honor={honor}");
+                assert_eq!(r.free_slack_min, 0, "task {uid} honor={honor}");
+                assert!(r.critical, "task {uid} honor={honor}");
+                assert_eq!(early_dates(&sched, uid), early_dates(&baseline, uid));
+            }
+            assert_eq!(sched.get(2).unwrap().late_finish, dt(6, 17));
+            assert_eq!(sched.project_finish, dt(13, 17));
+            let leveled = level(&deadline_chain(Some(dt(6, 17)), honor));
+            assert_eq!(leveled.finish(2), Some(dt(13, 17)));
+        }
+    }
+
+    #[test]
+    fn deadline_after_the_project_finish_changes_nothing() {
+        for honor in [true, false] {
+            let baseline = schedule(&deadline_chain(None, honor));
+            let sched = schedule(&deadline_chain(Some(dt(18, 17)), honor));
+            for uid in [1, 2] {
+                assert_eq!(
+                    sched.get(uid),
+                    baseline.get(uid),
+                    "task {uid} honor={honor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn met_deadline_tightens_a_non_critical_branch_to_the_deadline_gap() {
+        // A (5d) is critical; X (1d) -> C (1d) has 3d of total slack until C's
+        // deadline on Wed 03-04 17:00 leaves 1d, for C and for X that drives it.
+        let mut c = task(3, "C", 480);
+        c.predecessors.push(fs(2));
+        let mut proj = Project {
+            start_date: Some(dt(2, 8)),
+            tasks: vec![task(1, "A", 2400), task(2, "X", 480), c],
+            ..Project::default()
+        };
+        let baseline = schedule(&proj);
+        assert_eq!(baseline.get(3).unwrap().total_slack_min, 3 * 480);
+        proj.tasks[2].deadline = Some(dt(4, 17));
+        let sched = schedule(&proj);
+        for uid in [2, 3] {
+            let r = sched.get(uid).unwrap();
+            assert_eq!(r.total_slack_min, 480, "task {uid}");
+            assert!(!r.critical, "task {uid}");
+            assert_eq!(early_dates(&sched, uid), early_dates(&baseline, uid));
+        }
+        assert_eq!(sched.get(3).unwrap().late_finish, dt(4, 17));
+        assert_eq!(sched.get(1), baseline.get(1));
+    }
+
+    #[test]
+    fn deadline_and_finish_constraint_take_the_earlier_bound() {
+        use ConstraintType::{FinishNoLaterThan as Fnlt, MustFinishOn as Mfo};
+        // A (5d) -> B (5d) beside an unlinked Z (15d), so B finishing Fri
+        // 03-13 has 5d of slack to the project finish on Fri 03-20. Neither
+        // constraint date moves B's early dates.
+        // (constraint, constraint date, deadline, B's total slack)
+        for (constraint, date, deadline, slack) in [
+            (Fnlt, dt(18, 17), dt(17, 17), 2 * 480),
+            (Fnlt, dt(18, 17), dt(19, 17), 3 * 480),
+            (Mfo, dt(13, 17), dt(12, 17), -480),
+            (Mfo, dt(13, 17), dt(17, 17), 0),
+        ] {
+            for honor in [true, false] {
+                let mut proj = deadline_chain(Some(deadline), honor);
+                proj.tasks.push(task(3, "Z", 15 * 480));
+                let baseline = schedule(&proj);
+                proj.tasks[1].constraint = constraint;
+                proj.tasks[1].constraint_date = Some(date);
+                let sched = schedule(&proj);
+                let case = format!("{constraint:?} {deadline:?} honor={honor}");
+                let b = sched.get(2).unwrap();
+                assert_eq!(b.total_slack_min, slack, "{case}");
+                assert_eq!(sched.get(1).unwrap().total_slack_min, slack, "{case}");
+                assert_eq!(b.late_finish, date.min(deadline), "{case}");
+                assert_eq!(early_dates(&sched, 2), early_dates(&baseline, 2), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn milestone_deadline_keeps_fnlt_morning_semantics() {
+        // Milestone M lands at Fri 03-06 17:00 after A (5d); an unlinked Z
+        // (10d) keeps the project finish at Fri 03-13 so M has slack to lose.
+        // A morning deadline stays on its morning, exactly as an FNLT does.
+        // (deadline, M's total slack)
+        for (deadline, slack) in [(dt(10, 8), 480), (dt(5, 8), -960), (dt(9, 17), 480)] {
+            let mut proj = fs_milestone_project(2400);
+            proj.honor_constraints = false;
+            proj.tasks.push(task(3, "Z", 10 * 480));
+            let baseline = schedule(&proj);
+            let mut fnlt = proj.clone();
+            fnlt.tasks[1].constraint = ConstraintType::FinishNoLaterThan;
+            fnlt.tasks[1].constraint_date = Some(deadline);
+            proj.tasks[1].deadline = Some(deadline);
+            let sched = schedule(&proj);
+            let m = sched.get(2).unwrap();
+            let case = format!("{deadline:?}");
+            assert_eq!(m.late_start, deadline, "{case}");
+            assert_eq!(m.late_finish, deadline, "{case}");
+            assert_eq!(m.total_slack_min, slack, "{case}");
+            assert_eq!(early_dates(&sched, 2), early_dates(&baseline, 2), "{case}");
+            assert_eq!(sched.get(2), schedule(&fnlt).get(2), "{case}");
+        }
+    }
+
+    #[test]
+    fn linked_deadline_far_before_the_early_dates_stays_on_the_timeline() {
+        // A deadline a year early still measures its full miss rather than
+        // clamping to a timeline origin that the early dates alone would set.
+        let deadline = DateTime::from_ymd_hm(2025, 6, 2, 17, 0);
+        let sched = schedule(&deadline_chain(Some(deadline), true));
+        let b = sched.get(2).unwrap();
+        assert_eq!(b.late_finish, deadline);
+        // Working time from Mon 2025-06-02 17:00 to Fri 2026-03-13 17:00.
+        let miss = weekday_minutes(
+            DateTime::from_ymd_hm(2025, 6, 3, 8, 0),
+            DateTime::from_ymd_hm(2026, 3, 14, 8, 0),
+        );
+        for uid in [1, 2] {
+            assert_eq!(sched.get(uid).unwrap().total_slack_min, -miss, "task {uid}");
+        }
+        assert_eq!(early_dates(&sched, 2), (dt(9, 8), dt(13, 17)));
+    }
+
+    #[test]
+    fn unlinked_pre_start_deadline_reports_negative_slack_without_moving_dates() {
+        // The exact pre-start value is a follow-up; the miss must still show.
+        for honor in [true, false] {
+            let mut proj = deadline_chain(None, honor);
+            proj.tasks[1].predecessors.clear();
+            let baseline = schedule(&proj);
+            proj.tasks[1].deadline = Some(DateTime::from_ymd_hm(2026, 2, 16, 17, 0));
+            let sched = schedule(&proj);
+            let b = sched.get(2).unwrap();
+            assert!(b.total_slack_min < 0, "honor={honor}: {b:?}");
+            assert!(b.critical);
+            assert_eq!(early_dates(&sched, 2), early_dates(&baseline, 2));
+            assert_eq!(sched.get(1), baseline.get(1));
+        }
+    }
+
+    #[test]
+    fn deadline_defers_to_a_pre_start_constraint_window() {
+        let date = DateTime::from_ymd_hm(2026, 2, 16, 17, 0);
+        for honor in [true, false] {
+            let constraint_only = schedule(&unlinked_deadline(
+                ConstraintType::FinishNoLaterThan,
+                date,
+                honor,
+            ));
+            for deadline in [DateTime::from_ymd_hm(2026, 2, 27, 17, 0), dt(2, 17)] {
+                let mut proj = unlinked_deadline(ConstraintType::FinishNoLaterThan, date, honor);
+                proj.tasks[1].deadline = Some(deadline);
+                let sched = schedule(&proj);
+                assert_eq!(
+                    sched.get(2),
+                    constraint_only.get(2),
+                    "{deadline:?} honor={honor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_task_ignores_its_deadline() {
+        let mut proj = deadline_chain(None, true);
+        proj.tasks[1].manual = true;
+        proj.tasks[1].manual_start = Some(dt(9, 8));
+        let baseline = schedule(&proj);
+        proj.tasks[1].deadline = Some(dt(6, 17));
+        assert_eq!(schedule(&proj).get(2), baseline.get(2));
     }
 }
