@@ -408,6 +408,7 @@ fn project_tab(
         markdown: false,
         hf_edit: None,
         bundle_html: None,
+        load_failed: false,
     }
 }
 

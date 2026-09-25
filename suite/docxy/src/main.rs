@@ -160,6 +160,10 @@ struct PersistTab {
     hot: Option<String>,
     #[serde(default)]
     markdown: bool,
+    /// The tab's file could not be loaded, so `hot` holds a placeholder and
+    /// Save must not write it back over `path` (#209).
+    #[serde(default)]
+    load_failed: bool,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1087,6 +1091,10 @@ struct DocTab {
     /// around the new package on Save (and on Save As to another .html name),
     /// so its engine and web UI carry over.
     bundle_html: Option<String>,
+    /// `path` names a file this tab could not read. Its content is a
+    /// placeholder, so writing it back to that path would destroy the file:
+    /// Save refuses, Save As to another path works and clears this (#209).
+    load_failed: bool,
 }
 
 /// Live header/footer edit session: an editor over the parsed header/footer
@@ -1503,6 +1511,8 @@ struct Loaded {
     markdown: bool,
     status: SharedString,
     bundle_html: Option<String>,
+    /// `doc` is a placeholder because the file could not be loaded.
+    load_failed: bool,
 }
 
 impl Loaded {
@@ -1515,6 +1525,7 @@ impl Loaded {
             markdown: false,
             status: status.into(),
             bundle_html: None,
+            load_failed: true,
         }
     }
     fn into_tab(
@@ -1537,6 +1548,7 @@ impl Loaded {
             markdown: self.markdown,
             hf_edit: None,
             bundle_html: self.bundle_html,
+            load_failed: self.load_failed,
         }
     }
 }
@@ -1557,6 +1569,7 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
             markdown: false,
             status: "loaded".into(),
             bundle_html: None,
+            load_failed: false,
         },
         Err(e) => Loaded::empty(format!("load error: {e:?}")),
     }
@@ -1568,10 +1581,14 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
             Ok(opened) => {
                 let mut loaded = load_bytes(&opened.docx);
                 loaded.bundle_html = Some(opened.html);
-                loaded.status = match opened.warning {
-                    Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
-                    None => "loaded (editable HTML)".into(),
-                };
+                // A payload that is not a docx keeps its `load error: …`
+                // rather than reporting an empty document as loaded.
+                if !loaded.load_failed {
+                    loaded.status = match opened.warning {
+                        Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
+                        None => "loaded (editable HTML)".into(),
+                    };
+                }
                 loaded
             }
             Err(e) => Loaded::empty(format!("load error: {e}")),
@@ -1586,6 +1603,7 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
             markdown: true,
             status: "loaded (markdown)".into(),
             bundle_html: None,
+            load_failed: false,
         },
         Ok(bytes) => load_bytes(&bytes),
         Err(e) => Loaded::empty(format!("read error: {e}")),
@@ -1639,6 +1657,7 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
             markdown: false,
             hf_edit: None,
             bundle_html: None,
+            load_failed: false,
         }
     } else {
         doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
@@ -4014,6 +4033,10 @@ fn restore_tab(t: &PersistTab) -> DocTab {
             };
             let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
             tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
+            // The sidecar of a tab whose file failed to load holds only the
+            // placeholder, so the mark carries over (a corrupt sidecar is a
+            // placeholder too).
+            tab.load_failed = t.load_failed || tab.load_failed;
             tab
         }
         // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
@@ -4039,9 +4062,11 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 markdown: false,
                 hf_edit: None,
                 bundle_html: None,
+                load_failed: false,
             }
         }
-        // A document with no sidecar reloads its file, bundle included.
+        // A document with no sidecar reloads its file, bundle included; the
+        // fresh load alone says whether it failed.
         (Kind::Docx, None) if path.is_some() => {
             let l = doc_from_path(path.as_ref().unwrap());
             l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
@@ -4062,6 +4087,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 markdown,
                 hf_edit: None,
                 bundle_html: None,
+                load_failed: false,
             }
         }
     };
@@ -4103,6 +4129,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         dirty: t.dirty,
         hot,
         markdown: t.markdown,
+        load_failed: t.load_failed,
     }
 }
 
@@ -4322,6 +4349,7 @@ impl Docxy {
             markdown: false,
             hf_edit: None,
             bundle_html: None,
+            load_failed: false,
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -9656,6 +9684,27 @@ fn exit_hf_tab(tab: &mut DocTab) {
     }
 }
 
+/// What a Save onto the file a tab could not load says (#209).
+const DOC_LOAD_FAILED_SAVE: &str = "this file could not be opened; use Save As to save a new copy";
+
+/// Whether a save must be refused because it would write a load-failed tab's
+/// placeholder over the file it could not load: in place (`target` `None`),
+/// or a Save As that picks that same file (compared canonically, falling back
+/// to the paths as given when either cannot be resolved).
+fn refuses_load_failed_save(
+    load_failed: bool,
+    own: Option<&std::path::Path>,
+    target: Option<&std::path::Path>,
+) -> bool {
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    load_failed
+        && match (own, target) {
+            (_, None) => true,
+            (Some(own), Some(target)) => own == target || canon(own) == canon(target),
+            (None, Some(_)) => false,
+        }
+}
+
 /// Write a document tab to `target` (Save As, or the first save of a
 /// never-saved document to a picked path) or, with `None`, to its own file
 /// (refused when it has none). The format
@@ -9665,10 +9714,17 @@ fn exit_hf_tab(tab: &mut DocTab) {
 /// The tab is rebound (path, Markdown flag, title, held bundle) only after a
 /// successful write, so a refused or failed Save As leaves it saving where it
 /// did. Returns whether the file was written; the tab's status says either way.
+///
+/// A tab whose file failed to load never writes back to that file: its content
+/// is a placeholder, not the document (#209).
 fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let Surface::Doc(editor) = &tab.surface else {
         return false;
     };
+    if refuses_load_failed_save(tab.load_failed, tab.path.as_deref(), target.as_deref()) {
+        tab.status = DOC_LOAD_FAILED_SAVE.into();
+        return false;
+    }
     let (path, markdown) = match target {
         Some(path) => {
             let markdown = is_markdown_path(&path);
@@ -9711,6 +9767,7 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             tab.markdown = markdown;
             tab.path = Some(path);
             tab.dirty = false;
+            tab.load_failed = false;
             // The page just written is the one the next save rewraps.
             tab.bundle_html = match kind {
                 html_bundle::DocTarget::Html => String::from_utf8(bytes).ok(),

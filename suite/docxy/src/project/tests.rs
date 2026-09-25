@@ -68,6 +68,7 @@ fn persisted(path: Option<&Path>, hot: Option<&Path>, dirty: bool) -> PersistTab
         hot: hot.map(|p| p.to_string_lossy().into_owned()),
         dirty,
         markdown: false,
+        load_failed: false,
     }
 }
 
