@@ -247,29 +247,51 @@ pub(crate) fn commit_project_cell(tab: &mut DocTab) -> bool {
     }
 }
 
+/// Where a click in the entry table landed.
+enum ClickTarget {
+    Task(usize),
+    /// The entry row as drawn, just below the last task.
+    EntryRow,
+    /// The ruled space below the entry row.
+    Below,
+}
+
 pub(crate) fn project_cell_click(tab: &mut DocTab, row: usize, col: Option<usize>, double: bool) {
-    cell_click(tab, Some(row), col, double);
+    cell_click(tab, ClickTarget::Task(row), col, double);
 }
 
-/// A click on the entry row below the last task, in column `col`, or on the
-/// ruled rows below it (`None`: the column stays). The cursor goes to the entry
-/// row, where typing appends a task. A failed commit keeps the edit and its
-/// status, and the cursor stays.
+/// A click on the entry row below the last task, in column `col` (`None`:
+/// outside the table, the column stays). The cursor goes to the entry row,
+/// where typing appends a task. A failed commit keeps the edit and its status,
+/// and the cursor stays.
 pub(crate) fn project_entry_click(tab: &mut DocTab, col: Option<usize>, double: bool) {
-    cell_click(tab, None, col, double);
+    cell_click(tab, ClickTarget::EntryRow, col, double);
 }
 
-/// `row` is a task's index, or `None` for the entry row.
-fn cell_click(tab: &mut DocTab, row: Option<usize>, col: Option<usize>, double: bool) {
+/// A click on the ruled rows below the entry row: commit like any click-away,
+/// then go to the entry row, keeping the column.
+pub(crate) fn project_below_click(tab: &mut DocTab) {
+    cell_click(tab, ClickTarget::Below, None, false);
+}
+
+fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double: bool) {
+    let Surface::Project(v) = &tab.surface else {
+        return;
+    };
+    let count = v.ed.project().tasks.len();
+    let entry_edit = v.cell.as_ref().is_some_and(|c| c.uid.is_none());
     if !commit_project_cell(tab) {
         return;
     }
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
-    match row {
-        Some(row) => v.select_row(row),
-        None => v.enter_entry_row(),
+    let appended = entry_edit && v.ed.project().tasks.len() > count;
+    match target {
+        ClickTarget::Task(row) => v.select_row(row),
+        // Committing the entry row's edit made the clicked row a task.
+        ClickTarget::EntryRow if appended => v.select_row(count),
+        ClickTarget::EntryRow | ClickTarget::Below => v.enter_entry_row(),
     }
     if let Some(col) = col {
         v.col = col.min(6);

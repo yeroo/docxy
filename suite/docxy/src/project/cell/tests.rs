@@ -314,7 +314,7 @@ fn clicking_below_the_last_task_commits_then_moves_to_the_entry_row() {
     let mut t = tab();
     key(&mut t, "down");
     edit(&mut t, 1, "Renamed");
-    project_entry_click(&mut t, None, false);
+    project_below_click(&mut t);
     assert!(v(&t).cell.is_none());
     assert_eq!(v(&t).ed.project().tasks[1].name, "Renamed");
     assert!(v(&t).on_entry_row());
@@ -323,7 +323,7 @@ fn clicking_below_the_last_task_commits_then_moves_to_the_entry_row() {
     assert_eq!(v(&t).col, 1, "a click below the entry row keeps the column");
     assert!(t.dirty);
     // With nothing open it only moves the cursor.
-    project_entry_click(&mut t, None, false);
+    project_below_click(&mut t);
     assert!(v(&t).cell.is_none());
     assert_eq!(v(&t).cursor_row(), 3);
     assert_eq!(v(&t).ed.undo_depth(), 1);
@@ -671,4 +671,60 @@ fn enter_after_editing_the_last_task_goes_to_the_entry_row() {
     project_cell_click(&mut t, 0, Some(1), false);
     assert!(!v(&t).on_entry_row());
     assert_eq!(v(&t).cursor_row(), 0);
+}
+
+#[test]
+fn clicking_the_entry_row_while_editing_it_lands_on_the_new_task() {
+    // Single click: the clicked cell now belongs to the task the commit made.
+    let mut t = tab();
+    project_entry_click(&mut t, Some(1), false);
+    edit(&mut t, 1, "Design");
+    project_entry_click(&mut t, Some(2), false);
+    assert_eq!(v(&t).ed.project().tasks.len(), 4);
+    assert!(!v(&t).on_entry_row());
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, 2));
+    edit(&mut t, 2, "3d");
+    key(&mut t, "enter");
+    let tasks = &v(&t).ed.project().tasks;
+    assert_eq!(tasks.len(), 4, "no second, unnamed task");
+    assert_eq!(
+        (tasks[3].name.as_str(), tasks[3].duration_min),
+        ("Design", 1440)
+    );
+    assert_eq!(v(&t).cursor_row(), 4);
+
+    // Double click opens the new task's cell.
+    let mut t = tab();
+    project_entry_click(&mut t, Some(1), false);
+    edit(&mut t, 1, "Design");
+    project_entry_click(&mut t, Some(2), true);
+    let cell = v(&t).cell.as_ref().expect("the double click opens an edit");
+    assert_eq!(
+        (cell.uid, cell.col),
+        (Some(v(&t).ed.project().tasks[3].uid), 2)
+    );
+
+    // Outside a cell of that row (its chart side), too.
+    let mut t = tab();
+    project_entry_click(&mut t, Some(1), false);
+    edit(&mut t, 1, "Design");
+    project_entry_click(&mut t, None, false);
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, 1));
+
+    // A click below the entry row goes to the new entry row.
+    let mut t = tab();
+    project_entry_click(&mut t, Some(1), false);
+    edit(&mut t, 1, "Design");
+    project_below_click(&mut t);
+    assert_eq!(v(&t).ed.project().tasks.len(), 4);
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 4);
+
+    // An empty entry edit appends nothing, so the click stays on the entry row.
+    let mut t = tab();
+    project_entry_click(&mut t, Some(1), false);
+    key(&mut t, "f2");
+    project_entry_click(&mut t, Some(2), false);
+    assert!(v(&t).on_entry_row());
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (3, 2));
 }

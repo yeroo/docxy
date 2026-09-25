@@ -888,7 +888,7 @@ pub(super) fn project_el(
                 // entry row land here.
                 .on_click(cx.listener(move |this, _, window, cx| {
                     if let Some(tab) = this.tabs.get_mut(index) {
-                        project_entry_click(tab, None, false);
+                        project_below_click(tab);
                     }
                     this.refocus(window, cx);
                 }))

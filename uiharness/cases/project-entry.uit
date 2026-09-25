@@ -58,3 +58,18 @@ test empty project takes its first task from the entry row
   assert undo_depth is 1
   assert cell_row is 1
   shot window
+
+test project entry row click after typing lands on the new task
+  open copy:../fixtures/gantt-summary.xml
+  click B4
+  type Design
+  click C4
+  assert tasks is 4
+  assert cell_row is 3
+  assert cell is Duration
+  type 3d
+  key enter
+  assert tasks is 4
+  assert cell B4 is Design
+  assert cell C4 is 3d
+  assert cell_row is 4
