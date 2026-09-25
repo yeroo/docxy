@@ -7,9 +7,10 @@ Total Slack and Critical with the oracle embedded in the fixture.
 
 The copy has every task's <Start>, <Finish>, <TotalSlack> and <Critical>
 removed, so Project must schedule from the inputs (durations, links, lags,
-constraints, calendars) and cannot read the oracle back. Before comparing
-dates, it checks that Project imported those inputs as the file states them
-(input fidelity), so an import problem is not mistaken for a scheduling fact.
+constraints, calendars and their exceptions) and cannot read the oracle back.
+Before comparing dates, it checks that Project imported those inputs as the
+file states them (input fidelity), so an import problem is not mistaken for a
+scheduling fact.
 
 Exit status is 1 on any fidelity failure or schedule mismatch, 2 if
 Microsoft Project is already running, 0 otherwise.
@@ -87,6 +88,40 @@ def read_fixture(path):
     return tasks
 
 
+def read_exceptions(path):
+    """Each calendar's <Exceptions> as the file states them: calendar name ->
+    sorted (name, type, first date, last date, working)."""
+    root = ET.parse(path).getroot()
+    out = {}
+    for cal in root.findall("p:Calendars/p:Calendar", NS):
+        rows = []
+        for e in cal.findall("p:Exceptions/p:Exception", NS):
+            period = e.find("p:TimePeriod", NS)
+            rows.append((text(e, "Name", ""), int(text(e, "Type", "1")),
+                         text(period, "FromDate")[:10], text(period, "ToDate")[:10],
+                         text(e, "DayWorking") == "1"))
+        if rows:
+            out[text(cal, "Name")] = sorted(rows)
+    return out
+
+
+def project_exceptions(project, names):
+    """The same view of Project's calendars with these names: base calendars
+    and resource calendars. A calendar Project does not have maps to None."""
+    calendars = {cal.Name: cal for cal in project.BaseCalendars}
+    for r in project.Resources:
+        if r is not None and r.Calendar is not None:
+            calendars.setdefault(r.Calendar.Name, r.Calendar)
+    out = {}
+    for name in names:
+        cal = calendars.get(name)
+        out[name] = None if cal is None else sorted(
+            (e.Name or "", e.Type, when(e.Start)[:10], when(e.Finish)[:10],
+             bool(cal.Period(e.Start).Working))
+            for e in cal.Exceptions)
+    return out
+
+
 def strip_oracle(xml):
     """Remove each task's own oracle elements; baselines keep their dates."""
     def one_task(m):
@@ -142,6 +177,15 @@ def check(app, path, tmpdir):
 
         fidelity, mismatches = [], []
         print(name)
+        # Calendar exceptions (#126): count, name, type, dates and whether the
+        # day works.
+        want_exceptions = read_exceptions(path)
+        got_exceptions = project_exceptions(project, want_exceptions)
+        for cal_name, want in want_exceptions.items():
+            got = got_exceptions[cal_name]
+            if got != want:
+                fidelity.append(f"  FIDELITY calendar {cal_name}: exceptions file={want}"
+                                f" project={got}")
         if sorted(t.UniqueID for t in tasks) != sorted(expected):
             fidelity.append(f"  FIDELITY task UIDs {sorted(t.UniqueID for t in tasks)}"
                             f" != file {sorted(expected)}")

@@ -14,7 +14,9 @@ corpus validates the scheduler without needing Project. Rerun the script
 whenever a fixture changes. Exceptions: file 19's manual-task expectations
 (#77), file 20's task-field expectations (#80) and file 22's progress
 expectations (#81) are hand-derived from our scheduler and not yet verified in
-Project, as is file 23's derived calendar (#83).
+Project, as is file 23's derived calendar (#83). Files 24 and 25 (calendar
+exceptions, #126) were verified against Project Professional 2024 (build
+16.0.17932.21000), as generated and as projcore's write_mspdi writes them.
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -110,16 +112,19 @@ def blank_row(uid, oid, fields=()):
     return "\n".join(lines)
 
 
+def working_times(times):
+    return (["      <WorkingTimes>"]
+            + [f"        <WorkingTime><FromTime>{f}</FromTime><ToTime>{t}</ToTime></WorkingTime>"
+               for (f, t) in times]
+            + ["      </WorkingTimes>"])
+
+
 def weekday(day_type, working, times):
     """One <WeekDay>. day_type: 1=Sun..7=Sat. times: list of (from, to) 'HH:MM:SS'."""
     out = [f"    <WeekDay><DayType>{day_type}</DayType>"
            f"<DayWorking>{1 if working else 0}</DayWorking>"]
     if working and times:
-        out.append("      <WorkingTimes>")
-        for (f, t) in times:
-            out.append(f"        <WorkingTime><FromTime>{f}</FromTime>"
-                       f"<ToTime>{t}</ToTime></WorkingTime>")
-        out.append("      </WorkingTimes>")
+        out += working_times(times)
     out.append("    </WeekDay>")
     return "\n".join(out)
 
@@ -127,7 +132,39 @@ def weekday(day_type, working, times):
 SHIFT = [("08:00:00", "12:00:00"), ("13:00:00", "17:00:00")]
 
 
-def standard_calendar(uid=1, name="Standard", saturday=False):
+def exception_legacy(ex):
+    """An exception's legacy form: a `DayType 0` <WeekDay> over its dates."""
+    _name, first, last, times = ex
+    out = [f"    <WeekDay><DayType>0</DayType><DayWorking>{1 if times else 0}</DayWorking>",
+           f"      <TimePeriod><FromDate>{first}T00:00:00</FromDate>"
+           f"<ToDate>{last}T23:59:00</ToDate></TimePeriod>"]
+    if times:
+        out += working_times(times)
+    out.append("    </WeekDay>")
+    return "\n".join(out)
+
+
+def exceptions(exs):
+    """<Exceptions> for date-range exceptions (name, first date, last date,
+    working times or [] for a day off), in the shape Project writes them."""
+    out = ["    <Exceptions>"]
+    for name, first, last, times in exs:
+        out += ["    <Exception><EnteredByOccurrences>0</EnteredByOccurrences>",
+                f"      <TimePeriod><FromDate>{first}T00:00:00</FromDate>"
+                f"<ToDate>{last}T23:59:00</ToDate></TimePeriod>",
+                f"      <Occurrences>1</Occurrences><Name>{name}</Name><Type>1</Type>"
+                f"<DayWorking>{1 if times else 0}</DayWorking>"]
+        if times:
+            out += working_times(times)
+        out.append("    </Exception>")
+    out.append("    </Exceptions>")
+    return "\n".join(out)
+
+
+def standard_calendar(uid=1, name="Standard", saturday=False, exs=()):
+    """Standard's week. `exs` are its date-range exceptions, written in both
+    forms as Project writes them: legacy `DayType 0` weekdays and
+    <Exceptions>."""
     days = []
     # DayType 1=Sunday .. 7=Saturday.
     for dt in range(1, 8):
@@ -137,9 +174,11 @@ def standard_calendar(uid=1, name="Standard", saturday=False):
             days.append(weekday(dt, saturday, SHIFT if saturday else []))
         else:  # Mon..Fri
             days.append(weekday(dt, True, SHIFT))
+    days += [exception_legacy(ex) for ex in exs]
     return (f"  <Calendar>\n    <UID>{uid}</UID><Name>{name}</Name>"
             f"<IsBaseCalendar>1</IsBaseCalendar>\n"
-            f"    <WeekDays>\n" + "\n".join(days) + "\n    </WeekDays>\n  </Calendar>")
+            f"    <WeekDays>\n" + "\n".join(days) + "\n    </WeekDays>\n"
+            + (exceptions(exs) + "\n" if exs else "") + "  </Calendar>")
 
 
 def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
@@ -556,6 +595,53 @@ def build():
             task(1, "Frame", 5 * D, dt(2), dt(9, "17:00:00"), **CRIT, calendar=2),
             task(2, "Paint", D, dt(10), dt(10, "17:00:00"), **CRIT, preds=[(1, FS, 0)]),
         ]), resources_xml=crew_res, calendars=[standard_calendar(), crew]))
+
+    # 24 — calendar exceptions (#126): Standard takes Wed 4 off ("Founders
+    # day") and works Saturday 14 08:00-12:00 ("Stocktake"), both written in
+    # the two forms Project writes. Pour's 3 days skip the holiday (Mon 2, Tue
+    # 3, Thu 5); Cure runs Fri 6 to Fri 13; Inspect's day is Saturday's four
+    # hours and Monday 16's morning.
+    holiday_exs = [("Founders day", "2026-03-04", "2026-03-04", []),
+                   ("Stocktake", "2026-03-14", "2026-03-14", [("08:00:00", "12:00:00")])]
+    add("24-calendar-holiday.xml", ["calendar", "calendar-exception", "round-trip", "link",
+                                    "link-fs"],
+        "A holiday inside a task pushes its finish out a day; a working Saturday "
+        "with changed hours carries a later task; both exceptions survive saves.",
+        project("calendar-holiday", "\n".join([
+            task(1, "Pour", 3 * D, dt(2), dt(5, "17:00:00"), **CRIT),
+            task(2, "Cure", 6 * D, dt(6), dt(13, "17:00:00"), **CRIT, preds=[(1, FS, 0)]),
+            task(3, "Inspect", D, dt(14), dt(16, "12:00:00"), **CRIT, preds=[(2, FS, 0)]),
+        ]), calendars=[standard_calendar(exs=holiday_exs)]))
+
+    # 25 — a derived calendar and its base's holidays (#126). Standard takes
+    # Wed 4 and Wed 11 off. Alice's resource calendar derives from it, states
+    # Wednesday as 07:00-15:00 and works Wed 11 07:00-15:00 as an exception of
+    # its own. Project 2024 resolves a date to the first exception down the
+    # chain, then the first stated weekday: the base's Wed 4 holiday beats
+    # Alice's own Wednesday, and her own Wed 11 exception beats the base's
+    # holiday. Frame (on Alice) runs Mon 2, Tue 3 and Thu 5; Paint (Standard)
+    # Fri 6; Seal (Alice) Mon 9, Tue 10 and Wed 11 until 15:00. Project keeps a
+    # derived calendar's name only when it is its resource's name.
+    own_wed = [("07:00:00", "15:00:00")]
+    alice_exs = [("Inventory", "2026-03-11", "2026-03-11", own_wed)]
+    alice = ("  <Calendar>\n    <UID>2</UID><Name>Alice</Name>"
+             "<IsBaseCalendar>0</IsBaseCalendar><BaseCalendarUID>1</BaseCalendarUID>\n"
+             "    <WeekDays>\n" + weekday(4, True, own_wed) + "\n"
+             + "\n".join(exception_legacy(ex) for ex in alice_exs)
+             + "\n    </WeekDays>\n" + exceptions(alice_exs) + "\n  </Calendar>")
+    add("25-derived-calendar-holiday.xml", ["calendar", "calendar-exception",
+                                            "derived-calendar", "link", "link-fs"],
+        "A resource calendar derived from Standard keeps Standard's holiday on a "
+        "weekday it states itself, and its own exception overrides Standard's.",
+        project("derived-calendar-holiday", "\n".join([
+            task(1, "Frame", 3 * D, dt(2), dt(5, "17:00:00"), **CRIT, calendar=2),
+            task(2, "Paint", D, dt(6), dt(6, "17:00:00"), **CRIT, preds=[(1, FS, 0)]),
+            task(3, "Seal", 3 * D, dt(9), dt(11, "15:00:00"), **CRIT, calendar=2,
+                 preds=[(2, FS, 0)]),
+        ]), resources_xml=crew_res, calendars=[
+            standard_calendar(exs=[holiday_exs[0],
+                                   ("Founders week", "2026-03-11", "2026-03-11", [])]),
+            alice]))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",
