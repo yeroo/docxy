@@ -74,7 +74,10 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
 /// Render a full Markdown document: a heading, the fenced Mermaid chart, and a
 /// task table (start, finish, duration, total/free slack, critical) as a text
 /// fallback for viewers that don't render Mermaid. Summary names are bold and
-/// their durations span the rolled-up dates under the project's default calendar.
+/// their durations are the working time between the rolled-up dates, measured
+/// as [`crate::schedule::task_duration_min`] measures them: on the project's
+/// default calendar, or on its leaves' calendars when the default has no
+/// working time.
 pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
     let heading = sanitize(&proj.title)
         .or_else(|| sanitize(&proj.name))
