@@ -613,6 +613,7 @@ pub(crate) fn commit_prompt(tab: &mut DocTab, prompt: ProjectPrompt) {
 pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
     if let Surface::Project(v) = &mut tab.surface {
         tab.dirty = v.ed.dirty();
+        v.latch_entry_row();
         // The list always holds the entry row, so there is a row to reveal.
         if reveal {
             v.scroll

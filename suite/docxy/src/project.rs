@@ -43,6 +43,8 @@ impl ProjectView {
     fn new(project: Project, dirty: bool) -> Self {
         let ed = ProjectEditor::restored(project, dirty);
         let scale = gantt_scale(&ed);
+        // A plan without tasks has only the entry row.
+        let entry = ed.project().tasks.is_empty();
         Self {
             ed,
             scroll: UniformListScrollHandle::new(),
@@ -54,7 +56,7 @@ impl ProjectView {
             prompt: None,
             col: 1,
             cell: None,
-            entry: false,
+            entry,
             exported: None,
             width: 590. + SCROLLBAR_W,
             timeline: true,
@@ -98,6 +100,16 @@ impl ProjectView {
     /// no other row.
     pub fn on_entry_row(&self) -> bool {
         self.entry || self.ed.project().tasks.is_empty()
+    }
+
+    /// Latch the entry row once the plan has no tasks, so tasks that appear
+    /// later without the user moving (an agent's `task.add`, Redo, a reload)
+    /// go above the cursor rather than under it. Called wherever an edit may
+    /// have emptied the plan; a new view latches it too.
+    pub fn latch_entry_row(&mut self) {
+        if self.ed.project().tasks.is_empty() {
+            self.entry = true;
+        }
     }
 
     /// The row the cell cursor is on: a task's index, or the task count for

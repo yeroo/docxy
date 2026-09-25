@@ -18,8 +18,9 @@ fn tab() -> DocTab {
     for (name, duration) in [("First", 480), ("Second", 960)] {
         vm(&mut t).ed.add_task(None, name, duration).unwrap();
     }
+    // A view over the finished plan, as opening it builds one.
     let p = v(&t).ed.project().clone();
-    vm(&mut t).ed = ProjectEditor::new(p);
+    t.surface = Surface::Project(ProjectView::new(p, false));
     vm(&mut t).ed.select(1);
     t
 }
@@ -777,6 +778,9 @@ fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
     assert!(t.dirty);
     apply_project_act(&mut t, ProjectAct::Undo);
     assert_eq!(v(&t).ed.project(), &before);
+    // Emptying the plan latched the entry row, so select the summary again.
+    assert!(v(&t).on_entry_row());
+    project_cell_click(&mut t, 0, None, false);
 
     // The prompt bar's Delete button commits through the same path as Enter.
     apply_project_act(&mut t, ProjectAct::DeleteTask);
@@ -885,4 +889,19 @@ fn f3_from_the_entry_row_starts_at_the_first_task_after_undo_and_redo() {
     apply_project_act(&mut t, ProjectAct::FindNext);
     assert_eq!(v(&t).ed.sel(), 0, "F3 starts at the first task");
     assert!(!v(&t).on_entry_row());
+}
+
+#[test]
+fn deleting_every_task_latches_the_entry_row_through_undo() {
+    let mut t = tab();
+    project_cell_click(&mut t, 0, None, false);
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    assert!(v(&t).ed.project().tasks.is_empty());
+    assert!(v(&t).entry, "an emptied plan latches the entry row");
+    // Undo brings a task back above the cursor, which stays on the entry row.
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project().tasks.len(), 1);
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 1);
 }

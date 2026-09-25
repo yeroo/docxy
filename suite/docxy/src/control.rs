@@ -199,8 +199,10 @@ pub(crate) fn project_verb(
                     unreachable!()
                 };
                 // The cursor keeps its row kind: the entry row is derived
-                // from the task count, so it stays valid over any reload.
+                // from the task count, so it stays valid over any reload,
+                // and a reload to an empty plan latches it.
                 v.ed.replace_project(fresh.ed.project().clone());
+                v.latch_entry_row();
                 v.cancel_prompt();
                 v.cell = None;
                 v.refresh_schedule_layout();
@@ -225,6 +227,7 @@ pub(crate) fn project_verb(
                     tab.dirty = v.ed.dirty();
                     v.cancel_prompt();
                     v.cell = None;
+                    v.latch_entry_row();
                     effect.repaint = true;
                     effect.activity = true;
                 }

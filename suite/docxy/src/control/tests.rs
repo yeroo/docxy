@@ -609,3 +609,64 @@ fn agent_find_and_task_add_leave_the_entry_row_cursor_alone() {
     assert!(view(&tabs[0]).on_entry_row());
     assert_eq!(view(&tabs[0]).cursor_row(), count);
 }
+
+/// Type `text` into the Project cell cursor and commit it with Enter.
+fn type_enter(t: &mut DocTab, text: &str) {
+    project_input(t, "x", Some(text), Modifiers::default());
+    project_input(t, "enter", None, Modifiers::default());
+}
+
+#[test]
+fn an_empty_plans_entry_row_survives_an_agent_task_add() {
+    let mut tabs = vec![new_project_tab()];
+    call(&mut tabs, 0, "task.add", args(r#"{"name":"Agent"}"#)).unwrap();
+    assert!(view(&tabs[0]).on_entry_row());
+    assert_eq!(view(&tabs[0]).cursor_row(), 1);
+    // Typing appends a second task; it does not rename the agent's.
+    type_enter(&mut tabs[0], "Typed");
+    let names: Vec<_> = view(&tabs[0])
+        .ed
+        .project()
+        .tasks
+        .iter()
+        .map(|t| t.name.as_str())
+        .collect();
+    assert_eq!(names, ["Agent", "Typed"]);
+}
+
+#[test]
+fn an_agent_emptying_the_plan_latches_the_entry_row() {
+    let mut tabs = vec![tab()];
+    vm(&mut tabs[0]).select_row(0);
+    for uid in [1, 2] {
+        call(
+            &mut tabs,
+            0,
+            "task.del",
+            Json::obj(vec![("uid", Json::Num(uid as f64))]),
+        )
+        .unwrap();
+    }
+    call(&mut tabs, 0, "task.add", args(r#"{"name":"Agent"}"#)).unwrap();
+    assert!(view(&tabs[0]).on_entry_row());
+    assert_eq!(view(&tabs[0]).cursor_row(), 1);
+}
+
+#[test]
+fn reloading_an_empty_plan_that_gained_tasks_keeps_the_entry_row() {
+    let dir = scratch();
+    let path = dir.join("plan.xml");
+    let empty =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/gantt-empty.xml");
+    std::fs::copy(empty, &path).unwrap();
+    let mut tabs = vec![project_tab_from_path(&path)];
+    assert!(view(&tabs[0]).on_entry_row());
+    std::fs::copy(fixture(), &path).unwrap();
+    call(&mut tabs, 0, "proj.reload", Json::Null).unwrap();
+    assert_eq!(view(&tabs[0]).ed.project().tasks.len(), 2);
+    assert!(view(&tabs[0]).on_entry_row());
+    assert_eq!(view(&tabs[0]).cursor_row(), 2);
+    type_enter(&mut tabs[0], "Typed");
+    assert_eq!(view(&tabs[0]).ed.project().tasks.len(), 3);
+    assert_eq!(view(&tabs[0]).ed.project().tasks[0].name, "Task 1");
+}
