@@ -434,6 +434,7 @@ fn a_tab_that_failed_to_load_stays_unsaveable_after_a_restart() {
         let mut restored = exit_and_restore(&mut [t], &format!("load-failed-{dirty}"));
         let r = &mut restored[0];
         assert!(r.load_failed, "dirty={dirty}: {}", r.status);
+        assert!(r.status.starts_with("load error"), "{}", r.status);
         assert_eq!(r.dirty, dirty);
         r.dirty = true;
         assert!(!save_doc_tab(r, None));
@@ -464,7 +465,7 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
         dirty: false,
         hot: None,
         markdown: false,
-        load_failed: true,
+        load_failed: Some(true),
     };
     // Repaired since the session was saved: a normal, saveable document.
     let mut t = restore_tab(&persisted(&good));
@@ -479,6 +480,62 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
         good.display().to_string()
     ))
     .unwrap();
-    assert!(!old.load_failed);
+    assert_eq!(old.load_failed, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/close-tests")
+        .join(format!("{}-load-failed-old-session", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let broken = dir.join("broken.docx");
+    std::fs::write(&broken, b"not a zip").unwrap();
+    let good = dir.join("good.docx");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        &good,
+    )
+    .unwrap();
+    for (i, (path, failed)) in [(&broken, true), (&good, false)].into_iter().enumerate() {
+        let mut t = tab_from_path(path);
+        t.dirty = true;
+        // Written as a session from before #209: sidecar present, no mark.
+        let mut p = persist_tab(&dir, i, &t);
+        assert!(p.hot.is_some());
+        p.load_failed = None;
+        let mut r = restore_tab(&p);
+        assert_eq!(r.load_failed, failed, "{}: {}", path.display(), r.status);
+        assert_eq!(r.status.starts_with("load error"), failed, "{}", r.status);
+        assert_eq!(save_doc_tab(&mut r, None), !failed, "{}", r.status);
+    }
+    assert_eq!(std::fs::read(&broken).unwrap(), b"not a zip");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_corrupt_sidecar_restores_marked_and_says_the_copy_failed() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/close-tests")
+        .join(format!("{}-load-failed-sidecar", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.docx");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        &good,
+    )
+    .unwrap();
+    let before = std::fs::read(&good).unwrap();
+    let mut t = tab_from_path(&good);
+    t.dirty = true;
+    let p = persist_tab(&dir, 0, &t);
+    assert_eq!(p.load_failed, Some(false));
+    std::fs::write(p.hot.as_ref().unwrap(), b"not a zip").unwrap();
+    let mut r = restore_tab(&p);
+    assert!(r.load_failed);
+    assert!(r.status.contains("restored copy"), "{}", r.status);
+    assert!(!save_doc_tab(&mut r, None));
+    assert_eq!(std::fs::read(&good).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -161,9 +161,10 @@ struct PersistTab {
     #[serde(default)]
     markdown: bool,
     /// The tab's file could not be loaded, so `hot` holds a placeholder and
-    /// Save must not write it back over `path` (#209).
+    /// Save must not write it back over `path` (#209). `None` in a session
+    /// written before this was recorded: restore then asks the file itself.
     #[serde(default)]
-    load_failed: bool,
+    load_failed: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -4026,17 +4027,28 @@ fn restore_tab(t: &PersistTab) -> DocTab {
     let mut tab = match (t.kind, &hot) {
         (Kind::Docx, Some(hp)) => {
             let mut l = doc_from_path(hp);
-            l.status = if t.dirty {
+            // The sidecar of a tab whose file failed to load holds only the
+            // placeholder, so the mark carries over. A session written before
+            // the mark existed cannot say, so the file is asked directly;
+            // otherwise its placeholder would come back saveable over it.
+            let file_failed = match t.load_failed {
+                Some(failed) => failed,
+                None => path.as_ref().is_some_and(|p| doc_from_path(p).load_failed),
+            };
+            // A corrupt sidecar is a placeholder too.
+            let copy_failed = l.load_failed;
+            l.load_failed = file_failed || copy_failed;
+            l.status = if copy_failed {
+                "load error: the restored copy of this document could not be read; use Save As to save a new copy".into()
+            } else if file_failed {
+                format!("load error: {DOC_LOAD_FAILED_SAVE}").into()
+            } else if t.dirty {
                 "unsaved — restored".into()
             } else {
                 "loaded".into()
             };
             let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
             tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
-            // The sidecar of a tab whose file failed to load holds only the
-            // placeholder, so the mark carries over (a corrupt sidecar is a
-            // placeholder too).
-            tab.load_failed = t.load_failed || tab.load_failed;
             tab
         }
         // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
@@ -4129,7 +4141,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         dirty: t.dirty,
         hot,
         markdown: t.markdown,
-        load_failed: t.load_failed,
+        load_failed: Some(t.load_failed),
     }
 }
 
