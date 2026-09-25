@@ -5641,7 +5641,8 @@ impl Docxy {
             | Region::ProjectHbarTable
             | Region::ProjectHbarChart
             | Region::ProjectVbar
-            | Region::ProjectTimeline => self.project_region_bounds(region),
+            | Region::ProjectTimeline
+            | Region::ProjectSplit => self.project_region_bounds(region),
             Region::Grid => self.grid_bounds(),
             Region::Cells(_, _, _, _) if self.active_is_project() => {
                 self.project_region_bounds(region)
