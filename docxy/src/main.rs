@@ -387,6 +387,8 @@ fn export_html_headless(loaded: &Input, source: &str, out: &str) -> Result<usize
             .unwrap_or_else(|| "document".into());
         (format!("{stem}.docx"), save_package(&loaded.pkg))
     };
+    // Replace nothing but a missing file or a Word bundle.
+    htmlbundle::check_html_target(Path::new(out))?;
     let page = html::export(&name, &docx)?;
     export_atomic(Some(Path::new(source)), Path::new(out), page.as_bytes())
         .map_err(|e| format!("cannot write {out}: {e}"))?;
@@ -1987,13 +1989,21 @@ impl App {
         {
             return;
         }
+        fname = fname.trim().to_string();
+        let path = dir.join(&fname);
+        let path_str = path.to_string_lossy().into_owned();
+        // A page replaces only a missing file or a Word bundle, never the
+        // user's own page (the terminal Save As does not ask about overwrites).
+        if target == DocFormat::Html {
+            if let Err(e) = htmlbundle::check_html_target(&path) {
+                self.status = Some(format!("save failed: {e}"));
+                return;
+            }
+        }
         if target == DocFormat::Html && self.bundle_html.is_none() && !html::can_export() {
             self.status = Some(format!("Save As editable HTML: {}", html::NO_ENGINE));
             return;
         }
-        fname = fname.trim().to_string();
-        let path = dir.join(&fname);
-        let path_str = path.to_string_lossy().into_owned();
         if self.hf_edit.is_some() {
             self.exit_hf_edit(true);
         }
@@ -3213,6 +3223,10 @@ impl App {
             self.status = Some("save failed: the editable HTML this file came from is gone".into());
             return;
         };
+        if let Err(e) = htmlbundle::check_html_target(Path::new(&path)) {
+            self.status = Some(format!("save failed: {e}"));
+            return;
+        }
         match htmlbundle::rewrap(old, &docx) {
             Ok(page) => {
                 if self.finish_save(&path, page.as_bytes(), Some(&docx)) {
@@ -11056,6 +11070,58 @@ mod html_bundle_tests {
         let out = std::fs::read_to_string(dir.join("notes.html")).unwrap();
         assert!(htmlbundle::unwrap(&out).is_ok(), "a bundle, not OOXML");
         assert_eq!(app.format, DocFormat::Html);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_never_replaces_a_page_that_is_not_a_bundle() {
+        let dir = temp("no-clobber");
+        let plain = dir.join("index.html");
+        let legacy = dir.join("report.htm");
+        std::fs::write(&plain, "<html><body>mine</body></html>").unwrap();
+        std::fs::write(&legacy, b"<html>caf\xe9</html>").unwrap();
+
+        // From a .docx, and from an opened bundle (rewrap would not care what
+        // it replaces), onto both pages.
+        let bundle_path = dir.join("sample.docx.html");
+        std::fs::write(&bundle_path, bundle_of(&sample_docx(), "sample.docx")).unwrap();
+        for from_bundle in [false, true] {
+            for (target, before) in [
+                (&plain, b"<html><body>mine</body></html>".to_vec()),
+                (&legacy, b"<html>caf\xe9</html>".to_vec()),
+            ] {
+                let mut app = if from_bundle {
+                    open_app(&bundle_path)
+                } else {
+                    let mut app =
+                        App::new(load_package(&sample_docx()).unwrap(), "sample.docx", false);
+                    app.path = dir.join("sample.docx").to_string_lossy().into_owned();
+                    app
+                };
+                let name = target.file_name().unwrap().to_string_lossy().into_owned();
+                app.commit_save_as(dir.clone(), name.clone());
+                let status = app.status.clone().unwrap_or_default();
+                assert!(status.contains("not overwriting"), "{name}: {status}");
+                assert_eq!(std::fs::read(target).unwrap(), before, "{name} replaced");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_refuses_when_the_bundle_was_replaced_by_a_plain_page() {
+        let dir = temp("replaced");
+        let path = dir.join("sample.docx.html");
+        std::fs::write(&path, bundle_of(&sample_docx(), "sample.docx")).unwrap();
+        let mut app = open_app(&path);
+        std::fs::write(&path, "<html>someone else's page</html>").unwrap();
+        app.modified = true;
+        app.save();
+        assert!(app.modified);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "<html>someone else's page</html>"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

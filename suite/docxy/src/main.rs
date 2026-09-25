@@ -1108,6 +1108,9 @@ struct Docxy {
     ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
+    /// Set by Save As for the save it triggers: the destination is a new name,
+    /// so a bundle already there is not this document's to rewrap.
+    saving_as: bool,
     clip: Option<Clip>,
     theme_pref: ThemePref,
     /// When set, closing the window with unsaved tabs shows a confirm dialog.
@@ -4012,7 +4015,9 @@ fn restore_tab(t: &PersistTab) -> DocTab {
             } else {
                 "loaded".into()
             };
-            l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
+            let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
+            tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
+            tab
         }
         // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
         // keep the original on-disk `path` (so Save still targets the real
@@ -4042,6 +4047,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
         _ => {
             let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
             let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
+            let bundle_html = html_bundle::restored_bundle(path.as_deref());
             DocTab {
                 kind: t.kind,
                 title: t.title.clone().into(),
@@ -4054,7 +4060,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 notes,
                 markdown,
                 hf_edit: None,
-                bundle_html: None,
+                bundle_html,
             }
         }
     };
@@ -4138,6 +4144,7 @@ impl Docxy {
             ribbon_min: false,
             backstage: false,
             bs_new: false,
+            saving_as: false,
             clip: None,
             theme_pref,
             ask_on_close,
@@ -9851,6 +9858,9 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Save As marks the one save it triggers; a plain Save targets the
+        // tab's own file.
+        let own_path = !std::mem::take(&mut self.saving_as);
         if self.active_is_project() {
             return self.save_project(false, window, cx);
         }
@@ -9885,7 +9895,8 @@ impl Docxy {
             }
             html_bundle::DocTarget::Html => {
                 let docx = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
-                match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), &docx) {
+                match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), own_path, &docx)
+                {
                     Ok(page) => page.into_bytes(),
                     Err(e) => {
                         tab.status = format!("save failed: {e}").into();
@@ -9981,6 +9992,7 @@ impl Docxy {
             return self.save_project(true, window, cx);
         }
         if self.pick_doc_save_target() {
+            self.saving_as = true;
             self.save_active(window, cx);
         } else {
             self.refocus(window, cx);

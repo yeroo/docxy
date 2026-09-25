@@ -105,6 +105,26 @@ fn a_spreadsheet_bundle_is_pointed_at_xlsxy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn html_export_never_replaces_a_page_that_is_not_a_bundle() {
+    let dir = temp("no-clobber");
+    let docx = dir.join("sample.docx");
+    std::fs::write(&docx, sample_docx()).unwrap();
+    for (name, before) in [
+        ("index.html", b"<html><body>mine</body></html>".to_vec()),
+        ("report.htm", b"<html>caf\xe9</html>".to_vec()),
+    ] {
+        let out_path = dir.join(name);
+        std::fs::write(&out_path, &before).unwrap();
+        let out = docxy(&[&docx, Path::new("--html"), &out_path]);
+        assert!(!out.status.success(), "{name}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("not overwriting"), "{name}: {err}");
+        assert_eq!(std::fs::read(&out_path).unwrap(), before, "{name} replaced");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(not(feature = "html-export"))]
 #[test]
 fn html_export_says_it_was_not_built_in() {

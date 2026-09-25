@@ -292,8 +292,6 @@ fn meta_json_round_trips_awkward_text() {
 #[test]
 fn names_follow_the_convention() {
     assert_eq!(bundle_name("sample.docx"), "sample.docx.html");
-    assert_eq!(source_name("dir/sample.docx.html"), Some("dir/sample.docx"));
-    assert_eq!(source_name("sample.html"), None);
     // Every HTML name is a bundle candidate, whatever its inner extension.
     for html in [
         r"C:\x\Report.DOCX.HTML",
@@ -410,9 +408,10 @@ fn sibling_warning_fires_only_when_the_original_changed() {
     assert!(w.starts_with("sample.docx changed since export"), "{w}");
     let renamed = dir.join("sample.docx (1).html");
     assert!(sibling_warning(&renamed, &edited).is_some());
-    // The recorded name cannot reach outside the folder.
+    // The recorded name cannot reach outside the folder: from `dir/sub`,
+    // `../sample.docx` would be the changed original.
     let mut sneaky = edited.clone();
-    sneaky.set("sourceName", "../../sample.docx");
+    sneaky.set("sourceName", "../sample.docx");
     let inner = dir.join("sub");
     std::fs::create_dir_all(&inner).unwrap();
     assert_eq!(sibling_warning(&inner.join("x.html"), &sneaky), None);
@@ -422,6 +421,45 @@ fn sibling_warning_fires_only_when_the_original_changed() {
     // No sibling, no warning.
     std::fs::remove_file(&docx).unwrap();
     assert_eq!(sibling_warning(&bundle_path, &edited), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn only_missing_files_and_word_bundles_may_be_overwritten() {
+    let dir = temp_dir("target");
+    let missing = dir.join("new.html");
+    assert_eq!(check_html_target(&missing), Ok(None));
+
+    let bundle_path = dir.join("b.docx (1).html");
+    let page = bundle(b"PK");
+    std::fs::write(&bundle_path, &page).unwrap();
+    assert_eq!(check_html_target(&bundle_path), Ok(Some(page.clone())));
+
+    let refuse = |path: &std::path::Path, why: &str| {
+        let err = check_html_target(path).unwrap_err();
+        assert!(err.starts_with("not overwriting"), "{err}");
+        assert!(err.contains(why), "{err}");
+    };
+    let plain = dir.join("index.html");
+    std::fs::write(&plain, "<html><body>mine</body></html>").unwrap();
+    refuse(&plain, "not a docxy editable HTML file");
+    // Word's "Save as Web Page" writes windows-1252.
+    let legacy = dir.join("report.htm");
+    std::fs::write(&legacy, b"<html>caf\xe9</html>").unwrap();
+    refuse(&legacy, "not a docxy editable HTML file");
+    let sheet = dir.join("book.html");
+    let xlsx = wrap(&test_assets(), b"e", "xlsx", "book.xlsx", b"PK", "0", WHEN).unwrap();
+    std::fs::write(&sheet, xlsx).unwrap();
+    refuse(&sheet, "holds a xlsx file");
+    let damaged = dir.join("damaged.html");
+    std::fs::write(
+        &damaged,
+        page.replace(&base64::encode(b"PK"), &base64::encode(b"XX")),
+    )
+    .unwrap();
+    refuse(&damaged, "integrity");
+    // A directory cannot be read as a file.
+    refuse(&dir, "not overwriting");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -64,39 +64,36 @@ pub(crate) fn open(path: &Path) -> Result<Opened, String> {
     })
 }
 
-/// The page to write at `path` around `docx`:
+/// The page to write at `path` around `docx`. First the rule every page write
+/// follows ([`htmlbundle::check_html_target`]): only a missing file or a Word
+/// bundle is replaced; an unreadable file, a non-UTF-8 page, a plain page or a
+/// bundle of another format is refused. Then:
 ///
 /// 1. the bundle this document was opened from (`opened`), rewrapped, so its
 ///    engine and UI carry over, including on Save As to another name;
-/// 2. else the bundle already at `path` (a tab restored after a restart),
-///    rewrapped;
-/// 3. else a new bundle, which needs the engine.
-///
-/// A file at `path` that is not a bundle is never overwritten.
+/// 2. else, on a plain Save (`own_path`: the tab's own file, e.g. a tab
+///    restored after a restart), the bundle already there, rewrapped;
+/// 3. else a new bundle whose name and hashes are this document's, which
+///    needs the engine. (Save As onto someone else's bundle does not inherit
+///    its metadata.)
 pub(crate) fn bundle_bytes(
     path: &Path,
     opened: Option<&str>,
+    own_path: bool,
     docx: &[u8],
 ) -> Result<String, String> {
-    if let Some(old) = opened {
+    let existing = htmlbundle::check_html_target(path)?;
+    let base = opened.or(existing.as_deref().filter(|_| own_path));
+    if let Some(old) = base {
         return htmlbundle::rewrap(old, docx).map_err(|e| e.to_string());
-    }
-    let file = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if let Ok(existing) = std::fs::read_to_string(path) {
-        return match htmlbundle::rewrap(&existing, docx) {
-            Ok(page) => Ok(page),
-            Err(htmlbundle::Error::NotABundle) => Err(format!(
-                "not overwriting {file}: it is not a docxy editable HTML file"
-            )),
-            Err(e) => Err(format!("{file}: {e}")),
-        };
     }
     let engine = ENGINE.ok_or(
         "this build of docxy cannot make editable HTML (build it with --features html-export)",
     )?;
+    let file = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     htmlbundle::wrap(
         &htmlbundle::docx_assets(),
         engine,
@@ -107,6 +104,14 @@ pub(crate) fn bundle_bytes(
         &htmlbundle::now_utc(),
     )
     .map_err(|e| e.to_string())
+}
+
+/// The bundle HTML a tab restored after a restart holds: its file's, when
+/// that file is a Word bundle. (The restored content itself may come from the
+/// hot-exit sidecar; the bundle is what Save and Save As rewrap.)
+pub(crate) fn restored_bundle(path: Option<&Path>) -> Option<String> {
+    let path = path.filter(|p| doc_target(p, false) == DocTarget::Html)?;
+    htmlbundle::check_html_target(path).ok().flatten()
 }
 
 #[cfg(test)]
@@ -167,8 +172,8 @@ mod tests {
         let path = dir.join("sample.docx.html");
         let original = bundle(b"PK one");
         std::fs::write(&path, &original).unwrap();
-        // A tab restored after a restart holds no bundle: the file is rewrapped.
-        let html = bundle_bytes(&path, None, b"PK two").unwrap();
+        // A plain Save with no bundle held (a restored tab): the file is rewrapped.
+        let html = bundle_bytes(&path, None, true, b"PK two").unwrap();
         let cut = |h: &str| h[..h.rfind(htmlbundle::PAYLOAD_OPEN).unwrap()].to_string();
         assert_eq!(cut(&html), cut(&original));
         let b = htmlbundle::unwrap(&html).unwrap();
@@ -189,7 +194,7 @@ mod tests {
         let opened = std::fs::read_to_string(&from).unwrap();
         // The destination exists and is a different bundle: the opened one wins.
         std::fs::write(&to, bundle(b"PK other")).unwrap();
-        let html = bundle_bytes(&to, Some(&opened), b"PK two").unwrap();
+        let html = bundle_bytes(&to, Some(&opened), false, b"PK two").unwrap();
         assert!(html.contains(&htmlbundle::base64::encode(b"\0asm stand-in")));
         assert_eq!(htmlbundle::unwrap(&html).unwrap().payload, b"PK two");
         let _ = std::fs::remove_dir_all(&dir);
@@ -199,7 +204,7 @@ mod tests {
     fn a_new_bundle_needs_the_engine() {
         let dir = temp("new");
         let to = dir.join("fresh.docx.html");
-        match bundle_bytes(&to, None, b"PK new") {
+        match bundle_bytes(&to, None, false, b"PK new") {
             Ok(page) => {
                 assert!(can_export());
                 let b = htmlbundle::unwrap(&page).unwrap();
@@ -219,8 +224,31 @@ mod tests {
         let dir = temp("plain");
         let page = dir.join("page.html");
         std::fs::write(&page, "<html>mine</html>").unwrap();
-        let err = bundle_bytes(&page, None, b"PK").unwrap_err();
-        assert!(err.contains("not overwriting page.html"), "{err}");
+        for (opened, own) in [(None, true), (None, false), (Some("x"), false)] {
+            let err = bundle_bytes(&page, opened, own, b"PK").unwrap_err();
+            assert!(err.contains("not overwriting page.html"), "{err}");
+        }
+        // Nor a page in another encoding (Word's windows-1252 "Web Page").
+        let legacy = dir.join("report.htm");
+        std::fs::write(&legacy, b"<html>caf\xe9</html>").unwrap();
+        let err = bundle_bytes(&legacy, None, true, b"PK").unwrap_err();
+        assert!(err.contains("not overwriting report.htm"), "{err}");
+        assert_eq!(std::fs::read(&legacy).unwrap(), b"<html>caf\xe9</html>");
+        // Nor a bundle of another format.
+        let sheet = dir.join("book.html");
+        let xlsx = htmlbundle::wrap(
+            &htmlbundle::docx_assets(),
+            b"e",
+            "xlsx",
+            "book.xlsx",
+            b"PK",
+            "t",
+            "2026-09-25T00:00:00Z",
+        )
+        .unwrap();
+        std::fs::write(&sheet, &xlsx).unwrap();
+        let err = bundle_bytes(&sheet, None, true, b"PK").unwrap_err();
+        assert!(err.contains("holds a xlsx file"), "{err}");
         assert!(open(&page).is_err());
         assert_eq!(std::fs::read_to_string(&page).unwrap(), "<html>mine</html>");
         let _ = std::fs::remove_dir_all(&dir);
@@ -234,9 +262,45 @@ mod tests {
             std::fs::write(&path, bundle(b"PK one")).unwrap();
             let o = open(&path).unwrap();
             assert_eq!(o.docx, b"PK one", "{name}");
-            let page = bundle_bytes(&path, Some(&o.html), b"PK two").unwrap();
+            let page = bundle_bytes(&path, Some(&o.html), true, b"PK two").unwrap();
             assert_eq!(htmlbundle::unwrap(&page).unwrap().payload, b"PK two");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_onto_another_bundle_does_not_inherit_its_metadata() {
+        let dir = temp("inherit");
+        let other = dir.join("theirs.docx.html");
+        std::fs::write(&other, bundle(b"PK theirs")).unwrap();
+        match bundle_bytes(&other, None, false, b"PK mine") {
+            Ok(page) => {
+                let b = htmlbundle::unwrap(&page).unwrap();
+                assert_eq!(b.meta.source_name(), "theirs.docx");
+                assert_eq!(
+                    b.meta.source_sha256(),
+                    htmlbundle::sha256::hex_digest(b"PK mine"),
+                    "a fresh page for this document, not a rewrap of theirs"
+                );
+            }
+            Err(e) => assert!(e.contains("--features html-export"), "{e}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_restored_tab_gets_its_bundle_back() {
+        let dir = temp("restore");
+        let path = dir.join("sample.docx (1).html");
+        let page = bundle(b"PK one");
+        std::fs::write(&path, &page).unwrap();
+        assert_eq!(restored_bundle(Some(&path)), Some(page));
+        let plain = dir.join("page.html");
+        std::fs::write(&plain, "<html></html>").unwrap();
+        assert_eq!(restored_bundle(Some(&plain)), None);
+        assert_eq!(restored_bundle(Some(&dir.join("gone.html"))), None);
+        assert_eq!(restored_bundle(Some(&dir.join("a.docx"))), None);
+        assert_eq!(restored_bundle(None), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

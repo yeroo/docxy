@@ -483,11 +483,38 @@ pub fn is_html_path(path: &str) -> bool {
     lower.ends_with(".html") || lower.ends_with(".htm")
 }
 
-/// `sample.docx.html` → `sample.docx` (the path the bundle was exported from,
-/// by the naming convention). `None` when `path` is not `<name>.<ext>.html`.
-pub fn source_name(path: &str) -> Option<&str> {
-    bundle_inner_ext(path)?;
-    Some(&path[..path.len() - ".html".len()])
+/// Whether a Word page may be written to `path`, and what is there now: the
+/// one rule docxy, the suite and `--html` share before writing any page.
+///
+/// - nothing there → `Ok(None)`, a new file;
+/// - a docx bundle → `Ok(Some(its HTML))`, which may be replaced;
+/// - anything else → `Err("not overwriting <file>: …")`: an unreadable file
+///   (permissions, a sharing violation), one that is not UTF-8 (Word's
+///   windows-1252 "Web Page"), a page that is not a bundle, or a bundle of
+///   another format. A user's own page is never replaced by a bundle.
+pub fn check_html_target(path: &std::path::Path) -> Result<Option<String>, String> {
+    let file = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let refuse = |why: &str| Err(format!("not overwriting {file}: {why}"));
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return refuse(&e.to_string()),
+    };
+    let Ok(html) = String::from_utf8(bytes) else {
+        return refuse("it is not a docxy editable HTML file");
+    };
+    match unwrap(&html) {
+        Ok(b) if b.meta.format() == "docx" => Ok(Some(html)),
+        Ok(b) => refuse(&format!(
+            "it holds a {} file, not a Word document",
+            b.meta.format()
+        )),
+        Err(Error::NotABundle) => refuse("it is not a docxy editable HTML file"),
+        Err(e) => refuse(&e.to_string()),
+    }
 }
 
 /// The original-file name a new bundle saved as `file` records: the name
