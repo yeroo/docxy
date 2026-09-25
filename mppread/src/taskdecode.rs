@@ -57,7 +57,7 @@ fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Re
         return Err("link record length mismatch".into());
     }
     let positions: HashMap<_, _> = out.iter().enumerate().map(|(i, t)| (t.uid, i)).collect();
-    for rec in cons.chunks_exact(20) {
+    for rec in cons.as_chunks::<20>().0 {
         let pred_uid = u32_at(rec, 4);
         let succ_uid = u32_at(rec, 8);
         if pred_uid == 0 || succ_uid == 0 {
@@ -99,8 +99,10 @@ fn decode_name(v2: &[u8], off: usize, uid: u32) -> Result<String, String> {
         return Err(format!("invalid task name block for UID {uid}"));
     }
     let units: Vec<u16> = value
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     if *units.last().unwrap() != 0 {
         return Err(format!("unterminated task name for UID {uid}"));
@@ -184,7 +186,7 @@ fn legacy_names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32
     }
     let mut seen = HashSet::new();
     let mut out = HashMap::new();
-    for e in vm[24..end].chunks_exact(8) {
+    for e in vm[24..end].as_chunks::<8>().0 {
         let uid = u16_at(e, 0) as u32;
         let key = u16_at(e, 2);
         let off = u32_at(e, 4) as usize;
