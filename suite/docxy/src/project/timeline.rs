@@ -192,6 +192,7 @@ pub(crate) fn timeline_el(
         .h(px(TIMELINE_H))
         .flex_none()
         .bg(pal.panel)
+        .border_t_1()
         .border_b_1()
         .border_color(pal.border)
         .child(probe(
@@ -208,7 +209,7 @@ pub(crate) fn timeline_el(
                 .justify_center()
                 .border_r_1()
                 .border_color(pal.border)
-                .text_size(px(9.))
+                .text_size(px(8.))
                 .line_height(px(9.))
                 .font_weight(FontWeight::BOLD)
                 .text_color(pal.dim)
