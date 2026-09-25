@@ -156,7 +156,8 @@ fn tool_defs() -> Json {
         ),
         tool(
             "yppxy_del",
-            "Delete a task by UID (links pointing at it are dropped). Undoable.",
+            "Delete a task by UID; a summary takes its subtasks with it (reply `removed` lists \
+             every UID). Links pointing at removed tasks are dropped. One undo step.",
             vec![uid(), target(), tab()],
             &["uid"],
         ),

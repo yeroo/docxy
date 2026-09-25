@@ -235,13 +235,13 @@ start screen, a light/dark theme toggle, and mouse support. Try it:
 | ↑ ↓ · j / k · g / G | move the selection (top / bottom) |
 | ← → · h / l | scroll the Gantt timeline |
 | n · Insert | add a task below |
-| x · Delete | delete the task |
+| x · Delete | delete the task (a summary asks first, then takes its subtasks) |
 | Tab · Shift-Tab | indent / outdent (auto-forms summary tasks) |
 | Enter · F2 | rename the task |
 | d | set duration (`3d` / `4h` / `2w`) |
 | p | add a predecessor by task ID |
 | c | set a date constraint (`SNET 2026-03-05`, `MSO …`, `none`) |
-| a | assign a resource to the task (created on first use; empty clears) |
+| a | assign a resource to the task (created on first use; `Name[25%]` sets units; empty clears) |
 | b | set the baseline (planned-vs-current variance in the header) |
 | L | toggle resource leveling (delay bars to fit resource capacity) |
 | Ctrl-F · F3 | find task by name · repeat |

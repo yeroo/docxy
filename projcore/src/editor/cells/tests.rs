@@ -74,10 +74,11 @@ fn resources_preserve_allocations_and_undo_creation_together() {
     let before = ed.project().clone();
     let depth = ed.undo_depth();
     ed.mark_saved();
-    ed.set_resources(10, &["bob".into(), "ALICE".into(), "Alice".into()])
+    // Retained allocations survive when their cell text is unchanged.
+    ed.set_resources(10, &["bob".into(), "ALICE[50%]".into(), "Alice".into()])
         .unwrap();
     unchanged(&ed, &before, (depth, 0, false));
-    ed.set_resources(10, &["alice".into(), "Carol".into(), "carol".into()])
+    ed.set_resources(10, &["alice [50%]".into(), "Carol".into(), "carol".into()])
         .unwrap();
     assert_eq!(ed.undo_depth(), depth + 1);
     assert_eq!(ed.proj.assignments[0], kept);
@@ -247,9 +248,9 @@ fn scheduling_range_accounts_for_time_before_the_anchor() {
 #[test]
 fn resource_tokens_preserve_significant_whitespace_and_prefer_exact_assignments() {
     for (stored, token) in [
-        ("Alice ", "Alice "),
-        (" Alice", " alice"),
-        (" Alice ", " ALICE "),
+        ("Alice ", "Alice [50%]"),
+        (" Alice", " alice[50%]"),
+        (" Alice ", " ALICE [50%] "),
     ] {
         let mut ed = editor();
         ed.assign_resource(10, "Alice").unwrap();
@@ -320,7 +321,7 @@ fn duplicate_resource_names_preserve_the_assigned_identity_or_reject_ambiguity()
     let retained = ed.proj.assignments[1];
     let before = ed.project().clone();
     let depth = ed.undo_depth();
-    ed.set_resources(10, &["Alice".into(), "Bob".into()])
+    ed.set_resources(10, &["Alice[50%]".into(), "Bob".into()])
         .unwrap();
     assert!(ed.proj.assignments.contains(&retained));
     assert!(
@@ -340,8 +341,8 @@ fn duplicate_resource_names_preserve_the_assigned_identity_or_reject_ambiguity()
             .contains("ambiguous")
     );
     unchanged(&ed, &before, (depth, 1, false));
-    // One assigned match wins even for a name-only no-op, preserving redo.
-    ed.set_resources(10, &["alice".into()]).unwrap();
+    // One assigned match wins even for a text-unchanged no-op, preserving redo.
+    ed.set_resources(10, &["alice[50%]".into()]).unwrap();
     unchanged(&ed, &before, (depth, 1, false));
     // assign_resource retains its existing first-match behavior; two assigned matches
     // with neither spelling an exact match must still be rejected.
@@ -832,4 +833,408 @@ fn repeating_a_manual_tasks_duration_keeps_its_pinned_finish() {
     assert_eq!(task.manual_finish, before.manual_finish);
     assert_eq!(task.manual_duration_min, before.manual_duration_min);
     assert_eq!(saved(&ed, 10), saved_before);
+}
+
+/// Task 10 lasts two days and task 30 is a milestone; resource 1 is `Bob`.
+fn with_bob(kind: ResourceType, max_units: f64) -> Editor {
+    let mut ed = editor();
+    ed.proj.tasks[0].duration_min = 960;
+    ed.proj.tasks[2].duration_min = 0;
+    ed.proj.resources.push(Resource {
+        uid: 1,
+        id: 1,
+        name: "Bob".into(),
+        kind,
+        max_units,
+        ..Resource::default()
+    });
+    Editor::new(ed.proj)
+}
+
+fn allocation(ed: &Editor, task: i32, resource: i32) -> (f64, i64) {
+    let a = ed
+        .proj
+        .assignments
+        .iter()
+        .find(|a| a.task_uid == task && a.resource_uid == resource)
+        .unwrap();
+    (a.units, a.work_min)
+}
+
+fn resource_uid(ed: &Editor, name: &str) -> i32 {
+    ed.proj
+        .resources
+        .iter()
+        .find(|r| r.name == name)
+        .unwrap()
+        .uid
+}
+
+#[test]
+fn both_entry_points_assign_work_resources_at_capped_max_units() {
+    use ResourceType::{Cost, Material, Work};
+    for (kind, max_units, units) in [
+        (Work, 0.5, 0.5),
+        (Work, 3.0, 1.0),
+        (Work, 1.0, 1.0),
+        (Work, 0.0, 1.0),
+        (Work, -0.5, 1.0),
+        (Work, f64::NAN, 1.0),
+        (Work, f64::INFINITY, 1.0),
+        (Material, 0.5, 1.0),
+        (Cost, 0.5, 1.0),
+    ] {
+        for cell in [false, true] {
+            let mut ed = with_bob(kind, max_units);
+            for task in [10, 30] {
+                if cell {
+                    ed.set_resources(task, &["bob".into()]).unwrap();
+                } else {
+                    assert_eq!(
+                        ed.assign_resource(task, "bob").unwrap(),
+                        AssignOutcome::Assigned
+                    );
+                }
+            }
+            let case = format!("{kind:?} {max_units} cell={cell}");
+            assert_eq!(
+                allocation(&ed, 10, 1),
+                (units, (960. * units) as i64),
+                "{case}"
+            );
+            assert_eq!(allocation(&ed, 30, 1), (units, 0), "{case}");
+        }
+    }
+    // A resource created by typing a new name is a 100% work resource.
+    let mut ed = with_bob(Work, 0.5);
+    ed.assign_resource(10, "Dan").unwrap();
+    ed.set_resources(20, &["Eve".into()]).unwrap();
+    assert_eq!(allocation(&ed, 10, resource_uid(&ed, "Dan")), (1.0, 960));
+    assert_eq!(allocation(&ed, 20, resource_uid(&ed, "Eve")), (1.0, 480));
+}
+
+#[test]
+fn resource_names_show_work_units_that_are_not_100_percent() {
+    for (units, text) in [
+        (0.5, "50%"),
+        (1. / 3., "33.33%"),
+        (0.125, "12.5%"),
+        (1.5, "150%"),
+        (1.0, "100%"),
+        (0.0, "0%"),
+    ] {
+        assert_eq!(format_units(units), text);
+    }
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    ed.proj.resources.push(Resource {
+        uid: 2,
+        id: 2,
+        name: "Cement".into(),
+        kind: ResourceType::Material,
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    ed.proj.resources.push(Resource {
+        uid: 3,
+        id: 3,
+        name: "Pool".into(),
+        max_units: 3.0,
+        ..Resource::default()
+    });
+    ed.set_resources(10, &["Bob".into(), "Cement[50%]".into(), "Pool".into()])
+        .unwrap();
+    // Explicit units apply to any kind; only work resources show them.
+    assert_eq!(allocation(&ed, 10, 2), (0.5, 480));
+    assert_eq!(
+        format_resource_names(&ed.proj, 10),
+        "Bob[50%], Cement, Pool"
+    );
+    ed.proj.assignments[2].units = 1.0 + 1e-12;
+    assert_eq!(
+        format_resource_names(&ed.proj, 10),
+        "Bob[50%], Cement, Pool"
+    );
+    assert_eq!(format_resource_names(&ed.proj, 20), "");
+}
+
+#[test]
+fn bracketed_units_round_trip_through_the_resource_names_text() {
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    // Explicit units on new assignments, including over-allocation.
+    ed.set_resources(10, &["Bob[150%]".into(), " Carol [25 %] ".into()])
+        .unwrap();
+    assert_eq!(ed.undo_depth(), 1);
+    assert_eq!(allocation(&ed, 10, 1), (1.5, 1440));
+    assert_eq!(allocation(&ed, 10, resource_uid(&ed, "Carol")), (0.25, 240));
+    assert!(ed.proj.resources.iter().all(|r| !r.name.contains('[')));
+    assert_eq!(format_resource_names(&ed.proj, 10), "Bob[150%], Carol[25%]");
+    // Committing the shown text is a no-op, even for units it rounds.
+    ed.proj.assignments[0].units = 1. / 3.;
+    ed.proj.assignments[0].work_min = 123;
+    ed.mark_saved();
+    let before = ed.project().clone();
+    let text = format_resource_names(&ed.proj, 10);
+    assert_eq!(text, "Bob[33.33%], Carol[25%]");
+    let tokens: Vec<String> = text.split(',').map(str::to_owned).collect();
+    ed.set_resources(10, &tokens).unwrap();
+    unchanged(&ed, &before, (1, 0, false));
+    // Different units: one undo step, work rescaled from the duration.
+    ed.set_resources(10, &["Bob[50%]".into(), "Carol[25%]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 1), (0.5, 480));
+    assert_eq!(ed.undo_depth(), 2);
+    ed.undo();
+    assert_eq!(ed.project(), &before);
+    ed.redo();
+    // Deleting a work bracket means 100%; a non-work bare name keeps its units.
+    ed.proj.resources.push(Resource {
+        uid: 9,
+        id: 9,
+        name: "Cement".into(),
+        kind: ResourceType::Material,
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    ed.set_resources(10, &["Bob[50%]".into(), "Cement[40%]".into()])
+        .unwrap();
+    ed.set_resources(10, &["Bob".into(), "Cement".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 1), (1.0, 960));
+    assert_eq!(allocation(&ed, 10, 9), (0.4, 384));
+    // An imported 0% assignment shows `[0%]` and survives an unchanged commit.
+    ed.proj.assignments[0].units = 0.0;
+    let before = ed.project().clone();
+    let depth = ed.undo_depth();
+    ed.set_resources(10, &["Bob[0%]".into(), "Cement".into()])
+        .unwrap();
+    assert_eq!(ed.project(), &before);
+    assert_eq!(ed.undo_depth(), depth);
+}
+
+#[test]
+fn malformed_units_are_rejected_atomically_unless_a_resource_has_that_name() {
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    ed.set_resources(10, &["Bob".into()]).unwrap();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    for token in [
+        "Bob[abc%]",
+        "Bob[-5%]",
+        "Bob[0%]",
+        "Bob[50]",
+        "Bob[%]",
+        "Bob[NaN%]",
+        "Bob[inf%]",
+        "[50%]",
+    ] {
+        let err = format!("Invalid units in '{token}'");
+        assert_eq!(
+            ed.set_resources(10, &["Carol".into(), token.into()]),
+            Err(err.clone())
+        );
+        assert_eq!(ed.set_resources(20, &[token.into()]), Err(err.clone()));
+        assert_eq!(ed.assign_resource(20, token), Err(err));
+        unchanged(&ed, &before, (1, 0, false));
+    }
+    // A whole-token name match wins over the units suffix.
+    for (uid, name) in [(5, "Crew [A%]"), (6, "Rig[50%]")] {
+        ed.proj.resources.push(Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+    }
+    let count = ed.proj.resources.len();
+    ed.set_resources(20, &[" crew [a%] ".into(), "RIG[50%]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 20, 5), (1.0, 480));
+    assert_eq!(allocation(&ed, 20, 6), (1.0, 480));
+    assert_eq!(
+        ed.assign_resource(30, "Rig[50%]").unwrap(),
+        AssignOutcome::Assigned
+    );
+    assert_eq!(allocation(&ed, 30, 6), (1.0, 0));
+    assert_eq!(ed.proj.resources.len(), count);
+}
+
+#[test]
+fn assign_prompt_takes_units_and_changes_only_different_ones() {
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    assert_eq!(
+        ed.assign_resource(10, "Bob[25%]").unwrap(),
+        AssignOutcome::Assigned
+    );
+    assert_eq!(allocation(&ed, 10, 1), (0.25, 240));
+    ed.mark_saved();
+    let before = ed.project().clone();
+    for same in ["bob", " BOB [25%] "] {
+        assert_eq!(
+            ed.assign_resource(10, same).unwrap(),
+            AssignOutcome::AlreadyAssigned
+        );
+        unchanged(&ed, &before, (1, 0, false));
+    }
+    assert_eq!(
+        ed.assign_resource(10, "Bob[75%]").unwrap(),
+        AssignOutcome::Assigned
+    );
+    assert_eq!(allocation(&ed, 10, 1), (0.75, 720));
+    assert_eq!(ed.proj.assignments.len(), 1);
+    assert_eq!(ed.undo_depth(), 2);
+    ed.undo();
+    assert_eq!(ed.project(), &before);
+    ed.assign_resource(20, "Dan[40%]").unwrap();
+    assert_eq!(allocation(&ed, 20, resource_uid(&ed, "Dan")), (0.4, 192));
+}
+
+#[test]
+fn partial_units_survive_mspdi() {
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    ed.assign_resource(10, "Bob").unwrap();
+    let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+    let a = back.assignments.iter().find(|a| a.task_uid == 10).unwrap();
+    assert_eq!((a.units, a.work_min), (0.5, 480));
+    assert_eq!(format_resource_names(&back, 10), "Bob[50%]");
+}
+
+#[test]
+fn leveling_books_assignments_at_their_units() {
+    let mut ed = with_bob(ResourceType::Work, 1.0);
+    ed.proj.tasks[1].duration_min = 960;
+    ed.set_resources(10, &["Bob[50%]".into()]).unwrap();
+    ed.set_resources(20, &["Bob[50%]".into()]).unwrap();
+    let starts = |ed: &Editor| {
+        let leveled = crate::schedule::level(ed.project());
+        [10, 20].map(|uid| leveled.start(uid).unwrap().to_mspdi())
+    };
+    // Two half-time bookings fit Bob's 100% side by side.
+    assert_eq!(starts(&ed), ["2026-01-05T08:00:00", "2026-01-05T08:00:00"]);
+    // At 100% the second task must wait for the first.
+    ed.set_resources(20, &["Bob".into()]).unwrap();
+    assert_eq!(starts(&ed), ["2026-01-05T08:00:00", "2026-01-07T08:00:00"]);
+}
+
+#[test]
+fn a_literal_bracketed_resource_does_not_steal_the_assigned_cell_text() {
+    let mut ed = with_bob(ResourceType::Work, 0.5);
+    ed.set_resources(10, &["Bob".into()]).unwrap();
+    // Older builds created resources like this when `Bob[50%]` was typed.
+    ed.proj.resources.push(Resource {
+        uid: 7,
+        id: 7,
+        name: "Bob[50%]".into(),
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    ed.mark_saved();
+    let before = ed.project().clone();
+    ed.set_resources(10, &["bob[50%] ".into()]).unwrap();
+    unchanged(&ed, &before, (1, 0, false));
+    ed.set_resources(10, &["Bob[50%]".into(), "Carol".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 1), (0.5, 480));
+    assert_eq!(format_resource_names(&ed.proj, 10), "Bob[50%], Carol");
+    // Where Bob is not assigned, the whole name still wins, and recommitting keeps it.
+    ed.set_resources(20, &["Bob[50%]".into()]).unwrap();
+    assert_eq!(allocation(&ed, 20, 7), (1.0, 480));
+    let depth = ed.undo_depth();
+    ed.set_resources(20, &["bob[50%]".into()]).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    // Both assigned: the cell reads the same text twice, so either token is ambiguous.
+    ed.set_resources(10, &["Bob[50%]".into(), "Carol".into(), "Rig".into()])
+        .unwrap();
+    ed.proj.assignments.push(Assignment {
+        uid: 99,
+        task_uid: 10,
+        resource_uid: 7,
+        units: 1.0,
+        work_min: 960,
+    });
+    assert_eq!(
+        format_resource_names(&ed.proj, 10),
+        "Bob[50%], Carol, Rig, Bob[50%]"
+    );
+    ed.mark_saved();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    for tokens in [&["Bob[50%]"][..], &["Bob[50%]", "Carol", "Rig", "Bob[50%]"]] {
+        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        assert_eq!(
+            ed.set_resources(10, &tokens),
+            Err("Resource name 'Bob[50%]' is ambiguous".into())
+        );
+        unchanged(&ed, &before, history);
+    }
+}
+
+/// Two-day task 10 with the given Work resources (all at Max. Units 100%) and assignments.
+fn on_task_10(resources: &[(i32, &str)], assigned: &[(i32, f64)]) -> Editor {
+    let mut ed = editor();
+    ed.proj.tasks[0].duration_min = 960;
+    for &(uid, name) in resources {
+        ed.proj.resources.push(Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+    }
+    for (k, &(resource_uid, units)) in assigned.iter().enumerate() {
+        ed.proj.assignments.push(Assignment {
+            uid: k as i32 + 1,
+            task_uid: 10,
+            resource_uid,
+            units,
+            work_min: work_for(960, units),
+        });
+    }
+    Editor::new(ed.proj)
+}
+
+fn commit_shown_text(ed: &mut Editor) -> Result<(), String> {
+    let text = format_resource_names(&ed.proj, 10);
+    // The suite splits on commas without trimming, as here.
+    let tokens: Vec<String> = text.split(',').map(str::to_owned).collect();
+    ed.set_resources(10, &tokens)
+}
+
+#[test]
+fn names_and_shown_text_share_one_exactness_ladder() {
+    // Deleting ALICE's bracket, or changing it, never unassigns ALICE via Alice.
+    for (token, units) in [
+        (" ALICE", 1.0),
+        ("ALICE", 1.0),
+        (" ALICE[75%]", 0.75),
+        ("ALICE[75%]", 0.75),
+    ] {
+        let mut ed = on_task_10(&[(1, "Alice"), (2, "ALICE")], &[(1, 1.0), (2, 0.5)]);
+        assert_eq!(format_resource_names(&ed.proj, 10), "Alice, ALICE[50%]");
+        ed.set_resources(10, &["Alice".into(), token.into()])
+            .unwrap();
+        assert_eq!(allocation(&ed, 10, 1), (1.0, 960), "{token}");
+        assert_eq!(
+            allocation(&ed, 10, 2),
+            (units, work_for(960, units)),
+            "{token}"
+        );
+    }
+    // An exact rendering beats a case-insensitive literal name.
+    let mut ed = on_task_10(&[(1, "Bob"), (2, "bob[50%]")], &[(1, 0.5), (2, 1.0)]);
+    assert_eq!(format_resource_names(&ed.proj, 10), "Bob[50%], bob[50%]");
+    let before = ed.project().clone();
+    commit_shown_text(&mut ed).unwrap();
+    unchanged(&ed, &before, (0, 0, false));
+}
+
+#[test]
+fn duplicate_assignments_of_one_resource_survive_an_unchanged_commit() {
+    for units in [[1.0, 0.5], [0.5, 1.0], [0.5, 0.5]] {
+        let mut ed = on_task_10(&[(1, "Bob")], &[(1, units[0]), (1, units[1])]);
+        let before = ed.project().clone();
+        commit_shown_text(&mut ed).unwrap();
+        unchanged(&ed, &before, (0, 0, false));
+    }
 }

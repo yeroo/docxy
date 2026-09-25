@@ -59,6 +59,11 @@ impl<A: Clone> Confirm<A> {
         &self.prompt
     }
 
+    /// The action Yes would run, so a host can drop a dialog whose target changed.
+    pub fn action(&self) -> &A {
+        &self.action
+    }
+
     /// Keys: ←/→/Tab move between Yes/No, y/n choose directly, Enter confirms
     /// the selection, Esc cancels.
     pub fn key(&mut self, key: KeyEvent) -> ConfirmOutcome<A> {

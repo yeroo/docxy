@@ -34,7 +34,9 @@ use ribbon::{Act, Ribbon};
 
 use mppread::project::project_from_mpp;
 use projcore::datetime::DateTime;
-use projcore::editor::{AssignOutcome, Editor, FindOutcome, constraint_hint, parse_duration};
+use projcore::editor::{
+    AssignOutcome, Editor, FindOutcome, constraint_hint, format_resource_names, parse_duration,
+};
 #[cfg(test)]
 use projcore::model::Predecessor;
 use projcore::model::{LinkType, Project, Task};
@@ -308,6 +310,8 @@ enum PromptKind {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum ConfirmAction {
     Exit,
+    /// Delete this task and its subtasks.
+    DeleteTask(i32),
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
@@ -327,8 +331,8 @@ struct App {
     prompt: Option<Prompt>,
     status: String,
     quit: bool,
-    /// The shared Yes/No exit confirmation modal, open while asking whether
-    /// to quit (Ctrl+Q / File ▸ Exit).
+    /// The shared Yes/No modal, open while asking whether to quit (Ctrl+Q /
+    /// File ▸ Exit) or to delete a summary with its subtasks.
     confirm: Option<backstage::Confirm<ConfirmAction>>,
     // ribbon + backstage + chrome
     ribbon: Ribbon,
@@ -436,16 +440,20 @@ impl App {
     /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
     fn request_exit(&mut self) {
         self.backstage = None;
+        // A text prompt takes keys before the modal would, so it must not
+        // stay open underneath it.
+        self.prompt = None;
+        self.confirm = Some(self.exit_confirm());
+    }
+
+    /// The Exit question, warning about unsaved changes when there are any.
+    fn exit_confirm(&self) -> backstage::Confirm<ConfirmAction> {
         let prompt = if self.ed.dirty() {
             "Exit yppxy? Unsaved changes will be lost."
         } else {
             "Exit yppxy?"
         };
-        self.confirm = Some(backstage::Confirm::new(
-            prompt,
-            ConfirmAction::Exit,
-            Color::Yellow,
-        ));
+        backstage::Confirm::new(prompt, ConfirmAction::Exit, Color::Yellow)
     }
 
     /// Act on the shared dialog's outcome.
@@ -457,6 +465,7 @@ impl App {
                 self.confirm = None;
                 match action {
                     ConfirmAction::Exit => self.quit = true,
+                    ConfirmAction::DeleteTask(uid) => self.delete_subtree(uid),
                 }
             }
         }
@@ -687,11 +696,53 @@ impl App {
         }
     }
 
+    /// Delete the selected task; a summary asks first, because its subtasks
+    /// go with it.
     fn delete_task(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
-            if let Err(message) = self.ed.delete_task(uid) {
-                self.status = message;
+        let Some(uid) = self.ed.selected_uid() else {
+            return;
+        };
+        match self.ed.subtree_len(uid) {
+            Ok(0) => self.delete_subtree(uid),
+            Ok(n) => {
+                // As in `request_exit`: no hidden prompt may take the modal's keys.
+                self.prompt = None;
+                let name = self.ed.project().task(uid).map_or("", |t| &t.name);
+                let noun = if n == 1 { "subtask" } else { "subtasks" };
+                self.confirm = Some(backstage::Confirm::new(
+                    format!("Delete '{name}' and its {n} {noun}?"),
+                    ConfirmAction::DeleteTask(uid),
+                    Color::Yellow,
+                ));
             }
+            Err(message) => self.status = message,
+        }
+    }
+
+    /// Bring an open question up to date after an agent edit or a reload.
+    /// A summary-delete question is dropped: its task, count and project were
+    /// read before the change. An Exit question gets its unsaved-changes
+    /// warning updated in place: the user's Yes/No choice is kept, and
+    /// nothing else is closed (the modal already owns the input).
+    fn refresh_confirm(&mut self) {
+        let Some(c) = &self.confirm else {
+            return;
+        };
+        match c.action() {
+            ConfirmAction::DeleteTask(_) => self.confirm = None,
+            ConfirmAction::Exit => {
+                let next = self.exit_confirm();
+                if next.prompt() != c.prompt() {
+                    let yes = c.yes_selected();
+                    self.confirm = Some(if yes { next } else { next.default_no() });
+                }
+            }
+        }
+    }
+
+    fn delete_subtree(&mut self, uid: i32) {
+        if let Err(message) = self.ed.delete_task(uid) {
+            self.status = message;
         }
     }
 
@@ -1095,7 +1146,7 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
 }
 
 fn on_mouse(app: &mut App, m: MouseEvent) {
-    // A modal confirmation (Exit) owns the whole screen while open — before
+    // A modal confirmation (Exit, summary delete) owns the whole screen while open — before
     // the welcome screen or backstage, so it can appear over either.
     if app.confirm.is_some() {
         if m.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -1221,7 +1272,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
-    // A modal confirmation (Exit) owns all keys while open — before the
+    // A modal confirmation (Exit, summary delete) owns all keys while open — before the
     // welcome screen or backstage, so it can appear over either.
     if app.confirm.is_some() {
         app.confirm_key(k);
@@ -1537,10 +1588,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             ));
         }
         // Resources assigned to the selected task.
-        let res = task_resources(app.ed.project(), t.uid);
+        let res = format_resource_names(app.ed.project(), t.uid);
         if !res.is_empty() {
             spans.push(Span::styled(
-                format!("· 👤 {} ", res.join(", ")),
+                format!("· 👤 {res} "),
                 Style::default().add_modifier(Modifier::DIM),
             ));
         }
@@ -2564,6 +2615,24 @@ mod tests {
     }
 
     #[test]
+    fn status_line_shows_partial_units_while_initials_use_plain_names() {
+        let mut proj = new_project();
+        proj.resources.push(projcore::model::Resource {
+            uid: 1,
+            id: 1,
+            name: "Bob".into(),
+            max_units: 0.5,
+            ..Default::default()
+        });
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
+        app.assign_resource("Bob");
+        app.assign_resource("Zed[25%]");
+        let s = buffer_text(&mut app, 110, 24);
+        assert!(s.contains("Bob[50%], Zed[25%]"), "{s}");
+        assert!(s.contains("·BZ"), "{s}");
+    }
+
+    #[test]
     fn level_toggle_delays_shared_resource() {
         let mut proj = new_project(); // task 1 (1d)
         proj.tasks.push(Task {
@@ -2628,6 +2697,101 @@ mod tests {
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
         );
         assert!(app.quit);
+    }
+
+    #[test]
+    fn n_on_a_summary_inserts_its_first_child() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.indent(1); // task 2 under task 1
+        app.ed.select(0);
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        let rows: Vec<_> = app
+            .ed
+            .project()
+            .tasks
+            .iter()
+            .map(|t| (t.uid, t.outline_level, t.summary))
+            .collect();
+        assert_eq!(rows, [(1, 1, true), (3, 2, false), (2, 2, false)]);
+        assert_eq!(app.ed.selected_uid(), Some(3));
+    }
+
+    #[test]
+    fn deleting_a_summary_asks_first_and_takes_its_subtasks() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.add_task();
+        for row in [1, 2] {
+            app.ed.select(row);
+            app.indent(1); // tasks 2 and 3 under task 1
+        }
+        let before = app.ed.project().clone();
+        let depth = app.ed.undo_depth();
+        let delete = || KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
+
+        // A leaf goes at once.
+        on_key(&mut app, delete());
+        assert!(app.confirm.is_none());
+        assert_eq!(app.ed.project().tasks.len(), 2);
+        assert!(app.ed.undo());
+
+        // A summary asks; No/Esc keeps everything, with no undo entry.
+        app.ed.select(0);
+        on_key(&mut app, delete());
+        let prompt = app.confirm.as_ref().unwrap().prompt().to_string();
+        assert_eq!(prompt, "Delete 'New task' and its 2 subtasks?");
+        on_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm.is_none());
+        assert_eq!(app.ed.project(), &before);
+        assert_eq!(
+            (app.ed.undo_depth(), app.ed.redo_depth()),
+            (depth, 1),
+            "history holds only the undone leaf delete"
+        );
+
+        // Yes deletes the summary and its subtasks in one undo step.
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(app.confirm.is_none());
+        assert!(!app.quit);
+        assert!(app.ed.project().tasks.is_empty());
+        assert!(app.ed.undo());
+        assert_eq!(app.ed.project(), &before);
+    }
+
+    #[test]
+    fn a_summary_delete_closes_any_text_prompt_under_its_modal() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.indent(1);
+        app.ed.select(0);
+        let before = app.ed.project().clone();
+        // Ribbon clicks reach `apply_act` while a text prompt is open.
+        app.apply_act(Act::Rename);
+        assert!(app.prompt.is_some());
+        app.apply_act(Act::DeleteTask);
+        assert!(
+            app.prompt.is_none(),
+            "the prompt would take the modal's keys"
+        );
+        on_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm.is_none(), "Esc reaches the visible question");
+        assert_eq!(app.ed.project(), &before);
+
+        // File ▸ Exit over a prompt is the same case.
+        app.apply_act(Act::Rename);
+        app.request_exit();
+        assert!(app.prompt.is_none());
     }
 
     #[test]

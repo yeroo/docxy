@@ -170,7 +170,8 @@ the existing value; typing replaces it. Enter commits and moves down, Tab and
 Shift+Tab commit and move between columns, and Escape cancels. Invalid input
 stays open for correction. ID and summary dates/duration are read-only.
 
-Arrow keys move the cell cursor. Insert/Delete add/delete tasks;
+Arrow keys move the cell cursor. Insert/Delete add/delete tasks (Delete on a
+summary asks first: Enter deletes it with its subtasks, Esc cancels);
 Alt+Shift+Right/Left indent/outdent; Alt+Right/Left pan the Gantt;
 Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find,
 undo/redo, save, and export. The former bare-letter commands are available on
@@ -182,8 +183,18 @@ On a manual task, Start moves the task to that day's first working time (08:00
 on a non-working day) keeping its duration, and Finish sets its finish at the
 day's last working time (17:00 on a non-working day) and its duration to the
 working time in between; neither adds a constraint. Predecessors use
-displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated;
-retained assignments keep their units/work, and unknown names create resources.
+displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated,
+and unknown names create resources. A new work assignment starts at the
+resource's Max. Units capped at 100%, with work = duration x units; `Name[NN%]`
+sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
+allowed). The cell shows `Name[NN%]` for a work assignment that is not at 100%,
+and deleting the bracket resets it to 100%. In the Resource Names cell, a token
+that names, or equals the shown `Name[NN%]` text of, one of the task's
+assignments keeps that assignment, with exact spellings before case-insensitive
+ones (a token that fits two resources equally well is ambiguous and rejected);
+otherwise an existing resource whose name matches the whole token wins;
+otherwise a name ending in `[...]` must hold valid `NN%` units. Retained
+assignments whose text is unchanged keep their units/work.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
 be entered individually through the resource-list syntax.

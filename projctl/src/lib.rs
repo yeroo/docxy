@@ -19,7 +19,7 @@
 //! | `task.get` | `{uid}` | one task |
 //! | `task.set` | `{uid, name?, duration?, level?}` | the updated task |
 //! | `task.add` | `{after?, name?, duration?}` | the new task |
-//! | `task.del` | `{uid}` | `{deleted}` |
+//! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
 //! | `link.del` | `{uid, pred}` | the updated task |
 //! | `find` | `{query}` | `{count, tasks:[…]}` |
@@ -248,8 +248,14 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
 
 fn task_del(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
-    ed.delete_task(uid)?;
-    Ok(Json::obj(vec![("deleted", Json::Num(uid as f64))]))
+    let removed = ed.delete_task(uid)?;
+    Ok(Json::obj(vec![
+        ("deleted", Json::Num(uid as f64)),
+        (
+            "removed",
+            Json::Arr(removed.into_iter().map(|u| Json::Num(u as f64)).collect()),
+        ),
+    ]))
 }
 
 fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
@@ -386,6 +392,32 @@ mod tests {
     }
 
     #[test]
+    fn deleting_a_summary_removes_its_subtree_without_asking() {
+        let mut a = app();
+        let phase = add(&mut a, "Phase", "1d");
+        let p1 = add(&mut a, "P1", "1d");
+        let p2 = add(&mut a, "P2", "1d");
+        for uid in [p1, p2] {
+            a.indent(uid as i32, 1).unwrap();
+        }
+        let r = task_del(&mut a, &Json::obj(vec![("uid", Json::Num(phase as f64))])).unwrap();
+        assert_eq!(r.get("deleted"), Some(&Json::Num(phase as f64)));
+        let removed: Vec<f64> = r
+            .get("removed")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| match j {
+                Json::Num(n) => *n,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(removed, [phase, p1, p2].map(|u| u as f64));
+        assert_eq!(a.project().tasks.len(), 1, "only the original task is left");
+    }
+
+    #[test]
     fn find_matches_by_name() {
         let mut a = app();
         add(&mut a, "Write spec", "1d");
@@ -448,6 +480,20 @@ mod tests {
         assert_eq!(r.get_usize("level"), Some(3));
         assert_eq!(a.sel(), 0);
         assert_eq!(a.undo_depth(), 2);
+    }
+
+    #[test]
+    fn add_after_a_summary_makes_its_first_child() {
+        let mut a = app();
+        let child = add(&mut a, "Child", "1d") as i32;
+        a.indent(child, 1).unwrap();
+        let args = Json::parse(r#"{"after":1,"name":"First"}"#).unwrap();
+        let r = dispatch_editor(&mut a, "task.add", &args).unwrap().unwrap();
+        assert_eq!(r.get_usize("level"), Some(2));
+        let summary = task_get(&a, &Json::obj(vec![("uid", Json::Num(1.0))])).unwrap();
+        assert_eq!(summary.get("summary"), Some(&Json::Bool(true)));
+        let levels: Vec<_> = a.project().tasks.iter().map(|t| t.outline_level).collect();
+        assert_eq!(levels, [1, 2, 2], "Child stays under the summary");
     }
 
     #[test]

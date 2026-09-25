@@ -15,8 +15,10 @@ const UNDO_CAP: usize = 100;
 
 mod cells;
 pub use cells::{
-    day_finish, format_duration_exact, format_predecessors, parse_cell_date, parse_predecessors,
+    day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
+    parse_predecessors,
 };
+use cells::{format_units, parse_resource_token};
 
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {
@@ -315,9 +317,11 @@ impl Editor {
         FindOutcome::NotFound
     }
 
-    /// Insert after a UID, or append; take the outline level of the nearest
-    /// task above (blank rows are skipped), at least 1.
-    /// The returned row is not automatically selected.
+    /// Insert after a UID, or append. As in Microsoft Project, the new task is
+    /// the next sibling of the task above it, or that task's first child when
+    /// it is a summary; the row it pushes down plays no part, and blank rows
+    /// are skipped (see [`level_at`]). The returned row is not automatically
+    /// selected.
     pub fn add_task(
         &mut self,
         after: Option<i32>,
@@ -329,7 +333,7 @@ impl Editor {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
         };
-        let outline_level = task_level_above(&self.proj, at);
+        let outline_level = level_at(&self.proj, at);
         let uid = self
             .proj
             .tasks
@@ -364,16 +368,59 @@ impl Editor {
         Ok(at)
     }
 
-    pub fn delete_task(&mut self, uid: i32) -> Result<(), String> {
+    /// Rows `uid` owns in the positional outline: itself, then every following
+    /// row deeper than it. Uses levels, not the `summary` flag, so a stale flag
+    /// cannot cause a partial delete. Blank rows are outside the outline: they
+    /// neither end a subtree nor own one. One between two of its descendants
+    /// goes with it; one after its last descendant stays.
+    fn subtree(&self, uid: i32) -> Result<std::ops::Range<usize>, String> {
         let i = self.index(uid)?;
+        let task = &self.proj.tasks[i];
+        if task.is_null {
+            return Ok(i..i + 1);
+        }
+        let mut end = i + 1;
+        for (k, row) in self.proj.tasks.iter().enumerate().skip(i + 1) {
+            if row.is_null {
+                continue;
+            }
+            if row.outline_level <= task.outline_level {
+                break;
+            }
+            end = k + 1;
+        }
+        Ok(i..end)
+    }
+
+    /// How many subtasks (all depths) deleting `uid` would also remove; hosts
+    /// confirm before deleting when this is non-zero. Blank rows inside the
+    /// subtree go with it but are not subtasks.
+    pub fn subtree_len(&self, uid: i32) -> Result<usize, String> {
+        let range = self.subtree(uid)?;
+        Ok(self.proj.tasks[range]
+            .iter()
+            .skip(1)
+            .filter(|t| !t.is_null)
+            .count())
+    }
+
+    /// Delete `uid` and its whole subtree as one undo step, returning the
+    /// removed UIDs in outline order (the task first).
+    pub fn delete_task(&mut self, uid: i32) -> Result<Vec<i32>, String> {
+        let range = self.subtree(uid)?;
+        let removed: Vec<i32> = self.proj.tasks[range.clone()]
+            .iter()
+            .map(|t| t.uid)
+            .collect();
         self.edit_structure(|proj| {
-            proj.tasks.remove(i);
+            proj.tasks.drain(range);
             for t in &mut proj.tasks {
-                t.predecessors.retain(|p| p.uid != uid);
+                t.predecessors.retain(|p| !removed.contains(&p.uid));
             }
             // Remove assignments as well, so they cannot attach to a reused UID.
-            proj.assignments.retain(|a| a.task_uid != uid);
-        })
+            proj.assignments.retain(|a| !removed.contains(&a.task_uid));
+        })?;
+        Ok(removed)
     }
 
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
@@ -554,15 +601,40 @@ impl Editor {
             return Ok(AssignOutcome::Cleared);
         }
         let mut resources = self.proj.resources.clone();
-        let rid = find_or_stage_resource(&mut resources, name)?;
-        if self
+        // A resource literally named like `Crew [A%]` wins over the units suffix.
+        let (rid, units) = match resources.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+            Some(r) => (r.uid, None),
+            None => {
+                let (base, units) = parse_resource_token(name)?;
+                (find_or_stage_resource(&mut resources, base.trim())?, units)
+            }
+        };
+        // A blank row is assigned as the task the edit makes it.
+        let duration = self.row_as_edited(i).duration_min;
+        if let Some(k) = self
             .proj
             .assignments
             .iter()
-            .any(|a| a.task_uid == uid && a.resource_uid == rid)
+            .position(|a| a.task_uid == uid && a.resource_uid == rid)
         {
-            return Ok(AssignOutcome::AlreadyAssigned);
+            // Only different explicit units change an existing assignment.
+            let Some(u) =
+                units.filter(|&u| format_units(u) != format_units(self.proj.assignments[k].units))
+            else {
+                return Ok(AssignOutcome::AlreadyAssigned);
+            };
+            let u = checked_units(u, name)?;
+            self.edit_row(i, |proj, _| {
+                let a = &mut proj.assignments[k];
+                a.units = u;
+                a.work_min = work_for(duration, u);
+            })?;
+            return Ok(AssignOutcome::Assigned);
         }
+        let units = match units {
+            Some(u) => checked_units(u, name)?,
+            None => default_units(resources.iter().find(|r| r.uid == rid).expect("staged")),
+        };
         let mut next_aid = self
             .proj
             .assignments
@@ -570,8 +642,7 @@ impl Editor {
             .map(|a| a.uid)
             .max()
             .unwrap_or(0);
-        let work = self.row_as_edited(i).duration_min;
-        let assignment = new_assignment(&mut next_aid, uid, rid, work)?;
+        let assignment = new_assignment(&mut next_aid, uid, rid, units, duration)?;
         self.edit_row(i, |proj, _| {
             proj.resources = resources;
             proj.assignments.push(assignment);
@@ -660,11 +731,36 @@ fn find_or_stage_resource(resources: &mut Vec<Resource>, name: &str) -> Result<i
     Ok(uid)
 }
 
+/// A work resource is assigned at its Max. Units, capped at 100% (as in Project);
+/// other kinds, and unusable capacities, at 100%.
+fn default_units(r: &Resource) -> f64 {
+    if r.kind == ResourceType::Work && r.max_units.is_finite() && r.max_units > 0.0 {
+        r.max_units.min(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Assignment work: the task duration scaled by the units (saturating).
+fn work_for(duration_min: i64, units: f64) -> i64 {
+    (duration_min as f64 * units).round() as i64
+}
+
+/// Explicitly entered units must be positive to create or change an assignment.
+fn checked_units(units: f64, token: &str) -> Result<f64, String> {
+    if units > 0.0 {
+        Ok(units)
+    } else {
+        Err(format!("Invalid units in '{}'", token.trim()))
+    }
+}
+
 fn new_assignment(
     next_uid: &mut i32,
     task_uid: i32,
     resource_uid: i32,
-    work_min: i64,
+    units: f64,
+    duration_min: i64,
 ) -> Result<Assignment, String> {
     *next_uid = next_uid
         .checked_add(1)
@@ -673,38 +769,27 @@ fn new_assignment(
         uid: *next_uid,
         task_uid,
         resource_uid,
-        units: 1.0,
-        work_min,
+        units,
+        work_min: work_for(duration_min, units),
     })
 }
 
-/// The outline level a task inserted at row `at` takes: that of the nearest
-/// task above it (blank rows are outside the outline), at least 1.
-fn task_level_above(proj: &Project, at: usize) -> u32 {
-    proj.tasks[..at]
-        .iter()
-        .rev()
-        .find(|t| !t.is_null)
-        .map_or(1, |t| t.outline_level.max(1))
-}
-
-/// The outline level blank row `i` takes when it becomes a task: under a
-/// summary above it, its first subtask's level (so the summary keeps its
-/// children, as in Project); otherwise the level of the task above, at least 1.
-fn blank_row_level(proj: &Project, i: usize) -> u32 {
-    let Some(above) = proj.tasks[..i].iter().rposition(|t| !t.is_null) else {
+/// The outline level of a task placed at row `at`, whether inserted there or
+/// a blank row there becoming a task. As in Microsoft Project it is the next
+/// sibling of the nearest task above, or that task's first child when it is
+/// a summary (so the summary keeps its children); the rows below play no
+/// part. Blank rows are outside the outline and skipped. At least 1.
+fn level_at(proj: &Project, at: usize) -> u32 {
+    let Some(above) = proj.tasks[..at].iter().rposition(|t| !t.is_null) else {
         return 1;
     };
-    let level = if proj.is_outline_summary(above) {
-        // The rows between are blank, so the next task is its first child.
-        proj.tasks[i + 1..]
-            .iter()
-            .find(|t| !t.is_null)
-            .map_or(1, |t| t.outline_level)
+    let level = proj.tasks[above].outline_level;
+    // A summary's first child is deeper still, so `+ 1` stays within 20.
+    if proj.is_outline_summary(above) {
+        level + 1
     } else {
-        proj.tasks[above].outline_level
-    };
-    level.max(1)
+        level.max(1)
+    }
 }
 
 /// Row `i` as it becomes when edited. Typing into a blank row turns it into a
@@ -717,7 +802,7 @@ fn materialized(proj: &Project, i: usize, start: DateTime) -> Task {
     if t.is_null {
         t.is_null = false;
         if t.outline_level == 0 {
-            t.outline_level = blank_row_level(proj, i);
+            t.outline_level = level_at(proj, i);
         }
         if t.duration_min == 0 {
             t.duration_min = proj.days_to_minutes(1.0);
@@ -1091,13 +1176,14 @@ mod tests {
                         .unwrap_err()
                         .contains("Closed")
                     );
-                    // Inserting after the parent exposes it as a leaf, too.
-                    assert!(
-                        ed.add_task(Some(1), "Inserted", 480)
-                            .unwrap_err()
-                            .contains("Closed")
-                    );
                     if empty_default {
+                        // Inserting keeps the parent a summary, so only a
+                        // closed default calendar rejects the new task.
+                        assert!(
+                            ed.add_task(Some(1), "Inserted", 480)
+                                .unwrap_err()
+                                .contains("Closed")
+                        );
                         assert!(
                             ed.add_task(None, "Appended", 480)
                                 .unwrap_err()
@@ -1115,6 +1201,15 @@ mod tests {
         for empty_default in [false, true] {
             let mut ed = Editor::new(project_with_unused_empty_calendar(empty_default));
             assert_reopens(&ed);
+            if !empty_default {
+                // A first child keeps the empty-calendar summary a summary.
+                let mut ed = Editor::new(project_with_unused_empty_calendar(false));
+                let at = ed.add_task(Some(1), "Inserted", 480).unwrap();
+                let tasks = &ed.project().tasks;
+                assert_eq!(tasks[at].outline_level, tasks[0].outline_level + 1);
+                assert!(tasks[0].summary);
+                assert_reopens(&ed);
+            }
             ed.rename(2, "Renamed").unwrap();
             assert_reopens(&ed);
             ed.set_duration_min(2, 960).unwrap();
@@ -1127,8 +1222,10 @@ mod tests {
             assert_reopens(&ed);
             assert!(ed.redo());
             assert_reopens(&ed);
-            // Removing the empty-calendar parent leaves a valid-calendar task.
-            ed.delete_task(1).unwrap();
+            // Removing the empty-calendar summary removes its subtree with it,
+            // and the empty plan still reopens.
+            assert_eq!(ed.delete_task(1).unwrap(), vec![1, 2]);
+            assert!(ed.project().tasks.is_empty());
             assert_reopens(&ed);
             if !empty_default {
                 ed.add_task(None, "New task", 480).unwrap();
@@ -1240,7 +1337,7 @@ mod tests {
         type Edit = fn(&mut Editor) -> Result<(), String>;
         let bad: &[Edit] = &[
             |e| e.add_task(Some(999), "bad", 480).map(|_| ()),
-            |e| e.delete_task(999),
+            |e| e.delete_task(999).map(|_| ()),
             |e| e.indent(999, 1),
             |e| e.rename(999, "bad"),
             |e| e.set_duration(999, "1d"),
@@ -1309,7 +1406,7 @@ mod tests {
     }
 
     #[test]
-    fn append_and_insert_inherit_preceding_level_without_selecting() {
+    fn append_and_insert_follow_the_row_above_without_selecting() {
         let mut ed = editor();
         ed.indent(1, 1).unwrap();
         ed.indent(2, 2).unwrap();
@@ -1317,9 +1414,10 @@ mod tests {
         let at = ed.add_task(None, "Append", 480).unwrap();
         assert_eq!(at, 2);
         assert_eq!(ed.project().tasks[at].outline_level, 3);
+        // Task 1 is a summary over Task 2, so the insert is its first child.
         let at = ed.add_task(Some(1), "Insert", 480).unwrap();
         assert_eq!(at, 1);
-        assert_eq!(ed.project().tasks[at].outline_level, 2);
+        assert_eq!(ed.project().tasks[at].outline_level, 3);
         assert_eq!(ed.sel(), 1);
         ed.replace_project(Project::default());
         assert_eq!(ed.add_task(None, "First", 0).unwrap(), 0);
@@ -1342,6 +1440,220 @@ mod tests {
         assert_eq!(ed.selected_uid(), None);
         ed.select(usize::MAX);
         assert_eq!(ed.sel(), 0);
+    }
+
+    /// Tasks `(uid, name, level)` scheduled from a fixed start.
+    fn outline(rows: &[(i32, &str, u32)]) -> Editor {
+        Editor::new(Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: rows
+                .iter()
+                .map(|&(uid, name, outline_level)| Task {
+                    uid,
+                    id: uid,
+                    name: name.into(),
+                    outline_level,
+                    duration_min: 480,
+                    ..Task::default()
+                })
+                .collect(),
+            ..Project::default()
+        })
+    }
+
+    fn names(ed: &Editor) -> Vec<(&str, u32)> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| (&*t.name, t.outline_level))
+            .collect()
+    }
+
+    /// `(name, outline_level, summary)` for every row.
+    fn rows(ed: &Editor) -> Vec<(&str, u32, bool)> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| (&*t.name, t.outline_level, t.summary))
+            .collect()
+    }
+
+    fn uid_of(ed: &Editor, name: &str) -> i32 {
+        ed.project()
+            .tasks
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .uid
+    }
+
+    #[test]
+    fn a_task_inserted_under_a_summary_is_its_first_child() {
+        // The issue's repro, on an untitled project.
+        let mut ed = Editor::new(Project::default());
+        ed.add_task(None, "S", 480).unwrap();
+        ed.add_task(None, "c1", 480).unwrap();
+        ed.indent(uid_of(&ed, "c1"), 1).unwrap();
+        let before = ed.project().clone();
+        let s = uid_of(&ed, "S");
+        assert_eq!(ed.add_task(Some(s), "New", 480).unwrap(), 1);
+        assert_eq!(
+            rows(&ed),
+            [("S", 1, true), ("New", 2, false), ("c1", 2, false)]
+        );
+        // One undo step puts the outline back.
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+    }
+
+    #[test]
+    fn a_task_inserted_after_a_leaf_is_its_sibling() {
+        // S{c1, c2}, Y: inserting above Y (below c2) stays inside S.
+        let mut ed = outline(&[(1, "S", 1), (2, "c1", 2), (3, "c2", 2), (4, "Y", 1)]);
+        assert_eq!(ed.add_task(Some(3), "New", 480).unwrap(), 3);
+        assert_eq!(
+            rows(&ed),
+            [
+                ("S", 1, true),
+                ("c1", 2, false),
+                ("c2", 2, false),
+                ("New", 2, false),
+                ("Y", 1, false),
+            ]
+        );
+        // After a plain task, the new one is a sibling at its level.
+        let mut ed = outline(&[(1, "S", 1), (2, "Y", 1)]);
+        ed.add_task(Some(1), "New", 480).unwrap();
+        assert_eq!(names(&ed), [("S", 1), ("New", 1), ("Y", 1)]);
+        // Appending copies the last row, which is never a summary.
+        let mut ed = outline(&[(1, "S", 1), (2, "c1", 2)]);
+        ed.add_task(None, "New", 480).unwrap();
+        assert_eq!(
+            rows(&ed),
+            [("S", 1, true), ("c1", 2, false), ("New", 2, false)]
+        );
+    }
+
+    #[test]
+    fn a_task_inserted_under_a_nested_summary_goes_one_level_deeper() {
+        let mut ed = outline(&[(1, "A", 1), (2, "S", 2), (3, "c", 3), (4, "B", 1)]);
+        ed.add_task(Some(2), "New", 480).unwrap();
+        assert_eq!(
+            rows(&ed),
+            [
+                ("A", 1, true),
+                ("S", 2, true),
+                ("New", 3, false),
+                ("c", 3, false),
+                ("B", 1, false),
+            ]
+        );
+        // An outline that skips a level: the new task is S's child, and the
+        // deeper row it pushes down stays inside S.
+        let mut ed = outline(&[(1, "S", 1), (2, "c", 3), (3, "Y", 1)]);
+        ed.add_task(Some(1), "New", 480).unwrap();
+        assert_eq!(
+            rows(&ed),
+            [
+                ("S", 1, true),
+                ("New", 2, true),
+                ("c", 3, false),
+                ("Y", 1, false),
+            ]
+        );
+    }
+
+    fn phase_plan() -> Editor {
+        outline(&[
+            (1, "A", 1),
+            (2, "Phase", 1),
+            (3, "P1", 2),
+            (4, "P2", 2),
+            (5, "B", 1),
+        ])
+    }
+
+    #[test]
+    fn deleting_a_summary_deletes_its_subtree_as_one_undo_step() {
+        let mut ed = phase_plan();
+        assert_eq!(ed.subtree_len(2), Ok(2));
+        assert_eq!(ed.subtree_len(3), Ok(0));
+        ed.select(1);
+        let before = ed.project().clone();
+        let depth = ed.undo_depth();
+
+        assert_eq!(ed.delete_task(2).unwrap(), vec![2, 3, 4]);
+        assert_eq!(names(&ed), [("A", 1), ("B", 1)]);
+        assert!(!ed.project().tasks[0].summary, "A must not adopt P1/P2");
+        assert_eq!(
+            ed.selected_uid(),
+            Some(5),
+            "selection moves to the row after"
+        );
+        assert_eq!(ed.undo_depth(), depth + 1);
+        assert_schedule(&ed);
+
+        let after = ed.project().clone();
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+        assert_schedule(&ed);
+        assert!(ed.redo());
+        assert_eq!(ed.project(), &after);
+    }
+
+    #[test]
+    fn deleting_a_nested_summary_stops_at_its_own_level() {
+        let mut ed = outline(&[
+            (1, "Phase", 1),
+            (2, "Sub", 2),
+            (3, "S1", 3),
+            (4, "S2", 3),
+            (5, "P2", 2),
+            (6, "B", 1),
+        ]);
+        assert_eq!(ed.subtree_len(1), Ok(4));
+        assert_eq!(ed.subtree_len(2), Ok(2));
+        assert_eq!(ed.delete_task(2).unwrap(), vec![2, 3, 4]);
+        assert_eq!(names(&ed), [("Phase", 1), ("P2", 2), ("B", 1)]);
+        assert!(ed.project().tasks[0].summary);
+        // A trailing subtree runs to the end of the plan.
+        assert_eq!(ed.delete_task(1).unwrap(), vec![1, 5]);
+        assert_eq!(names(&ed), [("B", 1)]);
+        assert!(ed.subtree_len(999).is_err());
+    }
+
+    #[test]
+    fn deleting_a_summary_drops_links_and_assignments_of_its_subtasks() {
+        let mut ed = phase_plan();
+        ed.add_predecessor(5, 3, LinkType::FinishStart, 0).unwrap();
+        ed.add_predecessor(5, 1, LinkType::FinishStart, 0).unwrap();
+        ed.assign_resource(4, "Alice").unwrap();
+        ed.assign_resource(1, "Alice").unwrap();
+
+        ed.delete_task(2).unwrap();
+        let b = ed.project().task(5).unwrap();
+        assert_eq!(
+            b.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(ed.project().assignments.iter().all(|a| a.task_uid == 1));
+        assert_eq!(ed.project().assignments.len(), 1);
+        assert_schedule(&ed);
+    }
+
+    #[test]
+    fn a_reused_subtask_uid_does_not_inherit_its_assignment() {
+        // The trailing summary's child holds the highest UID and a resource.
+        let mut ed = outline(&[(1, "A", 1), (3, "Phase", 1), (2, "P1", 2)]);
+        ed.assign_resource(2, "Alice").unwrap();
+        assert_eq!(ed.delete_task(3).unwrap(), vec![3, 2]);
+        assert!(ed.project().assignments.is_empty());
+
+        let at = ed.add_task(None, "Replacement", 480).unwrap();
+        let uid = ed.project().tasks[at].uid;
+        assert_eq!(uid, 2, "the removed subtask's UID is reused");
+        assert!(ed.project().assignments.iter().all(|a| a.task_uid != uid));
+        assert_schedule(&ed);
     }
 
     #[test]
@@ -2013,6 +2325,124 @@ mod tests {
         ed.rename(3, "Typed").unwrap();
         assert!(!ed.project().tasks[1].manual);
         assert_eq!(ed.project().tasks[1].manual_start, None);
+    }
+
+    /// Phase (summary), a level-0 blank row, then Phase's child at level 2,
+    /// and a top-level task after it.
+    fn summary_blank_child_editor() -> Editor {
+        let task = |uid, outline_level, is_null| Task {
+            uid,
+            id: uid,
+            name: if is_null {
+                String::new()
+            } else {
+                format!("T{uid}")
+            },
+            outline_level,
+            duration_min: if is_null { 0 } else { 480 },
+            is_null,
+            ..Task::default()
+        };
+        let mut phase = task(1, 1, false);
+        phase.summary = true;
+        Editor::new(Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: vec![
+                phase,
+                task(3, 0, true),
+                task(2, 2, false),
+                task(4, 1, false),
+            ],
+            ..Project::default()
+        })
+    }
+
+    #[test]
+    fn a_task_inserted_after_a_blank_row_under_a_summary_is_its_first_child() {
+        let mut ed = summary_blank_child_editor();
+        let at = ed.add_task(Some(3), "Inserted", 480).unwrap();
+        assert_eq!(at, 2);
+        let levels: Vec<_> = ed.project().tasks.iter().map(|t| t.outline_level).collect();
+        assert_eq!(levels, [1, 0, 2, 2, 1]);
+        let summaries: Vec<_> = ed.project().tasks.iter().map(|t| t.summary).collect();
+        assert_eq!(summaries, [true, false, false, false, false]);
+    }
+
+    #[test]
+    fn a_summary_delete_runs_past_a_blank_row_between_its_children() {
+        let mut ed = summary_blank_child_editor();
+        // Phase, a blank row and a child, then another child after the blank.
+        let mut proj = ed.project().clone();
+        proj.tasks.insert(
+            1,
+            Task {
+                uid: 5,
+                id: 5,
+                name: "T5".into(),
+                outline_level: 2,
+                duration_min: 480,
+                ..Task::default()
+            },
+        );
+        // A blank row after the subtree's last child stays.
+        proj.tasks.insert(
+            4,
+            Task {
+                uid: 6,
+                id: 6,
+                is_null: true,
+                ..Task::default()
+            },
+        );
+        ed.replace_project(proj);
+        let uids = |ed: &Editor| ed.project().tasks.iter().map(|t| t.uid).collect::<Vec<_>>();
+        assert_eq!(uids(&ed), [1, 5, 3, 2, 6, 4]);
+        // The blank row goes with the subtree but is not a subtask.
+        assert_eq!(ed.subtree_len(1), Ok(2));
+        assert_eq!(ed.delete_task(1), Ok(vec![1, 5, 3, 2]));
+        assert_eq!(uids(&ed), [6, 4]);
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.undo());
+        // A blank row owns no subtree: deleting it deletes only itself, even
+        // at level 0 above deeper rows.
+        assert_eq!(ed.subtree_len(3), Ok(0));
+        assert_eq!(ed.delete_task(3), Ok(vec![3]));
+        assert_eq!(uids(&ed), [1, 5, 2, 6, 4]);
+    }
+
+    #[test]
+    fn assigning_a_blank_row_assigns_the_task_it_becomes() {
+        let mut proj = blank_row_editor().project().clone();
+        proj.resources.push(Resource {
+            uid: 1,
+            id: 1,
+            name: "Half".into(),
+            kind: ResourceType::Work,
+            max_units: 0.5,
+            ..Resource::default()
+        });
+        for set in [false, true] {
+            let mut ed = Editor::new(proj.clone());
+            if set {
+                ed.set_resources(3, &["Half".into()]).unwrap();
+            } else {
+                ed.assign_resource(3, "Half").unwrap();
+            }
+            let t = &ed.project().tasks[1];
+            assert!(!t.is_null && t.duration_min == 480);
+            // Max. Units (#95) apply, and the work is the new task's one day.
+            let a = ed
+                .project()
+                .assignments
+                .iter()
+                .find(|a| a.task_uid == 3)
+                .unwrap();
+            assert_eq!((a.units, a.work_min), (0.5, 240));
+            assert_eq!(ed.undo_depth(), 1);
+            assert!(ed.undo());
+            assert!(ed.project().tasks[1].is_null);
+            assert!(ed.project().assignments.is_empty());
+        }
     }
 
     #[test]
