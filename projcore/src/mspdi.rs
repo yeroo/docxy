@@ -496,7 +496,7 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
                     "Name" => cal.name = text_of(p),
                     "IsBaseCalendar" => is_base = bool_of(p),
                     "IsBaselineCalendar" => cal.is_baseline_calendar = bool_of(p),
-                    "BaseCalendarUID" => base_uid = text_of(p).trim().parse().ok(),
+                    "BaseCalendarUID" => base_uid = opt_i32_of(p),
                     "WeekDays" => parse_weekdays(p, &mut cal.week),
                     _ => p.skip_element(),
                 }
@@ -1138,7 +1138,6 @@ fn write_calendar(s: &mut String, c: &Calendar) {
     s.push_str("    <Calendar>\n");
     tag(s, 3, "UID", &c.uid.to_string());
     tag(s, 3, "Name", &c.name);
-    let flag = |on: bool| if on { "1" } else { "0" };
     tag(s, 3, "IsBaseCalendar", flag(c.base_calendar_uid.is_none()));
     tag(s, 3, "IsBaselineCalendar", flag(c.is_baseline_calendar));
     tag(

@@ -663,9 +663,10 @@ impl Project {
         cal.resolve_week(|uid| self.calendar(uid))
     }
 
-    /// The working week a task schedules against: its own calendar, else the
-    /// project default, else the first calendar, else a synthesized Standard,
-    /// resolved through its base chain.
+    /// A task's working week, resolved through its base chain: the task's
+    /// calendar, or the project default when the task names none; if that UID
+    /// is missing, the first calendar; with no calendars, Standard. This differs
+    /// from the scheduler, which falls back to the project default (#131).
     pub fn calendar_for(&self, task: &Task) -> Week {
         let want = task.calendar_uid.unwrap_or(self.default_calendar_uid);
         match self.calendar(want).or_else(|| self.calendars.first()) {
