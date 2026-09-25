@@ -262,7 +262,10 @@ pub(crate) fn project_cell_click(tab: &mut DocTab, row: usize, col: Option<usize
 
 /// A click on the entry row below the last task, in column `col` (`None`:
 /// outside the table, the column stays). The cursor goes to the entry row,
-/// where typing appends a task. A failed commit keeps the edit and its status,
+/// where typing appends a task, unless the click commits an open entry-row
+/// edit that appends one: the clicked row is then that task, so the cursor
+/// lands on it, as in Project (not on the new entry row below, where typing
+/// would make a second task). A failed commit keeps the edit and its status,
 /// and the cursor stays.
 pub(crate) fn project_entry_click(tab: &mut DocTab, col: Option<usize>, double: bool) {
     cell_click(tab, ClickTarget::EntryRow, col, double);
