@@ -26,6 +26,6 @@ pub mod yppx;
 
 pub use datetime::DateTime;
 pub use model::{
-    Assignment, Baseline, Calendar, ConstraintType, DayWorking, LinkType, Predecessor, Project,
-    Rate, Resource, Task, TaskType, Week, WorkingTime,
+    Assignment, Baseline, Calendar, CalendarException, ConstraintType, DayWorking, LinkType,
+    Predecessor, Project, Rate, Resource, Task, TaskType, Week, WorkCalendar, WorkingTime,
 };

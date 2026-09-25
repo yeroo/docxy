@@ -4910,12 +4910,14 @@ mod tests {
         proj.calendars = vec![standard, derived(2, 1, &[(5, DayWorking::default())])];
         // Mon, Tue, Thu, then (Friday off) Monday.
         assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-09T17:00:00");
-        // Stating Wednesday itself overrides the base's holiday.
+        // Stating Wednesday itself does not bring the base's holiday back.
         proj.calendars[1].week[3] = Some(Calendar::standard_week()[3].clone());
-        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-05T17:00:00");
-        // Its own holiday beats its own Wednesday.
-        proj.calendars[1].exceptions.push(holiday(4, 4));
         assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-09T17:00:00");
+        // Only its own working exception does.
+        proj.calendars[1]
+            .exceptions
+            .push(worked(4, &[(8, 12), (13, 17)]));
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-05T17:00:00");
     }
 
     #[test]

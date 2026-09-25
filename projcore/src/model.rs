@@ -694,11 +694,13 @@ impl Calendar {
 /// exceptions, a plain weekly pattern, or the union of several calendars (the
 /// summary calendar's fallback).
 ///
-/// A day resolves calendar by calendar down the base chain, to the first of:
-/// the calendar's own scheduled exception covering that date, then the weekday
-/// it states. A day nothing states is non-working. So a derived calendar
-/// inherits its base's holidays unless it states that date or weekday itself
-/// (MPXJ's rule).
+/// A day resolves to the first scheduled exception covering that date, looking
+/// down the base chain from the calendar itself; failing that, to the first
+/// calendar in the chain that states that weekday. A day nothing states is
+/// non-working. So a derived calendar keeps its base's holidays even on a
+/// weekday it states itself, and only its own exception overrides one. This
+/// is Microsoft Project 2024's rule (checked on a resource calendar, #126);
+/// MPXJ instead lets a derived calendar's own weekday win.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WorkCalendar(Kind);
 
@@ -755,17 +757,17 @@ impl Level {
         }
     }
 
-    /// What this calendar itself states for day number `day`: an exception
-    /// covering it, else its weekday, else nothing.
-    fn day(&self, day: i64) -> Option<&DayWorking> {
+    /// This calendar's own exception covering day number `day`.
+    fn exception(&self, day: i64) -> Option<&DayWorking> {
         let after = self
             .exceptions
             .partition_point(|&(first, _, _)| first <= day);
-        if let Some((_, last, working)) = after.checked_sub(1).map(|i| &self.exceptions[i]) {
-            if day <= *last {
-                return Some(working);
-            }
-        }
+        let (_, last, working) = &self.exceptions[after.checked_sub(1)?];
+        (day <= *last).then_some(working)
+    }
+
+    /// The weekday of day number `day`, if this calendar states it.
+    fn weekday(&self, day: i64) -> Option<&DayWorking> {
         self.week[(day + 4).rem_euclid(7) as usize].as_ref()
     }
 }
@@ -797,7 +799,11 @@ impl WorkCalendar {
         out.clear();
         match &self.0 {
             Kind::Chain(levels) => {
-                if let Some(working) = levels.iter().find_map(|level| level.day(day)) {
+                let working = levels
+                    .iter()
+                    .find_map(|level| level.exception(day))
+                    .or_else(|| levels.iter().find_map(|level| level.weekday(day)));
+                if let Some(working) = working {
                     out.extend(merge(working.times.iter().copied()));
                 }
             }
@@ -1187,36 +1193,38 @@ mod tests {
     }
 
     #[test]
-    fn derived_calendar_resolves_own_exception_then_own_weekday_then_base() {
-        // Standard with Wed 4th and Thu 5th off <- a calendar stating Wednesday
-        // (07-15) and a short Monday 2nd of its own.
+    fn derived_calendar_resolves_exceptions_down_the_chain_before_weekdays() {
+        // Project 2024's rule, from the #126 probe: Standard takes Wed 4th and
+        // Wed 11th off <- Crew states Wednesday 07-15, works 09-11 on the 11th
+        // and takes Fri 6th off <- a calendar deriving from Crew states nothing.
         let mut base = Calendar::standard(1);
-        base.exceptions.push(exception(4, 5, DayWorking::default()));
+        base.exceptions.push(exception(4, 4, DayWorking::default()));
+        base.exceptions
+            .push(exception(11, 11, DayWorking::default()));
         let mut wednesday: [Option<DayWorking>; 7] = Default::default();
         wednesday[3] = Some(hours(7, 15));
-        let mut own = derived(2, 1, wednesday);
-        own.exceptions.push(exception(2, 2, hours(10, 12)));
-        let mut proj = Project {
-            calendars: vec![base, own],
+        let mut crew = derived(2, 1, wednesday);
+        crew.exceptions.push(exception(11, 11, hours(9, 11)));
+        crew.exceptions.push(exception(6, 6, DayWorking::default()));
+        let proj = Project {
+            calendars: vec![base, crew, derived(3, 2, Default::default())],
             ..Project::default()
         };
-        let cal = proj.resolved_calendar(&proj.calendars[1]);
-        assert_eq!(cal.day(march(2)), hours(10, 12).times);
-        assert_eq!(cal.day(march(3)), Calendar::standard_week()[2].times);
-        // Its own weekday beats the base's holiday; the next day inherits it.
-        assert_eq!(cal.day(march(4)), hours(7, 15).times);
-        assert!(cal.day(march(5)).is_empty());
-        assert_eq!(cal.week(), proj.resolved_week(&proj.calendars[1]));
-        // Its own exception beats its own weekday.
-        proj.calendars[1]
-            .exceptions
-            .push(exception(4, 4, DayWorking::default()));
-        let cal = proj.resolved_calendar(&proj.calendars[1]);
-        assert!(cal.day(march(4)).is_empty());
-        // The base alone keeps both holidays.
+        for uid in [2, 3] {
+            let cal = proj.resolved_calendar(proj.calendar(uid).unwrap());
+            // The base's holiday beats Crew's own Wednesday.
+            assert!(cal.day(march(4)).is_empty(), "{uid}");
+            assert_eq!(cal.day(march(5)), Calendar::standard_week()[4].times);
+            assert!(cal.day(march(6)).is_empty(), "{uid}");
+            // Crew's own exception beats the base's holiday.
+            assert_eq!(cal.day(march(11)), hours(9, 11).times);
+            assert_eq!(cal.day(march(18)), hours(7, 15).times);
+            assert_eq!(cal.week(), proj.resolved_week(proj.calendar(uid).unwrap()));
+        }
         let base = proj.resolved_calendar(&proj.calendars[0]);
-        assert!(base.day(march(4)).is_empty() && base.day(march(5)).is_empty());
+        assert!(base.day(march(11)).is_empty());
         assert_eq!(base.day(march(6)), Calendar::standard_week()[5].times);
+        assert_eq!(base.day(march(18)), Calendar::standard_week()[3].times);
     }
 
     #[test]
