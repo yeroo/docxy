@@ -234,26 +234,48 @@ fn a_week_is_the_plans_working_days_per_week() {
 
 #[test]
 fn a_milestone_at_the_end_of_the_day_moves_by_one_date() {
-    // A milestone after a 1-day task sits at its finish instant, Mon 17:00.
-    // Tue 17:00 would be scheduled Wed 08:00, so it lands in Tuesday's
-    // last working period instead.
+    // A milestone after a 1-day task sits at its finish instant, Mon 17:00;
+    // task 30 follows it, starting Tue 08:00.
     let mut ed = editor();
     ed.set_duration_min(20, 0).unwrap();
     ed.add_predecessor(20, 10, LinkType::FinishStart, 0)
         .unwrap();
+    ed.add_predecessor(30, 20, LinkType::FinishStart, 0)
+        .unwrap();
     assert_eq!(ed.schedule().get(20).unwrap().early_start, at(0, 17));
-    assert_eq!(ed.move_task(20, "1d"), Ok(at(1, 13)));
-    assert_snet(&ed, 20, at(1, 13));
-    assert_eq!(
-        ed.move_task(20, "-1d"),
-        Ok(at(0, 17)),
-        "the link still holds it"
-    );
+    assert_eq!(ed.schedule().get(30).unwrap().early_start, at(1, 8));
+    // One working day later: Tue 17:00, so its successor moves a day too.
+    assert_eq!(ed.move_task(20, "1d"), Ok(at(1, 17)));
+    assert_snet(&ed, 20, at(1, 17));
+    assert_eq!(ed.schedule().get(30).unwrap().early_start, at(2, 8));
+    assert_eq!(ed.move_task(20, "-1d"), Ok(at(0, 17)), "the link holds it");
+    assert_eq!(ed.schedule().get(30).unwrap().early_start, at(1, 8));
+}
+
+#[test]
+fn an_unlinked_evening_milestone_moves_there_and_back() {
+    let mut ed = editor();
+    ed.set_duration_min(20, 0).unwrap();
+    ed.set_constraint(20, "mfo 2026-01-05T17:00:00").unwrap();
+    ed.add_predecessor(30, 20, LinkType::FinishStart, 0)
+        .unwrap();
+    assert_eq!(ed.schedule().get(20).unwrap().early_start, at(0, 17));
+    assert_eq!(ed.move_task(20, "1d"), Ok(at(1, 17)));
+    assert_snet(&ed, 20, at(1, 17));
+    assert_eq!(ed.schedule().get(30).unwrap().early_start, at(2, 8));
+    assert_eq!(ed.move_task(20, "-1d"), Ok(at(0, 17)));
+    assert_snet(&ed, 20, at(0, 17));
+    assert_eq!(ed.schedule().get(30).unwrap().early_start, at(1, 8));
+    // Backward over a weekend, from an evening: Friday evening, though the
+    // project start still holds an unlinked task.
+    assert_eq!(ed.move_task(20, "-1d"), Ok(at(0, 8)));
+    let t = ed.project().task(20).unwrap();
+    assert_eq!(t.constraint_date, Some(at(-3, 17)));
 }
 
 #[test]
 fn a_start_after_the_target_days_hours_stays_on_that_date() {
-    // Fridays work 08:00-12:00 only; the task starts Thu 13:00.
+    // Fridays work 08:00-12:00 only.
     let mut proj = editor().project().clone();
     proj.calendars[0].week[5] = Some(DayWorking {
         times: vec![crate::model::WorkingTime {
@@ -262,6 +284,7 @@ fn a_start_after_the_target_days_hours_stays_on_that_date() {
         }],
     });
     let mut ed = Editor::new(proj.clone());
+    // An auto task at Thu 13:00 starts Friday's working period.
     ed.set_start_at(10, at(3, 13)).unwrap();
     assert_eq!(ed.schedule().get(10).unwrap().early_start, at(3, 13));
     assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 8)), "Friday");
@@ -269,11 +292,35 @@ fn a_start_after_the_target_days_hours_stays_on_that_date() {
     // A time inside Friday's hours is kept.
     ed.set_start_at(10, at(3, 10)).unwrap();
     assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 10)));
-    // A manual task's pinned start is clamped the same way.
+    // A milestone at Thu 17:00 ends Friday's working time.
+    ed.set_duration_min(20, 0).unwrap();
+    ed.set_start_at(20, at(3, 17)).unwrap();
+    assert_eq!(ed.schedule().get(20).unwrap().early_start, at(3, 17));
+    assert_eq!(ed.move_task(20, "1d"), Ok(at(4, 12)));
+    assert_snet(&ed, 20, at(4, 12));
+    // A manual task keeps its time exactly: the scheduler never snaps it.
     let task = &mut proj.tasks[0];
     task.manual = true;
     task.manual_start = Some(at(3, 13));
+    task.duration_min = 120;
     let mut ed = Editor::new(proj);
-    assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 8)));
-    assert_eq!(ed.project().task(10).unwrap().manual_start, Some(at(4, 8)));
+    assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 13)));
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(
+        (task.manual_start, task.duration_min),
+        (Some(at(4, 13)), 120)
+    );
+}
+
+#[test]
+fn a_manual_task_at_the_end_of_the_day_keeps_its_time() {
+    let mut proj = editor().project().clone();
+    let task = &mut proj.tasks[0];
+    task.manual = true;
+    task.manual_start = Some(at(0, 17));
+    task.duration_min = 120;
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.move_task(10, "1d"), Ok(at(1, 17)));
+    assert_eq!(ed.disp_finish(10), Some(at(2, 10)), "Tue 17:00 plus 2h");
+    assert_eq!(ed.project().task(10).unwrap().duration_min, 120);
 }

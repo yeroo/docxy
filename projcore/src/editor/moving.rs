@@ -1,12 +1,15 @@
 //! Task › Tasks › Move: moving a task in time by working days, as Project's
 //! Move Task Forward/Backward does.
 use super::*;
-use crate::model::WorkCalendar;
+use crate::model::{WorkCalendar, WorkingTime};
 use crate::schedule::HORIZON_DAYS;
 
 impl Editor {
     /// Move a task's start by `text` working days on its calendar, keeping
-    /// the time of day where that day still works then. `text` is a signed
+    /// the time of day. Only where an auto task's new day has stopped working
+    /// by then does it move within that day: a milestone to the day's last
+    /// working instant, another task to the start of the day's last working
+    /// period. `text` is a signed
     /// whole number of days (`1d`, `-1d`) or weeks (`1w`), where a week is
     /// the plan's hours per week over its hours per day, rounded (5 by
     /// default); zero, anything else, or more than the scheduling horizon is
@@ -31,7 +34,13 @@ impl Editor {
             .or_else(|| self.sched.get(uid).map(|r| r.early_start))
             .ok_or("The row has no task to move")?;
         let calendar = cells::task_calendar(&self.proj, task);
-        let start = shift_working_days(&calendar, base, days)?;
+        let (day, last) = shift_working_days(&calendar, base, days)?;
+        // A manual start is kept as it is: the scheduler never snaps it.
+        let start = if task.pinned_dates().is_some() {
+            day
+        } else {
+            auto_start(task, day, last)
+        };
         self.validate_pinned_day(start)?;
         self.set_start_at(uid, start)?;
         Ok(self.disp_start(uid).unwrap_or(start))
@@ -71,17 +80,15 @@ fn week_days(proj: &Project) -> i64 {
 }
 
 /// `from` moved by `days` working days of `calendar` (backward when
-/// negative), at the same time of day; non-working days are skipped. A time
-/// at or after the target day's last working time would be scheduled on the
-/// next working day, so it becomes the start of that day's last working
-/// period, which keeps the task on the target date. Refused
-/// when the walk leaves the scheduling horizon: as out of range when the
-/// calendar works but not enough, else as a calendar without working days.
+/// negative), at the same time of day; non-working days are skipped. Comes
+/// with that day's last working period. Refused when the walk leaves the
+/// scheduling horizon: as out of range when the calendar works but not
+/// enough, else as a calendar without working days.
 fn shift_working_days(
     calendar: &WorkCalendar,
     from: DateTime,
     days: i64,
-) -> Result<DateTime, String> {
+) -> Result<(DateTime, WorkingTime), String> {
     let step = days.signum();
     let mut left = days.unsigned_abs();
     let mut offset = 0i64;
@@ -101,12 +108,24 @@ fn shift_working_days(
             left -= 1;
         }
     }
-    let target = from.add_days(offset);
-    // `slots` is the target day's working time: the walk stopped on it.
-    Ok(match slots.last() {
-        Some(last) if target.minute_of_day() >= last.to => target.with_minute_of_day(last.from),
-        _ => target,
-    })
+    // `slots` is the target day's working time: the walk stopped on it, and
+    // `days` is never zero, so it ran.
+    let last = *slots.last().expect("the walk ends on a working day");
+    Ok((from.add_days(offset), last))
+}
+
+/// An auto task's Start-No-Earlier-Than on `day`, whose last working period
+/// is `last`. A time at or after that period's end would be scheduled on the
+/// next working day: a milestone keeps the period's end instant, which the
+/// scheduler holds a milestone at, and another task starts that period.
+fn auto_start(task: &Task, day: DateTime, last: WorkingTime) -> DateTime {
+    if day.minute_of_day() < last.to {
+        day
+    } else if task.duration_min == 0 {
+        day.with_minute_of_day(last.to)
+    } else {
+        day.with_minute_of_day(last.from)
+    }
 }
 
 #[cfg(test)]
