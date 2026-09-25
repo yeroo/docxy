@@ -70,7 +70,7 @@ fn resources_preserve_allocations_and_undo_creation_together() {
         .unwrap();
     ed.proj.assignments[0].units = 0.5;
     ed.proj.assignments[0].work_min = 123;
-    let kept = ed.proj.assignments[0];
+    let kept = ed.proj.assignments[0].clone();
     let before = ed.project().clone();
     let depth = ed.undo_depth();
     ed.mark_saved();
@@ -257,7 +257,7 @@ fn resource_tokens_preserve_significant_whitespace_and_prefer_exact_assignments(
         ed.proj.resources[0].name = stored.into();
         ed.proj.assignments[0].units = 0.5;
         ed.proj.assignments[0].work_min = 123;
-        let retained = ed.proj.assignments[0];
+        let retained = ed.proj.assignments[0].clone();
         let before = ed.project().clone();
         let depth = ed.undo_depth();
         ed.set_resources(10, &[token.into(), " Bob ".into()])
@@ -318,7 +318,7 @@ fn duplicate_resource_names_preserve_the_assigned_identity_or_reject_ambiguity()
     ed.proj.resources[1].name = "ALICE".into();
     ed.proj.assignments[1].units = 0.5;
     ed.proj.assignments[1].work_min = 123;
-    let retained = ed.proj.assignments[1];
+    let retained = ed.proj.assignments[1].clone();
     let before = ed.project().clone();
     let depth = ed.undo_depth();
     ed.set_resources(10, &["Alice[50%]".into(), "Bob".into()])
@@ -1151,6 +1151,7 @@ fn a_literal_bracketed_resource_does_not_steal_the_assigned_cell_text() {
         resource_uid: 7,
         units: 1.0,
         work_min: 960,
+        ..Assignment::default()
     });
     assert_eq!(
         format_resource_names(&ed.proj, 10),
@@ -1189,6 +1190,7 @@ fn on_task_10(resources: &[(i32, &str)], assigned: &[(i32, f64)]) -> Editor {
             resource_uid,
             units,
             work_min: work_for(960, units),
+            ..Assignment::default()
         });
     }
     Editor::new(ed.proj)

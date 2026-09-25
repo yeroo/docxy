@@ -771,6 +771,7 @@ fn new_assignment(
         resource_uid,
         units,
         work_min: work_for(duration_min, units),
+        ..Assignment::default()
     })
 }
 

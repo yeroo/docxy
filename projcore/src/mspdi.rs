@@ -372,12 +372,10 @@ fn parse_assignments(p: &mut XmlParser, out: &mut Vec<Assignment>) {
 }
 
 fn parse_assignment(p: &mut XmlParser) -> Assignment {
+    // Absent Units means 100%, not the zero `Default` would give.
     let mut a = Assignment {
-        uid: 0,
-        task_uid: 0,
-        resource_uid: 0,
         units: 1.0,
-        work_min: 0,
+        ..Assignment::default()
     };
     loop {
         match p.next() {
