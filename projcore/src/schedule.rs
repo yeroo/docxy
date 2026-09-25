@@ -779,10 +779,22 @@ impl<'a> Scheduler<'a> {
                         ConstraintType::MustFinishOn | ConstraintType::MustStartOn
                     ) || f_abs <= finish_abs;
                     if binds {
-                        let s_abs = if t.duration_min == 0 {
-                            f_abs
+                        let (s_abs, f_abs) = if t.duration_min != 0 {
+                            (pre.abs_start(finish_index - t.duration_min), f_abs)
+                        } else if finish_constraint {
+                            // As `milestone`, on the pre-start timeline: a
+                            // morning deadline stays on its morning.
+                            let mut m = if pre.snap(dates.raw) == dates.raw {
+                                dates.raw
+                            } else {
+                                f_abs
+                            };
+                            if t.constraint == ConstraintType::FinishNoLaterThan {
+                                m = m.min(bound_instant);
+                            }
+                            (m, m)
                         } else {
-                            pre.abs_start(finish_index - t.duration_min)
+                            (f_abs, f_abs)
                         };
                         pre_start_window = Some((pre, s_abs, f_abs));
                     }
@@ -3062,6 +3074,56 @@ mod tests {
                 assert_eq!(phase.late_start, late_start, "{case}");
                 assert!(phase.critical, "{case}");
             }
+        }
+    }
+
+    #[test]
+    fn unlinked_pre_start_milestone_keeps_morning_deadline() {
+        let monday = DateTime::from_ymd_hm(2026, 2, 16, 8, 0);
+        let monday_evening = DateTime::from_ymd_hm(2026, 2, 16, 17, 0);
+        // (date, late instant, slack): a morning deadline stays on its
+        // morning, an evening one on its evening.
+        for (date, slack) in [(monday, -10 * 480), (monday_evening, -9 * 480)] {
+            for constraint in [
+                ConstraintType::MustFinishOn,
+                ConstraintType::FinishNoLaterThan,
+            ] {
+                for honor in [true, false] {
+                    for successor in [false, true] {
+                        let mut proj = unlinked_deadline(constraint, date, honor);
+                        proj.tasks[1].duration_min = 0;
+                        if successor {
+                            let mut b = task(3, "B", 480);
+                            b.predecessors.push(fs(2));
+                            proj.tasks.push(b);
+                        }
+                        let case =
+                            format!("{constraint:?} {date:?} honor={honor} successor={successor}");
+                        let r = *schedule(&proj).get(2).unwrap();
+                        assert_eq!(r.early_start, proj.start_date.unwrap(), "{case}");
+                        assert_eq!(r.early_finish, proj.start_date.unwrap(), "{case}");
+                        assert_eq!(r.late_start, date, "{case}");
+                        assert_eq!(r.late_finish, date, "{case}");
+                        assert_eq!(r.total_slack_min, slack, "{case}");
+                    }
+                }
+            }
+        }
+        // An FNLT never moves the milestone past its successor's own instant:
+        // a linked milestone due Friday evening holds the Monday morning back.
+        for honor in [true, false] {
+            let mut proj = unlinked_deadline(ConstraintType::FinishNoLaterThan, monday, honor);
+            proj.tasks[1].duration_min = 0;
+            let mut c = task(3, "C", 0);
+            c.predecessors.push(fs(2));
+            c.constraint = ConstraintType::FinishNoLaterThan;
+            c.constraint_date = Some(DateTime::from_ymd_hm(2026, 2, 13, 17, 0));
+            proj.tasks.push(c);
+            let r = *schedule(&proj).get(2).unwrap();
+            let friday_evening = DateTime::from_ymd_hm(2026, 2, 13, 17, 0);
+            assert_eq!(r.late_start, friday_evening, "honor={honor}");
+            assert_eq!(r.late_finish, friday_evening, "honor={honor}");
+            assert_eq!(r.total_slack_min, -10 * 480, "honor={honor}");
         }
     }
 
