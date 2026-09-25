@@ -252,8 +252,8 @@ State keys, as the app reports them after every driving verb:
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
-| `selected_task`, `tasks`, `bar_<id>` | Project: selected task index (zero-based), task count, and each task's bar geometry by displayed ID |
-| `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name, and `none` or the filename of the last successful Gantt export |
+| `selected_task`, `tasks`, `bar_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's bar geometry by displayed ID |
+| `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name (empty on the entry row), and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
 | `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |
@@ -320,7 +320,9 @@ one while leveling is on.
 
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns;
-Up/Down/Home/End move between rows. Tab/Shift+Tab move between columns.
+Up/Down/Home/End move between rows; Down from the last task, or a click below
+it, goes to the entry row, where typing appends a task (`click B<tasks+1>`
+addresses it). Tab/Shift+Tab move between columns.
 Insert/Delete add/delete tasks (Delete on a summary asks first: Enter deletes it
 with its subtasks, Esc cancels, and typed text is ignored while that prompt is
 open; the state's `prompt` reads `delete:`), Alt+Shift+Right/Left indent/outdent,
