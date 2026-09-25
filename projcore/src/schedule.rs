@@ -3085,6 +3085,41 @@ mod tests {
     }
 
     #[test]
+    fn unlinked_pre_start_start_milestone_reports_negative_slack() {
+        // An SNLT/MSO milestone takes the evening side of its date's index,
+        // as the shared timeline places a post-start one; only finish
+        // constraints keep a morning deadline on its morning (#89).
+        let friday_evening = DateTime::from_ymd_hm(2026, 2, 13, 17, 0);
+        let monday_noon = DateTime::from_ymd_hm(2026, 2, 16, 12, 0);
+        for (date, late, slack) in [
+            (
+                DateTime::from_ymd_hm(2026, 2, 16, 8, 0),
+                friday_evening,
+                -10 * 480,
+            ),
+            (monday_noon, monday_noon, -9 * 480 - 240),
+        ] {
+            for constraint in [
+                ConstraintType::StartNoLaterThan,
+                ConstraintType::MustStartOn,
+            ] {
+                for honor in [true, false] {
+                    let mut proj = unlinked_deadline(constraint, date, honor);
+                    proj.tasks[1].duration_min = 0;
+                    let case = format!("{constraint:?} {date:?} honor={honor}");
+                    let r = *schedule(&proj).get(2).unwrap();
+                    assert_eq!(r.early_start, proj.start_date.unwrap(), "{case}");
+                    assert_eq!(r.early_finish, proj.start_date.unwrap(), "{case}");
+                    assert_eq!(r.late_start, late, "{case}");
+                    assert_eq!(r.late_finish, late, "{case}");
+                    assert_eq!(r.total_slack_min, slack, "{case}");
+                    assert!(r.critical, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn unlinked_pre_start_milestone_keeps_morning_deadline() {
         let monday = DateTime::from_ymd_hm(2026, 2, 16, 8, 0);
         let monday_evening = DateTime::from_ymd_hm(2026, 2, 16, 17, 0);
