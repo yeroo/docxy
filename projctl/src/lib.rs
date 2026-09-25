@@ -483,6 +483,20 @@ mod tests {
     }
 
     #[test]
+    fn add_after_a_summary_makes_its_first_child() {
+        let mut a = app();
+        let child = add(&mut a, "Child", "1d") as i32;
+        a.indent(child, 1).unwrap();
+        let args = Json::parse(r#"{"after":1,"name":"First"}"#).unwrap();
+        let r = dispatch_editor(&mut a, "task.add", &args).unwrap().unwrap();
+        assert_eq!(r.get_usize("level"), Some(2));
+        let summary = task_get(&a, &Json::obj(vec![("uid", Json::Num(1.0))])).unwrap();
+        assert_eq!(summary.get("summary"), Some(&Json::Bool(true)));
+        let levels: Vec<_> = a.project().tasks.iter().map(|t| t.outline_level).collect();
+        assert_eq!(levels, [1, 2, 2], "Child stays under the summary");
+    }
+
+    #[test]
     fn project_verbs_dispatch_on_a_bare_editor() {
         let mut ed = Editor::new(new_project());
         let r = dispatch_editor(
