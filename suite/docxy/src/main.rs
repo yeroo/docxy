@@ -1083,6 +1083,10 @@ struct DocTab {
     /// edit mode): keystrokes/clicks route to this editor instead of the body,
     /// and its blocks are serialized back into the package part on exit/save.
     hf_edit: Option<HfEdit>,
+    /// For a document opened from editable HTML: that bundle's HTML, rewrapped
+    /// around the new package on Save (and on Save As to another .html name),
+    /// so its engine and web UI carry over.
+    bundle_html: Option<String>,
 }
 
 /// Live header/footer edit session: an editor over the parsed header/footer
@@ -1104,9 +1108,6 @@ struct Docxy {
     ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
-    /// Save As: the path the document had before, so saving to a new
-    /// `.docx.html` name rewraps the bundle it came from (keeping its engine).
-    save_as_from: Option<PathBuf>,
     clip: Option<Clip>,
     theme_pref: ThemePref,
     /// When set, closing the window with unsaved tabs shows a confirm dialog.
@@ -1501,6 +1502,7 @@ struct Loaded {
     pkg: Option<Package>,
     markdown: bool,
     status: SharedString,
+    bundle_html: Option<String>,
 }
 
 impl Loaded {
@@ -1512,6 +1514,7 @@ impl Loaded {
             pkg: None,
             markdown: false,
             status: status.into(),
+            bundle_html: None,
         }
     }
     fn into_tab(
@@ -1533,6 +1536,7 @@ impl Loaded {
             notes: self.notes,
             markdown: self.markdown,
             hf_edit: None,
+            bundle_html: self.bundle_html,
         }
     }
 }
@@ -1552,6 +1556,7 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
             pkg: Some(pkg),
             markdown: false,
             status: "loaded".into(),
+            bundle_html: None,
         },
         Err(e) => Loaded::empty(format!("load error: {e:?}")),
     }
@@ -1562,6 +1567,7 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
         return match html_bundle::open(path) {
             Ok(opened) => {
                 let mut loaded = load_bytes(&opened.docx);
+                loaded.bundle_html = Some(opened.html);
                 loaded.status = match opened.warning {
                     Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
                     None => "loaded (editable HTML)".into(),
@@ -1579,6 +1585,7 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
             pkg: None,
             markdown: true,
             status: "loaded (markdown)".into(),
+            bundle_html: None,
         },
         Ok(bytes) => load_bytes(&bytes),
         Err(e) => Loaded::empty(format!("read error: {e}")),
@@ -1631,6 +1638,7 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
             notes: vec![],
             markdown: false,
             hf_edit: None,
+            bundle_html: None,
         }
     } else {
         doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
@@ -4028,6 +4036,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 notes: vec![],
                 markdown: false,
                 hf_edit: None,
+                bundle_html: None,
             }
         }
         _ => {
@@ -4045,6 +4054,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 notes,
                 markdown,
                 hf_edit: None,
+                bundle_html: None,
             }
         }
     };
@@ -4128,7 +4138,6 @@ impl Docxy {
             ribbon_min: false,
             backstage: false,
             bs_new: false,
-            save_as_from: None,
             clip: None,
             theme_pref,
             ask_on_close,
@@ -4305,6 +4314,7 @@ impl Docxy {
             notes: vec![],
             markdown: false,
             hf_edit: None,
+            bundle_html: None,
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -9865,8 +9875,8 @@ impl Docxy {
         });
         // Markdown-backed tabs save as Markdown, editable-HTML bundles rewrap
         // their package, everything else is lossless .docx.
-        let came_from = self.save_as_from.take();
-        let bytes = match html_bundle::doc_target(&path, tab.markdown) {
+        let target = html_bundle::doc_target(&path, tab.markdown);
+        let bytes = match target {
             html_bundle::DocTarget::Markdown => {
                 docxcore::markdown::to_markdown(&editor.doc).into_bytes()
             }
@@ -9875,8 +9885,8 @@ impl Docxy {
             }
             html_bundle::DocTarget::Html => {
                 let docx = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
-                match html_bundle::bundle_bytes(&path, came_from.as_deref(), &docx) {
-                    Ok(bytes) => bytes,
+                match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), &docx) {
+                    Ok(page) => page.into_bytes(),
                     Err(e) => {
                         tab.status = format!("save failed: {e}").into();
                         return self.refocus(window, cx);
@@ -9890,6 +9900,11 @@ impl Docxy {
                 tab.path = Some(path.clone());
                 tab.dirty = false;
                 tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+                // The page just written is the one the next save rewraps.
+                tab.bundle_html = match target {
+                    html_bundle::DocTarget::Html => String::from_utf8(bytes).ok(),
+                    _ => None,
+                };
             }
             Err(e) => tab.status = format!("save failed: {e}").into(),
         }
@@ -9988,17 +10003,18 @@ impl Docxy {
         let from_bundle = self
             .tabs
             .get(self.active)
-            .and_then(|t| t.path.as_deref())
-            .is_some_and(|p| html_bundle::doc_target(p, false) == html_bundle::DocTarget::Html);
+            .is_some_and(|t| t.bundle_html.is_some());
         if from_bundle || html_bundle::can_export() {
             dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
         }
+        // The name is written as picked (the dialog already asked about
+        // overwriting it): any .html name saves a bundle, found by its content
+        // when opened again.
         if let Some(path) = dialog.set_file_name(start).save_file() {
-            let path = html_bundle::normalize_save_target(path);
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 // Choosing a .md name switches the tab to Markdown, and vice-versa.
                 tab.markdown = is_markdown_path(&path);
-                self.save_as_from = tab.path.replace(path);
+                tab.path = Some(path);
             }
             true
         } else {

@@ -294,16 +294,49 @@ fn names_follow_the_convention() {
     assert_eq!(bundle_name("sample.docx"), "sample.docx.html");
     assert_eq!(source_name("dir/sample.docx.html"), Some("dir/sample.docx"));
     assert_eq!(source_name("sample.html"), None);
-    assert!(is_docx_bundle_path("C:\\x\\Report.DOCX.HTML"));
-    assert!(!is_docx_bundle_path("book.xlsx.html"));
-    assert!(!is_docx_bundle_path("sample.docx"));
-    assert!(!is_docx_bundle_path("dir.docx/page.html"));
+    // Every HTML name is a bundle candidate, whatever its inner extension.
+    for html in [
+        r"C:\x\Report.DOCX.HTML",
+        "sample.docx (1).html",
+        "sample.docx(1).html",
+        "notes.html",
+        "old.HTM",
+    ] {
+        assert!(is_html_path(html), "{html}");
+    }
+    assert!(!is_html_path("sample.docx"));
     assert_eq!(bundle_inner_ext("book.xlsx.html").as_deref(), Some("xlsx"));
+    assert_eq!(docx_source_name("notes.html"), "notes.docx");
+    assert_eq!(docx_source_name("sample.docx.html"), "sample.docx");
+    assert_eq!(docx_source_name("Report.DOCX.htm"), "Report.DOCX");
+    assert_eq!(
+        docx_source_name("sample.docx (1).html"),
+        "sample.docx (1).docx"
+    );
+}
+
+#[test]
+fn a_slot_name_in_the_document_name_stays_text() {
+    let html = wrap(
+        &test_assets(),
+        b"engine",
+        "docx",
+        "a{{payload}}b{{engine}}.docx",
+        b"PK",
+        "0",
+        WHEN,
+    )
+    .unwrap();
+    assert!(html.contains("<title>a&#123;&#123;payload}}b&#123;&#123;engine}}.docx</title>"));
+    assert_eq!(html.matches(PAYLOAD_OPEN).count(), 1);
+    let b = unwrap(&html).unwrap();
+    assert_eq!(b.payload, b"PK");
+    assert_eq!(b.meta.source_name(), "a{{payload}}b{{engine}}.docx");
 }
 
 /// The page rebuilds its own file in JS (`web/engine.js` `rebuildFile`), and
 /// that must equal [`rewrap`] byte for byte. This writes the Rust side of that
-/// comparison for `webapp/test/rebuild.test.mjs`: a bundle, a new payload, and
+/// comparison for `webapp/test/engine.test.mjs`: a bundle, a new payload, and
 /// the rewrapped bundle. An awkward source name exercises the JSON escaping
 /// both sides must share. Regenerate with `UPDATE_REWRAP_FIXTURE=1 cargo test
 /// -p htmlbundle`.
@@ -314,7 +347,7 @@ fn rewrap_fixture_for_the_page_is_current() {
         &test_assets(),
         b"\0asm fake engine",
         "docx",
-        "a \"quoted\" \\ <name> & \u{2028}\u{1F600}.docx",
+        "a \"quoted\" \\ <name> & {{payload}} \u{2028}\u{1F600}.docx",
         b"PK first payload",
         "0.5.0",
         WHEN,
@@ -371,10 +404,18 @@ fn sibling_warning_fires_only_when_the_original_changed() {
         .meta;
     assert_eq!(sibling_warning(&bundle_path, &edited), None);
 
-    // Changing the original does.
+    // Changing the original does, whatever the bundle is called.
     std::fs::write(&docx, b"original, edited in Word").unwrap();
     let w = sibling_warning(&bundle_path, &edited).unwrap();
     assert!(w.starts_with("sample.docx changed since export"), "{w}");
+    let renamed = dir.join("sample.docx (1).html");
+    assert!(sibling_warning(&renamed, &edited).is_some());
+    // The recorded name cannot reach outside the folder.
+    let mut sneaky = edited.clone();
+    sneaky.set("sourceName", "../../sample.docx");
+    let inner = dir.join("sub");
+    std::fs::create_dir_all(&inner).unwrap();
+    assert_eq!(sibling_warning(&inner.join("x.html"), &sneaky), None);
     // Nothing was written to the sibling.
     assert_eq!(std::fs::read(&docx).unwrap(), b"original, edited in Word");
 

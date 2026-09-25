@@ -38,27 +38,38 @@ pub fn export(source_name: &str, docx: &[u8]) -> Result<String, String> {
 }
 
 /// An opened bundle: its HTML (kept for [`htmlbundle::rewrap`] on save), the
-/// embedded package, and the "changed since export" warning, if any.
+/// embedded package, the name it was exported from, and the "changed since
+/// export" warning, if any.
 pub struct Opened {
     pub html: String,
     pub docx: Vec<u8>,
+    pub source_name: String,
     pub warning: Option<String>,
 }
 
-/// Read a `.docx.html` bundle from disk.
+/// Read an editable-HTML bundle from disk, by its content: any name works,
+/// and a page that is not a bundle is refused (`htmlbundle::Error::NotABundle`).
 pub fn open(path: &str) -> Result<Opened, String> {
     let html = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let bundle = htmlbundle::unwrap(&html).map_err(|e| format!("{path}: {e}"))?;
-    if bundle.meta.format() != "docx" {
-        return Err(format!(
-            "{path} holds a {} document, not a Word document",
-            bundle.meta.format()
-        ));
+    match bundle.meta.format() {
+        "docx" => {}
+        "xlsx" => {
+            return Err(format!(
+                "{path} is a spreadsheet, not a document — try: xlsxy {path}"
+            ));
+        }
+        other => return Err(format!("{path} holds a {other} file, not a Word document")),
     }
     let warning = htmlbundle::sibling_warning(Path::new(path), &bundle.meta);
+    let source_name = match bundle.meta.source_name() {
+        "" => htmlbundle::docx_source_name(&file_name(path)),
+        name => name.to_string(),
+    };
     Ok(Opened {
         html,
         docx: bundle.payload,
+        source_name,
         warning,
     })
 }

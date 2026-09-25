@@ -142,13 +142,8 @@ fn html_export_writes_one_offline_file_around_the_original_bytes() {
     assert!(!html.contains("connect-src"));
     // No reference to any other file: every src/href is inline or a fragment.
     let lower = html.to_ascii_lowercase();
-    for attr in [" src=", " href=", "<link", "@import", "url("] {
+    for attr in [" src=", " href=", "<link"] {
         for (i, _) in lower.match_indices(attr) {
-            // `url(` as CSS, not the tail of an identifier like `mediaUrl(`.
-            let prev = lower[..i].chars().next_back().unwrap_or(' ');
-            if attr == "url(" && (prev.is_alphanumeric() || prev == '_') {
-                continue;
-            }
             let v = lower[i + attr.len()..].trim_start_matches(['"', '\'']);
             assert!(
                 v.starts_with("data:") || v.starts_with('#'),
@@ -156,6 +151,20 @@ fn html_export_writes_one_offline_file_around_the_original_bytes() {
                 &html[i..(i + 60).min(html.len())]
             );
         }
+    }
+    // The stylesheet loads nothing either (`url(` in the scripts is JS, such
+    // as `new URL(`, not a CSS fetch).
+    let css_open = "<style id=\"docxy-css\">";
+    let s = lower.find(css_open).unwrap() + css_open.len();
+    let css = &lower[s..s + lower[s..].find("</style>").unwrap()];
+    assert!(!css.contains("@import"));
+    for (i, _) in css.match_indices("url(") {
+        let v = css[i + 4..].trim_start_matches(['"', '\'']);
+        assert!(
+            v.starts_with("data:"),
+            "stylesheet fetch: {}",
+            &css[i..(i + 60).min(css.len())]
+        );
     }
     // The payload is the original package, byte for byte, and the engine a
     // real wasm module.

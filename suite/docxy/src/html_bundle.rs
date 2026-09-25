@@ -6,7 +6,7 @@
 //! [`htmlbundle::rewrap`]); making a new one embeds the `docxwasm` engine, which
 //! only the `html-export` feature compiles in (see `build.rs`).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[cfg(feature = "html-export")]
 const ENGINE: Option<&[u8]> = Some(include_bytes!(concat!(env!("OUT_DIR"), "/docxwasm.wasm")));
@@ -26,10 +26,11 @@ pub(crate) enum DocTarget {
     Html,
 }
 
-/// The format a document path saves as: `*.docx.html` is a bundle, Markdown
-/// by extension, Word otherwise.
+/// The format a document path saves as: any `.html`/`.htm` is a bundle (never
+/// OOXML or Markdown written over an HTML name), Markdown by flag, Word
+/// otherwise.
 pub(crate) fn doc_target(path: &Path, markdown: bool) -> DocTarget {
-    if htmlbundle::is_docx_bundle_path(&path.to_string_lossy()) {
+    if htmlbundle::is_html_path(&path.to_string_lossy()) {
         DocTarget::Html
     } else if markdown {
         DocTarget::Markdown
@@ -38,21 +39,11 @@ pub(crate) fn doc_target(path: &Path, markdown: bool) -> DocTarget {
     }
 }
 
-/// A Save As name picked with the "Editable HTML" filter must stay
-/// recognizable as a bundle: `report.html` becomes `report.docx.html`, so the
-/// original format is in the name (the `<original name>.html` convention).
-pub(crate) fn normalize_save_target(path: PathBuf) -> PathBuf {
-    let s = path.to_string_lossy();
-    let lower = s.to_ascii_lowercase();
-    if !lower.ends_with(".html") || htmlbundle::bundle_inner_ext(&lower).is_some() {
-        return path;
-    }
-    PathBuf::from(format!("{}.docx.html", &s[..s.len() - ".html".len()]))
-}
-
-/// A bundle opened from disk: the embedded Word package, and the "changed
-/// since export" note when the original beside it no longer matches.
+/// A bundle opened from disk (by its content, whatever it is called): its
+/// HTML, the embedded Word package, and the "changed since export" note when
+/// the original beside it no longer matches.
 pub(crate) struct Opened {
+    pub html: String,
     pub docx: Vec<u8>,
     pub warning: Option<String>,
 }
@@ -69,53 +60,59 @@ pub(crate) fn open(path: &Path) -> Result<Opened, String> {
     Ok(Opened {
         warning: htmlbundle::sibling_warning(path, &bundle.meta),
         docx: bundle.payload,
+        html,
     })
 }
 
-/// The bytes to write for a bundle at `path` around `docx`: rewrap the bundle
-/// already there (or the one this document came from, on Save As), keeping its
-/// engine and UI; otherwise make a new one, which needs the engine.
+/// The page to write at `path` around `docx`:
+///
+/// 1. the bundle this document was opened from (`opened`), rewrapped, so its
+///    engine and UI carry over, including on Save As to another name;
+/// 2. else the bundle already at `path` (a tab restored after a restart),
+///    rewrapped;
+/// 3. else a new bundle, which needs the engine.
+///
+/// A file at `path` that is not a bundle is never overwritten.
 pub(crate) fn bundle_bytes(
     path: &Path,
-    came_from: Option<&Path>,
+    opened: Option<&str>,
     docx: &[u8],
-) -> Result<Vec<u8>, String> {
-    let existing = [Some(path), came_from]
-        .into_iter()
-        .flatten()
-        .filter(|p| htmlbundle::is_docx_bundle_path(&p.to_string_lossy()))
-        .find_map(|p| std::fs::read_to_string(p).ok());
-    if let Some(old) = existing {
-        return htmlbundle::rewrap(&old, docx)
-            .map(String::into_bytes)
-            .map_err(|e| e.to_string());
+) -> Result<String, String> {
+    if let Some(old) = opened {
+        return htmlbundle::rewrap(old, docx).map_err(|e| e.to_string());
     }
-    let engine = ENGINE.ok_or(
-        "this build of docxy cannot make editable HTML (build it with --features html-export)",
-    )?;
     let file = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let source = htmlbundle::source_name(&file)
-        .unwrap_or("document.docx")
-        .to_string();
+    if let Ok(existing) = std::fs::read_to_string(path) {
+        return match htmlbundle::rewrap(&existing, docx) {
+            Ok(page) => Ok(page),
+            Err(htmlbundle::Error::NotABundle) => Err(format!(
+                "not overwriting {file}: it is not a docxy editable HTML file"
+            )),
+            Err(e) => Err(format!("{file}: {e}")),
+        };
+    }
+    let engine = ENGINE.ok_or(
+        "this build of docxy cannot make editable HTML (build it with --features html-export)",
+    )?;
     htmlbundle::wrap(
         &htmlbundle::docx_assets(),
         engine,
         "docx",
-        &source,
+        &htmlbundle::docx_source_name(&file),
         docx,
         env!("CARGO_PKG_VERSION"),
         &htmlbundle::now_utc(),
     )
-    .map(String::into_bytes)
     .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     fn temp(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("suite-html-{tag}-{}", std::process::id()));
@@ -138,15 +135,22 @@ mod tests {
     }
 
     #[test]
-    fn bundle_paths_save_as_html() {
-        assert_eq!(
-            doc_target(Path::new("a/sample.docx.html"), false),
-            DocTarget::Html
-        );
-        assert_eq!(
-            doc_target(Path::new("a/SAMPLE.DOCX.HTML"), true),
-            DocTarget::Html
-        );
+    fn every_html_name_saves_as_a_bundle() {
+        for html in [
+            "a/sample.docx.html",
+            "a/SAMPLE.DOCX.HTML",
+            "a/sample.docx (1).html",
+            "a/sample.docx(1).html",
+            "a/notes.html",
+            "a/page.htm",
+        ] {
+            assert_eq!(
+                doc_target(Path::new(html), false),
+                DocTarget::Html,
+                "{html}"
+            );
+            assert_eq!(doc_target(Path::new(html), true), DocTarget::Html, "{html}");
+        }
         assert_eq!(
             doc_target(Path::new("a/notes.md"), true),
             DocTarget::Markdown
@@ -155,21 +159,6 @@ mod tests {
             doc_target(Path::new("a/sample.docx"), false),
             DocTarget::Docx
         );
-        assert_eq!(doc_target(Path::new("a/page.html"), false), DocTarget::Docx);
-    }
-
-    #[test]
-    fn save_as_names_keep_the_original_format_in_them() {
-        assert_eq!(
-            normalize_save_target(PathBuf::from("d/report.html")),
-            PathBuf::from("d/report.docx.html")
-        );
-        for keep in ["d/report.docx.html", "d/report.docx", "d/notes.md"] {
-            assert_eq!(
-                normalize_save_target(PathBuf::from(keep)),
-                PathBuf::from(keep)
-            );
-        }
     }
 
     #[test]
@@ -178,8 +167,8 @@ mod tests {
         let path = dir.join("sample.docx.html");
         let original = bundle(b"PK one");
         std::fs::write(&path, &original).unwrap();
-        let bytes = bundle_bytes(&path, None, b"PK two").unwrap();
-        let html = String::from_utf8(bytes).unwrap();
+        // A tab restored after a restart holds no bundle: the file is rewrapped.
+        let html = bundle_bytes(&path, None, b"PK two").unwrap();
         let cut = |h: &str| h[..h.rfind(htmlbundle::PAYLOAD_OPEN).unwrap()].to_string();
         assert_eq!(cut(&html), cut(&original));
         let b = htmlbundle::unwrap(&html).unwrap();
@@ -197,7 +186,10 @@ mod tests {
         let from = dir.join("sample.docx.html");
         std::fs::write(&from, bundle(b"PK one")).unwrap();
         let to = dir.join("copy.docx.html");
-        let html = String::from_utf8(bundle_bytes(&to, Some(&from), b"PK two").unwrap()).unwrap();
+        let opened = std::fs::read_to_string(&from).unwrap();
+        // The destination exists and is a different bundle: the opened one wins.
+        std::fs::write(&to, bundle(b"PK other")).unwrap();
+        let html = bundle_bytes(&to, Some(&opened), b"PK two").unwrap();
         assert!(html.contains(&htmlbundle::base64::encode(b"\0asm stand-in")));
         assert_eq!(htmlbundle::unwrap(&html).unwrap().payload, b"PK two");
         let _ = std::fs::remove_dir_all(&dir);
@@ -207,11 +199,10 @@ mod tests {
     fn a_new_bundle_needs_the_engine() {
         let dir = temp("new");
         let to = dir.join("fresh.docx.html");
-        let from = dir.join("fresh.docx");
-        match bundle_bytes(&to, Some(&from), b"PK new") {
-            Ok(bytes) => {
+        match bundle_bytes(&to, None, b"PK new") {
+            Ok(page) => {
                 assert!(can_export());
-                let b = htmlbundle::unwrap(&String::from_utf8(bytes).unwrap()).unwrap();
+                let b = htmlbundle::unwrap(&page).unwrap();
                 assert_eq!(b.meta.source_name(), "fresh.docx");
                 assert_eq!(b.payload, b"PK new");
             }
@@ -219,6 +210,32 @@ mod tests {
                 assert!(!can_export());
                 assert!(e.contains("--features html-export"), "{e}");
             }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plain_html_file_is_never_overwritten() {
+        let dir = temp("plain");
+        let page = dir.join("page.html");
+        std::fs::write(&page, "<html>mine</html>").unwrap();
+        let err = bundle_bytes(&page, None, b"PK").unwrap_err();
+        assert!(err.contains("not overwriting page.html"), "{err}");
+        assert!(open(&page).is_err());
+        assert_eq!(std::fs::read_to_string(&page).unwrap(), "<html>mine</html>");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renamed_bundles_open_by_content() {
+        let dir = temp("renamed");
+        for name in ["sample.docx (1).html", "sample.docx(1).html", "notes.html"] {
+            let path = dir.join(name);
+            std::fs::write(&path, bundle(b"PK one")).unwrap();
+            let o = open(&path).unwrap();
+            assert_eq!(o.docx, b"PK one", "{name}");
+            let page = bundle_bytes(&path, Some(&o.html), b"PK two").unwrap();
+            assert_eq!(htmlbundle::unwrap(&page).unwrap().payload, b"PK two");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

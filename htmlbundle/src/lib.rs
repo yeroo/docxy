@@ -210,13 +210,12 @@ pub fn wrap(
             ("payload", &payload_text),
         ],
     );
-    // The payload must be the block `rfind` lands on: last in the shell, and no
-    // inlined asset may spell the marker itself.
+    // Readers find the payload with `rfind`, so it must be the file's last
+    // element (a marker spelled earlier, in a script, is then harmless).
     let (start, end) = payload_span(&html)?;
     if html[start..end] != payload_text || html[end..].contains("<script") {
         return Err(Error::UnsafeAsset(
-            "the payload block must be the last element, and no asset may contain its marker"
-                .into(),
+            "shell.html must end with the payload block".into(),
         ));
     }
     Ok(html)
@@ -354,6 +353,9 @@ fn html_escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#39;"),
+            // The escaped name is filled into the template before the data
+            // slots are; a literal `{{payload}}` in it must not become a slot.
+            '{' => out.push_str("&#123;"),
             c => out.push(c),
         }
     }
@@ -471,9 +473,14 @@ pub fn bundle_inner_ext(path: &str) -> Option<String> {
     (!name.is_empty() && !ext.is_empty()).then(|| ext.to_string())
 }
 
-/// Whether `path` names a docx editable-HTML bundle (`*.docx.html`).
-pub fn is_docx_bundle_path(path: &str) -> bool {
-    bundle_inner_ext(path).as_deref() == Some("docx")
+/// Whether `path` is an HTML file name (`.html`/`.htm`, any case). To docxy
+/// such a path is only ever a bundle: it is opened by its *content* (the
+/// payload block and its `format`), never as a plain package, and saving to it
+/// always writes a bundle. The `<name>.docx.html` convention is only a hint:
+/// browsers save `sample.docx (1).html`, and people pick `notes.html`.
+pub fn is_html_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".html") || lower.ends_with(".htm")
 }
 
 /// `sample.docx.html` → `sample.docx` (the path the bundle was exported from,
@@ -483,13 +490,38 @@ pub fn source_name(path: &str) -> Option<&str> {
     Some(&path[..path.len() - ".html".len()])
 }
 
+/// The original-file name a new bundle saved as `file` records: the name
+/// without `.html`/`.htm`, as a `.docx` (`notes.html` → `notes.docx`,
+/// `sample.docx.html` → `sample.docx`).
+pub fn docx_source_name(file: &str) -> String {
+    let lower = file.to_ascii_lowercase();
+    let cut = if lower.ends_with(".html") {
+        file.len() - 5
+    } else if lower.ends_with(".htm") {
+        file.len() - 4
+    } else {
+        file.len()
+    };
+    let stem = &file[..cut];
+    if stem.to_ascii_lowercase().ends_with(".docx") {
+        stem.to_string()
+    } else {
+        format!("{stem}.docx")
+    }
+}
+
 /// The "changed since export" check: when the file a bundle was exported
-/// from still sits next to it (`sample.docx` beside `sample.docx.html`) and
-/// no longer hashes to `sourceSha256`, a warning naming it. Informational
-/// only — nothing is read from or written to that file beyond hashing it.
+/// from (its recorded `sourceName`) still sits in the bundle's folder and no
+/// longer hashes to `sourceSha256`, a warning naming it. The bundle's own name
+/// does not matter (`sample.docx (1).html` still finds `sample.docx`), and only
+/// the recorded name's last component is used, so it cannot point elsewhere.
+/// Informational only: the sibling is hashed, never written.
 pub fn sibling_warning(bundle_path: &std::path::Path, meta: &Meta) -> Option<String> {
-    let path = bundle_path.to_string_lossy();
-    let sibling = std::path::PathBuf::from(source_name(&path)?);
+    let name = std::path::Path::new(meta.source_name()).file_name()?;
+    let sibling = bundle_path.parent()?.join(name);
+    if sibling == bundle_path {
+        return None;
+    }
     let bytes = std::fs::read(&sibling).ok()?;
     if meta.source_sha256().is_empty() || sha256::hex_digest(&bytes) == meta.source_sha256() {
         return None;
