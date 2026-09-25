@@ -15,7 +15,8 @@ const UNDO_CAP: usize = 100;
 
 mod cells;
 pub use cells::{
-    day_finish, format_duration_exact, format_predecessors, parse_cell_date, parse_predecessors,
+    day_finish, format_duration_exact, format_predecessors, format_resource_names, format_units,
+    parse_cell_date, parse_predecessors, parse_resource_token,
 };
 
 /// A fixed Monday anchor, shared by new schedules and undated imports.
@@ -542,15 +543,39 @@ impl Editor {
             return Ok(AssignOutcome::Cleared);
         }
         let mut resources = self.proj.resources.clone();
-        let rid = find_or_stage_resource(&mut resources, name)?;
-        if self
+        // A resource literally named like `Crew [A%]` wins over the units suffix.
+        let (rid, units) = match resources.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
+            Some(r) => (r.uid, None),
+            None => {
+                let (base, units) = parse_resource_token(name)?;
+                (find_or_stage_resource(&mut resources, base.trim())?, units)
+            }
+        };
+        let duration = self.proj.tasks[i].duration_min;
+        if let Some(k) = self
             .proj
             .assignments
             .iter()
-            .any(|a| a.task_uid == uid && a.resource_uid == rid)
+            .position(|a| a.task_uid == uid && a.resource_uid == rid)
         {
-            return Ok(AssignOutcome::AlreadyAssigned);
+            // Only different explicit units change an existing assignment.
+            let Some(u) =
+                units.filter(|&u| format_units(u) != format_units(self.proj.assignments[k].units))
+            else {
+                return Ok(AssignOutcome::AlreadyAssigned);
+            };
+            let u = checked_units(u, name)?;
+            self.snapshot();
+            let a = &mut self.proj.assignments[k];
+            a.units = u;
+            a.work_min = work_for(duration, u);
+            self.changed();
+            return Ok(AssignOutcome::Assigned);
         }
+        let units = match units {
+            Some(u) => checked_units(u, name)?,
+            None => default_units(resources.iter().find(|r| r.uid == rid).expect("staged")),
+        };
         let mut next_aid = self
             .proj
             .assignments
@@ -558,7 +583,7 @@ impl Editor {
             .map(|a| a.uid)
             .max()
             .unwrap_or(0);
-        let assignment = new_assignment(&mut next_aid, uid, rid, self.proj.tasks[i].duration_min)?;
+        let assignment = new_assignment(&mut next_aid, uid, rid, units, duration)?;
         self.snapshot();
         self.proj.resources = resources;
         self.proj.assignments.push(assignment);
@@ -646,11 +671,36 @@ fn find_or_stage_resource(resources: &mut Vec<Resource>, name: &str) -> Result<i
     Ok(uid)
 }
 
+/// A work resource is assigned at its Max. Units, capped at 100% (as in Project);
+/// other kinds, and unusable capacities, at 100%.
+fn default_units(r: &Resource) -> f64 {
+    if r.kind == ResourceType::Work && r.max_units.is_finite() && r.max_units > 0.0 {
+        r.max_units.min(1.0)
+    } else {
+        1.0
+    }
+}
+
+/// Assignment work: the task duration scaled by the units (saturating).
+fn work_for(duration_min: i64, units: f64) -> i64 {
+    (duration_min as f64 * units).round() as i64
+}
+
+/// Explicitly entered units must be positive to create or change an assignment.
+fn checked_units(units: f64, token: &str) -> Result<f64, String> {
+    if units > 0.0 {
+        Ok(units)
+    } else {
+        Err(format!("Invalid units in '{}'", token.trim()))
+    }
+}
+
 fn new_assignment(
     next_uid: &mut i32,
     task_uid: i32,
     resource_uid: i32,
-    work_min: i64,
+    units: f64,
+    duration_min: i64,
 ) -> Result<Assignment, String> {
     *next_uid = next_uid
         .checked_add(1)
@@ -659,8 +709,8 @@ fn new_assignment(
         uid: *next_uid,
         task_uid,
         resource_uid,
-        units: 1.0,
-        work_min,
+        units,
+        work_min: work_for(duration_min, units),
     })
 }
 
