@@ -1806,6 +1806,206 @@ mod tests {
         assert!(!cal.week[0].as_ref().unwrap().working()); // Sunday (DayType 1) off
     }
 
+    /// `Standard` (UID 1) as Project writes a base calendar, plus `calendars`,
+    /// and two tasks on calendars `a` and `b`.
+    fn calendars_xml(calendars: &str, a: i32, b: i32) -> String {
+        let day = |d: u32, on: bool| {
+            if on {
+                format!(
+                    "<WeekDay><DayType>{d}</DayType><DayWorking>1</DayWorking><WorkingTimes>\
+                     <WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime>\
+                     <WorkingTime><FromTime>13:00:00</FromTime><ToTime>17:00:00</ToTime></WorkingTime>\
+                     </WorkingTimes></WeekDay>"
+                )
+            } else {
+                format!("<WeekDay><DayType>{d}</DayType><DayWorking>0</DayWorking></WeekDay>")
+            }
+        };
+        let standard: String = (1..=7).map(|d| day(d, (2..=6).contains(&d))).collect();
+        format!(
+            r#"<Project><CalendarUID>1</CalendarUID><Calendars>
+            <Calendar><UID>1</UID><Name>Standard</Name><IsBaseCalendar>1</IsBaseCalendar>
+              <IsBaselineCalendar>0</IsBaselineCalendar><BaseCalendarUID>-1</BaseCalendarUID>
+              <WeekDays>{standard}</WeekDays></Calendar>
+            {calendars}
+            </Calendars><Tasks>
+            <Task><UID>1</UID><ID>1</ID><Name>A</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT8H0M0S</Duration><CalendarUID>{a}</CalendarUID></Task>
+            <Task><UID>2</UID><ID>2</ID><Name>B</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT8H0M0S</Duration><CalendarUID>{b}</CalendarUID></Task>
+            </Tasks></Project>"#
+        )
+    }
+
+    /// A resource-style calendar derived from Standard with Friday off, and one
+    /// that states no weekdays at all (the usual shape in Project's files).
+    const DERIVED: &str = r#"
+        <Calendar><UID>2</UID><Name>Night crew</Name><IsBaseCalendar>0</IsBaseCalendar>
+          <IsBaselineCalendar>1</IsBaselineCalendar><BaseCalendarUID>1</BaseCalendarUID>
+          <WeekDays><WeekDay><DayType>6</DayType><DayWorking>0</DayWorking></WeekDay></WeekDays>
+        </Calendar>
+        <Calendar><UID>3</UID><Name>Plain</Name><IsBaseCalendar>0</IsBaseCalendar>
+          <IsBaselineCalendar>0</IsBaselineCalendar><BaseCalendarUID>1</BaseCalendarUID>
+        </Calendar>"#;
+
+    /// The `<Calendar>` element with this UID in written MSPDI.
+    fn calendar_block(xml: &str, uid: i32) -> &str {
+        let start = xml
+            .find(&format!("<Calendar>\n      <UID>{uid}</UID>"))
+            .unwrap();
+        let end = start + xml[start..].find("</Calendar>").unwrap();
+        &xml[start..end]
+    }
+
+    #[test]
+    fn derived_calendars_keep_their_base_through_mspdi_and_yppx() {
+        // Task A is on the calendar with no weekdays of its own: before #83 it
+        // read as seven non-working days and the file was rejected.
+        let proj = read_mspdi(&calendars_xml(DERIVED, 3, 2)).unwrap();
+        let night = proj.calendar(2).unwrap();
+        assert_eq!(night.base_calendar_uid, Some(1));
+        assert!(night.is_baseline_calendar);
+        let mut friday_off: [Option<DayWorking>; 7] = Default::default();
+        friday_off[5] = Some(DayWorking::default());
+        assert_eq!(night.week, friday_off);
+        let plain = proj.calendar(3).unwrap();
+        assert_eq!(plain.base_calendar_uid, Some(1));
+        assert!(!plain.is_baseline_calendar);
+        assert_eq!(plain.week, <[Option<DayWorking>; 7]>::default());
+        let standard = proj.calendar(1).unwrap();
+        assert_eq!(standard.base_calendar_uid, None);
+
+        let xml = write_mspdi(&proj);
+        assert!(calendar_block(&xml, 1).contains(
+            "<Name>Standard</Name>\n      <IsBaseCalendar>1</IsBaseCalendar>\n      \
+             <IsBaselineCalendar>0</IsBaselineCalendar>\n      \
+             <BaseCalendarUID>-1</BaseCalendarUID>\n      <WeekDays>"
+        ));
+        assert!(calendar_block(&xml, 2).contains(
+            "<Name>Night crew</Name>\n      <IsBaseCalendar>0</IsBaseCalendar>\n      \
+             <IsBaselineCalendar>1</IsBaselineCalendar>\n      \
+             <BaseCalendarUID>1</BaseCalendarUID>\n      <WeekDays>"
+        ));
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.calendars, proj.calendars);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.calendars, proj.calendars);
+    }
+
+    #[test]
+    fn derived_calendar_writes_only_its_own_weekdays_and_a_base_writes_all_seven() {
+        let mut proj = read_mspdi(&calendars_xml(DERIVED, 1, 1)).unwrap();
+        proj.calendars
+            .push(Calendar::base(4, "Closed", Default::default()));
+        // A base calendar whose days are unstated in memory.
+        proj.calendars.push(Calendar {
+            week: Default::default(),
+            ..Calendar::base(5, "Unstated", Default::default())
+        });
+        let xml = write_mspdi(&proj);
+        let night = calendar_block(&xml, 2);
+        assert_eq!(night.matches("<WeekDay>").count(), 1);
+        assert!(night.contains("<DayType>6</DayType>\n          <DayWorking>0</DayWorking>"));
+        let plain = calendar_block(&xml, 3);
+        assert_eq!(plain.matches("<WeekDay>").count(), 0);
+        assert!(!plain.contains("<WeekDays>"));
+        assert_eq!(calendar_block(&xml, 1).matches("<WeekDay>").count(), 7);
+        for uid in [4, 5] {
+            let block = calendar_block(&xml, uid);
+            assert_eq!(block.matches("<WeekDay>").count(), 7, "calendar {uid}");
+            assert_eq!(
+                block.matches("<DayWorking>0</DayWorking>").count(),
+                7,
+                "calendar {uid}"
+            );
+        }
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(
+            back.calendar(5).unwrap().week,
+            Calendar::base(5, "", Default::default()).week
+        );
+    }
+
+    #[test]
+    fn reader_decides_base_or_derived_from_both_flags() {
+        let cases = [
+            // IsBaseCalendar wins over a stray BaseCalendarUID.
+            (
+                "<IsBaseCalendar>1</IsBaseCalendar><BaseCalendarUID>1</BaseCalendarUID>",
+                None,
+            ),
+            // MSPDI's default for IsBaseCalendar is false.
+            ("<BaseCalendarUID>1</BaseCalendarUID>", Some(1)),
+            (
+                "<IsBaseCalendar>0</IsBaseCalendar><BaseCalendarUID>-1</BaseCalendarUID>",
+                None,
+            ),
+            ("<IsBaseCalendar>0</IsBaseCalendar>", None),
+            (
+                "<IsBaseCalendar>0</IsBaseCalendar><BaseCalendarUID>x</BaseCalendarUID>",
+                None,
+            ),
+        ];
+        for (flags, base) in cases {
+            let cal = format!(
+                "<Calendar><UID>2</UID><Name>C</Name>{flags}<WeekDays>\
+                 <WeekDay><DayType>2</DayType><DayWorking>1</DayWorking><WorkingTimes>\
+                 <WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime>\
+                 </WorkingTimes></WeekDay></WeekDays></Calendar>"
+            );
+            let proj = read_mspdi(&calendars_xml(&cal, 1, 1)).unwrap();
+            let cal = proj.calendar(2).unwrap();
+            assert_eq!(cal.base_calendar_uid, base, "{flags}");
+            // A base calendar's unstated days are non-working; a derived one's
+            // are inherited.
+            let unstated = cal.week[3].clone();
+            match base {
+                None => assert_eq!(unstated, Some(DayWorking::default()), "{flags}"),
+                Some(_) => assert_eq!(unstated, None, "{flags}"),
+            }
+        }
+    }
+
+    #[test]
+    fn task_on_a_derived_calendar_with_a_broken_chain_and_no_own_time_is_rejected() {
+        for base in [99, 2] {
+            let cal = format!(
+                "<Calendar><UID>2</UID><Name>Orphan</Name><IsBaseCalendar>0</IsBaseCalendar>\
+                 <BaseCalendarUID>{base}</BaseCalendarUID></Calendar>"
+            );
+            let error = read_mspdi(&calendars_xml(&cal, 1, 2)).unwrap_err();
+            assert!(
+                error.contains("calendar \"Orphan\" (UID 2) has no working time"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn day_type_zero_does_not_overwrite_sunday() {
+        let exception = "<WeekDay><DayType>0</DayType><DayWorking>1</DayWorking>\
+             <TimePeriod><FromDate>2026-03-01T00:00:00</FromDate>\
+             <ToDate>2026-03-01T23:59:00</ToDate></TimePeriod><WorkingTimes>\
+             <WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime>\
+             </WorkingTimes></WeekDay>";
+        let cals = format!(
+            "<Calendar><UID>2</UID><Name>Base</Name><IsBaseCalendar>1</IsBaseCalendar>\
+             <WeekDays><WeekDay><DayType>1</DayType><DayWorking>0</DayWorking></WeekDay>\
+             {exception}</WeekDays></Calendar>\
+             <Calendar><UID>3</UID><Name>Derived</Name><IsBaseCalendar>0</IsBaseCalendar>\
+             <BaseCalendarUID>1</BaseCalendarUID><WeekDays>{exception}</WeekDays></Calendar>"
+        );
+        let proj = read_mspdi(&calendars_xml(&cals, 1, 1)).unwrap();
+        assert_eq!(
+            proj.calendar(2).unwrap().week[0],
+            Some(DayWorking::default())
+        );
+        assert_eq!(
+            proj.calendar(3).unwrap().week,
+            <[Option<DayWorking>; 7]>::default()
+        );
+    }
+
     fn empty_calendar_project() -> Project {
         let mut proj = read_mspdi(MINIMAL).unwrap();
         proj.calendars
