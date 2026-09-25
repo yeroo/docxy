@@ -5,13 +5,17 @@ use crate::model::WorkCalendar;
 use crate::schedule::HORIZON_DAYS;
 
 impl Editor {
-    /// Move a task's start by `text` (see [`parse_move`]) working days on its
-    /// calendar, keeping the time of day. An auto task gets a
-    /// Start-No-Earlier-Than constraint there and a manual task's pinned
-    /// start moves (see [`Self::set_start_at`]); one undo step. The base is
-    /// the unleveled start: leveling is recomputed on every edit, so a base
-    /// that included its delay would drift on each move. Returns the new
-    /// start.
+    /// Move a task's start by `text` working days on its calendar, keeping
+    /// the time of day where that day still works then. `text` is a signed
+    /// whole number of days (`1d`, `-1d`) or weeks (`1w`), where a week is
+    /// the plan's hours per week over its hours per day, rounded (5 by
+    /// default); zero, anything else, or more than the scheduling horizon is
+    /// refused. An auto task gets a Start-No-Earlier-Than constraint there
+    /// and a manual task's pinned start moves (see [`Self::set_start_at`]);
+    /// one undo step. The base is the unleveled start: leveling is
+    /// recomputed on every edit, so a base that included its delay would
+    /// drift on each move. Returns the start the task is shown at afterwards,
+    /// which links or leveling can hold later than the moved-to date.
     pub fn move_task(&mut self, uid: i32, text: &str) -> Result<DateTime, String> {
         let task = &self.proj.tasks[self.index(uid)?];
         if task.is_null {
@@ -30,7 +34,7 @@ impl Editor {
         let start = shift_working_days(&calendar, base, days)?;
         self.validate_pinned_day(start)?;
         self.set_start_at(uid, start)?;
-        Ok(start)
+        Ok(self.disp_start(uid).unwrap_or(start))
     }
 }
 
@@ -67,7 +71,10 @@ fn week_days(proj: &Project) -> i64 {
 }
 
 /// `from` moved by `days` working days of `calendar` (backward when
-/// negative), at the same time of day; non-working days are skipped. Refused
+/// negative), at the same time of day; non-working days are skipped. A time
+/// at or after the target day's last working time would be scheduled on the
+/// next working day, so it becomes the start of that day's last working
+/// period, which keeps the task on the target date. Refused
 /// when the walk leaves the scheduling horizon: as out of range when the
 /// calendar works but not enough, else as a calendar without working days.
 fn shift_working_days(
@@ -94,7 +101,12 @@ fn shift_working_days(
             left -= 1;
         }
     }
-    Ok(from.add_days(offset))
+    let target = from.add_days(offset);
+    // `slots` is the target day's working time: the walk stopped on it.
+    Ok(match slots.last() {
+        Some(last) if target.minute_of_day() >= last.to => target.with_minute_of_day(last.from),
+        _ => target,
+    })
 }
 
 #[cfg(test)]

@@ -231,3 +231,49 @@ fn a_week_is_the_plans_working_days_per_week() {
     proj.hours_per_day = 0.0;
     assert_eq!(parse_move("1w", &proj), Ok(5), "unusable hours fall back");
 }
+
+#[test]
+fn a_milestone_at_the_end_of_the_day_moves_by_one_date() {
+    // A milestone after a 1-day task sits at its finish instant, Mon 17:00.
+    // Tue 17:00 would be scheduled Wed 08:00, so it lands in Tuesday's
+    // last working period instead.
+    let mut ed = editor();
+    ed.set_duration_min(20, 0).unwrap();
+    ed.add_predecessor(20, 10, LinkType::FinishStart, 0)
+        .unwrap();
+    assert_eq!(ed.schedule().get(20).unwrap().early_start, at(0, 17));
+    assert_eq!(ed.move_task(20, "1d"), Ok(at(1, 13)));
+    assert_snet(&ed, 20, at(1, 13));
+    assert_eq!(
+        ed.move_task(20, "-1d"),
+        Ok(at(0, 17)),
+        "the link still holds it"
+    );
+}
+
+#[test]
+fn a_start_after_the_target_days_hours_stays_on_that_date() {
+    // Fridays work 08:00-12:00 only; the task starts Thu 13:00.
+    let mut proj = editor().project().clone();
+    proj.calendars[0].week[5] = Some(DayWorking {
+        times: vec![crate::model::WorkingTime {
+            from: 8 * 60,
+            to: 12 * 60,
+        }],
+    });
+    let mut ed = Editor::new(proj.clone());
+    ed.set_start_at(10, at(3, 13)).unwrap();
+    assert_eq!(ed.schedule().get(10).unwrap().early_start, at(3, 13));
+    assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 8)), "Friday");
+    assert_snet(&ed, 10, at(4, 8));
+    // A time inside Friday's hours is kept.
+    ed.set_start_at(10, at(3, 10)).unwrap();
+    assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 10)));
+    // A manual task's pinned start is clamped the same way.
+    let task = &mut proj.tasks[0];
+    task.manual = true;
+    task.manual_start = Some(at(3, 13));
+    let mut ed = Editor::new(proj);
+    assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 8)));
+    assert_eq!(ed.project().task(10).unwrap().manual_start, Some(at(4, 8)));
+}

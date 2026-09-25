@@ -1015,6 +1015,20 @@ fn move_prompts_for_an_amount_and_reports_the_new_start() {
     );
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), 1);
+    // The status names the date the task is scheduled on: a milestone at
+    // its predecessor's 17:00 finish moves to the next day, not two.
+    let mut t = tab();
+    vm(&mut t).ed.set_duration_min(2, 0).unwrap();
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
+    commit(&mut t, ProjectAct::MoveTask, "1d");
+    assert_eq!(t.status.as_ref(), "Moved to 2026-01-06");
+    assert_eq!(
+        v(&t).ed.disp_start(2).unwrap().day_number(),
+        projcore::DateTime::from_ymd_hm(2026, 1, 6, 0, 0).day_number()
+    );
     // So does a summary.
     let mut t = summary_tab();
     let before = v(&t).ed.project().clone();
