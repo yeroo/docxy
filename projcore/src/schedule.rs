@@ -1214,27 +1214,12 @@ fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
         .filter(|t| t.is_null)
         .map(|t| t.uid)
         .collect();
-    let mut kept = Project {
-        tasks: Vec::new(),
-        assignments: Vec::new(),
-        ..proj.clone()
-    };
-    kept.tasks = proj
-        .tasks
-        .iter()
-        .filter(|t| !t.is_null)
-        .cloned()
-        .map(|mut t| {
-            t.predecessors.retain(|p| !blank.contains(&p.uid));
-            t
-        })
-        .collect();
-    kept.assignments = proj
-        .assignments
-        .iter()
-        .filter(|a| !blank.contains(&a.task_uid))
-        .copied()
-        .collect();
+    let mut kept = proj.clone();
+    kept.tasks.retain(|t| !t.is_null);
+    for t in &mut kept.tasks {
+        t.predecessors.retain(|p| !blank.contains(&p.uid));
+    }
+    kept.assignments.retain(|a| !blank.contains(&a.task_uid));
     std::borrow::Cow::Owned(kept)
 }
 
