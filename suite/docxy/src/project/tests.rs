@@ -107,15 +107,28 @@ fn extensions_route_to_project_and_mpp_is_imported() {
 
 #[test]
 fn every_mspdi_fixture_opens_and_matches_its_date_oracle() {
-    let paths: Vec<_> = std::fs::read_dir(corpus(""))
+    // The corpus generator keeps manifest.json in step with the fixtures, so the
+    // expected set comes from there instead of a count that each new fixture breaks.
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(corpus("manifest.json")).unwrap()).unwrap();
+    let mut listed: Vec<String> = manifest["files"]
+        .as_array()
+        .expect("manifest.json has a files array")
+        .iter()
+        .map(|f| f["file"].as_str().expect("files[].file").to_owned())
+        .collect();
+    listed.sort();
+    let mut paths: Vec<_> = std::fs::read_dir(corpus(""))
         .unwrap()
         .map(|e| e.unwrap().path())
         .filter(|p| ext_is(p, "xml"))
         .collect();
-    assert!(
-        paths.len() >= 19,
-        "expected the full seed corpus, got {}",
-        paths.len()
+    paths.sort();
+    let on_disk: Vec<String> = paths.iter().map(|p| file_name(p)).collect();
+    assert!(!listed.is_empty(), "manifest.json lists no fixtures");
+    assert_eq!(
+        on_disk, listed,
+        "corpus/mspdi fixtures differ from manifest.json"
     );
     for path in paths {
         let tab = tab_from_path(&path);
