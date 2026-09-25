@@ -442,6 +442,7 @@ dependencies = [
  "backstagecore",
  "ctlcore",
  "docxcore",
+ "htmlbundle",
  "image",
  "opccore",
  "ratatui",

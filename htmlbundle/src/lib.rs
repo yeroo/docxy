@@ -483,6 +483,26 @@ pub fn source_name(path: &str) -> Option<&str> {
     Some(&path[..path.len() - ".html".len()])
 }
 
+/// The "changed since export" check: when the file a bundle was exported
+/// from still sits next to it (`sample.docx` beside `sample.docx.html`) and
+/// no longer hashes to `sourceSha256`, a warning naming it. Informational
+/// only — nothing is read from or written to that file beyond hashing it.
+pub fn sibling_warning(bundle_path: &std::path::Path, meta: &Meta) -> Option<String> {
+    let path = bundle_path.to_string_lossy();
+    let sibling = std::path::PathBuf::from(source_name(&path)?);
+    let bytes = std::fs::read(&sibling).ok()?;
+    if meta.source_sha256().is_empty() || sha256::hex_digest(&bytes) == meta.source_sha256() {
+        return None;
+    }
+    let name = sibling
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| sibling.display().to_string());
+    Some(format!(
+        "{name} changed since export; this file keeps its own copy"
+    ))
+}
+
 /// Seconds since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn utc_timestamp(secs: u64) -> String {
     let days = (secs / 86_400) as i64;

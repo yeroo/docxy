@@ -6,6 +6,7 @@
 //!   docxy <file.docx> --pdf <out>  headless: export to PDF and exit
 //!   docxy <in> --md <out.md>       headless: convert to Markdown and exit
 //!   docxy <in> --docx <out.docx>   headless: convert to .docx and exit
+//!   docxy <in> --html <out.docx.html>  headless: export editable HTML and exit
 //!
 //! The logic lives in the pure `docxcore` crate; this binary is the TUI shell:
 //! it maps `docxcore::render` lines onto ratatui, draws a caret via the render
@@ -14,6 +15,7 @@
 mod backstage;
 mod bidi;
 mod control;
+mod html;
 mod mcp;
 mod metafile;
 mod protection;
@@ -86,13 +88,25 @@ use ratatui_image::{Image, Resize};
 enum DocFormat {
     Docx,
     Markdown,
+    /// A `.docx` carried inside an editable-HTML bundle (`sample.docx.html`).
+    /// It edits exactly like [`DocFormat::Docx`]; save rewraps the bundle.
+    Html,
 }
 
-/// Pick a format from a path's extension (Markdown for `.md`/`.markdown`/`.mdown`,
-/// `.docx` otherwise).
+impl DocFormat {
+    /// Whether the document is a Word package (plain or inside a bundle).
+    fn is_docx(self) -> bool {
+        matches!(self, DocFormat::Docx | DocFormat::Html)
+    }
+}
+
+/// Pick a format from a path's extension (`*.docx.html` is a bundle, checked
+/// first; Markdown for `.md`/`.markdown`/`.mdown`; `.docx` otherwise).
 fn format_for(path: &str) -> DocFormat {
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdown") {
+    if htmlbundle::is_docx_bundle_path(&lower) {
+        DocFormat::Html
+    } else if lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdown") {
         DocFormat::Markdown
     } else {
         DocFormat::Docx
@@ -111,13 +125,50 @@ fn window_title(app: &str, path: &str, dirty: bool) -> String {
 
 /// Load a file into a package, parsing Markdown into a numbered package when the
 /// path is a `.md`. Returns the package and the format it was read as.
+#[cfg(test)]
 fn load_input(path: &str) -> Result<(Package, DocFormat), String> {
+    load_input_ext(path).map(|i| (i.pkg, i.format))
+}
+
+/// A loaded input file: the package, its format and, for an editable-HTML
+/// bundle, the bundle's HTML (kept so save can rewrap it), the embedded
+/// package's exact bytes and the "changed since export" warning.
+struct Input {
+    pkg: Package,
+    format: DocFormat,
+    bundle_html: Option<String>,
+    payload: Option<Vec<u8>>,
+    warning: Option<String>,
+}
+
+fn load_input_ext(path: &str) -> Result<Input, String> {
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".xlsx") || lower.ends_with(".xls") {
+    if lower.ends_with(".xlsx")
+        || lower.ends_with(".xls")
+        || htmlbundle::bundle_inner_ext(&lower).is_some_and(|e| e == "xlsx" || e == "xls")
+    {
         return Err(format!(
             "{path} is a spreadsheet, not a document — try: xlsxy {path}"
         ));
     }
+    if format_for(path) == DocFormat::Html {
+        let opened = html::open(path)?;
+        let pkg = load_package(&opened.docx).map_err(|e| format!("{path}: {e}"))?;
+        return Ok(Input {
+            pkg,
+            format: DocFormat::Html,
+            bundle_html: Some(opened.html),
+            payload: Some(opened.docx),
+            warning: opened.warning,
+        });
+    }
+    let plain = |(pkg, format)| Input {
+        pkg,
+        format,
+        bundle_html: None,
+        payload: None,
+        warning: None,
+    };
     let data = std::fs::read(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     match format_for(path) {
         DocFormat::Markdown => {
@@ -127,10 +178,11 @@ fn load_input(path: &str) -> Result<(Package, DocFormat), String> {
                 DocFormat::Markdown,
             ))
         }
-        DocFormat::Docx => load_package(&data)
+        DocFormat::Docx | DocFormat::Html => load_package(&data)
             .map(|p| (p, DocFormat::Docx))
             .map_err(|e| e.to_string()),
     }
+    .map(plain)
 }
 
 /// Turn Markdown text into a document of literal lines: one paragraph per line,
@@ -206,25 +258,67 @@ fn main() -> ExitCode {
     let start = parsed.input.is_none();
     // With a file argument we load it (Markdown or .docx, by extension); with none,
     // start a fresh blank document.
-    let (pkg, input, format) = match parsed.input {
-        Some(input) => match load_input(&input) {
-            Ok((pkg, fmt)) => (pkg, input, fmt),
+    let (loaded, input) = match parsed.input {
+        Some(input) => match load_input_ext(&input) {
+            Ok(loaded) => (loaded, input),
             Err(e) => {
                 eprintln!("error: {e}");
                 return ExitCode::FAILURE;
             }
         },
         None => {
-            if parsed.pdf_out.is_some() || parsed.md_out.is_some() || parsed.docx_out.is_some() {
-                eprintln!("error: headless conversion (--pdf/--md/--docx) requires an input file");
+            if parsed.pdf_out.is_some()
+                || parsed.md_out.is_some()
+                || parsed.docx_out.is_some()
+                || parsed.html_out.is_some()
+            {
+                eprintln!(
+                    "error: headless conversion (--pdf/--md/--docx/--html) requires an input file"
+                );
                 return ExitCode::from(2);
             }
             let pkg = new_package(Document {
                 body: vec![Block::Paragraph(docxcore::model::Paragraph::default())],
             });
-            (pkg, "untitled.docx".to_string(), DocFormat::Docx)
+            let loaded = Input {
+                pkg,
+                format: DocFormat::Docx,
+                bundle_html: None,
+                payload: None,
+                warning: None,
+            };
+            (loaded, "untitled.docx".to_string())
         }
     };
+    let format = loaded.format;
+
+    if let Some(out) = parsed.html_out {
+        return match export_html_headless(&loaded, &input, &out) {
+            Ok(len) => {
+                println!("wrote {out} ({len} bytes)");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    // A bundle's embedded package is the original file: `--docx` hands it back
+    // byte for byte instead of re-serializing it.
+    if let (Some(out), Some(payload)) = (&parsed.docx_out, &loaded.payload) {
+        return match export_atomic(Some(Path::new(&input)), Path::new(out), payload) {
+            Ok(()) => {
+                println!("wrote {out} ({} bytes)", payload.len());
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: cannot write {out}: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let pkg = loaded.pkg;
 
     let conversion = parsed
         .pdf_out
@@ -244,7 +338,8 @@ fn main() -> ExitCode {
         };
     }
 
-    match run_tui(pkg, &input, format, parsed.vim, start) {
+    let bundle = loaded.bundle_html.map(|html| (html, loaded.warning));
+    match run_tui(pkg, &input, format, bundle, parsed.vim, start) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
@@ -294,6 +389,31 @@ fn convert_headless(
     Ok(bytes.len())
 }
 
+/// `--html`: wrap the input as a new editable-HTML bundle. The embedded
+/// package is the input's own bytes where it has them (a `.docx`, or a
+/// bundle's payload), so export never re-serializes a Word file.
+fn export_html_headless(loaded: &Input, source: &str, out: &str) -> Result<usize, String> {
+    let (name, docx) = if let Some(payload) = &loaded.payload {
+        let name = htmlbundle::source_name(&html::file_name(source))
+            .unwrap_or("document.docx")
+            .to_string();
+        (name, payload.clone())
+    } else if loaded.format == DocFormat::Docx {
+        let bytes = std::fs::read(source).map_err(|e| format!("cannot read {source}: {e}"))?;
+        (html::file_name(source), bytes)
+    } else {
+        let stem = Path::new(source)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "document".into());
+        (format!("{stem}.docx"), save_package(&loaded.pkg))
+    };
+    let page = html::export(&name, &docx)?;
+    export_atomic(Some(Path::new(source)), Path::new(out), page.as_bytes())
+        .map_err(|e| format!("cannot write {out}: {e}"))?;
+    Ok(page.len())
+}
+
 fn print_usage() {
     eprintln!(
         "Docxy — terminal .docx & Markdown editor\n\n\
@@ -304,9 +424,10 @@ fn print_usage() {
            docxy <file> --pdf <out>        export to PDF and exit\n  \
            docxy <file> --md <out.md>      convert to Markdown and exit\n  \
            docxy <file> --docx <out.docx>  convert to Word .docx and exit\n  \
+           docxy <file> --html <out.docx.html>  export as editable HTML and exit\n  \
            docxy --mcp                      run the MCP bridge to drive a live docxy\n  \
            docxy install skill              install the agent SKILL.md (self-onboarding)\n  \
-           (Save As to a .md/.docx name converts between the two formats;\n   \
+           (Save As to a .md/.docx/.docx.html name converts between the formats;\n   \
             View ▸ Markdown switches a .md between rendered and source)\n\n\
          EDITOR KEYS:\n  \
            type / Enter / Backspace / Delete    edit text\n  \
@@ -329,6 +450,7 @@ struct Parsed {
     pdf_out: Option<String>,
     md_out: Option<String>,
     docx_out: Option<String>,
+    html_out: Option<String>,
     help: bool,
     vim: bool,
 }
@@ -338,6 +460,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut pdf_out = None;
     let mut md_out = None;
     let mut docx_out = None;
+    let mut html_out = None;
     let mut help = false;
     let mut vim = false;
     let mut i = 0;
@@ -355,6 +478,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--pdf" => pdf_out = Some(value(&mut i, "--pdf")?),
             "--md" => md_out = Some(value(&mut i, "--md")?),
             "--docx" => docx_out = Some(value(&mut i, "--docx")?),
+            "--html" => html_out = Some(value(&mut i, "--html")?),
             s if s.starts_with('-') => return Err(format!("error: unknown option {s}")),
             s => {
                 if input.is_some() {
@@ -370,6 +494,7 @@ fn parse_args(args: &[String]) -> Result<Parsed, String> {
         pdf_out,
         md_out,
         docx_out,
+        html_out,
         help,
         vim,
     })
@@ -860,8 +985,12 @@ struct App {
     pkg: Package,
     editor: Editor,
     path: String,
-    /// The on-disk format this document is bound to (`.docx` or Markdown).
+    /// The on-disk format this document is bound to (`.docx`, Markdown, or a
+    /// `.docx` inside an editable-HTML bundle).
     format: DocFormat,
+    /// For [`DocFormat::Html`]: the bundle's HTML, rewrapped around the new
+    /// package on save so its engine and web UI stay exactly as they were.
+    bundle_html: Option<String>,
     /// While editing a Markdown file: `true` shows the raw source (each line an
     /// editable paragraph), `false` shows it rendered. Always `false` for `.docx`.
     md_source: bool,
@@ -1066,6 +1195,7 @@ impl App {
             editor: Editor::new(doc),
             path: path.to_string(),
             format: format_for(path),
+            bundle_html: None,
             md_source: false,
             modified: false,
             start_screen: false,
@@ -1860,7 +1990,7 @@ impl App {
         }
         // Resolve the target format + ensure the name carries an extension.
         let lower = name.to_ascii_lowercase();
-        let known = [".docx", ".md", ".markdown", ".mdown"];
+        let known = [".docx.html", ".docx", ".md", ".markdown", ".mdown"];
         let (mut fname, target) = if known.iter().any(|e| lower.ends_with(e)) {
             let fmt = format_for(&name);
             (name, fmt)
@@ -1869,12 +1999,17 @@ impl App {
             f.push_str(match self.format {
                 DocFormat::Markdown => ".md",
                 DocFormat::Docx => ".docx",
+                DocFormat::Html => ".docx.html",
             });
             (f, self.format)
         };
-        if target != self.format
+        if target.is_docx() != self.format.is_docx()
             && !self.mutation_allowed(protection::MutationKind::PackageMetadata)
         {
+            return;
+        }
+        if target == DocFormat::Html && self.bundle_html.is_none() && !html::can_export() {
+            self.status = Some(format!("Save As editable HTML: {}", html::NO_ENGINE));
             return;
         }
         fname = fname.trim().to_string();
@@ -1891,21 +2026,45 @@ impl App {
                 let pkg = new_markdown_package(from_markdown(&md));
                 (md.into_bytes(), pkg)
             }
-            DocFormat::Docx => {
-                let bytes = if self.format == DocFormat::Docx && !self.modified {
+            DocFormat::Docx | DocFormat::Html => {
+                let docx = if self.format.is_docx() && !self.modified {
                     save_package_preserving_document(&self.pkg)
                 } else {
                     self.pkg.document = self.current_document();
                     save_package(&self.pkg)
                 };
-                let pkg = load_package(&bytes).unwrap_or_else(|_| self.pkg.clone());
-                (bytes, pkg)
+                let pkg = load_package(&docx).unwrap_or_else(|_| self.pkg.clone());
+                if target != DocFormat::Html {
+                    (docx, pkg)
+                } else {
+                    // Keep an opened bundle's engine and UI; a new one embeds
+                    // this build's.
+                    let page = match &self.bundle_html {
+                        Some(old) => htmlbundle::rewrap(old, &docx).map_err(|e| e.to_string()),
+                        None => {
+                            let source = htmlbundle::source_name(&fname)
+                                .unwrap_or(&fname)
+                                .to_string();
+                            html::export(&source, &docx)
+                        }
+                    };
+                    match page {
+                        Ok(page) => (page.into_bytes(), pkg),
+                        Err(e) => {
+                            self.status = Some(format!("save failed: {e}"));
+                            return;
+                        }
+                    }
+                }
             }
         };
         match write_atomic(Path::new(&path), &bytes) {
             Ok(()) => {
                 let n = bytes.len();
                 self.load_package_state(pkg, path_str.clone());
+                if target == DocFormat::Html {
+                    self.bundle_html = String::from_utf8(bytes).ok();
+                }
                 self.backstage = None;
                 self.status = Some(format!("Saved {path_str} ({n} bytes)"));
             }
@@ -1964,10 +2123,14 @@ impl App {
     /// Replace the open document with one loaded from `path` (Markdown or `.docx`).
     fn open_path(&mut self, path: &std::path::Path) {
         let p = path.display().to_string();
-        match load_input(&p) {
-            Ok((pkg, _fmt)) => {
-                self.load_package_state(pkg, p.clone());
-                self.status = Some(format!("opened {p}"));
+        match load_input_ext(&p) {
+            Ok(input) => {
+                self.load_package_state(input.pkg, p.clone());
+                self.bundle_html = input.bundle_html;
+                self.status = Some(match input.warning {
+                    Some(w) => format!("opened {p} — {w}"),
+                    None => format!("opened {p}"),
+                });
             }
             Err(e) => self.status = Some(format!("cannot open {p}: {e}")),
         }
@@ -2093,6 +2256,7 @@ impl App {
         self.numbering = Rc::new(numbering);
         self.rels = rels;
         self.format = format_for(&path);
+        self.bundle_html = None;
         // Page view has no meaning for Markdown (no fixed pages).
         if self.format == DocFormat::Markdown {
             self.page_view = false;
@@ -3053,23 +3217,44 @@ impl App {
             self.exit_hf_edit(true);
         }
         let path = self.path.clone();
-        let bytes = match self.format {
-            DocFormat::Markdown => self.current_markdown().into_bytes(),
-            DocFormat::Docx => {
-                if self.modified {
-                    self.pkg.document = self.editor.doc.clone();
-                    save_package(&self.pkg)
-                } else {
-                    save_package_preserving_document(&self.pkg)
+        let docx = match self.format {
+            DocFormat::Markdown => None,
+            DocFormat::Docx | DocFormat::Html => Some(if self.modified {
+                self.pkg.document = self.editor.doc.clone();
+                save_package(&self.pkg)
+            } else {
+                save_package_preserving_document(&self.pkg)
+            }),
+        };
+        let bytes = match (&docx, self.format) {
+            (_, DocFormat::Markdown) => self.current_markdown().into_bytes(),
+            // An opened bundle keeps its engine and UI: only the payload changes.
+            (Some(docx), DocFormat::Html) => {
+                let rewrapped = self
+                    .bundle_html
+                    .as_deref()
+                    .ok_or_else(|| "the editable HTML this file came from is gone".to_string())
+                    .and_then(|old| htmlbundle::rewrap(old, docx).map_err(|e| e.to_string()));
+                match rewrapped {
+                    Ok(html) => html.into_bytes(),
+                    Err(e) => {
+                        self.status = Some(format!("save failed: {e}"));
+                        return;
+                    }
                 }
             }
+            (Some(docx), _) => docx.clone(),
+            (None, _) => unreachable!("Word formats always serialize a package"),
         };
         match write_atomic(Path::new(&path), &bytes) {
             Ok(()) => {
-                if self.format == DocFormat::Docx {
-                    if let Ok(pkg) = load_package(&bytes) {
+                if let Some(docx) = &docx {
+                    if let Ok(pkg) = load_package(docx) {
                         self.pkg = pkg;
                     }
+                }
+                if self.format == DocFormat::Html {
+                    self.bundle_html = String::from_utf8(bytes.clone()).ok();
                 }
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", path, bytes.len()));
@@ -5956,7 +6141,9 @@ impl App {
 /// document stats, and the accent matches docxy's ribbon (light blue).
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
-        &["docx"]
+        // `html` lists editable-HTML bundles (`*.docx.html`); opening any other
+        // .html says it is not one.
+        &["docx", "html"]
     }
 
     fn default_save_name(&self) -> String {
@@ -5969,7 +6156,12 @@ impl backstage::BackstageHost for App {
     /// Render a quick preview of the highlighted `.docx`.
     fn preview_lines(&self, path: &std::path::Path, width: usize) -> Vec<String> {
         let w = width.max(8);
-        match std::fs::read(path).ok().and_then(|d| load_package(&d).ok()) {
+        let bytes = if format_for(&path.to_string_lossy()) == DocFormat::Html {
+            html::open(&path.to_string_lossy()).ok().map(|o| o.docx)
+        } else {
+            std::fs::read(path).ok()
+        };
+        match bytes.and_then(|d| load_package(&d).ok()) {
             Some(pkg) => {
                 let styles = pkg
                     .part("word/styles.xml")
@@ -6556,7 +6748,14 @@ fn handle_event(app: &mut App, ev: Event) -> bool {
     }
 }
 
-fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) -> io::Result<()> {
+fn run_tui(
+    pkg: Package,
+    path: &str,
+    format: DocFormat,
+    bundle: Option<(String, Option<String>)>,
+    vim: bool,
+    start: bool,
+) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -6572,6 +6771,12 @@ fn run_tui(pkg: Package, path: &str, format: DocFormat, vim: bool, start: bool) 
 
     let mut app = App::new(pkg, path, vim);
     app.format = format;
+    if let Some((html, warning)) = bundle {
+        app.bundle_html = Some(html);
+        if let Some(w) = warning {
+            app.status = Some(w);
+        }
+    }
     // Restore persisted view-mode toggles and enable saving them going forward.
     let prefs = ViewPrefs::load();
     // Page view is a `.docx`-only concept; never restore it for Markdown.
@@ -10623,5 +10828,202 @@ mod tests {
         fn into_key(self) -> KeyEvent {
             KeyEvent::new(self, KeyModifiers::NONE)
         }
+    }
+}
+
+#[cfg(test)]
+mod html_bundle_tests {
+    //! Editable HTML (`*.docx.html`) in the terminal editor: open, save back
+    //! into the bundle, Save As out of and into the format.
+    use super::*;
+
+    fn sample_docx() -> Vec<u8> {
+        std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../assets/sample.docx"
+        ))
+        .unwrap()
+    }
+
+    fn bundle_of(docx: &[u8], name: &str) -> String {
+        // Reading and rewrapping never touch the engine block, so a stand-in
+        // engine keeps these tests independent of the html-export feature.
+        htmlbundle::wrap(
+            &htmlbundle::docx_assets(),
+            b"\0asm stand-in",
+            "docx",
+            name,
+            docx,
+            "test",
+            "2026-09-25T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("docxy-html-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn open_app(path: &std::path::Path) -> App {
+        let mut app = App::new(new_package(Document::default()), "untitled.docx", false);
+        app.open_path(path);
+        app
+    }
+
+    #[test]
+    fn bundle_paths_pick_the_html_format() {
+        assert_eq!(format_for("sample.docx.html"), DocFormat::Html);
+        assert_eq!(format_for(r"C:\x\Report.DOCX.HTML"), DocFormat::Html);
+        assert_eq!(format_for("page.html"), DocFormat::Docx);
+        assert!(DocFormat::Html.is_docx());
+        let err = load_input_ext("book.xlsx.html").err().unwrap();
+        assert!(err.contains("spreadsheet"), "{err}");
+    }
+
+    #[test]
+    fn opening_a_bundle_edits_the_embedded_docx() {
+        let dir = temp("open");
+        let path = dir.join("sample.docx.html");
+        std::fs::write(&path, bundle_of(&sample_docx(), "sample.docx")).unwrap();
+        let app = open_app(&path);
+        assert_eq!(app.format, DocFormat::Html);
+        assert!(app.bundle_html.is_some());
+        assert!(app.editor.doc.body.len() > 10);
+        assert!(window_title("docxy", &app.path, false).ends_with("sample.docx.html"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_rewraps_the_bundle_in_place() {
+        let dir = temp("save");
+        let path = dir.join("sample.docx.html");
+        let original = bundle_of(&sample_docx(), "sample.docx");
+        std::fs::write(&path, &original).unwrap();
+        let mut app = open_app(&path);
+        app.editor.set_caret(Caret::top(0, 0));
+        app.editor.insert_str("Edited in docxy ");
+        app.modified = true;
+        app.save();
+        assert!(!app.modified, "{:?}", app.status);
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        let cut = |h: &str| h[..h.rfind(htmlbundle::PAYLOAD_OPEN).unwrap()].to_string();
+        assert_eq!(cut(&saved), cut(&original), "engine and UI untouched");
+        let b = htmlbundle::unwrap(&saved).unwrap();
+        let before = htmlbundle::unwrap(&original).unwrap();
+        assert_eq!(b.meta.source_sha256(), before.meta.source_sha256());
+        let pkg = load_package(&b.payload).unwrap();
+        assert!(
+            pkg.document.body[0]
+                .plain_text()
+                .starts_with("Edited in docxy ")
+        );
+
+        // Saving again rewraps the file it just wrote.
+        app.editor.insert_str("again ");
+        app.modified = true;
+        app.save();
+        let again = htmlbundle::unwrap(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let pkg = load_package(&again.payload).unwrap();
+        assert!(
+            pkg.document.body[0]
+                .plain_text()
+                .starts_with("Edited in docxy again ")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_docx_writes_plain_ooxml() {
+        let dir = temp("saveas-docx");
+        let path = dir.join("sample.docx.html");
+        std::fs::write(&path, bundle_of(&sample_docx(), "sample.docx")).unwrap();
+        let mut app = open_app(&path);
+        app.commit_save_as(dir.clone(), "out.docx".to_string());
+        let bytes = std::fs::read(dir.join("out.docx")).unwrap();
+        assert_eq!(&bytes[..2], b"PK");
+        assert!(load_package(&bytes).is_ok());
+        assert_eq!(app.format, DocFormat::Docx);
+        assert!(app.bundle_html.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_bundle_from_an_open_bundle_keeps_its_engine() {
+        let dir = temp("saveas-bundle");
+        let path = dir.join("sample.docx.html");
+        let original = bundle_of(&sample_docx(), "sample.docx");
+        std::fs::write(&path, &original).unwrap();
+        let mut app = open_app(&path);
+        app.commit_save_as(dir.clone(), "copy.docx.html".to_string());
+        let copy = std::fs::read_to_string(dir.join("copy.docx.html")).unwrap();
+        assert!(copy.contains(&htmlbundle::base64::encode(b"\0asm stand-in")));
+        assert_eq!(app.format, DocFormat::Html);
+        assert!(app.path.ends_with("copy.docx.html"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_bundle_from_a_docx_needs_the_engine() {
+        let dir = temp("saveas-new");
+        let mut app = App::new(load_package(&sample_docx()).unwrap(), "sample.docx", false);
+        app.path = dir.join("sample.docx").to_string_lossy().into_owned();
+        app.commit_save_as(dir.clone(), "sample.docx.html".to_string());
+        let out = dir.join("sample.docx.html");
+        if html::can_export() {
+            let b = htmlbundle::unwrap(&std::fs::read_to_string(&out).unwrap()).unwrap();
+            assert_eq!(b.meta.source_name(), "sample.docx");
+            assert!(load_package(&b.payload).is_ok());
+            assert_eq!(app.format, DocFormat::Html);
+        } else {
+            assert!(!out.exists());
+            let status = app.status.clone().unwrap_or_default();
+            assert!(status.contains("--features html-export"), "{status}");
+            assert_eq!(app.format, DocFormat::Docx);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_changed_original_next_to_the_bundle_is_reported() {
+        let dir = temp("sibling");
+        let path = dir.join("sample.docx.html");
+        std::fs::write(&path, bundle_of(&sample_docx(), "sample.docx")).unwrap();
+        std::fs::write(dir.join("sample.docx"), sample_docx()).unwrap();
+        let app = open_app(&path);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(!status.contains("changed since export"), "{status}");
+
+        std::fs::write(dir.join("sample.docx"), b"edited elsewhere").unwrap();
+        let app = open_app(&path);
+        let status = app.status.clone().unwrap_or_default();
+        assert!(
+            status.contains("sample.docx changed since export"),
+            "{status}"
+        );
+        // Informational only: the original is untouched.
+        assert_eq!(
+            std::fs::read(dir.join("sample.docx")).unwrap(),
+            b"edited elsewhere"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_bundle_is_refused_clearly() {
+        let dir = temp("damaged");
+        let path = dir.join("sample.docx.html");
+        let good = bundle_of(b"PK original", "sample.docx");
+        let bad = good.replace(
+            &htmlbundle::base64::encode(b"PK original"),
+            &htmlbundle::base64::encode(b"PK tampered"),
+        );
+        std::fs::write(&path, bad).unwrap();
+        let err = load_input_ext(&path.to_string_lossy()).err().unwrap();
+        assert!(err.contains("integrity"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

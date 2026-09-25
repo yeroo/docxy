@@ -29,6 +29,9 @@ ctlcore = { version = "0.5.0", path = "../ctlcore" }
 ratatui = "0.29"
 ribboncore = { version = "0.1.0", path = "../ribboncore" }
 backstagecore = { version = "0.1.0", path = "../backstagecore" }
+# Editable HTML (*.docx.html): open and save bundles (always), and make new
+# ones (only with the `html-export` feature, which embeds the wasm engine).
+htmlbundle = { version = "0.5.0", path = "../htmlbundle" }
 # OS clipboard bridge (copy/paste across applications).
 arboard = "3"
 # Inline images (kitty/iTerm2/Sixel, with a half-block fallback).
@@ -44,3 +47,14 @@ unicode-bidi = "0.3.18"
 # Rasterize legacy WMF/EMF vector images via the OS's GDI (Windows only).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_SystemInformation"] }
+
+[build-dependencies]
+htmlbundle = { version = "0.5.0", path = "../htmlbundle" }
+
+[features]
+# Embed the docxwasm engine so `--html` and Save As *.docx.html can make new
+# editable-HTML files. Needs `rustup target add wasm32-unknown-unknown`, or
+# DOCXY_HTML_ENGINE=<path to a prebuilt docxwasm.wasm>. Off by default so a
+# plain `cargo install docxy` needs no wasm toolchain; opening and saving an
+# existing .docx.html works either way.
+html-export = []

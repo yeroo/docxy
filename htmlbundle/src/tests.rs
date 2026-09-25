@@ -343,6 +343,47 @@ fn rewrap_fixture_for_the_page_is_current() {
     }
 }
 
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("htmlbundle-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn sibling_warning_fires_only_when_the_original_changed() {
+    let dir = temp_dir("sibling");
+    let docx = dir.join("sample.docx");
+    let bundle_path = dir.join("sample.docx.html");
+    std::fs::write(&docx, b"original").unwrap();
+    let html = bundle(b"original");
+    std::fs::write(&bundle_path, &html).unwrap();
+    let meta = unwrap(&html).unwrap().meta;
+    assert_eq!(
+        sibling_warning(&bundle_path, &meta),
+        None,
+        "untouched original"
+    );
+
+    // Editing the bundle does not make the untouched original look changed.
+    let edited = unwrap(&rewrap(&html, b"edited in the browser").unwrap())
+        .unwrap()
+        .meta;
+    assert_eq!(sibling_warning(&bundle_path, &edited), None);
+
+    // Changing the original does.
+    std::fs::write(&docx, b"original, edited in Word").unwrap();
+    let w = sibling_warning(&bundle_path, &edited).unwrap();
+    assert!(w.starts_with("sample.docx changed since export"), "{w}");
+    // Nothing was written to the sibling.
+    assert_eq!(std::fs::read(&docx).unwrap(), b"original, edited in Word");
+
+    // No sibling, no warning.
+    std::fs::remove_file(&docx).unwrap();
+    assert_eq!(sibling_warning(&bundle_path, &edited), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn timestamps() {
     assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");

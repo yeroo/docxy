@@ -176,6 +176,7 @@ fn path_info(app: &App) -> Json {
     let fmt = match app.format {
         DocFormat::Docx => "docx",
         DocFormat::Markdown => "markdown",
+        DocFormat::Html => "docx-html",
     };
     let mut fields = vec![
         ("path", Json::Str(app.path.clone())),

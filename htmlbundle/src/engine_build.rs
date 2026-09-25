@@ -83,6 +83,11 @@ pub fn prepare_engine(workspace_root: &Path, out_dir: &Path) -> Result<PathBuf, 
     for key in SCRUBBED_ENV {
         cmd.env_remove(key);
     }
+    // Every exported page carries this engine as base64, so build it for
+    // size: symbols stripped and opt-level "s" take it from ~1.4 MB to ~1.06 MB.
+    // (Only this nested build; the VS Code/JetBrains wasm is untouched.)
+    cmd.env("CARGO_PROFILE_RELEASE_STRIP", "true")
+        .env("CARGO_PROFILE_RELEASE_OPT_LEVEL", "s");
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("CARGO_LLVM_COV") {
             cmd.env_remove(key);
