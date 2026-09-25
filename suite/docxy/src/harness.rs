@@ -554,10 +554,17 @@ pub enum Region {
     Gantt,
     /// Visible part of a task bar, addressed by displayed task ID.
     Bar(i32),
+    /// The Project table's horizontal scrollbar strip.
+    ProjectHbarTable,
+    /// The Project chart's horizontal scrollbar strip.
+    ProjectHbarChart,
+    /// The Project's vertical scrollbar strip, shared by table and chart.
+    ProjectVbar,
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
-/// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`.
+/// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
+/// `project-hbar-chart`, `project-vbar`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -572,7 +579,11 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "grid" if arg.is_none() => Ok(Region::Grid),
         "chart-panel" if arg.is_none() => Ok(Region::ChartPanel),
         "gantt" if arg.is_none() => Ok(Region::Gantt),
-        "window" | "grid" | "chart-panel" | "gantt" => {
+        "project-hbar-table" if arg.is_none() => Ok(Region::ProjectHbarTable),
+        "project-hbar-chart" if arg.is_none() => Ok(Region::ProjectHbarChart),
+        "project-vbar" if arg.is_none() => Ok(Region::ProjectVbar),
+        "window" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
+        | "project-hbar-chart" | "project-vbar" => {
             Err(format!("'{head}' does not take an argument; use '{head}'"))
         }
         "cell" | "cells" => {
@@ -604,7 +615,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3)"
+            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar)"
         )),
     }
 }
@@ -620,6 +631,9 @@ pub fn region_name(region: Region) -> String {
         Region::Chart(i) => format!("chart:{i}"),
         Region::Gantt => "gantt".into(),
         Region::Bar(id) => format!("bar:{id}"),
+        Region::ProjectHbarTable => "project-hbar-table".into(),
+        Region::ProjectHbarChart => "project-hbar-chart".into(),
+        Region::ProjectVbar => "project-vbar".into(),
     }
 }
 
@@ -2881,6 +2895,9 @@ mod tests {
             Region::Chart(3),
             Region::Gantt,
             Region::Bar(3),
+            Region::ProjectHbarTable,
+            Region::ProjectHbarChart,
+            Region::ProjectVbar,
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }
@@ -2888,6 +2905,7 @@ mod tests {
         assert_eq!(region_name(Region::Cells(2, 1, 2, 1)), "cell:B3");
         assert_eq!(region_name(Region::Cells(0, 0, 4, 2)), "cell:A1:C5");
         assert!(parse_region("gantt:1").is_err());
+        assert!(parse_region("project-vbar:1").is_err());
         assert!(parse_region("bar:abc").is_err());
         assert!(parse_region("bar:").is_err());
     }

@@ -5599,7 +5599,11 @@ impl Docxy {
                 origin: point(px(0.), px(0.)),
                 size: window.viewport_size(),
             }),
-            Region::Gantt | Region::Bar(_) => self.project_region_bounds(region),
+            Region::Gantt
+            | Region::Bar(_)
+            | Region::ProjectHbarTable
+            | Region::ProjectHbarChart
+            | Region::ProjectVbar => self.project_region_bounds(region),
             Region::Grid => self.grid_bounds(),
             Region::Cells(_, _, _, _) if self.active_is_project() => {
                 self.project_region_bounds(region)

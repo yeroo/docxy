@@ -76,10 +76,11 @@ impl ProjectView {
     pub fn reveal_col(&mut self) {
         let left: f32 = WIDTHS[..self.col].iter().sum();
         let right = left + WIDTHS[self.col];
-        if left < self.table_x {
-            self.table_x = left;
-        } else if right > self.table_x + self.table_w {
-            self.table_x = (right - self.table_w).min(left);
+        let x = self.table_x.get();
+        if left < x {
+            self.table_x.set(left);
+        } else if right > x + self.table_w {
+            self.table_x.set((right - self.table_w).min(left));
         }
         self.clamp_offsets();
     }

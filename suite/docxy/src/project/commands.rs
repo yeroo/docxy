@@ -635,7 +635,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             ScrollRight => {
                 v.pan_gantt(true);
             }
-            GoToStart => v.gantt_x = 0.,
+            GoToStart => v.gantt_x.set(0.),
             Save | ExportGantt => {} // window-dependent host actions
         }
         Ok(())
