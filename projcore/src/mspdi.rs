@@ -76,7 +76,12 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     // keep its text so a save writes it back. A block with
                     // child elements (OutlineCodes, ExtendedAttributes, ...) is
                     // consumed whole so its children can't be mistaken for
-                    // header fields.
+                    // header fields. So is a prefixed element or one carrying
+                    // attributes: an option stores only a name and text, so
+                    // writing it back would lose its namespace binding (an
+                    // unbound `x:` prefix, or a foreign `xmlns` moved into
+                    // MSPDI's) or attributes such as `xsi:nil`.
+                    _ if name.contains(':') || !p.attrs().is_empty() => p.skip_element(),
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
                             set_option(&mut proj.options, name, text);
@@ -688,9 +693,9 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Serialize a [`Project`] back to MSPDI XML.
 ///
 /// Emits the fields projcore models — enough for MS Project to open the file
-/// and for our own reader to round-trip — plus, in [`PROJECT_HEADER`] order,
-/// every project-level option the reader kept verbatim in
-/// [`Project::options`]. Other elements outside the model (custom fields,
+/// and for our own reader to round-trip — plus every project-level option the
+/// reader kept verbatim in [`Project::options`]: the schema's in
+/// [`PROJECT_HEADER`] order, then any others in read order. Other elements outside the model (custom fields,
 /// views, extended attributes, outline codes) are not preserved: this is a
 /// model-faithful writer, not a byte-faithful one. Each task's stored
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
@@ -2875,6 +2880,25 @@ mod tests {
             ]
         );
         assert!(!xml.contains("ZzBlock") && !xml.contains("<A>") && !xml.contains("FieldID"));
+    }
+
+    #[test]
+    fn namespaced_or_attributed_header_leaves_are_not_stored() {
+        let proj = read_mspdi(
+            r#"<Project xmlns="http://schemas.microsoft.com/project" xmlns:x="urn:x">
+                 <x:Ext>1</x:Ext>
+                 <Other xmlns="urn:other">2</Other>
+                 <Nil xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:nil="true"/>
+                 <Author>Me</Author>
+                 <Tasks/>
+               </Project>"#,
+        )
+        .unwrap();
+        // Only the plain leaf is an option; a save could not rebind the rest.
+        assert_eq!(proj.options, [("Author".to_string(), "Me".to_string())]);
+        let xml = write_mspdi(&proj);
+        assert!(!xml.contains("x:") && !xml.contains("urn:other"));
+        assert!(!xml.contains("<Other>") && !xml.contains("<Nil>"));
     }
 
     #[test]
