@@ -95,8 +95,8 @@ fn segment_offsets_tile_every_paragraph() {
         assert_eq!(at, len, "widths must sum to the caret length: {p:?}");
         // And the editor agrees about that length.
         let path = richdoc::parse_path(p.get_str("p").unwrap()).unwrap();
-        let para = richdoc::para_at(&s.editor.doc.body, &path).unwrap();
-        assert_eq!(para_text_len_via_editor(&s, &path), richdoc::para_len(para));
+        let para = resolve_para(&s.editor.doc.body, &path).unwrap();
+        assert_eq!(para_text_len_via_editor(&s, &path), para_text_len(para));
     }
 }
 

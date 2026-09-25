@@ -13,13 +13,14 @@
 //!   the width the editor gives it — one for a tab or break, zero for fields,
 //!   tracked changes, drawings and other anchors the editor cannot enter.
 //!
-//! Widths come from [`docxcore::editor::inline_len`], so the page and the editor
-//! can never disagree about where an offset is. Formatting is the *effective*
+//! Widths come from [`docxcore::editor::inline_len`] (and paragraph lengths
+//! from `para_text_len`), the editor's own functions, so the page and the
+//! editor can never disagree about where an offset is. Formatting is the *effective*
 //! formatting (styles resolved), since that is what the page must draw.
 
 use std::collections::HashMap;
 
-use docxcore::editor::inline_len;
+use docxcore::editor::{inline_len, para_text_len};
 use docxcore::load::Relationships;
 use docxcore::model::{
     Align, Block, BreakKind, Document, Inline, PageGeom, Paragraph, RevisionKind, RunProps, Table,
@@ -50,33 +51,6 @@ pub fn parse_path(s: &str) -> Option<Vec<usize>> {
         return None;
     }
     s.split('.').map(|p| p.parse().ok()).collect()
-}
-
-/// The paragraph at an editor path, following the editor's addressing: a
-/// table step is `table, row, cell`, and a step past a paragraph enters the
-/// text box at that inline index.
-pub fn para_at<'d>(body: &'d [Block], path: &[usize]) -> Option<&'d Paragraph> {
-    let (i, rest) = path.split_first()?;
-    match body.get(*i)? {
-        Block::Paragraph(p) if rest.is_empty() => Some(p),
-        Block::Paragraph(p) => {
-            let (k, inner) = rest.split_first()?;
-            match p.content.get(*k)? {
-                Inline::TextBox { blocks, .. } => para_at(blocks, inner),
-                _ => None,
-            }
-        }
-        Block::Table(t) if rest.len() >= 2 => {
-            let cell = t.rows.get(rest[0])?.cells.get(rest[1])?;
-            para_at(&cell.blocks, &rest[2..])
-        }
-        _ => None,
-    }
-}
-
-/// A paragraph's caret length.
-pub fn para_len(p: &Paragraph) -> usize {
-    p.content.iter().map(inline_len).sum()
 }
 
 /// The body as JSON: `{"page":{…},"blocks":[…]}`.
@@ -168,7 +142,7 @@ pub fn align_name(a: Align) -> &'static str {
 
 fn push_paragraph(out: &mut String, p: &Paragraph, path: &[usize], ctx: &Ctx<'_>) {
     let props = &p.props;
-    let len = para_len(p);
+    let len = para_text_len(p);
     out.push_str("{\"t\":\"p\",\"p\":");
     json::push_str(out, &path_str(path));
     out.push_str(&format!(",\"len\":{len}"));

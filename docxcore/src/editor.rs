@@ -1881,11 +1881,15 @@ fn clamp_caret(body: &[Block], caret: &mut Caret) {
     caret.offset = caret.offset.min(len);
 }
 
-fn para_text_len(p: &Paragraph) -> usize {
+/// A paragraph's caret length: the sum of its inlines' [`inline_len`].
+pub fn para_text_len(p: &Paragraph) -> usize {
     p.content.iter().map(inline_len).sum()
 }
 
-fn resolve_para<'a>(body: &'a [Block], path: &[usize]) -> Option<&'a Paragraph> {
+/// The paragraph a caret path names: a table step is `table, row, cell`, and a
+/// step past a paragraph enters the text box at that inline index. `None` when
+/// the path does not end on a paragraph.
+pub fn resolve_para<'a>(body: &'a [Block], path: &[usize]) -> Option<&'a Paragraph> {
     let (i, rest) = path.split_first()?;
     match body.get(*i)? {
         Block::Paragraph(p) if rest.is_empty() => Some(p),

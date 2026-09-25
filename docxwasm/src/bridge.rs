@@ -17,7 +17,7 @@
 use std::rc::Rc;
 
 use docxcore::agent;
-use docxcore::editor::{Caret, Clip, Editor, RevisionLocation};
+use docxcore::editor::{Caret, Clip, Editor, RevisionLocation, para_text_len, resolve_para};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::model::{
@@ -25,7 +25,9 @@ use docxcore::model::{
     RevisionTarget, UnsupportedRevisionKind, VertAlign,
 };
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
-use docxcore::package::{Package, load_package, save_package};
+use docxcore::package::{
+    BULLET_LIST_NUM_ID, NUMBER_LIST_NUM_ID, Package, load_package, save_package,
+};
 use docxcore::protection::{MutationKind, authorize};
 use docxcore::render::{self, Color, ImageBox, LineMap, RenderOptions};
 use docxcore::review::{MalformedRevisionReason, RevisionAction, RevisionOutcome};
@@ -57,11 +59,6 @@ pub fn docx_to_markdown(bytes: &[u8]) -> Option<String> {
         &markers,
     ))
 }
-
-/// The numbering ids [`Package::ensure_list`] provisions for the bullet and
-/// decimal lists the `list` command toggles.
-const LIST_BULLET: i32 = 9990;
-const LIST_NUMBER: i32 = 9991;
 
 /// A live editing session over one `.docx`.
 pub struct Session {
@@ -1374,9 +1371,9 @@ impl Session {
         }
         let caret = |path: &str, off: &str| -> Option<Caret> {
             let path = richdoc::parse_path(path.trim())?;
-            let para = richdoc::para_at(&self.editor.doc.body, &path)?;
+            let para = resolve_para(&self.editor.doc.body, &path)?;
             let off: usize = off.trim().parse().ok()?;
-            Some(Caret::at(path, off.min(richdoc::para_len(para))))
+            Some(Caret::at(path, off.min(para_text_len(para))))
         };
         let (Some(anchor), Some(head)) = (caret(a[0], a[1]), caret(a[2], a[3])) else {
             return false;
@@ -1486,8 +1483,8 @@ impl Session {
             && sp.line_rule.as_deref() == Some("auto");
         out.push_str(&format!(
             ",\"noSpacing\":{no_spacing},\"bullets\":{},\"numbers\":{},\"borderBottom\":{},\"inTable\":{in_table},\"selection\":{}",
-            self.editor.all_in_list(LIST_BULLET),
-            self.editor.all_in_list(LIST_NUMBER),
+            self.editor.all_in_list(BULLET_LIST_NUM_ID),
+            self.editor.all_in_list(NUMBER_LIST_NUM_ID),
             pp.borders.bottom.is_some(),
             self.editor.has_selection()
         ));
@@ -3457,5 +3454,4 @@ mod tests {
 }
 
 #[cfg(test)]
-#[path = "bridge_html_tests.rs"]
 mod html_tests;

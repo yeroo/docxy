@@ -602,6 +602,12 @@ pub struct Package {
     pub document: Document,
 }
 
+/// The numbering id (and abstract id) [`Package::ensure_list`] provisions for
+/// the bullet list that list commands toggle. A reserved high id, unlikely to
+/// collide with a document's own lists.
+pub const BULLET_LIST_NUM_ID: i32 = 9990;
+/// The decimal-list counterpart of [`BULLET_LIST_NUM_ID`].
+pub const NUMBER_LIST_NUM_ID: i32 = 9991;
 impl Package {
     /// Resolve the settings part through the main document relationship. The
     /// conventional name remains a compatibility fallback for older fixtures
@@ -1249,11 +1255,17 @@ impl Package {
     /// *existing* package via this call references `ilvl=1`, `2`, etc.; with only
     /// `ilvl=0` defined, [`crate::numbering::Numbering::marker`] falls back to a
     /// stray decimal marker (or Word shows no marker at all) for any nested item.
+    /// Ensure the bullet (or decimal) list [`BULLET_LIST_NUM_ID`] /
+    /// [`NUMBER_LIST_NUM_ID`] is defined in `word/numbering.xml`; returns its id.
     pub fn ensure_list(&mut self, bullet: bool) -> i32 {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
         // Reserved high ids, unlikely to collide with a document's own lists.
-        let (num_id, abs_id) = if bullet { (9990, 9990) } else { (9991, 9991) };
+        let (num_id, abs_id) = if bullet {
+            (BULLET_LIST_NUM_ID, BULLET_LIST_NUM_ID)
+        } else {
+            (NUMBER_LIST_NUM_ID, NUMBER_LIST_NUM_ID)
+        };
         let levels = markdown_list_levels(bullet);
         let abstract_xml =
             format!("<w:abstractNum w:abstractNumId=\"{abs_id}\">{levels}</w:abstractNum>");
