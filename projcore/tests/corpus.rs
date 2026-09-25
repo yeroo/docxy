@@ -9,10 +9,10 @@
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
 //! 16 (#58), 17 (#60) and 18 (#59). The exception is file 19 (issue #77):
 //! its manual-task slack and critical flags are hand-derived from our
-//! scheduler, not yet verified in Project. File 20 (issue #100) was
-//! hand-written from the issue's Project 2021 capture, not run through the
-//! script. Slack invariants below also check properties that do not depend on
-//! the embedded expectations.
+//! scheduler, not yet verified in Project. File 20's oracle (issue #100) was
+//! entered by hand from the issue's Project 2021 capture; the file was not run
+//! through `verify_mspdi_project.py`. Slack invariants below also check
+//! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
 use projcore::schedule::{level, schedule};

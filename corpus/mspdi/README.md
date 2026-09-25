@@ -52,10 +52,10 @@ marks `<Manual>1</Manual>` manual, so a Project run can check it.
 File 20 records a missed task Deadline
 ([issue #100](https://github.com/yeroo/docxy/issues/100)): B's deadline is
 five days before its finish, so A and B both carry -5 days total slack and no
-date moves. It was hand-written, and its oracle is taken from the issue's
-Project 2021 capture of `15-deadline-missed` in the private spec corpus. It was
-**not** checked by `verify_mspdi_project.py`, which does not check the Deadline
-on import.
+date moves. The file is generated like the others, but its oracle values were
+entered by hand from the issue's Project 2021 capture of `15-deadline-missed`
+in the private spec corpus. It was **not** checked by
+`verify_mspdi_project.py`, which does not check the Deadline on import.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
