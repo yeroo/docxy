@@ -60,13 +60,11 @@ impl Editor {
         if task.constraint == constraint && task.constraint_date == date {
             return Ok(());
         }
-        self.check_materialize(i)?;
-        self.snapshot();
-        materialize(&mut self.proj, i);
-        self.proj.tasks[i].constraint = constraint;
-        self.proj.tasks[i].constraint_date = date;
-        self.changed();
-        Ok(())
+        self.edit_structure(|proj| {
+            materialize(proj, i);
+            proj.tasks[i].constraint = constraint;
+            proj.tasks[i].constraint_date = date;
+        })
     }
 
     /// Set a task's start to a typed day. A manual task moves there, at the
@@ -83,13 +81,12 @@ impl Editor {
         if task.manual_start == Some(start) && task.manual_finish.is_none() {
             return Ok(());
         }
-        self.check_materialize(i)?;
-        self.snapshot();
-        materialize(&mut self.proj, i);
-        let task = &mut self.proj.tasks[i];
-        task.manual_start = Some(start);
-        task.manual_finish = None;
-        self.changed();
+        self.edit_structure(|proj| {
+            materialize(proj, i);
+            let task = &mut proj.tasks[i];
+            task.manual_start = Some(start);
+            task.manual_finish = None;
+        })?;
         self.stamp_pinned_dates(uid);
         Ok(())
     }
@@ -124,19 +121,20 @@ impl Editor {
             return Ok(());
         }
         self.validate_cell_horizon(uid, Some(duration), None)?;
-        self.check_materialize(i)?;
-        self.snapshot();
-        materialize(&mut self.proj, i);
-        let task = &mut self.proj.tasks[i];
-        if duration != task.duration_min {
-            commit_estimate(task);
-        }
-        task.manual_start = Some(start);
-        task.manual_finish = Some(finish);
-        task.duration_min = duration;
-        task.manual_duration_min = Some(duration);
-        task.milestone = duration == 0;
-        self.changed();
+        self.edit_structure(|proj| {
+            // As in update_task, a blank row's default duration is not typed.
+            let was_blank = proj.tasks[i].is_null;
+            materialize(proj, i);
+            let task = &mut proj.tasks[i];
+            if was_blank || duration != task.duration_min {
+                commit_estimate(task);
+            }
+            task.manual_start = Some(start);
+            task.manual_finish = Some(finish);
+            task.duration_min = duration;
+            task.manual_duration_min = Some(duration);
+            task.milestone = duration == 0;
+        })?;
         self.stamp_pinned_dates(uid);
         Ok(())
     }
@@ -160,9 +158,12 @@ impl Editor {
     ) -> Result<(), String> {
         let i = self.index(uid)?;
         let mut seen = std::collections::HashSet::new();
+        let current = &self.proj.tasks[i].predecessors;
         for p in &predecessors {
             self.index(p.uid)?;
-            if self.is_blank(p.uid) {
+            // A link to a blank row the task already has is kept (it shows in
+            // the cell); only a new one is refused.
+            if self.is_blank(p.uid) && !current.iter().any(|c| c.uid == p.uid) {
                 let id = self.proj.task(p.uid).map_or(p.uid, |t| t.id);
                 return Err(format!("No task with ID {id}"));
             }
@@ -177,12 +178,10 @@ impl Editor {
             return Ok(());
         }
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;
-        self.check_materialize(i)?;
-        self.snapshot();
-        materialize(&mut self.proj, i);
-        self.proj.tasks[i].predecessors = predecessors;
-        self.changed();
-        Ok(())
+        self.edit_structure(|proj| {
+            materialize(proj, i);
+            proj.tasks[i].predecessors = predecessors;
+        })
     }
 
     /// Replace membership while preserving allocation data for retained resources.
@@ -281,12 +280,11 @@ impl Editor {
                 materialized(&self.proj, i).duration_min,
             )?);
         }
-        self.check_materialize(i)?;
-        self.snapshot();
-        materialize(&mut self.proj, i);
-        self.proj.resources = resources;
-        self.proj.assignments = assignments;
-        self.changed();
+        self.edit_structure(|proj| {
+            materialize(proj, i);
+            proj.resources = resources;
+            proj.assignments = assignments;
+        })?;
         Ok(())
     }
 }

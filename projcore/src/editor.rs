@@ -203,18 +203,6 @@ impl Editor {
         self.proj.task(uid).is_some_and(|t| t.is_null)
     }
 
-    /// Before an edit outside [`Self::edit_structure`] turns blank row `i`
-    /// into a task, refuse it if that task could not be scheduled.
-    fn check_materialize(&self, i: usize) -> Result<(), String> {
-        if !self.proj.tasks[i].is_null {
-            return Ok(());
-        }
-        let mut next = self.proj.clone();
-        materialize(&mut next, i);
-        recompute_summaries(&mut next);
-        crate::schedule::calendar_error(&next).map_or(Ok(()), Err)
-    }
-
     fn snapshot(&mut self) {
         self.push_undo(self.proj.clone());
     }
@@ -298,7 +286,8 @@ impl Editor {
         FindOutcome::NotFound
     }
 
-    /// Insert after a UID, or append; inherit the preceding row's outline level.
+    /// Insert after a UID, or append; take the outline level of the nearest
+    /// task above (blank rows are skipped), at least 1.
     /// The returned row is not automatically selected.
     pub fn add_task(
         &mut self,
@@ -418,13 +407,16 @@ impl Editor {
             return Ok(());
         }
         self.edit_structure(|proj| {
+            // A blank row's `1 day?` is a default, not a duration the user
+            // typed: typing any duration into it commits it.
+            let was_blank = proj.tasks[i].is_null;
             materialize(proj, i);
             let t = &mut proj.tasks[i];
             if let Some(name) = patch.name {
                 t.name = name;
             }
             if let Some(min) = patch.duration_min {
-                if min != t.duration_min {
+                if was_blank || min != t.duration_min {
                     commit_estimate(t);
                 }
                 t.duration_min = min;
@@ -490,16 +482,14 @@ impl Editor {
         {
             return Err(format!("Already depends on {pred}"));
         }
-        self.check_materialize(i)?;
-        self.snapshot();
-        materialize(&mut self.proj, i);
-        self.proj.tasks[i].predecessors.push(Predecessor {
-            uid: pred,
-            link,
-            lag_min,
-        });
-        self.changed();
-        Ok(())
+        self.edit_structure(|proj| {
+            materialize(proj, i);
+            proj.tasks[i].predecessors.push(Predecessor {
+                uid: pred,
+                link,
+                lag_min,
+            });
+        })
     }
 
     pub fn remove_predecessor(&mut self, uid: i32, pred: i32) -> Result<(), String> {
@@ -553,12 +543,11 @@ impl Editor {
             .unwrap_or(0);
         let work = materialized(&self.proj, i).duration_min;
         let assignment = new_assignment(&mut next_aid, uid, rid, work)?;
-        self.check_materialize(i)?;
-        self.snapshot();
-        materialize(&mut self.proj, i);
-        self.proj.resources = resources;
-        self.proj.assignments.push(assignment);
-        self.changed();
+        self.edit_structure(|proj| {
+            materialize(proj, i);
+            proj.resources = resources;
+            proj.assignments.push(assignment);
+        })?;
         Ok(AssignOutcome::Assigned)
     }
 
@@ -1766,6 +1755,26 @@ mod tests {
             (t.duration_min, t.estimated, t.milestone),
             (960, Some(false), false)
         );
+        // Typing exactly the default one day commits it too.
+        let mut ed = blank_row_editor();
+        ed.set_duration_min(3, 480).unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!(
+            (t.duration_min, t.estimated, t.is_null),
+            (480, Some(false), false)
+        );
+        // So does a manual blank row's typed finish that lands on one day.
+        let mut proj = blank_row_editor().project().clone();
+        proj.tasks[1].manual = true;
+        proj.tasks[1].manual_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+        let mut ed = Editor::new(proj);
+        ed.set_finish(3, DateTime::from_ymd_hm(2026, 1, 5, 0, 0))
+            .unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!(
+            (t.duration_min, t.estimated, t.is_null),
+            (480, Some(false), false)
+        );
         let mut ed = blank_row_editor();
         ed.toggle_milestone(3).unwrap();
         let t = &ed.project().tasks[1];
@@ -1793,6 +1802,34 @@ mod tests {
         assert_eq!(ed.project(), &before);
         assert_eq!(ed.undo_depth(), 0);
         assert!(!ed.dirty());
+    }
+
+    #[test]
+    fn a_link_to_a_blank_row_the_task_already_has_survives_a_cell_edit() {
+        let proj = crate::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-task-fields.xml"))
+            .unwrap();
+        let mut ed = Editor::new(proj);
+        // Pour (UID 4) links from Excavate (2) and from the blank row (3).
+        let links = ed.project().task(4).unwrap().predecessors.clone();
+        assert_eq!(links.iter().map(|p| p.uid).collect::<Vec<_>>(), [2, 3]);
+        let mut edited = links.clone();
+        edited[0].lag_min = 480;
+        ed.set_predecessors(4, edited.clone()).unwrap();
+        assert_eq!(ed.project().task(4).unwrap().predecessors, edited);
+        // The blank row still does not drive Pour: only the new lag does.
+        assert_eq!(
+            ed.schedule().get(4).unwrap().early_start,
+            DateTime::from_ymd_hm(2026, 3, 5, 8, 0)
+        );
+        let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+        assert_eq!(back.tasks, ed.project().tasks);
+        // A new link to the blank row is still refused.
+        let mut added = ed.project().task(2).unwrap().predecessors.clone();
+        added.push(links[1]);
+        assert_eq!(
+            ed.set_predecessors(2, added).unwrap_err(),
+            "No task with ID 3"
+        );
     }
 
     #[test]
