@@ -314,7 +314,9 @@ cover every task, including those outside the visible timeline.
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns;
 Up/Down/Home/End move between rows. Tab/Shift+Tab move between columns.
-Insert/Delete add/delete tasks, Alt+Shift+Right/Left indent/outdent,
+Insert/Delete add/delete tasks (Delete on a summary asks first: Enter deletes it
+with its subtasks, Esc cancels, and typed text is ignored while that prompt is
+open; the state's `prompt` reads `delete:`), Alt+Shift+Right/Left indent/outdent,
 Alt+Right/Left pan the Gantt, and Ctrl+Shift+L toggles leveling. Former bare-letter
 commands (`n x d p c a b L`) now type into cells. Duration, predecessor, constraint,
 resource, baseline, and Rename commands remain on the ribbon; ribbon Rename

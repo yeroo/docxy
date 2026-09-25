@@ -235,7 +235,7 @@ start screen, a light/dark theme toggle, and mouse support. Try it:
 | ↑ ↓ · j / k · g / G | move the selection (top / bottom) |
 | ← → · h / l | scroll the Gantt timeline |
 | n · Insert | add a task below |
-| x · Delete | delete the task |
+| x · Delete | delete the task (a summary asks first, then takes its subtasks) |
 | Tab · Shift-Tab | indent / outdent (auto-forms summary tasks) |
 | Enter · F2 | rename the task |
 | d | set duration (`3d` / `4h` / `2w`) |
