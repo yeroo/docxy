@@ -34,7 +34,8 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Calendar, ConstraintType, LinkType, Project, ResourceType, Task, Week, WorkingTime,
+    Calendar, ConstraintType, LinkType, Project, ResourceType, Task, Week, WorkCalendar,
+    WorkingTime,
 };
 use std::collections::HashMap;
 
@@ -106,20 +107,19 @@ struct Timeline {
 
 impl Timeline {
     /// Reserve working days before the anchor for leads, finish-driven starts,
-    /// and late dates under conflicting constraints. Empty calendars need none.
-    fn origin(week: &[Vec<(u32, u32)>; 7], anchor: i64, min_before: i64) -> i64 {
-        if min_before <= 0 || week.iter().flatten().all(|&(from, to)| from >= to) {
+    /// and late dates under conflicting constraints. Calendars without weekly
+    /// working time need none.
+    fn origin(cal: &WorkCalendar, anchor: i64, min_before: i64) -> i64 {
+        if min_before <= 0 || !cal.has_working_time() {
             return anchor;
         }
         let mut day = anchor.div_euclid(1440);
         let mut work = 0;
+        let mut slots = Vec::new();
         for _ in 0..HORIZON_DAYS {
             day -= 1;
-            let dow = (day + 4).rem_euclid(7) as usize;
-            work += week[dow]
-                .iter()
-                .map(|&(from, to)| to.saturating_sub(from) as i64)
-                .sum::<i64>();
+            cal.day_into(day, &mut slots);
+            work += slots.iter().map(|t| (t.to - t.from) as i64).sum::<i64>();
             if work >= min_before {
                 break;
             }
@@ -127,11 +127,11 @@ impl Timeline {
         day * 1440
     }
 
-    /// Build a timeline for `week` (Sun=0..Sat=6 working patterns) starting at
-    /// `origin_abs`, extended until it covers at least `min_total` working
-    /// minutes after `anchor_abs` and reaches wall-clock minute `min_reach`.
+    /// Build a timeline for `cal` starting at `origin_abs`, extended until it
+    /// covers at least `min_total` working minutes after `anchor_abs` and
+    /// reaches wall-clock minute `min_reach`.
     fn build(
-        week: &[Vec<(u32, u32)>; 7],
+        cal: &WorkCalendar,
         origin_abs: i64,
         anchor_abs: i64,
         min_total: i64,
@@ -145,11 +145,12 @@ impl Timeline {
         let mut forward_total = 0;
         let mut first = true;
         let mut guard = 0;
+        let mut slots = Vec::new();
         loop {
-            let dow = (day + 4).rem_euclid(7) as usize;
+            cal.day_into(day, &mut slots);
             let floor = if first { origin_mod } else { 0 };
             first = false;
-            for &(from, to) in &week[dow] {
+            for &WorkingTime { from, to } in &slots {
                 let from = from.max(floor);
                 if from < to {
                     let s = day * 1440 + from as i64;
@@ -235,7 +236,7 @@ impl Timeline {
 struct Scheduler<'a> {
     proj: &'a Project,
     timelines: HashMap<i32, Timeline>,
-    weeks: HashMap<i32, [Vec<(u32, u32)>; 7]>,
+    weeks: HashMap<i32, WorkCalendar>,
     default_cal: i32,
     anchor: i64,
     /// No timeline starts before this day, however far back a date lies.
@@ -346,26 +347,23 @@ impl<'a> Scheduler<'a> {
             .calendars
             .iter()
             .filter(|cal| used_calendars.contains(&cal.uid))
-            .map(|cal| (cal.uid, week_pairs(&calendars.week(cal))))
+            .map(|cal| (cal.uid, calendars.calendar(cal)))
             .collect();
         weeks
             .entry(default_cal)
-            .or_insert_with(|| week_pairs(&Calendar::standard_week()));
+            .or_insert_with(|| WorkCalendar::weekly(Calendar::standard_week()));
 
         // A pinned task's duration-derived finish lies past its start; reserve
         // wall-clock reach for its duration at its calendar's weekly rate,
         // resolved exactly as `tl()` resolves it. A calendar without working
-        // time cannot schedule the task at all.
+        // time cannot schedule the task at all. Exceptions are not counted:
+        // the forward horizon already covers the work in working minutes.
         let pinned_reach = proj.tasks.iter().filter_map(|t| {
             let (start, _) = t.pinned_dates()?;
             let week = weeks
                 .get(&t.calendar_uid.unwrap_or(default_cal))
                 .or_else(|| weeks.get(&default_cal))?;
-            let per_week: i64 = week
-                .iter()
-                .flatten()
-                .map(|&(from, to)| to.saturating_sub(from) as i64)
-                .sum();
+            let per_week: i64 = week.week().iter().map(|day| day.minutes()).sum();
             (per_week > 0).then(|| {
                 let wall = (t.duration_min.max(0) as i128 * 7 * 1440 + per_week as i128 - 1)
                     / per_week as i128;
@@ -972,7 +970,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // ---- summary rollup ----
-        let mut summary_cal: Option<Week> = None;
+        let mut summary_cal: Option<WorkCalendar> = None;
         for (i, t) in self.proj.tasks.iter().enumerate() {
             if !t.summary {
                 continue;
@@ -1125,17 +1123,6 @@ fn finish_instant(
     tl.abs_finish(finish_index)
 }
 
-/// Convert a resolved week's patterns into sorted `(from, to)` minute pairs.
-fn week_pairs(week: &Week) -> [Vec<(u32, u32)>; 7] {
-    let mut out: [Vec<(u32, u32)>; 7] = Default::default();
-    for (d, day) in week.iter().enumerate() {
-        let mut v: Vec<(u32, u32)> = day.times.iter().map(|t| (t.from, t.to)).collect();
-        v.sort_by_key(|&(f, _)| f);
-        out[d] = v;
-    }
-    out
-}
-
 fn has_working_time(week: &Week) -> bool {
     week.iter()
         .flat_map(|day| &day.times)
@@ -1169,9 +1156,16 @@ impl<'a> CalendarResolver<'a> {
             .copied()
     }
 
-    /// `cal`'s working week, resolved through its base chain.
+    /// `cal`'s working week, resolved through its base chain. Whether a
+    /// calendar can schedule at all is decided on this weekly pattern alone.
     fn week(&self, cal: &'a Calendar) -> Week {
         cal.resolve_week(|uid| self.calendars.get(&uid).copied())
+    }
+
+    /// `cal`'s working time by date, exceptions included, resolved through its
+    /// base chain.
+    fn calendar(&self, cal: &'a Calendar) -> WorkCalendar {
+        cal.resolve(|uid| self.calendars.get(&uid).copied())
     }
 
     /// A leaf the scheduler keeps: its resolved calendar has working time.
@@ -1315,19 +1309,19 @@ fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
 /// is measured by [`task_duration_min`] instead, which falls back to the leaves'
 /// calendars when this one has no working time.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
-    let week = match proj.calendar(proj.default_calendar_uid) {
-        Some(cal) => proj.resolved_week(cal),
-        None => Calendar::standard_week(),
+    let cal = match proj.calendar(proj.default_calendar_uid) {
+        Some(cal) => proj.resolved_calendar(cal),
+        None => WorkCalendar::weekly(Calendar::standard_week()),
     };
-    working_minutes_on(&week, start, finish)
+    working_minutes_on(&cal, start, finish)
 }
 
 /// Working minutes between two wall-clock instants on one calendar, counted
 /// through the same timeline the scheduler uses.
-pub(crate) fn working_minutes_on(week: &Week, start: DateTime, finish: DateTime) -> i64 {
+pub(crate) fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: DateTime) -> i64 {
     let a = start.minutes().min(finish.minutes());
     let b = start.minutes().max(finish.minutes());
-    let tl = Timeline::build(&week_pairs(week), a, a, (b - a) + 480, b + 1440);
+    let tl = Timeline::build(cal, a, a, (b - a) + 480, b + 1440);
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
@@ -1361,47 +1355,30 @@ pub(crate) fn summary_or_leaf_min(
     }
 }
 
-/// The working week every summary is measured on. MS Project uses the project
-/// calendar, resolved as the scheduler resolves it. When that calendar has no
-/// working time (allowed as long as every leaf uses its own working calendar),
-/// the substitute is the per-weekday union of the working time of the
-/// calendars of all schedulable leaves, so equal dates still mean equal
-/// durations across summaries.
-fn summary_calendar(proj: &Project) -> Week {
+/// The calendar every summary is measured on. MS Project uses the project
+/// calendar, resolved as the scheduler resolves it, exceptions included. When
+/// that calendar has no weekly working time (allowed as long as every leaf uses
+/// its own working calendar), the substitute is the per-date union of the
+/// working time of the calendars of all schedulable leaves, so equal dates
+/// still mean equal durations across summaries.
+fn summary_calendar(proj: &Project) -> WorkCalendar {
     let calendars = CalendarResolver::new(proj);
     let Some(default) = calendars.resolve(None) else {
-        return Calendar::standard_week();
+        return WorkCalendar::weekly(Calendar::standard_week());
     };
-    let default_week = calendars.week(default);
-    if has_working_time(&default_week) {
-        return default_week;
+    if has_working_time(&calendars.week(default)) {
+        return calendars.calendar(default);
     }
-    let mut union: Week = Default::default();
     let mut seen = std::collections::HashSet::new();
-    for cal in proj
-        .tasks
-        .iter()
-        .filter(|t| calendars.schedulable(t))
-        .filter_map(|t| calendars.resolve(t.calendar_uid))
-        .filter(|cal| seen.insert(cal.uid))
-    {
-        for (day, times) in union.iter_mut().zip(&calendars.week(cal)) {
-            day.times
-                .extend(times.times.iter().filter(|t| t.from < t.to).copied());
-        }
-    }
-    for day in &mut union {
-        day.times.sort_by_key(|t| t.from);
-        let mut merged: Vec<WorkingTime> = Vec::new();
-        for t in day.times.drain(..) {
-            match merged.last_mut() {
-                Some(last) if t.from <= last.to => last.to = last.to.max(t.to),
-                _ => merged.push(t),
-            }
-        }
-        day.times = merged;
-    }
-    union
+    WorkCalendar::union(
+        proj.tasks
+            .iter()
+            .filter(|t| calendars.schedulable(t))
+            .filter_map(|t| calendars.resolve(t.calendar_uid))
+            .filter(|cal| seen.insert(cal.uid))
+            .map(|cal| calendars.calendar(cal))
+            .collect(),
+    )
 }
 
 // ---- resource leveling ------------------------------------------------------
@@ -4854,5 +4831,127 @@ mod tests {
         let baseline = schedule(&proj);
         proj.tasks[1].deadline = Some(dt(6, 17));
         assert_eq!(schedule(&proj).get(2), baseline.get(2));
+    }
+
+    /// A non-working date-range exception over 2026-03-`first`..=`last`.
+    fn holiday(first: u32, last: u32) -> CalendarException {
+        CalendarException::date_range(
+            at(first, 0),
+            DateTime::from_ymd_hm(2026, 3, last, 23, 59),
+            DayWorking::default(),
+        )
+    }
+
+    /// A working exception on 2026-03-`day` with these `(from, to)` hours.
+    fn worked(day: u32, hours: &[(u32, u32)]) -> CalendarException {
+        CalendarException::date_range(
+            at(day, 0),
+            DateTime::from_ymd_hm(2026, 3, day, 23, 59),
+            DayWorking {
+                times: hours
+                    .iter()
+                    .map(|&(from, to)| WorkingTime {
+                        from: from * 60,
+                        to: to * 60,
+                    })
+                    .collect(),
+            },
+        )
+    }
+
+    #[test]
+    fn a_holiday_inside_a_task_pushes_its_finish_out_by_that_day() {
+        let mut proj = march2(vec![task(1, "A", 3 * 480)]);
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-04T17:00:00");
+        proj.calendars[0].exceptions.push(holiday(4, 4));
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-05T17:00:00".into())
+        );
+        assert_eq!(level(&proj).finish(1), Some(at(5, 17)));
+        // A holiday on the project start moves the start to the next day.
+        proj.calendars[0].exceptions = vec![holiday(2, 2)];
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-03T08:00:00".into(), "2026-03-05T17:00:00".into())
+        );
+    }
+
+    #[test]
+    fn a_multi_day_holiday_covers_each_date_from_first_to_last() {
+        let mut proj = march2(vec![task(1, "A", 3 * 480)]);
+        proj.calendars[0].exceptions.push(holiday(3, 5));
+        // Monday, Friday, then the next Monday.
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-09T17:00:00");
+    }
+
+    #[test]
+    fn a_working_exception_replaces_that_days_hours() {
+        // Tuesday 08:00-12:00 only: two days end Wednesday noon.
+        let mut proj = march2(vec![task(1, "A", 2 * 480)]);
+        proj.calendars[0].exceptions.push(worked(3, &[(8, 12)]));
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-04T12:00:00");
+        // A working Saturday: six days end that Saturday.
+        let mut proj = march2(vec![task(1, "A", 6 * 480)]);
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-09T17:00:00");
+        proj.calendars[0]
+            .exceptions
+            .push(worked(7, &[(8, 12), (13, 17)]));
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-07T17:00:00");
+    }
+
+    #[test]
+    fn a_task_on_a_derived_calendar_skips_its_base_calendars_holiday() {
+        let mut a = task(1, "A", 4 * 480);
+        a.calendar_uid = Some(2);
+        let mut standard = Calendar::standard(1);
+        standard.exceptions.push(holiday(4, 4));
+        let mut proj = march2(vec![a]);
+        proj.calendars = vec![standard, derived(2, 1, &[(5, DayWorking::default())])];
+        // Mon, Tue, Thu, then (Friday off) Monday.
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-09T17:00:00");
+        // Stating Wednesday itself overrides the base's holiday.
+        proj.calendars[1].week[3] = Some(Calendar::standard_week()[3].clone());
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-05T17:00:00");
+        // Its own holiday beats its own Wednesday.
+        proj.calendars[1].exceptions.push(holiday(4, 4));
+        assert_eq!(dates(&schedule(&proj), 1).1, "2026-03-09T17:00:00");
+    }
+
+    #[test]
+    fn exceptions_never_make_an_empty_calendar_schedulable() {
+        let mut closed = closed_calendar(2);
+        closed.exceptions.push(worked(7, &[(8, 17)]));
+        let mut a = task(1, "A", 480);
+        a.calendar_uid = Some(2);
+        let mut proj = march2(vec![a]);
+        proj.calendars.push(closed);
+        assert!(
+            calendar_error(&proj)
+                .unwrap()
+                .contains("has no working time")
+        );
+    }
+
+    #[test]
+    fn summary_duration_and_working_minutes_skip_a_holiday() {
+        let mut b = child(3, "B", 480, 1);
+        b.predecessors.push(fs(2));
+        let mut proj = march2(vec![phase(1), child(2, "A", 480, 1), b]);
+        proj.calendars[0].exceptions.push(holiday(3, 3));
+        let s = schedule(&proj);
+        assert_eq!(dates(&s, 3).1, "2026-03-04T17:00:00");
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(960));
+        assert_eq!(working_minutes_between(&proj, at(2, 8), at(4, 17)), 960);
+        // On a closed project calendar the leaves' calendars, holidays
+        // included, measure the summary.
+        let mut b = child(3, "B", 480, 3);
+        b.predecessors.push(fs(2));
+        let mut standard = Calendar::standard(3);
+        standard.exceptions.push(holiday(3, 3));
+        let proj = closed_default(vec![phase(1), child(2, "A", 480, 3), b], vec![standard]);
+        let s = schedule(&proj);
+        assert_eq!(dates(&s, 1).1, "2026-03-04T17:00:00");
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(960));
     }
 }

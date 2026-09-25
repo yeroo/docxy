@@ -1425,3 +1425,27 @@ fn typed_dates_resolve_derived_calendars_like_the_scheduler() {
         day_finish(ed.project(), &task, monday).unwrap()
     );
 }
+
+#[test]
+fn typed_finish_across_a_holiday_counts_only_working_time() {
+    let mut ed = manual_editor();
+    // Wednesday 2026-01-07 is a holiday on the project calendar.
+    let holiday = parse_cell_date("2026-01-07").unwrap();
+    ed.proj.calendars[0]
+        .exceptions
+        .push(crate::model::CalendarException::date_range(
+            holiday,
+            holiday.add_minutes(23 * 60 + 59),
+            crate::model::DayWorking::default(),
+        ));
+    ed.set_finish(20, parse_cell_date("2026-01-08").unwrap())
+        .unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(mspdi(task.manual_finish).unwrap(), "2026-01-08T17:00:00");
+    // Monday, Tuesday and Thursday.
+    assert_eq!(task.duration_min, 3 * 480);
+    // A holiday has no working finish for an auto task's constraint.
+    let auto = Task::default();
+    assert!(day_finish(ed.project(), &auto, holiday).is_err());
+    assert!(day_finish(ed.project(), &auto, holiday.add_days(1)).is_ok());
+}

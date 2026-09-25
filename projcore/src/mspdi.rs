@@ -540,9 +540,11 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
         base_calendar_uid: None,
         is_baseline_calendar: false,
         week: Default::default(),
+        exceptions: Vec::new(),
     };
     let mut is_base = false;
     let mut base_uid: Option<i32> = None;
+    let mut legacy = Vec::new();
     loop {
         match p.next() {
             Event::Start => {
@@ -553,13 +555,21 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
                     "IsBaseCalendar" => is_base = bool_of(p),
                     "IsBaselineCalendar" => cal.is_baseline_calendar = bool_of(p),
                     "BaseCalendarUID" => base_uid = opt_i32_of(p),
-                    "WeekDays" => parse_weekdays(p, &mut cal.week),
+                    "WeekDays" => parse_weekdays(p, &mut cal.week, &mut legacy),
+                    "Exceptions" => parse_exceptions(p, &mut cal.exceptions),
                     _ => p.skip_element(),
                 }
             }
             Event::End | Event::Eof => break,
             _ => {}
         }
+    }
+    // Project writes each date-range exception twice: as a legacy `DayType 0`
+    // weekday and in `Exceptions`. `Exceptions` is the full form and wins; a
+    // file with only the legacy form (an older writer's) reads as the same
+    // date-range exceptions.
+    if cal.exceptions.is_empty() {
+        cal.exceptions = legacy;
     }
     // A derived calendar states only the days it overrides and inherits the
     // rest; a base calendar's unstated days are non-working.
@@ -575,12 +585,16 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
     cal
 }
 
-fn parse_weekdays(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
+fn parse_weekdays(
+    p: &mut XmlParser,
+    week: &mut [Option<DayWorking>; 7],
+    legacy: &mut Vec<CalendarException>,
+) {
     loop {
         match p.next() {
             Event::Start => {
                 if p.name() == "WeekDay" {
-                    parse_weekday(p, week);
+                    parse_weekday(p, week, legacy);
                 } else {
                     p.skip_element();
                 }
@@ -591,10 +605,86 @@ fn parse_weekdays(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
     }
 }
 
-fn parse_weekday(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
+fn parse_weekday(
+    p: &mut XmlParser,
+    week: &mut [Option<DayWorking>; 7],
+    legacy: &mut Vec<CalendarException>,
+) {
     // MSPDI DayType: 1=Sunday .. 7=Saturday. Our week[] is Sunday=0..Saturday=6.
-    // DayType 0 is a legacy exception entry, not a weekday (exceptions: #126).
-    let mut day_type: Option<usize> = None;
+    // DayType 0 is Project's legacy form of a date-range exception.
+    let mut day_type: Option<i64> = None;
+    let mut working = false;
+    let mut times: Vec<WorkingTime> = Vec::new();
+    let mut period = (None, None);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "DayType" => day_type = opt_int_of(p),
+                    "DayWorking" => working = bool_of(p),
+                    "WorkingTimes" => parse_working_times(p, &mut times),
+                    "TimePeriod" => period = parse_time_period(p),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    // A non-working day yields empty times even if some were present.
+    let day = DayWorking {
+        times: if working { times } else { Vec::new() },
+    };
+    match day_type {
+        Some(d @ 1..=7) => week[d as usize - 1] = Some(day),
+        Some(0) => {
+            if let (Some(from), Some(to)) = period {
+                legacy.push(CalendarException::date_range(from, to, day));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `TimePeriod`: its `FromDate` and `ToDate`.
+fn parse_time_period(p: &mut XmlParser) -> (Option<DateTime>, Option<DateTime>) {
+    let (mut from, mut to) = (None, None);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "FromDate" => from = DateTime::parse_mspdi(&text_of(p)),
+                    "ToDate" => to = DateTime::parse_mspdi(&text_of(p)),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    (from, to)
+}
+
+fn parse_exceptions(p: &mut XmlParser, out: &mut Vec<CalendarException>) {
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "Exception" {
+                    out.push(parse_exception(p));
+                } else {
+                    p.skip_element();
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+}
+
+fn parse_exception(p: &mut XmlParser) -> CalendarException {
+    let mut exception = CalendarException::default();
     let mut working = false;
     let mut times: Vec<WorkingTime> = Vec::new();
     loop {
@@ -602,12 +692,17 @@ fn parse_weekday(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
-                    "DayType" => {
-                        day_type = match int_of(p) {
-                            d @ 1..=7 => Some(d as usize - 1),
-                            _ => None,
-                        }
-                    }
+                    "EnteredByOccurrences" => exception.entered_by_occurrences = opt_bool_of(p),
+                    "TimePeriod" => (exception.from, exception.to) = parse_time_period(p),
+                    "Occurrences" => exception.occurrences = opt_i32_of(p),
+                    "Name" => exception.name = Some(text_of(p)),
+                    "Type" => exception.kind = opt_i32_of(p),
+                    "Period" => exception.period = opt_i32_of(p),
+                    "DaysOfWeek" => exception.days_of_week = opt_i32_of(p),
+                    "MonthItem" => exception.month_item = opt_i32_of(p),
+                    "MonthPosition" => exception.month_position = opt_i32_of(p),
+                    "Month" => exception.month = opt_i32_of(p),
+                    "MonthDay" => exception.month_day = opt_i32_of(p),
                     "DayWorking" => working = bool_of(p),
                     "WorkingTimes" => parse_working_times(p, &mut times),
                     _ => p.skip_element(),
@@ -617,12 +712,10 @@ fn parse_weekday(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
             _ => {}
         }
     }
-    if let Some(d) = day_type {
-        // A non-working day yields empty times even if some were present.
-        week[d] = Some(DayWorking {
-            times: if working { times } else { Vec::new() },
-        });
+    if working {
+        exception.day.times = times;
     }
+    exception
 }
 
 fn parse_working_times(p: &mut XmlParser, out: &mut Vec<WorkingTime>) {
@@ -818,9 +911,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 ///
 /// The computed task fields (`OutlineNumber`, early/late dates, the four
 /// slacks, `Critical`) come from [`crate::schedule::schedule`], never from
-/// values read from a file. Known limit: that schedule ignores calendar
-/// exceptions (#126), so on a plan with holidays these fields can differ from
-/// Project's and from the stored `Start`/`Finish`.
+/// values read from a file. That schedule honours each calendar's daily
+/// (`Type 1`) exceptions. Known limit: recurring exceptions (`Type` 2-8, or a
+/// `Period` above 1) are written back but not scheduled, so on a plan with one
+/// these fields can differ from Project's and from the stored `Start`/`Finish`.
 pub fn write_mspdi(proj: &Project) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
@@ -1311,33 +1405,109 @@ fn write_calendar(s: &mut String, c: &Calendar) {
             (None, Some(_)) => None,
         })
         .collect();
-    if days.is_empty() {
-        s.push_str("    </Calendar>\n");
+    // Like Project, each exception the scheduler honours is also written in
+    // the legacy form, a `DayType 0` weekday over its dates.
+    let legacy: Vec<(&CalendarException, DateTime, DateTime)> = c
+        .exceptions
+        .iter()
+        .filter(|e| e.scheduled().is_some())
+        .filter_map(|e| Some((e, e.from?, e.to?)))
+        .collect();
+    if !days.is_empty() || !legacy.is_empty() {
+        s.push_str("      <WeekDays>\n");
+        for (idx, day) in days {
+            // model week[] is Sun=0..Sat=6; MSPDI DayType is 1=Sun..7=Sat.
+            s.push_str("        <WeekDay>\n");
+            tag(s, 5, "DayType", &(idx + 1).to_string());
+            write_day_working(s, day);
+            s.push_str("        </WeekDay>\n");
+        }
+        for (e, from, to) in legacy {
+            s.push_str("        <WeekDay>\n");
+            tag(s, 5, "DayType", "0");
+            tag(s, 5, "DayWorking", if e.day.working() { "1" } else { "0" });
+            write_time_period(s, from, to);
+            write_working_times(s, &e.day);
+            s.push_str("        </WeekDay>\n");
+        }
+        s.push_str("      </WeekDays>\n");
+    }
+    if !c.exceptions.is_empty() {
+        s.push_str("      <Exceptions>\n");
+        for e in &c.exceptions {
+            write_exception(s, e);
+        }
+        s.push_str("      </Exceptions>\n");
+    }
+    s.push_str("    </Calendar>\n");
+}
+
+/// One `Exception`, its elements in schema order; a field the reader found
+/// absent stays absent.
+fn write_exception(s: &mut String, e: &CalendarException) {
+    let int = |s: &mut String, name: &str, value: Option<i32>| {
+        if let Some(value) = value {
+            tag(s, 5, name, &value.to_string());
+        }
+    };
+    s.push_str("        <Exception>\n");
+    if let Some(entered) = e.entered_by_occurrences {
+        tag(s, 5, "EnteredByOccurrences", flag(entered));
+    }
+    if e.from.is_some() || e.to.is_some() {
+        s.push_str("          <TimePeriod>\n");
+        if let Some(from) = e.from {
+            tag(s, 6, "FromDate", &from.to_mspdi());
+        }
+        if let Some(to) = e.to {
+            tag(s, 6, "ToDate", &to.to_mspdi());
+        }
+        s.push_str("          </TimePeriod>\n");
+    }
+    int(s, "Occurrences", e.occurrences);
+    if let Some(name) = &e.name {
+        tag(s, 5, "Name", name);
+    }
+    int(s, "Type", e.kind);
+    int(s, "Period", e.period);
+    int(s, "DaysOfWeek", e.days_of_week);
+    int(s, "MonthItem", e.month_item);
+    int(s, "MonthPosition", e.month_position);
+    int(s, "Month", e.month);
+    int(s, "MonthDay", e.month_day);
+    write_day_working(s, &e.day);
+    s.push_str("        </Exception>\n");
+}
+
+/// A legacy weekday's `TimePeriod`.
+fn write_time_period(s: &mut String, from: DateTime, to: DateTime) {
+    s.push_str("          <TimePeriod>\n");
+    tag(s, 6, "FromDate", &from.to_mspdi());
+    tag(s, 6, "ToDate", &to.to_mspdi());
+    s.push_str("          </TimePeriod>\n");
+}
+
+/// `DayWorking`, then `WorkingTimes` when the day works.
+fn write_day_working(s: &mut String, day: &DayWorking) {
+    tag(s, 5, "DayWorking", if day.working() { "1" } else { "0" });
+    write_working_times(s, day);
+}
+
+fn write_working_times(s: &mut String, day: &DayWorking) {
+    if !day.working() {
         return;
     }
-    s.push_str("      <WeekDays>\n");
-    for (idx, day) in days {
-        // model week[] is Sun=0..Sat=6; MSPDI DayType is 1=Sun..7=Sat.
-        s.push_str("        <WeekDay>\n");
-        tag(s, 5, "DayType", &(idx + 1).to_string());
-        tag(s, 5, "DayWorking", if day.working() { "1" } else { "0" });
-        if day.working() {
-            s.push_str("          <WorkingTimes>\n");
-            for w in &day.times {
-                s.push_str("            <WorkingTime>");
-                s.push_str(&format!(
-                    "<FromTime>{}</FromTime><ToTime>{}</ToTime>",
-                    min_to_clock(w.from),
-                    min_to_clock(w.to)
-                ));
-                s.push_str("</WorkingTime>\n");
-            }
-            s.push_str("          </WorkingTimes>\n");
-        }
-        s.push_str("        </WeekDay>\n");
+    s.push_str("          <WorkingTimes>\n");
+    for w in &day.times {
+        s.push_str("            <WorkingTime>");
+        s.push_str(&format!(
+            "<FromTime>{}</FromTime><ToTime>{}</ToTime>",
+            min_to_clock(w.from),
+            min_to_clock(w.to)
+        ));
+        s.push_str("</WorkingTime>\n");
     }
-    s.push_str("      </WeekDays>\n");
-    s.push_str("    </Calendar>\n");
+    s.push_str("          </WorkingTimes>\n");
 }
 
 /// Write `<Name>text</Name>` at the given indent depth (2 spaces each), with the
@@ -4115,5 +4285,235 @@ mod tests {
                 "{element}"
             );
         }
+    }
+
+    /// A plan whose Standard calendar carries `standard_extra` (legacy weekday
+    /// entries) and `standard_exceptions`, plus a calendar "Crew" derived from
+    /// it with `crew`, and one 3-day task.
+    fn exceptions_xml(standard_extra: &str, standard_exceptions: &str, crew: &str) -> String {
+        let day = |d: u32| {
+            if (2..=6).contains(&d) {
+                format!(
+                    "<WeekDay><DayType>{d}</DayType><DayWorking>1</DayWorking><WorkingTimes>\
+                     <WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime>\
+                     <WorkingTime><FromTime>13:00:00</FromTime><ToTime>17:00:00</ToTime></WorkingTime>\
+                     </WorkingTimes></WeekDay>"
+                )
+            } else {
+                format!("<WeekDay><DayType>{d}</DayType><DayWorking>0</DayWorking></WeekDay>")
+            }
+        };
+        let week: String = (1..=7).map(day).collect();
+        format!(
+            r#"<Project><StartDate>2026-03-02T08:00:00</StartDate><CalendarUID>1</CalendarUID><Calendars>
+            <Calendar><UID>1</UID><Name>Standard</Name><IsBaseCalendar>1</IsBaseCalendar>
+              <BaseCalendarUID>-1</BaseCalendarUID>
+              <WeekDays>{week}{standard_extra}</WeekDays>{standard_exceptions}</Calendar>
+            <Calendar><UID>2</UID><Name>Crew</Name><IsBaseCalendar>0</IsBaseCalendar>
+              <BaseCalendarUID>1</BaseCalendarUID>{crew}</Calendar>
+            </Calendars><Tasks>
+            <Task><UID>1</UID><ID>1</ID><Name>A</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT24H0M0S</Duration></Task>
+            </Tasks></Project>"#
+        )
+    }
+
+    const LEGACY_HOLIDAY: &str = "<WeekDay><DayType>0</DayType><DayWorking>0</DayWorking>\
+        <TimePeriod><FromDate>2026-03-04T00:00:00</FromDate><ToDate>2026-03-04T23:59:00</ToDate></TimePeriod>\
+        </WeekDay>";
+    const LEGACY_SATURDAY: &str = "<WeekDay><DayType>0</DayType><DayWorking>1</DayWorking>\
+        <TimePeriod><FromDate>2026-03-07T00:00:00</FromDate><ToDate>2026-03-07T23:59:00</ToDate></TimePeriod>\
+        <WorkingTimes><WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime></WorkingTimes>\
+        </WeekDay>";
+    /// Project's own shape: a named holiday, a working Saturday, and a
+    /// yearly recurrence with every recurrence field.
+    const EXCEPTIONS: &str = "<Exceptions>\
+        <Exception><EnteredByOccurrences>0</EnteredByOccurrences>\
+          <TimePeriod><FromDate>2026-03-04T00:00:00</FromDate><ToDate>2026-03-04T23:59:00</ToDate></TimePeriod>\
+          <Occurrences>1</Occurrences><Name>Founders day</Name><Type>1</Type><DayWorking>0</DayWorking></Exception>\
+        <Exception><EnteredByOccurrences>0</EnteredByOccurrences>\
+          <TimePeriod><FromDate>2026-03-07T00:00:00</FromDate><ToDate>2026-03-07T23:59:00</ToDate></TimePeriod>\
+          <Occurrences>1</Occurrences><Name>Stocktake</Name><Type>1</Type><DayWorking>1</DayWorking>\
+          <WorkingTimes><WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime></WorkingTimes>\
+        </Exception>\
+        <Exception><EnteredByOccurrences>1</EnteredByOccurrences>\
+          <TimePeriod><FromDate>2026-12-25T00:00:00</FromDate><ToDate>2030-12-25T23:59:00</ToDate></TimePeriod>\
+          <Occurrences>5</Occurrences><Name>Christmas &amp; co</Name><Type>2</Type><Period>1</Period>\
+          <DaysOfWeek>0</DaysOfWeek><MonthItem>0</MonthItem><MonthPosition>0</MonthPosition>\
+          <Month>11</Month><MonthDay>25</MonthDay><DayWorking>0</DayWorking></Exception>\
+        </Exceptions>";
+    const CREW_MONDAY_OFF: &str = "<Exceptions><Exception>\
+        <TimePeriod><FromDate>2026-03-09T00:00:00</FromDate><ToDate>2026-03-09T23:59:00</ToDate></TimePeriod>\
+        <Type>1</Type><DayWorking>0</DayWorking></Exception></Exceptions>";
+
+    fn march(day: u32) -> DateTime {
+        DateTime::from_ymd_hm(2026, 3, day, 0, 0)
+    }
+
+    fn march_end(day: u32) -> DateTime {
+        DateTime::from_ymd_hm(2026, 3, day, 23, 59)
+    }
+
+    fn morning() -> DayWorking {
+        DayWorking {
+            times: vec![WorkingTime {
+                from: 8 * 60,
+                to: 12 * 60,
+            }],
+        }
+    }
+
+    #[test]
+    fn calendar_exceptions_keep_every_field_through_mspdi_and_yppx() {
+        let xml = exceptions_xml(
+            &format!("{LEGACY_HOLIDAY}{LEGACY_SATURDAY}"),
+            EXCEPTIONS,
+            CREW_MONDAY_OFF,
+        );
+        let proj = read_mspdi(&xml).unwrap();
+        let standard = proj.calendar(1).unwrap();
+        // The legacy entries repeat the first two exceptions and are not added.
+        assert_eq!(
+            standard.exceptions,
+            [
+                CalendarException {
+                    name: Some("Founders day".into()),
+                    ..CalendarException::date_range(march(4), march_end(4), DayWorking::default())
+                },
+                CalendarException {
+                    name: Some("Stocktake".into()),
+                    ..CalendarException::date_range(march(7), march_end(7), morning())
+                },
+                CalendarException {
+                    name: Some("Christmas & co".into()),
+                    from: Some(DateTime::from_ymd_hm(2026, 12, 25, 0, 0)),
+                    to: Some(DateTime::from_ymd_hm(2030, 12, 25, 23, 59)),
+                    kind: Some(2),
+                    occurrences: Some(5),
+                    entered_by_occurrences: Some(true),
+                    period: Some(1),
+                    days_of_week: Some(0),
+                    month_item: Some(0),
+                    month_position: Some(0),
+                    month: Some(11),
+                    month_day: Some(25),
+                    day: DayWorking::default(),
+                },
+            ]
+        );
+        let crew = proj.calendar(2).unwrap();
+        assert_eq!(
+            crew.exceptions,
+            [CalendarException {
+                kind: Some(1),
+                from: Some(march(9)),
+                to: Some(march_end(9)),
+                ..CalendarException::default()
+            }]
+        );
+        assert_eq!(crew.week, <[Option<DayWorking>; 7]>::default());
+
+        let written = write_mspdi(&proj);
+        assert_eq!(read_mspdi(&written).unwrap().calendars, proj.calendars);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.calendars, proj.calendars);
+        // Each scheduled exception is also written in the legacy form, the
+        // yearly one only in `Exceptions`.
+        let block = calendar_block(&written, 1);
+        assert_eq!(block.matches("<DayType>0</DayType>").count(), 2);
+        assert_eq!(block.matches("<Exception>").count(), 3);
+        assert!(block.find("</WeekDays>").unwrap() < block.find("<Exceptions>").unwrap());
+        // A derived calendar with no weekdays of its own still writes its
+        // exceptions, and the legacy form of the scheduled one.
+        let block = calendar_block(&written, 2);
+        assert_eq!(block.matches("<WeekDay>").count(), 1);
+        assert_eq!(block.matches("<DayType>0</DayType>").count(), 1);
+        assert_eq!(block.matches("<Exception>").count(), 1);
+        // Only the calendar has a name; the exception had none to write.
+        assert_eq!(block.matches("<Name>").count(), 1);
+        assert!(!block.contains("<Occurrences>"));
+
+        // The holiday moves the task: Mon, Tue, then Thu. The working Saturday
+        // comes after it.
+        let sched = crate::schedule::schedule(&proj);
+        assert_eq!(
+            sched.get(1).unwrap().early_finish.to_mspdi(),
+            "2026-03-05T17:00:00"
+        );
+    }
+
+    #[test]
+    fn exception_elements_are_written_in_schema_order() {
+        let proj = read_mspdi(&exceptions_xml("", EXCEPTIONS, "")).unwrap();
+        let written = write_mspdi(&proj);
+        let block = calendar_block(&written, 1);
+        let yearly = &block[block.find("<Name>Christmas").unwrap()..];
+        let start = block[..block.len() - yearly.len()]
+            .rfind("<Exception>")
+            .unwrap();
+        let end = start + block[start..].find("</Exception>").unwrap();
+        let names: Vec<&str> = block[start + "<Exception>".len()..end]
+            .split('<')
+            .filter(|t| !t.trim().is_empty() && !t.starts_with('/'))
+            .map(|t| t.split('>').next().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "EnteredByOccurrences",
+                "TimePeriod",
+                "FromDate",
+                "ToDate",
+                "Occurrences",
+                "Name",
+                "Type",
+                "Period",
+                "DaysOfWeek",
+                "MonthItem",
+                "MonthPosition",
+                "Month",
+                "MonthDay",
+                "DayWorking",
+            ]
+        );
+        assert!(written.contains("<Name>Christmas &amp; co</Name>"));
+    }
+
+    #[test]
+    fn legacy_exception_entries_alone_read_as_date_range_exceptions() {
+        let xml = exceptions_xml(&format!("{LEGACY_HOLIDAY}{LEGACY_SATURDAY}"), "", "");
+        let proj = read_mspdi(&xml).unwrap();
+        assert_eq!(
+            proj.calendar(1).unwrap().exceptions,
+            [
+                CalendarException::date_range(march(4), march_end(4), DayWorking::default()),
+                CalendarException::date_range(march(7), march_end(7), morning()),
+            ]
+        );
+        // Written in both forms and read back from `Exceptions`: a fixed point.
+        let written = write_mspdi(&proj);
+        let block = calendar_block(&written, 1);
+        assert_eq!(block.matches("<DayType>0</DayType>").count(), 2);
+        assert_eq!(block.matches("<Exception>").count(), 2);
+        assert_eq!(block.matches("<Occurrences>1</Occurrences>").count(), 2);
+        assert_eq!(block.matches("<Name>").count(), 1);
+        let again = read_mspdi(&written).unwrap();
+        assert_eq!(again.calendars, proj.calendars);
+        assert_eq!(write_mspdi(&again), written);
+    }
+
+    #[test]
+    fn exceptions_win_over_legacy_entries_that_disagree() {
+        // Only the `Exceptions` form counts when both are present.
+        let only_saturday = "<Exceptions><Exception>\
+            <TimePeriod><FromDate>2026-03-07T00:00:00</FromDate><ToDate>2026-03-07T23:59:00</ToDate></TimePeriod>\
+            <Type>1</Type><DayWorking>1</DayWorking>\
+            <WorkingTimes><WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime></WorkingTimes>\
+            </Exception></Exceptions>";
+        let proj = read_mspdi(&exceptions_xml(LEGACY_HOLIDAY, only_saturday, "")).unwrap();
+        let exceptions = &proj.calendar(1).unwrap().exceptions;
+        assert_eq!(exceptions.len(), 1);
+        assert_eq!(exceptions[0].from, Some(march(7)));
+        assert_eq!(exceptions[0].day, morning());
     }
 }

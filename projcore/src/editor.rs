@@ -509,8 +509,9 @@ impl Editor {
                 t.outline_level = lv;
             }
         })?;
-        // Only a date change restamps: projcore ignores calendar exceptions,
-        // so our finish can differ from the one Project wrote. A blank row's
+        // Only a date change restamps: a rename or a level change keeps the
+        // Finish Project wrote, which our schedule can still differ from
+        // (recurring calendar exceptions are not scheduled). A blank row's
         // new dates are stamped by edit_row.
         if duration_changed {
             self.stamp_pinned_dates(uid);

@@ -533,8 +533,9 @@ pub type Week = [DayWorking; 7];
 
 /// A working-time calendar. `week[d]` is indexed by weekday, Sunday=0..Saturday=6
 /// (matching [`DateTime::weekday`]). A derived calendar states only the days it
-/// overrides; resolve its working time with [`Project::resolved_week`] rather
-/// than reading `week` directly.
+/// overrides; resolve its working time with [`Project::resolved_calendar`]
+/// (by date, with exceptions) or [`Project::resolved_week`] (the weekly
+/// pattern alone) rather than reading `week` directly.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Calendar {
     pub uid: i32,
@@ -548,6 +549,62 @@ pub struct Calendar {
     /// calendar's day; a base calendar has no base, so there an unstated day is
     /// non-working.
     pub week: [Option<DayWorking>; 7],
+    /// MSPDI `Exceptions`, in file order: holidays, one-off working days and
+    /// changed hours. Only [`CalendarException::scheduled`] ones change working
+    /// time; the rest are kept so a save writes them back.
+    pub exceptions: Vec<CalendarException>,
+}
+
+/// One MSPDI calendar exception, with every field kept as read (`None` when
+/// the file omitted it) so a save writes it back unchanged.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct CalendarException {
+    pub name: Option<String>,
+    /// `TimePeriod/FromDate` and `TimePeriod/ToDate`.
+    pub from: Option<DateTime>,
+    pub to: Option<DateTime>,
+    /// MSPDI `Type`: 1 is daily, 2-8 are recurring patterns.
+    pub kind: Option<i32>,
+    pub occurrences: Option<i32>,
+    pub entered_by_occurrences: Option<bool>,
+    pub period: Option<i32>,
+    pub days_of_week: Option<i32>,
+    pub month_item: Option<i32>,
+    pub month_position: Option<i32>,
+    pub month: Option<i32>,
+    pub month_day: Option<i32>,
+    /// The day's working time; empty `times` ⇒ non-working.
+    pub day: DayWorking,
+}
+
+impl CalendarException {
+    /// A date-range exception filled in as Project writes one (daily, one
+    /// occurrence, not entered by occurrences, no name). Project's legacy
+    /// `WeekDay` `DayType 0` entries read as these, so a save and a reread
+    /// give the same value.
+    pub fn date_range(from: DateTime, to: DateTime, day: DayWorking) -> CalendarException {
+        CalendarException {
+            from: Some(from),
+            to: Some(to),
+            kind: Some(1),
+            occurrences: Some(1),
+            entered_by_occurrences: Some(false),
+            day,
+            ..CalendarException::default()
+        }
+    }
+
+    /// The inclusive range of day numbers the scheduler honours this exception
+    /// on: a daily (`Type 1`) exception, from `FromDate`'s date to `ToDate`'s
+    /// date. A recurrence (`Type` 2-8, or `Period` > 1) is kept but not
+    /// scheduled, and yields `None`.
+    pub fn scheduled(&self) -> Option<(i64, i64)> {
+        if self.kind != Some(1) || self.period.is_some_and(|p| p > 1) {
+            return None;
+        }
+        let first = self.from?.day_number();
+        Some((first, self.to?.day_number().max(first)))
+    }
 }
 
 impl Calendar {
@@ -591,6 +648,7 @@ impl Calendar {
             base_calendar_uid: None,
             is_baseline_calendar: false,
             week: week.map(Some),
+            exceptions: Vec::new(),
         }
     }
 
@@ -614,6 +672,193 @@ impl Calendar {
         }
         week.map(|day| day.cloned().unwrap_or_default())
     }
+
+    /// This calendar's working time by date, exceptions included, through the
+    /// base chain [`Calendar::resolve_week`] walks.
+    pub fn resolve<'a>(&'a self, lookup: impl Fn(i32) -> Option<&'a Calendar>) -> WorkCalendar {
+        let mut levels = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut next = Some(self);
+        while let Some(cal) = next {
+            if !seen.insert(cal.uid) {
+                break;
+            }
+            levels.push(Level::new(cal));
+            next = cal.base_calendar_uid.and_then(&lookup);
+        }
+        WorkCalendar(Kind::Chain(levels))
+    }
+}
+
+/// Working time resolved by date: a calendar with its base chain and
+/// exceptions, a plain weekly pattern, or the union of several calendars (the
+/// summary calendar's fallback).
+///
+/// A day resolves calendar by calendar down the base chain, to the first of:
+/// the calendar's own scheduled exception covering that date, then the weekday
+/// it states. A day nothing states is non-working. So a derived calendar
+/// inherits its base's holidays unless it states that date or weekday itself
+/// (MPXJ's rule).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WorkCalendar(Kind);
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Kind {
+    Chain(Vec<Level>),
+    Union(Vec<WorkCalendar>),
+}
+
+/// One calendar of a base chain.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Level {
+    /// Scheduled exceptions as disjoint `(first_day, last_day, working)`
+    /// ranges sorted by day. Where exceptions overlap, the first in file order
+    /// wins.
+    exceptions: Vec<(i64, i64, DayWorking)>,
+    week: [Option<DayWorking>; 7],
+}
+
+impl Level {
+    fn new(cal: &Calendar) -> Level {
+        let mut ranges: Vec<(i64, i64, DayWorking)> = Vec::new();
+        for exception in &cal.exceptions {
+            let Some(range) = exception.scheduled() else {
+                continue;
+            };
+            // Keep only the days no earlier exception claimed.
+            let mut pieces = vec![range];
+            for &(taken_first, taken_last, _) in &ranges {
+                pieces = pieces
+                    .into_iter()
+                    .flat_map(|(first, last)| {
+                        if taken_last < first || taken_first > last {
+                            vec![(first, last)]
+                        } else {
+                            [(first, taken_first - 1), (taken_last + 1, last)]
+                                .into_iter()
+                                .filter(|(first, last)| first <= last)
+                                .collect()
+                        }
+                    })
+                    .collect();
+            }
+            ranges.extend(
+                pieces
+                    .into_iter()
+                    .map(|(first, last)| (first, last, exception.day.clone())),
+            );
+        }
+        ranges.sort_by_key(|&(first, _, _)| first);
+        Level {
+            exceptions: ranges,
+            week: cal.week.clone(),
+        }
+    }
+
+    /// What this calendar itself states for day number `day`: an exception
+    /// covering it, else its weekday, else nothing.
+    fn day(&self, day: i64) -> Option<&DayWorking> {
+        let after = self
+            .exceptions
+            .partition_point(|&(first, _, _)| first <= day);
+        if let Some((_, last, working)) = after.checked_sub(1).map(|i| &self.exceptions[i]) {
+            if day <= *last {
+                return Some(working);
+            }
+        }
+        self.week[(day + 4).rem_euclid(7) as usize].as_ref()
+    }
+}
+
+impl WorkCalendar {
+    /// A calendar that is the same every week.
+    pub fn weekly(week: Week) -> WorkCalendar {
+        WorkCalendar(Kind::Chain(vec![Level {
+            exceptions: Vec::new(),
+            week: week.map(Some),
+        }]))
+    }
+
+    /// Working time wherever any of `calendars` works.
+    pub fn union(calendars: Vec<WorkCalendar>) -> WorkCalendar {
+        WorkCalendar(Kind::Union(calendars))
+    }
+
+    /// The working time on day number `day` (as [`DateTime::day_number`]):
+    /// sorted, positive-length slots, overlaps merged.
+    pub fn day(&self, day: i64) -> Vec<WorkingTime> {
+        let mut out = Vec::new();
+        self.day_into(day, &mut out);
+        out
+    }
+
+    /// [`WorkCalendar::day`] into a reused buffer, which is cleared first.
+    pub(crate) fn day_into(&self, day: i64, out: &mut Vec<WorkingTime>) {
+        out.clear();
+        match &self.0 {
+            Kind::Chain(levels) => {
+                if let Some(working) = levels.iter().find_map(|level| level.day(day)) {
+                    out.extend(merge(working.times.iter().copied()));
+                }
+            }
+            Kind::Union(calendars) => {
+                let mut all = Vec::new();
+                let mut one = Vec::new();
+                for cal in calendars {
+                    cal.day_into(day, &mut one);
+                    all.append(&mut one);
+                }
+                out.extend(merge(all.into_iter()));
+            }
+        }
+    }
+
+    /// The weekly pattern alone, exceptions ignored. Whether a calendar can
+    /// schedule at all is decided on this, so an exception never makes an
+    /// otherwise empty calendar schedulable.
+    pub fn week(&self) -> Week {
+        match &self.0 {
+            Kind::Chain(levels) => std::array::from_fn(|dow| {
+                levels
+                    .iter()
+                    .find_map(|level| level.week[dow].clone())
+                    .unwrap_or_default()
+            }),
+            Kind::Union(calendars) => {
+                let weeks: Vec<Week> = calendars.iter().map(WorkCalendar::week).collect();
+                std::array::from_fn(|dow| DayWorking {
+                    times: merge(
+                        weeks
+                            .iter()
+                            .flat_map(|week| week[dow].times.iter().copied()),
+                    ),
+                })
+            }
+        }
+    }
+
+    /// Whether the weekly pattern has any working time (see
+    /// [`WorkCalendar::week`]).
+    pub fn has_working_time(&self) -> bool {
+        self.week()
+            .iter()
+            .flat_map(|day| &day.times)
+            .any(|t| t.from < t.to)
+    }
+}
+
+/// Sorted, positive-length slots with overlapping ones merged.
+fn merge(times: impl Iterator<Item = WorkingTime>) -> Vec<WorkingTime> {
+    let mut times: Vec<WorkingTime> = times.filter(|t| t.from < t.to).collect();
+    times.sort_by_key(|t| t.from);
+    let mut merged: Vec<WorkingTime> = Vec::with_capacity(times.len());
+    for t in times {
+        match merged.last_mut() {
+            Some(last) if t.from <= last.to => last.to = last.to.max(t.to),
+            _ => merged.push(t),
+        }
+    }
+    merged
 }
 
 /// A whole project: tasks, staffing, and the calendars they schedule against.
@@ -709,14 +954,22 @@ impl Project {
     }
 
     /// `cal`'s working week, resolved through its base chain in this project.
+    /// Exceptions are ignored; see [`Project::resolved_calendar`].
     pub fn resolved_week(&self, cal: &Calendar) -> Week {
         cal.resolve_week(|uid| self.calendar(uid))
+    }
+
+    /// `cal`'s working time by date, exceptions included, resolved through its
+    /// base chain in this project.
+    pub fn resolved_calendar(&self, cal: &Calendar) -> WorkCalendar {
+        cal.resolve(|uid| self.calendar(uid))
     }
 
     /// A task's working week, resolved through its base chain: the task's
     /// calendar, or the project default when the task names none; if that UID
     /// is missing, the first calendar; with no calendars, Standard. This differs
     /// from the scheduler, which falls back to the project default (#131).
+    /// This is the weekly pattern alone: calendar exceptions are ignored.
     pub fn calendar_for(&self, task: &Task) -> Week {
         let want = task.calendar_uid.unwrap_or(self.default_calendar_uid);
         match self.calendar(want).or_else(|| self.calendars.first()) {
@@ -837,6 +1090,7 @@ mod tests {
             base_calendar_uid: Some(base),
             is_baseline_calendar: false,
             week,
+            exceptions: Vec::new(),
         }
     }
 
@@ -917,5 +1171,150 @@ mod tests {
         let p = Project::default();
         assert_eq!(p.minutes_to_days(960), 2.0); // 16h @ 8h/day
         assert_eq!(p.days_to_minutes(2.0), 960);
+    }
+
+    fn march(day: u32) -> i64 {
+        DateTime::from_ymd_hm(2026, 3, day, 0, 0).day_number()
+    }
+
+    /// A date-range exception over 2026-03-`first`..=`last`.
+    fn exception(first: u32, last: u32, day: DayWorking) -> CalendarException {
+        CalendarException::date_range(
+            DateTime::from_ymd_hm(2026, 3, first, 0, 0),
+            DateTime::from_ymd_hm(2026, 3, last, 23, 59),
+            day,
+        )
+    }
+
+    #[test]
+    fn derived_calendar_resolves_own_exception_then_own_weekday_then_base() {
+        // Standard with Wed 4th and Thu 5th off <- a calendar stating Wednesday
+        // (07-15) and a short Monday 2nd of its own.
+        let mut base = Calendar::standard(1);
+        base.exceptions.push(exception(4, 5, DayWorking::default()));
+        let mut wednesday: [Option<DayWorking>; 7] = Default::default();
+        wednesday[3] = Some(hours(7, 15));
+        let mut own = derived(2, 1, wednesday);
+        own.exceptions.push(exception(2, 2, hours(10, 12)));
+        let mut proj = Project {
+            calendars: vec![base, own],
+            ..Project::default()
+        };
+        let cal = proj.resolved_calendar(&proj.calendars[1]);
+        assert_eq!(cal.day(march(2)), hours(10, 12).times);
+        assert_eq!(cal.day(march(3)), Calendar::standard_week()[2].times);
+        // Its own weekday beats the base's holiday; the next day inherits it.
+        assert_eq!(cal.day(march(4)), hours(7, 15).times);
+        assert!(cal.day(march(5)).is_empty());
+        assert_eq!(cal.week(), proj.resolved_week(&proj.calendars[1]));
+        // Its own exception beats its own weekday.
+        proj.calendars[1]
+            .exceptions
+            .push(exception(4, 4, DayWorking::default()));
+        let cal = proj.resolved_calendar(&proj.calendars[1]);
+        assert!(cal.day(march(4)).is_empty());
+        // The base alone keeps both holidays.
+        let base = proj.resolved_calendar(&proj.calendars[0]);
+        assert!(base.day(march(4)).is_empty() && base.day(march(5)).is_empty());
+        assert_eq!(base.day(march(6)), Calendar::standard_week()[5].times);
+    }
+
+    #[test]
+    fn overlapping_exceptions_resolve_to_the_first_in_file_order() {
+        let off = DayWorking::default;
+        let mut cal = Calendar::standard(1);
+        cal.exceptions = vec![exception(3, 5, off()), exception(4, 6, hours(9, 10))];
+        let work = Project::default().resolved_calendar(&cal);
+        for day in [3, 4, 5] {
+            assert!(work.day(march(day)).is_empty(), "{day}");
+        }
+        assert_eq!(work.day(march(6)), hours(9, 10).times);
+        // A later exception around an earlier one keeps only its outer days.
+        cal.exceptions = vec![exception(4, 5, hours(9, 10)), exception(3, 7, off())];
+        let work = Project::default().resolved_calendar(&cal);
+        assert_eq!(work.day(march(2)), Calendar::standard_week()[1].times);
+        assert!(work.day(march(3)).is_empty());
+        assert_eq!(work.day(march(4)), hours(9, 10).times);
+        assert_eq!(work.day(march(5)), hours(9, 10).times);
+        assert!(work.day(march(6)).is_empty());
+    }
+
+    #[test]
+    fn only_daily_exceptions_schedule_over_whole_dates() {
+        let at =
+            |day: u32, hour: u32, minute: u32| DateTime::from_ymd_hm(2026, 3, day, hour, minute);
+        let one = CalendarException::date_range(at(4, 0, 0), at(4, 0, 0), DayWorking::default());
+        // A ToDate at midnight of the FromDate's date is still that one day.
+        assert_eq!(one.scheduled(), Some((march(4), march(4))));
+        let two = CalendarException {
+            to: Some(at(5, 0, 0)),
+            ..one.clone()
+        };
+        assert_eq!(two.scheduled(), Some((march(4), march(5))));
+        let backwards = CalendarException {
+            to: Some(at(3, 12, 0)),
+            ..one.clone()
+        };
+        assert_eq!(backwards.scheduled(), Some((march(4), march(4))));
+        let every = CalendarException {
+            period: Some(1),
+            ..one.clone()
+        };
+        assert_eq!(every.scheduled(), Some((march(4), march(4))));
+        // Recurrences and incomplete ones are kept but never scheduled.
+        let unscheduled = [
+            CalendarException {
+                kind: Some(2),
+                ..one.clone()
+            },
+            CalendarException {
+                kind: Some(6),
+                days_of_week: Some(8),
+                ..one.clone()
+            },
+            CalendarException {
+                period: Some(2),
+                ..one.clone()
+            },
+            CalendarException {
+                kind: None,
+                ..one.clone()
+            },
+            CalendarException {
+                from: None,
+                ..one.clone()
+            },
+        ];
+        let mut cal = Calendar::standard(1);
+        for e in unscheduled {
+            assert_eq!(e.scheduled(), None, "{e:?}");
+            cal.exceptions.push(e);
+        }
+        let work = Project::default().resolved_calendar(&cal);
+        assert_eq!(work.day(march(4)), Calendar::standard_week()[3].times);
+    }
+
+    #[test]
+    fn union_merges_each_date_and_weekly_pattern_ignores_exceptions() {
+        let mut short = Calendar::standard(1);
+        short.exceptions.push(exception(4, 4, hours(9, 10)));
+        let mut late = Calendar::standard(2);
+        late.exceptions.push(exception(4, 4, hours(9, 15)));
+        let proj = Project::default();
+        let union = WorkCalendar::union(vec![
+            proj.resolved_calendar(&short),
+            proj.resolved_calendar(&late),
+        ]);
+        assert_eq!(union.day(march(4)), hours(9, 15).times);
+        assert_eq!(union.day(march(3)), Calendar::standard_week()[2].times);
+        assert_eq!(union.week(), Calendar::standard_week());
+        assert!(union.has_working_time());
+        // A working exception on an otherwise empty calendar is still no
+        // weekly working time.
+        let mut closed = Calendar::base(3, "Closed", Default::default());
+        closed.exceptions.push(exception(4, 4, hours(8, 17)));
+        let closed = proj.resolved_calendar(&closed);
+        assert_eq!(closed.day(march(4)), hours(8, 17).times);
+        assert!(!closed.has_working_time());
     }
 }
