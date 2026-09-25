@@ -695,15 +695,6 @@ impl App {
         });
     }
 
-    /// Open the Save As prompt, prefilled with the bound path.
-    fn save_as_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            kind: PromptKind::SaveAs,
-            label: "Save as".into(),
-            buf: self.path.clone().unwrap_or_default(),
-        });
-    }
-
     /// `L`: flip resource leveling.
     fn toggle_level(&mut self) {
         self.set_level(!self.ed.leveled());
@@ -850,7 +841,13 @@ impl App {
                     self.status = format!("Save failed: {e}");
                 }
             }
-            None => self.save_as_prompt(),
+            None => {
+                self.prompt = Some(Prompt {
+                    kind: PromptKind::SaveAs,
+                    label: "Save as".into(),
+                    buf: String::new(),
+                });
+            }
         }
     }
 
@@ -1976,42 +1973,31 @@ mod tests {
     fn save_as_prompt_retains_binding_on_failure_and_adds_native_extension() {
         let dir = std::env::temp_dir().join(format!("yppxy-save-prompt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let old = dir.join("original.xml");
-        for (label, binding) in [
-            ("untitled", None),
-            ("bound", Some(old.to_string_lossy().into_owned())),
-        ] {
-            let mut app = App::new(new_project(), binding.clone(), false);
-            app.ed.rename(1, "Unsaved change").unwrap();
-            if binding.is_none() {
-                app.save();
-            } else {
-                app.save_as_prompt();
-            }
-            app.prompt.as_mut().unwrap().buf = dir.join("plan.mpp").to_string_lossy().into_owned();
-            on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            assert_eq!(app.path, binding);
-            assert!(app.ed.dirty());
-            assert!(app.status.contains("Project schedules can only be saved"));
-            assert!(!dir.join("plan.mpp").exists());
-            if binding.is_none() {
-                app.save();
-            } else {
-                app.save_as_prompt();
-            }
-            let target = dir.join(label);
-            app.prompt.as_mut().unwrap().buf = target.to_string_lossy().into_owned();
-            on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-            let actual = target.with_extension("yppx");
-            assert_eq!(app.path.as_deref(), actual.to_str());
-            assert!(!app.ed.dirty());
-            assert_eq!(
-                load(actual.to_str().unwrap()).unwrap().tasks[0].name,
-                "Unsaved change"
-            );
-            assert!(!target.exists());
-            std::fs::remove_file(actual).unwrap();
-        }
+        // The prompt only opens for an untitled plan (Save on an unbound file);
+        // backstage Save As with a bound path is covered by
+        // `project_saves_refuse_mpp_and_other_unsupported_formats`.
+        let mut app = App::new(new_project(), None, false);
+        app.ed.rename(1, "Unsaved change").unwrap();
+        app.save();
+        app.prompt.as_mut().unwrap().buf = dir.join("plan.mpp").to_string_lossy().into_owned();
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.path, None);
+        assert!(app.ed.dirty());
+        assert!(app.status.contains("Project schedules can only be saved"));
+        assert!(!dir.join("plan.mpp").exists());
+        app.save();
+        let target = dir.join("untitled");
+        app.prompt.as_mut().unwrap().buf = target.to_string_lossy().into_owned();
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let actual = target.with_extension("yppx");
+        assert_eq!(app.path.as_deref(), actual.to_str());
+        assert!(!app.ed.dirty());
+        assert_eq!(
+            load(actual.to_str().unwrap()).unwrap().tasks[0].name,
+            "Unsaved change"
+        );
+        assert!(!target.exists());
+        std::fs::remove_file(actual).unwrap();
         std::fs::remove_dir(dir).unwrap();
     }
 
