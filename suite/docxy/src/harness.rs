@@ -1330,7 +1330,12 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
         }
     }
     if let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface) {
-        out.extend(crate::project_state(v));
+        let body_h = app
+            .probes
+            .borrow()
+            .get("project-body")
+            .map(|b| f32::from(b.size.height));
+        out.extend(crate::project_state(v, body_h));
     }
     Json::Obj(out)
 }

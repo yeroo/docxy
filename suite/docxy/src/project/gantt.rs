@@ -139,22 +139,144 @@ pub(crate) fn gantt_viewport(body: Bounds<Pixels>, table_w: f32) -> Option<Bound
     )
 }
 
+/// Weekend days in the visible range; the header and the body backdrop shade these.
+pub(crate) fn shaded_days(scale: GanttScale, offset: f32, width: f32) -> Vec<i64> {
+    scale
+        .visible(offset, width)
+        .filter(|d| scale.is_weekend(*d))
+        .collect()
+}
+
+/// The left edge of each visible day, relative to the chart viewport.
+pub(crate) fn day_lines(scale: GanttScale, offset: f32, width: f32) -> Vec<f32> {
+    scale
+        .visible(offset, width)
+        .map(|day| day as f32 * DAY_W - offset)
+        .filter(|x| (0. ..width).contains(x))
+        .collect()
+}
+
+/// The bottom rule of each row in view, in body pixels. `scroll_y` grows downward, so the
+/// rules follow the list's scroll phase whether a row holds a task or not.
+pub(crate) fn row_rules(body_h: f32, scroll_y: f32) -> Vec<f32> {
+    let scroll_y = scroll_y.max(0.);
+    ((scroll_y / ROW_H).floor() as i64..)
+        .map(|k| (k + 1) as f32 * ROW_H - 1. - scroll_y)
+        .skip_while(|y| *y < 0.)
+        .take_while(|y| *y < body_h)
+        .collect()
+}
+
+/// Ruled empty rows visible below the last task, counting a partly visible one.
+pub(crate) fn filler_rows(body_h: f32, scroll_y: f32, count: usize) -> usize {
+    let used = count as f32 * ROW_H - scroll_y.max(0.);
+    ((body_h - used).max(0.) / ROW_H).ceil() as usize
+}
+
+fn weekend_fill(pal: Pal) -> Hsla {
+    Hsla { a: 0.12, ..pal.dim }
+}
+
 fn backdrop(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            for day in scale
-                .visible(offset, width)
-                .filter(|d| scale.is_weekend(*d))
-            {
+            for day in shaded_days(scale, offset, width) {
                 window.paint_quad(fill(
                     Bounds {
                         origin: point(bounds.origin.x + px(day as f32 * DAY_W), bounds.origin.y),
                         size: size(px(DAY_W), bounds.size.height),
                     },
-                    Hsla { a: 0.12, ..pal.dim },
+                    weekend_fill(pal),
                 ));
             }
+        },
+    )
+    .absolute()
+    .size_full()
+}
+
+/// The grid behind every row of the body, task or empty: table rules and column dividers,
+/// chart shading, day lines and rules. Painted once at full height so it fills the pane.
+pub(crate) fn body_grid(
+    view: &ProjectView,
+    scroll: UniformListScrollHandle,
+    pal: Pal,
+) -> impl IntoElement {
+    let (table_w, table_x, gantt_x, scale) = (view.table_w, view.table_x, view.gantt_x, view.scale);
+    let rule = Hsla {
+        a: pal.border.a * 0.6,
+        ..pal.border
+    };
+    let day_rule = Hsla {
+        a: pal.border.a * 0.35,
+        ..pal.border
+    };
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            // Read at paint: the list's prepaint, which runs after this canvas's, settles the offset.
+            let scroll_y = -f32::from(scroll.0.borrow().base_handle.offset().y);
+            let body_h = f32::from(bounds.size.height);
+            let rules = row_rules(body_h, scroll_y);
+            let hline = |window: &mut Window, x: Pixels, w: Pixels, y: f32| {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: point(x, bounds.origin.y + px(y)),
+                        size: size(w, px(1.)),
+                    },
+                    rule,
+                ));
+            };
+            let vline = |window: &mut Window, x: Pixels, color: Hsla| {
+                window.paint_quad(fill(
+                    Bounds {
+                        origin: point(x, bounds.origin.y),
+                        size: size(px(1.), bounds.size.height),
+                    },
+                    color,
+                ));
+            };
+            let table = Bounds {
+                origin: bounds.origin,
+                size: size(px(table_w).min(bounds.size.width), bounds.size.height),
+            };
+            window.with_content_mask(Some(ContentMask { bounds: table }), |window| {
+                let mut edge = 0.;
+                for w in WIDTHS {
+                    edge += w;
+                    vline(window, bounds.origin.x + px(edge - table_x - 1.), rule);
+                }
+                for y in &rules {
+                    hline(window, bounds.origin.x, table.size.width, *y);
+                }
+            });
+            // The rows' inset divider, continued below the last task.
+            vline(window, bounds.origin.x + px(table_w), pal.border);
+            let Some(chart) = gantt_viewport(bounds, table_w) else {
+                return;
+            };
+            let width = f32::from(chart.size.width);
+            window.with_content_mask(Some(ContentMask { bounds: chart }), |window| {
+                for day in shaded_days(scale, gantt_x, width) {
+                    window.paint_quad(fill(
+                        Bounds {
+                            origin: point(
+                                chart.origin.x + px(day as f32 * DAY_W - gantt_x),
+                                chart.origin.y,
+                            ),
+                            size: size(px(DAY_W), chart.size.height),
+                        },
+                        weekend_fill(pal),
+                    ));
+                }
+                for x in day_lines(scale, gantt_x, width) {
+                    vline(window, chart.origin.x + px(x), day_rule);
+                }
+                for y in &rules {
+                    hline(window, chart.origin.x, chart.size.width, *y);
+                }
+            });
         },
     )
     .absolute()
@@ -190,16 +312,10 @@ pub(crate) fn gantt_strip(
     bar: Option<GanttBar>,
     id: i32,
     scale: GanttScale,
-    offset: f32,
-    width: f32,
     pal: Pal,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
 ) -> impl IntoElement {
-    let strip = div()
-        .relative()
-        .w(px(scale.width()))
-        .h(px(ROW_H))
-        .child(backdrop(scale, offset, width, pal));
+    let strip = div().relative().w(px(scale.width())).h(px(ROW_H));
     let Some(bar) = bar else {
         return strip;
     };

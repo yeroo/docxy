@@ -260,7 +260,7 @@ fn harness_state_uses_displayed_ids_and_includes_tasks_outside_the_view() {
     let Surface::Project(v) = t.surface else {
         unreachable!()
     };
-    let state = project_state(&v);
+    let state = project_state(&v, None);
     use ctlcore::json::Json;
     assert!(state.contains(&("bar_1".into(), Json::Str("summary 0-1".into()))));
     assert!(state.contains(&("bar_2".into(), Json::Str("critical 0-0".into()))));
@@ -269,7 +269,92 @@ fn harness_state_uses_displayed_ids_and_includes_tasks_outside_the_view() {
     p.tasks = (1..=100).map(|id| task(id, 1, 1)).collect();
     p.tasks[0].id = 200;
     let v = ProjectView::new(p, false);
-    let state = project_state(&v);
+    let state = project_state(&v, None);
     assert!(state.contains(&("bar_200".into(), Json::Str("critical 0-0".into()))));
     assert!(state.contains(&("bar_100".into(), Json::Str("critical 0-0".into()))));
+}
+
+fn monday_scale(days: i64) -> GanttScale {
+    let origin_day = (0..7)
+        .find(|d| {
+            GanttScale {
+                origin_day: *d,
+                days: 1,
+            }
+            .date(0)
+            .weekday()
+                == 1
+        })
+        .unwrap();
+    GanttScale { origin_day, days }
+}
+
+#[test]
+fn row_rules_fill_the_body_and_follow_the_scroll_phase() {
+    assert_eq!(row_rules(100., 0.), [27., 55., 83.]);
+    assert_eq!(row_rules(84., 0.), [27., 55., 83.]);
+    assert_eq!(row_rules(83., 0.), [27., 55.]);
+    assert!(row_rules(0., 0.).is_empty());
+    // A scrolled list moves the rules up by the offset modulo a row, never off the grid.
+    assert_eq!(row_rules(100., 10.), [17., 45., 73.]);
+    assert_eq!(row_rules(100., 10. + ROW_H * 7.), row_rules(100., 10.));
+    assert_eq!(row_rules(100., 27.), [0., 28., 56., 84.]);
+    assert_eq!(row_rules(100., 28.), row_rules(100., 0.));
+}
+
+#[test]
+fn filler_rows_count_the_ruled_space_below_the_last_task() {
+    assert_eq!(filler_rows(280., 0., 0), 10);
+    assert_eq!(filler_rows(280., 0., 3), 7);
+    assert_eq!(filler_rows(290., 0., 3), 8, "a partly visible row counts");
+    assert_eq!(filler_rows(280., 0., 10), 0);
+    assert_eq!(filler_rows(280., 0., 20), 0, "more tasks than fit");
+    assert_eq!(
+        filler_rows(280., 20. * ROW_H - 280., 20),
+        0,
+        "scrolled to the end"
+    );
+    assert_eq!(
+        filler_rows(280., 10., 3),
+        8,
+        "scrolling uncovers more empty rows"
+    );
+}
+
+#[test]
+fn day_lines_follow_horizontal_scroll_and_stay_in_the_viewport() {
+    let scale = monday_scale(30);
+    assert_eq!(day_lines(scale, 0., 110.), [0., 22., 44., 66., 88.]);
+    assert_eq!(day_lines(scale, 11., 110.), [11., 33., 55., 77., 99.]);
+    assert_eq!(day_lines(scale, DAY_W, 2. * DAY_W), [0., 22.]);
+    // No lines past the scale's last day.
+    assert_eq!(day_lines(scale, 28. * DAY_W, 10. * DAY_W), [0., 22.]);
+    assert!(day_lines(scale, 0., 0.).is_empty());
+}
+
+#[test]
+fn shaded_days_are_the_visible_weekends() {
+    let scale = monday_scale(30);
+    assert_eq!(shaded_days(scale, 0., 14. * DAY_W), [5, 6, 12, 13]);
+    assert_eq!(shaded_days(scale, 6. * DAY_W, 2. * DAY_W), [6]);
+    assert_eq!(shaded_days(scale, 5.5 * DAY_W, DAY_W), [5, 6]);
+    assert_eq!(shaded_days(scale, 26. * DAY_W, 10. * DAY_W), [26, 27]);
+}
+
+#[test]
+fn harness_state_reports_filler_rows_for_the_laid_out_body() {
+    use ctlcore::json::Json;
+    let mut p = untitled_project();
+    p.tasks = (1..=3).map(|id| task(id, 1, 1)).collect();
+    let v = ProjectView::new(p, false);
+    let filler = |body_h| {
+        project_state(&v, body_h)
+            .into_iter()
+            .find(|(k, _)| k == "filler_rows")
+            .map(|(_, j)| j)
+    };
+    assert_eq!(filler(Some(280.)), Some(Json::Num(7.)));
+    assert_eq!(filler(None), Some(Json::Num(0.)));
+    let v = ProjectView::new(untitled_project(), false);
+    assert!(project_state(&v, Some(280.)).contains(&("filler_rows".into(), Json::Num(10.))));
 }

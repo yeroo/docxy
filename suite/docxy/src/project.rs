@@ -176,12 +176,22 @@ fn project_region(
     }
 }
 
-pub(super) fn project_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Json)> {
+/// `body_h` is the last frame's `project-body` height; `None` before the first layout.
+pub(super) fn project_state(
+    v: &ProjectView,
+    body_h: Option<f32>,
+) -> Vec<(String, ctlcore::json::Json)> {
     use ctlcore::json::Json;
     let scale = gantt_scale(&v.ed);
+    let count = v.ed.project().tasks.len();
+    let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
     let mut entries = vec![
         ("selected_task".into(), Json::Num(v.ed.sel() as f64)),
-        ("tasks".into(), Json::Num(v.ed.project().tasks.len() as f64)),
+        ("tasks".into(), Json::Num(count as f64)),
+        (
+            "filler_rows".into(),
+            Json::Num(body_h.map_or(0, |h| filler_rows(h, scroll_y, count)) as f64),
+        ),
         (
             "prompt".into(),
             Json::Str(
@@ -688,9 +698,6 @@ pub(super) fn project_el(
                     gantt_header(scale, gantt_x, gantt_w, pal),
                 )),
         )
-        .when(count == 0, |d| {
-            d.child(div().p_4().text_color(pal.dim).child("No tasks"))
-        })
         .child(
             div()
                 .relative()
@@ -699,6 +706,7 @@ pub(super) fn project_el(
                 .min_h_0()
                 .w_full()
                 .overflow_hidden()
+                .child(body_grid(view, view.scroll.clone(), pal))
                 .child(probe(probes, "project-body"))
                 .child(
                     uniform_list(
@@ -745,8 +753,6 @@ pub(super) fn project_el(
                                                     gantt_bar(&v.ed, task, scale),
                                                     task.id,
                                                     scale,
-                                                    gantt_x,
-                                                    gantt_w,
                                                     pal,
                                                     &row_probes,
                                                 ),
@@ -766,7 +772,22 @@ pub(super) fn project_el(
                     .flex_1()
                     .h_full()
                     .min_h_0(),
-                ),
+                )
+                .when(count == 0, |d| {
+                    // Over the first ruled row, so the grid runs under it.
+                    d.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .h(px(ROW_H))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .text_color(pal.dim)
+                            .child("No tasks"),
+                    )
+                }),
         )
 }
 
