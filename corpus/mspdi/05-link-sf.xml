@@ -5,6 +5,7 @@
   <MinutesPerWeek>2400</MinutesPerWeek>
   <CalendarUID>1</CalendarUID>
   <StartDate>2026-03-02T08:00:00</StartDate>
+  <ProjectExternallyEdited>0</ProjectExternallyEdited>
   <Tasks>
     <Task>
       <UID>1</UID><ID>1</ID>
@@ -14,6 +15,7 @@
       <Milestone>0</Milestone>
       <Duration>PT16H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>
+      <TotalSlack>0</TotalSlack><Critical>1</Critical>
       <ConstraintType>4</ConstraintType>
       <ConstraintDate>2026-03-04T08:00:00</ConstraintDate>
     </Task>
@@ -25,6 +27,7 @@
       <Milestone>0</Milestone>
       <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-03T08:00:00</Start><Finish>2026-03-04T08:00:00</Finish>
+      <TotalSlack>9600</TotalSlack><Critical>0</Critical>
       <PredecessorLink>
         <PredecessorUID>1</PredecessorUID>
         <Type>2</Type>
