@@ -120,6 +120,22 @@ pub(crate) fn table_pane_width(width: f32) -> f32 {
     (width * 0.5).clamp(320., TABLE_W).min(width.max(0.))
 }
 
+/// The split bar never hides the ID column, and leaves the chart some days.
+pub(crate) const MIN_TABLE_W: f32 = WIDTHS[0];
+pub(crate) const MIN_CHART_W: f32 = 48.;
+
+/// The table pane's width for a user split, or the default without one. When the
+/// window is too narrow for both minimums the chart's yields first.
+pub(crate) fn split_table_width(width: f32, split: Option<f32>) -> f32 {
+    let Some(w) = split else {
+        return table_pane_width(width);
+    };
+    w.min(TABLE_W)
+        .min(width - GANTT_INSET - SCROLLBAR_W - MIN_CHART_W)
+        .max(MIN_TABLE_W)
+        .min(width.max(0.))
+}
+
 pub(crate) fn intersect(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Option<Bounds<Pixels>> {
     let r = a.intersect(&b);
     (!r.is_empty()).then_some(r)

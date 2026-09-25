@@ -166,6 +166,94 @@ fn layout_reserves_the_vertical_scrollbar_right_of_the_chart() {
 }
 
 #[test]
+fn split_table_width_clamps_to_the_table_and_chart_minimums() {
+    for width in [0., 100., 400., 1180., 2000.] {
+        assert_eq!(split_table_width(width, None), table_pane_width(width));
+    }
+    for (width, split, table) in [
+        (1180., 690., 690.),
+        (1180., 5000., TABLE_W),
+        (1180., -500., MIN_TABLE_W),
+        // The chart keeps MIN_CHART_W: 400 - 6 - 16 - 48.
+        (400., 900., 330.),
+        (400., 10., MIN_TABLE_W),
+        // Too narrow for both minimums: the chart's yields, then the window's width wins.
+        (100., 500., MIN_TABLE_W),
+        (30., 20., 30.),
+        (0., 500., 0.),
+    ] {
+        assert_eq!(
+            split_table_width(width, Some(split)),
+            table,
+            "{width} {split}"
+        );
+    }
+}
+
+#[test]
+fn set_split_moves_the_divider_and_keeps_the_width_invariant() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    v.layout(1180.);
+    assert_eq!((v.split, v.table_w), (None, 590.));
+    for (split, table) in [(690., 690.), (-500., MIN_TABLE_W), (5000., TABLE_W)] {
+        v.set_split(split);
+        assert_eq!((v.split, v.table_w), (Some(table), table));
+        assert_eq!(v.table_w + GANTT_INSET + v.gantt_w + SCROLLBAR_W, 1180.);
+    }
+    // A narrow window squeezes the table to leave the chart its minimum...
+    v.layout(400.);
+    assert_eq!((v.table_w, v.gantt_w), (330., MIN_CHART_W));
+    // ...and a window too narrow for both keeps the ID column.
+    v.layout(100.);
+    assert_eq!((v.table_w, v.gantt_w), (MIN_TABLE_W, 30.));
+    v.layout(1180.);
+    assert_eq!(v.table_w, TABLE_W);
+}
+
+#[test]
+fn a_split_drag_does_not_reveal_the_selected_column() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    v.layout(1180.);
+    assert_eq!(v.col, 1);
+    // Scroll the Name column (48..288) out of view, then drag the split.
+    v.table_x.set(TABLE_W - v.table_w);
+    v.set_split(700.);
+    // Only clamped to the wider pane's range, not brought back to 48.
+    assert_eq!(v.table_x.get(), TABLE_W - 700.);
+    v.layout(1180.);
+    assert_eq!(v.table_x.get(), TABLE_W - 700.);
+    // A window resize that leaves the table pane alone does not reveal either.
+    v.layout(1300.);
+    assert_eq!((v.table_w, v.table_x.get()), (700., TABLE_W - 700.));
+    // One that narrows the table pane does.
+    v.layout(700.);
+    assert_eq!(v.table_w, 630.);
+    assert_eq!(v.table_x.get(), 48.);
+}
+
+#[test]
+fn a_split_survives_frames_and_resizes_and_double_click_resets_it() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    v.layout(1180.);
+    v.set_split(700.);
+    for width in [1180., 1180., 2000., 1180.] {
+        v.layout(width);
+        assert_eq!(v.table_w, 700.);
+        assert_eq!(v.table_w + GANTT_INSET + v.gantt_w + SCROLLBAR_W, width);
+    }
+    let state = project_state(&v, None);
+    assert!(state.contains(&("table_w".into(), ctlcore::json::Json::Num(700.))));
+    assert!(state.contains(&("gantt_w".into(), ctlcore::json::Json::Num(458.))));
+    v.reset_split();
+    assert_eq!((v.split, v.table_w), (None, 590.));
+    v.layout(2000.);
+    assert_eq!(v.table_w, table_pane_width(2000.));
+    // Window view state: nothing to undo, nothing to save.
+    assert_eq!(v.ed.undo_depth(), 0);
+    assert!(!v.ed.dirty());
+}
+
+#[test]
 fn pane_scroll_maps_gpui_offsets_and_clamps_both_ends() {
     let offset = PaneOffset::default();
     let bar = PaneScroll {

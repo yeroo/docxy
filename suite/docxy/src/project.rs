@@ -37,6 +37,9 @@ pub(super) struct ProjectView {
     pub width: f32,
     /// Whether the Timeline pane is shown: window view state, never saved.
     pub timeline: bool,
+    /// The table pane width the user dragged the split bar to; `None` is the
+    /// default. Window view state, never saved.
+    pub split: Option<f32>,
 }
 
 impl ProjectView {
@@ -60,21 +63,38 @@ impl ProjectView {
             exported: None,
             width: 590. + SCROLLBAR_W,
             timeline: true,
+            split: None,
         }
     }
 
-    /// Runs every frame, so it reveals the selected column only on a resize:
-    /// a table-scrollbar drag that hides that column must stay where it was put.
+    /// Runs every frame, so it reveals the selected column only when the table
+    /// pane resizes: a table-scrollbar drag that hides that column must stay
+    /// where it was put.
     pub fn layout(&mut self, width: f32) {
-        let table_w = table_pane_width(width);
-        let resized = table_w != self.table_w;
+        let old = self.table_w;
         self.width = width;
-        self.table_w = table_w;
-        self.gantt_w = (width - table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
-        self.refresh_schedule_layout();
-        if resized {
+        self.apply_widths();
+        if self.table_w != old {
             self.reveal_col();
         }
+    }
+
+    fn apply_widths(&mut self) {
+        self.table_w = split_table_width(self.width, self.split);
+        self.gantt_w = (self.width - self.table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
+        self.refresh_schedule_layout();
+    }
+
+    /// Moves the split bar. It writes `table_w` itself, so the next frame's
+    /// `layout` sees no resize and leaves the table where it was scrolled.
+    pub fn set_split(&mut self, table_w: f32) {
+        self.split = Some(split_table_width(self.width, Some(table_w)));
+        self.apply_widths();
+    }
+
+    pub fn reset_split(&mut self) {
+        self.split = None;
+        self.apply_widths();
     }
 
     pub fn refresh_schedule_layout(&mut self) {
@@ -295,6 +315,11 @@ fn project_region(
             .get(&name)
             .ok_or_else(|| format!("the {name} scrollbar has not been laid out"));
     }
+    if let harness::Region::ProjectSplit = region {
+        return probes
+            .get(&harness::region_name(region))
+            .ok_or_else(|| "the split bar has not been laid out".into());
+    }
     let body = probes
         .get("project-body")
         .ok_or("the Project body has not been laid out")?;
@@ -385,6 +410,8 @@ pub(super) fn project_state(
             "exported".into(),
             Json::Str(v.exported.clone().unwrap_or_else(|| "none".into())),
         ),
+        ("table_w".into(), Json::Num(f64::from(v.table_w))),
+        ("gantt_w".into(), Json::Num(f64::from(v.gantt_w))),
     ];
     entries.extend(v.ed.project().tasks.iter().map(|t| {
         (
@@ -855,173 +882,250 @@ pub(super) fn project_el(
         .text_color(pal.fg)
         .text_size(px(12.))
         .when(view.timeline, |d| d.child(timeline_el(view, pal, probes)))
+        // The split bar spans header, body and scrollbar strip, under the Timeline.
         .child(
-            h_flex()
-                .h(px(ROW_H))
-                .flex_none()
-                .bg(pal.panel)
-                .font_weight(FontWeight::BOLD)
-                .child(pane(
-                    table_w,
-                    table_x,
-                    row_cells(
-                        [
-                            "ID",
-                            "Name",
-                            "Duration",
-                            "Start",
-                            "Finish",
-                            "Predecessors",
-                            "Resource Names",
-                        ]
-                        .map(str::to_string),
-                        0.,
-                    ),
-                ))
-                .child(chart_pane(
-                    gantt_w,
-                    gantt_x,
-                    pal,
-                    gantt_header(scale, gantt_x, gantt_w, pal),
-                ))
-                // Above the vertical scrollbar.
-                .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
-        )
-        .child(
-            div()
-                .id(("project-body", index))
+            v_flex()
+                .id(("project-split-area", index))
                 .relative()
-                .flex()
                 .flex_1()
                 .min_h_0()
                 .w_full()
-                .overflow_hidden()
-                .child(body_grid(view, pal))
-                .child(probe(probes, "project-body"))
-                // Rows stop propagation, so only the ruled empty rows below the
-                // entry row land here.
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if let Some(tab) = this.tabs.get_mut(index) {
-                        project_below_click(tab);
-                    }
-                    this.refocus(window, cx);
-                }))
+                .on_drag_move::<SplitDrag>(cx.listener(
+                    move |this, e: &DragMoveEvent<SplitDrag>, window, cx| {
+                        cx.set_active_drag_cursor_style(CursorStyle::ResizeLeftRight, window);
+                        if let Some(Surface::Project(v)) =
+                            this.tabs.get_mut(index).map(|t| &mut t.surface)
+                        {
+                            v.set_split(
+                                f32::from(e.event.position.x - e.bounds.left()) - GANTT_INSET / 2.,
+                            );
+                            cx.notify();
+                        }
+                    },
+                ))
                 .child(
-                    uniform_list(
-                        ("project-rows", index),
-                        // The tasks, then the entry row.
-                        count + 1,
-                        cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                            let Some(Surface::Project(v)) =
-                                this.tabs.get(index).map(|t| &t.surface)
-                            else {
-                                return vec![];
-                            };
-                            let cursor_row = v.cursor_row();
-                            let tasks = &v.ed.project().tasks;
-                            // Past the last task, the one entry row (`None`).
-                            range
-                                .filter(|&i| i <= tasks.len())
-                                .map(|i| {
-                                    let task = tasks.get(i);
-                                    let is_task = task.is_some();
-                                    let indent =
-                                        task.map_or(0, |t| t.outline_level)
-                                            .saturating_sub(1)
-                                            .min(20) as f32
-                                            * 12.;
-                                    h_flex()
-                                        .id(("project-row", i))
-                                        .h(px(ROW_H))
-                                        .w_full()
-                                        .cursor_pointer()
-                                        .when(task.is_some_and(|t| t.summary), |d| {
-                                            d.font_weight(FontWeight::BOLD)
-                                        })
-                                        .when(i == cursor_row, |d| d.bg(pal.sel))
-                                        .child(pane(
-                                            table_w,
-                                            table_x,
-                                            editable_row_cells(
-                                                v,
-                                                task,
-                                                i,
-                                                index,
-                                                indent,
-                                                &row_probes,
-                                                window,
-                                                cx,
-                                            ),
-                                        ))
-                                        .child(chart_pane(
-                                            gantt_w,
-                                            gantt_x,
-                                            pal,
-                                            // The entry row has no bar, so no `bar:` probe.
-                                            gantt_strip(
-                                                task.and_then(|t| gantt_bar(&v.ed, t, scale)),
-                                                task.map_or(0, |t| t.id),
-                                                scale,
-                                                pal,
-                                                &row_probes,
-                                            ),
-                                        ))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            if let Some(tab) = this.tabs.get_mut(index) {
-                                                if is_task {
-                                                    project_cell_click(tab, i, None, false);
-                                                } else {
-                                                    project_entry_click(tab, None, false);
-                                                }
-                                            }
-                                            this.refocus(window, cx);
-                                        }))
-                                })
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .track_scroll(&view.scroll)
-                    .flex_1()
-                    .h_full()
-                    .min_h_0(),
+                    h_flex()
+                        .h(px(ROW_H))
+                        .flex_none()
+                        .bg(pal.panel)
+                        .font_weight(FontWeight::BOLD)
+                        .child(pane(
+                            table_w,
+                            table_x,
+                            row_cells(
+                                [
+                                    "ID",
+                                    "Name",
+                                    "Duration",
+                                    "Start",
+                                    "Finish",
+                                    "Predecessors",
+                                    "Resource Names",
+                                ]
+                                .map(str::to_string),
+                                0.,
+                            ),
+                        ))
+                        .child(chart_pane(
+                            gantt_w,
+                            gantt_x,
+                            pal,
+                            gantt_header(scale, gantt_x, gantt_w, pal),
+                        ))
+                        // Above the vertical scrollbar.
+                        .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
                 )
-                // Project's one vertical bar, shared by table and chart, over the
-                // SCROLLBAR_W that `layout` keeps out of the chart.
                 .child(
                     div()
-                        .absolute()
-                        .top_0()
-                        .right_0()
-                        .bottom_0()
-                        .w(px(SCROLLBAR_W))
-                        .child(probe(probes, vbar.clone()))
+                        .id(("project-body", index))
+                        .relative()
+                        .flex()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .overflow_hidden()
+                        .child(body_grid(view, pal))
+                        .child(probe(probes, "project-body"))
+                        // Rows stop propagation, so only the ruled empty rows below the
+                        // entry row land here.
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(tab) = this.tabs.get_mut(index) {
+                                project_below_click(tab);
+                            }
+                            this.refocus(window, cx);
+                        }))
                         .child(
-                            Scrollbar::vertical(&view.scroll)
-                                .id(SharedString::from(vbar))
-                                .scrollbar_show(ScrollbarShow::Always),
+                            uniform_list(
+                                ("project-rows", index),
+                                // The tasks, then the entry row.
+                                count + 1,
+                                cx.processor(
+                                    move |this, range: std::ops::Range<usize>, window, cx| {
+                                        let Some(Surface::Project(v)) =
+                                            this.tabs.get(index).map(|t| &t.surface)
+                                        else {
+                                            return vec![];
+                                        };
+                                        let cursor_row = v.cursor_row();
+                                        let tasks = &v.ed.project().tasks;
+                                        // Past the last task, the one entry row (`None`).
+                                        range
+                                            .filter(|&i| i <= tasks.len())
+                                            .map(|i| {
+                                                let task = tasks.get(i);
+                                                let is_task = task.is_some();
+                                                let indent = task
+                                                    .map_or(0, |t| t.outline_level)
+                                                    .saturating_sub(1)
+                                                    .min(20)
+                                                    as f32
+                                                    * 12.;
+                                                h_flex()
+                                                    .id(("project-row", i))
+                                                    .h(px(ROW_H))
+                                                    .w_full()
+                                                    .cursor_pointer()
+                                                    .when(task.is_some_and(|t| t.summary), |d| {
+                                                        d.font_weight(FontWeight::BOLD)
+                                                    })
+                                                    .when(i == cursor_row, |d| d.bg(pal.sel))
+                                                    .child(pane(
+                                                        table_w,
+                                                        table_x,
+                                                        editable_row_cells(
+                                                            v,
+                                                            task,
+                                                            i,
+                                                            index,
+                                                            indent,
+                                                            &row_probes,
+                                                            window,
+                                                            cx,
+                                                        ),
+                                                    ))
+                                                    .child(chart_pane(
+                                                        gantt_w,
+                                                        gantt_x,
+                                                        pal,
+                                                        // The entry row has no bar, so no `bar:` probe.
+                                                        gantt_strip(
+                                                            task.and_then(|t| {
+                                                                gantt_bar(&v.ed, t, scale)
+                                                            }),
+                                                            task.map_or(0, |t| t.id),
+                                                            scale,
+                                                            pal,
+                                                            &row_probes,
+                                                        ),
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            if let Some(tab) =
+                                                                this.tabs.get_mut(index)
+                                                            {
+                                                                if is_task {
+                                                                    project_cell_click(
+                                                                        tab, i, None, false,
+                                                                    );
+                                                                } else {
+                                                                    project_entry_click(
+                                                                        tab, None, false,
+                                                                    );
+                                                                }
+                                                            }
+                                                            this.refocus(window, cx);
+                                                        },
+                                                    ))
+                                            })
+                                            .collect::<Vec<_>>()
+                                    },
+                                ),
+                            )
+                            .track_scroll(&view.scroll)
+                            .flex_1()
+                            .h_full()
+                            .min_h_0(),
+                        )
+                        // Project's one vertical bar, shared by table and chart, over the
+                        // SCROLLBAR_W that `layout` keeps out of the chart.
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .w(px(SCROLLBAR_W))
+                                .child(probe(probes, vbar.clone()))
+                                .child(
+                                    Scrollbar::vertical(&view.scroll)
+                                        .id(SharedString::from(vbar))
+                                        .scrollbar_show(ScrollbarShow::Always),
+                                ),
                         ),
-                ),
+                )
+                // Independent horizontal bars under the table and the chart, as in Project.
+                .child(
+                    h_flex()
+                        .h(px(SCROLLBAR_W))
+                        .flex_none()
+                        .bg(pal.panel)
+                        .child(hbar_strip(
+                            table_bar,
+                            harness::Region::ProjectHbarTable,
+                            probes,
+                        ))
+                        .child(div().w(px(GANTT_INSET)).h_full().flex_none())
+                        .child(hbar_strip(
+                            chart_bar,
+                            harness::Region::ProjectHbarChart,
+                            probes,
+                        ))
+                        .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
+                )
+                .child(split_bar(table_w, index, probes, cx)),
         )
-        // Independent horizontal bars under the table and the chart, as in Project.
-        .child(
-            h_flex()
-                .h(px(SCROLLBAR_W))
-                .flex_none()
-                .bg(pal.panel)
-                .child(hbar_strip(
-                    table_bar,
-                    harness::Region::ProjectHbarTable,
-                    probes,
-                ))
-                .child(div().w(px(GANTT_INSET)).h_full().flex_none())
-                .child(hbar_strip(
-                    chart_bar,
-                    harness::Region::ProjectHbarChart,
-                    probes,
-                ))
-                .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
-        )
+}
+
+/// The drag payload for the split bar; it draws nothing, since the panes follow the pointer.
+struct SplitDrag;
+
+impl Render for SplitDrag {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        gpui::Empty
+    }
+}
+
+/// Over the `GANTT_INSET` gutter. It blocks presses from the row and body under
+/// it, but lets the wheel through so the rows still scroll there.
+fn split_bar(
+    table_w: f32,
+    index: usize,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    cx: &mut Context<Docxy>,
+) -> impl IntoElement {
+    div()
+        .id(("project-split", index))
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(table_w))
+        .w(px(GANTT_INSET))
+        .block_mouse_except_scroll()
+        .cursor(CursorStyle::ResizeLeftRight)
+        .child(probe(
+            probes,
+            harness::region_name(harness::Region::ProjectSplit),
+        ))
+        .on_drag(SplitDrag, |_, _, _, cx| cx.new(|_| SplitDrag))
+        .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+            if ev.click_count() >= 2
+                && let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface)
+            {
+                v.reset_split();
+            }
+            this.refocus(window, cx);
+        }))
 }
 
 fn hbar_strip(

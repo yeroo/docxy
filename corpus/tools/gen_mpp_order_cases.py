@@ -2,7 +2,7 @@
 """Generate the .mpp cases for issue #68 that the other corpora lack.
 
 - blank (null) task rows between real tasks;
-- rows inserted, moved or re-indented after creation, so the task UID order
+- rows inserted, moved, sorted or re-indented after creation, so the task UID order
   differs from the task ID (row) order.
 
 Drives a licensed Microsoft Project over COM. Each case is saved as Project's
@@ -11,7 +11,7 @@ corpus/mpp/order/, which is git-ignored like every other .mpp/.xml there.
 mppread/tests/oracle_corpus.rs compares the decoder against these when present.
 
 Usage (from the repo root, Windows):
-    python corpus/tools/gen_mpp_order_cases.py
+    python corpus/tools/gen_mpp_order_cases.py [case_function ...]
 Requires: Microsoft Project desktop and pywin32. Close Project gracefully if a
 run is interrupted; never force-kill WINPROJ.EXE (it wedges COM activation).
 """
@@ -108,13 +108,31 @@ def moved_rows(app):
     save(app, "o4-moved-rows")
 
 
+def sorted_renumbered(app):
+    p = new_plan(app)
+    for n, days in (("A", 3), ("B", 1), ("C", 4), ("D", 2)):
+        add(p, n, days)
+    p.Tasks(2).Predecessors = "1"
+    # Sorting with permanent renumbering keeps each task's record and
+    # changes its ID: rows become B, D, A, C. The generated early-bound
+    # wrapper silently ignores Sort, so call it late-bound.
+    late = win32.dynamic.Dispatch(app._oleobj_)
+    late.Sort("Duration")  # further arguments turn it back into a no-op
+    ids = [(t.ID, t.Name) for t in p.Tasks]
+    if ids != [(1, "B"), (2, "D"), (3, "A"), (4, "C")]:
+        raise RuntimeError(f"Sort did not renumber: {ids}")
+    save(app, "o5-sorted-renumbered")
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
     app = win32.Dispatch("MSProject.Application")
     try:
         app.Visible = False
         app.DisplayAlerts = False
-        for case in (blank_rows, inserted_task, inserted_hierarchy, moved_rows):
+        cases = (blank_rows, inserted_task, inserted_hierarchy, moved_rows, sorted_renumbered)
+        only = sys.argv[1:]
+        for case in (c for c in cases if not only or c.__name__ in only):
             case(app)
     finally:
         for call in (lambda: app.FileCloseAll(0), lambda: app.Quit(0)):

@@ -3,6 +3,8 @@ use std::collections::HashSet;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CurrentRecord {
+    /// Position of this record's FixedMeta entry, which also indexes Fixed2Meta.
+    pub entry: usize,
     pub id: u32,
     pub uid: u32,
     pub offset: usize,
@@ -102,6 +104,7 @@ fn current_index(
             ));
         }
         rows.push(CurrentRecord {
+            entry: i,
             id,
             uid,
             offset: begin,
@@ -114,6 +117,72 @@ fn current_index(
         return Err("task IDs are not contiguous from zero".into());
     }
     Ok(rows)
+}
+
+/// Length of a current Project `Fixed2Data` task record.
+pub(crate) const FIXED2_LEN: usize = 64;
+const FIXED2_META_LEN: usize = 96;
+
+/// A task's current Project `Fixed2Meta` entry and `Fixed2Data` record.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fixed2<'a> {
+    pub meta: &'a [u8],
+    pub data: &'a [u8],
+}
+
+/// Pair each current row with its second fixed block. Fixed2Meta counts the
+/// same entries as FixedMeta, in the same order, one 64-byte record each. The
+/// records carry no UID, so the pairing is checked another way: a task
+/// record holds its GUID at +0 and its row sort key (an f64, fractional for
+/// inserted rows) at +16, and a blank row holds neither. Sorted by task ID,
+/// the tasks' sort keys must strictly increase. Project rewrites the keys when
+/// it renumbers rows in place (corpus case `order/o5-sorted-renumbered`).
+pub(crate) fn current_fixed2<'a>(
+    meta: &'a [u8],
+    data: &'a [u8],
+    fixed_count: usize,
+    rows: &[CurrentRecord],
+) -> Result<Vec<Fixed2<'a>>, String> {
+    let u32_at = |o: usize| u32::from_le_bytes(meta[o..o + 4].try_into().unwrap()) as usize;
+    if meta.len() < 16 || meta[..4] != [0xba, 0xad, 0xdf, 0xfa] {
+        return Err("invalid Fixed2Meta header".into());
+    }
+    let count = u32_at(8);
+    if count != fixed_count
+        || Some(meta.len()) != count.checked_mul(FIXED2_META_LEN).map(|n| n + 16)
+        || u32_at(12) != data.len()
+        || Some(data.len()) != count.checked_mul(FIXED2_LEN)
+    {
+        return Err("Fixed2Meta count or Fixed2Data length mismatch".into());
+    }
+    if (0..count).any(|i| u32_at(16 + i * FIXED2_META_LEN + 4) != i * FIXED2_LEN) {
+        return Err("invalid Fixed2Meta offsets".into());
+    }
+    let mut last_key = 0f64;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let rec = &data[row.entry * FIXED2_LEN..(row.entry + 1) * FIXED2_LEN];
+        let blank_guid = rec[..16].iter().all(|&b| b == 0);
+        let key = f64::from_le_bytes(rec[16..24].try_into().unwrap());
+        if row.is_null {
+            if !blank_guid || key != 0.0 {
+                return Err(format!("Fixed2Data blank row {} carries a task", row.id));
+            }
+        } else if blank_guid || !key.is_finite() || key <= last_key {
+            return Err(format!(
+                "Fixed2Data record out of step with task UID {}",
+                row.uid
+            ));
+        } else {
+            last_key = key;
+        }
+        let m = 16 + row.entry * FIXED2_META_LEN;
+        out.push(Fixed2 {
+            meta: &meta[m..m + FIXED2_META_LEN],
+            data: rec,
+        });
+    }
+    Ok(out)
 }
 
 fn legacy_index(data: &[u8], offsets: &[usize]) -> Result<Vec<LegacyRecord>, String> {
