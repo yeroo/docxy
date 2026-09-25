@@ -14,7 +14,7 @@ corpus validates the scheduler without needing Project. Rerun the script
 whenever a fixture changes. Exceptions: file 19's manual-task expectations
 (#77), file 20's task-field expectations (#80) and file 22's progress
 expectations (#81) are hand-derived from our scheduler and not yet verified in
-Project.
+Project, as is file 23's derived calendar (#83).
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -534,6 +534,28 @@ def build():
                 ("RemainingDuration", iso(D)), ("RemainingCost", "400"),
                 ("RemainingWork", iso(D)), ("PhysicalPercentComplete", 0)]),
         ]), resources_xml=progress_res, assignments_xml=progress_asn))
+
+    # 23 — a derived calendar keeps its base through a save (#83): "Crew"
+    # derives from Standard (BaseCalendarUID 1), is flagged IsBaselineCalendar
+    # and states only Friday, which it takes off; every other day is Standard's.
+    # A resource uses it, as Project's resource calendars do, and so does task
+    # Frame, whose 5 days run Mon 2-Thu 5, skip Friday and finish Mon 9. Project's
+    # UI offers only base calendars to tasks, so a task on a derived calendar is
+    # our shape, not Project's; hand-derived, not verified in Project.
+    crew = ("  <Calendar>\n    <UID>2</UID><Name>Crew</Name>"
+            "<IsBaseCalendar>0</IsBaseCalendar><IsBaselineCalendar>1</IsBaselineCalendar>"
+            "<BaseCalendarUID>1</BaseCalendarUID>\n"
+            "    <WeekDays>\n" + weekday(6, False, []) + "\n    </WeekDays>\n  </Calendar>")
+    crew_res = ("    <Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>"
+                "<Type>1</Type><MaxUnits>1</MaxUnits><CalendarUID>2</CalendarUID></Resource>")
+    add("23-derived-calendar.xml", ["calendar", "derived-calendar", "round-trip", "link",
+                                    "link-fs"],
+        "A calendar derived from Standard keeps its base, its own Friday off and "
+        "IsBaselineCalendar through saves; a task on it skips Friday.",
+        project("derived-calendar", "\n".join([
+            task(1, "Frame", 5 * D, dt(2), dt(9, "17:00:00"), **CRIT, calendar=2),
+            task(2, "Paint", D, dt(10), dt(10, "17:00:00"), **CRIT, preds=[(1, FS, 0)]),
+        ]), resources_xml=crew_res, calendars=[standard_calendar(), crew]))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

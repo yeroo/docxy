@@ -78,11 +78,18 @@ tracked plan, and its actual dates equal the scheduled ones, so the oracle
 holds while the scheduler ignores progress. It is **not** verified against
 Project 2021, and no Project file with an assignment `<Baseline>` was
 available: that shape follows Microsoft's schema.
+File 23 keeps a derived calendar derived
+([issue #83](https://github.com/yeroo/docxy/issues/83)): `Crew` derives from
+`Standard`, is flagged `IsBaselineCalendar` and states only its own Friday off.
+A resource uses it, and so does a task. Project's UI offers only base
+calendars to tasks, so a task on a derived calendar is our shape, not
+Project's. The file is **not** verified against Project 2021.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
   off. File 12 adds a second calendar with Saturday working; file 16 adds the
-  built-in 24 Hours calendar, working midnight to midnight every day.
+  built-in 24 Hours calendar, working midnight to midnight every day; file 23
+  adds a calendar derived from Standard with its own Friday off.
 
 ## Files
 
@@ -110,6 +117,7 @@ available: that shape follows Microsoft's schema.
 | `20-task-fields` | stored task fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`; the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
 | `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
 | `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx` |
+| `23-derived-calendar` | derived calendar | `BaseCalendarUID`, `IsBaselineCalendar` and only the calendar's own weekday survive MSPDI and `.yppx`; a task on it inherits Standard's week, skips its own Friday off and finishes Mon 9 |
 
 See `manifest.json` for machine-readable tags.
 

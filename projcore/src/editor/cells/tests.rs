@@ -271,7 +271,7 @@ fn scheduling_range_accounts_for_time_before_the_anchor() {
     }
     // A continuous calendar can use the entire 100-year backward budget as
     // well as the forward budget. The old reserve only covered one direction.
-    for day in &mut ed.proj.calendars[0].week {
+    for day in ed.proj.calendars[0].week.iter_mut().flatten() {
         day.times = vec![crate::model::WorkingTime { from: 0, to: 1440 }];
     }
     // Keep an SF leaf link so this project needs a backward horizon.
@@ -509,7 +509,7 @@ fn dates_are_strict_and_finish_uses_effective_calendar() {
     );
     let mut cal = Calendar::standard(99);
     cal.week[6] = cal.week[1].clone();
-    cal.week[6].times.last_mut().unwrap().to = 18 * 60;
+    cal.week[6].as_mut().unwrap().times.last_mut().unwrap().to = 18 * 60;
     ed.proj.calendars.push(cal);
     ed.proj.tasks[0].calendar_uid = Some(99);
     let sat = day_finish(
@@ -1372,4 +1372,56 @@ fn new_resources_and_assignments_write_none_of_the_imported_fields() {
             "{name}"
         );
     }
+}
+
+#[test]
+fn typed_dates_resolve_derived_calendars_like_the_scheduler() {
+    // Two calendars share UID 1, the second with a 07:00-19:00 Monday; a task
+    // on calendar 2, derived from 1 with Tuesday off.
+    let mut ed = editor();
+    let mut long = Calendar::standard(1);
+    long.week[1] = Some(crate::model::DayWorking {
+        times: vec![crate::model::WorkingTime {
+            from: 7 * 60,
+            to: 19 * 60,
+        }],
+    });
+    let derived = Calendar {
+        base_calendar_uid: Some(1),
+        week: [
+            None,
+            None,
+            Some(crate::model::DayWorking::default()),
+            None,
+            None,
+            None,
+            None,
+        ],
+        ..Calendar::standard(2)
+    };
+    ed.proj.calendars = vec![Calendar::standard(1), long, derived];
+    ed.proj.tasks[0].calendar_uid = Some(2);
+    let task = ed.project().task(10).unwrap().clone();
+    let monday = parse_cell_date("2026-03-02").unwrap();
+    // The scheduler's rule: the last calendar with UID 1 is the base.
+    assert_eq!(
+        day_finish(ed.project(), &task, monday)
+            .unwrap()
+            .minute_of_day(),
+        19 * 60
+    );
+    assert_eq!(
+        day_start(ed.project(), &task, monday).minute_of_day(),
+        7 * 60
+    );
+    let tuesday = parse_cell_date("2026-03-03").unwrap();
+    assert!(day_finish(ed.project(), &task, tuesday).is_err());
+    let mut proj = ed.project().clone();
+    proj.start_date = Some(monday.add_minutes(7 * 60));
+    proj.tasks[0].duration_min = 12 * 60;
+    let sched = crate::schedule::schedule(&proj);
+    assert_eq!(
+        sched.get(10).unwrap().early_finish,
+        day_finish(ed.project(), &task, monday).unwrap()
+    );
 }

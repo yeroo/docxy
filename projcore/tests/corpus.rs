@@ -14,8 +14,9 @@
 //! 21's oracle (issue #100) was entered by hand from the issue's Project 2021
 //! capture; the file was not run through `verify_mspdi_project.py`. File 22
 //! (issue #81) carries progress values of our own and is not verified in
-//! Project either, and neither are file 13's resource and assignment fields
-//! of issue #84, chosen to leave its schedule unchanged. Slack invariants below also check
+//! Project either, nor is file 23's derived calendar (issue #83), nor are
+//! file 13's resource and assignment fields of issue #84, chosen to leave its
+//! schedule unchanged. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -194,6 +195,11 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
         files
             .iter()
             .any(|p| p.file_name().unwrap() == "22-progress.xml")
+    );
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "23-derived-calendar.xml")
     );
     for path in files {
         let xml = std::fs::read_to_string(&path).unwrap();
@@ -678,6 +684,32 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
             );
         }
     }
+}
+
+#[test]
+fn derived_calendar_fixture_keeps_its_base_through_a_save() {
+    use projcore::DayWorking;
+    let xml = std::fs::read_to_string(corpus_dir().join("23-derived-calendar.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let mut friday_off: [Option<DayWorking>; 7] = Default::default();
+    friday_off[5] = Some(DayWorking::default());
+    let check = |proj: &projcore::Project, what: &str| {
+        let crew = proj.calendar(2).unwrap();
+        assert_eq!(crew.base_calendar_uid, Some(1), "{what}");
+        assert!(crew.is_baseline_calendar, "{what}");
+        assert_eq!(crew.week, friday_off, "{what}");
+        assert_eq!(proj.resources[0].calendar_uid, Some(2), "{what}");
+    };
+    check(&proj, "read");
+    let saved = write_mspdi(&proj);
+    for element in [
+        "<BaseCalendarUID>1</BaseCalendarUID>",
+        "<IsBaselineCalendar>1</IsBaselineCalendar>",
+    ] {
+        assert_eq!(saved.matches(element).count(), 1, "{element}");
+    }
+    check(&read_mspdi(&saved).unwrap(), "MSPDI");
+    check(&read_yppx(&write_yppx(&proj)).unwrap(), ".yppx");
 }
 
 /// The full native pipeline on real files: MSPDI → .yppx package → back → the

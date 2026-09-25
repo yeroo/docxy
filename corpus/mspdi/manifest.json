@@ -216,6 +216,18 @@
         "link-fs"
       ],
       "desc": "Percent complete, actuals, stop/resume, remaining values, variances and assignment baselines survive saves."
+    },
+    {
+      "file": "23-derived-calendar.xml",
+      "category": "calendar",
+      "tags": [
+        "calendar",
+        "derived-calendar",
+        "round-trip",
+        "link",
+        "link-fs"
+      ],
+      "desc": "A calendar derived from Standard keeps its base, its own Friday off and IsBaselineCalendar through saves; a task on it skips Friday."
     }
   ]
 }

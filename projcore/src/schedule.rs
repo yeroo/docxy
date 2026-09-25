@@ -33,7 +33,9 @@
 //! finish-to-start successors and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
-use crate::model::{Calendar, ConstraintType, LinkType, Project, ResourceType, Task, WorkingTime};
+use crate::model::{
+    Calendar, ConstraintType, LinkType, Project, ResourceType, Task, Week, WorkingTime,
+};
 use std::collections::HashMap;
 
 /// Maximum calendar days on either side of the scheduling anchor.
@@ -344,11 +346,11 @@ impl<'a> Scheduler<'a> {
             .calendars
             .iter()
             .filter(|cal| used_calendars.contains(&cal.uid))
-            .map(|cal| (cal.uid, week_pairs(cal)))
+            .map(|cal| (cal.uid, week_pairs(&calendars.week(cal))))
             .collect();
         weeks
             .entry(default_cal)
-            .or_insert_with(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
+            .or_insert_with(|| week_pairs(&Calendar::standard_week()));
 
         // A pinned task's duration-derived finish lies past its start; reserve
         // wall-clock reach for its duration at its calendar's weekly rate,
@@ -970,7 +972,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // ---- summary rollup ----
-        let mut summary_cal: Option<Calendar> = None;
+        let mut summary_cal: Option<Week> = None;
         for (i, t) in self.proj.tasks.iter().enumerate() {
             if !t.summary {
                 continue;
@@ -1123,10 +1125,10 @@ fn finish_instant(
     tl.abs_finish(finish_index)
 }
 
-/// Convert a calendar's weekday patterns into sorted `(from, to)` minute pairs.
-fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
+/// Convert a resolved week's patterns into sorted `(from, to)` minute pairs.
+fn week_pairs(week: &Week) -> [Vec<(u32, u32)>; 7] {
     let mut out: [Vec<(u32, u32)>; 7] = Default::default();
-    for (d, day) in cal.week.iter().enumerate() {
+    for (d, day) in week.iter().enumerate() {
         let mut v: Vec<(u32, u32)> = day.times.iter().map(|t| (t.from, t.to)).collect();
         v.sort_by_key(|&(f, _)| f);
         out[d] = v;
@@ -1134,9 +1136,8 @@ fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
     out
 }
 
-fn has_working_time(cal: &Calendar) -> bool {
-    cal.week
-        .iter()
+fn has_working_time(week: &Week) -> bool {
+    week.iter()
         .flat_map(|day| &day.times)
         .any(|t| t.from < t.to)
 }
@@ -1144,6 +1145,8 @@ fn has_working_time(cal: &Calendar) -> bool {
 /// Resolves a task's calendar exactly as the scheduler does: the last calendar
 /// with a UID wins, an unknown `calendar_uid` falls back to the default, and a
 /// missing default is a synthesized Standard (which always has working time).
+/// A derived calendar's working time comes from its base chain, found by the
+/// same rule.
 struct CalendarResolver<'a> {
     calendars: HashMap<i32, &'a Calendar>,
     default_uid: i32,
@@ -1166,11 +1169,18 @@ impl<'a> CalendarResolver<'a> {
             .copied()
     }
 
+    /// `cal`'s working week, resolved through its base chain.
+    fn week(&self, cal: &'a Calendar) -> Week {
+        cal.resolve_week(|uid| self.calendars.get(&uid).copied())
+    }
+
     /// A leaf the scheduler keeps: its resolved calendar has working time.
     fn schedulable(&self, task: &Task) -> bool {
         !task.summary
             && !task.is_null
-            && self.resolve(task.calendar_uid).is_none_or(has_working_time)
+            && self
+                .resolve(task.calendar_uid)
+                .is_none_or(|cal| has_working_time(&self.week(cal)))
     }
 }
 
@@ -1186,7 +1196,7 @@ pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
             // The scheduler synthesizes Standard when the default is absent.
             continue;
         };
-        if !has_working_time(cal) {
+        if !has_working_time(&calendars.week(cal)) {
             return Some(format!(
                 "calendar {:?} (UID {}) has no working time; task {:?} (UID {}) cannot be scheduled",
                 cal.name, cal.uid, task.name, task.uid
@@ -1305,25 +1315,19 @@ fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
 /// is measured by [`task_duration_min`] instead, which falls back to the leaves'
 /// calendars when this one has no working time.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
-    let cal = proj
-        .calendars
-        .iter()
-        .find(|c| c.uid == proj.default_calendar_uid)
-        .cloned()
-        .unwrap_or_else(|| crate::model::Calendar::standard(proj.default_calendar_uid));
-    working_minutes_on(&cal, start, finish)
+    let week = match proj.calendar(proj.default_calendar_uid) {
+        Some(cal) => proj.resolved_week(cal),
+        None => Calendar::standard_week(),
+    };
+    working_minutes_on(&week, start, finish)
 }
 
 /// Working minutes between two wall-clock instants on one calendar, counted
 /// through the same timeline the scheduler uses.
-pub(crate) fn working_minutes_on(
-    cal: &crate::model::Calendar,
-    start: DateTime,
-    finish: DateTime,
-) -> i64 {
+pub(crate) fn working_minutes_on(week: &Week, start: DateTime, finish: DateTime) -> i64 {
     let a = start.minutes().min(finish.minutes());
     let b = start.minutes().max(finish.minutes());
-    let tl = Timeline::build(&week_pairs(cal), a, a, (b - a) + 480, b + 1440);
+    let tl = Timeline::build(&week_pairs(week), a, a, (b - a) + 480, b + 1440);
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
@@ -1357,25 +1361,22 @@ pub(crate) fn summary_or_leaf_min(
     }
 }
 
-/// The calendar every summary is measured on. MS Project uses the project
+/// The working week every summary is measured on. MS Project uses the project
 /// calendar, resolved as the scheduler resolves it. When that calendar has no
 /// working time (allowed as long as every leaf uses its own working calendar),
 /// the substitute is the per-weekday union of the working time of the
 /// calendars of all schedulable leaves, so equal dates still mean equal
 /// durations across summaries.
-fn summary_calendar(proj: &Project) -> Calendar {
+fn summary_calendar(proj: &Project) -> Week {
     let calendars = CalendarResolver::new(proj);
     let Some(default) = calendars.resolve(None) else {
-        return Calendar::standard(proj.default_calendar_uid);
+        return Calendar::standard_week();
     };
-    if has_working_time(default) {
-        return default.clone();
+    let default_week = calendars.week(default);
+    if has_working_time(&default_week) {
+        return default_week;
     }
-    let mut union = Calendar {
-        uid: default.uid,
-        name: default.name.clone(),
-        week: Default::default(),
-    };
+    let mut union: Week = Default::default();
     let mut seen = std::collections::HashSet::new();
     for cal in proj
         .tasks
@@ -1384,12 +1385,12 @@ fn summary_calendar(proj: &Project) -> Calendar {
         .filter_map(|t| calendars.resolve(t.calendar_uid))
         .filter(|cal| seen.insert(cal.uid))
     {
-        for (day, times) in union.week.iter_mut().zip(&cal.week) {
+        for (day, times) in union.iter_mut().zip(&calendars.week(cal)) {
             day.times
                 .extend(times.times.iter().filter(|t| t.from < t.to).copied());
         }
     }
-    for day in &mut union.week {
+    for day in &mut union {
         day.times.sort_by_key(|t| t.from);
         let mut merged: Vec<WorkingTime> = Vec::new();
         for t in day.times.drain(..) {
@@ -1763,11 +1764,8 @@ mod tests {
             proj.tasks.insert(2, row);
             proj.tasks[3].predecessors.push(fs(3));
             proj.tasks[4].predecessors.push(fs(3));
-            proj.calendars.push(Calendar {
-                uid: 9,
-                name: "Never".into(),
-                week: Default::default(),
-            });
+            proj.calendars
+                .push(Calendar::base(9, "Never", Default::default()));
             proj.assignments.push(Assignment {
                 uid: 1,
                 task_uid: 3,
@@ -2175,7 +2173,7 @@ mod tests {
     fn fs_milestone_cross_calendar_keeps_predecessor_instant() {
         let mut proj = fs_milestone_project(960);
         let mut shorter = Calendar::standard(2);
-        for day in &mut shorter.week {
+        for day in shorter.week.iter_mut().flatten() {
             if !day.times.is_empty() {
                 day.times = vec![WorkingTime {
                     from: 9 * 60,
@@ -2300,18 +2298,14 @@ mod tests {
     }
 
     fn closed_calendar(uid: i32) -> Calendar {
-        Calendar {
-            uid,
-            name: "Closed".into(),
-            week: Default::default(),
-        }
+        Calendar::base(uid, "Closed", Default::default())
     }
 
     #[test]
     fn twenty_four_hour_calendar_matches_project() {
         let mut cal = Calendar::standard(3);
         cal.name = "24 Hours".into();
-        for day in &mut cal.week {
+        for day in cal.week.iter_mut().flatten() {
             day.times = vec![WorkingTime { from: 0, to: 1440 }];
         }
         let mut build = task(1, "Build", 3 * 480);
@@ -2928,10 +2922,10 @@ mod tests {
         let tl = baseline.tl(&proj.tasks[0]);
         let expected = (tl.segs[0].start, tl.segs.len());
         let mut sparse = Calendar::standard(2);
-        for day in &mut sparse.week {
+        for day in sparse.week.iter_mut().flatten() {
             day.times.clear();
         }
-        sparse.week[1].times.push(WorkingTime {
+        sparse.week[1].as_mut().unwrap().times.push(WorkingTime {
             from: 8 * 60,
             to: 9 * 60,
         });
@@ -3045,7 +3039,7 @@ mod tests {
         let mut proj = before_start_project();
         let mut cal = Calendar::standard(2);
         for dow in [0, 2, 3, 4, 5, 6] {
-            cal.week[dow].times.clear();
+            cal.week[dow].as_mut().unwrap().times.clear();
         }
         proj.tasks[0].calendar_uid = Some(2);
         // The used Mondays-only calendar determines the shared origin here.
@@ -3069,7 +3063,7 @@ mod tests {
         let mut sunday = Calendar::standard(2);
         sunday.week[0] = sunday.week[1].clone();
         for dow in 1..7 {
-            sunday.week[dow].times.clear();
+            sunday.week[dow].as_mut().unwrap().times.clear();
         }
         proj.calendars.push(sunday);
         proj.tasks[0].calendar_uid = Some(2);
@@ -4119,7 +4113,7 @@ mod tests {
         // Mondays only: 480 working minutes a week.
         let mut mondays = Calendar::standard(2);
         for day in [2, 3, 4, 5] {
-            mondays.week[day] = DayWorking::default();
+            mondays.week[day] = Some(DayWorking::default());
         }
         // Pinned beyond the working-minute budget after the anchor.
         let start = DateTime::from_ymd_hm(2031, 3, 3, 8, 0);
@@ -4235,7 +4229,11 @@ mod tests {
     fn weekly(uid: i32, days: &[(usize, u32, u32)]) -> Calendar {
         let mut cal = closed_calendar(uid);
         for &(dow, from, to) in days {
-            cal.week[dow].times.push(WorkingTime { from, to });
+            cal.week[dow]
+                .as_mut()
+                .unwrap()
+                .times
+                .push(WorkingTime { from, to });
         }
         cal
     }
@@ -4324,7 +4322,7 @@ mod tests {
         // Leaves on a 24-hour calendar: the summary is still measured on the
         // project's Standard calendar, as MS Project measures it.
         let mut always = closed_calendar(3);
-        for day in &mut always.week {
+        for day in always.week.iter_mut().flatten() {
             day.times = vec![WorkingTime { from: 0, to: 1440 }];
         }
         let mut b = child(3, "B", 480, 3);
@@ -4341,6 +4339,127 @@ mod tests {
             ("2026-03-02T08:00:00".into(), "2026-03-03T00:00:00".into())
         );
         assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(480));
+    }
+
+    /// A calendar derived from `base` that states only `own` days.
+    fn derived(uid: i32, base: i32, own: &[(usize, DayWorking)]) -> Calendar {
+        let mut cal = Calendar {
+            base_calendar_uid: Some(base),
+            week: Default::default(),
+            ..Calendar::standard(uid)
+        };
+        cal.name = format!("Derived {uid}");
+        for (day, working) in own {
+            cal.week[*day] = Some(working.clone());
+        }
+        cal
+    }
+
+    #[test]
+    fn derived_calendar_resolves_through_its_base_at_schedule_time() {
+        // Friday off, everything else inherited from Standard.
+        let mut a = task(1, "A", 5 * 480);
+        a.calendar_uid = Some(2);
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a],
+            calendars: vec![
+                Calendar::standard(1),
+                derived(2, 1, &[(5, DayWorking::default())]),
+            ],
+            ..Project::default()
+        };
+        assert_eq!(calendar_error(&proj), None);
+        // Mon-Thu, then Friday is skipped.
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-09T17:00:00".into())
+        );
+        // Shorten the base calendar's Monday only: the derived calendar follows.
+        proj.calendars[0].week[1] = Some(DayWorking {
+            times: vec![WorkingTime {
+                from: 8 * 60,
+                to: 12 * 60,
+            }],
+        });
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-10T17:00:00".into())
+        );
+    }
+
+    #[test]
+    fn derived_calendar_without_own_days_is_not_rejected() {
+        let mut a = task(1, "A", 480);
+        a.calendar_uid = Some(2);
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a],
+            calendars: vec![Calendar::standard(1), derived(2, 1, &[])],
+            ..Project::default()
+        };
+        assert_eq!(calendar_error(&proj), None);
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-02T17:00:00".into())
+        );
+        // Without a base to inherit from, it has no working time at all.
+        proj.calendars[1].base_calendar_uid = Some(99);
+        assert!(
+            calendar_error(&proj)
+                .unwrap()
+                .contains("calendar \"Derived 2\" (UID 2) has no working time")
+        );
+    }
+
+    #[test]
+    fn summary_is_measured_on_a_derived_project_calendar() {
+        // As `summary_duration_stays_on_a_working_default_calendar`, but
+        // the project calendar derives from Standard and states no days. Read
+        // as its own days only, it would have no working time and the summary
+        // would be measured on the leaves' 24-hour calendar instead.
+        let mut always = closed_calendar(3);
+        for day in always.week.iter_mut().flatten() {
+            day.times = vec![WorkingTime { from: 0, to: 1440 }];
+        }
+        let mut b = child(3, "B", 480, 3);
+        b.predecessors.push(fs(2));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![phase(1), child(2, "A", 480, 3), b],
+            calendars: vec![Calendar::standard(5), derived(1, 5, &[]), always],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-03T00:00:00".into())
+        );
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(480));
+    }
+
+    #[test]
+    fn base_chain_lookup_takes_the_last_calendar_with_a_uid() {
+        // Two calendars share UID 1; the second works 07:00-19:00 on Mondays.
+        let mut long = Calendar::standard(1);
+        long.week[1] = Some(DayWorking {
+            times: vec![WorkingTime {
+                from: 7 * 60,
+                to: 19 * 60,
+            }],
+        });
+        let mut a = task(1, "A", 12 * 60);
+        a.calendar_uid = Some(2);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 7, 0)),
+            tasks: vec![a],
+            calendars: vec![Calendar::standard(1), long, derived(2, 1, &[])],
+            ..Project::default()
+        };
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T07:00:00".into(), "2026-03-02T19:00:00".into())
+        );
     }
 
     #[test]

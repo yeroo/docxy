@@ -147,13 +147,12 @@ fn fmt_days(days: f64) -> String {
 }
 
 /// True when the project's default calendar takes both weekend days off, so the
-/// Mermaid `excludes weekends` directive matches the schedule.
+/// Mermaid `excludes weekends` directive matches the schedule. A missing default
+/// is the scheduler's synthesized Standard, which does.
 fn excludes_weekends(proj: &Project) -> bool {
-    proj.calendars
-        .iter()
-        .find(|c| c.uid == proj.default_calendar_uid)
-        .or_else(|| proj.calendars.first())
-        .map(|c| !c.week[0].working() && !c.week[6].working())
+    proj.calendar(proj.default_calendar_uid)
+        .map(|c| proj.resolved_week(c))
+        .map(|week| !week[0].working() && !week[6].working())
         .unwrap_or(true)
 }
 
@@ -567,11 +566,7 @@ mod tests {
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
             tasks: vec![phase, a, b],
             calendars: vec![
-                Calendar {
-                    uid: 1,
-                    name: "Closed".into(),
-                    week: Default::default(),
-                },
+                Calendar::base(1, "Closed", Default::default()),
                 Calendar::standard(3),
             ],
             ..Project::default()
@@ -601,5 +596,42 @@ mod tests {
         let m = to_mermaid(&proj, &s);
         // colon/comma removed from the name so the task line stays parseable.
         assert!(m.contains("Design phase one :"), "got:\n{m}");
+    }
+
+    #[test]
+    fn weekend_check_resolves_a_derived_project_calendar() {
+        // The base works Saturdays; the project calendar derives from it.
+        let mut six_day = Calendar::standard(3);
+        six_day.week[6] = six_day.week[1].clone();
+        let derived = |own_saturday: Option<crate::model::DayWorking>| Calendar {
+            base_calendar_uid: Some(3),
+            week: [None, None, None, None, None, None, own_saturday],
+            ..Calendar::standard(1)
+        };
+        let mut proj = Project {
+            calendars: vec![six_day, derived(None)],
+            ..Project::default()
+        };
+        assert!(!excludes_weekends(&proj));
+        proj.calendars[1] = derived(Some(crate::model::DayWorking::default()));
+        assert!(excludes_weekends(&proj));
+    }
+
+    #[test]
+    fn weekend_check_uses_standard_when_the_default_calendar_is_missing() {
+        // The scheduler synthesizes Standard for a missing default; the only
+        // calendar present works every day and must not be consulted.
+        let mut every_day = Calendar::standard(3);
+        every_day.week[0] = every_day.week[1].clone();
+        every_day.week[6] = every_day.week[1].clone();
+        let a = task(1, "A", 480);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a],
+            calendars: vec![every_day],
+            ..Project::default()
+        };
+        assert!(excludes_weekends(&proj));
+        assert!(to_mermaid(&proj, &schedule(&proj)).contains("excludes weekends"));
     }
 }
