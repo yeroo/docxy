@@ -1693,7 +1693,7 @@ pub fn dispatch(
 
         // Persist and go. The reply is written first (see the pump).
         "quit" => {
-            crate::commit_project_cells_for_exit(&mut app.tabs);
+            crate::close::commit_pending_for_exit(&mut app.tabs);
             app.persist();
             Ok(Done {
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),

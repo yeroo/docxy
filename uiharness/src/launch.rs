@@ -192,9 +192,11 @@ pub fn launch(exe: &Path, sandbox: &Path) -> Result<Launched, String> {
     let child = Command::new(exe)
         .arg(HARNESS_FLAG)
         .env(CONFIG_DIR_ENV, &sandbox)
-        // The sandbox is also the child's working directory, so the one save
-        // path that falls back to `current_dir()` (an untitled document) writes
-        // there rather than into the repository the harness was run from.
+        // The sandbox is also the child's working directory, as a defensive
+        // default: no save path falls back to `current_dir()` any more (a
+        // never-saved document or workbook refuses in a harness), but anything
+        // that ever writes relative to the cwd lands here rather than in the
+        // repository the harness was run from.
         .current_dir(&sandbox)
         // Inherited, so a refusal from the isolation gate is visible rather
         // than swallowed — it is written to stderr and is the one message a

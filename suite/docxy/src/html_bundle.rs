@@ -325,6 +325,25 @@ mod tests {
     }
 
     #[test]
+    fn a_never_saved_tab_is_not_written_to_the_working_directory() {
+        // #98: without a picked target there is nowhere to write; the old
+        // `<cwd>/<title>` fallback must not come back through save_doc_tab.
+        let dir = temp("never-saved");
+        let mut tab = docx_tab(&dir);
+        tab.path = None;
+        tab.title = "never-saved-164.docx".into();
+        tab.dirty = true;
+        assert!(!crate::save_doc_tab(&mut tab, None));
+        assert!(tab.dirty);
+        assert!(tab.status.contains("never been saved"), "{}", tab.status);
+        let cwd = std::env::current_dir()
+            .unwrap()
+            .join("never-saved-164.docx");
+        assert!(!cwd.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn saving_a_new_document_onto_another_bundle_makes_its_own_page() {
         // The close path's first save of an untitled document, and Save As,
         // both pass the picked target: never adopt the bundle found there.

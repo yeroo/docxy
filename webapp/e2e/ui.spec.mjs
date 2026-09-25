@@ -232,19 +232,23 @@ test('drops, drags and spellcheck replacements are cancelled', async ({ page, gu
 });
 
 test('Find selects the next match; Replace all edits', async ({ page, guard }, testInfo) => {
-  await openBundle(page, bundleCopy(testInfo));
+  // A paragraph with a hyperlink and tracked changes: matches must land at
+  // editor offsets, not at plain-text positions that count revision text.
+  await openBundle(page, bundleCopy(testInfo, 'review.docx'));
   await page.locator('p[data-p="0"]').click();
   await page.keyboard.press('Control+f');
   await expect(page.locator('#findbar')).toBeVisible();
-  await page.locator('#find-input').fill('rich TEXT');
+  await page.locator('#find-input').fill('END');
   await page.keyboard.press('Enter');
-  expect(await page.evaluate(() => document.getSelection().toString())).toBe('Rich text');
-  // (Replace All runs docxcore's replace_all, which does not yet account for
-  // tracked-change text in a paragraph; this document has none.)
-  await page.locator('#find-input').fill('Rich text');
-  await page.locator('#replace-input').fill('Rich prose');
+  expect(await page.evaluate(() => document.getSelection().toString())).toBe('end');
+  await page.locator('#find-input').fill('end');
+  await page.locator('#replace-input').fill('finish');
   await page.getByRole('button', { name: 'Replace all' }).click();
-  await expect(page.locator('#doc')).toContainText('Rich prose');
-  await expect(page.locator('#doc')).not.toContainText('Rich text');
+  await expect(page.locator('p[data-p="1"]')).toHaveText('Start linkaddedremoved finish.');
+  const saved = await saveViaDownload(page, testInfo);
+  const xml = documentXmlOfBundle(saved.path, testInfo);
+  expect(xml).toContain('finish.');
+  expect(xml).toContain('<w:ins w:id="1" w:author="Ada"');
+  expect(xml).toContain('<w:delText>removed</w:delText>');
   await guard.check();
 });

@@ -25,12 +25,17 @@
 //! modes report link conflicts as negative total slack within the timeline's
 //! bounded horizon. Constraints before the project start do not pull unlinked
 //! tasks before it, but a deadline there still reports its miss as negative
-//! slack. Summary tasks roll up from their descendants. Resource
+//! slack. A task's deadline bounds only its late finish, like an FNLT would,
+//! whatever HonorConstraints says: it never moves scheduled dates, and a
+//! missed one shows as negative total slack on the task and its drivers.
+//! Summary tasks roll up from their descendants. Resource
 //! leveling is separate from CPM. Free slack is computed precisely for
 //! finish-to-start successors and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
-use crate::model::{Calendar, ConstraintType, LinkType, Project, ResourceType, Task, WorkingTime};
+use crate::model::{
+    Calendar, ConstraintType, LinkType, Project, ResourceType, Task, Week, WorkingTime,
+};
 use std::collections::HashMap;
 
 /// Maximum calendar days on either side of the scheduling anchor.
@@ -305,14 +310,22 @@ impl<'a> Scheduler<'a> {
             .iter()
             .filter(|t| !t.summary && t.constraint_date.is_some())
             .filter(|t| is_backward(t.constraint));
-        let has_backward_constraints = backward_constraints.clone().next().is_some();
+        // A deadline bounds late dates like a backward constraint does.
+        let deadlines = proj
+            .tasks
+            .iter()
+            .filter(|t| !t.summary && t.deadline.is_some());
+        let has_backward_constraints =
+            backward_constraints.clone().next().is_some() || deadlines.clone().next().is_some();
+        let linked = |t: &&Task| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid));
         // An unlinked deadline is floored at the anchor. Its raw date must not
         // add an unused prefix to every calendar's timeline.
         // A pinned start can precede the anchor, and a violated link into it
         // puts its predecessors' late dates earlier still.
         let earliest_backward_date = backward_constraints
-            .filter(|t| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid)))
+            .filter(linked)
             .filter_map(|t| t.constraint_date)
+            .chain(deadlines.filter(linked).filter_map(|t| t.deadline))
             .map(|date| date.minutes())
             .chain(pinned_starts.clone())
             .min();
@@ -333,11 +346,11 @@ impl<'a> Scheduler<'a> {
             .calendars
             .iter()
             .filter(|cal| used_calendars.contains(&cal.uid))
-            .map(|cal| (cal.uid, week_pairs(cal)))
+            .map(|cal| (cal.uid, week_pairs(&calendars.week(cal))))
             .collect();
         weeks
             .entry(default_cal)
-            .or_insert_with(|| week_pairs(&crate::model::Calendar::standard(default_cal)));
+            .or_insert_with(|| week_pairs(&Calendar::standard_week()));
 
         // A pinned task's duration-derived finish lies past its start; reserve
         // wall-clock reach for its duration at its calendar's weekly rate,
@@ -472,23 +485,30 @@ impl<'a> Scheduler<'a> {
             .collect()
     }
 
-    /// Normalize dates identically for CPM and leveling. Only unlinked tasks
+    /// The earliest instant a task's dates may take. Only unlinked tasks
     /// retain the project-start floor; linked tasks can use the full horizon.
-    fn constraint_dates(&self, task: &Task, linked: bool) -> Option<ConstraintDates> {
+    fn date_floor(&self, task: &Task, linked: bool) -> i64 {
         let tl = self.tl(task);
-        let floor = if linked {
+        if linked {
             tl.abs_start(0)
         } else {
             tl.snap(self.anchor)
-        };
+        }
+    }
+
+    /// Normalize dates identically for CPM and leveling, floored as
+    /// [`Self::date_floor`] says.
+    fn constraint_dates(&self, task: &Task, linked: bool) -> Option<ConstraintDates> {
+        let tl = self.tl(task);
+        let floor = self.date_floor(task, linked);
         let raw_date = task.constraint_date?.minutes();
         let date = raw_date.max(floor);
-        let finish = tl.abs_finish(tl.to_index(date)).max(floor);
+        let (finish, milestone) = finish_instants(tl, raw_date, floor);
         Some(ConstraintDates {
             start: tl.snap(date),
             finish,
             floor,
-            milestone: if tl.snap(date) == date { date } else { finish },
+            milestone,
             raw: raw_date,
             // The forward pass keeps the floor; the backward pass measures
             // the raw date on a pre-start timeline (`pre_start_timelines`).
@@ -751,8 +771,9 @@ impl<'a> Scheduler<'a> {
             }
             // Hard constraints (backward-affecting).
             let mut hard_finish_bound = false;
-            // A milestone's MFO/FNLT instant, kept when the bound binds. An
-            // FNLT never moves it past what the successors allow.
+            // A milestone's MFO/FNLT/deadline instant, kept when the bound
+            // binds. An FNLT or deadline never moves it past what the
+            // successors allow on its own working index.
             let mut milestone_late = None;
             let mut pre_start_window = None;
             if let Some(dates) = self
@@ -783,7 +804,20 @@ impl<'a> Scheduler<'a> {
                     };
                     // A date at or before the absolute cap is clamped there,
                     // keeping the full duration after the first instant.
-                    let finish_index = finish_index.max(t.duration_min);
+                    let mut finish_index = finish_index.max(t.duration_min);
+                    // A start constraint's window can finish after the
+                    // project start, where a deadline may bound it tighter.
+                    // Like any unlinked deadline it is floored at the project
+                    // start, so it never binds a finish constraint's earlier
+                    // raw date, nor a milestone's window, which ends by then.
+                    if let Some(deadline) = t.deadline.filter(|_| !finish_constraint) {
+                        let (d_f, _) = finish_instants(pre, deadline.minutes(), dates.floor);
+                        let d_index = pre.to_index(d_f).max(t.duration_min);
+                        if d_index < finish_index {
+                            debug_assert_ne!(t.duration_min, 0);
+                            finish_index = d_index;
+                        }
+                    }
                     let f_abs = pre.abs_finish(finish_index);
                     let binds = matches!(
                         t.constraint,
@@ -819,7 +853,8 @@ impl<'a> Scheduler<'a> {
                     }
                     ConstraintType::FinishNoLaterThan if df <= finish_abs => {
                         finish_abs = df;
-                        milestone_late = (span == 0).then_some(milestone.min(bound_instant));
+                        milestone_late =
+                            (span == 0).then(|| capped_milestone(tl, milestone, bound_instant));
                         hard_finish_bound = true;
                     }
                     ConstraintType::StartNoLaterThan => {
@@ -836,6 +871,25 @@ impl<'a> Scheduler<'a> {
                     _ => {}
                 }
             }
+            // A deadline bounds the late finish like an FNLT, but it is not a
+            // constraint: it applies whatever HonorConstraints says and never
+            // moves scheduled dates. A pre-start window has already taken it
+            // into account.
+            if let Some(deadline) = t.deadline.filter(|_| !pinned && pre_start_window.is_none()) {
+                let floor = self.date_floor(t, linked_tasks.contains(&t.uid));
+                let (df, milestone) = finish_instants(tl, deadline.minutes(), floor);
+                if df <= finish_abs {
+                    finish_abs = df;
+                    hard_finish_bound = true;
+                    if span == 0 {
+                        // An MFO/MSO can have set `finish_abs` past the
+                        // successor bounds, so only a bound on the deadline's
+                        // own index caps it.
+                        let m = capped_milestone(tl, milestone, bound_instant);
+                        milestone_late = Some(milestone_late.map_or(m, |late: i64| late.min(m)));
+                    }
+                }
+            }
             let finish_index = tl.to_index(finish_abs);
             let (s_abs, f_abs) = if let Some((pre, s_abs, f_abs)) = pre_start_window {
                 late_tl.insert(t.uid, pre);
@@ -848,9 +902,9 @@ impl<'a> Scheduler<'a> {
                 // reuse the early instants unless a hard date set that bound.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                // A binding MFO/FNLT milestone sits on its constraint instant
-                // (an FNLT capped by the successor bound), which can be the
-                // morning side of the deadline's index.
+                // A binding MFO/FNLT/deadline milestone sits on its own
+                // instant (an FNLT or deadline capped by the successor bound),
+                // which can be the morning side of that date's index.
                 if let Some(m) = milestone_late {
                     debug_assert_eq!(tl.to_index(m), finish_index);
                 }
@@ -918,7 +972,7 @@ impl<'a> Scheduler<'a> {
         }
 
         // ---- summary rollup ----
-        let mut summary_cal: Option<Calendar> = None;
+        let mut summary_cal: Option<Week> = None;
         for (i, t) in self.proj.tasks.iter().enumerate() {
             if !t.summary {
                 continue;
@@ -986,6 +1040,29 @@ impl<'a> Scheduler<'a> {
     }
 }
 
+/// A finish date's instants on `tl`, floored at `floor`: the evening that
+/// completes its working index, and a milestone's instant, which is the date
+/// itself when it is a working start instant (a morning deadline stays on its
+/// morning), else that evening.
+fn finish_instants(tl: &Timeline, date: i64, floor: i64) -> (i64, i64) {
+    let date = date.max(floor);
+    let finish = tl.abs_finish(tl.to_index(date)).max(floor);
+    let milestone = if tl.snap(date) == date { date } else { finish };
+    (finish, milestone)
+}
+
+/// A milestone's late instant under a finish bound whose own instant is
+/// `milestone`: the successors' zero-lag `bound_instant` caps it only on the
+/// same working index (its morning or evening side). An MFO/MSO overrides the
+/// successor bounds, so a bound on an earlier index must not pull it there.
+fn capped_milestone(tl: &Timeline, milestone: i64, bound_instant: i64) -> i64 {
+    if tl.to_index(bound_instant) == tl.to_index(milestone) {
+        milestone.min(bound_instant)
+    } else {
+        milestone
+    }
+}
+
 /// Constraints that bound a task's late dates.
 fn is_backward(constraint: ConstraintType) -> bool {
     matches!(
@@ -1048,10 +1125,10 @@ fn finish_instant(
     tl.abs_finish(finish_index)
 }
 
-/// Convert a calendar's weekday patterns into sorted `(from, to)` minute pairs.
-fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
+/// Convert a resolved week's patterns into sorted `(from, to)` minute pairs.
+fn week_pairs(week: &Week) -> [Vec<(u32, u32)>; 7] {
     let mut out: [Vec<(u32, u32)>; 7] = Default::default();
-    for (d, day) in cal.week.iter().enumerate() {
+    for (d, day) in week.iter().enumerate() {
         let mut v: Vec<(u32, u32)> = day.times.iter().map(|t| (t.from, t.to)).collect();
         v.sort_by_key(|&(f, _)| f);
         out[d] = v;
@@ -1059,9 +1136,8 @@ fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
     out
 }
 
-fn has_working_time(cal: &Calendar) -> bool {
-    cal.week
-        .iter()
+fn has_working_time(week: &Week) -> bool {
+    week.iter()
         .flat_map(|day| &day.times)
         .any(|t| t.from < t.to)
 }
@@ -1069,6 +1145,8 @@ fn has_working_time(cal: &Calendar) -> bool {
 /// Resolves a task's calendar exactly as the scheduler does: the last calendar
 /// with a UID wins, an unknown `calendar_uid` falls back to the default, and a
 /// missing default is a synthesized Standard (which always has working time).
+/// A derived calendar's working time comes from its base chain, found by the
+/// same rule.
 struct CalendarResolver<'a> {
     calendars: HashMap<i32, &'a Calendar>,
     default_uid: i32,
@@ -1091,11 +1169,18 @@ impl<'a> CalendarResolver<'a> {
             .copied()
     }
 
+    /// `cal`'s working week, resolved through its base chain.
+    fn week(&self, cal: &'a Calendar) -> Week {
+        cal.resolve_week(|uid| self.calendars.get(&uid).copied())
+    }
+
     /// A leaf the scheduler keeps: its resolved calendar has working time.
     fn schedulable(&self, task: &Task) -> bool {
         !task.summary
             && !task.is_null
-            && self.resolve(task.calendar_uid).is_none_or(has_working_time)
+            && self
+                .resolve(task.calendar_uid)
+                .is_none_or(|cal| has_working_time(&self.week(cal)))
     }
 }
 
@@ -1111,7 +1196,7 @@ pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
             // The scheduler synthesizes Standard when the default is absent.
             continue;
         };
-        if !has_working_time(cal) {
+        if !has_working_time(&calendars.week(cal)) {
             return Some(format!(
                 "calendar {:?} (UID {}) has no working time; task {:?} (UID {}) cannot be scheduled",
                 cal.name, cal.uid, task.name, task.uid
@@ -1230,25 +1315,19 @@ fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
 /// is measured by [`task_duration_min`] instead, which falls back to the leaves'
 /// calendars when this one has no working time.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
-    let cal = proj
-        .calendars
-        .iter()
-        .find(|c| c.uid == proj.default_calendar_uid)
-        .cloned()
-        .unwrap_or_else(|| crate::model::Calendar::standard(proj.default_calendar_uid));
-    working_minutes_on(&cal, start, finish)
+    let week = match proj.calendar(proj.default_calendar_uid) {
+        Some(cal) => proj.resolved_week(cal),
+        None => Calendar::standard_week(),
+    };
+    working_minutes_on(&week, start, finish)
 }
 
 /// Working minutes between two wall-clock instants on one calendar, counted
 /// through the same timeline the scheduler uses.
-pub(crate) fn working_minutes_on(
-    cal: &crate::model::Calendar,
-    start: DateTime,
-    finish: DateTime,
-) -> i64 {
+pub(crate) fn working_minutes_on(week: &Week, start: DateTime, finish: DateTime) -> i64 {
     let a = start.minutes().min(finish.minutes());
     let b = start.minutes().max(finish.minutes());
-    let tl = Timeline::build(&week_pairs(cal), a, a, (b - a) + 480, b + 1440);
+    let tl = Timeline::build(&week_pairs(week), a, a, (b - a) + 480, b + 1440);
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
@@ -1282,25 +1361,22 @@ pub(crate) fn summary_or_leaf_min(
     }
 }
 
-/// The calendar every summary is measured on. MS Project uses the project
+/// The working week every summary is measured on. MS Project uses the project
 /// calendar, resolved as the scheduler resolves it. When that calendar has no
 /// working time (allowed as long as every leaf uses its own working calendar),
 /// the substitute is the per-weekday union of the working time of the
 /// calendars of all schedulable leaves, so equal dates still mean equal
 /// durations across summaries.
-fn summary_calendar(proj: &Project) -> Calendar {
+fn summary_calendar(proj: &Project) -> Week {
     let calendars = CalendarResolver::new(proj);
     let Some(default) = calendars.resolve(None) else {
-        return Calendar::standard(proj.default_calendar_uid);
+        return Calendar::standard_week();
     };
-    if has_working_time(default) {
-        return default.clone();
+    let default_week = calendars.week(default);
+    if has_working_time(&default_week) {
+        return default_week;
     }
-    let mut union = Calendar {
-        uid: default.uid,
-        name: default.name.clone(),
-        week: Default::default(),
-    };
+    let mut union: Week = Default::default();
     let mut seen = std::collections::HashSet::new();
     for cal in proj
         .tasks
@@ -1309,12 +1385,12 @@ fn summary_calendar(proj: &Project) -> Calendar {
         .filter_map(|t| calendars.resolve(t.calendar_uid))
         .filter(|cal| seen.insert(cal.uid))
     {
-        for (day, times) in union.week.iter_mut().zip(&cal.week) {
+        for (day, times) in union.iter_mut().zip(&calendars.week(cal)) {
             day.times
                 .extend(times.times.iter().filter(|t| t.from < t.to).copied());
         }
     }
-    for day in &mut union.week {
+    for day in &mut union {
         day.times.sort_by_key(|t| t.from);
         let mut merged: Vec<WorkingTime> = Vec::new();
         for t in day.times.drain(..) {
@@ -1688,17 +1764,15 @@ mod tests {
             proj.tasks.insert(2, row);
             proj.tasks[3].predecessors.push(fs(3));
             proj.tasks[4].predecessors.push(fs(3));
-            proj.calendars.push(Calendar {
-                uid: 9,
-                name: "Never".into(),
-                week: Default::default(),
-            });
+            proj.calendars
+                .push(Calendar::base(9, "Never", Default::default()));
             proj.assignments.push(Assignment {
                 uid: 1,
                 task_uid: 3,
                 resource_uid: 1,
                 units: 1.0,
                 work_min: 2400,
+                ..Assignment::default()
             });
         }
         proj
@@ -2099,7 +2173,7 @@ mod tests {
     fn fs_milestone_cross_calendar_keeps_predecessor_instant() {
         let mut proj = fs_milestone_project(960);
         let mut shorter = Calendar::standard(2);
-        for day in &mut shorter.week {
+        for day in shorter.week.iter_mut().flatten() {
             if !day.times.is_empty() {
                 day.times = vec![WorkingTime {
                     from: 9 * 60,
@@ -2224,18 +2298,14 @@ mod tests {
     }
 
     fn closed_calendar(uid: i32) -> Calendar {
-        Calendar {
-            uid,
-            name: "Closed".into(),
-            week: Default::default(),
-        }
+        Calendar::base(uid, "Closed", Default::default())
     }
 
     #[test]
     fn twenty_four_hour_calendar_matches_project() {
         let mut cal = Calendar::standard(3);
         cal.name = "24 Hours".into();
-        for day in &mut cal.week {
+        for day in cal.week.iter_mut().flatten() {
             day.times = vec![WorkingTime { from: 0, to: 1440 }];
         }
         let mut build = task(1, "Build", 3 * 480);
@@ -2404,6 +2474,7 @@ mod tests {
                 resource_uid: 1,
                 units: 1.0,
                 work_min: 480,
+                ..Assignment::default()
             });
         }
         let proj = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(&proj)).unwrap();
@@ -2851,10 +2922,10 @@ mod tests {
         let tl = baseline.tl(&proj.tasks[0]);
         let expected = (tl.segs[0].start, tl.segs.len());
         let mut sparse = Calendar::standard(2);
-        for day in &mut sparse.week {
+        for day in sparse.week.iter_mut().flatten() {
             day.times.clear();
         }
-        sparse.week[1].times.push(WorkingTime {
+        sparse.week[1].as_mut().unwrap().times.push(WorkingTime {
             from: 8 * 60,
             to: 9 * 60,
         });
@@ -2968,7 +3039,7 @@ mod tests {
         let mut proj = before_start_project();
         let mut cal = Calendar::standard(2);
         for dow in [0, 2, 3, 4, 5, 6] {
-            cal.week[dow].times.clear();
+            cal.week[dow].as_mut().unwrap().times.clear();
         }
         proj.tasks[0].calendar_uid = Some(2);
         // The used Mondays-only calendar determines the shared origin here.
@@ -2992,7 +3063,7 @@ mod tests {
         let mut sunday = Calendar::standard(2);
         sunday.week[0] = sunday.week[1].clone();
         for dow in 1..7 {
-            sunday.week[dow].times.clear();
+            sunday.week[dow].as_mut().unwrap().times.clear();
         }
         proj.calendars.push(sunday);
         proj.tasks[0].calendar_uid = Some(2);
@@ -3696,7 +3767,7 @@ mod tests {
             task_uid: task,
             resource_uid: res,
             units,
-            work_min: 0,
+            ..Assignment::default()
         }
     }
 
@@ -4042,7 +4113,7 @@ mod tests {
         // Mondays only: 480 working minutes a week.
         let mut mondays = Calendar::standard(2);
         for day in [2, 3, 4, 5] {
-            mondays.week[day] = DayWorking::default();
+            mondays.week[day] = Some(DayWorking::default());
         }
         // Pinned beyond the working-minute budget after the anchor.
         let start = DateTime::from_ymd_hm(2031, 3, 3, 8, 0);
@@ -4158,7 +4229,11 @@ mod tests {
     fn weekly(uid: i32, days: &[(usize, u32, u32)]) -> Calendar {
         let mut cal = closed_calendar(uid);
         for &(dow, from, to) in days {
-            cal.week[dow].times.push(WorkingTime { from, to });
+            cal.week[dow]
+                .as_mut()
+                .unwrap()
+                .times
+                .push(WorkingTime { from, to });
         }
         cal
     }
@@ -4247,7 +4322,7 @@ mod tests {
         // Leaves on a 24-hour calendar: the summary is still measured on the
         // project's Standard calendar, as MS Project measures it.
         let mut always = closed_calendar(3);
-        for day in &mut always.week {
+        for day in always.week.iter_mut().flatten() {
             day.times = vec![WorkingTime { from: 0, to: 1440 }];
         }
         let mut b = child(3, "B", 480, 3);
@@ -4264,6 +4339,127 @@ mod tests {
             ("2026-03-02T08:00:00".into(), "2026-03-03T00:00:00".into())
         );
         assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(480));
+    }
+
+    /// A calendar derived from `base` that states only `own` days.
+    fn derived(uid: i32, base: i32, own: &[(usize, DayWorking)]) -> Calendar {
+        let mut cal = Calendar {
+            base_calendar_uid: Some(base),
+            week: Default::default(),
+            ..Calendar::standard(uid)
+        };
+        cal.name = format!("Derived {uid}");
+        for (day, working) in own {
+            cal.week[*day] = Some(working.clone());
+        }
+        cal
+    }
+
+    #[test]
+    fn derived_calendar_resolves_through_its_base_at_schedule_time() {
+        // Friday off, everything else inherited from Standard.
+        let mut a = task(1, "A", 5 * 480);
+        a.calendar_uid = Some(2);
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a],
+            calendars: vec![
+                Calendar::standard(1),
+                derived(2, 1, &[(5, DayWorking::default())]),
+            ],
+            ..Project::default()
+        };
+        assert_eq!(calendar_error(&proj), None);
+        // Mon-Thu, then Friday is skipped.
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-09T17:00:00".into())
+        );
+        // Shorten the base calendar's Monday only: the derived calendar follows.
+        proj.calendars[0].week[1] = Some(DayWorking {
+            times: vec![WorkingTime {
+                from: 8 * 60,
+                to: 12 * 60,
+            }],
+        });
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-10T17:00:00".into())
+        );
+    }
+
+    #[test]
+    fn derived_calendar_without_own_days_is_not_rejected() {
+        let mut a = task(1, "A", 480);
+        a.calendar_uid = Some(2);
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a],
+            calendars: vec![Calendar::standard(1), derived(2, 1, &[])],
+            ..Project::default()
+        };
+        assert_eq!(calendar_error(&proj), None);
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-02T17:00:00".into())
+        );
+        // Without a base to inherit from, it has no working time at all.
+        proj.calendars[1].base_calendar_uid = Some(99);
+        assert!(
+            calendar_error(&proj)
+                .unwrap()
+                .contains("calendar \"Derived 2\" (UID 2) has no working time")
+        );
+    }
+
+    #[test]
+    fn summary_is_measured_on_a_derived_project_calendar() {
+        // As `summary_duration_stays_on_a_working_default_calendar`, but
+        // the project calendar derives from Standard and states no days. Read
+        // as its own days only, it would have no working time and the summary
+        // would be measured on the leaves' 24-hour calendar instead.
+        let mut always = closed_calendar(3);
+        for day in always.week.iter_mut().flatten() {
+            day.times = vec![WorkingTime { from: 0, to: 1440 }];
+        }
+        let mut b = child(3, "B", 480, 3);
+        b.predecessors.push(fs(2));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![phase(1), child(2, "A", 480, 3), b],
+            calendars: vec![Calendar::standard(5), derived(1, 5, &[]), always],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-03T00:00:00".into())
+        );
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(480));
+    }
+
+    #[test]
+    fn base_chain_lookup_takes_the_last_calendar_with_a_uid() {
+        // Two calendars share UID 1; the second works 07:00-19:00 on Mondays.
+        let mut long = Calendar::standard(1);
+        long.week[1] = Some(DayWorking {
+            times: vec![WorkingTime {
+                from: 7 * 60,
+                to: 19 * 60,
+            }],
+        });
+        let mut a = task(1, "A", 12 * 60);
+        a.calendar_uid = Some(2);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 7, 0)),
+            tasks: vec![a],
+            calendars: vec![Calendar::standard(1), long, derived(2, 1, &[])],
+            ..Project::default()
+        };
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T07:00:00".into(), "2026-03-02T19:00:00".into())
+        );
     }
 
     #[test]
@@ -4342,5 +4538,321 @@ mod tests {
         let lv = level(&proj);
         assert_eq!(lv.start(10), lv.start(2));
         assert_eq!(lv.finish(10), lv.finish(2));
+    }
+
+    fn dt(day: u32, hour: u32) -> DateTime {
+        DateTime::from_ymd_hm(2026, 3, day, hour, 0)
+    }
+
+    /// A (5d) -> B (5d) FS from Mon 2026-03-02; B finishes Fri 03-13 17:00.
+    fn deadline_chain(deadline: Option<DateTime>, honor: bool) -> Project {
+        let mut b = task(2, "B", 2400);
+        b.predecessors.push(fs(1));
+        b.deadline = deadline;
+        Project {
+            start_date: Some(dt(2, 8)),
+            honor_constraints: honor,
+            tasks: vec![task(1, "A", 2400), b],
+            ..Project::default()
+        }
+    }
+
+    fn early_dates(sched: &Schedule, uid: i32) -> (DateTime, DateTime) {
+        let r = sched.get(uid).unwrap();
+        (r.early_start, r.early_finish)
+    }
+
+    #[test]
+    fn missed_deadline_gives_task_and_its_driver_negative_slack() {
+        // #100: Project 2024 reports -5d total slack and 0 free slack on both.
+        for honor in [true, false] {
+            let baseline = schedule(&deadline_chain(None, honor));
+            let sched = schedule(&deadline_chain(Some(dt(6, 17)), honor));
+            for uid in [1, 2] {
+                let r = sched.get(uid).unwrap();
+                assert_eq!(r.total_slack_min, -2400, "task {uid} honor={honor}");
+                assert_eq!(r.free_slack_min, 0, "task {uid} honor={honor}");
+                assert!(r.critical, "task {uid} honor={honor}");
+                assert_eq!(early_dates(&sched, uid), early_dates(&baseline, uid));
+            }
+            assert_eq!(sched.get(2).unwrap().late_finish, dt(6, 17));
+            assert_eq!(sched.project_finish, dt(13, 17));
+            let leveled = level(&deadline_chain(Some(dt(6, 17)), honor));
+            assert_eq!(leveled.finish(2), Some(dt(13, 17)));
+        }
+    }
+
+    #[test]
+    fn deadline_after_the_project_finish_changes_nothing() {
+        for honor in [true, false] {
+            let baseline = schedule(&deadline_chain(None, honor));
+            let sched = schedule(&deadline_chain(Some(dt(18, 17)), honor));
+            for uid in [1, 2] {
+                assert_eq!(
+                    sched.get(uid),
+                    baseline.get(uid),
+                    "task {uid} honor={honor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn met_deadline_tightens_a_non_critical_branch_to_the_deadline_gap() {
+        // A (5d) is critical; X (1d) -> C (1d) has 3d of total slack until C's
+        // deadline on Wed 03-04 17:00 leaves 1d, for C and for X that drives it.
+        let mut c = task(3, "C", 480);
+        c.predecessors.push(fs(2));
+        let mut proj = Project {
+            start_date: Some(dt(2, 8)),
+            tasks: vec![task(1, "A", 2400), task(2, "X", 480), c],
+            ..Project::default()
+        };
+        let baseline = schedule(&proj);
+        assert_eq!(baseline.get(3).unwrap().total_slack_min, 3 * 480);
+        proj.tasks[2].deadline = Some(dt(4, 17));
+        let sched = schedule(&proj);
+        for uid in [2, 3] {
+            let r = sched.get(uid).unwrap();
+            assert_eq!(r.total_slack_min, 480, "task {uid}");
+            assert!(!r.critical, "task {uid}");
+            assert_eq!(early_dates(&sched, uid), early_dates(&baseline, uid));
+        }
+        assert_eq!(sched.get(3).unwrap().late_finish, dt(4, 17));
+        assert_eq!(sched.get(1), baseline.get(1));
+    }
+
+    #[test]
+    fn deadline_and_finish_constraint_take_the_earlier_bound() {
+        use ConstraintType::{FinishNoLaterThan as Fnlt, MustFinishOn as Mfo};
+        // A (5d) -> B (5d) beside an unlinked Z (15d), so B finishing Fri
+        // 03-13 has 5d of slack to the project finish on Fri 03-20. Neither
+        // constraint date moves B's early dates.
+        // (constraint, constraint date, deadline, B's total slack)
+        for (constraint, date, deadline, slack) in [
+            (Fnlt, dt(18, 17), dt(17, 17), 2 * 480),
+            (Fnlt, dt(18, 17), dt(19, 17), 3 * 480),
+            (Mfo, dt(13, 17), dt(12, 17), -480),
+            (Mfo, dt(13, 17), dt(17, 17), 0),
+        ] {
+            for honor in [true, false] {
+                let mut proj = deadline_chain(Some(deadline), honor);
+                proj.tasks.push(task(3, "Z", 15 * 480));
+                let baseline = schedule(&proj);
+                proj.tasks[1].constraint = constraint;
+                proj.tasks[1].constraint_date = Some(date);
+                let sched = schedule(&proj);
+                let case = format!("{constraint:?} {deadline:?} honor={honor}");
+                let b = sched.get(2).unwrap();
+                assert_eq!(b.total_slack_min, slack, "{case}");
+                assert_eq!(sched.get(1).unwrap().total_slack_min, slack, "{case}");
+                assert_eq!(b.late_finish, date.min(deadline), "{case}");
+                assert_eq!(early_dates(&sched, 2), early_dates(&baseline, 2), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn milestone_deadline_keeps_fnlt_morning_semantics() {
+        // Milestone M lands at Fri 03-06 17:00 after A (5d); an unlinked Z
+        // (10d) keeps the project finish at Fri 03-13 so M has slack to lose.
+        // A morning deadline stays on its morning, exactly as an FNLT does.
+        // (deadline, M's total slack)
+        for (deadline, slack) in [(dt(10, 8), 480), (dt(5, 8), -960), (dt(9, 17), 480)] {
+            let mut proj = fs_milestone_project(2400);
+            proj.honor_constraints = false;
+            proj.tasks.push(task(3, "Z", 10 * 480));
+            let baseline = schedule(&proj);
+            let mut fnlt = proj.clone();
+            fnlt.tasks[1].constraint = ConstraintType::FinishNoLaterThan;
+            fnlt.tasks[1].constraint_date = Some(deadline);
+            proj.tasks[1].deadline = Some(deadline);
+            let sched = schedule(&proj);
+            let m = sched.get(2).unwrap();
+            let case = format!("{deadline:?}");
+            assert_eq!(m.late_start, deadline, "{case}");
+            assert_eq!(m.late_finish, deadline, "{case}");
+            assert_eq!(m.total_slack_min, slack, "{case}");
+            assert_eq!(early_dates(&sched, 2), early_dates(&baseline, 2), "{case}");
+            assert_eq!(sched.get(2), schedule(&fnlt).get(2), "{case}");
+        }
+    }
+
+    #[test]
+    fn linked_deadline_far_before_the_early_dates_stays_on_the_timeline() {
+        // A deadline a year early still measures its full miss rather than
+        // clamping to a timeline origin that the early dates alone would set.
+        let deadline = DateTime::from_ymd_hm(2025, 6, 2, 17, 0);
+        let sched = schedule(&deadline_chain(Some(deadline), true));
+        let b = sched.get(2).unwrap();
+        assert_eq!(b.late_finish, deadline);
+        // Working time from Mon 2025-06-02 17:00 to Fri 2026-03-13 17:00.
+        let miss = weekday_minutes(
+            DateTime::from_ymd_hm(2025, 6, 3, 8, 0),
+            DateTime::from_ymd_hm(2026, 3, 14, 8, 0),
+        );
+        for uid in [1, 2] {
+            assert_eq!(sched.get(uid).unwrap().total_slack_min, -miss, "task {uid}");
+        }
+        assert_eq!(early_dates(&sched, 2), (dt(9, 8), dt(13, 17)));
+    }
+
+    #[test]
+    fn unlinked_pre_start_deadline_reports_negative_slack_without_moving_dates() {
+        // The exact pre-start value is a follow-up; the miss must still show.
+        for honor in [true, false] {
+            let mut proj = deadline_chain(None, honor);
+            proj.tasks[1].predecessors.clear();
+            let baseline = schedule(&proj);
+            proj.tasks[1].deadline = Some(DateTime::from_ymd_hm(2026, 2, 16, 17, 0));
+            let sched = schedule(&proj);
+            let b = sched.get(2).unwrap();
+            assert!(b.total_slack_min < 0, "honor={honor}: {b:?}");
+            assert!(b.critical);
+            assert_eq!(early_dates(&sched, 2), early_dates(&baseline, 2));
+            assert_eq!(sched.get(1), baseline.get(1));
+        }
+    }
+
+    #[test]
+    fn deadline_defers_to_a_pre_start_constraint_window() {
+        let date = DateTime::from_ymd_hm(2026, 2, 16, 17, 0);
+        for honor in [true, false] {
+            let constraint_only = schedule(&unlinked_deadline(
+                ConstraintType::FinishNoLaterThan,
+                date,
+                honor,
+            ));
+            for deadline in [DateTime::from_ymd_hm(2026, 2, 27, 17, 0), dt(2, 17)] {
+                let mut proj = unlinked_deadline(ConstraintType::FinishNoLaterThan, date, honor);
+                proj.tasks[1].deadline = Some(deadline);
+                let sched = schedule(&proj);
+                assert_eq!(
+                    sched.get(2),
+                    constraint_only.get(2),
+                    "{deadline:?} honor={honor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn milestone_deadline_under_a_hard_constraint_ignores_an_earlier_successor_bound() {
+        use ConstraintType::{MustFinishOn as Mfo, MustStartOn as Mso};
+        // M is pinned late by an MFO/MSO, which overrides its successor S.
+        // S's own deadline puts S's late start on Thu 03-05, days before M's
+        // deadline (Tue 03-10 17:00): that earlier instant must not become
+        // M's late finish, which is the deadline's.
+        // (constraint, constraint date)
+        for (constraint, date) in [
+            (Mfo, dt(20, 17)),
+            (Mso, dt(23, 8)),
+            (Mfo, dt(10, 17)),
+            (Mso, dt(11, 8)),
+        ] {
+            for honor in [true, false] {
+                let mut m = task(1, "M", 0);
+                m.constraint = constraint;
+                m.constraint_date = Some(date);
+                m.deadline = Some(dt(10, 17));
+                let mut s = task(2, "S", 480);
+                s.predecessors.push(fs(1));
+                s.deadline = Some(dt(5, 17));
+                let proj = Project {
+                    start_date: Some(dt(2, 8)),
+                    honor_constraints: honor,
+                    tasks: vec![m, s],
+                    ..Project::default()
+                };
+                let sched = schedule(&proj);
+                let case = format!("{constraint:?} {date:?} honor={honor}");
+                assert_eq!(sched.get(2).unwrap().late_start, dt(5, 8), "{case}");
+                let m = sched.get(1).unwrap();
+                assert_eq!(m.late_start, dt(10, 17), "{case}");
+                assert_eq!(m.late_finish, dt(10, 17), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_tightens_a_pre_start_start_constraint_window() {
+        // An unlinked 10d task with an SNLT/MSO on Fri 02-27, before the
+        // project start: the window alone finishes Thu 03-12 (-1d of slack).
+        // A deadline on Tue 03-03 17:00 moves the late start to Wed 02-18,
+        // -8d from the Mon 03-02 start; a deadline after 03-12 changes nothing.
+        let date = DateTime::from_ymd_hm(2026, 2, 27, 8, 0);
+        for constraint in [
+            ConstraintType::StartNoLaterThan,
+            ConstraintType::MustStartOn,
+        ] {
+            for honor in [true, false] {
+                let window = |deadline: Option<DateTime>| {
+                    let mut proj = unlinked_deadline(constraint, date, honor);
+                    proj.tasks[1].duration_min = 10 * 480;
+                    proj.tasks[1].deadline = deadline;
+                    *schedule(&proj).get(2).unwrap()
+                };
+                let case = format!("{constraint:?} honor={honor}");
+                let alone = window(None);
+                assert_eq!(alone.late_finish, dt(12, 17), "{case}");
+                assert_eq!(alone.total_slack_min, -480, "{case}");
+                let tight = window(Some(dt(3, 17)));
+                assert_eq!(tight.late_finish, dt(3, 17), "{case}");
+                assert_eq!(
+                    tight.late_start,
+                    DateTime::from_ymd_hm(2026, 2, 18, 8, 0),
+                    "{case}"
+                );
+                assert_eq!(tight.total_slack_min, -8 * 480, "{case}");
+                assert_eq!(
+                    (tight.early_start, tight.early_finish),
+                    (alone.early_start, alone.early_finish),
+                    "{case}"
+                );
+                assert_eq!(window(Some(dt(13, 17))), alone, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn pre_start_window_floors_its_deadline_at_the_project_start() {
+        // X (1d) is unlinked with an SNLT on Fri 02-27, before the Mon 03-02
+        // start, and a deadline four weeks earlier still. Like every unlinked
+        // deadline, it is floored at the project start, so it cannot tighten
+        // the window (-1d). An unrelated pre-start task on the same calendar,
+        // which moves the pre-start timeline's origin, must not change X.
+        let snlt = |uid: i32, day: u32| {
+            let mut t = task(uid, "X", 480);
+            t.constraint = ConstraintType::StartNoLaterThan;
+            t.constraint_date = Some(DateTime::from_ymd_hm(2026, 2, day, 8, 0));
+            t
+        };
+        for honor in [true, false] {
+            for deadline in [None, Some(DateTime::from_ymd_hm(2026, 2, 2, 17, 0))] {
+                let mut x = snlt(1, 27);
+                x.deadline = deadline;
+                let mut proj = Project {
+                    start_date: Some(dt(2, 8)),
+                    honor_constraints: honor,
+                    tasks: vec![x],
+                    ..Project::default()
+                };
+                let alone = *schedule(&proj).get(1).unwrap();
+                let case = format!("{deadline:?} honor={honor}");
+                assert_eq!(alone.total_slack_min, -480, "{case}");
+                proj.tasks.push(snlt(2, 2));
+                assert_eq!(schedule(&proj).get(1), Some(&alone), "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn pinned_task_ignores_its_deadline() {
+        let mut proj = deadline_chain(None, true);
+        proj.tasks[1].manual = true;
+        proj.tasks[1].manual_start = Some(dt(9, 8));
+        let baseline = schedule(&proj);
+        proj.tasks[1].deadline = Some(dt(6, 17));
+        assert_eq!(schedule(&proj).get(2), baseline.get(2));
     }
 }

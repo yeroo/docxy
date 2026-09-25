@@ -15,7 +15,7 @@ the computed dates, slack and critical flags equal the embedded ones. It also
 checks that every project has a critical leaf and that its last-finishing
 leaves have nonpositive slack.
 
-All 18 files were verified against Microsoft Project 2021 in
+All 18 files were verified against Microsoft Project 2024 in
 [issue #74](https://github.com/yeroo/docxy/issues/74) by
 `corpus/tools/verify_mspdi_project.py`. The script has Project schedule a copy
 of each file with every task's `Start`, `Finish`, `TotalSlack` and `Critical`
@@ -28,23 +28,23 @@ project start with zero duration. The #74 run found no oracle to correct, and
 it reproduces the owner's earlier manual runs below.
 
 The owner checked the SF shapes in files 05 and 14 against Microsoft Project
-2021 in [issue #53](https://github.com/yeroo/docxy/issues/53). File 05's B finish
+2024 in [issue #53](https://github.com/yeroo/docxy/issues/53). File 05's B finish
 was corrected from March 3 at 17:00 to March 4 at 08:00, the instant A starts.
 File 14 records Project scheduling the SF successor before the project start.
-File 16 records the 24-hour calendar dates verified against Project 2021 in
+File 16 records the 24-hour calendar dates verified against Project 2024 in
 [issue #58](https://github.com/yeroo/docxy/issues/58): a three-day duration
 (24 working hours) finishes exactly one day after its start.
-File 17 records the FNLT conflict verified against Project 2021 in
+File 17 records the FNLT conflict verified against Project 2024 in
 [issue #60](https://github.com/yeroo/docxy/issues/60): the constraint takes
 precedence over the FS link, with -5 days total slack on both tasks.
-File 18 records the FS milestone dates verified against Project 2021 in
+File 18 records the FS milestone dates verified against Project 2024 in
 [issue #59](https://github.com/yeroo/docxy/issues/59): zero-duration successors
 keep the predecessor's finish instant. Only zero-lag links were verified;
 for nonzero lag the scheduler uses the finish side of the successor calendar's
 working-time boundary, which remains unverified against Project.
 File 19 pins manually scheduled tasks
 ([issue #77](https://github.com/yeroo/docxy/issues/77)) and is **not**
-verified against Project 2021: its Start/Finish are what a manual task
+verified against Project 2024: its Start/Finish are what a manual task
 keeps by definition, but its `TotalSlack`/`Critical` are hand-derived from our
 scheduler, including the violated link (Review, pinned two days before Design
 finishes, gets -2 days). `verify_mspdi_project.py` keeps the tasks this file
@@ -53,15 +53,43 @@ File 20 keeps the task fields Project writes that change scheduling
 ([issue #80](https://github.com/yeroo/docxy/issues/80)): task type,
 effort-driven, estimated, active, priority, deadline, levelling options,
 display flags, WBS, `GUID`/`CreateDate` and the stored `Work`/`Cost`. Like
-file 19 it is **not** verified against Project 2021, for two reasons: docxy
+file 19 it is **not** verified against Project 2024, for two reasons: docxy
 still schedules its inactive task (Project would drop it), and its blank row
 (`<IsNull>1</IsNull>`, between two linked tasks under a summary) has a shape
 of our own, because no Project file with a blank row was available.
+File 21 records a missed task Deadline
+([issue #100](https://github.com/yeroo/docxy/issues/100)): B's deadline is
+five days before its finish, so A and B both carry -5 days total slack and no
+date moves. The file is generated like the others, but its oracle values were
+entered by hand from the issue's Project 2024 capture of `15-deadline-missed`
+in the private spec corpus. It was **not** checked by
+`verify_mspdi_project.py`, which does not check the Deadline on import.
+File 13 also keeps the resource and assignment fields of
+[issue #84](https://github.com/yeroo/docxy/issues/84): the unit each rate is shown in,
+booking type, flags and stored work, and the assignment's contour, flags, own
+dates and regular work. Those values are of our own and were chosen to leave
+the task's schedule as it is (a flat contour, no progress), so the #74 oracle
+still holds. The file was not run through Project again after they were added.
+File 22 keeps recorded progress
+([issue #81](https://github.com/yeroo/docxy/issues/81)): percent complete,
+actuals, `Stop`/`Resume`, remaining values and variances on tasks and
+assignments, and assignment baselines. Its shapes follow a Project 2024
+tracked plan, and its actual dates equal the scheduled ones, so the oracle
+holds while the scheduler ignores progress. It is **not** verified against
+Project 2024, and no Project file with an assignment `<Baseline>` was
+available: that shape follows Microsoft's schema.
+File 23 keeps a derived calendar derived
+([issue #83](https://github.com/yeroo/docxy/issues/83)): `Crew` derives from
+`Standard`, is flagged `IsBaselineCalendar` and states only its own Friday off.
+A resource uses it, and so does a task. Project's UI offers only base
+calendars to tasks, so a task on a derived calendar is our shape, not
+Project's. The file is **not** verified against Project 2024.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
   off. File 12 adds a second calendar with Saturday working; file 16 adds the
-  built-in 24 Hours calendar, working midnight to midnight every day.
+  built-in 24 Hours calendar, working midnight to midnight every day; file 23
+  adds a calendar derived from Standard with its own Friday off.
 
 ## Files
 
@@ -79,7 +107,7 @@ of our own, because no Project file with a blank row was available.
 | `10-summary` | outline rollup | summary derives from children |
 | `11-resource-assignment` | resource + assignment | units × work parsing |
 | `12-calendar-6day` | custom calendar | Saturday working changes the finish |
-| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006) |
+| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006); rate display units (a standard rate shown per day, an overtime rate shown per week), booking type, generic/budget/inactive/levelling flags, work group and stored work, and an assignment's contour, fixed-material and fixed-rate-units flags, own dates and regular work (#84) |
 | `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
 | `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
 | `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |
@@ -87,6 +115,9 @@ of our own, because no Project file with a blank row was available.
 | `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
 | `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
 | `20-task-fields` | stored task fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`; the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
+| `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
+| `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx` |
+| `23-derived-calendar` | derived calendar | `BaseCalendarUID`, `IsBaselineCalendar` and only the calendar's own weekday survive MSPDI and `.yppx`; a task on it inherits Standard's week, skips its own Friday off and finishes Mon 9 |
 
 See `manifest.json` for machine-readable tags.
 

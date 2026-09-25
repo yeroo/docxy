@@ -201,6 +201,8 @@ pub struct Task {
     pub estimated: Option<bool>,
     /// Levelling priority, 0..=1000.
     pub priority: Option<i32>,
+    /// Bounds the late finish only, so a missed deadline shows as negative
+    /// total slack. It never moves scheduled dates.
     pub deadline: Option<DateTime>,
     pub level_assignments: Option<bool>,
     pub leveling_can_split: Option<bool>,
@@ -220,6 +222,29 @@ pub struct Task {
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
     pub over_allocated: Option<bool>,
+    // Recorded progress, kept as read so a save writes it back. docxy neither
+    // computes nor reconciles it: the scheduler ignores it and edits leave it
+    // as read. Durations and work are whole minutes, rounded from the source.
+    /// Percents, 0..=100.
+    pub percent_complete: Option<u8>,
+    pub percent_work_complete: Option<u8>,
+    pub physical_percent_complete: Option<u8>,
+    pub actual_start: Option<DateTime>,
+    pub actual_finish: Option<DateTime>,
+    /// Where completed work ends and remaining work picks up.
+    pub stop: Option<DateTime>,
+    pub resume: Option<DateTime>,
+    pub actual_duration_min: Option<i64>,
+    pub remaining_duration_min: Option<i64>,
+    pub actual_work_min: Option<i64>,
+    pub remaining_work_min: Option<i64>,
+    pub actual_cost: Option<Rate>,
+    pub remaining_cost: Option<Rate>,
+    /// Variances as MSPDI stores them, not interpreted: `StartVariance` and
+    /// `FinishVariance` are integers, `WorkVariance` a float kept as decimal text.
+    pub start_variance: Option<i64>,
+    pub finish_variance: Option<i64>,
+    pub work_variance: Option<Rate>,
 }
 
 impl Task {
@@ -383,10 +408,33 @@ pub struct Resource {
     pub overtime_rate: Option<Rate>,
     pub cost_per_use: Option<Rate>,
     pub calendar_uid: Option<i32>,
+    // Stored as read so a save writes them back; nothing here schedules,
+    // levels or costs with them, and edits do not refresh them.
+    /// The unit Project displays each rate in, as the MSPDI code (1 minute,
+    /// 2 hour, 3 day, 4 week, 5 month, 7 year; the standard rate also 8, a
+    /// material rate). Kept as the code so an unnamed one still round-trips.
+    /// The rate text is kept as written, not converted to this unit.
+    pub standard_rate_format: Option<u8>,
+    pub overtime_rate_format: Option<u8>,
+    /// 0 committed, 1 proposed.
+    pub booking_type: Option<u8>,
+    /// 0 default, 1 none, 2 email, 3 web.
+    pub work_group: Option<u8>,
+    pub is_generic: Option<bool>,
+    pub is_budget: Option<bool>,
+    pub is_inactive: Option<bool>,
+    pub can_level: Option<bool>,
+    pub over_allocated: Option<bool>,
+    /// Decimal text, e.g. `1` = 100%.
+    pub peak_units: Option<Rate>,
+    /// Work in whole minutes, rounded from the source.
+    pub work_min: Option<i64>,
+    pub regular_work_min: Option<i64>,
+    pub remaining_work_min: Option<i64>,
 }
 
 /// An assignment of a resource to a task.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Assignment {
     pub uid: i32,
     pub task_uid: i32,
@@ -394,6 +442,64 @@ pub struct Assignment {
     pub units: f64,
     /// Work in **minutes**.
     pub work_min: i64,
+    // Recorded progress, kept as read so a save writes it back; see the same
+    // block on [`Task`]. Work is whole minutes, rounded from the source.
+    /// 0..=100.
+    pub percent_work_complete: Option<u8>,
+    pub actual_start: Option<DateTime>,
+    pub actual_finish: Option<DateTime>,
+    pub stop: Option<DateTime>,
+    pub resume: Option<DateTime>,
+    pub actual_work_min: Option<i64>,
+    pub remaining_work_min: Option<i64>,
+    pub actual_cost: Option<Rate>,
+    pub remaining_cost: Option<Rate>,
+    /// Variances as MSPDI stores them, not interpreted (integers for dates,
+    /// decimal text for work and cost).
+    pub start_variance: Option<i64>,
+    pub finish_variance: Option<i64>,
+    pub work_variance: Option<Rate>,
+    pub cost_variance: Option<Rate>,
+    // Stored as read, like the progress above; the scheduler neither uses
+    // nor refreshes them.
+    /// How the work is spread over time: 0 flat .. 8 contoured.
+    pub work_contour: Option<u8>,
+    pub fixed_material: Option<bool>,
+    pub has_fixed_rate_units: Option<bool>,
+    /// The assignment's own dates, which differ from its task's when it is
+    /// delayed or contoured.
+    pub start: Option<DateTime>,
+    pub finish: Option<DateTime>,
+    /// Work less overtime, in whole minutes. An edit that changes `work_min`
+    /// clears it, since keeping it would assert overtime nobody entered.
+    pub regular_work_min: Option<i64>,
+    /// Saved plans, sorted by number with at most one record per slot (0..=10).
+    pub baselines: Vec<AssignmentBaseline>,
+}
+
+impl Assignment {
+    pub fn baseline(&self, number: u8) -> Option<&AssignmentBaseline> {
+        self.baselines.iter().find(|b| b.number == number)
+    }
+
+    /// Replace the whole record for a slot, maintaining unique, sorted slots.
+    pub fn set_baseline_slot(&mut self, baseline: AssignmentBaseline) {
+        self.baselines.retain(|b| b.number != baseline.number);
+        self.baselines.push(baseline);
+        self.baselines.sort_by_key(|b| b.number);
+    }
+}
+
+/// A recorded plan in one MSPDI baseline slot of an assignment.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct AssignmentBaseline {
+    /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
+    pub number: u8,
+    pub start: Option<DateTime>,
+    pub finish: Option<DateTime>,
+    /// Recorded work in whole minutes; None when omitted or invalid.
+    pub work_min: Option<i64>,
+    pub cost: Option<Rate>,
 }
 
 /// A working-time slot within a day, in minutes-of-day (`from` inclusive,
@@ -421,19 +527,38 @@ impl DayWorking {
     }
 }
 
+/// A week of working patterns, indexed by weekday, Sunday=0..Saturday=6
+/// (matching [`DateTime::weekday`]), with every day resolved.
+pub type Week = [DayWorking; 7];
+
 /// A working-time calendar. `week[d]` is indexed by weekday, Sunday=0..Saturday=6
-/// (matching [`DateTime::weekday`]).
+/// (matching [`DateTime::weekday`]). A derived calendar states only the days it
+/// overrides; resolve its working time with [`Project::resolved_week`] rather
+/// than reading `week` directly.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Calendar {
     pub uid: i32,
     pub name: String,
-    pub week: [DayWorking; 7],
+    /// The calendar this one derives from (MSPDI `BaseCalendarUID`); `None`
+    /// for a base calendar.
+    pub base_calendar_uid: Option<i32>,
+    /// MSPDI `IsBaselineCalendar`, kept as read.
+    pub is_baseline_calendar: bool,
+    /// The weekdays this calendar states itself. `None` inherits the base
+    /// calendar's day; a base calendar has no base, so there an unstated day is
+    /// non-working.
+    pub week: [Option<DayWorking>; 7],
 }
 
 impl Calendar {
     /// The MS Project "Standard" base calendar: Mon–Fri, 08:00–12:00 &
     /// 13:00–17:00 (8 working hours), weekends off.
     pub fn standard(uid: i32) -> Calendar {
+        Calendar::base(uid, "Standard", Calendar::standard_week())
+    }
+
+    /// The working week of [`Calendar::standard`].
+    pub fn standard_week() -> Week {
         let shift = vec![
             WorkingTime {
                 from: 8 * 60,
@@ -446,20 +571,48 @@ impl Calendar {
         ];
         let off = DayWorking::default();
         let on = DayWorking { times: shift };
+        // Sun, Mon, Tue, Wed, Thu, Fri, Sat
+        [
+            off.clone(),
+            on.clone(),
+            on.clone(),
+            on.clone(),
+            on.clone(),
+            on,
+            off,
+        ]
+    }
+
+    /// A base calendar with the given weekly pattern.
+    pub fn base(uid: i32, name: &str, week: Week) -> Calendar {
         Calendar {
             uid,
-            name: "Standard".into(),
-            // Sun, Mon, Tue, Wed, Thu, Fri, Sat
-            week: [
-                off.clone(),
-                on.clone(),
-                on.clone(),
-                on.clone(),
-                on.clone(),
-                on,
-                off,
-            ],
+            name: name.into(),
+            base_calendar_uid: None,
+            is_baseline_calendar: false,
+            week: week.map(Some),
         }
+    }
+
+    /// This calendar's working week, each day it does not state taken from its
+    /// base chain (`lookup` finds a calendar by UID). A missing base or a cycle
+    /// ends the chain; a day still unresolved is non-working.
+    pub fn resolve_week<'a>(&'a self, lookup: impl Fn(i32) -> Option<&'a Calendar>) -> Week {
+        let mut week: [Option<&DayWorking>; 7] = [None; 7];
+        let mut seen = std::collections::HashSet::new();
+        let mut next = Some(self);
+        while let Some(cal) = next {
+            if !seen.insert(cal.uid) {
+                break;
+            }
+            for (day, own) in week.iter_mut().zip(&cal.week) {
+                if day.is_none() {
+                    *day = own.as_ref();
+                }
+            }
+            next = cal.base_calendar_uid.and_then(&lookup);
+        }
+        week.map(|day| day.cloned().unwrap_or_default())
     }
 }
 
@@ -479,6 +632,11 @@ pub struct Project {
     pub hours_per_week: f64,
     /// UID of the project's default calendar.
     pub default_calendar_uid: i32,
+    /// Project-level MSPDI options docxy stores but does not model
+    /// (`ScheduleFromStart`, currency, task defaults, ...), as (element name,
+    /// text) in read order. A save writes each back verbatim, so an unsupported
+    /// setting survives rather than resetting to Project's default.
+    pub options: Vec<(String, String)>,
     /// Tasks in outline order. UIDs are unique: the readers reject duplicates,
     /// and the scheduler, links and assignments all look tasks up by UID.
     pub tasks: Vec<Task>,
@@ -498,6 +656,7 @@ impl Default for Project {
             hours_per_day: 8.0,
             hours_per_week: 40.0,
             default_calendar_uid: 1,
+            options: Vec::new(),
             tasks: Vec::new(),
             resources: Vec::new(),
             assignments: Vec::new(),
@@ -507,6 +666,14 @@ impl Default for Project {
 }
 
 impl Project {
+    /// The stored text of an unmodeled project option (see [`Project::options`]).
+    pub fn option(&self, name: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Whether this row has outline children, independently of its stored flag.
     /// Blank rows are outside the outline: one is never a summary, and the
     /// next non-blank row decides whether the row above it is.
@@ -535,16 +702,27 @@ impl Project {
         self.tasks.iter().find(|t| t.uid == uid)
     }
 
-    /// The calendar a task schedules against: its own, else the project default,
-    /// else the first calendar, else a synthesized Standard.
-    pub fn calendar_for(&self, task: &Task) -> Calendar {
+    /// The calendar with this UID. When several share it, the last wins, as in
+    /// the scheduler.
+    pub fn calendar(&self, uid: i32) -> Option<&Calendar> {
+        self.calendars.iter().rev().find(|c| c.uid == uid)
+    }
+
+    /// `cal`'s working week, resolved through its base chain in this project.
+    pub fn resolved_week(&self, cal: &Calendar) -> Week {
+        cal.resolve_week(|uid| self.calendar(uid))
+    }
+
+    /// A task's working week, resolved through its base chain: the task's
+    /// calendar, or the project default when the task names none; if that UID
+    /// is missing, the first calendar; with no calendars, Standard. This differs
+    /// from the scheduler, which falls back to the project default (#131).
+    pub fn calendar_for(&self, task: &Task) -> Week {
         let want = task.calendar_uid.unwrap_or(self.default_calendar_uid);
-        self.calendars
-            .iter()
-            .find(|c| c.uid == want)
-            .or_else(|| self.calendars.first())
-            .cloned()
-            .unwrap_or_else(|| Calendar::standard(want))
+        match self.calendar(want).or_else(|| self.calendars.first()) {
+            Some(cal) => self.resolved_week(cal),
+            None => Calendar::standard_week(),
+        }
     }
 }
 
@@ -646,9 +824,92 @@ mod tests {
     #[test]
     fn standard_calendar_is_8h_weekdays() {
         let cal = Calendar::standard(1);
-        assert_eq!(cal.week[1].minutes(), 480); // Monday
-        assert!(!cal.week[0].working()); // Sunday off
-        assert!(!cal.week[6].working()); // Saturday off
+        let week = Project::default().resolved_week(&cal);
+        assert_eq!(week[1].minutes(), 480); // Monday
+        assert!(!week[0].working()); // Sunday off
+        assert!(!week[6].working()); // Saturday off
+    }
+
+    fn derived(uid: i32, base: i32, week: [Option<DayWorking>; 7]) -> Calendar {
+        Calendar {
+            uid,
+            name: format!("Derived {uid}"),
+            base_calendar_uid: Some(base),
+            is_baseline_calendar: false,
+            week,
+        }
+    }
+
+    fn hours(from: u32, to: u32) -> DayWorking {
+        DayWorking {
+            times: vec![WorkingTime {
+                from: from * 60,
+                to: to * 60,
+            }],
+        }
+    }
+
+    #[test]
+    fn derived_week_resolves_transitively_through_its_base_chain() {
+        // Standard <- 2 (Friday off) <- 3 (Monday 07-15).
+        let mut friday_off: [Option<DayWorking>; 7] = Default::default();
+        friday_off[5] = Some(DayWorking::default());
+        let mut short_monday: [Option<DayWorking>; 7] = Default::default();
+        short_monday[1] = Some(hours(7, 15));
+        let proj = Project {
+            calendars: vec![
+                Calendar::standard(1),
+                derived(2, 1, friday_off),
+                derived(3, 2, short_monday),
+            ],
+            ..Project::default()
+        };
+        let week = proj.resolved_week(&proj.calendars[2]);
+        let standard = Calendar::standard_week();
+        assert_eq!(week[1], hours(7, 15));
+        assert_eq!(week[2], standard[2]);
+        assert_eq!(week[4], standard[4]);
+        assert!(!week[5].working());
+        assert!(!week[0].working() && !week[6].working());
+    }
+
+    #[test]
+    fn broken_base_chains_end_and_leave_unresolved_days_non_working() {
+        let mut monday: [Option<DayWorking>; 7] = Default::default();
+        monday[1] = Some(hours(8, 12));
+        for calendars in [
+            // Missing base.
+            vec![derived(2, 99, monday.clone())],
+            // Self-reference.
+            vec![derived(2, 2, monday.clone())],
+            // A longer cycle.
+            vec![
+                derived(2, 3, monday.clone()),
+                derived(3, 2, Default::default()),
+            ],
+        ] {
+            let proj = Project {
+                calendars,
+                ..Project::default()
+            };
+            let week = proj.resolved_week(&proj.calendars[0]);
+            assert_eq!(week[1], hours(8, 12));
+            for day in [0, 2, 3, 4, 5, 6] {
+                assert!(!week[day].working(), "day {day}");
+            }
+        }
+    }
+
+    #[test]
+    fn calendar_lookup_takes_the_last_calendar_with_a_uid() {
+        let mut long = Calendar::standard(1);
+        long.week[1] = Some(hours(6, 20));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), long.clone()],
+            ..Project::default()
+        };
+        assert_eq!(proj.calendar(1), Some(&long));
+        assert_eq!(proj.calendar_for(&Task::default())[1], hours(6, 20));
     }
 
     #[test]

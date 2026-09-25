@@ -48,7 +48,10 @@ separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
 `stored_*` and used as an **oracle** for the scheduler. The editor rewrites them
 for a manual task whose dates it edits, so a save's `Start`/`Finish` agree with
 its `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
-open).
+open). Project-level options the model does not hold (`ScheduleFromStart`,
+currency, task defaults, file identity, ...) are kept verbatim in
+`Project::options` and written back on save; docxy does not act on them yet, so
+it still schedules forward even when `ScheduleFromStart` is 0.
 
 `projcore::editor::Editor` owns the editable project, its 100-entry undo history,
 selection, dirty flag, computed schedule and optional leveling overlay. Validated
@@ -119,7 +122,7 @@ There's no free high-fidelity oracle for scheduling (Project isn't scriptable in
 CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds twenty tiny
 one-feature MSPDI files, each embedding every task's `Start`/`Finish`,
 `TotalSlack` and `Critical`. In files 01–18 these are the values Microsoft
-Project 2021 computes: `corpus/tools/verify_mspdi_project.py` checked every
+Project 2024 computes: `corpus/tools/verify_mspdi_project.py` checked every
 one against Project over COM (#74), with the oracle elements removed from the
 copy Project schedules. Files 19 (manual tasks, #77) and 20 (stored task
 fields and a blank row, #80) are hand-derived from our scheduler and not yet

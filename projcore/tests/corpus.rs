@@ -3,14 +3,20 @@
 //! the oracle values embedded in each file (`corpus/mspdi/*.xml`, produced by
 //! `corpus/tools/gen_mspdi_corpus.py`).
 //!
-//! Every embedded value in files 01-18 was checked against Project 2021 by
+//! Every embedded value in files 01-18 was checked against Project 2024 by
 //! `corpus/tools/verify_mspdi_project.py` (issue #74), which has Project
 //! schedule a copy of each file with the oracle elements removed. It also
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
 //! 16 (#58), 17 (#60) and 18 (#59). The exceptions are file 19 (issue #77),
 //! whose manual-task slack and critical flags are hand-derived from our
 //! scheduler, and file 20 (issue #80), whose task fields and blank row are
-//! ours; neither is verified in Project yet. Blank rows carry no oracle. Slack invariants below also check
+//! ours; neither is verified in Project yet. Blank rows carry no oracle. File
+//! 21's oracle (issue #100) was entered by hand from the issue's Project 2024
+//! capture; the file was not run through `verify_mspdi_project.py`. File 22
+//! (issue #81) carries progress values of our own and is not verified in
+//! Project either, nor is file 23's derived calendar (issue #83), nor are
+//! file 13's resource and assignment fields of issue #84, chosen to leave its
+//! schedule unchanged. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -48,7 +54,7 @@ fn every_file_parses_and_schedules() {
 }
 
 #[test]
-fn fnlt_conflict_matches_project_2021_negative_slack() {
+fn fnlt_conflict_matches_project_2024_negative_slack() {
     let xml =
         std::fs::read_to_string(corpus_dir().join("17-constraint-fnlt-conflict.xml")).unwrap();
     let proj = read_mspdi(&xml).unwrap();
@@ -58,6 +64,41 @@ fn fnlt_conflict_matches_project_2021_negative_slack() {
         let r = sched.get(uid).unwrap();
         assert_eq!(r.total_slack_min, -2400);
         assert!(r.critical);
+    }
+}
+
+#[test]
+fn missed_deadline_matches_project_2024_negative_slack() {
+    // #100: B's Deadline (Fri 03-06) is five days before it finishes, so B and
+    // A, which drives it, both get -5d total slack; no date moves.
+    let xml = std::fs::read_to_string(corpus_dir().join("21-deadline-missed.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let deadline = proj.tasks[1].deadline;
+    assert_eq!(
+        deadline.map(|d| d.to_mspdi()).as_deref(),
+        Some("2026-03-06T17:00:00")
+    );
+    let mut without = proj.clone();
+    without.tasks[1].deadline = None;
+    let baseline = schedule(&without);
+    // The deadline survives MSPDI and .yppx saves, and so does its slack.
+    let saved = read_mspdi(&write_mspdi(&proj)).unwrap();
+    let packaged = read_yppx(&write_yppx(&proj)).unwrap();
+    for (label, proj) in [("read", &proj), ("mspdi", &saved), ("yppx", &packaged)] {
+        assert_eq!(proj.tasks[1].deadline, deadline, "{label}");
+        let sched = schedule(proj);
+        for uid in [1, 2] {
+            let r = sched.get(uid).unwrap();
+            let base = baseline.get(uid).unwrap();
+            assert_eq!(r.total_slack_min, -2400, "{label} task {uid}");
+            assert_eq!(r.free_slack_min, 0, "{label} task {uid}");
+            assert!(r.critical, "{label} task {uid}");
+            assert_eq!(
+                (r.early_start, r.early_finish),
+                (base.early_start, base.early_finish),
+                "{label} task {uid}"
+            );
+        }
     }
 }
 
@@ -118,7 +159,7 @@ fn every_corpus_finishing_leaf_has_nonpositive_slack() {
 }
 
 #[test]
-fn sf_fixture_matches_project_2021_slack_and_finish_instant() {
+fn sf_fixture_matches_project_2024_slack_and_finish_instant() {
     let xml = std::fs::read_to_string(corpus_dir().join("05-link-sf.xml")).unwrap();
     let proj = read_mspdi(&xml).unwrap();
     let sched = schedule(&proj);
@@ -150,6 +191,16 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             .iter()
             .any(|p| p.file_name().unwrap() == "20-task-fields.xml")
     );
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "22-progress.xml")
+    );
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "23-derived-calendar.xml")
+    );
     for path in files {
         let xml = std::fs::read_to_string(&path).unwrap();
         let proj = read_mspdi(&xml).unwrap();
@@ -173,6 +224,13 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             "{}: MSPDI resources changed",
             path.display()
         );
+        // Including #81's recorded progress and assignment baselines.
+        assert_eq!(
+            xml_back.assignments,
+            proj.assignments,
+            "{}: MSPDI assignments changed",
+            path.display()
+        );
         let package_back = read_yppx(&write_yppx(&proj)).unwrap();
         assert_eq!(
             package_back.tasks,
@@ -192,7 +250,114 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             "{}: .yppx resources changed",
             path.display()
         );
+        assert_eq!(
+            package_back.assignments,
+            proj.assignments,
+            "{}: .yppx assignments changed",
+            path.display()
+        );
     }
+}
+
+/// The leaf children of `<Project>` (its header options), as (name, decoded
+/// text), read with the bare XML parser rather than projcore's reader.
+fn header_leaves(xml: &str) -> Vec<(String, String)> {
+    use opccore::xml::{Event, XmlParser};
+    let mut p = XmlParser::new(xml);
+    while !(p.next() == Event::Start && p.name() == "Project") {}
+    let mut leaves = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                let (mut text, mut leaf) = (String::new(), true);
+                loop {
+                    match p.next() {
+                        Event::Text => XmlParser::append_decoded(p.text(), &mut text),
+                        Event::Start => {
+                            leaf = false;
+                            p.skip_element();
+                        }
+                        Event::End | Event::Eof => break,
+                    }
+                }
+                if leaf {
+                    leaves.push((name, text));
+                }
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    leaves
+}
+
+/// Issue #82: a save kept only the header fields docxy models. Every other
+/// project option in a corpus file must come back with its text, through both
+/// formats; the modeled ones are compared by value.
+#[test]
+fn project_options_round_trip_through_mspdi_and_yppx() {
+    const MODELED: &[&str] = &[
+        "Name",
+        "Title",
+        "StartDate",
+        "CalendarUID",
+        "MinutesPerDay",
+        "MinutesPerWeek",
+        "HoursPerDay",
+        "HonorConstraints",
+        "NewTasksAreManual",
+    ];
+    let mut options_seen = 0;
+    for path in mspdi_files() {
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let proj = read_mspdi(&xml).unwrap();
+        let package = read_yppx(&write_yppx(&proj)).unwrap();
+        for saved in [write_mspdi(&proj), write_mspdi(&package)] {
+            let leaves = header_leaves(&saved);
+            for (name, text) in header_leaves(&xml) {
+                if MODELED.contains(&name.as_str()) {
+                    continue;
+                }
+                options_seen += 1;
+                let found: Vec<_> = leaves.iter().filter(|(n, _)| *n == name).collect();
+                assert_eq!(
+                    found,
+                    [&(name.clone(), text)],
+                    "{}: {name} not saved as read",
+                    path.display()
+                );
+            }
+            let back = read_mspdi(&saved).unwrap();
+            assert_eq!(
+                (
+                    &back.name,
+                    &back.title,
+                    back.start_date,
+                    back.default_calendar_uid,
+                    back.hours_per_day,
+                    back.hours_per_week,
+                    back.honor_constraints,
+                    back.new_tasks_are_manual,
+                ),
+                (
+                    &proj.name,
+                    &proj.title,
+                    proj.start_date,
+                    proj.default_calendar_uid,
+                    proj.hours_per_day,
+                    proj.hours_per_week,
+                    proj.honor_constraints,
+                    proj.new_tasks_are_manual,
+                ),
+                "{}: modeled header changed",
+                path.display()
+            );
+        }
+    }
+    // Every fixture carries ProjectExternallyEdited, which Project needs to
+    // import the saved durations intact.
+    assert!(options_seen > 0);
 }
 
 #[test]
@@ -245,7 +410,7 @@ fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     Some(&xml[start..start + len])
 }
 
-/// Project 2021's TotalSlack (tenths of a minute) and Critical for every task
+/// Project 2024's TotalSlack (tenths of a minute) and Critical for every task
 /// but blank rows, read from the raw XML: `read_mspdi` deliberately ignores
 /// both.
 fn embedded_slack_oracle(name: &str, xml: &str) -> Vec<(i32, i64, bool)> {
@@ -295,7 +460,7 @@ fn scheduler_matches_embedded_project_slack_and_critical() {
 }
 
 /// A save writes TotalSlack and Critical from docxy's own schedule; for the
-/// files verified in Project 2021 they are Project's values.
+/// files verified in Project 2024 they are Project's values.
 #[test]
 fn saved_files_carry_project_slack_and_critical() {
     for path in mspdi_files() {
@@ -365,6 +530,186 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
     let saved = write_mspdi(&proj);
     assert_eq!(saved.matches("<IsNull>1</IsNull>").count(), 1);
     assert_eq!(saved.matches("<IsNull>0</IsNull>").count(), 4);
+}
+
+#[test]
+fn progress_fixture_keeps_actuals_through_a_save() {
+    use projcore::DateTime;
+    let xml = std::fs::read_to_string(corpus_dir().join("22-progress.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let percent: Vec<_> = proj.tasks.iter().map(|t| t.percent_complete).collect();
+    assert_eq!(percent, [Some(100), Some(50), Some(0)]);
+    let pour = proj.task(2).unwrap();
+    assert_eq!(
+        (pour.stop, pour.resume),
+        (
+            Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0)),
+            Some(DateTime::from_ymd_hm(2026, 3, 6, 8, 0))
+        )
+    );
+    assert_eq!(pour.remaining_duration_min, Some(960));
+    let slots: Vec<_> = proj.assignments[1]
+        .baselines
+        .iter()
+        .map(|b| b.number)
+        .collect();
+    assert_eq!(slots, [0, 1]);
+    // What the issue saw dropped comes back from a save, element for element.
+    let saved = write_mspdi(&proj);
+    for element in [
+        "<PercentComplete>",
+        "<PercentWorkComplete>",
+        "<PhysicalPercentComplete>",
+        "<ActualStart>",
+        "<ActualFinish>",
+        "<ActualDuration>",
+        "<ActualWork>",
+        "<ActualCost>",
+        "<Stop>",
+        "<Resume>",
+        "<RemainingDuration>",
+        "<RemainingWork>",
+        "<RemainingCost>",
+        "<StartVariance>",
+        "<FinishVariance>",
+        "<WorkVariance>",
+        "<CostVariance>",
+        "<Baseline>",
+    ] {
+        assert_eq!(
+            saved.matches(element).count(),
+            xml.matches(element).count(),
+            "{element}"
+        );
+    }
+}
+
+#[test]
+fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
+    use projcore::DateTime;
+    use projcore::model::Rate;
+    let xml = std::fs::read_to_string(corpus_dir().join("13-resource-fields.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    // A round trip alone would pass if the reader ignored these: read them.
+    let alice = &proj.resources[0];
+    assert_eq!(
+        (alice.standard_rate_format, alice.overtime_rate_format),
+        (Some(3), Some(4)),
+        "a standard rate shown per day and an overtime rate shown per week"
+    );
+    assert_eq!((alice.booking_type, alice.work_group), (Some(1), Some(1)));
+    assert_eq!(
+        (
+            alice.is_generic,
+            alice.is_inactive,
+            alice.can_level,
+            alice.over_allocated
+        ),
+        (Some(true), Some(false), Some(true), Some(false))
+    );
+    assert_eq!(alice.peak_units, Rate::parse("1"));
+    assert_eq!(
+        (
+            alice.work_min,
+            alice.regular_work_min,
+            alice.remaining_work_min
+        ),
+        (Some(960), Some(960), Some(960))
+    );
+    assert_eq!(proj.resources[1].is_budget, Some(true));
+    assert_eq!(proj.resources[2].is_inactive, Some(true));
+    let a = &proj.assignments[0];
+    assert_eq!(
+        (a.work_contour, a.fixed_material, a.has_fixed_rate_units),
+        (Some(0), Some(false), Some(true))
+    );
+    assert_eq!(
+        (a.start, a.finish),
+        (
+            Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0))
+        )
+    );
+    assert_eq!(a.regular_work_min, Some(960));
+    assert_eq!(
+        (a.percent_work_complete, a.remaining_work_min),
+        (Some(0), Some(960))
+    );
+    // What the issue saw dropped comes back from a save, element for element.
+    let saved = write_mspdi(&proj);
+    let section = |xml: &str, name: &str| {
+        let open = xml.find(&format!("<{name}>")).unwrap();
+        xml[open..xml.find(&format!("</{name}>")).unwrap()].to_string()
+    };
+    for (name, elements) in [
+        (
+            "Resources",
+            &[
+                "<StandardRateFormat>3</StandardRateFormat>",
+                "<OvertimeRateFormat>4</OvertimeRateFormat>",
+                "<BookingType>1</BookingType>",
+                "<IsGeneric>1</IsGeneric>",
+                "<IsBudget>1</IsBudget>",
+                "<IsInactive>",
+                "<CanLevel>1</CanLevel>",
+                "<WorkGroup>1</WorkGroup>",
+                "<PeakUnits>1</PeakUnits>",
+                "<OverAllocated>0</OverAllocated>",
+                "<Work>PT16H0M0S</Work>",
+                "<RegularWork>PT16H0M0S</RegularWork>",
+                "<RemainingWork>PT16H0M0S</RemainingWork>",
+            ][..],
+        ),
+        (
+            "Assignments",
+            &[
+                "<WorkContour>0</WorkContour>",
+                "<FixedMaterial>0</FixedMaterial>",
+                "<HasFixedRateUnits>1</HasFixedRateUnits>",
+                "<Start>2026-03-02T08:00:00</Start>",
+                "<Finish>2026-03-03T17:00:00</Finish>",
+                "<RegularWork>PT16H0M0S</RegularWork>",
+                "<RemainingWork>PT16H0M0S</RemainingWork>",
+                "<PercentWorkComplete>0</PercentWorkComplete>",
+            ][..],
+        ),
+    ] {
+        let (input, output) = (section(&xml, name), section(&saved, name));
+        for element in elements {
+            assert!(input.contains(element), "fixture lacks {element}");
+            assert_eq!(
+                output.matches(element).count(),
+                input.matches(element).count(),
+                "{name}: {element}"
+            );
+        }
+    }
+}
+
+#[test]
+fn derived_calendar_fixture_keeps_its_base_through_a_save() {
+    use projcore::DayWorking;
+    let xml = std::fs::read_to_string(corpus_dir().join("23-derived-calendar.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let mut friday_off: [Option<DayWorking>; 7] = Default::default();
+    friday_off[5] = Some(DayWorking::default());
+    let check = |proj: &projcore::Project, what: &str| {
+        let crew = proj.calendar(2).unwrap();
+        assert_eq!(crew.base_calendar_uid, Some(1), "{what}");
+        assert!(crew.is_baseline_calendar, "{what}");
+        assert_eq!(crew.week, friday_off, "{what}");
+        assert_eq!(proj.resources[0].calendar_uid, Some(2), "{what}");
+    };
+    check(&proj, "read");
+    let saved = write_mspdi(&proj);
+    for element in [
+        "<BaseCalendarUID>1</BaseCalendarUID>",
+        "<IsBaselineCalendar>1</IsBaselineCalendar>",
+    ] {
+        assert_eq!(saved.matches(element).count(), 1, "{element}");
+    }
+    check(&read_mspdi(&saved).unwrap(), "MSPDI");
+    check(&read_yppx(&write_yppx(&proj)).unwrap(), ".yppx");
 }
 
 /// The full native pipeline on real files: MSPDI → .yppx package → back → the

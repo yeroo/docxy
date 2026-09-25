@@ -72,9 +72,21 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
                     "Calendars" => parse_calendars(&mut p, &mut proj.calendars),
-                    // An unknown element at this level: consume it whole so its
-                    // children can't be mistaken for header fields.
-                    _ => p.skip_element(),
+                    // Any other leaf is a project option docxy does not model:
+                    // keep its text so a save writes it back. A block with
+                    // child elements (OutlineCodes, ExtendedAttributes, ...) is
+                    // consumed whole so its children can't be mistaken for
+                    // header fields. So is a prefixed element or one carrying
+                    // attributes: an option stores only a name and text, so
+                    // writing it back would lose its namespace binding (an
+                    // unbound `x:` prefix, or a foreign `xmlns` moved into
+                    // MSPDI's) or attributes such as `xsi:nil`.
+                    _ if name.contains(':') || !p.attrs().is_empty() => p.skip_element(),
+                    _ => {
+                        if let Some(text) = leaf_text_of(&mut p) {
+                            set_option(&mut proj.options, name, text);
+                        }
+                    }
                 }
             }
             Event::Eof => break,
@@ -104,15 +116,40 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
 /// decoding XML entities. Any nested element is skipped whole. Consumes the
 /// element's closing `End`.
 fn text_of(p: &mut XmlParser) -> String {
+    element_text(p).0
+}
+
+/// Like [`text_of`], but `None` when the element has a child element, so a
+/// block is never flattened into the text of its leaves.
+fn leaf_text_of(p: &mut XmlParser) -> Option<String> {
+    let (text, leaf) = element_text(p);
+    leaf.then_some(text)
+}
+
+/// The element's decoded text, and whether it had no child elements.
+fn element_text(p: &mut XmlParser) -> (String, bool) {
     let mut s = String::new();
+    let mut leaf = true;
     loop {
         match p.next() {
             Event::Text => XmlParser::append_decoded(p.text(), &mut s),
-            Event::Start => p.skip_element(),
+            Event::Start => {
+                leaf = false;
+                p.skip_element();
+            }
             Event::End | Event::Eof => break,
         }
     }
-    s
+    (s, leaf)
+}
+
+/// Store an unmodeled project option. A repeated name keeps its first
+/// position and takes the later value, as a reader of the last value would.
+fn set_option(options: &mut Vec<(String, String)>, name: String, text: String) {
+    match options.iter_mut().find(|(n, _)| *n == name) {
+        Some(slot) => slot.1 = text,
+        None => options.push((name, text)),
+    }
 }
 
 /// Reject ambiguous explicit IDs before allocating missing ones in file order.
@@ -226,6 +263,24 @@ fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
                     "Work" => t.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => t.cost = rate_of(p),
                     "OverAllocated" => t.over_allocated = opt_bool_of(p),
+                    "PercentComplete" => t.percent_complete = percent_of(p),
+                    "PercentWorkComplete" => t.percent_work_complete = percent_of(p),
+                    "PhysicalPercentComplete" => t.physical_percent_complete = percent_of(p),
+                    "ActualStart" => t.actual_start = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualFinish" => t.actual_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Stop" => t.stop = DateTime::parse_mspdi(&text_of(p)),
+                    "Resume" => t.resume = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualDuration" => t.actual_duration_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingDuration" => {
+                        t.remaining_duration_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ActualWork" => t.actual_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingWork" => t.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "ActualCost" => t.actual_cost = rate_of(p),
+                    "RemainingCost" => t.remaining_cost = rate_of(p),
+                    "StartVariance" => t.start_variance = opt_int_of(p),
+                    "FinishVariance" => t.finish_variance = opt_int_of(p),
+                    "WorkVariance" => t.work_variance = rate_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -336,6 +391,19 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "OvertimeRate" => r.overtime_rate = rate_of(p),
                     "CostPerUse" => r.cost_per_use = rate_of(p),
                     "CalendarUID" => r.calendar_uid = Some(int_of(p) as i32),
+                    "StandardRateFormat" => r.standard_rate_format = opt_u8_of(p),
+                    "OvertimeRateFormat" => r.overtime_rate_format = opt_u8_of(p),
+                    "BookingType" => r.booking_type = opt_u8_of(p),
+                    "WorkGroup" => r.work_group = opt_u8_of(p),
+                    "IsGeneric" => r.is_generic = opt_bool_of(p),
+                    "IsBudget" => r.is_budget = opt_bool_of(p),
+                    "IsInactive" => r.is_inactive = opt_bool_of(p),
+                    "CanLevel" => r.can_level = opt_bool_of(p),
+                    "OverAllocated" => r.over_allocated = opt_bool_of(p),
+                    "PeakUnits" => r.peak_units = rate_of(p),
+                    "Work" => r.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RegularWork" => r.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingWork" => r.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
                     _ => p.skip_element(),
                 }
             }
@@ -372,12 +440,10 @@ fn parse_assignments(p: &mut XmlParser, out: &mut Vec<Assignment>) {
 }
 
 fn parse_assignment(p: &mut XmlParser) -> Assignment {
+    // Absent Units means 100%, not the zero `Default` would give.
     let mut a = Assignment {
-        uid: 0,
-        task_uid: 0,
-        resource_uid: 0,
         units: 1.0,
-        work_min: 0,
+        ..Assignment::default()
     };
     loop {
         match p.next() {
@@ -389,6 +455,27 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
                     "ResourceUID" => a.resource_uid = int_of(p) as i32,
                     "Units" => a.units = float_of(p),
                     "Work" => a.work_min = iso8601_to_minutes(&text_of(p)),
+                    "PercentWorkComplete" => a.percent_work_complete = percent_of(p),
+                    "ActualStart" => a.actual_start = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualFinish" => a.actual_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Stop" => a.stop = DateTime::parse_mspdi(&text_of(p)),
+                    "Resume" => a.resume = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualWork" => a.actual_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingWork" => a.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "ActualCost" => a.actual_cost = rate_of(p),
+                    "RemainingCost" => a.remaining_cost = rate_of(p),
+                    "StartVariance" => a.start_variance = opt_int_of(p),
+                    "FinishVariance" => a.finish_variance = opt_int_of(p),
+                    "WorkVariance" => a.work_variance = rate_of(p),
+                    "CostVariance" => a.cost_variance = rate_of(p),
+                    "WorkContour" => a.work_contour = opt_u8_of(p),
+                    "FixedMaterial" => a.fixed_material = opt_bool_of(p),
+                    "HasFixedRateUnits" => a.has_fixed_rate_units = opt_bool_of(p),
+                    "Start" => a.start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => a.finish = DateTime::parse_mspdi(&text_of(p)),
+                    "RegularWork" => a.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    // Its Start/Finish/Work/Cost are the recorded plan's, not the assignment's.
+                    "Baseline" => parse_assignment_baseline(p, &mut a),
                     _ => p.skip_element(),
                 }
             }
@@ -397,6 +484,37 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
         }
     }
     a
+}
+
+/// Parse an assignment's recorded plan; the same slot rules as [`parse_baseline`].
+fn parse_assignment_baseline(p: &mut XmlParser, a: &mut Assignment) {
+    let mut baseline = AssignmentBaseline::default();
+    let mut number = Some(0);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "Number" => {
+                        number = text_of(p).trim().parse::<u8>().ok().filter(|n| *n <= 10);
+                    }
+                    "Start" => baseline.start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Work" => baseline.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => baseline.cost = rate_of(p),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    if let Some(number) = number {
+        if baseline != AssignmentBaseline::default() {
+            baseline.number = number;
+            a.set_baseline_slot(baseline);
+        }
+    }
 }
 
 fn parse_calendars(p: &mut XmlParser, out: &mut Vec<Calendar>) {
@@ -419,8 +537,12 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
     let mut cal = Calendar {
         uid: 0,
         name: String::new(),
+        base_calendar_uid: None,
+        is_baseline_calendar: false,
         week: Default::default(),
     };
+    let mut is_base = false;
+    let mut base_uid: Option<i32> = None;
     loop {
         match p.next() {
             Event::Start => {
@@ -428,6 +550,9 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
                 match name.as_str() {
                     "UID" => cal.uid = int_of(p) as i32,
                     "Name" => cal.name = text_of(p),
+                    "IsBaseCalendar" => is_base = bool_of(p),
+                    "IsBaselineCalendar" => cal.is_baseline_calendar = bool_of(p),
+                    "BaseCalendarUID" => base_uid = opt_i32_of(p),
                     "WeekDays" => parse_weekdays(p, &mut cal.week),
                     _ => p.skip_element(),
                 }
@@ -436,10 +561,21 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
             _ => {}
         }
     }
+    // A derived calendar states only the days it overrides and inherits the
+    // rest; a base calendar's unstated days are non-working.
+    if is_base {
+        base_uid = None;
+    }
+    cal.base_calendar_uid = base_uid.filter(|&uid| uid != -1);
+    if cal.base_calendar_uid.is_none() {
+        for day in &mut cal.week {
+            day.get_or_insert_with(DayWorking::default);
+        }
+    }
     cal
 }
 
-fn parse_weekdays(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
+fn parse_weekdays(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
     loop {
         match p.next() {
             Event::Start => {
@@ -455,8 +591,9 @@ fn parse_weekdays(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
     }
 }
 
-fn parse_weekday(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
+fn parse_weekday(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
     // MSPDI DayType: 1=Sunday .. 7=Saturday. Our week[] is Sunday=0..Saturday=6.
+    // DayType 0 is a legacy exception entry, not a weekday (exceptions: #126).
     let mut day_type: Option<usize> = None;
     let mut working = false;
     let mut times: Vec<WorkingTime> = Vec::new();
@@ -465,7 +602,12 @@ fn parse_weekday(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
-                    "DayType" => day_type = Some((int_of(p) as usize).saturating_sub(1)),
+                    "DayType" => {
+                        day_type = match int_of(p) {
+                            d @ 1..=7 => Some(d as usize - 1),
+                            _ => None,
+                        }
+                    }
                     "DayWorking" => working = bool_of(p),
                     "WorkingTimes" => parse_working_times(p, &mut times),
                     _ => p.skip_element(),
@@ -476,12 +618,10 @@ fn parse_weekday(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
         }
     }
     if let Some(d) = day_type {
-        if d < 7 {
-            // A non-working day yields empty times even if some were present.
-            week[d] = DayWorking {
-                times: if working { times } else { Vec::new() },
-            };
-        }
+        // A non-working day yields empty times even if some were present.
+        week[d] = Some(DayWorking {
+            times: if working { times } else { Vec::new() },
+        });
     }
 }
 
@@ -561,6 +701,16 @@ fn opt_int_of(p: &mut XmlParser) -> Option<i64> {
     text_of(p).trim().parse().ok()
 }
 
+/// A small code such as a rate unit or contour: outside `u8` stays absent.
+fn opt_u8_of(p: &mut XmlParser) -> Option<u8> {
+    opt_int_of(p).and_then(|n| u8::try_from(n).ok())
+}
+
+/// A percentage, 0..=100; anything else stays absent.
+fn percent_of(p: &mut XmlParser) -> Option<u8> {
+    text_of(p).trim().parse().ok().filter(|n| *n <= 100)
+}
+
 fn opt_i32_of(p: &mut XmlParser) -> Option<i32> {
     text_of(p).trim().parse().ok()
 }
@@ -612,8 +762,9 @@ pub fn iso8601_to_minutes(s: &str) -> i64 {
 }
 
 /// Parse the supported duration components without treating invalid input as zero.
-/// Baselines need to distinguish a recorded zero from an unavailable duration;
-/// task and assignment imports retain the permissive parser above.
+/// Optional durations (baselines, progress, stored work, resource work) need to
+/// distinguish a recorded zero from an unavailable one; only the required task
+/// `Duration` and assignment `Work` keep the permissive parser above.
 fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
     let body = s.trim().strip_prefix('P')?;
     let mut minutes = 0i64;
@@ -656,8 +807,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Serialize a [`Project`] back to MSPDI XML.
 ///
 /// Emits the fields projcore models — enough for MS Project to open the file
-/// and for our own reader to round-trip. Elements outside the model (custom
-/// fields, views, extended attributes) are not preserved: this is a
+/// and for our own reader to round-trip — plus every project-level option the
+/// reader kept verbatim in [`Project::options`]: the schema's in
+/// [`PROJECT_HEADER`] order, then any others in read order. Other elements outside the model (custom fields,
+/// views, extended attributes, outline codes) are not preserved: this is a
 /// model-faithful writer, not a byte-faithful one. Each task's stored
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
 /// stamping them back), so a scheduled project exports with dates Project can
@@ -672,43 +825,18 @@ pub fn write_mspdi(proj: &Project) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");
     s.push_str("<Project xmlns=\"http://schemas.microsoft.com/project\">\n");
-    tag(&mut s, 1, "Name", &proj.name);
-    if !proj.title.is_empty() {
-        tag(&mut s, 1, "Title", &proj.title);
+    for &name in PROJECT_HEADER {
+        if let Some(text) = header_text(proj, name) {
+            tag(&mut s, 1, name, &text);
+        }
     }
-    tag(
-        &mut s,
-        1,
-        "MinutesPerDay",
-        &((proj.hours_per_day * 60.0).round() as i64).to_string(),
-    );
-    tag(
-        &mut s,
-        1,
-        "MinutesPerWeek",
-        &((proj.hours_per_week * 60.0).round() as i64).to_string(),
-    );
-    tag(
-        &mut s,
-        1,
-        "CalendarUID",
-        &proj.default_calendar_uid.to_string(),
-    );
-    if let Some(d) = proj.start_date {
-        tag(&mut s, 1, "StartDate", &d.to_mspdi());
+    // Options the schema does not name (a newer Project's, or another
+    // emitter's) still survive, after the ones it does.
+    for (name, text) in &proj.options {
+        if !PROJECT_HEADER.contains(&name.as_str()) {
+            tag(&mut s, 1, name, text);
+        }
     }
-    tag(
-        &mut s,
-        1,
-        "HonorConstraints",
-        if proj.honor_constraints { "1" } else { "0" },
-    );
-    tag(
-        &mut s,
-        1,
-        "NewTasksAreManual",
-        if proj.new_tasks_are_manual { "1" } else { "0" },
-    );
 
     s.push_str("  <Tasks>\n");
     let sched = crate::schedule::schedule(proj);
@@ -745,6 +873,97 @@ pub fn write_mspdi(proj: &Project) -> String {
 
     s.push_str("</Project>\n");
     s
+}
+
+/// The scalar children of MSPDI's `<Project>`, in the schema's sequence order
+/// (the order Project itself writes them). The writer walks it to place the
+/// modeled fields and the stored options; it never filters what the reader
+/// keeps.
+const PROJECT_HEADER: &[&str] = &[
+    "SaveVersion",
+    "BuildNumber",
+    "Name",
+    "GUID",
+    "Title",
+    "Subject",
+    "Category",
+    "Company",
+    "Manager",
+    "Author",
+    "CreationDate",
+    "Revision",
+    "LastSaved",
+    "ScheduleFromStart",
+    "StartDate",
+    "FinishDate",
+    "FYStartDate",
+    "CriticalSlackLimit",
+    "CurrencyDigits",
+    "CurrencySymbol",
+    "CurrencyCode",
+    "CurrencySymbolPosition",
+    "CalendarUID",
+    "DefaultStartTime",
+    "DefaultFinishTime",
+    "MinutesPerDay",
+    "MinutesPerWeek",
+    "DaysPerMonth",
+    "DefaultTaskType",
+    "DefaultFixedCostAccrual",
+    "DefaultStandardRate",
+    "DefaultOvertimeRate",
+    "DurationFormat",
+    "WorkFormat",
+    "EditableActualCosts",
+    "HonorConstraints",
+    "EarnedValueMethod",
+    "InsertedProjectsLikeSummary",
+    "MultipleCriticalPaths",
+    "NewTasksEffortDriven",
+    "NewTasksEstimated",
+    "SplitsInProgressTasks",
+    "SpreadActualCost",
+    "SpreadPercentComplete",
+    "TaskUpdatesResource",
+    "FiscalYearStart",
+    "WeekStartDay",
+    "MoveCompletedEndsBack",
+    "MoveRemainingStartsBack",
+    "MoveRemainingStartsForward",
+    "MoveCompletedEndsForward",
+    "BaselineForEarnedValue",
+    "AutoAddNewResourcesAndTasks",
+    "StatusDate",
+    "CurrentDate",
+    "MicrosoftProjectServerURL",
+    "Autolink",
+    "NewTaskStartDate",
+    "NewTasksAreManual",
+    "DefaultTaskEVMethod",
+    "ProjectExternallyEdited",
+    "ExtendedCreationDate",
+    "ActualsInSync",
+    "RemoveFileProperties",
+    "AdminProject",
+    "UpdateManuallyScheduledTasksWhenEditingLinks",
+    "KeepTaskOnNearestWorkingTimeWhenMadeAutoScheduled",
+];
+
+/// The text a save writes for one header element: the modeled value (never
+/// `None` for the fields always written), else the option stored verbatim.
+fn header_text(proj: &Project, name: &str) -> Option<String> {
+    let flag = |on: bool| Some(if on { "1" } else { "0" }.to_string());
+    match name {
+        "Name" => Some(proj.name.clone()),
+        "Title" => (!proj.title.is_empty()).then(|| proj.title.clone()),
+        "StartDate" => proj.start_date.map(|d| d.to_mspdi()),
+        "CalendarUID" => Some(proj.default_calendar_uid.to_string()),
+        "MinutesPerDay" => Some(((proj.hours_per_day * 60.0).round() as i64).to_string()),
+        "MinutesPerWeek" => Some(((proj.hours_per_week * 60.0).round() as i64).to_string()),
+        "HonorConstraints" => flag(proj.honor_constraints),
+        "NewTasksAreManual" => flag(proj.new_tasks_are_manual),
+        _ => proj.option(name).map(str::to_string),
+    }
 }
 
 /// The computed values a save writes for one task, from docxy's own schedule.
@@ -813,7 +1032,7 @@ fn opt_text(s: &mut String, name: &str, value: Option<impl ToString>) {
 }
 
 /// Write one task's children in the MSPDI `Task` sequence (the order Project
-/// 2021 writes them). A blank row writes only what it stores: no computed
+/// 2024 writes them). A blank row writes only what it stores: no computed
 /// fields and none of the elements every task otherwise states.
 fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     let task = !t.is_null;
@@ -850,6 +1069,8 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 3, "DurationFormat", "7");
     }
     opt_text(s, "Work", t.work_min.map(min_to_iso));
+    opt_date(s, "Stop", t.stop);
+    opt_date(s, "Resume", t.resume);
     opt_flag(s, "EffortDriven", t.effort_driven);
     opt_flag(s, "Recurring", t.recurring);
     opt_flag(s, "OverAllocated", t.over_allocated);
@@ -869,6 +1090,15 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 3, "EarlyFinish", &r.early_finish.to_mspdi());
         tag(s, 3, "LateStart", &r.late_start.to_mspdi());
         tag(s, 3, "LateFinish", &r.late_finish.to_mspdi());
+    }
+    opt_text(s, "StartVariance", t.start_variance);
+    opt_text(s, "FinishVariance", t.finish_variance);
+    opt_text(
+        s,
+        "WorkVariance",
+        t.work_variance.as_ref().map(Rate::as_str),
+    );
+    if let Some(r) = computed.result {
         // Slack is working minutes in the model, tenths of a minute in MSPDI.
         for (name, min) in [
             ("FreeSlack", r.free_slack_min),
@@ -879,7 +1109,25 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
             tag(s, 3, name, &(min * 10).to_string());
         }
     }
+    opt_text(s, "PercentComplete", t.percent_complete);
+    opt_text(s, "PercentWorkComplete", t.percent_work_complete);
     opt_text(s, "Cost", t.cost.as_ref().map(Rate::as_str));
+    opt_date(s, "ActualStart", t.actual_start);
+    opt_date(s, "ActualFinish", t.actual_finish);
+    opt_text(s, "ActualDuration", t.actual_duration_min.map(min_to_iso));
+    opt_text(s, "ActualCost", t.actual_cost.as_ref().map(Rate::as_str));
+    opt_text(s, "ActualWork", t.actual_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "RemainingDuration",
+        t.remaining_duration_min.map(min_to_iso),
+    );
+    opt_text(
+        s,
+        "RemainingCost",
+        t.remaining_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "RemainingWork", t.remaining_work_min.map(min_to_iso));
     if task || t.constraint != ConstraintType::AsSoonAsPossible {
         tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
     }
@@ -893,6 +1141,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_flag(s, "IgnoreResourceCalendar", t.ignore_resource_calendar);
     opt_flag(s, "HideBar", t.hide_bar);
     opt_flag(s, "Rollup", t.rollup);
+    opt_text(s, "PhysicalPercentComplete", t.physical_percent_complete);
     opt_text(s, "EarnedValueMethod", t.earned_value_method);
     for p in &t.predecessors {
         s.push_str("      <PredecessorLink>\n");
@@ -940,25 +1189,40 @@ fn write_resource(s: &mut String, r: &Resource) {
             tag(s, 3, name, value);
         }
     }
+    opt_text(s, "WorkGroup", r.work_group);
     tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
+    opt_text(s, "PeakUnits", r.peak_units.as_ref().map(Rate::as_str));
+    opt_flag(s, "OverAllocated", r.over_allocated);
+    opt_flag(s, "CanLevel", r.can_level);
     if let Some(accrue_at) = r.accrue_at {
         tag(s, 3, "AccrueAt", &accrue_at.code().to_string());
     }
-    for (name, value) in [
-        ("StandardRate", &r.standard_rate),
-        ("OvertimeRate", &r.overtime_rate),
-        ("CostPerUse", &r.cost_per_use),
-    ] {
-        if let Some(value) = value {
-            tag(s, 3, name, value.as_str());
-        }
-    }
+    opt_text(s, "Work", r.work_min.map(min_to_iso));
+    opt_text(s, "RegularWork", r.regular_work_min.map(min_to_iso));
+    opt_text(s, "RemainingWork", r.remaining_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "StandardRate",
+        r.standard_rate.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "StandardRateFormat", r.standard_rate_format);
+    opt_text(
+        s,
+        "OvertimeRate",
+        r.overtime_rate.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "OvertimeRateFormat", r.overtime_rate_format);
+    opt_text(s, "CostPerUse", r.cost_per_use.as_ref().map(Rate::as_str));
     if let Some(c) = r.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
     }
+    opt_flag(s, "IsGeneric", r.is_generic);
+    opt_flag(s, "IsInactive", r.is_inactive);
+    opt_text(s, "BookingType", r.booking_type);
     if r.kind == ResourceType::Cost {
         tag(s, 3, "IsCostResource", "1");
     }
+    opt_flag(s, "IsBudget", r.is_budget);
     s.push_str("    </Resource>\n");
 }
 
@@ -967,8 +1231,57 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     tag(s, 3, "UID", &a.uid.to_string());
     tag(s, 3, "TaskUID", &a.task_uid.to_string());
     tag(s, 3, "ResourceUID", &a.resource_uid.to_string());
+    // Microsoft's Assignment sequence, as Project 2024 writes it.
+    opt_text(s, "PercentWorkComplete", a.percent_work_complete);
+    opt_text(s, "ActualCost", a.actual_cost.as_ref().map(Rate::as_str));
+    opt_date(s, "ActualFinish", a.actual_finish);
+    opt_date(s, "ActualStart", a.actual_start);
+    opt_text(s, "ActualWork", a.actual_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "CostVariance",
+        a.cost_variance.as_ref().map(Rate::as_str),
+    );
+    opt_date(s, "Finish", a.finish);
+    opt_text(s, "FinishVariance", a.finish_variance);
+    opt_text(
+        s,
+        "WorkVariance",
+        a.work_variance.as_ref().map(Rate::as_str),
+    );
+    opt_flag(s, "HasFixedRateUnits", a.has_fixed_rate_units);
+    opt_flag(s, "FixedMaterial", a.fixed_material);
+    opt_text(s, "RegularWork", a.regular_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "RemainingCost",
+        a.remaining_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "RemainingWork", a.remaining_work_min.map(min_to_iso));
+    opt_date(s, "Start", a.start);
+    opt_date(s, "Stop", a.stop);
+    opt_date(s, "Resume", a.resume);
+    opt_text(s, "StartVariance", a.start_variance);
     tag(s, 3, "Units", &fmt_f(a.units));
     tag(s, 3, "Work", &min_to_iso(a.work_min));
+    opt_text(s, "WorkContour", a.work_contour);
+    for baseline in &a.baselines {
+        s.push_str("      <Baseline>\n");
+        tag(s, 4, "Number", &baseline.number.to_string());
+        if let Some(start) = baseline.start {
+            tag(s, 4, "Start", &start.to_mspdi());
+        }
+        if let Some(finish) = baseline.finish {
+            tag(s, 4, "Finish", &finish.to_mspdi());
+        }
+        if let Some(work) = baseline.work_min {
+            tag(s, 4, "Work", &min_to_iso(work));
+        }
+        if let Some(cost) = &baseline.cost {
+            tag(s, 4, "Cost", cost.as_str());
+        }
+        s.push_str("      </Baseline>\n");
+    }
     s.push_str("    </Assignment>\n");
 }
 
@@ -976,9 +1289,34 @@ fn write_calendar(s: &mut String, c: &Calendar) {
     s.push_str("    <Calendar>\n");
     tag(s, 3, "UID", &c.uid.to_string());
     tag(s, 3, "Name", &c.name);
-    tag(s, 3, "IsBaseCalendar", "1");
+    tag(s, 3, "IsBaseCalendar", flag(c.base_calendar_uid.is_none()));
+    tag(s, 3, "IsBaselineCalendar", flag(c.is_baseline_calendar));
+    tag(
+        s,
+        3,
+        "BaseCalendarUID",
+        &c.base_calendar_uid.unwrap_or(-1).to_string(),
+    );
+    // A base calendar states all seven days, an unstated one as non-working. A
+    // derived calendar states only the days it overrides, so Project keeps
+    // inheriting the rest from its base.
+    let non_working = DayWorking::default();
+    let days: Vec<(usize, &DayWorking)> = c
+        .week
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, day)| match (day, c.base_calendar_uid) {
+            (Some(day), _) => Some((idx, day)),
+            (None, None) => Some((idx, &non_working)),
+            (None, Some(_)) => None,
+        })
+        .collect();
+    if days.is_empty() {
+        s.push_str("    </Calendar>\n");
+        return;
+    }
     s.push_str("      <WeekDays>\n");
-    for (idx, day) in c.week.iter().enumerate() {
+    for (idx, day) in days {
         // model week[] is Sun=0..Sat=6; MSPDI DayType is 1=Sun..7=Sat.
         s.push_str("        <WeekDay>\n");
         tag(s, 5, "DayType", &(idx + 1).to_string());
@@ -1484,33 +1822,36 @@ mod tests {
     fn resource_children_follow_schema_sequence() {
         // Microsoft: XML Schema for the Resources Element (Project 2016).
         // https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-resources-element
-        let r = Resource {
-            kind: ResourceType::Cost,
+        let full = |kind| Resource {
+            kind,
             initials: Some("A".into()),
             material_label: Some("unit".into()),
             code: Some("C7".into()),
             group: Some("Eng".into()),
+            work_group: Some(1),
+            peak_units: Rate::parse("1"),
+            over_allocated: Some(false),
+            can_level: Some(true),
             accrue_at: Some(AccrueAt::End),
+            work_min: Some(480),
+            regular_work_min: Some(480),
+            remaining_work_min: Some(240),
             standard_rate: Rate::parse("50"),
+            standard_rate_format: Some(3),
             overtime_rate: Rate::parse("75"),
+            overtime_rate_format: Some(2),
             cost_per_use: Rate::parse("10"),
             calendar_uid: Some(1),
+            is_generic: Some(false),
+            is_inactive: Some(false),
+            booking_type: Some(0),
+            is_budget: Some(true),
             ..Resource::default()
         };
-        let mut xml = String::new();
-        write_resource(&mut xml, &r);
-        let mut parser = XmlParser::new(&xml);
-        let mut names = Vec::new();
-        loop {
-            match parser.next() {
-                Event::Start => names.push(parser.name().to_string()),
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        assert_eq!(
-            names,
-            [
+        for r in [full(ResourceType::Cost), full(ResourceType::Work)] {
+            let mut xml = String::new();
+            write_resource(&mut xml, &r);
+            let mut expected = vec![
                 "Resource",
                 "UID",
                 "ID",
@@ -1520,16 +1861,33 @@ mod tests {
                 "MaterialLabel",
                 "Code",
                 "Group",
+                "WorkGroup",
                 "MaxUnits",
+                "PeakUnits",
+                "OverAllocated",
+                "CanLevel",
                 "AccrueAt",
+                "Work",
+                "RegularWork",
+                "RemainingWork",
                 "StandardRate",
+                "StandardRateFormat",
                 "OvertimeRate",
+                "OvertimeRateFormat",
                 "CostPerUse",
                 "CalendarUID",
-                "IsCostResource"
-            ]
-        );
-        assert_eq!(resource_project(&xml).resources, vec![r]);
+                "IsGeneric",
+                "IsInactive",
+                "BookingType",
+                "IsCostResource",
+                "IsBudget",
+            ];
+            if r.kind != ResourceType::Cost {
+                expected.retain(|name| *name != "IsCostResource");
+            }
+            assert_eq!(element_names(&xml), expected, "{:?}", r.kind);
+            assert_eq!(resource_project(&xml).resources, vec![r]);
+        }
     }
 
     #[test]
@@ -1614,17 +1972,214 @@ mod tests {
         assert_eq!(proj.calendars.len(), 1);
         let cal = &proj.calendars[0];
         assert_eq!(cal.name, "Std");
-        assert_eq!(cal.week[1].minutes(), 480); // Monday (DayType 2) = 8h
-        assert!(!cal.week[0].working()); // Sunday (DayType 1) off
+        assert_eq!(cal.week[1].as_ref().unwrap().minutes(), 480); // Monday (DayType 2) = 8h
+        assert!(!cal.week[0].as_ref().unwrap().working()); // Sunday (DayType 1) off
+    }
+
+    /// `Standard` (UID 1) as Project writes a base calendar, plus `calendars`,
+    /// and two tasks on calendars `a` and `b`.
+    fn calendars_xml(calendars: &str, a: i32, b: i32) -> String {
+        let day = |d: u32, on: bool| {
+            if on {
+                format!(
+                    "<WeekDay><DayType>{d}</DayType><DayWorking>1</DayWorking><WorkingTimes>\
+                     <WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime>\
+                     <WorkingTime><FromTime>13:00:00</FromTime><ToTime>17:00:00</ToTime></WorkingTime>\
+                     </WorkingTimes></WeekDay>"
+                )
+            } else {
+                format!("<WeekDay><DayType>{d}</DayType><DayWorking>0</DayWorking></WeekDay>")
+            }
+        };
+        let standard: String = (1..=7).map(|d| day(d, (2..=6).contains(&d))).collect();
+        format!(
+            r#"<Project><CalendarUID>1</CalendarUID><Calendars>
+            <Calendar><UID>1</UID><Name>Standard</Name><IsBaseCalendar>1</IsBaseCalendar>
+              <IsBaselineCalendar>0</IsBaselineCalendar><BaseCalendarUID>-1</BaseCalendarUID>
+              <WeekDays>{standard}</WeekDays></Calendar>
+            {calendars}
+            </Calendars><Tasks>
+            <Task><UID>1</UID><ID>1</ID><Name>A</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT8H0M0S</Duration><CalendarUID>{a}</CalendarUID></Task>
+            <Task><UID>2</UID><ID>2</ID><Name>B</Name><OutlineLevel>1</OutlineLevel>
+              <Duration>PT8H0M0S</Duration><CalendarUID>{b}</CalendarUID></Task>
+            </Tasks></Project>"#
+        )
+    }
+
+    /// A resource-style calendar derived from Standard with Friday off, and one
+    /// that states no weekdays at all (the usual shape in Project's files).
+    const DERIVED: &str = r#"
+        <Calendar><UID>2</UID><Name>Night crew</Name><IsBaseCalendar>0</IsBaseCalendar>
+          <IsBaselineCalendar>1</IsBaselineCalendar><BaseCalendarUID>1</BaseCalendarUID>
+          <WeekDays><WeekDay><DayType>6</DayType><DayWorking>0</DayWorking></WeekDay></WeekDays>
+        </Calendar>
+        <Calendar><UID>3</UID><Name>Plain</Name><IsBaseCalendar>0</IsBaseCalendar>
+          <IsBaselineCalendar>0</IsBaselineCalendar><BaseCalendarUID>1</BaseCalendarUID>
+        </Calendar>"#;
+
+    /// The `<Calendar>` element with this UID in written MSPDI.
+    fn calendar_block(xml: &str, uid: i32) -> &str {
+        let start = xml
+            .find(&format!("<Calendar>\n      <UID>{uid}</UID>"))
+            .unwrap();
+        let end = start + xml[start..].find("</Calendar>").unwrap();
+        &xml[start..end]
+    }
+
+    #[test]
+    fn derived_calendars_keep_their_base_through_mspdi_and_yppx() {
+        // Task A is on the calendar with no weekdays of its own: before #83 it
+        // read as seven non-working days and the file was rejected.
+        let proj = read_mspdi(&calendars_xml(DERIVED, 3, 2)).unwrap();
+        let night = proj.calendar(2).unwrap();
+        assert_eq!(night.base_calendar_uid, Some(1));
+        assert!(night.is_baseline_calendar);
+        let mut friday_off: [Option<DayWorking>; 7] = Default::default();
+        friday_off[5] = Some(DayWorking::default());
+        assert_eq!(night.week, friday_off);
+        let plain = proj.calendar(3).unwrap();
+        assert_eq!(plain.base_calendar_uid, Some(1));
+        assert!(!plain.is_baseline_calendar);
+        assert_eq!(plain.week, <[Option<DayWorking>; 7]>::default());
+        let standard = proj.calendar(1).unwrap();
+        assert_eq!(standard.base_calendar_uid, None);
+
+        let xml = write_mspdi(&proj);
+        assert!(calendar_block(&xml, 1).contains(
+            "<Name>Standard</Name>\n      <IsBaseCalendar>1</IsBaseCalendar>\n      \
+             <IsBaselineCalendar>0</IsBaselineCalendar>\n      \
+             <BaseCalendarUID>-1</BaseCalendarUID>\n      <WeekDays>"
+        ));
+        assert!(calendar_block(&xml, 2).contains(
+            "<Name>Night crew</Name>\n      <IsBaseCalendar>0</IsBaseCalendar>\n      \
+             <IsBaselineCalendar>1</IsBaselineCalendar>\n      \
+             <BaseCalendarUID>1</BaseCalendarUID>\n      <WeekDays>"
+        ));
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.calendars, proj.calendars);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.calendars, proj.calendars);
+    }
+
+    #[test]
+    fn derived_calendar_writes_only_its_own_weekdays_and_a_base_writes_all_seven() {
+        let mut proj = read_mspdi(&calendars_xml(DERIVED, 1, 1)).unwrap();
+        proj.calendars
+            .push(Calendar::base(4, "Closed", Default::default()));
+        // A base calendar whose days are unstated in memory.
+        proj.calendars.push(Calendar {
+            week: Default::default(),
+            ..Calendar::base(5, "Unstated", Default::default())
+        });
+        let xml = write_mspdi(&proj);
+        let night = calendar_block(&xml, 2);
+        assert_eq!(night.matches("<WeekDay>").count(), 1);
+        assert!(night.contains("<DayType>6</DayType>\n          <DayWorking>0</DayWorking>"));
+        let plain = calendar_block(&xml, 3);
+        assert_eq!(plain.matches("<WeekDay>").count(), 0);
+        assert!(!plain.contains("<WeekDays>"));
+        assert_eq!(calendar_block(&xml, 1).matches("<WeekDay>").count(), 7);
+        for uid in [4, 5] {
+            let block = calendar_block(&xml, uid);
+            assert_eq!(block.matches("<WeekDay>").count(), 7, "calendar {uid}");
+            assert_eq!(
+                block.matches("<DayWorking>0</DayWorking>").count(),
+                7,
+                "calendar {uid}"
+            );
+        }
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(
+            back.calendar(5).unwrap().week,
+            Calendar::base(5, "", Default::default()).week
+        );
+    }
+
+    #[test]
+    fn reader_decides_base_or_derived_from_both_flags() {
+        let cases = [
+            // IsBaseCalendar wins over a stray BaseCalendarUID.
+            (
+                "<IsBaseCalendar>1</IsBaseCalendar><BaseCalendarUID>1</BaseCalendarUID>",
+                None,
+            ),
+            // MSPDI's default for IsBaseCalendar is false.
+            ("<BaseCalendarUID>1</BaseCalendarUID>", Some(1)),
+            (
+                "<IsBaseCalendar>0</IsBaseCalendar><BaseCalendarUID>-1</BaseCalendarUID>",
+                None,
+            ),
+            ("<IsBaseCalendar>0</IsBaseCalendar>", None),
+            (
+                "<IsBaseCalendar>0</IsBaseCalendar><BaseCalendarUID>x</BaseCalendarUID>",
+                None,
+            ),
+        ];
+        for (flags, base) in cases {
+            let cal = format!(
+                "<Calendar><UID>2</UID><Name>C</Name>{flags}<WeekDays>\
+                 <WeekDay><DayType>2</DayType><DayWorking>1</DayWorking><WorkingTimes>\
+                 <WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime>\
+                 </WorkingTimes></WeekDay></WeekDays></Calendar>"
+            );
+            let proj = read_mspdi(&calendars_xml(&cal, 1, 1)).unwrap();
+            let cal = proj.calendar(2).unwrap();
+            assert_eq!(cal.base_calendar_uid, base, "{flags}");
+            // A base calendar's unstated days are non-working; a derived one's
+            // are inherited.
+            let unstated = cal.week[3].clone();
+            match base {
+                None => assert_eq!(unstated, Some(DayWorking::default()), "{flags}"),
+                Some(_) => assert_eq!(unstated, None, "{flags}"),
+            }
+        }
+    }
+
+    #[test]
+    fn task_on_a_derived_calendar_with_a_broken_chain_and_no_own_time_is_rejected() {
+        for base in [99, 2] {
+            let cal = format!(
+                "<Calendar><UID>2</UID><Name>Orphan</Name><IsBaseCalendar>0</IsBaseCalendar>\
+                 <BaseCalendarUID>{base}</BaseCalendarUID></Calendar>"
+            );
+            let error = read_mspdi(&calendars_xml(&cal, 1, 2)).unwrap_err();
+            assert!(
+                error.contains("calendar \"Orphan\" (UID 2) has no working time"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn day_type_zero_does_not_overwrite_sunday() {
+        let exception = "<WeekDay><DayType>0</DayType><DayWorking>1</DayWorking>\
+             <TimePeriod><FromDate>2026-03-01T00:00:00</FromDate>\
+             <ToDate>2026-03-01T23:59:00</ToDate></TimePeriod><WorkingTimes>\
+             <WorkingTime><FromTime>08:00:00</FromTime><ToTime>12:00:00</ToTime></WorkingTime>\
+             </WorkingTimes></WeekDay>";
+        let cals = format!(
+            "<Calendar><UID>2</UID><Name>Base</Name><IsBaseCalendar>1</IsBaseCalendar>\
+             <WeekDays><WeekDay><DayType>1</DayType><DayWorking>0</DayWorking></WeekDay>\
+             {exception}</WeekDays></Calendar>\
+             <Calendar><UID>3</UID><Name>Derived</Name><IsBaseCalendar>0</IsBaseCalendar>\
+             <BaseCalendarUID>1</BaseCalendarUID><WeekDays>{exception}</WeekDays></Calendar>"
+        );
+        let proj = read_mspdi(&calendars_xml(&cals, 1, 1)).unwrap();
+        assert_eq!(
+            proj.calendar(2).unwrap().week[0],
+            Some(DayWorking::default())
+        );
+        assert_eq!(
+            proj.calendar(3).unwrap().week,
+            <[Option<DayWorking>; 7]>::default()
+        );
     }
 
     fn empty_calendar_project() -> Project {
         let mut proj = read_mspdi(MINIMAL).unwrap();
-        proj.calendars.push(Calendar {
-            uid: 3,
-            name: "Closed".into(),
-            week: Default::default(),
-        });
+        proj.calendars
+            .push(Calendar::base(3, "Closed", Default::default()));
         proj
     }
 
@@ -1738,7 +2293,7 @@ mod tests {
     #[test]
     fn twenty_four_hour_calendar_round_trips() {
         let mut proj = Project::default();
-        for day in &mut proj.calendars[0].week {
+        for day in proj.calendars[0].week.iter_mut().flatten() {
             day.times = vec![WorkingTime { from: 0, to: 1440 }];
         }
         let xml = write_mspdi(&proj);
@@ -2024,9 +2579,11 @@ mod tests {
         let back = read_mspdi(&xml).unwrap();
         assert_eq!(back.calendars.len(), 1);
         let cal = &back.calendars[0];
-        assert_eq!(cal.week[1].minutes(), 480); // Monday still 8h
-        assert_eq!(cal.week[1].times.len(), 2); // two shifts preserved
-        assert!(!cal.week[0].working() && !cal.week[6].working()); // weekend off
+        assert_eq!(cal.week[1].as_ref().unwrap().minutes(), 480); // Monday still 8h
+        assert_eq!(cal.week[1].as_ref().unwrap().times.len(), 2); // two shifts preserved
+        assert!(
+            !cal.week[0].as_ref().unwrap().working() && !cal.week[6].as_ref().unwrap().working()
+        ); // weekend off
     }
 
     // ---- task fields (#80) ----
@@ -2277,9 +2834,10 @@ mod tests {
 
     #[test]
     fn task_children_follow_schema_sequence() {
-        // The MSPDI Task sequence, as Project 2021 writes it (checked over the
-        // 1569 tasks of a private Project 2021 corpus) and as Microsoft's XML
-        // Schema for the Tasks Element lists it.
+        // The MSPDI Task sequence, as Project 2024 writes it (checked over the
+        // 1569 tasks of a private Project 2024 corpus) and as Microsoft's XML
+        // Schema for the Tasks Element lists it. That corpus has no task-level
+        // ActualCost or ActualWork; their places are the schema's.
         let mut proj = task_project(TASK_FIELDS);
         let t = &mut proj.tasks[0];
         t.manual = true;
@@ -2296,6 +2854,24 @@ mod tests {
             duration_min: Some(480),
             ..Baseline::default()
         });
+        let progress = task_project(PROGRESS).tasks.remove(0);
+        let t = &mut proj.tasks[0];
+        t.percent_complete = progress.percent_complete;
+        t.percent_work_complete = progress.percent_work_complete;
+        t.physical_percent_complete = progress.physical_percent_complete;
+        t.actual_start = progress.actual_start;
+        t.actual_finish = progress.actual_finish;
+        t.stop = progress.stop;
+        t.resume = progress.resume;
+        t.actual_duration_min = progress.actual_duration_min;
+        t.remaining_duration_min = progress.remaining_duration_min;
+        t.actual_work_min = progress.actual_work_min;
+        t.remaining_work_min = progress.remaining_work_min;
+        t.actual_cost = progress.actual_cost.clone();
+        t.remaining_cost = progress.remaining_cost.clone();
+        t.start_variance = progress.start_variance;
+        t.finish_variance = progress.finish_variance;
+        t.work_variance = progress.work_variance.clone();
         proj.tasks.insert(
             0,
             Task {
@@ -2345,6 +2921,8 @@ mod tests {
                 "ManualDuration",
                 "DurationFormat",
                 "Work",
+                "Stop",
+                "Resume",
                 "EffortDriven",
                 "Recurring",
                 "OverAllocated",
@@ -2359,11 +2937,24 @@ mod tests {
                 "EarlyFinish",
                 "LateStart",
                 "LateFinish",
+                "StartVariance",
+                "FinishVariance",
+                "WorkVariance",
                 "FreeSlack",
                 "TotalSlack",
                 "StartSlack",
                 "FinishSlack",
+                "PercentComplete",
+                "PercentWorkComplete",
                 "Cost",
+                "ActualStart",
+                "ActualFinish",
+                "ActualDuration",
+                "ActualCost",
+                "ActualWork",
+                "RemainingDuration",
+                "RemainingCost",
+                "RemainingWork",
                 "ConstraintType",
                 "CalendarUID",
                 "ConstraintDate",
@@ -2375,6 +2966,7 @@ mod tests {
                 "IgnoreResourceCalendar",
                 "HideBar",
                 "Rollup",
+                "PhysicalPercentComplete",
                 "EarnedValueMethod",
                 "PredecessorLink",
                 "PredecessorUID",
@@ -2595,5 +3187,933 @@ mod tests {
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
         assert_eq!(package.tasks, proj.tasks);
+    }
+
+    /// The `<Project>` header of a written file: each child up to the first
+    /// collection, as (name, decoded text); a child with children gets "<block>".
+    fn header_of(xml: &str) -> Vec<(String, String)> {
+        let mut p = XmlParser::new(xml);
+        while !(p.next() == Event::Start && p.name() == "Project") {}
+        let mut header = Vec::new();
+        loop {
+            match p.next() {
+                Event::Start if p.name() == "Tasks" => break,
+                Event::Start => {
+                    let name = p.name().to_string();
+                    let text = leaf_text_of(&mut p).unwrap_or_else(|| "<block>".into());
+                    header.push((name, text));
+                }
+                Event::End | Event::Eof => break,
+                Event::Text => {}
+            }
+        }
+        header
+    }
+
+    /// Issue #82's list of the options a save lost, typed out independently of
+    /// `PROJECT_HEADER` so a gap in that table cannot hide here.
+    const ISSUE_82_OPTIONS: &[&str] = &[
+        "ScheduleFromStart",
+        "HonorConstraints",
+        "NewTasksAreManual",
+        "NewTasksEffortDriven",
+        "NewTasksEstimated",
+        "DefaultTaskType",
+        "Autolink",
+        "CriticalSlackLimit",
+        "MultipleCriticalPaths",
+        "DefaultStartTime",
+        "DefaultFinishTime",
+        "DaysPerMonth",
+        "WeekStartDay",
+        "FYStartDate",
+        "FiscalYearStart",
+        "SplitsInProgressTasks",
+        "MoveCompletedEndsBack",
+        "MoveCompletedEndsForward",
+        "MoveRemainingStartsBack",
+        "MoveRemainingStartsForward",
+        "SpreadPercentComplete",
+        "SpreadActualCost",
+        "TaskUpdatesResource",
+        "ActualsInSync",
+        "EditableActualCosts",
+        "EarnedValueMethod",
+        "DefaultTaskEVMethod",
+        "BaselineForEarnedValue",
+        "DefaultFixedCostAccrual",
+        "CurrencySymbol",
+        "CurrencyCode",
+        "CurrencyDigits",
+        "CurrencySymbolPosition",
+        "DurationFormat",
+        "WorkFormat",
+        "CurrentDate",
+        "FinishDate",
+        "Author",
+        "GUID",
+        "CreationDate",
+        "LastSaved",
+        "Revision",
+        "SaveVersion",
+    ];
+
+    /// A header carrying every schema option, in reverse schema order so the
+    /// writer's order cannot come from the input's. Modeled fields get values
+    /// they format back identically; the rest get a value unique to them.
+    fn full_header() -> Vec<(String, String)> {
+        PROJECT_HEADER
+            .iter()
+            .map(|&name| {
+                let text = match name {
+                    "Name" => "Plan".to_string(),
+                    "Title" => "Backward plan".to_string(),
+                    "StartDate" => "2026-03-02T08:00:00".to_string(),
+                    "CalendarUID" => "1".to_string(),
+                    "MinutesPerDay" => "420".to_string(),
+                    "MinutesPerWeek" => "2100".to_string(),
+                    "HonorConstraints" => "0".to_string(),
+                    "NewTasksAreManual" => "1".to_string(),
+                    "ScheduleFromStart" => "0".to_string(),
+                    _ => format!("{name}-value"),
+                };
+                (name.to_string(), text)
+            })
+            .collect()
+    }
+
+    fn header_xml(header: &[(String, String)], extra: &str) -> String {
+        let mut xml = String::from("<Project>");
+        for (name, text) in header.iter().rev() {
+            xml.push_str(&format!("<{name}>{text}</{name}>"));
+        }
+        xml.push_str(extra);
+        xml.push_str("<Tasks/></Project>");
+        xml
+    }
+
+    #[test]
+    fn every_project_option_survives_mspdi_and_yppx_saves_in_schema_order() {
+        let expected = full_header();
+        for name in ISSUE_82_OPTIONS {
+            assert!(expected.iter().any(|(n, _)| n == name), "{name} untested");
+        }
+        let proj = read_mspdi(&header_xml(&expected, "")).unwrap();
+        assert_eq!(proj.option("ScheduleFromStart"), Some("0"));
+        let xml = write_mspdi(&proj);
+        // Every option once, with its text, in schema order.
+        assert_eq!(header_of(&xml), expected);
+        assert!(xml.contains("<ScheduleFromStart>0</ScheduleFromStart>"));
+        // A save stores the options in schema order; the saved file reads back
+        // to the same header.
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(header_of(&write_mspdi(&package)), expected);
+    }
+
+    #[test]
+    fn project_options_keep_xml_specials_and_empty_values() {
+        let proj = read_mspdi(
+            "<Project><Author>A &amp; B</Author><Subject/>\
+             <CurrencySymbol>&lt;€&gt;</CurrencySymbol></Project>",
+        )
+        .unwrap();
+        assert_eq!(proj.option("Author"), Some("A & B"));
+        assert_eq!(proj.option("Subject"), Some(""));
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Author>A &amp; B</Author>"));
+        assert!(xml.contains("<CurrencySymbol>&lt;€&gt;</CurrencySymbol>"));
+        assert!(xml.contains("<Subject></Subject>"));
+        let back = read_mspdi(&xml).unwrap();
+        for name in ["Author", "Subject", "CurrencySymbol"] {
+            assert_eq!(back.option(name), proj.option(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn unknown_leaf_options_survive_after_the_schema_ones_and_blocks_do_not() {
+        let proj = read_mspdi(
+            "<Project><ZzFutureOption>7</ZzFutureOption><Author>Me</Author>\
+             <ZzBlock><A>1</A></ZzBlock><ZzRepeat>a</ZzRepeat>\
+             <ExtendedAttributes><ExtendedAttribute><FieldID>1</FieldID>\
+             </ExtendedAttribute></ExtendedAttributes>\
+             <ZzOther>x</ZzOther><ZzRepeat>b</ZzRepeat><Tasks/></Project>",
+        )
+        .unwrap();
+        let xml = write_mspdi(&proj);
+        let header = header_of(&xml);
+        let names: Vec<&str> = header.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "Name",
+                "Author",
+                "CalendarUID",
+                "MinutesPerDay",
+                "MinutesPerWeek",
+                "HonorConstraints",
+                "NewTasksAreManual",
+                "ZzFutureOption",
+                "ZzRepeat",
+                "ZzOther",
+            ]
+        );
+        // A repeat keeps its first place and takes the later value.
+        assert_eq!(
+            header[7..],
+            [
+                ("ZzFutureOption".to_string(), "7".to_string()),
+                ("ZzRepeat".to_string(), "b".to_string()),
+                ("ZzOther".to_string(), "x".to_string()),
+            ]
+        );
+        assert!(!xml.contains("ZzBlock") && !xml.contains("<A>") && !xml.contains("FieldID"));
+    }
+
+    #[test]
+    fn namespaced_or_attributed_header_leaves_are_not_stored() {
+        let proj = read_mspdi(
+            r#"<Project xmlns="http://schemas.microsoft.com/project" xmlns:x="urn:x">
+                 <x:Ext>1</x:Ext>
+                 <Other xmlns="urn:other">2</Other>
+                 <Nil xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:nil="true"/>
+                 <Author>Me</Author>
+                 <Tasks/>
+               </Project>"#,
+        )
+        .unwrap();
+        // Only the plain leaf is an option; a save could not rebind the rest.
+        assert_eq!(proj.options, [("Author".to_string(), "Me".to_string())]);
+        let xml = write_mspdi(&proj);
+        assert!(!xml.contains("x:") && !xml.contains("urn:other"));
+        assert!(!xml.contains("<Other>") && !xml.contains("<Nil>"));
+    }
+
+    #[test]
+    fn absent_project_options_stay_absent() {
+        let proj = read_mspdi("<Project><HoursPerDay>7</HoursPerDay></Project>").unwrap();
+        // HoursPerDay is modeled (written back as MinutesPerDay), not stored.
+        assert!(proj.options.is_empty());
+        let header = header_of(&write_mspdi(&proj));
+        assert_eq!(
+            header,
+            [
+                ("Name", ""),
+                ("CalendarUID", "1"),
+                ("MinutesPerDay", "420"),
+                ("MinutesPerWeek", "2100"),
+                ("HonorConstraints", "1"),
+                ("NewTasksAreManual", "0"),
+            ]
+            .map(|(n, t)| (n.to_string(), t.to_string()))
+        );
+    }
+
+    /// A tracked task carrying every progress field #81 keeps, in schema order.
+    const PROGRESS: &str = "<Task><UID>1</UID><ID>1</ID><Name>Pour</Name>\
+        <OutlineLevel>1</OutlineLevel><Duration>PT32H0M0S</Duration>\
+        <Stop>2026-03-03T17:00:00</Stop><Resume>2026-03-04T08:00:00</Resume>\
+        <StartVariance>4800</StartVariance><FinishVariance>-4800</FinishVariance>\
+        <WorkVariance>960000.0</WorkVariance>\
+        <PercentComplete>50</PercentComplete><PercentWorkComplete>40</PercentWorkComplete>\
+        <ActualStart>2026-03-02T08:00:00</ActualStart><ActualFinish>2026-03-05T17:00:00</ActualFinish>\
+        <ActualDuration>PT16H0M0S</ActualDuration><ActualCost>800.25</ActualCost>\
+        <ActualWork>PT16H30M0S</ActualWork><RemainingDuration>PT16H0M0S</RemainingDuration>\
+        <RemainingCost>799.75</RemainingCost><RemainingWork>PT15H30M0S</RemainingWork>\
+        <PhysicalPercentComplete>30</PhysicalPercentComplete></Task>";
+
+    /// Task elements #81 keeps.
+    const PROGRESS_TASK_ELEMENTS: [&str; 16] = [
+        "PercentComplete",
+        "PercentWorkComplete",
+        "PhysicalPercentComplete",
+        "ActualStart",
+        "ActualFinish",
+        "ActualDuration",
+        "ActualWork",
+        "ActualCost",
+        "Stop",
+        "Resume",
+        "RemainingDuration",
+        "RemainingWork",
+        "RemainingCost",
+        "StartVariance",
+        "FinishVariance",
+        "WorkVariance",
+    ];
+
+    /// A tracked assignment carrying every progress field #81 keeps, and two baselines.
+    const PROGRESS_ASSIGNMENT: &str = "<Assignment><UID>1</UID><TaskUID>1</TaskUID>\
+        <ResourceUID>1</ResourceUID><PercentWorkComplete>50</PercentWorkComplete>\
+        <ActualCost>400</ActualCost><ActualFinish>2026-03-05T17:00:00</ActualFinish>\
+        <ActualStart>2026-03-02T08:00:00</ActualStart><ActualWork>PT16H0M0S</ActualWork>\
+        <CostVariance>-12.5</CostVariance><FinishVariance>4800</FinishVariance>\
+        <WorkVariance>480000.0</WorkVariance><RemainingCost>400.00</RemainingCost>\
+        <RemainingWork>PT16H0M0S</RemainingWork><Stop>2026-03-03T17:00:00</Stop>\
+        <Resume>2026-03-04T08:00:00</Resume><StartVariance>0</StartVariance>\
+        <Units>1</Units><Work>PT32H0M0S</Work>\
+        <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start>\
+        <Finish>2026-03-05T17:00:00</Finish><Work>PT32H0M0S</Work><Cost>800</Cost></Baseline>\
+        <Baseline><Number>3</Number><Work>PT4H0M0S</Work></Baseline></Assignment>";
+
+    /// Assignment elements #81 keeps.
+    const PROGRESS_ASSIGNMENT_ELEMENTS: [&str; 14] = [
+        "PercentWorkComplete",
+        "ActualCost",
+        "ActualFinish",
+        "ActualStart",
+        "ActualWork",
+        "CostVariance",
+        "FinishVariance",
+        "WorkVariance",
+        "RemainingCost",
+        "RemainingWork",
+        "Stop",
+        "Resume",
+        "StartVariance",
+        "Baseline",
+    ];
+
+    fn assignment_project(assignments: &str) -> Project {
+        read_mspdi(&format!(
+            "<Project><StartDate>2026-03-02T08:00:00</StartDate><Tasks>\
+             <Task><UID>1</UID><ID>1</ID><OutlineLevel>1</OutlineLevel>\
+             <Duration>PT32H0M0S</Duration></Task></Tasks><Resources>\
+             <Resource><UID>1</UID><ID>1</ID><Name>Crew</Name></Resource></Resources>\
+             <Assignments>{assignments}</Assignments></Project>"
+        ))
+        .unwrap()
+    }
+
+    /// The `<Assignments>` section of a written file.
+    fn assignment_xml(xml: &str) -> &str {
+        &xml[xml.find("<Assignments>").unwrap()..xml.find("</Assignments>").unwrap()]
+    }
+
+    fn d(day: u32, hour: u32) -> Option<DateTime> {
+        Some(DateTime::from_ymd_hm(2026, 3, day, hour, 0))
+    }
+
+    #[test]
+    fn progress_fields_are_read() {
+        assert_eq!(
+            task_project(PROGRESS).tasks[0],
+            Task {
+                uid: 1,
+                id: 1,
+                name: "Pour".into(),
+                outline_level: 1,
+                duration_min: 1920,
+                percent_complete: Some(50),
+                percent_work_complete: Some(40),
+                physical_percent_complete: Some(30),
+                actual_start: d(2, 8),
+                actual_finish: d(5, 17),
+                stop: d(3, 17),
+                resume: d(4, 8),
+                actual_duration_min: Some(960),
+                remaining_duration_min: Some(960),
+                actual_work_min: Some(990),
+                remaining_work_min: Some(930),
+                actual_cost: Rate::parse("800.25"),
+                remaining_cost: Rate::parse("799.75"),
+                start_variance: Some(4800),
+                finish_variance: Some(-4800),
+                work_variance: Rate::parse("960000.0"),
+                ..Task::default()
+            }
+        );
+        assert_eq!(
+            assignment_project(PROGRESS_ASSIGNMENT).assignments,
+            [Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 1920,
+                percent_work_complete: Some(50),
+                actual_start: d(2, 8),
+                actual_finish: d(5, 17),
+                stop: d(3, 17),
+                resume: d(4, 8),
+                actual_work_min: Some(960),
+                remaining_work_min: Some(960),
+                actual_cost: Rate::parse("400"),
+                remaining_cost: Rate::parse("400.00"),
+                start_variance: Some(0),
+                finish_variance: Some(4800),
+                work_variance: Rate::parse("480000.0"),
+                cost_variance: Rate::parse("-12.5"),
+                // The baseline's Start/Finish are not the assignment's own.
+                work_contour: None,
+                fixed_material: None,
+                has_fixed_rate_units: None,
+                start: None,
+                finish: None,
+                regular_work_min: None,
+                baselines: vec![
+                    AssignmentBaseline {
+                        number: 0,
+                        start: d(2, 8),
+                        finish: d(5, 17),
+                        work_min: Some(1920),
+                        cost: Rate::parse("800"),
+                    },
+                    AssignmentBaseline {
+                        number: 3,
+                        work_min: Some(240),
+                        ..AssignmentBaseline::default()
+                    },
+                ],
+            }]
+        );
+    }
+
+    #[test]
+    fn progress_fields_survive_mspdi_and_native_package_round_trips() {
+        let mut proj = assignment_project(PROGRESS_ASSIGNMENT);
+        proj.tasks = task_project(PROGRESS).tasks;
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<PercentComplete>50</PercentComplete>",
+            "<PercentWorkComplete>40</PercentWorkComplete>",
+            "<PhysicalPercentComplete>30</PhysicalPercentComplete>",
+            "<ActualStart>2026-03-02T08:00:00</ActualStart>",
+            "<ActualFinish>2026-03-05T17:00:00</ActualFinish>",
+            "<Stop>2026-03-03T17:00:00</Stop>",
+            "<Resume>2026-03-04T08:00:00</Resume>",
+            "<ActualDuration>PT16H0M0S</ActualDuration>",
+            "<ActualWork>PT16H30M0S</ActualWork>",
+            "<ActualCost>800.25</ActualCost>",
+            "<RemainingDuration>PT16H0M0S</RemainingDuration>",
+            "<RemainingWork>PT15H30M0S</RemainingWork>",
+            "<RemainingCost>799.75</RemainingCost>",
+            "<StartVariance>4800</StartVariance>",
+            "<FinishVariance>-4800</FinishVariance>",
+            "<WorkVariance>960000.0</WorkVariance>",
+        ] {
+            assert!(task_xml(&xml).contains(element), "missing {element}");
+        }
+        for element in [
+            "<PercentWorkComplete>50</PercentWorkComplete>",
+            "<ActualCost>400</ActualCost>",
+            "<ActualWork>PT16H0M0S</ActualWork>",
+            "<CostVariance>-12.5</CostVariance>",
+            "<WorkVariance>480000.0</WorkVariance>",
+            "<RemainingCost>400.00</RemainingCost>",
+            "<StartVariance>0</StartVariance>",
+            "<Cost>800</Cost>",
+        ] {
+            assert!(assignment_xml(&xml).contains(element), "missing {element}");
+        }
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.tasks, proj.tasks);
+        assert_eq!(back.assignments, proj.assignments);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks, proj.tasks);
+        assert_eq!(package.assignments, proj.assignments);
+    }
+
+    #[test]
+    fn progress_durations_round_to_minutes() {
+        // As Project 2024 wrote them in a tracked plan: whole minutes are the
+        // model's unit, so the seconds do not survive a save.
+        let mut proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <ActualWork>PT32H9M36S</ActualWork><RemainingWork>PT15H50M24S</RemainingWork>\
+             </Assignment>",
+        );
+        proj.tasks = task_project(
+            "<Task><UID>1</UID><ActualWork>PT32H9M36S</ActualWork>\
+             <ActualDuration>PT0H0M30S</ActualDuration></Task>",
+        )
+        .tasks;
+        assert_eq!(proj.tasks[0].actual_work_min, Some(1930));
+        assert_eq!(proj.tasks[0].actual_duration_min, Some(1));
+        let a = &proj.assignments[0];
+        assert_eq!(a.actual_work_min, Some(1930));
+        assert_eq!(a.remaining_work_min, Some(950));
+        let xml = write_mspdi(&proj);
+        assert!(task_xml(&xml).contains("<ActualWork>PT32H10M0S</ActualWork>"));
+        assert!(task_xml(&xml).contains("<ActualDuration>PT0H1M0S</ActualDuration>"));
+        assert!(assignment_xml(&xml).contains("<ActualWork>PT32H10M0S</ActualWork>"));
+        assert!(assignment_xml(&xml).contains("<RemainingWork>PT15H50M0S</RemainingWork>"));
+    }
+
+    #[test]
+    fn absent_progress_fields_stay_absent() {
+        let proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <Units>1</Units><Work>PT32H0M0S</Work></Assignment>",
+        );
+        assert_eq!(
+            proj.assignments,
+            [Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 1920,
+                ..Assignment::default()
+            }]
+        );
+        assert_eq!(
+            proj.tasks[0],
+            Task {
+                uid: 1,
+                id: 1,
+                outline_level: 1,
+                duration_min: 1920,
+                ..Task::default()
+            }
+        );
+        let xml = write_mspdi(&proj);
+        for name in PROGRESS_TASK_ELEMENTS {
+            assert!(!task_xml(&xml).contains(&format!("<{name}>")), "{name}");
+        }
+        for name in PROGRESS_ASSIGNMENT_ELEMENTS {
+            assert!(
+                !assignment_xml(&xml).contains(&format!("<{name}>")),
+                "{name}"
+            );
+        }
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.tasks, proj.tasks);
+        assert_eq!(back.assignments, proj.assignments);
+    }
+
+    #[test]
+    fn invalid_progress_fields_stay_absent() {
+        for element in [
+            "<PercentComplete>101</PercentComplete>",
+            "<PercentComplete>-1</PercentComplete>",
+            "<PercentComplete>abc</PercentComplete>",
+            "<PercentComplete/>",
+            "<PercentWorkComplete>50.5</PercentWorkComplete>",
+            "<PhysicalPercentComplete>256</PhysicalPercentComplete>",
+            "<ActualStart>soon</ActualStart>",
+            "<ActualFinish/>",
+            "<Stop>x</Stop>",
+            "<Resume>NA</Resume>",
+            "<ActualDuration>banana</ActualDuration>",
+            "<ActualDuration/>",
+            "<RemainingDuration>PT</RemainingDuration>",
+            "<ActualWork>8h</ActualWork>",
+            "<RemainingWork>-PT8H0M0S</RemainingWork>",
+            "<ActualCost>NaN</ActualCost>",
+            "<RemainingCost>x</RemainingCost>",
+            "<StartVariance>1.5</StartVariance>",
+            "<FinishVariance>x</FinishVariance>",
+            "<WorkVariance>x</WorkVariance>",
+            "<WorkVariance>inf</WorkVariance>",
+        ] {
+            let proj = task_project(&format!("<Task><UID>1</UID>{element}</Task>"));
+            assert_eq!(
+                proj.tasks[0],
+                Task {
+                    uid: 1,
+                    ..Task::default()
+                },
+                "{element}"
+            );
+            let xml = write_mspdi(&proj);
+            for name in PROGRESS_TASK_ELEMENTS {
+                assert!(!task_xml(&xml).contains(&format!("<{name}>")), "{element}");
+            }
+        }
+        for element in [
+            "<PercentWorkComplete>101</PercentWorkComplete>",
+            "<PercentWorkComplete>x</PercentWorkComplete>",
+            "<ActualStart>soon</ActualStart>",
+            "<ActualFinish>x</ActualFinish>",
+            "<Stop/>",
+            "<Resume>x</Resume>",
+            "<ActualWork>banana</ActualWork>",
+            "<RemainingWork>PT8X</RemainingWork>",
+            "<ActualCost>x</ActualCost>",
+            "<RemainingCost>NaN</RemainingCost>",
+            "<StartVariance>x</StartVariance>",
+            "<FinishVariance>2.5</FinishVariance>",
+            "<WorkVariance>x</WorkVariance>",
+            "<CostVariance>x</CostVariance>",
+            "<Baseline><Number>0</Number><Work>x</Work><Cost>x</Cost></Baseline>",
+        ] {
+            let proj = assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 {element}</Assignment>"
+            ));
+            assert_eq!(
+                proj.assignments,
+                [Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    ..Assignment::default()
+                }],
+                "{element}"
+            );
+            let xml = write_mspdi(&proj);
+            for name in PROGRESS_ASSIGNMENT_ELEMENTS {
+                assert!(
+                    !assignment_xml(&xml).contains(&format!("<{name}>")),
+                    "{element}"
+                );
+            }
+        }
+        // The percent range is inclusive.
+        for n in [0, 100] {
+            let proj = task_project(&format!(
+                "<Task><UID>1</UID><PercentComplete>{n}</PercentComplete></Task>"
+            ));
+            assert_eq!(proj.tasks[0].percent_complete, Some(n));
+        }
+    }
+
+    #[test]
+    fn assignment_baselines_round_trip() {
+        let baselines = |xml: &str| {
+            assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 {xml}</Assignment>"
+            ))
+            .assignments
+            .remove(0)
+            .baselines
+        };
+        let work = |number, min| AssignmentBaseline {
+            number,
+            work_min: Some(min),
+            ..AssignmentBaseline::default()
+        };
+        // Slots are sorted; a missing Number is slot 0.
+        assert_eq!(
+            baselines(
+                "<Baseline><Number>10</Number><Work>PT1H0M0S</Work></Baseline>\
+                 <Baseline><Work>PT2H0M0S</Work></Baseline>"
+            ),
+            [work(0, 120), work(10, 60)]
+        );
+        // A duplicate slot replaces the whole record, cost included.
+        assert_eq!(
+            baselines(
+                "<Baseline><Number>1</Number><Work>PT1H0M0S</Work><Cost>5</Cost></Baseline>\
+                 <Baseline><Number>1</Number><Work>PT2H0M0S</Work></Baseline>"
+            ),
+            [work(1, 120)]
+        );
+        // An empty record, and an invalid or out-of-range Number, are dropped.
+        assert_eq!(
+            baselines(
+                "<Baseline><Number>2</Number></Baseline>\
+                 <Baseline><Number>11</Number><Work>PT1H0M0S</Work></Baseline>\
+                 <Baseline><Number>x</Number><Work>PT1H0M0S</Work></Baseline>"
+            ),
+            []
+        );
+        // A recorded zero is kept, not confused with an absent value.
+        assert_eq!(
+            baselines("<Baseline><Number>4</Number><Work>PT0H0M0S</Work></Baseline>"),
+            [work(4, 0)]
+        );
+        let proj = assignment_project(PROGRESS_ASSIGNMENT);
+        let xml = write_mspdi(&proj);
+        assert_eq!(read_mspdi(&xml).unwrap().assignments, proj.assignments);
+    }
+
+    #[test]
+    fn assignment_children_follow_schema_sequence() {
+        // The MSPDI Assignment sequence, as Project 2024 writes it (merged over
+        // the assignments of a private Project 2024 corpus) and as Microsoft's
+        // XML Schema lists it. That corpus has no assignment ActualCost or
+        // Baseline; their places are the schema's.
+        let mut proj = assignment_project(PROGRESS_ASSIGNMENT);
+        let a = &mut proj.assignments[0];
+        a.finish = d(5, 17);
+        a.has_fixed_rate_units = Some(true);
+        a.fixed_material = Some(false);
+        a.regular_work_min = Some(1920);
+        a.start = d(2, 8);
+        a.work_contour = Some(1);
+        let mut xml = String::new();
+        write_assignment(&mut xml, &proj.assignments[0]);
+        assert_eq!(
+            element_names(&xml),
+            [
+                "Assignment",
+                "UID",
+                "TaskUID",
+                "ResourceUID",
+                "PercentWorkComplete",
+                "ActualCost",
+                "ActualFinish",
+                "ActualStart",
+                "ActualWork",
+                "CostVariance",
+                "Finish",
+                "FinishVariance",
+                "WorkVariance",
+                "HasFixedRateUnits",
+                "FixedMaterial",
+                "RegularWork",
+                "RemainingCost",
+                "RemainingWork",
+                "Start",
+                "Stop",
+                "Resume",
+                "StartVariance",
+                "Units",
+                "Work",
+                "WorkContour",
+                "Baseline",
+                "Number",
+                "Start",
+                "Finish",
+                "Work",
+                "Cost",
+                "Baseline",
+                "Number",
+                "Work",
+            ]
+        );
+    }
+
+    /// A work resource carrying every field #84 keeps, with a standard rate
+    /// shown per day and an overtime rate shown per week.
+    const RESOURCE_FIELDS: &str = "<Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>\
+        <Type>1</Type><WorkGroup>2</WorkGroup><MaxUnits>1</MaxUnits><PeakUnits>1.5</PeakUnits>\
+        <OverAllocated>1</OverAllocated><CanLevel>0</CanLevel><Work>PT40H0M0S</Work>\
+        <RegularWork>PT32H0M0S</RegularWork><RemainingWork>PT24H0M0S</RemainingWork>\
+        <StandardRate>800</StandardRate><StandardRateFormat>3</StandardRateFormat>\
+        <OvertimeRate>6000</OvertimeRate><OvertimeRateFormat>4</OvertimeRateFormat>\
+        <IsGeneric>1</IsGeneric><IsInactive>0</IsInactive><BookingType>1</BookingType>\
+        <IsBudget>0</IsBudget></Resource>";
+
+    /// Resource elements #84 keeps.
+    const RESOURCE_FIELD_ELEMENTS: [&str; 13] = [
+        "WorkGroup",
+        "PeakUnits",
+        "OverAllocated",
+        "CanLevel",
+        "Work",
+        "RegularWork",
+        "RemainingWork",
+        "StandardRateFormat",
+        "OvertimeRateFormat",
+        "IsGeneric",
+        "IsInactive",
+        "BookingType",
+        "IsBudget",
+    ];
+
+    /// An assignment carrying every field #84 keeps, besides #81's progress.
+    const CONTOUR_ASSIGNMENT: &str = "<Assignment><UID>1</UID><TaskUID>1</TaskUID>\
+        <ResourceUID>1</ResourceUID><PercentWorkComplete>25</PercentWorkComplete>\
+        <Finish>2026-03-06T12:00:00</Finish><HasFixedRateUnits>1</HasFixedRateUnits>\
+        <FixedMaterial>0</FixedMaterial><RegularWork>PT32H0M0S</RegularWork>\
+        <RemainingWork>PT24H0M0S</RemainingWork><Start>2026-03-03T08:00:00</Start>\
+        <Units>1</Units><Work>PT32H0M0S</Work><WorkContour>3</WorkContour></Assignment>";
+
+    /// Assignment elements #84 keeps.
+    const CONTOUR_ASSIGNMENT_ELEMENTS: [&str; 6] = [
+        "Finish",
+        "HasFixedRateUnits",
+        "FixedMaterial",
+        "RegularWork",
+        "Start",
+        "WorkContour",
+    ];
+
+    #[test]
+    fn resource_rate_units_and_flags_are_read() {
+        assert_eq!(
+            resource_project(RESOURCE_FIELDS).resources,
+            [Resource {
+                uid: 1,
+                id: 1,
+                name: "Alice".into(),
+                kind: ResourceType::Work,
+                max_units: 1.0,
+                standard_rate: Rate::parse("800"),
+                overtime_rate: Rate::parse("6000"),
+                standard_rate_format: Some(3),
+                overtime_rate_format: Some(4),
+                booking_type: Some(1),
+                work_group: Some(2),
+                is_generic: Some(true),
+                is_budget: Some(false),
+                is_inactive: Some(false),
+                can_level: Some(false),
+                over_allocated: Some(true),
+                peak_units: Rate::parse("1.5"),
+                work_min: Some(2400),
+                regular_work_min: Some(1920),
+                remaining_work_min: Some(1440),
+                ..Resource::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn resource_rate_units_and_flags_survive_mspdi_and_native_package_round_trips() {
+        let proj = resource_project(RESOURCE_FIELDS);
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<WorkGroup>2</WorkGroup>",
+            "<PeakUnits>1.5</PeakUnits>",
+            "<OverAllocated>1</OverAllocated>",
+            "<CanLevel>0</CanLevel>",
+            "<Work>PT40H0M0S</Work>",
+            "<RegularWork>PT32H0M0S</RegularWork>",
+            "<RemainingWork>PT24H0M0S</RemainingWork>",
+            "<StandardRate>800</StandardRate>",
+            "<StandardRateFormat>3</StandardRateFormat>",
+            "<OvertimeRate>6000</OvertimeRate>",
+            "<OvertimeRateFormat>4</OvertimeRateFormat>",
+            "<IsGeneric>1</IsGeneric>",
+            "<IsInactive>0</IsInactive>",
+            "<BookingType>1</BookingType>",
+            "<IsBudget>0</IsBudget>",
+        ] {
+            assert!(xml.contains(element), "missing {element}");
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.resources, proj.resources);
+    }
+
+    #[test]
+    fn assignment_contour_flags_and_dates_are_read() {
+        assert_eq!(
+            assignment_project(CONTOUR_ASSIGNMENT).assignments,
+            [Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 1920,
+                percent_work_complete: Some(25),
+                remaining_work_min: Some(1440),
+                work_contour: Some(3),
+                fixed_material: Some(false),
+                has_fixed_rate_units: Some(true),
+                start: d(3, 8),
+                finish: d(6, 12),
+                regular_work_min: Some(1920),
+                ..Assignment::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn assignment_contour_flags_and_dates_survive_mspdi_and_native_package_round_trips() {
+        let proj = assignment_project(CONTOUR_ASSIGNMENT);
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<PercentWorkComplete>25</PercentWorkComplete>",
+            "<Finish>2026-03-06T12:00:00</Finish>",
+            "<HasFixedRateUnits>1</HasFixedRateUnits>",
+            "<FixedMaterial>0</FixedMaterial>",
+            "<RegularWork>PT32H0M0S</RegularWork>",
+            "<RemainingWork>PT24H0M0S</RemainingWork>",
+            "<Start>2026-03-03T08:00:00</Start>",
+            "<WorkContour>3</WorkContour>",
+        ] {
+            assert!(assignment_xml(&xml).contains(element), "missing {element}");
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().assignments, proj.assignments);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.assignments, proj.assignments);
+    }
+
+    #[test]
+    fn absent_resource_and_assignment_fields_stay_absent() {
+        let proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <Units>1</Units><Work>PT32H0M0S</Work></Assignment>",
+        );
+        assert_eq!(
+            proj.resources,
+            [Resource {
+                uid: 1,
+                id: 1,
+                name: "Crew".into(),
+                max_units: 1.0,
+                ..Resource::default()
+            }]
+        );
+        let xml = write_mspdi(&proj);
+        let resources = &xml[xml.find("<Resources>").unwrap()..xml.find("</Resources>").unwrap()];
+        for name in RESOURCE_FIELD_ELEMENTS {
+            assert!(!resources.contains(&format!("<{name}>")), "{name}");
+        }
+        for name in CONTOUR_ASSIGNMENT_ELEMENTS {
+            assert!(
+                !assignment_xml(&xml).contains(&format!("<{name}>")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_resource_fields_stay_absent() {
+        for element in [
+            "<StandardRateFormat>h</StandardRateFormat>",
+            "<OvertimeRateFormat>256</OvertimeRateFormat>",
+            "<BookingType>300</BookingType>",
+            "<WorkGroup>-1</WorkGroup>",
+            "<IsGeneric>yes</IsGeneric>",
+            "<IsBudget>2</IsBudget>",
+            "<IsInactive/>",
+            "<CanLevel>on</CanLevel>",
+            "<OverAllocated>x</OverAllocated>",
+            "<PeakUnits>lots</PeakUnits>",
+            "<Work>8h</Work>",
+            "<RegularWork/>",
+            "<RemainingWork>PT</RemainingWork>",
+        ] {
+            let proj = resource_project(&format!(
+                "<Resource><UID>1</UID><ID>1</ID><Name>A</Name>{element}</Resource>"
+            ));
+            assert_eq!(
+                proj.resources,
+                [Resource {
+                    uid: 1,
+                    id: 1,
+                    name: "A".into(),
+                    max_units: 1.0,
+                    ..Resource::default()
+                }],
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_assignment_fields_stay_absent() {
+        for element in [
+            "<WorkContour>-1</WorkContour>",
+            "<WorkContour>flat</WorkContour>",
+            "<FixedMaterial>maybe</FixedMaterial>",
+            "<HasFixedRateUnits/>",
+            "<Start>soon</Start>",
+            "<Finish/>",
+            "<RegularWork>8h</RegularWork>",
+        ] {
+            let proj = assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 {element}</Assignment>"
+            ));
+            assert_eq!(
+                proj.assignments,
+                [Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    ..Assignment::default()
+                }],
+                "{element}"
+            );
+        }
     }
 }

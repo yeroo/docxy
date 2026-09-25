@@ -118,7 +118,7 @@
         "resource-fields",
         "round-trip"
       ],
-      "desc": "Work resource identity and rates, Cost resource, and Material label survive saving."
+      "desc": "Work resource identity, rates and their display units, booking type and flags, Cost and Material resources, and an assignment's contour, flags and dates survive saving."
     },
     {
       "file": "14-link-sf-before-start.xml",
@@ -147,7 +147,7 @@
         "calendar-24hour",
         "round-trip"
       ],
-      "desc": "Project 2021 (#58): three 8-hour duration days finish after 24 continuous hours."
+      "desc": "Project 2024 (#58): three 8-hour duration days finish after 24 continuous hours."
     },
     {
       "file": "17-constraint-fnlt-conflict.xml",
@@ -157,7 +157,7 @@
         "constraint-fnlt",
         "negative-slack"
       ],
-      "desc": "Project 2021 (#60): FNLT overrides the FS link; both tasks have -5d total slack."
+      "desc": "Project 2024 (#60): FNLT overrides the FS link; both tasks have -5d total slack."
     },
     {
       "file": "18-milestone-after-fs.xml",
@@ -167,7 +167,7 @@
         "link",
         "link-fs"
       ],
-      "desc": "Project 2021 (#59): FS milestones keep the predecessor finish instant."
+      "desc": "Project 2024 (#59): FS milestones keep the predecessor finish instant."
     },
     {
       "file": "19-manual-tasks.xml",
@@ -193,6 +193,41 @@
         "link-fs"
       ],
       "desc": "Task type, estimate, active, deadline, levelling and a blank row survive saves."
+    },
+    {
+      "file": "21-deadline-missed.xml",
+      "category": "deadline",
+      "tags": [
+        "deadline",
+        "link",
+        "link-fs",
+        "negative-slack"
+      ],
+      "desc": "Project 2024 (#100): a missed Deadline gives B and its driver A -5d total slack."
+    },
+    {
+      "file": "22-progress.xml",
+      "category": "progress",
+      "tags": [
+        "progress",
+        "assignment",
+        "round-trip",
+        "link",
+        "link-fs"
+      ],
+      "desc": "Percent complete, actuals, stop/resume, remaining values, variances and assignment baselines survive saves."
+    },
+    {
+      "file": "23-derived-calendar.xml",
+      "category": "calendar",
+      "tags": [
+        "calendar",
+        "derived-calendar",
+        "round-trip",
+        "link",
+        "link-fs"
+      ],
+      "desc": "A calendar derived from Standard keeps its base, its own Friday off and IsBaselineCalendar through saves; a task on it skips Friday."
     }
   ]
 }

@@ -9655,8 +9655,9 @@ fn exit_hf_tab(tab: &mut DocTab) {
     }
 }
 
-/// Write a document tab to `target` (Save As, or the first save of an untitled
-/// document to a picked path) or, with `None`, to its own file. The format
+/// Write a document tab to `target` (Save As, or the first save of a
+/// never-saved document to a picked path) or, with `None`, to its own file
+/// (refused when it has none). The format
 /// follows the destination: Markdown for a `.md` target (or a Markdown tab
 /// saved in place), an editable-HTML page for any `.html`, Word otherwise.
 ///
@@ -9672,14 +9673,15 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             let markdown = is_markdown_path(&path);
             (path, markdown)
         }
-        None => (
-            tab.path.clone().unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .join(tab.title.to_string())
-            }),
-            tab.markdown,
-        ),
+        None => match tab.path.clone() {
+            Some(path) => (path, tab.markdown),
+            // Never-saved documents are given a picked target (#98); there is
+            // no `<cwd>/<title>` fallback to write over.
+            None => {
+                tab.status = "this document has never been saved: use Save As".into();
+                return false;
+            }
+        },
     };
     // Markdown-backed tabs save as Markdown, editable-HTML pages rewrap the
     // bundle the tab holds (or become a new one), everything else is lossless
@@ -9942,9 +9944,36 @@ impl Docxy {
     /// an untitled document to a picked path) or to its own file (`None`).
     fn save_doc(&mut self, target: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_hf(); // commit any open header/footer edits into the package first
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            save_doc_tab(tab, target);
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        if !matches!(tab.surface, Surface::Doc(_)) {
+            return;
         }
+        // A never-saved document asks where to go, like a never-saved
+        // workbook, instead of writing `<cwd>/<title>` over whatever is there.
+        // The picked path is saved to like Save As: the tab is rebound only
+        // once that write succeeds.
+        let target = match target {
+            Some(target) => Some(target),
+            None => match doc_save_target(tab.path.as_deref(), self.harness.is_some()) {
+                DocSaveTarget::InPlace => None,
+                // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
+                // this thread and stops the control pump dead (see `save_sheet`).
+                DocSaveTarget::RefuseHarness => {
+                    self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
+                    return self.refocus(window, cx);
+                }
+                DocSaveTarget::NeedsDialog => match self.pick_doc_save_target() {
+                    Some(picked) => Some(picked),
+                    None => {
+                        self.tabs[self.active].status = "save cancelled".into();
+                        return self.refocus(window, cx);
+                    }
+                },
+            },
+        };
+        save_doc_tab(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
         self.persist();
@@ -12360,6 +12389,49 @@ impl Docxy {
         }
         self.scroll_to_caret();
         cx.notify();
+    }
+}
+
+/// What a harness instance says when asked to save a never-saved document.
+const DOC_NEVER_SAVED_HARNESS: &str =
+    "this document has never been saved, and a harness instance cannot open the Save As dialog";
+
+/// Where a document Save goes, decided before anything is written.
+#[derive(Debug, PartialEq, Eq)]
+enum DocSaveTarget {
+    /// The tab has a path: overwrite it.
+    InPlace,
+    /// Never saved: ask with the Save As dialog.
+    NeedsDialog,
+    /// Never saved, in a harness instance that must not open a native dialog.
+    RefuseHarness,
+}
+
+fn doc_save_target(path: Option<&std::path::Path>, harness: bool) -> DocSaveTarget {
+    match path {
+        Some(_) => DocSaveTarget::InPlace,
+        None if harness => DocSaveTarget::RefuseHarness,
+        None => DocSaveTarget::NeedsDialog,
+    }
+}
+
+#[cfg(test)]
+mod doc_save_target_tests {
+    use super::{DocSaveTarget, doc_save_target};
+    use std::path::Path;
+
+    #[test]
+    fn a_saved_document_saves_in_place_harness_or_not() {
+        let path = Path::new("report.docx");
+        for harness in [false, true] {
+            assert_eq!(doc_save_target(Some(path), harness), DocSaveTarget::InPlace);
+        }
+    }
+
+    #[test]
+    fn a_never_saved_document_asks_or_refuses_but_never_picks_a_path() {
+        assert_eq!(doc_save_target(None, false), DocSaveTarget::NeedsDialog);
+        assert_eq!(doc_save_target(None, true), DocSaveTarget::RefuseHarness);
     }
 }
 
@@ -21153,8 +21225,10 @@ fn main() {
             // when there are unsaved tabs.
             let on_close = view.clone();
             window.on_window_should_close(cx, move |_window, cx| {
-                on_close.update(cx, |this, _| {
-                    commit_project_cells_for_exit(&mut this.tabs);
+                on_close.update(cx, |this, cx| {
+                    close::commit_pending_for_exit(&mut this.tabs);
+                    // A cancelled close keeps the window: repaint the committed cell.
+                    cx.notify();
                     this.persist();
                     // ⚠️ Not in a harness instance — the same modal-loop trap as
                     // `open_args`, and here it would wedge the shutdown the

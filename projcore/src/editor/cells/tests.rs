@@ -1,4 +1,5 @@
 use super::*;
+use crate::model::{AssignmentBaseline, Rate};
 
 fn editor() -> Editor {
     let mut p = untitled_project();
@@ -70,7 +71,7 @@ fn resources_preserve_allocations_and_undo_creation_together() {
         .unwrap();
     ed.proj.assignments[0].units = 0.5;
     ed.proj.assignments[0].work_min = 123;
-    let kept = ed.proj.assignments[0];
+    let kept = ed.proj.assignments[0].clone();
     let before = ed.project().clone();
     let depth = ed.undo_depth();
     ed.mark_saved();
@@ -89,6 +90,57 @@ fn resources_preserve_allocations_and_undo_creation_together() {
     ed.redo();
     ed.set_resources(10, &[]).unwrap();
     assert!(ed.proj.assignments.is_empty());
+}
+
+#[test]
+fn resource_names_edits_keep_assignment_progress() {
+    let mut ed = editor();
+    ed.set_resources(10, &["Alice".into(), "Bob".into()])
+        .unwrap();
+    for a in &mut ed.proj.assignments {
+        a.percent_work_complete = Some(50);
+        a.actual_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        a.stop = Some(DateTime::from_ymd_hm(2026, 3, 2, 12, 0));
+        a.resume = Some(DateTime::from_ymd_hm(2026, 3, 2, 13, 0));
+        a.actual_work_min = Some(240);
+        a.remaining_work_min = Some(240);
+        a.actual_cost = Rate::parse("200");
+        a.work_variance = Rate::parse("0.0");
+        a.set_baseline_slot(AssignmentBaseline {
+            number: 0,
+            work_min: Some(480),
+            cost: Rate::parse("400"),
+            ..AssignmentBaseline::default()
+        });
+    }
+    let tracked = ed.proj.assignments.clone();
+    let before = ed.project().clone();
+    ed.mark_saved();
+    let depth = ed.undo_depth();
+    // The cell's own text changes nothing.
+    let text = format_resource_names(&ed.proj, 10);
+    let names: Vec<String> = text.split(", ").map(String::from).collect();
+    ed.set_resources(10, &names).unwrap();
+    unchanged(&ed, &before, (depth, 0, false));
+    // Adding a resource leaves the tracked assignments as they were.
+    ed.set_resources(10, &["Alice".into(), "Bob".into(), "Carol".into()])
+        .unwrap();
+    assert_eq!(ed.proj.assignments[..2], tracked);
+    assert_eq!(ed.proj.assignments[2].percent_work_complete, None);
+    // A units change rewrites units and work only.
+    ed.set_resources(10, &["Alice[50%]".into(), "Bob".into()])
+        .unwrap();
+    let alice = &ed.proj.assignments[0];
+    assert_eq!(alice.units, 0.5);
+    assert_eq!(
+        Assignment {
+            units: tracked[0].units,
+            work_min: tracked[0].work_min,
+            ..alice.clone()
+        },
+        tracked[0]
+    );
+    assert_eq!(ed.proj.assignments[1], tracked[1]);
 }
 
 #[test]
@@ -219,7 +271,7 @@ fn scheduling_range_accounts_for_time_before_the_anchor() {
     }
     // A continuous calendar can use the entire 100-year backward budget as
     // well as the forward budget. The old reserve only covered one direction.
-    for day in &mut ed.proj.calendars[0].week {
+    for day in ed.proj.calendars[0].week.iter_mut().flatten() {
         day.times = vec![crate::model::WorkingTime { from: 0, to: 1440 }];
     }
     // Keep an SF leaf link so this project needs a backward horizon.
@@ -257,7 +309,7 @@ fn resource_tokens_preserve_significant_whitespace_and_prefer_exact_assignments(
         ed.proj.resources[0].name = stored.into();
         ed.proj.assignments[0].units = 0.5;
         ed.proj.assignments[0].work_min = 123;
-        let retained = ed.proj.assignments[0];
+        let retained = ed.proj.assignments[0].clone();
         let before = ed.project().clone();
         let depth = ed.undo_depth();
         ed.set_resources(10, &[token.into(), " Bob ".into()])
@@ -318,7 +370,7 @@ fn duplicate_resource_names_preserve_the_assigned_identity_or_reject_ambiguity()
     ed.proj.resources[1].name = "ALICE".into();
     ed.proj.assignments[1].units = 0.5;
     ed.proj.assignments[1].work_min = 123;
-    let retained = ed.proj.assignments[1];
+    let retained = ed.proj.assignments[1].clone();
     let before = ed.project().clone();
     let depth = ed.undo_depth();
     ed.set_resources(10, &["Alice[50%]".into(), "Bob".into()])
@@ -457,7 +509,7 @@ fn dates_are_strict_and_finish_uses_effective_calendar() {
     );
     let mut cal = Calendar::standard(99);
     cal.week[6] = cal.week[1].clone();
-    cal.week[6].times.last_mut().unwrap().to = 18 * 60;
+    cal.week[6].as_mut().unwrap().times.last_mut().unwrap().to = 18 * 60;
     ed.proj.calendars.push(cal);
     ed.proj.tasks[0].calendar_uid = Some(99);
     let sat = day_finish(
@@ -1151,6 +1203,7 @@ fn a_literal_bracketed_resource_does_not_steal_the_assigned_cell_text() {
         resource_uid: 7,
         units: 1.0,
         work_min: 960,
+        ..Assignment::default()
     });
     assert_eq!(
         format_resource_names(&ed.proj, 10),
@@ -1189,6 +1242,7 @@ fn on_task_10(resources: &[(i32, &str)], assigned: &[(i32, f64)]) -> Editor {
             resource_uid,
             units,
             work_min: work_for(960, units),
+            ..Assignment::default()
         });
     }
     Editor::new(ed.proj)
@@ -1237,4 +1291,137 @@ fn duplicate_assignments_of_one_resource_survive_an_unchanged_commit() {
         commit_shown_text(&mut ed).unwrap();
         unchanged(&ed, &before, (0, 0, false));
     }
+}
+
+#[test]
+fn units_edits_keep_imported_assignment_fields_but_clear_regular_work() {
+    for prompt in [false, true] {
+        let mut ed = editor();
+        ed.set_resources(10, &["Alice".into()]).unwrap();
+        let a = &mut ed.proj.assignments[0];
+        a.work_contour = Some(3);
+        a.fixed_material = Some(false);
+        a.has_fixed_rate_units = Some(true);
+        a.start = Some(DateTime::from_ymd_hm(2026, 3, 3, 8, 0));
+        a.finish = Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0));
+        a.regular_work_min = Some(480);
+        let imported = a.clone();
+        if prompt {
+            ed.assign_resource(10, "Alice[50%]").unwrap();
+        } else {
+            ed.set_resources(10, &["Alice[50%]".into()]).unwrap();
+        }
+        // Regular work was the old Work less overtime; kept, it would invent overtime.
+        let a = &ed.proj.assignments[0];
+        assert_eq!((a.units, a.work_min, a.regular_work_min), (0.5, 240, None));
+        assert_eq!(
+            Assignment {
+                units: imported.units,
+                work_min: imported.work_min,
+                regular_work_min: imported.regular_work_min,
+                ..a.clone()
+            },
+            imported,
+            "prompt: {prompt}"
+        );
+    }
+}
+
+#[test]
+fn new_resources_and_assignments_write_none_of_the_imported_fields() {
+    let mut ed = editor();
+    ed.set_resources(10, &["Alice".into()]).unwrap();
+    ed.assign_resource(20, "Bob").unwrap();
+    assert_eq!(ed.proj.resources.len(), 2);
+    assert_eq!(ed.proj.assignments.len(), 2);
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    let section = |name: &str| {
+        let open = xml.find(&format!("<{name}>")).unwrap();
+        &xml[open..xml.find(&format!("</{name}>")).unwrap()]
+    };
+    for name in [
+        "WorkGroup",
+        "PeakUnits",
+        "OverAllocated",
+        "CanLevel",
+        "Work",
+        "RegularWork",
+        "RemainingWork",
+        "StandardRateFormat",
+        "OvertimeRateFormat",
+        "IsGeneric",
+        "IsInactive",
+        "BookingType",
+        "IsBudget",
+    ] {
+        assert!(
+            !section("Resources").contains(&format!("<{name}>")),
+            "{name}"
+        );
+    }
+    for name in [
+        "Finish",
+        "HasFixedRateUnits",
+        "FixedMaterial",
+        "RegularWork",
+        "Start",
+        "WorkContour",
+    ] {
+        assert!(
+            !section("Assignments").contains(&format!("<{name}>")),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn typed_dates_resolve_derived_calendars_like_the_scheduler() {
+    // Two calendars share UID 1, the second with a 07:00-19:00 Monday; a task
+    // on calendar 2, derived from 1 with Tuesday off.
+    let mut ed = editor();
+    let mut long = Calendar::standard(1);
+    long.week[1] = Some(crate::model::DayWorking {
+        times: vec![crate::model::WorkingTime {
+            from: 7 * 60,
+            to: 19 * 60,
+        }],
+    });
+    let derived = Calendar {
+        base_calendar_uid: Some(1),
+        week: [
+            None,
+            None,
+            Some(crate::model::DayWorking::default()),
+            None,
+            None,
+            None,
+            None,
+        ],
+        ..Calendar::standard(2)
+    };
+    ed.proj.calendars = vec![Calendar::standard(1), long, derived];
+    ed.proj.tasks[0].calendar_uid = Some(2);
+    let task = ed.project().task(10).unwrap().clone();
+    let monday = parse_cell_date("2026-03-02").unwrap();
+    // The scheduler's rule: the last calendar with UID 1 is the base.
+    assert_eq!(
+        day_finish(ed.project(), &task, monday)
+            .unwrap()
+            .minute_of_day(),
+        19 * 60
+    );
+    assert_eq!(
+        day_start(ed.project(), &task, monday).minute_of_day(),
+        7 * 60
+    );
+    let tuesday = parse_cell_date("2026-03-03").unwrap();
+    assert!(day_finish(ed.project(), &task, tuesday).is_err());
+    let mut proj = ed.project().clone();
+    proj.start_date = Some(monday.add_minutes(7 * 60));
+    proj.tasks[0].duration_min = 12 * 60;
+    let sched = crate::schedule::schedule(&proj);
+    assert_eq!(
+        sched.get(10).unwrap().early_finish,
+        day_finish(ed.project(), &task, monday).unwrap()
+    );
 }
