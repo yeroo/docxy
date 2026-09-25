@@ -147,7 +147,8 @@ pub struct Runner<'a> {
     base: PathBuf,
     sandbox: PathBuf,
     opts: ProbeOpts,
-    /// Reply from the most recent `call` step, for `assert reply.<path>`.
+    /// Reply from the most recent driving verb, for `assert reply.<path>`;
+    /// opening another file clears it so a case cannot assert stale data.
     last_reply: Option<Json>,
 }
 
@@ -219,6 +220,7 @@ impl<'a> Runner<'a> {
         match &step.action {
             Action::Call { verb, args } => self.verb(out, verb, args.clone()),
             Action::Open(path) | Action::OpenCopy(path) => {
+                self.last_reply = None;
                 let full = self.base.join(path);
                 if !full.is_file() {
                     return err(out, format!("no such file: {}", full.display()));

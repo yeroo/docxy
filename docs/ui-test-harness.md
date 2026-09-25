@@ -195,6 +195,8 @@ living under the harness's own directory.
 
 `basic.docx` is a copy of the repository's blank Word template
 (`offxy-vscode/mcp/templates/blank.docx`) for the cross-kind ribbon smoke case.
+`doc-table.docx` has a paragraph before and after a two-cell table; the
+`doc-state.uit` case uses it to check Table's contextual visibility.
 
 Every verb goes in through **the same entry point the pointer or keyboard
 would**. A verb that reached past a handler into the state it maintains could
@@ -229,6 +231,7 @@ the case cover the behaviour around it.
 | `border A1 top dashed` | the pixels, one named edge (`top`, `right`, `bottom`, `left`) |
 | `no border H20 teal` | the pixels: no such line on any edge |
 | `<key> is [not] <value>` | one key of the app's state reply |
+| `reply.<path> is [not] <value>` | a field from the last successful driving verb's reply; `open` clears it |
 | `cell B2 is [not] <text>` | what that cell shows |
 | `no fill preview` | `filling` and `fill_preview` together |
 | `cells unchanged` | every cell of the last `snapshot` |
@@ -250,6 +253,46 @@ State keys, as the app reports them after every driving verb:
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
+
+Dotted keys traverse objects, and numeric components index arrays: `assert
+sel.start is 1`, `assert reply.tabs.0.name is File`. A later driving verb
+replaces the saved reply, and `open` clears it.
+
+### Document tabs
+
+`state()` and `call doc {}` report `text`, `textboxes`, `sel`, `anchor`,
+`caret`, `cross_story`, `para`, `run`, `view`, and `hf_edit` from the active body
+editor. `doc` returns only those document fields. `text` is the main story;
+each paragraph contributes a final `\n`, including a table cell paragraph.
+Tab is `\t`, and line/page/column breaks are `\u000B`/`\u000C`/`\u000E`.
+Cached field and revision text has no editor caret and contributes no offset.
+Text boxes appear in `textboxes` as separate stories.
+
+Offsets count Unicode scalar values, as the editor does. Word counts UTF-16
+code units, so offsets after an astral character need conversion for external
+comparison. Table row and cell boundaries add no extra marks in this model.
+The final paragraph mark is present in `text`, but the offset after it is not
+addressable.
+
+`anchor` and `caret` are `{story, offset}`. A story is `main` or
+`textbox:<host path>`. On a document tab, `sel` is `{story,start,end}` with
+ordered numeric ends when both endpoints are in one story. If a selection
+crosses stories, `sel` is `null`, `cross_story` is true, and the two endpoints
+still report their stories and offsets. On a sheet, `sel` remains its A1 cell
+reference string. `hf_edit` indicates that keys currently reach a header or
+footer editor; `selection-set` refuses while it is open.
+
+| Call | Effect |
+|---|---|
+| `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; both offsets are validated before either changes |
+| `ribbon-read {}` | list File, ribbon tabs and contextual Table (while the caret is in a table), groups, commands, galleries and Quick Access Toolbar |
+| `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command id or unique label on a valid tab and invoke the same action handler as its button |
+| `status-read {}` | read the tab's status line as an ordered `items` array |
+| `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
+
+`ribbon-read` and `ribbon-click` work on document and Project tabs. The app
+does not model command enabled states. Extend Selection mode, native prompts,
+and backstage pages are not represented by these verbs.
 
 Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
 `cancel` are the other answers; omitting the answer refuses a dirty close).
@@ -510,5 +553,6 @@ harness end to end is exercised by running it.
 ## Not covered
 
 - **CI.** It needs a desktop session for `PrintWindow`.
-- **Doc and Mail editing.** Word ribbon navigation has cross-kind smoke coverage;
-  document editing gestures are not harness verbs.
+- **Mail editing and advanced document UI.** Document text, selection, ribbon,
+  status and File rail are covered. Menus, dialogs, pane contents and pointer
+  gestures in document text still need harness drivers.

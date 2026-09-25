@@ -1,5 +1,5 @@
 test document state follows keys, selections, ribbon commands and backstage
-  open ../fixtures/basic.docx
+  open copy:../fixtures/basic.docx
   type hello
   assert text is hello
   assert caret.offset is 5
@@ -27,11 +27,19 @@ test document state follows keys, selections, ribbon commands and backstage
   assert view.ruler is true
   call ribbon-click {"tab":"View","command":"showhide"}
   assert view.marks is true
+  call ribbon-click {"tab":"Home","command":"Center"}
+  assert para.alignment is center
+  call ribbon-click {"tab":"Home","command":"Bullets"}
+  assert para.list is not null
+  key ctrl+end enter
+  assert para.index is 1
   call doc {}
-  assert reply.text is hello
-  assert reply.run.bold is false
+  assert reply.para.index is 1
   call status-read {}
   assert reply.items.0.text is loaded
+  key ctrl+s
+  call status-read {}
+  assert reply.items.0.text is not loaded
   call backstage {"action":"open"}
   assert reply.open is true
   assert reply.items.0 is Back
@@ -45,8 +53,17 @@ test table context follows the caret and exposes Table ribbon
   call selection-set {"start":7,"end":7}
   assert para.index is 1
   call ribbon-read {}
+  assert reply.tab_count is 6
   assert reply.tabs.5.name is Table
   key alt t escape escape
   assert ribbon_tab is Table
   call selection-set {"start":0,"end":0}
   assert ribbon_tab is Home
+  call ribbon-read {}
+  assert reply.tab_count is 5
+
+test header editing is reported separately from the body
+  open copy:../fixtures/basic.docx
+  assert hf_edit is false
+  call ribbon-click {"tab":"Insert","command":"Edit Header"}
+  assert hf_edit is true

@@ -2,11 +2,19 @@
 //! contributes one `\n`; table row and cell boundaries add no extra character.
 //! Text boxes are separate stories, keyed by the path of their host inline.
 //! Every character in a story has exactly one caret immediately before it.
+//! Offsets count Unicode scalar values, like `Editor::Caret::offset`. Word uses
+//! UTF-16 code units, so an astral character takes one offset here and two in
+//! Word. External comparisons must convert before comparing such text.
+//! Cached text inside fields, revisions and other zero-length wrappers is
+//! omitted: the editor cannot place a caret inside it. Hyperlink run text is
+//! included because those runs do have editor offsets.
 
 use super::{Caret, inline_len};
 use crate::model::{Block, BreakKind, Document, Inline};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// A Unicode-scalar offset within one story (Word's UTF-16 offsets differ for
+/// astral characters).
 pub struct StoryOffset {
     pub story: String,
     pub offset: usize,
@@ -150,6 +158,8 @@ fn inline_chars(inline: &Inline) -> String {
         Inline::Break(BreakKind::Line) => "\u{000b}".into(),
         Inline::Break(BreakKind::Page) => "\u{000c}".into(),
         Inline::Break(BreakKind::Column) => "\u{000e}".into(),
+        // The editor assigns zero caret units to fields, revision wrappers and
+        // other preserved inline payloads, even when they cache visible text.
         _ => String::new(),
     }
 }

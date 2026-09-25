@@ -215,6 +215,114 @@ enum RibbonTab {
     Table,
 }
 
+#[derive(Clone, Copy)]
+enum BackstageRailAction {
+    Back,
+    New,
+    Open,
+    Save,
+    SaveAs,
+    Export,
+    Close,
+}
+
+struct BackstageRailItem {
+    id: &'static str,
+    label: &'static str,
+    display: &'static str,
+    action: BackstageRailAction,
+    project_only: bool,
+}
+
+const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
+    BackstageRailItem {
+        id: "bs-back",
+        label: "Back",
+        display: "← Back",
+        action: BackstageRailAction::Back,
+        project_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-new",
+        label: "New",
+        display: "New",
+        action: BackstageRailAction::New,
+        project_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-open",
+        label: "Open…",
+        display: "Open…",
+        action: BackstageRailAction::Open,
+        project_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-save",
+        label: "Save",
+        display: "Save",
+        action: BackstageRailAction::Save,
+        project_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-saveas",
+        label: "Save As…",
+        display: "Save As…",
+        action: BackstageRailAction::SaveAs,
+        project_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-export",
+        label: "Export…",
+        display: "Export…",
+        action: BackstageRailAction::Export,
+        project_only: true,
+    },
+    BackstageRailItem {
+        id: "bs-close",
+        label: "Close",
+        display: "Close",
+        action: BackstageRailAction::Close,
+        project_only: false,
+    },
+];
+
+fn backstage_rail_items(project: bool) -> impl Iterator<Item = &'static BackstageRailItem> {
+    BACKSTAGE_RAIL
+        .iter()
+        .filter(move |item| !item.project_only || project)
+}
+
+#[derive(Clone, Copy)]
+enum QatAction {
+    Undo,
+    Redo,
+}
+
+struct QatItem {
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+    tip: &'static str,
+    action: QatAction,
+}
+
+const QAT_ITEMS: &[QatItem] = &[
+    QatItem {
+        id: "qat-undo",
+        icon: "undo",
+        label: "Undo",
+        tip: "Undo (Ctrl+Z)",
+        action: QatAction::Undo,
+    },
+    QatItem {
+        id: "qat-redo",
+        icon: "redo",
+        label: "Redo",
+        tip: "Redo (Ctrl+Y)",
+        action: QatAction::Redo,
+    },
+];
+
 // ---- runtime ---------------------------------------------------------------
 
 enum Surface {
@@ -4090,6 +4198,65 @@ impl Docxy {
     fn refocus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    fn open_backstage(&mut self, cx: &mut Context<Self>) {
+        self.project_prompt_cancel();
+        self.backstage = true;
+        self.bs_new = false;
+        cx.notify();
+    }
+
+    fn backstage_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.backstage = false;
+        self.bs_new = false;
+        self.refocus(window, cx);
+    }
+
+    fn select_ribbon_tab(&mut self, tab: RibbonTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.ribbon_tab = tab;
+        self.refocus(window, cx);
+    }
+
+    fn backstage_rail_action(
+        &mut self,
+        action: BackstageRailAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            BackstageRailAction::Back => self.backstage_back(window, cx),
+            BackstageRailAction::New => {
+                self.bs_new = true;
+                cx.notify();
+            }
+            BackstageRailAction::Open => self.open_file(window, cx),
+            BackstageRailAction::Save => self.save_active(window, cx),
+            BackstageRailAction::SaveAs => self.save_as(window, cx),
+            BackstageRailAction::Export => self.project_act(ProjectAct::ExportGantt, window, cx),
+            BackstageRailAction::Close => self.backstage_close(window, cx),
+        }
+    }
+
+    fn qat_action(&mut self, action: QatAction, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_is_project() {
+            return self.project_act(
+                match action {
+                    QatAction::Undo => ProjectAct::Undo,
+                    QatAction::Redo => ProjectAct::Redo,
+                },
+                window,
+                cx,
+            );
+        }
+        self.with_editor(window, cx, |ed| match action {
+            QatAction::Undo => {
+                ed.undo();
+            }
+            QatAction::Redo => {
+                ed.redo();
+            }
+        });
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -14018,13 +14185,9 @@ impl Docxy {
                     .when(show_kt, |d| d.child(keytip_badge(tab_key)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         if is_file {
-                            this.project_prompt_cancel();
-                            this.backstage = true;
-                            this.bs_new = false;
-                            cx.notify();
+                            this.open_backstage(cx);
                         } else if let Some(t) = this_tab {
-                            this.ribbon_tab = t;
-                            this.refocus(window, cx);
+                            this.select_ribbon_tab(t, window, cx);
                         }
                     })),
             );
@@ -14051,8 +14214,7 @@ impl Docxy {
                     })
                     .child("Table")
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.ribbon_tab = RibbonTab::Table;
-                        this.refocus(window, cx);
+                        this.select_ribbon_tab(RibbonTab::Table, window, cx);
                     })),
             );
         }
@@ -14228,10 +14390,7 @@ impl Docxy {
             KeyTip::Tabs => {
                 if c.eq_ignore_ascii_case("F") {
                     self.keytips = KeyTip::Off;
-                    self.project_prompt_cancel();
-                    self.backstage = true;
-                    self.bs_new = false;
-                    return cx.notify();
+                    return self.open_backstage(cx);
                 }
                 let ribbon = ribbon_for(self.ribbon_kind());
                 if let Some(i) = ribbon
@@ -14239,10 +14398,14 @@ impl Docxy {
                     .iter()
                     .position(|t| t.key_tip.eq_ignore_ascii_case(c))
                 {
-                    self.ribbon_tab = ribbon_tab_set(self.ribbon_kind())[i + 1].0.unwrap();
+                    self.select_ribbon_tab(
+                        ribbon_tab_set(self.ribbon_kind())[i + 1].0.unwrap(),
+                        window,
+                        cx,
+                    );
                     self.keytips = KeyTip::Commands;
                 } else if c.eq_ignore_ascii_case("T") && self.caret_table().is_some() {
-                    self.ribbon_tab = RibbonTab::Table;
+                    self.select_ribbon_tab(RibbonTab::Table, window, cx);
                     self.keytips = KeyTip::Commands;
                 } else {
                     self.keytips = KeyTip::Off;
@@ -16600,77 +16763,31 @@ impl Docxy {
         sidebar: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let rail_item =
-            |cx: &mut Context<Self>,
-             id: &'static str,
-             label: &'static str,
-             f: fn(&mut Docxy, &mut Window, &mut Context<Docxy>)| {
+        let mut rail = v_flex().w(px(220.)).h_full().py_3().gap_1().bg(sidebar);
+        for item in backstage_rail_items(self.active_is_project()) {
+            let action = item.action;
+            rail = rail.child(
                 div()
-                    .id(id)
+                    .id(item.id)
                     .w_full()
                     .px_4()
                     .py_2()
                     .cursor_pointer()
                     .rounded_sm()
-                    .text_color(fg)
-                    .hover(|d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)))
-                    .child(label)
-                    .on_click(cx.listener(move |this, _, window, cx| f(this, window, cx)))
-            };
-
-        let rail = v_flex()
-            .w(px(220.))
-            .h_full()
-            .py_3()
-            .gap_1()
-            .bg(sidebar)
-            .child(
-                div()
-                    .id("bs-back")
-                    .px_4()
-                    .py_2()
-                    .cursor_pointer()
-                    .text_color(rgb(BRAND))
-                    .child("\u{2190} Back")
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.backstage = false;
-                        this.bs_new = false;
-                        this.refocus(window, cx);
+                    .text_color(if matches!(action, BackstageRailAction::Back) {
+                        hsla_u(BRAND)
+                    } else {
+                        fg
+                    })
+                    .when(!matches!(action, BackstageRailAction::Back), |d| {
+                        d.hover(|d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)))
+                    })
+                    .child(item.display)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.backstage_rail_action(action, window, cx)
                     })),
-            )
-            .child(
-                div()
-                    .id("bs-new")
-                    .w_full()
-                    .px_4()
-                    .py_2()
-                    .cursor_pointer()
-                    .rounded_sm()
-                    .text_color(fg)
-                    .hover(|d| d.bg(rgb(BRAND)).text_color(rgb(FILE_FG)))
-                    .child("New")
-                    .on_click(cx.listener(|this, _, _w, cx| {
-                        this.bs_new = true;
-                        cx.notify();
-                    })),
-            )
-            .child(rail_item(cx, "bs-open", "Open\u{2026}", |t, w, cx| {
-                t.open_file(w, cx)
-            }))
-            .child(rail_item(cx, "bs-save", "Save", |t, w, cx| {
-                t.save_active(w, cx)
-            }))
-            .child(rail_item(cx, "bs-saveas", "Save As\u{2026}", |t, w, cx| {
-                t.save_as(w, cx)
-            }))
-            .when(self.active_is_project(), |d| {
-                d.child(rail_item(cx, "bs-export", "Export…", |t, w, cx| {
-                    t.project_act(ProjectAct::ExportGantt, w, cx)
-                }))
-            })
-            .child(rail_item(cx, "bs-close", "Close", |t, w, cx| {
-                t.backstage_close(w, cx);
-            }));
+            );
+        }
 
         let pane = if self.bs_new {
             let card = |cx: &mut Context<Self>,
@@ -17028,34 +17145,18 @@ impl Render for Docxy {
                         .items_center()
                         .gap_0p5()
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(qat_btn(
-                            "qat-undo",
-                            "undo",
-                            "Undo (Ctrl+Z)",
-                            pal,
-                            cx.listener(|this, _, window, cx| {
-                                if this.active_is_project() {
-                                    return this.project_act(ProjectAct::Undo, window, cx);
-                                }
-                                this.with_editor(window, cx, |e| {
-                                    e.undo();
-                                })
-                            }),
-                        ))
-                        .child(qat_btn(
-                            "qat-redo",
-                            "redo",
-                            "Redo (Ctrl+Y)",
-                            pal,
-                            cx.listener(|this, _, window, cx| {
-                                if this.active_is_project() {
-                                    return this.project_act(ProjectAct::Redo, window, cx);
-                                }
-                                this.with_editor(window, cx, |e| {
-                                    e.redo();
-                                })
-                            }),
-                        )),
+                        .children(QAT_ITEMS.iter().map(|item| {
+                            let action = item.action;
+                            qat_btn(
+                                item.id,
+                                item.icon,
+                                item.tip,
+                                pal,
+                                cx.listener(move |this, _, window, cx| {
+                                    this.qat_action(action, window, cx)
+                                }),
+                            )
+                        })),
                 )
                 .child(
                     h_flex()

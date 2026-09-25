@@ -2508,11 +2508,14 @@ fn title_case(s: &str) -> String {
     out
 }
 
-/// The run properties at char `offset` in `content` (the run covering the
-/// character before the offset, else the one at it).
+/// Run properties at a caret: the run containing the preceding character wins.
+/// If that character is a tab/break or the caret is at the start, use the first
+/// run at or after the caret, including an empty formatted run. Beyond all runs,
+/// retain the last nonempty run's properties.
 fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
     let mut pos = 0;
     let mut last = RunProps::default();
+    let mut next = None;
     for inline in content {
         let runs: &[Run] = match inline {
             Inline::Run(r) => std::slice::from_ref(r),
@@ -2525,11 +2528,11 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
         };
         for r in runs {
             let len = r.text.chars().count();
-            if offset == 0 && pos == 0 && len > 0 {
-                return r.props.clone();
-            }
             if offset > pos && offset <= pos + len {
                 return r.props.clone();
+            }
+            if pos >= offset && next.is_none() {
+                next = Some(r.props.clone());
             }
             if len > 0 {
                 last = r.props.clone();
@@ -2537,7 +2540,7 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
             pos += len;
         }
     }
-    last
+    next.unwrap_or(last)
 }
 
 #[cfg(test)]
@@ -2561,6 +2564,27 @@ mod tests {
         ];
         assert!(!run_props_at(&content, 0).bold);
         assert!(run_props_at(&content, 2).bold);
+        let with_tab = vec![
+            Inline::Tab(RunProps::default()),
+            content[0].clone(),
+            content[1].clone(),
+        ];
+        assert!(!run_props_at(&with_tab, 0).bold);
+        assert!(!run_props_at(&with_tab, 1).bold);
+        let with_break = vec![Inline::Break(BreakKind::Line), content[1].clone()];
+        assert!(run_props_at(&with_break, 0).bold);
+        assert!(run_props_at(&with_break, 1).bold);
+        let with_empty = vec![
+            Inline::Run(Run {
+                text: String::new(),
+                props: RunProps {
+                    bold: true,
+                    ..Default::default()
+                },
+            }),
+            content[0].clone(),
+        ];
+        assert!(run_props_at(&with_empty, 0).bold);
     }
 
     fn para(text: &str) -> Block {
