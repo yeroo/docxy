@@ -154,6 +154,19 @@ impl Editor {
         }
     }
 
+    /// The duration shown alongside [`Self::disp_start`]/[`Self::disp_finish`]:
+    /// a leaf's own duration, or a summary's working time between its displayed
+    /// (leveled when leveling is on) dates. `None` for an unknown or
+    /// unscheduled task.
+    pub fn disp_duration_min(&self, uid: i32) -> Option<i64> {
+        let task = self.proj.task(uid)?;
+        let start = self.disp_start(uid)?;
+        let finish = self.disp_finish(uid)?;
+        Some(crate::schedule::summary_or_leaf_min(
+            &self.proj, task, start, finish,
+        ))
+    }
+
     fn index(&self, uid: i32) -> Result<usize, String> {
         self.proj
             .tasks
@@ -467,15 +480,12 @@ impl Editor {
                         number: 0,
                         start: Some(r.early_start),
                         finish: Some(r.early_finish),
-                        duration_min: Some(if t.summary {
-                            crate::schedule::working_minutes_between(
-                                &self.proj,
-                                r.early_start,
-                                r.early_finish,
-                            )
-                        } else {
-                            t.duration_min
-                        }),
+                        duration_min: Some(crate::schedule::summary_or_leaf_min(
+                            &self.proj,
+                            t,
+                            r.early_start,
+                            r.early_finish,
+                        )),
                     },
                 ))
             })
@@ -1182,6 +1192,52 @@ mod tests {
             ed.disp_start(2),
             Some(ed.schedule().get(2).unwrap().early_start)
         );
+    }
+
+    #[test]
+    fn displayed_summary_duration_follows_leveled_dates() {
+        let mut proj = editor().project().clone();
+        for t in &mut proj.tasks {
+            t.outline_level = 2;
+        }
+        proj.tasks.insert(
+            0,
+            Task {
+                uid: 3,
+                id: 3,
+                name: "Phase".into(),
+                outline_level: 1,
+                summary: true,
+                duration_min: 0,
+                ..Task::default()
+            },
+        );
+        let mut ed = Editor::new(proj);
+        ed.assign_resource(1, "Alice").unwrap();
+        ed.assign_resource(2, "Alice").unwrap();
+        // Unleveled, the two 1d children run in parallel: the summary spans 1d.
+        assert_eq!(ed.disp_duration_min(3), Some(480));
+        assert_eq!(ed.disp_duration_min(1), Some(480));
+
+        ed.toggle_level();
+        let cpm =
+            crate::schedule::task_duration_min(ed.project(), ed.schedule(), &ed.project().tasks[0]);
+        assert_eq!(cpm, Some(480));
+        // Leveling serialises them on Alice: the displayed span is 2d, matching
+        // the displayed start/finish rather than the CPM dates.
+        let shown = ed.disp_duration_min(3);
+        assert_eq!(
+            shown,
+            Some(crate::schedule::working_minutes_between(
+                ed.project(),
+                ed.disp_start(3).unwrap(),
+                ed.disp_finish(3).unwrap(),
+            ))
+        );
+        assert_eq!(shown, Some(960));
+        assert_ne!(shown, cpm);
+        assert_eq!(ed.disp_duration_min(1), Some(480));
+        assert_eq!(ed.disp_duration_min(99), None);
     }
 
     #[test]
