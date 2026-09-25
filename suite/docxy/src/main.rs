@@ -160,6 +160,11 @@ struct PersistTab {
     hot: Option<String>,
     #[serde(default)]
     markdown: bool,
+    /// The tab's file could not be loaded, so `hot` holds a placeholder and
+    /// Save must not write it back over `path` (#209). `None` in a session
+    /// written before this was recorded: restore then asks the file itself.
+    #[serde(default)]
+    load_failed: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -1087,6 +1092,12 @@ struct DocTab {
     /// around the new package on Save (and on Save As to another .html name),
     /// so its engine and web UI carry over.
     bundle_html: Option<String>,
+    /// `path` names a file this tab could not read. Its content is a
+    /// placeholder, so writing it back to that path would destroy the file:
+    /// Save refuses, Save As to another path works and clears this (#209).
+    /// Only ever about the file at `path`: an unreadable hot-exit copy
+    /// reopens that file instead of marking the tab.
+    load_failed: bool,
 }
 
 /// Live header/footer edit session: an editor over the parsed header/footer
@@ -1503,6 +1514,8 @@ struct Loaded {
     markdown: bool,
     status: SharedString,
     bundle_html: Option<String>,
+    /// `doc` is a placeholder because the file could not be loaded.
+    load_failed: bool,
 }
 
 impl Loaded {
@@ -1515,6 +1528,7 @@ impl Loaded {
             markdown: false,
             status: status.into(),
             bundle_html: None,
+            load_failed: true,
         }
     }
     fn into_tab(
@@ -1537,6 +1551,7 @@ impl Loaded {
             markdown: self.markdown,
             hf_edit: None,
             bundle_html: self.bundle_html,
+            load_failed: self.load_failed,
         }
     }
 }
@@ -1557,6 +1572,7 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
             markdown: false,
             status: "loaded".into(),
             bundle_html: None,
+            load_failed: false,
         },
         Err(e) => Loaded::empty(format!("load error: {e:?}")),
     }
@@ -1568,10 +1584,14 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
             Ok(opened) => {
                 let mut loaded = load_bytes(&opened.docx);
                 loaded.bundle_html = Some(opened.html);
-                loaded.status = match opened.warning {
-                    Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
-                    None => "loaded (editable HTML)".into(),
-                };
+                // A payload that is not a docx keeps its `load error: …`
+                // rather than reporting an empty document as loaded.
+                if !loaded.load_failed {
+                    loaded.status = match opened.warning {
+                        Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
+                        None => "loaded (editable HTML)".into(),
+                    };
+                }
                 loaded
             }
             Err(e) => Loaded::empty(format!("load error: {e}")),
@@ -1586,6 +1606,14 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
             markdown: true,
             status: "loaded (markdown)".into(),
             bundle_html: None,
+            load_failed: false,
+        },
+        // A 0-byte file (Explorer's "New → Word Document") has nothing to
+        // lose: it opens as a new document that saves over it.
+        Ok(bytes) if bytes.is_empty() => Loaded {
+            status: "loaded (empty file)".into(),
+            load_failed: false,
+            ..Loaded::empty("")
         },
         Ok(bytes) => load_bytes(&bytes),
         Err(e) => Loaded::empty(format!("read error: {e}")),
@@ -1639,6 +1667,7 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
             markdown: false,
             hf_edit: None,
             bundle_html: None,
+            load_failed: false,
         }
     } else {
         doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
@@ -4007,14 +4036,54 @@ fn restore_tab(t: &PersistTab) -> DocTab {
     let mut tab = match (t.kind, &hot) {
         (Kind::Docx, Some(hp)) => {
             let mut l = doc_from_path(hp);
-            l.status = if t.dirty {
-                "unsaved — restored".into()
+            // A 0-byte sidecar is a truncated write, not an empty document:
+            // the user-file rule that opens one as new must not apply here.
+            let unreadable = l.load_failed || std::fs::metadata(hp).is_ok_and(|m| m.len() == 0);
+            if unreadable {
+                // The sidecar itself is unreadable, so its content is lost
+                // either way: a tab with a file reopens it exactly as with no
+                // sidecar (the fresh load alone decides the mark); a
+                // never-saved one keeps the placeholder, with no file to
+                // protect.
+                match &path {
+                    Some(p) => {
+                        let mut fresh = doc_from_path(p);
+                        if !fresh.load_failed {
+                            fresh.status = "loaded — the restored copy could not be read, so the file was reopened from disk".into();
+                        }
+                        fresh.into_tab(t.kind, t.title.clone().into(), path, false)
+                    }
+                    None => {
+                        l.load_failed = false;
+                        l.status =
+                            "load error: the restored copy of this document could not be read"
+                                .into();
+                        l.into_tab(t.kind, t.title.clone().into(), None, t.dirty)
+                    }
+                }
             } else {
-                "loaded".into()
-            };
-            let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
-            tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
-            tab
+                // The sidecar of a tab whose file failed to load holds only
+                // the placeholder, so the mark carries over. A session written
+                // before the mark existed cannot say, so a file that is there
+                // is asked directly (a missing one has nothing to lose, and
+                // the sidecar holds real content).
+                l.load_failed = match t.load_failed {
+                    Some(failed) => failed,
+                    None => path
+                        .as_ref()
+                        .is_some_and(|p| p.exists() && doc_from_path(p).load_failed),
+                };
+                l.status = if l.load_failed {
+                    format!("load error: {DOC_LOAD_FAILED_SAVE}").into()
+                } else if t.dirty {
+                    "unsaved — restored".into()
+                } else {
+                    "loaded".into()
+                };
+                let mut tab = l.into_tab(t.kind, t.title.clone().into(), path, t.dirty);
+                tab.bundle_html = html_bundle::restored_bundle(tab.path.as_deref());
+                tab
+            }
         }
         // Spreadsheet with unsaved content: load the hot .xlsx sidecar but
         // keep the original on-disk `path` (so Save still targets the real
@@ -4039,9 +4108,11 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 markdown: false,
                 hf_edit: None,
                 bundle_html: None,
+                load_failed: false,
             }
         }
-        // A document with no sidecar reloads its file, bundle included.
+        // A document with no sidecar reloads its file, bundle included; the
+        // fresh load alone says whether it failed.
         (Kind::Docx, None) if path.is_some() => {
             let l = doc_from_path(path.as_ref().unwrap());
             l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
@@ -4062,6 +4133,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 markdown,
                 hf_edit: None,
                 bundle_html: None,
+                load_failed: false,
             }
         }
     };
@@ -4103,6 +4175,7 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         dirty: t.dirty,
         hot,
         markdown: t.markdown,
+        load_failed: Some(t.load_failed),
     }
 }
 
@@ -4322,6 +4395,7 @@ impl Docxy {
             markdown: false,
             hf_edit: None,
             bundle_html: None,
+            load_failed: false,
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -9656,6 +9730,33 @@ fn exit_hf_tab(tab: &mut DocTab) {
     }
 }
 
+/// `path` resolved to the file it names, or as given when it cannot be
+/// resolved (a missing file): what "the same file" means for open dedup and
+/// the load-failed save guard alike.
+fn canonical(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.into())
+}
+
+/// What a Save onto the file a tab could not load says (#209).
+const DOC_LOAD_FAILED_SAVE: &str = "this file could not be opened; use Save As to save a new copy";
+
+/// Whether a save must be refused because it would write a load-failed tab's
+/// placeholder over the file it could not load: in place (`target` `None`),
+/// or a Save As that picks that same file (compared canonically, falling back
+/// to the paths as given when either cannot be resolved).
+fn refuses_load_failed_save(
+    load_failed: bool,
+    own: Option<&std::path::Path>,
+    target: Option<&std::path::Path>,
+) -> bool {
+    load_failed
+        && match (own, target) {
+            (_, None) => true,
+            (Some(own), Some(target)) => own == target || canonical(own) == canonical(target),
+            (None, Some(_)) => false,
+        }
+}
+
 /// Write a document tab to `target` (Save As, or the first save of a
 /// never-saved document to a picked path) or, with `None`, to its own file
 /// (refused when it has none). The format
@@ -9665,10 +9766,17 @@ fn exit_hf_tab(tab: &mut DocTab) {
 /// The tab is rebound (path, Markdown flag, title, held bundle) only after a
 /// successful write, so a refused or failed Save As leaves it saving where it
 /// did. Returns whether the file was written; the tab's status says either way.
+///
+/// A tab whose file failed to load never writes back to that file: its content
+/// is a placeholder, not the document (#209).
 fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
     let Surface::Doc(editor) = &tab.surface else {
         return false;
     };
+    if refuses_load_failed_save(tab.load_failed, tab.path.as_deref(), target.as_deref()) {
+        tab.status = DOC_LOAD_FAILED_SAVE.into();
+        return false;
+    }
     let (path, markdown) = match target {
         Some(path) => {
             let markdown = is_markdown_path(&path);
@@ -9711,6 +9819,7 @@ fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
             tab.markdown = markdown;
             tab.path = Some(path);
             tab.dirty = false;
+            tab.load_failed = false;
             // The page just written is the one the next save rewraps.
             tab.bundle_html = match kind {
                 html_bundle::DocTarget::Html => String::from_utf8(bytes).ok(),
@@ -10095,15 +10204,13 @@ impl Docxy {
     /// before reloading it from disk.
     fn open_args(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
-        let canon =
-            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let mut changed = false;
         for path in paths {
-            let key = canon(&path);
+            let key = canonical(&path);
             match self
                 .tabs
                 .iter()
-                .position(|t| t.path.as_deref().map(canon) == Some(key.clone()))
+                .position(|t| t.path.as_deref().map(canonical) == Some(key.clone()))
             {
                 Some(i) => {
                     // ⚠️ A harness instance never asks, and always reloads —
@@ -12506,6 +12613,173 @@ mod doc_save_target_tests {
 }
 
 #[cfg(test)]
+mod load_failed_save_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use std::path::Path;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/load-failed-tests")
+            .join(format!("{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn word_bundle(docx: &[u8]) -> String {
+        htmlbundle::wrap(
+            &htmlbundle::docx_assets(),
+            b"\0asm stand-in",
+            "docx",
+            "sample.docx",
+            docx,
+            "test",
+            "2026-09-25T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    fn basic_docx() -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        )
+        .unwrap()
+    }
+
+    /// Opens `path`, which must fail to load, edits the tab, and checks that
+    /// neither Save nor a Save As onto the same file touches it.
+    fn refused_in_place(path: &Path) -> DocTab {
+        let before = std::fs::read(path).ok();
+        let mut tab = tab_from_path(&path.to_path_buf());
+        assert!(tab.load_failed, "{}", tab.status);
+        tab.dirty = true;
+        assert!(!save_doc_tab(&mut tab, None));
+        assert_eq!(tab.status.as_ref(), DOC_LOAD_FAILED_SAVE);
+        assert!(tab.dirty, "a refused save leaves the tab dirty");
+        tab.status = "".into();
+        assert!(!save_doc_tab(&mut tab, Some(path.to_path_buf())));
+        assert_eq!(tab.status.as_ref(), DOC_LOAD_FAILED_SAVE);
+        assert!(tab.dirty);
+        assert_eq!(tab.path.as_deref(), Some(path));
+        assert_eq!(std::fs::read(path).ok(), before, "{}", path.display());
+        tab
+    }
+
+    #[test]
+    fn only_a_load_failed_tab_saving_onto_its_own_file_is_refused() {
+        let dir = temp("helper");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for name in ["broken.docx", "broken.docx.html"] {
+            let own = dir.join(name);
+            let other = dir.join(format!("copy-{name}"));
+            // Refused whether the file is there (garbled) or not (missing).
+            for exists in [false, true] {
+                if exists {
+                    std::fs::write(&own, b"garbled").unwrap();
+                }
+                assert!(refuses_load_failed_save(true, Some(&own), None));
+                assert!(refuses_load_failed_save(true, Some(&own), Some(&own)));
+                assert!(!refuses_load_failed_save(true, Some(&own), Some(&other)));
+                for target in [None, Some(own.as_path()), Some(other.as_path())] {
+                    assert!(!refuses_load_failed_save(false, Some(&own), target));
+                }
+            }
+            // The same file spelled another way is still that file.
+            let spelled = dir.join("sub").join("..").join(name);
+            assert!(refuses_load_failed_save(true, Some(&own), Some(&spelled)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_docx_load_refuses_save_in_place_and_keeps_the_file() {
+        let dir = temp("docx");
+        let path = dir.join("broken.docx");
+        std::fs::write(&path, b"not a zip").unwrap();
+        let mut tab = refused_in_place(&path);
+        let copy = dir.join("copy.docx");
+        assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
+        assert!(!tab.load_failed && !tab.dirty);
+        assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
+        tab.dirty = true;
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        assert!(!tab_from_path(&copy).load_failed);
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a zip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_is_not_created_by_save_in_place() {
+        let dir = temp("missing");
+        let path = dir.join("missing.docx");
+        let tab = refused_in_place(&path);
+        assert!(!path.exists());
+        drop(tab);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plain_html_page_opened_as_a_document_is_refused() {
+        let dir = temp("plain-html");
+        let path = dir.join("broken.docx.html");
+        std::fs::write(&path, "<html>mine</html>").unwrap();
+        refused_in_place(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_word_bundle_with_a_bad_payload_refuses_save_in_place() {
+        let dir = temp("bad-payload");
+        let path = dir.join("sample.docx.html");
+        std::fs::write(&path, word_bundle(b"PK one")).unwrap();
+        let tab = tab_from_path(&path);
+        assert!(tab.status.starts_with("load error"), "{}", tab.status);
+        let mut tab = refused_in_place(&path);
+        let copy = dir.join("copy.docx");
+        assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
+        assert!(!tab.load_failed);
+        assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_zero_byte_docx_opens_as_a_new_document_and_saves() {
+        let dir = temp("zero-byte");
+        let path = dir.join("new.docx");
+        std::fs::write(&path, b"").unwrap();
+        let mut tab = tab_from_path(&path);
+        assert!(!tab.load_failed, "{}", tab.status);
+        assert!(tab.status.starts_with("loaded"), "{}", tab.status);
+        tab.dirty = true;
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let reopened = tab_from_path(&path);
+        assert!(reopened.pkg.is_some(), "{}", reopened.status);
+        assert_eq!(reopened.status.as_ref(), "loaded");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn documents_that_load_are_not_marked_and_save_in_place() {
+        let dir = temp("good");
+        let docx = dir.join("good.docx");
+        std::fs::write(&docx, basic_docx()).unwrap();
+        let md = dir.join("good.md");
+        std::fs::write(&md, "# Notes\n\nText.\n").unwrap();
+        let page = dir.join("good.docx.html");
+        std::fs::write(&page, word_bundle(&basic_docx())).unwrap();
+        for path in [docx, md, page] {
+            let mut tab = tab_from_path(&path);
+            assert!(!tab.load_failed, "{}: {}", path.display(), tab.status);
+            assert!(!tab.status.starts_with("load error"), "{}", tab.status);
+            tab.dirty = true;
+            assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod sheet_save_tests {
     use super::{
         DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SheetSaveDecision, Surface,
@@ -12555,6 +12829,7 @@ mod sheet_save_tests {
             markdown: true,
             hf_edit: None,
             bundle_html: None,
+            load_failed: false,
         }
     }
 

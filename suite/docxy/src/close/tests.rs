@@ -418,3 +418,199 @@ fn window_close_leaves_an_untouched_cell_editor_open_and_the_cell_intact() {
         a1_is_text_007(&restored[i]);
     }
 }
+
+#[test]
+fn a_tab_that_failed_to_load_stays_unsaveable_after_a_restart() {
+    let dir = close_test_dir("load-failed-source");
+    let path = dir.join("broken.docx");
+    std::fs::write(&path, b"not a zip").unwrap();
+    for dirty in [false, true] {
+        let mut t = tab_from_path(&path);
+        assert!(t.load_failed, "{}", t.status);
+        t.dirty = dirty;
+        let mut restored = exit_and_restore(&mut [t], &format!("load-failed-{dirty}"));
+        let r = &mut restored[0];
+        assert!(r.load_failed, "dirty={dirty}: {}", r.status);
+        assert!(r.status.starts_with("load error"), "{}", r.status);
+        assert_eq!(r.dirty, dirty);
+        r.dirty = true;
+        assert!(!save_doc_tab(r, None));
+        assert_eq!(r.status.as_ref(), DOC_LOAD_FAILED_SAVE);
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a zip");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
+    let dir = close_test_dir("load-failed-reload");
+    let good = dir.join("repaired.docx");
+    basic_docx_at(&good);
+    let broken = dir.join("broken.docx");
+    std::fs::write(&broken, b"not a zip").unwrap();
+    let persisted = |path: &std::path::Path| PersistTab {
+        kind: Kind::Docx,
+        title: file_name(path),
+        path: Some(path.display().to_string()),
+        dirty: false,
+        hot: None,
+        markdown: false,
+        load_failed: Some(true),
+    };
+    // Repaired since the session was saved: a normal, saveable document.
+    let mut t = restore_tab(&persisted(&good));
+    assert!(!t.load_failed, "{}", t.status);
+    t.dirty = true;
+    assert!(save_doc_tab(&mut t, None), "{}", t.status);
+    // Still broken: marked by the fresh load itself.
+    assert!(restore_tab(&persisted(&broken)).load_failed);
+    // A session written before the mark existed still reads, unmarked.
+    let old: PersistTab = serde_json::from_str(&format!(
+        r#"{{"kind":"Docx","title":"repaired.docx","path":{:?}}}"#,
+        good.display().to_string()
+    ))
+    .unwrap();
+    assert_eq!(old.load_failed, None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
+    let dir = close_test_dir("load-failed-old-session");
+    let broken = dir.join("broken.docx");
+    std::fs::write(&broken, b"not a zip").unwrap();
+    let good = dir.join("good.docx");
+    basic_docx_at(&good);
+    for (i, (path, failed)) in [(&broken, true), (&good, false)].into_iter().enumerate() {
+        let mut t = tab_from_path(path);
+        t.dirty = true;
+        // Written as a session from before #209: sidecar present, no mark.
+        let mut p = persist_tab(&dir, i, &t);
+        assert!(p.hot.is_some());
+        p.load_failed = None;
+        let mut r = restore_tab(&p);
+        assert_eq!(r.load_failed, failed, "{}: {}", path.display(), r.status);
+        assert_eq!(r.status.starts_with("load error"), failed, "{}", r.status);
+        assert_eq!(save_doc_tab(&mut r, None), !failed, "{}", r.status);
+    }
+    assert_eq!(std::fs::read(&broken).unwrap(), b"not a zip");
+    // A good tab whose file has since gone missing keeps its content and
+    // saves it back; a missing file has nothing to lose.
+    let gone = dir.join("gone.docx");
+    basic_docx_at(&gone);
+    let mut t = tab_from_path(&gone);
+    t.dirty = true;
+    let text = doc_text(&t);
+    let mut p = persist_tab(&dir, 5, &t);
+    p.load_failed = None;
+    std::fs::remove_file(&gone).unwrap();
+    let mut r = restore_tab(&p);
+    assert!(!r.load_failed, "{}", r.status);
+    assert_eq!(doc_text(&r), text);
+    assert!(save_doc_tab(&mut r, None), "{}", r.status);
+    assert!(!tab_from_path(&gone).load_failed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn close_test_dir(tag: &str) -> PathBuf {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/close-tests")
+        .join(format!("{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn basic_docx_at(path: &std::path::Path) {
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        path,
+    )
+    .unwrap();
+}
+
+fn doc_text(t: &DocTab) -> String {
+    let Surface::Doc(ed) = &t.surface else {
+        panic!("not a document")
+    };
+    docxcore::markdown::to_markdown(&ed.doc)
+}
+
+#[test]
+fn a_corrupt_sidecar_reopens_the_file_from_disk() {
+    let dir = close_test_dir("load-failed-sidecar");
+    let good = dir.join("good.docx");
+    basic_docx_at(&good);
+    let on_disk = doc_text(&tab_from_path(&good));
+    // A truncated (0-byte) sidecar is as unreadable as a garbled one, even
+    // though a 0-byte file of the user's own opens as a new document.
+    for (dirty, corrupt) in [
+        (false, &b"not a zip"[..]),
+        (true, b"not a zip"),
+        (true, b""),
+    ] {
+        let mut t = tab_from_path(&good);
+        t.dirty = dirty;
+        let p = persist_tab(&dir, 0, &t);
+        std::fs::write(p.hot.as_ref().unwrap(), corrupt).unwrap();
+        let mut r = restore_tab(&p);
+        assert!(!r.load_failed, "dirty={dirty}: {}", r.status);
+        assert!(!r.dirty);
+        assert!(r.status.starts_with("loaded"), "{}", r.status);
+        assert!(r.status.contains("restored copy"), "{}", r.status);
+        assert_eq!(doc_text(&r), on_disk);
+        // The next exit and restart is an ordinary one.
+        let again = restore_tab(&persist_tab(&dir, 1, &r));
+        assert!(!again.load_failed && again.status.starts_with("loaded"));
+        r.dirty = true;
+        assert!(save_doc_tab(&mut r, None), "{}", r.status);
+        let saved = tab_from_path(&good);
+        assert!(
+            !saved.load_failed && saved.pkg.is_some(),
+            "{}",
+            saved.status
+        );
+        assert_eq!(doc_text(&saved), on_disk);
+    }
+    // A file that is itself broken stays marked, by the fresh load.
+    let broken = dir.join("broken.docx");
+    std::fs::write(&broken, b"not a zip").unwrap();
+    let p = persist_tab(&dir, 2, &tab_from_path(&broken));
+    std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
+    let mut r = restore_tab(&p);
+    assert!(r.load_failed);
+    assert!(r.status.starts_with("load error"), "{}", r.status);
+    r.dirty = true;
+    assert!(!save_doc_tab(&mut r, None));
+    assert_eq!(std::fs::read(&broken).unwrap(), b"not a zip");
+    // A never-saved document has no file to protect: unmarked, Save asks.
+    let mut t = tab_from_path(&good);
+    t.path = None;
+    let p = persist_tab(&dir, 3, &t);
+    std::fs::write(p.hot.as_ref().unwrap(), b"garbage").unwrap();
+    let r = restore_tab(&p);
+    assert!(!r.load_failed && r.path.is_none());
+    assert!(r.status.starts_with("load error"), "{}", r.status);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_persisted_mark_holds_over_a_file_that_loads_at_restart() {
+    let dir = close_test_dir("load-failed-persisted");
+    let path = dir.join("x.docx");
+    let t = tab_from_path(&path);
+    assert!(t.load_failed, "{}", t.status);
+    let json = serde_json::to_string(&persist_tab(&dir, 0, &t)).unwrap();
+    let p: PersistTab = serde_json::from_str(&json).unwrap();
+    assert_eq!(p.load_failed, Some(true));
+    // The file appears (or is repaired) before the restart; the sidecar
+    // still holds only the placeholder.
+    basic_docx_at(&path);
+    let before = std::fs::read(&path).unwrap();
+    let mut r = restore_tab(&p);
+    assert!(r.load_failed, "{}", r.status);
+    r.dirty = true;
+    assert!(!save_doc_tab(&mut r, None));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    let _ = std::fs::remove_dir_all(&dir);
+}
