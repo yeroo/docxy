@@ -147,6 +147,9 @@ pub struct Runner<'a> {
     base: PathBuf,
     sandbox: PathBuf,
     opts: ProbeOpts,
+    /// Reply from the most recent driving verb, for `assert reply.<path>`;
+    /// opening another file clears it so a case cannot assert stale data.
+    last_reply: Option<Json>,
 }
 
 impl<'a> Runner<'a> {
@@ -162,6 +165,7 @@ impl<'a> Runner<'a> {
             base: base.into(),
             sandbox: sandbox.into(),
             opts: ProbeOpts::default(),
+            last_reply: None,
         }
     }
 
@@ -181,6 +185,7 @@ impl<'a> Runner<'a> {
     /// the steps after it were written assuming it worked, and running them
     /// would report failures that are only that step's failure again.
     pub fn run_case(&mut self, case: &Case) -> CaseOutcome {
+        self.last_reply = None;
         let mut steps = Vec::new();
         let mut snapshot: BTreeMap<String, String> = BTreeMap::new();
         let mut snapshot_range = String::new();
@@ -214,7 +219,23 @@ impl<'a> Runner<'a> {
         };
         match &step.action {
             Action::Call { verb, args } => self.verb(out, verb, args.clone()),
+            Action::CallError {
+                verb,
+                args,
+                message,
+            } => match self.driver.call(verb, args.clone()) {
+                Err(actual) if actual.contains(message) => out,
+                Err(actual) => fail(
+                    out,
+                    format!("expected refusal containing '{message}', got '{actual}'"),
+                ),
+                Ok(_) => fail(
+                    out,
+                    format!("expected '{verb}' to be refused with '{message}', but it succeeded"),
+                ),
+            },
             Action::Open(path) | Action::OpenCopy(path) => {
+                self.last_reply = None;
                 let full = self.base.join(path);
                 if !full.is_file() {
                     return err(out, format!("no such file: {}", full.display()));
@@ -322,9 +343,12 @@ impl<'a> Runner<'a> {
     }
 
     /// Send a driving verb; a refusal is an `Error`, not a failed expectation.
-    fn verb(&self, out: StepOutcome, verb: &str, args: Json) -> StepOutcome {
+    fn verb(&mut self, out: StepOutcome, verb: &str, args: Json) -> StepOutcome {
         match self.driver.call(verb, args) {
-            Ok(_) => out,
+            Ok(reply) => {
+                self.last_reply = Some(reply);
+                out
+            }
             Err(e) => err(out, e),
         }
     }
@@ -345,11 +369,19 @@ impl<'a> Runner<'a> {
                 negated,
                 value,
             } => {
-                let state = match self.state() {
-                    Ok(s) => s,
-                    Err(e) => return err(out, e),
+                let path = key.strip_prefix("reply.").unwrap_or(key);
+                let state = if key.starts_with("reply.") {
+                    match &self.last_reply {
+                        Some(reply) => reply.clone(),
+                        None => return err(out, "no prior verb reply to assert"),
+                    }
+                } else {
+                    match self.state() {
+                        Ok(s) => s,
+                        Err(e) => return err(out, e),
+                    }
                 };
-                let Some(got) = state.get(key) else {
+                let Some(got) = json_path(&state, path) else {
                     return err(
                         out,
                         format!(
@@ -511,6 +543,16 @@ impl<'a> Runner<'a> {
             .save(case, &format!("{line:03}-{region}"), img)
             .map_err(|e| format!("saving the capture: {e}"))
     }
+}
+
+/// Dotted keys let a script assert nested document state without comparing
+/// whole JSON objects. Numeric components index arrays (`tabs.0.name`).
+fn json_path<'a>(value: &'a Json, path: &str) -> Option<&'a Json> {
+    path.split('.')
+        .try_fold(value, |current, part| match current {
+            Json::Arr(items) => items.get(part.parse::<usize>().ok()?),
+            _ => current.get(part),
+        })
 }
 
 fn err(mut out: StepOutcome, detail: impl Into<String>) -> StepOutcome {
@@ -687,6 +729,23 @@ pub fn copy_fixture(source: &Path, sandbox: &Path, case: &str) -> Result<PathBuf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotted_state_paths_read_objects_and_array_items() {
+        let state = Json::obj(vec![
+            ("sel", Json::obj(vec![("start", Json::Num(2.0))])),
+            (
+                "tabs",
+                Json::Arr(vec![Json::obj(vec![("name", Json::Str("Home".into()))])]),
+            ),
+        ]);
+        assert_eq!(json_path(&state, "sel.start"), Some(&Json::Num(2.0)));
+        assert_eq!(
+            json_path(&state, "tabs.0.name").and_then(Json::as_str),
+            Some("Home")
+        );
+        assert!(json_path(&state, "tabs.1.name").is_none());
+    }
 
     #[test]
     fn a_number_reads_as_a_test_would_write_it() {

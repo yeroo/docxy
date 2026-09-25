@@ -29,6 +29,8 @@
 use crate::control::Done;
 use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
+use docxcore::editor::{Editor, FlatDocument, StoryOffset};
+use docxcore::model::{Align, VertAlign};
 use gpui::{App, Context, Entity, KeyDownEvent, Keystroke, Window};
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
@@ -750,6 +752,466 @@ fn num_or_null(v: Option<usize>) -> Json {
 
 // ---- reading the app ------------------------------------------------------
 
+/// Snapshot of view controls needed to serialize a document without a window.
+#[derive(Clone, Copy)]
+struct ViewFlags {
+    hf_edit: bool,
+    page: bool,
+    marks: bool,
+    ruler: bool,
+    navigation: bool,
+    comments: bool,
+    notes: bool,
+    zoom: f32,
+    dark: bool,
+}
+
+impl ViewFlags {
+    fn live(app: &crate::Docxy, window: &Window) -> Self {
+        Self {
+            hf_edit: app.hf_active(),
+            page: app.page_view,
+            marks: app.show_marks,
+            ruler: app.show_ruler,
+            navigation: app.show_nav,
+            comments: app.show_comments,
+            notes: app.show_notes,
+            zoom: app.zoom,
+            dark: app.theme_pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark,
+        }
+    }
+}
+
+fn signed(n: i32) -> Json {
+    Json::Num(n as f64)
+}
+fn optional_signed(n: Option<i32>) -> Json {
+    n.map(signed).unwrap_or(Json::Null)
+}
+fn optional_u32(n: Option<u32>) -> Json {
+    n.map(|v| Json::Num(v as f64)).unwrap_or(Json::Null)
+}
+fn endpoint(position: &StoryOffset) -> Json {
+    Json::obj(vec![
+        ("story", Json::Str(position.story.clone())),
+        ("offset", Json::Num(position.offset as f64)),
+    ])
+}
+
+/// The document-only reply, shared by `state` and the `doc` verb.
+fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
+    let flat = FlatDocument::new(&editor.doc);
+    let caret = flat.locate(&editor.caret);
+    let anchor = editor
+        .anchor
+        .as_ref()
+        .and_then(|c| flat.locate(c))
+        .or_else(|| caret.clone());
+    let cross_story = matches!((&caret, &anchor), (Some(c), Some(a)) if c.story != a.story);
+    let sel = match (&caret, &anchor) {
+        (Some(c), Some(a)) if c.story == a.story => Json::obj(vec![
+            ("story", Json::Str(c.story.clone())),
+            ("start", Json::Num(c.offset.min(a.offset) as f64)),
+            ("end", Json::Num(c.offset.max(a.offset) as f64)),
+        ]),
+        _ => Json::Null,
+    };
+    let p = editor.caret_para_props();
+    let r = editor.caret_props();
+    let alignment = match p.align {
+        Align::Left => "left",
+        Align::Center => "center",
+        Align::Right => "right",
+        Align::Justify => "justify",
+    };
+    let vert_align = match r.vert_align {
+        VertAlign::Baseline => "baseline",
+        VertAlign::Superscript => "superscript",
+        VertAlign::Subscript => "subscript",
+    };
+    let para_index = caret.as_ref().and_then(|c| {
+        flat.story(&c.story)
+            .and_then(|s| s.paragraph_index(&editor.caret))
+    });
+    let para = Json::obj(vec![
+        ("index", num_or_null(para_index)),
+        ("style", str_or_null(p.style_id)),
+        ("alignment", Json::Str(alignment.into())),
+        (
+            "ind",
+            Json::obj(vec![
+                ("left", signed(p.indent)),
+                ("right", signed(p.indent_right)),
+                ("first_line", signed(p.first_line)),
+            ]),
+        ),
+        (
+            "spacing",
+            Json::obj(vec![
+                ("before", optional_signed(p.spacing.before)),
+                ("after", optional_signed(p.spacing.after)),
+                ("line", optional_signed(p.spacing.line)),
+                ("rule", str_or_null(p.spacing.line_rule)),
+            ]),
+        ),
+        (
+            "list",
+            p.num_id
+                .map(|id| Json::obj(vec![("num_id", signed(id)), ("level", signed(p.ilvl))]))
+                .unwrap_or(Json::Null),
+        ),
+    ]);
+    let run = Json::obj(vec![
+        ("bold", Json::Bool(r.bold)),
+        ("italic", Json::Bool(r.italic)),
+        ("underline", Json::Bool(r.underline)),
+        ("strike", Json::Bool(r.strike)),
+        ("font", str_or_null(r.font)),
+        ("size_half_pts", optional_u32(r.size_half_pts)),
+        ("color", str_or_null(r.color)),
+        ("highlight", str_or_null(r.highlight)),
+        ("vert_align", Json::Str(vert_align.into())),
+    ]);
+    let view = Json::obj(vec![
+        (
+            "layout",
+            Json::Str(if flags.page { "print" } else { "web" }.into()),
+        ),
+        ("marks", Json::Bool(flags.marks)),
+        ("ruler", Json::Bool(flags.ruler)),
+        ("navigation", Json::Bool(flags.navigation)),
+        ("comments_pane", Json::Bool(flags.comments)),
+        ("notes_pane", Json::Bool(flags.notes)),
+        ("zoom", Json::Num(flags.zoom as f64)),
+        (
+            "theme",
+            Json::Str(if flags.dark { "dark" } else { "light" }.into()),
+        ),
+    ]);
+    Json::obj(vec![
+        ("text", Json::Str(flat.main().text.clone())),
+        (
+            "textboxes",
+            Json::Arr(
+                flat.stories
+                    .iter()
+                    .skip(1)
+                    .map(|s| {
+                        Json::obj(vec![
+                            ("story", Json::Str(s.id.clone())),
+                            ("text", Json::Str(s.text.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("sel", sel),
+        (
+            "anchor",
+            anchor.as_ref().map(endpoint).unwrap_or(Json::Null),
+        ),
+        ("caret", caret.as_ref().map(endpoint).unwrap_or(Json::Null)),
+        ("cross_story", Json::Bool(cross_story)),
+        ("hf_edit", Json::Bool(flags.hf_edit)),
+        ("para", para),
+        ("run", run),
+        ("view", view),
+    ])
+}
+
+fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
+    match app.tabs.get(app.active).map(|t| &t.surface) {
+        Some(crate::Surface::Doc(ed)) => Ok(ed),
+        _ => Err("the active tab is not a document".into()),
+    }
+}
+
+/// Ribbon verbs address only surfaces that render this ribbon model.
+fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
+    if app.backstage {
+        return Err("the ribbon is hidden while File (backstage) is open".into());
+    }
+    if app.ribbon_min {
+        return Err("the ribbon is collapsed".into());
+    }
+    match app.tabs.get(app.active).map(|t| &t.surface) {
+        Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(()),
+        _ => Err("the active tab has no document or Project ribbon".into()),
+    }
+}
+
+/// One live status-line item in the order the app draws it.
+fn status_json(status: &str) -> Json {
+    Json::obj(vec![(
+        "items",
+        Json::Arr(vec![Json::obj(vec![("text", Json::Str(status.into()))])]),
+    )])
+}
+
+/// Validate both main-story offsets before changing the editor's selection.
+fn select_offsets(editor: &mut Editor, start: usize, end: usize) -> Result<(), String> {
+    let flat = FlatDocument::new(&editor.doc);
+    let limit = flat.main().len();
+    let validate = |n| {
+        flat.main().caret(n).ok_or_else(|| format!("offset {n} is not addressable in the main story (valid: 0..{}; final paragraph mark has no following caret)", limit.saturating_sub(1)))
+    };
+    let anchor = validate(start)?;
+    let caret = validate(end)?;
+    editor.clear_selection();
+    editor.set_caret(anchor);
+    editor.extend_selection(true);
+    editor.set_caret(caret);
+    Ok(())
+}
+
+/// Owned command data extracted from one ribbonspec control.
+#[derive(Clone)]
+struct RibbonCommand {
+    id: String,
+    label: String,
+    tip_title: String,
+    tip_body: String,
+    key_tip: String,
+    act: crate::Act,
+    gallery: bool,
+}
+
+impl RibbonCommand {
+    fn from_cmd(cmd: &crate::rs::Cmd<crate::Act>) -> Self {
+        Self {
+            id: cmd.id.into(),
+            label: cmd.label.into(),
+            tip_title: cmd.tip.title.into(),
+            tip_body: cmd.tip.body.into(),
+            key_tip: cmd.key_tip.into(),
+            act: cmd.act,
+            gallery: false,
+        }
+    }
+    fn json(&self, checked: &impl Fn(&RibbonCommand) -> bool) -> Json {
+        Json::obj(vec![
+            ("id", Json::Str(self.id.clone())),
+            ("label", Json::Str(self.label.clone())),
+            (
+                "tip",
+                Json::obj(vec![
+                    ("title", Json::Str(self.tip_title.clone())),
+                    ("body", Json::Str(self.tip_body.clone())),
+                ]),
+            ),
+            ("key_tip", Json::Str(self.key_tip.clone())),
+            ("checked", Json::Bool(checked(self))),
+        ])
+    }
+}
+
+/// Flatten all command-bearing control shapes in visual order.
+fn control_commands(control: &crate::Control<crate::Act>, out: &mut Vec<RibbonCommand>) {
+    use crate::rs::{Cell, Control};
+    match control {
+        Control::Large(c) | Control::Toggle(c) => out.push(RibbonCommand::from_cmd(c)),
+        Control::Column(cs) => out.extend(cs.iter().map(RibbonCommand::from_cmd)),
+        Control::Split { primary, menu } => {
+            out.push(RibbonCommand::from_cmd(primary));
+            out.extend(menu.iter().map(RibbonCommand::from_cmd));
+        }
+        Control::Dropdown { cmd, items } => {
+            out.push(RibbonCommand::from_cmd(cmd));
+            out.extend(items.iter().map(RibbonCommand::from_cmd));
+        }
+        Control::Gallery(g) => out.extend(g.items.iter().map(|item| RibbonCommand {
+            id: format!("{}:{}", g.id, item.label),
+            label: item.label.into(),
+            tip_title: g.tip.title.into(),
+            tip_body: g.tip.body.into(),
+            key_tip: String::new(),
+            act: item.act,
+            gallery: true,
+        })),
+        Control::Rows(rows) => {
+            for cell in rows.iter().flatten() {
+                match cell {
+                    Cell::Btn(c) | Cell::Combo { cmd: c, .. } => {
+                        out.push(RibbonCommand::from_cmd(c))
+                    }
+                }
+            }
+        }
+        Control::Separator => {}
+    }
+}
+
+/// Commands offered on one tab, used by click resolution.
+fn tab_commands(tab: &crate::rs::Tab<crate::Act>) -> Vec<RibbonCommand> {
+    let mut out = Vec::new();
+    for group in &tab.groups {
+        for control in &group.items {
+            control_commands(control, &mut out);
+        }
+    }
+    out
+}
+
+/// Groups and controls as the renderer presents one tab.
+fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(&RibbonCommand) -> bool) -> Json {
+    let groups = tab
+        .groups
+        .iter()
+        .map(|group| {
+            let mut commands = Vec::new();
+            let mut galleries = Vec::new();
+            for control in &group.items {
+                control_commands(control, &mut commands);
+                if let crate::Control::Gallery(g) = control {
+                    galleries.push(Json::obj(vec![
+                        ("id", Json::Str(g.id.into())),
+                        (
+                            "items",
+                            Json::Arr(g.items.iter().map(|i| Json::Str(i.label.into())).collect()),
+                        ),
+                    ]));
+                }
+            }
+            Json::obj(vec![
+                ("title", Json::Str(group.title.into())),
+                ("launcher", Json::Bool(group.launcher.is_some())),
+                (
+                    "commands",
+                    Json::Arr(commands.iter().map(|c| c.json(checked)).collect()),
+                ),
+                ("galleries", Json::Arr(galleries)),
+            ])
+        })
+        .collect();
+    Json::obj(vec![
+        ("name", Json::Str(tab.name.into())),
+        ("key_tip", Json::Str(tab.key_tip.into())),
+        ("kind", Json::Str("ribbon".into())),
+        ("groups", Json::Arr(groups)),
+    ])
+}
+
+/// Pure ribbon snapshot for a tab kind and table context.
+fn ribbon_json_for(
+    kind: crate::Kind,
+    in_table: bool,
+    checked: impl Fn(&RibbonCommand) -> bool,
+) -> Json {
+    let ribbon = crate::ribbon_for(kind);
+    let (_, file_name, file_tip) = crate::ribbon_tab_set(kind)[0];
+    let mut tabs = vec![Json::obj(vec![
+        ("name", Json::Str(file_name.into())),
+        ("key_tip", Json::Str(file_tip.into())),
+        ("kind", Json::Str("backstage".into())),
+        ("groups", Json::Arr(Vec::new())),
+    ])];
+    tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
+    if kind == crate::Kind::Docx && in_table {
+        tabs.push(tab_json(&crate::table_tab(), &checked));
+    }
+    let tab_count = tabs.len();
+    let qat = crate::QAT_ITEMS
+        .iter()
+        .map(|item| {
+            Json::obj(vec![
+                ("id", Json::Str(item.id.into())),
+                ("label", Json::Str(item.label.into())),
+                (
+                    "tip",
+                    Json::obj(vec![
+                        ("title", Json::Str(item.tip.into())),
+                        ("body", Json::Str(String::new())),
+                    ]),
+                ),
+                ("key_tip", Json::Str(String::new())),
+                ("checked", Json::Bool(false)),
+            ])
+        })
+        .collect();
+    Json::obj(vec![
+        ("tabs", Json::Arr(tabs)),
+        ("tab_count", Json::Num(tab_count as f64)),
+        ("qat", Json::Arr(qat)),
+    ])
+}
+
+/// Ribbon snapshot using the active tab and live checked states.
+fn ribbon_json(app: &crate::Docxy) -> Json {
+    ribbon_json_for(app.ribbon_kind(), app.caret_table().is_some(), |command| {
+        if command.gallery {
+            app.gallery_item_selected(command.act)
+        } else {
+            app.act_active(command.act)
+        }
+    })
+}
+
+/// Resolve a currently valid tab name before a synthetic ribbon click.
+fn ribbon_tab_by_name(kind: crate::Kind, name: &str) -> Result<crate::RibbonTab, String> {
+    crate::ribbon_tab_set(kind)
+        .iter()
+        .find_map(|(tab, label, _)| (*label == name).then_some(*tab).flatten())
+        .or_else(|| {
+            (kind == crate::Kind::Docx && name == "Table").then_some(crate::RibbonTab::Table)
+        })
+        .ok_or_else(|| format!("'{name}' is not a ribbon tab for the active document"))
+}
+
+/// Find a command on the actual active-kind ribbon definition.
+fn resolve_ribbon_command(
+    app: &crate::Docxy,
+    tab_name: &str,
+    query: &str,
+) -> Result<crate::Act, String> {
+    let kind = app.ribbon_kind();
+    if tab_name == "File" {
+        return Err("File is backstage; use the backstage verb".into());
+    }
+    ribbon_tab_by_name(kind, tab_name)?;
+    let in_table = app.caret_table().is_some();
+    let tab = if tab_name == "Table" {
+        if !in_table {
+            return Err("Table tab is not active outside a table".into());
+        }
+        crate::table_tab()
+    } else {
+        crate::ribbon_for(kind)
+            .tabs
+            .into_iter()
+            .find(|t| t.name == tab_name)
+            .ok_or_else(|| format!("'{tab_name}' is not a ribbon tab for the active document"))?
+    };
+    let commands = tab_commands(&tab);
+    resolve_commands(&commands, tab_name, query)
+}
+
+/// Resolve by id first, then by label only when it is unique.
+fn resolve_commands(
+    commands: &[RibbonCommand],
+    tab_name: &str,
+    query: &str,
+) -> Result<crate::Act, String> {
+    let matches: Vec<_> = {
+        let ids: Vec<_> = commands.iter().filter(|c| c.id == query).collect();
+        if ids.is_empty() {
+            commands.iter().filter(|c| c.label == query).collect()
+        } else {
+            ids
+        }
+    };
+    match matches.as_slice() {
+        [only] => Ok(only.act),
+        [] => Err(format!("command '{query}' is not on tab '{tab_name}'")),
+        many => Err(format!(
+            "command '{query}' is ambiguous on tab '{tab_name}': {}",
+            many.iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 /// The active spreadsheet, or the refusal every cell verb needs.
 fn sheet(app: &crate::Docxy) -> Result<&SheetView, String> {
     app.active_sheet()
@@ -782,7 +1244,7 @@ fn load_failure(app: &crate::Docxy) -> Option<String> {
 /// One shape for every driving verb, so a test reads the same keys whichever
 /// one it just sent. The sheet half is absent when the active tab is not a
 /// spreadsheet (`type` and `key` reach the document surface too).
-fn state(app: &crate::Docxy) -> Json {
+fn state(app: &crate::Docxy, window: &Window) -> Json {
     let mut out = vec![
         ("tab", Json::Num(app.active as f64)),
         ("tabs", Json::Num(app.tabs.len() as f64)),
@@ -862,6 +1324,11 @@ fn state(app: &crate::Docxy) -> Json {
         ("sel_hidden", Json::Bool(ov.sel_hidden)),
     ]);
     let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    if let Ok(ed) = active_doc(app) {
+        if let Json::Obj(fields) = doc_state(ed, &ViewFlags::live(app, window)) {
+            out.extend(fields);
+        }
+    }
     if let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface) {
         out.extend(crate::project_state(v));
     }
@@ -878,6 +1345,8 @@ fn state(app: &crate::Docxy) -> Json {
 /// input uses [`crate::Docxy::on_key`], action-bound Tab variants use their
 /// `tab_key`/`shift_tab_key` handlers, and `select-chart` is the press on a chart
 /// card.
+/// `selection-set` is setup: it uses the editor's caret API after validating
+/// both offsets because the UI has no pointer-by-offset operation.
 /// A verb that reached past those into the state they maintain could pass while
 /// the handler under test was broken — the one way this harness could be worse
 /// than nothing.
@@ -889,6 +1358,52 @@ pub fn dispatch(
     cx: &mut Context<crate::Docxy>,
 ) -> Result<Done, String> {
     match verb {
+        "doc" => Done::ok(doc_state(active_doc(app)?, &ViewFlags::live(app, window))),
+        "selection-set" => {
+            let (start, end) = (arg_usize(args, "start")?, arg_usize(args, "end")?);
+            if app.hf_active() {
+                return Err("selection-set cannot address the body while a header or footer is being edited".into());
+            }
+            let ed = app
+                .active_editor()
+                .ok_or("the active tab is not a document")?;
+            select_offsets(ed, start, end)?;
+            app.refocus(window, cx);
+            Done::ok(state(app, window))
+        }
+        "status-read" => {
+            let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
+            Done::ok(status_json(&tab.status))
+        }
+        "backstage" => {
+            match arg_str(args, "action")? {
+                "open" => app.open_backstage(cx),
+                "close" => app.backstage_back(window, cx),
+                "read" => {}
+                _ => return Err("'action' must be open, close or read".into()),
+            }
+            let items = crate::backstage_rail_items(app.active_is_project());
+            Done::ok(Json::obj(vec![
+                ("open", Json::Bool(app.backstage)),
+                (
+                    "items",
+                    Json::Arr(items.map(|item| Json::Str(item.display.into())).collect()),
+                ),
+            ]))
+        }
+        "ribbon-read" => {
+            ribbon_surface(app)?;
+            Done::ok(ribbon_json(app))
+        }
+        "ribbon-click" => {
+            ribbon_surface(app)?;
+            let tab = arg_str(args, "tab")?.to_string();
+            let command = arg_str(args, "command")?.to_string();
+            let act = resolve_ribbon_command(app, &tab, &command)?;
+            app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
+            app.dispatch(act, window, cx);
+            Done::ok(state(app, window))
+        }
         "close-tab" => {
             let index = match args.get("index") {
                 Some(_) => arg_usize(args, "index")?,
@@ -908,19 +1423,19 @@ pub fn dispatch(
                 Some(_) => return Err("'answer' must be save, discard or cancel".into()),
             };
             app.close_tab_with(index, answer, window, cx);
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
         // The same handler as the Backstage rail item, not a synthetic click.
         "backstage-close" => {
             app.backstage_close(window, cx);
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
         "ask-on-close" => {
             let Some(Json::Bool(on)) = args.get("on") else {
                 return Err("'on' must be a boolean".into());
             };
             app.set_ask_on_close(*on, cx);
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
         "ping" => Done::ok(Json::obj(vec![
             ("instance", Json::Str(instance_name())),
@@ -949,7 +1464,7 @@ pub fn dispatch(
             // the load went, so it is what decides.
             match load_failure(app) {
                 Some(why) => Err(format!("{raw}: {why}")),
-                None => Done::ok(state(app)),
+                None => Done::ok(state(app, window)),
             }
         }
 
@@ -968,13 +1483,13 @@ pub fn dispatch(
                 }
                 crate::project_cell_click(tab, cell.0 as usize, Some(cell.1 as usize), dbl);
                 app.refocus(window, cx);
-                return Done::ok(state(app));
+                return Done::ok(state(app, window));
             }
             sheet(app)?;
             app.grid_press_cell(cell, cx);
             app.cell_click(cell.0, cell.1, shift, dbl, window, cx);
             app.grid_release(cx);
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
 
         // A drag: the press plants the anchor, each cell crossed is a move, the
@@ -987,7 +1502,7 @@ pub fn dispatch(
                 app.grid_drag_over(r, c, cx);
             }
             app.grid_release(cx);
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
 
         // Type text, one key event per character.
@@ -995,7 +1510,7 @@ pub fn dispatch(
             for stroke in typed_keys(arg_str(args, "text")?)? {
                 press(app, stroke, window, cx);
             }
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
 
         // One key, or a list of them ("keys": ["ctrl+c", "down", "ctrl+v"]).
@@ -1024,7 +1539,7 @@ pub fn dispatch(
             for stroke in strokes {
                 press(app, stroke, window, cx);
             }
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
 
         // Select a chart, as pressing its card does (press then release, with
@@ -1041,7 +1556,7 @@ pub fn dispatch(
             }
             app.chart_press(idx, (0, 0), (0.0, 0.0), cx);
             app.grid_release(cx);
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
 
         // Give a reference field the keyboard, as clicking it does.
@@ -1061,7 +1576,7 @@ pub fn dispatch(
                 )
             })?;
             app.ref_field_focus(target, seed, cx);
-            Done::ok(state(app))
+            Done::ok(state(app, window))
         }
 
         // Read one cell: what it shows, and what re-editing it would put in the
@@ -1151,7 +1666,7 @@ pub fn dispatch(
 
         // State assertions include tab metadata for every surface; spreadsheet
         // selection fields are added by state() only when a sheet is active.
-        "selection" => Done::ok(state(app)),
+        "selection" => Done::ok(state(app, window)),
 
         // Persist and go. The reply is written first (see the pump).
         "quit" => {
@@ -1231,6 +1746,418 @@ fn press(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use docxcore::model::{Block, Document, ParProps, Paragraph, Run, RunProps, Spacing};
+
+    fn editor(props: ParProps, run: RunProps) -> Editor {
+        Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props,
+                content: vec![docxcore::model::Inline::Run(Run {
+                    text: "abc".into(),
+                    props: run,
+                })],
+            })],
+        })
+    }
+
+    #[test]
+    fn theme_reply_resolves_preference_without_waiting_for_render() {
+        use gpui::WindowAppearance;
+        use gpui_component::ThemeMode;
+        assert_eq!(
+            crate::ThemePref::Dark.resolve(WindowAppearance::Light),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            crate::ThemePref::Light.resolve(WindowAppearance::Dark),
+            ThemeMode::Light
+        );
+        assert_eq!(
+            crate::ThemePref::Auto.resolve(WindowAppearance::Dark),
+            ThemeMode::Dark
+        );
+        assert_eq!(
+            crate::ThemePref::Auto.resolve(WindowAppearance::Light),
+            ThemeMode::Light
+        );
+    }
+
+    #[test]
+    fn document_fields_read_editor_and_view_values() {
+        let props = ParProps {
+            style_id: Some("Heading2".into()),
+            align: Align::Center,
+            indent: 720,
+            indent_right: 240,
+            first_line: -120,
+            num_id: Some(17),
+            ilvl: 2,
+            spacing: Spacing {
+                before: Some(100),
+                after: Some(200),
+                line: Some(360),
+                line_rule: Some("auto".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let run = RunProps {
+            bold: true,
+            italic: true,
+            underline: true,
+            strike: true,
+            font: Some("Aptos".into()),
+            size_half_pts: Some(26),
+            color: Some("AABBCC".into()),
+            highlight: Some("yellow".into()),
+            vert_align: VertAlign::Superscript,
+            ..Default::default()
+        };
+        let flags = ViewFlags {
+            hf_edit: false,
+            page: false,
+            marks: true,
+            ruler: true,
+            navigation: true,
+            comments: true,
+            notes: true,
+            zoom: 1.5,
+            dark: true,
+        };
+        let state = doc_state(&editor(props, run), &flags);
+        assert_eq!(state.get_str("text"), Some("abc\n"));
+        assert_eq!(state.get("hf_edit"), Some(&Json::Bool(false)));
+        let para = state.get("para").unwrap();
+        assert_eq!(para.get_usize("index"), Some(0));
+        assert_eq!(para.get_str("style"), Some("Heading2"));
+        assert_eq!(para.get_str("alignment"), Some("center"));
+        assert_eq!(
+            para.get("ind").unwrap().get("left"),
+            Some(&Json::Num(720.0))
+        );
+        assert_eq!(
+            para.get("ind").unwrap().get("right"),
+            Some(&Json::Num(240.0))
+        );
+        assert_eq!(
+            para.get("ind").unwrap().get("first_line"),
+            Some(&Json::Num(-120.0))
+        );
+        assert_eq!(
+            para.get("spacing").unwrap().get("before"),
+            Some(&Json::Num(100.0))
+        );
+        assert_eq!(
+            para.get("spacing").unwrap().get("after"),
+            Some(&Json::Num(200.0))
+        );
+        assert_eq!(
+            para.get("spacing").unwrap().get("line"),
+            Some(&Json::Num(360.0))
+        );
+        assert_eq!(para.get("spacing").unwrap().get_str("rule"), Some("auto"));
+        assert_eq!(
+            para.get("list").unwrap().get("num_id"),
+            Some(&Json::Num(17.0))
+        );
+        assert_eq!(
+            para.get("list").unwrap().get("level"),
+            Some(&Json::Num(2.0))
+        );
+        let run = state.get("run").unwrap();
+        for name in ["bold", "italic", "underline", "strike"] {
+            assert_eq!(run.get(name), Some(&Json::Bool(true)), "{name}");
+        }
+        assert_eq!(run.get_str("font"), Some("Aptos"));
+        assert_eq!(run.get("size_half_pts"), Some(&Json::Num(26.0)));
+        assert_eq!(run.get_str("color"), Some("AABBCC"));
+        assert_eq!(run.get_str("highlight"), Some("yellow"));
+        assert_eq!(run.get_str("vert_align"), Some("superscript"));
+        let view = state.get("view").unwrap();
+        assert_eq!(view.get_str("layout"), Some("web"));
+        for name in [
+            "marks",
+            "ruler",
+            "navigation",
+            "comments_pane",
+            "notes_pane",
+        ] {
+            assert_eq!(view.get(name), Some(&Json::Bool(true)), "{name}");
+        }
+        assert_eq!(view.get("zoom"), Some(&Json::Num(1.5)));
+        assert_eq!(view.get_str("theme"), Some("dark"));
+
+        let defaults = doc_state(
+            &editor(ParProps::default(), RunProps::default()),
+            &ViewFlags {
+                hf_edit: false,
+                page: true,
+                marks: false,
+                ruler: false,
+                navigation: false,
+                comments: false,
+                notes: false,
+                zoom: 1.0,
+                dark: false,
+            },
+        );
+        assert_ne!(state.get("para"), defaults.get("para"));
+        assert_ne!(state.get("run"), defaults.get("run"));
+        assert_ne!(state.get("view"), defaults.get("view"));
+        let at = |value: &Json, path: &[&str]| -> Json {
+            path.iter()
+                .fold(value, |v, key| v.get(key).unwrap())
+                .clone()
+        };
+        for path in [
+            &["para", "style"][..],
+            &["para", "alignment"],
+            &["para", "ind", "left"],
+            &["para", "ind", "right"],
+            &["para", "ind", "first_line"],
+            &["para", "spacing", "before"],
+            &["para", "spacing", "after"],
+            &["para", "spacing", "line"],
+            &["para", "spacing", "rule"],
+            &["para", "list"],
+            &["run", "bold"],
+            &["run", "italic"],
+            &["run", "underline"],
+            &["run", "strike"],
+            &["run", "font"],
+            &["run", "size_half_pts"],
+            &["run", "color"],
+            &["run", "highlight"],
+            &["run", "vert_align"],
+            &["view", "layout"],
+            &["view", "marks"],
+            &["view", "ruler"],
+            &["view", "navigation"],
+            &["view", "comments_pane"],
+            &["view", "notes_pane"],
+            &["view", "zoom"],
+            &["view", "theme"],
+        ] {
+            assert_ne!(
+                at(&state, path),
+                at(&defaults, path),
+                "{path:?} must reflect live values"
+            );
+        }
+    }
+
+    #[test]
+    fn selection_set_validates_before_mutating_and_preserves_direction() {
+        let mut ed = editor(ParProps::default(), RunProps::default());
+        select_offsets(&mut ed, 3, 1).unwrap();
+        assert_eq!(ed.anchor.as_ref().unwrap().offset, 3);
+        assert_eq!(ed.caret.offset, 1);
+        let before = (ed.anchor.clone(), ed.caret.clone());
+        assert!(select_offsets(&mut ed, 1, 4).is_err());
+        assert_eq!((ed.anchor, ed.caret), before);
+    }
+
+    #[test]
+    fn document_state_preserves_cross_story_endpoints() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![
+                    docxcore::model::Inline::Run(Run {
+                        text: "host".into(),
+                        props: RunProps::default(),
+                    }),
+                    docxcore::model::Inline::TextBox {
+                        raw: String::new(),
+                        blocks: vec![Block::Paragraph(Paragraph {
+                            props: ParProps::default(),
+                            content: vec![docxcore::model::Inline::Run(Run {
+                                text: "box".into(),
+                                props: RunProps::default(),
+                            })],
+                        })],
+                    },
+                ],
+            })],
+        });
+        ed.set_caret(docxcore::editor::Caret::top(0, 4));
+        ed.extend_selection(true);
+        ed.move_right();
+        let state = doc_state(
+            &ed,
+            &ViewFlags {
+                hf_edit: false,
+                page: true,
+                marks: false,
+                ruler: false,
+                navigation: false,
+                comments: false,
+                notes: false,
+                zoom: 1.0,
+                dark: false,
+            },
+        );
+        assert_eq!(state.get("cross_story"), Some(&Json::Bool(true)));
+        assert_eq!(state.get("sel"), Some(&Json::Null));
+        assert_eq!(state.get("anchor").unwrap().get_str("story"), Some("main"));
+        assert_eq!(state.get("anchor").unwrap().get_usize("offset"), Some(4));
+        assert_eq!(
+            state.get("caret").unwrap().get_str("story"),
+            Some("textbox:0/1")
+        );
+        assert_eq!(state.get("caret").unwrap().get_usize("offset"), Some(0));
+        assert_eq!(state.get_str("text"), Some("host\n"));
+        assert_eq!(
+            state.get("textboxes").unwrap().as_array().unwrap()[0].get_str("text"),
+            Some("box\n")
+        );
+    }
+
+    #[test]
+    fn ribbon_reflects_definition_and_checked_state() {
+        let off = ribbon_json_for(crate::Kind::Docx, false, |_| false);
+        let on = ribbon_json_for(crate::Kind::Docx, true, |c| {
+            matches!(c.act, crate::Act::Bold)
+        });
+        let tabs = off.get("tabs").unwrap().as_array().unwrap();
+        assert_eq!(tabs[0].get_str("name"), Some("File"));
+        assert_eq!(tabs[0].get_str("kind"), Some("backstage"));
+        assert_eq!(
+            tabs.iter()
+                .map(|t| t.get_str("name").unwrap())
+                .collect::<Vec<_>>(),
+            vec!["File", "Home", "Insert", "Review", "View"]
+        );
+        let tabs_on = on.get("tabs").unwrap().as_array().unwrap();
+        assert_eq!(tabs_on.last().unwrap().get_str("name"), Some("Table"));
+        let groups = tabs_on[1].get("groups").unwrap().as_array().unwrap();
+        let commands: Vec<&Json> = groups
+            .iter()
+            .flat_map(|g| g.get("commands").unwrap().as_array().unwrap())
+            .collect();
+        let bold = commands
+            .iter()
+            .find(|c| c.get_str("id") == Some("b"))
+            .unwrap();
+        assert_eq!(bold.get_str("label"), Some("Bold"));
+        assert_eq!(bold.get("checked"), Some(&Json::Bool(true)));
+        assert!(bold.get("tip").unwrap().get_str("title").is_some());
+        assert!(bold.get("key_tip").is_some());
+        assert!(!on.get("qat").unwrap().as_array().unwrap().is_empty());
+        assert!(
+            groups
+                .iter()
+                .any(|g| !g.get("galleries").unwrap().as_array().unwrap().is_empty())
+        );
+    }
+
+    #[test]
+    fn style_gallery_checked_matches_heading_preview() {
+        let mut props = ParProps::default();
+        props.style_id = Some("Heading1".into());
+        let editor = editor(props, RunProps::default());
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, |c| {
+            c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
+        });
+        let tabs = ribbon.get("tabs").unwrap().as_array().unwrap();
+        let commands: Vec<&Json> = tabs[1]
+            .get("groups")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g.get("commands").unwrap().as_array().unwrap())
+            .collect();
+        let checked = |label| {
+            commands
+                .iter()
+                .find(|c| c.get_str("label") == Some(label))
+                .unwrap()
+                .get("checked")
+        };
+        assert_eq!(checked("Heading 1"), Some(&Json::Bool(true)));
+        assert_eq!(checked("Normal"), Some(&Json::Bool(false)));
+    }
+
+    #[test]
+    fn normal_paragraph_selects_only_normal_gallery_item() {
+        let mut editor = editor(ParProps::default(), RunProps::default());
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, |c| {
+            c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
+        });
+        let commands = ribbon.get("tabs").unwrap().as_array().unwrap()[1]
+            .get("groups")
+            .unwrap()
+            .as_array()
+            .unwrap()[3]
+            .get("commands")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let selected: Vec<&str> = commands
+            .iter()
+            .filter(|c| c.get("checked") == Some(&Json::Bool(true)))
+            .filter_map(|c| c.get_str("label"))
+            .collect();
+        assert_eq!(selected, ["Normal"]);
+        editor.set_space_before(Some(0));
+        editor.set_space_after(Some(0));
+        editor.set_line_spacing(240, "auto");
+        assert!(crate::gallery_style_selected(
+            &editor.caret_para_props(),
+            crate::Act::NoSpacing
+        ));
+        assert!(!crate::gallery_style_selected(
+            &editor.caret_para_props(),
+            crate::Act::Normal
+        ));
+    }
+
+    #[test]
+    fn ribbon_resolver_rejects_ambiguous_labels_and_status_is_live_text() {
+        let commands = vec![
+            RibbonCommand {
+                id: "one".into(),
+                label: "Same".into(),
+                tip_title: String::new(),
+                tip_body: String::new(),
+                key_tip: String::new(),
+                act: crate::Act::Bold,
+                gallery: false,
+            },
+            RibbonCommand {
+                id: "two".into(),
+                label: "Same".into(),
+                tip_title: String::new(),
+                tip_body: String::new(),
+                key_tip: String::new(),
+                act: crate::Act::Italic,
+                gallery: false,
+            },
+        ];
+        let err = resolve_commands(&commands, "Home", "Same").err().unwrap();
+        assert!(err.contains("one, two"));
+        assert!(resolve_commands(&commands, "Home", "one").is_ok());
+        assert_eq!(
+            status_json("saved")
+                .get("items")
+                .unwrap()
+                .as_array()
+                .unwrap()[0]
+                .get_str("text"),
+            Some("saved")
+        );
+        assert_eq!(
+            status_json("changed")
+                .get("items")
+                .unwrap()
+                .as_array()
+                .unwrap()[0]
+                .get_str("text"),
+            Some("changed")
+        );
+    }
 
     fn args(list: &[&str]) -> Vec<OsString> {
         list.iter().map(OsString::from).collect()
