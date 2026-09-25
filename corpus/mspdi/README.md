@@ -65,7 +65,7 @@ entered by hand from the issue's Project 2021 capture of `15-deadline-missed`
 in the private spec corpus. It was **not** checked by
 `verify_mspdi_project.py`, which does not check the Deadline on import.
 File 13 also keeps the resource and assignment fields of
-[issue #84](https://github.com/yeroo/docxy/issues/84): each rate's unit,
+[issue #84](https://github.com/yeroo/docxy/issues/84): the unit each rate is shown in,
 booking type, flags and stored work, and the assignment's contour, flags, own
 dates and regular work. Those values are of our own and were chosen to leave
 the task's schedule as it is (a flat contour, no progress), so the #74 oracle
@@ -100,7 +100,7 @@ available: that shape follows Microsoft's schema.
 | `10-summary` | outline rollup | summary derives from children |
 | `11-resource-assignment` | resource + assignment | units × work parsing |
 | `12-calendar-6day` | custom calendar | Saturday working changes the finish |
-| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006); rate units (a daily standard, a weekly overtime rate), booking type, generic/budget/inactive/levelling flags, work group and stored work, and an assignment's contour, fixed-material and fixed-rate-units flags, own dates and regular work (#84) |
+| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006); rate display units (a standard rate shown per day, an overtime rate shown per week), booking type, generic/budget/inactive/levelling flags, work group and stored work, and an assignment's contour, fixed-material and fixed-rate-units flags, own dates and regular work (#84) |
 | `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
 | `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
 | `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |

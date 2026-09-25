@@ -410,14 +410,15 @@ pub struct Resource {
     pub calendar_uid: Option<i32>,
     // Stored as read so a save writes them back; nothing here schedules,
     // levels or costs with them, and edits do not refresh them.
-    /// The unit each rate is quoted in, as the MSPDI code (1 minute, 2 hour,
-    /// 3 day, 4 week, 5 month, 7 year). Kept as the code so an unnamed one
-    /// still round-trips; the rate text itself is unchanged.
+    /// The unit Project displays each rate in, as the MSPDI code (1 minute,
+    /// 2 hour, 3 day, 4 week, 5 month, 7 year; the standard rate also 8, a
+    /// material rate). Kept as the code so an unnamed one still round-trips.
+    /// The rate text is kept as written, not converted to this unit.
     pub standard_rate_format: Option<u8>,
     pub overtime_rate_format: Option<u8>,
     /// 0 committed, 1 proposed.
     pub booking_type: Option<u8>,
-    /// 0 default, 1 web, 2 email, 3 none.
+    /// 0 default, 1 none, 2 email, 3 web.
     pub work_group: Option<u8>,
     pub is_generic: Option<bool>,
     pub is_budget: Option<bool>,

@@ -589,7 +589,7 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     assert_eq!(
         (alice.standard_rate_format, alice.overtime_rate_format),
         (Some(3), Some(4)),
-        "a daily standard rate and a weekly overtime rate"
+        "a standard rate shown per day and an overtime rate shown per week"
     );
     assert_eq!((alice.booking_type, alice.work_group), (Some(1), Some(1)));
     assert_eq!(

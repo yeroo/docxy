@@ -193,7 +193,7 @@ fn headless_save_keeps_project_options() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// Issue #84: saving dropped each rate's unit, booking type, resource flags and
+/// Issue #84: saving dropped each rate's display unit, booking type, resource flags and
 /// assignment contours, so a daily rate could reopen read as hourly.
 #[test]
 fn headless_save_keeps_resource_and_assignment_fields() {

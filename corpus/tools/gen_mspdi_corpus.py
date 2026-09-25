@@ -290,7 +290,8 @@ def build():
                            standard_calendar(2, "SixDay", saturday=True)]))
 
     # 13 — resource identity/rates and all three kinds survive saving (#52),
-    # with each rate's unit (a daily standard and a weekly overtime rate),
+    # with each rate's display unit (a standard rate shown per day and an
+    # overtime rate shown per week),
     # booking type, flags and stored work, and an assignment's contour, flags,
     # own dates and regular work (#84).
     rich_res = (
@@ -318,7 +319,7 @@ def build():
                 "<Units>1</Units><Work>PT16H0M0S</Work><WorkContour>0</WorkContour>"
                 "</Assignment>")
     add("13-resource-fields.xml", ["resource", "resource-fields", "round-trip"],
-        "Work resource identity, rates and rate units, booking type and flags, Cost and "
+        "Work resource identity, rates and their display units, booking type and flags, Cost and "
         "Material resources, and an assignment's contour, flags and dates survive saving.",
         project("resource-fields",
                 task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
