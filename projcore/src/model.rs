@@ -222,6 +222,29 @@ pub struct Task {
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
     pub over_allocated: Option<bool>,
+    // Recorded progress, kept as read so a save writes it back. docxy neither
+    // computes nor reconciles it: the scheduler ignores it and edits leave it
+    // as read. Durations and work are whole minutes, rounded from the source.
+    /// Percents, 0..=100.
+    pub percent_complete: Option<u8>,
+    pub percent_work_complete: Option<u8>,
+    pub physical_percent_complete: Option<u8>,
+    pub actual_start: Option<DateTime>,
+    pub actual_finish: Option<DateTime>,
+    /// Where completed work ends and remaining work picks up.
+    pub stop: Option<DateTime>,
+    pub resume: Option<DateTime>,
+    pub actual_duration_min: Option<i64>,
+    pub remaining_duration_min: Option<i64>,
+    pub actual_work_min: Option<i64>,
+    pub remaining_work_min: Option<i64>,
+    pub actual_cost: Option<Rate>,
+    pub remaining_cost: Option<Rate>,
+    /// Variances as MSPDI stores them, not interpreted: `StartVariance` and
+    /// `FinishVariance` are integers, `WorkVariance` a float kept as decimal text.
+    pub start_variance: Option<i64>,
+    pub finish_variance: Option<i64>,
+    pub work_variance: Option<Rate>,
 }
 
 impl Task {
@@ -388,7 +411,7 @@ pub struct Resource {
 }
 
 /// An assignment of a resource to a task.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct Assignment {
     pub uid: i32,
     pub task_uid: i32,
@@ -396,6 +419,51 @@ pub struct Assignment {
     pub units: f64,
     /// Work in **minutes**.
     pub work_min: i64,
+    // Recorded progress, kept as read so a save writes it back; see the same
+    // block on [`Task`]. Work is whole minutes, rounded from the source.
+    /// 0..=100.
+    pub percent_work_complete: Option<u8>,
+    pub actual_start: Option<DateTime>,
+    pub actual_finish: Option<DateTime>,
+    pub stop: Option<DateTime>,
+    pub resume: Option<DateTime>,
+    pub actual_work_min: Option<i64>,
+    pub remaining_work_min: Option<i64>,
+    pub actual_cost: Option<Rate>,
+    pub remaining_cost: Option<Rate>,
+    /// Variances as MSPDI stores them, not interpreted (integers for dates,
+    /// decimal text for work and cost).
+    pub start_variance: Option<i64>,
+    pub finish_variance: Option<i64>,
+    pub work_variance: Option<Rate>,
+    pub cost_variance: Option<Rate>,
+    /// Saved plans, sorted by number with at most one record per slot (0..=10).
+    pub baselines: Vec<AssignmentBaseline>,
+}
+
+impl Assignment {
+    pub fn baseline(&self, number: u8) -> Option<&AssignmentBaseline> {
+        self.baselines.iter().find(|b| b.number == number)
+    }
+
+    /// Replace the whole record for a slot, maintaining unique, sorted slots.
+    pub fn set_baseline_slot(&mut self, baseline: AssignmentBaseline) {
+        self.baselines.retain(|b| b.number != baseline.number);
+        self.baselines.push(baseline);
+        self.baselines.sort_by_key(|b| b.number);
+    }
+}
+
+/// A recorded plan in one MSPDI baseline slot of an assignment.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct AssignmentBaseline {
+    /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
+    pub number: u8,
+    pub start: Option<DateTime>,
+    pub finish: Option<DateTime>,
+    /// Recorded work in whole minutes; None when omitted or invalid.
+    pub work_min: Option<i64>,
+    pub cost: Option<Rate>,
 }
 
 /// A working-time slot within a day, in minutes-of-day (`from` inclusive,

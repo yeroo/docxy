@@ -204,6 +204,18 @@
         "negative-slack"
       ],
       "desc": "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack."
+    },
+    {
+      "file": "22-progress.xml",
+      "category": "progress",
+      "tags": [
+        "progress",
+        "assignment",
+        "round-trip",
+        "link",
+        "link-fs"
+      ],
+      "desc": "Percent complete, actuals, stop/resume, remaining values, variances and assignment baselines survive saves."
     }
   ]
 }
