@@ -256,6 +256,7 @@ State keys, as the app reports them after every driving verb:
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name, and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
+| `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
 
 Dotted keys traverse objects, and numeric components index arrays: `assert
@@ -312,8 +313,9 @@ cover every task, including those outside the visible chart.
 
 Project `timeline` is `shown` or `hidden` (View > Split View > Timeline).
 `timeline_start` and `timeline_finish` are the Timeline's end labels in Project's
-date form, for example `Mon 3/2/26`; the finish is the leveled one while leveling
-is on.
+date form, for example `Mon 3/2/26`. They span every displayed bar: a task shown
+before the project start moves the start earlier, and the finish is the leveled
+one while leveling is on.
 
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns;
