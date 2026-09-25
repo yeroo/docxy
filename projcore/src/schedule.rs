@@ -29,7 +29,7 @@
 //! finish-to-start successors and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
-use crate::model::{ConstraintType, LinkType, Project, ResourceType, Task};
+use crate::model::{Calendar, ConstraintType, LinkType, Project, ResourceType, Task};
 use std::collections::HashMap;
 
 /// Maximum calendar days on either side of the scheduling anchor.
@@ -236,20 +236,21 @@ struct ConstraintDates {
 
 impl<'a> Scheduler<'a> {
     fn new(proj: &'a Project) -> Scheduler<'a> {
-        // Anchor: explicit project start, else earliest stored or pinned start,
-        // else a fixed Monday, snapped to the default calendar's first working
-        // instant.
+        // Anchor: explicit project start, else the earliest stored or pinned
+        // start of a leaf `run()` schedules, else a fixed Monday, snapped to
+        // the default calendar's first working instant. Summaries and leaves
+        // without working time never place the anchor.
         let default_cal = proj.default_calendar_uid;
-        let pinned_starts = proj
-            .tasks
-            .iter()
-            .filter(|t| !t.summary)
+        let calendars = CalendarResolver::new(proj);
+        let schedulable = proj.tasks.iter().filter(|t| calendars.schedulable(t));
+        let pinned_starts = schedulable
+            .clone()
             .filter_map(|t| t.pinned_dates().map(|(start, _)| start.minutes()));
         let raw_anchor = proj
             .start_date
             .or_else(|| {
-                proj.tasks
-                    .iter()
+                schedulable
+                    .clone()
                     .flat_map(|t| [t.stored_start, t.pinned_dates().map(|(start, _)| start)])
                     .flatten()
                     .min()
@@ -875,35 +876,57 @@ fn week_pairs(cal: &crate::model::Calendar) -> [Vec<(u32, u32)>; 7] {
     out
 }
 
+fn has_working_time(cal: &Calendar) -> bool {
+    cal.week
+        .iter()
+        .flat_map(|day| &day.times)
+        .any(|t| t.from < t.to)
+}
+
+/// Resolves a task's calendar exactly as the scheduler does: the last calendar
+/// with a UID wins, an unknown `calendar_uid` falls back to the default, and a
+/// missing default is a synthesized Standard (which always has working time).
+struct CalendarResolver<'a> {
+    calendars: HashMap<i32, &'a Calendar>,
+    default_uid: i32,
+}
+
+impl<'a> CalendarResolver<'a> {
+    fn new(proj: &'a Project) -> Self {
+        CalendarResolver {
+            calendars: proj.calendars.iter().map(|cal| (cal.uid, cal)).collect(),
+            default_uid: proj.default_calendar_uid,
+        }
+    }
+
+    /// The calendar `calendar_uid` schedules on; `None` for the synthesized
+    /// Standard.
+    fn resolve(&self, calendar_uid: Option<i32>) -> Option<&'a Calendar> {
+        self.calendars
+            .get(&calendar_uid.unwrap_or(self.default_uid))
+            .or_else(|| self.calendars.get(&self.default_uid))
+            .copied()
+    }
+
+    /// A leaf the scheduler keeps: its resolved calendar has working time.
+    fn schedulable(&self, task: &Task) -> bool {
+        !task.summary && self.resolve(task.calendar_uid).is_none_or(has_working_time)
+    }
+}
+
 /// Reject tasks that have no working time and are leaves either in the stored
 /// schedule or in the outline the editor uses to recompute summary flags.
 pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
-    // Match Scheduler::new's last-wins calendar map and tl's default fallback.
-    let calendars: HashMap<_, _> = proj
-        .calendars
-        .iter()
-        .map(|cal| {
-            let has_work = cal
-                .week
-                .iter()
-                .flat_map(|day| &day.times)
-                .any(|t| t.from < t.to);
-            (cal.uid, (cal, has_work))
-        })
-        .collect();
+    let calendars = CalendarResolver::new(proj);
     for (i, task) in proj.tasks.iter().enumerate() {
         if task.summary && proj.is_outline_summary(i) {
             continue;
         }
-        let uid = task.calendar_uid.unwrap_or(proj.default_calendar_uid);
-        let Some((cal, has_work)) = calendars
-            .get(&uid)
-            .or_else(|| calendars.get(&proj.default_calendar_uid))
-        else {
+        let Some(cal) = calendars.resolve(task.calendar_uid) else {
             // The scheduler synthesizes Standard when the default is absent.
             continue;
         };
-        if !has_work {
+        if !has_working_time(cal) {
             return Some(format!(
                 "calendar {:?} (UID {}) has no working time; task {:?} (UID {}) cannot be scheduled",
                 cal.name, cal.uid, task.name, task.uid
@@ -3318,5 +3341,51 @@ mod tests {
         assert_eq!(task_duration_min(&proj, &s, &proj.tasks[2]), Some(960));
         // No schedule result for a task outside the scheduled project.
         assert_eq!(task_duration_min(&proj, &s, &task(99, "Ghost", 480)), None);
+    }
+
+    fn phase(uid: i32) -> Task {
+        Task {
+            summary: true,
+            ..task(uid, "Phase", 0)
+        }
+    }
+
+    #[test]
+    fn anchor_ignores_starts_of_tasks_that_are_not_scheduled() {
+        let early = DateTime::from_ymd_hm(2023, 6, 5, 8, 0);
+        let mut valid = task(1, "Valid", 480);
+        valid.stored_start = Some(DateTime::from_ymd_hm(2024, 1, 8, 8, 0));
+        let mut dropped = task(2, "Closed", 480);
+        dropped.calendar_uid = Some(3);
+        dropped.stored_start = Some(early);
+        let pinned = Task {
+            manual: true,
+            manual_start: Some(early),
+            manual_finish: Some(DateTime::from_ymd_hm(2023, 6, 6, 17, 0)),
+            ..dropped.clone()
+        };
+        let mut summary = phase(10);
+        summary.stored_start = Some(early);
+        let nested = Task {
+            outline_level: 2,
+            ..valid.clone()
+        };
+        let project = |tasks| Project {
+            tasks,
+            calendars: vec![Calendar::standard(1), closed_calendar(3)],
+            ..Project::default()
+        };
+        let expected = schedule(&project(vec![valid.clone()]));
+        assert_eq!(expected.project_start, valid.stored_start.unwrap());
+        for tasks in [
+            vec![dropped, valid.clone()],
+            vec![pinned, valid],
+            vec![summary, nested],
+        ] {
+            let actual = schedule(&project(tasks));
+            assert_eq!(actual.project_start, expected.project_start);
+            assert_eq!(actual.get(1), expected.get(1));
+            assert_eq!(actual.project_finish, expected.project_finish);
+        }
     }
 }
