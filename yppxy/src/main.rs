@@ -899,7 +899,12 @@ impl App {
 fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
     let fin = sched.project_finish.parts();
     let start = sched.project_start.parts();
-    let leaves = proj.tasks.iter().filter(|t| !t.summary).count();
+    // Blank rows (#80) are not tasks.
+    let leaves = proj
+        .tasks
+        .iter()
+        .filter(|t| !t.summary && !t.is_null)
+        .count();
     let crit = proj
         .tasks
         .iter()
@@ -923,6 +928,10 @@ fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
         String::new(),
     ];
     for t in proj.tasks.iter().take(16) {
+        if t.is_null {
+            out.push(String::new());
+            continue;
+        }
         let indent = "  ".repeat(t.outline_level.saturating_sub(1) as usize);
         let bullet = if t.summary {
             "▾"
@@ -2038,6 +2047,21 @@ mod tests {
         // No bar or milestone in the Gantt; weekend shading only.
         let gantt = row(blank, app.gantt_x0..99);
         assert!(gantt.chars().all(|c| c == ' ' || c == '·'), "{gantt}");
+    }
+
+    #[test]
+    fn preview_does_not_count_or_draw_a_blank_row() {
+        let proj =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-task-fields.xml"))
+                .unwrap();
+        let sched = projcore::schedule::schedule(&proj);
+        let lines = project_preview(&proj, &sched);
+        assert!(
+            lines.contains(&"Tasks:   3 (2 critical)".to_string()),
+            "{lines:?}"
+        );
+        let rows: Vec<_> = lines.iter().skip(5).map(|l| l.trim()).collect();
+        assert_eq!(rows, ["▾ Phase", "• Excavate", "", "• Pour", "• Inspect"]);
     }
 
     #[test]
