@@ -550,7 +550,7 @@ pub enum Region {
     Cells(u32, u32, u32, u32),
     /// A chart card on the sheet, by index — the same index `select-chart` uses.
     Chart(usize),
-    /// Visible Project timeline body, excluding its date header.
+    /// Visible Project Gantt chart body, excluding its date header.
     Gantt,
     /// Visible part of a task bar, addressed by displayed task ID.
     Bar(i32),
@@ -560,11 +560,13 @@ pub enum Region {
     ProjectHbarChart,
     /// The Project's vertical scrollbar strip, shared by table and chart.
     ProjectVbar,
+    /// The Project Timeline pane above the Gantt view, when it is shown.
+    ProjectTimeline,
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
-/// `project-hbar-chart`, `project-vbar`.
+/// `project-hbar-chart`, `project-vbar`, `project-timeline`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -582,8 +584,9 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-hbar-table" if arg.is_none() => Ok(Region::ProjectHbarTable),
         "project-hbar-chart" if arg.is_none() => Ok(Region::ProjectHbarChart),
         "project-vbar" if arg.is_none() => Ok(Region::ProjectVbar),
+        "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
         "window" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
-        | "project-hbar-chart" | "project-vbar" => {
+        | "project-hbar-chart" | "project-vbar" | "project-timeline" => {
             Err(format!("'{head}' does not take an argument; use '{head}'"))
         }
         "cell" | "cells" => {
@@ -615,7 +618,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar)"
+            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline)"
         )),
     }
 }
@@ -634,6 +637,7 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectHbarTable => "project-hbar-table".into(),
         Region::ProjectHbarChart => "project-hbar-chart".into(),
         Region::ProjectVbar => "project-vbar".into(),
+        Region::ProjectTimeline => "project-timeline".into(),
     }
 }
 
@@ -2898,6 +2902,7 @@ mod tests {
             Region::ProjectHbarTable,
             Region::ProjectHbarChart,
             Region::ProjectVbar,
+            Region::ProjectTimeline,
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }
@@ -2906,6 +2911,7 @@ mod tests {
         assert_eq!(region_name(Region::Cells(0, 0, 4, 2)), "cell:A1:C5");
         assert!(parse_region("gantt:1").is_err());
         assert!(parse_region("project-vbar:1").is_err());
+        assert!(parse_region("project-timeline:1").is_err());
         assert!(parse_region("bar:abc").is_err());
         assert!(parse_region("bar:").is_err());
     }

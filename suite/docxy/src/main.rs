@@ -5603,7 +5603,8 @@ impl Docxy {
             | Region::Bar(_)
             | Region::ProjectHbarTable
             | Region::ProjectHbarChart
-            | Region::ProjectVbar => self.project_region_bounds(region),
+            | Region::ProjectVbar
+            | Region::ProjectTimeline => self.project_region_bounds(region),
             Region::Grid => self.grid_bounds(),
             Region::Cells(_, _, _, _) if self.active_is_project() => {
                 self.project_region_bounds(region)
@@ -16697,10 +16698,9 @@ impl Docxy {
         let rp = doc.map(|ed| ed.caret_props());
         let pp = doc.map(|ed| ed.caret_para_props());
         match act {
-            Project(ProjectAct::LevelAll) => self
-                .tabs
-                .get(self.active)
-                .is_some_and(|t| matches!(&t.surface, Surface::Project(v) if v.ed.leveled())),
+            Project(act) => self.tabs.get(self.active).is_some_and(
+                |t| matches!(&t.surface, Surface::Project(v) if project_act_active(v, act)),
+            ),
             Bold => rp.is_some_and(|p| p.bold),
             Italic => rp.is_some_and(|p| p.italic),
             Underline => rp.is_some_and(|p| p.underline),
