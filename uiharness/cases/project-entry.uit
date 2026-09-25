@@ -11,7 +11,7 @@ test project entry row appends a typed task as one undo step
   key enter
   assert tasks is 4
   assert cell B4 is Design
-  assert cell C4 is 1 day?
+  assert cell C4 is 1d
   assert cell_row is 4
   assert undo_depth is 1
   type Build
@@ -22,7 +22,7 @@ test project entry row appends a typed task as one undo step
   assert cell is Duration
   key down
   assert cell_row is 5
-  key delete alt p b
+  key delete alt+shift+right alt+shift+left
   assert tasks is 5
   assert prompt is none
   assert undo_depth is 2
