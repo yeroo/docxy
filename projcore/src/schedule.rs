@@ -798,15 +798,15 @@ impl<'a> Scheduler<'a> {
                     let mut finish_index = finish_index.max(t.duration_min);
                     // A start constraint's window can finish after the
                     // project start, where a deadline may bound it tighter.
-                    // A finish constraint's raw date already precedes the
-                    // deadline's project-start floor.
-                    let mut deadline_milestone = None;
+                    // Like any unlinked deadline it is floored at the project
+                    // start, so it never binds a finish constraint's earlier
+                    // raw date, nor a milestone's window, which ends by then.
                     if let Some(deadline) = t.deadline.filter(|_| !finish_constraint) {
-                        let (d_f, d_m) = finish_instants(pre, deadline.minutes(), pre.abs_start(0));
+                        let (d_f, _) = finish_instants(pre, deadline.minutes(), dates.floor);
                         let d_index = pre.to_index(d_f).max(t.duration_min);
                         if d_index < finish_index {
+                            debug_assert_ne!(t.duration_min, 0);
                             finish_index = d_index;
-                            deadline_milestone = Some(capped_milestone(pre, d_m, bound_instant));
                         }
                     }
                     let f_abs = pre.abs_finish(finish_index);
@@ -830,8 +830,7 @@ impl<'a> Scheduler<'a> {
                             }
                             (m, m)
                         } else {
-                            let m = deadline_milestone.unwrap_or(f_abs);
-                            (m, m)
+                            (f_abs, f_abs)
                         };
                         pre_start_window = Some((pre, s_abs, f_abs));
                     }
@@ -4543,6 +4542,38 @@ mod tests {
                     "{case}"
                 );
                 assert_eq!(window(Some(dt(13, 17))), alone, "{case}");
+            }
+        }
+    }
+
+    #[test]
+    fn pre_start_window_floors_its_deadline_at_the_project_start() {
+        // X (1d) is unlinked with an SNLT on Fri 02-27, before the Mon 03-02
+        // start, and a deadline four weeks earlier still. Like every unlinked
+        // deadline, it is floored at the project start, so it cannot tighten
+        // the window (-1d). An unrelated pre-start task on the same calendar,
+        // which moves the pre-start timeline's origin, must not change X.
+        let snlt = |uid: i32, day: u32| {
+            let mut t = task(uid, "X", 480);
+            t.constraint = ConstraintType::StartNoLaterThan;
+            t.constraint_date = Some(DateTime::from_ymd_hm(2026, 2, day, 8, 0));
+            t
+        };
+        for honor in [true, false] {
+            for deadline in [None, Some(DateTime::from_ymd_hm(2026, 2, 2, 17, 0))] {
+                let mut x = snlt(1, 27);
+                x.deadline = deadline;
+                let mut proj = Project {
+                    start_date: Some(dt(2, 8)),
+                    honor_constraints: honor,
+                    tasks: vec![x],
+                    ..Project::default()
+                };
+                let alone = *schedule(&proj).get(1).unwrap();
+                let case = format!("{deadline:?} honor={honor}");
+                assert_eq!(alone.total_slack_min, -480, "{case}");
+                proj.tasks.push(snlt(2, 2));
+                assert_eq!(schedule(&proj).get(1), Some(&alone), "{case}");
             }
         }
     }
