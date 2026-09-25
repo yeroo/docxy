@@ -176,7 +176,12 @@ impl Editor {
     }
 
     fn snapshot(&mut self) {
-        self.undo.push(self.proj.clone());
+        self.push_undo(self.proj.clone());
+    }
+
+    /// Record `prev` as the state to undo to: caps history and clears redo.
+    fn push_undo(&mut self, prev: Project) {
+        self.undo.push(prev);
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
         }
@@ -203,8 +208,9 @@ impl Editor {
         if let Some(error) = crate::schedule::calendar_error(&next) {
             return Err(error);
         }
-        self.snapshot();
-        self.proj = next;
+        // Move the old project into history; `next` is already a full copy.
+        let prev = std::mem::replace(&mut self.proj, next);
+        self.push_undo(prev);
         self.changed();
         Ok(())
     }
@@ -1347,6 +1353,27 @@ mod tests {
                 )
             });
         }
+    }
+
+    #[test]
+    fn structural_edits_keep_the_history_cap_and_clear_redo() {
+        let mut ed = editor();
+        ed.add_task(None, "Undone", 480).unwrap();
+        assert!(ed.undo());
+        assert_eq!(ed.redo_depth(), 1);
+        let before = ed.project().clone();
+        ed.add_task(None, "Structural", 480).unwrap();
+        assert_eq!((ed.undo_depth(), ed.redo_depth()), (1, 0));
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+        let mut states = vec![before];
+        for i in 0..UNDO_CAP + 5 {
+            ed.add_task(None, &format!("T{i}"), 480).unwrap();
+            states.push(ed.project().clone());
+        }
+        assert_eq!(ed.undo_depth(), UNDO_CAP);
+        while ed.undo() {}
+        assert_eq!(ed.project(), &states[5]);
     }
 
     #[test]
