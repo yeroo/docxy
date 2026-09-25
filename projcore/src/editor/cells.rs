@@ -67,6 +67,83 @@ impl Editor {
         Ok(())
     }
 
+    /// Set a task's start to a typed day. A manual task moves there, at the
+    /// day's first working time, keeping its duration; an auto task gets a
+    /// Start-No-Earlier-Than constraint on that day.
+    pub fn set_start(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
+        let i = self.index(uid)?;
+        let task = &self.proj.tasks[i];
+        if !task.manual {
+            return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(day));
+        }
+        self.validate_pinned_day(day)?;
+        let start = day_start(&self.proj, task, day);
+        if task.manual_start == Some(start) && task.manual_finish.is_none() {
+            return Ok(());
+        }
+        self.snapshot();
+        let task = &mut self.proj.tasks[i];
+        task.manual_start = Some(start);
+        task.manual_finish = None;
+        self.changed();
+        self.stamp_pinned_dates(uid);
+        Ok(())
+    }
+
+    /// Set a task's finish to a typed day. A manual task keeps its start and
+    /// its duration becomes the working time up to the day's last working
+    /// time; an auto task gets a Finish-No-Earlier-Than constraint.
+    pub fn set_finish(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
+        let i = self.index(uid)?;
+        let task = &self.proj.tasks[i];
+        if !task.manual {
+            let finish = day_finish(&self.proj, task, day)?;
+            return self.set_constraint_typed(
+                uid,
+                ConstraintType::FinishNoEarlierThan,
+                Some(finish),
+            );
+        }
+        self.validate_pinned_day(day)?;
+        // Like a typed start, a manual finish may fall on a non-working day.
+        let finish = day_end(&self.proj, task, day);
+        let start = match task.pinned_dates() {
+            Some((start, _)) => start,
+            None => self.disp_start(uid).ok_or("The task has no start")?,
+        };
+        if finish < start {
+            return Err("Finish is before the task's start".into());
+        }
+        let calendar = task_calendar(&self.proj, task);
+        let duration = crate::schedule::working_minutes_on(&calendar, start, finish);
+        if task.manual_start == Some(start) && task.manual_finish == Some(finish) {
+            return Ok(());
+        }
+        self.validate_cell_horizon(uid, Some(duration), None)?;
+        self.snapshot();
+        let task = &mut self.proj.tasks[i];
+        task.manual_start = Some(start);
+        task.manual_finish = Some(finish);
+        task.duration_min = duration;
+        task.manual_duration_min = Some(duration);
+        task.milestone = duration == 0;
+        self.changed();
+        self.stamp_pinned_dates(uid);
+        Ok(())
+    }
+
+    /// A pinned date must lie within the scheduler's timeline around the
+    /// project start, or its finish could not be derived from it.
+    fn validate_pinned_day(&self, day: DateTime) -> Result<(), String> {
+        let offset = day.minutes() - self.sched.project_start.minutes();
+        if offset.abs() > HORIZON_DAYS * 1440 {
+            return Err(
+                "Date is outside the scheduling range (100 years around the project start)".into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn set_predecessors(
         &mut self,
         uid: i32,
@@ -316,11 +393,9 @@ pub fn parse_cell_date(text: &str) -> Result<DateTime, String> {
     Ok(d)
 }
 
-/// Finish boundary for a typed date, with exactly the scheduler's calendar fallback.
-pub fn day_finish(proj: &Project, task: &Task, date: DateTime) -> Result<DateTime, String> {
-    let fallback = Calendar::standard(proj.default_calendar_uid);
-    let calendar = proj
-        .calendars
+/// A task's calendar, with exactly the scheduler's fallback.
+fn task_calendar(proj: &Project, task: &Task) -> Calendar {
+    proj.calendars
         .iter()
         .find(|c| c.uid == task.calendar_uid.unwrap_or(proj.default_calendar_uid))
         .or_else(|| {
@@ -328,7 +403,39 @@ pub fn day_finish(proj: &Project, task: &Task, date: DateTime) -> Result<DateTim
                 .iter()
                 .find(|c| c.uid == proj.default_calendar_uid)
         })
-        .unwrap_or(&fallback);
+        .cloned()
+        .unwrap_or_else(|| Calendar::standard(proj.default_calendar_uid))
+}
+
+/// Start of a typed date: its first working time, or 08:00 (Project's default
+/// start time) on a non-working day, where a manual task may still start.
+fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
+    let from = task_calendar(proj, task).week[date.weekday() as usize]
+        .times
+        .iter()
+        .filter(|s| s.to > s.from)
+        .map(|s| s.from)
+        .min()
+        .unwrap_or(8 * 60);
+    date.start_of_day().add_minutes(i64::from(from))
+}
+
+/// Finish of a typed date: its last working time, or 17:00 on a non-working
+/// day, where a manual task may still finish.
+fn day_end(proj: &Project, task: &Task, date: DateTime) -> DateTime {
+    let to = task_calendar(proj, task).week[date.weekday() as usize]
+        .times
+        .iter()
+        .filter(|s| s.to > s.from)
+        .map(|s| s.to)
+        .max()
+        .unwrap_or(17 * 60);
+    date.start_of_day().add_minutes(i64::from(to))
+}
+
+/// Finish boundary for a typed date, with exactly the scheduler's calendar fallback.
+pub fn day_finish(proj: &Project, task: &Task, date: DateTime) -> Result<DateTime, String> {
+    let calendar = task_calendar(proj, task);
     let end = calendar.week[date.weekday() as usize]
         .times
         .iter()

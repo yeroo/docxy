@@ -66,6 +66,8 @@ def read_fixture(path):
             "uid": int(text(t, "UID")),
             "name": text(t, "Name"),
             "summary": text(t, "Summary") == "1",
+            # Manually scheduled (#77); an absent <Manual> means auto.
+            "manual": text(t, "Manual") == "1",
             "duration": minutes(text(t, "Duration")),
             "ctype": int(text(t, "ConstraintType", "0")),
             "cdate": text(t, "ConstraintDate"),
@@ -128,8 +130,10 @@ def check(app, path, tmpdir):
     try:
         project = app.ActiveProject
         tasks = [t for t in project.Tasks if t is not None]
+        # Tasks the file marks manual stay manual (#77); every other task is
+        # scheduled automatically, whatever Project's import default.
         for t in tasks:
-            if t.Manual:
+            if t.Manual and not expected.get(t.UniqueID, {}).get("manual"):
                 t.Manual = False
         app.CalculateProject()
 

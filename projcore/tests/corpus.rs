@@ -3,11 +3,13 @@
 //! the oracle values embedded in each file (`corpus/mspdi/*.xml`, produced by
 //! `corpus/tools/gen_mspdi_corpus.py`).
 //!
-//! Every embedded value was checked against Project 2021 by
+//! Every embedded value in files 01-18 was checked against Project 2021 by
 //! `corpus/tools/verify_mspdi_project.py` (issue #74), which has Project
 //! schedule a copy of each file with the oracle elements removed. It also
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
-//! 16 (#58), 17 (#60) and 18 (#59). Slack invariants below also check
+//! 16 (#58), 17 (#60) and 18 (#59). The exception is file 19 (issue #77):
+//! its manual-task slack and critical flags are hand-derived from our
+//! scheduler, not yet verified in Project. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -32,7 +34,7 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
     assert!(
-        files.len() >= 18,
+        files.len() >= 19,
         "expected the full seed corpus, got {}",
         files.len()
     );
@@ -329,6 +331,84 @@ fn baselines_round_trip_through_mspdi_and_yppx() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn manual_task_mode_and_dates_survive_mspdi_and_yppx() {
+    let files = mspdi_files();
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "19-manual-tasks.xml")
+    );
+    for path in files {
+        let proj = read_mspdi(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        for (kind, back) in [("MSPDI", xml_back), (".yppx", package_back)] {
+            assert_eq!(
+                back.new_tasks_are_manual,
+                proj.new_tasks_are_manual,
+                "{}: {kind} NewTasksAreManual changed",
+                path.display()
+            );
+            assert_eq!(back.tasks.len(), proj.tasks.len());
+            for (expected, actual) in proj.tasks.iter().zip(&back.tasks) {
+                assert_eq!(
+                    (
+                        actual.manual,
+                        actual.manual_start,
+                        actual.manual_finish,
+                        actual.manual_duration_min
+                    ),
+                    (
+                        expected.manual,
+                        expected.manual_start,
+                        expected.manual_finish,
+                        expected.manual_duration_min
+                    ),
+                    "{}: {kind} task {} manual fields changed",
+                    path.display(),
+                    expected.uid
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn manual_fixture_pins_tasks_and_flags_the_violated_link() {
+    use projcore::DateTime;
+    let proj =
+        read_mspdi(&std::fs::read_to_string(corpus_dir().join("19-manual-tasks.xml")).unwrap())
+            .unwrap();
+    assert!(proj.new_tasks_are_manual);
+    let manual: Vec<_> = proj
+        .tasks
+        .iter()
+        .filter(|t| t.manual)
+        .map(|t| t.uid)
+        .collect();
+    assert_eq!(manual, vec![3, 4]);
+    let review = proj.task(3).unwrap();
+    assert_eq!(
+        review.manual_start,
+        Some(DateTime::from_ymd_hm(2026, 3, 3, 8, 0))
+    );
+    assert_eq!(review.manual_duration_min, Some(480));
+    let sched = schedule(&proj);
+    // Design finishes Wednesday; Review is pinned on Tuesday, two days early.
+    assert_eq!(sched.get(3).unwrap().total_slack_min, -960);
+    // Vendor, pinned after the link allows, drives Build and the finish.
+    assert_eq!(sched.get(4).unwrap().total_slack_min, 0);
+    // Leveling (no resources) keeps every pinned date.
+    let leveled = level(&proj);
+    for uid in [3, 4] {
+        assert_eq!(
+            leveled.start(uid),
+            Some(sched.get(uid).unwrap().early_start)
+        );
     }
 }
 

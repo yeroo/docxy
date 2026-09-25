@@ -539,3 +539,297 @@ fn finish_cell_uses_the_six_day_corpus_calendar() {
     ed.undo();
     assert_eq!(ed.disp_finish(1).unwrap().parts().day, 7);
 }
+
+fn manual_editor() -> Editor {
+    let mut ed = editor();
+    for task in &mut ed.proj.tasks {
+        task.manual = true;
+        task.manual_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    }
+    // The file's own finish for task 10, stale once the duration changes.
+    ed.proj.tasks[0].stored_finish = Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0));
+    ed.proj.tasks[0].manual_finish = Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0));
+    ed.reschedule();
+    ed
+}
+
+fn mspdi(date: Option<DateTime>) -> Option<String> {
+    date.map(DateTime::to_mspdi)
+}
+
+#[test]
+fn new_tasks_follow_the_plans_default_mode() {
+    let mut ed = editor();
+    let at = ed.add_task(None, "auto", 480).unwrap();
+    assert!(!ed.project().tasks[at].manual);
+    assert_eq!(ed.project().tasks[at].manual_start, None);
+
+    ed.proj.new_tasks_are_manual = true;
+    let at = ed.add_task(None, "manual", 960).unwrap();
+    let task = &ed.project().tasks[at];
+    assert!(task.manual);
+    assert_eq!(mspdi(task.manual_start), mspdi(ed.project().start_date));
+    assert_eq!(task.manual_duration_min, Some(960));
+    // Without a project start, use the anchor the schedule actually uses.
+    ed.proj.start_date = None;
+    ed.reschedule();
+    let anchor = ed.schedule().project_start;
+    let at = ed.add_task(None, "undated", 480).unwrap();
+    assert_eq!(ed.project().tasks[at].manual_start, Some(anchor));
+}
+
+#[test]
+fn duration_edit_on_a_manual_task_keeps_its_start_and_moves_its_finish() {
+    let mut ed = manual_editor();
+    ed.set_duration(10, "2d").unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(
+        mspdi(task.manual_start).unwrap(),
+        "2026-01-05T08:00:00".to_string()
+    );
+    assert_eq!(task.manual_finish, None);
+    assert_eq!(task.manual_duration_min, Some(960));
+    // Not the stale stored finish: the finish follows the new duration.
+    assert_eq!(mspdi(ed.disp_finish(10)).unwrap(), "2026-01-06T17:00:00");
+}
+
+#[test]
+fn typed_start_moves_a_manual_task_without_a_constraint() {
+    let mut ed = manual_editor();
+    ed.set_start(10, parse_cell_date("2026-01-08").unwrap())
+        .unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
+    assert_eq!(task.manual_finish, None);
+    assert_eq!(task.duration_min, 480);
+    assert_eq!(mspdi(ed.disp_start(10)).unwrap(), "2026-01-08T08:00:00");
+    assert_eq!(mspdi(ed.disp_finish(10)).unwrap(), "2026-01-08T17:00:00");
+    // Undo restores the pinned finish in the same step.
+    ed.undo();
+    assert_eq!(
+        mspdi(ed.project().task(10).unwrap().manual_finish).unwrap(),
+        "2026-01-05T17:00:00"
+    );
+}
+
+#[test]
+fn typed_finish_sets_a_manual_tasks_duration_without_a_constraint() {
+    let mut ed = manual_editor();
+    ed.set_finish(20, parse_cell_date("2026-01-07").unwrap())
+        .unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
+    assert_eq!(mspdi(task.manual_finish).unwrap(), "2026-01-07T17:00:00");
+    assert_eq!(task.duration_min, 1440);
+    assert_eq!(task.manual_duration_min, Some(1440));
+    assert_eq!(mspdi(ed.disp_finish(20)).unwrap(), "2026-01-07T17:00:00");
+
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    assert!(
+        ed.set_finish(20, parse_cell_date("2026-01-02").unwrap())
+            .is_err()
+    );
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn typed_finish_counts_working_time_on_the_tasks_own_calendar() {
+    let mut ed = manual_editor();
+    let mut six_day = Calendar::standard(7);
+    six_day.week[6] = six_day.week[1].clone();
+    ed.proj.calendars.push(six_day);
+    ed.proj.tasks[1].calendar_uid = Some(7);
+    // Friday 2026-01-09 to Monday 2026-01-12, with Saturday working.
+    ed.set_start(20, parse_cell_date("2026-01-09").unwrap())
+        .unwrap();
+    ed.set_finish(20, parse_cell_date("2026-01-12").unwrap())
+        .unwrap();
+    assert_eq!(ed.project().task(20).unwrap().duration_min, 1440);
+}
+
+#[test]
+fn typed_dates_on_auto_tasks_still_set_constraints() {
+    let mut ed = editor();
+    ed.set_start(10, parse_cell_date("2026-01-08").unwrap())
+        .unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.constraint, ConstraintType::StartNoEarlierThan);
+    assert_eq!(task.manual_start, None);
+    ed.set_finish(20, parse_cell_date("2026-01-08").unwrap())
+        .unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(task.constraint, ConstraintType::FinishNoEarlierThan);
+    assert_eq!(mspdi(task.constraint_date).unwrap(), "2026-01-08T17:00:00");
+}
+
+/// What a save writes for a task: its Start/Finish and ManualStart.
+fn saved(ed: &Editor, uid: i32) -> (Option<String>, Option<String>, Option<String>) {
+    let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+    let task = back.task(uid).unwrap();
+    (
+        mspdi(task.stored_start),
+        mspdi(task.stored_finish),
+        mspdi(task.manual_start),
+    )
+}
+
+fn assert_saved_consistently(ed: &Editor, uid: i32) {
+    let (start, finish, manual_start) = saved(ed, uid);
+    assert!(manual_start.is_some());
+    assert_eq!(start, manual_start, "Start must equal ManualStart");
+    assert_eq!(
+        finish,
+        mspdi(ed.schedule().get(uid).map(|r| r.early_finish))
+    );
+}
+
+#[test]
+fn edited_manual_tasks_save_start_and_finish_matching_their_pinned_dates() {
+    let mut ed = manual_editor();
+    for task in &mut ed.proj.tasks {
+        // As read from a file: Start/Finish of the original plan.
+        task.stored_start = task.manual_start;
+        task.stored_finish = Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0));
+    }
+    ed.set_start(10, parse_cell_date("2026-01-08").unwrap())
+        .unwrap();
+    assert_saved_consistently(&ed, 10);
+    assert_eq!(saved(&ed, 10).1.unwrap(), "2026-01-08T17:00:00");
+
+    ed.set_finish(20, parse_cell_date("2026-01-07").unwrap())
+        .unwrap();
+    assert_saved_consistently(&ed, 20);
+    assert_eq!(saved(&ed, 20).1.unwrap(), "2026-01-07T17:00:00");
+
+    ed.set_duration(30, "3d").unwrap();
+    assert_saved_consistently(&ed, 30);
+    assert_eq!(saved(&ed, 30).1.unwrap(), "2026-01-07T17:00:00");
+
+    ed.proj.new_tasks_are_manual = true;
+    let at = ed.add_task(None, "new", 480).unwrap();
+    let uid = ed.project().tasks[at].uid;
+    assert_saved_consistently(&ed, uid);
+
+    // Undo returns the file's own dates in the same step.
+    ed.undo();
+    ed.undo();
+    assert_eq!(saved(&ed, 30).1.unwrap(), "2026-01-05T17:00:00");
+}
+
+#[test]
+fn unedited_manual_tasks_save_exactly_what_was_read() {
+    let ed = manual_editor();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(
+        (saved(&ed, 10).0, saved(&ed, 10).1),
+        (mspdi(task.stored_start), mspdi(task.stored_finish))
+    );
+}
+
+#[test]
+fn manual_finish_on_a_non_working_day_is_accepted_like_a_start() {
+    let mut ed = manual_editor();
+    // Saturday 2026-01-10: the day's end defaults to 17:00.
+    ed.set_finish(20, parse_cell_date("2026-01-10").unwrap())
+        .unwrap();
+    let task = ed.project().task(20).unwrap();
+    assert_eq!(mspdi(task.manual_finish).unwrap(), "2026-01-10T17:00:00");
+    // Monday to Friday is five working days; Saturday adds none.
+    assert_eq!(task.duration_min, 2400);
+    // An auto task's FNET still needs a working day.
+    let mut auto = editor();
+    assert!(
+        auto.set_finish(20, parse_cell_date("2026-01-10").unwrap())
+            .is_err()
+    );
+}
+
+#[test]
+fn manual_dates_outside_the_scheduling_range_are_rejected() {
+    let mut ed = manual_editor();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    for text in ["2200-01-01", "1026-03-02"] {
+        let day = parse_cell_date(text).unwrap();
+        assert!(ed.set_start(10, day).is_err(), "{text}");
+        assert!(ed.set_finish(10, day).is_err(), "{text}");
+        unchanged(&ed, &before, history);
+    }
+}
+
+#[test]
+fn manual_summary_is_not_pinned_and_keeps_its_file_dates() {
+    let mut ed = editor();
+    let file_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    let file_finish = Some(DateTime::from_ymd_hm(2026, 1, 7, 17, 0));
+    {
+        let summary = &mut ed.proj.tasks[0];
+        summary.manual = true;
+        summary.manual_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        summary.stored_start = file_start;
+        summary.stored_finish = file_finish;
+    }
+    ed.proj.tasks[1].outline_level = 2;
+    ed.reschedule();
+    assert!(ed.project().tasks[0].summary);
+    assert_eq!(ed.project().tasks[0].pinned_dates(), None);
+    // The summary rolls up from its child, not from its ManualStart.
+    assert_eq!(
+        mspdi(ed.disp_start(10)).unwrap(),
+        "2026-01-05T08:00:00".to_string()
+    );
+    ed.rename(10, "Phase").unwrap();
+    assert_eq!(
+        (saved(&ed, 10).0, saved(&ed, 10).1),
+        (mspdi(file_start), mspdi(file_finish))
+    );
+}
+
+#[test]
+fn renaming_or_indenting_a_manual_task_keeps_its_file_dates() {
+    let mut ed = manual_editor();
+    // Project's finish includes a holiday projcore does not model.
+    let file_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    let file_finish = Some(DateTime::from_ymd_hm(2026, 1, 6, 17, 0));
+    ed.proj.tasks[1].stored_start = file_start;
+    ed.proj.tasks[1].stored_finish = file_finish;
+    ed.rename(20, "renamed").unwrap();
+    ed.update_task(
+        20,
+        TaskPatch {
+            level: Some(2),
+            ..TaskPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        (saved(&ed, 20).0, saved(&ed, 20).1),
+        (mspdi(file_start), mspdi(file_finish))
+    );
+    // A duration edit does restamp.
+    ed.set_duration(20, "2d").unwrap();
+    assert_saved_consistently(&ed, 20);
+}
+
+#[test]
+fn repeating_a_manual_tasks_duration_keeps_its_pinned_finish() {
+    let mut ed = manual_editor();
+    let before = ed.project().task(10).unwrap().clone();
+    assert!(before.manual_finish.is_some());
+    let saved_before = saved(&ed, 10);
+    // As projctl's task.set sends it: a rename plus the current duration.
+    ed.update_task(
+        10,
+        TaskPatch {
+            name: Some("renamed".into()),
+            duration_min: Some(before.duration_min),
+            ..TaskPatch::default()
+        },
+    )
+    .unwrap();
+    let task = ed.project().task(10).unwrap();
+    assert_eq!(task.manual_finish, before.manual_finish);
+    assert_eq!(task.manual_duration_min, before.manual_duration_min);
+    assert_eq!(saved(&ed, 10), saved_before);
+}

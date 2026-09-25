@@ -141,12 +141,22 @@ pub struct Task {
     pub calendar_uid: Option<i32>,
     /// Start/Finish as stored in the source file (Project's own computed
     /// values). Used as an oracle; the scheduler writes its own results
-    /// elsewhere.
+    /// elsewhere. The editor rewrites them for a manual task whose dates it
+    /// edits (start, finish or duration), so a save's Start/Finish agree
+    /// with its pinned dates.
     pub stored_start: Option<DateTime>,
     pub stored_finish: Option<DateTime>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     /// Use set_baseline_slot to replace a slot; UI variance uses slot 0.
     pub baselines: Vec<Baseline>,
+    /// Manually scheduled (MSPDI `Manual`): the task stays at the dates the
+    /// user gave it instead of moving with its links and constraints.
+    pub manual: bool,
+    /// MSPDI `ManualStart`/`ManualFinish`/`ManualDuration`, kept as read so they
+    /// round-trip even on auto tasks, where Project also writes them.
+    pub manual_start: Option<DateTime>,
+    pub manual_finish: Option<DateTime>,
+    pub manual_duration_min: Option<i64>,
 }
 
 impl Task {
@@ -159,6 +169,22 @@ impl Task {
         self.baselines.retain(|b| b.number != baseline.number);
         self.baselines.push(baseline);
         self.baselines.sort_by_key(|b| b.number);
+    }
+
+    /// The dates a manual task is pinned to: its manual start (else the stored
+    /// start) and its manual finish, if any. When the finish is absent the
+    /// scheduler derives it from the start and `duration_min`. The stored
+    /// finish is never used: it goes stale as soon as the duration is edited.
+    /// `None` for auto tasks and for a manual task with no start at all
+    /// (Project's "TBD" task), which then schedules like an auto task. Also
+    /// `None` for summaries: their dates roll up from their children, and a
+    /// manual summary's own dates are not modeled.
+    pub fn pinned_dates(&self) -> Option<(DateTime, Option<DateTime>)> {
+        if !self.manual || self.summary {
+            return None;
+        }
+        let start = self.manual_start.or(self.stored_start)?;
+        Some((start, self.manual_finish))
     }
 
     pub fn is_milestone(&self) -> bool {
@@ -378,6 +404,9 @@ pub struct Project {
     pub start_date: Option<DateTime>,
     /// Let date constraints override conflicting links (MSPDI HonorConstraints).
     pub honor_constraints: bool,
+    /// Whether tasks added to this plan start out manually scheduled (MSPDI
+    /// `NewTasksAreManual`).
+    pub new_tasks_are_manual: bool,
     /// Conversion factor for rendering durations (MSPDI `HoursPerDay`).
     pub hours_per_day: f64,
     pub hours_per_week: f64,
@@ -396,6 +425,7 @@ impl Default for Project {
             title: String::new(),
             start_date: None,
             honor_constraints: true,
+            new_tasks_are_manual: false,
             hours_per_day: 8.0,
             hours_per_week: 40.0,
             default_calendar_uid: 1,

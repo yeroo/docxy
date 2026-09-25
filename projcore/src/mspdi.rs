@@ -53,6 +53,7 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Title" => proj.title = text_of(&mut p),
                     "StartDate" => proj.start_date = DateTime::parse_mspdi(&text_of(&mut p)),
                     "HonorConstraints" => proj.honor_constraints = bool_of(&mut p),
+                    "NewTasksAreManual" => proj.new_tasks_are_manual = bool_of(&mut p),
                     "MinutesPerDay" => minutes_per_day = text_of(&mut p).trim().parse().ok(),
                     "MinutesPerWeek" => minutes_per_week = text_of(&mut p).trim().parse().ok(),
                     // Some emitters use HoursPerDay directly; honor it too.
@@ -180,6 +181,10 @@ fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
                     "Duration" => t.duration_min = iso8601_to_minutes(&text_of(p)),
                     "Start" => t.stored_start = DateTime::parse_mspdi(&text_of(p)),
                     "Finish" => t.stored_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Manual" => t.manual = bool_of(p),
+                    "ManualStart" => t.manual_start = DateTime::parse_mspdi(&text_of(p)),
+                    "ManualFinish" => t.manual_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "ManualDuration" => t.manual_duration_min = try_iso8601_to_minutes(&text_of(p)),
                     "ConstraintType" => {
                         t.constraint = ConstraintType::from_code(int_of(p)).unwrap_or_default();
                     }
@@ -644,6 +649,12 @@ pub fn write_mspdi(proj: &Project) -> String {
         "HonorConstraints",
         if proj.honor_constraints { "1" } else { "0" },
     );
+    tag(
+        &mut s,
+        1,
+        "NewTasksAreManual",
+        if proj.new_tasks_are_manual { "1" } else { "0" },
+    );
 
     s.push_str("  <Tasks>\n");
     for t in &proj.tasks {
@@ -681,6 +692,7 @@ fn write_task(s: &mut String, t: &Task) {
     tag(s, 3, "UID", &t.uid.to_string());
     tag(s, 3, "ID", &t.id.to_string());
     tag(s, 3, "Name", &t.name);
+    tag(s, 3, "Manual", if t.manual { "1" } else { "0" });
     tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
     tag(s, 3, "Summary", if t.summary { "1" } else { "0" });
     tag(s, 3, "Milestone", if t.milestone { "1" } else { "0" });
@@ -691,6 +703,15 @@ fn write_task(s: &mut String, t: &Task) {
     }
     if let Some(d) = t.stored_finish {
         tag(s, 3, "Finish", &d.to_mspdi());
+    }
+    if let Some(d) = t.manual_start {
+        tag(s, 3, "ManualStart", &d.to_mspdi());
+    }
+    if let Some(d) = t.manual_finish {
+        tag(s, 3, "ManualFinish", &d.to_mspdi());
+    }
+    if let Some(min) = t.manual_duration_min {
+        tag(s, 3, "ManualDuration", &min_to_iso(min));
     }
     tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
     if let Some(d) = t.constraint_date {
@@ -967,6 +988,75 @@ mod tests {
                 honor_constraints
             );
         }
+    }
+
+    const MANUAL_XML: &str = r#"<Project><NewTasksAreManual>1</NewTasksAreManual><Tasks>
+      <Task><UID>1</UID><Name>Manual</Name><Manual>1</Manual><Duration>PT8H0M0S</Duration>
+        <Start>2026-03-02T08:00:00</Start><Finish>2026-03-02T17:00:00</Finish>
+        <ManualStart>2026-03-02T08:00:00</ManualStart><ManualDuration>PT8H0M0S</ManualDuration></Task>
+      <Task><UID>2</UID><Name>Auto</Name><Manual>0</Manual><Duration>PT16H0M0S</Duration>
+        <ManualStart>2026-03-03T08:00:00</ManualStart><ManualFinish>2026-03-04T17:00:00</ManualFinish>
+        <ManualDuration>PT16H0M0S</ManualDuration></Task>
+    </Tasks></Project>"#;
+
+    #[test]
+    fn task_mode_and_manual_fields_are_read() {
+        let proj = read_mspdi(MANUAL_XML).unwrap();
+        assert!(proj.new_tasks_are_manual);
+        let (manual, auto) = (&proj.tasks[0], &proj.tasks[1]);
+        assert!(manual.manual);
+        assert_eq!(
+            manual.manual_start.unwrap().to_mspdi(),
+            "2026-03-02T08:00:00"
+        );
+        assert_eq!(manual.manual_finish, None);
+        assert_eq!(manual.manual_duration_min, Some(480));
+        // Project writes the manual fields on auto tasks too; keep them as read.
+        assert!(!auto.manual);
+        assert_eq!(
+            auto.manual_finish.unwrap().to_mspdi(),
+            "2026-03-04T17:00:00"
+        );
+        assert_eq!(auto.manual_duration_min, Some(960));
+        assert!(!read_mspdi("<Project/>").unwrap().new_tasks_are_manual);
+    }
+
+    #[test]
+    fn task_mode_and_manual_fields_survive_mspdi_and_native_package_round_trips() {
+        let proj = read_mspdi(MANUAL_XML).unwrap();
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<NewTasksAreManual>1</NewTasksAreManual>"));
+        assert!(xml.contains("<Manual>1</Manual>"));
+        assert!(xml.contains("<ManualStart>2026-03-02T08:00:00</ManualStart>"));
+        assert!(xml.contains("<ManualDuration>PT8H0M0S</ManualDuration>"));
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks, proj.tasks);
+        assert!(package.new_tasks_are_manual);
+    }
+
+    #[test]
+    fn saved_file_states_every_task_mode_and_the_project_default() {
+        let proj = Project {
+            tasks: vec![Task {
+                uid: 1,
+                ..Task::default()
+            }],
+            ..Project::default()
+        };
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Manual>0</Manual>"));
+        assert!(xml.contains("<NewTasksAreManual>0</NewTasksAreManual>"));
+        // Absent manual fields stay absent rather than being invented.
+        assert!(!xml.contains("<ManualStart>"));
+        assert!(!xml.contains("<ManualDuration>"));
+    }
+
+    #[test]
+    fn invalid_manual_duration_stays_absent() {
+        let xml = "<Project><Tasks><Task><UID>1</UID><Manual>1</Manual>\
+                   <ManualDuration>banana</ManualDuration></Task></Tasks></Project>";
+        assert_eq!(read_mspdi(xml).unwrap().tasks[0].manual_duration_min, None);
     }
 
     fn resource_project(resources: &str) -> Project {

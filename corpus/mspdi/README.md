@@ -42,6 +42,13 @@ File 18 records the FS milestone dates verified against Project 2021 in
 keep the predecessor's finish instant. Only zero-lag links were verified;
 for nonzero lag the scheduler uses the finish side of the successor calendar's
 working-time boundary, which remains unverified against Project.
+File 19 pins manually scheduled tasks
+([issue #77](https://github.com/yeroo/docxy/issues/77)) and is the one fixture
+**not** verified against Project 2021: its Start/Finish are what a manual task
+keeps by definition, but its `TotalSlack`/`Critical` are hand-derived from our
+scheduler, including the violated link (Review, pinned two days before Design
+finishes, gets -2 days). `verify_mspdi_project.py` keeps the tasks this file
+marks `<Manual>1</Manual>` manual, so a Project run can check it.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
@@ -70,6 +77,7 @@ working-time boundary, which remains unverified against Project.
 | `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |
 | `17-constraint-fnlt-conflict` | FNLT versus FS link | default constraint precedence and -5 days total slack on both tasks |
 | `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
+| `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
 
 See `manifest.json` for machine-readable tags.
 

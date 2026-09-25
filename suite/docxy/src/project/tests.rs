@@ -113,7 +113,7 @@ fn every_mspdi_fixture_opens_and_matches_its_date_oracle() {
         .filter(|p| ext_is(p, "xml"))
         .collect();
     assert!(
-        paths.len() >= 18,
+        paths.len() >= 19,
         "expected the full seed corpus, got {}",
         paths.len()
     );

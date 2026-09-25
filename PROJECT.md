@@ -45,7 +45,10 @@ Built bottom-up, each a pure module:
 
 The model is **pure input** — the scheduler never mutates it; it returns a
 separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
-`stored_*` and used as an **oracle** for the scheduler.
+`stored_*` and used as an **oracle** for the scheduler. The editor rewrites them
+for a manual task whose dates it edits, so a save's `Start`/`Finish` agree with
+its `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
+open).
 
 `projcore::editor::Editor` owns the editable project, its 100-entry undo history,
 selection, dirty flag, computed schedule and optional leveling overlay. Validated
@@ -58,6 +61,9 @@ clears history while retaining the find query and leveling preference.
 
 - **Tasks** have a duration in *working minutes*, an outline level (summary
   tasks own the deeper rows below them), and may be milestones (zero duration).
+  A task is auto-scheduled or **manually scheduled** (MSPDI `Manual`, with
+  `ManualStart`/`ManualFinish`/`ManualDuration`); tasks added to a plan follow
+  its `NewTasksAreManual` default.
 - **Dependencies** are the four link types with lag/lead: Finish-to-Start,
   Start-to-Start, Finish-to-Finish, Start-to-Finish. Lag is stored in MSPDI as
   *tenths of a minute* — one of several unit traps the reader normalizes.
@@ -96,6 +102,13 @@ Wednesday 08:00" both come out right.
   horizon; pre-start constraints do not pull unlinked tasks before the project
   start. Also computed: the **critical** flag (slack ≤ 0) and **summary
   rollup** (a summary's dates derive from its descendants).
+- **Manual tasks** stay at their pinned dates: the manual start (else the stored
+  start) and the manual finish, else start + duration on the task calendar.
+  Links and constraints never move them; auto successors schedule from the
+  pinned dates. A violated link shows as negative total slack (at least the gap
+  between the pinned and the link-driven start); an unlinked manual task gets no
+  slack penalty, even before the project start. A manual task without any start
+  schedules like an auto task.
 
 Leaf tasks are ordered by a Kahn topological sort of the dependency graph;
 cycles fall back to input order.
@@ -122,8 +135,9 @@ resources have free capacity for its whole duration (a sweep-based peak-load
 check that supports fractional units). A predecessor's leveling delay propagates
 to its successors, preserving every link's gap. v1 is single-calendar,
 delay-only, and treats a task's occupation as its wall-clock span; multi-calendar
-leveling and task splitting are future work. `yppxy` toggles the overlay with
-`L` (View ▸ Level).
+leveling and task splitting are future work. Leveling never moves a manual
+task: its bookings are placed first, and auto tasks level around them.
+`yppxy` toggles the overlay with `L` (View ▸ Level).
 
 ## Formats
 
@@ -159,8 +173,12 @@ Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find
 undo/redo, save, and export. The former bare-letter commands are available on
 the ribbon; letters now start cell edits. Ribbon Rename still opens its Name prompt.
 
-Dates use `YYYY-MM-DD`. Start sets SNET; Finish sets FNET at the chosen working
-day's calendar finish (non-working Finish dates are rejected). Predecessors use
+Dates use `YYYY-MM-DD`. On an auto task, Start sets SNET and Finish sets FNET at
+the chosen working day's calendar finish (non-working Finish dates are rejected).
+On a manual task, Start moves the task to that day's first working time (08:00
+on a non-working day) keeping its duration, and Finish sets its finish at the
+day's last working time (17:00 on a non-working day) and its duration to the
+working time in between; neither adds a constraint. Predecessors use
 displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated;
 retained assignments keep their units/work, and unknown names create resources.
 An unchanged edit preserves history and existing constraints. Cycles retain the

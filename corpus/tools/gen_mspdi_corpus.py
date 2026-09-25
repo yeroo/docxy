@@ -11,7 +11,8 @@ covered 05 and 14 (#53), 16 (#58), 17 (#60) and 18 (#59); the script
 reproduces them. `projcore/tests/corpus.rs` reads each file, runs the CPM
 scheduler, and asserts the computed values match the embedded ones, so the
 corpus validates the scheduler without needing Project. Rerun the script
-whenever a fixture changes.
+whenever a fixture changes. Exception: file 19's manual-task expectations
+(#77) are hand-derived from our scheduler and not yet verified in Project.
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -41,16 +42,22 @@ def iso(minutes):
 
 def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
          outline=1, summary=False, milestone=False, preds=(), ctype=None,
-         cdate=None, calendar=None, baselines=()):
+         cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
+         manual_finish=None, manual_duration=None):
     """One <Task>. `preds` is a list of (uid, type_code, lag_tenths_of_min).
     `start`/`finish` are the embedded oracle values (MSPDI datetime strings);
     `slack` (working minutes) and `critical` are Project's TotalSlack and
-    Critical. They are required so a new task cannot omit its oracle."""
+    Critical. They are required so a new task cannot omit its oracle.
+    `manual` (0/1) and the manual_* fields are written only when given."""
     oid = uid if oid is None else oid
     lines = [
         "    <Task>",
         f"      <UID>{uid}</UID><ID>{oid}</ID>",
         f"      <Name>{name}</Name>",
+    ]
+    if manual is not None:
+        lines.append(f"      <Manual>{manual}</Manual>")
+    lines += [
         f"      <OutlineLevel>{outline}</OutlineLevel>",
         f"      <Summary>{1 if summary else 0}</Summary>",
         f"      <Milestone>{1 if milestone else 0}</Milestone>",
@@ -59,6 +66,11 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
         # MSPDI TotalSlack is in tenths of a minute.
         f"      <TotalSlack>{slack * 10}</TotalSlack><Critical>{1 if critical else 0}</Critical>",
     ]
+    for tag, value in [("ManualStart", manual_start), ("ManualFinish", manual_finish),
+                       ("ManualDuration",
+                        iso(manual_duration) if manual_duration is not None else None)]:
+        if value is not None:
+            lines.append(f"      <{tag}>{value}</{tag}>")
     if ctype is not None:
         lines.append(f"      <ConstraintType>{ctype}</ConstraintType>")
         if cdate is not None:
@@ -117,7 +129,7 @@ def standard_calendar(uid=1, name="Standard", saturday=False):
 
 
 def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
-            calendars=None):
+            calendars=None, new_tasks_are_manual=None):
     calendars = calendars or [standard_calendar()]
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -131,6 +143,10 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
         # <Duration> and rederives it from Start/Finish, which zeroes tasks that
         # start at the project start (#74).
         "  <ProjectExternallyEdited>0</ProjectExternallyEdited>",
+    ]
+    if new_tasks_are_manual is not None:
+        parts.append(f"  <NewTasksAreManual>{new_tasks_are_manual}</NewTasksAreManual>")
+    parts += [
         "  <Tasks>",
         tasks_xml,
         "  </Tasks>",
@@ -327,6 +343,27 @@ def build():
             task(6, "M2", 0, dt(9, "17:00:00"), dt(9, "17:00:00"), **CRIT,
                  milestone=True, preds=[(5, FS, 0)]),
         ])))
+
+    # 19 — manually scheduled tasks (#77) stay at their pinned dates: one pinned
+    # before its FS link allows (the link wants Thu 5), one pinned after it
+    # (Mon 9), and an auto successor that follows the pinned finish.
+    add("19-manual-tasks.xml", ["manual", "link", "link-fs", "summary", "round-trip"],
+        "Manual tasks keep their pinned dates; an auto successor follows them.",
+        project("manual-tasks", "\n".join([
+            task(1, "Phase", 9 * D, dt(2), dt(12, "17:00:00"), slack=-2 * D,
+                 critical=True, summary=True, manual=0),
+            task(2, "Design", 3 * D, dt(2), dt(4, "17:00:00"), slack=2 * D,
+                 critical=False, outline=2, manual=0),
+            # Pinned Tue 3, the link wants Thu 5: the violation is -2d of slack.
+            task(3, "Review", D, dt(3), dt(3, "17:00:00"), slack=-2 * D, critical=True,
+                 outline=2, preds=[(2, FS, 0)], manual=1, manual_start=dt(3),
+                 manual_duration=D),
+            task(4, "Vendor", 2 * D, dt(9), dt(10, "17:00:00"), **CRIT, outline=2,
+                 preds=[(2, FS, 0)], manual=1, manual_start=dt(9),
+                 manual_finish=dt(10, "17:00:00"), manual_duration=2 * D),
+            task(5, "Build", 2 * D, dt(11), dt(12, "17:00:00"), **CRIT, outline=2,
+                 preds=[(4, FS, 0)], manual=0),
+        ]), new_tasks_are_manual=1))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

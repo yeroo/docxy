@@ -279,6 +279,10 @@ impl Editor {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or("No task IDs available")?;
+        // Follow the plan's own default mode; a manual task starts at the
+        // project start (or the anchor the schedule actually uses).
+        let manual = self.proj.new_tasks_are_manual;
+        let manual_start = manual.then(|| self.proj.start_date.unwrap_or(self.sched.project_start));
         self.edit_structure(|proj| {
             proj.tasks.insert(
                 at,
@@ -289,10 +293,14 @@ impl Editor {
                     outline_level,
                     duration_min,
                     milestone: duration_min == 0,
+                    manual,
+                    manual_start,
+                    manual_duration_min: manual.then_some(duration_min),
                     ..Task::default()
                 },
             )
         })?;
+        self.stamp_pinned_dates(uid);
         Ok(at)
     }
 
@@ -357,6 +365,7 @@ impl Editor {
             self.validate_cell_horizon(uid, patch.duration_min, None)?;
         }
         let t = &self.proj.tasks[i];
+        let duration_changed = patch.duration_min.is_some_and(|min| min != t.duration_min);
         if patch.name.as_ref().is_none_or(|name| *name == t.name)
             && patch
                 .duration_min
@@ -373,11 +382,47 @@ impl Editor {
             if let Some(min) = patch.duration_min {
                 t.duration_min = min;
                 t.milestone = min == 0;
+                // A manual task keeps its start; its finish follows a new
+                // duration instead of staying pinned. Repeating the current
+                // duration keeps a pinned finish.
+                if t.manual && duration_changed {
+                    t.manual_duration_min = Some(min);
+                    t.manual_finish = None;
+                }
             }
             if let Some(lv) = patch.level {
                 t.outline_level = lv;
             }
-        })
+        })?;
+        // Only a date change restamps: projcore ignores calendar exceptions,
+        // so our finish can differ from the one Project wrote.
+        if duration_changed {
+            self.stamp_pinned_dates(uid);
+        }
+        Ok(())
+    }
+
+    /// After an edit to a manual task's dates, record its pinned start and
+    /// scheduled finish as the Start/Finish a save writes. Project does not
+    /// reschedule manual tasks on open, so they must agree with
+    /// ManualStart/Duration. Stored dates do feed the scheduler (the anchor
+    /// of a plan without a start date, and the timeline reach), so reschedule
+    /// after stamping to keep the schedule in step with the model.
+    fn stamp_pinned_dates(&mut self, uid: i32) {
+        let Ok(i) = self.index(uid) else {
+            return;
+        };
+        let Some((start, _)) = self.proj.tasks[i].pinned_dates() else {
+            return;
+        };
+        let finish = self.sched.get(uid).map(|r| r.early_finish);
+        let task = &mut self.proj.tasks[i];
+        if (task.stored_start, task.stored_finish) == (Some(start), finish) {
+            return;
+        }
+        task.stored_start = Some(start);
+        task.stored_finish = finish;
+        self.reschedule();
     }
 
     pub fn add_predecessor(
@@ -741,6 +786,45 @@ mod tests {
         assert_eq!(
             ed.project().tasks[1].baseline(0).unwrap().duration_min,
             Some(960)
+        );
+    }
+
+    #[test]
+    fn stamping_a_manual_task_leaves_the_schedule_in_step_with_the_model() {
+        // No start date: the anchor comes from the earliest stored start.
+        let march = |day| DateTime::from_ymd_hm(2026, 3, day, 8, 0);
+        let proj = Project {
+            tasks: vec![
+                Task {
+                    uid: 1,
+                    id: 1,
+                    name: "M".into(),
+                    outline_level: 1,
+                    duration_min: 480,
+                    manual: true,
+                    manual_start: Some(march(2)),
+                    stored_start: Some(march(2)),
+                    ..Task::default()
+                },
+                Task {
+                    uid: 2,
+                    id: 2,
+                    name: "A".into(),
+                    outline_level: 1,
+                    duration_min: 480,
+                    ..Task::default()
+                },
+            ],
+            ..Project::default()
+        };
+        let mut ed = Editor::new(proj);
+        ed.set_start(1, DateTime::from_ymd_hm(2026, 3, 16, 0, 0))
+            .unwrap();
+        assert_schedule(&ed);
+        assert_eq!(
+            ed.schedule().get(2).unwrap().early_start,
+            march(16),
+            "the unlinked auto task follows the moved anchor now, not on the next edit"
         );
     }
 
