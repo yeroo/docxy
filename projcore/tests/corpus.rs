@@ -14,7 +14,9 @@
 //! 21's oracle (issue #100) was entered by hand from the issue's Project 2024
 //! capture; the file was not run through `verify_mspdi_project.py`. File 22
 //! (issue #81) carries progress values of our own and is not verified in
-//! Project either, nor is file 23's derived calendar (issue #83). Slack invariants below also check
+//! Project either, nor is file 23's derived calendar (issue #83), nor are
+//! file 13's resource and assignment fields of issue #84, chosen to leave its
+//! schedule unchanged. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -579,6 +581,108 @@ fn progress_fixture_keeps_actuals_through_a_save() {
             xml.matches(element).count(),
             "{element}"
         );
+    }
+}
+
+#[test]
+fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
+    use projcore::DateTime;
+    use projcore::model::Rate;
+    let xml = std::fs::read_to_string(corpus_dir().join("13-resource-fields.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    // A round trip alone would pass if the reader ignored these: read them.
+    let alice = &proj.resources[0];
+    assert_eq!(
+        (alice.standard_rate_format, alice.overtime_rate_format),
+        (Some(3), Some(4)),
+        "a standard rate shown per day and an overtime rate shown per week"
+    );
+    assert_eq!((alice.booking_type, alice.work_group), (Some(1), Some(1)));
+    assert_eq!(
+        (
+            alice.is_generic,
+            alice.is_inactive,
+            alice.can_level,
+            alice.over_allocated
+        ),
+        (Some(true), Some(false), Some(true), Some(false))
+    );
+    assert_eq!(alice.peak_units, Rate::parse("1"));
+    assert_eq!(
+        (
+            alice.work_min,
+            alice.regular_work_min,
+            alice.remaining_work_min
+        ),
+        (Some(960), Some(960), Some(960))
+    );
+    assert_eq!(proj.resources[1].is_budget, Some(true));
+    assert_eq!(proj.resources[2].is_inactive, Some(true));
+    let a = &proj.assignments[0];
+    assert_eq!(
+        (a.work_contour, a.fixed_material, a.has_fixed_rate_units),
+        (Some(0), Some(false), Some(true))
+    );
+    assert_eq!(
+        (a.start, a.finish),
+        (
+            Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0))
+        )
+    );
+    assert_eq!(a.regular_work_min, Some(960));
+    assert_eq!(
+        (a.percent_work_complete, a.remaining_work_min),
+        (Some(0), Some(960))
+    );
+    // What the issue saw dropped comes back from a save, element for element.
+    let saved = write_mspdi(&proj);
+    let section = |xml: &str, name: &str| {
+        let open = xml.find(&format!("<{name}>")).unwrap();
+        xml[open..xml.find(&format!("</{name}>")).unwrap()].to_string()
+    };
+    for (name, elements) in [
+        (
+            "Resources",
+            &[
+                "<StandardRateFormat>3</StandardRateFormat>",
+                "<OvertimeRateFormat>4</OvertimeRateFormat>",
+                "<BookingType>1</BookingType>",
+                "<IsGeneric>1</IsGeneric>",
+                "<IsBudget>1</IsBudget>",
+                "<IsInactive>",
+                "<CanLevel>1</CanLevel>",
+                "<WorkGroup>1</WorkGroup>",
+                "<PeakUnits>1</PeakUnits>",
+                "<OverAllocated>0</OverAllocated>",
+                "<Work>PT16H0M0S</Work>",
+                "<RegularWork>PT16H0M0S</RegularWork>",
+                "<RemainingWork>PT16H0M0S</RemainingWork>",
+            ][..],
+        ),
+        (
+            "Assignments",
+            &[
+                "<WorkContour>0</WorkContour>",
+                "<FixedMaterial>0</FixedMaterial>",
+                "<HasFixedRateUnits>1</HasFixedRateUnits>",
+                "<Start>2026-03-02T08:00:00</Start>",
+                "<Finish>2026-03-03T17:00:00</Finish>",
+                "<RegularWork>PT16H0M0S</RegularWork>",
+                "<RemainingWork>PT16H0M0S</RemainingWork>",
+                "<PercentWorkComplete>0</PercentWorkComplete>",
+            ][..],
+        ),
+    ] {
+        let (input, output) = (section(&xml, name), section(&saved, name));
+        for element in elements {
+            assert!(input.contains(element), "fixture lacks {element}");
+            assert_eq!(
+                output.matches(element).count(),
+                input.matches(element).count(),
+                "{name}: {element}"
+            );
+        }
     }
 }
 

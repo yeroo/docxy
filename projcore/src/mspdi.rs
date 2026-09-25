@@ -391,6 +391,19 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "OvertimeRate" => r.overtime_rate = rate_of(p),
                     "CostPerUse" => r.cost_per_use = rate_of(p),
                     "CalendarUID" => r.calendar_uid = Some(int_of(p) as i32),
+                    "StandardRateFormat" => r.standard_rate_format = opt_u8_of(p),
+                    "OvertimeRateFormat" => r.overtime_rate_format = opt_u8_of(p),
+                    "BookingType" => r.booking_type = opt_u8_of(p),
+                    "WorkGroup" => r.work_group = opt_u8_of(p),
+                    "IsGeneric" => r.is_generic = opt_bool_of(p),
+                    "IsBudget" => r.is_budget = opt_bool_of(p),
+                    "IsInactive" => r.is_inactive = opt_bool_of(p),
+                    "CanLevel" => r.can_level = opt_bool_of(p),
+                    "OverAllocated" => r.over_allocated = opt_bool_of(p),
+                    "PeakUnits" => r.peak_units = rate_of(p),
+                    "Work" => r.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RegularWork" => r.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingWork" => r.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
                     _ => p.skip_element(),
                 }
             }
@@ -455,6 +468,12 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
                     "FinishVariance" => a.finish_variance = opt_int_of(p),
                     "WorkVariance" => a.work_variance = rate_of(p),
                     "CostVariance" => a.cost_variance = rate_of(p),
+                    "WorkContour" => a.work_contour = opt_u8_of(p),
+                    "FixedMaterial" => a.fixed_material = opt_bool_of(p),
+                    "HasFixedRateUnits" => a.has_fixed_rate_units = opt_bool_of(p),
+                    "Start" => a.start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => a.finish = DateTime::parse_mspdi(&text_of(p)),
+                    "RegularWork" => a.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
                     // Its Start/Finish/Work/Cost are the recorded plan's, not the assignment's.
                     "Baseline" => parse_assignment_baseline(p, &mut a),
                     _ => p.skip_element(),
@@ -682,6 +701,11 @@ fn opt_int_of(p: &mut XmlParser) -> Option<i64> {
     text_of(p).trim().parse().ok()
 }
 
+/// A small code such as a rate unit or contour: outside `u8` stays absent.
+fn opt_u8_of(p: &mut XmlParser) -> Option<u8> {
+    opt_int_of(p).and_then(|n| u8::try_from(n).ok())
+}
+
 /// A percentage, 0..=100; anything else stays absent.
 fn percent_of(p: &mut XmlParser) -> Option<u8> {
     text_of(p).trim().parse().ok().filter(|n| *n <= 100)
@@ -738,8 +762,9 @@ pub fn iso8601_to_minutes(s: &str) -> i64 {
 }
 
 /// Parse the supported duration components without treating invalid input as zero.
-/// Baselines need to distinguish a recorded zero from an unavailable duration;
-/// task and assignment imports retain the permissive parser above.
+/// Optional durations (baselines, progress, stored work, resource work) need to
+/// distinguish a recorded zero from an unavailable one; only the required task
+/// `Duration` and assignment `Work` keep the permissive parser above.
 fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
     let body = s.trim().strip_prefix('P')?;
     let mut minutes = 0i64;
@@ -1164,25 +1189,40 @@ fn write_resource(s: &mut String, r: &Resource) {
             tag(s, 3, name, value);
         }
     }
+    opt_text(s, "WorkGroup", r.work_group);
     tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
+    opt_text(s, "PeakUnits", r.peak_units.as_ref().map(Rate::as_str));
+    opt_flag(s, "OverAllocated", r.over_allocated);
+    opt_flag(s, "CanLevel", r.can_level);
     if let Some(accrue_at) = r.accrue_at {
         tag(s, 3, "AccrueAt", &accrue_at.code().to_string());
     }
-    for (name, value) in [
-        ("StandardRate", &r.standard_rate),
-        ("OvertimeRate", &r.overtime_rate),
-        ("CostPerUse", &r.cost_per_use),
-    ] {
-        if let Some(value) = value {
-            tag(s, 3, name, value.as_str());
-        }
-    }
+    opt_text(s, "Work", r.work_min.map(min_to_iso));
+    opt_text(s, "RegularWork", r.regular_work_min.map(min_to_iso));
+    opt_text(s, "RemainingWork", r.remaining_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "StandardRate",
+        r.standard_rate.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "StandardRateFormat", r.standard_rate_format);
+    opt_text(
+        s,
+        "OvertimeRate",
+        r.overtime_rate.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "OvertimeRateFormat", r.overtime_rate_format);
+    opt_text(s, "CostPerUse", r.cost_per_use.as_ref().map(Rate::as_str));
     if let Some(c) = r.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
     }
+    opt_flag(s, "IsGeneric", r.is_generic);
+    opt_flag(s, "IsInactive", r.is_inactive);
+    opt_text(s, "BookingType", r.booking_type);
     if r.kind == ResourceType::Cost {
         tag(s, 3, "IsCostResource", "1");
     }
+    opt_flag(s, "IsBudget", r.is_budget);
     s.push_str("    </Resource>\n");
 }
 
@@ -1202,23 +1242,29 @@ fn write_assignment(s: &mut String, a: &Assignment) {
         "CostVariance",
         a.cost_variance.as_ref().map(Rate::as_str),
     );
+    opt_date(s, "Finish", a.finish);
     opt_text(s, "FinishVariance", a.finish_variance);
     opt_text(
         s,
         "WorkVariance",
         a.work_variance.as_ref().map(Rate::as_str),
     );
+    opt_flag(s, "HasFixedRateUnits", a.has_fixed_rate_units);
+    opt_flag(s, "FixedMaterial", a.fixed_material);
+    opt_text(s, "RegularWork", a.regular_work_min.map(min_to_iso));
     opt_text(
         s,
         "RemainingCost",
         a.remaining_cost.as_ref().map(Rate::as_str),
     );
     opt_text(s, "RemainingWork", a.remaining_work_min.map(min_to_iso));
+    opt_date(s, "Start", a.start);
     opt_date(s, "Stop", a.stop);
     opt_date(s, "Resume", a.resume);
     opt_text(s, "StartVariance", a.start_variance);
     tag(s, 3, "Units", &fmt_f(a.units));
     tag(s, 3, "Work", &min_to_iso(a.work_min));
+    opt_text(s, "WorkContour", a.work_contour);
     for baseline in &a.baselines {
         s.push_str("      <Baseline>\n");
         tag(s, 4, "Number", &baseline.number.to_string());
@@ -1776,33 +1822,36 @@ mod tests {
     fn resource_children_follow_schema_sequence() {
         // Microsoft: XML Schema for the Resources Element (Project 2016).
         // https://learn.microsoft.com/en-us/office-project/xml-data-interchange/xml-schema-for-the-resources-element
-        let r = Resource {
-            kind: ResourceType::Cost,
+        let full = |kind| Resource {
+            kind,
             initials: Some("A".into()),
             material_label: Some("unit".into()),
             code: Some("C7".into()),
             group: Some("Eng".into()),
+            work_group: Some(1),
+            peak_units: Rate::parse("1"),
+            over_allocated: Some(false),
+            can_level: Some(true),
             accrue_at: Some(AccrueAt::End),
+            work_min: Some(480),
+            regular_work_min: Some(480),
+            remaining_work_min: Some(240),
             standard_rate: Rate::parse("50"),
+            standard_rate_format: Some(3),
             overtime_rate: Rate::parse("75"),
+            overtime_rate_format: Some(2),
             cost_per_use: Rate::parse("10"),
             calendar_uid: Some(1),
+            is_generic: Some(false),
+            is_inactive: Some(false),
+            booking_type: Some(0),
+            is_budget: Some(true),
             ..Resource::default()
         };
-        let mut xml = String::new();
-        write_resource(&mut xml, &r);
-        let mut parser = XmlParser::new(&xml);
-        let mut names = Vec::new();
-        loop {
-            match parser.next() {
-                Event::Start => names.push(parser.name().to_string()),
-                Event::Eof => break,
-                _ => {}
-            }
-        }
-        assert_eq!(
-            names,
-            [
+        for r in [full(ResourceType::Cost), full(ResourceType::Work)] {
+            let mut xml = String::new();
+            write_resource(&mut xml, &r);
+            let mut expected = vec![
                 "Resource",
                 "UID",
                 "ID",
@@ -1812,16 +1861,33 @@ mod tests {
                 "MaterialLabel",
                 "Code",
                 "Group",
+                "WorkGroup",
                 "MaxUnits",
+                "PeakUnits",
+                "OverAllocated",
+                "CanLevel",
                 "AccrueAt",
+                "Work",
+                "RegularWork",
+                "RemainingWork",
                 "StandardRate",
+                "StandardRateFormat",
                 "OvertimeRate",
+                "OvertimeRateFormat",
                 "CostPerUse",
                 "CalendarUID",
-                "IsCostResource"
-            ]
-        );
-        assert_eq!(resource_project(&xml).resources, vec![r]);
+                "IsGeneric",
+                "IsInactive",
+                "BookingType",
+                "IsCostResource",
+                "IsBudget",
+            ];
+            if r.kind != ResourceType::Cost {
+                expected.retain(|name| *name != "IsCostResource");
+            }
+            assert_eq!(element_names(&xml), expected, "{:?}", r.kind);
+            assert_eq!(resource_project(&xml).resources, vec![r]);
+        }
     }
 
     #[test]
@@ -3477,6 +3543,13 @@ mod tests {
                 finish_variance: Some(4800),
                 work_variance: Rate::parse("480000.0"),
                 cost_variance: Rate::parse("-12.5"),
+                // The baseline's Start/Finish are not the assignment's own.
+                work_contour: None,
+                fixed_material: None,
+                has_fixed_rate_units: None,
+                start: None,
+                finish: None,
+                regular_work_min: None,
                 baselines: vec![
                     AssignmentBaseline {
                         number: 0,
@@ -3753,7 +3826,14 @@ mod tests {
         // the assignments of a private Project 2024 corpus) and as Microsoft's
         // XML Schema lists it. That corpus has no assignment ActualCost or
         // Baseline; their places are the schema's.
-        let proj = assignment_project(PROGRESS_ASSIGNMENT);
+        let mut proj = assignment_project(PROGRESS_ASSIGNMENT);
+        let a = &mut proj.assignments[0];
+        a.finish = d(5, 17);
+        a.has_fixed_rate_units = Some(true);
+        a.fixed_material = Some(false);
+        a.regular_work_min = Some(1920);
+        a.start = d(2, 8);
+        a.work_contour = Some(1);
         let mut xml = String::new();
         write_assignment(&mut xml, &proj.assignments[0]);
         assert_eq!(
@@ -3769,15 +3849,21 @@ mod tests {
                 "ActualStart",
                 "ActualWork",
                 "CostVariance",
+                "Finish",
                 "FinishVariance",
                 "WorkVariance",
+                "HasFixedRateUnits",
+                "FixedMaterial",
+                "RegularWork",
                 "RemainingCost",
                 "RemainingWork",
+                "Start",
                 "Stop",
                 "Resume",
                 "StartVariance",
                 "Units",
                 "Work",
+                "WorkContour",
                 "Baseline",
                 "Number",
                 "Start",
@@ -3789,5 +3875,245 @@ mod tests {
                 "Work",
             ]
         );
+    }
+
+    /// A work resource carrying every field #84 keeps, with a standard rate
+    /// shown per day and an overtime rate shown per week.
+    const RESOURCE_FIELDS: &str = "<Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>\
+        <Type>1</Type><WorkGroup>2</WorkGroup><MaxUnits>1</MaxUnits><PeakUnits>1.5</PeakUnits>\
+        <OverAllocated>1</OverAllocated><CanLevel>0</CanLevel><Work>PT40H0M0S</Work>\
+        <RegularWork>PT32H0M0S</RegularWork><RemainingWork>PT24H0M0S</RemainingWork>\
+        <StandardRate>800</StandardRate><StandardRateFormat>3</StandardRateFormat>\
+        <OvertimeRate>6000</OvertimeRate><OvertimeRateFormat>4</OvertimeRateFormat>\
+        <IsGeneric>1</IsGeneric><IsInactive>0</IsInactive><BookingType>1</BookingType>\
+        <IsBudget>0</IsBudget></Resource>";
+
+    /// Resource elements #84 keeps.
+    const RESOURCE_FIELD_ELEMENTS: [&str; 13] = [
+        "WorkGroup",
+        "PeakUnits",
+        "OverAllocated",
+        "CanLevel",
+        "Work",
+        "RegularWork",
+        "RemainingWork",
+        "StandardRateFormat",
+        "OvertimeRateFormat",
+        "IsGeneric",
+        "IsInactive",
+        "BookingType",
+        "IsBudget",
+    ];
+
+    /// An assignment carrying every field #84 keeps, besides #81's progress.
+    const CONTOUR_ASSIGNMENT: &str = "<Assignment><UID>1</UID><TaskUID>1</TaskUID>\
+        <ResourceUID>1</ResourceUID><PercentWorkComplete>25</PercentWorkComplete>\
+        <Finish>2026-03-06T12:00:00</Finish><HasFixedRateUnits>1</HasFixedRateUnits>\
+        <FixedMaterial>0</FixedMaterial><RegularWork>PT32H0M0S</RegularWork>\
+        <RemainingWork>PT24H0M0S</RemainingWork><Start>2026-03-03T08:00:00</Start>\
+        <Units>1</Units><Work>PT32H0M0S</Work><WorkContour>3</WorkContour></Assignment>";
+
+    /// Assignment elements #84 keeps.
+    const CONTOUR_ASSIGNMENT_ELEMENTS: [&str; 6] = [
+        "Finish",
+        "HasFixedRateUnits",
+        "FixedMaterial",
+        "RegularWork",
+        "Start",
+        "WorkContour",
+    ];
+
+    #[test]
+    fn resource_rate_units_and_flags_are_read() {
+        assert_eq!(
+            resource_project(RESOURCE_FIELDS).resources,
+            [Resource {
+                uid: 1,
+                id: 1,
+                name: "Alice".into(),
+                kind: ResourceType::Work,
+                max_units: 1.0,
+                standard_rate: Rate::parse("800"),
+                overtime_rate: Rate::parse("6000"),
+                standard_rate_format: Some(3),
+                overtime_rate_format: Some(4),
+                booking_type: Some(1),
+                work_group: Some(2),
+                is_generic: Some(true),
+                is_budget: Some(false),
+                is_inactive: Some(false),
+                can_level: Some(false),
+                over_allocated: Some(true),
+                peak_units: Rate::parse("1.5"),
+                work_min: Some(2400),
+                regular_work_min: Some(1920),
+                remaining_work_min: Some(1440),
+                ..Resource::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn resource_rate_units_and_flags_survive_mspdi_and_native_package_round_trips() {
+        let proj = resource_project(RESOURCE_FIELDS);
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<WorkGroup>2</WorkGroup>",
+            "<PeakUnits>1.5</PeakUnits>",
+            "<OverAllocated>1</OverAllocated>",
+            "<CanLevel>0</CanLevel>",
+            "<Work>PT40H0M0S</Work>",
+            "<RegularWork>PT32H0M0S</RegularWork>",
+            "<RemainingWork>PT24H0M0S</RemainingWork>",
+            "<StandardRate>800</StandardRate>",
+            "<StandardRateFormat>3</StandardRateFormat>",
+            "<OvertimeRate>6000</OvertimeRate>",
+            "<OvertimeRateFormat>4</OvertimeRateFormat>",
+            "<IsGeneric>1</IsGeneric>",
+            "<IsInactive>0</IsInactive>",
+            "<BookingType>1</BookingType>",
+            "<IsBudget>0</IsBudget>",
+        ] {
+            assert!(xml.contains(element), "missing {element}");
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.resources, proj.resources);
+    }
+
+    #[test]
+    fn assignment_contour_flags_and_dates_are_read() {
+        assert_eq!(
+            assignment_project(CONTOUR_ASSIGNMENT).assignments,
+            [Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 1920,
+                percent_work_complete: Some(25),
+                remaining_work_min: Some(1440),
+                work_contour: Some(3),
+                fixed_material: Some(false),
+                has_fixed_rate_units: Some(true),
+                start: d(3, 8),
+                finish: d(6, 12),
+                regular_work_min: Some(1920),
+                ..Assignment::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn assignment_contour_flags_and_dates_survive_mspdi_and_native_package_round_trips() {
+        let proj = assignment_project(CONTOUR_ASSIGNMENT);
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<PercentWorkComplete>25</PercentWorkComplete>",
+            "<Finish>2026-03-06T12:00:00</Finish>",
+            "<HasFixedRateUnits>1</HasFixedRateUnits>",
+            "<FixedMaterial>0</FixedMaterial>",
+            "<RegularWork>PT32H0M0S</RegularWork>",
+            "<RemainingWork>PT24H0M0S</RemainingWork>",
+            "<Start>2026-03-03T08:00:00</Start>",
+            "<WorkContour>3</WorkContour>",
+        ] {
+            assert!(assignment_xml(&xml).contains(element), "missing {element}");
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().assignments, proj.assignments);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.assignments, proj.assignments);
+    }
+
+    #[test]
+    fn absent_resource_and_assignment_fields_stay_absent() {
+        let proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <Units>1</Units><Work>PT32H0M0S</Work></Assignment>",
+        );
+        assert_eq!(
+            proj.resources,
+            [Resource {
+                uid: 1,
+                id: 1,
+                name: "Crew".into(),
+                max_units: 1.0,
+                ..Resource::default()
+            }]
+        );
+        let xml = write_mspdi(&proj);
+        let resources = &xml[xml.find("<Resources>").unwrap()..xml.find("</Resources>").unwrap()];
+        for name in RESOURCE_FIELD_ELEMENTS {
+            assert!(!resources.contains(&format!("<{name}>")), "{name}");
+        }
+        for name in CONTOUR_ASSIGNMENT_ELEMENTS {
+            assert!(
+                !assignment_xml(&xml).contains(&format!("<{name}>")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_resource_fields_stay_absent() {
+        for element in [
+            "<StandardRateFormat>h</StandardRateFormat>",
+            "<OvertimeRateFormat>256</OvertimeRateFormat>",
+            "<BookingType>300</BookingType>",
+            "<WorkGroup>-1</WorkGroup>",
+            "<IsGeneric>yes</IsGeneric>",
+            "<IsBudget>2</IsBudget>",
+            "<IsInactive/>",
+            "<CanLevel>on</CanLevel>",
+            "<OverAllocated>x</OverAllocated>",
+            "<PeakUnits>lots</PeakUnits>",
+            "<Work>8h</Work>",
+            "<RegularWork/>",
+            "<RemainingWork>PT</RemainingWork>",
+        ] {
+            let proj = resource_project(&format!(
+                "<Resource><UID>1</UID><ID>1</ID><Name>A</Name>{element}</Resource>"
+            ));
+            assert_eq!(
+                proj.resources,
+                [Resource {
+                    uid: 1,
+                    id: 1,
+                    name: "A".into(),
+                    max_units: 1.0,
+                    ..Resource::default()
+                }],
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_assignment_fields_stay_absent() {
+        for element in [
+            "<WorkContour>-1</WorkContour>",
+            "<WorkContour>flat</WorkContour>",
+            "<FixedMaterial>maybe</FixedMaterial>",
+            "<HasFixedRateUnits/>",
+            "<Start>soon</Start>",
+            "<Finish/>",
+            "<RegularWork>8h</RegularWork>",
+        ] {
+            let proj = assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 {element}</Assignment>"
+            ));
+            assert_eq!(
+                proj.assignments,
+                [Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    ..Assignment::default()
+                }],
+                "{element}"
+            );
+        }
     }
 }

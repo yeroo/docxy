@@ -408,6 +408,29 @@ pub struct Resource {
     pub overtime_rate: Option<Rate>,
     pub cost_per_use: Option<Rate>,
     pub calendar_uid: Option<i32>,
+    // Stored as read so a save writes them back; nothing here schedules,
+    // levels or costs with them, and edits do not refresh them.
+    /// The unit Project displays each rate in, as the MSPDI code (1 minute,
+    /// 2 hour, 3 day, 4 week, 5 month, 7 year; the standard rate also 8, a
+    /// material rate). Kept as the code so an unnamed one still round-trips.
+    /// The rate text is kept as written, not converted to this unit.
+    pub standard_rate_format: Option<u8>,
+    pub overtime_rate_format: Option<u8>,
+    /// 0 committed, 1 proposed.
+    pub booking_type: Option<u8>,
+    /// 0 default, 1 none, 2 email, 3 web.
+    pub work_group: Option<u8>,
+    pub is_generic: Option<bool>,
+    pub is_budget: Option<bool>,
+    pub is_inactive: Option<bool>,
+    pub can_level: Option<bool>,
+    pub over_allocated: Option<bool>,
+    /// Decimal text, e.g. `1` = 100%.
+    pub peak_units: Option<Rate>,
+    /// Work in whole minutes, rounded from the source.
+    pub work_min: Option<i64>,
+    pub regular_work_min: Option<i64>,
+    pub remaining_work_min: Option<i64>,
 }
 
 /// An assignment of a resource to a task.
@@ -437,6 +460,19 @@ pub struct Assignment {
     pub finish_variance: Option<i64>,
     pub work_variance: Option<Rate>,
     pub cost_variance: Option<Rate>,
+    // Stored as read, like the progress above; the scheduler neither uses
+    // nor refreshes them.
+    /// How the work is spread over time: 0 flat .. 8 contoured.
+    pub work_contour: Option<u8>,
+    pub fixed_material: Option<bool>,
+    pub has_fixed_rate_units: Option<bool>,
+    /// The assignment's own dates, which differ from its task's when it is
+    /// delayed or contoured.
+    pub start: Option<DateTime>,
+    pub finish: Option<DateTime>,
+    /// Work less overtime, in whole minutes. An edit that changes `work_min`
+    /// clears it, since keeping it would assert overtime nobody entered.
+    pub regular_work_min: Option<i64>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     pub baselines: Vec<AssignmentBaseline>,
 }

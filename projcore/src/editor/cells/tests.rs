@@ -1294,6 +1294,87 @@ fn duplicate_assignments_of_one_resource_survive_an_unchanged_commit() {
 }
 
 #[test]
+fn units_edits_keep_imported_assignment_fields_but_clear_regular_work() {
+    for prompt in [false, true] {
+        let mut ed = editor();
+        ed.set_resources(10, &["Alice".into()]).unwrap();
+        let a = &mut ed.proj.assignments[0];
+        a.work_contour = Some(3);
+        a.fixed_material = Some(false);
+        a.has_fixed_rate_units = Some(true);
+        a.start = Some(DateTime::from_ymd_hm(2026, 3, 3, 8, 0));
+        a.finish = Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0));
+        a.regular_work_min = Some(480);
+        let imported = a.clone();
+        if prompt {
+            ed.assign_resource(10, "Alice[50%]").unwrap();
+        } else {
+            ed.set_resources(10, &["Alice[50%]".into()]).unwrap();
+        }
+        // Regular work was the old Work less overtime; kept, it would invent overtime.
+        let a = &ed.proj.assignments[0];
+        assert_eq!((a.units, a.work_min, a.regular_work_min), (0.5, 240, None));
+        assert_eq!(
+            Assignment {
+                units: imported.units,
+                work_min: imported.work_min,
+                regular_work_min: imported.regular_work_min,
+                ..a.clone()
+            },
+            imported,
+            "prompt: {prompt}"
+        );
+    }
+}
+
+#[test]
+fn new_resources_and_assignments_write_none_of_the_imported_fields() {
+    let mut ed = editor();
+    ed.set_resources(10, &["Alice".into()]).unwrap();
+    ed.assign_resource(20, "Bob").unwrap();
+    assert_eq!(ed.proj.resources.len(), 2);
+    assert_eq!(ed.proj.assignments.len(), 2);
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    let section = |name: &str| {
+        let open = xml.find(&format!("<{name}>")).unwrap();
+        &xml[open..xml.find(&format!("</{name}>")).unwrap()]
+    };
+    for name in [
+        "WorkGroup",
+        "PeakUnits",
+        "OverAllocated",
+        "CanLevel",
+        "Work",
+        "RegularWork",
+        "RemainingWork",
+        "StandardRateFormat",
+        "OvertimeRateFormat",
+        "IsGeneric",
+        "IsInactive",
+        "BookingType",
+        "IsBudget",
+    ] {
+        assert!(
+            !section("Resources").contains(&format!("<{name}>")),
+            "{name}"
+        );
+    }
+    for name in [
+        "Finish",
+        "HasFixedRateUnits",
+        "FixedMaterial",
+        "RegularWork",
+        "Start",
+        "WorkContour",
+    ] {
+        assert!(
+            !section("Assignments").contains(&format!("<{name}>")),
+            "{name}"
+        );
+    }
+}
+
+#[test]
 fn typed_dates_resolve_derived_calendars_like_the_scheduler() {
     // Two calendars share UID 1, the second with a 07:00-19:00 Monday; a task
     // on calendar 2, derived from 1 with Tuesday off.

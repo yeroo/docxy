@@ -192,3 +192,76 @@ fn headless_save_keeps_project_options() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Issue #84: saving dropped each rate's display unit, booking type, resource flags and
+/// assignment contours, so a daily rate could reopen read as hourly.
+#[test]
+fn headless_save_keeps_resource_and_assignment_fields() {
+    let dir = std::env::temp_dir().join(format!("yppxy-cli-save-issue84-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mspdi/13-resource-fields.xml");
+    let source = std::fs::read_to_string(&input).unwrap();
+    let section = |xml: &str, name: &str| {
+        let open = xml.find(&format!("<{name}>")).unwrap();
+        xml[open..xml.find(&format!("</{name}>")).unwrap()].to_string()
+    };
+    for name in ["out.xml", "out.yppx"] {
+        let target = dir.join(name);
+        let result = yppxy_save(Some(&input), &target);
+        assert!(
+            result.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = std::fs::read(&target).unwrap();
+        // The .yppx package wraps the same MSPDI part; read it to reach it.
+        let xml = if name.ends_with(".xml") {
+            String::from_utf8(bytes).unwrap()
+        } else {
+            projcore::mspdi::write_mspdi(&projcore::yppx::read_yppx(&bytes).unwrap())
+        };
+        for (section_name, elements) in [
+            (
+                "Resources",
+                &[
+                    "<StandardRateFormat>3</StandardRateFormat>",
+                    "<OvertimeRateFormat>4</OvertimeRateFormat>",
+                    "<BookingType>1</BookingType>",
+                    "<IsGeneric>1</IsGeneric>",
+                    "<IsBudget>1</IsBudget>",
+                    "<IsInactive>0</IsInactive>",
+                    "<IsInactive>1</IsInactive>",
+                    "<CanLevel>1</CanLevel>",
+                    "<WorkGroup>1</WorkGroup>",
+                    "<PeakUnits>1</PeakUnits>",
+                    "<OverAllocated>0</OverAllocated>",
+                    "<Work>PT16H0M0S</Work>",
+                    "<RegularWork>PT16H0M0S</RegularWork>",
+                    "<RemainingWork>PT16H0M0S</RemainingWork>",
+                ][..],
+            ),
+            (
+                "Assignments",
+                &[
+                    "<WorkContour>0</WorkContour>",
+                    "<FixedMaterial>0</FixedMaterial>",
+                    "<HasFixedRateUnits>1</HasFixedRateUnits>",
+                    "<Start>2026-03-02T08:00:00</Start>",
+                    "<Finish>2026-03-03T17:00:00</Finish>",
+                    "<RegularWork>PT16H0M0S</RegularWork>",
+                    "<RemainingWork>PT16H0M0S</RemainingWork>",
+                    "<PercentWorkComplete>0</PercentWorkComplete>",
+                ][..],
+            ),
+        ] {
+            assert!(section(&source, section_name).contains(elements[0]));
+            let saved = section(&xml, section_name);
+            for element in elements {
+                assert!(saved.contains(element), "{name}: lost {element}");
+            }
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

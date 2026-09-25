@@ -258,6 +258,8 @@ impl Editor {
             if let Some(u) = units {
                 a.units = u;
                 a.work_min = work_for(duration, u);
+                // Regular work is Work less overtime; a stale value would invent overtime.
+                a.regular_work_min = None;
                 changed = true;
             }
         }
