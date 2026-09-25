@@ -758,7 +758,7 @@ impl<'a> Scheduler<'a> {
             if !t.summary {
                 continue;
             }
-            let kids = descendant_leaves(self.proj, i);
+            let kids = descendant_leaves(self.proj, i, &leaves);
             let child: Vec<&TaskResult> = kids.iter().filter_map(|u| results.get(u)).collect();
             if child.is_empty() {
                 continue;
@@ -987,16 +987,18 @@ fn topo_order(
     order
 }
 
-/// UIDs of the leaf tasks nested under the summary at position `sidx` (those
-/// following rows with a deeper outline level, until the level returns).
-fn descendant_leaves(proj: &Project, sidx: usize) -> Vec<i32> {
+/// UIDs of the scheduled leaves nested under the summary at position `sidx`
+/// (following rows with a deeper outline level, until the level returns).
+/// Membership is by position in `leaves` (sorted), so a dropped leaf cannot
+/// pull in a scheduled task elsewhere that shares its UID.
+fn descendant_leaves(proj: &Project, sidx: usize, leaves: &[usize]) -> Vec<i32> {
     let level = proj.tasks[sidx].outline_level;
     let mut out = Vec::new();
-    for t in &proj.tasks[sidx + 1..] {
+    for (i, t) in proj.tasks.iter().enumerate().skip(sidx + 1) {
         if t.outline_level <= level {
             break;
         }
-        if !t.summary {
+        if leaves.binary_search(&i).is_ok() {
             out.push(t.uid);
         }
     }
@@ -1007,6 +1009,9 @@ fn descendant_leaves(proj: &Project, sidx: usize) -> Vec<i32> {
 /// computed [`Schedule`].
 /// Leaves with no working time have no result. Readers reject files containing
 /// such leaves, and structural editor operations validate newly exposed leaves.
+///
+/// Task UIDs must be unique: results, links and assignments are keyed by UID.
+/// Readers reject duplicates; a code-built project must not contain them.
 pub fn schedule(proj: &Project) -> Schedule {
     Scheduler::new(proj).run()
 }
@@ -1346,7 +1351,7 @@ impl Scheduler<'_> {
             if !t.summary {
                 continue;
             }
-            let kids = descendant_leaves(self.proj, i);
+            let kids = descendant_leaves(self.proj, i, &leaves);
             let cs: Vec<DateTime> = kids.iter().filter_map(|u| start.get(u).copied()).collect();
             let cf: Vec<DateTime> = kids.iter().filter_map(|u| finish.get(u).copied()).collect();
             if let (Some(&s), Some(&f)) = (cs.iter().min(), cf.iter().max()) {
@@ -3343,6 +3348,14 @@ mod tests {
         assert_eq!(task_duration_min(&proj, &s, &task(99, "Ghost", 480)), None);
     }
 
+    fn child(uid: i32, name: &str, duration: i64, calendar: i32) -> Task {
+        Task {
+            outline_level: 2,
+            calendar_uid: Some(calendar),
+            ..task(uid, name, duration)
+        }
+    }
+
     fn phase(uid: i32) -> Task {
         Task {
             summary: true,
@@ -3387,5 +3400,44 @@ mod tests {
             assert_eq!(actual.get(1), expected.get(1));
             assert_eq!(actual.project_finish, expected.project_finish);
         }
+    }
+
+    #[test]
+    fn rollup_ignores_an_unscheduled_leaf_sharing_a_uid() {
+        // Summary 10 holds valid leaf 2 and dropped leaf 5; a valid task 5
+        // outside it runs a week later and must not widen the summary.
+        let mut outside = task(5, "Outside", 2400);
+        outside.predecessors.push(fs(2));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![
+                phase(10),
+                child(2, "Valid", 480, 1),
+                child(5, "Closed", 480, 3),
+                outside,
+            ],
+            calendars: vec![Calendar::standard(1), closed_calendar(3)],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        let (sum, kid) = (s.get(10).unwrap(), s.get(2).unwrap());
+        assert!(s.get(5).unwrap().early_finish > kid.early_finish);
+        assert_eq!(
+            (
+                sum.early_start,
+                sum.early_finish,
+                sum.late_start,
+                sum.late_finish
+            ),
+            (
+                kid.early_start,
+                kid.early_finish,
+                kid.late_start,
+                kid.late_finish
+            )
+        );
+        let lv = level(&proj);
+        assert_eq!(lv.start(10), lv.start(2));
+        assert_eq!(lv.finish(10), lv.finish(2));
     }
 }
