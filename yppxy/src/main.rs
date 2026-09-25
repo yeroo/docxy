@@ -308,6 +308,8 @@ enum PromptKind {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum ConfirmAction {
     Exit,
+    /// Delete this task and its subtasks.
+    DeleteTask(i32),
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
@@ -457,6 +459,7 @@ impl App {
                 self.confirm = None;
                 match action {
                     ConfirmAction::Exit => self.quit = true,
+                    ConfirmAction::DeleteTask(uid) => self.delete_subtree(uid),
                 }
             }
         }
@@ -687,11 +690,30 @@ impl App {
         }
     }
 
+    /// Delete the selected task; a summary asks first, because its subtasks
+    /// go with it.
     fn delete_task(&mut self) {
-        if let Some(uid) = self.ed.selected_uid() {
-            if let Err(message) = self.ed.delete_task(uid) {
-                self.status = message;
+        let Some(uid) = self.ed.selected_uid() else {
+            return;
+        };
+        match self.ed.subtree_len(uid) {
+            Ok(0) => self.delete_subtree(uid),
+            Ok(n) => {
+                let name = self.ed.project().task(uid).map_or("", |t| &t.name);
+                let noun = if n == 1 { "subtask" } else { "subtasks" };
+                self.confirm = Some(backstage::Confirm::new(
+                    format!("Delete '{name}' and its {n} {noun}?"),
+                    ConfirmAction::DeleteTask(uid),
+                    Color::Yellow,
+                ));
             }
+            Err(message) => self.status = message,
+        }
+    }
+
+    fn delete_subtree(&mut self, uid: i32) {
+        if let Err(message) = self.ed.delete_task(uid) {
+            self.status = message;
         }
     }
 
@@ -2570,6 +2592,49 @@ mod tests {
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
         );
         assert!(app.quit);
+    }
+
+    #[test]
+    fn deleting_a_summary_asks_first_and_takes_its_subtasks() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.add_task();
+        for row in [1, 2] {
+            app.ed.select(row);
+            app.indent(1); // tasks 2 and 3 under task 1
+        }
+        let before = app.ed.project().clone();
+        let depth = app.ed.undo_depth();
+        let delete = || KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
+
+        // A leaf goes at once.
+        on_key(&mut app, delete());
+        assert!(app.confirm.is_none());
+        assert_eq!(app.ed.project().tasks.len(), 2);
+        assert!(app.ed.undo());
+
+        // A summary asks; No/Esc keeps everything, with no undo entry.
+        app.ed.select(0);
+        on_key(&mut app, delete());
+        let prompt = app.confirm.as_ref().unwrap().prompt().to_string();
+        assert_eq!(prompt, "Delete 'New task' and its 2 subtasks?");
+        on_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm.is_none());
+        assert_eq!(app.ed.project(), &before);
+        assert_eq!(
+            (app.ed.undo_depth(), app.ed.redo_depth()),
+            (depth, 1),
+            "history holds only the undone leaf delete"
+        );
+
+        // Yes deletes the summary and its subtasks in one undo step.
+        on_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        on_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(app.confirm.is_none());
+        assert!(!app.quit);
+        assert!(app.ed.project().tasks.is_empty());
+        assert!(app.ed.undo());
+        assert_eq!(app.ed.project(), &before);
     }
 
     #[test]
