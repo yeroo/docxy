@@ -648,9 +648,10 @@ impl<'a> Scheduler<'a> {
             // Every task must finish by the project finish, even when an
             // SS/SF successor only bounds its start.
             let mut finish_abs = project_finish_abs;
-            // The latest instant the successor bounds allow. A zero-lag FS
-            // successor lets a milestone sit at its late start itself, even
-            // on the morning side of the index `finish_abs` holds.
+            // The latest instant the successor bounds allow. A milestone's
+            // start and finish are one instant, so a zero-lag link bounds it
+            // by the successor's own late start (FS, SS) or late finish (FF,
+            // SF), even on the morning side of the index `finish_abs` holds.
             let mut bound_instant = project_finish_abs;
             if let Some(list) = succs.get(&t.uid) {
                 for &(suid, link, lag) in list {
@@ -673,8 +674,12 @@ impl<'a> Scheduler<'a> {
                     };
                     if let Some(c) = cand {
                         finish_abs = finish_abs.min(c);
-                        let allowed = match (link, sls) {
-                            (LinkType::FinishStart, Some(x)) if span == 0 && lag == 0 => x,
+                        let endpoint = match link {
+                            LinkType::FinishStart | LinkType::StartStart => sls,
+                            LinkType::FinishFinish | LinkType::StartFinish => slf,
+                        };
+                        let allowed = match endpoint {
+                            Some(x) if span == 0 && lag == 0 => x,
                             _ => c,
                         };
                         bound_instant = bound_instant.min(allowed);
@@ -733,8 +738,9 @@ impl<'a> Scheduler<'a> {
                 // reuse the early instants unless a hard date set that bound.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                // A binding MFO/FNLT milestone sits on its constraint instant,
-                // which can be the morning side of the deadline's index.
+                // A binding MFO/FNLT milestone sits on its constraint instant
+                // (an FNLT capped by the successor bound), which can be the
+                // morning side of the deadline's index.
                 if let Some(m) = milestone_late {
                     debug_assert_eq!(tl.to_index(m), finish_index);
                 }
@@ -1604,6 +1610,41 @@ mod tests {
             assert_eq!(m.late_finish, friday, "{case}");
             assert!(m.late_finish <= sched.project_finish, "{case}");
             assert_eq!(m.total_slack_min, 960, "{case}");
+        }
+    }
+
+    #[test]
+    fn fnlt_milestone_morning_deadline_holds_for_every_zero_lag_successor_link() {
+        // A zero-lag successor bounds the milestone's one instant by its own
+        // late start or finish, so no link type maps LF to the prior evening.
+        let monday = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
+        for link in [
+            LinkType::FinishStart,
+            LinkType::StartStart,
+            LinkType::FinishFinish,
+            LinkType::StartFinish,
+        ] {
+            let mut proj = finish_constrained_milestone(
+                2880,
+                ConstraintType::FinishNoLaterThan,
+                monday,
+                true,
+                true,
+            );
+            let mut b = task(3, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 2,
+                link,
+                lag_min: 0,
+            });
+            proj.tasks.push(b);
+            let sched = schedule(&proj);
+            let m = sched.get(2).unwrap();
+            assert_eq!(m.early_start, monday, "{link:?}");
+            assert_eq!(m.early_finish, monday, "{link:?}");
+            assert_eq!(m.late_start, monday, "{link:?}");
+            assert_eq!(m.late_finish, monday, "{link:?}");
+            assert_eq!(m.total_slack_min, -480, "{link:?}");
         }
     }
 
