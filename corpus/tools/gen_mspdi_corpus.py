@@ -112,28 +112,24 @@ def blank_row(uid, oid, fields=()):
     return "\n".join(lines)
 
 
-def weekday(day_type, working, times):
-    """One <WeekDay>. day_type: 1=Sun..7=Sat. times: list of (from, to) 'HH:MM:SS'."""
-    out = [f"    <WeekDay><DayType>{day_type}</DayType>"
-           f"<DayWorking>{1 if working else 0}</DayWorking>"]
-    if working and times:
-        out.append("      <WorkingTimes>")
-        for (f, t) in times:
-            out.append(f"        <WorkingTime><FromTime>{f}</FromTime>"
-                       f"<ToTime>{t}</ToTime></WorkingTime>")
-        out.append("      </WorkingTimes>")
-    out.append("    </WeekDay>")
-    return "\n".join(out)
-
-
-SHIFT = [("08:00:00", "12:00:00"), ("13:00:00", "17:00:00")]
-
-
 def working_times(times):
     return (["      <WorkingTimes>"]
             + [f"        <WorkingTime><FromTime>{f}</FromTime><ToTime>{t}</ToTime></WorkingTime>"
                for (f, t) in times]
             + ["      </WorkingTimes>"])
+
+
+def weekday(day_type, working, times):
+    """One <WeekDay>. day_type: 1=Sun..7=Sat. times: list of (from, to) 'HH:MM:SS'."""
+    out = [f"    <WeekDay><DayType>{day_type}</DayType>"
+           f"<DayWorking>{1 if working else 0}</DayWorking>"]
+    if working and times:
+        out += working_times(times)
+    out.append("    </WeekDay>")
+    return "\n".join(out)
+
+
+SHIFT = [("08:00:00", "12:00:00"), ("13:00:00", "17:00:00")]
 
 
 def exception_legacy(ex):
