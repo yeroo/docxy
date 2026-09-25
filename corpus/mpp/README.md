@@ -107,8 +107,17 @@ with a licensed Project desktop install and pywin32:
 python corpus/tools/gen_mpp_order_cases.py
 ```
 
-The generated `.mpp` and `.xml` files stay git-ignored. The generator source is
-kept with the fetch scripts in `corpus/tools/`.
+The test also checks eight task-mode cases in `manual/` when present: one
+task switched auto to manual, a manual task beside auto ones, the new-task
+default set to manual, and attempts to make manual dates differ from the
+scheduled ones. Generate them the same way:
+
+```powershell
+python corpus/tools/gen_mpp_manual_cases.py
+```
+
+The generated `.mpp` and `.xml` files stay git-ignored. The generator sources
+are kept with the fetch scripts in `corpus/tools/`.
 
 1. Drop a few `.mpp` files here, ideally spanning Project versions and with the
    same schedule saved *both* as `.mpp` and as MSPDI `.xml` (File ▸ Save As ▸
@@ -173,7 +182,20 @@ Current Project blank rows are identified by their short FixedMeta record and
 omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
 row ID order. Resources, assignments, calendars, baselines, progress,
-constraints, and custom fields are not imported. MPP9
+constraints, and custom fields are not imported.
+
+Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
+byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and
+duration are at +50, +54 and +58 of its 64-byte `Fixed2Data` record. The
+duration is in tenths of a minute, followed at +62 by its MSPDI DurationFormat.
+An elapsed manual duration has no oracle yet and is left unknown. Fixed2 records
+carry no UID, so their pairing with FixedMeta rows is checked by the task GUID
+and row sort key at +0 and +16. An auto task's manual bytes can be stale (a
+moved row keeps them with a zero duration), and Project's MSPDI export derives
+its ManualStart/Finish/Duration from Start/Finish/Duration, so they are not
+decoded. None of the `manual/` attempts saved manual dates that differ from the
+scheduled ones. The project's `NewTasksAreManual` is the 2-byte `Props` entry
+`0x024013C8` (`0000` or `ff00`). Legacy MPP9 files have no manual tasks. MPP9
 link records in the local samples all have zero lag and LagFormat 7, so nonzero
 legacy lag has no oracle yet. Newest Project links have positive and negative
 lag examples checked against MSPDI.
