@@ -92,6 +92,24 @@ impl ProjectView {
         true
     }
 
+    /// The table and chart scrollbars' handles. Each strip is drawn at the width
+    /// its handle clamps against: gpui-component takes the track length from the
+    /// strip, so the two must be the same number.
+    pub fn pane_scrolls(&self) -> (PaneScroll, PaneScroll) {
+        (
+            PaneScroll {
+                offset: self.table_x.clone(),
+                content: TABLE_W,
+                viewport: self.table_w,
+            },
+            PaneScroll {
+                offset: self.gantt_x.clone(),
+                content: self.scale.width(),
+                viewport: self.gantt_w,
+            },
+        )
+    }
+
     pub fn pan_gantt(&mut self, right: bool) {
         self.gantt_x
             .set(self.gantt_x.get() + if right { DAY_W } else { -DAY_W });
@@ -715,18 +733,8 @@ pub(super) fn project_el(
         view.gantt_x.get(),
         view.scale,
     );
-    // Each strip is drawn at the width its handle clamps against: gpui-component
-    // takes the track length from the strip, so the two must be the same number.
-    let table_bar = PaneScroll {
-        offset: view.table_x.clone(),
-        content: TABLE_W,
-        viewport: table_w,
-    };
-    let chart_bar = PaneScroll {
-        offset: view.gantt_x.clone(),
-        content: scale.width(),
-        viewport: gantt_w,
-    };
+    let (table_bar, chart_bar) = view.pane_scrolls();
+    let vbar = harness::region_name(harness::Region::ProjectVbar);
     let row_probes = probes.clone();
     v_flex()
         .flex_1()
@@ -856,10 +864,10 @@ pub(super) fn project_el(
                         .right_0()
                         .bottom_0()
                         .w(px(SCROLLBAR_W))
-                        .child(probe(probes, "project-vbar"))
+                        .child(probe(probes, vbar.clone()))
                         .child(
                             Scrollbar::vertical(&view.scroll)
-                                .id("project-vbar")
+                                .id(SharedString::from(vbar))
                                 .scrollbar_show(ScrollbarShow::Always),
                         ),
                 ),
@@ -870,27 +878,37 @@ pub(super) fn project_el(
                 .h(px(SCROLLBAR_W))
                 .flex_none()
                 .bg(pal.panel)
-                .child(hbar_strip(table_bar, "project-hbar-table", probes))
+                .child(hbar_strip(
+                    table_bar,
+                    harness::Region::ProjectHbarTable,
+                    probes,
+                ))
                 .child(div().w(px(GANTT_INSET)).h_full().flex_none())
-                .child(hbar_strip(chart_bar, "project-hbar-chart", probes))
+                .child(hbar_strip(
+                    chart_bar,
+                    harness::Region::ProjectHbarChart,
+                    probes,
+                ))
                 .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
         )
 }
 
 fn hbar_strip(
     bar: PaneScroll,
-    id: &'static str,
+    region: harness::Region,
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
 ) -> impl IntoElement {
+    // One name for the probe, the Scrollbar's state id and the harness region.
+    let id = harness::region_name(region);
     div()
         .relative()
         .w(px(bar.viewport))
         .h_full()
         .flex_none()
-        .child(probe(probes, id))
+        .child(probe(probes, id.clone()))
         .child(
             Scrollbar::horizontal(&bar)
-                .id(id)
+                .id(SharedString::from(id))
                 .scrollbar_show(ScrollbarShow::Always),
         )
 }

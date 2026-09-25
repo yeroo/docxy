@@ -196,23 +196,29 @@ fn pane_scroll_maps_gpui_offsets_and_clamps_both_ends() {
 fn table_and_chart_scrollbars_move_only_their_own_pane() {
     let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
     v.layout(1180.);
-    let table = PaneScroll {
-        offset: v.table_x.clone(),
-        content: TABLE_W,
-        viewport: v.table_w,
-    };
-    let chart = PaneScroll {
-        offset: v.gantt_x.clone(),
-        content: v.scale.width(),
-        viewport: v.gantt_w,
-    };
+    // The handles project_el renders.
+    let (table, chart) = v.pane_scrolls();
+    assert_eq!(
+        (table.content, table.viewport),
+        (TABLE_W, v.table_w),
+        "the table bar spans the table"
+    );
+    assert_eq!(
+        (chart.content, chart.viewport),
+        (v.scale.width(), v.gantt_w),
+        "the chart bar spans the timescale"
+    );
     table.set_offset(point(px(-100.), px(0.)));
     assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 0.));
     chart.set_offset(point(px(-200.), px(0.)));
     assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 200.));
-    // The next frame's layout keeps both where the bars put them.
+    // Offsets changed by keys show on the bars.
+    v.pan_gantt(true);
+    assert_eq!(chart.offset(), point(px(-(200. + DAY_W)), px(0.)));
+    assert_eq!(table.offset(), point(px(-100.), px(0.)));
+    // The next frame's layout keeps both where they were put.
     v.layout(1180.);
-    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 200.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 200. + DAY_W));
 }
 
 #[test]
