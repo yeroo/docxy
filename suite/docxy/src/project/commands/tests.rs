@@ -676,3 +676,70 @@ fn project_info_has_schedule_counts_and_outline_bullets() {
     assert_eq!(info[3], "• Phase");
     assert_eq!(info[4], "  • A");
 }
+
+/// `First` as a summary over `Second`, with the summary selected.
+fn summary_tab() -> DocTab {
+    let mut t = tab();
+    vm(&mut t).ed.indent(2, 1).unwrap();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).ed.mark_saved();
+    t
+}
+
+#[test]
+fn deleting_a_summary_asks_first_and_escape_changes_nothing() {
+    let mut t = summary_tab();
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    let prompt = v(&t).prompt.clone().expect("a summary delete asks first");
+    assert_eq!(prompt.kind, PromptKind::ConfirmDelete);
+    assert_eq!(prompt.kind.name(), "delete");
+    assert_eq!(
+        prompt_label(&prompt, &v(&t).ed).as_ref(),
+        "Delete 'First' and its 1 subtask? Enter = delete, Esc = cancel"
+    );
+    assert_eq!(v(&t).ed.project(), &before);
+
+    // Typing and backspace do not fill a yes/no prompt.
+    project_input(&mut t, "d", Some("d"), Modifiers::default());
+    project_input(&mut t, "backspace", None, Modifiers::default());
+    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "");
+
+    project_input(&mut t, "escape", None, Modifiers::default());
+    assert!(v(&t).prompt.is_none());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    assert!(!t.dirty);
+}
+
+#[test]
+fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
+    let mut t = summary_tab();
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    project_input(&mut t, "enter", None, Modifiers::default());
+    assert!(v(&t).prompt.is_none());
+    assert!(v(&t).ed.project().tasks.is_empty());
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(t.dirty);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project(), &before);
+
+    // The prompt bar's Delete button commits through the same path as Enter.
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    let prompt = vm(&mut t).prompt.take().unwrap();
+    commit_prompt(&mut t, prompt);
+    assert!(v(&t).ed.project().tasks.is_empty());
+}
+
+#[test]
+fn deleting_a_leaf_needs_no_confirmation() {
+    let mut t = summary_tab();
+    vm(&mut t).ed.select(1);
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    assert!(v(&t).prompt.is_none());
+    assert_eq!(v(&t).ed.project().tasks.len(), 1);
+    assert!(!v(&t).ed.project().tasks[0].summary);
+}

@@ -304,6 +304,8 @@ pub(crate) enum PromptKind {
     Constraint,
     Assign,
     Find,
+    /// Yes/no: delete the prompt's summary and its subtasks.
+    ConfirmDelete,
 }
 impl PromptKind {
     pub fn name(self) -> &'static str {
@@ -314,7 +316,12 @@ impl PromptKind {
             Self::Constraint => "constraint",
             Self::Assign => "assign",
             Self::Find => "find",
+            Self::ConfirmDelete => "delete",
         }
+    }
+    /// A confirmation has no input box, so typing must not fill its buffer.
+    fn takes_text(self) -> bool {
+        self != Self::ConfirmDelete
     }
     fn label(self) -> &'static str {
         match self {
@@ -324,8 +331,24 @@ impl PromptKind {
             Self::Constraint => "Constraint (TYPE [date])",
             Self::Assign => "Assign resource (empty to clear)",
             Self::Find => "Find",
+            Self::ConfirmDelete => "Delete",
         }
     }
+}
+
+/// The prompt bar's label. A delete confirmation names the task and how many
+/// subtasks go with it, read from the editor so it cannot go stale.
+pub(crate) fn prompt_label(p: &ProjectPrompt, ed: &ProjectEditor) -> SharedString {
+    if p.kind != PromptKind::ConfirmDelete {
+        return p.kind.label().into();
+    }
+    let Some(uid) = p.uid else {
+        return p.kind.label().into();
+    };
+    let name = ed.project().task(uid).map_or("", |t| &t.name);
+    let n = ed.subtree_len(uid).unwrap_or(0);
+    let noun = if n == 1 { "subtask" } else { "subtasks" };
+    format!("Delete '{name}' and its {n} {noun}? Enter = delete, Esc = cancel").into()
 }
 
 #[derive(Clone, Debug)]
@@ -422,12 +445,14 @@ pub(crate) fn project_input(
             "escape" => {}
             "enter" => commit_prompt(tab, prompt),
             "backspace" => {
-                prompt.buf.pop();
+                if prompt.kind.takes_text() {
+                    prompt.buf.pop();
+                }
                 v.prompt = Some(prompt);
             }
             "tab" => v.prompt = Some(prompt),
             _ => {
-                if let Some(text) = text {
+                if let Some(text) = text.filter(|_| prompt.kind.takes_text()) {
                     prompt.buf.extend(text.chars().filter(|c| !c.is_control()));
                 }
                 v.prompt = Some(prompt);
@@ -517,6 +542,9 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
             )));
         }
         PromptKind::Assign => return assign_status(&mut v.ed, uid, &p.buf),
+        PromptKind::ConfirmDelete => {
+            v.ed.delete_task(uid)?;
+        }
         PromptKind::Find => unreachable!(),
     }
     Ok(None)
@@ -562,7 +590,12 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             }
             DeleteTask => {
                 if let Some(uid) = v.ed.selected_uid() {
-                    v.ed.delete_task(uid)?;
+                    // A summary takes its subtasks with it, so ask first.
+                    if v.ed.subtree_len(uid)? > 0 {
+                        v.open_prompt(PromptKind::ConfirmDelete);
+                    } else {
+                        v.ed.delete_task(uid)?;
+                    }
                 }
             }
             Milestone => {
@@ -773,6 +806,17 @@ impl Docxy {
         }
         self.refocus(window, cx);
     }
+    /// The prompt bar's confirm button: the same commit as Enter.
+    pub(crate) fn project_prompt_confirm(&mut self) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if let Surface::Project(v) = &mut tab.surface {
+            if let Some(prompt) = v.prompt.take() {
+                commit_prompt(tab, prompt);
+            }
+        }
+    }
     pub(crate) fn project_prompt_cancel(&mut self) {
         if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
             v.cancel_prompt();
@@ -845,6 +889,7 @@ impl Docxy {
             return None;
         };
         let prompt = v.prompt.as_ref()?;
+        let confirm = !prompt.kind.takes_text();
         Some(
             h_flex()
                 .w_full()
@@ -859,23 +904,40 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(pal.dim)
-                        .child(prompt.kind.label()),
+                        .text_color(if confirm { pal.fg } else { pal.dim })
+                        .child(prompt_label(prompt, &v.ed)),
                 )
-                .child(
-                    h_flex()
-                        .min_w(px(180.))
-                        .max_w(px(500.))
-                        .h(px(24.))
-                        .px_2()
-                        .items_center()
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(hsla_u(BRAND))
-                        .text_color(pal.fg)
-                        .child(prompt.buf.clone())
-                        .child(div().w(px(1.5)).h(px(14.)).bg(hsla_u(BRAND))),
-                )
+                // A yes/no question gets a button, not an input box.
+                .when(confirm, |bar| {
+                    bar.child(
+                        div()
+                            .id("project-prompt-confirm")
+                            .px_2()
+                            .cursor_pointer()
+                            .text_color(hsla_u(BRAND))
+                            .child(prompt.kind.label())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.project_prompt_confirm();
+                                this.refocus(window, cx);
+                            })),
+                    )
+                })
+                .when(!confirm, |bar| {
+                    bar.child(
+                        h_flex()
+                            .min_w(px(180.))
+                            .max_w(px(500.))
+                            .h(px(24.))
+                            .px_2()
+                            .items_center()
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(hsla_u(BRAND))
+                            .text_color(pal.fg)
+                            .child(prompt.buf.clone())
+                            .child(div().w(px(1.5)).h(px(14.)).bg(hsla_u(BRAND))),
+                    )
+                })
                 .child(
                     div()
                         .id("project-prompt-cancel")
