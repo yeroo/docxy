@@ -604,12 +604,12 @@ fn assignment_find_leveling_recalc_and_navigation_statuses() {
     apply_project_act(&mut t, ProjectAct::Recalc);
     assert_eq!(t.status.as_ref(), "Rescheduled (automatic on every edit)");
     apply_project_act(&mut t, ProjectAct::ScrollRight);
-    assert_eq!(v(&t).gantt_x, DAY_W);
+    assert_eq!(v(&t).gantt_x.get(), DAY_W);
     apply_project_act(&mut t, ProjectAct::ScrollLeft);
-    assert_eq!(v(&t).gantt_x, 0.);
+    assert_eq!(v(&t).gantt_x.get(), 0.);
     apply_project_act(&mut t, ProjectAct::ScrollRight);
     apply_project_act(&mut t, ProjectAct::GoToStart);
-    assert_eq!(v(&t).gantt_x, 0.);
+    assert_eq!(v(&t).gantt_x.get(), 0.);
 }
 
 #[test]

@@ -356,8 +356,11 @@ Comparison is case-insensitive, and `is not` negates.
 ### Regions
 
 `window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
-`bar:<id>` (for example `bar:3`). `gantt` is the visible Project timeline body,
-excluding its header and divider; `bar:<id>` addresses a task by displayed ID. Inside a
+`bar:<id>` (for example `bar:3`), `project-hbar-table`, `project-hbar-chart`,
+`project-vbar`. `gantt` is the visible Project timeline body, excluding its header,
+divider and vertical scrollbar; `bar:<id>` addresses a task by displayed ID. The
+`project-*` regions are the Project tab's three scrollbar strips: under the table, under
+the chart, and down the right edge of the rows. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 

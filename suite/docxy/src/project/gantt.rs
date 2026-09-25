@@ -125,16 +125,18 @@ pub(crate) fn intersect(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Option<Bounds<P
     (!r.is_empty()).then_some(r)
 }
 
-pub(crate) fn gantt_viewport(body: Bounds<Pixels>, table_w: f32) -> Option<Bounds<Pixels>> {
+/// The chart is `gantt_w` wide, so the vertical scrollbar right of it is not chart.
+pub(crate) fn gantt_viewport(
+    body: Bounds<Pixels>,
+    table_w: f32,
+    gantt_w: f32,
+) -> Option<Bounds<Pixels>> {
     let chart_x = table_w + GANTT_INSET;
     intersect(
         body,
         Bounds {
             origin: point(body.origin.x + px(chart_x), body.origin.y),
-            size: size(
-                (body.size.width - px(chart_x)).max(px(0.)),
-                body.size.height,
-            ),
+            size: size(px(gantt_w), body.size.height),
         },
     )
 }
@@ -201,8 +203,14 @@ fn backdrop(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> impl IntoEl
 pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
     // The handle the list tracks, so the rules cannot drift from the rows.
     let scroll = view.scroll.clone();
-    let (table_w, table_x, gantt_x, scale) =
-        (view.table_w, view.table_x, view.gantt_x, view.chart_scale());
+    // The same widths and offsets the rows are drawn at this render.
+    let (table_w, gantt_w, table_x, gantt_x, scale) = (
+        view.table_w,
+        view.gantt_w,
+        view.table_x.get(),
+        view.gantt_x.get(),
+        view.chart_scale(),
+    );
     let rule = Hsla {
         a: pal.border.a * 0.6,
         ..pal.border
@@ -252,7 +260,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
             });
             // The rows' inset divider, continued below the last task.
             vline(window, bounds.origin.x + px(table_w), pal.border);
-            let Some(chart) = gantt_viewport(bounds, table_w) else {
+            let Some(chart) = gantt_viewport(bounds, table_w, gantt_w) else {
                 return;
             };
             let width = f32::from(chart.size.width);

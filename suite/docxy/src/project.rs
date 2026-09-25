@@ -1,8 +1,11 @@
 //! Project tab: file/session policy and the Gantt view over the shared editor.
 use super::*;
+use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
 use projcore::editor::{Editor as ProjectEditor, untitled_project};
 use projcore::{LinkType, Project, Task, mspdi, yppx};
+use std::cell::Cell;
 use std::path::Path;
+use std::rc::Rc;
 mod gantt;
 pub(super) use gantt::*;
 mod commands;
@@ -13,8 +16,8 @@ pub(super) use cell::*;
 pub(super) struct ProjectView {
     pub ed: ProjectEditor,
     pub scroll: UniformListScrollHandle,
-    pub table_x: f32,
-    pub gantt_x: f32,
+    pub table_x: PaneOffset,
+    pub gantt_x: PaneOffset,
     pub table_w: f32,
     pub gantt_w: f32,
     pub scale: GanttScale,
@@ -31,10 +34,10 @@ impl ProjectView {
         Self {
             ed,
             scroll: UniformListScrollHandle::new(),
-            table_x: 0.,
-            gantt_x: 0.,
+            table_x: PaneOffset::default(),
+            gantt_x: PaneOffset::default(),
             table_w: 590.,
-            gantt_w: 590. - GANTT_INSET,
+            gantt_w: 590. - GANTT_INSET - SCROLLBAR_W,
             scale,
             prompt: None,
             col: 1,
@@ -43,11 +46,17 @@ impl ProjectView {
         }
     }
 
+    /// Runs every frame, so it reveals the selected column only on a resize:
+    /// a table-scrollbar drag that hides that column must stay where it was put.
     pub fn layout(&mut self, width: f32) {
-        self.table_w = table_pane_width(width);
-        self.gantt_w = (width - self.table_w - GANTT_INSET).max(0.);
+        let table_w = table_pane_width(width);
+        let resized = table_w != self.table_w;
+        self.table_w = table_w;
+        self.gantt_w = (width - table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
         self.refresh_schedule_layout();
-        self.reveal_col();
+        if resized {
+            self.reveal_col();
+        }
     }
 
     pub fn refresh_schedule_layout(&mut self) {
@@ -65,10 +74,8 @@ impl ProjectView {
     }
 
     fn clamp_offsets(&mut self) {
-        self.table_x = self.table_x.clamp(0., (TABLE_W - self.table_w).max(0.));
-        self.gantt_x = self
-            .gantt_x
-            .clamp(0., (self.scale.width() - self.gantt_w).max(0.));
+        self.table_x.clamp(TABLE_W, self.table_w);
+        self.gantt_x.clamp(self.scale.width(), self.gantt_w);
     }
 
     /// Navigation and horizontal scrolling only; command completion owns row reveal.
@@ -94,9 +101,72 @@ impl ProjectView {
         true
     }
 
+    /// The table and chart scrollbars' handles. Each strip is drawn at the width
+    /// its handle clamps against: gpui-component takes the track length from the
+    /// strip, so the two must be the same number.
+    pub fn pane_scrolls(&self) -> (PaneScroll, PaneScroll) {
+        (
+            PaneScroll {
+                offset: self.table_x.clone(),
+                content: TABLE_W,
+                viewport: self.table_w,
+            },
+            PaneScroll {
+                offset: self.gantt_x.clone(),
+                content: self.scale.width(),
+                viewport: self.gantt_w,
+            },
+        )
+    }
+
     pub fn pan_gantt(&mut self, right: bool) {
-        self.gantt_x += if right { DAY_W } else { -DAY_W };
+        self.gantt_x
+            .set(self.gantt_x.get() + if right { DAY_W } else { -DAY_W });
         self.clamp_offsets();
+    }
+}
+
+/// A pane's horizontal offset, shared with its scrollbar: gpui-component calls
+/// `ScrollbarHandle::set_offset` from a mouse handler that has no `Docxy` to write to.
+#[derive(Clone, Default, Debug)]
+pub(super) struct PaneOffset(Rc<Cell<f32>>);
+
+impl PaneOffset {
+    pub fn get(&self) -> f32 {
+        self.0.get()
+    }
+
+    pub fn set(&self, x: f32) {
+        self.0.set(x);
+    }
+
+    /// Keep the offset within `[0, content - viewport]`.
+    fn clamp(&self, content: f32, viewport: f32) {
+        self.set(self.get().clamp(0., (content - viewport).max(0.)));
+    }
+}
+
+/// The scrollbar's view of one horizontal pane, rebuilt each render from the
+/// same widths the pane and its strip are drawn at.
+#[derive(Clone)]
+pub(super) struct PaneScroll {
+    offset: PaneOffset,
+    content: f32,
+    viewport: f32,
+}
+
+impl ScrollbarHandle for PaneScroll {
+    fn offset(&self) -> Point<Pixels> {
+        point(px(-self.offset.get()), px(0.))
+    }
+
+    fn set_offset(&self, offset: Point<Pixels>) {
+        self.offset.set(-f32::from(offset.x));
+        self.offset.clamp(self.content, self.viewport);
+    }
+
+    fn content_size(&self) -> Size<Pixels> {
+        size(px(self.content), px(SCROLLBAR_W))
     }
 }
 
@@ -136,10 +206,21 @@ fn project_region(
     probes: &Probes,
     region: harness::Region,
 ) -> Result<Bounds<Pixels>, String> {
+    // The strips are probed under their region names; they need no Gantt viewport.
+    if let harness::Region::ProjectHbarTable
+    | harness::Region::ProjectHbarChart
+    | harness::Region::ProjectVbar = region
+    {
+        let name = harness::region_name(region);
+        return probes
+            .get(&name)
+            .ok_or_else(|| format!("the {name} scrollbar has not been laid out"));
+    }
     let body = probes
         .get("project-body")
         .ok_or("the Project body has not been laid out")?;
-    let viewport = gantt_viewport(body, v.table_w).ok_or("the Gantt viewport is empty")?;
+    let viewport =
+        gantt_viewport(body, v.table_w, v.gantt_w).ok_or("the Gantt viewport is empty")?;
     match region {
         harness::Region::Cells(r0, c0, r1, c1) => {
             if r0 != r1 || c0 != c1 || c0 >= 7 {
@@ -533,6 +614,9 @@ const WIDTHS: [f32; 7] = [48., 240., 80., 100., 100., 150., 190.];
 const TABLE_W: f32 = sum_widths();
 /// Includes the divider, leaving space between clipped table text and the chart.
 const GANTT_INSET: f32 = 6.;
+/// gpui-component's private scrollbar `WIDTH`: it paints the bar in the last 16px
+/// of its strip's cross axis, so a thinner strip clips the bar.
+const SCROLLBAR_W: f32 = 16.;
 
 const fn sum_widths() -> f32 {
     let mut total = 0.;
@@ -664,10 +748,12 @@ pub(super) fn project_el(
     let (table_w, gantt_w, table_x, gantt_x, scale) = (
         view.table_w,
         view.gantt_w,
-        view.table_x,
-        view.gantt_x,
+        view.table_x.get(),
+        view.gantt_x.get(),
         view.chart_scale(),
     );
+    let (table_bar, chart_bar) = view.pane_scrolls();
+    let vbar = harness::region_name(harness::Region::ProjectVbar);
     let row_probes = probes.clone();
     v_flex()
         .flex_1()
@@ -705,7 +791,9 @@ pub(super) fn project_el(
                     gantt_x,
                     pal,
                     gantt_header(scale, gantt_x, gantt_w, pal),
-                )),
+                ))
+                // Above the vertical scrollbar.
+                .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
         )
         .child(
             div()
@@ -791,6 +879,22 @@ pub(super) fn project_el(
                     .h_full()
                     .min_h_0(),
                 )
+                // Project's one vertical bar, shared by table and chart, over the
+                // SCROLLBAR_W that `layout` keeps out of the chart.
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .right_0()
+                        .bottom_0()
+                        .w(px(SCROLLBAR_W))
+                        .child(probe(probes, vbar.clone()))
+                        .child(
+                            Scrollbar::vertical(&view.scroll)
+                                .id(SharedString::from(vbar))
+                                .scrollbar_show(ScrollbarShow::Always),
+                        ),
+                )
                 .when(count == 0, |d| {
                     // Over the first ruled row, so the grid runs under it.
                     d.child(
@@ -806,6 +910,45 @@ pub(super) fn project_el(
                             .child("No tasks"),
                     )
                 }),
+        )
+        // Independent horizontal bars under the table and the chart, as in Project.
+        .child(
+            h_flex()
+                .h(px(SCROLLBAR_W))
+                .flex_none()
+                .bg(pal.panel)
+                .child(hbar_strip(
+                    table_bar,
+                    harness::Region::ProjectHbarTable,
+                    probes,
+                ))
+                .child(div().w(px(GANTT_INSET)).h_full().flex_none())
+                .child(hbar_strip(
+                    chart_bar,
+                    harness::Region::ProjectHbarChart,
+                    probes,
+                ))
+                .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),
+        )
+}
+
+fn hbar_strip(
+    bar: PaneScroll,
+    region: harness::Region,
+    probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
+) -> impl IntoElement {
+    // One name for the probe, the Scrollbar's state id and the harness region.
+    let id = harness::region_name(region);
+    div()
+        .relative()
+        .w(px(bar.viewport))
+        .h_full()
+        .flex_none()
+        .child(probe(probes, id.clone()))
+        .child(
+            Scrollbar::horizontal(&bar)
+                .id(SharedString::from(id))
+                .scrollbar_show(ScrollbarShow::Always),
         )
 }
 

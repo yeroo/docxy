@@ -110,7 +110,7 @@ fn snapshot(t: &DocTab) -> Snapshot {
         query: v.ed.find_query().into(),
         leveled: v.ed.leveled(),
         scroll: v.scroll.0.borrow().base_handle.offset(),
-        offsets: (v.table_x, v.gantt_x),
+        offsets: (v.table_x.get(), v.gantt_x.get()),
         reveal: v
             .scroll
             .0
@@ -195,7 +195,7 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
     vm(&mut tabs[0]).ed.undo();
     vm(&mut tabs[0]).ed.mark_saved();
     vm(&mut tabs[0]).ed.select(1);
-    vm(&mut tabs[0]).gantt_x = 20.;
+    vm(&mut tabs[0]).gantt_x.set(20.);
     vm(&mut tabs[0]).open_prompt(PromptKind::Rename);
     let before = snapshot(&tabs[0]);
     for (verb, a) in [
@@ -434,8 +434,8 @@ fn reload_commits_only_a_successful_load() {
     vm(&mut tabs[0]).ed.toggle_level();
     vm(&mut tabs[0]).ed.find("unsaved");
     vm(&mut tabs[0]).layout(400.);
-    vm(&mut tabs[0]).table_x = 20.;
-    vm(&mut tabs[0]).gantt_x = 10.;
+    vm(&mut tabs[0]).table_x.set(20.);
+    vm(&mut tabs[0]).gantt_x.set(10.);
     let scroll = view(&tabs[0]).scroll.clone();
     scroll
         .0
@@ -468,17 +468,20 @@ fn reload_commits_only_a_successful_load() {
         project_tab_from_path(&source).status.to_string()
     );
     // A shorter schedule or narrower content clamps stale offsets without replacing the view.
-    vm(&mut tabs[0]).table_x = f32::MAX;
-    vm(&mut tabs[0]).gantt_x = f32::MAX;
+    vm(&mut tabs[0]).table_x.set(f32::MAX);
+    vm(&mut tabs[0]).gantt_x.set(f32::MAX);
     call(&mut tabs, 0, "proj.reload", Json::Null).unwrap();
     let v = view(&tabs[0]);
-    assert!(v.table_x > 0. && v.table_x < f32::MAX);
-    assert_eq!(v.gantt_x, (v.scale.width() - v.gantt_w).max(0.));
-    let offsets = (v.table_x, v.gantt_x);
+    assert!(v.table_x.get() > 0. && v.table_x.get() < f32::MAX);
+    assert_eq!(v.gantt_x.get(), (v.scale.width() - v.gantt_w).max(0.));
+    let offsets = (v.table_x.get(), v.gantt_x.get());
     vm(&mut tabs[0]).col = 6;
     vm(&mut tabs[0]).key("right", false);
     vm(&mut tabs[0]).pan_gantt(true);
-    assert_eq!((view(&tabs[0]).table_x, view(&tabs[0]).gantt_x), offsets);
+    assert_eq!(
+        (view(&tabs[0]).table_x.get(), view(&tabs[0]).gantt_x.get()),
+        offsets
+    );
     tabs[0].path = None;
     let before = snapshot(&tabs[0]);
     assert!(call(&mut tabs, 0, "proj.reload", Json::Null).is_err());
