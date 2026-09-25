@@ -108,7 +108,7 @@ fn tool_defs() -> Json {
         tool(
             "yppxy_tasks",
             "List every task of the live schedule (including unsaved edits): uid, name, outline \
-             level, duration, scheduled start/finish, critical flag, slack, and predecessors.",
+             level, manual (true = Manually Scheduled), duration, scheduled start/finish, critical              flag, slack, and predecessors.",
             vec![target(), tab()],
             &[],
         ),
@@ -121,12 +121,19 @@ fn tool_defs() -> Json {
         tool(
             "yppxy_set",
             "Edit a task: rename, change duration (\"3d\", \"4h\", \"2w\"; \"0d\" = milestone), \
-             or change outline level (1..20). Undoable; the plan reschedules.",
+             change outline level (1..20), or switch between Manually and Auto Scheduled              (\"manual\": true pins the task at its current dates; false lets the scheduler              place it). One undo step; the plan reschedules.",
             vec![
                 uid(),
                 ("name", prop("string", "New task name.")),
                 ("duration", prop("string", "New duration, e.g. \"3d\".")),
                 ("level", prop("integer", "New outline level (1..20).")),
+                (
+                    "manual",
+                    prop(
+                        "boolean",
+                        "true = Manually Scheduled (pinned at its current dates), false = Auto Scheduled.",
+                    ),
+                ),
                 target(),
                 tab(),
             ],
@@ -358,6 +365,22 @@ mod tests {
                 Some("object")
             );
         }
+    }
+
+    #[test]
+    fn set_takes_the_task_mode_as_a_boolean() {
+        let defs = tool_defs();
+        let set = defs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get_str("name") == Some("yppxy_set"))
+            .unwrap();
+        let props = set.get("inputSchema").unwrap().get("properties").unwrap();
+        assert_eq!(
+            props.get("manual").unwrap().get_str("type"),
+            Some("boolean")
+        );
     }
 
     #[test]

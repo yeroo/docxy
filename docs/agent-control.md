@@ -47,7 +47,11 @@ Successful edits use the live editor's undo stack, reschedule, cancel the target
 prompt, discard its uncommitted cell edit, and repaint. Successful `proj.reload`
 also discards that tab's pending cell edit. `task.del` on a summary deletes its
 whole subtree as one undo step, without the confirmation the Project tab shows,
-and lists every removed UID in `removed`.
+and lists every removed UID in `removed`. `task.set` takes `manual: true|false`
+to switch a task between Manually and Auto Scheduled: a task that becomes manual
+is pinned at its shown start and finish, one that becomes auto is placed by its
+links and constraints again. It may be combined with `name`, `duration` and
+`level` in one undo step; every task in `task.list`/`task.get` reports `manual`.
 
 File handling differs from the TUI:
 
