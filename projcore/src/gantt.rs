@@ -74,7 +74,10 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
 /// Render a full Markdown document: a heading, the fenced Mermaid chart, and a
 /// task table (start, finish, duration, total/free slack, critical) as a text
 /// fallback for viewers that don't render Mermaid. Summary names are bold and
-/// their durations span the rolled-up dates under the project's default calendar.
+/// their durations are the working time between the rolled-up dates, measured
+/// as [`crate::schedule::task_duration_min`] measures them: on the project's
+/// default calendar, or on its leaves' calendars when the default has no
+/// working time.
 pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
     let heading = sanitize(&proj.title)
         .or_else(|| sanitize(&proj.name))
@@ -492,6 +495,46 @@ mod tests {
         let mermaid = to_mermaid(&proj, &sched);
         assert!(mermaid.contains("    section P | Q\n"));
         assert!(mermaid.contains("    A | B :crit, 2026-03-02, 1d\n"));
+    }
+
+    #[test]
+    fn markdown_measures_summaries_on_leaf_calendars_when_default_has_none() {
+        let mut phase = task(1, "Phase", 0);
+        phase.summary = true;
+        let mut a = task(2, "A", 480);
+        let mut b = task(3, "B", 480);
+        b.predecessors = vec![Predecessor {
+            uid: 2,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        }];
+        for leaf in [&mut a, &mut b] {
+            leaf.outline_level = 2;
+            leaf.calendar_uid = Some(3);
+        }
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![phase, a, b],
+            calendars: vec![
+                Calendar {
+                    uid: 1,
+                    name: "Closed".into(),
+                    week: Default::default(),
+                },
+                Calendar::standard(3),
+            ],
+            ..Project::default()
+        };
+        let md = to_markdown(&proj, &schedule(&proj));
+        assert_eq!(
+            table_rows(&md)[1][..4],
+            [
+                "**Phase**",
+                "2026-03-02 08:00:00",
+                "2026-03-03 17:00:00",
+                "2d"
+            ]
+        );
     }
 
     #[test]

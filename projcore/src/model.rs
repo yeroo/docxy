@@ -412,6 +412,8 @@ pub struct Project {
     pub hours_per_week: f64,
     /// UID of the project's default calendar.
     pub default_calendar_uid: i32,
+    /// Tasks in outline order. UIDs are unique: the readers reject duplicates,
+    /// and the scheduler, links and assignments all look tasks up by UID.
     pub tasks: Vec<Task>,
     pub resources: Vec<Resource>,
     pub assignments: Vec<Assignment>,
