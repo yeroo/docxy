@@ -163,9 +163,9 @@ curl -sSL -o corpus/mpp/construction.mpp \
 
 ### Known decode gaps
 
-The importer validates the newest Project 2021 task layout and the MPP9 layout
+The importer validates the newest Project 2024 task layout and the MPP9 layout
 used by the three local legacy samples. The newest layout is checked against 46
-generated snapshots and 27 paired Project 2021 XML exports. All 46 MPP12
+generated snapshots and 27 paired Project 2024 XML exports. All 46 MPP12
 snapshot files currently return a task-table error; that layout needs its own
 field map before it can be imported.
 

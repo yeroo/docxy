@@ -147,7 +147,7 @@
         "calendar-24hour",
         "round-trip"
       ],
-      "desc": "Project 2021 (#58): three 8-hour duration days finish after 24 continuous hours."
+      "desc": "Project 2024 (#58): three 8-hour duration days finish after 24 continuous hours."
     },
     {
       "file": "17-constraint-fnlt-conflict.xml",
@@ -157,7 +157,7 @@
         "constraint-fnlt",
         "negative-slack"
       ],
-      "desc": "Project 2021 (#60): FNLT overrides the FS link; both tasks have -5d total slack."
+      "desc": "Project 2024 (#60): FNLT overrides the FS link; both tasks have -5d total slack."
     },
     {
       "file": "18-milestone-after-fs.xml",
@@ -167,7 +167,7 @@
         "link",
         "link-fs"
       ],
-      "desc": "Project 2021 (#59): FS milestones keep the predecessor finish instant."
+      "desc": "Project 2024 (#59): FS milestones keep the predecessor finish instant."
     },
     {
       "file": "19-manual-tasks.xml",
@@ -203,7 +203,7 @@
         "link-fs",
         "negative-slack"
       ],
-      "desc": "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack."
+      "desc": "Project 2024 (#100): a missed Deadline gives B and its driver A -5d total slack."
     },
     {
       "file": "22-progress.xml",

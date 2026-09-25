@@ -3,7 +3,7 @@
 //! the oracle values embedded in each file (`corpus/mspdi/*.xml`, produced by
 //! `corpus/tools/gen_mspdi_corpus.py`).
 //!
-//! Every embedded value in files 01-18 was checked against Project 2021 by
+//! Every embedded value in files 01-18 was checked against Project 2024 by
 //! `corpus/tools/verify_mspdi_project.py` (issue #74), which has Project
 //! schedule a copy of each file with the oracle elements removed. It also
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
@@ -11,7 +11,7 @@
 //! whose manual-task slack and critical flags are hand-derived from our
 //! scheduler, and file 20 (issue #80), whose task fields and blank row are
 //! ours; neither is verified in Project yet. Blank rows carry no oracle. File
-//! 21's oracle (issue #100) was entered by hand from the issue's Project 2021
+//! 21's oracle (issue #100) was entered by hand from the issue's Project 2024
 //! capture; the file was not run through `verify_mspdi_project.py`. File 22
 //! (issue #81) carries progress values of our own and is not verified in
 //! Project either, nor is file 23's derived calendar (issue #83). Slack invariants below also check
@@ -52,7 +52,7 @@ fn every_file_parses_and_schedules() {
 }
 
 #[test]
-fn fnlt_conflict_matches_project_2021_negative_slack() {
+fn fnlt_conflict_matches_project_2024_negative_slack() {
     let xml =
         std::fs::read_to_string(corpus_dir().join("17-constraint-fnlt-conflict.xml")).unwrap();
     let proj = read_mspdi(&xml).unwrap();
@@ -66,7 +66,7 @@ fn fnlt_conflict_matches_project_2021_negative_slack() {
 }
 
 #[test]
-fn missed_deadline_matches_project_2021_negative_slack() {
+fn missed_deadline_matches_project_2024_negative_slack() {
     // #100: B's Deadline (Fri 03-06) is five days before it finishes, so B and
     // A, which drives it, both get -5d total slack; no date moves.
     let xml = std::fs::read_to_string(corpus_dir().join("21-deadline-missed.xml")).unwrap();
@@ -157,7 +157,7 @@ fn every_corpus_finishing_leaf_has_nonpositive_slack() {
 }
 
 #[test]
-fn sf_fixture_matches_project_2021_slack_and_finish_instant() {
+fn sf_fixture_matches_project_2024_slack_and_finish_instant() {
     let xml = std::fs::read_to_string(corpus_dir().join("05-link-sf.xml")).unwrap();
     let proj = read_mspdi(&xml).unwrap();
     let sched = schedule(&proj);
@@ -408,7 +408,7 @@ fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     Some(&xml[start..start + len])
 }
 
-/// Project 2021's TotalSlack (tenths of a minute) and Critical for every task
+/// Project 2024's TotalSlack (tenths of a minute) and Critical for every task
 /// but blank rows, read from the raw XML: `read_mspdi` deliberately ignores
 /// both.
 fn embedded_slack_oracle(name: &str, xml: &str) -> Vec<(i32, i64, bool)> {
@@ -458,7 +458,7 @@ fn scheduler_matches_embedded_project_slack_and_critical() {
 }
 
 /// A save writes TotalSlack and Critical from docxy's own schedule; for the
-/// files verified in Project 2021 they are Project's values.
+/// files verified in Project 2024 they are Project's values.
 #[test]
 fn saved_files_carry_project_slack_and_critical() {
     for path in mspdi_files() {

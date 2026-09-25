@@ -1007,7 +1007,7 @@ fn opt_text(s: &mut String, name: &str, value: Option<impl ToString>) {
 }
 
 /// Write one task's children in the MSPDI `Task` sequence (the order Project
-/// 2021 writes them). A blank row writes only what it stores: no computed
+/// 2024 writes them). A blank row writes only what it stores: no computed
 /// fields and none of the elements every task otherwise states.
 fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     let task = !t.is_null;
@@ -1191,7 +1191,7 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     tag(s, 3, "UID", &a.uid.to_string());
     tag(s, 3, "TaskUID", &a.task_uid.to_string());
     tag(s, 3, "ResourceUID", &a.resource_uid.to_string());
-    // Microsoft's Assignment sequence, as Project 2021 writes it.
+    // Microsoft's Assignment sequence, as Project 2024 writes it.
     opt_text(s, "PercentWorkComplete", a.percent_work_complete);
     opt_text(s, "ActualCost", a.actual_cost.as_ref().map(Rate::as_str));
     opt_date(s, "ActualFinish", a.actual_finish);
@@ -2768,8 +2768,8 @@ mod tests {
 
     #[test]
     fn task_children_follow_schema_sequence() {
-        // The MSPDI Task sequence, as Project 2021 writes it (checked over the
-        // 1569 tasks of a private Project 2021 corpus) and as Microsoft's XML
+        // The MSPDI Task sequence, as Project 2024 writes it (checked over the
+        // 1569 tasks of a private Project 2024 corpus) and as Microsoft's XML
         // Schema for the Tasks Element lists it. That corpus has no task-level
         // ActualCost or ActualWork; their places are the schema's.
         let mut proj = task_project(TASK_FIELDS);
@@ -3542,7 +3542,7 @@ mod tests {
 
     #[test]
     fn progress_durations_round_to_minutes() {
-        // As Project 2021 wrote them in a tracked plan: whole minutes are the
+        // As Project 2024 wrote them in a tracked plan: whole minutes are the
         // model's unit, so the seconds do not survive a save.
         let mut proj = assignment_project(
             "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
@@ -3749,8 +3749,8 @@ mod tests {
 
     #[test]
     fn assignment_children_follow_schema_sequence() {
-        // The MSPDI Assignment sequence, as Project 2021 writes it (merged over
-        // the assignments of a private Project 2021 corpus) and as Microsoft's
+        // The MSPDI Assignment sequence, as Project 2024 writes it (merged over
+        // the assignments of a private Project 2024 corpus) and as Microsoft's
         // XML Schema lists it. That corpus has no assignment ActualCost or
         // Baseline; their places are the schema's.
         let proj = assignment_project(PROGRESS_ASSIGNMENT);
