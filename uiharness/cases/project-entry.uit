@@ -1,0 +1,75 @@
+test project entry row appends a typed task as one undo step
+  open copy:../fixtures/gantt-summary.xml
+  assert tasks is 3
+  click B4
+  assert cell_row is 3
+  assert selected_task is 3
+  assert selected_name is empty
+  shot window
+  type Design
+  assert cell_edit is Design
+  key enter
+  assert tasks is 4
+  assert cell B4 is Design
+  assert cell C4 is 1d
+  assert cell_row is 4
+  assert undo_depth is 1
+  type Build
+  key tab
+  assert tasks is 5
+  assert cell B5 is Build
+  assert cell_row is 4
+  assert cell is Duration
+  key down
+  assert cell_row is 5
+  key delete alt+shift+right alt+shift+left
+  assert tasks is 5
+  assert prompt is none
+  assert undo_depth is 2
+  key ctrl+z
+  assert tasks is 4
+  assert cell_row is 4
+  key up
+  assert cell_row is 3
+  assert selected_name is Design
+  shot window
+
+test project entry row rejects a bad value without adding a task
+  open copy:../fixtures/gantt-summary.xml
+  click C4
+  type banana
+  key enter
+  assert cell_edit is banana
+  assert tasks is 3
+  key escape
+  assert cell_edit is none
+  assert tasks is 3
+  assert undo_depth is 0
+  assert dirty is false
+
+test empty project takes its first task from the entry row
+  open copy:../fixtures/gantt-empty.xml
+  assert tasks is 0
+  assert cell_row is 0
+  type Design
+  key enter
+  assert tasks is 1
+  assert cell B1 is Design
+  assert undo_depth is 1
+  assert cell_row is 1
+  shot window
+
+test project entry row click after typing lands on the new task
+  open copy:../fixtures/gantt-summary.xml
+  click B4
+  type Design
+  click C4
+  assert tasks is 4
+  assert cell_row is 3
+  assert cell is Duration
+  type 3d
+  key enter
+  assert tasks is 4
+  assert cell B4 is Design
+  assert cell C4 is 3d
+  assert cell_row is 4

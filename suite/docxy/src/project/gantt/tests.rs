@@ -336,7 +336,8 @@ fn indent_and_outdent_change_geometry_and_undo_redo_restore_it() {
     };
     assert_eq!(v.ed.undo_depth(), 0);
     v.ed = editor(vec![task(1, 1, 1), task(2, 4, 1)]);
-    v.ed.select(1);
+    // Off the empty plan's entry row, onto task 2.
+    v.select_row(1);
     indent_project(&mut t, -1);
     let Surface::Project(v) = &t.surface else {
         unreachable!()

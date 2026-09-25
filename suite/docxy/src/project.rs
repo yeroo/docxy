@@ -26,6 +26,12 @@ pub(super) struct ProjectView {
     pub prompt: Option<ProjectPrompt>,
     pub col: usize,
     pub cell: Option<CellEdit>,
+    /// The cell cursor is on the entry row below the last task, where typing
+    /// appends a task, as in Project; see [`Self::on_entry_row`]. Entering it
+    /// selects the last task, but later edits (Redo, an agent's `task.add`, a
+    /// reload) can move the editor's selection, so on the entry row read
+    /// [`Self::cursor_row`] and [`Self::selected_uid`], never `ed.sel()`.
+    pub entry: bool,
     pub exported: Option<String>,
     /// The whole pane's width, which the Timeline spans.
     pub width: f32,
@@ -40,6 +46,8 @@ impl ProjectView {
     fn new(project: Project, dirty: bool) -> Self {
         let ed = ProjectEditor::restored(project, dirty);
         let scale = gantt_scale(&ed);
+        // A plan without tasks has only the entry row.
+        let entry = ed.project().tasks.is_empty();
         Self {
             ed,
             scroll: UniformListScrollHandle::new(),
@@ -51,6 +59,7 @@ impl ProjectView {
             prompt: None,
             col: 1,
             cell: None,
+            entry,
             exported: None,
             width: 590. + SCROLLBAR_W,
             timeline: true,
@@ -107,6 +116,50 @@ impl ProjectView {
         self.gantt_x.clamp(self.scale.width(), self.gantt_w);
     }
 
+    /// Whether the cell cursor is on the entry row. A plan without tasks has
+    /// no other row.
+    pub fn on_entry_row(&self) -> bool {
+        self.entry || self.ed.project().tasks.is_empty()
+    }
+
+    /// Latch the entry row once the plan has no tasks, so tasks that appear
+    /// later without the user moving (an agent's `task.add`, Redo, a reload)
+    /// go above the cursor rather than under it. Called wherever an edit may
+    /// have emptied the plan; a new view latches it too.
+    pub fn latch_entry_row(&mut self) {
+        if self.ed.project().tasks.is_empty() {
+            self.entry = true;
+        }
+    }
+
+    /// The row the cell cursor is on: a task's index, or the task count for
+    /// the entry row.
+    pub fn cursor_row(&self) -> usize {
+        if self.on_entry_row() {
+            self.ed.project().tasks.len()
+        } else {
+            self.ed.sel()
+        }
+    }
+
+    /// The task the cursor is on; none on the entry row, so commands that act
+    /// on the selected task do nothing there.
+    pub fn selected_uid(&self) -> Option<i32> {
+        if self.on_entry_row() {
+            None
+        } else {
+            self.ed.selected_uid()
+        }
+    }
+
+    /// Put the cursor on the entry row. The selection moves to the last task,
+    /// so a search from here starts at the first task.
+    pub fn enter_entry_row(&mut self) {
+        self.cancel_prompt();
+        self.entry = true;
+        self.ed.select(usize::MAX);
+    }
+
     /// Navigation and horizontal scrolling only; command completion owns row reveal.
     pub fn key(&mut self, key: &str, shift: bool) -> bool {
         if matches!(key, "left" | "right" | "tab") {
@@ -119,13 +172,22 @@ impl ProjectView {
             self.reveal_col();
             return true;
         }
+        let count = self.ed.project().tasks.len();
         let index = match key {
+            // From the entry row, Up goes to the last task.
+            "up" if self.on_entry_row() => count.saturating_sub(1),
             "up" => self.ed.sel().saturating_sub(1),
-            "down" => self.ed.sel().saturating_add(1),
+            // Down from the last task goes to the entry row, as in Project.
+            "down" if self.on_entry_row() || self.ed.sel() + 1 >= count => {
+                self.enter_entry_row();
+                return true;
+            }
+            "down" => self.ed.sel() + 1,
             "home" => 0,
-            "end" => self.ed.project().tasks.len().saturating_sub(1),
+            "end" => count.saturating_sub(1),
             _ => return false,
         };
+        self.entry = false;
         self.ed.select(index);
         true
     }
@@ -204,7 +266,7 @@ pub(super) fn indent_project(tab: &mut DocTab, delta: i32) {
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
-    let Some(uid) = v.ed.selected_uid() else {
+    let Some(uid) = v.selected_uid() else {
         return;
     };
     let level = v.ed.project().task(uid).unwrap().outline_level;
@@ -268,13 +330,15 @@ fn project_region(
             if r0 != r1 || c0 != c1 || c0 >= 7 {
                 return Err("Project regions address one entry-table cell".into());
             }
-            let task =
-                v.ed.project()
-                    .tasks
-                    .get(r0 as usize)
-                    .ok_or("No task at this row")?;
+            let tasks = &v.ed.project().tasks;
+            // The entry row sits just below the last task.
+            let row = match tasks.get(r0 as usize) {
+                Some(task) => task.id.to_string(),
+                None if r0 as usize == tasks.len() => "entry".into(),
+                None => return Err("No task at this row".into()),
+            };
             let cell = probes
-                .get(&format!("project-cell:{}:{c0}", task.id))
+                .get(&format!("project-cell:{row}:{c0}"))
                 .ok_or("Project cell is not rendered")?;
             // The absolute probe fills the padding box; include the cell's 1px border.
             let cell = Bounds {
@@ -318,7 +382,7 @@ pub(super) fn project_state(
     let count = v.ed.project().tasks.len();
     let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
     let mut entries = vec![
-        ("selected_task".into(), Json::Num(v.ed.sel() as f64)),
+        ("selected_task".into(), Json::Num(v.cursor_row() as f64)),
         ("tasks".into(), Json::Num(count as f64)),
         (
             "filler_rows".into(),
@@ -336,9 +400,8 @@ pub(super) fn project_state(
         (
             "selected_name".into(),
             Json::Str(
-                v.ed.project()
-                    .tasks
-                    .get(v.ed.sel())
+                v.selected_uid()
+                    .and_then(|uid| v.ed.project().task(uid))
                     .map(|t| t.name.clone())
                     .unwrap_or_default(),
             ),
@@ -695,9 +758,10 @@ fn row_cells(values: [String; 7], indent: f32) -> impl IntoElement {
         }))
 }
 
+/// A row's cells: a task's, or the empty entry row's when `task` is `None`.
 fn editable_row_cells(
     v: &ProjectView,
-    task: &Task,
+    task: Option<&Task>,
     row: usize,
     index: usize,
     indent: f32,
@@ -705,61 +769,64 @@ fn editable_row_cells(
     window: &Window,
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
-    h_flex().h(px(ROW_H)).items_center().children(
-        project_row(&v.ed, task)
-            .into_iter()
-            .enumerate()
-            .map(|(col, value)| {
-                let edit = v
-                    .cell
-                    .as_ref()
-                    .filter(|c| c.uid == task.uid && c.col == col);
-                let content = if let Some(edit) = edit {
-                    let measure = Measurer::new(window);
-                    let offset = edit.scroll_x(WIDTHS[col] - 24., |s| {
-                        measure.width(s, 12., task.summary, false)
-                    });
-                    h_flex()
-                        .relative()
-                        .left(px(-offset))
-                        .flex_none()
-                        .items_center()
-                        .child(edit.buf[..edit.caret].to_owned())
-                        .child(div().flex_none().w(px(1.5)).h(px(16.)).bg(hsla_u(BRAND)))
-                        .child(edit.buf[edit.caret..].to_owned())
-                        .into_any_element()
-                } else {
-                    div().child(value).into_any_element()
-                };
-                div()
-                    .id(("project-cell", row * 7 + col))
+    let values = task.map(|t| project_row(&v.ed, t)).unwrap_or_default();
+    let (uid, summary) = (task.map(|t| t.uid), task.is_some_and(|t| t.summary));
+    let probe_row = task.map_or_else(|| "entry".to_string(), |t| t.id.to_string());
+    let cursor_row = v.cursor_row();
+    h_flex()
+        .h(px(ROW_H))
+        .items_center()
+        .children(values.into_iter().enumerate().map(|(col, value)| {
+            let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
+            let content = if let Some(edit) = edit {
+                let measure = Measurer::new(window);
+                let offset =
+                    edit.scroll_x(WIDTHS[col] - 24., |s| measure.width(s, 12., summary, false));
+                h_flex()
                     .relative()
-                    .flex()
-                    .items_center()
-                    .w(px(WIDTHS[col]))
-                    .h(px(ROW_H))
+                    .left(px(-offset))
                     .flex_none()
-                    .px_2()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .border_1()
-                    .border_color(if row == v.ed.sel() && col == v.col {
-                        hsla_u(BRAND)
-                    } else {
-                        hsla(0., 0., 0., 0.)
-                    })
-                    .when(col == 1 && edit.is_none(), |d| d.pl(px(8. + indent)))
-                    .child(probe(probes, format!("project-cell:{}:{col}", task.id)))
-                    .child(content)
-                    .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
-                        cx.stop_propagation();
-                        if let Some(tab) = this.tabs.get_mut(index) {
-                            project_cell_click(tab, row, Some(col), ev.click_count() >= 2);
+                    .items_center()
+                    .child(edit.buf[..edit.caret].to_owned())
+                    .child(div().flex_none().w(px(1.5)).h(px(16.)).bg(hsla_u(BRAND)))
+                    .child(edit.buf[edit.caret..].to_owned())
+                    .into_any_element()
+            } else {
+                div().child(value).into_any_element()
+            };
+            div()
+                .id(("project-cell", row * 7 + col))
+                .relative()
+                .flex()
+                .items_center()
+                .w(px(WIDTHS[col]))
+                .h(px(ROW_H))
+                .flex_none()
+                .px_2()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .border_1()
+                .border_color(if row == cursor_row && col == v.col {
+                    hsla_u(BRAND)
+                } else {
+                    hsla(0., 0., 0., 0.)
+                })
+                .when(col == 1 && edit.is_none(), |d| d.pl(px(8. + indent)))
+                .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
+                .child(content)
+                .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if let Some(tab) = this.tabs.get_mut(index) {
+                        let double = ev.click_count() >= 2;
+                        if uid.is_some() {
+                            project_cell_click(tab, row, Some(col), double);
+                        } else {
+                            project_entry_click(tab, Some(col), double);
                         }
-                        this.refocus(window, cx);
-                    }))
-            }),
-    )
+                    }
+                    this.refocus(window, cx);
+                }))
+        }))
 }
 
 fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement {
@@ -879,17 +946,19 @@ pub(super) fn project_el(
                         .overflow_hidden()
                         .child(body_grid(view, pal))
                         .child(probe(probes, "project-body"))
-                        // Rows stop propagation, so only the ruled empty rows land here.
+                        // Rows stop propagation, so only the ruled empty rows below the
+                        // entry row land here.
                         .on_click(cx.listener(move |this, _, window, cx| {
                             if let Some(tab) = this.tabs.get_mut(index) {
-                                project_blank_click(tab);
+                                project_below_click(tab);
                             }
                             this.refocus(window, cx);
                         }))
                         .child(
                             uniform_list(
                                 ("project-rows", index),
-                                count,
+                                // The tasks, then the entry row.
+                                count + 1,
                                 cx.processor(
                                     move |this, range: std::ops::Range<usize>, window, cx| {
                                         let Some(Surface::Project(v)) =
@@ -897,64 +966,77 @@ pub(super) fn project_el(
                                         else {
                                             return vec![];
                                         };
+                                        let cursor_row = v.cursor_row();
+                                        let tasks = &v.ed.project().tasks;
+                                        // Past the last task, the one entry row (`None`).
                                         range
-                                            .filter_map(|i| {
-                                                v.ed.project().tasks.get(i).map(|task| {
-                                                    let indent = task
-                                                        .outline_level
-                                                        .saturating_sub(1)
-                                                        .min(20)
-                                                        as f32
-                                                        * 12.;
-                                                    h_flex()
-                                                        .id(("project-row", i))
-                                                        .h(px(ROW_H))
-                                                        .w_full()
-                                                        .cursor_pointer()
-                                                        .when(task.summary, |d| {
-                                                            d.font_weight(FontWeight::BOLD)
-                                                        })
-                                                        .when(i == v.ed.sel(), |d| d.bg(pal.sel))
-                                                        .child(pane(
-                                                            table_w,
-                                                            table_x,
-                                                            editable_row_cells(
-                                                                v,
-                                                                task,
-                                                                i,
-                                                                index,
-                                                                indent,
-                                                                &row_probes,
-                                                                window,
-                                                                cx,
-                                                            ),
-                                                        ))
-                                                        .child(chart_pane(
-                                                            gantt_w,
-                                                            gantt_x,
+                                            .filter(|&i| i <= tasks.len())
+                                            .map(|i| {
+                                                let task = tasks.get(i);
+                                                let is_task = task.is_some();
+                                                let indent = task
+                                                    .map_or(0, |t| t.outline_level)
+                                                    .saturating_sub(1)
+                                                    .min(20)
+                                                    as f32
+                                                    * 12.;
+                                                h_flex()
+                                                    .id(("project-row", i))
+                                                    .h(px(ROW_H))
+                                                    .w_full()
+                                                    .cursor_pointer()
+                                                    .when(task.is_some_and(|t| t.summary), |d| {
+                                                        d.font_weight(FontWeight::BOLD)
+                                                    })
+                                                    .when(i == cursor_row, |d| d.bg(pal.sel))
+                                                    .child(pane(
+                                                        table_w,
+                                                        table_x,
+                                                        editable_row_cells(
+                                                            v,
+                                                            task,
+                                                            i,
+                                                            index,
+                                                            indent,
+                                                            &row_probes,
+                                                            window,
+                                                            cx,
+                                                        ),
+                                                    ))
+                                                    .child(chart_pane(
+                                                        gantt_w,
+                                                        gantt_x,
+                                                        pal,
+                                                        // The entry row has no bar, so no `bar:` probe.
+                                                        gantt_strip(
+                                                            task.and_then(|t| {
+                                                                gantt_bar(&v.ed, t, scale)
+                                                            }),
+                                                            task.map_or(0, |t| t.id),
+                                                            scale,
                                                             pal,
-                                                            gantt_strip(
-                                                                gantt_bar(&v.ed, task, scale),
-                                                                task.id,
-                                                                scale,
-                                                                pal,
-                                                                &row_probes,
-                                                            ),
-                                                        ))
-                                                        .on_click(cx.listener(
-                                                            move |this, _, window, cx| {
-                                                                cx.stop_propagation();
-                                                                if let Some(tab) =
-                                                                    this.tabs.get_mut(index)
-                                                                {
+                                                            &row_probes,
+                                                        ),
+                                                    ))
+                                                    .on_click(cx.listener(
+                                                        move |this, _, window, cx| {
+                                                            cx.stop_propagation();
+                                                            if let Some(tab) =
+                                                                this.tabs.get_mut(index)
+                                                            {
+                                                                if is_task {
                                                                     project_cell_click(
                                                                         tab, i, None, false,
                                                                     );
+                                                                } else {
+                                                                    project_entry_click(
+                                                                        tab, None, false,
+                                                                    );
                                                                 }
-                                                                this.refocus(window, cx);
-                                                            },
-                                                        ))
-                                                })
+                                                            }
+                                                            this.refocus(window, cx);
+                                                        },
+                                                    ))
                                             })
                                             .collect::<Vec<_>>()
                                     },
@@ -980,22 +1062,7 @@ pub(super) fn project_el(
                                         .id(SharedString::from(vbar))
                                         .scrollbar_show(ScrollbarShow::Always),
                                 ),
-                        )
-                        .when(count == 0, |d| {
-                            // Over the first ruled row, so the grid runs under it.
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top_0()
-                                    .left_0()
-                                    .h(px(ROW_H))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .text_color(pal.dim)
-                                    .child("No tasks"),
-                            )
-                        }),
+                        ),
                 )
                 // Independent horizontal bars under the table and the chart, as in Project.
                 .child(
