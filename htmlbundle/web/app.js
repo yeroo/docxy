@@ -32,6 +32,7 @@
     fileHandle: null,
     media: {},
     status: 'loaded',
+    edits: 0,
   };
   var el = {};
 
@@ -192,7 +193,10 @@
     el.status.classList.toggle('unsaved', S.dirty);
   }
 
+  // Every applied edit counts, so a save can tell whether the document changed
+  // while it was being written (see save()).
   function markDirty() {
+    S.edits++;
     if (!S.dirty) {
       S.dirty = true;
       updateChip();
@@ -1023,7 +1027,12 @@
   };
 
   function runAll(cmds) {
-    syncSelection();
+    var sel = syncSelection();
+    // Word and line deletes select-then-delete; with a selection already
+    // there, the delete removes just that selection (as every editor does).
+    if (sel && cmds.length > 1 && (sel.a.p !== sel.f.p || sel.a.o !== sel.f.o)) {
+      cmds = cmds.slice(-1);
+    }
     var last = null;
     cmds.forEach(function (c) {
       var r = S.engine.exec(c);
@@ -1089,6 +1098,16 @@
       if (S.backstage) { closeBackstage(); return; }
     }
     if (!inDoc || S.composing) return;
+    // Ctrl/Alt+Backspace/Delete over a selection deletes the selection.
+    // Firefox collapses the selection before its beforeinput (and then targets
+    // the previous word), so this is decided here, while the selection is
+    // still the one the user sees.
+    if ((e.key === 'Backspace' || e.key === 'Delete') && (mod || e.altKey) &&
+        !document.getSelection().isCollapsed) {
+      e.preventDefault();
+      run(e.key === 'Backspace' ? 'backspace' : 'delete');
+      return;
+    }
     var cmd = null;
     if (mod && !e.shiftKey && k === 'z') cmd = 'undo';
     else if (mod && (k === 'y' || (e.shiftKey && k === 'z'))) cmd = 'redo';
@@ -1151,8 +1170,23 @@
     d.addEventListener('click', function (e) {
       // Ctrl+click follows a link, as in Word.
       var link = e.target.closest && e.target.closest('.link[title]');
-      if (link && (e.ctrlKey || e.metaKey)) window.open(link.title, '_blank', 'noopener');
+      if (link && (e.ctrlKey || e.metaKey) && !openLink(link.title)) {
+        toast('This link opens only in docxy or Word');
+      }
     });
+  }
+
+  // Open a document link in a new tab: web and mail links only. In-document
+  // bookmarks (#…) would reopen this page as a second editable copy, and
+  // javascript:, data: and file: links are not something a document should
+  // be able to run or reach from here.
+  function openLink(target) {
+    var url;
+    try { url = new URL(target, location.href); } catch (err) { return false; }
+    if (url.href.split('#')[0] === location.href.split('#')[0]) return false;
+    if (['http:', 'https:', 'mailto:'].indexOf(url.protocol) < 0) return false;
+    window.open(url.href, '_blank', 'noopener');
+    return true;
   }
 
   // ---- Backstage ------------------------------------------------------------------
@@ -1264,16 +1298,30 @@
   // Save this page with the edits: the file is rebuilt around the new package
   // (DocxyEngine.rebuildFile == htmlbundle::rewrap). Chromium writes in place
   // through the File System Access API; other browsers download a copy.
+  //
+  // Saves run one at a time (a second waits for the first, so two writes to
+  // one handle cannot finish out of order), and a save only clears the dirty
+  // mark if no edit landed while it was being written.
+  var saving = Promise.resolve();
   function save(saveAs) {
+    var next = saving.then(function () { return saveNow(saveAs); });
+    saving = next.catch(function () {});
+    return next;
+  }
+
+  function saveNow(saveAs) {
+    var edits = S.edits;
     var built = E.rebuildFile(textOf, S.engine.save());
     var name = bundleFileName();
     var done = function () {
       $('docxy-payload').textContent = built.payload;
       S.meta = built.meta;
-      S.dirty = false;
-      S.status = 'saved';
+      if (S.edits === edits) {
+        S.dirty = false;
+        S.status = 'saved';
+      }
       updateChip();
-      toast('Saved');
+      toast(S.dirty ? 'Saved; newer edits are not saved yet' : 'Saved');
     };
     if (typeof window.showSaveFilePicker !== 'function') {
       download(built.html, name, 'text/html');
