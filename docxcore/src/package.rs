@@ -1246,8 +1246,9 @@ impl Package {
     }
 
     /// Ensure `numbering.xml` defines a simple bullet (or decimal) list and return
-    /// its `numId`, creating the part + relationship + content-type if absent. Used
-    /// by the Bullets/Numbering ribbon commands so applied lists render and save.
+    /// its `numId` ([`BULLET_LIST_NUM_ID`] or [`NUMBER_LIST_NUM_ID`]), creating
+    /// the part + relationship + content-type if absent. Used by the
+    /// Bullets/Numbering ribbon commands so applied lists render and save.
     ///
     /// Defines all 9 indent levels (`ilvl` 0..9, [`markdown_list_levels`]) — the
     /// same set [`new_markdown_package`] defines for a fresh markdown package —
@@ -1255,12 +1256,9 @@ impl Package {
     /// *existing* package via this call references `ilvl=1`, `2`, etc.; with only
     /// `ilvl=0` defined, [`crate::numbering::Numbering::marker`] falls back to a
     /// stray decimal marker (or Word shows no marker at all) for any nested item.
-    /// Ensure the bullet (or decimal) list [`BULLET_LIST_NUM_ID`] /
-    /// [`NUMBER_LIST_NUM_ID`] is defined in `word/numbering.xml`; returns its id.
     pub fn ensure_list(&mut self, bullet: bool) -> i32 {
         const W_NS: &str = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
         const R_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
-        // Reserved high ids, unlikely to collide with a document's own lists.
         let (num_id, abs_id) = if bullet {
             (BULLET_LIST_NUM_ID, BULLET_LIST_NUM_ID)
         } else {
