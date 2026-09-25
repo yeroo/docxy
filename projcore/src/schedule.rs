@@ -454,6 +454,7 @@ impl<'a> Scheduler<'a> {
                 let week = &self.weeks[&uid];
                 // Room for the longest late window before the earliest date,
                 // and past the early start for a start constraint's finish.
+                // Windows at or before the absolute cap start at the cap.
                 let budget = duration + 480;
                 let origin = Timeline::origin(week, earliest, budget).max(self.earliest_origin);
                 (
@@ -773,6 +774,9 @@ impl<'a> Scheduler<'a> {
                     } else {
                         pre.to_index(pre.snap(dates.raw)) + t.duration_min
                     };
+                    // A date at or before the absolute cap is clamped there,
+                    // keeping the full duration after the first instant.
+                    let finish_index = finish_index.max(t.duration_min);
                     let f_abs = pre.abs_finish(finish_index);
                     let binds = matches!(
                         t.constraint,
@@ -3001,8 +3005,11 @@ mod tests {
         let unlinked = sched.get(3).unwrap();
         assert_eq!(unlinked.early_start, baseline.get(3).unwrap().early_start);
         assert_eq!(unlinked.early_finish, baseline.get(3).unwrap().early_finish);
-        assert_eq!(unlinked.late_finish.minutes(), side.segs[0].start);
-        assert_eq!(unlinked.late_start, unlinked.late_finish);
+        assert_eq!(unlinked.late_start.minutes(), side.segs[0].start);
+        assert_eq!(
+            working_minutes_between(&proj, unlinked.late_start, unlinked.late_finish),
+            480
+        );
         assert!(unlinked.late_start.minutes() < cap + 7 * 1440);
         assert_eq!(
             unlinked.total_slack_min,
