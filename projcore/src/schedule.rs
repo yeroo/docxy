@@ -3088,7 +3088,7 @@ mod tests {
     fn unlinked_pre_start_milestone_keeps_morning_deadline() {
         let monday = DateTime::from_ymd_hm(2026, 2, 16, 8, 0);
         let monday_evening = DateTime::from_ymd_hm(2026, 2, 16, 17, 0);
-        // (date, late instant, slack): a morning deadline stays on its
+        // (date, slack): a morning deadline stays on its
         // morning, an evening one on its evening.
         for (date, slack) in [(monday, -10 * 480), (monday_evening, -9 * 480)] {
             for constraint in [
