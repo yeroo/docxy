@@ -85,6 +85,7 @@ fn path_info(app: &App) -> Json {
 mod tests {
     use super::*;
     use crate::new_project;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     fn app() -> App {
         App::new(new_project(), Some("ctl-test.xml".to_string()), false)
     }
@@ -207,14 +208,24 @@ mod tests {
             assert!(a.confirm.is_none(), "{verb} must drop the stale question");
         }
 
-        // An Exit question stays, but its warning follows the now-dirty plan.
+        // An Exit question stays, its warning follows the now-dirty plan,
+        // and the user's No survives the update.
         let mut a = app();
         a.request_exit();
         assert!(!a.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
+        a.confirm_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!a.confirm.as_ref().unwrap().yes_selected());
         dispatch(&mut a, "task.del", &uid(1)).unwrap();
         let exit = a.confirm.as_ref().expect("the Exit question stays open");
         assert_eq!(exit.action(), &crate::ConfirmAction::Exit);
         assert!(exit.prompt().contains("Unsaved"));
+        assert!(!exit.yes_selected(), "No must stay selected");
+        // A second edit leaves the (unchanged) question alone.
+        dispatch(&mut a, "task.add", &Json::Null).unwrap();
+        assert!(!a.confirm.as_ref().unwrap().yes_selected());
+        a.confirm_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!a.quit, "Enter on No must not quit");
+        assert!(a.confirm.is_none());
     }
 
     #[test]

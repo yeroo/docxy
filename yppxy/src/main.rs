@@ -441,16 +441,17 @@ impl App {
         // A text prompt takes keys before the modal would, so it must not
         // stay open underneath it.
         self.prompt = None;
+        self.confirm = Some(self.exit_confirm());
+    }
+
+    /// The Exit question, warning about unsaved changes when there are any.
+    fn exit_confirm(&self) -> backstage::Confirm<ConfirmAction> {
         let prompt = if self.ed.dirty() {
             "Exit yppxy? Unsaved changes will be lost."
         } else {
             "Exit yppxy?"
         };
-        self.confirm = Some(backstage::Confirm::new(
-            prompt,
-            ConfirmAction::Exit,
-            Color::Yellow,
-        ));
+        backstage::Confirm::new(prompt, ConfirmAction::Exit, Color::Yellow)
     }
 
     /// Act on the shared dialog's outcome.
@@ -718,13 +719,22 @@ impl App {
 
     /// Bring an open question up to date after an agent edit or a reload.
     /// A summary-delete question is dropped: its task, count and project were
-    /// read before the change. An Exit question is asked again, so its
-    /// unsaved-changes warning follows the plan's dirty state.
+    /// read before the change. An Exit question gets its unsaved-changes
+    /// warning updated in place: the user's Yes/No choice is kept, and
+    /// nothing else is closed (the modal already owns the input).
     fn refresh_confirm(&mut self) {
-        match self.confirm.as_ref().map(|c| c.action()) {
-            Some(ConfirmAction::DeleteTask(_)) => self.confirm = None,
-            Some(ConfirmAction::Exit) => self.request_exit(),
-            None => {}
+        let Some(c) = &self.confirm else {
+            return;
+        };
+        match c.action() {
+            ConfirmAction::DeleteTask(_) => self.confirm = None,
+            ConfirmAction::Exit => {
+                let next = self.exit_confirm();
+                if next.prompt() != c.prompt() {
+                    let yes = c.yes_selected();
+                    self.confirm = Some(if yes { next } else { next.default_no() });
+                }
+            }
         }
     }
 
