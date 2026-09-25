@@ -1,5 +1,5 @@
 test project timeline shows the plan span and toggles from the View tab
-  open ../../corpus/mspdi/02-link-fs.xml
+  open ../fixtures/project-timeline.xml
   assert timeline is shown
   assert timeline_start is Mon 3/2/26
   assert timeline_finish is Thu 3/5/26
