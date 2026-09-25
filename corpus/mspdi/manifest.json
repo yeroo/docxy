@@ -228,6 +228,30 @@
         "link-fs"
       ],
       "desc": "A calendar derived from Standard keeps its base, its own Friday off and IsBaselineCalendar through saves; a task on it skips Friday."
+    },
+    {
+      "file": "24-calendar-holiday.xml",
+      "category": "calendar",
+      "tags": [
+        "calendar",
+        "calendar-exception",
+        "round-trip",
+        "link",
+        "link-fs"
+      ],
+      "desc": "A holiday inside a task pushes its finish out a day; a working Saturday with changed hours carries a later task; both exceptions survive saves."
+    },
+    {
+      "file": "25-derived-calendar-holiday.xml",
+      "category": "calendar",
+      "tags": [
+        "calendar",
+        "calendar-exception",
+        "derived-calendar",
+        "link",
+        "link-fs"
+      ],
+      "desc": "A resource calendar derived from Standard keeps Standard's holiday on a weekday it states itself, and its own exception overrides Standard's."
     }
   ]
 }

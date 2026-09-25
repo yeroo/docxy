@@ -16,7 +16,9 @@
 //! (issue #81) carries progress values of our own and is not verified in
 //! Project either, nor is file 23's derived calendar (issue #83), nor are
 //! file 13's resource and assignment fields of issue #84, chosen to leave its
-//! schedule unchanged. Slack invariants below also check
+//! schedule unchanged. Files 24 and 25 (calendar exceptions, issue #126) were
+//! checked against Project 2024 by `verify_mspdi_project.py`, both as
+//! generated and as `write_mspdi` writes them back. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -710,6 +712,71 @@ fn derived_calendar_fixture_keeps_its_base_through_a_save() {
     }
     check(&read_mspdi(&saved).unwrap(), "MSPDI");
     check(&read_yppx(&write_yppx(&proj)).unwrap(), ".yppx");
+}
+
+#[test]
+fn holiday_fixture_keeps_exceptions_and_skips_the_holiday() {
+    use projcore::{CalendarException, DateTime, DayWorking, WorkingTime};
+    let xml = std::fs::read_to_string(corpus_dir().join("24-calendar-holiday.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let day = |d: u32, working: DayWorking, name: &str| CalendarException {
+        name: Some(name.into()),
+        ..CalendarException::date_range(
+            DateTime::from_ymd_hm(2026, 3, d, 0, 0),
+            DateTime::from_ymd_hm(2026, 3, d, 23, 59),
+            working,
+        )
+    };
+    let expected = [
+        day(4, DayWorking::default(), "Founders day"),
+        day(
+            14,
+            DayWorking {
+                times: vec![WorkingTime {
+                    from: 8 * 60,
+                    to: 12 * 60,
+                }],
+            },
+            "Stocktake",
+        ),
+    ];
+    let check = |proj: &projcore::Project, what: &str| {
+        // The legacy weekday entries repeat the two exceptions and add none.
+        assert_eq!(proj.calendar(1).unwrap().exceptions, expected, "{what}");
+        let s = schedule(proj);
+        let finish = |uid| s.get(uid).unwrap().early_finish.to_mspdi();
+        // Pour skips Wed 4; Inspect works Saturday 14's four hours.
+        assert_eq!(finish(1), "2026-03-05T17:00:00", "{what}");
+        assert_eq!(finish(3), "2026-03-16T12:00:00", "{what}");
+    };
+    check(&proj, "read");
+    let saved = write_mspdi(&proj);
+    assert_eq!(saved.matches("<DayType>0</DayType>").count(), 2);
+    assert_eq!(saved.matches("<Exception>").count(), 2);
+    check(&read_mspdi(&saved).unwrap(), "MSPDI");
+    check(&read_yppx(&write_yppx(&proj)).unwrap(), ".yppx");
+}
+
+#[test]
+fn derived_calendar_keeps_its_bases_holiday_but_not_over_its_own_exception() {
+    let xml =
+        std::fs::read_to_string(corpus_dir().join("25-derived-calendar-holiday.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let s = schedule(&proj);
+    let dates = |uid| {
+        let r = s.get(uid).unwrap();
+        (r.early_start.to_mspdi(), r.early_finish.to_mspdi())
+    };
+    // Standard's Wed 4 holiday beats Alice's own Wednesday...
+    assert_eq!(
+        dates(1),
+        ("2026-03-02T08:00:00".into(), "2026-03-05T17:00:00".into())
+    );
+    // ...and Alice's own Wed 11 exception (07:00-15:00) beats Standard's.
+    assert_eq!(
+        dates(3),
+        ("2026-03-09T08:00:00".into(), "2026-03-11T15:00:00".into())
+    );
 }
 
 /// The full native pipeline on real files: MSPDI → .yppx package → back → the

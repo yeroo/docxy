@@ -15,7 +15,7 @@ the computed dates, slack and critical flags equal the embedded ones. It also
 checks that every project has a critical leaf and that its last-finishing
 leaves have nonpositive slack.
 
-All 18 files were verified against Microsoft Project 2024 in
+Files 01-18 were verified against Microsoft Project 2024 in
 [issue #74](https://github.com/yeroo/docxy/issues/74) by
 `corpus/tools/verify_mspdi_project.py`. The script has Project schedule a copy
 of each file with every task's `Start`, `Finish`, `TotalSlack` and `Critical`
@@ -83,13 +83,33 @@ File 23 keeps a derived calendar derived
 `Standard`, is flagged `IsBaselineCalendar` and states only its own Friday off.
 A resource uses it, and so does a task. Project's UI offers only base
 calendars to tasks, so a task on a derived calendar is our shape, not
-Project's. The file is **not** verified against Project 2024.
+Project's. The file is **not** verified against Project 2024: Project imports
+`Crew` renamed `Unassigned`, so the verifier's calendar check fails on it
+(its dates match). Project keeps a derived calendar's name when it is the name
+of the resource that uses it, as in file 25.
+Files 24 and 25 add calendar exceptions
+([issue #126](https://github.com/yeroo/docxy/issues/126)), written in both
+forms Project writes: a legacy `DayType 0` weekday and an `<Exception>`. In 24,
+Standard takes Wed 4 off and works Saturday 14 08:00-12:00, so Pour's three
+days skip the holiday and Inspect's day is Saturday's four hours plus Monday
+16's morning. In 25, Standard takes Wed 4 and Wed 11 off, and Alice's resource
+calendar derives from it, states Wednesday as 07:00-15:00, and has its own
+working Wed 11. A date resolves to the first exception down the base chain,
+then the first stated weekday: the base's Wed 4 holiday beats Alice's own
+Wednesday, and her own Wed 11 exception beats the base's holiday. Both files
+were verified against Microsoft Project Professional 2024 (build
+16.0.17932.21000) by `verify_mspdi_project.py`, which now also checks that
+Project imported every calendar exception (name, type, dates, working). The
+check passed both on the generated files and on `write_mspdi`'s output for them.
+Only daily (`Type 1`) exceptions are scheduled. Recurring ones (`Type` 2-8, or
+a `Period` above 1) are kept and written back, but not scheduled.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
   off. File 12 adds a second calendar with Saturday working; file 16 adds the
   built-in 24 Hours calendar, working midnight to midnight every day; file 23
-  adds a calendar derived from Standard with its own Friday off.
+  adds a calendar derived from Standard with its own Friday off; files 24 and
+  25 add holidays and changed-hours exceptions.
 
 ## Files
 
@@ -118,6 +138,8 @@ Project's. The file is **not** verified against Project 2024.
 | `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
 | `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx` |
 | `23-derived-calendar` | derived calendar | `BaseCalendarUID`, `IsBaselineCalendar` and only the calendar's own weekday survive MSPDI and `.yppx`; a task on it inherits Standard's week, skips its own Friday off and finishes Mon 9 |
+| `24-calendar-holiday` | calendar exceptions | a holiday inside a task pushes its finish out a day; a working Saturday with changed hours carries the next task; both exceptions survive MSPDI and `.yppx` in both forms |
+| `25-derived-calendar-holiday` | exceptions on a derived calendar | the base's holiday beats a weekday the derived calendar states; the derived calendar's own exception beats the base's holiday |
 
 See `manifest.json` for machine-readable tags.
 
