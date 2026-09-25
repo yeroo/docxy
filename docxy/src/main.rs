@@ -1961,9 +1961,13 @@ impl App {
     }
 
     /// Write the document to `dir/name`, picking the format from the typed
-    /// extension (`.md`/`.markdown` → Markdown, `.docx` → Word; none → keep the
-    /// current format). This is how a `.docx` is exported to Markdown and vice
-    /// versa. Makes the new file current and closes the backstage.
+    /// extension: `.md`/`.markdown` → Markdown, `.docx` → Word, `.html`/`.htm` →
+    /// editable HTML (the opened bundle rewrapped, else a new page when this
+    /// build has the engine; an existing file there that is not a Word bundle
+    /// is refused, never replaced). With no extension the current format's is
+    /// added (`.md`, `.docx`, or `.docx.html` for an opened bundle). This is how
+    /// a document moves between formats. Makes the new file current and closes
+    /// the backstage.
     fn commit_save_as(&mut self, dir: std::path::PathBuf, name: String) {
         if name.is_empty() {
             self.status = Some("Save As — type a file name first.".to_string());

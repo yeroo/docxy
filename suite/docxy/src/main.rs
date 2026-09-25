@@ -1108,9 +1108,6 @@ struct Docxy {
     ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
-    /// Set by Save As for the save it triggers: the destination is a new name,
-    /// so a bundle already there is not this document's to rewrap.
-    saving_as: bool,
     clip: Option<Clip>,
     theme_pref: ThemePref,
     /// When set, closing the window with unsaved tabs shows a confirm dialog.
@@ -4044,10 +4041,14 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 bundle_html: None,
             }
         }
+        // A document with no sidecar reloads its file, bundle included.
+        (Kind::Docx, None) if path.is_some() => {
+            let l = doc_from_path(path.as_ref().unwrap());
+            l.into_tab(t.kind, t.title.clone().into(), path, t.dirty)
+        }
         _ => {
             let (surface, comments, notes, pkg, status) = build_surface(t.kind, path.as_ref());
             let markdown = path.as_deref().map(is_markdown_path).unwrap_or(false);
-            let bundle_html = html_bundle::restored_bundle(path.as_deref());
             DocTab {
                 kind: t.kind,
                 title: t.title.clone().into(),
@@ -4060,7 +4061,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 notes,
                 markdown,
                 hf_edit: None,
-                bundle_html,
+                bundle_html: None,
             }
         }
     };
@@ -4144,7 +4145,6 @@ impl Docxy {
             ribbon_min: false,
             backstage: false,
             bs_new: false,
-            saving_as: false,
             clip: None,
             theme_pref,
             ask_on_close,
@@ -9655,6 +9655,73 @@ fn exit_hf_tab(tab: &mut DocTab) {
     }
 }
 
+/// Write a document tab to `target` (Save As, or the first save of an untitled
+/// document to a picked path) or, with `None`, to its own file. The format
+/// follows the destination: Markdown for a `.md` target (or a Markdown tab
+/// saved in place), an editable-HTML page for any `.html`, Word otherwise.
+///
+/// The tab is rebound (path, Markdown flag, title, held bundle) only after a
+/// successful write, so a refused or failed Save As leaves it saving where it
+/// did. Returns whether the file was written; the tab's status says either way.
+fn save_doc_tab(tab: &mut DocTab, target: Option<PathBuf>) -> bool {
+    let Surface::Doc(editor) = &tab.surface else {
+        return false;
+    };
+    let (path, markdown) = match target {
+        Some(path) => {
+            let markdown = is_markdown_path(&path);
+            (path, markdown)
+        }
+        None => (
+            tab.path.clone().unwrap_or_else(|| {
+                std::env::current_dir()
+                    .unwrap_or_default()
+                    .join(tab.title.to_string())
+            }),
+            tab.markdown,
+        ),
+    };
+    // Markdown-backed tabs save as Markdown, editable-HTML pages rewrap the
+    // bundle the tab holds (or become a new one), everything else is lossless
+    // .docx.
+    let kind = html_bundle::doc_target(&path, markdown);
+    let bytes = match kind {
+        html_bundle::DocTarget::Markdown => {
+            docxcore::markdown::to_markdown(&editor.doc).into_bytes()
+        }
+        html_bundle::DocTarget::Docx => doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref()),
+        html_bundle::DocTarget::Html => {
+            let docx = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
+            match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), &docx) {
+                Ok(page) => page.into_bytes(),
+                Err(e) => {
+                    tab.status = format!("save failed: {e}").into();
+                    return false;
+                }
+            }
+        }
+    };
+    match opccore::fsio::write_atomic(&path, &bytes) {
+        Ok(()) => {
+            tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
+            tab.title = file_name(&path).into();
+            tab.markdown = markdown;
+            tab.path = Some(path);
+            tab.dirty = false;
+            // The page just written is the one the next save rewraps.
+            tab.bundle_html = match kind {
+                html_bundle::DocTarget::Html => String::from_utf8(bytes).ok(),
+                _ => None,
+            };
+            true
+        }
+        Err(e) => {
+            tab.status = format!("save failed: {e}").into();
+            false
+        }
+    }
+}
+
 impl Docxy {
     /// Serialize the open header/footer editor back into its package part (called
     /// on exit and before every save) so edits persist. Leaves the session open.
@@ -9858,9 +9925,6 @@ impl Docxy {
     }
 
     fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Save As marks the one save it triggers; a plain Save targets the
-        // tab's own file.
-        let own_path = !std::mem::take(&mut self.saving_as);
         if self.active_is_project() {
             return self.save_project(false, window, cx);
         }
@@ -9871,53 +9935,15 @@ impl Docxy {
             }
             return self.save_sheet(window, cx);
         }
+        self.save_doc(None, window, cx);
+    }
+
+    /// Save the active document tab to `target` (Save As, or the first save of
+    /// an untitled document to a picked path) or to its own file (`None`).
+    fn save_doc(&mut self, target: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_hf(); // commit any open header/footer edits into the package first
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let Surface::Doc(editor) = &tab.surface else {
-            return;
-        };
-        let path = tab.path.clone().unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .join(tab.title.to_string())
-        });
-        // Markdown-backed tabs save as Markdown, editable-HTML bundles rewrap
-        // their package, everything else is lossless .docx.
-        let target = html_bundle::doc_target(&path, tab.markdown);
-        let bytes = match target {
-            html_bundle::DocTarget::Markdown => {
-                docxcore::markdown::to_markdown(&editor.doc).into_bytes()
-            }
-            html_bundle::DocTarget::Docx => {
-                doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref())
-            }
-            html_bundle::DocTarget::Html => {
-                let docx = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
-                match html_bundle::bundle_bytes(&path, tab.bundle_html.as_deref(), own_path, &docx)
-                {
-                    Ok(page) => page.into_bytes(),
-                    Err(e) => {
-                        tab.status = format!("save failed: {e}").into();
-                        return self.refocus(window, cx);
-                    }
-                }
-            }
-        };
-        match opccore::fsio::write_atomic(&path, &bytes) {
-            Ok(()) => {
-                tab.title = file_name(&path).into();
-                tab.path = Some(path.clone());
-                tab.dirty = false;
-                tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
-                // The page just written is the one the next save rewraps.
-                tab.bundle_html = match target {
-                    html_bundle::DocTarget::Html => String::from_utf8(bytes).ok(),
-                    _ => None,
-                };
-            }
-            Err(e) => tab.status = format!("save failed: {e}").into(),
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            save_doc_tab(tab, target);
         }
         self.backstage = false;
         self.bs_new = false;
@@ -9991,17 +10017,16 @@ impl Docxy {
         if self.active_is_project() {
             return self.save_project(true, window, cx);
         }
-        if self.pick_doc_save_target() {
-            self.saving_as = true;
-            self.save_active(window, cx);
-        } else {
-            self.refocus(window, cx);
+        match self.pick_doc_save_target() {
+            Some(target) => self.save_doc(Some(target), window, cx),
+            None => self.refocus(window, cx),
         }
     }
 
-    /// Pick and bind a document Save As destination. The caller owns save,
-    /// cancellation status, and any harness guard against native dialogs.
-    fn pick_doc_save_target(&mut self) -> bool {
+    /// Ask for a document Save As destination. The caller saves to it (the tab
+    /// is rebound only once that save succeeds) and owns the cancellation
+    /// status and any harness guard against native dialogs.
+    fn pick_doc_save_target(&self) -> Option<PathBuf> {
         let start = self
             .tabs
             .get(self.active)
@@ -10022,16 +10047,7 @@ impl Docxy {
         // The name is written as picked (the dialog already asked about
         // overwriting it): any .html name saves a bundle, found by its content
         // when opened again.
-        if let Some(path) = dialog.set_file_name(start).save_file() {
-            if let Some(tab) = self.tabs.get_mut(self.active) {
-                // Choosing a .md name switches the tab to Markdown, and vice-versa.
-                tab.markdown = is_markdown_path(&path);
-                tab.path = Some(path);
-            }
-            true
-        } else {
-            false
-        }
+        dialog.set_file_name(start).save_file()
     }
 
     fn open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {

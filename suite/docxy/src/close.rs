@@ -142,9 +142,14 @@ impl Docxy {
                     "this document has never been saved, and a harness instance cannot open the Save As dialog".into();
                 return;
             }
-            if !self.pick_doc_save_target() {
-                self.tabs[self.active].status = "save cancelled".into();
-                return;
+            match self.pick_doc_save_target() {
+                // A picked destination is saved to like Save As: nothing found
+                // there (a bundle's metadata, say) is adopted.
+                Some(target) => return self.save_doc(Some(target), window, cx),
+                None => {
+                    self.tabs[self.active].status = "save cancelled".into();
+                    return;
+                }
             }
         }
         self.save_active(window, cx);
