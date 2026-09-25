@@ -12,6 +12,9 @@
 use crate::model::*;
 use crate::review::{RevisionAction, RevisionOutcome};
 
+mod flat;
+pub use flat::{FlatDocument, FlatStory, StoryOffset};
+
 /// A path into the document tree (to a paragraph) plus a character offset.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Caret {
@@ -2522,6 +2525,9 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
         };
         for r in runs {
             let len = r.text.chars().count();
+            if offset == 0 && pos == 0 && len > 0 {
+                return r.props.clone();
+            }
             if offset > pos && offset <= pos + len {
                 return r.props.clone();
             }
@@ -2537,6 +2543,25 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_props_at_paragraph_start_reads_first_run() {
+        let content = vec![
+            Inline::Run(Run {
+                text: "a".into(),
+                props: RunProps::default(),
+            }),
+            Inline::Run(Run {
+                text: "b".into(),
+                props: RunProps {
+                    bold: true,
+                    ..Default::default()
+                },
+            }),
+        ];
+        assert!(!run_props_at(&content, 0).bold);
+        assert!(run_props_at(&content, 2).bold);
+    }
 
     fn para(text: &str) -> Block {
         Block::Paragraph(Paragraph {
