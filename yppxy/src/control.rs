@@ -19,7 +19,7 @@
 //! | `task.get` | `{uid}` | one task |
 //! | `task.set` | `{uid, name?, duration?, level?}` | the updated task |
 //! | `task.add` | `{after?, name?, duration?}` | the new task |
-//! | `task.del` | `{uid}` | `{deleted}` |
+//! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
 //! | `link.del` | `{uid, pred}` | the updated task |
 //! | `find` | `{query}` | `{count, tasks:[…]}` |
@@ -63,6 +63,11 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         other => projctl::dispatch_editor(&mut app.ed, other, args)
             .unwrap_or_else(|| Err(format!("unknown verb '{other}'"))),
     };
+    if out.is_ok()
+        && (projctl::MUTATING.contains(&verb) || matches!(verb, "proj.open" | "proj.reload"))
+    {
+        app.drop_delete_confirm();
+    }
     if out.is_ok() {
         // An agent edit flashes this pane's status dot, so a watcher sees the
         // plan being worked on.
@@ -171,6 +176,42 @@ mod tests {
         assert_eq!(a.ed.project().tasks.len(), n0);
         a.redo();
         assert_eq!(a.ed.project().tasks.len(), n0 + 1);
+    }
+
+    #[test]
+    fn agent_edits_and_reloads_drop_a_pending_summary_delete() {
+        let uid = |u: i32| Json::obj(vec![("uid", Json::Num(u as f64))]);
+        for (verb, args) in [
+            (
+                "task.set",
+                Json::obj(vec![("uid", Json::Num(2.0)), ("level", Json::Num(1.0))]),
+            ),
+            ("task.add", Json::obj(vec![("after", Json::Num(1.0))])),
+            ("task.del", uid(2)),
+            ("proj.reload", Json::Null),
+            (
+                "proj.open",
+                Json::obj(vec![("path", Json::Str("missing.xml".into()))]),
+            ),
+        ] {
+            let mut a = app();
+            add(&mut a, "Child", "1d");
+            a.ed.indent(2, 1).unwrap();
+            a.ed.select(0);
+            a.delete_task();
+            assert!(a.confirm.is_some(), "{verb}");
+            // Reads leave the question open.
+            dispatch(&mut a, "task.list", &Json::Null).unwrap();
+            assert!(a.confirm.is_some(), "{verb}");
+            dispatch(&mut a, verb, &args).unwrap();
+            assert!(a.confirm.is_none(), "{verb} must drop the stale question");
+        }
+
+        // An Exit question is not about the plan, so it stays.
+        let mut a = app();
+        a.request_exit();
+        dispatch(&mut a, "task.del", &uid(1)).unwrap();
+        assert!(a.confirm.is_some());
     }
 
     #[test]

@@ -329,8 +329,8 @@ struct App {
     prompt: Option<Prompt>,
     status: String,
     quit: bool,
-    /// The shared Yes/No exit confirmation modal, open while asking whether
-    /// to quit (Ctrl+Q / File ▸ Exit).
+    /// The shared Yes/No modal, open while asking whether to quit (Ctrl+Q /
+    /// File ▸ Exit) or to delete a summary with its subtasks.
     confirm: Option<backstage::Confirm<ConfirmAction>>,
     // ribbon + backstage + chrome
     ribbon: Ribbon,
@@ -708,6 +708,18 @@ impl App {
                 ));
             }
             Err(message) => self.status = message,
+        }
+    }
+
+    /// Drop a pending summary-delete question: its task, count and project
+    /// were read before an agent edit or a reload changed them. An Exit
+    /// question stays.
+    fn drop_delete_confirm(&mut self) {
+        if matches!(
+            self.confirm.as_ref().map(|c| c.action()),
+            Some(ConfirmAction::DeleteTask(_))
+        ) {
+            self.confirm = None;
         }
     }
 
@@ -1108,7 +1120,7 @@ fn run_tui(proj: Project, path: Option<String>, vim: bool) -> io::Result<()> {
 }
 
 fn on_mouse(app: &mut App, m: MouseEvent) {
-    // A modal confirmation (Exit) owns the whole screen while open — before
+    // A modal confirmation (Exit, summary delete) owns the whole screen while open — before
     // the welcome screen or backstage, so it can appear over either.
     if app.confirm.is_some() {
         if m.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -1234,7 +1246,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         return;
     }
 
-    // A modal confirmation (Exit) owns all keys while open — before the
+    // A modal confirmation (Exit, summary delete) owns all keys while open — before the
     // welcome screen or backstage, so it can appear over either.
     if app.confirm.is_some() {
         app.confirm_key(k);
