@@ -137,6 +137,9 @@ pub struct Task {
     pub predecessors: Vec<Predecessor>,
     pub constraint: ConstraintType,
     pub constraint_date: Option<DateTime>,
+    /// MSPDI `Deadline`: bounds the late finish only, so a missed deadline
+    /// shows as negative total slack. It never moves scheduled dates.
+    pub deadline: Option<DateTime>,
     /// Task-specific calendar UID; falls back to the project calendar.
     pub calendar_uid: Option<i32>,
     /// Start/Finish as stored in the source file (Project's own computed

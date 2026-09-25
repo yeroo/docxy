@@ -189,6 +189,7 @@ fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
                         t.constraint = ConstraintType::from_code(int_of(p)).unwrap_or_default();
                     }
                     "ConstraintDate" => t.constraint_date = DateTime::parse_mspdi(&text_of(p)),
+                    "Deadline" => t.deadline = DateTime::parse_mspdi(&text_of(p)),
                     "CalendarUID" => t.calendar_uid = Some(int_of(p) as i32),
                     "PredecessorLink" => {
                         if let Some(pred) = parse_predecessor(p) {
@@ -720,6 +721,10 @@ fn write_task(s: &mut String, t: &Task) {
     if let Some(c) = t.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
     }
+    // Schema order puts Deadline after both CalendarUID and ConstraintDate.
+    if let Some(d) = t.deadline {
+        tag(s, 3, "Deadline", &d.to_mspdi());
+    }
     for p in &t.predecessors {
         s.push_str("      <PredecessorLink>\n");
         tag(s, 4, "PredecessorUID", &p.uid.to_string());
@@ -1033,6 +1038,33 @@ mod tests {
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
         assert_eq!(package.tasks, proj.tasks);
         assert!(package.new_tasks_are_manual);
+    }
+
+    #[test]
+    fn deadline_round_trips_after_calendar_uid() {
+        let deadline = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        let proj = Project {
+            tasks: vec![Task {
+                uid: 1,
+                constraint_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                calendar_uid: Some(1),
+                deadline: Some(deadline),
+                ..Task::default()
+            }],
+            ..Project::default()
+        };
+        let xml = write_mspdi(&proj);
+        let task = &xml[xml.find("<Task>").unwrap()..];
+        let at = |tag: &str| task.find(tag).unwrap_or_else(|| panic!("{tag} missing"));
+        // MSPDI orders CalendarUID and ConstraintDate before Deadline.
+        assert!(at("<ConstraintDate>") < at("<Deadline>"));
+        assert!(at("<CalendarUID>") < at("<Deadline>"));
+        assert!(xml.contains("<Deadline>2026-03-06T17:00:00</Deadline>"));
+        assert_eq!(read_mspdi(&xml).unwrap().tasks[0].deadline, Some(deadline));
+        // No deadline, no element.
+        let mut none = proj.clone();
+        none.tasks[0].deadline = None;
+        assert!(!write_mspdi(&none).contains("<Deadline>"));
     }
 
     #[test]
