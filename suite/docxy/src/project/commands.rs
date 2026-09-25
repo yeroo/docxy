@@ -384,7 +384,11 @@ pub(crate) struct ProjectPrompt {
 }
 
 impl ProjectView {
+    /// Task prompts do not open on the entry row, which has no task; Find does.
     pub fn open_prompt(&mut self, kind: PromptKind) {
+        if kind != PromptKind::Find && self.on_entry_row() {
+            return;
+        }
         let task = self.ed.project().tasks.get(self.ed.sel());
         let buf = match kind {
             PromptKind::Rename => task.map(|t| t.name.clone()).unwrap_or_default(),
@@ -395,7 +399,7 @@ impl ProjectView {
             kind,
             buf,
             uid: (kind != PromptKind::Find)
-                .then(|| self.ed.selected_uid())
+                .then(|| self.selected_uid())
                 .flatten(),
         });
     }
@@ -404,7 +408,23 @@ impl ProjectView {
     }
     pub fn select_row(&mut self, row: usize) {
         self.cancel_prompt();
+        self.entry = false;
         self.ed.select(row);
+    }
+
+    /// Find the next match; an empty query repeats the last search. From the
+    /// entry row the search starts at the first task, and a hit leaves it.
+    pub fn find(&mut self, query: &str) -> Option<String> {
+        if self.on_entry_row() {
+            // Tasks added after the cursor went there (Redo, the control
+            // pipe) can leave the selection short of the last task.
+            self.ed.select(usize::MAX);
+        }
+        let status = find_status(&mut self.ed, query);
+        if matches!(status, Some((FindOutcome::Found(_), _))) {
+            self.entry = false;
+        }
+        status.map(|(_, status)| status)
     }
 }
 
@@ -498,20 +518,22 @@ pub(crate) fn project_input(
             }
             return None;
         }
-        let before = (v.ed.sel(), v.ed.selected_uid());
+        let before = (v.cursor_row(), v.selected_uid());
         v.key(key, m.shift);
-        let changed = before != (v.ed.sel(), v.ed.selected_uid());
+        let changed = before != (v.cursor_row(), v.selected_uid());
         complete_project(tab, changed);
     }
     None
 }
 
-fn find_status(ed: &mut ProjectEditor, query: &str) -> Option<String> {
-    match ed.find(query) {
-        FindOutcome::Inactive => None,
-        FindOutcome::Found(_) => Some(format!("Found '{}'  (F3 next)", ed.find_query())),
-        FindOutcome::NotFound => Some(format!("No task matching '{}'", ed.find_query())),
-    }
+fn find_status(ed: &mut ProjectEditor, query: &str) -> Option<(FindOutcome, String)> {
+    let outcome = ed.find(query);
+    let status = match outcome {
+        FindOutcome::Inactive => return None,
+        FindOutcome::Found(_) => format!("Found '{}'  (F3 next)", ed.find_query()),
+        FindOutcome::NotFound => format!("No task matching '{}'", ed.find_query()),
+    };
+    Some((outcome, status))
 }
 
 fn assign_status(ed: &mut ProjectEditor, uid: i32, text: &str) -> Result<Option<String>, String> {
@@ -526,7 +548,7 @@ fn assign_status(ed: &mut ProjectEditor, uid: i32, text: &str) -> Result<Option<
 
 fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, String> {
     if p.kind == PromptKind::Find {
-        return Ok(find_status(&mut v.ed, &p.buf));
+        return Ok(v.find(&p.buf));
     }
     let uid = p.uid.ok_or("No task selected")?;
     match p.kind {
@@ -591,8 +613,11 @@ pub(crate) fn commit_prompt(tab: &mut DocTab, prompt: ProjectPrompt) {
 pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
     if let Surface::Project(v) = &mut tab.surface {
         tab.dirty = v.ed.dirty();
-        if reveal && !v.ed.project().tasks.is_empty() {
-            v.scroll.scroll_to_item(v.ed.sel(), ScrollStrategy::Nearest);
+        v.latch_entry_row();
+        // The list always holds the entry row, so there is a row to reveal.
+        if reveal {
+            v.scroll
+                .scroll_to_item(v.cursor_row(), ScrollStrategy::Nearest);
         }
     }
 }
@@ -610,11 +635,12 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     let result: Result<(), String> = (|| {
         match act {
             AddTask => {
-                let at = v.ed.add_task(v.ed.selected_uid(), "New task", 480)?;
-                v.ed.select(at);
+                // On the entry row there is no task to insert after: append.
+                let at = v.ed.add_task(v.selected_uid(), "New task", 480)?;
+                v.select_row(at);
             }
             DeleteTask => {
-                if let Some(uid) = v.ed.selected_uid() {
+                if let Some(uid) = v.selected_uid() {
                     // A summary takes its subtasks with it, so ask first.
                     if v.ed.subtree_len(uid)? > 0 {
                         v.open_prompt(PromptKind::ConfirmDelete);
@@ -624,7 +650,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 }
             }
             Milestone => {
-                if let Some(uid) = v.ed.selected_uid() {
+                if let Some(uid) = v.selected_uid() {
                     v.ed.toggle_milestone(uid)?;
                 }
             }
@@ -636,7 +662,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Assign => v.open_prompt(PromptKind::Assign),
             Find => v.open_prompt(PromptKind::Find),
             ClearResources => {
-                if let Some(uid) = v.ed.selected_uid() {
+                if let Some(uid) = v.selected_uid() {
                     status = assign_status(&mut v.ed, uid, "")?;
                 }
             }
@@ -686,7 +712,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                     .into(),
                 )
             }
-            FindNext => status = find_status(&mut v.ed, ""),
+            FindNext => status = v.find(""),
             ScrollLeft => {
                 v.pan_gantt(false);
             }

@@ -584,6 +584,9 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
     for key in ["up", "down", "home", "end"] {
         assert!(view_mut(&mut t).key(key, false));
         assert_eq!(view(&t).ed.sel(), 0);
+        // An empty plan has only the entry row.
+        assert!(view(&t).on_entry_row());
+        assert_eq!(view(&t).cursor_row(), 0);
     }
     for i in 0..100 {
         view_mut(&mut t)
@@ -591,15 +594,27 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
             .add_task(None, &format!("Task {i}"), 480)
             .unwrap();
     }
-    for (key, selected) in [
-        ("end", 99),
-        ("down", 99),
-        ("up", 98),
-        ("home", 0),
-        ("up", 0),
+    // Down from the last task goes to the entry row (100), as in Project;
+    // Up from there goes back to the last task.
+    for (key, cursor, selected) in [
+        ("end", 99, 99),
+        ("down", 100, 99),
+        ("down", 100, 99),
+        ("up", 99, 99),
+        ("up", 98, 98),
+        ("down", 99, 99),
+        ("down", 100, 99),
+        ("end", 99, 99),
+        ("down", 100, 99),
+        ("home", 0, 0),
+        ("up", 0, 0),
     ] {
         assert!(view_mut(&mut t).key(key, false));
-        assert_eq!(view(&t).ed.sel(), selected);
+        assert_eq!(
+            (view(&t).cursor_row(), view(&t).ed.sel()),
+            (cursor, selected),
+            "{key}"
+        );
     }
     assert!(view(&t).ed.dirty());
     assert!(!view_mut(&mut t).key("d", false));

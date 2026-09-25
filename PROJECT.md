@@ -173,6 +173,14 @@ the existing value; typing replaces it. Enter commits and moves down, Tab and
 Shift+Tab commit and move between columns, and Escape cancels. Invalid input
 stays open for correction. ID and summary dates/duration are read-only.
 
+As in Project, the blank row below the last task is the entry row: clicking any
+empty row below the tasks, or Down from the last task, puts the cell cursor
+there, and typing into it then committing appends a task (`1 day?` unless a
+duration is typed), as one undo step. A new plan starts there, so typing a name
+creates its first task. Commands that act on the selected task (Delete,
+milestone, indent/outdent, clear resources, the task prompts) do nothing on the
+entry row; Insert appends, and Find searches from the first task.
+
 Arrow keys move the cell cursor. Insert/Delete add/delete tasks (Delete on a
 summary asks first: Enter deletes it with its subtasks, Esc cancels);
 Alt+Shift+Right/Left indent/outdent; Alt+Right/Left pan the Gantt;

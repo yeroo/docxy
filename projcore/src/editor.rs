@@ -69,6 +69,8 @@ pub struct Editor {
     leveled: bool,
     level: Option<Leveled>,
     last_find: String,
+    /// Snapshots ever recorded; unlike `undo.len()` it still moves at `UNDO_CAP`.
+    pushes: u64,
 }
 
 impl Editor {
@@ -90,6 +92,7 @@ impl Editor {
             leveled: false,
             level: None,
             last_find: String::new(),
+            pushes: 0,
         }
     }
 
@@ -240,6 +243,7 @@ impl Editor {
 
     /// Record `prev` as the state to undo to: caps history and clears redo.
     fn push_undo(&mut self, prev: Project) {
+        self.pushes += 1;
         self.undo.push(prev);
         if self.undo.len() > UNDO_CAP {
             self.undo.remove(0);
@@ -366,6 +370,63 @@ impl Editor {
         })?;
         self.stamp_pinned_dates(uid);
         Ok(at)
+    }
+
+    /// Append a blank row and apply `edit` to it as ONE undo step, as typing
+    /// into Project's entry row below the last task does. The row becomes a
+    /// task through the ordinary setters (see [`materialized`]). Returns the
+    /// new row and `edit`'s value. If `edit` fails or leaves the row blank,
+    /// nothing changes: no row, history, dirty flag or selection change.
+    pub fn append_row<T>(
+        &mut self,
+        edit: impl FnOnce(&mut Editor, i32) -> Result<T, String>,
+    ) -> Result<Option<(usize, T)>, String> {
+        let uid = self
+            .proj
+            .tasks
+            .iter()
+            .map(|t| t.uid)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("No task IDs available")?;
+        let i = self.proj.tasks.len();
+        // Outside history: the scheduler drops blank rows, so the schedule
+        // stays valid, and every setter validates before its one snapshot.
+        self.proj.tasks.push(Task {
+            uid,
+            id: uid,
+            is_null: true,
+            ..Task::default()
+        });
+        let pushes = self.pushes;
+        let result = edit(self, uid);
+        let made = self.pushes != pushes && self.proj.tasks.get(i).is_some_and(|t| !t.is_null);
+        match result {
+            Ok(value) if made => {
+                debug_assert_eq!(self.pushes, pushes + 1, "one setter, one snapshot");
+                // The snapshot holds the blank row; without it, one Undo
+                // removes the whole task.
+                let top = self.undo.last_mut().expect("the setter pushed");
+                debug_assert!(top.tasks.last().is_some_and(|t| t.uid == uid && t.is_null));
+                top.tasks.pop();
+                Ok(Some((i, value)))
+            }
+            result => {
+                debug_assert_eq!(
+                    self.pushes, pushes,
+                    "a no-op or rejected edit pushes nothing"
+                );
+                debug_assert!(
+                    self.proj
+                        .tasks
+                        .last()
+                        .is_some_and(|t| t.uid == uid && t.is_null)
+                );
+                self.proj.tasks.pop();
+                result.map(|_| None)
+            }
+        }
     }
 
     /// Rows `uid` owns in the positional outline: itself, then every following
@@ -2500,5 +2561,203 @@ mod tests {
             .unwrap();
         let t = &ed.project().tasks[0];
         assert_eq!((t.duration_min, t.estimated), (960, Some(false)));
+    }
+
+    // ---- the entry row below the last task (#145) ----
+
+    #[test]
+    fn append_row_makes_one_estimated_task_as_one_undo_step() {
+        let mut ed = editor();
+        ed.indent(2, 1).unwrap();
+        ed.mark_saved();
+        let before = ed.project().clone();
+        let depth = ed.undo_depth();
+        let (row, ()) = ed
+            .append_row(|ed, uid| ed.rename(uid, "Typed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row, 2);
+        let t = &ed.project().tasks[2];
+        assert_eq!(
+            t,
+            &Task {
+                uid: 3,
+                id: 3,
+                name: "Typed".into(),
+                // The level of the task above, as Project's typed blank row.
+                outline_level: 2,
+                duration_min: 480,
+                estimated: Some(true),
+                ..Task::default()
+            }
+        );
+        assert!(ed.schedule().get(3).is_some());
+        assert!(ed.dirty());
+        assert_eq!((ed.undo_depth(), ed.redo_depth()), (depth + 1, 0));
+        assert_eq!(ed.sel(), 0, "the host selects the new row");
+        let after = ed.project().clone();
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before, "one Undo removes the whole task");
+        assert!(ed.redo());
+        assert_eq!(ed.project(), &after);
+        assert_schedule(&ed);
+    }
+
+    #[test]
+    fn append_row_passes_the_setters_value_and_uses_every_setter() {
+        let day = DateTime::from_ymd_hm(2026, 1, 7, 0, 0);
+        type RowEdit = dyn Fn(&mut Editor, i32) -> Result<(), String>;
+        let edits: Vec<(&str, Box<RowEdit>)> = vec![
+            (
+                "duration",
+                Box::new(|ed, uid| ed.set_duration_min(uid, 960)),
+            ),
+            ("milestone", Box::new(|ed, uid| ed.set_duration_min(uid, 0))),
+            ("start", Box::new(move |ed, uid| ed.set_start(uid, day))),
+            ("finish", Box::new(move |ed, uid| ed.set_finish(uid, day))),
+            (
+                "predecessors",
+                Box::new(|ed, uid| {
+                    let preds = parse_predecessors("1", ed.project())?;
+                    ed.set_predecessors(uid, preds)
+                }),
+            ),
+            (
+                "resources",
+                Box::new(|ed, uid| ed.set_resources(uid, &["Bob".to_string()])),
+            ),
+        ];
+        for (name, edit) in edits {
+            let mut ed = editor();
+            let before = ed.project().clone();
+            let appended = ed.append_row(|ed, uid| edit(ed, uid)).unwrap();
+            assert_eq!(appended, Some((2, ())), "{name}");
+            let t = &ed.project().tasks[2];
+            assert!(!t.is_null && t.uid == 3, "{name}");
+            assert_eq!(ed.undo_depth(), 1, "{name}");
+            assert!(ed.undo());
+            assert_eq!(ed.project(), &before, "{name}");
+        }
+        let mut ed = editor();
+        let got = ed
+            .append_row(|ed, uid| {
+                ed.rename(uid, "Valued")?;
+                Ok(uid * 10)
+            })
+            .unwrap();
+        assert_eq!(got, Some((2, 30)));
+    }
+
+    #[test]
+    fn a_rejected_or_blank_append_changes_nothing() {
+        let mut ed = editor();
+        ed.rename(1, "Renamed").unwrap();
+        ed.rename(2, "Renamed too").unwrap();
+        assert!(ed.undo());
+        ed.select(1);
+        for dirty in [false, true] {
+            if !dirty {
+                ed.mark_saved();
+            }
+            assert_unchanged(&mut ed, |ed| {
+                let e = ed.append_row(|ed, uid| ed.set_duration_min(uid, -1));
+                assert!(e.unwrap_err().contains("negative"));
+                let e = ed.append_row(|ed, uid| {
+                    let preds = parse_predecessors("99", ed.project())?;
+                    ed.set_predecessors(uid, preds)
+                });
+                assert!(e.is_err());
+                // An empty name leaves the row blank: nothing to append.
+                assert_eq!(ed.append_row(|ed, uid| ed.rename(uid, "")).unwrap(), None);
+                assert_eq!(ed.append_row(|_, _| Ok(())).unwrap(), None);
+            });
+            assert_eq!(ed.redo_depth(), 1);
+            // Dirty, still with a redo branch, for the second pass.
+            ed.rename(1, "Dirty").unwrap();
+            assert!(ed.undo());
+        }
+    }
+
+    #[test]
+    fn append_row_is_exact_with_a_full_history() {
+        let mut ed = editor();
+        for i in 0..UNDO_CAP + 3 {
+            ed.rename(1, &format!("R{i}")).unwrap();
+        }
+        assert_eq!(ed.undo_depth(), UNDO_CAP);
+        let oldest = ed.undo[0].clone();
+        assert_unchanged(&mut ed, |ed| {
+            assert!(
+                ed.append_row(|ed, uid| ed.set_duration_min(uid, -1))
+                    .is_err()
+            );
+        });
+        assert_eq!(
+            ed.undo[0], oldest,
+            "a rejected append keeps the oldest step"
+        );
+        let before = ed.project().clone();
+        ed.append_row(|ed, uid| ed.rename(uid, "Typed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(ed.undo_depth(), UNDO_CAP);
+        assert_eq!(
+            ed.undo[0],
+            ed_undo_after_trim(&oldest),
+            "trimmed exactly once"
+        );
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before, "one Undo removes only the new task");
+    }
+
+    /// The oldest entry after one more push trims `oldest`: task 1 renamed once more.
+    fn ed_undo_after_trim(oldest: &Project) -> Project {
+        let mut next = oldest.clone();
+        let n: usize = next.tasks[0].name[1..].parse().unwrap();
+        next.tasks[0].name = format!("R{}", n + 1);
+        next
+    }
+
+    #[test]
+    fn append_row_in_a_manual_plan_stamps_a_pinned_manual_task() {
+        let mut proj = editor().project().clone();
+        proj.new_tasks_are_manual = true;
+        let start = proj.start_date.unwrap();
+        let mut ed = Editor::new(proj);
+        let before = ed.project().clone();
+        ed.append_row(|ed, uid| ed.rename(uid, "Typed"))
+            .unwrap()
+            .unwrap();
+        let t = ed.project().tasks[2].clone();
+        assert!(t.manual && !t.is_null);
+        assert_eq!(
+            (t.manual_start, t.manual_duration_min),
+            (Some(start), Some(480))
+        );
+        let r = *ed.schedule().get(3).unwrap();
+        assert_eq!(
+            (t.stored_start, t.stored_finish),
+            (Some(start), Some(r.early_finish))
+        );
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+    }
+
+    #[test]
+    fn append_row_on_an_empty_plan_makes_the_first_task() {
+        let mut ed = Editor::new(untitled_project());
+        let (row, ()) = ed
+            .append_row(|ed, uid| ed.rename(uid, "Design"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(row, 0);
+        let t = &ed.project().tasks[0];
+        assert_eq!(
+            (t.uid, t.id, t.name.as_str(), t.outline_level),
+            (1, 1, "Design", 1)
+        );
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.undo());
+        assert!(ed.project().tasks.is_empty());
     }
 }

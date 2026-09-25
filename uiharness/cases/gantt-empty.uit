@@ -4,7 +4,10 @@ test empty gantt indent is a no-op
   assert dirty is false
   key alt p b
   assert dirty is false
+  assert cell_edit is none
   key tab shift+tab
+  assert cell_edit is none
+  assert cell_row is 0
   assert status is loaded — 0 tasks
   key ctrl+z
   assert status is Nothing to undo

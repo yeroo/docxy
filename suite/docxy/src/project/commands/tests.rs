@@ -18,8 +18,9 @@ fn tab() -> DocTab {
     for (name, duration) in [("First", 480), ("Second", 960)] {
         vm(&mut t).ed.add_task(None, name, duration).unwrap();
     }
+    // A view over the finished plan, as opening it builds one.
     let p = v(&t).ed.project().clone();
-    vm(&mut t).ed = ProjectEditor::new(p);
+    t.surface = Surface::Project(ProjectView::new(p, false));
     vm(&mut t).ed.select(1);
     t
 }
@@ -490,9 +491,12 @@ fn prompts_bind_uid_cancel_and_edit_unicode_without_dispatching_commands() {
     apply_project_act(&mut t, ProjectAct::Rename);
     apply_project_act(&mut t, ProjectAct::Undo);
     assert!(v(&t).prompt.is_none());
+    // An empty plan has only the entry row, where task prompts do not open.
     let mut empty = new_project_tab();
-    commit(&mut empty, ProjectAct::Rename, "Empty");
-    assert_eq!(empty.status.as_ref(), "No task selected");
+    let status = empty.status.clone();
+    apply_project_act(&mut empty, ProjectAct::Rename);
+    assert!(v(&empty).prompt.is_none());
+    assert_eq!(empty.status, status);
     assert!(!empty.dirty);
 }
 
@@ -774,6 +778,9 @@ fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
     assert!(t.dirty);
     apply_project_act(&mut t, ProjectAct::Undo);
     assert_eq!(v(&t).ed.project(), &before);
+    // Emptying the plan latched the entry row, so select the summary again.
+    assert!(v(&t).on_entry_row());
+    project_cell_click(&mut t, 0, None, false);
 
     // The prompt bar's Delete button commits through the same path as Enter.
     apply_project_act(&mut t, ProjectAct::DeleteTask);
@@ -790,4 +797,111 @@ fn deleting_a_leaf_needs_no_confirmation() {
     assert!(v(&t).prompt.is_none());
     assert_eq!(v(&t).ed.project().tasks.len(), 1);
     assert!(!v(&t).ed.project().tasks[0].summary);
+}
+
+// ---- the entry row below the last task (#145) ----
+
+#[test]
+fn task_commands_do_nothing_on_the_entry_row() {
+    use ProjectAct::*;
+    let mut t = tab();
+    // Give the last task something every command would change.
+    vm(&mut t).ed.assign_resource(2, "Bob").unwrap();
+    let p = v(&t).ed.project().clone();
+    vm(&mut t).ed = ProjectEditor::new(p);
+    project_entry_click(&mut t, None, false);
+    assert!(v(&t).on_entry_row());
+    let before = v(&t).ed.project().clone();
+    let status = t.status.clone();
+    for act in [
+        DeleteTask,
+        Milestone,
+        Indent,
+        Outdent,
+        ClearResources,
+        Rename,
+        Duration,
+        AddLink,
+        Constraint,
+        Assign,
+    ] {
+        apply_project_act(&mut t, act);
+        assert!(v(&t).prompt.is_none(), "{act:?} opened a prompt");
+        assert_eq!(v(&t).ed.project(), &before, "{act:?}");
+        assert_eq!(v(&t).ed.undo_depth(), 0, "{act:?}");
+        assert_eq!(t.status, status, "{act:?}");
+        assert!(!t.dirty, "{act:?}");
+        assert!(v(&t).on_entry_row(), "{act:?}");
+    }
+    // The same commands still act on a task row.
+    project_cell_click(&mut t, 1, None, false);
+    apply_project_act(&mut t, Milestone);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+}
+
+#[test]
+fn insert_on_the_entry_row_appends_and_selects_a_new_task() {
+    let mut t = tab();
+    project_entry_click(&mut t, None, false);
+    apply_project_act(&mut t, ProjectAct::AddTask);
+    let tasks = &v(&t).ed.project().tasks;
+    assert_eq!(tasks.len(), 3);
+    assert_eq!(tasks[2].name, "New task");
+    assert!(!v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 2);
+    assert_eq!(take_reveal(&t), Some(2));
+}
+
+#[test]
+fn find_from_the_entry_row_starts_at_the_first_task_and_leaves_it() {
+    let mut t = tab();
+    // The cursor was on the first task; both tasks match "s".
+    project_cell_click(&mut t, 0, None, false);
+    project_entry_click(&mut t, None, false);
+    commit(&mut t, ProjectAct::Find, "s");
+    assert_eq!(v(&t).ed.sel(), 0, "{}", t.status);
+    assert!(!v(&t).on_entry_row(), "a hit leaves the entry row");
+    // A miss stays on the entry row.
+    project_entry_click(&mut t, None, false);
+    commit(&mut t, ProjectAct::Find, "nothing like it");
+    assert!(v(&t).on_entry_row());
+    assert_eq!(t.status.as_ref(), "No task matching 'nothing like it'");
+}
+
+#[test]
+fn f3_from_the_entry_row_starts_at_the_first_task_after_undo_and_redo() {
+    let mut t = tab();
+    // "ir" matches First and Third, not Second.
+    project_entry_click(&mut t, None, false);
+    commit(&mut t, ProjectAct::Find, "ir");
+    assert_eq!(v(&t).ed.sel(), 0);
+    project_entry_click(&mut t, Some(1), false);
+    project_input(&mut t, "t", Some("Third"), Modifiers::default());
+    project_input(&mut t, "enter", None, Modifiers::default());
+    assert_eq!(v(&t).ed.project().tasks[2].name, "Third");
+    assert!(v(&t).on_entry_row());
+    // Undo, then Redo, leave the selection short of the last task.
+    apply_project_act(&mut t, ProjectAct::Undo);
+    apply_project_act(&mut t, ProjectAct::Redo);
+    assert_eq!(v(&t).ed.project().tasks.len(), 3);
+    assert!(v(&t).on_entry_row());
+    assert_ne!(v(&t).ed.sel(), 2);
+    apply_project_act(&mut t, ProjectAct::FindNext);
+    assert_eq!(v(&t).ed.sel(), 0, "F3 starts at the first task");
+    assert!(!v(&t).on_entry_row());
+}
+
+#[test]
+fn deleting_every_task_latches_the_entry_row_through_undo() {
+    let mut t = tab();
+    project_cell_click(&mut t, 0, None, false);
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    assert!(v(&t).ed.project().tasks.is_empty());
+    assert!(v(&t).entry, "an emptied plan latches the entry row");
+    // Undo brings a task back above the cursor, which stays on the entry row.
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project().tasks.len(), 1);
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 1);
 }
