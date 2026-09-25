@@ -65,6 +65,7 @@ options for run:
 
 regions:
   window  grid  chart-panel  cell:B3  cell:A1:C5  chart:0  gantt  bar:3
+  project-hbar-table  project-hbar-chart  project-vbar
 ";
 
 fn main() -> ExitCode {
