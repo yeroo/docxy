@@ -127,31 +127,112 @@ fn horizontal_offsets_clamp_on_keys_resize_and_schedule_changes() {
     v.layout(1180.);
     assert_eq!(v.table_w, 590.);
     v.pan_gantt(true);
-    assert_eq!(v.gantt_x, DAY_W);
+    assert_eq!(v.gantt_x.get(), DAY_W);
     assert!(v.key("right", false));
     assert_eq!(v.col, 2);
-    assert_eq!(v.table_x, 0.);
+    assert_eq!(v.table_x.get(), 0.);
     for _ in 0..500 {
         v.pan_gantt(true);
         v.key("right", false);
     }
-    assert_eq!(v.table_x, TABLE_W - 590.);
-    assert_eq!(v.gantt_w, 584.);
-    assert_eq!(v.gantt_x, v.scale.width() - 584.);
+    assert_eq!(v.table_x.get(), TABLE_W - 590.);
+    assert_eq!(v.gantt_w, 568.);
+    assert_eq!(v.gantt_x.get(), v.scale.width() - 568.);
     v.ed.set_duration(1, "1d").unwrap();
     v.layout(1180.);
-    assert_eq!(v.gantt_x, 76.);
+    assert_eq!(v.gantt_x.get(), 92.);
     v.layout(2000.);
-    assert_eq!((v.table_x, v.gantt_x), (0., 0.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
     for _ in 0..10 {
         v.pan_gantt(false);
         v.key("left", false);
     }
-    assert_eq!((v.table_x, v.gantt_x), (0., 0.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
     for (width, table) in [(460., 320.), (800., 400.), (1180., 590.), (2000., 908.)] {
         assert_eq!(table_pane_width(width), table);
         assert!(width - table >= 140.);
     }
+}
+
+#[test]
+fn layout_reserves_the_vertical_scrollbar_right_of_the_chart() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    for width in [460., 800., 1180., 2000.] {
+        v.layout(width);
+        assert_eq!(v.table_w + GANTT_INSET + v.gantt_w + SCROLLBAR_W, width);
+    }
+    v.layout(100.);
+    assert_eq!(v.gantt_w, 0.);
+}
+
+#[test]
+fn pane_scroll_maps_gpui_offsets_and_clamps_both_ends() {
+    let offset = PaneOffset::default();
+    let bar = PaneScroll {
+        offset: offset.clone(),
+        content: TABLE_W,
+        viewport: 400.,
+    };
+    assert_eq!(bar.content_size(), size(px(TABLE_W), px(SCROLLBAR_W)));
+    // gpui offsets are negative as content moves left.
+    bar.set_offset(point(px(-120.), px(0.)));
+    assert_eq!(offset.get(), 120.);
+    assert_eq!(bar.offset(), point(px(-120.), px(0.)));
+    bar.set_offset(point(px(-10_000.), px(0.)));
+    assert_eq!(offset.get(), TABLE_W - 400.);
+    bar.set_offset(point(px(50.), px(0.)));
+    assert_eq!(offset.get(), 0.);
+    // Content that fits has nowhere to scroll.
+    let fits = PaneScroll {
+        offset: offset.clone(),
+        content: 300.,
+        viewport: 400.,
+    };
+    fits.set_offset(point(px(-50.), px(0.)));
+    assert_eq!(offset.get(), 0.);
+}
+
+#[test]
+fn table_and_chart_scrollbars_move_only_their_own_pane() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    v.layout(1180.);
+    // The handles project_el renders.
+    let (table, chart) = v.pane_scrolls();
+    assert_eq!(
+        (table.content, table.viewport),
+        (TABLE_W, v.table_w),
+        "the table bar spans the table"
+    );
+    assert_eq!(
+        (chart.content, chart.viewport),
+        (v.scale.width(), v.gantt_w),
+        "the chart bar spans the timescale"
+    );
+    table.set_offset(point(px(-100.), px(0.)));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 0.));
+    chart.set_offset(point(px(-200.), px(0.)));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 200.));
+    // Offsets changed by keys show on the bars.
+    v.pan_gantt(true);
+    assert_eq!(chart.offset(), point(px(-(200. + DAY_W)), px(0.)));
+    assert_eq!(table.offset(), point(px(-100.), px(0.)));
+    // The next frame's layout keeps both where they were put.
+    v.layout(1180.);
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (100., 200. + DAY_W));
+}
+
+#[test]
+fn a_table_scrollbar_drag_is_not_undone_by_the_next_frame() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    v.layout(1180.);
+    assert_eq!(v.col, 1);
+    // Drag the Name column (48..288) out of view to the left.
+    v.table_x.set(TABLE_W - v.table_w);
+    v.layout(1180.);
+    assert_eq!(v.table_x.get(), TABLE_W - v.table_w);
+    // A resize still brings the selected column back.
+    v.layout(1000.);
+    assert_eq!(v.table_x.get(), 48.);
 }
 
 #[test]
@@ -218,7 +299,7 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
     };
     assert_eq!(
         project_region(&v, &probes, harness::Region::Gantt).unwrap(),
-        rect(416., 80., 394., 400.)
+        rect(416., 80., 378., 400.)
     );
     assert!(
         project_region(&v, &probes, harness::Region::Bar(1))
@@ -242,6 +323,7 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
         rect(410., 100., 6., 14.), // divider/inset is outside the chart viewport
         rect(420., 60., 40., 14.),
         rect(420., 480., 40., 14.),
+        rect(796., 100., 10., 14.), // under the vertical scrollbar, right of the chart
         rect(810., 100., 40., 14.),
     ] {
         probes.last[1].1 = r;
@@ -251,6 +333,41 @@ fn regions_use_body_origin_clip_both_axes_and_reject_hidden_bars() {
                 .contains("outside")
         );
     }
+}
+
+#[test]
+fn scrollbar_regions_are_their_probed_strips() {
+    let mut v = ProjectView::new(editor(vec![task(1, 2, 1)]).project().clone(), false);
+    v.layout(800.);
+    let mut probes = Probes::default();
+    for region in [
+        harness::Region::ProjectHbarTable,
+        harness::Region::ProjectHbarChart,
+        harness::Region::ProjectVbar,
+    ] {
+        assert!(
+            project_region(&v, &probes, region)
+                .unwrap_err()
+                .contains("has not been laid out")
+        );
+    }
+    probes.last = vec![
+        ("project-hbar-table".into(), rect(10., 480., 400., 16.)),
+        ("project-hbar-chart".into(), rect(416., 480., 378., 16.)),
+        ("project-vbar".into(), rect(794., 80., 16., 400.)),
+    ];
+    assert_eq!(
+        project_region(&v, &probes, harness::Region::ProjectHbarTable).unwrap(),
+        rect(10., 480., 400., 16.)
+    );
+    assert_eq!(
+        project_region(&v, &probes, harness::Region::ProjectHbarChart).unwrap(),
+        rect(416., 480., 378., 16.)
+    );
+    assert_eq!(
+        project_region(&v, &probes, harness::Region::ProjectVbar).unwrap(),
+        rect(794., 80., 16., 400.)
+    );
 }
 
 #[test]

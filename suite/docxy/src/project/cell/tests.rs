@@ -69,13 +69,13 @@ fn navigation_scrolls_and_all_printable_shortcuts_start_an_edit() {
         key(&mut t, "right");
     }
     assert_eq!(v(&t).col, 6);
-    assert!(v(&t).table_x > 0.);
-    assert_eq!(v(&t).gantt_x, 0.);
+    assert!(v(&t).table_x.get() > 0.);
+    assert_eq!(v(&t).gantt_x.get(), 0.);
     for _ in 0..10 {
         key(&mut t, "left");
     }
     assert_eq!(v(&t).col, 0);
-    assert_eq!(v(&t).table_x, 0.);
+    assert_eq!(v(&t).table_x.get(), 0.);
     key(&mut t, "f2");
     assert!(v(&t).cell.is_none());
     assert!(t.status.contains("read-only"));

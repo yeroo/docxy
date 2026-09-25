@@ -125,16 +125,18 @@ pub(crate) fn intersect(a: Bounds<Pixels>, b: Bounds<Pixels>) -> Option<Bounds<P
     (!r.is_empty()).then_some(r)
 }
 
-pub(crate) fn gantt_viewport(body: Bounds<Pixels>, table_w: f32) -> Option<Bounds<Pixels>> {
+/// The chart is `gantt_w` wide, so the vertical scrollbar right of it is not chart.
+pub(crate) fn gantt_viewport(
+    body: Bounds<Pixels>,
+    table_w: f32,
+    gantt_w: f32,
+) -> Option<Bounds<Pixels>> {
     let chart_x = table_w + GANTT_INSET;
     intersect(
         body,
         Bounds {
             origin: point(body.origin.x + px(chart_x), body.origin.y),
-            size: size(
-                (body.size.width - px(chart_x)).max(px(0.)),
-                body.size.height,
-            ),
+            size: size(px(gantt_w), body.size.height),
         },
     )
 }
