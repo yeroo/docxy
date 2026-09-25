@@ -29,7 +29,7 @@
 //! finish-to-start successors and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
-use crate::model::{Calendar, ConstraintType, LinkType, Project, ResourceType, Task};
+use crate::model::{Calendar, ConstraintType, LinkType, Project, ResourceType, Task, WorkingTime};
 use std::collections::HashMap;
 
 /// Maximum calendar days on either side of the scheduling anchor.
@@ -1019,7 +1019,9 @@ pub fn schedule(proj: &Project) -> Schedule {
 /// Working minutes between two wall-clock instants under the project's default
 /// calendar. Used when importing a file that stores computed wall-clock
 /// start/finish (a `.mpp`) but not an explicit working-minute duration: the
-/// duration is `working_minutes_between(start, finish)`.
+/// duration is `working_minutes_between(start, finish)`. A summary's duration
+/// is measured by [`task_duration_min`] instead, which falls back to the leaves'
+/// calendars when this one has no working time.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
     let cal = proj
         .calendars
@@ -1067,10 +1069,56 @@ pub(crate) fn summary_or_leaf_min(
     finish: DateTime,
 ) -> i64 {
     if task.summary {
-        working_minutes_between(proj, start, finish)
+        working_minutes_on(&summary_calendar(proj), start, finish)
     } else {
         task.duration_min
     }
+}
+
+/// The calendar every summary is measured on. MS Project uses the project
+/// calendar, resolved as the scheduler resolves it. When that calendar has no
+/// working time (allowed as long as every leaf uses its own working calendar),
+/// the substitute is the per-weekday union of the working time of the
+/// calendars of all schedulable leaves, so equal dates still mean equal
+/// durations across summaries.
+fn summary_calendar(proj: &Project) -> Calendar {
+    let calendars = CalendarResolver::new(proj);
+    let Some(default) = calendars.resolve(None) else {
+        return Calendar::standard(proj.default_calendar_uid);
+    };
+    if has_working_time(default) {
+        return default.clone();
+    }
+    let mut union = Calendar {
+        uid: default.uid,
+        name: default.name.clone(),
+        week: Default::default(),
+    };
+    let mut seen = std::collections::HashSet::new();
+    for cal in proj
+        .tasks
+        .iter()
+        .filter(|t| calendars.schedulable(t))
+        .filter_map(|t| calendars.resolve(t.calendar_uid))
+        .filter(|cal| seen.insert(cal.uid))
+    {
+        for (day, times) in union.week.iter_mut().zip(&cal.week) {
+            day.times
+                .extend(times.times.iter().filter(|t| t.from < t.to).copied());
+        }
+    }
+    for day in &mut union.week {
+        day.times.sort_by_key(|t| t.from);
+        let mut merged: Vec<WorkingTime> = Vec::new();
+        for t in day.times.drain(..) {
+            match merged.last_mut() {
+                Some(last) if t.from <= last.to => last.to = last.to.max(t.to),
+                _ => merged.push(t),
+            }
+        }
+        day.times = merged;
+    }
+    union
 }
 
 // ---- resource leveling ------------------------------------------------------
@@ -3348,6 +3396,24 @@ mod tests {
         assert_eq!(task_duration_min(&proj, &s, &task(99, "Ghost", 480)), None);
     }
 
+    fn weekly(uid: i32, days: &[(usize, u32, u32)]) -> Calendar {
+        let mut cal = closed_calendar(uid);
+        for &(dow, from, to) in days {
+            cal.week[dow].times.push(WorkingTime { from, to });
+        }
+        cal
+    }
+
+    /// Default calendar 1 has no working time; every leaf sets its own.
+    fn closed_default(tasks: Vec<Task>, calendars: Vec<Calendar>) -> Project {
+        Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks,
+            calendars: [vec![closed_calendar(1)], calendars].concat(),
+            ..Project::default()
+        }
+    }
+
     fn child(uid: i32, name: &str, duration: i64, calendar: i32) -> Task {
         Task {
             outline_level: 2,
@@ -3361,6 +3427,84 @@ mod tests {
             summary: true,
             ..task(uid, "Phase", 0)
         }
+    }
+
+    #[test]
+    fn summary_duration_uses_leaf_calendars_when_default_has_no_work() {
+        let mut b = child(3, "B", 480, 3);
+        b.predecessors.push(fs(2));
+        let proj = closed_default(
+            vec![phase(1), child(2, "A", 480, 3), b],
+            vec![Calendar::standard(3)],
+        );
+        let s = schedule(&proj);
+        assert_eq!(dates(&s, 1).1, "2026-03-03T17:00:00");
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(960));
+        let lv = level(&proj);
+        assert_eq!(
+            summary_or_leaf_min(
+                &proj,
+                &proj.tasks[0],
+                lv.start(1).unwrap(),
+                lv.finish(1).unwrap()
+            ),
+            960
+        );
+    }
+
+    #[test]
+    fn summary_duration_unions_every_leaf_calendar() {
+        // Standard Mon-Fri, a Saturday morning, and a long Monday overlapping
+        // both Standard shifts: Monday counts 08:00-18:00 once, not twice.
+        let saturday = weekly(4, &[(6, 480, 720)]);
+        let long_monday = weekly(5, &[(1, 600, 1080)]);
+        let mut sat = child(3, "Sat", 240, 4);
+        sat.predecessors.push(fs(2));
+        let proj = closed_default(
+            vec![
+                phase(1),
+                child(2, "A", 480, 3),
+                sat,
+                child(4, "Mon", 480, 5),
+            ],
+            vec![Calendar::standard(3), saturday, long_monday],
+        );
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-07T12:00:00".into())
+        );
+        let monday = 600;
+        let tue_to_fri = 4 * 480;
+        let saturday = 240;
+        assert_eq!(
+            task_duration_min(&proj, &s, &proj.tasks[0]),
+            Some(monday + tue_to_fri + saturday)
+        );
+    }
+
+    #[test]
+    fn summary_duration_stays_on_a_working_default_calendar() {
+        // Leaves on a 24-hour calendar: the summary is still measured on the
+        // project's Standard calendar, as MS Project measures it.
+        let mut always = closed_calendar(3);
+        for day in &mut always.week {
+            day.times = vec![WorkingTime { from: 0, to: 1440 }];
+        }
+        let mut b = child(3, "B", 480, 3);
+        b.predecessors.push(fs(2));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![phase(1), child(2, "A", 480, 3), b],
+            calendars: vec![Calendar::standard(1), always],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-03T00:00:00".into())
+        );
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(480));
     }
 
     #[test]

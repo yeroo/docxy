@@ -495,6 +495,46 @@ mod tests {
     }
 
     #[test]
+    fn markdown_measures_summaries_on_leaf_calendars_when_default_has_none() {
+        let mut phase = task(1, "Phase", 0);
+        phase.summary = true;
+        let mut a = task(2, "A", 480);
+        let mut b = task(3, "B", 480);
+        b.predecessors = vec![Predecessor {
+            uid: 2,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        }];
+        for leaf in [&mut a, &mut b] {
+            leaf.outline_level = 2;
+            leaf.calendar_uid = Some(3);
+        }
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![phase, a, b],
+            calendars: vec![
+                Calendar {
+                    uid: 1,
+                    name: "Closed".into(),
+                    week: Default::default(),
+                },
+                Calendar::standard(3),
+            ],
+            ..Project::default()
+        };
+        let md = to_markdown(&proj, &schedule(&proj));
+        assert_eq!(
+            table_rows(&md)[1][..4],
+            [
+                "**Phase**",
+                "2026-03-02 08:00:00",
+                "2026-03-03 17:00:00",
+                "2d"
+            ]
+        );
+    }
+
+    #[test]
     fn names_with_special_chars_are_sanitized() {
         let mut a = task(1, "Design: phase, one", 480);
         a.id = 1;

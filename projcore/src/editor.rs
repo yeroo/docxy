@@ -1350,6 +1350,47 @@ mod tests {
     }
 
     #[test]
+    fn summary_durations_and_baselines_use_leaf_calendars_on_an_empty_default() {
+        let mut proj = untitled_project();
+        proj.calendars = vec![
+            crate::model::Calendar {
+                uid: 1,
+                name: "Closed".into(),
+                week: Default::default(),
+            },
+            crate::model::Calendar::standard(3),
+        ];
+        proj.tasks = (1..=3)
+            .map(|uid| Task {
+                uid,
+                id: uid,
+                name: format!("Task {uid}"),
+                outline_level: if uid == 1 { 1 } else { 2 },
+                summary: uid == 1,
+                calendar_uid: (uid != 1).then_some(3),
+                duration_min: if uid == 1 { 0 } else { 480 },
+                predecessors: if uid == 3 {
+                    vec![crate::model::Predecessor {
+                        uid: 2,
+                        link: LinkType::FinishStart,
+                        lag_min: 0,
+                    }]
+                } else {
+                    vec![]
+                },
+                ..Task::default()
+            })
+            .collect();
+        let mut ed = Editor::new(proj);
+        assert_eq!(ed.disp_duration_min(1), Some(960));
+        ed.toggle_level();
+        assert_eq!(ed.disp_duration_min(1), Some(960));
+        ed.set_baseline();
+        let baseline = ed.project().tasks[0].baseline(0).unwrap();
+        assert_eq!(baseline.duration_min, Some(960));
+    }
+
+    #[test]
     fn history_cap_redo_branch_and_selection_clamping() {
         let mut ed = editor();
         assert!(!ed.undo());
