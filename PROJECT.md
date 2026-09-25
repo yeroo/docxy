@@ -122,7 +122,7 @@ There's no free high-fidelity oracle for scheduling (Project isn't scriptable in
 CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds twenty tiny
 one-feature MSPDI files, each embedding every task's `Start`/`Finish`,
 `TotalSlack` and `Critical`. In files 01–18 these are the values Microsoft
-Project 2021 computes: `corpus/tools/verify_mspdi_project.py` checked every
+Project 2024 computes: `corpus/tools/verify_mspdi_project.py` checked every
 one against Project over COM (#74), with the oracle elements removed from the
 copy Project schedules. Files 19 (manual tasks, #77) and 20 (stored task
 fields and a blank row, #80) are hand-derived from our scheduler and not yet

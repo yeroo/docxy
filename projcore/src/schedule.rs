@@ -4564,7 +4564,7 @@ mod tests {
 
     #[test]
     fn missed_deadline_gives_task_and_its_driver_negative_slack() {
-        // #100: Project 2021 reports -5d total slack and 0 free slack on both.
+        // #100: Project 2024 reports -5d total slack and 0 free slack on both.
         for honor in [true, false] {
             let baseline = schedule(&deadline_chain(None, honor));
             let sched = schedule(&deadline_chain(Some(dt(6, 17)), honor));

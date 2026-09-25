@@ -130,7 +130,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
 }
 
 #[test]
-fn project_2021_oracles() {
+fn project_2024_oracles() {
     let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     if snapshots.join("01-empty.mpp").exists() {
         let newest = pairs(&snapshots, "")

@@ -5,7 +5,7 @@ Unlike the xlsx corpus, there is no free high-fidelity oracle for project
 scheduling (MS Project is the reference implementation and isn't scriptable
 in CI). Each file embeds Start/Finish, TotalSlack and Critical for a standard
 8h/day Mon-Fri calendar anchored at Monday 2026-03-02 08:00. Every value was
-checked against Project 2021 by corpus/tools/verify_mspdi_project.py (#74),
+checked against Project 2024 by corpus/tools/verify_mspdi_project.py (#74),
 which schedules a copy with these oracle elements removed. Earlier owner runs
 covered 05 and 14 (#53), 16 (#58), 17 (#60) and 18 (#59); the script
 reproduces them. `projcore/tests/corpus.rs` reads each file, runs the CPM
@@ -174,7 +174,7 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
 
 
 D = 480  # one working day in minutes
-# Project 2021 (#74) gives most tasks no total slack and marks them critical.
+# Project 2024 (#74) gives most tasks no total slack and marks them critical.
 CRIT = {"slack": 0, "critical": True}
 
 # Anchor Mon 2026-03-02 08:00. Working days: Mon2 Tue3 Wed4 Thu5 Fri6 (Sat7/Sun8
@@ -306,7 +306,7 @@ def build():
                 task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
                 resources_xml=rich_res, assignments_xml=asn))
 
-    # 14 — Project 2021 places the SF successor before the project start (#53).
+    # 14 — Project 2024 places the SF successor before the project start (#53).
     add("14-link-sf-before-start.xml", ["link", "link-sf", "before-start"],
         "Start-to-finish successor begins before the project start.",
         project("link-sf-before-start", "\n".join([
@@ -330,22 +330,22 @@ def build():
                      "<IsBaseCalendar>1</IsBaseCalendar><WeekDays>\n"
                      + full_days + "\n</WeekDays></Calendar>")
     add("16-24-hour-calendar.xml", ["calendar", "calendar-24hour", "round-trip"],
-        "Project 2021 (#58): three 8-hour duration days finish after 24 continuous hours.",
+        "Project 2024 (#58): three 8-hour duration days finish after 24 continuous hours.",
         project("24-hour-calendar", task(1, "Build", 3 * D, dt(2), dt(3), **CRIT, calendar=3),
                 calendars=[standard_calendar(), full_calendar]))
 
-    # 17 — Project 2021 honors FNLT over the FS link and reports -5d slack (#60).
+    # 17 — Project 2024 honors FNLT over the FS link and reports -5d slack (#60).
     add("17-constraint-fnlt-conflict.xml", ["constraint", "constraint-fnlt", "negative-slack"],
-        "Project 2021 (#60): FNLT overrides the FS link; both tasks have -5d total slack.",
+        "Project 2024 (#60): FNLT overrides the FS link; both tasks have -5d total slack.",
         project("constraint-fnlt-conflict", "\n".join([
             task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True),
             task(2, "B", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True,
                  preds=[(1, FS, 0)], ctype=FNLT, cdate=dt(6, "17:00:00")),
         ])))
 
-    # 18 — Project 2021 places FS milestones at the predecessor's finish (#59).
+    # 18 — Project 2024 places FS milestones at the predecessor's finish (#59).
     add("18-milestone-after-fs.xml", ["milestone", "link", "link-fs"],
-        "Project 2021 (#59): FS milestones keep the predecessor finish instant.",
+        "Project 2024 (#59): FS milestones keep the predecessor finish instant.",
         project("milestone-after-fs", "\n".join([
             task(1, "A", 2 * D, dt(2), dt(3, "17:00:00"), slack=4 * D, critical=False),
             task(2, "Sign-off", 0, dt(3, "17:00:00"), dt(3, "17:00:00"),
@@ -382,7 +382,7 @@ def build():
     # 20 — task fields Project writes that the model keeps (#80): task type,
     # effort-driven, estimated, active, priority, deadline, levelling, display
     # flags, WBS, GUID/CreateDate, stored Work/Cost, and a blank row between
-    # two linked tasks under a summary. Values follow a Project 2021 corpus:
+    # two linked tasks under a summary. Values follow a Project 2024 corpus:
     # most tasks estimated, Priority 500 or 900, LevelingDelayFormat 8.
     # Hand-derived like file 19, not verified in Project: docxy still
     # schedules the inactive task, and the blank row's shape is ours.
@@ -431,7 +431,7 @@ def build():
     # 21 — B misses its Deadline by 5 days. The deadline bounds late finish
     # only: dates stay put and A and B both get -5d total slack (#100).
     add("21-deadline-missed.xml", ["deadline", "link", "link-fs", "negative-slack"],
-        "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack.",
+        "Project 2024 (#100): a missed Deadline gives B and its driver A -5d total slack.",
         project("deadline-missed", "\n".join([
             task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True),
             task(2, "B", 5 * D, dt(9), dt(13, "17:00:00"), slack=-5 * D, critical=True,
@@ -441,7 +441,7 @@ def build():
     # 22 — recorded progress survives saves (#81): a complete task, an
     # in-progress task stopped Thu 5 and resuming Fri 6, and a not-started
     # task, each with an assignment carrying its actuals; the in-progress
-    # assignment also has two baseline slots. Shapes follow a Project 2021
+    # assignment also has two baseline slots. Shapes follow a Project 2024
     # tracked plan (Stop == Resume == finish once complete, Resume at the next
     # working moment after Stop). The actual dates equal the scheduled ones, so
     # the oracle holds while the scheduler ignores progress. Hand-derived like
