@@ -275,6 +275,10 @@ fn load_theme_pref() -> bool {
 
 /// Persist the theme preference. Best-effort — failures are ignored.
 fn save_theme_pref(light: bool) {
+    // Tests toggle the theme; never let them rewrite the user's prefs.
+    if cfg!(test) {
+        return;
+    }
     let Some(p) = prefs_path() else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -350,9 +354,25 @@ struct App {
     list_y0: u16,     // absolute y of the first task row
     list_left_w: u16, // width of the task pane (left of the gantt)
     gantt_x0: u16,    // absolute x where the gantt inner area begins
+    screen_w: u16,    // terminal width, for the tab-strip Theme button
 }
 
 const RIBBON_H: u16 = 7; // tab strip (1) + body (6: border, 2 rows, separator, titles, border)
+
+/// The Theme button at the right end of the ribbon tab strip — yppxy's
+/// counterpart of the suite's title-bar button (Microsoft Project has no
+/// ribbon command for it). `T` toggles the theme too.
+const THEME_BTN: &str = "◐ Theme";
+
+/// Columns `[a, b)` of [`THEME_BTN`] on a tab strip `width` wide whose tabs end
+/// at `tabs_right`: right-aligned with a one-column margin, or `None` when it
+/// would come within two columns of the tabs. Drawing and clicks both use it.
+fn theme_btn_cols(width: u16, tabs_right: u16) -> Option<(u16, u16)> {
+    let w = THEME_BTN.width() as u16;
+    let b = width.checked_sub(1)?;
+    let a = b.checked_sub(w)?;
+    (a >= tabs_right + 2).then_some((a, b))
+}
 
 impl App {
     fn new(proj: Project, path: Option<String>, vim: bool) -> App {
@@ -392,6 +412,7 @@ impl App {
             list_y0: 0,
             list_left_w: 0,
             gantt_x0: 0,
+            screen_w: 0,
             vim,
         }
     }
@@ -641,7 +662,15 @@ impl App {
                     buf: cur,
                 });
             }
+            Act::Find => self.find_prompt(),
             Act::Baseline => self.set_baseline(),
+            Act::CalculateProject => {
+                // The scheduler reruns on every edit, so there is nothing
+                // pending; say so, in the suite's words.
+                self.status = "Rescheduled (automatic on every edit)".into();
+            }
+            Act::LevelAll => self.set_level(true),
+            Act::ClearLeveling => self.set_level(false),
             Act::Assign => {
                 self.prompt = Some(Prompt {
                     kind: PromptKind::Assign,
@@ -654,22 +683,38 @@ impl App {
             Act::ScrollLeft => self.hscroll -= 1,
             Act::ScrollRight => self.hscroll += 1,
             Act::GoToStart => self.hscroll = 0,
-            Act::ThemeToggle => self.theme_toggle(),
-            Act::Level => self.toggle_level(),
-            Act::Save => self.save(),
-            Act::SaveAs => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::SaveAs,
-                    label: "Save as".into(),
-                    buf: self.path.clone().unwrap_or_default(),
-                });
-            }
-            Act::Todo(name) => self.status = format!("{name} — not implemented yet"),
         }
     }
 
+    /// Open the Find prompt (Ctrl+F and Task › Editing › Find).
+    fn find_prompt(&mut self) {
+        self.prompt = Some(Prompt {
+            kind: PromptKind::Find,
+            label: "Find".into(),
+            buf: String::new(),
+        });
+    }
+
+    /// Open the Save As prompt, prefilled with the bound path.
+    fn save_as_prompt(&mut self) {
+        self.prompt = Some(Prompt {
+            kind: PromptKind::SaveAs,
+            label: "Save as".into(),
+            buf: self.path.clone().unwrap_or_default(),
+        });
+    }
+
+    /// `L`: flip resource leveling.
     fn toggle_level(&mut self) {
-        self.ed.toggle_level();
+        self.set_level(!self.ed.leveled());
+    }
+
+    /// Resource › Level › Level All (`on`) / Clear Leveling (`!on`). Idempotent;
+    /// the status reports the resulting state either way, as the suite does.
+    fn set_level(&mut self, on: bool) {
+        if self.ed.leveled() != on {
+            self.ed.toggle_level();
+        }
         self.status = if self.ed.leveled() {
             "Resource leveling ON — bars delayed to fit resource capacity"
         } else {
@@ -805,13 +850,7 @@ impl App {
                     self.status = format!("Save failed: {e}");
                 }
             }
-            None => {
-                self.prompt = Some(Prompt {
-                    kind: PromptKind::SaveAs,
-                    label: "Save as".into(),
-                    buf: String::new(),
-                });
-            }
+            None => self.save_as_prompt(),
         }
     }
 
@@ -1206,6 +1245,14 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         MouseEventKind::Down(MouseButton::Left) => {
             // Ribbon area (top RIBBON_H rows).
             if y < RIBBON_H {
+                if y == 0 {
+                    if let Some((a, b)) = theme_btn_cols(app.screen_w, app.ribbon.width()) {
+                        if x >= a && x < b {
+                            app.theme_toggle();
+                            return;
+                        }
+                    }
+                }
                 match app.ribbon.hit(x, y, true) {
                     ribbon::Hit::Tab(i) => {
                         if app.ribbon.tab_is_file(i) {
@@ -1310,13 +1357,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
             KeyCode::Char('e') => app.export_md(),
             KeyCode::Char('z') => app.undo(),
             KeyCode::Char('y') | KeyCode::Char('r') => app.redo(),
-            KeyCode::Char('f') => {
-                app.prompt = Some(Prompt {
-                    kind: PromptKind::Find,
-                    label: "Find".into(),
-                    buf: String::new(),
-                });
-            }
+            KeyCode::Char('f') => app.find_prompt(),
             KeyCode::Char('q') => app.request_exit(), // Ctrl+Q: confirm even if dirty
             _ => {}
         }
@@ -1382,6 +1423,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('b') => app.set_baseline(),
         KeyCode::Char('L') => app.toggle_level(),
+        KeyCode::Char('T') => app.theme_toggle(),
         KeyCode::Char('a') => {
             app.prompt = Some(Prompt {
                 kind: PromptKind::Assign,
@@ -1514,13 +1556,10 @@ fn draw(f: &mut Frame, app: &mut App) {
         return;
     }
 
-    // Reflect toggle state (theme, leveling) in the ribbon.
+    // Reflect leveling in the ribbon (Level All drawn as an active toggle).
     let mut toggles = Vec::new();
-    if app.light {
-        toggles.push(Act::ThemeToggle);
-    }
     if app.ed.leveled() {
-        toggles.push(Act::Level);
+        toggles.push(Act::LevelAll);
     }
     app.ribbon.set_toggles(toggles);
 
@@ -1535,6 +1574,17 @@ fn draw(f: &mut Frame, app: &mut App) {
         ])
         .split(area);
     f.render_widget(Paragraph::new(app.ribbon.render_tabs(app.rfocus)), rows[0]);
+    app.screen_w = area.width;
+    if let Some((a, b)) = theme_btn_cols(area.width, app.ribbon.width()) {
+        let btn = Rect {
+            x: area.x + a,
+            y: rows[0].y,
+            width: b - a,
+            height: 1,
+        };
+        let style = Style::default().fg(Color::Yellow);
+        f.render_widget(Paragraph::new(Span::styled(THEME_BTN, style)), btn);
+    }
     f.render_widget(Paragraph::new(app.ribbon.render_body(app.rfocus)), rows[1]);
     draw_header(f, rows[2], app);
     draw_body(f, rows[3], app);
@@ -1825,7 +1875,7 @@ fn build_gantt_row(
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let help = "n add · d dur · p dep · Tab indent · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · q quit";
+    let help = "n add · d dur · p dep · Tab indent · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · T theme · q quit";
     let text = if app.status.is_empty() {
         help.to_string()
     } else {
@@ -1936,7 +1986,7 @@ mod tests {
             if binding.is_none() {
                 app.save();
             } else {
-                app.apply_act(Act::SaveAs);
+                app.save_as_prompt();
             }
             app.prompt.as_mut().unwrap().buf = dir.join("plan.mpp").to_string_lossy().into_owned();
             on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1947,7 +1997,7 @@ mod tests {
             if binding.is_none() {
                 app.save();
             } else {
-                app.apply_act(Act::SaveAs);
+                app.save_as_prompt();
             }
             let target = dir.join(label);
             app.prompt.as_mut().unwrap().buf = target.to_string_lossy().into_owned();
@@ -2438,12 +2488,9 @@ mod tests {
         });
         let mut app = App::new(proj, Some("plan.yppx".into()), false);
         let s = buffer_text(&mut app, 110, 24);
-        assert!(
-            s.contains("File")
-                && s.contains("Task")
-                && s.contains("Schedule")
-                && s.contains("View")
-        );
+        for tab in ["File", "Task", "Resource", "Report", "Project", "View"] {
+            assert!(s.contains(tab), "tab {tab} missing");
+        }
         assert!(s.contains("Milestone"), "ribbon body missing");
         assert!(s.contains("Gantt"), "gantt pane missing");
     }
@@ -2807,5 +2854,121 @@ mod tests {
         on_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.confirm.is_none());
         assert!(!app.quit);
+    }
+
+    fn click(app: &mut App, x: u16, y: u16) {
+        on_mouse(
+            app,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: x,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+    }
+
+    /// Row `y` of a `w`-wide frame, as text.
+    fn frame_row(app: &mut App, w: u16, y: u16) -> String {
+        buffer_text(app, w, 22)
+            .chars()
+            .skip(y as usize * w as usize)
+            .take(w as usize)
+            .collect()
+    }
+
+    #[test]
+    fn calculate_project_reports_automatic_scheduling() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.apply_act(Act::CalculateProject);
+        assert_eq!(app.status, "Rescheduled (automatic on every edit)");
+    }
+
+    #[test]
+    fn level_all_and_clear_leveling_are_idempotent() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        let on = "Resource leveling ON — bars delayed to fit resource capacity";
+        for (act, leveled, status) in [
+            (Act::LevelAll, true, on),
+            (Act::LevelAll, true, on),
+            (Act::ClearLeveling, false, "Resource leveling OFF"),
+            (Act::ClearLeveling, false, "Resource leveling OFF"),
+        ] {
+            app.apply_act(act);
+            assert_eq!(app.ed.leveled(), leveled, "{act:?}");
+            assert_eq!(app.status, status, "{act:?}");
+        }
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('L'), KeyModifiers::SHIFT),
+        );
+        assert!(app.ed.leveled(), "L still toggles");
+        buffer_text(&mut app, 110, 22);
+        assert!(
+            app.ribbon.toggle_on(Act::LevelAll),
+            "Level All drawn active"
+        );
+    }
+
+    #[test]
+    fn tab_strip_theme_button_toggles_theme() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        let light = app.light;
+        let row0 = frame_row(&mut app, 100, 0);
+        let (a, b) = theme_btn_cols(100, app.ribbon.width()).unwrap();
+        assert_eq!(
+            row0.chars().skip(a as usize).collect::<String>().trim_end(),
+            THEME_BTN
+        );
+        click(&mut app, a, 0);
+        assert_eq!(app.light, !light);
+        click(&mut app, b - 1, 0);
+        assert_eq!(app.light, light);
+        // A tab click still switches tabs and leaves the theme alone.
+        let x = (0..100)
+            .find(|&x| matches!(app.ribbon.hit(x, 0, false), ribbon::Hit::Tab(2)))
+            .unwrap();
+        click(&mut app, x, 0);
+        assert_eq!(app.ribbon.active_tab(), 2);
+        assert_eq!(app.light, light);
+    }
+
+    #[test]
+    fn theme_button_hidden_when_narrow() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        // Six tabs end at column 50: the button needs 60 columns.
+        assert!(theme_btn_cols(60, app.ribbon.width()).is_some());
+        assert_eq!(theme_btn_cols(59, app.ribbon.width()), None);
+        let light = app.light;
+        assert!(!frame_row(&mut app, 59, 0).contains("Theme"));
+        for x in 51..59 {
+            click(&mut app, x, 0);
+        }
+        assert_eq!(app.light, light);
+    }
+
+    #[test]
+    fn t_key_toggles_theme() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        let light = app.light;
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.light, !light);
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT),
+        );
+        assert_eq!(app.light, light);
+    }
+
+    #[test]
+    fn ribbon_find_opens_find_prompt() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.apply_act(Act::Find);
+        let p = app.prompt.as_ref().expect("Find prompt");
+        assert!(matches!(p.kind, PromptKind::Find));
+        assert_eq!(p.label, "Find");
     }
 }
