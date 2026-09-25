@@ -151,7 +151,7 @@ One JSON object per line; one reply line per request:
 | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 | `doc.read` | `{start?, end?}` or `{range?:"a..b"}` (default: whole doc) | `{total, start, end, text, blocks:[{index, kind, text, heading?}]}` |
-| `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` |
+| `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` — `start`/`end` are editor offsets (see notes) |
 | `doc.replace-range` | `{start, end?, text, markdown?}` | `{replaced, total}` |
 | `doc.insert` | `{at, text, markdown?}` | `{total}` |
 | `doc.append` | `{text, markdown?}` | `{total}` |
@@ -195,6 +195,21 @@ Notes:
   A document can have distinct first-page and even-page headers/footers;
   those aren't surfaced by these verbs — only `app.headers.default`/
   `app.footers.default`.
+- **`doc.find` and `doc.replace-all` see only the text the editor can edit.**
+  A paragraph's editable text is its runs, simple links, tabs and breaks. Text
+  it only shows is not searched or replaced: tracked changes (`w:ins`/`w:del`),
+  field results, footnote/endnote references, equations, SmartArt, chart
+  titles, inline text boxes, and complex links. A link is complex when it
+  holds anything but plain text runs, for example a tracked change, a field, a
+  bookmark or a proofing mark (`w:proofErr`); an external link is also
+  complex when it holds a tab or a break (an anchor link may hold those and
+  stay simple). A match's
+  `start`/`end` count only editable text, while `text` is the paragraph's full
+  plain text (the form `doc.replace-range` round-trips), which includes the
+  rest. So `text[start..end]` is the match only when the paragraph holds
+  nothing but editable text; otherwise don't splice `text` at those offsets.
+  A text box's own paragraphs are still searched and replaced, as matches
+  under their own `path` (with no `block`/`text`).
 - `doc.replace-all` and `doc.undo`/`doc.redo` no-op cleanly: a `query` that
   matches nothing, or an undo/redo on an empty stack, reports `replaced:0`/
   `done:false` and does **not** mark the document modified or flash the

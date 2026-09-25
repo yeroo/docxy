@@ -1269,6 +1269,41 @@ mod tests {
         assert_eq!(paras(&ed.doc), vec!["X and X"]);
     }
 
+    /// #197: a link and tracked changes before the match must not shift the
+    /// match or the edit. Offsets are editor offsets; revision text is not
+    /// searched and stays untouched.
+    #[test]
+    fn find_and_replace_all_ignore_zero_width_inlines_before_the_match() {
+        let xml = "<w:document><w:body><w:p>\
+            <w:r><w:t xml:space=\"preserve\">Start </w:t></w:r>\
+            <w:hyperlink w:anchor=\"top\"><w:r><w:t>link</w:t></w:r></w:hyperlink>\
+            <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>added</w:t></w:r></w:ins>\
+            <w:del w:id=\"2\" w:author=\"A\"><w:r><w:delText>removed</w:delText></w:r></w:del>\
+            <w:r><w:t xml:space=\"preserve\"> end.</w:t></w:r>\
+            </w:p></w:body></w:document>";
+        let doc = crate::load::parse_document_xml(xml, &crate::load::Relationships::default());
+        let matches = find(&doc, "end", false);
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].start, matches[0].end), (11, 14));
+        assert!(find(&doc, "added", false).is_empty());
+
+        let mut ed = Editor::new(doc);
+        assert_eq!(replace_all(&mut ed, "end", "finish", false), (1, 1));
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!("expected a paragraph");
+        };
+        // plain_text still includes the (untouched) revision text.
+        assert_eq!(p.plain_text(), "Start linkaddedremoved finish.");
+        assert_eq!(
+            p.content
+                .iter()
+                .filter(|i| matches!(i, Inline::Revision { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(replace_all(&mut ed, "removed", "X", false), (0, 0));
+    }
+
     #[test]
     fn undo_redo_report_whether_anything_happened() {
         let mut ed = Editor::new(doc_with(&["A"]));

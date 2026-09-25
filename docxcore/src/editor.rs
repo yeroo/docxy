@@ -734,9 +734,10 @@ impl Editor {
         }
     }
 
+    /// The caret paragraph's text in editor offsets (see [`editor_text`]).
     fn cur_text(&self) -> String {
         resolve_para(&self.doc.body, &self.caret.path)
-            .map(|p| p.plain_text())
+            .map(|p| editor_text(&p.content))
             .unwrap_or_default()
     }
 
@@ -1403,13 +1404,15 @@ impl Editor {
         }
     }
 
-    /// The plain text currently selected (empty if no selection).
+    /// The plain text currently selected (empty if no selection). Selection
+    /// offsets are editor offsets, so this slices [`editor_text`], not
+    /// `plain_text` (which also holds zero-width inlines' text).
     pub fn selection_text(&self) -> String {
         self.selection_spans()
             .iter()
             .filter_map(|(path, s, e)| {
                 resolve_para(&self.doc.body, path).map(|p| {
-                    p.plain_text()
+                    editor_text(&p.content)
                         .chars()
                         .skip(*s)
                         .take(e.saturating_sub(*s))
@@ -1460,6 +1463,12 @@ impl Editor {
 /// The search core behind [`Editor::find_all`] — a free function over
 /// `&[Block]` so [`crate::agent::find`] can call it without needing a live
 /// `Editor`.
+///
+/// It searches the text the editor can address ([`editor_text`]), so match
+/// offsets are editor offsets that selection and editing can use directly.
+/// Text the editor gives zero width (tracked changes, field results, footnote
+/// refs, complex hyperlinks' `content`, …) is drawn but not searched: a match
+/// there could be neither selected nor replaced.
 pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool) -> Vec<Match> {
     if query.is_empty() {
         return Vec::new();
@@ -1470,7 +1479,7 @@ pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool
         let Some(p) = resolve_para(body, &path) else {
             continue;
         };
-        let t: Vec<char> = p.plain_text().chars().collect();
+        let t: Vec<char> = editor_text(&p.content).chars().collect();
         if t.len() < q.len() {
             continue;
         }
@@ -1534,11 +1543,29 @@ impl Editor {
     }
 
     /// Replace the current selection with plain text (used by replace-current).
+    ///
+    /// A selection within one paragraph is rewritten in place, exactly as
+    /// [`Editor::replace_all`] rewrites a match (one undo step), so Replace
+    /// and Replace All agree. A selection across paragraphs, or text holding
+    /// a newline (which splits the paragraph), deletes then types instead.
     pub fn replace_current_with(&mut self, text: &str) {
-        if self.has_selection() {
-            self.delete_selection();
-            self.insert_str(text);
+        let Some((lo, hi)) = self.selection_range() else {
+            return;
+        };
+        if lo.path == hi.path && !text.contains('\n') {
+            self.checkpoint(EditKind::Structural);
+            if let Some(p) = para_mut(&mut self.doc.body, &lo.path) {
+                replace_range_in_content(&mut p.content, lo.offset, hi.offset, text);
+            }
+            self.anchor = None;
+            self.caret = Caret {
+                offset: lo.offset + text.chars().count(),
+                path: lo.path,
+            };
+            return;
         }
+        self.delete_selection();
+        self.insert_str(text);
     }
 
     /// Replace every match of `query` with `with`. Returns the number replaced.
@@ -1560,16 +1587,16 @@ impl Editor {
             groups.push((m.path.clone(), vec![m]));
         }
         let mut count = 0;
-        for (path, mut ms) in groups {
+        // Paragraphs back to front too. A text box's paragraphs are addressed
+        // through the host's inline index (`[i, k, j]`, listed after `[i]`),
+        // and an edit to the host can remove an emptied run before the text
+        // box and shift `k`: edit the text box paragraphs first, while their
+        // paths still resolve to the same text box.
+        for (path, mut ms) in groups.into_iter().rev() {
             ms.sort_by_key(|m| std::cmp::Reverse(m.start)); // back-to-front keeps offsets valid
             if let Some(p) = para_mut(&mut self.doc.body, &path) {
                 for m in ms {
-                    for _ in m.start..m.end {
-                        content_delete(&mut p.content, m.start);
-                    }
-                    for (k, ch) in with.chars().enumerate() {
-                        content_insert(&mut p.content, m.start + k, ch);
-                    }
+                    replace_range_in_content(&mut p.content, m.start, m.end, with);
                     count += 1;
                 }
             }
@@ -2015,6 +2042,62 @@ fn inline_len(i: &Inline) -> usize {
         | Inline::UnsupportedRevision { .. }
         | Inline::FootnoteRef { .. }
         | Inline::Raw(_) => 0,
+    }
+}
+
+/// A paragraph's text in editor offset space: one char per offset, matching
+/// [`inline_len`] inline by inline (zero-width inlines contribute nothing, a
+/// hyperlink contributes its `runs`, a tab is `'\t'`, a break is `'\n'`).
+/// Unlike [`Paragraph::plain_text`], every char here is one the caret can
+/// reach, so offsets into it can be selected and edited.
+fn editor_text(content: &[Inline]) -> String {
+    let mut out = String::new();
+    for inline in content {
+        match inline {
+            Inline::Run(r) => out.push_str(&r.text),
+            Inline::Hyperlink(h) => h.runs.iter().for_each(|r| out.push_str(&r.text)),
+            Inline::Tab(_) => out.push('\t'),
+            Inline::Break(_) => out.push('\n'),
+            Inline::SmartArt { .. }
+            | Inline::Chart { .. }
+            | Inline::Equation { .. }
+            | Inline::Field { .. }
+            | Inline::TextBox { .. }
+            | Inline::Revision { .. }
+            | Inline::UnsupportedRevision { .. }
+            | Inline::FootnoteRef { .. }
+            | Inline::Raw(_) => {}
+        }
+    }
+    out
+}
+
+/// Replace editor offsets `[start, end)` with `with`, in place.
+///
+/// The replacement is inserted *inside* the match, after its first char, and
+/// the matched chars are deleted afterwards. `content_insert` at offset
+/// `start + 1` resolves to the inline holding the first matched char, because
+/// every earlier inline ends at or before `start`; so nothing is inserted on
+/// the far side of an adjacent zero-width inline (a field, a tracked change,
+/// …). When that inline is a run or hyperlink, the replacement lands in it and
+/// takes its formatting (as Word does), and it never goes empty mid-edit.
+/// When it is a tab or break (a match starting with `\t`/`\n`), there is no
+/// run to take: the replacement goes into the following run, or a new
+/// unformatted run, right where the tab or break was.
+fn replace_range_in_content(content: &mut Vec<Inline>, start: usize, end: usize, with: &str) {
+    if end <= start {
+        for (k, ch) in with.chars().enumerate() {
+            content_insert(content, start + k, ch);
+        }
+        return;
+    }
+    let w = with.chars().count();
+    for (k, ch) in with.chars().enumerate() {
+        content_insert(content, start + 1 + k, ch);
+    }
+    content_delete(content, start);
+    for _ in start + 1..end {
+        content_delete(content, start + w);
     }
 }
 
@@ -3113,6 +3196,604 @@ mod tests {
         ed.select_match(&ms[0]);
         ed.replace_current_with("three");
         assert_eq!(top_text(&ed), vec!["one three"]);
+    }
+
+    // ---- #197: find / replace in editor offsets around zero-width inlines ----
+
+    /// A one-paragraph document loaded from `<w:p>` inner XML, so the inlines
+    /// are exactly what the loader produces for real files.
+    fn xml_doc(p_inner: &str) -> Document {
+        crate::load::parse_document_xml(
+            &format!("<w:document><w:body><w:p>{p_inner}</w:p></w:body></w:document>"),
+            &crate::load::Relationships::default(),
+        )
+    }
+
+    fn first_para(ed: &Editor) -> &Paragraph {
+        match &ed.doc.body[0] {
+            Block::Paragraph(p) => p,
+            other => panic!("expected a paragraph, got {other:?}"),
+        }
+    }
+
+    fn etext(ed: &Editor) -> String {
+        editor_text(&first_para(ed).content)
+    }
+
+    /// Every inline that is not a plain run, in order: what Replace All must
+    /// leave alone.
+    fn non_runs(ed: &Editor) -> Vec<Inline> {
+        first_para(ed)
+            .content
+            .iter()
+            .filter(|i| !matches!(i, Inline::Run(_)))
+            .cloned()
+            .collect()
+    }
+
+    /// The issue's repro: a plain link and two tracked changes before ` end.`.
+    const REPRO_197: &str = "<w:r><w:t xml:space=\"preserve\">Start </w:t></w:r>\
+        <w:hyperlink w:anchor=\"top\"><w:r><w:t>link</w:t></w:r></w:hyperlink>\
+        <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>added</w:t></w:r></w:ins>\
+        <w:del w:id=\"2\" w:author=\"A\"><w:r><w:delText>removed</w:delText></w:r></w:del>\
+        <w:r><w:t xml:space=\"preserve\"> end.</w:t></w:r>";
+
+    const FIELD_197: &str = "<w:r><w:t xml:space=\"preserve\">Page </w:t></w:r>\
+        <w:fldSimple w:instr=\" REF fig \"><w:r><w:t>Figure9</w:t></w:r></w:fldSimple>\
+        <w:r><w:t xml:space=\"preserve\"> end.</w:t></w:r>";
+
+    const FOOTNOTE_197: &str = "<w:r><w:t>Note</w:t></w:r>\
+        <w:r><w:rPr><w:rStyle w:val=\"FootnoteReference\"/></w:rPr>\
+        <w:footnoteReference w:id=\"7\"/></w:r>\
+        <w:r><w:t xml:space=\"preserve\"> end.</w:t></w:r>";
+
+    const COMPLEX_LINK_197: &str = "<w:r><w:t xml:space=\"preserve\">See </w:t></w:r>\
+        <w:hyperlink w:anchor=\"top\"><w:r><w:t>here</w:t></w:r>\
+        <w:ins w:id=\"3\" w:author=\"A\"><w:r><w:t>more</w:t></w:r></w:ins></w:hyperlink>\
+        <w:r><w:t xml:space=\"preserve\"> end.</w:t></w:r>";
+
+    /// Find `end` selects exactly `end`, and Replace All rewrites exactly it,
+    /// leaving every non-run inline untouched and in order.
+    fn assert_find_and_replace_end(p_inner: &str) {
+        let mut ed = Editor::new(xml_doc(p_inner));
+        let before = etext(&ed);
+        let at = before.chars().count() - "end.".chars().count();
+        let ms = ed.find_all("end", false);
+        assert_eq!(
+            ms,
+            vec![Match {
+                path: vec![0],
+                start: at,
+                end: at + 3
+            }],
+            "match offsets must be editor offsets in {before:?}"
+        );
+        ed.select_match(&ms[0]);
+        assert_eq!(ed.selection_text(), "end");
+        let kept = non_runs(&ed);
+        assert_eq!(ed.replace_all("end", "finish", false), 1);
+        assert_eq!(etext(&ed), before.replacen("end", "finish", 1));
+        assert_eq!(non_runs(&ed), kept, "zero-width inlines must survive");
+        match first_para(&ed).content.last() {
+            Some(Inline::Run(r)) => assert_eq!(r.text, " finish."),
+            other => panic!("replacement not in the trailing run: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_all_repro_197_edits_the_matched_text() {
+        let ed = Editor::new(xml_doc(REPRO_197));
+        let p = first_para(&ed);
+        // The loader's shape: a plain link (runs filled, no content) and two
+        // tracked changes, all before the match.
+        assert!(
+            matches!(&p.content[1], Inline::Hyperlink(h) if h.runs.len() == 1 && h.content.is_empty())
+        );
+        assert!(matches!(
+            &p.content[2],
+            Inline::Revision {
+                kind: RevisionKind::Insert,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &p.content[3],
+            Inline::Revision {
+                kind: RevisionKind::Delete,
+                ..
+            }
+        ));
+        assert_eq!(etext(&ed), "Start link end.");
+        assert_find_and_replace_end(REPRO_197);
+        let mut ed = Editor::new(xml_doc(REPRO_197));
+        ed.replace_all("end", "finish", false);
+        assert_eq!(etext(&ed), "Start link finish.");
+    }
+
+    #[test]
+    fn find_next_repro_197_selects_the_matched_text() {
+        let mut ed = Editor::new(xml_doc(REPRO_197));
+        let m = ed.find_next("end", false, false).expect("a match");
+        assert_eq!((m.start, m.end), (11, 14));
+        ed.select_match(&m);
+        assert_eq!(ed.caret.offset, 14);
+        assert_eq!(ed.selection_text(), "end");
+    }
+
+    #[test]
+    fn find_and_replace_after_a_field_197() {
+        let ed = Editor::new(xml_doc(FIELD_197));
+        assert!(
+            first_para(&ed)
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::Field { text, .. } if text == "Figure9"))
+        );
+        assert_find_and_replace_end(FIELD_197);
+    }
+
+    #[test]
+    fn find_and_replace_after_a_footnote_ref_197() {
+        let ed = Editor::new(xml_doc(FOOTNOTE_197));
+        assert!(
+            first_para(&ed)
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::FootnoteRef { id: 7, .. }))
+        );
+        assert_find_and_replace_end(FOOTNOTE_197);
+    }
+
+    #[test]
+    fn find_and_replace_after_a_complex_hyperlink_197() {
+        let ed = Editor::new(xml_doc(COMPLEX_LINK_197));
+        // A link holding a revision keeps its text in `content`, not `runs`.
+        assert!(first_para(&ed).content.iter().any(
+            |i| matches!(i, Inline::Hyperlink(h) if h.runs.is_empty() && !h.content.is_empty())
+        ));
+        assert_find_and_replace_end(COMPLEX_LINK_197);
+    }
+
+    #[test]
+    fn text_only_inside_zero_width_inlines_is_not_matched_197() {
+        for (xml, query) in [
+            (REPRO_197, "added"),
+            (REPRO_197, "removed"),
+            (FIELD_197, "Figure9"),
+            (FOOTNOTE_197, "7"),
+            (COMPLEX_LINK_197, "here"),
+            (COMPLEX_LINK_197, "more"),
+        ] {
+            let mut ed = Editor::new(xml_doc(xml));
+            let before = ed.doc.clone();
+            assert!(ed.find_all(query, false).is_empty(), "{query:?} matched");
+            assert_eq!(ed.find_next(query, false, false), None);
+            assert_eq!(
+                crate::agent::replace_all(&mut ed, query, "X", false),
+                (0, 0),
+                "{query:?} replaced"
+            );
+            assert_eq!(ed.doc, before);
+            assert!(!ed.undo(), "no-op Replace All must not checkpoint");
+        }
+    }
+
+    fn bold() -> RunProps {
+        RunProps {
+            bold: true,
+            ..Default::default()
+        }
+    }
+
+    fn run(text: &str, props: RunProps) -> Inline {
+        Inline::Run(Run {
+            text: text.into(),
+            props,
+        })
+    }
+
+    fn field(text: &str) -> Inline {
+        Inline::Field {
+            raw: "<w:fldSimple/>".into(),
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn replace_range_keeps_a_whole_hyperlink_197() {
+        let mut content = vec![
+            run("Go ", RunProps::default()),
+            Inline::Hyperlink(Hyperlink {
+                anchor: Some("top".into()),
+                runs: vec![Run {
+                    text: "here".into(),
+                    props: RunProps::default(),
+                }],
+                ..Default::default()
+            }),
+            run(".", RunProps::default()),
+        ];
+        replace_range_in_content(&mut content, 3, 7, "there");
+        assert_eq!(editor_text(&content), "Go there.");
+        match &content[1] {
+            Inline::Hyperlink(h) => {
+                assert_eq!(h.anchor.as_deref(), Some("top"));
+                assert_eq!(h.runs.len(), 1);
+                assert_eq!(h.runs[0].text, "there");
+            }
+            other => panic!("hyperlink lost: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replace_all_keeps_a_whole_hyperlink_197() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:r><w:t xml:space=\"preserve\">Go </w:t></w:r>\
+             <w:hyperlink w:anchor=\"top\"><w:r><w:t>here</w:t></w:r></w:hyperlink>\
+             <w:r><w:t>.</w:t></w:r>",
+        ));
+        assert_eq!(ed.replace_all("here", "there", false), 1);
+        assert_eq!(etext(&ed), "Go there.");
+        assert!(matches!(
+            &first_para(&ed).content[1],
+            Inline::Hyperlink(h) if h.runs.iter().map(|r| r.text.as_str()).collect::<String>() == "there"
+        ));
+    }
+
+    #[test]
+    fn replace_all_keeps_a_whole_bold_run_bold_197() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![
+                    run("a ", RunProps::default()),
+                    run("bold", bold()),
+                    run(" c", RunProps::default()),
+                ],
+            })],
+        });
+        assert_eq!(ed.replace_all("bold", "heavy", false), 1);
+        assert_eq!(etext(&ed), "a heavy c");
+        assert_eq!(first_para(&ed).content[1], run("heavy", bold()));
+    }
+
+    #[test]
+    fn replace_range_after_a_field_stays_after_it_197() {
+        let mut content = vec![field("F"), run("end.", RunProps::default())];
+        replace_range_in_content(&mut content, 0, 3, "finish");
+        assert_eq!(
+            content,
+            vec![field("F"), run("finish.", RunProps::default())]
+        );
+        // The whole trailing run matched: it must not reappear before the field.
+        let mut content = vec![field("F"), run("end", bold())];
+        replace_range_in_content(&mut content, 0, 3, "finish");
+        assert_eq!(content, vec![field("F"), run("finish", bold())]);
+    }
+
+    #[test]
+    fn replace_range_across_a_field_keeps_the_field_197() {
+        let mut content = vec![
+            run("ab", RunProps::default()),
+            field("F"),
+            run("cd", RunProps::default()),
+        ];
+        replace_range_in_content(&mut content, 0, 4, "X");
+        assert_eq!(editor_text(&content), "X");
+        assert!(content.contains(&field("F")));
+    }
+
+    #[test]
+    fn replace_range_with_nothing_deletes_the_match_197() {
+        let mut content = vec![run("a bold c", RunProps::default())];
+        replace_range_in_content(&mut content, 2, 7, "");
+        assert_eq!(content, vec![run("a c", RunProps::default())]);
+    }
+
+    #[test]
+    fn selection_text_uses_editor_offsets_197() {
+        let mut ed = Editor::new(xml_doc(REPRO_197));
+        ed.select_match(&Match {
+            path: vec![0],
+            start: 6,
+            end: 14,
+        });
+        assert_eq!(ed.selection_text(), "link end");
+    }
+
+    #[test]
+    fn word_motion_uses_editor_offsets_197() {
+        let mut ed = Editor::new(xml_doc(
+            "<w:r><w:t xml:space=\"preserve\">Start </w:t></w:r>\
+             <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>added</w:t></w:r></w:ins>\
+             <w:r><w:t xml:space=\"preserve\"> end</w:t></w:r>",
+        ));
+        assert_eq!(etext(&ed), "Start  end");
+        ed.caret = Caret::at(vec![0], 0);
+        ed.move_word_right();
+        assert_eq!(ed.caret.offset, 7, "Ctrl-Right stops at `end`");
+        ed.move_word_right();
+        assert_eq!(ed.caret.offset, 10, "then at the paragraph end");
+        ed.caret = Caret::at(vec![0], 10);
+        ed.move_word_left();
+        assert_eq!(ed.caret.offset, 7, "Ctrl-Left stops at `end`");
+    }
+
+    #[test]
+    fn replace_range_starting_at_a_tab_takes_the_tabs_place_197() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![
+                    run("a", RunProps::default()),
+                    Inline::Tab(RunProps::default()),
+                    run("b c", bold()),
+                ],
+            })],
+        });
+        let ms = ed.find_all("\tb", false);
+        assert_eq!((ms[0].start, ms[0].end), (1, 3));
+        assert_eq!(ed.replace_all("\tb", "X", false), 1);
+        assert_eq!(etext(&ed), "aX c");
+        // No run to inherit from at a tab: the replacement joins the next run.
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("a", RunProps::default()), run("X c", bold())]
+        );
+        // A tab with nothing after it: a new run in the tab's place.
+        let mut content = vec![
+            run("a", RunProps::default()),
+            Inline::Tab(RunProps::default()),
+            field("F"),
+        ];
+        replace_range_in_content(&mut content, 1, 2, "X");
+        assert_eq!(editor_text(&content), "aX");
+        assert_eq!(content.last(), Some(&field("F")));
+    }
+
+    fn text_box(text: &str) -> Inline {
+        Inline::TextBox {
+            raw: "<w:txbxContent/>".into(),
+            blocks: vec![para(text)],
+        }
+    }
+
+    /// The text of the paragraph inside the host's `n`th text box.
+    fn box_text(ed: &Editor, n: usize) -> String {
+        first_para(ed)
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::TextBox { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .nth(n)
+            .map(|blocks| match &blocks[0] {
+                Block::Paragraph(p) => p.plain_text(),
+                other => panic!("expected a paragraph, got {other:?}"),
+            })
+            .expect("text box")
+    }
+
+    /// Emptying a host run shifts the host's inline indices. Text-box paths
+    /// go through those indices, so they must be edited first, or they
+    /// resolve to the wrong text box (or none).
+    #[test]
+    fn replace_all_edits_text_boxes_before_their_host_197() {
+        // An empty replacement of a whole run, and a non-empty one whose
+        // match crosses runs (its second run empties): both remove a run.
+        for (runs, with, host, tb1) in [
+            (
+                vec![run("x ", RunProps::default()), run("ab", bold())],
+                "",
+                "x ",
+                "",
+            ),
+            (
+                vec![run("x a", RunProps::default()), run("b", bold())],
+                "Q",
+                "x Q",
+                "Q",
+            ),
+        ] {
+            let mut content = runs;
+            content.extend([text_box("ab"), text_box("zz")]);
+            let mut ed = Editor::new(Document {
+                body: vec![Block::Paragraph(Paragraph {
+                    props: ParProps::default(),
+                    content,
+                })],
+            });
+            assert_eq!(ed.find_all("ab", false).len(), 2);
+            assert_eq!(ed.replace_all("ab", with, false), 2, "with {with:?}");
+            assert_eq!(etext(&ed), host, "with {with:?}");
+            assert_eq!(box_text(&ed, 0), tb1, "with {with:?}");
+            assert_eq!(box_text(&ed, 1), "zz", "with {with:?}");
+        }
+    }
+
+    /// Single Replace (select the match, replace it) must give the same
+    /// document as Replace All, and undo in one step.
+    fn assert_replace_current_matches_replace_all(doc: Document, query: &str, with: &str) {
+        let mut all = Editor::new(doc.clone());
+        assert_eq!(all.replace_all(query, with, false), 1);
+
+        let mut one = Editor::new(doc);
+        let original = one.doc.clone();
+        let ms = one.find_all(query, false);
+        assert_eq!(ms.len(), 1);
+        one.select_match(&ms[0]);
+        one.replace_current_with(with);
+        assert_eq!(one.doc, all.doc, "Replace and Replace All disagree");
+        assert!(!one.has_selection());
+        assert_eq!(one.caret.offset, ms[0].start + with.chars().count());
+        assert!(one.undo());
+        assert_eq!(one.doc, original, "one undo restores the document");
+        assert!(!one.undo(), "single Replace is one undo step");
+    }
+
+    #[test]
+    fn replace_current_after_a_field_stays_after_it_197() {
+        let doc = xml_doc(
+            "<w:fldSimple w:instr=\" REF fig \"><w:r><w:t>F</w:t></w:r></w:fldSimple>\
+             <w:r><w:t>end.</w:t></w:r>",
+        );
+        assert!(
+            matches!(doc.body[0], Block::Paragraph(ref p) if matches!(p.content[0], Inline::Field { .. }))
+        );
+        assert_replace_current_matches_replace_all(doc.clone(), "end", "finish");
+        let mut ed = Editor::new(doc);
+        let ms = ed.find_all("end", false);
+        ed.select_match(&ms[0]);
+        ed.replace_current_with("finish");
+        assert!(matches!(first_para(&ed).content[0], Inline::Field { .. }));
+        assert_eq!(etext(&ed), "finish.");
+    }
+
+    #[test]
+    fn replace_current_keeps_a_whole_hyperlink_197() {
+        let doc = xml_doc(
+            "<w:r><w:t xml:space=\"preserve\">Go </w:t></w:r>\
+             <w:hyperlink w:anchor=\"top\"><w:r><w:t>here</w:t></w:r></w:hyperlink>\
+             <w:r><w:t>.</w:t></w:r>",
+        );
+        assert_replace_current_matches_replace_all(doc.clone(), "here", "there");
+        let mut ed = Editor::new(doc);
+        let ms = ed.find_all("here", false);
+        ed.select_match(&ms[0]);
+        ed.replace_current_with("there");
+        assert!(matches!(
+            &first_para(&ed).content[1],
+            Inline::Hyperlink(h) if h.runs.iter().map(|r| r.text.as_str()).collect::<String>() == "there"
+        ));
+    }
+
+    #[test]
+    fn replace_current_keeps_a_whole_bold_run_bold_197() {
+        let doc = Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![
+                    run("a ", RunProps::default()),
+                    run("bold", bold()),
+                    run(" c", RunProps::default()),
+                ],
+            })],
+        };
+        assert_replace_current_matches_replace_all(doc.clone(), "bold", "heavy");
+        let mut ed = Editor::new(doc);
+        let ms = ed.find_all("bold", false);
+        ed.select_match(&ms[0]);
+        ed.replace_current_with("heavy");
+        assert_eq!(first_para(&ed).content[1], run("heavy", bold()));
+    }
+
+    #[test]
+    fn replace_current_with_a_newline_still_splits_the_paragraph() {
+        let mut ed = Editor::new(doc(&["one two"]));
+        let ms = ed.find_all("two", false);
+        ed.select_match(&ms[0]);
+        ed.replace_current_with("x\ny");
+        assert_eq!(top_text(&ed), vec!["one x", "y"]);
+    }
+
+    /// One of every `Inline` variant, each with visible text where it has any.
+    /// `variant_name` has no wildcard arm, so a new variant fails to compile
+    /// here until it is added to this list.
+    fn every_inline() -> Vec<Inline> {
+        fn variant_name(i: &Inline) -> &'static str {
+            match i {
+                Inline::Run(_) => "Run",
+                Inline::Hyperlink(_) => "Hyperlink",
+                Inline::Break(_) => "Break",
+                Inline::Tab(_) => "Tab",
+                Inline::SmartArt { .. } => "SmartArt",
+                Inline::Chart { .. } => "Chart",
+                Inline::Equation { .. } => "Equation",
+                Inline::TextBox { .. } => "TextBox",
+                Inline::Field { .. } => "Field",
+                Inline::Revision { .. } => "Revision",
+                Inline::UnsupportedRevision { .. } => "UnsupportedRevision",
+                Inline::FootnoteRef { .. } => "FootnoteRef",
+                Inline::Raw(_) => "Raw",
+            }
+        }
+        let all = vec![
+            run("run", RunProps::default()),
+            Inline::Hyperlink(Hyperlink {
+                runs: vec![Run {
+                    text: "link".into(),
+                    props: RunProps::default(),
+                }],
+                ..Default::default()
+            }),
+            Inline::Hyperlink(Hyperlink {
+                content: vec![run("complex", RunProps::default())],
+                ..Default::default()
+            }),
+            Inline::Break(BreakKind::Line),
+            Inline::Tab(RunProps::default()),
+            Inline::SmartArt {
+                raw: String::new(),
+                text: vec!["smart".into()],
+            },
+            Inline::Chart {
+                raw: String::new(),
+                chart: crate::chart::Chart {
+                    kind: crate::chart::ChartKind::Bar,
+                    title: Some("title".into()),
+                    series: Vec::new(),
+                },
+            },
+            Inline::Equation {
+                raw: String::new(),
+                text: "x+y".into(),
+                latex: None,
+            },
+            Inline::TextBox {
+                raw: String::new(),
+                blocks: vec![para("box")],
+            },
+            field("result"),
+            Inline::Revision {
+                kind: RevisionKind::Insert,
+                metadata: RevisionMetadata::default(),
+                raw: String::new(),
+                content: vec![run("added", RunProps::default())],
+                content_changed: false,
+            },
+            Inline::UnsupportedRevision {
+                kind: UnsupportedRevisionKind::MoveFrom,
+                metadata: RevisionMetadata::default(),
+                raw: String::new(),
+            },
+            Inline::FootnoteRef {
+                id: 7,
+                endnote: false,
+                raw: String::new(),
+            },
+            Inline::Raw("<w:bookmarkStart/>".into()),
+        ];
+        let names: std::collections::BTreeSet<_> = all.iter().map(variant_name).collect();
+        assert_eq!(names.len(), 13, "every Inline variant is listed");
+        all
+    }
+
+    #[test]
+    fn editor_text_matches_inline_len_for_every_variant_197() {
+        for inline in every_inline() {
+            let text = editor_text(std::slice::from_ref(&inline));
+            assert_eq!(
+                text.chars().count(),
+                inline_len(&inline),
+                "editor_text and inline_len disagree on {inline:?}"
+            );
+        }
+        let all = every_inline();
+        assert_eq!(
+            editor_text(&all).chars().count(),
+            all.iter().map(inline_len).sum::<usize>()
+        );
     }
 
     #[test]
