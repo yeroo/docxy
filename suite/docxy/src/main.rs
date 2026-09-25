@@ -143,18 +143,6 @@ impl ThemePref {
     }
 }
 
-/// Style represented by a gallery preview; Normal has no explicit style id.
-fn style_preview_id(preview: &str) -> Option<&'static str> {
-    match preview {
-        "title" => Some("Title"),
-        "subtitle" => Some("Subtitle"),
-        "h1" => Some("Heading1"),
-        "h2" => Some("Heading2"),
-        "h3" => Some("Heading3"),
-        _ => None,
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 struct PersistTab {
     kind: Kind,
@@ -12483,6 +12471,29 @@ enum Act {
     LaunchParagraph,
 }
 
+/// The gallery's selected item follows the paragraph formatting its actions set.
+fn gallery_style_selected(props: &docxcore::model::ParProps, act: Act) -> bool {
+    use Act::*;
+    let style = props.style_id.as_deref();
+    let normal = matches!(style, None | Some("Normal"));
+    let spacing = &props.spacing;
+    let no_spacing = normal
+        && spacing.before == Some(0)
+        && spacing.after == Some(0)
+        && spacing.line == Some(240)
+        && spacing.line_rule.as_deref() == Some("auto");
+    match act {
+        Normal => normal && !no_spacing,
+        NoSpacing => no_spacing,
+        H1 => style == Some("Heading1"),
+        H2 => style == Some("Heading2"),
+        H3 => style == Some("Heading3"),
+        Title => style == Some("Title"),
+        Subtitle => style == Some("Subtitle"),
+        _ => false,
+    }
+}
+
 /// Word's line-spacing menu presets, as (label, multiple, `w:line` twips).
 const LINE_SPACINGS: &[(&str, f32, i32)] = &[
     ("1.0", 1.0, 240),
@@ -16478,6 +16489,15 @@ impl Docxy {
         }
     }
 
+    /// Whether the Styles gallery shows `act`'s item as selected for the caret's
+    /// paragraph; the renderer and the UI harness both read it.
+    fn gallery_item_selected(&self, act: Act) -> bool {
+        let Some(Surface::Doc(editor)) = self.tabs.get(self.active).map(|tab| &tab.surface) else {
+            return false;
+        };
+        gallery_style_selected(&editor.caret_para_props(), act)
+    }
+
     /// The Styles gallery: a row of thumbnail boxes, each showing its name in that
     /// style's own weight/size (Word's Style gallery).
     fn style_gallery(
@@ -16486,13 +16506,6 @@ impl Docxy {
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let cur = self.tabs.get(self.active).and_then(|t| {
-            if let Surface::Doc(ed) = &t.surface {
-                ed.caret_para_style()
-            } else {
-                None
-            }
-        });
         let boxes: Vec<AnyElement> = gal
             .items
             .iter()
@@ -16507,8 +16520,7 @@ impl Docxy {
                     "h3" => (12.0, FontWeight::SEMIBOLD),
                     _ => (11.0, FontWeight::NORMAL),
                 };
-                let style_id = style_preview_id(it.preview);
-                let selected = cur.as_deref() == style_id;
+                let selected = self.gallery_item_selected(it.act);
                 div()
                     .id(it.label)
                     .flex()

@@ -49,7 +49,26 @@ test document state follows keys, selections, ribbon commands and backstage
   assert reply.open is true
   call backstage {"action":"close"}
   assert reply.open is false
+  key ctrl+f1
+  call-error ribbon-click {"tab":"Home","command":"Bold"} => the ribbon is collapsed
+  call-error ribbon-read {} => the ribbon is collapsed
+  key ctrl+f1
   call ribbon-click {"tab":"Home","command":"Bold"}
+
+test style gallery selects one paragraph style
+  open copy:../fixtures/basic.docx
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.0.checked is true
+  assert reply.tabs.1.groups.3.commands.1.checked is false
+  call ribbon-click {"tab":"Home","command":"styles:No Spacing"}
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.0.checked is false
+  assert reply.tabs.1.groups.3.commands.1.checked is true
+  call ribbon-click {"tab":"Home","command":"styles:Heading 1"}
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.0.checked is false
+  assert reply.tabs.1.groups.3.commands.1.checked is false
+  assert reply.tabs.1.groups.3.commands.2.checked is true
 
 test table context follows the caret and exposes Table ribbon
   open ../fixtures/doc-table.docx

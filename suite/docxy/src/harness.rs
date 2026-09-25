@@ -931,6 +931,9 @@ fn ribbon_surface(app: &crate::Docxy) -> Result<(), String> {
     if app.backstage {
         return Err("the ribbon is hidden while File (backstage) is open".into());
     }
+    if app.ribbon_min {
+        return Err("the ribbon is collapsed".into());
+    }
     match app.tabs.get(app.active).map(|t| &t.surface) {
         Some(crate::Surface::Doc(_) | crate::Surface::Project(_)) => Ok(()),
         _ => Err("the active tab has no document or Project ribbon".into()),
@@ -970,7 +973,7 @@ struct RibbonCommand {
     tip_body: String,
     key_tip: String,
     act: crate::Act,
-    gallery_preview: Option<&'static str>,
+    gallery: bool,
 }
 
 impl RibbonCommand {
@@ -982,14 +985,10 @@ impl RibbonCommand {
             tip_body: cmd.tip.body.into(),
             key_tip: cmd.key_tip.into(),
             act: cmd.act,
-            gallery_preview: None,
+            gallery: false,
         }
     }
-    fn json(&self, checked: &impl Fn(crate::Act) -> bool, current_style: Option<&str>) -> Json {
-        let selected = self.gallery_preview.map_or_else(
-            || checked(self.act),
-            |preview| current_style == crate::style_preview_id(preview),
-        );
+    fn json(&self, checked: &impl Fn(&RibbonCommand) -> bool) -> Json {
         Json::obj(vec![
             ("id", Json::Str(self.id.clone())),
             ("label", Json::Str(self.label.clone())),
@@ -1001,7 +1000,7 @@ impl RibbonCommand {
                 ]),
             ),
             ("key_tip", Json::Str(self.key_tip.clone())),
-            ("checked", Json::Bool(selected)),
+            ("checked", Json::Bool(checked(self))),
         ])
     }
 }
@@ -1027,7 +1026,7 @@ fn control_commands(control: &crate::Control<crate::Act>, out: &mut Vec<RibbonCo
             tip_body: g.tip.body.into(),
             key_tip: String::new(),
             act: item.act,
-            gallery_preview: Some(item.preview),
+            gallery: true,
         })),
         Control::Rows(rows) => {
             for cell in rows.iter().flatten() {
@@ -1054,11 +1053,7 @@ fn tab_commands(tab: &crate::rs::Tab<crate::Act>) -> Vec<RibbonCommand> {
 }
 
 /// Groups and controls as the renderer presents one tab.
-fn tab_json(
-    tab: &crate::rs::Tab<crate::Act>,
-    checked: &impl Fn(crate::Act) -> bool,
-    current_style: Option<&str>,
-) -> Json {
+fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(&RibbonCommand) -> bool) -> Json {
     let groups = tab
         .groups
         .iter()
@@ -1082,12 +1077,7 @@ fn tab_json(
                 ("launcher", Json::Bool(group.launcher.is_some())),
                 (
                     "commands",
-                    Json::Arr(
-                        commands
-                            .iter()
-                            .map(|c| c.json(checked, current_style))
-                            .collect(),
-                    ),
+                    Json::Arr(commands.iter().map(|c| c.json(checked)).collect()),
                 ),
                 ("galleries", Json::Arr(galleries)),
             ])
@@ -1105,8 +1095,7 @@ fn tab_json(
 fn ribbon_json_for(
     kind: crate::Kind,
     in_table: bool,
-    checked: impl Fn(crate::Act) -> bool,
-    current_style: Option<&str>,
+    checked: impl Fn(&RibbonCommand) -> bool,
 ) -> Json {
     let ribbon = crate::ribbon_for(kind);
     let (_, file_name, file_tip) = crate::ribbon_tab_set(kind)[0];
@@ -1116,14 +1105,9 @@ fn ribbon_json_for(
         ("kind", Json::Str("backstage".into())),
         ("groups", Json::Arr(Vec::new())),
     ])];
-    tabs.extend(
-        ribbon
-            .tabs
-            .iter()
-            .map(|t| tab_json(t, &checked, current_style)),
-    );
+    tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
     if kind == crate::Kind::Docx && in_table {
-        tabs.push(tab_json(&crate::table_tab(), &checked, current_style));
+        tabs.push(tab_json(&crate::table_tab(), &checked));
     }
     let tab_count = tabs.len();
     let qat = crate::QAT_ITEMS
@@ -1153,16 +1137,13 @@ fn ribbon_json_for(
 
 /// Ribbon snapshot using the active tab and live checked states.
 fn ribbon_json(app: &crate::Docxy) -> Json {
-    let current_style = app.tabs.get(app.active).and_then(|tab| match &tab.surface {
-        crate::Surface::Doc(editor) => editor.caret_para_style(),
-        _ => None,
-    });
-    ribbon_json_for(
-        app.ribbon_kind(),
-        app.caret_table().is_some(),
-        |act| app.act_active(act),
-        current_style.as_deref(),
-    )
+    ribbon_json_for(app.ribbon_kind(), app.caret_table().is_some(), |command| {
+        if command.gallery {
+            app.gallery_item_selected(command.act)
+        } else {
+            app.act_active(command.act)
+        }
+    })
 }
 
 /// Resolve a currently valid tab name before a synthetic ribbon click.
@@ -2035,13 +2016,10 @@ mod tests {
 
     #[test]
     fn ribbon_reflects_definition_and_checked_state() {
-        let off = ribbon_json_for(crate::Kind::Docx, false, |_| false, None);
-        let on = ribbon_json_for(
-            crate::Kind::Docx,
-            true,
-            |a| matches!(a, crate::Act::Bold),
-            None,
-        );
+        let off = ribbon_json_for(crate::Kind::Docx, false, |_| false);
+        let on = ribbon_json_for(crate::Kind::Docx, true, |c| {
+            matches!(c.act, crate::Act::Bold)
+        });
         let tabs = off.get("tabs").unwrap().as_array().unwrap();
         assert_eq!(tabs[0].get_str("name"), Some("File"));
         assert_eq!(tabs[0].get_str("kind"), Some("backstage"));
@@ -2079,13 +2057,9 @@ mod tests {
         let mut props = ParProps::default();
         props.style_id = Some("Heading1".into());
         let editor = editor(props, RunProps::default());
-        let current_style = editor.caret_para_style();
-        let ribbon = ribbon_json_for(
-            crate::Kind::Docx,
-            false,
-            |_| false,
-            current_style.as_deref(),
-        );
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, |c| {
+            c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
+        });
         let tabs = ribbon.get("tabs").unwrap().as_array().unwrap();
         let commands: Vec<&Json> = tabs[1]
             .get("groups")
@@ -2107,6 +2081,40 @@ mod tests {
     }
 
     #[test]
+    fn normal_paragraph_selects_only_normal_gallery_item() {
+        let mut editor = editor(ParProps::default(), RunProps::default());
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, |c| {
+            c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
+        });
+        let commands = ribbon.get("tabs").unwrap().as_array().unwrap()[1]
+            .get("groups")
+            .unwrap()
+            .as_array()
+            .unwrap()[3]
+            .get("commands")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        let selected: Vec<&str> = commands
+            .iter()
+            .filter(|c| c.get("checked") == Some(&Json::Bool(true)))
+            .filter_map(|c| c.get_str("label"))
+            .collect();
+        assert_eq!(selected, ["Normal"]);
+        editor.set_space_before(Some(0));
+        editor.set_space_after(Some(0));
+        editor.set_line_spacing(240, "auto");
+        assert!(crate::gallery_style_selected(
+            &editor.caret_para_props(),
+            crate::Act::NoSpacing
+        ));
+        assert!(!crate::gallery_style_selected(
+            &editor.caret_para_props(),
+            crate::Act::Normal
+        ));
+    }
+
+    #[test]
     fn ribbon_resolver_rejects_ambiguous_labels_and_status_is_live_text() {
         let commands = vec![
             RibbonCommand {
@@ -2116,7 +2124,7 @@ mod tests {
                 tip_body: String::new(),
                 key_tip: String::new(),
                 act: crate::Act::Bold,
-                gallery_preview: None,
+                gallery: false,
             },
             RibbonCommand {
                 id: "two".into(),
@@ -2125,7 +2133,7 @@ mod tests {
                 tip_body: String::new(),
                 key_tip: String::new(),
                 act: crate::Act::Italic,
-                gallery_preview: None,
+                gallery: false,
             },
         ];
         let err = resolve_commands(&commands, "Home", "Same").err().unwrap();
