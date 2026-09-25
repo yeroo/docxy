@@ -354,23 +354,18 @@ impl<'a> Scheduler<'a> {
             .or_insert_with(|| WorkCalendar::weekly(Calendar::standard_week()));
 
         // A pinned task's duration-derived finish lies past its start; reserve
-        // wall-clock reach for its duration at its calendar's weekly rate,
-        // resolved exactly as `tl()` resolves it. A calendar without working
-        // time cannot schedule the task at all. Exceptions are not counted:
-        // the forward horizon already covers the work in working minutes.
+        // wall-clock reach for its duration on its calendar, resolved exactly
+        // as `tl()` resolves it, exceptions included: the forward horizon is
+        // counted from the anchor, not from a pinned start, so holidays in a
+        // far task's span need reach of their own. A calendar without weekly
+        // working time cannot schedule the task at all.
         let pinned_reach = proj.tasks.iter().filter_map(|t| {
             let (start, _) = t.pinned_dates()?;
-            let week = weeks
+            let cal = weeks
                 .get(&t.calendar_uid.unwrap_or(default_cal))
                 .or_else(|| weeks.get(&default_cal))?;
-            let per_week: i64 = week.week().iter().map(|day| day.minutes()).sum();
-            (per_week > 0).then(|| {
-                let wall = (t.duration_min.max(0) as i128 * 7 * 1440 + per_week as i128 - 1)
-                    / per_week as i128;
-                start
-                    .minutes()
-                    .saturating_add(wall.min(i64::MAX as i128) as i64)
-            })
+            cal.has_working_time()
+                .then(|| reach_after(cal, start.minutes(), t.duration_min.max(0)))
         });
         let far_dates = proj
             .tasks
@@ -1036,6 +1031,27 @@ impl<'a> Scheduler<'a> {
         }
         min_gap
     }
+}
+
+/// The wall-clock instant at which `work` working minutes on `cal`, counted
+/// from `start`, are done; at most [`HORIZON_DAYS`] days past `start`.
+fn reach_after(cal: &WorkCalendar, start: i64, mut work: i64) -> i64 {
+    let mut slots = Vec::new();
+    let first = start.div_euclid(1440);
+    for day in first..=first + HORIZON_DAYS {
+        cal.day_into(day, &mut slots);
+        for t in &slots {
+            let from = (day * 1440 + i64::from(t.from)).max(start);
+            let to = day * 1440 + i64::from(t.to);
+            if from < to {
+                if work <= to - from {
+                    return from + work;
+                }
+                work -= to - from;
+            }
+        }
+    }
+    start.saturating_add(HORIZON_DAYS * 1440)
 }
 
 /// A finish date's instants on `tl`, floored at `floor`: the evening that
@@ -4955,5 +4971,44 @@ mod tests {
         let s = schedule(&proj);
         assert_eq!(dates(&s, 1).1, "2026-03-04T17:00:00");
         assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(960));
+    }
+
+    #[test]
+    fn a_far_pinned_task_across_a_long_holiday_keeps_its_start_and_finish() {
+        // Pinned well past the working-minute padding, with a holiday of almost
+        // four months inside its ten days: its reach must count the holiday.
+        let start = DateTime::from_ymd_hm(2027, 6, 7, 8, 0);
+        let mut proj = march2(vec![manual(1, "Far", 10 * 480, start)]);
+        proj.calendars[0]
+            .exceptions
+            .push(CalendarException::date_range(
+                DateTime::from_ymd_hm(2027, 6, 8, 0, 0),
+                DateTime::from_ymd_hm(2027, 9, 30, 23, 59),
+                DayWorking::default(),
+            ));
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2027-06-07T08:00:00".into(), "2027-10-13T17:00:00".into())
+        );
+    }
+
+    #[test]
+    fn reach_after_counts_working_time_from_the_start_instant() {
+        let cal = WorkCalendar::weekly(Calendar::standard_week());
+        // Friday 10:00 plus eight hours: Friday's remaining 6h, then Monday's
+        // first 2h.
+        assert_eq!(
+            reach_after(&cal, at(6, 10).minutes(), 480),
+            at(9, 10).minutes()
+        );
+        assert_eq!(
+            reach_after(&cal, at(6, 10).minutes(), 0),
+            at(6, 10).minutes()
+        );
+        let closed = WorkCalendar::weekly(Default::default());
+        assert_eq!(
+            reach_after(&closed, at(6, 10).minutes(), 480),
+            at(6, 10).minutes() + HORIZON_DAYS * 1440
+        );
     }
 }
