@@ -57,7 +57,14 @@ file 19 it is **not** verified against Project 2021, for two reasons: docxy
 still schedules its inactive task (Project would drop it), and its blank row
 (`<IsNull>1</IsNull>`, between two linked tasks under a summary) has a shape
 of our own, because no Project file with a blank row was available.
-File 21 keeps recorded progress
+File 21 records a missed task Deadline
+([issue #100](https://github.com/yeroo/docxy/issues/100)): B's deadline is
+five days before its finish, so A and B both carry -5 days total slack and no
+date moves. The file is generated like the others, but its oracle values were
+entered by hand from the issue's Project 2021 capture of `15-deadline-missed`
+in the private spec corpus. It was **not** checked by
+`verify_mspdi_project.py`, which does not check the Deadline on import.
+File 22 keeps recorded progress
 ([issue #81](https://github.com/yeroo/docxy/issues/81)): percent complete,
 actuals, `Stop`/`Resume`, remaining values and variances on tasks and
 assignments, and assignment baselines. Its shapes follow a Project 2021
@@ -95,7 +102,8 @@ available: that shape follows Microsoft's schema.
 | `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
 | `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
 | `20-task-fields` | stored task fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`; the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
-| `21-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx` |
+| `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
+| `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx` |
 
 See `manifest.json` for machine-readable tags.
 

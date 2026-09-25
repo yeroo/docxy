@@ -12,7 +12,7 @@ reproduces them. `projcore/tests/corpus.rs` reads each file, runs the CPM
 scheduler, and asserts the computed values match the embedded ones, so the
 corpus validates the scheduler without needing Project. Rerun the script
 whenever a fixture changes. Exceptions: file 19's manual-task expectations
-(#77), file 20's task-field expectations (#80) and file 21's progress
+(#77), file 20's task-field expectations (#80) and file 22's progress
 expectations (#81) are hand-derived from our scheduler and not yet verified in
 Project.
 
@@ -428,7 +428,17 @@ def build():
                                     ("Priority", 500), ("Estimated", 1)] + common),
         ])))
 
-    # 21 — recorded progress survives saves (#81): a complete task, an
+    # 21 — B misses its Deadline by 5 days. The deadline bounds late finish
+    # only: dates stay put and A and B both get -5d total slack (#100).
+    add("21-deadline-missed.xml", ["deadline", "link", "link-fs", "negative-slack"],
+        "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack.",
+        project("deadline-missed", "\n".join([
+            task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True),
+            task(2, "B", 5 * D, dt(9), dt(13, "17:00:00"), slack=-5 * D, critical=True,
+                 preds=[(1, FS, 0)], fields=[("Deadline", dt(6, "17:00:00"))]),
+        ])))
+
+    # 22 — recorded progress survives saves (#81): a complete task, an
     # in-progress task stopped Thu 5 and resuming Fri 6, and a not-started
     # task, each with an assignment carrying its actuals; the in-progress
     # assignment also has two baseline slots. Shapes follow a Project 2021
@@ -477,7 +487,7 @@ def build():
             ("PercentWorkComplete", 0), ("RemainingCost", "400"),
             ("RemainingWork", iso(D))]),
     ])
-    add("21-progress.xml", ["progress", "assignment", "round-trip", "link", "link-fs"],
+    add("22-progress.xml", ["progress", "assignment", "round-trip", "link", "link-fs"],
         "Percent complete, actuals, stop/resume, remaining values, variances and "
         "assignment baselines survive saves.",
         project("progress", "\n".join([

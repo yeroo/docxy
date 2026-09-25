@@ -195,7 +195,18 @@
       "desc": "Task type, estimate, active, deadline, levelling and a blank row survive saves."
     },
     {
-      "file": "21-progress.xml",
+      "file": "21-deadline-missed.xml",
+      "category": "deadline",
+      "tags": [
+        "deadline",
+        "link",
+        "link-fs",
+        "negative-slack"
+      ],
+      "desc": "Project 2021 (#100): a missed Deadline gives B and its driver A -5d total slack."
+    },
+    {
+      "file": "22-progress.xml",
       "category": "progress",
       "tags": [
         "progress",

@@ -9,9 +9,12 @@
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
 //! 16 (#58), 17 (#60) and 18 (#59). The exceptions are file 19 (issue #77),
 //! whose manual-task slack and critical flags are hand-derived from our
-//! scheduler, file 20 (issue #80), whose task fields and blank row are
-//! ours, and file 21 (issue #81), whose progress values are ours; none is
-//! verified in Project yet. Blank rows carry no oracle. Slack invariants below also check
+//! scheduler, and file 20 (issue #80), whose task fields and blank row are
+//! ours; neither is verified in Project yet. Blank rows carry no oracle. File
+//! 21's oracle (issue #100) was entered by hand from the issue's Project 2021
+//! capture; the file was not run through `verify_mspdi_project.py`. File 22
+//! (issue #81) carries progress values of our own and is not verified in
+//! Project either. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -59,6 +62,41 @@ fn fnlt_conflict_matches_project_2021_negative_slack() {
         let r = sched.get(uid).unwrap();
         assert_eq!(r.total_slack_min, -2400);
         assert!(r.critical);
+    }
+}
+
+#[test]
+fn missed_deadline_matches_project_2021_negative_slack() {
+    // #100: B's Deadline (Fri 03-06) is five days before it finishes, so B and
+    // A, which drives it, both get -5d total slack; no date moves.
+    let xml = std::fs::read_to_string(corpus_dir().join("21-deadline-missed.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let deadline = proj.tasks[1].deadline;
+    assert_eq!(
+        deadline.map(|d| d.to_mspdi()).as_deref(),
+        Some("2026-03-06T17:00:00")
+    );
+    let mut without = proj.clone();
+    without.tasks[1].deadline = None;
+    let baseline = schedule(&without);
+    // The deadline survives MSPDI and .yppx saves, and so does its slack.
+    let saved = read_mspdi(&write_mspdi(&proj)).unwrap();
+    let packaged = read_yppx(&write_yppx(&proj)).unwrap();
+    for (label, proj) in [("read", &proj), ("mspdi", &saved), ("yppx", &packaged)] {
+        assert_eq!(proj.tasks[1].deadline, deadline, "{label}");
+        let sched = schedule(proj);
+        for uid in [1, 2] {
+            let r = sched.get(uid).unwrap();
+            let base = baseline.get(uid).unwrap();
+            assert_eq!(r.total_slack_min, -2400, "{label} task {uid}");
+            assert_eq!(r.free_slack_min, 0, "{label} task {uid}");
+            assert!(r.critical, "{label} task {uid}");
+            assert_eq!(
+                (r.early_start, r.early_finish),
+                (base.early_start, base.early_finish),
+                "{label} task {uid}"
+            );
+        }
     }
 }
 
@@ -154,7 +192,7 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
     assert!(
         files
             .iter()
-            .any(|p| p.file_name().unwrap() == "21-progress.xml")
+            .any(|p| p.file_name().unwrap() == "22-progress.xml")
     );
     for path in files {
         let xml = std::fs::read_to_string(&path).unwrap();
@@ -389,7 +427,7 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
 #[test]
 fn progress_fixture_keeps_actuals_through_a_save() {
     use projcore::DateTime;
-    let xml = std::fs::read_to_string(corpus_dir().join("21-progress.xml")).unwrap();
+    let xml = std::fs::read_to_string(corpus_dir().join("22-progress.xml")).unwrap();
     let proj = read_mspdi(&xml).unwrap();
     let percent: Vec<_> = proj.tasks.iter().map(|t| t.percent_complete).collect();
     assert_eq!(percent, [Some(100), Some(50), Some(0)]);
