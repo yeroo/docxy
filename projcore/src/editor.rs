@@ -1101,11 +1101,11 @@ mod tests {
 
     fn project_with_unused_empty_calendar(empty_default: bool) -> Project {
         let mut proj = untitled_project();
-        proj.calendars.push(crate::model::Calendar {
-            uid: 3,
-            name: "Closed".into(),
-            week: Default::default(),
-        });
+        proj.calendars.push(crate::model::Calendar::base(
+            3,
+            "Closed",
+            Default::default(),
+        ));
         proj.tasks = vec![
             Task {
                 uid: 1,
@@ -1864,11 +1864,7 @@ mod tests {
     fn summary_durations_and_baselines_use_leaf_calendars_on_an_empty_default() {
         let mut proj = untitled_project();
         proj.calendars = vec![
-            crate::model::Calendar {
-                uid: 1,
-                name: "Closed".into(),
-                week: Default::default(),
-            },
+            crate::model::Calendar::base(1, "Closed", Default::default()),
             crate::model::Calendar::standard(3),
         ];
         proj.tasks = (1..=3)

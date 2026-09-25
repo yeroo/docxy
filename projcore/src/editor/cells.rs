@@ -1,6 +1,6 @@
 //! Atomic operations and lossless text interchange for entry-table cells.
 use super::*;
-use crate::model::Calendar;
+use crate::model::{Calendar, Week};
 use crate::schedule::{HORIZON_DAYS, HORIZON_PADDING_MIN};
 
 impl Editor {
@@ -528,24 +528,22 @@ pub fn parse_cell_date(text: &str) -> Result<DateTime, String> {
     Ok(d)
 }
 
-/// A task's calendar, with exactly the scheduler's fallback.
-fn task_calendar(proj: &Project, task: &Task) -> Calendar {
-    proj.calendars
-        .iter()
-        .find(|c| c.uid == task.calendar_uid.unwrap_or(proj.default_calendar_uid))
-        .or_else(|| {
-            proj.calendars
-                .iter()
-                .find(|c| c.uid == proj.default_calendar_uid)
-        })
-        .cloned()
-        .unwrap_or_else(|| Calendar::standard(proj.default_calendar_uid))
+/// A task's working week, with exactly the scheduler's fallback and base-chain
+/// resolution.
+fn task_calendar(proj: &Project, task: &Task) -> Week {
+    match proj
+        .calendar(task.calendar_uid.unwrap_or(proj.default_calendar_uid))
+        .or_else(|| proj.calendar(proj.default_calendar_uid))
+    {
+        Some(cal) => proj.resolved_week(cal),
+        None => Calendar::standard_week(),
+    }
 }
 
 /// Start of a typed date: its first working time, or 08:00 (Project's default
 /// start time) on a non-working day, where a manual task may still start.
 fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
-    let from = task_calendar(proj, task).week[date.weekday() as usize]
+    let from = task_calendar(proj, task)[date.weekday() as usize]
         .times
         .iter()
         .filter(|s| s.to > s.from)
@@ -558,7 +556,7 @@ fn day_start(proj: &Project, task: &Task, date: DateTime) -> DateTime {
 /// Finish of a typed date: its last working time, or 17:00 on a non-working
 /// day, where a manual task may still finish.
 fn day_end(proj: &Project, task: &Task, date: DateTime) -> DateTime {
-    let to = task_calendar(proj, task).week[date.weekday() as usize]
+    let to = task_calendar(proj, task)[date.weekday() as usize]
         .times
         .iter()
         .filter(|s| s.to > s.from)
@@ -571,7 +569,7 @@ fn day_end(proj: &Project, task: &Task, date: DateTime) -> DateTime {
 /// Finish boundary for a typed date, with exactly the scheduler's calendar fallback.
 pub fn day_finish(proj: &Project, task: &Task, date: DateTime) -> Result<DateTime, String> {
     let calendar = task_calendar(proj, task);
-    let end = calendar.week[date.weekday() as usize]
+    let end = calendar[date.weekday() as usize]
         .times
         .iter()
         .filter(|s| s.to > s.from)
