@@ -30,6 +30,42 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
     Ok(())
 }
 
+/// Window close and harness `quit`: fold every tab's pending edit into what
+/// hot-exit persists. Best-effort, never refuses: an invalid Project buffer
+/// stays uncommitted and its last committed model is persisted. Header/footer
+/// is flushed rather than exited, so a cancelled window close keeps the user in
+/// header/footer mode.
+pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
+    for tab in tabs {
+        let _ = commit_project_cell(tab);
+        // An editor opened and left as seeded must not rewrite the cell:
+        // commit_edit reparses it (text "007" would become the number 7).
+        // Left open, a cancelled close keeps the editor as it was.
+        if let Surface::Sheet(v) = &mut tab.surface
+            && v.editing
+                .as_deref()
+                .is_some_and(|buf| buf != v.edit_string(v.sel.0, v.sel.1))
+        {
+            tab.dirty |= v.commit_edit();
+        }
+        if hf_changed(tab) {
+            flush_hf_tab(tab);
+        }
+    }
+}
+
+/// Whether the open header/footer editor differs from its part. An untouched
+/// editor must not dirty the tab or replace the part with a re-serialization;
+/// both sides go through the same serializer, so byte layout does not matter.
+fn hf_changed(tab: &DocTab) -> bool {
+    let (Some(hf), Some(pkg)) = (tab.hf_edit.as_ref(), tab.pkg.as_ref()) else {
+        return false;
+    };
+    let part = parse_hf_part(pkg, &hf.part_name);
+    docxcore::serialize::blocks_to_xml(&hf.editor.doc.body)
+        != docxcore::serialize::blocks_to_xml(&part)
+}
+
 fn close_step(
     tab: &mut DocTab,
     ask: impl FnOnce(&DocTab) -> Result<CloseAnswer, String>,

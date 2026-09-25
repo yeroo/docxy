@@ -192,14 +192,6 @@ impl ProjectView {
     }
 }
 
-/// Close-time persistence saves every valid Project buffer, including inactive tabs.
-/// Invalid buffers leave the last committed model available for hot-exit recovery.
-pub(crate) fn commit_project_cells_for_exit(tabs: &mut [DocTab]) {
-    for tab in tabs {
-        let _ = commit_project_cell(tab);
-    }
-}
-
 /// Commit before changing focus or dispatching commands. Failure preserves edit and selection.
 pub(crate) fn commit_project_cell(tab: &mut DocTab) -> bool {
     let Surface::Project(v) = &mut tab.surface else {

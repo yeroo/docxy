@@ -21062,8 +21062,10 @@ fn main() {
             // when there are unsaved tabs.
             let on_close = view.clone();
             window.on_window_should_close(cx, move |_window, cx| {
-                on_close.update(cx, |this, _| {
-                    commit_project_cells_for_exit(&mut this.tabs);
+                on_close.update(cx, |this, cx| {
+                    close::commit_pending_for_exit(&mut this.tabs);
+                    // A cancelled close keeps the window: repaint the committed cell.
+                    cx.notify();
                     this.persist();
                     // ⚠️ Not in a harness instance — the same modal-loop trap as
                     // `open_args`, and here it would wedge the shutdown the

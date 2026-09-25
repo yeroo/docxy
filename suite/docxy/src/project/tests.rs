@@ -355,7 +355,7 @@ fn hot_exit_commits_all_valid_buffers_and_preserves_models_on_invalid_input() {
     view_mut(&mut tabs[2]).col = 2;
     view_mut(&mut tabs[2]).open_cell(Some("invalid")).unwrap();
     let invalid_model = view(&tabs[2]).ed.project().clone();
-    commit_project_cells_for_exit(&mut tabs);
+    crate::close::commit_pending_for_exit(&mut tabs);
     for (i, tab) in tabs.iter().enumerate() {
         let saved = persist_tab(&dir.0, i, tab);
         let restored = restore_project_tab(&saved);
