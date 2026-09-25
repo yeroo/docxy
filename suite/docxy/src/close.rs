@@ -30,6 +30,21 @@ fn commit_pending_for_close(tab: &mut DocTab) -> Result<(), String> {
     Ok(())
 }
 
+/// Window close and harness `quit`: fold every tab's pending edit into what
+/// hot-exit persists. Best-effort, never refuses: an invalid Project buffer
+/// stays uncommitted and its last committed model is persisted. Header/footer
+/// is flushed rather than exited, so a cancelled window close keeps the user in
+/// header/footer mode.
+pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
+    for tab in tabs {
+        let _ = commit_project_cell(tab);
+        if let Surface::Sheet(v) = &mut tab.surface {
+            tab.dirty |= v.commit_edit();
+        }
+        flush_hf_tab(tab);
+    }
+}
+
 fn close_step(
     tab: &mut DocTab,
     ask: impl FnOnce(&DocTab) -> Result<CloseAnswer, String>,

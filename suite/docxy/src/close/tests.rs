@@ -182,3 +182,122 @@ fn removal_preserves_existing_active_index_rules_including_last_tab() {
     assert_eq!(active, 0);
     assert!(tabs.is_empty());
 }
+
+/// Commit for window close, write every tab's hot-exit sidecar, then restore
+/// them as the next launch would.
+fn exit_and_restore(tabs: &mut [DocTab], name: &str) -> Vec<DocTab> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/close-tests")
+        .join(format!("{}-{name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    commit_pending_for_exit(tabs);
+    let restored = tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| restore_tab(&persist_tab(&dir, i, t)))
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    restored
+}
+
+fn pending_sheet(text: &str) -> DocTab {
+    let mut t = tab(Kind::Xlsx);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    v.editing = Some(text.into());
+    assert!(!t.dirty);
+    t
+}
+
+fn sheet_a1(t: &DocTab) -> String {
+    let Surface::Sheet(v) = &t.surface else {
+        panic!("{}", t.status)
+    };
+    assert!(v.editing.is_none());
+    v.edit_string(0, 0)
+}
+
+/// An open header/footer editor holding `text`; returns its part name.
+fn open_hf(t: &mut DocTab, is_header: bool, text: &str) -> String {
+    let part_name = t
+        .pkg
+        .as_mut()
+        .unwrap()
+        .create_hf(is_header, "default")
+        .unwrap();
+    let mut editor = Editor::new(empty_doc());
+    editor.insert_str(text);
+    t.hf_edit = Some(HfEdit {
+        editor,
+        part_name: part_name.clone(),
+        is_header,
+        variant: "default",
+    });
+    t.dirty = false;
+    part_name
+}
+
+fn part_text(t: &DocTab, part_name: &str) -> String {
+    String::from_utf8_lossy(t.pkg.as_ref().unwrap().part(part_name).unwrap()).into_owned()
+}
+
+#[test]
+fn window_close_commits_pending_sheet_edits_on_every_tab() {
+    let mut tabs = vec![
+        tab(Kind::Docx),
+        pending_sheet("Pending active"),
+        pending_sheet("Pending inactive"),
+    ];
+    let restored = exit_and_restore(&mut tabs, "sheet");
+    for (i, text) in [(1, "Pending active"), (2, "Pending inactive")] {
+        // Committed in the live tab, so the dirty check and a cancelled close see it.
+        assert!(tabs[i].dirty);
+        assert_eq!(sheet_a1(&tabs[i]), text);
+        assert!(restored[i].dirty);
+        assert_eq!(sheet_a1(&restored[i]), text);
+    }
+    assert!(!restored[0].dirty);
+}
+
+#[test]
+fn window_close_flushes_open_header_and_footer_on_every_tab() {
+    let mut tabs = vec![tab(Kind::Xlsx), tab(Kind::Docx), tab(Kind::Docx)];
+    let header = open_hf(&mut tabs[1], true, "Pending header");
+    let footer = open_hf(&mut tabs[2], false, "Pending footer");
+    let restored = exit_and_restore(&mut tabs, "hf");
+    for (i, part, text) in [
+        (1, &header, "Pending header"),
+        (2, &footer, "Pending footer"),
+    ] {
+        assert!(tabs[i].dirty);
+        // Flushed, not exited: a cancelled close stays in header/footer mode.
+        assert!(tabs[i].hf_edit.is_some());
+        assert!(part_text(&tabs[i], part).contains(text));
+        assert!(restored[i].dirty);
+        assert!(restored[i].hf_edit.is_none());
+        assert!(part_text(&restored[i], part).contains(text), "{i}");
+    }
+    assert!(!restored[0].dirty);
+}
+
+#[test]
+fn window_close_does_not_stop_at_an_invalid_project_buffer() {
+    let mut project = tab(Kind::Project);
+    project_cell_click(&mut project, 1, Some(2), false);
+    project_input(&mut project, "text", Some("banana"), Modifiers::default());
+    let mut doc = tab(Kind::Docx);
+    let header = open_hf(&mut doc, true, "After invalid");
+    let mut tabs = vec![project, pending_sheet("After invalid"), doc];
+    let restored = exit_and_restore(&mut tabs, "invalid");
+    let Surface::Project(v) = &tabs[0].surface else {
+        panic!()
+    };
+    assert_eq!(v.cell.as_ref().unwrap().buf, "banana");
+    assert!(!tabs[0].dirty);
+    assert_eq!(sheet_a1(&restored[1]), "After invalid");
+    assert!(restored[1].dirty);
+    assert!(part_text(&restored[2], &header).contains("After invalid"));
+    assert!(restored[2].dirty);
+}
