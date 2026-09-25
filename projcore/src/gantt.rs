@@ -597,4 +597,23 @@ mod tests {
         // colon/comma removed from the name so the task line stays parseable.
         assert!(m.contains("Design phase one :"), "got:\n{m}");
     }
+
+    #[test]
+    fn weekend_check_resolves_a_derived_project_calendar() {
+        // The base works Saturdays; the project calendar derives from it.
+        let mut six_day = Calendar::standard(3);
+        six_day.week[6] = six_day.week[1].clone();
+        let derived = |own_saturday: Option<crate::model::DayWorking>| Calendar {
+            base_calendar_uid: Some(3),
+            week: [None, None, None, None, None, None, own_saturday],
+            ..Calendar::standard(1)
+        };
+        let mut proj = Project {
+            calendars: vec![six_day, derived(None)],
+            ..Project::default()
+        };
+        assert!(!excludes_weekends(&proj));
+        proj.calendars[1] = derived(Some(crate::model::DayWorking::default()));
+        assert!(excludes_weekends(&proj));
+    }
 }

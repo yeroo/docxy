@@ -4341,6 +4341,127 @@ mod tests {
         assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(480));
     }
 
+    /// A calendar derived from `base` that states only `own` days.
+    fn derived(uid: i32, base: i32, own: &[(usize, DayWorking)]) -> Calendar {
+        let mut cal = Calendar {
+            base_calendar_uid: Some(base),
+            week: Default::default(),
+            ..Calendar::standard(uid)
+        };
+        cal.name = format!("Derived {uid}");
+        for (day, working) in own {
+            cal.week[*day] = Some(working.clone());
+        }
+        cal
+    }
+
+    #[test]
+    fn derived_calendar_resolves_through_its_base_at_schedule_time() {
+        // Friday off, everything else inherited from Standard.
+        let mut a = task(1, "A", 5 * 480);
+        a.calendar_uid = Some(2);
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a],
+            calendars: vec![
+                Calendar::standard(1),
+                derived(2, 1, &[(5, DayWorking::default())]),
+            ],
+            ..Project::default()
+        };
+        assert_eq!(calendar_error(&proj), None);
+        // Mon-Thu, then Friday is skipped.
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-09T17:00:00".into())
+        );
+        // Shorten the base calendar's Monday only: the derived calendar follows.
+        proj.calendars[0].week[1] = Some(DayWorking {
+            times: vec![WorkingTime {
+                from: 8 * 60,
+                to: 12 * 60,
+            }],
+        });
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-10T17:00:00".into())
+        );
+    }
+
+    #[test]
+    fn derived_calendar_without_own_days_is_not_rejected() {
+        let mut a = task(1, "A", 480);
+        a.calendar_uid = Some(2);
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a],
+            calendars: vec![Calendar::standard(1), derived(2, 1, &[])],
+            ..Project::default()
+        };
+        assert_eq!(calendar_error(&proj), None);
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-02T17:00:00".into())
+        );
+        // Without a base to inherit from, it has no working time at all.
+        proj.calendars[1].base_calendar_uid = Some(99);
+        assert!(
+            calendar_error(&proj)
+                .unwrap()
+                .contains("calendar \"Derived 2\" (UID 2) has no working time")
+        );
+    }
+
+    #[test]
+    fn summary_is_measured_on_a_derived_project_calendar() {
+        // As `summary_duration_stays_on_a_working_default_calendar`, but
+        // the project calendar derives from Standard and states no days. Read
+        // as its own days only, it would have no working time and the summary
+        // would be measured on the leaves' 24-hour calendar instead.
+        let mut always = closed_calendar(3);
+        for day in always.week.iter_mut().flatten() {
+            day.times = vec![WorkingTime { from: 0, to: 1440 }];
+        }
+        let mut b = child(3, "B", 480, 3);
+        b.predecessors.push(fs(2));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![phase(1), child(2, "A", 480, 3), b],
+            calendars: vec![Calendar::standard(5), derived(1, 5, &[]), always],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(
+            dates(&s, 1),
+            ("2026-03-02T08:00:00".into(), "2026-03-03T00:00:00".into())
+        );
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(480));
+    }
+
+    #[test]
+    fn base_chain_lookup_takes_the_last_calendar_with_a_uid() {
+        // Two calendars share UID 1; the second works 07:00-19:00 on Mondays.
+        let mut long = Calendar::standard(1);
+        long.week[1] = Some(DayWorking {
+            times: vec![WorkingTime {
+                from: 7 * 60,
+                to: 19 * 60,
+            }],
+        });
+        let mut a = task(1, "A", 12 * 60);
+        a.calendar_uid = Some(2);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 7, 0)),
+            tasks: vec![a],
+            calendars: vec![Calendar::standard(1), long, derived(2, 1, &[])],
+            ..Project::default()
+        };
+        assert_eq!(
+            dates(&schedule(&proj), 1),
+            ("2026-03-02T07:00:00".into(), "2026-03-02T19:00:00".into())
+        );
+    }
+
     #[test]
     fn anchor_ignores_starts_of_tasks_that_are_not_scheduled() {
         let early = DateTime::from_ymd_hm(2023, 6, 5, 8, 0);

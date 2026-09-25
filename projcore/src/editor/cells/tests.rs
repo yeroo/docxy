@@ -1292,3 +1292,55 @@ fn duplicate_assignments_of_one_resource_survive_an_unchanged_commit() {
         unchanged(&ed, &before, (0, 0, false));
     }
 }
+
+#[test]
+fn typed_dates_resolve_derived_calendars_like_the_scheduler() {
+    // Two calendars share UID 1, the second with a 07:00-19:00 Monday; a task
+    // on calendar 2, derived from 1 with Tuesday off.
+    let mut ed = editor();
+    let mut long = Calendar::standard(1);
+    long.week[1] = Some(crate::model::DayWorking {
+        times: vec![crate::model::WorkingTime {
+            from: 7 * 60,
+            to: 19 * 60,
+        }],
+    });
+    let derived = Calendar {
+        base_calendar_uid: Some(1),
+        week: [
+            None,
+            None,
+            Some(crate::model::DayWorking::default()),
+            None,
+            None,
+            None,
+            None,
+        ],
+        ..Calendar::standard(2)
+    };
+    ed.proj.calendars = vec![Calendar::standard(1), long, derived];
+    ed.proj.tasks[0].calendar_uid = Some(2);
+    let task = ed.project().task(10).unwrap().clone();
+    let monday = parse_cell_date("2026-03-02").unwrap();
+    // The scheduler's rule: the last calendar with UID 1 is the base.
+    assert_eq!(
+        day_finish(ed.project(), &task, monday)
+            .unwrap()
+            .minute_of_day(),
+        19 * 60
+    );
+    assert_eq!(
+        day_start(ed.project(), &task, monday).minute_of_day(),
+        7 * 60
+    );
+    let tuesday = parse_cell_date("2026-03-03").unwrap();
+    assert!(day_finish(ed.project(), &task, tuesday).is_err());
+    let mut proj = ed.project().clone();
+    proj.start_date = Some(monday.add_minutes(7 * 60));
+    proj.tasks[0].duration_min = 12 * 60;
+    let sched = crate::schedule::schedule(&proj);
+    assert_eq!(
+        sched.get(10).unwrap().early_finish,
+        day_finish(ed.project(), &task, monday).unwrap()
+    );
+}
