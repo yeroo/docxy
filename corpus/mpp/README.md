@@ -99,8 +99,9 @@ cargo test -p mppread --test oracle_corpus -- --nocapture
 The test also checks the 46 generated snapshots under `snapshots/`, including
 the MPP12 match-or-refuse cases. It skips an absent corpus, and checks expected
 file counts when one is present. The external paired corpus has 27 plans. It
-also checks four local row-order cases in `order/` when present: blank rows,
-inserted tasks, inserted hierarchy, and moved rows. Generate them on Windows
+also checks five local row-order cases in `order/` when present: blank rows,
+inserted tasks, inserted hierarchy, moved rows, and rows sorted with permanent
+renumbering. Generate them on Windows
 with a licensed Project desktop install and pywin32:
 
 ```powershell

@@ -220,7 +220,7 @@ fn project_2024_oracles() {
     let order = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/order");
     if order.exists() {
         let cases = pairs(&order, "");
-        assert_eq!(cases.len(), 4);
+        assert_eq!(cases.len(), 5);
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false);
         }
