@@ -31,6 +31,9 @@ pub(super) struct ProjectView {
     pub width: f32,
     /// Whether the Timeline pane is shown: window view state, never saved.
     pub timeline: bool,
+    /// The table pane width the user dragged the split bar to; `None` is the
+    /// default. Window view state, never saved.
+    pub split: Option<f32>,
 }
 
 impl ProjectView {
@@ -51,21 +54,38 @@ impl ProjectView {
             exported: None,
             width: 590. + SCROLLBAR_W,
             timeline: true,
+            split: None,
         }
     }
 
-    /// Runs every frame, so it reveals the selected column only on a resize:
-    /// a table-scrollbar drag that hides that column must stay where it was put.
+    /// Runs every frame, so it reveals the selected column only when the table
+    /// pane resizes: a table-scrollbar drag that hides that column must stay
+    /// where it was put.
     pub fn layout(&mut self, width: f32) {
-        let table_w = table_pane_width(width);
-        let resized = table_w != self.table_w;
+        let old = self.table_w;
         self.width = width;
-        self.table_w = table_w;
-        self.gantt_w = (width - table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
-        self.refresh_schedule_layout();
-        if resized {
+        self.apply_widths();
+        if self.table_w != old {
             self.reveal_col();
         }
+    }
+
+    fn apply_widths(&mut self) {
+        self.table_w = split_table_width(self.width, self.split);
+        self.gantt_w = (self.width - self.table_w - GANTT_INSET - SCROLLBAR_W).max(0.);
+        self.refresh_schedule_layout();
+    }
+
+    /// Moves the split bar. It writes `table_w` itself, so the next frame's
+    /// `layout` sees no resize and leaves the table where it was scrolled.
+    pub fn set_split(&mut self, table_w: f32) {
+        self.split = Some(split_table_width(self.width, Some(table_w)));
+        self.apply_widths();
+    }
+
+    pub fn reset_split(&mut self) {
+        self.split = None;
+        self.apply_widths();
     }
 
     pub fn refresh_schedule_layout(&mut self) {
@@ -322,6 +342,8 @@ pub(super) fn project_state(
             "exported".into(),
             Json::Str(v.exported.clone().unwrap_or_else(|| "none".into())),
         ),
+        ("table_w".into(), Json::Num(f64::from(v.table_w))),
+        ("gantt_w".into(), Json::Num(f64::from(v.gantt_w))),
     ];
     entries.extend(v.ed.project().tasks.iter().map(|t| {
         (
