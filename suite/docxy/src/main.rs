@@ -9684,6 +9684,13 @@ fn exit_hf_tab(tab: &mut DocTab) {
     }
 }
 
+/// `path` resolved to the file it names, or as given when it cannot be
+/// resolved (a missing file): what "the same file" means for open dedup and
+/// the load-failed save guard alike.
+fn canonical(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.into())
+}
+
 /// What a Save onto the file a tab could not load says (#209).
 const DOC_LOAD_FAILED_SAVE: &str = "this file could not be opened; use Save As to save a new copy";
 
@@ -9696,11 +9703,10 @@ fn refuses_load_failed_save(
     own: Option<&std::path::Path>,
     target: Option<&std::path::Path>,
 ) -> bool {
-    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     load_failed
         && match (own, target) {
             (_, None) => true,
-            (Some(own), Some(target)) => own == target || canon(own) == canon(target),
+            (Some(own), Some(target)) => own == target || canonical(own) == canonical(target),
             (None, Some(_)) => false,
         }
 }
@@ -10167,15 +10173,13 @@ impl Docxy {
     /// before reloading it from disk.
     fn open_args(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         self.project_prompt_cancel();
-        let canon =
-            |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let mut changed = false;
         for path in paths {
-            let key = canon(&path);
+            let key = canonical(&path);
             match self
                 .tabs
                 .iter()
-                .position(|t| t.path.as_deref().map(canon) == Some(key.clone()))
+                .position(|t| t.path.as_deref().map(canonical) == Some(key.clone()))
             {
                 Some(i) => {
                     // ⚠️ A harness instance never asks, and always reloads —

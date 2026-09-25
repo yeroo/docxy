@@ -97,10 +97,6 @@ fn loaded_project(path: &Path) -> Result<DocTab, String> {
     }
 }
 
-fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.into())
-}
-
 fn open_project(tabs: &mut Vec<DocTab>, args: &Json) -> Result<(Json, Effect), String> {
     if args.get("tab").is_some() {
         return Err("proj.open does not take 'tab'".into());
