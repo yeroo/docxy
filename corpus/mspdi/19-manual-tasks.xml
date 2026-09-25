@@ -5,6 +5,7 @@
   <MinutesPerWeek>2400</MinutesPerWeek>
   <CalendarUID>1</CalendarUID>
   <StartDate>2026-03-02T08:00:00</StartDate>
+  <ProjectExternallyEdited>0</ProjectExternallyEdited>
   <NewTasksAreManual>1</NewTasksAreManual>
   <Tasks>
     <Task>
@@ -16,6 +17,7 @@
       <Milestone>0</Milestone>
       <Duration>PT72H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-02T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>
+      <TotalSlack>-9600</TotalSlack><Critical>1</Critical>
     </Task>
     <Task>
       <UID>2</UID><ID>2</ID>
@@ -26,6 +28,7 @@
       <Milestone>0</Milestone>
       <Duration>PT24H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-02T08:00:00</Start><Finish>2026-03-04T17:00:00</Finish>
+      <TotalSlack>9600</TotalSlack><Critical>0</Critical>
     </Task>
     <Task>
       <UID>3</UID><ID>3</ID>
@@ -36,6 +39,7 @@
       <Milestone>0</Milestone>
       <Duration>PT8H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-03T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish>
+      <TotalSlack>-9600</TotalSlack><Critical>1</Critical>
       <ManualStart>2026-03-03T08:00:00</ManualStart>
       <ManualDuration>PT8H0M0S</ManualDuration>
       <PredecessorLink>
@@ -53,6 +57,7 @@
       <Milestone>0</Milestone>
       <Duration>PT16H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-09T08:00:00</Start><Finish>2026-03-10T17:00:00</Finish>
+      <TotalSlack>0</TotalSlack><Critical>1</Critical>
       <ManualStart>2026-03-09T08:00:00</ManualStart>
       <ManualFinish>2026-03-10T17:00:00</ManualFinish>
       <ManualDuration>PT16H0M0S</ManualDuration>
@@ -71,6 +76,7 @@
       <Milestone>0</Milestone>
       <Duration>PT16H0M0S</Duration><DurationFormat>7</DurationFormat>
       <Start>2026-03-11T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>
+      <TotalSlack>0</TotalSlack><Critical>1</Critical>
       <PredecessorLink>
         <PredecessorUID>4</PredecessorUID>
         <Type>1</Type>

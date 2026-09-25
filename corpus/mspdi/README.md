@@ -7,11 +7,25 @@ failing assertion points at a single code path.
 ## Embedded expectations
 
 There is no free high-fidelity oracle for project scheduling — MS Project is the
-reference implementation and isn't scriptable in CI. So each file embeds the
-hand-derived `Start`/`Finish` expectations for a standard calendar.
+reference implementation and isn't scriptable in CI. So each file embeds every
+task's `Start`/`Finish`, `TotalSlack` (tenths of a minute, as MSPDI stores it)
+and `Critical` for a standard calendar.
 `projcore/tests/corpus.rs` reads each file, runs the CPM scheduler, and asserts
-the computed dates equal the embedded ones. It also checks that every project
-has a critical leaf and that its last-finishing leaves have nonpositive slack.
+the computed dates, slack and critical flags equal the embedded ones. It also
+checks that every project has a critical leaf and that its last-finishing
+leaves have nonpositive slack.
+
+All 18 files were verified against Microsoft Project 2021 in
+[issue #74](https://github.com/yeroo/docxy/issues/74) by
+`corpus/tools/verify_mspdi_project.py`. The script has Project schedule a copy
+of each file with every task's `Start`, `Finish`, `TotalSlack` and `Critical`
+removed, so Project cannot read the oracle back. Before comparing, it checks
+that Project imported each task's duration, links, lags, constraint and
+calendar as the file states them. Every file carries
+`<ProjectExternallyEdited>0</ProjectExternallyEdited>`: without it Project
+rederives durations from Start/Finish and imports tasks that start at the
+project start with zero duration. The #74 run found no oracle to correct, and
+it reproduces the owner's earlier manual runs below.
 
 The owner checked the SF shapes in files 05 and 14 against Microsoft Project
 2021 in [issue #53](https://github.com/yeroo/docxy/issues/53). File 05's B finish
@@ -28,13 +42,13 @@ File 18 records the FS milestone dates verified against Project 2021 in
 keep the predecessor's finish instant. Only zero-lag links were verified;
 for nonzero lag the scheduler uses the finish side of the successor calendar's
 working-time boundary, which remains unverified against Project.
-File 19 pins manually scheduled tasks ([issue #77](https://github.com/yeroo/docxy/issues/77)):
-its dates are what a manual task keeps by definition, but the slack our
-scheduler reports for a manual task whose link is violated (Review, pinned two
-days before Design finishes, gets -2 days) is **not** verified against Project
-2021.
-The other fixtures remain hand-derived expectations, not independently verified
-Project outputs.
+File 19 pins manually scheduled tasks
+([issue #77](https://github.com/yeroo/docxy/issues/77)) and is the one fixture
+**not** verified against Project 2021: its Start/Finish are what a manual task
+keeps by definition, but its `TotalSlack`/`Critical` are hand-derived from our
+scheduler, including the violated link (Review, pinned two days before Design
+finishes, gets -2 days). `verify_mspdi_project.py` keeps the tasks this file
+marks `<Manual>1</Manual>` manual, so a Project run can check it.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
@@ -74,4 +88,15 @@ python3 corpus/tools/gen_mspdi_corpus.py
 ```
 
 Pure stdlib Python; no external tools. Edit the generator (not the files) to add
-cases, then re-run and confirm `cargo test -p projcore` stays green.
+cases, then re-run and confirm `cargo test -p projcore` stays green. A new or
+changed oracle must come from Project: on Windows with Microsoft Project and
+pywin32, and with Project closed, run
+
+```
+python corpus/tools/verify_mspdi_project.py [file.xml ...]
+```
+
+It exits nonzero on any input-fidelity failure or schedule mismatch, and it
+never writes into `corpus/mspdi/`. If Project is already running it refuses to
+start (exit 2): Project is a single-instance COM server, so the script would
+otherwise attach to your session and close its projects without saving.

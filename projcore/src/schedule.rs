@@ -1015,6 +1015,36 @@ pub(crate) fn working_minutes_on(
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
+/// A task's scheduled duration in working minutes: a leaf's own
+/// `duration_min`, or for a summary the working time spanned by its rolled-up
+/// early start/finish. The stored `duration_min` of a summary is never
+/// recomputed, so every surface that shows one must derive it here. `None` when
+/// the task has no schedule result.
+pub fn task_duration_min(proj: &Project, sched: &Schedule, task: &Task) -> Option<i64> {
+    let r = sched.get(task.uid)?;
+    Some(summary_or_leaf_min(
+        proj,
+        task,
+        r.early_start,
+        r.early_finish,
+    ))
+}
+
+/// The one rule behind [`task_duration_min`] and the editor's displayed
+/// duration, which passes leveled dates instead of early ones.
+pub(crate) fn summary_or_leaf_min(
+    proj: &Project,
+    task: &Task,
+    start: DateTime,
+    finish: DateTime,
+) -> i64 {
+    if task.summary {
+        working_minutes_between(proj, start, finish)
+    } else {
+        task.duration_min
+    }
+}
+
 // ---- resource leveling ------------------------------------------------------
 
 /// The result of a resource-leveling pass: each task's leveled start/finish.
@@ -3266,5 +3296,27 @@ mod tests {
         // B is leveled behind A to Wednesday-Thursday; M stays on Thursday.
         assert_eq!(lv.start(2).unwrap().to_mspdi(), "2026-03-04T08:00:00");
         assert_eq!(lv.start(3).unwrap().to_mspdi(), "2026-03-05T08:00:00");
+    }
+
+    #[test]
+    fn task_duration_derives_summaries_from_rolled_up_dates() {
+        // The summary's stored duration (0) is stale; its children span 3d.
+        let mut sum = task(1, "Phase", 0);
+        sum.summary = true;
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 960);
+        b.outline_level = 2;
+        b.predecessors = vec![fs(2)];
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![sum, a, b],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[0]), Some(1440));
+        assert_eq!(task_duration_min(&proj, &s, &proj.tasks[2]), Some(960));
+        // No schedule result for a task outside the scheduled project.
+        assert_eq!(task_duration_min(&proj, &s, &task(99, "Ghost", 480)), None);
     }
 }

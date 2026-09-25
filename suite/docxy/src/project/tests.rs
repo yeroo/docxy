@@ -112,7 +112,11 @@ fn every_mspdi_fixture_opens_and_matches_its_date_oracle() {
         .map(|e| e.unwrap().path())
         .filter(|p| ext_is(p, "xml"))
         .collect();
-    assert_eq!(paths.len(), 19);
+    assert!(
+        paths.len() >= 19,
+        "expected the full seed corpus, got {}",
+        paths.len()
+    );
     for path in paths {
         let tab = tab_from_path(&path);
         assert!(tab.status.starts_with("loaded"), "{}", tab.status);
@@ -504,6 +508,46 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
     });
     let ed = ProjectEditor::new(p);
     assert_eq!(project_row(&ed, ed.project().task(9).unwrap())[5], "?999");
+}
+
+fn summary_fixture(stored_summary_min: Option<i64>) -> ProjectEditor {
+    let xml = std::fs::read_to_string(corpus("10-summary.xml")).unwrap();
+    let mut p = mspdi::read_mspdi(&xml).unwrap();
+    assert!(p.tasks[0].summary);
+    if let Some(min) = stored_summary_min {
+        p.tasks[0].duration_min = min;
+    }
+    ProjectEditor::new(p)
+}
+
+#[test]
+fn summary_duration_follows_child_edits_and_matches_the_gantt_export() {
+    let mut ed = summary_fixture(None);
+    let phase = ed.project().tasks[0].uid;
+    let b = ed.project().tasks[2].uid;
+    assert_eq!(ed.project().tasks[2].name, "B");
+    assert_eq!(project_row(&ed, ed.project().task(phase).unwrap())[2], "2d");
+    ed.set_duration_min(b, 1440).unwrap();
+    let row = project_row(&ed, ed.project().task(phase).unwrap());
+    assert_eq!(row[2], "4d");
+    let md = projcore::gantt::to_markdown(ed.project(), ed.schedule());
+    let exported = md
+        .lines()
+        .find(|l| l.starts_with("| **Phase** |"))
+        .unwrap()
+        .split('|')
+        .map(str::trim)
+        .nth(4)
+        .unwrap();
+    assert_eq!(row[2], exported);
+}
+
+#[test]
+fn summary_with_zero_stored_duration_is_not_shown_as_a_milestone() {
+    let ed = summary_fixture(Some(0));
+    let phase = ed.project().task(ed.project().tasks[0].uid).unwrap();
+    assert!(phase.is_milestone());
+    assert_eq!(project_row(&ed, phase)[2], "2d");
 }
 
 #[test]

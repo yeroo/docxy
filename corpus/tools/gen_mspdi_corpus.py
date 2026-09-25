@@ -3,15 +3,16 @@
 
 Unlike the xlsx corpus, there is no free high-fidelity oracle for project
 scheduling (MS Project is the reference implementation and isn't scriptable
-here). Each file embeds hand-derived Start/Finish expectations for a standard
-8h/day Mon-Fri calendar anchored at Monday 2026-03-02 08:00. The owner checked
-the SF shapes in files 05 and 14 against Project 2021 (issue #53), the
-24-hour calendar in file 16 (issue #58), and the FNLT conflict in file 17
-(issue #60); the other expectations, including the manual tasks in file 19,
-have not been independently verified against Project.
-`projcore/tests/corpus.rs` reads
-each file, runs the CPM scheduler, and asserts the computed dates match the
-embedded ones — so the corpus validates the scheduler without needing Project.
+in CI). Each file embeds Start/Finish, TotalSlack and Critical for a standard
+8h/day Mon-Fri calendar anchored at Monday 2026-03-02 08:00. Every value was
+checked against Project 2021 by corpus/tools/verify_mspdi_project.py (#74),
+which schedules a copy with these oracle elements removed. Earlier owner runs
+covered 05 and 14 (#53), 16 (#58), 17 (#60) and 18 (#59); the script
+reproduces them. `projcore/tests/corpus.rs` reads each file, runs the CPM
+scheduler, and asserts the computed values match the embedded ones, so the
+corpus validates the scheduler without needing Project. Rerun the script
+whenever a fixture changes. Exception: file 19's manual-task expectations
+(#77) are hand-derived from our scheduler and not yet verified in Project.
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -39,12 +40,14 @@ def iso(minutes):
     return f"PT{h}H{m}M0S"
 
 
-def task(uid, name, dur_min, start, finish, *, oid=None, outline=1,
-         summary=False, milestone=False, preds=(), ctype=None, cdate=None,
-         calendar=None, baselines=(), manual=None, manual_start=None,
+def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
+         outline=1, summary=False, milestone=False, preds=(), ctype=None,
+         cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
          manual_finish=None, manual_duration=None):
     """One <Task>. `preds` is a list of (uid, type_code, lag_tenths_of_min).
-    `start`/`finish` are the embedded oracle values (MSPDI datetime strings).
+    `start`/`finish` are the embedded oracle values (MSPDI datetime strings);
+    `slack` (working minutes) and `critical` are Project's TotalSlack and
+    Critical. They are required so a new task cannot omit its oracle.
     `manual` (0/1) and the manual_* fields are written only when given."""
     oid = uid if oid is None else oid
     lines = [
@@ -60,6 +63,8 @@ def task(uid, name, dur_min, start, finish, *, oid=None, outline=1,
         f"      <Milestone>{1 if milestone else 0}</Milestone>",
         f"      <Duration>{iso(dur_min)}</Duration><DurationFormat>7</DurationFormat>",
         f"      <Start>{start}</Start><Finish>{finish}</Finish>",
+        # MSPDI TotalSlack is in tenths of a minute.
+        f"      <TotalSlack>{slack * 10}</TotalSlack><Critical>{1 if critical else 0}</Critical>",
     ]
     for tag, value in [("ManualStart", manual_start), ("ManualFinish", manual_finish),
                        ("ManualDuration",
@@ -134,6 +139,10 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
         "  <MinutesPerWeek>2400</MinutesPerWeek>",
         "  <CalendarUID>1</CalendarUID>",
         f"  <StartDate>2026-03-02T08:00:00</StartDate>",
+        # Without this, Project treats the file as externally edited, ignores
+        # <Duration> and rederives it from Start/Finish, which zeroes tasks that
+        # start at the project start (#74).
+        "  <ProjectExternallyEdited>0</ProjectExternallyEdited>",
     ]
     if new_tasks_are_manual is not None:
         parts.append(f"  <NewTasksAreManual>{new_tasks_are_manual}</NewTasksAreManual>")
@@ -151,6 +160,8 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
 
 
 D = 480  # one working day in minutes
+# Project 2021 (#74) gives most tasks no total slack and marks them critical.
+CRIT = {"slack": 0, "critical": True}
 
 # Anchor Mon 2026-03-02 08:00. Working days: Mon2 Tue3 Wed4 Thu5 Fri6 (Sat7/Sun8
 # off) Mon9 ... Each task day runs 08:00-17:00.
@@ -173,50 +184,50 @@ def build():
     # 01 — a single 2-day task.
     add("01-single-task.xml", ["basic"], "One 2-day task; the irreducible minimum.",
         project("single-task",
-                task(1, "Dig foundation", 2 * D, dt(2), dt(3, "17:00:00"))))
+                task(1, "Dig foundation", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT)))
 
     # 02 — finish-to-start dependency.
     add("02-link-fs.xml", ["link", "link-fs"], "Finish-to-start dependency.",
         project("link-fs", "\n".join([
-            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00")),
-            task(2, "B", 2 * D, dt(4), dt(5, "17:00:00"), preds=[(1, FS, 0)]),
+            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
+            task(2, "B", 2 * D, dt(4), dt(5, "17:00:00"), **CRIT, preds=[(1, FS, 0)]),
         ])))
 
     # 03 — start-to-start dependency.
     add("03-link-ss.xml", ["link", "link-ss"], "Start-to-start dependency.",
         project("link-ss", "\n".join([
-            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00")),
-            task(2, "B", 3 * D, dt(2), dt(4, "17:00:00"), preds=[(1, SS, 0)]),
+            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
+            task(2, "B", 3 * D, dt(2), dt(4, "17:00:00"), **CRIT, preds=[(1, SS, 0)]),
         ])))
 
     # 04 — finish-to-finish dependency.
     add("04-link-ff.xml", ["link", "link-ff"], "Finish-to-finish dependency.",
         project("link-ff", "\n".join([
-            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00")),
-            task(2, "B", 1 * D, dt(3), dt(3, "17:00:00"), preds=[(1, FF, 0)]),
+            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
+            task(2, "B", 1 * D, dt(3), dt(3, "17:00:00"), **CRIT, preds=[(1, FF, 0)]),
         ])))
 
     # 05 — start-to-finish dependency (predecessor pinned by SNET so the
     # successor's finish lands on a real working boundary, not the anchor).
     add("05-link-sf.xml", ["link", "link-sf"], "Start-to-finish dependency.",
         project("link-sf", "\n".join([
-            task(1, "A", 2 * D, dt(4), dt(5, "17:00:00"), ctype=SNET, cdate=dt(4)),
-            task(2, "B", 1 * D, dt(3), dt(4), preds=[(1, SF, 0)]),
+            task(1, "A", 2 * D, dt(4), dt(5, "17:00:00"), **CRIT, ctype=SNET, cdate=dt(4)),
+            task(2, "B", 1 * D, dt(3), dt(4), slack=2 * D, critical=False, preds=[(1, SF, 0)]),
         ])))
 
     # 06 — FS with +2 day lag (LinkLag is tenths of a minute: 2d = 2*480*10).
     add("06-lag.xml", ["link", "lag"], "FS link with +2 working-day lag.",
         project("lag", "\n".join([
-            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00")),
-            task(2, "B", 1 * D, dt(6), dt(6, "17:00:00"),
+            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
+            task(2, "B", 1 * D, dt(6), dt(6, "17:00:00"), **CRIT,
                  preds=[(1, FS, 2 * D * 10)]),
         ])))
 
     # 07 — FS with -1 day lead (negative lag: overlap).
     add("07-lead.xml", ["link", "lead"], "FS link with -1 working-day lead.",
         project("lead", "\n".join([
-            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00")),
-            task(2, "B", 1 * D, dt(3), dt(3, "17:00:00"),
+            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
+            task(2, "B", 1 * D, dt(3), dt(3, "17:00:00"), **CRIT,
                  preds=[(1, FS, -1 * D * 10)]),
         ])))
 
@@ -224,22 +235,22 @@ def build():
     add("08-milestone.xml", ["milestone", "constraint", "constraint-snet"],
         "Zero-duration milestone with SNET constraint.",
         project("milestone",
-                task(1, "Permit approved", 0, dt(5), dt(5), milestone=True,
+                task(1, "Permit approved", 0, dt(5), dt(5), **CRIT, milestone=True,
                      ctype=SNET, cdate=dt(5))))
 
     # 09 — a Start-No-Earlier-Than constraint on a normal task.
     add("09-constraint-snet.xml", ["constraint", "constraint-snet"],
         "Start-No-Earlier-Than constraint delays the start.",
         project("constraint-snet",
-                task(1, "Delayed", 2 * D, dt(5), dt(6, "17:00:00"),
+                task(1, "Delayed", 2 * D, dt(5), dt(6, "17:00:00"), **CRIT,
                      ctype=SNET, cdate=dt(5))))
 
     # 10 — a summary task with two children (outline rollup).
     add("10-summary.xml", ["summary"], "Summary task rolling up two children.",
         project("summary", "\n".join([
-            task(1, "Phase", 2 * D, dt(2), dt(3, "17:00:00"), summary=True, outline=1),
-            task(2, "A", 1 * D, dt(2), dt(2, "17:00:00"), oid=2, outline=2),
-            task(3, "B", 1 * D, dt(3), dt(3, "17:00:00"), oid=3, outline=2,
+            task(1, "Phase", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT, summary=True, outline=1),
+            task(2, "A", 1 * D, dt(2), dt(2, "17:00:00"), **CRIT, oid=2, outline=2),
+            task(3, "B", 1 * D, dt(3), dt(3, "17:00:00"), **CRIT, oid=3, outline=2,
                  preds=[(2, FS, 0)]),
         ])))
 
@@ -251,7 +262,7 @@ def build():
     add("11-resource-assignment.xml", ["resource", "assignment"],
         "One work resource assigned to a task at 100% units.",
         project("resource-assignment",
-                task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00")),
+                task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
                 resources_xml=res, assignments_xml=asn))
 
     # 12 — a custom 6-day calendar (Saturday working) changes the finish date.
@@ -260,7 +271,7 @@ def build():
     add("12-calendar-6day.xml", ["calendar", "calendar-6day"],
         "Custom 6-day calendar (Saturday working) shortens the schedule.",
         project("calendar-6day",
-                task(1, "Six days", 6 * D, dt(2), dt(7, "17:00:00"), calendar=2),
+                task(1, "Six days", 6 * D, dt(2), dt(7, "17:00:00"), **CRIT, calendar=2),
                 calendars=[standard_calendar(1),
                            standard_calendar(2, "SixDay", saturday=True)]))
 
@@ -278,21 +289,22 @@ def build():
     add("13-resource-fields.xml", ["resource", "resource-fields", "round-trip"],
         "Work resource identity and rates, Cost resource, and Material label survive saving.",
         project("resource-fields",
-                task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00")),
+                task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
                 resources_xml=rich_res, assignments_xml=asn))
 
     # 14 — Project 2021 places the SF successor before the project start (#53).
     add("14-link-sf-before-start.xml", ["link", "link-sf", "before-start"],
         "Start-to-finish successor begins before the project start.",
         project("link-sf-before-start", "\n".join([
-            task(1, "A", 2 * D, "2026-02-26T08:00:00", dt(2), preds=[(2, SF, 0)]),
-            task(2, "B", 1 * D, dt(2), dt(2, "17:00:00")),
+            task(1, "A", 2 * D, "2026-02-26T08:00:00", dt(2), slack=D, critical=False,
+                 preds=[(2, SF, 0)]),
+            task(2, "B", 1 * D, dt(2), dt(2, "17:00:00"), **CRIT),
         ])))
 
     # 15 — recorded baseline plans differ from current task dates/durations (#55).
     add("15-baseline-slots.xml", ["baseline", "round-trip"],
         "Distinct baseline slots and recorded durations, including an omitted Duration.",
-        project("baseline-slots", task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"),
+        project("baseline-slots", task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT,
                 baselines=[(0, dt(4), dt(6, "17:00:00"), 3 * D),
                            (1, dt(9), dt(13, "17:00:00"), 5 * D),
                            (2, dt(16), dt(17, "17:00:00"), None)])))
@@ -305,15 +317,15 @@ def build():
                      + full_days + "\n</WeekDays></Calendar>")
     add("16-24-hour-calendar.xml", ["calendar", "calendar-24hour", "round-trip"],
         "Project 2021 (#58): three 8-hour duration days finish after 24 continuous hours.",
-        project("24-hour-calendar", task(1, "Build", 3 * D, dt(2), dt(3), calendar=3),
+        project("24-hour-calendar", task(1, "Build", 3 * D, dt(2), dt(3), **CRIT, calendar=3),
                 calendars=[standard_calendar(), full_calendar]))
 
     # 17 — Project 2021 honors FNLT over the FS link and reports -5d slack (#60).
     add("17-constraint-fnlt-conflict.xml", ["constraint", "constraint-fnlt", "negative-slack"],
         "Project 2021 (#60): FNLT overrides the FS link; both tasks have -5d total slack.",
         project("constraint-fnlt-conflict", "\n".join([
-            task(1, "A", 5 * D, dt(2), dt(6, "17:00:00")),
-            task(2, "B", 5 * D, dt(2), dt(6, "17:00:00"),
+            task(1, "A", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True),
+            task(2, "B", 5 * D, dt(2), dt(6, "17:00:00"), slack=-5 * D, critical=True,
                  preds=[(1, FS, 0)], ctype=FNLT, cdate=dt(6, "17:00:00")),
         ])))
 
@@ -321,14 +333,14 @@ def build():
     add("18-milestone-after-fs.xml", ["milestone", "link", "link-fs"],
         "Project 2021 (#59): FS milestones keep the predecessor finish instant.",
         project("milestone-after-fs", "\n".join([
-            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00")),
+            task(1, "A", 2 * D, dt(2), dt(3, "17:00:00"), slack=4 * D, critical=False),
             task(2, "Sign-off", 0, dt(3, "17:00:00"), dt(3, "17:00:00"),
-                 milestone=True, preds=[(1, FS, 0)]),
-            task(3, "Chain A", D, dt(2), dt(2, "17:00:00")),
-            task(4, "M1", 0, dt(2, "17:00:00"), dt(2, "17:00:00"),
+                 slack=4 * D, critical=False, milestone=True, preds=[(1, FS, 0)]),
+            task(3, "Chain A", D, dt(2), dt(2, "17:00:00"), **CRIT),
+            task(4, "M1", 0, dt(2, "17:00:00"), dt(2, "17:00:00"), **CRIT,
                  milestone=True, preds=[(3, FS, 0)]),
-            task(5, "B", 5 * D, dt(3), dt(9, "17:00:00"), preds=[(4, FS, 0)]),
-            task(6, "M2", 0, dt(9, "17:00:00"), dt(9, "17:00:00"),
+            task(5, "B", 5 * D, dt(3), dt(9, "17:00:00"), **CRIT, preds=[(4, FS, 0)]),
+            task(6, "M2", 0, dt(9, "17:00:00"), dt(9, "17:00:00"), **CRIT,
                  milestone=True, preds=[(5, FS, 0)]),
         ])))
 
@@ -338,14 +350,18 @@ def build():
     add("19-manual-tasks.xml", ["manual", "link", "link-fs", "summary", "round-trip"],
         "Manual tasks keep their pinned dates; an auto successor follows them.",
         project("manual-tasks", "\n".join([
-            task(1, "Phase", 9 * D, dt(2), dt(12, "17:00:00"), summary=True, manual=0),
-            task(2, "Design", 3 * D, dt(2), dt(4, "17:00:00"), outline=2, manual=0),
-            task(3, "Review", D, dt(3), dt(3, "17:00:00"), outline=2,
-                 preds=[(2, FS, 0)], manual=1, manual_start=dt(3), manual_duration=D),
-            task(4, "Vendor", 2 * D, dt(9), dt(10, "17:00:00"), outline=2,
+            task(1, "Phase", 9 * D, dt(2), dt(12, "17:00:00"), slack=-2 * D,
+                 critical=True, summary=True, manual=0),
+            task(2, "Design", 3 * D, dt(2), dt(4, "17:00:00"), slack=2 * D,
+                 critical=False, outline=2, manual=0),
+            # Pinned Tue 3, the link wants Thu 5: the violation is -2d of slack.
+            task(3, "Review", D, dt(3), dt(3, "17:00:00"), slack=-2 * D, critical=True,
+                 outline=2, preds=[(2, FS, 0)], manual=1, manual_start=dt(3),
+                 manual_duration=D),
+            task(4, "Vendor", 2 * D, dt(9), dt(10, "17:00:00"), **CRIT, outline=2,
                  preds=[(2, FS, 0)], manual=1, manual_start=dt(9),
                  manual_finish=dt(10, "17:00:00"), manual_duration=2 * D),
-            task(5, "Build", 2 * D, dt(11), dt(12, "17:00:00"), outline=2,
+            task(5, "Build", 2 * D, dt(11), dt(12, "17:00:00"), **CRIT, outline=2,
                  preds=[(4, FS, 0)], manual=0),
         ]), new_tasks_are_manual=1))
 

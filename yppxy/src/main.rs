@@ -98,12 +98,14 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(m) => {
             eprintln!("{m}");
-            eprintln!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
+            eprintln!(
+                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]"
+            );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
-        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
+        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]");
         return ExitCode::SUCCESS;
     }
 
@@ -183,6 +185,11 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
         }
         i += 1;
+    }
+    // Each headless mode exits after its own output, so a combination would
+    // silently skip one of them.
+    if out.gantt_md.is_some() && out.save.is_some() {
+        return Err("--gantt-md and --save cannot be combined".into());
     }
     Ok(out)
 }
@@ -1583,7 +1590,11 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         };
         let namecol = truncate(&full, 26);
         let dur = if t.summary {
-            String::new()
+            // The stored summary duration is stale; derive it from the shown dates.
+            app.ed.disp_duration_min(t.uid).map_or_else(
+                || "?".into(),
+                |min| fmt_days(app.ed.project().minutes_to_days(min)),
+            )
         } else if t.is_milestone() {
             "—".to_string()
         } else {
@@ -1973,6 +1984,26 @@ mod tests {
         assert!(load(source.to_str().unwrap()).is_ok());
         std::fs::remove_file(source).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn task_grid_shows_derived_summary_duration() {
+        use ratatui::backend::TestBackend;
+        let proj =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/10-summary.xml")).unwrap();
+        let mut app = App::new(proj, None, false);
+        let b = app.ed.project().tasks[2].uid;
+        app.ed.set_duration_min(b, 1440).unwrap();
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (1..45)
+            .map(|x| buf.cell((x, app.list_y0)).unwrap().symbol())
+            .collect();
+        assert_eq!(
+            row.split_whitespace().collect::<Vec<_>>(),
+            ["▾", "Phase", "4d", "0d"]
+        );
     }
 
     #[test]
