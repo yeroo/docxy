@@ -11,8 +11,9 @@ covered 05 and 14 (#53), 16 (#58), 17 (#60) and 18 (#59); the script
 reproduces them. `projcore/tests/corpus.rs` reads each file, runs the CPM
 scheduler, and asserts the computed values match the embedded ones, so the
 corpus validates the scheduler without needing Project. Rerun the script
-whenever a fixture changes. Exception: file 19's manual-task expectations
-(#77) are hand-derived from our scheduler and not yet verified in Project.
+whenever a fixture changes. Exceptions: file 19's manual-task expectations
+(#77) and file 20's task-field expectations (#80) are hand-derived from our
+scheduler and not yet verified in Project.
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -43,12 +44,13 @@ def iso(minutes):
 def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
          outline=1, summary=False, milestone=False, preds=(), ctype=None,
          cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
-         manual_finish=None, manual_duration=None):
+         manual_finish=None, manual_duration=None, fields=()):
     """One <Task>. `preds` is a list of (uid, type_code, lag_tenths_of_min).
     `start`/`finish` are the embedded oracle values (MSPDI datetime strings);
     `slack` (working minutes) and `critical` are Project's TotalSlack and
     Critical. They are required so a new task cannot omit its oracle.
-    `manual` (0/1) and the manual_* fields are written only when given."""
+    `manual` (0/1) and the manual_* fields are written only when given.
+    `fields` is a list of (element, text) for the stored task fields of #80."""
     oid = uid if oid is None else oid
     lines = [
         "    <Task>",
@@ -66,6 +68,7 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
         # MSPDI TotalSlack is in tenths of a minute.
         f"      <TotalSlack>{slack * 10}</TotalSlack><Critical>{1 if critical else 0}</Critical>",
     ]
+    lines += [f"      <{tag}>{value}</{tag}>" for tag, value in fields]
     for tag, value in [("ManualStart", manual_start), ("ManualFinish", manual_finish),
                        ("ManualDuration",
                         iso(manual_duration) if manual_duration is not None else None)]:
@@ -93,6 +96,16 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
                 lines.append(f"        <{tag}>{value}</{tag}>")
         lines.append("      </Baseline>")
     lines.append("    </Task>")
+    return "\n".join(lines)
+
+
+def blank_row(uid, oid, fields=()):
+    """One blank row (`<IsNull>1</IsNull>`): Project keeps it as an entry with
+    a UID and ID but it is not a task, so it carries no oracle. No Project
+    file with a blank row was available; this shape is ours, not Project's."""
+    lines = ["    <Task>", f"      <UID>{uid}</UID><ID>{oid}</ID>"]
+    lines += [f"      <{tag}>{value}</{tag}>" for tag, value in fields]
+    lines += ["      <IsNull>1</IsNull>", "    </Task>"]
     return "\n".join(lines)
 
 
@@ -364,6 +377,55 @@ def build():
             task(5, "Build", 2 * D, dt(11), dt(12, "17:00:00"), **CRIT, outline=2,
                  preds=[(4, FS, 0)], manual=0),
         ]), new_tasks_are_manual=1))
+
+    # 20 — task fields Project writes that the model keeps (#80): task type,
+    # effort-driven, estimated, active, priority, deadline, levelling, display
+    # flags, WBS, GUID/CreateDate, stored Work/Cost, and a blank row between
+    # two linked tasks under a summary. Values follow a Project 2021 corpus:
+    # most tasks estimated, Priority 500 or 900, LevelingDelayFormat 8.
+    # Hand-derived like file 19, not verified in Project: docxy still
+    # schedules the inactive task, and the blank row's shape is ours.
+    common = [("LevelAssignments", 1), ("LevelingCanSplit", 1),
+              ("LevelingDelay", 0), ("LevelingDelayFormat", 8),
+              ("IgnoreResourceCalendar", 0), ("HideBar", 0), ("EarnedValueMethod", 0),
+              ("Recurring", 0), ("OverAllocated", 0), ("ExternalTask", 0),
+              ("IsSubproject", 0), ("IsSubprojectReadOnly", 0)]
+    created = "2026-02-27T09:30:00"
+
+    def ident(n):
+        return [("GUID", f"0B6F1C20-4D3E-4A51-9C7B-00000000000{n}"),
+                ("CreateDate", created)]
+
+    add("20-task-fields.xml", ["task-fields", "round-trip", "blank-row", "summary", "link",
+                               "link-fs"],
+        "Task type, estimate, active, deadline, levelling and a blank row survive saves.",
+        project("task-fields", "\n".join([
+            task(1, "Phase", 3 * D, dt(2), dt(4, "17:00:00"), **CRIT, summary=True,
+                 fields=ident(1) + [("Active", 1), ("Type", 1), ("WBS", "1"),
+                                    ("Priority", 500), ("Estimated", 0), ("Rollup", 0)]
+                 + common),
+            task(2, "Excavate", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT, outline=2,
+                 fields=ident(2) + [("Active", 1), ("Type", 0), ("WBS", "1.1"),
+                                    ("Priority", 900), ("Estimated", 1),
+                                    ("EffortDriven", 1), ("Work", iso(2 * D)),
+                                    ("Cost", "1250.50"), ("Rollup", 1)] + common),
+            blank_row(3, 3, ident(3)),
+            # Its link from the blank row is ignored: Pour follows Excavate.
+            task(4, "Pour", D, dt(4), dt(4, "17:00:00"), **CRIT, outline=2,
+                 preds=[(2, FS, 0), (3, FS, 0)],
+                 fields=ident(4) + [("Active", 1), ("Type", 2), ("WBS", "1.2"),
+                                    ("Priority", 500), ("Estimated", 1),
+                                    ("EffortDriven", 0), ("Work", iso(0)),
+                                    ("Deadline", dt(20, "17:00:00")),
+                                    ("LevelAssignments", 0), ("LevelingCanSplit", 0),
+                                    ("LevelingDelay", 4800), ("LevelingDelayFormat", 7),
+                                    ("IgnoreResourceCalendar", 1), ("HideBar", 1),
+                                    ("EarnedValueMethod", 1), ("Rollup", 0)]),
+            # Inactive: Project drops it from the schedule; docxy does not yet.
+            task(5, "Inspect", D, dt(2), dt(2, "17:00:00"), slack=2 * D, critical=False,
+                 fields=ident(5) + [("Active", 0), ("Type", 1), ("WBS", "2"),
+                                    ("Priority", 500), ("Estimated", 1)] + common),
+        ])))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

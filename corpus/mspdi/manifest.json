@@ -180,6 +180,19 @@
         "round-trip"
       ],
       "desc": "Manual tasks keep their pinned dates; an auto successor follows them."
+    },
+    {
+      "file": "20-task-fields.xml",
+      "category": "task-fields",
+      "tags": [
+        "task-fields",
+        "round-trip",
+        "blank-row",
+        "summary",
+        "link",
+        "link-fs"
+      ],
+      "desc": "Task type, estimate, active, deadline, levelling and a blank row survive saves."
     }
   ]
 }

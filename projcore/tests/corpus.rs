@@ -7,9 +7,10 @@
 //! `corpus/tools/verify_mspdi_project.py` (issue #74), which has Project
 //! schedule a copy of each file with the oracle elements removed. It also
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
-//! 16 (#58), 17 (#60) and 18 (#59). The exception is file 19 (issue #77):
-//! its manual-task slack and critical flags are hand-derived from our
-//! scheduler, not yet verified in Project. Slack invariants below also check
+//! 16 (#58), 17 (#60) and 18 (#59). The exceptions are file 19 (issue #77),
+//! whose manual-task slack and critical flags are hand-derived from our
+//! scheduler, and file 20 (issue #80), whose task fields and blank row are
+//! ours; neither is verified in Project yet. Blank rows carry no oracle. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -34,7 +35,7 @@ fn mspdi_files() -> Vec<std::path::PathBuf> {
 fn every_file_parses_and_schedules() {
     let files = mspdi_files();
     assert!(
-        files.len() >= 19,
+        files.len() >= 20,
         "expected the full seed corpus, got {}",
         files.len()
     );
@@ -88,7 +89,7 @@ fn every_corpus_project_has_a_critical_leaf() {
         assert!(
             proj.tasks
                 .iter()
-                .filter(|t| !t.summary)
+                .filter(|t| !t.summary && !t.is_null)
                 .any(|t| sched.get(t.uid).unwrap().critical),
             "{}: no critical leaf",
             path.display()
@@ -101,7 +102,7 @@ fn every_corpus_finishing_leaf_has_nonpositive_slack() {
     for path in mspdi_files() {
         let proj = read_mspdi(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let sched = schedule(&proj);
-        for t in proj.tasks.iter().filter(|t| !t.summary) {
+        for t in proj.tasks.iter().filter(|t| !t.summary && !t.is_null) {
             let r = sched.get(t.uid).unwrap();
             if r.early_finish == sched.project_finish {
                 assert!(
@@ -137,17 +138,29 @@ fn sf_fixture_matches_project_2021_slack_and_finish_instant() {
 }
 
 #[test]
-fn resources_round_trip_through_mspdi_and_yppx() {
+fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
     let files = mspdi_files();
     assert!(
         files
             .iter()
             .any(|p| p.file_name().unwrap() == "13-resource-fields.xml")
     );
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "20-task-fields.xml")
+    );
     for path in files {
         let xml = std::fs::read_to_string(&path).unwrap();
         let proj = read_mspdi(&xml).unwrap();
         let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        // Every task field the model holds, including #80's stored fields.
+        assert_eq!(
+            xml_back.tasks,
+            proj.tasks,
+            "{}: MSPDI tasks changed",
+            path.display()
+        );
         assert_eq!(
             xml_back.calendars,
             proj.calendars,
@@ -161,6 +174,12 @@ fn resources_round_trip_through_mspdi_and_yppx() {
             path.display()
         );
         let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        assert_eq!(
+            package_back.tasks,
+            proj.tasks,
+            "{}: .yppx tasks changed",
+            path.display()
+        );
         assert_eq!(
             package_back.calendars,
             proj.calendars,
@@ -185,6 +204,14 @@ fn scheduler_matches_embedded_oracle() {
         let sched = schedule(&proj);
 
         for t in &proj.tasks {
+            if t.is_null {
+                assert!(
+                    sched.get(t.uid).is_none(),
+                    "{name}: blank row {} scheduled",
+                    t.uid
+                );
+                continue;
+            }
             let r = sched
                 .get(t.uid)
                 .unwrap_or_else(|| panic!("{name}: task {} not scheduled", t.uid));
@@ -218,11 +245,13 @@ fn element<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
     Some(&xml[start..start + len])
 }
 
-/// Project 2021's TotalSlack (tenths of a minute) and Critical for every task,
-/// read from the raw XML: `read_mspdi` deliberately ignores both.
+/// Project 2021's TotalSlack (tenths of a minute) and Critical for every task
+/// but blank rows, read from the raw XML: `read_mspdi` deliberately ignores
+/// both.
 fn embedded_slack_oracle(name: &str, xml: &str) -> Vec<(i32, i64, bool)> {
     xml.split("<Task>")
         .skip(1)
+        .filter(|task| element(task, "IsNull") != Some("1"))
         .map(|task| {
             let field =
                 |tag| element(task, tag).unwrap_or_else(|| panic!("{name}: a task has no <{tag}>"));
@@ -246,7 +275,8 @@ fn scheduler_matches_embedded_project_slack_and_critical() {
         let proj = read_mspdi(&xml).unwrap();
         let sched = schedule(&proj);
         let oracle = embedded_slack_oracle(&name, &xml);
-        assert_eq!(oracle.len(), proj.tasks.len(), "{name}: task count");
+        let tasks = proj.tasks.iter().filter(|t| !t.is_null).count();
+        assert_eq!(oracle.len(), tasks, "{name}: task count");
 
         for (uid, slack_min, critical) in oracle {
             let r = sched
@@ -262,6 +292,79 @@ fn scheduler_matches_embedded_project_slack_and_critical() {
             );
         }
     }
+}
+
+/// A save writes TotalSlack and Critical from docxy's own schedule; for the
+/// files verified in Project 2021 they are Project's values.
+#[test]
+fn saved_files_carry_project_slack_and_critical() {
+    for path in mspdi_files() {
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let proj = read_mspdi(&xml).unwrap();
+        let oracle = embedded_slack_oracle(&name, &xml);
+        let saved = write_mspdi(&proj);
+        assert_eq!(
+            embedded_slack_oracle(&name, &saved),
+            oracle,
+            "{name}: MSPDI"
+        );
+        let package = read_yppx(&write_yppx(&proj)).unwrap();
+        assert_eq!(
+            embedded_slack_oracle(&name, &write_mspdi(&package)),
+            oracle,
+            "{name}: .yppx"
+        );
+    }
+}
+
+#[test]
+fn task_fields_fixture_keeps_fields_and_a_blank_row() {
+    use projcore::{DateTime, TaskType};
+    let xml = std::fs::read_to_string(corpus_dir().join("20-task-fields.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let types: Vec<_> = proj.tasks.iter().map(|t| t.task_type).collect();
+    use TaskType::*;
+    assert_eq!(
+        types,
+        [
+            Some(FixedDuration),
+            Some(FixedUnits),
+            None,
+            Some(FixedWork),
+            Some(FixedDuration)
+        ]
+    );
+    let active: Vec<_> = proj.tasks.iter().map(|t| t.active).collect();
+    assert_eq!(
+        active,
+        [Some(true), Some(true), None, Some(true), Some(false)]
+    );
+    let pour = proj.task(4).unwrap();
+    assert_eq!(
+        pour.deadline,
+        Some(DateTime::from_ymd_hm(2026, 3, 20, 17, 0))
+    );
+    assert_eq!(
+        (pour.leveling_delay, pour.leveling_delay_format),
+        (Some(4800), Some(7))
+    );
+    assert_eq!(proj.task(2).unwrap().work_min, Some(960));
+    let blank = proj.task(3).unwrap();
+    assert!(blank.is_null);
+    assert_eq!((blank.id, blank.outline_level), (3, 0));
+    assert!(blank.guid.is_some() && blank.create_date.is_some());
+    // The blank row is not scheduled, and Pour follows Excavate as if it
+    // were not there.
+    let sched = schedule(&proj);
+    assert!(sched.get(3).is_none());
+    assert_eq!(
+        sched.get(4).unwrap().early_start,
+        DateTime::from_ymd_hm(2026, 3, 4, 8, 0)
+    );
+    let saved = write_mspdi(&proj);
+    assert!(saved.contains("<IsNull>1</IsNull>"));
+    assert_eq!(saved.matches("<IsNull>").count(), 1);
 }
 
 /// The full native pipeline on real files: MSPDI → .yppx package → back → the
@@ -284,7 +387,7 @@ fn yppx_package_round_trip_preserves_schedule() {
             "{name}: task count changed"
         );
         let sched = schedule(&back);
-        for t in &back.tasks {
+        for t in back.tasks.iter().filter(|t| !t.is_null) {
             let r = sched.get(t.uid).unwrap();
             if let Some(exp) = t.stored_start {
                 assert_eq!(
