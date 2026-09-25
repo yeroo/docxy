@@ -48,7 +48,7 @@ pub fn decode(text: &str) -> Option<Vec<u8>> {
     }
     let groups = clean.len() / 4;
     let mut out = Vec::with_capacity(groups * 3);
-    for (gi, g) in clean.chunks_exact(4).enumerate() {
+    for (gi, g) in clean.as_chunks::<4>().0.iter().enumerate() {
         let pad = g.iter().rev().take_while(|&&c| c == b'=').count();
         if pad > 2 || (pad > 0 && gi + 1 != groups) {
             return None;
