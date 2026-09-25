@@ -45,7 +45,9 @@ and `cell_edit` (pending cell buffer, or `null` when closed). Reads and rejected
 edits leave selection, prompts, pending cell edits, history and scroll unchanged.
 Successful edits use the live editor's undo stack, reschedule, cancel the target's
 prompt, discard its uncommitted cell edit, and repaint. Successful `proj.reload`
-also discards that tab's pending cell edit.
+also discards that tab's pending cell edit. `task.del` on a summary deletes its
+whole subtree as one undo step, without the confirmation the Project tab shows,
+and lists every removed UID in `removed`.
 
 File handling differs from the TUI:
 
