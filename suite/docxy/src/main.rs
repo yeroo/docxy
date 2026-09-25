@@ -1606,6 +1606,13 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
             bundle_html: None,
             load_failed: false,
         },
+        // A 0-byte file (Explorer's "New → Word Document") has nothing to
+        // lose: it opens as a new document that saves over it.
+        Ok(bytes) if bytes.is_empty() => Loaded {
+            status: "loaded (empty file)".into(),
+            load_failed: false,
+            ..Loaded::empty("")
+        },
         Ok(bytes) => load_bytes(&bytes),
         Err(e) => Loaded::empty(format!("read error: {e}")),
     }
@@ -12637,6 +12644,22 @@ mod load_failed_save_tests {
         assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
         assert!(!tab.load_failed);
         assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_zero_byte_docx_opens_as_a_new_document_and_saves() {
+        let dir = temp("zero-byte");
+        let path = dir.join("new.docx");
+        std::fs::write(&path, b"").unwrap();
+        let mut tab = tab_from_path(&path);
+        assert!(!tab.load_failed, "{}", tab.status);
+        assert!(tab.status.starts_with("loaded"), "{}", tab.status);
+        tab.dirty = true;
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        let reopened = tab_from_path(&path);
+        assert!(reopened.pkg.is_some(), "{}", reopened.status);
+        assert_eq!(reopened.status.as_ref(), "loaded");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
