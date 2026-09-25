@@ -255,7 +255,7 @@ fn project_region(
     }
     if let harness::Region::ProjectSplit = region {
         return probes
-            .get("project-split")
+            .get(&harness::region_name(region))
             .ok_or_else(|| "the split bar has not been laid out".into());
     }
     let body = probes
@@ -1029,8 +1029,8 @@ impl Render for SplitDrag {
     }
 }
 
-/// Over the `GANTT_INSET` gutter. It occludes so a press on it reaches neither
-/// the row nor the body under it.
+/// Over the `GANTT_INSET` gutter. It blocks presses from the row and body under
+/// it, but lets the wheel through so the rows still scroll there.
 fn split_bar(
     table_w: f32,
     index: usize,
@@ -1044,16 +1044,13 @@ fn split_bar(
         .bottom_0()
         .left(px(table_w))
         .w(px(GANTT_INSET))
-        .occlude()
+        .block_mouse_except_scroll()
         .cursor(CursorStyle::ResizeLeftRight)
         .child(probe(
             probes,
             harness::region_name(harness::Region::ProjectSplit),
         ))
-        .on_drag(SplitDrag, |_, _, _, cx| {
-            cx.stop_propagation();
-            cx.new(|_| SplitDrag)
-        })
+        .on_drag(SplitDrag, |_, _, _, cx| cx.new(|_| SplitDrag))
         .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
             if ev.click_count() >= 2
                 && let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface)
