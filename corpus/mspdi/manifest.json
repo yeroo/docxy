@@ -193,6 +193,18 @@
         "link-fs"
       ],
       "desc": "Task type, estimate, active, deadline, levelling and a blank row survive saves."
+    },
+    {
+      "file": "21-progress.xml",
+      "category": "progress",
+      "tags": [
+        "progress",
+        "assignment",
+        "round-trip",
+        "link",
+        "link-fs"
+      ],
+      "desc": "Percent complete, actuals, stop/resume, remaining values, variances and assignment baselines survive saves."
     }
   ]
 }
