@@ -825,7 +825,9 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 3, "Name", &t.name);
     }
     opt_flag(s, "Active", t.active);
-    if task {
+    // A blank row states only what it carries: flags when set, a constraint
+    // when not the default. It is never a summary (the outline skips it).
+    if task || t.manual {
         tag(s, 3, "Manual", flag(t.manual));
     }
     opt_text(s, "Type", t.task_type.map(TaskType::code));
@@ -852,8 +854,10 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_flag(s, "Recurring", t.recurring);
     opt_flag(s, "OverAllocated", t.over_allocated);
     opt_flag(s, "Estimated", t.estimated);
-    if task {
+    if task || t.milestone {
         tag(s, 3, "Milestone", flag(t.milestone));
+    }
+    if task {
         tag(s, 3, "Summary", flag(t.summary));
     }
     opt_flag(s, "Critical", computed.result.map(|r| r.critical));
@@ -876,7 +880,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         }
     }
     opt_text(s, "Cost", t.cost.as_ref().map(Rate::as_str));
-    if task {
+    if task || t.constraint != ConstraintType::AsSoonAsPossible {
         tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
     }
     opt_text(s, "CalendarUID", t.calendar_uid);
@@ -2525,6 +2529,44 @@ mod tests {
         <Task><UID>4</UID><ID>4</ID><Name>B</Name><OutlineLevel>2</OutlineLevel>
           <Duration>PT8H0M0S</Duration>
           <PredecessorLink><PredecessorUID>2</PredecessorUID><Type>1</Type></PredecessorLink></Task>";
+
+    #[test]
+    fn a_blank_row_keeps_its_mode_constraint_and_milestone_flag() {
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><IsNull>1</IsNull><Manual>1</Manual>
+               <Milestone>1</Milestone><Duration>PT8H0M0S</Duration>
+               <ConstraintType>4</ConstraintType><ConstraintDate>2026-03-04T08:00:00</ConstraintDate>
+               <Summary>0</Summary></Task>",
+        );
+        let t = &proj.tasks[0];
+        assert!(t.is_null && t.manual && t.milestone);
+        assert_eq!(t.constraint, ConstraintType::StartNoEarlierThan);
+        let xml = write_mspdi(&proj);
+        assert_eq!(
+            element_names(task_xml(&xml))
+                .into_iter()
+                .skip(2)
+                .collect::<Vec<_>>(),
+            [
+                "UID",
+                "ID",
+                "Manual",
+                "IsNull",
+                "OutlineLevel",
+                "Duration",
+                "Milestone",
+                "ConstraintType",
+                "ConstraintDate"
+            ]
+        );
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        // Defaults stay unstated on a blank row.
+        let plain = task_project("<Task><UID>1</UID><IsNull>1</IsNull></Task>");
+        let xml = write_mspdi(&plain);
+        for name in ["Manual", "Milestone", "Summary", "ConstraintType"] {
+            assert!(!task_xml(&xml).contains(&format!("<{name}>")), "{name}");
+        }
+    }
 
     #[test]
     fn blank_row_round_trips_without_computed_fields() {
