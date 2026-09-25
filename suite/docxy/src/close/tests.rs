@@ -421,10 +421,7 @@ fn window_close_leaves_an_untouched_cell_editor_open_and_the_cell_intact() {
 
 #[test]
 fn a_tab_that_failed_to_load_stays_unsaveable_after_a_restart() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../target/close-tests")
-        .join(format!("{}-load-failed-source", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = close_test_dir("load-failed-source");
     let path = dir.join("broken.docx");
     std::fs::write(&path, b"not a zip").unwrap();
     for dirty in [false, true] {
@@ -446,16 +443,9 @@ fn a_tab_that_failed_to_load_stays_unsaveable_after_a_restart() {
 
 #[test]
 fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../target/close-tests")
-        .join(format!("{}-load-failed-reload", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = close_test_dir("load-failed-reload");
     let good = dir.join("repaired.docx");
-    std::fs::copy(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
-        &good,
-    )
-    .unwrap();
+    basic_docx_at(&good);
     let broken = dir.join("broken.docx");
     std::fs::write(&broken, b"not a zip").unwrap();
     let persisted = |path: &std::path::Path| PersistTab {
@@ -486,18 +476,11 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
 
 #[test]
 fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../target/close-tests")
-        .join(format!("{}-load-failed-old-session", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = close_test_dir("load-failed-old-session");
     let broken = dir.join("broken.docx");
     std::fs::write(&broken, b"not a zip").unwrap();
     let good = dir.join("good.docx");
-    std::fs::copy(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
-        &good,
-    )
-    .unwrap();
+    basic_docx_at(&good);
     for (i, (path, failed)) in [(&broken, true), (&good, false)].into_iter().enumerate() {
         let mut t = tab_from_path(path);
         t.dirty = true;
@@ -608,5 +591,26 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     let r = restore_tab(&p);
     assert!(!r.load_failed && r.path.is_none());
     assert!(r.status.starts_with("load error"), "{}", r.status);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn the_persisted_mark_holds_over_a_file_that_loads_at_restart() {
+    let dir = close_test_dir("load-failed-persisted");
+    let path = dir.join("x.docx");
+    let t = tab_from_path(&path);
+    assert!(t.load_failed, "{}", t.status);
+    let json = serde_json::to_string(&persist_tab(&dir, 0, &t)).unwrap();
+    let p: PersistTab = serde_json::from_str(&json).unwrap();
+    assert_eq!(p.load_failed, Some(true));
+    // The file appears (or is repaired) before the restart; the sidecar
+    // still holds only the placeholder.
+    basic_docx_at(&path);
+    let before = std::fs::read(&path).unwrap();
+    let mut r = restore_tab(&p);
+    assert!(r.load_failed, "{}", r.status);
+    r.dirty = true;
+    assert!(!save_doc_tab(&mut r, None));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
