@@ -16,10 +16,12 @@ use projcore::{ConstraintType, DateTime, LinkType, Predecessor, Project, Task};
 /// table. Save As converts it to `.yppx`/MSPDI.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
-    let decoded = crate::mpp::decode_tasks(bytes)
+    let table = crate::taskdecode::decode_table(bytes)
         .map_err(|e| format!("cannot read the task table of this .mpp ({e})"))?;
-    let new_tasks_are_manual = crate::mpp::decode_new_tasks_are_manual(bytes)
+    let new_tasks_are_manual = table
+        .new_tasks_are_manual
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
+    let decoded = table.tasks;
     let name = [
         info.title.clone(),
         info.subject.clone(),

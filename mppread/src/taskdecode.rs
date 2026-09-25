@@ -266,36 +266,35 @@ fn manual_fields(rec: &[u8], uid: u32) -> Result<ManualFields, String> {
     Ok((start, finish, duration))
 }
 
-/// The project's new-task mode; see [`crate::mpp::decode_new_tasks_are_manual`].
-pub(crate) fn new_tasks_are_manual(bytes: &[u8]) -> Result<bool, String> {
-    let cfb = Cfb::open(bytes)?;
-    let paths = cfb.paths();
-    let Some(meta_path) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) else {
-        return Ok(false);
-    };
-    let prefix = meta_path.trim_end_matches("FixedMeta");
-    let read = |name: &str| {
-        cfb.read_path(&format!("{prefix}{name}"))
-            .ok_or_else(|| format!("partial task stream set: missing {name}"))
-    };
-    match fixedmeta::index(&read("FixedMeta")?, &read("FixedData")?)? {
-        fixedmeta::TaskIndex::Legacy(_) => Ok(false),
-        fixedmeta::TaskIndex::Current(_) => {
-            let props = prefix.trim_end_matches("TBkndTask/").to_string() + "Props";
-            let props = cfb
-                .read_path(&props)
-                .ok_or("missing project Props stream")?;
-            crate::props::new_tasks_are_manual(&props)
-        }
-    }
+/// A validated task table and the project's new-task mode. The mode is kept
+/// as its own result so a bad project option refuses an import but not
+/// [`decode`].
+pub(crate) struct Table {
+    pub tasks: Vec<MppTask>,
+    pub new_tasks_are_manual: Result<bool, String>,
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
+    decode_table(bytes).map(|table| table.tasks)
+}
+
+/// The project's new-task mode; see [`crate::mpp::decode_new_tasks_are_manual`].
+pub(crate) fn new_tasks_are_manual(bytes: &[u8]) -> Result<bool, String> {
+    decode_table(bytes)?.new_tasks_are_manual
+}
+
+/// Decode the task table. MPP9 predates manual tasks and a file without a
+/// task table has nothing to default, so both have an auto default; the
+/// newest layout reads it from the project Props beside the table.
+pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
     let cfb = Cfb::open(bytes)?;
     let paths = cfb.paths();
     let task_paths: Vec<_> = paths.iter().filter(|p| p.contains("TBkndTask/")).collect();
     if task_paths.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Table {
+            tasks: Vec::new(),
+            new_tasks_are_manual: Ok(false),
+        });
     }
     let Some(meta_path) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) else {
         return Err("partial task stream set: missing FixedMeta".into());
@@ -314,11 +313,23 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
             let fixed_count = u32_at(&fm, 8) as usize;
             let (f2m, f2d) = (read("Fixed2Meta")?, read("Fixed2Data")?);
             let fixed2 = fixedmeta::current_fixed2(&f2m, &f2d, fixed_count, &indexed)?;
-            decode_current(&cfb, prefix, &fd, &vm, &v2, indexed, &fixed2)
+            let tasks = decode_current(&cfb, prefix, &fd, &vm, &v2, indexed, &fixed2)?;
+            let props = prefix.trim_end_matches("TBkndTask/").to_string() + "Props";
+            let new_tasks_are_manual = cfb
+                .read_path(&props)
+                .ok_or_else(|| "missing project Props stream".to_string())
+                .and_then(|props| crate::props::new_tasks_are_manual(&props));
+            Ok(Table {
+                tasks,
+                new_tasks_are_manual,
+            })
         }
         fixedmeta::TaskIndex::Legacy(indexed) => {
             let uids: HashSet<_> = indexed.iter().map(|r| r.uid).collect();
-            decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)
+            Ok(Table {
+                tasks: decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)?,
+                new_tasks_are_manual: Ok(false),
+            })
         }
     }
 }
@@ -755,6 +766,28 @@ mod tests {
         // A file without a task table has no default to read.
         let no_tasks = write_cfb_tree(&[Node::Stream("Props", vec![0u8; 4])]);
         assert_eq!(new_tasks_are_manual(&no_tasks), Ok(false));
+    }
+    #[test]
+    fn the_default_is_refused_with_a_task_table_that_is_refused() {
+        let s = fixture();
+        // Task streams without FixedMeta are a partial set, not "no table".
+        let partial = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                Node::Stream("Props", s.props.clone()),
+                Node::Storage("TBkndTask", vec![Node::Stream("VarMeta", s.vm.clone())]),
+            ],
+        )]);
+        assert!(decode(&partial).is_err());
+        assert!(new_tasks_are_manual(&partial).is_err());
+        // A readable default beside a refused table is not answered either.
+        let mut s = fixture();
+        s.v2[4] = 1; // control character in a task name
+        assert!(decode(&file(&s, true)).is_err());
+        assert!(new_tasks_are_manual(&file(&s, true)).is_err());
+        let mut s = fixture();
+        s.f2m.clear();
+        assert!(new_tasks_are_manual(&file(&s, true)).is_err());
     }
     #[test]
     fn manual_leaf_imports_pinned_by_its_dates_and_auto_leaf_by_a_constraint() {

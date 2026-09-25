@@ -87,9 +87,8 @@ pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {
 
 /// Decode the project's default mode for new tasks (MSPDI
 /// `NewTasksAreManual`). MPP9 predates manual tasks, and a file without a task
-/// table has nothing to default, so both read `false`. Any other layout that
-/// [`decode_tasks`] does not recognize, or a missing or unrecognized value, is
-/// an error.
+/// table has nothing to default, so both read `false`. A task table that
+/// [`decode_tasks`] refuses, or a missing or unrecognized value, is an error.
 pub fn decode_new_tasks_are_manual(bytes: &[u8]) -> Result<bool, MppError> {
     crate::taskdecode::new_tasks_are_manual(bytes)
 }

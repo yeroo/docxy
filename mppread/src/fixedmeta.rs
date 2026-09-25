@@ -135,7 +135,8 @@ pub(crate) struct Fixed2<'a> {
 /// records carry no UID, so the pairing is checked another way: a task
 /// record holds its GUID at +0 and its row sort key (an f64, fractional for
 /// inserted rows) at +16, and a blank row holds neither. Sorted by task ID,
-/// the tasks' sort keys must strictly increase.
+/// the tasks' sort keys must strictly increase. Project rewrites the keys when
+/// it renumbers rows in place (corpus case `order/o5-sorted-renumbered`).
 pub(crate) fn current_fixed2<'a>(
     meta: &'a [u8],
     data: &'a [u8],
