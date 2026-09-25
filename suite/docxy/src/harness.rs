@@ -562,11 +562,13 @@ pub enum Region {
     ProjectVbar,
     /// The Project Timeline pane above the Gantt view, when it is shown.
     ProjectTimeline,
+    /// The Project split bar between the entry table and the Gantt chart.
+    ProjectSplit,
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
-/// `project-hbar-chart`, `project-vbar`, `project-timeline`.
+/// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -585,8 +587,9 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-hbar-chart" if arg.is_none() => Ok(Region::ProjectHbarChart),
         "project-vbar" if arg.is_none() => Ok(Region::ProjectVbar),
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
+        "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
         "window" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
-        | "project-hbar-chart" | "project-vbar" | "project-timeline" => {
+        | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split" => {
             Err(format!("'{head}' does not take an argument; use '{head}'"))
         }
         "cell" | "cells" => {
@@ -618,7 +621,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline)"
+            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split)"
         )),
     }
 }
@@ -638,6 +641,7 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectHbarChart => "project-hbar-chart".into(),
         Region::ProjectVbar => "project-vbar".into(),
         Region::ProjectTimeline => "project-timeline".into(),
+        Region::ProjectSplit => "project-split".into(),
     }
 }
 
@@ -2908,6 +2912,7 @@ mod tests {
             Region::ProjectHbarChart,
             Region::ProjectVbar,
             Region::ProjectTimeline,
+            Region::ProjectSplit,
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }
@@ -2917,6 +2922,7 @@ mod tests {
         assert!(parse_region("gantt:1").is_err());
         assert!(parse_region("project-vbar:1").is_err());
         assert!(parse_region("project-timeline:1").is_err());
+        assert!(parse_region("project-split:1").is_err());
         assert!(parse_region("bar:abc").is_err());
         assert!(parse_region("bar:").is_err());
     }

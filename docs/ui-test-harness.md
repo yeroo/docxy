@@ -256,6 +256,7 @@ State keys, as the app reports them after every driving verb:
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name, and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
+| `table_w`, `gantt_w` | Project: entry-table pane and Gantt chart widths in px. Split-bar drags move them; `table_w + 6 + gantt_w + 16` is the window width |
 | `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |
 | `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
@@ -366,12 +367,14 @@ Comparison is case-insensitive, and `is not` negates.
 
 `window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
 `bar:<id>` (for example `bar:3`), `project-hbar-table`, `project-hbar-chart`,
-`project-vbar`, `project-timeline`. `gantt` is the visible Project Gantt chart body,
+`project-vbar`, `project-timeline`, `project-split`. `gantt` is the visible Project Gantt chart body,
 excluding its header, divider and vertical scrollbar; `bar:<id>` addresses a task by
 displayed ID. The `project-hbar-*` and `project-vbar` regions are the Project tab's three
 scrollbar strips: under the table, under the chart, and down the right edge of the rows.
 `project-timeline` is the Timeline pane above the Gantt view, and is an error while
-View > Split View > Timeline has it hidden. Inside a
+View > Split View > Timeline has it hidden. `project-split` is the draggable bar
+between the entry table and the chart; its drags show in the `table_w` and `gantt_w`
+state entries. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 
