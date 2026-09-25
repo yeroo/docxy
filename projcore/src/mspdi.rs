@@ -754,29 +754,35 @@ struct Computed<'a> {
 }
 
 /// Outline numbers (`1`, `1.1`, `2`) in row order; blank rows get none, and
-/// level 0 (the project summary) is `0`. A row more than one level deeper
-/// than the row above it is numbered one level deeper, as Project would.
+/// level 0 (the project summary) is `0`. The number has one component per
+/// ancestor, not per level: a row more than one level deeper than the row
+/// above it is numbered one level deeper, as Project would, and a later row
+/// that returns to that slot (at the same level, or at any level between the
+/// parent's and its own) is the next sibling there, so 1, 3, 3 and 1, 3, 2
+/// both number 1, 1.1, 1.2.
 fn outline_numbers(tasks: &[Task]) -> Vec<Option<String>> {
-    let mut path: Vec<u32> = Vec::new();
+    // One (outline level, counter) per component of the current number.
+    let mut path: Vec<(u32, u32)> = Vec::new();
     tasks
         .iter()
         .map(|t| {
             if t.is_null {
                 return None;
             }
-            if t.outline_level == 0 {
+            let level = t.outline_level;
+            if level == 0 {
                 return Some("0".into());
             }
-            let depth = (t.outline_level as usize).min(path.len() + 1);
-            path.truncate(depth);
-            if path.len() == depth {
-                *path.last_mut().expect("depth >= 1") += 1;
-            } else {
-                path.push(1);
+            // Leave every slot at this level or deeper; the shallowest one left
+            // is the slot this row takes, as that slot's next sibling.
+            let mut previous = 0;
+            while path.last().is_some_and(|&(l, _)| l >= level) {
+                previous = path.pop().expect("checked non-empty").1;
             }
+            path.push((level, previous + 1));
             Some(
                 path.iter()
-                    .map(u32::to_string)
+                    .map(|(_, n)| n.to_string())
                     .collect::<Vec<_>>()
                     .join("."),
             )
@@ -2447,6 +2453,31 @@ mod tests {
         assert_eq!(get(1, "Critical"), "1");
         assert_eq!(get(1, "TotalSlack"), "0");
         assert_eq!(get(1, "OutlineNumber"), "1");
+    }
+
+    #[test]
+    fn outline_numbers_treat_a_jumped_level_as_one_slot() {
+        let rows = |levels: &[u32]| -> Vec<Option<String>> {
+            let tasks: Vec<Task> = levels
+                .iter()
+                .map(|&outline_level| Task {
+                    outline_level,
+                    ..Task::default()
+                })
+                .collect();
+            outline_numbers(&tasks)
+        };
+        let numbers = |ns: &[&str]| -> Vec<Option<String>> {
+            ns.iter().map(|n| Some(n.to_string())).collect()
+        };
+        // A repeated jumped row is the jumped row's sibling.
+        assert_eq!(rows(&[1, 3, 3]), numbers(&["1", "1.1", "1.2"]));
+        // A shallower row after a jump, still under the same parent, takes
+        // the jumped row's slot: its next sibling, not a second "1.1".
+        assert_eq!(rows(&[1, 3, 2]), numbers(&["1", "1.1", "1.2"]));
+        assert_eq!(rows(&[1, 3, 2, 3]), numbers(&["1", "1.1", "1.2", "1.2.1"]));
+        assert_eq!(rows(&[1, 2, 1]), numbers(&["1", "1.1", "2"]));
+        assert_eq!(rows(&[2, 2, 1]), numbers(&["1", "2", "3"]));
     }
 
     #[test]
