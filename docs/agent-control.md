@@ -196,13 +196,16 @@ Notes:
   those aren't surfaced by these verbs — only `app.headers.default`/
   `app.footers.default`.
 - **`doc.find` and `doc.replace-all` see only the text the editor can edit.**
-  Text inside tracked changes (`w:ins`/`w:del`), field results, footnote/
-  endnote references and links that hold such markup is shown but is not
-  searched or replaced. A match's `start`/`end` are editor offsets, which skip
-  that text, while `text` is the paragraph's full plain text (the form
-  `doc.replace-range` round-trips), which includes it. So in such a paragraph,
-  `text[start..end]` need not be the match: don't splice `text` at those
-  offsets.
+  A paragraph's editable text is its runs, simple links, tabs and breaks. Text
+  it only shows is not searched or replaced: tracked changes (`w:ins`/`w:del`),
+  field results, footnote/endnote references, equations, SmartArt, chart
+  titles, inline text boxes, and links that hold any of these. A match's
+  `start`/`end` count only editable text, while `text` is the paragraph's full
+  plain text (the form `doc.replace-range` round-trips), which includes the
+  rest. So `text[start..end]` is the match only when the paragraph holds
+  nothing but editable text; otherwise don't splice `text` at those offsets.
+  A text box's own paragraphs are still searched and replaced, as matches
+  under their own `path` (with no `block`/`text`).
 - `doc.replace-all` and `doc.undo`/`doc.redo` no-op cleanly: a `query` that
   matches nothing, or an undo/redo on an empty stack, reports `replaced:0`/
   `done:false` and does **not** mark the document modified or flash the

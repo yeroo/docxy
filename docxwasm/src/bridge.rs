@@ -592,8 +592,10 @@ impl Session {
             out.push_str(&m.end.to_string());
             // Top-level paragraph matches carry a direct block index + full
             // text, which a client can feed straight back to replace-range.
-            // `start`/`end` are editor offsets and `text` is `plain_text()`,
-            // which also holds tracked-change, field and footnote-ref text:
+            // `start`/`end` count only editor-editable text (runs, simple
+            // links, tabs, breaks), while `text` is `plain_text()`, which also
+            // holds the text of zero-width inlines (tracked changes, fields,
+            // footnote refs, equations, SmartArt, chart titles, text boxes):
             // when the paragraph has any, `text[start..end]` need not be the
             // match.
             if m.path.len() == 1 {
