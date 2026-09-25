@@ -1587,7 +1587,12 @@ impl Editor {
             groups.push((m.path.clone(), vec![m]));
         }
         let mut count = 0;
-        for (path, mut ms) in groups {
+        // Paragraphs back to front too. A text box's paragraphs are addressed
+        // through the host's inline index (`[i, k, j]`, listed after `[i]`),
+        // and an edit to the host can remove an emptied run before the text
+        // box and shift `k`: edit the text box paragraphs first, while their
+        // paths still resolve to the same text box.
+        for (path, mut ms) in groups.into_iter().rev() {
             ms.sort_by_key(|m| std::cmp::Reverse(m.start)); // back-to-front keeps offsets valid
             if let Some(p) = para_mut(&mut self.doc.body, &path) {
                 for m in ms {
@@ -3544,6 +3549,67 @@ mod tests {
         replace_range_in_content(&mut content, 1, 2, "X");
         assert_eq!(editor_text(&content), "aX");
         assert_eq!(content.last(), Some(&field("F")));
+    }
+
+    fn text_box(text: &str) -> Inline {
+        Inline::TextBox {
+            raw: "<w:txbxContent/>".into(),
+            blocks: vec![para(text)],
+        }
+    }
+
+    /// The text of the paragraph inside the host's `n`th text box.
+    fn box_text(ed: &Editor, n: usize) -> String {
+        first_para(ed)
+            .content
+            .iter()
+            .filter_map(|i| match i {
+                Inline::TextBox { blocks, .. } => Some(blocks),
+                _ => None,
+            })
+            .nth(n)
+            .map(|blocks| match &blocks[0] {
+                Block::Paragraph(p) => p.plain_text(),
+                other => panic!("expected a paragraph, got {other:?}"),
+            })
+            .expect("text box")
+    }
+
+    /// Emptying a host run shifts the host's inline indices. Text-box paths
+    /// go through those indices, so they must be edited first, or they
+    /// resolve to the wrong text box (or none).
+    #[test]
+    fn replace_all_edits_text_boxes_before_their_host_197() {
+        // An empty replacement of a whole run, and a non-empty one whose
+        // match crosses runs (its second run empties): both remove a run.
+        for (runs, with, host, tb1) in [
+            (
+                vec![run("x ", RunProps::default()), run("ab", bold())],
+                "",
+                "x ",
+                "",
+            ),
+            (
+                vec![run("x a", RunProps::default()), run("b", bold())],
+                "Q",
+                "x Q",
+                "Q",
+            ),
+        ] {
+            let mut content = runs;
+            content.extend([text_box("ab"), text_box("zz")]);
+            let mut ed = Editor::new(Document {
+                body: vec![Block::Paragraph(Paragraph {
+                    props: ParProps::default(),
+                    content,
+                })],
+            });
+            assert_eq!(ed.find_all("ab", false).len(), 2);
+            assert_eq!(ed.replace_all("ab", with, false), 2, "with {with:?}");
+            assert_eq!(etext(&ed), host, "with {with:?}");
+            assert_eq!(box_text(&ed, 0), tb1, "with {with:?}");
+            assert_eq!(box_text(&ed, 1), "zz", "with {with:?}");
+        }
     }
 
     /// Single Replace (select the match, replace it) must give the same
