@@ -282,8 +282,10 @@ impl Editor {
         FindOutcome::NotFound
     }
 
-    /// Insert after a UID, or append; inherit the preceding row's outline level.
-    /// The returned row is not automatically selected.
+    /// Insert after a UID, or append. As in Microsoft Project, the new task is
+    /// the next sibling of the row above it, or that row's first child when the
+    /// row above is a summary; the row it pushes down plays no part. The
+    /// returned row is not automatically selected.
     pub fn add_task(
         &mut self,
         after: Option<i32>,
@@ -295,11 +297,14 @@ impl Editor {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
         };
-        let outline_level = at
-            .checked_sub(1)
-            .and_then(|i| self.proj.tasks.get(i))
-            .map(|t| t.outline_level)
-            .unwrap_or(1);
+        // A summary's first child is deeper still, so `+ 1` stays within 20.
+        let outline_level = match at.checked_sub(1) {
+            Some(prev) if self.proj.is_outline_summary(prev) => {
+                self.proj.tasks[prev].outline_level + 1
+            }
+            Some(prev) => self.proj.tasks[prev].outline_level,
+            None => 1,
+        };
         let uid = self
             .proj
             .tasks
@@ -1015,13 +1020,14 @@ mod tests {
                         .unwrap_err()
                         .contains("Closed")
                     );
-                    // Inserting after the parent exposes it as a leaf, too.
-                    assert!(
-                        ed.add_task(Some(1), "Inserted", 480)
-                            .unwrap_err()
-                            .contains("Closed")
-                    );
                     if empty_default {
+                        // Inserting keeps the parent a summary, so only a
+                        // closed default calendar rejects the new task.
+                        assert!(
+                            ed.add_task(Some(1), "Inserted", 480)
+                                .unwrap_err()
+                                .contains("Closed")
+                        );
                         assert!(
                             ed.add_task(None, "Appended", 480)
                                 .unwrap_err()
@@ -1235,7 +1241,7 @@ mod tests {
     }
 
     #[test]
-    fn append_and_insert_inherit_preceding_level_without_selecting() {
+    fn append_and_insert_follow_the_row_above_without_selecting() {
         let mut ed = editor();
         ed.indent(1, 1).unwrap();
         ed.indent(2, 2).unwrap();
@@ -1243,9 +1249,10 @@ mod tests {
         let at = ed.add_task(None, "Append", 480).unwrap();
         assert_eq!(at, 2);
         assert_eq!(ed.project().tasks[at].outline_level, 3);
+        // Task 1 is a summary over Task 2, so the insert is its first child.
         let at = ed.add_task(Some(1), "Insert", 480).unwrap();
         assert_eq!(at, 1);
-        assert_eq!(ed.project().tasks[at].outline_level, 2);
+        assert_eq!(ed.project().tasks[at].outline_level, 3);
         assert_eq!(ed.sel(), 1);
         ed.replace_project(Project::default());
         assert_eq!(ed.add_task(None, "First", 0).unwrap(), 0);
@@ -1295,6 +1302,100 @@ mod tests {
             .iter()
             .map(|t| (&*t.name, t.outline_level))
             .collect()
+    }
+
+    /// `(name, outline_level, summary)` for every row.
+    fn rows(ed: &Editor) -> Vec<(&str, u32, bool)> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| (&*t.name, t.outline_level, t.summary))
+            .collect()
+    }
+
+    fn uid_of(ed: &Editor, name: &str) -> i32 {
+        ed.project()
+            .tasks
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap()
+            .uid
+    }
+
+    #[test]
+    fn a_task_inserted_under_a_summary_is_its_first_child() {
+        // The issue's repro, on an untitled project.
+        let mut ed = Editor::new(Project::default());
+        ed.add_task(None, "S", 480).unwrap();
+        ed.add_task(None, "c1", 480).unwrap();
+        ed.indent(uid_of(&ed, "c1"), 1).unwrap();
+        let before = ed.project().clone();
+        let s = uid_of(&ed, "S");
+        assert_eq!(ed.add_task(Some(s), "New", 480).unwrap(), 1);
+        assert_eq!(
+            rows(&ed),
+            [("S", 1, true), ("New", 2, false), ("c1", 2, false)]
+        );
+        // One undo step puts the outline back.
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+    }
+
+    #[test]
+    fn a_task_inserted_after_a_leaf_is_its_sibling() {
+        // S{c1, c2}, Y: inserting above Y (below c2) stays inside S.
+        let mut ed = outline(&[(1, "S", 1), (2, "c1", 2), (3, "c2", 2), (4, "Y", 1)]);
+        assert_eq!(ed.add_task(Some(3), "New", 480).unwrap(), 3);
+        assert_eq!(
+            rows(&ed),
+            [
+                ("S", 1, true),
+                ("c1", 2, false),
+                ("c2", 2, false),
+                ("New", 2, false),
+                ("Y", 1, false),
+            ]
+        );
+        // After a plain task, the new one is a sibling at its level.
+        let mut ed = outline(&[(1, "S", 1), (2, "Y", 1)]);
+        ed.add_task(Some(1), "New", 480).unwrap();
+        assert_eq!(names(&ed), [("S", 1), ("New", 1), ("Y", 1)]);
+        // Appending copies the last row, which is never a summary.
+        let mut ed = outline(&[(1, "S", 1), (2, "c1", 2)]);
+        ed.add_task(None, "New", 480).unwrap();
+        assert_eq!(
+            rows(&ed),
+            [("S", 1, true), ("c1", 2, false), ("New", 2, false)]
+        );
+    }
+
+    #[test]
+    fn a_task_inserted_under_a_nested_summary_goes_one_level_deeper() {
+        let mut ed = outline(&[(1, "A", 1), (2, "S", 2), (3, "c", 3), (4, "B", 1)]);
+        ed.add_task(Some(2), "New", 480).unwrap();
+        assert_eq!(
+            rows(&ed),
+            [
+                ("A", 1, true),
+                ("S", 2, true),
+                ("New", 3, false),
+                ("c", 3, false),
+                ("B", 1, false),
+            ]
+        );
+        // An outline that skips a level: the new task is S's child, and the
+        // deeper row it pushes down stays inside S.
+        let mut ed = outline(&[(1, "S", 1), (2, "c", 3), (3, "Y", 1)]);
+        ed.add_task(Some(1), "New", 480).unwrap();
+        assert_eq!(
+            rows(&ed),
+            [
+                ("S", 1, true),
+                ("New", 2, true),
+                ("c", 3, false),
+                ("Y", 1, false),
+            ]
+        );
     }
 
     fn phase_plan() -> Editor {
