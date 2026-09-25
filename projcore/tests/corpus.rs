@@ -363,8 +363,8 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
         DateTime::from_ymd_hm(2026, 3, 4, 8, 0)
     );
     let saved = write_mspdi(&proj);
-    assert!(saved.contains("<IsNull>1</IsNull>"));
-    assert_eq!(saved.matches("<IsNull>").count(), 1);
+    assert_eq!(saved.matches("<IsNull>1</IsNull>").count(), 1);
+    assert_eq!(saved.matches("<IsNull>0</IsNull>").count(), 4);
 }
 
 /// The full native pipeline on real files: MSPDI → .yppx package → back → the

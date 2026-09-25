@@ -1696,7 +1696,7 @@ mod tests {
         );
         assert!(ed.schedule().get(3).is_some());
         let xml = crate::mspdi::write_mspdi(ed.project());
-        assert!(!xml.contains("<IsNull>"), "{xml}");
+        assert!(!xml.contains("<IsNull>1</IsNull>"), "{xml}");
         assert_eq!(
             &crate::mspdi::read_mspdi(&xml).unwrap().tasks,
             &ed.project().tasks

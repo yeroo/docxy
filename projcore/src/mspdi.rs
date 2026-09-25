@@ -823,9 +823,8 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 3, "Manual", flag(t.manual));
     }
     opt_text(s, "Type", t.task_type.map(TaskType::code));
-    if t.is_null {
-        tag(s, 3, "IsNull", "1");
-    }
+    // Every row states it, as Project writes it.
+    tag(s, 3, "IsNull", flag(t.is_null));
     opt_date(s, "CreateDate", t.create_date);
     opt_text(s, "WBS", t.wbs.as_ref());
     opt_text(s, "OutlineNumber", computed.outline_number);
@@ -2118,7 +2117,7 @@ mod tests {
             assert!(xml.contains(element), "missing {element}");
         }
         // A task is not a blank row; the stored OutlineNumber is recomputed.
-        assert!(!xml.contains("<IsNull>"));
+        assert!(xml.contains("<IsNull>0</IsNull>"));
         assert!(xml.contains("<OutlineNumber>1</OutlineNumber>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
@@ -2144,11 +2143,12 @@ mod tests {
         }
     }
 
-    const NEW_TASK_ELEMENTS: [&str; 25] = [
+    /// Optional task elements #80 keeps. IsNull is not among them: every row
+    /// states it.
+    const NEW_TASK_ELEMENTS: [&str; 24] = [
         "GUID",
         "Active",
         "Type",
-        "IsNull",
         "CreateDate",
         "WBS",
         "Priority",
@@ -2199,6 +2199,7 @@ mod tests {
                 "{name}: {xml}"
             );
         }
+        assert!(xml.contains("<IsNull>0</IsNull>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
     }
 
@@ -2320,6 +2321,7 @@ mod tests {
                 "Active",
                 "Manual",
                 "Type",
+                "IsNull",
                 "CreateDate",
                 "WBS",
                 "OutlineNumber",
