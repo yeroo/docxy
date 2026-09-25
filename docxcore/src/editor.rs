@@ -2000,7 +2000,12 @@ fn collect_paths(body: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usiz
 
 // ---- content editing (operate on a paragraph's inline vector) ----
 
-fn inline_len(i: &Inline) -> usize {
+/// How many caret offsets an inline occupies: its characters for a run or a
+/// simple hyperlink, one for a tab or break, and zero for everything the editor
+/// treats as an opaque, uneditable anchor (fields, revisions, drawings, …).
+/// Hosts that map their own positions to editor offsets (the browser editor's
+/// `docx_doc` model) use this so the two never disagree.
+pub fn inline_len(i: &Inline) -> usize {
     match i {
         Inline::Run(r) => r.text.chars().count(),
         Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.chars().count()).sum(),

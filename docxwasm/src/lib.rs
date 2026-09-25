@@ -27,6 +27,7 @@
 
 pub mod bridge;
 pub mod json;
+pub mod richdoc;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -145,6 +146,33 @@ pub unsafe extern "C" fn docx_cmd(handle: u32, ptr: *const u8, len: usize) -> *m
         let (copied, applied) = s.dispatch(&cmd);
         s.command_view_json(copied.as_deref(), applied).into_bytes()
     })
+}
+
+/// The rich document model for the editable-HTML page (see
+/// [`bridge::Session::doc_json`]): paragraphs, runs and tables with editor
+/// paths and offsets, rendered by the page as DOM instead of a grid.
+#[unsafe(no_mangle)]
+pub extern "C" fn docx_doc(handle: u32) -> *mut u8 {
+    with_session(handle, |s| s.doc_json().into_bytes())
+}
+
+/// Apply one command (the same verbs as [`docx_cmd`]) without rendering the
+/// grid view; returns `{applied, copied?, caret, anchor, dirty}` (see
+/// [`bridge::Session::exec_json`]).
+///
+/// # Safety
+/// `ptr`/`len` must describe a live host allocation of the command string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn docx_exec(handle: u32, ptr: *const u8, len: usize) -> *mut u8 {
+    let cmd = String::from_utf8_lossy(unsafe { input(ptr, len) }).into_owned();
+    with_session(handle, |s| s.exec_json(&cmd).into_bytes())
+}
+
+/// Formatting state at the caret for the ribbon (see
+/// [`bridge::Session::state_json`]).
+#[unsafe(no_mangle)]
+pub extern "C" fn docx_state(handle: u32) -> *mut u8 {
+    with_session(handle, |s| s.state_json().into_bytes())
 }
 
 /// Serialize the document back to `.docx` bytes, losslessly. Returns a

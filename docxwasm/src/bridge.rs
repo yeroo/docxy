@@ -21,8 +21,8 @@ use docxcore::editor::{Caret, Clip, Editor, RevisionLocation};
 use docxcore::export::{PdfOptions, to_pdf};
 use docxcore::load::{Relationships, parse_rels_xml};
 use docxcore::model::{
-    Align, Block, Inline, PropertyScope, RevisionCategory, RevisionKind, RevisionTarget,
-    UnsupportedRevisionKind,
+    Align, Block, BorderKind, Inline, ParBorders, PropertyScope, RevisionCategory, RevisionKind,
+    RevisionTarget, UnsupportedRevisionKind, VertAlign,
 };
 use docxcore::numbering::{Numbering, compute_markers, parse_numbering_xml};
 use docxcore::package::{Package, load_package, save_package};
@@ -32,6 +32,7 @@ use docxcore::review::{MalformedRevisionReason, RevisionAction, RevisionOutcome}
 use docxcore::styles::{StyleSheet, parse_styles_xml};
 
 use crate::json;
+use crate::richdoc;
 
 /// Convert Markdown source to `.docx` bytes — the same conversion the terminal
 /// app does on `Save As` to a `.docx` name. Stateless (no session): the VS Code
@@ -56,6 +57,11 @@ pub fn docx_to_markdown(bytes: &[u8]) -> Option<String> {
         &markers,
     ))
 }
+
+/// The numbering ids [`Package::ensure_list`] provisions for the bullet and
+/// decimal lists the `list` command toggles.
+const LIST_BULLET: i32 = 9990;
+const LIST_NUMBER: i32 = 9991;
 
 /// A live editing session over one `.docx`.
 pub struct Session {
@@ -97,9 +103,10 @@ fn ctl_mutation_kind(verb: &str) -> Option<MutationKind> {
 fn dispatch_mutation_kind(op: &str) -> Option<MutationKind> {
     Some(match op {
         "bold" | "italic" | "underline" | "strike" | "heading" | "list" | "align" | "indent"
-        | "fontsize" | "color" => MutationKind::Formatting,
+        | "fontsize" | "color" | "vertalign" | "clearfmt" | "highlight" | "font" | "setsize"
+        | "linespacing" | "style" | "nospacing" | "case" | "borders" => MutationKind::Formatting,
         "insert" | "newline" | "backspace" | "delete" | "undo" | "redo" | "paste" | "replace"
-        | "cut" => MutationKind::Content,
+        | "cut" | "sort" | "hrule" => MutationKind::Content,
         _ => return None,
     })
 }
@@ -157,12 +164,7 @@ impl Session {
             selection: self.editor.selection_spans(),
             styles: self.styles.clone(),
             list_markers: Rc::new(compute_markers(&self.editor.doc, &self.numbering)),
-            page: self
-                .editor
-                .doc
-                .trailing_section_properties()
-                .map(|section| docxcore::model::PageGeom::from_sect_pr(&section.raw))
-                .unwrap_or_else(|| self.pkg.page_geom()),
+            page: self.page_geom(),
             headers: Default::default(),
             footers: Default::default(),
             title_page: false,
@@ -425,6 +427,72 @@ impl Session {
             "goto" => {
                 mutated = false;
                 self.do_goto(rest.trim());
+            }
+            "select" => {
+                mutated = false;
+                self.do_select(rest);
+            }
+            "vertalign" => self.editor.toggle_vert_align(match rest.trim() {
+                "sub" => VertAlign::Subscript,
+                _ => VertAlign::Superscript,
+            }),
+            "clearfmt" => self.editor.clear_run_formatting(),
+            "highlight" => {
+                let name = rest.trim();
+                self.editor
+                    .set_highlight((!name.is_empty()).then(|| name.to_string()));
+            }
+            "font" => {
+                let name = rest.trim();
+                if name.is_empty() {
+                    mutated = false;
+                } else {
+                    self.editor.set_font(name);
+                }
+            }
+            "setsize" => match rest.trim().parse::<u32>() {
+                Ok(half_pts) if (2..=264).contains(&half_pts) => {
+                    self.editor.set_font_size(half_pts)
+                }
+                _ => mutated = false,
+            },
+            "linespacing" => {
+                let mut a = rest.split('\t');
+                match a.next().unwrap_or("").trim().parse::<i32>() {
+                    Ok(line) if line > 0 => {
+                        let rule = a.next().map(str::trim).filter(|r| !r.is_empty());
+                        self.editor.set_line_spacing(line, rule.unwrap_or("auto"));
+                    }
+                    _ => mutated = false,
+                }
+            }
+            // A paragraph style by id (empty = Normal), as the Styles gallery sets it.
+            "style" => {
+                let id = rest.trim();
+                self.editor
+                    .set_para_style((!id.is_empty() && id != "Normal").then_some(id));
+            }
+            // Word's No Spacing, modelled as the suite does: Normal plus explicit
+            // single spacing with nothing before or after.
+            "nospacing" => {
+                self.editor.set_para_style(None);
+                self.editor.set_space_before(Some(0));
+                self.editor.set_space_after(Some(0));
+                self.editor.set_line_spacing(240, "auto");
+            }
+            "case" => self.editor.cycle_case(),
+            "sort" => self.editor.sort_paragraphs(),
+            "hrule" => self.editor.insert_hrule(),
+            "borders" => {
+                let has = self.editor.caret_para_props().borders.bottom.is_some();
+                self.editor.set_para_border(if has {
+                    ParBorders::default()
+                } else {
+                    ParBorders {
+                        top: None,
+                        bottom: Some(BorderKind::Single),
+                    }
+                });
             }
             _ => mutated = false,
         }
@@ -1289,6 +1357,155 @@ impl Session {
                 self.editor.caret = Caret::at(seg.path.clone(), seg.offset_for_col(col));
             }
         }
+    }
+
+    /// `select\t<anchorPath>\t<anchorOff>\t<headPath>\t<headOff>` — set the
+    /// selection logically (paths as `richdoc::path_str` writes them). The
+    /// browser editor maps its own DOM selection to editor positions and sends
+    /// this; anchor == head collapses to a caret. Offsets are clamped to the
+    /// paragraph; a path that does not name a paragraph leaves the selection
+    /// untouched. Returns whether it applied.
+    fn do_select(&mut self, rest: &str) -> bool {
+        let a: Vec<&str> = rest.split('\t').collect();
+        if a.len() != 4 {
+            return false;
+        }
+        let caret = |path: &str, off: &str| -> Option<Caret> {
+            let path = richdoc::parse_path(path.trim())?;
+            let para = richdoc::para_at(&self.editor.doc.body, &path)?;
+            let off: usize = off.trim().parse().ok()?;
+            Some(Caret::at(path, off.min(richdoc::para_len(para))))
+        };
+        let (Some(anchor), Some(head)) = (caret(a[0], a[1]), caret(a[2], a[3])) else {
+            return false;
+        };
+        self.editor.anchor = (anchor != head).then_some(anchor);
+        self.editor.set_caret(head);
+        true
+    }
+
+    /// Page size and margins of the (last) section.
+    fn page_geom(&self) -> docxcore::model::PageGeom {
+        self.editor
+            .doc
+            .trailing_section_properties()
+            .map(|section| docxcore::model::PageGeom::from_sect_pr(&section.raw))
+            .unwrap_or_else(|| self.pkg.page_geom())
+    }
+
+    /// `"caret":{…},"anchor":…,"dirty":…` — the selection in editor terms.
+    fn selection_fields(&self) -> String {
+        let pos = |c: &Caret| {
+            format!(
+                "{{\"p\":{},\"o\":{}}}",
+                json::quote(&richdoc::path_str(&c.path)),
+                c.offset
+            )
+        };
+        let anchor = match &self.editor.anchor {
+            Some(a) if *a != self.editor.caret => pos(a),
+            _ => "null".to_string(),
+        };
+        format!(
+            "\"caret\":{},\"anchor\":{},\"dirty\":{}",
+            pos(&self.editor.caret),
+            anchor,
+            self.dirty
+        )
+    }
+
+    /// The rich document model (see [`richdoc`]) plus the selection — what the
+    /// editable-HTML page renders as DOM.
+    pub fn doc_json(&self) -> String {
+        let markers = compute_markers(&self.editor.doc, &self.numbering);
+        let ctx = richdoc::Ctx {
+            styles: &self.styles,
+            markers: &markers,
+            rels: &self.rels,
+        };
+        let mut out = richdoc::doc_json(&self.editor.doc, &self.page_geom(), &ctx);
+        out.pop(); // the closing brace
+        out.push(',');
+        out.push_str(&self.selection_fields());
+        out.push('}');
+        out
+    }
+
+    /// Apply one [`Session::dispatch`] command and report the outcome without
+    /// rendering the grid view: `{"applied":…,"copied":…,"caret":…,"anchor":…,
+    /// "dirty":…}`. The browser editor re-reads [`Session::doc_json`] only when
+    /// something applied.
+    pub fn exec_json(&mut self, cmd: &str) -> String {
+        let (copied, applied) = self.dispatch(cmd);
+        let mut out = format!("{{\"applied\":{applied}");
+        if let Some(t) = copied {
+            out.push_str(",\"copied\":");
+            json::push_str(&mut out, &t);
+        }
+        out.push(',');
+        out.push_str(&self.selection_fields());
+        out.push('}');
+        out
+    }
+
+    /// Formatting at the caret, for the ribbon's checked states and the
+    /// contextual Table tab: the same facts the suite's `act_active` reads.
+    pub fn state_json(&self) -> String {
+        let rp = self.editor.caret_props();
+        let pp = self.editor.caret_para_props();
+        let in_table = matches!(
+            self.editor
+                .caret
+                .path
+                .first()
+                .and_then(|&i| self.editor.doc.body.get(i)),
+            Some(Block::Table(_))
+        );
+        let mut out = format!(
+            "{{\"bold\":{},\"italic\":{},\"underline\":{},\"strike\":{},\"superscript\":{},\"subscript\":{}",
+            rp.bold,
+            rp.italic,
+            rp.underline,
+            rp.strike,
+            rp.vert_align == VertAlign::Superscript,
+            rp.vert_align == VertAlign::Subscript
+        );
+        out.push_str(&format!(",\"align\":\"{}\"", richdoc::align_name(pp.align)));
+        out.push_str(",\"style\":");
+        match &pp.style_id {
+            Some(s) => json::push_str(&mut out, s),
+            None => out.push_str("null"),
+        }
+        let sp = &pp.spacing;
+        let no_spacing = matches!(pp.style_id.as_deref(), None | Some("Normal"))
+            && sp.before == Some(0)
+            && sp.after == Some(0)
+            && sp.line == Some(240)
+            && sp.line_rule.as_deref() == Some("auto");
+        out.push_str(&format!(
+            ",\"noSpacing\":{no_spacing},\"bullets\":{},\"numbers\":{},\"borderBottom\":{},\"inTable\":{in_table},\"selection\":{}",
+            self.editor.all_in_list(LIST_BULLET),
+            self.editor.all_in_list(LIST_NUMBER),
+            pp.borders.bottom.is_some(),
+            self.editor.has_selection()
+        ));
+        out.push_str(",\"font\":");
+        match &rp.font {
+            Some(f) => json::push_str(&mut out, f),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"size\":");
+        match rp.size_half_pts {
+            Some(s) => out.push_str(&s.to_string()),
+            None => out.push_str("null"),
+        }
+        out.push_str(",\"lineSpacing\":");
+        match sp.line_multiple() {
+            Some(m) => out.push_str(&format!("{m}")),
+            None => out.push_str("null"),
+        }
+        out.push('}');
+        out
     }
 
     /// Serialize the (edited) document back to `.docx` bytes, losslessly — every
@@ -3236,3 +3453,7 @@ mod tests {
         assert!(out.contains("**body text**"), "{out}");
     }
 }
+
+#[cfg(test)]
+#[path = "bridge_html_tests.rs"]
+mod html_tests;
