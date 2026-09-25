@@ -33,7 +33,8 @@ use its tools:
   "3d", "4h", "2w"; level = outline depth 1..20)
 - `yppxy_add` `{after?, name?, duration?}` — insert a task after uid `after`
   (or append); returns the new task with its uid
-- `yppxy_del` `{uid}` — delete a task (dangling links are dropped)
+- `yppxy_del` `{uid}` — delete a task; a summary takes its subtasks with it
+  (the reply's `removed` lists every UID; dangling links are dropped)
 - `yppxy_link` `{uid, pred, type?, lag?}` — make task `uid` depend on `pred`
   (type FS/SS/FF/SF, default FS; lag like "1d")
 - `yppxy_unlink` `{uid, pred}`

@@ -334,16 +334,42 @@ impl Editor {
         Ok(at)
     }
 
-    pub fn delete_task(&mut self, uid: i32) -> Result<(), String> {
+    /// Rows `uid` owns in the positional outline: itself, then every following
+    /// row deeper than it. Uses levels, not the `summary` flag, so a stale flag
+    /// cannot cause a partial delete.
+    fn subtree(&self, uid: i32) -> Result<std::ops::Range<usize>, String> {
         let i = self.index(uid)?;
+        let level = self.proj.tasks[i].outline_level;
+        let end = self.proj.tasks[i + 1..]
+            .iter()
+            .position(|t| t.outline_level <= level)
+            .map_or(self.proj.tasks.len(), |n| i + 1 + n);
+        Ok(i..end)
+    }
+
+    /// How many subtasks (all depths) deleting `uid` would also remove; hosts
+    /// confirm before deleting when this is non-zero.
+    pub fn subtree_len(&self, uid: i32) -> Result<usize, String> {
+        Ok(self.subtree(uid)?.len() - 1)
+    }
+
+    /// Delete `uid` and its whole subtree as one undo step, returning the
+    /// removed UIDs in outline order (the task first).
+    pub fn delete_task(&mut self, uid: i32) -> Result<Vec<i32>, String> {
+        let range = self.subtree(uid)?;
+        let removed: Vec<i32> = self.proj.tasks[range.clone()]
+            .iter()
+            .map(|t| t.uid)
+            .collect();
         self.edit_structure(|proj| {
-            proj.tasks.remove(i);
+            proj.tasks.drain(range);
             for t in &mut proj.tasks {
-                t.predecessors.retain(|p| p.uid != uid);
+                t.predecessors.retain(|p| !removed.contains(&p.uid));
             }
             // Remove assignments as well, so they cannot attach to a reused UID.
-            proj.assignments.retain(|a| a.task_uid != uid);
-        })
+            proj.assignments.retain(|a| !removed.contains(&a.task_uid));
+        })?;
+        Ok(removed)
     }
 
     pub fn indent(&mut self, uid: i32, delta: i32) -> Result<(), String> {
@@ -1025,8 +1051,10 @@ mod tests {
             assert_reopens(&ed);
             assert!(ed.redo());
             assert_reopens(&ed);
-            // Removing the empty-calendar parent leaves a valid-calendar task.
-            ed.delete_task(1).unwrap();
+            // Removing the empty-calendar summary removes its subtree with it,
+            // and the empty plan still reopens.
+            assert_eq!(ed.delete_task(1).unwrap(), vec![1, 2]);
+            assert!(ed.project().tasks.is_empty());
             assert_reopens(&ed);
             if !empty_default {
                 ed.add_task(None, "New task", 480).unwrap();
@@ -1138,7 +1166,7 @@ mod tests {
         type Edit = fn(&mut Editor) -> Result<(), String>;
         let bad: &[Edit] = &[
             |e| e.add_task(Some(999), "bad", 480).map(|_| ()),
-            |e| e.delete_task(999),
+            |e| e.delete_task(999).map(|_| ()),
             |e| e.indent(999, 1),
             |e| e.rename(999, "bad"),
             |e| e.set_duration(999, "1d"),
@@ -1240,6 +1268,126 @@ mod tests {
         assert_eq!(ed.selected_uid(), None);
         ed.select(usize::MAX);
         assert_eq!(ed.sel(), 0);
+    }
+
+    /// Tasks `(uid, name, level)` scheduled from a fixed start.
+    fn outline(rows: &[(i32, &str, u32)]) -> Editor {
+        Editor::new(Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: rows
+                .iter()
+                .map(|&(uid, name, outline_level)| Task {
+                    uid,
+                    id: uid,
+                    name: name.into(),
+                    outline_level,
+                    duration_min: 480,
+                    ..Task::default()
+                })
+                .collect(),
+            ..Project::default()
+        })
+    }
+
+    fn names(ed: &Editor) -> Vec<(&str, u32)> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| (&*t.name, t.outline_level))
+            .collect()
+    }
+
+    fn phase_plan() -> Editor {
+        outline(&[
+            (1, "A", 1),
+            (2, "Phase", 1),
+            (3, "P1", 2),
+            (4, "P2", 2),
+            (5, "B", 1),
+        ])
+    }
+
+    #[test]
+    fn deleting_a_summary_deletes_its_subtree_as_one_undo_step() {
+        let mut ed = phase_plan();
+        assert_eq!(ed.subtree_len(2), Ok(2));
+        assert_eq!(ed.subtree_len(3), Ok(0));
+        ed.select(1);
+        let before = ed.project().clone();
+        let depth = ed.undo_depth();
+
+        assert_eq!(ed.delete_task(2).unwrap(), vec![2, 3, 4]);
+        assert_eq!(names(&ed), [("A", 1), ("B", 1)]);
+        assert!(!ed.project().tasks[0].summary, "A must not adopt P1/P2");
+        assert_eq!(
+            ed.selected_uid(),
+            Some(5),
+            "selection moves to the row after"
+        );
+        assert_eq!(ed.undo_depth(), depth + 1);
+        assert_schedule(&ed);
+
+        let after = ed.project().clone();
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+        assert_schedule(&ed);
+        assert!(ed.redo());
+        assert_eq!(ed.project(), &after);
+    }
+
+    #[test]
+    fn deleting_a_nested_summary_stops_at_its_own_level() {
+        let mut ed = outline(&[
+            (1, "Phase", 1),
+            (2, "Sub", 2),
+            (3, "S1", 3),
+            (4, "S2", 3),
+            (5, "P2", 2),
+            (6, "B", 1),
+        ]);
+        assert_eq!(ed.subtree_len(1), Ok(4));
+        assert_eq!(ed.subtree_len(2), Ok(2));
+        assert_eq!(ed.delete_task(2).unwrap(), vec![2, 3, 4]);
+        assert_eq!(names(&ed), [("Phase", 1), ("P2", 2), ("B", 1)]);
+        assert!(ed.project().tasks[0].summary);
+        // A trailing subtree runs to the end of the plan.
+        assert_eq!(ed.delete_task(1).unwrap(), vec![1, 5]);
+        assert_eq!(names(&ed), [("B", 1)]);
+        assert!(ed.subtree_len(999).is_err());
+    }
+
+    #[test]
+    fn deleting_a_summary_drops_links_and_assignments_of_its_subtasks() {
+        let mut ed = phase_plan();
+        ed.add_predecessor(5, 3, LinkType::FinishStart, 0).unwrap();
+        ed.add_predecessor(5, 1, LinkType::FinishStart, 0).unwrap();
+        ed.assign_resource(4, "Alice").unwrap();
+        ed.assign_resource(1, "Alice").unwrap();
+
+        ed.delete_task(2).unwrap();
+        let b = ed.project().task(5).unwrap();
+        assert_eq!(
+            b.predecessors.iter().map(|p| p.uid).collect::<Vec<_>>(),
+            [1]
+        );
+        assert!(ed.project().assignments.iter().all(|a| a.task_uid == 1));
+        assert_eq!(ed.project().assignments.len(), 1);
+        assert_schedule(&ed);
+    }
+
+    #[test]
+    fn a_reused_subtask_uid_does_not_inherit_its_assignment() {
+        // The trailing summary's child holds the highest UID and a resource.
+        let mut ed = outline(&[(1, "A", 1), (3, "Phase", 1), (2, "P1", 2)]);
+        ed.assign_resource(2, "Alice").unwrap();
+        assert_eq!(ed.delete_task(3).unwrap(), vec![3, 2]);
+        assert!(ed.project().assignments.is_empty());
+
+        let at = ed.add_task(None, "Replacement", 480).unwrap();
+        let uid = ed.project().tasks[at].uid;
+        assert_eq!(uid, 2, "the removed subtask's UID is reused");
+        assert!(ed.project().assignments.iter().all(|a| a.task_uid != uid));
+        assert_schedule(&ed);
     }
 
     #[test]

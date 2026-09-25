@@ -167,7 +167,8 @@ the existing value; typing replaces it. Enter commits and moves down, Tab and
 Shift+Tab commit and move between columns, and Escape cancels. Invalid input
 stays open for correction. ID and summary dates/duration are read-only.
 
-Arrow keys move the cell cursor. Insert/Delete add/delete tasks;
+Arrow keys move the cell cursor. Insert/Delete add/delete tasks (Delete on a
+summary asks first: Enter deletes it with its subtasks, Esc cancels);
 Alt+Shift+Right/Left indent/outdent; Alt+Right/Left pan the Gantt;
 Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find,
 undo/redo, save, and export. The former bare-letter commands are available on
