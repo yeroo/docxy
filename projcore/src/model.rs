@@ -549,6 +549,11 @@ pub struct Project {
     pub hours_per_week: f64,
     /// UID of the project's default calendar.
     pub default_calendar_uid: i32,
+    /// Project-level MSPDI options docxy stores but does not model
+    /// (`ScheduleFromStart`, currency, task defaults, ...), as (element name,
+    /// text) in read order. A save writes each back verbatim, so an unsupported
+    /// setting survives rather than resetting to Project's default.
+    pub options: Vec<(String, String)>,
     /// Tasks in outline order. UIDs are unique: the readers reject duplicates,
     /// and the scheduler, links and assignments all look tasks up by UID.
     pub tasks: Vec<Task>,
@@ -568,6 +573,7 @@ impl Default for Project {
             hours_per_day: 8.0,
             hours_per_week: 40.0,
             default_calendar_uid: 1,
+            options: Vec::new(),
             tasks: Vec::new(),
             resources: Vec::new(),
             assignments: Vec::new(),
@@ -577,6 +583,14 @@ impl Default for Project {
 }
 
 impl Project {
+    /// The stored text of an unmodeled project option (see [`Project::options`]).
+    pub fn option(&self, name: &str) -> Option<&str> {
+        self.options
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     /// Whether this row has outline children, independently of its stored flag.
     /// Blank rows are outside the outline: one is never a summary, and the
     /// next non-blank row decides whether the row above it is.

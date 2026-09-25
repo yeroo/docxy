@@ -137,3 +137,58 @@ fn headless_gantt_md_and_save_together_are_refused() {
     assert!(!target.exists());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// Issue #82: `yppxy plan.xml --save out.xml` reset every project option docxy
+/// does not model. The schedule direction, currency and task defaults a plan's
+/// owner chose must reach the saved file, in both formats.
+#[test]
+fn headless_save_keeps_project_options() {
+    let dir = std::env::temp_dir().join(format!("yppxy-cli-save-issue82-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("plan.xml");
+    std::fs::write(
+        &input,
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Project xmlns="http://schemas.microsoft.com/project">
+  <Name>plan.xml</Name>
+  <ScheduleFromStart>0</ScheduleFromStart>
+  <StartDate>2026-03-02T08:00:00</StartDate>
+  <FinishDate>2026-03-06T17:00:00</FinishDate>
+  <CurrencyCode>EUR</CurrencyCode>
+  <CalendarUID>1</CalendarUID>
+  <MinutesPerDay>480</MinutesPerDay>
+  <DefaultTaskType>1</DefaultTaskType>
+  <Tasks>
+    <Task><UID>1</UID><ID>1</ID><Name>Build</Name><Duration>PT40H0M0S</Duration></Task>
+  </Tasks>
+</Project>
+"#,
+    )
+    .unwrap();
+    for name in ["out.xml", "out.yppx"] {
+        let target = dir.join(name);
+        let result = yppxy_save(Some(&input), &target);
+        assert!(
+            result.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = std::fs::read(&target).unwrap();
+        // The .yppx package wraps the same MSPDI part; read it to reach it.
+        let xml = if name.ends_with(".xml") {
+            String::from_utf8(bytes).unwrap()
+        } else {
+            projcore::mspdi::write_mspdi(&projcore::yppx::read_yppx(&bytes).unwrap())
+        };
+        for option in [
+            "<ScheduleFromStart>0</ScheduleFromStart>",
+            "<FinishDate>2026-03-06T17:00:00</FinishDate>",
+            "<CurrencyCode>EUR</CurrencyCode>",
+            "<DefaultTaskType>1</DefaultTaskType>",
+        ] {
+            assert!(xml.contains(option), "{name}: lost {option}");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

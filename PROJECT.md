@@ -48,7 +48,10 @@ separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
 `stored_*` and used as an **oracle** for the scheduler. The editor rewrites them
 for a manual task whose dates it edits, so a save's `Start`/`Finish` agree with
 its `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
-open).
+open). Project-level options the model does not hold (`ScheduleFromStart`,
+currency, task defaults, file identity, ...) are kept verbatim in
+`Project::options` and written back on save; docxy does not act on them yet, so
+it still schedules forward even when `ScheduleFromStart` is 0.
 
 `projcore::editor::Editor` owns the editable project, its 100-entry undo history,
 selection, dirty flag, computed schedule and optional leveling overlay. Validated
