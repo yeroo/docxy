@@ -1,7 +1,7 @@
 test project entry row appends a typed task as one undo step
   open copy:../fixtures/gantt-summary.xml
   assert tasks is 3
-  click B4
+  click C4
   assert cell_row is 3
   assert selected_task is 3
   assert selected_name is empty
@@ -10,14 +10,14 @@ test project entry row appends a typed task as one undo step
   assert cell_edit is Design
   key enter
   assert tasks is 4
-  assert cell B4 is Design
-  assert cell C4 is 1d
+  assert cell C4 is Design
+  assert cell D4 is 1d
   assert cell_row is 4
   assert undo_depth is 1
   type Build
   key tab
   assert tasks is 5
-  assert cell B5 is Build
+  assert cell C5 is Build
   assert cell_row is 4
   assert cell is Duration
   key down
@@ -36,7 +36,7 @@ test project entry row appends a typed task as one undo step
 
 test project entry row rejects a bad value without adding a task
   open copy:../fixtures/gantt-summary.xml
-  click C4
+  click D4
   type banana
   key enter
   assert cell_edit is banana
@@ -54,22 +54,22 @@ test empty project takes its first task from the entry row
   type Design
   key enter
   assert tasks is 1
-  assert cell B1 is Design
+  assert cell C1 is Design
   assert undo_depth is 1
   assert cell_row is 1
   shot window
 
 test project entry row click after typing lands on the new task
   open copy:../fixtures/gantt-summary.xml
-  click B4
-  type Design
   click C4
+  type Design
+  click D4
   assert tasks is 4
   assert cell_row is 3
   assert cell is Duration
   type 3d
   key enter
   assert tasks is 4
-  assert cell B4 is Design
-  assert cell C4 is 3d
+  assert cell C4 is Design
+  assert cell D4 is 3d
   assert cell_row is 4

@@ -1,0 +1,29 @@
+test project task mode switches from the cell and the ribbon
+  open copy:../fixtures/gantt-summary.xml
+  assert cell B2 is Auto Scheduled
+  click B2 double
+  assert cell_edit is Auto Scheduled
+  key escape
+  click B2
+  type m
+  key enter
+  assert cell_edit is none
+  assert cell B2 is Manually Scheduled
+  assert undo_depth is 1
+  assert dirty is true
+  key ctrl+z
+  assert cell B2 is Auto Scheduled
+  click B3
+  type x
+  key enter
+  assert cell_edit is x
+  assert status is Task Mode is Manually Scheduled or Auto Scheduled (type m or a)
+  key escape
+  assert cell_edit is none
+  click C3
+  key alt t u
+  assert cell B3 is Manually Scheduled
+  assert undo_depth is 1
+  key alt t a
+  assert cell B3 is Auto Scheduled
+  assert undo_depth is 2
