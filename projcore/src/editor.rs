@@ -1274,7 +1274,13 @@ mod tests {
     }
 
     fn phase_plan() -> Editor {
-        outline(&[(1, "A", 1), (2, "Phase", 1), (3, "P1", 2), (4, "P2", 2), (5, "B", 1)])
+        outline(&[
+            (1, "A", 1),
+            (2, "Phase", 1),
+            (3, "P1", 2),
+            (4, "P2", 2),
+            (5, "B", 1),
+        ])
     }
 
     #[test]
@@ -1289,7 +1295,11 @@ mod tests {
         assert_eq!(ed.delete_task(2).unwrap(), vec![2, 3, 4]);
         assert_eq!(names(&ed), [("A", 1), ("B", 1)]);
         assert!(!ed.project().tasks[0].summary, "A must not adopt P1/P2");
-        assert_eq!(ed.selected_uid(), Some(5), "selection moves to the row after");
+        assert_eq!(
+            ed.selected_uid(),
+            Some(5),
+            "selection moves to the row after"
+        );
         assert_eq!(ed.undo_depth(), depth + 1);
         assert_schedule(&ed);
 

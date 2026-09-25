@@ -2628,8 +2628,14 @@ mod tests {
         );
 
         // Yes deletes the summary and its subtasks in one undo step.
-        on_key(&mut app, KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        on_key(&mut app, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        on_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
         assert!(app.confirm.is_none());
         assert!(!app.quit);
         assert!(app.ed.project().tasks.is_empty());
