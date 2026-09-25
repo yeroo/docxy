@@ -232,6 +232,10 @@ struct ConstraintDates {
     floor: i64,
     late_floor: Option<i64>,
     finish_bound: Option<i64>,
+    /// A milestone's finish-constraint instant: the date itself when it is a
+    /// working start instant (a morning deadline stays on its morning), else
+    /// the evening that shares its index.
+    milestone: i64,
 }
 
 impl<'a> Scheduler<'a> {
@@ -425,6 +429,7 @@ impl<'a> Scheduler<'a> {
             start: tl.snap(date),
             finish,
             floor,
+            milestone: if tl.snap(date) == date { date } else { finish },
             // Preserve the legacy pre-start floor only when the unlinked
             // deadline itself was clamped. A post-start deadline can require
             // a pre-start late window to expose the task's negative slack.
@@ -514,6 +519,7 @@ impl<'a> Scheduler<'a> {
             let mut start_abs = linked_start.unwrap_or(self.anchor);
             let mut driven_start = start_abs;
             let mut finish_bound = None;
+            let mut milestone_finish: Option<i64> = None;
             if linked_start.is_some() {
                 linked_tasks.insert(t.uid);
             }
@@ -552,6 +558,7 @@ impl<'a> Scheduler<'a> {
                     start: ds,
                     finish: df,
                     floor,
+                    milestone,
                     ..
                 } = dates;
                 finish_bound = dates.finish_bound;
@@ -573,7 +580,14 @@ impl<'a> Scheduler<'a> {
                             || self.proj.honor_constraints =>
                     {
                         let previous_start = start_abs;
-                        start_abs = tl.abs_start(tl.to_index(df) - t.duration_min);
+                        // A milestone occupies the constraint's own instant,
+                        // not the next morning that shares its index.
+                        start_abs = if t.duration_min == 0 {
+                            milestone_finish = Some(milestone);
+                            milestone
+                        } else {
+                            tl.abs_start(tl.to_index(df) - t.duration_min)
+                        };
                         // Floor the finish date, not the duration-derived start
                         // of a linked task. Unlinked tasks retain anchor semantics.
                         if linked_start.is_none() {
@@ -598,12 +612,14 @@ impl<'a> Scheduler<'a> {
                 }
             }
             // A binding FS milestone occupies the finish instant, even in a
-            // nonworking gap. Later start-type links/constraints still snap.
-            let s_abs = if fs_milestone_start == Some(start_abs) {
-                start_abs
-            } else {
-                tl.snap(start_abs)
-            };
+            // nonworking gap, as does a binding MFO/FNLT milestone. Later
+            // start-type links/constraints still snap.
+            let s_abs =
+                if fs_milestone_start == Some(start_abs) || milestone_finish == Some(start_abs) {
+                    start_abs
+                } else {
+                    tl.snap(start_abs)
+                };
             let s_idx = tl.to_index(s_abs);
             let f_idx = s_idx + t.duration_min;
             let f_abs = finish_instant(t, tl, s_abs, f_idx, sf_bounds.into_iter(), finish_bound);
@@ -633,6 +649,11 @@ impl<'a> Scheduler<'a> {
             // Every task must finish by the project finish, even when an
             // SS/SF successor only bounds its start.
             let mut finish_abs = project_finish_abs;
+            // The latest instant the successor bounds allow. A milestone's
+            // start and finish are one instant, so a zero-lag link bounds it
+            // by the successor's own late start (FS, SS) or late finish (FF,
+            // SF), even on the morning side of the index `finish_abs` holds.
+            let mut bound_instant = project_finish_abs;
             if let Some(list) = succs.get(&t.uid) {
                 for &(suid, link, lag) in list {
                     let sls = ls_abs.get(&suid).copied();
@@ -654,16 +675,29 @@ impl<'a> Scheduler<'a> {
                     };
                     if let Some(c) = cand {
                         finish_abs = finish_abs.min(c);
+                        let endpoint = match link {
+                            LinkType::FinishStart | LinkType::StartStart => sls,
+                            LinkType::FinishFinish | LinkType::StartFinish => slf,
+                        };
+                        let allowed = match endpoint {
+                            Some(x) if span == 0 && lag == 0 => x,
+                            _ => c,
+                        };
+                        bound_instant = bound_instant.min(allowed);
                     }
                 }
             }
             // Hard constraints (backward-affecting).
             let mut late_start_floor = None;
             let mut hard_finish_bound = false;
+            // A milestone's MFO/FNLT instant, kept when the bound binds. An
+            // FNLT never moves it past what the successors allow.
+            let mut milestone_late = None;
             if let Some(ConstraintDates {
                 start: ds,
                 finish: df,
                 late_floor,
+                milestone,
                 ..
             }) = self
                 .constraint_dates(t, linked_tasks.contains(&t.uid))
@@ -674,9 +708,11 @@ impl<'a> Scheduler<'a> {
                         finish_abs = df;
                         hard_finish_bound = true;
                         late_start_floor = late_floor;
+                        milestone_late = (span == 0).then_some(milestone);
                     }
                     ConstraintType::FinishNoLaterThan if df <= finish_abs => {
                         finish_abs = df;
+                        milestone_late = (span == 0).then_some(milestone.min(bound_instant));
                         hard_finish_bound = true;
                         late_start_floor = late_floor;
                     }
@@ -703,8 +739,14 @@ impl<'a> Scheduler<'a> {
                 // reuse the early instants unless a hard date set that bound.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                let f_abs = tl
-                    .abs_finish(finish_index)
+                // A binding MFO/FNLT milestone sits on its constraint instant
+                // (an FNLT capped by the successor bound), which can be the
+                // morning side of the deadline's index.
+                if let Some(m) = milestone_late {
+                    debug_assert_eq!(tl.to_index(m), finish_index);
+                }
+                let f_abs = milestone_late
+                    .unwrap_or_else(|| tl.abs_finish(finish_index))
                     .max(late_start_floor.unwrap_or(i64::MIN));
                 let s_abs = if span == 0 {
                     f_abs
@@ -1500,6 +1542,218 @@ mod tests {
             assert_eq!(result.late_finish, result.early_finish);
             assert_eq!(leveled.start(uid), Some(result.early_start));
             assert_eq!(leveled.finish(uid), Some(result.early_finish));
+        }
+    }
+
+    /// Milestone M, FS after A (or unlinked), with a finish constraint.
+    fn finish_constrained_milestone(
+        duration: i64,
+        constraint: ConstraintType,
+        date: DateTime,
+        honor: bool,
+        linked: bool,
+    ) -> Project {
+        let mut proj = fs_milestone_project(duration);
+        proj.honor_constraints = honor;
+        let milestone = &mut proj.tasks[1];
+        if !linked {
+            milestone.predecessors.clear();
+        }
+        milestone.constraint = constraint;
+        milestone.constraint_date = Some(date);
+        proj
+    }
+
+    fn assert_milestone_at(proj: &Project, expected: DateTime, slack: i64, case: &str) {
+        let sched = schedule(proj);
+        let m = sched.get(2).unwrap();
+        assert_eq!(m.early_start, expected, "{case}");
+        assert_eq!(m.early_finish, expected, "{case}");
+        assert_eq!(m.late_start, expected, "{case}");
+        assert_eq!(m.late_finish, expected, "{case}");
+        assert_eq!(m.total_slack_min, slack, "{case}");
+        let leveled = level(proj);
+        assert_eq!(leveled.start(2), Some(expected), "{case}");
+        assert_eq!(leveled.finish(2), Some(expected), "{case}");
+    }
+
+    #[test]
+    fn finish_constrained_milestone_lands_at_constraint_evening() {
+        use ConstraintType::{FinishNoLaterThan as Fnlt, MustFinishOn as Mfo};
+        let friday = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        // (A duration, constraint, honor, linked, total slack)
+        for (duration, constraint, honor, linked, slack) in [
+            (2400, Mfo, true, true, 0),
+            (2400, Mfo, false, true, 0),
+            (2880, Fnlt, true, true, -480),
+            (2880, Mfo, true, true, -480),
+            (2400, Mfo, true, false, 0),
+        ] {
+            let proj = finish_constrained_milestone(duration, constraint, friday, honor, linked);
+            let case = format!("{duration} {constraint:?} honor={honor} linked={linked}");
+            assert_milestone_at(&proj, friday, slack, &case);
+        }
+    }
+
+    #[test]
+    fn finish_constrained_milestone_keeps_morning_deadline() {
+        let monday = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
+        let friday = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        // A morning MFO date stays on its morning, early and late alike.
+        for linked in [true, false] {
+            let proj = finish_constrained_milestone(
+                2400,
+                ConstraintType::MustFinishOn,
+                monday,
+                true,
+                linked,
+            );
+            assert_milestone_at(&proj, monday, 0, &format!("MFO Mon 08:00 linked={linked}"));
+        }
+        // Late dates keep the morning deadline when the early dates are later
+        // (negative slack) or when a successor maps the index to the prior
+        // evening. (constraint, honor, FS successor, early instant)
+        let monday_evening = DateTime::from_ymd_hm(2026, 3, 9, 17, 0);
+        for (constraint, honor, successor, early) in [
+            (ConstraintType::MustFinishOn, false, false, monday_evening),
+            (ConstraintType::FinishNoLaterThan, true, true, monday),
+            (
+                ConstraintType::FinishNoLaterThan,
+                false,
+                false,
+                monday_evening,
+            ),
+        ] {
+            let mut proj = finish_constrained_milestone(2880, constraint, monday, honor, true);
+            if successor {
+                let mut b = task(3, "B", 480);
+                b.predecessors.push(fs(2));
+                proj.tasks.push(b);
+            }
+            let case = format!("{constraint:?} honor={honor} successor={successor}");
+            let sched = schedule(&proj);
+            let m = sched.get(2).unwrap();
+            assert_eq!(m.early_start, early, "{case}");
+            assert_eq!(m.early_finish, early, "{case}");
+            assert_eq!(m.late_start, monday, "{case}");
+            assert_eq!(m.late_finish, monday, "{case}");
+            assert_eq!(m.total_slack_min, -480, "{case}");
+        }
+        // An FNLT on the same index never loosens the FS instant.
+        let proj = finish_constrained_milestone(
+            2400,
+            ConstraintType::FinishNoLaterThan,
+            monday,
+            true,
+            true,
+        );
+        assert_milestone_at(&proj, friday, 0, "FNLT Mon 08:00");
+    }
+
+    #[test]
+    fn fnlt_milestone_never_loosens_a_same_index_evening_bound() {
+        // M finishes Wed; the project finish (C) is Fri 17:00. A Mon 08:00
+        // FNLT shares that index but must not move LF past the Friday evening.
+        let monday = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
+        let friday = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        for ff_successor in [false, true] {
+            let mut proj = finish_constrained_milestone(
+                1440,
+                ConstraintType::FinishNoLaterThan,
+                monday,
+                true,
+                true,
+            );
+            proj.tasks.push(task(3, "C", 2400));
+            if ff_successor {
+                let mut d = task(4, "D", 480);
+                d.predecessors.push(Predecessor {
+                    uid: 2,
+                    link: LinkType::FinishFinish,
+                    lag_min: 0,
+                });
+                proj.tasks.push(d);
+            }
+            let sched = schedule(&proj);
+            let m = sched.get(2).unwrap();
+            let case = format!("ff_successor={ff_successor}");
+            assert_eq!(
+                m.early_start,
+                DateTime::from_ymd_hm(2026, 3, 4, 17, 0),
+                "{case}"
+            );
+            assert_eq!(m.late_start, friday, "{case}");
+            assert_eq!(m.late_finish, friday, "{case}");
+            assert!(m.late_finish <= sched.project_finish, "{case}");
+            assert_eq!(m.total_slack_min, 960, "{case}");
+        }
+    }
+
+    #[test]
+    fn fnlt_milestone_morning_deadline_holds_for_every_zero_lag_successor_link() {
+        // A zero-lag successor bounds the milestone's one instant by its own
+        // late start or finish, so no link type maps LF to the prior evening.
+        let monday = DateTime::from_ymd_hm(2026, 3, 9, 8, 0);
+        for link in [
+            LinkType::FinishStart,
+            LinkType::StartStart,
+            LinkType::FinishFinish,
+            LinkType::StartFinish,
+        ] {
+            let mut proj = finish_constrained_milestone(
+                2880,
+                ConstraintType::FinishNoLaterThan,
+                monday,
+                true,
+                true,
+            );
+            let mut b = task(3, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 2,
+                link,
+                lag_min: 0,
+            });
+            proj.tasks.push(b);
+            let sched = schedule(&proj);
+            let m = sched.get(2).unwrap();
+            assert_eq!(m.early_start, monday, "{link:?}");
+            assert_eq!(m.early_finish, monday, "{link:?}");
+            assert_eq!(m.late_start, monday, "{link:?}");
+            assert_eq!(m.late_finish, monday, "{link:?}");
+            assert_eq!(m.total_slack_min, -480, "{link:?}");
+        }
+    }
+
+    #[test]
+    fn nonbinding_fnlt_milestone_keeps_link_or_anchor_date() {
+        let friday = DateTime::from_ymd_hm(2026, 3, 6, 17, 0);
+        for honor in [true, false] {
+            let proj = finish_constrained_milestone(
+                2400,
+                ConstraintType::FinishNoLaterThan,
+                friday,
+                honor,
+                true,
+            );
+            assert_milestone_at(&proj, friday, 0, &format!("linked honor={honor}"));
+            // Unlinked, the milestone keeps the project start and its slack.
+            let proj = finish_constrained_milestone(
+                2400,
+                ConstraintType::FinishNoLaterThan,
+                friday,
+                honor,
+                false,
+            );
+            let sched = schedule(&proj);
+            let m = sched.get(2).unwrap();
+            let anchor = proj.start_date.unwrap();
+            assert_eq!(m.early_start, anchor, "honor={honor}");
+            assert_eq!(m.early_finish, anchor, "honor={honor}");
+            assert_eq!(m.late_finish, friday, "honor={honor}");
+            assert_eq!(m.total_slack_min, 2400, "honor={honor}");
+            let leveled = level(&proj);
+            assert_eq!(leveled.start(2), Some(anchor), "honor={honor}");
+            assert_eq!(leveled.finish(2), Some(anchor), "honor={honor}");
         }
     }
 
