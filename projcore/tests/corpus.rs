@@ -315,6 +315,14 @@ fn project_options_round_trip_through_mspdi_and_yppx() {
         let package = read_yppx(&write_yppx(&proj)).unwrap();
         for saved in [write_mspdi(&proj), write_mspdi(&package)] {
             let leaves = header_leaves(&saved);
+            // #111: every save says ProjectExternallyEdited = 0, once, which
+            // Project needs to import the saved durations intact.
+            let edited: Vec<_> = leaves
+                .iter()
+                .filter(|(n, _)| n == "ProjectExternallyEdited")
+                .map(|(_, t)| t.as_str())
+                .collect();
+            assert_eq!(edited, ["0"], "{}", path.display());
             for (name, text) in header_leaves(&xml) {
                 if MODELED.contains(&name.as_str()) {
                     continue;
@@ -355,8 +363,9 @@ fn project_options_round_trip_through_mspdi_and_yppx() {
             );
         }
     }
-    // Every fixture carries ProjectExternallyEdited, which Project needs to
-    // import the saved durations intact.
+    // The fixtures' only header leaf outside MODELED is ProjectExternallyEdited,
+    // which the writer now always writes as 0 itself rather than carrying it
+    // (#111); the pass-through of other options is covered in mspdi.rs.
     assert!(options_seen > 0);
 }
 

@@ -68,6 +68,10 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                             proj.default_calendar_uid = u;
                         }
                     }
+                    // docxy's durations are the schedule's input, so its saves
+                    // always declare them authoritative (see `header_text`);
+                    // a source's value is never kept.
+                    "ProjectExternallyEdited" => p.skip_element(),
                     "Tasks" => parse_tasks(&mut p, &mut proj.tasks, &mut task_uids),
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
@@ -816,6 +820,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// stamping them back), so a scheduled project exports with dates Project can
 /// display without recalculating.
 ///
+/// The header always says `<ProjectExternallyEdited>0</ProjectExternallyEdited>`,
+/// whatever the source said: the saved `<Duration>`s are docxy's own and
+/// authoritative, and without it Project recomputes them from Start/Finish.
+///
 /// The computed task fields (`OutlineNumber`, early/late dates, the four
 /// slacks, `Critical`) come from [`crate::schedule::schedule`], never from
 /// values read from a file. Known limit: that schedule ignores calendar
@@ -962,6 +970,9 @@ fn header_text(proj: &Project, name: &str) -> Option<String> {
         "MinutesPerWeek" => Some(((proj.hours_per_week * 60.0).round() as i64).to_string()),
         "HonorConstraints" => flag(proj.honor_constraints),
         "NewTasksAreManual" => flag(proj.new_tasks_are_manual),
+        // Without `0`, Project treats the file as edited outside Project,
+        // ignores each `<Duration>` and recomputes it from Start/Finish (#111).
+        "ProjectExternallyEdited" => Some("0".into()),
         _ => proj.option(name).map(str::to_string),
     }
 }
@@ -3275,6 +3286,7 @@ mod tests {
                     "HonorConstraints" => "0".to_string(),
                     "NewTasksAreManual" => "1".to_string(),
                     "ScheduleFromStart" => "0".to_string(),
+                    "ProjectExternallyEdited" => "0".to_string(),
                     _ => format!("{name}-value"),
                 };
                 (name.to_string(), text)
@@ -3352,6 +3364,7 @@ mod tests {
                 "MinutesPerWeek",
                 "HonorConstraints",
                 "NewTasksAreManual",
+                "ProjectExternallyEdited",
                 "ZzFutureOption",
                 "ZzRepeat",
                 "ZzOther",
@@ -3359,7 +3372,7 @@ mod tests {
         );
         // A repeat keeps its first place and takes the later value.
         assert_eq!(
-            header[7..],
+            header[8..],
             [
                 ("ZzFutureOption".to_string(), "7".to_string()),
                 ("ZzRepeat".to_string(), "b".to_string()),
@@ -3403,9 +3416,50 @@ mod tests {
                 ("MinutesPerWeek", "2100"),
                 ("HonorConstraints", "1"),
                 ("NewTasksAreManual", "0"),
+                ("ProjectExternallyEdited", "0"),
             ]
             .map(|(n, t)| (n.to_string(), t.to_string()))
         );
+    }
+
+    /// The `<ProjectExternallyEdited>` leaves of a saved header.
+    fn externally_edited(xml: &str) -> Vec<String> {
+        header_of(xml)
+            .into_iter()
+            .filter(|(n, _)| n == "ProjectExternallyEdited")
+            .map(|(_, t)| t)
+            .collect()
+    }
+
+    /// #111: without `ProjectExternallyEdited` = 0 Project recomputes every
+    /// duration from Start/Finish, so a project built in docxy must say it.
+    #[test]
+    fn save_declares_durations_authoritative() {
+        for proj in [Project::default(), crate::editor::untitled_project()] {
+            let xml = write_mspdi(&proj);
+            assert_eq!(externally_edited(&xml), ["0"]);
+            let names: Vec<String> = header_of(&xml).into_iter().map(|(n, _)| n).collect();
+            let at = |name: &str| names.iter().position(|n| n == name).unwrap();
+            assert!(at("NewTasksAreManual") < at("ProjectExternallyEdited"));
+            let tag = xml.find("<ProjectExternallyEdited>").unwrap();
+            assert!(tag < xml.find("<Tasks>").unwrap());
+        }
+    }
+
+    /// #111: a source that says `1` (or anything) saves as `0`, once, and the
+    /// reader keeps no stale option that a later save could repeat.
+    #[test]
+    fn externally_edited_source_saves_as_zero() {
+        let proj = read_mspdi(
+            "<Project><ProjectExternallyEdited>1</ProjectExternallyEdited><Tasks/></Project>",
+        )
+        .unwrap();
+        assert_eq!(proj.option("ProjectExternallyEdited"), None);
+        let xml = write_mspdi(&proj);
+        assert_eq!(externally_edited(&xml), ["0"]);
+        let again = read_mspdi(&xml).unwrap();
+        assert_eq!(again.option("ProjectExternallyEdited"), None);
+        assert_eq!(externally_edited(&write_mspdi(&again)), ["0"]);
     }
 
     /// A tracked task carrying every progress field #81 keeps, in schema order.

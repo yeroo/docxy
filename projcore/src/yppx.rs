@@ -90,6 +90,17 @@ mod tests {
         }
     }
 
+    /// #111: the package's MSPDI part tells Project to keep its durations.
+    #[test]
+    fn project_part_declares_durations_authoritative() {
+        let bytes = write_yppx(&Project::default());
+        let part = ZipArchive::open(&bytes).unwrap().read(MAIN_PART).unwrap();
+        let xml = String::from_utf8(part).unwrap();
+        let tag = "<ProjectExternallyEdited>0</ProjectExternallyEdited>";
+        assert_eq!(xml.matches(tag).count(), 1);
+        assert!(!xml.contains("<ProjectExternallyEdited>1"));
+    }
+
     fn sample() -> Project {
         let mut a = Task {
             uid: 1,
