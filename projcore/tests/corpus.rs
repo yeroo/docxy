@@ -294,9 +294,15 @@ fn header_leaves(xml: &str) -> Vec<(String, String)> {
     leaves
 }
 
-/// Issue #82: a save kept only the header fields docxy models. Every other
+/// Issue #82: a save kept only the header fields docxy models. Any unmodeled
 /// project option in a corpus file must come back with its text, through both
-/// formats; the modeled ones are compared by value.
+/// formats; the modeled ones are compared by value. Today the corpus carries
+/// none, so the mspdi.rs unit tests (`every_project_option_survives_...`,
+/// `unknown_leaf_options_...`) pin the pass-through.
+///
+/// Issue #111: every save says ProjectExternallyEdited = 0 exactly once,
+/// whatever the source said, which Project needs to import the saved
+/// durations intact.
 #[test]
 fn project_options_round_trip_through_mspdi_and_yppx() {
     const MODELED: &[&str] = &[
@@ -309,19 +315,24 @@ fn project_options_round_trip_through_mspdi_and_yppx() {
         "HoursPerDay",
         "HonorConstraints",
         "NewTasksAreManual",
+        "ProjectExternallyEdited",
     ];
-    let mut options_seen = 0;
     for path in mspdi_files() {
         let xml = std::fs::read_to_string(&path).unwrap();
         let proj = read_mspdi(&xml).unwrap();
         let package = read_yppx(&write_yppx(&proj)).unwrap();
         for saved in [write_mspdi(&proj), write_mspdi(&package)] {
             let leaves = header_leaves(&saved);
+            let edited: Vec<_> = leaves
+                .iter()
+                .filter(|(n, _)| n == "ProjectExternallyEdited")
+                .map(|(_, t)| t.as_str())
+                .collect();
+            assert_eq!(edited, ["0"], "{}", path.display());
             for (name, text) in header_leaves(&xml) {
                 if MODELED.contains(&name.as_str()) {
                     continue;
                 }
-                options_seen += 1;
                 let found: Vec<_> = leaves.iter().filter(|(n, _)| *n == name).collect();
                 assert_eq!(
                     found,
@@ -357,9 +368,6 @@ fn project_options_round_trip_through_mspdi_and_yppx() {
             );
         }
     }
-    // Every fixture carries ProjectExternallyEdited, which Project needs to
-    // import the saved durations intact.
-    assert!(options_seen > 0);
 }
 
 #[test]
