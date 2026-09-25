@@ -555,8 +555,9 @@ pub struct Calendar {
     pub exceptions: Vec<CalendarException>,
 }
 
-/// One MSPDI calendar exception, with every field kept as read (`None` when
-/// the file omitted it) so a save writes it back unchanged.
+/// One MSPDI calendar exception. Every `Option` field is kept as read (`None`
+/// when the file omitted it) so a save writes it back unchanged. `DayWorking`
+/// is always written, from whether `day` has working times, as for a weekday.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct CalendarException {
     pub name: Option<String>,

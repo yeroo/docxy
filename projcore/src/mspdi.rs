@@ -1442,8 +1442,9 @@ fn write_calendar(s: &mut String, c: &Calendar) {
     s.push_str("    </Calendar>\n");
 }
 
-/// One `Exception`, its elements in schema order; a field the reader found
-/// absent stays absent.
+/// One `Exception`, its elements in schema order. An optional field the
+/// reader found absent stays absent; `DayWorking` is always written, from
+/// whether the day has working times, as for a weekday.
 fn write_exception(s: &mut String, e: &CalendarException) {
     let int = |s: &mut String, name: &str, value: Option<i32>| {
         if let Some(value) = value {
