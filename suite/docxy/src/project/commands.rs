@@ -12,8 +12,11 @@ pub(crate) enum ProjectAct {
     Rename,
     Duration,
     AddLink,
+    UnlinkTasks,
+    MoveTask,
     Constraint,
     Baseline,
+    ClearBaseline,
     Recalc,
     Assign,
     ClearResources,
@@ -24,6 +27,7 @@ pub(crate) enum ProjectAct {
     ScrollRight,
     GoToStart,
     Find,
+    ScrollToTask,
     Timeline,
     // Keyboard/QAT/backstage only; excluded from the ribbon inventory.
     Level,
@@ -44,8 +48,11 @@ impl ProjectAct {
         Self::Rename,
         Self::Duration,
         Self::AddLink,
+        Self::UnlinkTasks,
+        Self::MoveTask,
         Self::Constraint,
         Self::Baseline,
+        Self::ClearBaseline,
         Self::Recalc,
         Self::Assign,
         Self::ClearResources,
@@ -56,6 +63,7 @@ impl ProjectAct {
         Self::ScrollRight,
         Self::GoToStart,
         Self::Find,
+        Self::ScrollToTask,
         Self::Timeline,
     ];
 }
@@ -94,6 +102,14 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "Alt+Shift+Left",
                                 "O",
                             ),
+                            cmd(
+                                "pr-unlink",
+                                "cut",
+                                "Unlink Tasks",
+                                UnlinkTasks,
+                                "Alt, T, U",
+                                "U",
+                            ),
                         ]),
                         Control::Large(cmd(
                             "pr-link",
@@ -104,6 +120,18 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "P",
                         )),
                     ],
+                ),
+                rs::group(
+                    "Tasks",
+                    75,
+                    vec![Control::Large(cmd(
+                        "pr-move",
+                        "indent-increase",
+                        "Move",
+                        MoveTask,
+                        "Alt, T, V",
+                        "V",
+                    ))],
                 ),
                 rs::group(
                     "Insert",
@@ -164,6 +192,14 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             DeleteTask,
                             "Delete",
                             "X",
+                        ),
+                        cmd(
+                            "pr-scroll-to-task",
+                            "align-left",
+                            "Scroll to Task",
+                            ScrollToTask,
+                            "Alt, T, S",
+                            "S",
                         ),
                     ])],
                 ),
@@ -258,6 +294,16 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                         "Alt, P, B",
                         "B",
                     )),
+                    // Project has it under Set Baseline's menu, which the
+                    // suite ribbon cannot draw yet, so it sits beside it.
+                    rs::column(vec![cmd(
+                        "pr-baseline-clear",
+                        "table-delete-row",
+                        "Clear Baseline",
+                        ClearBaseline,
+                        "Alt, P, L",
+                        "L",
+                    )]),
                 ],
             )],
         ),
@@ -327,6 +373,7 @@ pub(crate) enum PromptKind {
     Duration,
     Predecessor,
     Constraint,
+    Move,
     Assign,
     Find,
     /// Yes/no: delete the prompt's summary and its subtasks.
@@ -339,6 +386,7 @@ impl PromptKind {
             Self::Duration => "duration",
             Self::Predecessor => "predecessor",
             Self::Constraint => "constraint",
+            Self::Move => "move",
             Self::Assign => "assign",
             Self::Find => "find",
             Self::ConfirmDelete => "delete",
@@ -354,6 +402,7 @@ impl PromptKind {
             Self::Duration => "Duration (3d / 4h / 2w)",
             Self::Predecessor => "Predecessor ID",
             Self::Constraint => "Constraint (TYPE [date])",
+            Self::Move => "Move task by (1d / 1w / 4w; -1d back)",
             Self::Assign => "Assign resource (empty to clear)",
             Self::Find => "Find",
             Self::ConfirmDelete => "Delete",
@@ -588,6 +637,10 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
                     .to_ascii_uppercase()
             )));
         }
+        PromptKind::Move => {
+            let start = v.ed.move_task(uid, &p.buf)?;
+            return Ok(Some(format!("Moved to {}", date(Some(start)))));
+        }
         PromptKind::Assign => return assign_status(&mut v.ed, uid, &p.buf),
         PromptKind::ConfirmDelete => {
             v.ed.delete_task(uid)?;
@@ -658,6 +711,16 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Rename => v.open_prompt(PromptKind::Rename),
             Duration => v.open_prompt(PromptKind::Duration),
             AddLink => v.open_prompt(PromptKind::Predecessor),
+            UnlinkTasks => {
+                if let Some(uid) = v.selected_uid() {
+                    status = Some(match v.ed.unlink_task(uid)? {
+                        0 => "No links to remove".into(),
+                        1 => "Removed 1 link".into(),
+                        n => format!("Removed {n} links"),
+                    });
+                }
+            }
+            MoveTask => v.open_prompt(PromptKind::Move),
             Constraint => v.open_prompt(PromptKind::Constraint),
             Assign => v.open_prompt(PromptKind::Assign),
             Find => v.open_prompt(PromptKind::Find),
@@ -672,6 +735,16 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                     status =
                         Some("Baseline set — baseline bars now show under the current bars".into());
                 }
+            }
+            ClearBaseline => {
+                status = Some(
+                    if v.ed.clear_baseline()? {
+                        "Baseline cleared"
+                    } else {
+                        "No baseline to clear"
+                    }
+                    .into(),
+                );
             }
             Level | LevelAll | ClearLeveling => {
                 let want = match act {
@@ -720,6 +793,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 v.pan_gantt(true);
             }
             GoToStart => v.gantt_x.set(0.),
+            ScrollToTask => v.scroll_to_task(),
             Timeline => v.timeline = !v.timeline,
             Save | ExportGantt => {} // window-dependent host actions
         }
