@@ -700,6 +700,7 @@ pub(super) fn project_el(
         )
         .child(
             div()
+                .id(("project-body", index))
                 .relative()
                 .flex()
                 .flex_1()
@@ -708,6 +709,13 @@ pub(super) fn project_el(
                 .overflow_hidden()
                 .child(body_grid(view, view.scroll.clone(), pal))
                 .child(probe(probes, "project-body"))
+                // Rows stop propagation, so only the ruled empty rows land here.
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(tab) = this.tabs.get_mut(index) {
+                        project_blank_click(tab);
+                    }
+                    this.refocus(window, cx);
+                }))
                 .child(
                     uniform_list(
                         ("project-rows", index),
@@ -758,6 +766,7 @@ pub(super) fn project_el(
                                                 ),
                                             ))
                                             .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
                                                 if let Some(tab) = this.tabs.get_mut(index) {
                                                     project_cell_click(tab, i, None, false);
                                                 }
