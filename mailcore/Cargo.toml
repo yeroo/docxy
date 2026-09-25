@@ -24,4 +24,4 @@ editcore = { version = "0.1.0", path = "../editcore" }
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI (CryptProtectData / CryptUnprotectData) for the token cache at rest.
-windows-sys = { version = "0.59", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography", "Win32_Foundation"] }
