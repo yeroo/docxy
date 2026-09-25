@@ -43,8 +43,8 @@ keep the predecessor's finish instant. Only zero-lag links were verified;
 for nonzero lag the scheduler uses the finish side of the successor calendar's
 working-time boundary, which remains unverified against Project.
 File 19 pins manually scheduled tasks
-([issue #77](https://github.com/yeroo/docxy/issues/77)) and is the one fixture
-**not** verified against Project 2021: its Start/Finish are what a manual task
+([issue #77](https://github.com/yeroo/docxy/issues/77)) and is **not**
+verified against Project 2021: its Start/Finish are what a manual task
 keeps by definition, but its `TotalSlack`/`Critical` are hand-derived from our
 scheduler, including the violated link (Review, pinned two days before Design
 finishes, gets -2 days). `verify_mspdi_project.py` keeps the tasks this file
