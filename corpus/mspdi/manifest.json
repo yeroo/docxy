@@ -118,7 +118,7 @@
         "resource-fields",
         "round-trip"
       ],
-      "desc": "Work resource identity and rates, Cost resource, and Material label survive saving."
+      "desc": "Work resource identity, rates and rate units, booking type and flags, Cost and Material resources, and an assignment's contour, flags and dates survive saving."
     },
     {
       "file": "14-link-sf-before-start.xml",
