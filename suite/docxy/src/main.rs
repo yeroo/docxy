@@ -12,6 +12,7 @@
 mod close;
 mod control;
 mod harness;
+mod html_bundle;
 mod project;
 #[cfg(test)]
 mod ribbon_export;
@@ -1103,6 +1104,9 @@ struct Docxy {
     ribbon_min: bool,
     backstage: bool,
     bs_new: bool,
+    /// Save As: the path the document had before, so saving to a new
+    /// `.docx.html` name rewraps the bundle it came from (keeping its engine).
+    save_as_from: Option<PathBuf>,
     clip: Option<Clip>,
     theme_pref: ThemePref,
     /// When set, closing the window with unsaved tabs shows a confirm dialog.
@@ -1554,6 +1558,19 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
 }
 
 fn doc_from_path(path: &PathBuf) -> Loaded {
+    if html_bundle::doc_target(path, false) == html_bundle::DocTarget::Html {
+        return match html_bundle::open(path) {
+            Ok(opened) => {
+                let mut loaded = load_bytes(&opened.docx);
+                loaded.status = match opened.warning {
+                    Some(w) => format!("loaded (editable HTML) \u{00b7} {w}").into(),
+                    None => "loaded (editable HTML)".into(),
+                };
+                loaded
+            }
+            Err(e) => Loaded::empty(format!("load error: {e}")),
+        };
+    }
     match std::fs::read(path) {
         Ok(bytes) if is_markdown_path(path) => Loaded {
             doc: docxcore::markdown::from_markdown(&String::from_utf8_lossy(&bytes)),
@@ -4111,6 +4128,7 @@ impl Docxy {
             ribbon_min: false,
             backstage: false,
             bs_new: false,
+            save_as_from: None,
             clip: None,
             theme_pref,
             ask_on_close,
@@ -9840,17 +9858,32 @@ impl Docxy {
         let Surface::Doc(editor) = &tab.surface else {
             return;
         };
-        // Markdown-backed tabs save as Markdown; everything else as lossless .docx.
-        let bytes = if tab.markdown {
-            docxcore::markdown::to_markdown(&editor.doc).into_bytes()
-        } else {
-            doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref())
-        };
         let path = tab.path.clone().unwrap_or_else(|| {
             std::env::current_dir()
                 .unwrap_or_default()
                 .join(tab.title.to_string())
         });
+        // Markdown-backed tabs save as Markdown, editable-HTML bundles rewrap
+        // their package, everything else is lossless .docx.
+        let came_from = self.save_as_from.take();
+        let bytes = match html_bundle::doc_target(&path, tab.markdown) {
+            html_bundle::DocTarget::Markdown => {
+                docxcore::markdown::to_markdown(&editor.doc).into_bytes()
+            }
+            html_bundle::DocTarget::Docx => {
+                doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref())
+            }
+            html_bundle::DocTarget::Html => {
+                let docx = doc_to_docx(&editor.doc, &tab.comments, tab.pkg.as_ref());
+                match html_bundle::bundle_bytes(&path, came_from.as_deref(), &docx) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tab.status = format!("save failed: {e}").into();
+                        return self.refocus(window, cx);
+                    }
+                }
+            }
+        };
         match opccore::fsio::write_atomic(&path, &bytes) {
             Ok(()) => {
                 tab.title = file_name(&path).into();
@@ -9947,16 +9980,25 @@ impl Docxy {
             .get(self.active)
             .map(|t| t.title.to_string())
             .unwrap_or_else(|| "Untitled.docx".into());
-        if let Some(path) = rfd::FileDialog::new()
+        let mut dialog = rfd::FileDialog::new()
             .add_filter("Word document", &["docx"])
-            .add_filter("Markdown", &["md", "markdown"])
-            .set_file_name(start)
-            .save_file()
-        {
+            .add_filter("Markdown", &["md", "markdown"]);
+        // An open bundle can always be saved as one (it rewraps itself); a new
+        // one needs the engine this build may not carry.
+        let from_bundle = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.path.as_deref())
+            .is_some_and(|p| html_bundle::doc_target(p, false) == html_bundle::DocTarget::Html);
+        if from_bundle || html_bundle::can_export() {
+            dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
+        }
+        if let Some(path) = dialog.set_file_name(start).save_file() {
+            let path = html_bundle::normalize_save_target(path);
             if let Some(tab) = self.tabs.get_mut(self.active) {
                 // Choosing a .md name switches the tab to Markdown, and vice-versa.
                 tab.markdown = is_markdown_path(&path);
-                tab.path = Some(path);
+                self.save_as_from = tab.path.replace(path);
             }
             true
         } else {
@@ -9968,10 +10010,13 @@ impl Docxy {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter(
                 "All supported",
-                &["docx", "md", "markdown", "xlsx", "yppx", "xml", "mpp"],
+                &[
+                    "docx", "md", "markdown", "html", "xlsx", "yppx", "xml", "mpp",
+                ],
             )
             .add_filter("Project schedule", &["yppx", "xml", "mpp"])
             .add_filter("Word or Markdown", &["docx", "md", "markdown"])
+            .add_filter("Editable HTML (*.docx.html)", &["html"])
             .add_filter("Excel workbook", &["xlsx"])
             .pick_file()
         {
