@@ -559,11 +559,17 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
     let good = dir.join("good.docx");
     basic_docx_at(&good);
     let on_disk = doc_text(&tab_from_path(&good));
-    for dirty in [false, true] {
+    // A truncated (0-byte) sidecar is as unreadable as a garbled one, even
+    // though a 0-byte file of the user's own opens as a new document.
+    for (dirty, corrupt) in [
+        (false, &b"not a zip"[..]),
+        (true, b"not a zip"),
+        (true, b""),
+    ] {
         let mut t = tab_from_path(&good);
         t.dirty = dirty;
         let p = persist_tab(&dir, 0, &t);
-        std::fs::write(p.hot.as_ref().unwrap(), b"not a zip").unwrap();
+        std::fs::write(p.hot.as_ref().unwrap(), corrupt).unwrap();
         let mut r = restore_tab(&p);
         assert!(!r.load_failed, "dirty={dirty}: {}", r.status);
         assert!(!r.dirty);
@@ -575,7 +581,13 @@ fn a_corrupt_sidecar_reopens_the_file_from_disk() {
         assert!(!again.load_failed && again.status.starts_with("loaded"));
         r.dirty = true;
         assert!(save_doc_tab(&mut r, None), "{}", r.status);
-        assert!(!tab_from_path(&good).load_failed);
+        let saved = tab_from_path(&good);
+        assert!(
+            !saved.load_failed && saved.pkg.is_some(),
+            "{}",
+            saved.status
+        );
+        assert_eq!(doc_text(&saved), on_disk);
     }
     // A file that is itself broken stays marked, by the fresh load.
     let broken = dir.join("broken.docx");

@@ -4036,7 +4036,10 @@ fn restore_tab(t: &PersistTab) -> DocTab {
     let mut tab = match (t.kind, &hot) {
         (Kind::Docx, Some(hp)) => {
             let mut l = doc_from_path(hp);
-            if l.load_failed {
+            // A 0-byte sidecar is a truncated write, not an empty document:
+            // the user-file rule that opens one as new must not apply here.
+            let unreadable = l.load_failed || std::fs::metadata(hp).is_ok_and(|m| m.len() == 0);
+            if unreadable {
                 // The sidecar itself is unreadable, so its content is lost
                 // either way: a tab with a file reopens it exactly as with no
                 // sidecar (the fresh load alone decides the mark); a
