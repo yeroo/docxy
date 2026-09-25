@@ -278,6 +278,39 @@ fn invalid_inputs_and_click_away_preserve_everything() {
 }
 
 #[test]
+fn clicking_below_the_last_task_commits_without_selecting() {
+    let mut t = tab();
+    key(&mut t, "down");
+    edit(&mut t, 1, "Renamed");
+    project_blank_click(&mut t);
+    assert!(v(&t).cell.is_none());
+    assert_eq!(v(&t).ed.project().tasks[1].name, "Renamed");
+    assert_eq!(v(&t).ed.sel(), 1);
+    assert_eq!(v(&t).col, 1);
+    assert!(t.dirty);
+    // With nothing open it is a no-op, not a selection change.
+    project_blank_click(&mut t);
+    assert!(v(&t).cell.is_none());
+    assert_eq!(v(&t).ed.sel(), 1);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+
+    let mut t = tab();
+    let before = v(&t).ed.project().clone();
+    edit(&mut t, 2, "NaN");
+    project_blank_click(&mut t);
+    let status = t.status.clone();
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "NaN");
+    assert_eq!(
+        v(&t).cell.as_ref().unwrap().last_error.as_deref(),
+        Some(status.as_ref())
+    );
+    assert_eq!(v(&t).ed.sel(), 0);
+    assert_eq!(v(&t).col, 2);
+    assert_eq!(v(&t).ed.project(), &before);
+    assert!(!t.dirty);
+}
+
+#[test]
 fn clicking_prompts_and_tab_share_commit_policy() {
     let mut t = tab();
     edit(&mut t, 1, "New");

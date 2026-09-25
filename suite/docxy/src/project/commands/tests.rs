@@ -317,7 +317,7 @@ fn timeline_toggles_the_pane_as_view_state_only() {
             )
         );
     }
-    let state = project_state(v(&t));
+    let state = project_state(v(&t), None);
     assert!(state.contains(&("timeline".into(), ctlcore::json::Json::Str("hidden".into()))));
 }
 

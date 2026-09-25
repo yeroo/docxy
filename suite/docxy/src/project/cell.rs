@@ -247,6 +247,12 @@ pub(crate) fn project_cell_click(tab: &mut DocTab, row: usize, col: Option<usize
     complete_project(tab, true);
 }
 
+/// A click on the ruled rows below the last task: commit like any click-away, but select
+/// nothing, since there is no task there. A failed commit keeps the edit and its status.
+pub(crate) fn project_blank_click(tab: &mut DocTab) {
+    let _ = commit_project_cell(tab);
+}
+
 pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>, m: Modifiers) {
     if m.alt || m.platform || m.control {
         // Save commits the buffer before host dispatch; other chords cannot alter it.
