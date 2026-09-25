@@ -233,6 +233,107 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
     }
 }
 
+/// The leaf children of `<Project>` (its header options), as (name, decoded
+/// text), read with the bare XML parser rather than projcore's reader.
+fn header_leaves(xml: &str) -> Vec<(String, String)> {
+    use opccore::xml::{Event, XmlParser};
+    let mut p = XmlParser::new(xml);
+    while !(p.next() == Event::Start && p.name() == "Project") {}
+    let mut leaves = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                let (mut text, mut leaf) = (String::new(), true);
+                loop {
+                    match p.next() {
+                        Event::Text => XmlParser::append_decoded(p.text(), &mut text),
+                        Event::Start => {
+                            leaf = false;
+                            p.skip_element();
+                        }
+                        Event::End | Event::Eof => break,
+                    }
+                }
+                if leaf {
+                    leaves.push((name, text));
+                }
+            }
+            Event::End | Event::Eof => break,
+            Event::Text => {}
+        }
+    }
+    leaves
+}
+
+/// Issue #82: a save kept only the header fields docxy models. Every other
+/// project option in a corpus file must come back with its text, through both
+/// formats; the modeled ones are compared by value.
+#[test]
+fn project_options_round_trip_through_mspdi_and_yppx() {
+    const MODELED: &[&str] = &[
+        "Name",
+        "Title",
+        "StartDate",
+        "CalendarUID",
+        "MinutesPerDay",
+        "MinutesPerWeek",
+        "HoursPerDay",
+        "HonorConstraints",
+        "NewTasksAreManual",
+    ];
+    let mut options_seen = 0;
+    for path in mspdi_files() {
+        let xml = std::fs::read_to_string(&path).unwrap();
+        let proj = read_mspdi(&xml).unwrap();
+        let package = read_yppx(&write_yppx(&proj)).unwrap();
+        for saved in [write_mspdi(&proj), write_mspdi(&package)] {
+            let leaves = header_leaves(&saved);
+            for (name, text) in header_leaves(&xml) {
+                if MODELED.contains(&name.as_str()) {
+                    continue;
+                }
+                options_seen += 1;
+                let found: Vec<_> = leaves.iter().filter(|(n, _)| *n == name).collect();
+                assert_eq!(
+                    found,
+                    [&(name.clone(), text)],
+                    "{}: {name} not saved as read",
+                    path.display()
+                );
+            }
+            let back = read_mspdi(&saved).unwrap();
+            assert_eq!(
+                (
+                    &back.name,
+                    &back.title,
+                    back.start_date,
+                    back.default_calendar_uid,
+                    back.hours_per_day,
+                    back.hours_per_week,
+                    back.honor_constraints,
+                    back.new_tasks_are_manual,
+                ),
+                (
+                    &proj.name,
+                    &proj.title,
+                    proj.start_date,
+                    proj.default_calendar_uid,
+                    proj.hours_per_day,
+                    proj.hours_per_week,
+                    proj.honor_constraints,
+                    proj.new_tasks_are_manual,
+                ),
+                "{}: modeled header changed",
+                path.display()
+            );
+        }
+    }
+    // Every fixture carries ProjectExternallyEdited, which Project needs to
+    // import the saved durations intact.
+    assert!(options_seen > 0);
+}
+
 #[test]
 fn scheduler_matches_embedded_oracle() {
     for path in mspdi_files() {
