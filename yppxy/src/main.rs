@@ -98,12 +98,14 @@ fn main() -> ExitCode {
         Ok(p) => p,
         Err(m) => {
             eprintln!("{m}");
-            eprintln!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
+            eprintln!(
+                "usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]"
+            );
             return ExitCode::from(2);
         }
     };
     if parsed.help {
-        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out>]");
+        println!("usage: yppxy [file.(xml|yppx|mpp)] [--gantt-md <out>] [--save <out.(yppx|xml)>]");
         return ExitCode::SUCCESS;
     }
 
@@ -183,6 +185,11 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
         }
         i += 1;
+    }
+    // Each headless mode exits after its own output, so a combination would
+    // silently skip one of them.
+    if out.gantt_md.is_some() && out.save.is_some() {
+        return Err("--gantt-md and --save cannot be combined".into());
     }
     Ok(out)
 }
