@@ -235,7 +235,8 @@ fn open_hf(t: &mut DocTab, is_header: bool, text: &str) -> String {
         is_header,
         variant: "default",
     });
-    t.dirty = false;
+    // As the app leaves it: creating the part and typing both mark the tab dirty.
+    t.dirty = true;
     part_name
 }
 
@@ -300,4 +301,70 @@ fn window_close_does_not_stop_at_an_invalid_project_buffer() {
     assert!(restored[1].dirty);
     assert!(part_text(&restored[2], &header).contains("After invalid"));
     assert!(restored[2].dirty);
+}
+
+/// A saved .docx whose header was written by another tool (extra namespace,
+/// its own whitespace), loaded clean, with the header editor opened on it the
+/// way `enter_hf` opens it and nothing typed.
+fn untouched_existing_header(name: &str) -> (DocTab, String, Vec<u8>) {
+    let mut source = tab(Kind::Docx);
+    let pkg = source.pkg.as_mut().unwrap();
+    let part_name = pkg.create_hf(true, "default").unwrap();
+    let word_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
+        <w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
+        xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
+        xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\">\r\n  \
+        <w:p><w:r><w:t>Existing header</w:t></w:r></w:p>\r\n</w:hdr>";
+    assert!(pkg.set_part(&part_name, word_xml.as_bytes().to_vec()));
+    let Surface::Doc(ed) = &source.surface else {
+        panic!()
+    };
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../target/close-tests")
+        .join(format!("{}-{name}-source", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("with-header.docx");
+    std::fs::write(
+        &path,
+        doc_to_docx(&ed.doc, &source.comments, source.pkg.as_ref()),
+    )
+    .unwrap();
+    let mut t = tab_from_path(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(!t.dirty, "{}", t.status);
+    let pkg = t.pkg.as_ref().unwrap();
+    let part_name = hf_part_name_typed(pkg, true, "default").unwrap();
+    let before = pkg.part(&part_name).unwrap().to_vec();
+    assert_eq!(before, word_xml.as_bytes());
+    let body = parse_hf_part(pkg, &part_name);
+    t.hf_edit = Some(HfEdit {
+        editor: Editor::new(docxcore::model::Document { body }),
+        part_name: part_name.clone(),
+        is_header: true,
+        variant: "default",
+    });
+    (t, part_name, before)
+}
+
+#[test]
+fn window_close_leaves_an_untouched_header_editor_clean_and_its_part_intact() {
+    let (first, part_name, before) = untouched_existing_header("untouched-0");
+    let (last, _, _) = untouched_existing_header("untouched-2");
+    let mut tabs = vec![first, pending_sheet("Beside"), last];
+    let restored = exit_and_restore(&mut tabs, "untouched");
+    for i in [0, 2] {
+        assert!(!tabs[i].dirty, "{i}");
+        assert!(tabs[i].hf_edit.is_some());
+        assert_eq!(
+            tabs[i].pkg.as_ref().unwrap().part(&part_name).unwrap(),
+            &before[..]
+        );
+        assert!(!restored[i].dirty, "{i}");
+        assert_eq!(
+            restored[i].pkg.as_ref().unwrap().part(&part_name).unwrap(),
+            &before[..],
+            "{i}"
+        );
+    }
+    assert!(restored[1].dirty);
 }

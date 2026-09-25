@@ -41,8 +41,22 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
         if let Surface::Sheet(v) = &mut tab.surface {
             tab.dirty |= v.commit_edit();
         }
-        flush_hf_tab(tab);
+        if hf_changed(tab) {
+            flush_hf_tab(tab);
+        }
     }
+}
+
+/// Whether the open header/footer editor differs from its part. An untouched
+/// editor must not dirty the tab or replace the part with a re-serialization;
+/// both sides go through the same serializer, so byte layout does not matter.
+fn hf_changed(tab: &DocTab) -> bool {
+    let (Some(hf), Some(pkg)) = (tab.hf_edit.as_ref(), tab.pkg.as_ref()) else {
+        return false;
+    };
+    let part = parse_hf_part(pkg, &hf.part_name);
+    docxcore::serialize::blocks_to_xml(&hf.editor.doc.body)
+        != docxcore::serialize::blocks_to_xml(&part)
 }
 
 fn close_step(
