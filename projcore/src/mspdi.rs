@@ -481,8 +481,12 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
     let mut cal = Calendar {
         uid: 0,
         name: String::new(),
+        base_calendar_uid: None,
+        is_baseline_calendar: false,
         week: Default::default(),
     };
+    let mut is_base = false;
+    let mut base_uid: Option<i32> = None;
     loop {
         match p.next() {
             Event::Start => {
@@ -490,6 +494,9 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
                 match name.as_str() {
                     "UID" => cal.uid = int_of(p) as i32,
                     "Name" => cal.name = text_of(p),
+                    "IsBaseCalendar" => is_base = bool_of(p),
+                    "IsBaselineCalendar" => cal.is_baseline_calendar = bool_of(p),
+                    "BaseCalendarUID" => base_uid = text_of(p).trim().parse().ok(),
                     "WeekDays" => parse_weekdays(p, &mut cal.week),
                     _ => p.skip_element(),
                 }
@@ -498,10 +505,21 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
             _ => {}
         }
     }
+    // A derived calendar states only the days it overrides and inherits the
+    // rest; a base calendar's unstated days are non-working.
+    if is_base {
+        base_uid = None;
+    }
+    cal.base_calendar_uid = base_uid.filter(|&uid| uid != -1);
+    if cal.base_calendar_uid.is_none() {
+        for day in &mut cal.week {
+            day.get_or_insert_with(DayWorking::default);
+        }
+    }
     cal
 }
 
-fn parse_weekdays(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
+fn parse_weekdays(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
     loop {
         match p.next() {
             Event::Start => {
@@ -517,8 +535,9 @@ fn parse_weekdays(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
     }
 }
 
-fn parse_weekday(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
+fn parse_weekday(p: &mut XmlParser, week: &mut [Option<DayWorking>; 7]) {
     // MSPDI DayType: 1=Sunday .. 7=Saturday. Our week[] is Sunday=0..Saturday=6.
+    // DayType 0 is a legacy exception entry, not a weekday (exceptions: #126).
     let mut day_type: Option<usize> = None;
     let mut working = false;
     let mut times: Vec<WorkingTime> = Vec::new();
@@ -527,7 +546,12 @@ fn parse_weekday(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
-                    "DayType" => day_type = Some((int_of(p) as usize).saturating_sub(1)),
+                    "DayType" => {
+                        day_type = match int_of(p) {
+                            d @ 1..=7 => Some(d as usize - 1),
+                            _ => None,
+                        }
+                    }
                     "DayWorking" => working = bool_of(p),
                     "WorkingTimes" => parse_working_times(p, &mut times),
                     _ => p.skip_element(),
@@ -538,12 +562,10 @@ fn parse_weekday(p: &mut XmlParser, week: &mut [DayWorking; 7]) {
         }
     }
     if let Some(d) = day_type {
-        if d < 7 {
-            // A non-working day yields empty times even if some were present.
-            week[d] = DayWorking {
-                times: if working { times } else { Vec::new() },
-            };
-        }
+        // A non-working day yields empty times even if some were present.
+        week[d] = Some(DayWorking {
+            times: if working { times } else { Vec::new() },
+        });
     }
 }
 
@@ -1116,9 +1138,35 @@ fn write_calendar(s: &mut String, c: &Calendar) {
     s.push_str("    <Calendar>\n");
     tag(s, 3, "UID", &c.uid.to_string());
     tag(s, 3, "Name", &c.name);
-    tag(s, 3, "IsBaseCalendar", "1");
+    let flag = |on: bool| if on { "1" } else { "0" };
+    tag(s, 3, "IsBaseCalendar", flag(c.base_calendar_uid.is_none()));
+    tag(s, 3, "IsBaselineCalendar", flag(c.is_baseline_calendar));
+    tag(
+        s,
+        3,
+        "BaseCalendarUID",
+        &c.base_calendar_uid.unwrap_or(-1).to_string(),
+    );
+    // A base calendar states all seven days, an unstated one as non-working. A
+    // derived calendar states only the days it overrides, so Project keeps
+    // inheriting the rest from its base.
+    let non_working = DayWorking::default();
+    let days: Vec<(usize, &DayWorking)> = c
+        .week
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, day)| match (day, c.base_calendar_uid) {
+            (Some(day), _) => Some((idx, day)),
+            (None, None) => Some((idx, &non_working)),
+            (None, Some(_)) => None,
+        })
+        .collect();
+    if days.is_empty() {
+        s.push_str("    </Calendar>\n");
+        return;
+    }
     s.push_str("      <WeekDays>\n");
-    for (idx, day) in c.week.iter().enumerate() {
+    for (idx, day) in days {
         // model week[] is Sun=0..Sat=6; MSPDI DayType is 1=Sun..7=Sat.
         s.push_str("        <WeekDay>\n");
         tag(s, 5, "DayType", &(idx + 1).to_string());
@@ -1754,17 +1802,14 @@ mod tests {
         assert_eq!(proj.calendars.len(), 1);
         let cal = &proj.calendars[0];
         assert_eq!(cal.name, "Std");
-        assert_eq!(cal.week[1].minutes(), 480); // Monday (DayType 2) = 8h
-        assert!(!cal.week[0].working()); // Sunday (DayType 1) off
+        assert_eq!(cal.week[1].as_ref().unwrap().minutes(), 480); // Monday (DayType 2) = 8h
+        assert!(!cal.week[0].as_ref().unwrap().working()); // Sunday (DayType 1) off
     }
 
     fn empty_calendar_project() -> Project {
         let mut proj = read_mspdi(MINIMAL).unwrap();
-        proj.calendars.push(Calendar {
-            uid: 3,
-            name: "Closed".into(),
-            week: Default::default(),
-        });
+        proj.calendars
+            .push(Calendar::base(3, "Closed", Default::default()));
         proj
     }
 
@@ -1878,7 +1923,7 @@ mod tests {
     #[test]
     fn twenty_four_hour_calendar_round_trips() {
         let mut proj = Project::default();
-        for day in &mut proj.calendars[0].week {
+        for day in proj.calendars[0].week.iter_mut().flatten() {
             day.times = vec![WorkingTime { from: 0, to: 1440 }];
         }
         let xml = write_mspdi(&proj);
@@ -2164,9 +2209,11 @@ mod tests {
         let back = read_mspdi(&xml).unwrap();
         assert_eq!(back.calendars.len(), 1);
         let cal = &back.calendars[0];
-        assert_eq!(cal.week[1].minutes(), 480); // Monday still 8h
-        assert_eq!(cal.week[1].times.len(), 2); // two shifts preserved
-        assert!(!cal.week[0].working() && !cal.week[6].working()); // weekend off
+        assert_eq!(cal.week[1].as_ref().unwrap().minutes(), 480); // Monday still 8h
+        assert_eq!(cal.week[1].as_ref().unwrap().times.len(), 2); // two shifts preserved
+        assert!(
+            !cal.week[0].as_ref().unwrap().working() && !cal.week[6].as_ref().unwrap().working()
+        ); // weekend off
     }
 
     // ---- task fields (#80) ----

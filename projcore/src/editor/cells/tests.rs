@@ -271,7 +271,7 @@ fn scheduling_range_accounts_for_time_before_the_anchor() {
     }
     // A continuous calendar can use the entire 100-year backward budget as
     // well as the forward budget. The old reserve only covered one direction.
-    for day in &mut ed.proj.calendars[0].week {
+    for day in ed.proj.calendars[0].week.iter_mut().flatten() {
         day.times = vec![crate::model::WorkingTime { from: 0, to: 1440 }];
     }
     // Keep an SF leaf link so this project needs a backward horizon.
@@ -509,7 +509,7 @@ fn dates_are_strict_and_finish_uses_effective_calendar() {
     );
     let mut cal = Calendar::standard(99);
     cal.week[6] = cal.week[1].clone();
-    cal.week[6].times.last_mut().unwrap().to = 18 * 60;
+    cal.week[6].as_mut().unwrap().times.last_mut().unwrap().to = 18 * 60;
     ed.proj.calendars.push(cal);
     ed.proj.tasks[0].calendar_uid = Some(99);
     let sat = day_finish(

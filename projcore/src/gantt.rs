@@ -149,11 +149,10 @@ fn fmt_days(days: f64) -> String {
 /// True when the project's default calendar takes both weekend days off, so the
 /// Mermaid `excludes weekends` directive matches the schedule.
 fn excludes_weekends(proj: &Project) -> bool {
-    proj.calendars
-        .iter()
-        .find(|c| c.uid == proj.default_calendar_uid)
+    proj.calendar(proj.default_calendar_uid)
         .or_else(|| proj.calendars.first())
-        .map(|c| !c.week[0].working() && !c.week[6].working())
+        .map(|c| proj.resolved_week(c))
+        .map(|week| !week[0].working() && !week[6].working())
         .unwrap_or(true)
 }
 
@@ -567,11 +566,7 @@ mod tests {
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
             tasks: vec![phase, a, b],
             calendars: vec![
-                Calendar {
-                    uid: 1,
-                    name: "Closed".into(),
-                    week: Default::default(),
-                },
+                Calendar::base(1, "Closed", Default::default()),
                 Calendar::standard(3),
             ],
             ..Project::default()
