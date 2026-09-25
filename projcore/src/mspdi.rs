@@ -740,8 +740,9 @@ pub fn iso8601_to_minutes(s: &str) -> i64 {
 }
 
 /// Parse the supported duration components without treating invalid input as zero.
-/// Baselines need to distinguish a recorded zero from an unavailable duration;
-/// task and assignment imports retain the permissive parser above.
+/// Optional durations (baselines, progress, stored work, resource work) need to
+/// distinguish a recorded zero from an unavailable one; only the required task
+/// `Duration` and assignment `Work` keep the permissive parser above.
 fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
     let body = s.trim().strip_prefix('P')?;
     let mut minutes = 0i64;
@@ -1149,10 +1150,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
 }
 
 fn write_resource(s: &mut String, r: &Resource) {
-    s.push_str(
-        "    <Resource>
-",
-    );
+    s.push_str("    <Resource>\n");
     tag(s, 3, "UID", &r.uid.to_string());
     tag(s, 3, "ID", &r.id.to_string());
     tag(s, 3, "Name", &r.name);
@@ -1172,8 +1170,8 @@ fn write_resource(s: &mut String, r: &Resource) {
     opt_text(s, "WorkGroup", r.work_group);
     tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
     opt_text(s, "PeakUnits", r.peak_units.as_ref().map(Rate::as_str));
-    opt_text(s, "OverAllocated", r.over_allocated.map(flag));
-    opt_text(s, "CanLevel", r.can_level.map(flag));
+    opt_flag(s, "OverAllocated", r.over_allocated);
+    opt_flag(s, "CanLevel", r.can_level);
     if let Some(accrue_at) = r.accrue_at {
         tag(s, 3, "AccrueAt", &accrue_at.code().to_string());
     }
@@ -1196,17 +1194,14 @@ fn write_resource(s: &mut String, r: &Resource) {
     if let Some(c) = r.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
     }
-    opt_text(s, "IsGeneric", r.is_generic.map(flag));
-    opt_text(s, "IsInactive", r.is_inactive.map(flag));
+    opt_flag(s, "IsGeneric", r.is_generic);
+    opt_flag(s, "IsInactive", r.is_inactive);
     opt_text(s, "BookingType", r.booking_type);
     if r.kind == ResourceType::Cost {
         tag(s, 3, "IsCostResource", "1");
     }
-    opt_text(s, "IsBudget", r.is_budget.map(flag));
-    s.push_str(
-        "    </Resource>
-",
-    );
+    opt_flag(s, "IsBudget", r.is_budget);
+    s.push_str("    </Resource>\n");
 }
 
 fn write_assignment(s: &mut String, a: &Assignment) {
@@ -1232,8 +1227,8 @@ fn write_assignment(s: &mut String, a: &Assignment) {
         "WorkVariance",
         a.work_variance.as_ref().map(Rate::as_str),
     );
-    opt_text(s, "HasFixedRateUnits", a.has_fixed_rate_units.map(flag));
-    opt_text(s, "FixedMaterial", a.fixed_material.map(flag));
+    opt_flag(s, "HasFixedRateUnits", a.has_fixed_rate_units);
+    opt_flag(s, "FixedMaterial", a.fixed_material);
     opt_text(s, "RegularWork", a.regular_work_min.map(min_to_iso));
     opt_text(
         s,
@@ -3636,8 +3631,8 @@ mod tests {
         );
     }
 
-    /// A work resource carrying every field #84 keeps, with a daily standard
-    /// rate and a weekly overtime rate.
+    /// A work resource carrying every field #84 keeps, with a standard rate
+    /// shown per day and an overtime rate shown per week.
     const RESOURCE_FIELDS: &str = "<Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>\
         <Type>1</Type><WorkGroup>2</WorkGroup><MaxUnits>1</MaxUnits><PeakUnits>1.5</PeakUnits>\
         <OverAllocated>1</OverAllocated><CanLevel>0</CanLevel><Work>PT40H0M0S</Work>\
