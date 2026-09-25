@@ -262,6 +262,9 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
         ];
         // Top-level paragraph matches carry a direct block index + full text,
         // which a client can feed straight back to `doc.replace-range`.
+        // `start`/`end` are editor offsets and `text` is `plain_text()`, which
+        // also holds tracked-change, field and footnote-ref text: when the
+        // paragraph has any, `text[start..end]` need not be the match.
         if m.path.len() == 1 {
             f.push(("block", Json::Num(m.path[0] as f64)));
             if let Some(Block::Paragraph(p)) = body.get(m.path[0]) {
