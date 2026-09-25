@@ -66,7 +66,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
     if out.is_ok()
         && (projctl::MUTATING.contains(&verb) || matches!(verb, "proj.open" | "proj.reload"))
     {
-        app.drop_delete_confirm();
+        app.refresh_confirm();
     }
     if out.is_ok() {
         // An agent edit flashes this pane's status dot, so a watcher sees the
@@ -207,11 +207,14 @@ mod tests {
             assert!(a.confirm.is_none(), "{verb} must drop the stale question");
         }
 
-        // An Exit question is not about the plan, so it stays.
+        // An Exit question stays, but its warning follows the now-dirty plan.
         let mut a = app();
         a.request_exit();
+        assert!(!a.confirm.as_ref().unwrap().prompt().contains("Unsaved"));
         dispatch(&mut a, "task.del", &uid(1)).unwrap();
-        assert!(a.confirm.is_some());
+        let exit = a.confirm.as_ref().expect("the Exit question stays open");
+        assert_eq!(exit.action(), &crate::ConfirmAction::Exit);
+        assert!(exit.prompt().contains("Unsaved"));
     }
 
     #[test]

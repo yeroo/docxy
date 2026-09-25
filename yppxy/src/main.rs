@@ -438,6 +438,9 @@ impl App {
     /// Open the Exit confirmation modal (used by Ctrl+Q and File ▸ Exit).
     fn request_exit(&mut self) {
         self.backstage = None;
+        // A text prompt takes keys before the modal would, so it must not
+        // stay open underneath it.
+        self.prompt = None;
         let prompt = if self.ed.dirty() {
             "Exit yppxy? Unsaved changes will be lost."
         } else {
@@ -699,6 +702,8 @@ impl App {
         match self.ed.subtree_len(uid) {
             Ok(0) => self.delete_subtree(uid),
             Ok(n) => {
+                // As in `request_exit`: no hidden prompt may take the modal's keys.
+                self.prompt = None;
                 let name = self.ed.project().task(uid).map_or("", |t| &t.name);
                 let noun = if n == 1 { "subtask" } else { "subtasks" };
                 self.confirm = Some(backstage::Confirm::new(
@@ -711,15 +716,15 @@ impl App {
         }
     }
 
-    /// Drop a pending summary-delete question: its task, count and project
-    /// were read before an agent edit or a reload changed them. An Exit
-    /// question stays.
-    fn drop_delete_confirm(&mut self) {
-        if matches!(
-            self.confirm.as_ref().map(|c| c.action()),
-            Some(ConfirmAction::DeleteTask(_))
-        ) {
-            self.confirm = None;
+    /// Bring an open question up to date after an agent edit or a reload.
+    /// A summary-delete question is dropped: its task, count and project were
+    /// read before the change. An Exit question is asked again, so its
+    /// unsaved-changes warning follows the plan's dirty state.
+    fn refresh_confirm(&mut self) {
+        match self.confirm.as_ref().map(|c| c.action()) {
+            Some(ConfirmAction::DeleteTask(_)) => self.confirm = None,
+            Some(ConfirmAction::Exit) => self.request_exit(),
+            None => {}
         }
     }
 
@@ -2653,6 +2658,31 @@ mod tests {
         assert!(app.ed.project().tasks.is_empty());
         assert!(app.ed.undo());
         assert_eq!(app.ed.project(), &before);
+    }
+
+    #[test]
+    fn a_summary_delete_closes_any_text_prompt_under_its_modal() {
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.indent(1);
+        app.ed.select(0);
+        let before = app.ed.project().clone();
+        // Ribbon clicks reach `apply_act` while a text prompt is open.
+        app.apply_act(Act::Rename);
+        assert!(app.prompt.is_some());
+        app.apply_act(Act::DeleteTask);
+        assert!(
+            app.prompt.is_none(),
+            "the prompt would take the modal's keys"
+        );
+        on_key(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.confirm.is_none(), "Esc reaches the visible question");
+        assert_eq!(app.ed.project(), &before);
+
+        // File ▸ Exit over a prompt is the same case.
+        app.apply_act(Act::Rename);
+        app.request_exit();
+        assert!(app.prompt.is_none());
     }
 
     #[test]
