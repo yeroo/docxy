@@ -382,7 +382,9 @@ function docxyToolDefs() {
     ),
     tool(
       'docxy_find',
-      'Find all occurrences of a query in the live document; returns match positions and the containing paragraph.',
+      'Find all occurrences of a query in the live document; returns match positions and the containing paragraph. ' +
+        'Text inside tracked changes, fields, footnote refs and links holding such markup is not searched, ' +
+        'and start/end are editor offsets that skip it, so they need not index the returned text.',
       Object.fromEntries([
         ['query', prop('string', 'Text to search for.')],
         ['case_sensitive', prop('boolean', 'Match case (default false).')],
@@ -483,7 +485,8 @@ function docxyToolDefs() {
     tool(
       'docxy_replace_all',
       'Replace every occurrence of a query with text across the whole document ' +
-        '(case-insensitive unless case_sensitive:true). Undoable.',
+        '(case-insensitive unless case_sensitive:true); text inside tracked changes, ' +
+        'fields, footnote refs and links holding such markup is left alone. Undoable.',
       Object.fromEntries([
         ['query', prop('string', 'Text to search for.')],
         ['text', prop('string', 'Replacement text.')],

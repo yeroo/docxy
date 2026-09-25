@@ -151,7 +151,7 @@ One JSON object per line; one reply line per request:
 | `doc.path` | — | `{path, format, modified, blocks, protection?, watermark?}` |
 | `doc.outline` | — | `{headings:[{index, level, text}]}` |
 | `doc.read` | `{start?, end?}` or `{range?:"a..b"}` (default: whole doc) | `{total, start, end, text, blocks:[{index, kind, text, heading?}]}` |
-| `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` |
+| `doc.find` | `{query, case_sensitive?}` | `{query, count, matches:[{path, start, end, block?, text?}]}` — `start`/`end` are editor offsets (see notes) |
 | `doc.replace-range` | `{start, end?, text, markdown?}` | `{replaced, total}` |
 | `doc.insert` | `{at, text, markdown?}` | `{total}` |
 | `doc.append` | `{text, markdown?}` | `{total}` |
@@ -195,6 +195,14 @@ Notes:
   A document can have distinct first-page and even-page headers/footers;
   those aren't surfaced by these verbs — only `app.headers.default`/
   `app.footers.default`.
+- **`doc.find` and `doc.replace-all` see only the text the editor can edit.**
+  Text inside tracked changes (`w:ins`/`w:del`), field results, footnote/
+  endnote references and links that hold such markup is shown but is not
+  searched or replaced. A match's `start`/`end` are editor offsets, which skip
+  that text, while `text` is the paragraph's full plain text (the form
+  `doc.replace-range` round-trips), which includes it. So in such a paragraph,
+  `text[start..end]` need not be the match: don't splice `text` at those
+  offsets.
 - `doc.replace-all` and `doc.undo`/`doc.redo` no-op cleanly: a `query` that
   matches nothing, or an undo/redo on an empty stack, reports `replaced:0`/
   `done:false` and does **not** mark the document modified or flash the
