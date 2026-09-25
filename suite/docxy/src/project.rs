@@ -215,6 +215,21 @@ impl ProjectView {
             .set(self.gantt_x.get() + if right { DAY_W } else { -DAY_W });
         self.clamp_offsets();
     }
+
+    /// Task › Editing › Scroll to Task: pan the chart so the selected task's
+    /// bar starts a day in from its left edge. The scale is refreshed first:
+    /// an edit since the last layout may have moved its origin or end.
+    pub fn scroll_to_task(&mut self) {
+        self.refresh_schedule_layout();
+        let bar = self
+            .selected_uid()
+            .and_then(|uid| self.ed.project().task(uid))
+            .and_then(|task| gantt_bar(&self.ed, task, self.scale));
+        if let Some(bar) = bar {
+            self.gantt_x.set((bar.start - 1).max(0) as f32 * DAY_W);
+            self.clamp_offsets();
+        }
+    }
 }
 
 /// A pane's horizontal offset, shared with its scrollbar: gpui-component calls

@@ -241,16 +241,20 @@ fn project_instruction_paths_exist() {
         ("Task", "Schedule", "Indent Task", Indent),
         ("Task", "Schedule", "Outdent Task", Outdent),
         ("Task", "Schedule", "Link the Selected Tasks", AddLink),
+        ("Task", "Schedule", "Unlink Tasks", UnlinkTasks),
+        ("Task", "Tasks", "Move", MoveTask),
         ("Task", "Insert", "Task", AddTask),
         ("Task", "Insert", "Milestone", Milestone),
         ("Task", "Properties", "Information", Constraint),
         ("Task", "Editing", "Find", Find),
+        ("Task", "Editing", "Scroll to Task", ScrollToTask),
         ("Resource", "Assignments", "Assign Resources", Assign),
         ("Resource", "Level", "Level All", LevelAll),
         ("Resource", "Level", "Clear Leveling", ClearLeveling),
         ("Report", "Export", "Export Gantt", ExportGantt),
         ("Project", "Schedule", "Calculate Project", Recalc),
         ("Project", "Schedule", "Set Baseline", Baseline),
+        ("Project", "Schedule", "Clear Baseline", ClearBaseline),
         ("View", "Split View", "Timeline", Timeline),
     ] {
         let path = format!("{tab} > {group} > {label}");
@@ -566,11 +570,23 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
         (Assign, Some("Alice"), false),
         (ClearResources, None, false),
         (Baseline, None, false),
+        (ClearBaseline, None, false),
         (Milestone, None, true),
+        (UnlinkTasks, None, true),
+        (MoveTask, Some("1d"), true),
     ] {
         let mut t = tab();
         if act == Outdent {
             vm(&mut t).ed.indent(2, 1).unwrap();
+        }
+        if act == ClearBaseline {
+            vm(&mut t).ed.set_baseline();
+        }
+        if act == UnlinkTasks {
+            vm(&mut t)
+                .ed
+                .add_predecessor(2, 1, LinkType::FinishStart, 0)
+                .unwrap();
         }
         if act == ClearResources {
             vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
@@ -611,6 +627,12 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
                 t.baseline(0)
                     .is_some_and(|b| b.start.is_some() && b.finish.is_some())
             })),
+            ClearBaseline => assert!(after.tasks.iter().all(|t| t.baseline(0).is_none())),
+            UnlinkTasks => assert!(after.tasks.iter().all(|t| t.predecessors.is_empty())),
+            MoveTask => assert_eq!(
+                after.task(2).unwrap().constraint,
+                projcore::ConstraintType::StartNoEarlierThan
+            ),
             _ => unreachable!(),
         }
         apply_project_act(&mut t, Undo);
@@ -807,6 +829,10 @@ fn task_commands_do_nothing_on_the_entry_row() {
     let mut t = tab();
     // Give the last task something every command would change.
     vm(&mut t).ed.assign_resource(2, "Bob").unwrap();
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
     let p = v(&t).ed.project().clone();
     vm(&mut t).ed = ProjectEditor::new(p);
     project_entry_click(&mut t, None, false);
@@ -824,8 +850,13 @@ fn task_commands_do_nothing_on_the_entry_row() {
         AddLink,
         Constraint,
         Assign,
+        UnlinkTasks,
+        MoveTask,
+        ScrollToTask,
     ] {
+        vm(&mut t).gantt_x.set(44.);
         apply_project_act(&mut t, act);
+        assert_eq!(v(&t).gantt_x.get(), 44., "{act:?}");
         assert!(v(&t).prompt.is_none(), "{act:?} opened a prompt");
         assert_eq!(v(&t).ed.project(), &before, "{act:?}");
         assert_eq!(v(&t).ed.undo_depth(), 0, "{act:?}");
@@ -904,4 +935,122 @@ fn deleting_every_task_latches_the_entry_row_through_undo() {
     assert_eq!(v(&t).ed.project().tasks.len(), 1);
     assert!(v(&t).on_entry_row());
     assert_eq!(v(&t).cursor_row(), 1);
+}
+
+// ---- Project commands added for #118 ----
+
+#[test]
+fn unlink_tasks_reports_what_it_removed() {
+    let mut t = tab();
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
+    let depth = v(&t).ed.undo_depth();
+    // The first task: its one successor link goes.
+    vm(&mut t).ed.select(0);
+    apply_project_act(&mut t, ProjectAct::UnlinkTasks);
+    assert_eq!(t.status.as_ref(), "Removed 1 link");
+    assert!(v(&t).ed.project().task(2).unwrap().predecessors.is_empty());
+    assert!(t.dirty);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    vm(&mut t).ed.mark_saved();
+    apply_project_act(&mut t, ProjectAct::UnlinkTasks);
+    assert_eq!(t.status.as_ref(), "No links to remove");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(!v(&t).ed.dirty());
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project().task(2).unwrap().predecessors.len(), 1);
+}
+
+#[test]
+fn clear_baseline_reports_whether_there_was_one() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::ClearBaseline);
+    assert_eq!(t.status.as_ref(), "No baseline to clear");
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert!(!t.dirty);
+    apply_project_act(&mut t, ProjectAct::Baseline);
+    apply_project_act(&mut t, ProjectAct::ClearBaseline);
+    assert_eq!(t.status.as_ref(), "Baseline cleared");
+    assert!(
+        v(&t)
+            .ed
+            .project()
+            .tasks
+            .iter()
+            .all(|t| t.baseline(0).is_none())
+    );
+    assert_eq!(v(&t).ed.undo_depth(), 2);
+    assert!(t.dirty);
+}
+
+#[test]
+fn move_prompts_for_an_amount_and_reports_the_new_start() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::MoveTask);
+    let prompt = v(&t).prompt.clone().expect("Move asks how far");
+    assert_eq!((prompt.kind, prompt.uid), (PromptKind::Move, Some(2)));
+    assert_eq!(prompt.kind.name(), "move");
+    assert_eq!(
+        prompt_label(&prompt, &v(&t).ed).as_ref(),
+        "Move task by (1d / 1w / 4w; -1d back)"
+    );
+    for c in ["1", "w"] {
+        project_input(&mut t, c, Some(c), Modifiers::default());
+    }
+    project_input(&mut t, "enter", None, Modifiers::default());
+    assert_eq!(t.status.as_ref(), "Moved to 2026-01-12");
+    assert_eq!(
+        v(&t).ed.schedule().get(2).unwrap().early_start,
+        projcore::DateTime::from_ymd_hm(2026, 1, 12, 8, 0)
+    );
+    assert!(t.dirty);
+    // A refused amount says why and changes nothing.
+    let before = v(&t).ed.project().clone();
+    commit(&mut t, ProjectAct::MoveTask, "soon");
+    assert_eq!(
+        t.status.as_ref(),
+        "Couldn't read 'soon' (try 1d, 1w, 4w, -1d)"
+    );
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    // So does a summary.
+    let mut t = summary_tab();
+    let before = v(&t).ed.project().clone();
+    commit(&mut t, ProjectAct::MoveTask, "1d");
+    assert_eq!(t.status.as_ref(), "Move a subtask, not a summary");
+    assert_eq!(v(&t).ed.project(), &before);
+    assert!(!t.dirty);
+}
+
+#[test]
+fn scroll_to_task_puts_the_bar_a_day_in_from_the_left_edge() {
+    let mut t = tab();
+    // A narrow chart, so the pan's clamp does not decide where it lands.
+    vm(&mut t).gantt_w = 100.;
+    vm(&mut t).refresh_schedule_layout();
+    let days = v(&t).scale.days;
+    // Eight weeks on is past the scale the view last laid out: a stale
+    // scale would clamp the pan short of the bar.
+    vm(&mut t).ed.move_task(2, "8w").unwrap();
+    assert!(
+        v(&t).scale.days < 56,
+        "the view's scale is stale ({days} days)"
+    );
+    vm(&mut t).ed.mark_saved();
+    let before = v(&t).ed.project().clone();
+    let status = t.status.clone();
+    apply_project_act(&mut t, ProjectAct::ScrollToTask);
+    // Monday 2026-01-05 + 56 days, less the one-day margin.
+    assert_eq!(v(&t).gantt_x.get(), 55. * DAY_W);
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert_eq!(t.status, status);
+    assert!(!t.dirty);
+    assert_eq!(take_reveal(&t), None);
+    // A bar at the chart's origin scrolls to the very start.
+    vm(&mut t).ed.select(0);
+    apply_project_act(&mut t, ProjectAct::ScrollToTask);
+    assert_eq!(v(&t).gantt_x.get(), 0.);
 }
