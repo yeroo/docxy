@@ -183,6 +183,13 @@ fn refused_moves_change_nothing() {
             "Move is outside the scheduling range",
         ),
         (20, "40000d", "Move is outside the scheduling range"),
+        (
+            20,
+            "-9223372036854775808d",
+            "Move is outside the scheduling range",
+        ),
+        (20, "30000d", "Move is outside the scheduling range"),
+        (20, "-6000w", "Move is outside the scheduling range"),
     ] {
         assert_eq!(ed.move_task(uid, text), Err(error.into()), "{uid} {text}");
         assert_eq!(ed.project(), &before, "{uid} {text}");

@@ -27,8 +27,7 @@ impl Editor {
             .or_else(|| self.sched.get(uid).map(|r| r.early_start))
             .ok_or("The row has no task to move")?;
         let calendar = cells::task_calendar(&self.proj, task);
-        let start = shift_working_days(&calendar, base, days)
-            .ok_or("No working day in reach on the task's calendar")?;
+        let start = shift_working_days(&calendar, base, days)?;
         self.validate_pinned_day(start)?;
         self.set_start_at(uid, start)?;
         Ok(start)
@@ -53,7 +52,7 @@ pub fn parse_move(text: &str, proj: &Project) -> Result<i64, String> {
         return Err("Move by at least one day".into());
     }
     n.checked_mul(per)
-        .filter(|days| days.abs() <= HORIZON_DAYS)
+        .filter(|days| days.unsigned_abs() <= HORIZON_DAYS.unsigned_abs())
         .ok_or_else(|| "Move is outside the scheduling range".into())
 }
 
@@ -68,24 +67,34 @@ fn week_days(proj: &Project) -> i64 {
 }
 
 /// `from` moved by `days` working days of `calendar` (backward when
-/// negative), at the same time of day; non-working days are skipped. `None`
-/// when the calendar has too few working days within the scheduling horizon.
-fn shift_working_days(calendar: &WorkCalendar, from: DateTime, days: i64) -> Option<DateTime> {
+/// negative), at the same time of day; non-working days are skipped. Refused
+/// when the walk leaves the scheduling horizon: as out of range when the
+/// calendar works but not enough, else as a calendar without working days.
+fn shift_working_days(
+    calendar: &WorkCalendar,
+    from: DateTime,
+    days: i64,
+) -> Result<DateTime, String> {
     let step = days.signum();
-    let mut left = days.abs();
-    let mut offset = 0;
+    let mut left = days.unsigned_abs();
+    let mut offset = 0i64;
     let mut slots = Vec::new();
     while left > 0 {
-        offset += step;
-        if offset.abs() > HORIZON_DAYS {
-            return None;
+        if offset.unsigned_abs() >= HORIZON_DAYS.unsigned_abs() {
+            return Err(if left < days.unsigned_abs() {
+                "Move is outside the scheduling range"
+            } else {
+                "No working day in reach on the task's calendar"
+            }
+            .into());
         }
+        offset += step;
         calendar.day_into(from.day_number() + offset, &mut slots);
         if !slots.is_empty() {
             left -= 1;
         }
     }
-    Some(from.add_days(offset))
+    Ok(from.add_days(offset))
 }
 
 #[cfg(test)]
