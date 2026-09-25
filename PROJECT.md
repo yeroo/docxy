@@ -180,8 +180,14 @@ On a manual task, Start moves the task to that day's first working time (08:00
 on a non-working day) keeping its duration, and Finish sets its finish at the
 day's last working time (17:00 on a non-working day) and its duration to the
 working time in between; neither adds a constraint. Predecessors use
-displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated;
-retained assignments keep their units/work, and unknown names create resources.
+displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated,
+and unknown names create resources. A new work assignment starts at the
+resource's Max. Units capped at 100%, with work = duration x units; `Name[NN%]`
+sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
+allowed). The cell shows `Name[NN%]` for a work assignment that is not at 100%,
+and deleting the bracket resets it to 100%. An existing resource whose name
+matches the whole token wins; otherwise a name ending in `[...]` must hold valid
+`NN%` units. Retained assignments whose text is unchanged keep their units/work.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
 be entered individually through the resource-list syntax.
