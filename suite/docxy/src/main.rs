@@ -12494,6 +12494,157 @@ mod doc_save_target_tests {
 }
 
 #[cfg(test)]
+mod load_failed_save_tests {
+    use super::*;
+    use core::prelude::v1::test;
+    use std::path::Path;
+
+    fn temp(tag: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/load-failed-tests")
+            .join(format!("{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn word_bundle(docx: &[u8]) -> String {
+        htmlbundle::wrap(
+            &htmlbundle::docx_assets(),
+            b"\0asm stand-in",
+            "docx",
+            "sample.docx",
+            docx,
+            "test",
+            "2026-09-25T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    fn basic_docx() -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        )
+        .unwrap()
+    }
+
+    /// Opens `path`, which must fail to load, edits the tab, and checks that
+    /// neither Save nor a Save As onto the same file touches it.
+    fn refused_in_place(path: &Path) -> DocTab {
+        let before = std::fs::read(path).ok();
+        let mut tab = tab_from_path(&path.to_path_buf());
+        assert!(tab.load_failed, "{}", tab.status);
+        tab.dirty = true;
+        assert!(!save_doc_tab(&mut tab, None));
+        assert_eq!(tab.status.as_ref(), DOC_LOAD_FAILED_SAVE);
+        assert!(tab.dirty, "a refused save leaves the tab dirty");
+        tab.status = "".into();
+        assert!(!save_doc_tab(&mut tab, Some(path.to_path_buf())));
+        assert_eq!(tab.status.as_ref(), DOC_LOAD_FAILED_SAVE);
+        assert!(tab.dirty);
+        assert_eq!(tab.path.as_deref(), Some(path));
+        assert_eq!(std::fs::read(path).ok(), before, "{}", path.display());
+        tab
+    }
+
+    #[test]
+    fn only_a_load_failed_tab_saving_onto_its_own_file_is_refused() {
+        let dir = temp("helper");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for name in ["broken.docx", "broken.docx.html"] {
+            let own = dir.join(name);
+            let other = dir.join(format!("copy-{name}"));
+            // Refused whether the file is there (garbled) or not (missing).
+            for exists in [false, true] {
+                if exists {
+                    std::fs::write(&own, b"garbled").unwrap();
+                }
+                assert!(refuses_load_failed_save(true, Some(&own), None));
+                assert!(refuses_load_failed_save(true, Some(&own), Some(&own)));
+                assert!(!refuses_load_failed_save(true, Some(&own), Some(&other)));
+                for target in [None, Some(own.as_path()), Some(other.as_path())] {
+                    assert!(!refuses_load_failed_save(false, Some(&own), target));
+                }
+            }
+            // The same file spelled another way is still that file.
+            let spelled = dir.join("sub").join("..").join(name);
+            assert!(refuses_load_failed_save(true, Some(&own), Some(&spelled)));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_docx_load_refuses_save_in_place_and_keeps_the_file() {
+        let dir = temp("docx");
+        let path = dir.join("broken.docx");
+        std::fs::write(&path, b"not a zip").unwrap();
+        let mut tab = refused_in_place(&path);
+        let copy = dir.join("copy.docx");
+        assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
+        assert!(!tab.load_failed && !tab.dirty);
+        assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
+        tab.dirty = true;
+        assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        assert!(!tab_from_path(&copy).load_failed);
+        assert_eq!(std::fs::read(&path).unwrap(), b"not a zip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_file_is_not_created_by_save_in_place() {
+        let dir = temp("missing");
+        let path = dir.join("missing.docx");
+        let tab = refused_in_place(&path);
+        assert!(!path.exists());
+        drop(tab);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_plain_html_page_opened_as_a_document_is_refused() {
+        let dir = temp("plain-html");
+        let path = dir.join("broken.docx.html");
+        std::fs::write(&path, "<html>mine</html>").unwrap();
+        refused_in_place(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_word_bundle_with_a_bad_payload_refuses_save_in_place() {
+        let dir = temp("bad-payload");
+        let path = dir.join("sample.docx.html");
+        std::fs::write(&path, word_bundle(b"PK one")).unwrap();
+        let tab = tab_from_path(&path);
+        assert!(tab.status.starts_with("load error"), "{}", tab.status);
+        let mut tab = refused_in_place(&path);
+        let copy = dir.join("copy.docx");
+        assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
+        assert!(!tab.load_failed);
+        assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn documents_that_load_are_not_marked_and_save_in_place() {
+        let dir = temp("good");
+        let docx = dir.join("good.docx");
+        std::fs::write(&docx, basic_docx()).unwrap();
+        let md = dir.join("good.md");
+        std::fs::write(&md, "# Notes\n\nText.\n").unwrap();
+        let page = dir.join("good.docx.html");
+        std::fs::write(&page, word_bundle(&basic_docx())).unwrap();
+        for path in [docx, md, page] {
+            let mut tab = tab_from_path(&path);
+            assert!(!tab.load_failed, "{}: {}", path.display(), tab.status);
+            assert!(!tab.status.starts_with("load error"), "{}", tab.status);
+            tab.dirty = true;
+            assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
 mod doc_table_row_tests {
     use super::{Act, Block, Caret, Document, Docxy, Paragraph, Table};
     use docxcore::load::{Relationships, parse_document_xml};
