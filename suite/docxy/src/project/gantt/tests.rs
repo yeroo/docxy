@@ -358,3 +358,35 @@ fn harness_state_reports_filler_rows_for_the_laid_out_body() {
     let v = ProjectView::new(untitled_project(), false);
     assert!(project_state(&v, Some(280.)).contains(&("filler_rows".into(), Json::Num(10.))));
 }
+
+#[test]
+fn a_short_plan_on_a_wide_window_has_days_across_the_whole_chart() {
+    let mut p = untitled_project();
+    p.tasks = vec![task(1, 1, 1)];
+    let mut v = ProjectView::new(p, false);
+    let before = bar(&v.ed, 1);
+    v.layout(2000.);
+    assert!(
+        v.gantt_w > v.scale.width(),
+        "the plan is shorter than the chart"
+    );
+    let chart = v.chart_scale();
+    assert!(chart.width() >= v.gantt_w);
+    let last = *day_lines(chart, 0., v.gantt_w).last().unwrap();
+    assert!(
+        v.gantt_w - last <= DAY_W,
+        "last day line {last} of {}",
+        v.gantt_w
+    );
+    let weekend = shaded_days(chart, 0., v.gantt_w);
+    assert!(*weekend.last().unwrap() as f32 * DAY_W >= v.gantt_w - 7. * DAY_W);
+    // Bars keep their days, and the widened days are not a place to scroll to.
+    assert_eq!(bar(&v.ed, 1), before);
+    assert_eq!(chart.origin_day, v.scale.origin_day);
+    v.pan_gantt(true);
+    assert_eq!(v.gantt_x, 0.);
+    // A plan wider than the chart draws and scrolls on its own scale.
+    v.ed.set_duration(1, "60d").unwrap();
+    v.layout(1180.);
+    assert_eq!(v.chart_scale(), v.scale);
+}

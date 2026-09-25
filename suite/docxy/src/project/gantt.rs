@@ -198,12 +198,11 @@ fn backdrop(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> impl IntoEl
 
 /// The grid behind every row of the body, task or empty: table rules and column dividers,
 /// chart shading, day lines and rules. Painted once at full height so it fills the pane.
-pub(crate) fn body_grid(
-    view: &ProjectView,
-    scroll: UniformListScrollHandle,
-    pal: Pal,
-) -> impl IntoElement {
-    let (table_w, table_x, gantt_x, scale) = (view.table_w, view.table_x, view.gantt_x, view.scale);
+pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
+    // The handle the list tracks, so the rules cannot drift from the rows.
+    let scroll = view.scroll.clone();
+    let (table_w, table_x, gantt_x, scale) =
+        (view.table_w, view.table_x, view.gantt_x, view.chart_scale());
     let rule = Hsla {
         a: pal.border.a * 0.6,
         ..pal.border

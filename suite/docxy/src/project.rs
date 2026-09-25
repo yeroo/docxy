@@ -55,6 +55,15 @@ impl ProjectView {
         self.clamp_offsets();
     }
 
+    /// The drawn scale: the plan's, widened to the viewport so a short plan's chart still has
+    /// days to its right edge. Scrolling clamps to the plan's own scale, not this one.
+    pub fn chart_scale(&self) -> GanttScale {
+        GanttScale {
+            days: self.scale.days.max((self.gantt_w / DAY_W).ceil() as i64),
+            ..self.scale
+        }
+    }
+
     fn clamp_offsets(&mut self) {
         self.table_x = self.table_x.clamp(0., (TABLE_W - self.table_w).max(0.));
         self.gantt_x = self
@@ -657,7 +666,7 @@ pub(super) fn project_el(
         view.gantt_w,
         view.table_x,
         view.gantt_x,
-        view.scale,
+        view.chart_scale(),
     );
     let row_probes = probes.clone();
     v_flex()
@@ -707,7 +716,7 @@ pub(super) fn project_el(
                 .min_h_0()
                 .w_full()
                 .overflow_hidden()
-                .child(body_grid(view, view.scroll.clone(), pal))
+                .child(body_grid(view, pal))
                 .child(probe(probes, "project-body"))
                 // Rows stop propagation, so only the ruled empty rows land here.
                 .on_click(cx.listener(move |this, _, window, cx| {
