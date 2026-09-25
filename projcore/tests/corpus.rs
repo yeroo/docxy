@@ -12,8 +12,9 @@
 //! scheduler, and file 20 (issue #80), whose task fields and blank row are
 //! ours; neither is verified in Project yet. Blank rows carry no oracle. File
 //! 21's oracle (issue #100) was entered by hand from the issue's Project 2021
-//! capture; the file was not run through `verify_mspdi_project.py`. Slack
-//! invariants below also check
+//! capture; the file was not run through `verify_mspdi_project.py`. File 22
+//! (issue #81) carries progress values of our own and is not verified in
+//! Project either. Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -188,6 +189,11 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             .iter()
             .any(|p| p.file_name().unwrap() == "20-task-fields.xml")
     );
+    assert!(
+        files
+            .iter()
+            .any(|p| p.file_name().unwrap() == "22-progress.xml")
+    );
     for path in files {
         let xml = std::fs::read_to_string(&path).unwrap();
         let proj = read_mspdi(&xml).unwrap();
@@ -211,6 +217,13 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             "{}: MSPDI resources changed",
             path.display()
         );
+        // Including #81's recorded progress and assignment baselines.
+        assert_eq!(
+            xml_back.assignments,
+            proj.assignments,
+            "{}: MSPDI assignments changed",
+            path.display()
+        );
         let package_back = read_yppx(&write_yppx(&proj)).unwrap();
         assert_eq!(
             package_back.tasks,
@@ -228,6 +241,12 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             package_back.resources,
             proj.resources,
             "{}: .yppx resources changed",
+            path.display()
+        );
+        assert_eq!(
+            package_back.assignments,
+            proj.assignments,
+            "{}: .yppx assignments changed",
             path.display()
         );
     }
@@ -504,6 +523,58 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
     let saved = write_mspdi(&proj);
     assert_eq!(saved.matches("<IsNull>1</IsNull>").count(), 1);
     assert_eq!(saved.matches("<IsNull>0</IsNull>").count(), 4);
+}
+
+#[test]
+fn progress_fixture_keeps_actuals_through_a_save() {
+    use projcore::DateTime;
+    let xml = std::fs::read_to_string(corpus_dir().join("22-progress.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    let percent: Vec<_> = proj.tasks.iter().map(|t| t.percent_complete).collect();
+    assert_eq!(percent, [Some(100), Some(50), Some(0)]);
+    let pour = proj.task(2).unwrap();
+    assert_eq!(
+        (pour.stop, pour.resume),
+        (
+            Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0)),
+            Some(DateTime::from_ymd_hm(2026, 3, 6, 8, 0))
+        )
+    );
+    assert_eq!(pour.remaining_duration_min, Some(960));
+    let slots: Vec<_> = proj.assignments[1]
+        .baselines
+        .iter()
+        .map(|b| b.number)
+        .collect();
+    assert_eq!(slots, [0, 1]);
+    // What the issue saw dropped comes back from a save, element for element.
+    let saved = write_mspdi(&proj);
+    for element in [
+        "<PercentComplete>",
+        "<PercentWorkComplete>",
+        "<PhysicalPercentComplete>",
+        "<ActualStart>",
+        "<ActualFinish>",
+        "<ActualDuration>",
+        "<ActualWork>",
+        "<ActualCost>",
+        "<Stop>",
+        "<Resume>",
+        "<RemainingDuration>",
+        "<RemainingWork>",
+        "<RemainingCost>",
+        "<StartVariance>",
+        "<FinishVariance>",
+        "<WorkVariance>",
+        "<CostVariance>",
+        "<Baseline>",
+    ] {
+        assert_eq!(
+            saved.matches(element).count(),
+            xml.matches(element).count(),
+            "{element}"
+        );
+    }
 }
 
 /// The full native pipeline on real files: MSPDI → .yppx package → back → the

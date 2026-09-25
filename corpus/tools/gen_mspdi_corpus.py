@@ -12,8 +12,9 @@ reproduces them. `projcore/tests/corpus.rs` reads each file, runs the CPM
 scheduler, and asserts the computed values match the embedded ones, so the
 corpus validates the scheduler without needing Project. Rerun the script
 whenever a fixture changes. Exceptions: file 19's manual-task expectations
-(#77) and file 20's task-field expectations (#80) are hand-derived from our
-scheduler and not yet verified in Project.
+(#77), file 20's task-field expectations (#80) and file 22's progress
+expectations (#81) are hand-derived from our scheduler and not yet verified in
+Project.
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -436,6 +437,84 @@ def build():
             task(2, "B", 5 * D, dt(9), dt(13, "17:00:00"), slack=-5 * D, critical=True,
                  preds=[(1, FS, 0)], fields=[("Deadline", dt(6, "17:00:00"))]),
         ])))
+
+    # 22 — recorded progress survives saves (#81): a complete task, an
+    # in-progress task stopped Thu 5 and resuming Fri 6, and a not-started
+    # task, each with an assignment carrying its actuals; the in-progress
+    # assignment also has two baseline slots. Shapes follow a Project 2021
+    # tracked plan (Stop == Resume == finish once complete, Resume at the next
+    # working moment after Stop). The actual dates equal the scheduled ones, so
+    # the oracle holds while the scheduler ignores progress. Hand-derived like
+    # files 19 and 20, not verified in Project; no Project file with an
+    # assignment <Baseline> was available, so that shape follows the schema.
+    progress_res = ("    <Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>"
+                    "<Type>1</Type><MaxUnits>1</MaxUnits><StandardRate>50</StandardRate>"
+                    "</Resource>")
+
+    def assignment(uid, task_uid, work, fields=(), baselines=()):
+        # Children in Project's Assignment sequence.
+        lines = ["    <Assignment>",
+                 f"      <UID>{uid}</UID><TaskUID>{task_uid}</TaskUID>"
+                 "<ResourceUID>1</ResourceUID>"]
+        lines += [f"      <{tag}>{value}</{tag}>" for tag, value in fields]
+        lines.append(f"      <Units>1</Units><Work>{iso(work)}</Work>")
+        for number, children in baselines:
+            lines += ["      <Baseline>", f"        <Number>{number}</Number>"]
+            lines += [f"        <{tag}>{value}</{tag}>" for tag, value in children]
+            lines.append("      </Baseline>")
+        lines.append("    </Assignment>")
+        return "\n".join(lines)
+
+    progress_asn = "\n".join([
+        assignment(1, 1, 2 * D, [
+            ("PercentWorkComplete", 100), ("ActualCost", "800"),
+            ("ActualFinish", dt(3, "17:00:00")), ("ActualStart", dt(2)),
+            ("ActualWork", iso(2 * D)), ("CostVariance", "0"), ("FinishVariance", 0),
+            ("WorkVariance", "0.0"), ("Stop", dt(3, "17:00:00")),
+            ("Resume", dt(3, "17:00:00")), ("StartVariance", 0)],
+            baselines=[(0, [("Start", dt(2)), ("Finish", dt(3, "17:00:00")),
+                            ("Work", iso(2 * D)), ("Cost", "800")])]),
+        assignment(2, 2, 4 * D, [
+            ("PercentWorkComplete", 50), ("ActualCost", "800"), ("ActualStart", dt(4)),
+            ("ActualWork", iso(2 * D)), ("CostVariance", "400"),
+            ("FinishVariance", 4800), ("WorkVariance", "480000.0"),
+            ("RemainingCost", "800"), ("RemainingWork", iso(2 * D)),
+            ("Stop", dt(5, "17:00:00")), ("Resume", dt(6)), ("StartVariance", 0)],
+            baselines=[(0, [("Start", dt(4)), ("Finish", dt(6, "17:00:00")),
+                            ("Work", iso(3 * D)), ("Cost", "1200")]),
+                       (1, [("Work", iso(5 * D))])]),
+        assignment(3, 3, D, [
+            ("PercentWorkComplete", 0), ("RemainingCost", "400"),
+            ("RemainingWork", iso(D))]),
+    ])
+    add("22-progress.xml", ["progress", "assignment", "round-trip", "link", "link-fs"],
+        "Percent complete, actuals, stop/resume, remaining values, variances and "
+        "assignment baselines survive saves.",
+        project("progress", "\n".join([
+            task(1, "Excavate", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT, fields=[
+                ("Stop", dt(3, "17:00:00")), ("Resume", dt(3, "17:00:00")),
+                ("StartVariance", 0), ("FinishVariance", 0), ("WorkVariance", "0.0"),
+                ("PercentComplete", 100), ("PercentWorkComplete", 100),
+                ("ActualStart", dt(2)), ("ActualFinish", dt(3, "17:00:00")),
+                ("ActualDuration", iso(2 * D)), ("ActualCost", "800"),
+                ("ActualWork", iso(2 * D)), ("PhysicalPercentComplete", 0)]),
+            task(2, "Pour", 4 * D, dt(4), dt(9, "17:00:00"), **CRIT, preds=[(1, FS, 0)],
+                 fields=[
+                ("Stop", dt(5, "17:00:00")), ("Resume", dt(6)),
+                ("StartVariance", 0), ("FinishVariance", 4800),
+                ("WorkVariance", "480000.0"), ("PercentComplete", 50),
+                ("PercentWorkComplete", 50), ("ActualStart", dt(4)),
+                ("ActualDuration", iso(2 * D)), ("ActualCost", "800"),
+                ("ActualWork", iso(2 * D)), ("RemainingDuration", iso(2 * D)),
+                ("RemainingCost", "800"), ("RemainingWork", iso(2 * D)),
+                ("PhysicalPercentComplete", 40)]),
+            task(3, "Cure", D, dt(10), dt(10, "17:00:00"), **CRIT, preds=[(2, FS, 0)],
+                 fields=[
+                ("StartVariance", 4800), ("FinishVariance", 4800),
+                ("PercentComplete", 0), ("PercentWorkComplete", 0),
+                ("RemainingDuration", iso(D)), ("RemainingCost", "400"),
+                ("RemainingWork", iso(D)), ("PhysicalPercentComplete", 0)]),
+        ]), resources_xml=progress_res, assignments_xml=progress_asn))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

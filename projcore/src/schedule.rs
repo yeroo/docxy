@@ -1774,6 +1774,7 @@ mod tests {
                 resource_uid: 1,
                 units: 1.0,
                 work_min: 2400,
+                ..Assignment::default()
             });
         }
         proj
@@ -2479,6 +2480,7 @@ mod tests {
                 resource_uid: 1,
                 units: 1.0,
                 work_min: 480,
+                ..Assignment::default()
             });
         }
         let proj = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(&proj)).unwrap();
@@ -3771,7 +3773,7 @@ mod tests {
             task_uid: task,
             resource_uid: res,
             units,
-            work_min: 0,
+            ..Assignment::default()
         }
     }
 
