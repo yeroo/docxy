@@ -1136,7 +1136,35 @@ fn a_literal_bracketed_resource_does_not_steal_the_assigned_cell_text() {
         .unwrap();
     assert_eq!(allocation(&ed, 10, 1), (0.5, 480));
     assert_eq!(format_resource_names(&ed.proj, 10), "Bob[50%], Carol");
-    // Where Bob is not assigned, the whole name still wins.
+    // Where Bob is not assigned, the whole name still wins, and recommitting keeps it.
     ed.set_resources(20, &["Bob[50%]".into()]).unwrap();
     assert_eq!(allocation(&ed, 20, 7), (1.0, 480));
+    let depth = ed.undo_depth();
+    ed.set_resources(20, &["bob[50%]".into()]).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    // Both assigned: the cell reads the same text twice, so either token is ambiguous.
+    ed.set_resources(10, &["Bob[50%]".into(), "Carol".into(), "Rig".into()])
+        .unwrap();
+    ed.proj.assignments.push(Assignment {
+        uid: 99,
+        task_uid: 10,
+        resource_uid: 7,
+        units: 1.0,
+        work_min: 960,
+    });
+    assert_eq!(
+        format_resource_names(&ed.proj, 10),
+        "Bob[50%], Carol, Rig, Bob[50%]"
+    );
+    ed.mark_saved();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    for tokens in [&["Bob[50%]"][..], &["Bob[50%]", "Carol", "Rig", "Bob[50%]"]] {
+        let tokens: Vec<String> = tokens.iter().map(|t| t.to_string()).collect();
+        assert_eq!(
+            ed.set_resources(10, &tokens),
+            Err("Resource name 'Bob[50%]' is ambiguous".into())
+        );
+        unchanged(&ed, &before, history);
+    }
 }

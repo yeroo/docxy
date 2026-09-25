@@ -185,9 +185,11 @@ and unknown names create resources. A new work assignment starts at the
 resource's Max. Units capped at 100%, with work = duration x units; `Name[NN%]`
 sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
 allowed). The cell shows `Name[NN%]` for a work assignment that is not at 100%,
-and deleting the bracket resets it to 100%. An existing resource whose name
-matches the whole token wins; otherwise a name ending in `[...]` must hold valid
-`NN%` units. Retained assignments whose text is unchanged keep their units/work.
+and deleting the bracket resets it to 100%. In the Resource Names cell, a token
+that names, or equals the shown `Name[NN%]` text of, one of the task's
+assignments keeps that assignment (a token that fits two of them is ambiguous
+and rejected); otherwise an existing resource whose name matches the whole token
+wins; otherwise a name ending in `[...]` must hold valid `NN%` units. Retained assignments whose text is unchanged keep their units/work.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
 be entered individually through the resource-list syntax.

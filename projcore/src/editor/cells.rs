@@ -296,33 +296,40 @@ impl Editor {
                 .map(|r| r.uid)
                 .collect();
         }
-        match retained.as_slice() {
-            [rid] => return Ok(Some((*rid, None))),
-            [] => {}
-            _ => return Err(format!("Resource name '{raw}' is ambiguous")),
-        }
         let name = raw.trim();
+        // `Bob[50%]` is also the shown text of an assigned Bob. An unassigned
+        // resource literally named so never takes it; an assigned one is ambiguous.
+        let shown_matching = |exact: bool| -> Vec<_> {
+            self.proj
+                .assignments
+                .iter()
+                .filter(|a| a.task_uid == uid && !name.is_empty())
+                .filter_map(|a| {
+                    let r = resources.iter().find(|r| r.uid == a.resource_uid)?;
+                    let text = cell_text(r, a);
+                    let text = text.trim();
+                    (if exact {
+                        text == name
+                    } else {
+                        text.eq_ignore_ascii_case(name)
+                    })
+                    .then_some((a.resource_uid, Some(a.units)))
+                })
+                .collect()
+        };
+        // An exact spelling beats a case-insensitive one, as for names above.
+        let mut shown = shown_matching(true);
+        if shown.is_empty() {
+            shown = shown_matching(false);
+        }
+        match (retained.as_slice(), shown.as_slice()) {
+            ([rid], shown) if shown.iter().all(|s| s.0 == *rid) => return Ok(Some((*rid, None))),
+            ([], [found]) => return Ok(Some(*found)),
+            ([], []) => {}
+            _ => return Err(format!("Resource name '{name}' is ambiguous")),
+        }
         if name.is_empty() {
             return Ok(None);
-        }
-        // `Bob[50%]` names the assigned Bob before a resource literally named so.
-        let shown: Vec<_> = self
-            .proj
-            .assignments
-            .iter()
-            .filter(|a| a.task_uid == uid)
-            .filter_map(|a| {
-                let r = resources.iter().find(|r| r.uid == a.resource_uid)?;
-                let text = cell_text(r, a);
-                text.trim()
-                    .eq_ignore_ascii_case(name)
-                    .then_some((a.resource_uid, Some(a.units)))
-            })
-            .collect();
-        match shown.as_slice() {
-            [found] => return Ok(Some(*found)),
-            [] => {}
-            _ => return Err(format!("Resource name '{name}' is ambiguous")),
         }
         let matches: Vec<_> = resources
             .iter()
