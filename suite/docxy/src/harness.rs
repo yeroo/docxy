@@ -1501,10 +1501,16 @@ pub fn dispatch(
                 let crate::Surface::Project(v) = &tab.surface else {
                     return Err("Project is not loaded".into());
                 };
-                if cell.0 as usize >= v.ed.project().tasks.len() || cell.1 >= 7 {
+                // The row just below the last task is the entry row.
+                let count = v.ed.project().tasks.len();
+                if cell.0 as usize > count || cell.1 >= 7 {
                     return Err("Project cell is outside the entry table".into());
                 }
-                crate::project_cell_click(tab, cell.0 as usize, Some(cell.1 as usize), dbl);
+                if (cell.0 as usize) < count {
+                    crate::project_cell_click(tab, cell.0 as usize, Some(cell.1 as usize), dbl);
+                } else {
+                    crate::project_entry_click(tab, Some(cell.1 as usize), dbl);
+                }
                 app.refocus(window, cx);
                 return Done::ok(state(app, window));
             }

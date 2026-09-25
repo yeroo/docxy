@@ -583,3 +583,25 @@ fn open_focuses_loaded_duplicates_recovers_placeholders_and_preserves_failed_sta
     assert_eq!(tabs.len(), 3);
     assert!(matches!(tabs[2].surface, Surface::Project(_)));
 }
+
+#[test]
+fn agent_find_and_task_add_leave_the_entry_row_cursor_alone() {
+    // `find` only reads the plan (it never moves the selection), and a task an
+    // agent appends goes above the entry row the cursor is on.
+    let mut tabs = vec![tab()];
+    vm(&mut tabs[0]).enter_entry_row();
+    let count = view(&tabs[0]).ed.project().tasks.len();
+    let sel = view(&tabs[0]).ed.sel();
+    let (found, _) = call(&mut tabs, 0, "find", args(r#"{"query":"Task"}"#)).unwrap();
+    assert_eq!(found.get("count").and_then(Json::as_i64), Some(2));
+    assert!(view(&tabs[0]).on_entry_row());
+    assert_eq!(view(&tabs[0]).ed.sel(), sel);
+    let (info, _) = call(&mut tabs, 0, "proj.path", Json::Null).unwrap();
+    assert_eq!(
+        info.get("cell_row").and_then(Json::as_i64),
+        Some(count as i64)
+    );
+    call(&mut tabs, 0, "task.add", args(r#"{"name":"Agent"}"#)).unwrap();
+    assert!(view(&tabs[0]).on_entry_row());
+    assert_eq!(view(&tabs[0]).cursor_row(), count + 1);
+}

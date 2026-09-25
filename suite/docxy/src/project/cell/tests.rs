@@ -310,26 +310,28 @@ fn invalid_inputs_and_click_away_preserve_everything() {
 }
 
 #[test]
-fn clicking_below_the_last_task_commits_without_selecting() {
+fn clicking_below_the_last_task_commits_then_moves_to_the_entry_row() {
     let mut t = tab();
     key(&mut t, "down");
     edit(&mut t, 1, "Renamed");
-    project_blank_click(&mut t);
+    project_entry_click(&mut t, None, false);
     assert!(v(&t).cell.is_none());
     assert_eq!(v(&t).ed.project().tasks[1].name, "Renamed");
-    assert_eq!(v(&t).ed.sel(), 1);
-    assert_eq!(v(&t).col, 1);
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 3);
+    assert_eq!(v(&t).selected_uid(), None);
+    assert_eq!(v(&t).col, 1, "a click below the entry row keeps the column");
     assert!(t.dirty);
-    // With nothing open it is a no-op, not a selection change.
-    project_blank_click(&mut t);
+    // With nothing open it only moves the cursor.
+    project_entry_click(&mut t, None, false);
     assert!(v(&t).cell.is_none());
-    assert_eq!(v(&t).ed.sel(), 1);
+    assert_eq!(v(&t).cursor_row(), 3);
     assert_eq!(v(&t).ed.undo_depth(), 1);
 
     let mut t = tab();
     let before = v(&t).ed.project().clone();
     edit(&mut t, 2, "NaN");
-    project_blank_click(&mut t);
+    project_entry_click(&mut t, Some(1), false);
     let status = t.status.clone();
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "NaN");
     assert_eq!(
@@ -337,6 +339,7 @@ fn clicking_below_the_last_task_commits_without_selecting() {
         Some(status.as_ref())
     );
     assert_eq!(v(&t).ed.sel(), 0);
+    assert!(!v(&t).on_entry_row(), "a failed commit keeps the cursor");
     assert_eq!(v(&t).col, 2);
     assert_eq!(v(&t).ed.project(), &before);
     assert!(!t.dirty);
@@ -420,7 +423,7 @@ fn save_commits_a_cell_and_invalid_input_never_reaches_disk() {
 fn caret_edits_utf8_and_long_buffer_window_tracks_it() {
     let mut c = CellEdit {
         last_error: None,
-        uid: 1,
+        uid: Some(1),
         col: 1,
         initial: String::new(),
         buf: "aλ🙂z".into(),
@@ -485,4 +488,187 @@ fn resource_names_cell_shows_and_keeps_partial_units() {
     assert_eq!(units, [(1, 0.5), (2, 1.0), (3, 1.0)]);
     assert!(project.resources.iter().all(|r| !r.name.contains('[')));
     assert_eq!(row(&t), "Bob[50%], Alice, Carol");
+}
+
+// ---- the entry row below the last task (#145) ----
+
+fn state(t: &DocTab, name: &str) -> ctlcore::json::Json {
+    project_state(v(t), None)
+        .into_iter()
+        .chain(project_cell_state(v(t)))
+        .find(|(k, _)| k == name)
+        .unwrap()
+        .1
+}
+
+#[test]
+fn typing_into_the_entry_row_appends_one_task_as_one_undo_step() {
+    use ctlcore::json::Json;
+    let mut t = tab();
+    project_entry_click(&mut t, Some(1), false);
+    assert_eq!(state(&t, "cell_row"), Json::Num(3.));
+    assert_eq!(state(&t, "selected_task"), Json::Num(3.));
+    assert_eq!(state(&t, "selected_name"), Json::Str(String::new()));
+    edit(&mut t, 1, "Design");
+    assert_eq!(v(&t).cell.as_ref().unwrap().uid, None);
+    assert_eq!(
+        v(&t).ed.project().tasks.len(),
+        3,
+        "nothing until the commit"
+    );
+    key(&mut t, "enter");
+    let tasks = &v(&t).ed.project().tasks;
+    assert_eq!(tasks.len(), 4);
+    let new = &tasks[3];
+    // What Project makes of a typed blank row: `1 day?`.
+    assert_eq!(
+        (
+            new.name.as_str(),
+            new.duration_min,
+            new.estimated,
+            new.outline_level
+        ),
+        ("Design", 480, Some(true), 1)
+    );
+    assert!(!new.is_null);
+    // Enter lands on the new entry row, ready for the next task.
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 4);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert!(t.dirty);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(
+        v(&t).ed.project().tasks.len(),
+        3,
+        "one Undo removes the task"
+    );
+    assert!(
+        v(&t).on_entry_row(),
+        "Undo keeps the cursor on the entry row"
+    );
+    assert_eq!(v(&t).cursor_row(), 3);
+    apply_project_act(&mut t, ProjectAct::Redo);
+    assert_eq!(v(&t).ed.project().tasks[3].name, "Design");
+    assert!(v(&t).on_entry_row());
+}
+
+#[test]
+fn tab_after_an_entry_row_commit_stays_on_the_new_task() {
+    for (shift, col) in [(false, 2), (true, 0)] {
+        let mut t = tab();
+        project_entry_click(&mut t, Some(1), false);
+        edit(&mut t, 1, "Design");
+        project_input(
+            &mut t,
+            "tab",
+            None,
+            Modifiers {
+                shift,
+                ..Modifiers::default()
+            },
+        );
+        assert!(v(&t).cell.is_none());
+        assert!(!v(&t).on_entry_row());
+        assert_eq!((v(&t).cursor_row(), v(&t).col), (3, col));
+        assert_eq!(v(&t).ed.project().tasks[3].name, "Design");
+    }
+}
+
+#[test]
+fn every_column_of_the_entry_row_appends_a_task() {
+    for (col, text, check) in [
+        (2, "3d", "duration"),
+        (3, "2026-01-07", "start"),
+        (4, "2026-01-09", "finish"),
+        (5, "1", "predecessors"),
+        (6, "Bob", "resources"),
+    ] {
+        let mut t = tab();
+        project_entry_click(&mut t, Some(col), false);
+        edit(&mut t, col, text);
+        key(&mut t, "enter");
+        let ed = &v(&t).ed;
+        assert_eq!(ed.project().tasks.len(), 4, "{check}");
+        let new = &ed.project().tasks[3];
+        assert_eq!(project_row(ed, new)[col], text, "{check}");
+        assert_eq!(ed.undo_depth(), 1, "{check}");
+        assert!(v(&t).on_entry_row(), "{check}");
+        if col == 3 {
+            assert_eq!(t.status.as_ref(), "Constraint set: SNET (was ASAP)");
+        }
+    }
+}
+
+#[test]
+fn an_empty_or_rejected_entry_row_value_appends_nothing() {
+    let mut t = tab();
+    let before = v(&t).ed.project().clone();
+    project_entry_click(&mut t, Some(1), false);
+    // F2 opens an empty edit; committing it unchanged appends nothing.
+    key(&mut t, "f2");
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none());
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert!(!t.dirty);
+    // ID stays read-only there too.
+    vm(&mut t).col = 0;
+    project_input(&mut t, "x", Some("x"), Modifiers::default());
+    assert!(v(&t).cell.is_none());
+    assert_eq!(t.status.as_ref(), "ID is read-only");
+    for (col, text) in [(2, "NaN"), (2, "-1d"), (3, "2026-02-31"), (5, "99")] {
+        project_entry_click(&mut t, Some(col), false);
+        edit(&mut t, col, text);
+        key(&mut t, "enter");
+        let cell = v(&t)
+            .cell
+            .as_ref()
+            .expect("a rejected value keeps the edit");
+        assert_eq!(cell.buf, text);
+        assert_eq!(cell.last_error.as_deref(), Some(t.status.as_ref()));
+        assert!(v(&t).on_entry_row());
+        key(&mut t, "escape");
+        assert!(v(&t).cell.is_none());
+        assert_eq!(v(&t).ed.project(), &before, "{text}: no trailing blank row");
+        assert_eq!((v(&t).ed.undo_depth(), v(&t).ed.redo_depth()), (0, 0));
+        assert!(!t.dirty);
+    }
+}
+
+#[test]
+fn a_new_plan_takes_its_first_task_from_the_entry_row() {
+    use ctlcore::json::Json;
+    let mut t = new_project_tab();
+    assert!(v(&t).on_entry_row());
+    assert_eq!(state(&t, "cell_row"), Json::Num(0.));
+    for c in ["D", "e", "s", "i", "g", "n"] {
+        project_input(&mut t, c, Some(c), Modifiers::default());
+    }
+    key(&mut t, "enter");
+    let tasks = &v(&t).ed.project().tasks;
+    assert_eq!(tasks.len(), 1);
+    assert_eq!(tasks[0].name, "Design");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert_eq!(v(&t).cursor_row(), 1);
+    assert!(t.dirty);
+}
+
+#[test]
+fn enter_after_editing_the_last_task_goes_to_the_entry_row() {
+    let mut t = tab();
+    key(&mut t, "end");
+    edit(&mut t, 1, "Last");
+    key(&mut t, "enter");
+    assert_eq!(v(&t).ed.project().tasks[2].name, "Last");
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 3);
+    // Up goes back to the last task; a click on a task row leaves the entry row.
+    key(&mut t, "up");
+    assert_eq!(v(&t).cursor_row(), 2);
+    project_entry_click(&mut t, Some(2), false);
+    project_cell_click(&mut t, 0, Some(1), false);
+    assert!(!v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 0);
 }

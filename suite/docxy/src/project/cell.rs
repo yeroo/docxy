@@ -16,7 +16,8 @@ pub(super) const COLUMNS: [&str; 7] = [
 
 #[derive(Clone, Debug)]
 pub(crate) struct CellEdit {
-    pub uid: i32,
+    /// The edited task; `None` on the entry row, where committing appends one.
+    pub uid: Option<i32>,
     pub col: usize,
     pub initial: String,
     pub buf: String,
@@ -89,36 +90,45 @@ impl ProjectView {
         if self.prompt.is_some() || self.cell.is_some() {
             return Ok(());
         }
-        let task = self
-            .ed
-            .project()
-            .tasks
-            .get(self.ed.sel())
-            .ok_or("No task selected")?;
-        if self.col == 0 || (task.summary && (2..=4).contains(&self.col)) {
-            return Err(format!(
-                "{} is read-only{}",
-                COLUMNS[self.col],
-                if task.summary {
-                    " for summary tasks"
-                } else {
-                    ""
-                }
-            ));
-        }
-        let initial = if self.col == 2 {
-            if task.duration_min == 0 {
-                "0".into()
-            } else {
-                format_duration_exact(task.duration_min, self.ed.project())
+        let (uid, initial) = if self.on_entry_row() {
+            if self.col == 0 {
+                return Err("ID is read-only".into());
             }
+            // The entry row is empty until committing it appends a task.
+            (None, String::new())
         } else {
-            project_row(&self.ed, task)[self.col].clone()
+            let task = self
+                .ed
+                .project()
+                .tasks
+                .get(self.ed.sel())
+                .ok_or("No task selected")?;
+            if self.col == 0 || (task.summary && (2..=4).contains(&self.col)) {
+                return Err(format!(
+                    "{} is read-only{}",
+                    COLUMNS[self.col],
+                    if task.summary {
+                        " for summary tasks"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            let initial = if self.col == 2 {
+                if task.duration_min == 0 {
+                    "0".into()
+                } else {
+                    format_duration_exact(task.duration_min, self.ed.project())
+                }
+            } else {
+                project_row(&self.ed, task)[self.col].clone()
+            };
+            (Some(task.uid), initial)
         };
         let buf = typed.map(str::to_owned).unwrap_or_else(|| initial.clone());
         self.cell = Some(CellEdit {
             last_error: None,
-            uid: task.uid,
+            uid,
             col: self.col,
             initial,
             caret: buf.len(),
@@ -135,63 +145,79 @@ impl ProjectView {
         if cell.buf == cell.initial {
             return Ok(None);
         }
-        let uid = cell.uid;
-        let task = self
-            .ed
-            .project()
-            .task(uid)
-            .ok_or("The edited task no longer exists")?;
-        if task.summary && (2..=4).contains(&cell.col) {
-            return Err("Summary dates and duration are read-only".into());
-        }
-        match cell.col {
-            1 => self.ed.rename(uid, &cell.buf)?,
-            2 => {
-                let min = parse_duration(&cell.buf, self.ed.project())
-                    .ok_or("Invalid duration (try 3d, 4h, 2w)")?;
-                self.ed.set_duration_min(uid, min)?;
-            }
-            3 | 4 => {
-                let day = parse_cell_date(&cell.buf)?;
-                // A manual task takes the typed date as its own start or
-                // finish; an auto task gets an SNET/FNET constraint. Whether
-                // it is manual is read after the edit: typing into a blank
-                // row can make it a manual task.
-                let previous = (task.constraint, task.constraint_date);
-                if cell.col == 3 {
-                    self.ed.set_start(uid, day)?;
-                } else {
-                    self.ed.set_finish(uid, day)?;
-                }
-                let task = self
-                    .ed
-                    .project()
-                    .task(uid)
-                    .ok_or("The edited task no longer exists")?;
-                let current = (task.constraint, task.constraint_date);
-                if task.manual || current == previous {
-                    return Ok(None);
-                }
-                return Ok(Some(format!(
-                    "Constraint set: {} (was {})",
-                    current.0.abbrev(),
-                    previous.0.abbrev()
-                )));
-            }
-            5 => {
-                let predecessors = parse_predecessors(&cell.buf, self.ed.project())?;
-                self.ed.set_predecessors(uid, predecessors)?;
-            }
-            6 => self.ed.set_resources(
-                uid,
-                &cell.buf.split(',').map(str::to_owned).collect::<Vec<_>>(),
-            )?,
-            _ => return Err("ID is read-only".into()),
-        }
-        Ok(None)
+        let (col, buf) = (cell.col, cell.buf.clone());
+        let Some(uid) = cell.uid else {
+            // The entry row: one undo step appends the task and applies the value.
+            let Some((row, status)) = self
+                .ed
+                .append_row(|ed, uid| apply_cell(ed, uid, col, &buf))?
+            else {
+                return Ok(None);
+            };
+            self.entry = false;
+            self.ed.select(row);
+            return Ok(status);
+        };
+        apply_cell(&mut self.ed, uid, col, &buf)
     }
 }
 
+/// Apply a typed cell value to task `uid`; a status line on success.
+fn apply_cell(
+    ed: &mut ProjectEditor,
+    uid: i32,
+    col: usize,
+    buf: &str,
+) -> Result<Option<String>, String> {
+    let task = ed
+        .project()
+        .task(uid)
+        .ok_or("The edited task no longer exists")?;
+    if task.summary && (2..=4).contains(&col) {
+        return Err("Summary dates and duration are read-only".into());
+    }
+    match col {
+        1 => ed.rename(uid, buf)?,
+        2 => {
+            let min =
+                parse_duration(buf, ed.project()).ok_or("Invalid duration (try 3d, 4h, 2w)")?;
+            ed.set_duration_min(uid, min)?;
+        }
+        3 | 4 => {
+            let day = parse_cell_date(buf)?;
+            // A manual task takes the typed date as its own start or
+            // finish; an auto task gets an SNET/FNET constraint. Whether
+            // it is manual is read after the edit: typing into a blank
+            // row can make it a manual task.
+            let previous = (task.constraint, task.constraint_date);
+            if col == 3 {
+                ed.set_start(uid, day)?;
+            } else {
+                ed.set_finish(uid, day)?;
+            }
+            let task = ed
+                .project()
+                .task(uid)
+                .ok_or("The edited task no longer exists")?;
+            let current = (task.constraint, task.constraint_date);
+            if task.manual || current == previous {
+                return Ok(None);
+            }
+            return Ok(Some(format!(
+                "Constraint set: {} (was {})",
+                current.0.abbrev(),
+                previous.0.abbrev()
+            )));
+        }
+        5 => {
+            let predecessors = parse_predecessors(buf, ed.project())?;
+            ed.set_predecessors(uid, predecessors)?;
+        }
+        6 => ed.set_resources(uid, &buf.split(',').map(str::to_owned).collect::<Vec<_>>())?,
+        _ => return Err("ID is read-only".into()),
+    }
+    Ok(None)
+}
 /// Commit before changing focus or dispatching commands. Failure preserves edit and selection.
 pub(crate) fn commit_project_cell(tab: &mut DocTab) -> bool {
     let Surface::Project(v) = &mut tab.surface else {
@@ -222,13 +248,29 @@ pub(crate) fn commit_project_cell(tab: &mut DocTab) -> bool {
 }
 
 pub(crate) fn project_cell_click(tab: &mut DocTab, row: usize, col: Option<usize>, double: bool) {
+    cell_click(tab, Some(row), col, double);
+}
+
+/// A click on the entry row below the last task, in column `col`, or on the
+/// ruled rows below it (`None`: the column stays). The cursor goes to the entry
+/// row, where typing appends a task. A failed commit keeps the edit and its
+/// status, and the cursor stays.
+pub(crate) fn project_entry_click(tab: &mut DocTab, col: Option<usize>, double: bool) {
+    cell_click(tab, None, col, double);
+}
+
+/// `row` is a task's index, or `None` for the entry row.
+fn cell_click(tab: &mut DocTab, row: Option<usize>, col: Option<usize>, double: bool) {
     if !commit_project_cell(tab) {
         return;
     }
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
-    v.select_row(row);
+    match row {
+        Some(row) => v.select_row(row),
+        None => v.enter_entry_row(),
+    }
     if let Some(col) = col {
         v.col = col.min(6);
         v.reveal_col();
@@ -239,12 +281,6 @@ pub(crate) fn project_cell_click(tab: &mut DocTab, row: usize, col: Option<usize
         }
     }
     complete_project(tab, true);
-}
-
-/// A click on the ruled rows below the last task: commit like any click-away, but select
-/// nothing, since there is no task there. A failed commit keeps the edit and its status.
-pub(crate) fn project_blank_click(tab: &mut DocTab) {
-    let _ = commit_project_cell(tab);
 }
 
 pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>, m: Modifiers) {
@@ -281,7 +317,7 @@ pub(crate) fn project_cell_state(v: &ProjectView) -> Vec<(String, ctlcore::json:
     use ctlcore::json::Json;
     vec![
         ("cell".into(), Json::Str(COLUMNS[v.col].into())),
-        ("cell_row".into(), Json::Num(v.ed.sel() as f64)),
+        ("cell_row".into(), Json::Num(v.cursor_row() as f64)),
         (
             "cell_edit".into(),
             v.cell
