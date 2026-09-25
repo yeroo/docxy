@@ -1,0 +1,21 @@
+[package]
+name = "htmlbundle"
+description = "Dependency-free packer for docxy's editable HTML: wraps a .docx, the docxwasm engine and a suite-style web UI into one self-contained .docx.html, and unwraps it again."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["docx", "html", "offline", "editor", "ooxml"]
+categories = ["encoding", "text-processing"]
+# The web UI ships inside the crate (web/) so the published crate can wrap.
+include = ["src/**/*.rs", "web/*", "Cargo.toml"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# Intentionally std-only, like the rest of the core stack: its own SHA-256
+# and base64, and no JSON crate (the bundle metadata is one flat object).
