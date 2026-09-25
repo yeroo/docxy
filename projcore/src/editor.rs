@@ -1349,11 +1349,21 @@ mod tests {
         assert!(ed.project().assignments.iter().all(|a| a.task_uid == 1));
         assert_eq!(ed.project().assignments.len(), 1);
         assert_schedule(&ed);
+    }
+
+    #[test]
+    fn a_reused_subtask_uid_does_not_inherit_its_assignment() {
+        // The trailing summary's child holds the highest UID and a resource.
+        let mut ed = outline(&[(1, "A", 1), (3, "Phase", 1), (2, "P1", 2)]);
+        ed.assign_resource(2, "Alice").unwrap();
+        assert_eq!(ed.delete_task(3).unwrap(), vec![3, 2]);
+        assert!(ed.project().assignments.is_empty());
 
         let at = ed.add_task(None, "Replacement", 480).unwrap();
         let uid = ed.project().tasks[at].uid;
-        assert_eq!(uid, 6, "UIDs continue from the highest surviving one");
+        assert_eq!(uid, 2, "the removed subtask's UID is reused");
         assert!(ed.project().assignments.iter().all(|a| a.task_uid != uid));
+        assert_schedule(&ed);
     }
 
     #[test]
