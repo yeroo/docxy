@@ -27,8 +27,10 @@ pub(super) struct ProjectView {
     pub col: usize,
     pub cell: Option<CellEdit>,
     /// The cell cursor is on the entry row below the last task, where typing
-    /// appends a task, as in Project. The editor's selection then stays on
-    /// the last task; see [`Self::on_entry_row`].
+    /// appends a task, as in Project; see [`Self::on_entry_row`]. Entering it
+    /// selects the last task, but later edits (Redo, an agent's `task.add`, a
+    /// reload) can move the editor's selection, so on the entry row read
+    /// [`Self::cursor_row`] and [`Self::selected_uid`], never `ed.sel()`.
     pub entry: bool,
     pub exported: Option<String>,
     /// The whole pane's width, which the Timeline spans.

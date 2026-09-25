@@ -198,6 +198,8 @@ pub(crate) fn project_verb(
                 let Surface::Project(v) = &mut tab.surface else {
                     unreachable!()
                 };
+                // The cursor keeps its row kind: the entry row is derived
+                // from the task count, so it stays valid over any reload.
                 v.ed.replace_project(fresh.ed.project().clone());
                 v.cancel_prompt();
                 v.cell = None;
