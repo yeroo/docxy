@@ -386,6 +386,21 @@ fn paragraph_verbs_match_the_suite() {
 }
 
 #[test]
+fn tab_inserts_a_tab_inline() {
+    let mut s = open(&docx_from_body(&para("ab")));
+    s.exec_json("select\t0\t1\t0\t1");
+    let r = parse(&s.exec_json("tab"));
+    assert_eq!(r.get("applied"), Some(&Json::Bool(true)));
+    assert_eq!(r.get("caret").unwrap().get_usize("o"), Some(2));
+    let p = &all_paragraphs(&s)[0];
+    let segs = arr(p.get("segs").unwrap());
+    let tab = segs.iter().find(|g| g.get_str("k") == Some("tab")).unwrap();
+    assert_eq!(tab.get_usize("o"), Some(1));
+    assert_eq!(tab.get_usize("w"), Some(1));
+    assert_eq!(para_text(p), "ab");
+}
+
+#[test]
 fn copy_reports_text_without_mutating() {
     let mut s = open(&docx_from_body(&para("Hello")));
     s.exec_json("select\t0\t1\t0\t4");
@@ -418,6 +433,7 @@ fn read_only_documents_refuse_the_new_verbs() {
         "borders",
         "sort",
         "hrule",
+        "tab",
     ] {
         let r = parse(&s.exec_json(cmd));
         assert_eq!(r.get("applied"), Some(&Json::Bool(false)), "{cmd}");

@@ -106,7 +106,7 @@ fn dispatch_mutation_kind(op: &str) -> Option<MutationKind> {
         | "fontsize" | "color" | "vertalign" | "clearfmt" | "highlight" | "font" | "setsize"
         | "linespacing" | "style" | "nospacing" | "case" | "borders" => MutationKind::Formatting,
         "insert" | "newline" | "backspace" | "delete" | "undo" | "redo" | "paste" | "replace"
-        | "cut" | "sort" | "hrule" => MutationKind::Content,
+        | "cut" | "sort" | "hrule" | "tab" => MutationKind::Content,
         _ => return None,
     })
 }
@@ -481,6 +481,8 @@ impl Session {
                 self.editor.set_line_spacing(240, "auto");
             }
             "case" => self.editor.cycle_case(),
+            // A tab inline (`<w:tab/>`), not a tab character in the run text.
+            "tab" => self.editor.insert_tab(),
             "sort" => self.editor.sort_paragraphs(),
             "hrule" => self.editor.insert_hrule(),
             "borders" => {

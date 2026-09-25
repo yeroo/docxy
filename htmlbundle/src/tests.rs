@@ -301,6 +301,48 @@ fn names_follow_the_convention() {
     assert_eq!(bundle_inner_ext("book.xlsx.html").as_deref(), Some("xlsx"));
 }
 
+/// The page rebuilds its own file in JS (`web/engine.js` `rebuildFile`), and
+/// that must equal [`rewrap`] byte for byte. This writes the Rust side of that
+/// comparison for `webapp/test/rebuild.test.mjs`: a bundle, a new payload, and
+/// the rewrapped bundle. An awkward source name exercises the JSON escaping
+/// both sides must share. Regenerate with `UPDATE_REWRAP_FIXTURE=1 cargo test
+/// -p htmlbundle`.
+#[test]
+fn rewrap_fixture_for_the_page_is_current() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../webapp/test/fixtures");
+    let before = wrap(
+        &test_assets(),
+        b"\0asm fake engine",
+        "docx",
+        "a \"quoted\" \\ <name> & \u{2028}\u{1F600}.docx",
+        b"PK first payload",
+        "0.5.0",
+        WHEN,
+    )
+    .unwrap();
+    let next: Vec<u8> = (0..=255u8).chain(*b"PK second payload").collect();
+    let after = rewrap(&before, &next).unwrap();
+    let files: [(&str, &[u8]); 3] = [
+        ("rewrap-before.html", before.as_bytes()),
+        ("rewrap-payload.bin", &next),
+        ("rewrap-after.html", after.as_bytes()),
+    ];
+    if std::env::var_os("UPDATE_REWRAP_FIXTURE").is_some() {
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in files {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        return;
+    }
+    for (name, bytes) in files {
+        let on_disk = std::fs::read(dir.join(name)).unwrap_or_default();
+        assert!(
+            on_disk == bytes,
+            "webapp/test/fixtures/{name} is stale; regenerate with UPDATE_REWRAP_FIXTURE=1 cargo test -p htmlbundle"
+        );
+    }
+}
+
 #[test]
 fn timestamps() {
     assert_eq!(utc_timestamp(0), "1970-01-01T00:00:00Z");
