@@ -1045,6 +1045,15 @@ mod tests {
         for empty_default in [false, true] {
             let mut ed = Editor::new(project_with_unused_empty_calendar(empty_default));
             assert_reopens(&ed);
+            if !empty_default {
+                // A first child keeps the empty-calendar summary a summary.
+                let mut ed = Editor::new(project_with_unused_empty_calendar(false));
+                let at = ed.add_task(Some(1), "Inserted", 480).unwrap();
+                let tasks = &ed.project().tasks;
+                assert_eq!(tasks[at].outline_level, tasks[0].outline_level + 1);
+                assert!(tasks[0].summary);
+                assert_reopens(&ed);
+            }
             ed.rename(2, "Renamed").unwrap();
             assert_reopens(&ed);
             ed.set_duration_min(2, 960).unwrap();
