@@ -6,8 +6,9 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Assignment, Baseline, ConstraintType, LagFormat, LagKind, LagUnit, LinkType, Predecessor,
-    Project, Resource, ResourceType, Task, TaskType, TimephasedValue,
+    Assignment, AssignmentBaseline, Baseline, ConstraintType, LagFormat, LagKind, LagUnit,
+    LinkType, Predecessor, Project, Resource, ResourceBaseline, ResourceType, Task, TaskType,
+    TimephasedValue,
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
@@ -24,6 +25,8 @@ pub use cells::{
 use cells::parse_predecessors;
 use cells::{format_units, parse_resource_token};
 mod moving;
+#[cfg(test)]
+mod refresh_tests;
 
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {
@@ -79,6 +82,12 @@ pub struct Editor {
     last_find: String,
     /// Snapshots ever recorded; unlike `undo.len()` it still moves at `UNDO_CAP`.
     pushes: u64,
+    /// The schedule before the current edit, while that edit is being made.
+    /// Every reschedule within it refreshes what the edit made stale
+    /// ([`crate::assign::refresh`] against the model on top of the undo
+    /// stack); undo, redo and a new document clear it, since they restore a
+    /// model exactly and must not rewrite it.
+    pending: Option<Schedule>,
 }
 
 impl Editor {
@@ -101,6 +110,7 @@ impl Editor {
             level: None,
             last_find: String::new(),
             pushes: 0,
+            pending: None,
         }
     }
 
@@ -111,6 +121,7 @@ impl Editor {
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
+        self.pending = None;
         self.reschedule();
     }
 
@@ -149,6 +160,7 @@ impl Editor {
     }
 
     pub fn toggle_level(&mut self) {
+        self.pending = None;
         self.leveled = !self.leveled;
         self.reschedule();
     }
@@ -273,7 +285,10 @@ impl Editor {
     }
 
     /// Record `prev` as the state to undo to: caps history and clears redo.
+    /// Every edit comes through here, so it also opens the edit's refresh
+    /// (see `pending`).
     fn push_undo(&mut self, prev: Project) {
+        self.pending = Some(self.sched.clone());
         self.pushes += 1;
         self.undo.push(prev);
         if self.undo.len() > UNDO_CAP {
@@ -285,6 +300,10 @@ impl Editor {
     fn reschedule(&mut self) {
         recompute_summaries(&mut self.proj);
         self.sched = schedule(&self.proj);
+        // The refresh changes no scheduling input, so the schedule stands.
+        if let (Some(prev_sched), Some(prev)) = (&self.pending, self.undo.last()) {
+            crate::assign::refresh(prev, prev_sched, &mut self.proj, &self.sched);
+        }
         self.level = self.leveled.then(|| level(&self.proj));
     }
 
@@ -313,6 +332,7 @@ impl Editor {
         let Some(prev) = self.undo.pop() else {
             return false;
         };
+        self.pending = None;
         self.redo.push(std::mem::replace(&mut self.proj, prev));
         self.changed();
         true
@@ -322,6 +342,7 @@ impl Editor {
         let Some(next) = self.redo.pop() else {
             return false;
         };
+        self.pending = None;
         self.undo.push(std::mem::replace(&mut self.proj, next));
         self.changed();
         true
@@ -855,8 +876,9 @@ impl Editor {
                 return Ok(AssignOutcome::AlreadyAssigned);
             };
             let u = checked_units(u, name)?;
+            let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
             self.edit_row(i, |proj, _| {
-                proj.assignments[k].set_units(u, work_for(duration, u));
+                proj.assignments[k].set_units(u, assigned_work(kind, duration, u));
             })?;
             return Ok(AssignOutcome::Assigned);
         }
@@ -871,7 +893,8 @@ impl Editor {
             .map(|a| a.uid)
             .max()
             .unwrap_or(0);
-        let assignment = new_assignment(&mut next_aid, uid, rid, units, duration)?;
+        let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
+        let assignment = new_assignment(&mut next_aid, uid, rid, kind, units, duration)?;
         self.edit_row(i, |proj, _| {
             proj.resources = resources;
             proj.assignments.push(assignment);
@@ -879,6 +902,10 @@ impl Editor {
         Ok(AssignOutcome::Assigned)
     }
 
+    /// Project › Schedule › Set Baseline: record the plan as it is scheduled
+    /// now in the Baseline (slot 0) of every scheduled task, and of the
+    /// assignments and resources (see `baseline_assignments`), as one undo
+    /// step. Baseline1..10 stay.
     pub fn set_baseline(&mut self) {
         self.snapshot();
         let baselines: Vec<_> = self
@@ -907,7 +934,90 @@ impl Editor {
         for (i, baseline) in baselines {
             self.proj.tasks[i].set_baseline_slot(baseline);
         }
+        self.baseline_assignments();
         self.changed();
+    }
+
+    /// Set Baseline's part for assignments and resources, as Project writes
+    /// it: each assignment on a scheduled task records its span as the
+    /// schedule now places it and its stored work and cost (the cost priced
+    /// when it has none), and each resource with assignments records its
+    /// stored work and cost (else their sums), without earned value. Their
+    /// timephased Baseline records described the old plan and go, as Clear
+    /// Baseline drops them; none is synthesised. Baseline1..10 stay.
+    fn baseline_assignments(&mut self) {
+        let proj = &self.proj;
+        let mut costs: std::collections::HashMap<i32, Option<f64>> = Default::default();
+        let recorded: Vec<(usize, AssignmentBaseline)> = proj
+            .assignments
+            .iter()
+            .enumerate()
+            .filter_map(|(k, a)| {
+                let span = crate::assign::assignment_span(proj, &self.sched, a)?;
+                let cost = a
+                    .cost
+                    .clone()
+                    .or_else(|| crate::assign::assignment_cost(proj, a, span));
+                Some((
+                    k,
+                    AssignmentBaseline {
+                        number: 0,
+                        start: Some(span.0),
+                        finish: Some(span.1),
+                        work_min: Some(a.work_min),
+                        cost,
+                    },
+                ))
+            })
+            .collect();
+        for (k, b) in &recorded {
+            let cost = b.cost.as_ref().map(|c| c.to_f64().unwrap_or(0.0));
+            let total = costs
+                .entry(proj.assignments[*k].resource_uid)
+                .or_insert(Some(0.0));
+            *total = total.zip(cost).map(|(t, c)| t + c);
+        }
+        let resources: Vec<(usize, ResourceBaseline)> = proj
+            .resources
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| proj.assignments.iter().any(|a| a.resource_uid == r.uid))
+            .map(|(j, r)| {
+                let work: i64 = proj
+                    .assignments
+                    .iter()
+                    .filter(|a| a.resource_uid == r.uid)
+                    .map(|a| a.work_min)
+                    .sum();
+                let cost = r.cost.clone().or_else(|| {
+                    costs
+                        .get(&r.uid)
+                        .copied()
+                        .flatten()
+                        .and_then(crate::assign::money)
+                });
+                (
+                    j,
+                    ResourceBaseline {
+                        number: 0,
+                        work_min: Some(r.work_min.unwrap_or(work)),
+                        cost,
+                        bcws: None,
+                        bcwp: None,
+                    },
+                )
+            })
+            .collect();
+        for (k, baseline) in recorded {
+            let a = &mut self.proj.assignments[k];
+            a.set_baseline_slot(baseline);
+            a.timephased_data.retain(|t| !t.is_baseline_slot_zero());
+        }
+        for (j, baseline) in resources {
+            let r = &mut self.proj.resources[j];
+            r.set_baseline_slot(baseline);
+            r.timephased_data.retain(|t| !t.is_baseline_slot_zero());
+        }
     }
 
     /// Project › Schedule › Clear Baseline: remove the Baseline (slot 0) from
@@ -1014,6 +1124,18 @@ fn work_for(duration_min: i64, units: f64) -> i64 {
     (duration_min as f64 * units).round() as i64
 }
 
+/// The work an assignment is given at `units` on a task of `duration_min`,
+/// by its resource's kind: a work resource (or none) works the duration at
+/// its units; a material's work is its quantity, the units, in hours (Project
+/// 2024, paired corpus 21: 1 unit is `PT1H`); a cost resource has none.
+fn assigned_work(kind: Option<ResourceType>, duration_min: i64, units: f64) -> i64 {
+    match kind {
+        Some(ResourceType::Material) => (units * 60.0).round() as i64,
+        Some(ResourceType::Cost) => 0,
+        Some(ResourceType::Work) | None => work_for(duration_min, units),
+    }
+}
+
 /// A duration change on row `i` rescales its assignments' work to duration x
 /// units, as Project does for a fixed-units or fixed-duration task. A
 /// fixed-work task keeps its work, a summary's stored duration is not the one
@@ -1023,7 +1145,8 @@ fn work_for(duration_min: i64, units: f64) -> i64 {
 /// from, its work is duration x units once it has none (as after a milestone),
 /// and stays as read when a zero duration holds some. What described the old
 /// work is dropped as a units edit drops it ([`Assignment::set_work`]);
-/// progress is kept.
+/// progress is kept. A flat assignment delayed into its task works only from
+/// its `Delay` on, so it still finishes with the task.
 fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
     let t = &proj.tasks[i];
     if t.task_type == Some(TaskType::FixedWork) || proj.is_outline_summary(i) {
@@ -1041,7 +1164,8 @@ fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
             continue;
         }
         let work_min = match a.work_contour {
-            None | Some(0) => work_for(new_min, a.units),
+            // A delayed assignment works from its delay to the task finish.
+            None | Some(0) => work_for((new_min - a.delay_min()).max(0), a.units),
             Some(_) if old_min > 0 && a.work_min > 0 => {
                 (a.work_min as f64 * new_min as f64 / old_min as f64).round() as i64
             }
@@ -1065,6 +1189,7 @@ fn new_assignment(
     next_uid: &mut i32,
     task_uid: i32,
     resource_uid: i32,
+    kind: Option<ResourceType>,
     units: f64,
     duration_min: i64,
 ) -> Result<Assignment, String> {
@@ -1076,7 +1201,7 @@ fn new_assignment(
         task_uid,
         resource_uid,
         units,
-        work_min: work_for(duration_min, units),
+        work_min: assigned_work(kind, duration_min, units),
         ..Assignment::default()
     })
 }
@@ -1311,6 +1436,117 @@ mod tests {
             ed.project().tasks[1].baseline(0).unwrap().duration_min,
             Some(960)
         );
+    }
+
+    #[test]
+    fn set_baseline_captures_assignments_and_resources() {
+        use crate::model::{AssignmentBaseline, Rate, ResourceBaseline};
+        let rate = |text: &str| Rate::parse(text);
+        let record = |kind| TimephasedValue {
+            kind,
+            value: Some("PT8H0M0S".into()),
+            ..TimephasedValue::default()
+        };
+        let resource = |uid, cost: Option<Rate>| Resource {
+            uid,
+            id: uid,
+            name: format!("R{uid}"),
+            max_units: 1.0,
+            standard_rate: rate("50"),
+            work_min: Some(7),
+            cost,
+            ..Resource::default()
+        };
+        let mut proj = editor().project().clone();
+        // R1 stores its totals; R2 stores none, so its cost is the sum.
+        proj.resources = vec![resource(1, rate("7")), resource(2, None)];
+        proj.resources[1].work_min = None;
+        let old_slot = ResourceBaseline {
+            number: 1,
+            work_min: Some(1),
+            ..ResourceBaseline::default()
+        };
+        for r in &mut proj.resources {
+            r.set_baseline_slot(old_slot.clone());
+            r.set_baseline_slot(ResourceBaseline {
+                number: 0,
+                bcws: rate("5"),
+                bcwp: rate("5"),
+                ..ResourceBaseline::default()
+            });
+            r.timephased_data = vec![record(7), record(8), record(20)];
+        }
+        let assignment = |uid, task_uid, resource_uid, cost: Option<Rate>| Assignment {
+            uid,
+            task_uid,
+            resource_uid,
+            units: 1.0,
+            work_min: 480,
+            // Stored dates the schedule would not give it.
+            start: Some(DateTime::from_ymd_hm(2026, 1, 1, 8, 0)),
+            finish: Some(DateTime::from_ymd_hm(2026, 1, 1, 9, 0)),
+            cost,
+            baselines: vec![AssignmentBaseline {
+                number: 1,
+                work_min: Some(1),
+                ..AssignmentBaseline::default()
+            }],
+            timephased_data: vec![record(1), record(4), record(5), record(16)],
+            ..Assignment::default()
+        };
+        proj.assignments = vec![
+            assignment(1, 1, 1, rate("1234")),
+            assignment(2, 2, 2, None),
+            assignment(3, 1, 2, rate("100")),
+        ];
+        let mut ed = Editor::new(proj);
+        let before = ed.project().clone();
+        ed.set_baseline();
+        let p = ed.project();
+        let monday = DateTime::from_ymd_hm(2026, 1, 5, 8, 0);
+        // The span as scheduled now (both tasks start Monday), the stored
+        // cost, else the priced one.
+        for (a, cost) in p.assignments.iter().zip(["1234", "40000", "100"]) {
+            let b = a.baseline(0).unwrap();
+            assert_eq!(b.start, Some(monday), "{}", a.uid);
+            assert_eq!(b.finish, Some(monday.add_minutes(9 * 60)), "{}", a.uid);
+            assert_eq!(b.work_min, Some(480));
+            assert_eq!(b.cost.as_ref().map(Rate::as_str), Some(cost), "{}", a.uid);
+            assert_eq!(a.baseline(1).unwrap().work_min, Some(1));
+            let kinds: Vec<u8> = a.timephased_data.iter().map(|t| t.kind).collect();
+            assert_eq!(kinds, [1, 16]);
+        }
+        // Stored totals, else the sums; no earned value.
+        let recorded: Vec<_> = p
+            .resources
+            .iter()
+            .map(|r| {
+                let b = r.baseline(0).unwrap();
+                (
+                    b.work_min,
+                    b.cost.as_ref().map(Rate::as_str),
+                    b.bcws.clone(),
+                    b.bcwp.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (Some(7), Some("7"), None, None),
+                (Some(960), Some("40100"), None, None)
+            ]
+        );
+        for r in &p.resources {
+            assert_eq!(r.baseline(1), Some(&old_slot));
+            let kinds: Vec<u8> = r.timephased_data.iter().map(|t| t.kind).collect();
+            assert_eq!(kinds, [20]);
+        }
+        // Setting a baseline changes no current value, and is one undo step.
+        assert_eq!(p.assignments[1].cost, None);
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
     }
 
     #[test]
@@ -1987,7 +2223,13 @@ mod tests {
         ed.delete_task(2).unwrap();
         assert!(ed.project().assignments.iter().all(|a| a.task_uid != 2));
         assert_eq!(ed.project().assignments.len(), 1);
-        assert_eq!(ed.project().resources, before.resources);
+        // The resource stays; its totals lose the deleted assignment (#269).
+        let alice = &ed.project().resources[0];
+        assert_eq!(
+            (alice.uid, alice.work_min),
+            (before.resources[0].uid, Some(480))
+        );
+        assert_eq!(before.resources[0].work_min, Some(960));
         assert_schedule(&ed);
 
         let at = ed.add_task(None, "Replacement", 480).unwrap();

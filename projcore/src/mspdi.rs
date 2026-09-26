@@ -1324,6 +1324,12 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// (`Type 1`) exceptions. Known limit: recurring exceptions (`Type` 2-8, or a
 /// `Period` above 1) are written back but not scheduled, so on a plan with one
 /// these fields can differ from Project's and from the stored `Start`/`Finish`.
+///
+/// Assignment and resource values are written as the model holds them, never
+/// recomputed here: Project trusts them, and an unedited file keeps its own.
+/// The editor refreshes the ones an edit made stale (assignment dates, cost
+/// and remaining work, task and resource totals) when it makes the edit; see
+/// `assign::refresh`.
 pub fn write_mspdi(proj: &Project) -> String {
     let mut s = String::new();
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n");

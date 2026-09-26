@@ -344,14 +344,20 @@ pub struct Task {
     pub external_task: Option<bool>,
     pub is_subproject: Option<bool>,
     pub is_subproject_read_only: Option<bool>,
-    /// Stored values docxy does not compute: Work (minutes), Cost and
-    /// OverAllocated as Project last calculated them.
+    /// Work (minutes), Cost and OverAllocated as Project last calculated
+    /// them. docxy never computes them whole: they stay as read until an edit
+    /// changes the task's assignments (or a subtask's), or moves a subtask
+    /// with assignments in or out of the task in the outline; then Work and
+    /// Cost move by that change in assignment totals only, work resources'
+    /// work only (`assign::refresh`). An absent one stays absent.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
     // computes nor reconciles it: the scheduler ignores it and edits leave it
-    // as read. Durations and work are whole minutes, rounded from the source.
+    // as read, except that `remaining_work_min` and `remaining_cost` move with
+    // the task's assignments as `work_min` and `cost` do. Durations and work
+    // are whole minutes, rounded from the source.
     /// Percents, 0..=100.
     pub percent_complete: Option<u8>,
     pub percent_work_complete: Option<u8>,
@@ -527,6 +533,11 @@ impl Rate {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The rate as a number, `None` when it does not fit a finite `f64`.
+    pub fn to_f64(&self) -> Option<f64> {
+        self.0.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
 }
 
 /// A resource (person, equipment, material, or cost).
@@ -544,13 +555,17 @@ pub struct Resource {
     /// Availability, e.g. 1.0 = 100%.
     pub max_units: f64,
     pub accrue_at: Option<AccrueAt>,
-    /// Stored rates only; the scheduler does not calculate costs.
+    /// Currency per hour (per unit for a material); the cost per use is in
+    /// hundredths. [`crate::assign::assignment_cost`] prices from these when
+    /// the resource has no `rates` rows for a table.
     pub standard_rate: Option<Rate>,
     pub overtime_rate: Option<Rate>,
     pub cost_per_use: Option<Rate>,
     pub calendar_uid: Option<i32>,
-    // Stored as read so a save writes them back; nothing here schedules,
-    // levels or costs with them, and edits do not refresh them.
+    // Stored as read so a save writes them back. The totals (`work_min`
+    // through `cost`) are refreshed from the resource's assignments after an
+    // edit that changes those (see `assign::refresh`); the rest is
+    // never recomputed.
     /// The unit Project displays each rate in, as the MSPDI code (1 minute,
     /// 2 hour, 3 day, 4 week, 5 month, 7 year; the standard rate also 8, a
     /// material rate). Kept as the code so an unnamed one still round-trips.
@@ -584,21 +599,21 @@ pub struct Resource {
     pub extended_attributes: Vec<ExtendedAttributeValue>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     pub baselines: Vec<ResourceBaseline>,
-    /// Units available over date ranges, in file order. Project takes capacity
-    /// from these over `max_units`, so an edit that changes `max_units` must
-    /// also update the period it falls in.
+    /// Units available over date ranges, in file order. Project, and docxy's
+    /// leveler, take capacity from these over `max_units`, so an edit that
+    /// changes `max_units` must also update the period it falls in.
     pub availability_periods: Vec<AvailabilityPeriod>,
-    /// Cost rate tables A-E over date ranges, in file order. Project costs
-    /// from these: table A's current entry mirrors `standard_rate`,
-    /// `overtime_rate` and `cost_per_use`, so an edit of those must also
-    /// update that entry.
+    /// Cost rate tables A-E over date ranges, in file order. Project and
+    /// [`crate::assign::assignment_cost`] cost from these: table A's current
+    /// entry mirrors `standard_rate`, `overtime_rate` and `cost_per_use`, so
+    /// an edit of those must also update that entry.
     pub rates: Vec<RateEntry>,
     // The rest of Microsoft's Resource children, stored as read so a save
-    // writes them back. Nothing schedules, levels or costs with them, and no
-    // edit refreshes them: the totals, actuals and earned value go stale after
-    // an assignment edit, as `work_min` and `cost` already do. Text is kept as
-    // written (an empty GUID is dropped, as on Task), costs and earned value
-    // as decimal text, work in whole minutes.
+    // writes them back. An edit that changes the resource's assignments
+    // refreshes `start`, `finish` and `remaining_cost` with the totals above;
+    // the actuals, overtime cost and earned value are never recomputed. Text
+    // is kept as written (an empty GUID is dropped, as on Task), costs and
+    // earned value as decimal text, work in whole minutes.
     pub guid: Option<String>,
     pub is_null: Option<bool>,
     pub phonetics: Option<String>,
@@ -765,7 +780,10 @@ pub struct Assignment {
     /// Work in **minutes**.
     pub work_min: i64,
     // Recorded progress, kept as read so a save writes it back; see the same
-    // block on [`Task`]. Work is whole minutes, rounded from the source.
+    // block on [`Task`]. The actuals stay as read; an edit that changes the
+    // assignment's inputs derives `remaining_work_min` (work − actual work)
+    // and `remaining_cost` (cost − actual cost) again. Work is whole minutes,
+    // rounded from the source.
     /// 0..=100.
     pub percent_work_complete: Option<u8>,
     pub actual_start: Option<DateTime>,
@@ -782,8 +800,10 @@ pub struct Assignment {
     pub finish_variance: Option<i64>,
     pub work_variance: Option<Rate>,
     pub cost_variance: Option<Rate>,
-    // Stored as read, like the progress above; the scheduler neither uses
-    // nor refreshes them.
+    // Stored as read, like the progress above. An edit that changes an
+    // assignment's inputs (its task's dates, its units, work or resource)
+    // refreshes `start`, `finish`, `regular_work_min`, `cost` and the
+    // remaining work and cost from them; see `assign::refresh`.
     /// How the work is spread over time: 0 flat .. 8 contoured.
     pub work_contour: Option<u8>,
     pub fixed_material: Option<bool>,
@@ -793,16 +813,19 @@ pub struct Assignment {
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
     /// Work less overtime, in whole minutes. An edit that changes `work_min`
-    /// clears it, since keeping it would assert overtime nobody entered.
+    /// clears the overtime, so the refresh makes this the whole work.
     pub regular_work_min: Option<i64>,
-    /// Overtime work in whole minutes and the assignment's cost. Like
-    /// `regular_work_min`, a units edit clears them.
+    /// Overtime work in whole minutes and the assignment's cost (hundredths).
+    /// A work edit clears both; the refresh prices the cost again, or, for
+    /// one it cannot price (a cost resource's), restores the cost it had.
     pub overtime_work_min: Option<i64>,
     pub cost: Option<Rate>,
     /// Which of the resource's rate tables prices it: 0 = A .. 4 = E.
     pub cost_rate_table: Option<u8>,
-    /// Delays as MSPDI stores them (tenths of a minute), not converted and not
-    /// applied by the scheduler. The format is a duration unit code.
+    /// Delays as MSPDI stores them (tenths of a minute). They move the
+    /// assignment's own start ([`crate::assign::assignment_span`]), never its
+    /// task in CPM, whose duration already includes them. The format is a
+    /// duration unit code.
     pub delay: Option<i64>,
     pub leveling_delay: Option<i64>,
     pub leveling_delay_format: Option<u8>,
@@ -813,8 +836,9 @@ pub struct Assignment {
     pub baselines: Vec<AssignmentBaseline>,
     /// The work and cost spread over time, in file order. An edit that
     /// rewrites `work_min` (units or duration) drops the planned-work records
-    /// (see [`Assignment::set_work`]) and keeps the actuals and baselines; a
-    /// reschedule leaves it as stale as `start` and `finish`.
+    /// (see [`Assignment::set_work`]) and keeps the actuals and baselines; an
+    /// edit that moves `start`/`finish` drops them too, and none is ever
+    /// synthesised.
     pub timephased_data: Vec<TimephasedValue>,
     // The rest of Microsoft's Assignment children, stored as read like the
     // fields above. The overtime cost and remaining overtime describe the
@@ -872,7 +896,9 @@ impl Assignment {
     /// spread. Keeping them would invent overtime or misprice the new work.
     /// Actuals, earned value, the budget, baselines, delays, the rate table,
     /// notes and custom fields stay. Every edit that rewrites the work goes
-    /// through here, so a field derived from it has one place to join.
+    /// through here, so a field derived from it has one place to join; the
+    /// editor's refresh (`assign::refresh`) then derives the regular
+    /// work, cost, dates and remaining work again from the new work.
     pub fn set_work(&mut self, work_min: i64) {
         self.work_min = work_min;
         self.regular_work_min = None;
@@ -885,6 +911,18 @@ impl Assignment {
             .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
     }
 
+    /// The `Delay` in whole working minutes (MSPDI stores tenths), never
+    /// negative.
+    pub fn delay_min(&self) -> i64 {
+        tenths_to_min(self.delay)
+    }
+
+    /// The `LevelingDelay` in whole minutes, in the unit kind its format
+    /// gives (working or elapsed), never negative.
+    pub fn leveling_delay_min(&self) -> i64 {
+        tenths_to_min(self.leveling_delay)
+    }
+
     pub fn baseline(&self, number: u8) -> Option<&AssignmentBaseline> {
         self.baselines.iter().find(|b| b.number == number)
     }
@@ -895,6 +933,11 @@ impl Assignment {
         self.baselines.push(baseline);
         self.baselines.sort_by_key(|b| b.number);
     }
+}
+
+/// An MSPDI delay (tenths of a minute) in whole minutes, never negative.
+fn tenths_to_min(tenths: Option<i64>) -> i64 {
+    (tenths.unwrap_or(0).max(0) + 5) / 10
 }
 
 /// A recorded plan in one MSPDI baseline slot of an assignment.

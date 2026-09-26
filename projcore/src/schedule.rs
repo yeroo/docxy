@@ -1795,80 +1795,166 @@ impl Leveled {
 ///
 /// v1 scope: a single-pass, topological-order serial leveler operating in the
 /// default calendar's working-minute space; resource occupation is the task's
-/// wall-clock span. It only ever moves tasks *later*. Multi-calendar leveling
-/// and task splitting are out of scope.
+/// wall-clock span, from each assignment's `Delay` into it. A resource's
+/// capacity is its Max. Units, or over time its availability periods (none
+/// outside them). It only ever moves tasks *later*. A resource that has no
+/// capacity for the task anywhere later is left overallocated: the task is
+/// placed at the earliest start where every *other* resource fits, and at its
+/// earliest start (CPM plus the delay its links inherit) when it has no
+/// other. Multi-calendar leveling and task splitting are out of scope.
 /// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
     Scheduler::new(&without_blank_rows(proj)).level()
 }
 
-/// Peak concurrent booked load over `[start, end)` (a sweep over interval ends).
-fn max_load_in(bookings: &[(i64, i64, f64)], start: i64, end: i64) -> f64 {
-    let mut events: Vec<(i64, f64)> = Vec::new();
-    for &(s, e, u) in bookings {
-        if s < end && e > start {
-            events.push((s.max(start), u));
-            events.push((e.min(end), -u));
+/// One booking of a resource: `[start, end)` in the default timeline's
+/// index space, at `units`.
+type Booking = (i64, i64, f64);
+
+/// A resource's capacity over index space as steps `(from, units)` in order,
+/// each holding until the next; the first holds from the beginning of time.
+type Capacity = Vec<(i64, f64)>;
+
+/// A work resource's capacity. Without availability periods it is its Max.
+/// Units (100% when unusable) at all times. With them, as in Project 2024
+/// (CST-020), each period gives its `AvailableUnits` (`MaxUnits` when absent)
+/// from `AvailableFrom` up to `AvailableTo` (open-ended when absent or past
+/// the timeline), the first period in file order winning an overlap, and time
+/// outside every period has none.
+fn capacity(r: &crate::model::Resource, tl: &Timeline) -> Capacity {
+    let max = if r.max_units > 0.0 { r.max_units } else { 1.0 };
+    if r.availability_periods.is_empty() {
+        return vec![(i64::MIN, max)];
+    }
+    let periods: Vec<(i64, i64, f64)> = r
+        .availability_periods
+        .iter()
+        .map(|p| {
+            let from = p
+                .available_from
+                .map_or(i64::MIN, |d| tl.to_index(d.minutes()));
+            let to = p
+                .available_to
+                .map(|d| tl.to_index(d.minutes()))
+                .filter(|&to| to < tl.total)
+                .unwrap_or(i64::MAX);
+            let units = match &p.available_units {
+                Some(units) => units.to_f64().unwrap_or(0.0),
+                None => max,
+            };
+            (from, to, units)
+        })
+        .collect();
+    let mut points: Vec<i64> = periods
+        .iter()
+        .flat_map(|&(from, to, _)| [from, to])
+        .chain([i64::MIN])
+        .filter(|&p| p != i64::MAX)
+        .collect();
+    points.sort_unstable();
+    points.dedup();
+    let mut steps: Capacity = Vec::new();
+    for p in points {
+        let units = periods
+            .iter()
+            .find(|&&(from, to, _)| from <= p && p < to)
+            .map_or(0.0, |&(_, _, units)| units);
+        if steps.last().is_none_or(|&(_, last)| last != units) {
+            steps.push((p, units));
         }
     }
-    events.sort_by_key(|&(t, _)| t);
-    let (mut load, mut peak) = (0.0f64, 0.0f64);
-    for (_, d) in events {
-        load += d;
-        if load > peak {
-            peak = load;
-        }
-    }
-    peak
+    steps
 }
 
-/// Earliest index ≥ `start` where adding `units` for `dur` keeps one resource
-/// within `cap`.
+/// The capacity in effect at index `at`.
+fn capacity_at(cap: &[(i64, f64)], at: i64) -> f64 {
+    cap.iter()
+        .rev()
+        .find(|&&(from, _)| from <= at)
+        .map_or(0.0, |&(_, units)| units)
+}
+
+/// Whether adding `units` over `[lo, hi)` keeps one resource within its
+/// capacity on every stretch between booking and capacity breakpoints. A
+/// resource that is free and available somewhere takes an assignment above
+/// its capacity there: leveling cannot help it, and it waits for nothing.
+fn fits(bookings: &[Booking], cap: &[(i64, f64)], units: f64, lo: i64, hi: i64) -> bool {
+    let mut points: Vec<i64> = bookings
+        .iter()
+        .flat_map(|&(s, e, _)| [s, e])
+        .chain(cap.iter().map(|&(from, _)| from))
+        .filter(|&p| lo < p && p < hi)
+        .chain([lo])
+        .collect();
+    points.sort_unstable();
+    points.dedup();
+    points.into_iter().all(|p| {
+        let load: f64 = bookings
+            .iter()
+            .filter(|&&(s, e, _)| s <= p && p < e)
+            .map(|&(_, _, u)| u)
+            .sum();
+        let cap = capacity_at(cap, p);
+        load + units <= cap + 1e-9 || (load <= 1e-9 && cap > 0.0)
+    })
+}
+
+/// Earliest index ≥ `start` where one resource can take `units` over
+/// `[cand + from, cand + dur)`, `from` being its assignment's delay into the
+/// task. Tries the next booking end or capacity change that could free the
+/// window; when none is left (the resource has no capacity from some point
+/// on), the task stays at `start`.
 fn earliest_feasible(
-    bookings: &[(i64, i64, f64)],
-    cap: f64,
+    bookings: &[Booking],
+    cap: &[(i64, f64)],
     units: f64,
     start: i64,
+    from: i64,
     dur: i64,
 ) -> i64 {
-    if dur <= 0 {
+    if from >= dur {
         return start;
     }
     let mut cand = start;
     loop {
-        let end = cand + dur;
-        if max_load_in(bookings, cand, end) + units <= cap + 1e-9 {
+        let (lo, hi) = (cand + from, cand + dur);
+        if fits(bookings, cap, units, lo, hi) {
             return cand;
         }
-        // jump to the earliest time a blocking interval frees, then retry
-        let next = bookings
+        let freed = bookings
             .iter()
-            .filter(|&&(s, e, _)| s < end && e > cand)
-            .map(|&(_, e, _)| e)
-            .filter(|&e| e > cand)
-            .min();
-        match next {
-            Some(n) => cand = n,
-            None => return cand,
+            .filter(|&&(s, e, _)| s < hi && e > lo)
+            .map(|&(_, e, _)| e);
+        let changes = cap.iter().map(|&(at, _)| at);
+        match freed.chain(changes).filter(|&at| at > lo).min() {
+            Some(at) => cand = at - from,
+            None => return start,
         }
     }
 }
 
-/// Earliest index ≥ `start` feasible for *all* of a task's resources at once.
+/// A task's booking on one resource: its units and its delay into the task.
+type Demand = (i32, f64, i64);
+
+/// Earliest index ≥ `start` feasible for all of a task's resources at once,
+/// except that a resource with no capacity for it anywhere later (see
+/// [`earliest_feasible`]) accepts any index: the result is then the earliest
+/// where every other resource fits, which leaves that one overallocated.
 fn place_all(
-    res: &[(i32, f64)],
-    bookings: &HashMap<i32, Vec<(i64, i64, f64)>>,
-    caps: &HashMap<i32, f64>,
+    res: &[Demand],
+    bookings: &HashMap<i32, Vec<Booking>>,
+    caps: &HashMap<i32, Capacity>,
     start: i64,
     dur: i64,
 ) -> i64 {
     let mut cand = start;
     loop {
         let mut next: Option<i64> = None;
-        for &(rid, units) in res {
+        for &(rid, units, from) in res {
             let bk = bookings.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]);
-            let cap = caps.get(&rid).copied().unwrap_or(1.0);
-            let c = earliest_feasible(bk, cap, units, cand, dur);
+            // Every work resource has a capacity; nothing else is booked.
+            let cap = &caps[&rid];
+            let c = earliest_feasible(bk, cap, units, cand, from, dur);
             if c > cand {
                 next = Some(next.map_or(c, |n: i64| n.min(c)));
             }
@@ -1876,6 +1962,19 @@ fn place_all(
         match next {
             None => return cand,
             Some(n) => cand = n,
+        }
+    }
+}
+
+/// Book a task placed at `[start, finish)` on each of its resources, each from
+/// its own delay into the task; a delay past the finish books nothing.
+fn book(bookings: &mut HashMap<i32, Vec<Booking>>, res: &[Demand], start: i64, finish: i64) {
+    for &(rid, units, from) in res {
+        if start + from < finish {
+            bookings
+                .entry(rid)
+                .or_default()
+                .push((start + from, finish, units));
         }
     }
 }
@@ -1957,25 +2056,30 @@ impl Scheduler<'_> {
             .collect();
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
 
-        // Work-resource capacities and per-task assignments.
-        let mut caps: HashMap<i32, f64> = HashMap::new();
-        for r in &self.proj.resources {
-            if r.kind == ResourceType::Work {
-                caps.insert(r.uid, if r.max_units > 0.0 { r.max_units } else { 1.0 });
-            }
-        }
-        let mut assign: HashMap<i32, Vec<(i32, f64)>> = HashMap::new();
+        // Work-resource capacities and per-task assignments. An assignment
+        // books its resource from its `Delay` into the task on; its stored
+        // `LevelingDelay` is the output of Project's last leveling, which
+        // this pass replaces, so it is not added.
+        let caps: HashMap<i32, Capacity> = self
+            .proj
+            .resources
+            .iter()
+            .filter(|r| r.kind == ResourceType::Work)
+            .map(|r| (r.uid, capacity(r, tl)))
+            .collect();
+        let mut assign: HashMap<i32, Vec<Demand>> = HashMap::new();
         for a in &self.proj.assignments {
             if caps.contains_key(&a.resource_uid) {
-                assign
-                    .entry(a.task_uid)
-                    .or_default()
-                    .push((a.resource_uid, if a.units > 0.0 { a.units } else { 1.0 }));
+                assign.entry(a.task_uid).or_default().push((
+                    a.resource_uid,
+                    if a.units > 0.0 { a.units } else { 1.0 },
+                    a.delay_min(),
+                ));
             }
         }
 
         let mut delay: HashMap<i32, i64> = HashMap::new();
-        let mut bookings: HashMap<i32, Vec<(i64, i64, f64)>> = HashMap::new();
+        let mut bookings: HashMap<i32, Vec<Booking>> = HashMap::new();
         let mut start: HashMap<i32, DateTime> = HashMap::new();
         let mut finish: HashMap<i32, DateTime> = HashMap::new();
         // Auto tasks whose leveled start or finish differs from CPM.
@@ -1992,12 +2096,8 @@ impl Scheduler<'_> {
             let cpm = base.get(t.uid).expect("leaf scheduled");
             let s_idx = tl.to_index(cpm.early_start.minutes());
             let f_idx = tl.to_index(cpm.early_finish.minutes());
-            for (rid, units) in assign.get(&t.uid).into_iter().flatten() {
-                bookings
-                    .entry(*rid)
-                    .or_default()
-                    .push((s_idx, f_idx, *units));
-            }
+            let res = assign.get(&t.uid).map_or(&[][..], Vec::as_slice);
+            book(&mut bookings, res, s_idx, f_idx);
         }
 
         for &i in &order {
@@ -2043,12 +2143,7 @@ impl Scheduler<'_> {
             let res = assign.get(&t.uid).cloned().unwrap_or_default();
             let placed = place_all(&res, &bookings, &caps, earliest, t.duration_min);
             delay.insert(t.uid, placed - cpm_start_idx);
-            for (rid, units) in &res {
-                bookings
-                    .entry(*rid)
-                    .or_default()
-                    .push((placed, placed + t.duration_min, *units));
-            }
+            book(&mut bookings, &res, placed, placed + t.duration_min);
             // A predecessor can move only its instant, keeping its working
             // index (an elapsed lag into nonworking time, #104); a successor
             // that keeps that instant (a milestone, an SF finish) must follow.
@@ -4369,6 +4464,114 @@ mod tests {
         let lv = level(&proj);
         assert_eq!(lv.start(1).unwrap().to_mspdi(), "2026-03-02T08:00:00");
         assert_eq!(lv.start(2).unwrap().to_mspdi(), "2026-03-02T08:00:00"); // no delay
+    }
+
+    fn period(
+        from: Option<DateTime>,
+        to: Option<DateTime>,
+        units: &str,
+    ) -> crate::model::AvailabilityPeriod {
+        crate::model::AvailabilityPeriod {
+            available_from: from,
+            available_to: to,
+            available_units: crate::model::Rate::parse(units),
+        }
+    }
+
+    fn march(day: u32, hour: u32) -> DateTime {
+        DateTime::from_ymd_hm(2026, 3, day, hour, 0)
+    }
+
+    /// Two-day tasks A and B from Monday 2 March, both on `alice` at `units`.
+    fn shared(alice: Resource, units: f64) -> Project {
+        Project {
+            start_date: Some(march(2, 8)),
+            tasks: vec![task(1, "A", 960), task(2, "B", 960)],
+            resources: vec![alice],
+            assignments: vec![assign(1, 1, 1, units), assign(2, 2, 1, units)],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn leveling_takes_capacity_from_availability_periods() {
+        // At 100% two 50% tasks share Alice; a 50% period parts them.
+        let alice = worker(1, "Alice", 1.0);
+        assert_eq!(
+            level(&shared(alice.clone(), 0.5)).start(2),
+            Some(march(2, 8))
+        );
+        let half = Resource {
+            availability_periods: vec![period(None, None, "0.5")],
+            ..alice.clone()
+        };
+        let lv = level(&shared(half, 0.5));
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(march(4, 8)), Some(march(5, 17)))
+        );
+
+        // Unavailable Wednesday to Friday: B waits for the next period.
+        let gap = Resource {
+            availability_periods: vec![
+                period(Some(march(2, 8)), Some(march(3, 17)), "1"),
+                period(Some(march(9, 8)), None, "1"),
+            ],
+            ..alice
+        };
+        let lv = level(&shared(gap, 1.0));
+        assert_eq!(lv.start(1), Some(march(2, 8)));
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(march(9, 8)), Some(march(10, 17)))
+        );
+    }
+
+    #[test]
+    fn leveling_leaves_a_task_that_never_fits_at_its_earliest_start() {
+        // Alice is available Monday and Tuesday only: B cannot go anywhere
+        // later, so it stays where CPM put it.
+        let tail = Resource {
+            availability_periods: vec![period(Some(march(2, 8)), Some(march(3, 17)), "1")],
+            ..worker(1, "Alice", 1.0)
+        };
+        let lv = level(&shared(tail.clone(), 1.0));
+        assert_eq!(
+            (lv.start(1), lv.start(2)),
+            (Some(march(2, 8)), Some(march(2, 8)))
+        );
+
+        // Its earliest start still honours its links: S follows B, which
+        // Bob's leveling moves to Wednesday, so S stays at B's new finish,
+        // not at its CPM start.
+        let mut proj = shared(worker(2, "Bob", 1.0), 1.0);
+        for a in &mut proj.assignments {
+            a.resource_uid = 2;
+        }
+        let mut s = task(3, "S", 480);
+        s.predecessors = vec![fs(2)];
+        proj.tasks.push(s);
+        proj.resources.push(tail);
+        proj.assignments.push(assign(3, 3, 1, 1.0));
+        assert_eq!(schedule(&proj).get(3).unwrap().early_start, march(4, 8));
+        let lv = level(&proj);
+        assert_eq!(lv.start(2), Some(march(4, 8)));
+        assert_eq!(lv.start(3), Some(march(6, 8)));
+    }
+
+    #[test]
+    fn leveling_books_a_delayed_assignment_from_its_delay() {
+        // B runs four days, but Alice starts on it two days in, after A.
+        let mut proj = shared(worker(1, "Alice", 1.0), 1.0);
+        proj.tasks[1].duration_min = 4 * 480;
+        proj.assignments[1].delay = Some(960 * 10);
+        assert_eq!(level(&proj).start(2), Some(march(2, 8)));
+        // A stored leveling delay is Project's last pass, not a booking gap:
+        // it books from the task start and B waits for A.
+        proj.assignments[1].delay = None;
+        proj.assignments[1].leveling_delay = Some(960 * 10);
+        proj.assignments[1].leveling_delay_format = Some(7);
+        assert_eq!(level(&proj).start(2), Some(march(4, 8)));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! this targets project schedules: the domain of Microsoft Project.
 //!
 //! Layers:
+//! - [`assign`] — assignment dates and costs, refreshed after an edit.
 //! - [`editor`] — shared editing, selection, undo/redo and live scheduling.
 //! - [`datetime`] — a `std`-only civil wall-clock instant.
 //! - [`model`] — the pure domain model (tasks, links, resources, calendars).
@@ -16,6 +17,7 @@
 //! - [`yppx`] — the native `.yppx` OPC package (ZIP container), the
 //!   project-scheduling analog of `.docx`/`.xlsx`.
 
+pub mod assign;
 pub mod datetime;
 pub mod editor;
 pub mod gantt;
