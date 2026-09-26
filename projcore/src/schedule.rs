@@ -1610,6 +1610,60 @@ fn place_all(
 }
 
 impl Scheduler<'_> {
+    /// A milestone that leveling leaves on its CPM working index, recomputed
+    /// only because a predecessor's instant moved (#104). It keeps its CPM
+    /// instant unless an FS link placed it there in CPM; then it follows
+    /// that predecessor's leveled instant on the same index. Constraints
+    /// hold it as the CPM pass does: an honored MSO/MFO keeps the CPM
+    /// instant, and an honored FNLT/SNLT caps it.
+    fn releveled_milestone(
+        &self,
+        t: &Task,
+        tl: &Timeline,
+        cpm: &TaskResult,
+        base: &Schedule,
+        finish: &HashMap<i32, DateTime>,
+        linked: bool,
+    ) -> i64 {
+        let cpm_start = cpm.early_start.minutes();
+        let honored = |c| self.proj.honor_constraints && t.constraint == c;
+        if honored(ConstraintType::MustFinishOn) || honored(ConstraintType::MustStartOn) {
+            return cpm_start;
+        }
+        let placed = tl.to_index(cpm_start);
+        let mut s_abs = cpm_start;
+        for p in t
+            .predecessors
+            .iter()
+            .filter(|p| p.link == LinkType::FinishStart)
+        {
+            let (Some(was), Some(&now)) = (base.get(p.uid), finish.get(&p.uid)) else {
+                continue;
+            };
+            let offset = self.offset(p);
+            let instant = |f: DateTime| {
+                let (f, lag) = offset.forward(f.minutes());
+                fs_milestone_instant(tl, f, lag)
+            };
+            let (was, now) = (instant(was.early_finish), instant(now));
+            if was == cpm_start && tl.to_index(now) == placed {
+                s_abs = s_abs.max(now);
+            }
+        }
+        let cap = self
+            .constraint_dates(t, linked)
+            .and_then(|dates| match t.constraint {
+                ConstraintType::FinishNoLaterThan => Some(dates.milestone),
+                ConstraintType::StartNoLaterThan => Some(dates.start),
+                _ => None,
+            })
+            .filter(|_| self.proj.honor_constraints);
+        match cap {
+            Some(cap) => s_abs.min(cap.max(cpm_start)),
+            None => s_abs,
+        }
+    }
+
     fn level(&self) -> Leveled {
         let base = self.run();
         let tl = self
@@ -1740,7 +1794,10 @@ impl Scheduler<'_> {
                 (cpm.early_start.minutes(), cpm.early_finish.minutes())
             } else {
                 let mut s_abs = tl.abs_start(placed);
-                if t.duration_min == 0 {
+                if t.duration_min == 0 && placed == cpm_start_idx {
+                    let linked = t.predecessors.iter().any(|p| start.contains_key(&p.uid));
+                    s_abs = self.releveled_milestone(t, tl, cpm, &base, &finish, linked);
+                } else if t.duration_min == 0 {
                     let mut fs_instant: Option<i64> = None;
                     let mut start_bound = cpm.early_start.minutes();
                     for p in &t.predecessors {
@@ -1775,12 +1832,6 @@ impl Scheduler<'_> {
                     // already carries the task's SNET/MSO start bounds.
                     if let Some(instant) = fs_instant {
                         s_abs = instant.max(start_bound);
-                    } else if placed == cpm_start_idx {
-                        // Recomputed only because a predecessor's instant
-                        // moved, and no FS instant reaches this index: keep
-                        // the CPM instant, which may be held at a period's
-                        // end (an MFO, an SNET milestone).
-                        s_abs = start_bound;
                     }
                 }
                 let bounds = t.predecessors.iter().filter_map(|p| {
@@ -5280,7 +5331,7 @@ mod tests {
         g.predecessors = vec![lag_link(1, LinkType::FinishFinish, 2880, 8)];
         // Zero-lag milestones after G and after M: only G's and M's instants
         // move, not their working indices, and they must follow: Project's
-        // LevelNow puts both at Sat 7 17:00 too.
+        // LevelNow puts both at Sat 7 17:00 too, and gives every date below.
         let mut h = task(6, "H", 0);
         h.predecessors = vec![Predecessor::fs(5)];
         let mut n = task(7, "N", 0);
@@ -5297,6 +5348,30 @@ mod tests {
         x.predecessors = vec![Predecessor::working(5, LinkType::StartStart, 0)];
         x.constraint = ConstraintType::StartNoEarlierThan;
         x.constraint_date = Some(at(6, 17));
+        // An honored MFO or FNLT caps a milestone as in CPM: K2 (FS on G and
+        // FF on P1, which ends Fri 13), K3 (FF on G) and K4 (FS on G) keep
+        // their MFO instants; F1's FNLT Fri 13 does not bind, so it follows
+        // G to Saturday, while F2's FNLT Fri 6 holds it there.
+        let milestone = |uid, name, preds: Vec<Predecessor>, constraint, date| {
+            let mut t = task(uid, name, 0);
+            t.predecessors = preds;
+            t.constraint = constraint;
+            t.constraint_date = Some(date);
+            t
+        };
+        let mut p1 = task(10, "P1", 480);
+        p1.constraint = ConstraintType::FinishNoEarlierThan;
+        p1.constraint_date = Some(at(13, 17));
+        let ff = |uid| Predecessor::working(uid, LinkType::FinishFinish, 0);
+        let (mfo, fnlt) = (
+            ConstraintType::MustFinishOn,
+            ConstraintType::FinishNoLaterThan,
+        );
+        let k2 = milestone(11, "K2", vec![Predecessor::fs(5), ff(10)], mfo, at(13, 17));
+        let k3 = milestone(12, "K3", vec![ff(5)], mfo, at(6, 17));
+        let k4 = milestone(13, "K4", vec![Predecessor::fs(5)], mfo, at(6, 17));
+        let f1 = milestone(14, "F1", vec![Predecessor::fs(5)], fnlt, at(13, 17));
+        let f2 = milestone(15, "F2", vec![Predecessor::fs(5)], fnlt, at(6, 17));
         let mut proj = Project {
             start_date: Some(at(2, 8)),
             tasks: vec![
@@ -5309,6 +5384,12 @@ mod tests {
                 n,
                 k,
                 x,
+                p1,
+                k2,
+                k3,
+                k4,
+                f1,
+                f2,
             ],
             ..Project::default()
         };
@@ -5324,5 +5405,11 @@ mod tests {
         assert_eq!(dates(7), (at(7, 17), at(7, 17)));
         assert_eq!(dates(8), (at(13, 17), at(13, 17)));
         assert_eq!(dates(9), (at(6, 17), at(6, 17)));
+        assert_eq!(dates(10), (at(13, 8), at(13, 17)));
+        for (uid, expected) in [(11, at(13, 17)), (12, at(6, 17)), (13, at(6, 17))] {
+            assert_eq!(dates(uid), (expected, expected), "MFO milestone {uid}");
+        }
+        assert_eq!(dates(14), (at(7, 17), at(7, 17)), "F1");
+        assert_eq!(dates(15), (at(6, 17), at(6, 17)), "F2");
     }
 }
