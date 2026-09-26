@@ -190,9 +190,10 @@
         "blank-row",
         "summary",
         "link",
-        "link-fs"
+        "link-fs",
+        "custom-fields"
       ],
-      "desc": "Task type, estimate, active, deadline, levelling and a blank row survive saves."
+      "desc": "Task type, estimate, active, deadline, levelling, custom fields and a blank row survive saves."
     },
     {
       "file": "21-deadline-missed.xml",

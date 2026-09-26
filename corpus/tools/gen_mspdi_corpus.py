@@ -50,7 +50,7 @@ def iso(minutes):
 def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
          outline=1, summary=False, milestone=False, preds=(), ctype=None,
          cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
-         manual_finish=None, manual_duration=None, fields=()):
+         manual_finish=None, manual_duration=None, fields=(), ext=()):
     """One <Task>. `preds` is a list of (uid, type_code, link_lag) or
     (uid, type_code, link_lag, lag_format): LinkLag is tenths of a minute, or
     the percentage itself for LagFormat 19; the format defaults to 7 (days).
@@ -58,7 +58,9 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
     `slack` (working minutes) and `critical` are Project's TotalSlack and
     Critical. They are required so a new task cannot omit its oracle.
     `manual` (0/1) and the manual_* fields are written only when given.
-    `fields` is a list of (element, text) for the stored task fields of #80."""
+    `fields` is a list of (element, text) for the stored task fields of #80.
+    `ext` is a list of custom field values (#268), each a list of (element,
+    text) inside one <ExtendedAttribute>, written after the links."""
     oid = uid if oid is None else oid
     lines = [
         "    <Task>",
@@ -96,6 +98,10 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
             f"        <LinkLag>{lag}</LinkLag><LagFormat>{fmt[0] if fmt else 7}</LagFormat>",
             "      </PredecessorLink>",
         ]
+    for attribute in ext:
+        lines += ["      <ExtendedAttribute>"]
+        lines += [f"        <{tag}>{value}</{tag}>" for tag, value in attribute]
+        lines.append("      </ExtendedAttribute>")
     for number, baseline_start, baseline_finish, duration in baselines:
         lines += ["      <Baseline>", f"        <Number>{number}</Number>"]
         for tag, value in [("Start", baseline_start), ("Finish", baseline_finish),
@@ -187,7 +193,7 @@ def standard_calendar(uid=1, name="Standard", saturday=False, exs=()):
 
 
 def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
-            calendars=None, new_tasks_are_manual=None):
+            calendars=None, new_tasks_are_manual=None, extended_attributes=""):
     calendars = calendars or [standard_calendar()]
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -204,6 +210,9 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
     ]
     if new_tasks_are_manual is not None:
         parts.append(f"  <NewTasksAreManual>{new_tasks_are_manual}</NewTasksAreManual>")
+    if extended_attributes:
+        # Custom field definitions (#268): after the header, before the tasks.
+        parts += ["  <ExtendedAttributes>", extended_attributes, "  </ExtendedAttributes>"]
     parts += [
         "  <Tasks>",
         tasks_xml,
@@ -486,6 +495,44 @@ def build():
     # most tasks estimated, Priority 500 or 900, LevelingDelayFormat 8.
     # Hand-derived like file 19, not verified in Project: docxy still
     # schedules the inactive task, and the blank row's shape is ours.
+    # Custom fields (#268): a Text1 "Trade" lookup table and a Duration1
+    # formula, and task values for them, one picked from the table by its
+    # ValueGUID. The definition shapes follow Project's MSPDI schema.
+    definitions = "\n".join([
+        "    <ExtendedAttribute>",
+        "      <FieldID>188743731</FieldID>",
+        "      <FieldName>Text1</FieldName>",
+        "      <CFType>21</CFType>",
+        "      <Guid>000039B7-8BBE-4CEB-82C4-FA8C0B400033</Guid>",
+        "      <SecondaryPID>255868938</SecondaryPID>",
+        "      <SecondaryGuid>000039B7-8BBE-4CEB-82C4-FA8C0F40400A</SecondaryGuid>",
+        "      <Ltuid>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E001</Ltuid>",
+        "      <ValueList>",
+        "        <Value>",
+        "          <ID>1</ID>",
+        "          <Value>Civil</Value>",
+        "          <Description>Ground &amp; concrete</Description>",
+        "          <FieldGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101</FieldGUID>",
+        "        </Value>",
+        "        <Value>",
+        "          <ID>2</ID>",
+        "          <Value>M&amp;E</Value>",
+        "          <Description/>",
+        "          <FieldGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102</FieldGUID>",
+        "        </Value>",
+        "      </ValueList>",
+        "      <Alias>Trade</Alias>",
+        "      <AppendNewValues>0</AppendNewValues>",
+        "    </ExtendedAttribute>",
+        "    <ExtendedAttribute>",
+        "      <FieldID>188743783</FieldID>",
+        "      <FieldName>Duration1</FieldName>",
+        "      <Guid>000039B7-8BBE-4CEB-82C4-FA8C0B400067</Guid>",
+        "      <SecondaryPID>255868966</SecondaryPID>",
+        "      <Formula>[Duration]*2</Formula>",
+        "      <Alias>Buffer</Alias>",
+        "    </ExtendedAttribute>",
+    ])
     common = [("LevelAssignments", 1), ("LevelingCanSplit", 1),
               ("LevelingDelay", 0), ("LevelingDelayFormat", 8),
               ("IgnoreResourceCalendar", 0), ("HideBar", 0), ("EarnedValueMethod", 0),
@@ -498,8 +545,9 @@ def build():
                 ("CreateDate", created)]
 
     add("20-task-fields.xml", ["task-fields", "round-trip", "blank-row", "summary", "link",
-                               "link-fs"],
-        "Task type, estimate, active, deadline, levelling and a blank row survive saves.",
+                               "link-fs", "custom-fields"],
+        "Task type, estimate, active, deadline, levelling, custom fields and a blank row "
+        "survive saves.",
         project("task-fields", "\n".join([
             task(1, "Phase", 3 * D, dt(2), dt(4, "17:00:00"), **CRIT, summary=True,
                  fields=ident(1) + [("Active", 1), ("Type", 1), ("WBS", "1"),
@@ -509,7 +557,11 @@ def build():
                  fields=ident(2) + [("Active", 1), ("Type", 0), ("WBS", "1.1"),
                                     ("Priority", 900), ("Estimated", 1),
                                     ("EffortDriven", 1), ("Work", iso(2 * D)),
-                                    ("Cost", "1250.50"), ("Rollup", 1)] + common),
+                                    ("Cost", "1250.50"), ("Rollup", 1)] + common,
+                 ext=[[("FieldID", 188743731), ("Value", "Civil"),
+                       ("ValueGUID", "7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101")],
+                      [("FieldID", 188743783), ("Value", iso(4 * D)),
+                       ("DurationFormat", 7)]]),
             blank_row(3, 3, ident(3)),
             # Its link from the blank row is ignored: Pour follows Excavate.
             task(4, "Pour", D, dt(4), dt(4, "17:00:00"), **CRIT, outline=2,
@@ -521,12 +573,13 @@ def build():
                                     ("LevelAssignments", 0), ("LevelingCanSplit", 0),
                                     ("LevelingDelay", 4800), ("LevelingDelayFormat", 7),
                                     ("IgnoreResourceCalendar", 1), ("HideBar", 1),
-                                    ("EarnedValueMethod", 1), ("Rollup", 0)]),
+                                    ("EarnedValueMethod", 1), ("Rollup", 0)],
+                 ext=[[("FieldID", 188743731), ("Value", "M&amp;E")]]),
             # Inactive: Project drops it from the schedule; docxy does not yet.
             task(5, "Inspect", D, dt(2), dt(2, "17:00:00"), slack=2 * D, critical=False,
                  fields=ident(5) + [("Active", 0), ("Type", 1), ("WBS", "2"),
                                     ("Priority", 500), ("Estimated", 1)] + common),
-        ])))
+        ]), extended_attributes=definitions))
 
     # 21 — B misses its Deadline by 5 days. The deadline bounds late finish
     # only: dates stay put and A and B both get -5d total slack (#100).

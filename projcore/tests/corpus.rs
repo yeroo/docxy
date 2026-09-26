@@ -9,10 +9,11 @@
 //! reproduces the owner's earlier manual runs of files 05 and 14 (#53),
 //! 16 (#58), 17 (#60) and 18 (#59). The exceptions are file 19 (issue #77),
 //! whose manual-task slack and critical flags are hand-derived from our
-//! scheduler, and file 20 (issue #80), whose task fields and blank row are
-//! ours; neither is verified in Project yet. Blank rows carry no oracle. File
-//! 21's oracle (issue #100) was entered by hand from the issue's Project 2024
-//! capture; the file was not run through `verify_mspdi_project.py`. File 22
+//! scheduler, and file 20 (issue #80), whose task fields, blank row and
+//! custom fields (issue #268) are ours; neither is verified in Project yet.
+//! Blank rows carry no oracle. File 21's oracle (issue #100) was entered by
+//! hand from the issue's Project 2024 capture; the file was not run through
+//! `verify_mspdi_project.py`. File 22
 //! (issue #81) carries progress values of our own and is not verified in
 //! Project either, nor is file 23's derived calendar (issue #83), nor are
 //! file 13's resource and assignment fields of issue #84, chosen to leave its
@@ -236,6 +237,13 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             "{}: MSPDI assignments changed",
             path.display()
         );
+        // #268: the custom field definitions (aliases, lookup tables, formulas).
+        assert_eq!(
+            xml_back.extended_attribute_definitions,
+            proj.extended_attribute_definitions,
+            "{}: MSPDI custom field definitions changed",
+            path.display()
+        );
         let package_back = read_yppx(&write_yppx(&proj)).unwrap();
         assert_eq!(
             package_back.tasks,
@@ -259,6 +267,12 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             package_back.assignments,
             proj.assignments,
             "{}: .yppx assignments changed",
+            path.display()
+        );
+        assert_eq!(
+            package_back.extended_attribute_definitions,
+            proj.extended_attribute_definitions,
+            "{}: .yppx custom field definitions changed",
             path.display()
         );
     }
@@ -543,6 +557,58 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
     let saved = write_mspdi(&proj);
     assert_eq!(saved.matches("<IsNull>1</IsNull>").count(), 1);
     assert_eq!(saved.matches("<IsNull>0</IsNull>").count(), 4);
+}
+
+/// The first leaf named `name` in a kept element's tree, depth first.
+fn find_leaf<'a>(element: &'a projcore::model::XmlElement, name: &str) -> Option<&'a str> {
+    if element.name == name && element.children.is_empty() {
+        return Some(&element.text);
+    }
+    element.children.iter().find_map(|c| find_leaf(c, name))
+}
+
+#[test]
+fn task_fields_fixture_keeps_custom_fields() {
+    let xml = std::fs::read_to_string(corpus_dir().join("20-task-fields.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    // #268: the task values, including one picked from a lookup table.
+    let excavate = &proj.task(2).unwrap().extended_attributes;
+    assert_eq!(excavate.len(), 2);
+    assert_eq!(
+        (
+            excavate[0].field_id.as_str(),
+            excavate[0].value.as_deref(),
+            excavate[0].value_guid.as_deref()
+        ),
+        (
+            "188743731",
+            Some("Civil"),
+            Some("7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101")
+        )
+    );
+    assert_eq!(excavate[1].duration_format, Some(7));
+    let pour = &proj.task(4).unwrap().extended_attributes;
+    assert_eq!(pour[0].value.as_deref(), Some("M&E"));
+    // The definitions: the Text1 alias and its lookup table, the formula.
+    let defs = &proj.extended_attribute_definitions;
+    assert_eq!(defs.len(), 2);
+    assert_eq!(find_leaf(&defs[0], "Alias"), Some("Trade"));
+    let table = defs[0]
+        .children
+        .iter()
+        .find(|c| c.name == "ValueList")
+        .unwrap();
+    let values: Vec<_> = table
+        .children
+        .iter()
+        .map(|v| find_leaf(v, "Value"))
+        .collect();
+    assert_eq!(values, [Some("Civil"), Some("M&E")]);
+    assert_eq!(find_leaf(&defs[1], "Formula"), Some("[Duration]*2"));
+    // A save writes them back.
+    let back = read_mspdi(&write_mspdi(&proj)).unwrap();
+    assert_eq!(back.extended_attribute_definitions, *defs);
+    assert_eq!(back.task(2).unwrap().extended_attributes, *excavate);
 }
 
 #[test]

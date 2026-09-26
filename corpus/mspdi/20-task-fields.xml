@@ -6,6 +6,41 @@
   <CalendarUID>1</CalendarUID>
   <StartDate>2026-03-02T08:00:00</StartDate>
   <ProjectExternallyEdited>0</ProjectExternallyEdited>
+  <ExtendedAttributes>
+    <ExtendedAttribute>
+      <FieldID>188743731</FieldID>
+      <FieldName>Text1</FieldName>
+      <CFType>21</CFType>
+      <Guid>000039B7-8BBE-4CEB-82C4-FA8C0B400033</Guid>
+      <SecondaryPID>255868938</SecondaryPID>
+      <SecondaryGuid>000039B7-8BBE-4CEB-82C4-FA8C0F40400A</SecondaryGuid>
+      <Ltuid>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E001</Ltuid>
+      <ValueList>
+        <Value>
+          <ID>1</ID>
+          <Value>Civil</Value>
+          <Description>Ground &amp; concrete</Description>
+          <FieldGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101</FieldGUID>
+        </Value>
+        <Value>
+          <ID>2</ID>
+          <Value>M&amp;E</Value>
+          <Description/>
+          <FieldGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102</FieldGUID>
+        </Value>
+      </ValueList>
+      <Alias>Trade</Alias>
+      <AppendNewValues>0</AppendNewValues>
+    </ExtendedAttribute>
+    <ExtendedAttribute>
+      <FieldID>188743783</FieldID>
+      <FieldName>Duration1</FieldName>
+      <Guid>000039B7-8BBE-4CEB-82C4-FA8C0B400067</Guid>
+      <SecondaryPID>255868966</SecondaryPID>
+      <Formula>[Duration]*2</Formula>
+      <Alias>Buffer</Alias>
+    </ExtendedAttribute>
+  </ExtendedAttributes>
   <Tasks>
     <Task>
       <UID>1</UID><ID>1</ID>
@@ -69,6 +104,16 @@
       <ExternalTask>0</ExternalTask>
       <IsSubproject>0</IsSubproject>
       <IsSubprojectReadOnly>0</IsSubprojectReadOnly>
+      <ExtendedAttribute>
+        <FieldID>188743731</FieldID>
+        <Value>Civil</Value>
+        <ValueGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101</ValueGUID>
+      </ExtendedAttribute>
+      <ExtendedAttribute>
+        <FieldID>188743783</FieldID>
+        <Value>PT32H0M0S</Value>
+        <DurationFormat>7</DurationFormat>
+      </ExtendedAttribute>
     </Task>
     <Task>
       <UID>3</UID><ID>3</ID>
@@ -113,6 +158,10 @@
         <Type>1</Type>
         <LinkLag>0</LinkLag><LagFormat>7</LagFormat>
       </PredecessorLink>
+      <ExtendedAttribute>
+        <FieldID>188743731</FieldID>
+        <Value>M&amp;E</Value>
+      </ExtendedAttribute>
     </Task>
     <Task>
       <UID>5</UID><ID>5</ID>
