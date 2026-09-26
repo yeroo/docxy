@@ -70,6 +70,20 @@ booking type, flags and stored work, and the assignment's contour, flags, own
 dates and regular work. Those values are of our own and were chosen to leave
 the task's schedule as it is (a flat contour, no progress), so the #74 oracle
 still holds. The file was not run through Project again after they were added.
+[Issue #267](https://github.com/yeroo/docxy/issues/267) then gave file 13 a
+value for every other Resource and Assignment child in the Project 2010+
+sequence: GUIDs, hyperlinks, phonetics and account, the resource's own dates,
+actual and remaining overtime, percent work complete, the cost breakdown and
+earned value (SV, CV, ACWP, BCWS, BCWP, VAC), enterprise flags, protected
+actuals, creation dates, cost center and assignment owners, an outline code and
+timephased Baseline work and cost (types 7 and 8) and a cost rate table C,
+which the assignment now names, on the resource; and on the
+assignment its actuals, stop/resume, variances, rate scale, confirmation and
+response flags, peak units, budget cost and work and a Baseline. These values
+are synthetic and not mutually consistent (e.g. actuals on a 0% assignment);
+only the scheduler's inputs were left alone, with the resource calendar the
+Standard base calendar, so the #74 oracle still holds. They were **not**
+verified against Project.
 File 22 keeps recorded progress
 ([issue #81](https://github.com/yeroo/docxy/issues/81)): percent complete,
 actuals, `Stop`/`Resume`, remaining values and variances on tasks and
@@ -145,7 +159,7 @@ Project's warning have no MSPDI field; projcore's unit tests check them.
 | `10-summary` | outline rollup | summary derives from children |
 | `11-resource-assignment` | resource + assignment | units × work parsing |
 | `12-calendar-6day` | custom calendar | Saturday working changes the finish |
-| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006); rate display units (a standard rate shown per day, an overtime rate shown per week), booking type, generic/budget/inactive/levelling flags, work group and stored work, and an assignment's contour, fixed-material and fixed-rate-units flags, own dates and regular work (#84); availability dates and periods, cost rate tables A and B, e-mail, notes, cost, overtime work, a custom field and a baseline on the resource, and the assignment's cost, rate table, zero delays, notes, overtime, custom field and timephased work (#199) |
+| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006); rate display units (a standard rate shown per day, an overtime rate shown per week), booking type, generic/budget/inactive/levelling flags, work group and stored work, and an assignment's contour, fixed-material and fixed-rate-units flags, own dates and regular work (#84); availability dates and periods, cost rate tables A and B, e-mail, notes, cost, overtime work, a custom field and a baseline on the resource, and the assignment's cost, rate table, zero delays, notes, overtime, custom field and timephased work (#199); every other Resource and Assignment child, with synthetic values (#267) |
 | `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
 | `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
 | `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |
