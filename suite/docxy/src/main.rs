@@ -1283,6 +1283,43 @@ impl Probes {
     fn get(&self, name: &str) -> Option<Bounds<Pixels>> {
         self.last.iter().find(|(n, _)| n == name).map(|(_, b)| *b)
     }
+
+    /// Where `name` is on screen now, for input handlers. Events are dispatched
+    /// between frames, so `next` then holds the whole frame on screen, while
+    /// `last` is the one before it: absent on a surface's first frame, stale
+    /// after a move. Falls back to `last` for a region `next` lacks.
+    fn current(&self, name: &str) -> Option<Bounds<Pixels>> {
+        self.next
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| *b)
+            .or_else(|| self.get(name))
+    }
+}
+
+#[cfg(test)]
+mod probes_tests {
+    use super::Probes;
+    use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn current_reads_the_frame_on_screen_and_falls_back_to_the_one_before() {
+        let at = |x: f32| Bounds::new(point(px(x), px(0.)), size(px(10.), px(10.)));
+        let mut p = Probes::default();
+        // A surface's first frame: only `next` has it; `get` does not.
+        p.next.push(("project-body".into(), at(40.)));
+        assert_eq!(p.get("project-body"), None);
+        assert_eq!(p.current("project-body"), Some(at(40.)));
+        // The area moved in the frame on screen: `current` has the new edge.
+        p.last = std::mem::take(&mut p.next);
+        p.next.push(("project-body".into(), at(90.)));
+        assert_eq!(p.get("project-body"), Some(at(40.)));
+        assert_eq!(p.current("project-body"), Some(at(90.)));
+        // A region only the earlier frame has.
+        p.last.push(("chart-panel".into(), at(5.)));
+        assert_eq!(p.current("chart-panel"), Some(at(5.)));
+        assert_eq!(p.current("missing"), None);
+    }
 }
 
 /// A zero-paint element that records where it was laid out, under `name`.

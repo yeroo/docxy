@@ -987,11 +987,11 @@ pub(super) fn project_el(
                     if delta.x.is_zero() {
                         return;
                     }
-                    cx.stop_propagation();
                     // `project-body` spans the split area, so its left is the area's.
-                    let Some(body) = this.probes.borrow().get("project-body") else {
+                    let Some(body) = this.probes.borrow().current("project-body") else {
                         return;
                     };
+                    cx.stop_propagation();
                     if let Some(Surface::Project(v)) =
                         this.tabs.get_mut(index).map(|t| &mut t.surface)
                         && v.wheel(f32::from(ev.position.x - body.left()), f32::from(delta.x))
