@@ -8,8 +8,9 @@
 //! tasks becoming chart sections. For a standard Mon–Fri calendar the block
 //! carries `excludes weekends` so the bars skip non-working days the way the
 //! schedule does.
-//! The accompanying table includes bold summary rows with rolled-up dates and
-//! working durations, signed total slack, and the scheduler's free slack.
+//! The accompanying table includes bold summary rows with rolled-up dates (a
+//! manually scheduled summary's own dates) and working durations, signed total
+//! slack, and the scheduler's free slack.
 //!
 //! [Mermaid `gantt`]: https://mermaid.js.org/syntax/gantt.html
 
@@ -78,7 +79,8 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
 /// Render a full Markdown document: a heading, the fenced Mermaid chart, and a
 /// task table (start, finish, duration, total/free slack, critical) as a text
 /// fallback for viewers that don't render Mermaid. Summary names are bold and
-/// their durations are the working time between the rolled-up dates, measured
+/// their durations are the working time between their scheduled dates (rolled
+/// up, or a manual summary's own), measured
 /// as [`crate::schedule::task_duration_min`] measures them: on the project's
 /// default calendar, or on its leaves' calendars when the default has no
 /// working time.
@@ -357,6 +359,35 @@ mod tests {
                     "0d",
                     "✓"
                 ],
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_shows_a_manual_summary_s_own_dates() {
+        let mut parent = task(1, "P", 1);
+        parent.summary = true;
+        parent.manual = true;
+        parent.manual_start = Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0));
+        parent.manual_finish = Some(DateTime::from_ymd_hm(2026, 3, 6, 17, 0));
+        let mut a = task(2, "A", 1440);
+        a.outline_level = 2;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0)),
+            tasks: vec![parent, a],
+            ..Project::default()
+        };
+        let md = to_markdown(&proj, &schedule(&proj));
+        assert_eq!(
+            table_rows(&md)[1],
+            [
+                "**P**",
+                "2026-03-05 08:00:00",
+                "2026-03-06 17:00:00",
+                "2d",
+                "0d",
+                "0d",
+                "✓"
             ]
         );
     }

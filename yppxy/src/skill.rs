@@ -27,7 +27,11 @@ use its tools:
 - `yppxy_list` — which yppxy editors are running
 - `yppxy_status` — path, modified flag, task count, project start/finish
 - `yppxy_tasks` — every task: uid, name, outline level, manual, duration, scheduled
-  start/finish, critical flag, slack, predecessors
+  start/finish, critical flag, slack, predecessors. Summaries also have
+  `rollup_start`/`rollup_finish` (their subtasks' span); a manually scheduled
+  summary keeps its own start/finish, which can differ, and has `warning`
+  (true when its subtasks finish after it). Setting a manual summary's
+  duration sets its own span.
 - `yppxy_get` `{uid}` — one task
 - `yppxy_set` `{uid, name?, duration?, level?, manual?}` — edit a task (duration like
   "3d", "4h", "2w"; level = outline depth 1..20; manual = true pins the task at
@@ -92,6 +96,8 @@ mod tests {
             "task.set",
             "AGWINTERM_SESSION_ID",
             "agwintermctl split on",
+            "rollup_finish",
+            "warning",
         ] {
             assert!(SKILL_MD.contains(needle), "skill missing {needle}");
         }

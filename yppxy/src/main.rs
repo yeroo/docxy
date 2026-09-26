@@ -67,6 +67,8 @@ const ONTRACK: Color = Color::Rgb(58, 170, 154); // teal — has float
 const MILESTONE: Color = Color::Rgb(180, 130, 220);
 const SUMMARY: Color = Color::Rgb(150, 160, 172); // rollup bars
 const WEEKEND: Color = Color::Rgb(90, 100, 110);
+// A manual summary's subtasks running past its own finish (Project's warning).
+const WARNING: Color = Color::Rgb(220, 50, 47);
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -1815,6 +1817,13 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             .disp_finish(t.uid)
             .map(|d| d.day_number() - origin)
             .unwrap_or(i64::MIN);
+        // A manual summary keeps its own dates; its subtasks' span is drawn
+        // beside them.
+        let rollup = app
+            .ed
+            .disp_rollup(t.uid)
+            .filter(|_| t.manual_summary_dates().is_some())
+            .map(|(s, f)| (s.day_number() - origin, f.day_number() - origin));
         let mut line = build_gantt_row(
             gw,
             app.hscroll,
@@ -1824,6 +1833,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             crit,
             t.summary,
             t.is_milestone(),
+            rollup,
         );
         if i == app.ed.sel() {
             line.style = Style::default().bg(app.sel_bg());
@@ -1877,6 +1887,9 @@ fn build_scale(width: usize, hscroll: i64, base_day: i64) -> Line<'static> {
 
 /// One task's bar across the visible day columns. `s_day`/`e_day` are day
 /// offsets from the gantt origin (the earliest displayed or project start day).
+/// `rollup` is a manual summary's rolled-up span in the same offsets: the days
+/// of it outside the summary's own span are marked, those past its finish in
+/// the warning colour.
 #[allow(clippy::too_many_arguments)]
 fn build_gantt_row(
     width: usize,
@@ -1887,6 +1900,7 @@ fn build_gantt_row(
     crit: bool,
     is_summary: bool,
     milestone: bool,
+    rollup: Option<(i64, i64)>,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::with_capacity(width);
     let milestone = milestone && !is_summary;
@@ -1912,6 +1926,13 @@ fn build_gantt_row(
                 ch,
                 Style::default().fg(SUMMARY).add_modifier(Modifier::BOLD),
             ));
+        } else if rollup.is_some_and(|(r_s, r_e)| day >= r_s && day <= r_e) {
+            let style = if day > e_day {
+                Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(SUMMARY).add_modifier(Modifier::DIM)
+            };
+            spans.push(Span::styled("╍", style));
         } else if !milestone && in_span {
             spans.push(Span::styled("█", Style::default().fg(bar_color)));
         } else if weekend {
@@ -2279,6 +2300,7 @@ mod tests {
             false,
             false,
             false,
+            None,
         );
         assert_eq!(row.spans[0].content, "█");
         let app = App::new(new_project(), None, false);
@@ -2286,6 +2308,26 @@ mod tests {
             gantt_origin_day(&app),
             app.ed.schedule().project_start.day_number()
         );
+    }
+
+    #[test]
+    fn a_manual_summary_row_marks_its_rollup_outside_its_own_span() {
+        // Monday 2026-01-05 origin; the summary spans days 2..=3, its
+        // subtasks days 1..=6.
+        let origin = DateTime::from_ymd_hm(2026, 1, 5, 8, 0).day_number();
+        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((1, 6)));
+        let cells: Vec<&str> = row.spans.iter().map(|s| &*s.content).collect();
+        assert_eq!(cells, [" ", "╍", "▟", "▟", "╍", "╍", "╍", " ", " "]);
+        let fg = |col: usize| row.spans[col].style.fg;
+        assert_eq!(fg(1), Some(SUMMARY), "before its start: no warning");
+        for col in 4..=6 {
+            assert_eq!(fg(col), Some(WARNING), "day {col} runs past its finish");
+        }
+        // Weekend days inside the late rollup are marked too.
+        assert_ne!(cells[5], "·");
+        // An auto summary (or one within its own span) draws no rollup.
+        let row = build_gantt_row(9, 0, origin, 1, 6, false, true, false, None);
+        assert!(row.spans.iter().all(|s| s.style.fg != Some(WARNING)));
     }
 
     #[test]

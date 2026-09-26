@@ -109,7 +109,9 @@ fn tool_defs() -> Json {
             "yppxy_tasks",
             "List every task of the live schedule (including unsaved edits): uid, name, outline \
              level, manual (true = Manually Scheduled), duration, scheduled start/finish, critical \
-             flag, slack, and predecessors.",
+             flag, slack, and predecessors. Summaries add rollup_start/rollup_finish, the span of \
+             their subtasks; a manually scheduled summary keeps its own start/finish and adds \
+             warning (true when its subtasks finish after it).",
             vec![target(), tab()],
             &[],
         ),
