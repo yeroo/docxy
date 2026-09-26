@@ -620,7 +620,7 @@ pub(crate) fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Prede
     parse_predecessors_keeping(text, proj, &[])
 }
 
-/// [`parse_predecessors`] for re-entering `task`'s Predecessors cell: an
+/// Parse text typed into `task`'s Predecessors cell (`2FS+2ed, 3SS`). An
 /// entry spelled exactly as the cell shows one of the task's links keeps
 /// that link as it is. A lag shown in a fallback unit (a working month in
 /// days, a fraction of a day in minutes) keeps its format unless it is
