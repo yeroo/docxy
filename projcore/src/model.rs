@@ -586,9 +586,9 @@ pub struct Resource {
     pub extended_attributes: Vec<ExtendedAttributeValue>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     pub baselines: Vec<ResourceBaseline>,
-    /// Units available over date ranges, in file order. Project takes capacity
-    /// from these over `max_units`, so an edit that changes `max_units` must
-    /// also update the period it falls in.
+    /// Units available over date ranges, in file order. Project, and docxy's
+    /// leveler, take capacity from these over `max_units`, so an edit that
+    /// changes `max_units` must also update the period it falls in.
     pub availability_periods: Vec<AvailabilityPeriod>,
     /// Cost rate tables A-E over date ranges, in file order. Project and
     /// [`crate::assign::assignment_cost`] cost from these: table A's current
