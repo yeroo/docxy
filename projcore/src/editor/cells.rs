@@ -1,6 +1,7 @@
 //! Atomic operations and lossless text interchange for entry-table cells.
 use super::*;
-use crate::model::{Calendar, WorkCalendar};
+#[cfg(test)]
+use crate::model::Calendar;
 use crate::schedule::{HORIZON_DAYS, HORIZON_PADDING_MIN};
 
 impl Editor {
@@ -765,15 +766,7 @@ pub fn parse_cell_date(text: &str) -> Result<DateTime, String> {
 
 /// A task's working time by date, exceptions included, with exactly the
 /// scheduler's fallback and base-chain resolution.
-pub(super) fn task_calendar(proj: &Project, task: &Task) -> WorkCalendar {
-    match proj
-        .calendar(task.calendar_uid.unwrap_or(proj.default_calendar_uid))
-        .or_else(|| proj.calendar(proj.default_calendar_uid))
-    {
-        Some(cal) => proj.resolved_calendar(cal),
-        None => WorkCalendar::weekly(Calendar::standard_week()),
-    }
-}
+pub(super) use crate::assign::task_calendar;
 
 /// Start of a typed date: its first working time, or 08:00 (Project's default
 /// start time) on a non-working day or holiday, where a manual task may still

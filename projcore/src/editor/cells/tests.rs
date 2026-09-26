@@ -117,15 +117,40 @@ fn resource_names_edits_keep_assignment_progress() {
         .unwrap();
     assert_eq!(ed.proj.assignments[..2], tracked);
     assert_eq!(ed.proj.assignments[2].percent_work_complete, None);
-    // A units change rewrites units and work only.
+    // A units change rewrites units and work and refreshes what derives
+    // from them (#269): its dates from the actual start, its regular and
+    // remaining work, and its cost at the resource's (absent) rates.
     ed.set_resources(10, &["Alice[50%]".into(), "Bob".into()])
         .unwrap();
     let alice = &ed.proj.assignments[0];
     assert_eq!(alice.units, 0.5);
     assert_eq!(
+        (alice.start, alice.finish),
+        (
+            Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            Some(DateTime::from_ymd_hm(2026, 3, 2, 17, 0))
+        )
+    );
+    assert_eq!(
+        (alice.regular_work_min, alice.remaining_work_min),
+        (Some(240), Some(0))
+    );
+    let money = |r: &Option<Rate>| r.as_ref().map(|r| r.as_str().to_string());
+    assert_eq!(
+        (money(&alice.cost), money(&alice.remaining_cost)),
+        (Some("0".into()), Some("0".into()))
+    );
+    // The progress is kept.
+    assert_eq!(
         Assignment {
             units: tracked[0].units,
             work_min: tracked[0].work_min,
+            start: tracked[0].start,
+            finish: tracked[0].finish,
+            regular_work_min: tracked[0].regular_work_min,
+            remaining_work_min: tracked[0].remaining_work_min,
+            cost: tracked[0].cost.clone(),
+            remaining_cost: tracked[0].remaining_cost.clone(),
             ..alice.clone()
         },
         tracked[0]
@@ -1461,11 +1486,19 @@ fn units_edits_keep_imported_assignment_fields_but_clear_the_old_work() {
         } else {
             ed.set_resources(10, &["Alice[50%]".into()]).unwrap();
         }
-        // Regular work, overtime, cost and the planned-work spread described the
-        // old Work; kept, they would invent overtime or misprice the new one.
+        // Overtime and the planned-work spread described the old Work; kept,
+        // they would invent overtime. Regular work, cost and the dates are
+        // derived again from the new work (#269): Alice has no rates, and the
+        // one-day delay and two-day leveling delay start it on day 4.
         let a = &ed.proj.assignments[0];
-        assert_eq!((a.units, a.work_min, a.regular_work_min), (0.5, 240, None));
-        assert_eq!((a.overtime_work_min, &a.cost), (None, &None));
+        assert_eq!(
+            (a.units, a.work_min, a.regular_work_min),
+            (0.5, 240, Some(240))
+        );
+        assert_eq!(a.overtime_work_min, None);
+        assert_eq!(a.cost.as_ref().map(Rate::as_str), Some("0"));
+        let day4 = ed.schedule().get(10).unwrap().early_start.add_days(3);
+        assert_eq!((a.start, a.finish), (Some(day4), Some(day4)));
         // The recorded actuals and the baseline curve are kept.
         assert_eq!(
             a.timephased_data.iter().map(|t| t.kind).collect::<Vec<_>>(),
@@ -1481,6 +1514,10 @@ fn units_edits_keep_imported_assignment_fields_but_clear_the_old_work() {
                 overtime_work_min: imported.overtime_work_min,
                 cost: imported.cost.clone(),
                 timephased_data: imported.timephased_data.clone(),
+                start: imported.start,
+                finish: imported.finish,
+                remaining_work_min: imported.remaining_work_min,
+                remaining_cost: imported.remaining_cost.clone(),
                 ..a.clone()
             },
             imported,
@@ -1490,7 +1527,7 @@ fn units_edits_keep_imported_assignment_fields_but_clear_the_old_work() {
 }
 
 #[test]
-fn new_resources_and_assignments_write_none_of_the_imported_fields() {
+fn new_resources_and_assignments_write_only_derived_fields() {
     let mut ed = editor();
     ed.set_resources(10, &["Alice".into()]).unwrap();
     ed.assign_resource(20, "Bob").unwrap();
@@ -1506,9 +1543,6 @@ fn new_resources_and_assignments_write_none_of_the_imported_fields() {
         "PeakUnits",
         "OverAllocated",
         "CanLevel",
-        "Work",
-        "RegularWork",
-        "RemainingWork",
         "StandardRateFormat",
         "OvertimeRateFormat",
         "IsGeneric",
@@ -1518,8 +1552,6 @@ fn new_resources_and_assignments_write_none_of_the_imported_fields() {
         "EmailAddress",
         "AvailableFrom",
         "AvailableTo",
-        "OvertimeWork",
-        "Cost",
         "Notes",
         "ExtendedAttribute",
         "Baseline",
@@ -1532,13 +1564,9 @@ fn new_resources_and_assignments_write_none_of_the_imported_fields() {
         );
     }
     for name in [
-        "Finish",
         "HasFixedRateUnits",
         "FixedMaterial",
-        "RegularWork",
-        "Start",
         "WorkContour",
-        "Cost",
         "CostRateTable",
         "Delay",
         "LevelingDelay",
@@ -1550,6 +1578,27 @@ fn new_resources_and_assignments_write_none_of_the_imported_fields() {
     ] {
         assert!(
             !section("Assignments").contains(&format!("<{name}>")),
+            "{name}"
+        );
+    }
+    // What derives from the schedule and the rates is written (#269), so
+    // Project does not read an assignment without dates or a resource
+    // without totals.
+    for name in [
+        "Work",
+        "RegularWork",
+        "RemainingWork",
+        "OvertimeWork",
+        "Cost",
+    ] {
+        assert!(
+            section("Resources").contains(&format!("<{name}>")),
+            "{name}"
+        );
+    }
+    for name in ["Start", "Finish", "RegularWork", "RemainingWork", "Cost"] {
+        assert!(
+            section("Assignments").contains(&format!("<{name}>")),
             "{name}"
         );
     }
@@ -1694,10 +1743,21 @@ fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
     let before = ed.proj.assignments.clone();
     ed.set_duration_min(10, 960).unwrap();
     let after = &ed.proj.assignments;
-    // Overtime, cost and the planned spread described the old work, as on a
-    // units edit; the actuals and the baseline curve stay.
+    // Overtime and the planned spread described the old work, as on a units
+    // edit; the actuals and the baseline curve stay. The cost, dates and
+    // remaining work are derived again (#269): no rates, so no cost, and
+    // 960 minutes from the actual start.
     let a = &after[0];
-    assert_eq!((a.overtime_work_min, &a.cost), (None, &None));
+    assert_eq!(a.overtime_work_min, None);
+    assert_eq!(a.cost.as_ref().map(Rate::as_str), Some("0"));
+    assert_eq!(
+        (a.start, a.finish, a.remaining_work_min),
+        (
+            Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            Some(DateTime::from_ymd_hm(2026, 1, 6, 17, 0)),
+            Some(720)
+        )
+    );
     assert_eq!(
         a.timephased_data.iter().map(|t| t.kind).collect::<Vec<_>>(),
         [2, 4]
@@ -1707,7 +1767,11 @@ fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
             .iter()
             .map(|a| (a.task_uid, a.work_min, a.regular_work_min))
             .collect::<Vec<_>>(),
-        [(10, 960, None), (10, 480, None), (20, 480, Some(480))]
+        [
+            (10, 960, Some(960)),
+            (10, 480, Some(480)),
+            (20, 480, Some(480))
+        ]
     );
     // Nothing else changes; the other task's is untouched.
     for (a, was) in after.iter().zip(&before) {
@@ -1718,6 +1782,10 @@ fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
                 overtime_work_min: was.overtime_work_min,
                 cost: was.cost.clone(),
                 timephased_data: was.timephased_data.clone(),
+                start: was.start,
+                finish: was.finish,
+                remaining_work_min: was.remaining_work_min,
+                remaining_cost: was.remaining_cost.clone(),
                 ..a.clone()
             },
             was
@@ -1776,7 +1844,12 @@ fn contoured_work_stretches_with_the_duration() {
     let works: Vec<_> = (1..=4).map(|uid| work(&ed, uid)).collect();
     assert_eq!(
         works,
-        [(480, None), (960, None), (100, Some(100)), (480, None)]
+        [
+            (480, Some(480)),
+            (960, Some(960)),
+            (100, Some(100)),
+            (480, Some(480))
+        ]
     );
 }
 
@@ -1789,10 +1862,10 @@ fn a_contoured_assignment_gets_work_back_after_a_milestone_round_trip() {
     }];
     ed = Editor::new(ed.proj);
     ed.toggle_milestone(10).unwrap();
-    assert_eq!(work(&ed, 1), (0, None));
+    assert_eq!(work(&ed, 1), (0, Some(0)));
     // Zero work gives nothing to stretch: it restarts at duration x units.
     ed.toggle_milestone(10).unwrap();
-    assert_eq!(work(&ed, 1), (480, None));
+    assert_eq!(work(&ed, 1), (480, Some(480)));
 }
 
 #[test]
@@ -1803,18 +1876,18 @@ fn milestone_toggles_rescale_work_and_undo_restores_it_with_the_duration() {
     let uid = ed.proj.assignments[0].uid;
     ed.toggle_milestone(10).unwrap();
     assert_eq!(ed.proj.task(10).unwrap().duration_min, 0);
-    assert_eq!(work(&ed, uid), (0, None));
+    assert_eq!(work(&ed, uid), (0, Some(0)));
     ed.toggle_milestone(10).unwrap();
-    assert_eq!(work(&ed, uid), (240, None));
+    assert_eq!(work(&ed, uid), (240, Some(240)));
 
     ed.undo();
-    assert_eq!(work(&ed, uid), (0, None));
+    assert_eq!(work(&ed, uid), (0, Some(0)));
     ed.undo();
     assert_eq!(ed.proj.task(10).unwrap().duration_min, 480);
     assert_eq!(work(&ed, uid), (240, Some(240)));
     ed.redo();
     assert_eq!(ed.proj.task(10).unwrap().duration_min, 0);
-    assert_eq!(work(&ed, uid), (0, None));
+    assert_eq!(work(&ed, uid), (0, Some(0)));
 }
 
 #[test]
@@ -1825,9 +1898,9 @@ fn a_typed_manual_finish_rescales_assignment_work() {
     ed.set_finish(20, parse_cell_date("2026-01-07").unwrap())
         .unwrap();
     assert_eq!(ed.proj.task(20).unwrap().duration_min, 1440);
-    assert_eq!(work(&ed, uid), (720, None));
+    assert_eq!(work(&ed, uid), (720, Some(720)));
     ed.undo();
-    assert_eq!(work(&ed, uid), (240, None));
+    assert_eq!(work(&ed, uid), (240, Some(240)));
 }
 
 #[test]
@@ -1858,23 +1931,32 @@ fn fixed_work_material_and_cost_work_survive_a_duration_change() {
         imported(4, 10, -65535, 0.5, 240),
         imported(5, 20, 1, 1.0, 480),
     ];
-    // A fixed-work task's work is not rewritten, so nothing derived from it goes.
+    // A fixed-work task's work is not rewritten, so its overtime stays; what
+    // derives from its schedule and rates is refreshed (#269).
     with_work_derived(&mut ed.proj.assignments[4]);
-    let fixed = ed.proj.assignments[4].clone();
     ed = Editor::new(ed.proj);
     ed.set_duration_min(10, 960).unwrap();
     ed.set_duration_min(20, 960).unwrap();
-    assert_eq!(ed.proj.assignments[4], fixed);
+    let fixed = &ed.proj.assignments[4];
+    assert_eq!(
+        (
+            fixed.work_min,
+            fixed.overtime_work_min,
+            fixed.regular_work_min
+        ),
+        (480, Some(60), Some(420))
+    );
+    assert_eq!(fixed.cost.as_ref().map(Rate::as_str), Some("0"));
     assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
     let works: Vec<_> = (1..=5).map(|uid| work(&ed, uid)).collect();
     assert_eq!(
         works,
         [
-            (960, None),
+            (960, Some(960)),
             (5, Some(5)),
             (0, Some(0)),
-            (480, None),
-            (480, Some(480))
+            (480, Some(480)),
+            (480, Some(420))
         ]
     );
 }
@@ -1901,7 +1983,7 @@ fn a_summary_keeps_its_assignments_work_judged_by_the_edited_outline() {
         },
     )
     .unwrap();
-    assert_eq!(work(&ed, 1), (1440, None));
+    assert_eq!(work(&ed, 1), (1440, Some(1440)));
 }
 
 fn lag_pred(uid: i32, lag: i64, code: i64) -> Predecessor {

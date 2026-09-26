@@ -24,6 +24,8 @@ pub use cells::{
 use cells::parse_predecessors;
 use cells::{format_units, parse_resource_token};
 mod moving;
+#[cfg(test)]
+mod refresh_tests;
 
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {
@@ -79,6 +81,12 @@ pub struct Editor {
     last_find: String,
     /// Snapshots ever recorded; unlike `undo.len()` it still moves at `UNDO_CAP`.
     pushes: u64,
+    /// The schedule before the current edit, while that edit is being made.
+    /// Every reschedule within it refreshes what the edit made stale
+    /// ([`crate::assign::refresh`] against the model on top of the undo
+    /// stack); undo, redo and a new document clear it, since they restore a
+    /// model exactly and must not rewrite it.
+    pending: Option<Schedule>,
 }
 
 impl Editor {
@@ -101,6 +109,7 @@ impl Editor {
             level: None,
             last_find: String::new(),
             pushes: 0,
+            pending: None,
         }
     }
 
@@ -111,6 +120,7 @@ impl Editor {
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
+        self.pending = None;
         self.reschedule();
     }
 
@@ -149,6 +159,7 @@ impl Editor {
     }
 
     pub fn toggle_level(&mut self) {
+        self.pending = None;
         self.leveled = !self.leveled;
         self.reschedule();
     }
@@ -273,7 +284,10 @@ impl Editor {
     }
 
     /// Record `prev` as the state to undo to: caps history and clears redo.
+    /// Every edit comes through here, so it also opens the edit's refresh
+    /// (see `pending`).
     fn push_undo(&mut self, prev: Project) {
+        self.pending = Some(self.sched.clone());
         self.pushes += 1;
         self.undo.push(prev);
         if self.undo.len() > UNDO_CAP {
@@ -285,6 +299,10 @@ impl Editor {
     fn reschedule(&mut self) {
         recompute_summaries(&mut self.proj);
         self.sched = schedule(&self.proj);
+        // The refresh changes no scheduling input, so the schedule stands.
+        if let (Some(prev_sched), Some(prev)) = (&self.pending, self.undo.last()) {
+            crate::assign::refresh(prev, prev_sched, &mut self.proj, &self.sched);
+        }
         self.level = self.leveled.then(|| level(&self.proj));
     }
 
@@ -313,6 +331,7 @@ impl Editor {
         let Some(prev) = self.undo.pop() else {
             return false;
         };
+        self.pending = None;
         self.redo.push(std::mem::replace(&mut self.proj, prev));
         self.changed();
         true
@@ -322,6 +341,7 @@ impl Editor {
         let Some(next) = self.redo.pop() else {
             return false;
         };
+        self.pending = None;
         self.undo.push(std::mem::replace(&mut self.proj, next));
         self.changed();
         true
@@ -1987,7 +2007,13 @@ mod tests {
         ed.delete_task(2).unwrap();
         assert!(ed.project().assignments.iter().all(|a| a.task_uid != 2));
         assert_eq!(ed.project().assignments.len(), 1);
-        assert_eq!(ed.project().resources, before.resources);
+        // The resource stays; its totals lose the deleted assignment (#269).
+        let alice = &ed.project().resources[0];
+        assert_eq!(
+            (alice.uid, alice.work_min),
+            (before.resources[0].uid, Some(480))
+        );
+        assert_eq!(before.resources[0].work_min, Some(960));
         assert_schedule(&ed);
 
         let at = ed.add_task(None, "Replacement", 480).unwrap();
