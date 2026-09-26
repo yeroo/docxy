@@ -709,3 +709,55 @@ fn bar_styles_hide_critical_colour_and_baseline_only() {
         assert_eq!(styled_bar(bar, false, false).delay, base.delay);
     }
 }
+
+#[test]
+fn wheel_routes_to_the_pane_under_the_pointer_at_the_split_bar_middle() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    v.layout(1180.);
+    let mid = v.table_w + GANTT_INSET / 2.;
+    assert_eq!(v.pane_at(0.), ProjectPane::Table);
+    assert_eq!(v.pane_at(mid - 0.5), ProjectPane::Table);
+    assert_eq!(v.pane_at(mid), ProjectPane::Chart);
+    // The vertical scrollbar column, right of the chart.
+    assert_eq!(v.pane_at(1180. - 1.), ProjectPane::Chart);
+    v.set_split(400.);
+    assert_eq!(v.pane_at(400. + GANTT_INSET / 2. - 0.5), ProjectPane::Table);
+    assert_eq!(v.pane_at(400. + GANTT_INSET / 2.), ProjectPane::Chart);
+
+    // Over the table only table_x moves; gpui's negative delta scrolls right.
+    assert!(v.wheel(10., -30.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (30., 0.));
+    // Over the chart only gantt_x moves.
+    assert!(v.wheel(700., -50.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (30., 50.));
+    // Positive delta scrolls back left.
+    assert!(v.wheel(700., 20.));
+    assert_eq!(v.gantt_x.get(), 30.);
+    // A y-only delta reaches `wheel` as zero: nothing moves.
+    assert!(!v.wheel(10., 0.));
+    assert!(!v.wheel(700., 0.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (30., 30.));
+}
+
+#[test]
+fn wheel_clamps_like_clamp_offsets_and_reports_no_change_at_an_edge() {
+    let mut v = ProjectView::new(editor(vec![task(1, 60, 1)]).project().clone(), false);
+    v.layout(1180.);
+    assert_eq!((v.table_w, v.gantt_w), (590., 568.));
+    // At the left edge a leftward wheel is a no-op.
+    assert!(!v.wheel(10., 40.));
+    assert!(!v.wheel(700., 40.));
+    assert_eq!((v.table_x.get(), v.gantt_x.get()), (0., 0.));
+    // Far right clamps to content - viewport.
+    assert!(v.wheel(10., -100_000.));
+    assert!(v.wheel(700., -100_000.));
+    assert_eq!(v.table_x.get(), TABLE_W - 590.);
+    assert_eq!(v.gantt_x.get(), v.scale.width() - 568.);
+    assert!(!v.wheel(10., -10.));
+    assert!(!v.wheel(700., -10.));
+    // Wide enough for the whole table: the table has nothing to scroll.
+    v.layout(2. * TABLE_W + 400.);
+    assert_eq!(v.table_x.get(), 0.);
+    assert!(!v.wheel(10., -50.));
+    assert_eq!(v.table_x.get(), 0.);
+}

@@ -243,6 +243,43 @@ impl ProjectView {
             self.clamp_offsets();
         }
     }
+
+    /// The pane at `x`, relative to the split area's left edge. The boundary is
+    /// the middle of the split bar, where `SplitDrag` puts it.
+    pub fn pane_at(&self, x: f32) -> ProjectPane {
+        if x < self.table_w + GANTT_INSET / 2. {
+            ProjectPane::Table
+        } else {
+            ProjectPane::Chart
+        }
+    }
+
+    /// Scroll `pane` right by `dx` pixels (left when negative), clamped.
+    /// Returns whether its offset moved.
+    pub fn wheel_x(&mut self, pane: ProjectPane, dx: f32) -> bool {
+        let offset = match pane {
+            ProjectPane::Table => self.table_x.clone(),
+            ProjectPane::Chart => self.gantt_x.clone(),
+        };
+        let old = offset.get();
+        offset.set(old + dx);
+        self.clamp_offsets();
+        offset.get() != old
+    }
+
+    /// A horizontal wheel delta over the split area: scroll the pane under the
+    /// pointer at `x` (relative to the area's left edge). `delta_x` is gpui's,
+    /// which is negative to scroll right, as Shift+wheel down is on Windows.
+    pub fn wheel(&mut self, x: f32, delta_x: f32) -> bool {
+        delta_x != 0. && self.wheel_x(self.pane_at(x), -delta_x)
+    }
+}
+
+/// The two horizontally scrolled panes of the Project split area.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProjectPane {
+    Table,
+    Chart,
 }
 
 /// A pane's horizontal offset, shared with its scrollbar: gpui-component calls
@@ -943,6 +980,25 @@ pub(super) fn project_el(
                         }
                     },
                 ))
+                // Horizontal wheel (tilt, trackpad, Shift+wheel on every platform)
+                // scrolls the pane under the pointer; the rows keep the vertical wheel.
+                .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
+                    let delta = ev.delta.pixel_delta(window.line_height());
+                    if delta.x.is_zero() {
+                        return;
+                    }
+                    cx.stop_propagation();
+                    // `project-body` spans the split area, so its left is the area's.
+                    let Some(body) = this.probes.borrow().get("project-body") else {
+                        return;
+                    };
+                    if let Some(Surface::Project(v)) =
+                        this.tabs.get_mut(index).map(|t| &mut t.surface)
+                        && v.wheel(f32::from(ev.position.x - body.left()), f32::from(delta.x))
+                    {
+                        cx.notify();
+                    }
+                }))
                 .child(
                     h_flex()
                         .h(px(ROW_H))
@@ -1074,7 +1130,13 @@ pub(super) fn project_el(
                             .track_scroll(&view.scroll)
                             .flex_1()
                             .h_full()
-                            .min_h_0(),
+                            .min_h_0()
+                            // By default gpui turns an x-only delta into a vertical
+                            // scroll; the split area's wheel handler owns x.
+                            .map(|mut list| {
+                                list.style().restrict_scroll_to_axis = Some(true);
+                                list
+                            }),
                         )
                         // Project's one vertical bar, shared by table and chart, over the
                         // SCROLLBAR_W that `layout` keeps out of the chart.
