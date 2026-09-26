@@ -140,7 +140,8 @@ impl Editor {
         self.edit_row(i, |proj, was_blank| {
             // As in update_task, a blank row's default duration is not typed.
             let task = &mut proj.tasks[i];
-            let changed = was_blank || duration != task.duration_min;
+            let old = task.duration_min;
+            let changed = was_blank || duration != old;
             if changed {
                 commit_estimate(task);
             }
@@ -150,7 +151,7 @@ impl Editor {
             task.manual_duration_min = Some(duration);
             task.milestone = duration == 0;
             if changed {
-                rescale_work(proj, i, duration);
+                rescale_work(proj, i, old, duration);
             }
         })?;
         self.stamp_pinned_dates(uid);

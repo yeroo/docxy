@@ -1484,7 +1484,8 @@ fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
     a.actual_work_min = Some(240);
     a.remaining_work_min = Some(240);
     a.actual_cost = Some(Rate::parse("100").unwrap());
-    a.work_contour = Some(3);
+    // Flat by record, not by default: a contour scales differently.
+    a.work_contour = Some(0);
     a.start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
     a.baselines = vec![AssignmentBaseline {
         number: 0,
@@ -1528,6 +1529,45 @@ fn repeating_a_duration_keeps_imported_work_and_history() {
     let before = ed.project().clone();
     ed.set_duration_min(10, 480).unwrap();
     unchanged(&ed, &before, (0, 0, false));
+    // A rename in the same patch is an edit, but the duration it repeats is not.
+    ed.update_task(
+        10,
+        TaskPatch {
+            name: Some("x".into()),
+            duration_min: Some(480),
+            ..TaskPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(ed.proj.task(10).unwrap().name, "x");
+    assert_eq!(work(&ed, 1), (123, Some(123)));
+}
+
+#[test]
+fn contoured_work_stretches_with_the_duration() {
+    let mut ed = editor();
+    ed.proj.tasks[2].duration_min = 0;
+    ed.proj.tasks[2].milestone = true;
+    let contoured = |uid, task, work_min| Assignment {
+        work_contour: Some(3),
+        ..imported(uid, task, -65535, 1.0, work_min)
+    };
+    ed.proj.assignments = vec![
+        // A bell at a 100% peak does half the flat work.
+        contoured(1, 10, 240),
+        imported(2, 10, -65535, 1.0, 480),
+        // From a milestone there is no duration to scale from.
+        contoured(3, 30, 100),
+        imported(4, 30, -65535, 1.0, 0),
+    ];
+    ed = Editor::new(ed.proj);
+    ed.set_duration_min(10, 960).unwrap();
+    ed.set_duration_min(30, 480).unwrap();
+    let works: Vec<_> = (1..=4).map(|uid| work(&ed, uid)).collect();
+    assert_eq!(
+        works,
+        [(480, None), (960, None), (100, Some(100)), (480, None)]
+    );
 }
 
 #[test]

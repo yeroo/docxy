@@ -555,7 +555,7 @@ impl Editor {
                 // Against the row as materialized: a blank row's default
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
                 let changed = was_blank || min != t.duration_min;
-                rescale = changed.then_some(min);
+                rescale = changed.then_some((t.duration_min, min));
                 if changed {
                     commit_estimate(t);
                 }
@@ -573,8 +573,8 @@ impl Editor {
                 t.outline_level = lv;
             }
             // After the level, so a summary is judged by the outline the edit makes.
-            if let Some(min) = rescale {
-                rescale_work(proj, i, min);
+            if let Some((old, new)) = rescale {
+                rescale_work(proj, i, old, new);
             }
         })?;
         // Only a date change restamps: a rename or a level change keeps the
@@ -875,8 +875,11 @@ fn work_for(duration_min: i64, units: f64) -> i64 {
 /// units, as Project does for a fixed-units or fixed-duration task. A
 /// fixed-work task keeps its work, a summary's stored duration is not the one
 /// it shows, and material and cost work is not time, so those are left as
-/// read. Regular work is cleared as a units edit clears it; progress is kept.
-fn rescale_work(proj: &mut Project, i: usize, duration_min: i64) {
+/// read. A contoured assignment's units are its peak, so its contour stretches
+/// and its work scales with the duration instead (and stays as read from a
+/// zero duration). Regular work is cleared as a units edit clears it;
+/// progress is kept.
+fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
     let t = &proj.tasks[i];
     if t.task_type == Some(TaskType::FixedWork) || proj.is_outline_summary(i) {
         return;
@@ -892,7 +895,13 @@ fn rescale_work(proj: &mut Project, i: usize, duration_min: i64) {
         if kind.is_some_and(|r| r.kind != ResourceType::Work) {
             continue;
         }
-        a.work_min = work_for(duration_min, a.units);
+        a.work_min = match a.work_contour {
+            None | Some(0) => work_for(new_min, a.units),
+            Some(_) if old_min > 0 => {
+                (a.work_min as f64 * new_min as f64 / old_min as f64).round() as i64
+            }
+            Some(_) => continue,
+        };
         a.regular_work_min = None;
     }
 }
