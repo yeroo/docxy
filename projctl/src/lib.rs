@@ -140,6 +140,16 @@ fn task_json(ed: &Editor, t: &Task) -> Json {
     if let Some(f) = ed.disp_finish(t.uid) {
         fields.push(("finish", Json::Str(dt_str(f))));
     }
+    // A summary's rolled-up span. A manual summary keeps its own start and
+    // finish, and warns when its subtasks finish after it or it finishes
+    // after its parent manual summary.
+    if let Some((start, finish)) = ed.disp_rollup(t.uid) {
+        fields.push(("rollup_start", Json::Str(dt_str(start))));
+        fields.push(("rollup_finish", Json::Str(dt_str(finish))));
+    }
+    if t.summary && t.manual {
+        fields.push(("warning", Json::Bool(ed.summary_warning(t.uid))));
+    }
     if let Some(r) = ed.schedule().get(t.uid) {
         fields.push(("critical", Json::Bool(r.critical)));
         fields.push((
@@ -332,6 +342,42 @@ mod tests {
         .as_i64()
         .unwrap()
     }
+    #[test]
+    fn summaries_report_their_rollup_and_manual_ones_a_warning() {
+        let mut p = new_project();
+        p.tasks[0].name = "Phase".into();
+        for uid in [2, 3] {
+            p.tasks.push(Task {
+                uid,
+                id: uid,
+                name: format!("Sub {uid}"),
+                outline_level: 2,
+                duration_min: 480 * i64::from(uid),
+                ..Task::default()
+            });
+        }
+        let mut ed = Editor::new(p);
+        let get = |ed: &Editor, uid: i32| {
+            task_get(ed, &Json::obj(vec![("uid", Json::Num(uid as f64))])).unwrap()
+        };
+        let auto = get(&ed, 1);
+        assert_eq!(auto.get_str("rollup_start"), auto.get_str("start"));
+        assert_eq!(auto.get_str("rollup_finish"), auto.get_str("finish"));
+        assert!(auto.get("warning").is_none());
+        let leaf = get(&ed, 2);
+        assert!(leaf.get("rollup_start").is_none());
+        assert!(leaf.get("warning").is_none());
+
+        ed.set_manual(1, true).unwrap();
+        ed.set_duration(1, "1d").unwrap();
+        let manual = get(&ed, 1);
+        assert_eq!(manual.get_str("rollup_start"), manual.get_str("start"));
+        assert_ne!(manual.get_str("rollup_finish"), manual.get_str("finish"));
+        assert_eq!(manual.get("warning"), Some(&Json::Bool(true)));
+        ed.set_duration(1, "3d").unwrap();
+        assert_eq!(get(&ed, 1).get("warning"), Some(&Json::Bool(false)));
+    }
+
     #[test]
     fn add_set_and_get_a_task() {
         let mut a = app();

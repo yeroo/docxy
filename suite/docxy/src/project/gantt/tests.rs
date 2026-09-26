@@ -678,6 +678,100 @@ fn a_short_plan_on_a_wide_window_has_days_across_the_whole_chart() {
 }
 
 #[test]
+fn a_manual_summary_bar_carries_its_rollup_and_warning() {
+    let mut ed = editor(vec![task(1, 0, 1), task(2, 1, 2), task(3, 4, 2)]);
+    assert_eq!(bar(&ed, 1).state(), "summary 0-3");
+    ed.set_manual(1, true).unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-3 rollup 0-3");
+    assert_eq!(bar(&ed, 1).warning_days(), None);
+    // Shorter than its subtasks: they run past it, in the warning colour.
+    ed.set_duration(1, "1d").unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-0 rollup 0-3 warning");
+    assert_eq!(bar(&ed, 1).warning_days(), Some((1, 3)));
+    // Longer: the rollup sits inside it and nothing warns.
+    ed.set_duration(1, "10d").unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-11 rollup 0-3");
+    // Made automatic again, it rolls up and draws no second bar.
+    ed.set_manual(1, false).unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-3");
+    // A finish later on the summary's own last day warns on that day.
+    let same_day = GanttBar {
+        kind: BarKind::Summary,
+        start: 0,
+        end: 3,
+        baseline: None,
+        delay: None,
+        rollup: Some((0, 3)),
+        warning: true,
+    };
+    assert_eq!(same_day.warning_days(), Some((3, 3)));
+    // Without a rollup, a warned bar marks its own finish day.
+    let bare = GanttBar {
+        rollup: None,
+        ..same_day
+    };
+    assert_eq!(bare.warning_days(), Some((3, 3)));
+    assert_eq!(
+        GanttBar {
+            warning: false,
+            ..bare
+        }
+        .warning_days(),
+        None
+    );
+}
+
+/// A manual summary at `level` from `start` to `finish` (days of Jan 2026).
+fn manual_summary(uid: i32, level: u32, start: u32, finish: u32) -> Task {
+    Task {
+        summary: true,
+        manual: true,
+        manual_start: Some(projcore::DateTime::from_ymd_hm(2026, 1, start, 8, 0)),
+        manual_finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, finish, 17, 0)),
+        ..task(uid, 0, level)
+    }
+}
+
+#[test]
+fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
+    // O (1/5..1/16) > I (1/5..1/23) > A 1d: I's rollup is inside I, but I
+    // finishes after O. Day 0 is Monday 1/5.
+    let ed = editor(vec![
+        manual_summary(1, 1, 5, 16),
+        manual_summary(2, 2, 5, 23),
+        task(3, 1, 3),
+    ]);
+    let inner = bar(&ed, 2);
+    assert_eq!(inner.state(), "summary 0-18 rollup 0-0 warning");
+    assert_eq!(inner.warning_days(), Some((18, 18)));
+    // O's rollup (through I's own span) runs past O's finish.
+    assert_eq!(bar(&ed, 1).state(), "summary 0-11 rollup 0-18 warning");
+    assert_eq!(bar(&ed, 1).warning_days(), Some((12, 18)));
+    // O (1/5..1/6) > I (1/12..1/16) > A 2d, floored to 1/12.
+    let ed = editor(vec![
+        manual_summary(1, 1, 5, 6),
+        manual_summary(2, 2, 12, 16),
+        task(3, 2, 3),
+    ]);
+    let inner = bar(&ed, 2);
+    assert_eq!(inner.state(), "summary 7-11 rollup 7-8 warning");
+    assert_eq!(inner.warning_days(), Some((11, 11)));
+    // w1: a manual leaf past its manual summary warns in the editor, but
+    // only the summary's bar shows it.
+    let leaf = Task {
+        manual: true,
+        manual_start: Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+        manual_finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, 9, 17, 0)),
+        ..task(2, 5, 2)
+    };
+    let ed = editor(vec![manual_summary(1, 1, 5, 6), leaf]);
+    assert!(ed.summary_warning(2));
+    assert_eq!(bar(&ed, 2).state(), "critical 0-4");
+    assert_eq!(bar(&ed, 2).warning_days(), None);
+    assert_eq!(bar(&ed, 1).state(), "summary 0-1 rollup 0-4 warning");
+}
+
+#[test]
 fn bar_styles_hide_critical_colour_and_baseline_only() {
     let base = GanttBar {
         kind: BarKind::Critical,
@@ -685,6 +779,8 @@ fn bar_styles_hide_critical_colour_and_baseline_only() {
         end: 5,
         baseline: Some((1, 4)),
         delay: Some((0, 2)),
+        rollup: None,
+        warning: false,
     };
     assert_eq!(styled_bar(base, true, true), base);
     assert_eq!(

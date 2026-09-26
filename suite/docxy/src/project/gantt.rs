@@ -18,6 +18,11 @@ pub(crate) struct GanttBar {
     pub end: i64,
     pub baseline: Option<(i64, i64)>,
     pub delay: Option<(i64, i64)>,
+    /// A manual summary's rolled-up span, drawn beside its own dates.
+    pub rollup: Option<(i64, i64)>,
+    /// Project's warning on a manual summary: its subtasks finish after its
+    /// own finish, or it finishes after its manual parent summary's.
+    pub warning: bool,
 }
 
 impl GanttBar {
@@ -28,7 +33,28 @@ impl GanttBar {
             BarKind::Summary => "summary",
             BarKind::Milestone => "milestone",
         };
-        format!("{kind} {}-{}", self.start, self.end)
+        let mut state = format!("{kind} {}-{}", self.start, self.end);
+        if let Some((s, e)) = self.rollup {
+            state += &format!(" rollup {s}-{e}");
+        }
+        if self.warning {
+            state += " warning";
+        }
+        state
+    }
+
+    /// The days a warned bar draws in the warning colour: its rollup's days
+    /// past its own finish, else its own finish day. That covers subtasks
+    /// finishing later on that same day, and a summary that warns because it
+    /// finishes after its manual parent while its rollup stays inside it.
+    pub fn warning_days(self) -> Option<(i64, i64)> {
+        if !self.warning {
+            return None;
+        }
+        Some(match self.rollup {
+            Some((s, e)) if e > self.end => (s.max(self.end + 1), e),
+            _ => (self.end, self.end),
+        })
     }
 }
 
@@ -113,6 +139,12 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
             .map(|(s, e)| (day(s), day(e))),
         delay: (ed.leveled() && start > result.early_start)
             .then(|| (day(result.early_start), day(start))),
+        rollup: task
+            .manual_summary_dates()
+            .and(ed.disp_rollup(task.uid))
+            .map(|(s, e)| (day(s), day(e))),
+        // Leaf rows do not show the warning yet, as in yppxy.
+        warning: task.summary && ed.summary_warning(task.uid),
     })
 }
 
@@ -380,6 +412,24 @@ pub(crate) fn gantt_strip(
     }
     if let Some((s, e)) = bar.baseline {
         strip = strip.child(span(s, e, 22., 4., pal.dim));
+    }
+    // A manual summary's rollup: a thin bar above its own. Its warning marks
+    // the part past its finish, else its own finish day (an overrun within
+    // that day, or a finish past its manual parent), in the warning colour.
+    if let Some((s, e)) = bar.rollup {
+        strip = strip.child(span(
+            s,
+            e,
+            3.,
+            3.,
+            Hsla {
+                a: 0.6,
+                ..hsla_u(GANTT_SUMMARY)
+            },
+        ));
+    }
+    if let Some((s, e)) = bar.warning_days() {
+        strip = strip.child(span(s, e, 3., 3., hsla_u(GANTT_WARNING)));
     }
     let marker = probe(probes, format!("bar:{id}"));
     let element = match bar.kind {

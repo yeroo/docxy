@@ -390,10 +390,24 @@ impl Task {
     /// finish is never used: it goes stale as soon as the duration is edited.
     /// `None` for auto tasks and for a manual task with no start at all
     /// (Project's "TBD" task), which then schedules like an auto task. Also
-    /// `None` for summaries: their dates roll up from their children, and a
-    /// manual summary's own dates are not modeled.
+    /// `None` for summaries, which are never scheduled as leaves: a manual
+    /// summary's own dates come from [`Self::manual_summary_dates`].
     pub fn pinned_dates(&self) -> Option<(DateTime, Option<DateTime>)> {
         if !self.manual || self.summary {
+            return None;
+        }
+        let start = self.manual_start.or(self.stored_start)?;
+        Some((start, self.manual_finish))
+    }
+
+    /// The start and finish a manually scheduled summary keeps instead of
+    /// rolling up: its manual start (else the stored start) and its manual
+    /// finish, if any. When the finish is absent the scheduler derives it from
+    /// the start and `manual_duration_min`. `None` for leaves, auto summaries,
+    /// and a manual summary with no start (TBD), which rolls up as an auto
+    /// summary does.
+    pub fn manual_summary_dates(&self) -> Option<(DateTime, Option<DateTime>)> {
+        if !self.manual || !self.summary || self.is_null {
             return None;
         }
         let start = self.manual_start.or(self.stored_start)?;

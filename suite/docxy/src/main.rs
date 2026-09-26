@@ -1500,6 +1500,10 @@ impl Pal {
 const GANTT_CRIT: u32 = 0xD9642C;
 const GANTT_MILESTONE: u32 = 0xB482DC;
 const GANTT_SUMMARY: u32 = 0x96A0AC;
+// A manual summary's warning (Project's): its subtasks' days past its finish,
+// else its own finish day (an overrun within that day, or a finish past its
+// manual parent's).
+const GANTT_WARNING: u32 = 0xDC322F;
 const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
 const LINK: u32 = 0x2f6fdb;
 const FILE_FG: u32 = 0xffffff;

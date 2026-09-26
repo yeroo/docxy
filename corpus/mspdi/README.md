@@ -115,6 +115,13 @@ Project 2024's own: `gen_mpp_lag_cases.py` built it in Project, and
 `verify_mspdi_project.py`, which now compares each lag with its format, passed
 both on the generated file and on `write_mspdi`'s output for it.
 
+File 27 covers manually scheduled summaries
+([issue #124](https://github.com/yeroo/docxy/issues/124)). A manual summary's
+`Start`/`Finish` are its `ManualStart`/`ManualFinish`, and its `Duration` is
+the rolled-up span, as Project writes them. `verify_mspdi_project.py` passed on
+the generated file and on `write_mspdi`'s output for it. The rollup span and
+Project's warning have no MSPDI field; projcore's unit tests check them.
+
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
   off. File 12 adds a second calendar with Saturday working; file 16 adds the
@@ -152,6 +159,7 @@ both on the generated file and on `write_mspdi`'s output for it.
 | `24-calendar-holiday` | calendar exceptions | a holiday inside a task pushes its finish out a day; a working Saturday with changed hours carries the next task; both exceptions survive MSPDI and `.yppx` in both forms |
 | `25-derived-calendar-holiday` | exceptions on a derived calendar | the base's holiday beats a weekday the derived calendar states; the derived calendar's own exception beats the base's holiday |
 | `26-lag-percent-elapsed` | percentage and elapsed lags | ±% of the predecessor's duration, ±elapsed days across a weekend on FS/SS/FF/SF links, an estimated elapsed week, a working lag in hours; the lag and its `LagFormat` survive MSPDI and `.yppx` |
+| `27-manual-summary` | manually scheduled summaries | a manual summary keeps its own Start/Finish: a short one under an auto summary (whose slack its fixed span bounds), one whose finish is the project finish, its start flooring an ASAP subtask, a link pushing one past it and an MSO subtask ignoring it |
 
 See `manifest.json` for machine-readable tags.
 

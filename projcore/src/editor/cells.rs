@@ -91,7 +91,8 @@ impl Editor {
     /// Set a task's start to an exact instant, as [`Self::set_start`] does
     /// for a day: a manual task's pinned start moves there, keeping its
     /// duration; an auto task gets a Start-No-Earlier-Than constraint there,
-    /// replacing any other constraint.
+    /// replacing any other constraint. A manual summary keeps the span it
+    /// shows as its manual duration.
     pub fn set_start_at(&mut self, uid: i32, start: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
         let blank = self.proj.tasks[i].is_null;
@@ -100,13 +101,26 @@ impl Editor {
             return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(start));
         }
         self.validate_pinned_day(start)?;
-        if !blank && task.manual_start == Some(start) && task.manual_finish.is_none() {
+        let span = if task.summary {
+            self.disp_duration_min(uid).or(task.manual_duration_min)
+        } else {
+            task.manual_duration_min
+        };
+        if !blank
+            && task.manual_start == Some(start)
+            && task.manual_finish.is_none()
+            && task.manual_duration_min == span
+        {
             return Ok(());
         }
+        let summary = task.summary;
         self.edit_row(i, |proj, _| {
             let task = &mut proj.tasks[i];
             task.manual_start = Some(start);
             task.manual_finish = None;
+            if summary {
+                task.manual_duration_min = span;
+            }
         })?;
         self.stamp_pinned_dates(uid);
         Ok(())
@@ -131,12 +145,15 @@ impl Editor {
         self.validate_pinned_day(day)?;
         // Like a typed start, a manual finish may fall on a non-working day.
         let finish = day_end(&self.proj, task, day);
-        let start = match task.pinned_dates() {
+        let start = match task.pinned_dates().or_else(|| task.manual_summary_dates()) {
             Some((start, _)) => start,
             None => self.disp_start(uid).ok_or("The task has no start")?,
         };
         if finish < start {
             return Err("Finish is before the task's start".into());
+        }
+        if task.summary {
+            return self.set_manual_summary_span(i, start, finish);
         }
         let calendar = task_calendar(&self.proj, task);
         let duration = crate::schedule::working_minutes_on(&calendar, start, finish);
@@ -160,6 +177,34 @@ impl Editor {
             if changed {
                 rescale_work(proj, i, old, duration);
             }
+        })?;
+        self.stamp_pinned_dates(uid);
+        Ok(())
+    }
+
+    /// Pin manual summary `i` to `start`..`finish`; its manual duration is
+    /// the working time between them on the summary calendar. Its stored
+    /// duration, milestone flag and work belong to the rollup.
+    fn set_manual_summary_span(
+        &mut self,
+        i: usize,
+        start: DateTime,
+        finish: DateTime,
+    ) -> Result<(), String> {
+        let task = &self.proj.tasks[i];
+        let span = crate::schedule::summary_or_leaf_min(&self.proj, task, start, finish);
+        if task.manual_start == Some(start)
+            && task.manual_finish == Some(finish)
+            && task.manual_duration_min == Some(span)
+        {
+            return Ok(());
+        }
+        let uid = task.uid;
+        self.edit_row(i, |proj, _| {
+            let task = &mut proj.tasks[i];
+            task.manual_start = Some(start);
+            task.manual_finish = Some(finish);
+            task.manual_duration_min = Some(span);
         })?;
         self.stamp_pinned_dates(uid);
         Ok(())
