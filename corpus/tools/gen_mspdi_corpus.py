@@ -336,17 +336,42 @@ def build():
     # with each rate's display unit (a standard rate shown per day and an
     # overtime rate shown per week),
     # booking type, flags and stored work, and an assignment's contour, flags,
-    # own dates and regular work (#84).
+    # own dates and regular work (#84); the resource's e-mail, availability,
+    # overtime work, cost, notes, custom field, baseline, availability period
+    # and rate tables A and B, and the assignment's cost, rate table, delays,
+    # notes, overtime, custom field and timephased work (#199). The delays are
+    # zero and the period covers the whole plan, so the schedule is unchanged.
     rich_res = (
         "    <Resource><UID>1</UID><ID>1</ID><Name>Alice</Name><Type>1</Type>"
         "<Initials>A</Initials><Code>C7</Code><Group>Eng</Group><WorkGroup>1</WorkGroup>"
+        "<EmailAddress>alice@example.com</EmailAddress>"
         "<MaxUnits>1</MaxUnits><PeakUnits>1</PeakUnits><OverAllocated>0</OverAllocated>"
+        "<AvailableFrom>1984-01-01T00:00:00</AvailableFrom>"
+        "<AvailableTo>2049-12-31T23:59:00</AvailableTo>"
         "<CanLevel>1</CanLevel><AccrueAt>3</AccrueAt><Work>PT16H0M0S</Work>"
-        "<RegularWork>PT16H0M0S</RegularWork><RemainingWork>PT16H0M0S</RemainingWork>"
+        "<RegularWork>PT16H0M0S</RegularWork><OvertimeWork>PT0H0M0S</OvertimeWork>"
+        "<RemainingWork>PT16H0M0S</RemainingWork>"
         "<StandardRate>50</StandardRate><StandardRateFormat>3</StandardRateFormat>"
+        "<Cost>970</Cost>"
         "<OvertimeRate>75</OvertimeRate><OvertimeRateFormat>4</OvertimeRateFormat>"
-        "<CostPerUse>10</CostPerUse><IsGeneric>1</IsGeneric><IsInactive>0</IsInactive>"
-        "<BookingType>1</BookingType></Resource>\n"
+        "<CostPerUse>10</CostPerUse><Notes>Site lead &amp; first aider</Notes>"
+        "<IsGeneric>1</IsGeneric><IsInactive>0</IsInactive><BookingType>1</BookingType>"
+        "<ExtendedAttribute><FieldID>205520904</FieldID><Value>Ops</Value></ExtendedAttribute>"
+        "<Baseline><Number>0</Number><Work>PT16H0M0S</Work><Cost>970</Cost></Baseline>"
+        "<AvailabilityPeriods><AvailabilityPeriod>"
+        "<AvailableFrom>1984-01-01T00:00:00</AvailableFrom>"
+        "<AvailableTo>2049-12-31T23:59:00</AvailableTo>"
+        "<AvailableUnits>1</AvailableUnits></AvailabilityPeriod></AvailabilityPeriods>"
+        "<Rates>"
+        "<Rate><RatesFrom>1984-01-01T00:00:00</RatesFrom><RatesTo>2049-12-31T23:59:00</RatesTo>"
+        "<RateTable>0</RateTable><StandardRate>50</StandardRate>"
+        "<StandardRateFormat>3</StandardRateFormat><OvertimeRate>75</OvertimeRate>"
+        "<OvertimeRateFormat>4</OvertimeRateFormat><CostPerUse>10</CostPerUse></Rate>"
+        "<Rate><RatesFrom>1984-01-01T00:00:00</RatesFrom><RatesTo>2049-12-31T23:59:00</RatesTo>"
+        "<RateTable>1</RateTable><StandardRate>60</StandardRate>"
+        "<StandardRateFormat>2</StandardRateFormat><OvertimeRate>90</OvertimeRate>"
+        "<OvertimeRateFormat>2</OvertimeRateFormat><CostPerUse>10</CostPerUse></Rate>"
+        "</Rates></Resource>\n"
         "    <Resource><UID>2</UID><ID>2</ID><Name>Licence</Name><Type>0</Type>"
         "<MaxUnits>1</MaxUnits><IsCostResource>1</IsCostResource>"
         "<IsBudget>1</IsBudget></Resource>\n"
@@ -356,14 +381,26 @@ def build():
     )
     rich_asn = ("    <Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>"
                 "<PercentWorkComplete>0</PercentWorkComplete>"
+                "<Cost>970</Cost><CostRateTable>1</CostRateTable><Delay>0</Delay>"
                 f"<Finish>{dt(3, '17:00:00')}</Finish><HasFixedRateUnits>1</HasFixedRateUnits>"
-                "<FixedMaterial>0</FixedMaterial><RegularWork>PT16H0M0S</RegularWork>"
+                "<FixedMaterial>0</FixedMaterial>"
+                "<LevelingDelay>0</LevelingDelay><LevelingDelayFormat>7</LevelingDelayFormat>"
+                "<Notes>Pour on day one</Notes><OvertimeWork>PT0H0M0S</OvertimeWork>"
+                "<RegularWork>PT16H0M0S</RegularWork>"
                 f"<RemainingWork>PT16H0M0S</RemainingWork><Start>{dt(2)}</Start>"
                 "<Units>1</Units><Work>PT16H0M0S</Work><WorkContour>0</WorkContour>"
+                "<ExtendedAttribute><FieldID>255852547</FieldID><Value>12.5</Value>"
+                "</ExtendedAttribute>"
+                f"<TimephasedData><Type>1</Type><UID>1</UID><Start>{dt(2)}</Start>"
+                f"<Finish>{dt(3)}</Finish><Unit>2</Unit><Value>PT8H0M0S</Value></TimephasedData>"
+                f"<TimephasedData><Type>1</Type><UID>1</UID><Start>{dt(3)}</Start>"
+                f"<Finish>{dt(3, '17:00:00')}</Finish><Unit>2</Unit><Value>PT8H0M0S</Value>"
+                "</TimephasedData>"
                 "</Assignment>")
     add("13-resource-fields.xml", ["resource", "resource-fields", "round-trip"],
-        "Work resource identity, rates and their display units, booking type and flags, Cost and "
-        "Material resources, and an assignment's contour, flags and dates survive saving.",
+        "Work resource identity, rates and their display units, booking type and flags, "
+        "availability and cost rate tables, Cost and Material resources, and an assignment's "
+        "contour, flags, dates, delays, cost and timephased work survive saving.",
         project("resource-fields",
                 task(1, "Build", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT),
                 resources_xml=rich_res, assignments_xml=rich_asn))
