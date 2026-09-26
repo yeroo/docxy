@@ -1907,7 +1907,7 @@ fn build_gantt_row(
     warning: bool,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::with_capacity(width);
-    let warn_finish = warning && !rollup.is_some_and(|(_, r_e)| r_e > e_day);
+    let warn_finish = warning && rollup.is_none_or(|(_, r_e)| r_e <= e_day);
     let milestone = milestone && !is_summary;
     let bar_color = if crit { CRIT } else { ONTRACK };
     for col in 0..width {
