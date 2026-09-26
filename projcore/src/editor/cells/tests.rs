@@ -34,17 +34,7 @@ fn predecessor_validation_is_atomic_and_replacement_is_one_step() {
     }
     let self_link = parse_predecessors("1", ed.project()).unwrap();
     assert!(ed.set_predecessors(10, self_link).is_err());
-    assert!(
-        ed.set_predecessors(
-            10,
-            vec![Predecessor {
-                uid: 999,
-                link: LinkType::FinishStart,
-                lag_min: 0
-            }]
-        )
-        .is_err()
-    );
+    assert!(ed.set_predecessors(10, vec![Predecessor::fs(999)]).is_err());
     unchanged(&ed, &before, history);
     let preds = parse_predecessors("2SS+2h, 3FF-7m", ed.project()).unwrap();
     ed.set_predecessors(10, preds.clone()).unwrap();
@@ -197,11 +187,7 @@ fn aggregate_duration_and_lag_overflow_reject_before_snapshot() {
         assert!(
             ed.set_predecessors(
                 10,
-                vec![Predecessor {
-                    uid: 20,
-                    link: LinkType::FinishStart,
-                    lag_min
-                }]
+                vec![Predecessor::working(20, LinkType::FinishStart, lag_min)]
             )
             .is_err()
         );
@@ -250,11 +236,7 @@ fn scheduling_range_reserves_room_for_dated_start_indices() {
         assert!(
             ed.set_predecessors(
                 20,
-                vec![Predecessor {
-                    uid: 10,
-                    link: LinkType::FinishStart,
-                    lag_min,
-                }]
+                vec![Predecessor::working(10, LinkType::FinishStart, lag_min)]
             )
             .unwrap_err()
             .contains("scheduling range")
@@ -275,15 +257,8 @@ fn scheduling_range_accounts_for_time_before_the_anchor() {
         day.times = vec![crate::model::WorkingTime { from: 0, to: 1440 }];
     }
     // Keep an SF leaf link so this project needs a backward horizon.
-    ed.set_predecessors(
-        20,
-        vec![Predecessor {
-            uid: 30,
-            link: LinkType::StartFinish,
-            lag_min: 0,
-        }],
-    )
-    .unwrap();
+    ed.set_predecessors(20, vec![Predecessor::working(30, LinkType::StartFinish, 0)])
+        .unwrap();
     ed.set_constraint_typed(
         10,
         ConstraintType::StartNoEarlierThan,
@@ -558,17 +533,18 @@ fn all_corpus_predecessors_and_synthetic_lags_round_trip() {
         LinkType::StartFinish,
     ] {
         for lag_min in [-481, -120, -1, 0, 1, 120, 480, 960] {
-            let preds = vec![Predecessor {
-                uid: 20,
-                link,
-                lag_min,
-            }];
+            let preds = vec![Predecessor::working(20, link, lag_min)];
             ed.proj.tasks[0].predecessors = preds.clone();
-            assert_eq!(
+            let back =
                 parse_predecessors(&format_predecessors(&ed.proj.tasks[0], &ed.proj), &ed.proj)
-                    .unwrap(),
-                preds
-            );
+                    .unwrap();
+            // A lag in days that is not a whole number of hundredths shows in
+            // minutes: the time survives, the format becomes minutes.
+            let mut expected = preds;
+            if lag_min % 480 != 0 && (lag_min * 100) % 480 != 0 {
+                expected[0].lag_format = LagFormat::from_code(3).unwrap();
+            }
+            assert_eq!(back, expected, "{link:?} {lag_min}");
         }
     }
     for s in ["NaN", "inf", "-inf", "1e50d", "9223372036854775808m"] {
@@ -1778,4 +1754,225 @@ fn a_summary_keeps_its_assignments_work_judged_by_the_edited_outline() {
     )
     .unwrap();
     assert_eq!(work(&ed, 1), (1440, None));
+}
+
+fn lag_pred(uid: i32, lag: i64, code: i64) -> Predecessor {
+    Predecessor {
+        uid,
+        link: LinkType::FinishStart,
+        lag,
+        lag_format: LagFormat::from_code(code).unwrap(),
+    }
+}
+
+#[test]
+fn percent_and_elapsed_lags_show_in_their_own_kind() {
+    // #104: the issue's links, an estimated elapsed week and a working lag
+    // in hours each show as Project spells them, not as minutes.
+    let ed = editor();
+    let p = ed.project();
+    for (lag, code, text) in [
+        (50, 19, "1FS+50%"),
+        (-25, 19, "1FS-25%"),
+        (0, 19, "1FS+0%"),
+        (-25, 51, "1FS-25%?"),
+        (2880, 8, "1FS+2ed"),
+        (-1440, 8, "1FS-1ed"),
+        (10080, 42, "1FS+1ew?"),
+        (90, 6, "1FS+1.5eh"),
+        (7, 4, "1FS+7em"),
+        (43200, 12, "1FS+1emo"),
+        (180, 5, "1FS+3h"),
+        (2400, 9, "1FS+1w"),
+        (30, 3, "1FS+30m"),
+        (0, 3, "1FS+0m"),
+        (960, 39, "1FS+2d?"),
+        (-120, 7, "1FS-0.25d"),
+    ] {
+        let mut task = p.tasks[1].clone();
+        task.predecessors = vec![lag_pred(10, lag, code)];
+        assert_eq!(format_predecessors(&task, p), text, "{lag} format {code}");
+        assert_eq!(
+            parse_predecessors(text, p).unwrap(),
+            task.predecessors,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn every_supported_lag_format_reads_back_what_the_cell_shows() {
+    // Wherever the value is exact in its own unit, the cell text parses back
+    // to the same lag and format; otherwise the time survives and the format
+    // falls back to minutes, or to days for a working month.
+    let ed = editor();
+    let p = ed.project();
+    for code in (0..=64).filter(|&c| LagFormat::from_code(c).is_some()) {
+        let format = LagFormat::from_code(code).unwrap();
+        for lag in [
+            1, -1, 7, 30, -90, 480, 1440, -2880, 10080, 43200, 2400, 99_999,
+        ] {
+            let pred = lag_pred(10, lag, code);
+            let mut task = p.tasks[1].clone();
+            task.predecessors = vec![pred];
+            let text = format_predecessors(&task, p);
+            let back = parse_predecessors(&text, p).unwrap()[0];
+            assert_eq!(back.lag, lag, "{text}");
+            let month_in_days = format.kind() == LagKind::Working
+                && format.unit() == LagUnit::Month
+                && text.trim_end_matches('?').ends_with('d');
+            let expected = if back.lag_format == format {
+                format
+            } else if month_in_days {
+                LagFormat::new(LagUnit::Day, false, format.estimated()).unwrap()
+            } else {
+                let elapsed = format.kind() == LagKind::Elapsed;
+                LagFormat::new(LagUnit::Minute, elapsed, format.estimated()).unwrap()
+            };
+            assert_eq!(back.lag_format, expected, "{text} from format {code}");
+            // A working month always falls back; any other format only when
+            // its own unit cannot show the value exactly.
+            if format.unit() == LagUnit::Month && format.kind() == LagKind::Working {
+                assert_ne!(back.lag_format, format, "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn lag_grammar_refuses_what_it_cannot_schedule() {
+    let ed = editor();
+    let p = ed.project();
+    // Elapsed percent is unsupported; a working month has no days per month.
+    for text in [
+        "2FS+50e%",
+        "2FS+1mo",
+        "2FS+1.5%",
+        "2FS+2e",
+        "2FS+%",
+        "2FS+2ed??",
+        "2FS+2",
+    ] {
+        assert!(parse_predecessors(text, p).is_err(), "{text}");
+    }
+    assert_eq!(
+        parse_lag("+1emo", p),
+        Some((43200, LagFormat::from_code(12).unwrap()))
+    );
+    assert_eq!(
+        parse_lag("2 ED", p),
+        Some((2880, LagFormat::from_code(8).unwrap()))
+    );
+    assert_eq!(
+        parse_lag("-1.5eh?", p),
+        Some((-90, LagFormat::from_code(38).unwrap()))
+    );
+}
+
+#[test]
+fn editing_one_link_keeps_the_other_lag_kinds() {
+    // Re-entering a cell that shows percent and elapsed lags, with one link
+    // changed, keeps the others exactly; re-entering it unchanged is no edit.
+    let mut ed = editor();
+    let preds = vec![lag_pred(10, 50, 19), lag_pred(20, 2880, 8)];
+    ed.set_predecessors(30, preds.clone()).unwrap();
+    let text = format_predecessors(&ed.project().tasks[2], ed.project());
+    assert_eq!(text, "1FS+50%, 2FS+2ed");
+    let depth = ed.undo_depth();
+    ed.set_predecessors(30, parse_predecessors(&text, ed.project()).unwrap())
+        .unwrap();
+    assert_eq!(ed.undo_depth(), depth, "same text, no edit");
+    let edited = text.replace("+2ed", "+3ed");
+    ed.set_predecessors(30, parse_predecessors(&edited, ed.project()).unwrap())
+        .unwrap();
+    assert_eq!(
+        ed.project().tasks[2].predecessors,
+        vec![lag_pred(10, 50, 19), lag_pred(20, 3 * 1440, 8)]
+    );
+}
+
+#[test]
+fn a_percent_lag_counts_against_the_range_with_its_predecessors_duration() {
+    // A 1000% lag is ten times its predecessor's duration, including a
+    // duration the same edit gives that predecessor.
+    let mut ed = editor();
+    ed.set_predecessors(20, vec![lag_pred(10, 1000, 19)])
+        .unwrap();
+    let before = ed.project().clone();
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    // Ten times this overflows; the duration alone does not.
+    let huge = i64::MAX / 10;
+    assert!(
+        ed.set_duration_min(10, huge)
+            .unwrap_err()
+            .contains("scheduling range")
+    );
+    unchanged(&ed, &before, history);
+    assert!(
+        ed.set_predecessors(20, vec![lag_pred(10, i64::MAX, 19)])
+            .unwrap_err()
+            .contains("scheduling range")
+    );
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn add_link_refuses_a_lag_beyond_the_scheduling_range() {
+    // r1: a link added on its own is checked like a whole cell, so an
+    // overflowing percent lag cannot be stored and wedge later edits.
+    let mut ed = editor();
+    let before = ed.project().clone();
+    for (uid, lag, code) in [(10, i64::MAX, 19), (10, i64::MIN, 19), (10, i64::MAX, 7)] {
+        let link = lag_pred(uid, lag, code);
+        assert!(
+            ed.add_link(20, link)
+                .unwrap_err()
+                .contains("scheduling range")
+        );
+        unchanged(&ed, &before, (0, 0, false));
+    }
+    ed.add_link(20, lag_pred(10, 50, 19)).unwrap();
+    assert_eq!(
+        ed.project().tasks[1].predecessors,
+        vec![lag_pred(10, 50, 19)]
+    );
+    ed.rename(30, "still editable").unwrap();
+}
+
+#[test]
+fn re_entering_a_cell_keeps_links_shown_in_a_fallback_unit() {
+    // r1: a working month shows in days and a fraction of a day in minutes.
+    // Editing another link in the same cell keeps both formats; editing the
+    // fallback text itself takes the typed unit.
+    let mut ed = editor();
+    let month = lag_pred(10, 20 * 480, 11);
+    let odd = Predecessor {
+        uid: 20,
+        ..lag_pred(20, 100, 7)
+    };
+    ed.set_predecessors(30, vec![month, odd]).unwrap();
+    let task = &ed.project().tasks[2];
+    let text = format_predecessors(task, ed.project());
+    assert_eq!(text, "1FS+20d, 2FS+100m");
+    // Unchanged text is no edit.
+    let depth = ed.undo_depth();
+    let same = parse_task_predecessors(&text, task, ed.project()).unwrap();
+    assert_eq!(same, vec![month, odd]);
+    ed.set_predecessors(30, same).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    // Add an elapsed lag to a third link: the other two keep their formats.
+    let mut ed2 = editor();
+    ed2.set_predecessors(30, vec![month]).unwrap();
+    let task = &ed2.project().tasks[2];
+    let edited = format!("{}, 2FS+2ed", format_predecessors(task, ed2.project()));
+    let parsed = parse_task_predecessors(&edited, task, ed2.project()).unwrap();
+    assert_eq!(parsed, vec![month, lag_pred(20, 2880, 8)]);
+    // Spelling the month link differently is an edit in that unit.
+    let task = &ed2.project().tasks[2];
+    let parsed = parse_task_predecessors("1FS+4w", task, ed2.project()).unwrap();
+    assert_eq!(parsed, vec![lag_pred(10, 20 * 480, 9)]);
+    // Without the task, the fallback text reads in its shown unit.
+    let plain = parse_predecessors(&text, ed.project()).unwrap();
+    assert_eq!(plain[0].lag_format, LagFormat::DAYS);
+    assert_eq!(plain[1].lag_format.code(), 3);
 }

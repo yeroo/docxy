@@ -519,11 +519,7 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
         "—"
     );
     let mut p = ed.project().clone();
-    p.tasks[1].predecessors.push(projcore::Predecessor {
-        uid: 999,
-        link: LinkType::FinishStart,
-        lag_min: 0,
-    });
+    p.tasks[1].predecessors.push(projcore::Predecessor::fs(999));
     let ed = ProjectEditor::new(p);
     assert_eq!(
         project_row(&ed, ed.project().task(9).unwrap())[COL_PREDECESSORS],

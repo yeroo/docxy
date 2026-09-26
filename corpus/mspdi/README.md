@@ -103,6 +103,17 @@ Project imported every calendar exception (name, type, dates, working). The
 check passed both on the generated files and on `write_mspdi`'s output for them.
 Only daily (`Type 1`) exceptions are scheduled. Recurring ones (`Type` 2-8, or
 a `Period` above 1) are kept and written back, but not scheduled.
+File 26 covers the lag kinds
+([issue #104](https://github.com/yeroo/docxy/issues/104)). A percentage lag
+(`LagFormat` 19) stores the percentage itself in `LinkLag`, not tenths of a
+minute. It is a share of the predecessor's duration, counted as working time.
+An elapsed lag (`LagFormat` 8, an estimated elapsed week 42) counts calendar
+time from the predecessor's instant, and the link then acts as a zero-lag one
+from there. Starts snap to the next working time, while the milestone and the
+FF finish keep the Saturday 17:00 instant itself. The plan and every value are
+Project 2024's own: `gen_mpp_lag_cases.py` built it in Project, and
+`verify_mspdi_project.py`, which now compares each lag with its format, passed
+both on the generated file and on `write_mspdi`'s output for it.
 
 - **Anchor:** Monday 2026-03-02 08:00.
 - **Calendar:** Standard, 8h/day, Mon–Fri (08:00–12:00, 13:00–17:00); weekends
@@ -140,6 +151,7 @@ a `Period` above 1) are kept and written back, but not scheduled.
 | `23-derived-calendar` | derived calendar | `BaseCalendarUID`, `IsBaselineCalendar` and only the calendar's own weekday survive MSPDI and `.yppx`; a task on it inherits Standard's week, skips its own Friday off and finishes Mon 9 |
 | `24-calendar-holiday` | calendar exceptions | a holiday inside a task pushes its finish out a day; a working Saturday with changed hours carries the next task; both exceptions survive MSPDI and `.yppx` in both forms |
 | `25-derived-calendar-holiday` | exceptions on a derived calendar | the base's holiday beats a weekday the derived calendar states; the derived calendar's own exception beats the base's holiday |
+| `26-lag-percent-elapsed` | percentage and elapsed lags | ±% of the predecessor's duration, ±elapsed days across a weekend on FS/SS/FF/SF links, an estimated elapsed week, a working lag in hours; the lag and its `LagFormat` survive MSPDI and `.yppx` |
 
 See `manifest.json` for machine-readable tags.
 

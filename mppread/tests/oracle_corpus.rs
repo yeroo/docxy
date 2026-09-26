@@ -107,12 +107,19 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         let mut got: Vec<_> = a
             .predecessors
             .iter()
-            .map(|p| (p.pred_uid as i32, p.kind as i64, p.lag_min))
+            .map(|p| {
+                (
+                    p.pred_uid as i32,
+                    p.kind as i64,
+                    p.lag,
+                    i64::from(p.lag_format),
+                )
+            })
             .collect();
         let mut want: Vec<_> = e
             .predecessors
             .iter()
-            .map(|p| (p.uid, p.link.code(), p.lag_min))
+            .map(|p| (p.uid, p.link.code(), p.lag, p.lag_format.code()))
             .collect();
         got.sort();
         want.sort();
@@ -221,6 +228,16 @@ fn project_2024_oracles() {
     if order.exists() {
         let cases = pairs(&order, "");
         assert_eq!(cases.len(), 5);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false);
+        }
+    }
+    // Percentage, elapsed and estimated lags (#104): each is compared in its
+    // own kind and format, not only as minutes.
+    let lag = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/lag");
+    if lag.exists() {
+        let cases = pairs(&lag, "");
+        assert_eq!(cases.len(), 2);
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false);
         }

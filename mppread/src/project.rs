@@ -1,7 +1,7 @@
 //! Convert validated MPP metadata and tasks to a schedulable project.
 
 use projcore::editor::default_anchor;
-use projcore::{ConstraintType, DateTime, LinkType, Predecessor, Project, Task};
+use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Project, Task};
 
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
@@ -67,7 +67,10 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                         link: LinkType::from_code(p.kind as i64).ok_or_else(|| {
                             format!("unsupported link type {} for UID {}", p.kind, t.uid)
                         })?,
-                        lag_min: p.lag_min,
+                        lag: p.lag,
+                        lag_format: LagFormat::from_code(i64::from(p.lag_format)).ok_or_else(
+                            || format!("unsupported LagFormat {} for UID {}", p.lag_format, t.uid),
+                        )?,
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;

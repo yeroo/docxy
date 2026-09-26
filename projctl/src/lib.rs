@@ -20,7 +20,7 @@
 //! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
 //! | `task.add` | `{after?, name?, duration?}` | the new task |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
-//! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
+//! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` as the Predecessors cell spells it: `4h`, `2ed`, `50%`) |
 //! | `link.del` | `{uid, pred}` | the updated task |
 //! | `find` | `{query}` | `{count, tasks:[…]}` |
 //!
@@ -29,8 +29,8 @@
 
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
-use projcore::editor::{Editor, TaskPatch, parse_duration};
-use projcore::model::{LinkType, Task};
+use projcore::editor::{Editor, TaskPatch, parse_duration, parse_lag};
+use projcore::model::{LagFormat, LinkType, Predecessor, Task};
 
 /// Successful calls to these verbs signal agent editing activity.
 pub const MUTATING: &[&str] = &["task.set", "task.add", "task.del", "link.add", "link.del"];
@@ -113,7 +113,11 @@ fn task_json(ed: &Editor, t: &Task) -> Json {
             Json::obj(vec![
                 ("uid", Json::Num(p.uid as f64)),
                 ("type", Json::Str(link_name(p.link).to_string())),
-                ("lag_min", Json::Num(p.lag_min as f64)),
+                // Minutes of working or elapsed time, or a percentage of
+                // the predecessor's duration, as `lag_format` (MSPDI's
+                // LagFormat code) says.
+                ("lag", Json::Num(p.lag as f64)),
+                ("lag_format", Json::Num(p.lag_format.code() as f64)),
             ])
         })
         .collect();
@@ -271,12 +275,22 @@ fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         Some(t) => parse_link_name(t).ok_or("'type' must be FS, SS, FF, or SF")?,
         None => LinkType::FinishStart,
     };
-    let lag_min = match args.get_str("lag") {
-        Some(l) => parse_duration(l, ed.project())
-            .ok_or_else(|| format!("couldn't read lag '{l}' (try 1d, 4h)"))?,
-        None => 0,
+    // The Predecessors cell's lag grammar; a bare number stays working days.
+    let (lag, lag_format) = match args.get_str("lag") {
+        Some(l) => parse_lag(l, ed.project())
+            .or_else(|| parse_duration(l, ed.project()).map(|min| (min, LagFormat::DAYS)))
+            .ok_or_else(|| format!("couldn't read lag '{l}' (try 1d, 4h, 2ed, 50%)"))?,
+        None => (0, LagFormat::DAYS),
     };
-    ed.add_predecessor(uid, pred, link, lag_min)?;
+    ed.add_link(
+        uid,
+        Predecessor {
+            uid: pred,
+            link,
+            lag,
+            lag_format,
+        },
+    )?;
     task_get(ed, args)
 }
 
@@ -377,6 +391,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.get("predecessors").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn link_add_reads_percent_elapsed_and_bare_lags() {
+        // #104: link.add spells lags as the Predecessors cell does, keeps the
+        // format, and reports both the lag and its format.
+        for (text, lag, format) in [
+            ("50%", 50, 19),
+            ("-25%", -25, 19),
+            ("+2ed", 2880, 8),
+            ("1ew?", 10080, 42),
+            ("4h", 240, 5),
+            ("2", 960, 7),
+        ] {
+            let mut a = app();
+            let t1 = add(&mut a, "Build", "4d");
+            let t2 = add(&mut a, "Test", "1d");
+            let r = link_add(
+                &mut a,
+                &Json::obj(vec![
+                    ("uid", Json::Num(t2 as f64)),
+                    ("pred", Json::Num(t1 as f64)),
+                    ("lag", Json::Str(text.into())),
+                ]),
+            )
+            .unwrap();
+            let preds = r.get("predecessors").unwrap().as_array().unwrap();
+            assert_eq!(preds[0].get("lag").unwrap().as_i64(), Some(lag), "{text}");
+            assert_eq!(
+                preds[0].get("lag_format").unwrap().as_i64(),
+                Some(format),
+                "{text}"
+            );
+            assert_eq!(preds[0].get("lag_min"), None, "{text}");
+        }
+        let mut a = app();
+        let t1 = add(&mut a, "Build", "4d");
+        let t2 = add(&mut a, "Test", "1d");
+        for bad in ["50e%", "1mo", "2x"] {
+            let err = link_add(
+                &mut a,
+                &Json::obj(vec![
+                    ("uid", Json::Num(t2 as f64)),
+                    ("pred", Json::Num(t1 as f64)),
+                    ("lag", Json::Str(bad.into())),
+                ]),
+            )
+            .unwrap_err();
+            assert!(err.contains("couldn't read lag"), "{bad}: {err}");
+        }
     }
 
     #[test]
@@ -547,7 +611,7 @@ mod tests {
             .unwrap();
         let pred = ed.project().tasks[1].predecessors[0];
         assert_eq!(pred.link, LinkType::StartStart);
-        assert_eq!(pred.lag_min, 240);
+        assert_eq!((pred.lag, pred.lag_format.code()), (240, 5));
         dispatch_editor(&mut ed, "link.del", &link)
             .unwrap()
             .unwrap();

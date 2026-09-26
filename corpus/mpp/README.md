@@ -117,6 +117,16 @@ scheduled ones. Generate them the same way:
 python corpus/tools/gen_mpp_manual_cases.py
 ```
 
+It also checks two link-lag cases in `lag/` when present
+([#104](https://github.com/yeroo/docxy/issues/104)): percentage, elapsed and
+estimated-elapsed lags on every link type, and a predecessor's free slack
+across an elapsed lag. The lag is compared with its LagFormat, not only as
+minutes. Generate them the same way:
+
+```powershell
+python corpus/tools/gen_mpp_lag_cases.py
+```
+
 The generated `.mpp` and `.xml` files stay git-ignored. The generator sources
 are kept with the fetch scripts in `corpus/tools/`.
 
@@ -199,7 +209,11 @@ scheduled ones. The project's `NewTasksAreManual` is the 2-byte `Props` entry
 `0x024013C8` (`0000` or `ff00`). Legacy MPP9 files have no manual tasks. MPP9
 link records in the local samples all have zero lag and LagFormat 7, so nonzero
 legacy lag has no oracle yet. Newest Project links have positive and negative
-lag examples checked against MSPDI.
+lag examples checked against MSPDI. Their lag i32 at +14 and LagFormat u16 at
++18 encode exactly as MSPDI's `LinkLag` and `LagFormat`: tenths of a minute of
+working or elapsed time, or the percentage itself for format 19. The importer
+reads the formats projcore schedules (3-12, 19 and their estimated variants
+35-44 and 51) and refuses the others, elapsed percent (20, 52) included.
 
 The older `mppread::mpp::tasks` and `task_names` functions remain exploratory
 heuristic probes. They are not used by the importer. Their output may be

@@ -1,7 +1,7 @@
 //! Entry-table edit state and transitions, shared by keyboard, mouse and host actions.
 use super::*;
 use projcore::editor::{
-    format_duration_exact, parse_cell_date, parse_duration, parse_predecessors,
+    format_duration_exact, parse_cell_date, parse_duration, parse_task_predecessors,
 };
 
 pub(crate) const COL_ID: usize = 0;
@@ -238,7 +238,11 @@ fn apply_cell(
             )));
         }
         COL_PREDECESSORS => {
-            let predecessors = parse_predecessors(buf, ed.project())?;
+            let task = ed
+                .project()
+                .task(uid)
+                .ok_or("The edited task no longer exists")?;
+            let predecessors = parse_task_predecessors(buf, task, ed.project())?;
             ed.set_predecessors(uid, predecessors)?;
         }
         COL_RESOURCES => {

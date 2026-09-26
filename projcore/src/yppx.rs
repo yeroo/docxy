@@ -119,11 +119,7 @@ mod tests {
             duration_min: 480,
             ..Task::default()
         };
-        b.predecessors = vec![Predecessor {
-            uid: 1,
-            link: LinkType::FinishStart,
-            lag_min: 240,
-        }];
+        b.predecessors = vec![Predecessor::working(1, LinkType::FinishStart, 240)];
         Project {
             name: "Demo".into(),
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),

@@ -30,10 +30,17 @@ impl Editor {
                 &task.predecessors
             };
             for pred in preds {
+                // A percent lag is a share of its predecessor's duration,
+                // including the one this edit gives it.
+                let pred_duration = match self.proj.task(pred.uid) {
+                    Some(p) if p.uid == uid => duration.unwrap_or(p.duration_min),
+                    Some(p) => p.duration_min,
+                    None => 0,
+                };
                 total = total
                     .checked_add(
-                        pred.lag_min
-                            .checked_abs()
+                        pred.lag_minutes(pred_duration)
+                            .and_then(i64::checked_abs)
                             .ok_or("Lag exceeds scheduling range")?,
                     )
                     .ok_or("Lag exceeds scheduling range")?;
@@ -446,43 +453,197 @@ pub fn format_duration_exact(min: i64, proj: &Project) -> String {
     format!("{min}m")
 }
 
+/// Calendar minutes in one elapsed unit; `None` for a percentage.
+fn elapsed_unit_min(unit: LagUnit) -> Option<f64> {
+    Some(match unit {
+        LagUnit::Minute => 1.0,
+        LagUnit::Hour => 60.0,
+        LagUnit::Day => 1440.0,
+        LagUnit::Week => 7.0 * 1440.0,
+        // Project's elapsed month is 30 elapsed days.
+        LagUnit::Month => 30.0 * 1440.0,
+        LagUnit::Percent => return None,
+    })
+}
+
+/// Working minutes in one unit, as `parse_duration` counts them. A working
+/// month needs the project's days per month, which the model lacks.
+fn working_unit_min(unit: LagUnit, proj: &Project) -> Option<f64> {
+    match unit {
+        LagUnit::Minute => Some(1.0),
+        LagUnit::Hour => Some(60.0),
+        LagUnit::Day => Some(proj.hours_per_day * 60.0),
+        LagUnit::Week => Some(proj.hours_per_week * 60.0),
+        LagUnit::Month | LagUnit::Percent => None,
+    }
+}
+
+fn unit_suffix(unit: LagUnit) -> &'static str {
+    match unit {
+        LagUnit::Minute => "m",
+        LagUnit::Hour => "h",
+        LagUnit::Day => "d",
+        LagUnit::Week => "w",
+        LagUnit::Month => "mo",
+        LagUnit::Percent => "%",
+    }
+}
+
+/// Parse a signed lag as the Predecessors cell spells it: a number and a unit
+/// (`m`, `h`, `d`, `w` working; `em`, `eh`, `ed`, `ew`, `emo` elapsed; `%` of
+/// the predecessor's duration), optionally marked estimated with `?`. The
+/// unit sets the lag's format. Working months are refused: the model has no
+/// days per month to count them with.
+pub fn parse_lag(text: &str, proj: &Project) -> Option<(i64, LagFormat)> {
+    let t = text.trim().to_ascii_lowercase();
+    let (t, estimated) = match t.strip_suffix('?') {
+        Some(rest) => (rest.trim_end(), true),
+        None => (t.as_str(), false),
+    };
+    // Longer suffixes first: `emo` before `mo`/`m`, `em` before `m`.
+    let (num, unit, elapsed) = [
+        ("emo", LagUnit::Month, true),
+        ("em", LagUnit::Minute, true),
+        ("eh", LagUnit::Hour, true),
+        ("ed", LagUnit::Day, true),
+        ("ew", LagUnit::Week, true),
+        ("%", LagUnit::Percent, false),
+        ("m", LagUnit::Minute, false),
+        ("h", LagUnit::Hour, false),
+        ("d", LagUnit::Day, false),
+        ("w", LagUnit::Week, false),
+    ]
+    .into_iter()
+    .find_map(|(suffix, unit, elapsed)| {
+        t.strip_suffix(suffix).map(|n| (n.trim(), unit, elapsed))
+    })?;
+    let format = LagFormat::new(unit, elapsed, estimated)?;
+    let value = if unit == LagUnit::Percent {
+        num.parse::<i64>().ok()?
+    } else if !elapsed {
+        parse_duration(&format!("{num}{}", unit_suffix(unit)), proj)?
+    } else if let Ok(exact) = num.parse::<i64>() {
+        exact.checked_mul(elapsed_unit_min(unit)? as i64)?
+    } else {
+        let minutes = (num.parse::<f64>().ok()? * elapsed_unit_min(unit)?).round();
+        (minutes.is_finite() && minutes > i64::MIN as f64 && minutes < i64::MAX as f64)
+            .then_some(minutes as i64)?
+    };
+    Some((value, format))
+}
+
+/// A predecessor's lag as the cell shows it, signed, in its own unit when
+/// [`parse_lag`] reads that text back to the same lag and format. Otherwise
+/// it falls back to minutes of its kind (a working month shows in days), and
+/// re-entering the text changes only the format, never the time.
+pub fn format_lag(p: &Predecessor, proj: &Project) -> String {
+    let format = p.lag_format;
+    let sign = if p.lag >= 0 { "+" } else { "" };
+    let mark = if format.estimated() { "?" } else { "" };
+    let elapsed = format.kind() == LagKind::Elapsed;
+    let text = |value: String, unit: LagUnit| {
+        let e = if elapsed { "e" } else { "" };
+        format!("{sign}{value}{e}{}{mark}", unit_suffix(unit))
+    };
+    if format.kind() == LagKind::Percent {
+        return text(p.lag.to_string(), LagUnit::Percent);
+    }
+    let unit_min = |unit| {
+        if elapsed {
+            elapsed_unit_min(unit)
+        } else {
+            working_unit_min(unit, proj)
+        }
+    };
+    let unit = match format.unit() {
+        LagUnit::Month if !elapsed => LagUnit::Day,
+        unit => unit,
+    };
+    if let Some(per) = unit_min(unit).filter(|per| per.is_finite() && *per > 0.) {
+        let value = p.lag as f64 / per;
+        // At most two decimals, as Project shows a lag.
+        let shown = format!("{:.2}", value)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string();
+        let candidate = text(shown, unit);
+        if parse_lag(&candidate, proj) == Some((p.lag, format)) {
+            return candidate;
+        }
+        // A working month shows in days: the same time, in format days.
+        if unit != format.unit() && parse_lag(&candidate, proj).map(|(v, _)| v) == Some(p.lag) {
+            return candidate;
+        }
+    }
+    text(p.lag.to_string(), LagUnit::Minute)
+}
+
+/// One link as the Predecessors cell shows it.
+fn format_link(p: &Predecessor, proj: &Project) -> String {
+    let id = proj
+        .task(p.uid)
+        .map(|t| t.id.to_string())
+        .unwrap_or_else(|| format!("?{}", p.uid));
+    // A zero lag in days is the default and shows nothing; any other
+    // format shows, so re-entering the cell keeps it.
+    let plain = p.lag == 0 && p.lag_format == LagFormat::DAYS;
+    let kind = match p.link {
+        LinkType::FinishStart if plain => "",
+        LinkType::FinishStart => "FS",
+        LinkType::StartStart => "SS",
+        LinkType::FinishFinish => "FF",
+        LinkType::StartFinish => "SF",
+    };
+    let lag = if plain {
+        String::new()
+    } else {
+        format_lag(p, proj)
+    };
+    format!("{id}{kind}{lag}")
+}
+
 pub fn format_predecessors(task: &Task, proj: &Project) -> String {
     task.predecessors
         .iter()
-        .map(|p| {
-            let id = proj
-                .task(p.uid)
-                .map(|t| t.id.to_string())
-                .unwrap_or_else(|| format!("?{}", p.uid));
-            let kind = match p.link {
-                LinkType::FinishStart if p.lag_min == 0 => "",
-                LinkType::FinishStart => "FS",
-                LinkType::StartStart => "SS",
-                LinkType::FinishFinish => "FF",
-                LinkType::StartFinish => "SF",
-            };
-            let lag = if p.lag_min == 0 {
-                String::new()
-            } else {
-                format!(
-                    "{}{}",
-                    if p.lag_min > 0 { "+" } else { "" },
-                    format_duration_exact(p.lag_min, proj)
-                )
-            };
-            format!("{id}{kind}{lag}")
-        })
+        .map(|p| format_link(p, proj))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-pub fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Predecessor>, String> {
+/// Parse Predecessors cell text on its own, for tests. Re-entering a task's
+/// cell uses [`parse_task_predecessors`], which keeps fallback formats.
+#[cfg(test)]
+pub(crate) fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Predecessor>, String> {
+    parse_predecessors_keeping(text, proj, &[])
+}
+
+/// Parse text typed into `task`'s Predecessors cell (`2FS+2ed, 3SS`). An
+/// entry spelled exactly as the cell shows one of the task's links keeps
+/// that link as it is. A lag shown in a fallback unit (a working month in
+/// days, a fraction of a day in minutes) keeps its format unless it is
+/// edited.
+pub fn parse_task_predecessors(
+    text: &str,
+    task: &Task,
+    proj: &Project,
+) -> Result<Vec<Predecessor>, String> {
+    parse_predecessors_keeping(text, proj, &task.predecessors)
+}
+
+fn parse_predecessors_keeping(
+    text: &str,
+    proj: &Project,
+    existing: &[Predecessor],
+) -> Result<Vec<Predecessor>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
     for entry in text.split(',') {
         let entry = entry.trim().to_ascii_uppercase();
+        let shown = existing
+            .iter()
+            .find(|p| format_link(p, proj).to_ascii_uppercase() == entry);
         let end = entry.bytes().take_while(u8::is_ascii_digit).count();
         let id: i32 = entry[..end]
             .parse()
@@ -512,15 +673,26 @@ pub fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Predecessor>
                 break;
             }
         }
-        let lag_min = if rest.is_empty() {
-            0
+        let (lag, lag_format) = if rest.is_empty() {
+            (0, LagFormat::DAYS)
         } else {
-            if !rest.starts_with(['+', '-']) || !rest.ends_with(['D', 'H', 'M', 'W']) {
-                return Err("Expected FS/SS/FF/SF and signed lag (e.g. +2h)".into());
+            if !rest.starts_with(['+', '-']) {
+                return Err("Expected FS/SS/FF/SF and signed lag (e.g. +2h, +2ed, +50%)".into());
             }
-            parse_duration(rest, proj).ok_or("Invalid predecessor lag")?
+            parse_lag(rest, proj).ok_or("Invalid predecessor lag")?
         };
-        out.push(Predecessor { uid, link, lag_min });
+        let parsed = Predecessor {
+            uid,
+            link,
+            lag,
+            lag_format,
+        };
+        // The shown text parses to the same task, link and lag; only a
+        // fallback display can differ in format.
+        out.push(match shown {
+            Some(p) if (p.uid, p.link, p.lag) == (uid, link, lag) => *p,
+            _ => parsed,
+        });
     }
     Ok(out)
 }
