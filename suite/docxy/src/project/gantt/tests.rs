@@ -756,6 +756,19 @@ fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
     let inner = bar(&ed, 2);
     assert_eq!(inner.state(), "summary 7-11 rollup 7-8 warning");
     assert_eq!(inner.late_rollup(), Some((11, 11)));
+    // w1: a manual leaf past its manual summary warns in the editor, but
+    // only the summary's bar shows it.
+    let leaf = Task {
+        manual: true,
+        manual_start: Some(projcore::DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+        manual_finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, 9, 17, 0)),
+        ..task(2, 5, 2)
+    };
+    let ed = editor(vec![manual_summary(1, 1, 5, 6), leaf]);
+    assert!(ed.summary_warning(2));
+    assert_eq!(bar(&ed, 2).state(), "critical 0-4");
+    assert_eq!(bar(&ed, 2).late_rollup(), None);
+    assert_eq!(bar(&ed, 1).state(), "summary 0-1 rollup 0-4 warning");
 }
 
 #[test]

@@ -143,7 +143,8 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
             .manual_summary_dates()
             .and(ed.disp_rollup(task.uid))
             .map(|(s, e)| (day(s), day(e))),
-        warning: ed.summary_warning(task.uid),
+        // Leaf rows do not show the warning yet, as in yppxy.
+        warning: task.summary && ed.summary_warning(task.uid),
     })
 }
 
