@@ -676,16 +676,17 @@ fn checkpoint_for_block_range(ed: &mut Editor, start: usize) {
     ed.set_align(align);
 }
 
-/// Apply `patch`'s SET-to-value fields to every run in `content` — both bare
-/// [`Inline::Run`]s and the runs inside an [`Inline::Hyperlink`]. Every other
-/// inline kind (tabs, breaks, footnote refs, …) is left untouched, matching
+/// Apply `patch`'s SET-to-value fields to every run in `content` — bare
+/// [`Inline::Run`]s, the runs inside an [`Inline::Hyperlink`], and tabs (a tab
+/// is a run in OOXML, and text typed after it takes its props), matching
 /// `Editor`'s own char-range formatting helpers (`editor.rs`'s
-/// `edit_run_range`), which likewise never touches a `Tab`'s embedded
-/// `RunProps`.
+/// `edit_run_range`). Every other inline kind (breaks, footnote refs, …) is
+/// left untouched.
 fn apply_run_patch(content: &mut [Inline], patch: &RunPatch) {
     for inline in content.iter_mut() {
         match inline {
             Inline::Run(r) => apply_run_patch_props(&mut r.props, patch),
+            Inline::Tab(props) => apply_run_patch_props(props, patch),
             Inline::Hyperlink(h) => {
                 for r in h.runs.iter_mut() {
                     apply_run_patch_props(&mut r.props, patch);
@@ -1414,6 +1415,32 @@ mod tests {
         assert_eq!(n, 2);
         assert_eq!(bold_flags(&ed.doc.body[0]), vec![true, true]);
         assert_eq!(bold_flags(&ed.doc.body[1]), vec![true]);
+    }
+
+    #[test]
+    fn format_range_formats_tabs_too_120() {
+        let mut doc = doc_with(&["placeholder"]);
+        doc.body[0] = Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: vec![
+                Inline::Run(Run {
+                    text: "Name:".into(),
+                    props: RunProps::default(),
+                }),
+                Inline::Tab(RunProps::default()),
+            ],
+        });
+        let mut ed = Editor::new(doc);
+
+        format_range(&mut ed, 0, 0, &run_patch(&[("bold", "true")])).unwrap();
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!("expected a paragraph")
+        };
+        assert!(
+            matches!(&p.content[1], Inline::Tab(props) if props.bold),
+            "the tab is bold, so typing after it is too: {:?}",
+            p.content
+        );
     }
 
     #[test]

@@ -2505,7 +2505,13 @@ fn range_all_have(
                     }
                 }
             }
-            Inline::Tab(_) | Inline::Break(_) => pos += 1,
+            // A tab is a formatted character (see `edit_run_range`).
+            Inline::Tab(props) => {
+                if !check(props, 1, &mut pos) {
+                    return false;
+                }
+            }
+            Inline::Break(_) => pos += 1,
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -2589,7 +2595,15 @@ fn edit_run_range(
                 pos = p;
                 out.push(Inline::Hyperlink(h));
             }
+            // A tab is a run in OOXML: formatting applies to it like to any
+            // character, and typing after it takes its props. Only the props
+            // of `mid_fn`'s result are kept; its text stays a tab.
             Inline::Tab(rp) => {
+                let rp = if (start..end).contains(&pos) {
+                    mid_fn("\t", &rp).props
+                } else {
+                    rp
+                };
                 out.push(Inline::Tab(rp));
                 pos += 1;
             }
@@ -3020,6 +3034,154 @@ mod tests {
                 .expect("x is in a plain run outside the link");
             assert_eq!(x, want, "text typed after the tab");
         }
+    }
+
+    /// An editor over one paragraph holding `content`, with `[start, end)`
+    /// selected.
+    fn selected(content: Vec<Inline>, start: usize, end: usize) -> Editor {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content,
+            })],
+        });
+        ed.anchor = Some(Caret::at(vec![0], start));
+        ed.caret = Caret::at(vec![0], end);
+        ed
+    }
+
+    /// Formatting a selection formats the tabs in it too (a tab is a run in
+    /// OOXML), so typing after a tab keeps the line's formatting (#120 r2).
+    #[test]
+    fn bolding_a_line_bolds_its_tab_and_typing_after_it_is_bold_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(
+            vec![
+                run("Name:", plain()),
+                Inline::Tab(plain()),
+                run("John", plain()),
+            ],
+            0,
+            10,
+        );
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(bold()),
+                run("John", bold())
+            ]
+        );
+        ed.anchor = None;
+        ed.caret = Caret::at(vec![0], 6);
+        assert!(ed.caret_props().bold);
+        ed.insert_char('x');
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(bold()),
+                run("xJohn", bold())
+            ]
+        );
+    }
+
+    #[test]
+    fn unbolding_a_line_unbolds_its_tab_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(vec![run("Name:", bold()), Inline::Tab(bold())], 0, 6);
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("Name:", plain()), Inline::Tab(plain())]
+        );
+        ed.anchor = None;
+        ed.caret = Caret::at(vec![0], 6);
+        ed.insert_char('x');
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", plain()),
+                Inline::Tab(plain()),
+                run("x", plain())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_tab_in_bold_text_makes_the_toggle_bold_everything_120() {
+        let mut ed = selected(
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(RunProps::default()),
+                run("John", bold()),
+            ],
+            0,
+            10,
+        );
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(bold()),
+                run("John", bold())
+            ],
+            "not every selected character was bold, so Ctrl+B turns bold on"
+        );
+    }
+
+    #[test]
+    fn a_tab_only_selection_formats_just_the_tab_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(
+            vec![run("a", plain()), Inline::Tab(plain()), run("b", plain())],
+            1,
+            2,
+        );
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("a", plain()), Inline::Tab(bold()), run("b", plain())]
+        );
+        ed.set_font_size(28);
+        ed.set_color(Some("FF0000".into()));
+        let Inline::Tab(props) = &first_para(&ed).content[1] else {
+            panic!("the tab is still a tab")
+        };
+        assert_eq!(props.size_half_pts, Some(28));
+        assert_eq!(props.color.as_deref(), Some("FF0000"));
+        assert_eq!(first_para(&ed).content[0], run("a", plain()));
+        assert_eq!(first_para(&ed).content[2], run("b", plain()));
+    }
+
+    #[test]
+    fn clearing_formatting_clears_a_tabs_props_120() {
+        let mut ed = selected(vec![run("a", bold()), Inline::Tab(bold())], 0, 2);
+        ed.clear_run_formatting();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("a", RunProps::default()),
+                Inline::Tab(RunProps::default())
+            ]
+        );
+    }
+
+    #[test]
+    fn changing_case_over_a_tab_keeps_it_a_tab_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(
+            vec![run("ab", plain()), Inline::Tab(plain()), run("cd", plain())],
+            0,
+            5,
+        );
+        ed.cycle_case();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("Ab", plain()), Inline::Tab(plain()), run("Cd", plain())]
+        );
     }
 
     fn para(text: &str) -> Block {
