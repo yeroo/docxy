@@ -812,7 +812,8 @@ pub struct Assignment {
     /// clears the overtime, so the refresh makes this the whole work.
     pub regular_work_min: Option<i64>,
     /// Overtime work in whole minutes and the assignment's cost (hundredths).
-    /// A work edit clears both; the refresh prices the cost again.
+    /// A work edit clears both; the refresh prices the cost again, or, for
+    /// one it cannot price (a cost resource's), restores the cost it had.
     pub overtime_work_min: Option<i64>,
     pub cost: Option<Rate>,
     /// Which of the resource's rate tables prices it: 0 = A .. 4 = E.

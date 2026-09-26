@@ -372,9 +372,10 @@ fn ancestors(p: &Project, uid: i32) -> Vec<i32> {
 ///   is dropped when its dates or work moved.
 /// - A task keeps its stored `Work`, `Cost`, `RemainingWork` and
 ///   `RemainingCost` but moves each by how much its assignments' total moved
-///   (work counting work resources only), and so do its outline summaries;
-///   a fixed cost inside a stored task cost survives, and an absent total
-///   stays absent.
+///   (work counting work resources only), and so do its outline summaries; a
+///   task moved in the outline takes its assignments' totals from its old
+///   summaries to its new ones. A fixed cost inside a stored task cost
+///   survives, and an absent total stays absent.
 /// - A resource whose assignments changed (added, removed or refreshed) gets
 ///   its work, cost and remaining totals and its `Start`/`Finish` from them.
 pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project, sched: &Schedule) {
@@ -417,9 +418,12 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             a.timephased_data
                 .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
         }
-        if cost.is_some() {
-            a.cost = cost;
-        }
+        // A cost it cannot price (a cost resource's, entered by hand, or one
+        // without a resource) stays as it was, even where a work edit
+        // cleared it.
+        a.cost = cost
+            .or_else(|| a.cost.clone())
+            .or_else(|| was.and_then(|b| b.cost.clone()));
         let overtime = a.overtime_work_min.unwrap_or(0).max(0);
         a.regular_work_min = Some((a.work_min - overtime).max(0));
         a.remaining_work_min = Some((a.work_min - a.actual_work_min.unwrap_or(0)).max(0));
@@ -430,8 +434,10 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
     }
 
     // Tasks: move the stored totals by the change in their assignments', and
-    // every outline summary above them by the same (a deleted task's by its
-    // old summaries), so a summary keeps equalling its subtasks.
+    // every outline summary above them by the same. A task the edit moved in
+    // the outline (or deleted, or added) leaves its old summaries with all it
+    // had and joins its new ones with all it has, so each summary keeps its
+    // stored total's relation to its subtasks.
     let changed: HashSet<i32> = prev
         .assignments
         .iter()
@@ -439,25 +445,36 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         .map(|a| a.task_uid)
         .collect();
     let mut moved: HashMap<i32, Totals> = HashMap::new();
+    let mut add = |uid: i32, (w, c, rw, rc): Totals, sign: i64| {
+        let sum = moved.entry(uid).or_insert((0, 0.0, 0, 0.0));
+        let f = sign as f64;
+        *sum = (
+            sum.0 + sign * w,
+            sum.1 + f * c,
+            sum.2 + sign * rw,
+            sum.3 + f * rc,
+        );
+    };
     for uid in changed {
         let (w0, c0, rw0, rc0) = task_totals(prev, uid);
         let (w1, c1, rw1, rc1) = task_totals(proj, uid);
         let delta = (w1 - w0, c1 - c0, rw1 - rw0, rc1 - rc0);
-        if delta == (0, 0.0, 0, 0.0) {
-            continue;
-        }
-        let targets = match proj.task(uid) {
-            Some(_) => [vec![uid], ancestors(proj, uid)].concat(),
-            None => ancestors(prev, uid),
-        };
-        for target in targets {
-            let sum = moved.entry(target).or_insert((0, 0.0, 0, 0.0));
-            *sum = (
-                sum.0 + delta.0,
-                sum.1 + delta.1,
-                sum.2 + delta.2,
-                sum.3 + delta.3,
-            );
+        let (was_under, now_under) = (ancestors(prev, uid), ancestors(proj, uid));
+        if was_under == now_under {
+            if delta == (0, 0.0, 0, 0.0) {
+                continue;
+            }
+            for target in std::iter::once(uid).chain(now_under) {
+                add(target, delta, 1);
+            }
+        } else {
+            add(uid, delta, 1);
+            for target in was_under {
+                add(target, (w0, c0, rw0, rc0), -1);
+            }
+            for target in now_under {
+                add(target, (w1, c1, rw1, rc1), 1);
+            }
         }
     }
     for t in &mut proj.tasks {

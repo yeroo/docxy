@@ -333,10 +333,12 @@ fn a_material_moves_its_tasks_cost_but_not_its_work() {
     let t = &ed.project().tasks[0];
     assert_eq!((t.work_min, t.remaining_work_min), (Some(480), Some(480)));
     assert_eq!(text(&t.cost), Some("4001"));
+    // The material resource's own Work is its quantity, as in Project.
+    assert_eq!(ed.project().resources[1].work_min, Some(60));
     ed.set_resources(1, &["Alice".into()]).unwrap();
     let t = &ed.project().tasks[0];
     assert_eq!((t.work_min, text(&t.cost)), (Some(480), Some("2501")));
-    // The material resource's own Work is its quantity, as in Project.
+    // And none once it is removed.
     assert_eq!(ed.project().resources[1].work_min, Some(0));
 }
 
@@ -388,4 +390,94 @@ fn summaries_move_with_their_subtasks() {
             row(1, 960, "91500")
         ]
     );
+    // Deleting summary 3 takes both its tasks' assignments (work 960 + 480,
+    // cost 90000 + 1) out of the project summary, which keeps the rest.
+    assert!(ed.undo());
+    assert_eq!(totals(&ed), edited);
+    ed.delete_task(3).unwrap();
+    assert_eq!(totals(&ed), [row(0, 0, "3000")]);
+}
+
+#[test]
+fn a_task_moved_in_the_outline_takes_its_totals_along() {
+    // The project summary (UID 0) over summary 3 (over task 1) and task 2.
+    let level = |mut t: Task, outline_level: u32, work: i64, cost: &str| {
+        t.outline_level = outline_level;
+        t.work_min = Some(work);
+        t.cost = Rate::parse(cost);
+        t
+    };
+    let mut ed = staffed();
+    ed.proj.tasks = vec![
+        level(task(0, 0), 0, 960, "3002"),
+        level(task(3, 0), 1, 480, "1501"),
+        level(task(1, 1), 2, 480, "1501"),
+        level(task(2, 1), 1, 480, "1501"),
+    ];
+    ed = Editor::new(ed.proj);
+    let totals = |ed: &Editor| -> Vec<(i32, Option<i64>, Option<String>)> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| (t.uid, t.work_min, text(&t.cost).map(String::from)))
+            .collect()
+    };
+    let row = |uid: i32, work: i64, cost: &str| (uid, Some(work), Some(cost.to_string()));
+    let before = totals(&ed);
+    // Indented under summary 3, task 2 brings its assignment's work 480 and
+    // (stale) cost 1; the project summary already counted it.
+    ed.indent(2, 1).unwrap();
+    assert_eq!(
+        totals(&ed),
+        [
+            row(0, 960, "3002"),
+            row(3, 960, "1502"),
+            row(1, 480, "1501"),
+            row(2, 480, "1501"),
+        ]
+    );
+    ed.indent(2, -1).unwrap();
+    assert_eq!(totals(&ed), before);
+}
+
+#[test]
+fn a_units_edit_keeps_a_cost_resources_cost() {
+    // Summary 3 over task 1, which carries a $500 Pool (cost resource) charge.
+    let mut ed = staffed();
+    ed.proj.resources.push(Resource {
+        uid: 4,
+        id: 4,
+        name: "Pool".into(),
+        kind: ResourceType::Cost,
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    let mut summary = task(3, 0);
+    let mut leaf = task(1, 1);
+    leaf.outline_level = 2;
+    for t in [&mut summary, &mut leaf] {
+        t.cost = Rate::parse("50000");
+    }
+    ed.proj.tasks = vec![summary, leaf];
+    ed.proj.assignments = vec![Assignment {
+        uid: 5,
+        task_uid: 1,
+        resource_uid: 4,
+        units: 1.0,
+        cost: Rate::parse("50000"),
+        remaining_cost: Rate::parse("50000"),
+        ..Assignment::default()
+    }];
+    ed = Editor::new(ed.proj);
+    ed.assign_resource(1, "Pool[50%]").unwrap();
+    let a = assignment(&ed, 5);
+    assert_eq!(a.units, 0.5);
+    assert_eq!(
+        (text(&a.cost), text(&a.remaining_cost)),
+        (Some("50000"), Some("50000"))
+    );
+    for t in &ed.project().tasks {
+        assert_eq!(text(&t.cost), Some("50000"), "{}", t.uid);
+    }
+    assert_eq!(text(&ed.project().resources[1].cost), Some("50000"));
 }
