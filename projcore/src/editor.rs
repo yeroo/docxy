@@ -7,7 +7,7 @@
 use crate::datetime::DateTime;
 use crate::model::{
     Assignment, Baseline, ConstraintType, LinkType, Predecessor, Project, Resource, ResourceType,
-    Task,
+    Task, TaskType,
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
@@ -609,6 +609,7 @@ impl Editor {
             if let Some(name) = patch.name {
                 t.name = name;
             }
+            let mut rescale = None;
             // The mode before the duration: a new duration then updates the
             // pin as it does for any manual task.
             if let Some(manual) = patch.manual.filter(|&m| m != t.manual) {
@@ -622,6 +623,7 @@ impl Editor {
                 // Against the row as materialized: a blank row's default
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
                 let changed = was_blank || min != t.duration_min;
+                rescale = changed.then_some((t.duration_min, min));
                 if changed {
                     commit_estimate(t);
                 }
@@ -637,6 +639,10 @@ impl Editor {
             }
             if let Some(lv) = patch.level {
                 t.outline_level = lv;
+            }
+            // After the level, so a summary is judged by the outline the edit makes.
+            if let Some((old, new)) = rescale {
+                rescale_work(proj, i, old, new);
             }
         })?;
         // Only a date change restamps: a rename or a level change keeps the
@@ -931,6 +937,43 @@ fn default_units(r: &Resource) -> f64 {
 /// Assignment work: the task duration scaled by the units (saturating).
 fn work_for(duration_min: i64, units: f64) -> i64 {
     (duration_min as f64 * units).round() as i64
+}
+
+/// A duration change on row `i` rescales its assignments' work to duration x
+/// units, as Project does for a fixed-units or fixed-duration task. A
+/// fixed-work task keeps its work, a summary's stored duration is not the one
+/// it shows, and material and cost work is not time, so those are left as
+/// read. A contoured assignment's units are its peak, so its contour stretches
+/// and its work scales with the duration instead. Without a basis to scale
+/// from, its work is duration x units once it has none (as after a milestone),
+/// and stays as read when a zero duration holds some. Regular work is cleared
+/// as a units edit clears it; progress is kept.
+fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
+    let t = &proj.tasks[i];
+    if t.task_type == Some(TaskType::FixedWork) || proj.is_outline_summary(i) {
+        return;
+    }
+    let uid = t.uid;
+    let Project {
+        assignments,
+        resources,
+        ..
+    } = proj;
+    for a in assignments.iter_mut().filter(|a| a.task_uid == uid) {
+        let kind = resources.iter().find(|r| r.uid == a.resource_uid);
+        if kind.is_some_and(|r| r.kind != ResourceType::Work) {
+            continue;
+        }
+        a.work_min = match a.work_contour {
+            None | Some(0) => work_for(new_min, a.units),
+            Some(_) if old_min > 0 && a.work_min > 0 => {
+                (a.work_min as f64 * new_min as f64 / old_min as f64).round() as i64
+            }
+            Some(_) if a.work_min > 0 => continue,
+            Some(_) => work_for(new_min, a.units),
+        };
+        a.regular_work_min = None;
+    }
 }
 
 /// Explicitly entered units must be positive to create or change an assignment.

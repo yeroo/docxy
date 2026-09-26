@@ -1449,3 +1449,243 @@ fn typed_finish_across_a_holiday_counts_only_working_time() {
     assert!(day_finish(ed.project(), &auto, holiday).is_err());
     assert!(day_finish(ed.project(), &auto, holiday.add_days(1)).is_ok());
 }
+
+/// Assignment `uid` of `resource` on `task`, as a file would carry it: with
+/// regular work, which a rescale must clear.
+fn imported(uid: i32, task: i32, resource: i32, units: f64, work_min: i64) -> Assignment {
+    Assignment {
+        uid,
+        task_uid: task,
+        resource_uid: resource,
+        units,
+        work_min,
+        regular_work_min: Some(work_min),
+        ..Assignment::default()
+    }
+}
+
+fn work(ed: &Editor, uid: i32) -> (i64, Option<i64>) {
+    let a = ed.proj.assignments.iter().find(|a| a.uid == uid).unwrap();
+    (a.work_min, a.regular_work_min)
+}
+
+#[test]
+fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
+    let mut ed = editor();
+    ed.set_resources(10, &["Alice".into(), "Bob[50%]".into()])
+        .unwrap();
+    ed.set_resources(20, &["Alice".into()]).unwrap();
+    for a in &mut ed.proj.assignments {
+        a.regular_work_min = Some(a.work_min);
+    }
+    let a = &mut ed.proj.assignments[0];
+    a.percent_work_complete = Some(50);
+    a.actual_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    a.actual_work_min = Some(240);
+    a.remaining_work_min = Some(240);
+    a.actual_cost = Some(Rate::parse("100").unwrap());
+    // Flat by record, not by default: a contour scales differently.
+    a.work_contour = Some(0);
+    a.start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+    a.baselines = vec![AssignmentBaseline {
+        number: 0,
+        work_min: Some(480),
+        ..AssignmentBaseline::default()
+    }];
+    let before = ed.proj.assignments.clone();
+    ed.set_duration_min(10, 960).unwrap();
+    let after = &ed.proj.assignments;
+    assert_eq!(
+        after
+            .iter()
+            .map(|a| (a.task_uid, a.work_min, a.regular_work_min))
+            .collect::<Vec<_>>(),
+        [(10, 960, None), (10, 480, None), (20, 480, Some(480))]
+    );
+    // Only work and regular work change; the other task's is untouched.
+    for (a, was) in after.iter().zip(&before) {
+        assert_eq!(
+            &Assignment {
+                work_min: was.work_min,
+                regular_work_min: was.regular_work_min,
+                ..a.clone()
+            },
+            was
+        );
+    }
+    assert_eq!(after[2], before[2]);
+
+    // A save writes the new Work.
+    let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+    let saved: Vec<_> = back.assignments.iter().map(|a| a.work_min).collect();
+    assert_eq!(saved, [960, 480, 480]);
+}
+
+#[test]
+fn repeating_a_duration_keeps_imported_work_and_history() {
+    let mut ed = editor();
+    ed.proj.assignments.push(imported(1, 10, -65535, 1.0, 123));
+    ed = Editor::new(ed.proj);
+    let before = ed.project().clone();
+    ed.set_duration_min(10, 480).unwrap();
+    unchanged(&ed, &before, (0, 0, false));
+    // A rename in the same patch is an edit, but the duration it repeats is not.
+    ed.update_task(
+        10,
+        TaskPatch {
+            name: Some("x".into()),
+            duration_min: Some(480),
+            ..TaskPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(ed.proj.task(10).unwrap().name, "x");
+    assert_eq!(work(&ed, 1), (123, Some(123)));
+}
+
+#[test]
+fn contoured_work_stretches_with_the_duration() {
+    let mut ed = editor();
+    ed.proj.tasks[2].duration_min = 0;
+    ed.proj.tasks[2].milestone = true;
+    let contoured = |uid, task, work_min| Assignment {
+        work_contour: Some(3),
+        ..imported(uid, task, -65535, 1.0, work_min)
+    };
+    ed.proj.assignments = vec![
+        // A bell at a 100% peak does half the flat work.
+        contoured(1, 10, 240),
+        imported(2, 10, -65535, 1.0, 480),
+        // From a milestone there is no duration to scale from.
+        contoured(3, 30, 100),
+        imported(4, 30, -65535, 1.0, 0),
+    ];
+    ed = Editor::new(ed.proj);
+    ed.set_duration_min(10, 960).unwrap();
+    ed.set_duration_min(30, 480).unwrap();
+    let works: Vec<_> = (1..=4).map(|uid| work(&ed, uid)).collect();
+    assert_eq!(
+        works,
+        [(480, None), (960, None), (100, Some(100)), (480, None)]
+    );
+}
+
+#[test]
+fn a_contoured_assignment_gets_work_back_after_a_milestone_round_trip() {
+    let mut ed = editor();
+    ed.proj.assignments = vec![Assignment {
+        work_contour: Some(3),
+        ..imported(1, 10, -65535, 1.0, 240)
+    }];
+    ed = Editor::new(ed.proj);
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(work(&ed, 1), (0, None));
+    // Zero work gives nothing to stretch: it restarts at duration x units.
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(work(&ed, 1), (480, None));
+}
+
+#[test]
+fn milestone_toggles_rescale_work_and_undo_restores_it_with_the_duration() {
+    let mut ed = editor();
+    ed.set_resources(10, &["Alice[50%]".into()]).unwrap();
+    ed.proj.assignments[0].regular_work_min = Some(240);
+    let uid = ed.proj.assignments[0].uid;
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(ed.proj.task(10).unwrap().duration_min, 0);
+    assert_eq!(work(&ed, uid), (0, None));
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(work(&ed, uid), (240, None));
+
+    ed.undo();
+    assert_eq!(work(&ed, uid), (0, None));
+    ed.undo();
+    assert_eq!(ed.proj.task(10).unwrap().duration_min, 480);
+    assert_eq!(work(&ed, uid), (240, Some(240)));
+    ed.redo();
+    assert_eq!(ed.proj.task(10).unwrap().duration_min, 0);
+    assert_eq!(work(&ed, uid), (0, None));
+}
+
+#[test]
+fn a_typed_manual_finish_rescales_assignment_work() {
+    let mut ed = manual_editor();
+    ed.set_resources(20, &["Alice[50%]".into()]).unwrap();
+    let uid = ed.proj.assignments[0].uid;
+    ed.set_finish(20, parse_cell_date("2026-01-07").unwrap())
+        .unwrap();
+    assert_eq!(ed.proj.task(20).unwrap().duration_min, 1440);
+    assert_eq!(work(&ed, uid), (720, None));
+    ed.undo();
+    assert_eq!(work(&ed, uid), (240, None));
+}
+
+#[test]
+fn fixed_work_material_and_cost_work_survive_a_duration_change() {
+    let mut ed = editor();
+    ed.proj.tasks[1].task_type = Some(TaskType::FixedWork);
+    for (uid, kind) in [(1, ResourceType::Work), (2, ResourceType::Material)] {
+        ed.proj.resources.push(Resource {
+            uid,
+            id: uid,
+            name: format!("R{uid}"),
+            kind,
+            ..Resource::default()
+        });
+    }
+    ed.proj.resources.push(Resource {
+        uid: 3,
+        id: 3,
+        name: "Travel".into(),
+        kind: ResourceType::Cost,
+        ..Resource::default()
+    });
+    ed.proj.assignments = vec![
+        imported(1, 10, 1, 1.0, 480),
+        imported(2, 10, 2, 2.0, 5),
+        imported(3, 10, 3, 1.0, 0),
+        // Project's unassigned resource resolves to no resource: work.
+        imported(4, 10, -65535, 0.5, 240),
+        imported(5, 20, 1, 1.0, 480),
+    ];
+    ed = Editor::new(ed.proj);
+    ed.set_duration_min(10, 960).unwrap();
+    ed.set_duration_min(20, 960).unwrap();
+    assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
+    let works: Vec<_> = (1..=5).map(|uid| work(&ed, uid)).collect();
+    assert_eq!(
+        works,
+        [
+            (960, None),
+            (5, Some(5)),
+            (0, Some(0)),
+            (480, None),
+            (480, Some(480))
+        ]
+    );
+}
+
+#[test]
+fn a_summary_keeps_its_assignments_work_judged_by_the_edited_outline() {
+    let mut ed = editor();
+    for (task, level) in ed.proj.tasks.iter_mut().zip([1, 1, 2]) {
+        task.outline_level = level;
+    }
+    ed.proj.assignments = vec![imported(1, 20, -65535, 1.0, 480)];
+    ed = Editor::new(ed.proj);
+    // Task 20 is the summary of task 30.
+    ed.set_duration_min(20, 960).unwrap();
+    assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
+    assert_eq!(work(&ed, 1), (480, Some(480)));
+    // Demoted beside task 30 in the same edit, it is a leaf again.
+    ed.update_task(
+        20,
+        TaskPatch {
+            duration_min: Some(1440),
+            level: Some(2),
+            ..TaskPatch::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(work(&ed, 1), (1440, None));
+}
