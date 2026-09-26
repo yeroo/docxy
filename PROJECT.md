@@ -75,8 +75,13 @@ clears history while retaining the find query and leveling preference.
   its dates still roll up from its subtasks. The status bar's `New Tasks: …`
   (yppxy's `M`) switches the plan's default.
 - **Dependencies** are the four link types with lag/lead: Finish-to-Start,
-  Start-to-Start, Finish-to-Finish, Start-to-Finish. Lag is stored in MSPDI as
-  *tenths of a minute* — one of several unit traps the reader normalizes.
+  Start-to-Start, Finish-to-Finish, Start-to-Finish. A lag is working time,
+  **elapsed** calendar time (`+2ed`, counted from the predecessor's instant,
+  after which the link acts as a zero-lag one), or a **percentage** of the
+  predecessor's duration (`+50%`). Its MSPDI `LagFormat` selects the unit of
+  `LinkLag`: *tenths of a minute* of working or elapsed time, or the percentage
+  itself for formats 19/51 — one of several unit traps the reader normalizes.
+  The format is kept and written back; unsupported formats fail the read.
 - **Constraints** pin dates: ASAP/ALAP and the six hard ones
   (SNET/SNLT/FNET/FNLT/MSO/MFO).
 - **Calendars** define working time per weekday (e.g. Mon–Fri 08:00–12:00,
