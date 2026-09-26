@@ -439,7 +439,10 @@ impl Editor {
     /// stop when rendered — a literal `\t` would collapse to nothing.
     ///
     /// The tab takes the formatting typing at the caret would (a tab typed in
-    /// bold text is bold, as in Word), so text typed after it keeps that too.
+    /// bold text is bold, as in Word), so text typed after it keeps that too,
+    /// except next to a hyperlink: the tab never lands inside the link, so it
+    /// takes the formatting before the link, not the link's style (see
+    /// `tab_props_at`).
     pub fn insert_tab(&mut self) {
         if self.has_selection() {
             self.delete_selection();
