@@ -37,6 +37,10 @@ pub(super) struct ProjectView {
     pub width: f32,
     /// Whether the Timeline pane is shown: window view state, never saved.
     pub timeline: bool,
+    /// The press on the Timeline's view box while its button is held: the
+    /// pointer's x and the chart offset then. A drag of the box is measured
+    /// from it; `None` when no press is held, and a drag without one does nothing.
+    pub timeline_press: Option<(f32, f32)>,
     /// Gantt Chart Format › Bar Styles › Critical Tasks: critical bars drawn in
     /// the critical colour. Window view state, never saved.
     pub show_critical: bool,
@@ -69,6 +73,7 @@ impl ProjectView {
             exported: None,
             width: 590. + SCROLLBAR_W,
             timeline: true,
+            timeline_press: None,
             show_critical: true,
             show_baseline: true,
             split: None,
@@ -958,7 +963,9 @@ pub(super) fn project_el(
         .overflow_hidden()
         .text_color(pal.fg)
         .text_size(px(12.))
-        .when(view.timeline, |d| d.child(timeline_el(view, pal, probes)))
+        .when(view.timeline, |d| {
+            d.child(timeline_el(view, index, pal, probes, cx))
+        })
         // The split bar spans header, body and scrollbar strip, under the Timeline.
         .child(
             v_flex()
