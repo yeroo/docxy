@@ -128,9 +128,10 @@ impl ProjectView {
             }
             let initial = if self.col == COL_DURATION {
                 // A manual summary's duration is the span it shows.
-                let min = match task.summary {
-                    true => self.ed.disp_duration_min(task.uid).unwrap_or(0),
-                    false => task.duration_min,
+                let min = if task.summary {
+                    self.ed.disp_duration_min(task.uid).unwrap_or(0)
+                } else {
+                    task.duration_min
                 };
                 if min == 0 {
                     "0".into()

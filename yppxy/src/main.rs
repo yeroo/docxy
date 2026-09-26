@@ -67,7 +67,9 @@ const ONTRACK: Color = Color::Rgb(58, 170, 154); // teal — has float
 const MILESTONE: Color = Color::Rgb(180, 130, 220);
 const SUMMARY: Color = Color::Rgb(150, 160, 172); // rollup bars
 const WEEKEND: Color = Color::Rgb(90, 100, 110);
-// A manual summary's subtasks running past its own finish (Project's warning).
+// A manual summary's warning (Project's): its subtasks' days past its finish,
+// else its own finish day (an overrun within that day, or a finish past its
+// manual parent's).
 const WARNING: Color = Color::Rgb(220, 50, 47);
 
 fn main() -> ExitCode {

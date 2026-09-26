@@ -683,11 +683,11 @@ fn a_manual_summary_bar_carries_its_rollup_and_warning() {
     assert_eq!(bar(&ed, 1).state(), "summary 0-3");
     ed.set_manual(1, true).unwrap();
     assert_eq!(bar(&ed, 1).state(), "summary 0-3 rollup 0-3");
-    assert_eq!(bar(&ed, 1).late_rollup(), None);
+    assert_eq!(bar(&ed, 1).warning_days(), None);
     // Shorter than its subtasks: they run past it, in the warning colour.
     ed.set_duration(1, "1d").unwrap();
     assert_eq!(bar(&ed, 1).state(), "summary 0-0 rollup 0-3 warning");
-    assert_eq!(bar(&ed, 1).late_rollup(), Some((1, 3)));
+    assert_eq!(bar(&ed, 1).warning_days(), Some((1, 3)));
     // Longer: the rollup sits inside it and nothing warns.
     ed.set_duration(1, "10d").unwrap();
     assert_eq!(bar(&ed, 1).state(), "summary 0-11 rollup 0-3");
@@ -704,19 +704,19 @@ fn a_manual_summary_bar_carries_its_rollup_and_warning() {
         rollup: Some((0, 3)),
         warning: true,
     };
-    assert_eq!(same_day.late_rollup(), Some((3, 3)));
+    assert_eq!(same_day.warning_days(), Some((3, 3)));
     // Without a rollup, a warned bar marks its own finish day.
     let bare = GanttBar {
         rollup: None,
         ..same_day
     };
-    assert_eq!(bare.late_rollup(), Some((3, 3)));
+    assert_eq!(bare.warning_days(), Some((3, 3)));
     assert_eq!(
         GanttBar {
             warning: false,
             ..bare
         }
-        .late_rollup(),
+        .warning_days(),
         None
     );
 }
@@ -743,10 +743,10 @@ fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
     ]);
     let inner = bar(&ed, 2);
     assert_eq!(inner.state(), "summary 0-18 rollup 0-0 warning");
-    assert_eq!(inner.late_rollup(), Some((18, 18)));
+    assert_eq!(inner.warning_days(), Some((18, 18)));
     // O's rollup (through I's own span) runs past O's finish.
     assert_eq!(bar(&ed, 1).state(), "summary 0-11 rollup 0-18 warning");
-    assert_eq!(bar(&ed, 1).late_rollup(), Some((12, 18)));
+    assert_eq!(bar(&ed, 1).warning_days(), Some((12, 18)));
     // O (1/5..1/6) > I (1/12..1/16) > A 2d, floored to 1/12.
     let ed = editor(vec![
         manual_summary(1, 1, 5, 6),
@@ -755,7 +755,7 @@ fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
     ]);
     let inner = bar(&ed, 2);
     assert_eq!(inner.state(), "summary 7-11 rollup 7-8 warning");
-    assert_eq!(inner.late_rollup(), Some((11, 11)));
+    assert_eq!(inner.warning_days(), Some((11, 11)));
     // w1: a manual leaf past its manual summary warns in the editor, but
     // only the summary's bar shows it.
     let leaf = Task {
@@ -767,7 +767,7 @@ fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
     let ed = editor(vec![manual_summary(1, 1, 5, 6), leaf]);
     assert!(ed.summary_warning(2));
     assert_eq!(bar(&ed, 2).state(), "critical 0-4");
-    assert_eq!(bar(&ed, 2).late_rollup(), None);
+    assert_eq!(bar(&ed, 2).warning_days(), None);
     assert_eq!(bar(&ed, 1).state(), "summary 0-1 rollup 0-4 warning");
 }
 

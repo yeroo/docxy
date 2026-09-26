@@ -220,7 +220,8 @@ stays open for correction. ID and an auto summary's dates/duration are
 read-only. A manual summary's Start, Finish and Duration set its own span as
 they do for a manual task, without touching its subtasks; its Gantt row adds
 the subtasks' rolled-up span as a thin bar above its own, the part past its
-finish in a warning colour (yppxy marks those days `╍`).
+finish in a warning colour (yppxy marks those days `╍`), else its own finish
+day (an overrun within that day, or a finish past its manual parent).
 
 As in Project, the blank row below the last task is the entry row: clicking any
 empty row below the tasks, or Down from the last task, puts the cell cursor

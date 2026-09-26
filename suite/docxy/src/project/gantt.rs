@@ -47,7 +47,7 @@ impl GanttBar {
     /// past its own finish, else its own finish day. That covers subtasks
     /// finishing later on that same day, and a summary that warns because it
     /// finishes after its manual parent while its rollup stays inside it.
-    pub fn late_rollup(self) -> Option<(i64, i64)> {
+    pub fn warning_days(self) -> Option<(i64, i64)> {
         if !self.warning {
             return None;
         }
@@ -413,8 +413,9 @@ pub(crate) fn gantt_strip(
     if let Some((s, e)) = bar.baseline {
         strip = strip.child(span(s, e, 22., 4., pal.dim));
     }
-    // A manual summary's rollup: a thin bar above its own, the part past its
-    // finish in the warning colour.
+    // A manual summary's rollup: a thin bar above its own. Its warning marks
+    // the part past its finish, else its own finish day (an overrun within
+    // that day, or a finish past its manual parent), in the warning colour.
     if let Some((s, e)) = bar.rollup {
         strip = strip.child(span(
             s,
@@ -427,7 +428,7 @@ pub(crate) fn gantt_strip(
             },
         ));
     }
-    if let Some((s, e)) = bar.late_rollup() {
+    if let Some((s, e)) = bar.warning_days() {
         strip = strip.child(span(s, e, 3., 3., hsla_u(GANTT_WARNING)));
     }
     let marker = probe(probes, format!("bar:{id}"));

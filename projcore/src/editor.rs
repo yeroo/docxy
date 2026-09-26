@@ -617,9 +617,10 @@ impl Editor {
         let t = &self.proj.tasks[i];
         // A manual summary's duration is its own span, not its stored one.
         let manual_summary = t.summary && t.manual && patch.manual.is_none_or(|m| m);
-        let (current, milestone) = match manual_summary {
-            true => (self.disp_duration_min(uid).unwrap_or(t.duration_min), None),
-            false => (t.duration_min, Some(t.milestone)),
+        let (current, milestone) = if manual_summary {
+            (self.disp_duration_min(uid).unwrap_or(t.duration_min), None)
+        } else {
+            (t.duration_min, Some(t.milestone))
         };
         let duration_changed = patch.duration_min.is_some_and(|min| min != current);
         // A blank row always becomes a task: a mode is an edit of it too.

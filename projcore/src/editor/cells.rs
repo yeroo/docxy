@@ -101,9 +101,10 @@ impl Editor {
             return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(start));
         }
         self.validate_pinned_day(start)?;
-        let span = match task.summary {
-            true => self.disp_duration_min(uid).or(task.manual_duration_min),
-            false => task.manual_duration_min,
+        let span = if task.summary {
+            self.disp_duration_min(uid).or(task.manual_duration_min)
+        } else {
+            task.manual_duration_min
         };
         if !blank
             && task.manual_start == Some(start)
