@@ -1657,8 +1657,9 @@ impl Scheduler<'_> {
         let mut bookings: HashMap<i32, Vec<(i64, i64, f64)>> = HashMap::new();
         let mut start: HashMap<i32, DateTime> = HashMap::new();
         let mut finish: HashMap<i32, DateTime> = HashMap::new();
-        // Auto tasks whose leveled dates differ from their CPM dates.
-        let mut moved = std::collections::HashSet::new();
+        // Auto tasks whose leveled start or finish differs from CPM.
+        let mut moved_start = std::collections::HashSet::new();
+        let mut moved_finish = std::collections::HashSet::new();
 
         // Manual tasks never move, so book them before placing anything else:
         // auto tasks earlier in topological order must level around them.
@@ -1730,7 +1731,11 @@ impl Scheduler<'_> {
             // A predecessor can move only its instant, keeping its working
             // index (an elapsed lag into nonworking time, #104); a successor
             // that keeps that instant (a milestone, an SF finish) must follow.
-            let pred_moved = t.predecessors.iter().any(|p| moved.contains(&p.uid));
+            // Only the endpoint the link counts from matters.
+            let pred_moved = t.predecessors.iter().any(|p| match p.link {
+                LinkType::FinishStart | LinkType::FinishFinish => moved_finish.contains(&p.uid),
+                LinkType::StartStart | LinkType::StartFinish => moved_start.contains(&p.uid),
+            });
             let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 && !pred_moved {
                 (cpm.early_start.minutes(), cpm.early_finish.minutes())
             } else {
@@ -1770,6 +1775,12 @@ impl Scheduler<'_> {
                     // already carries the task's SNET/MSO start bounds.
                     if let Some(instant) = fs_instant {
                         s_abs = instant.max(start_bound);
+                    } else if placed == cpm_start_idx {
+                        // Recomputed only because a predecessor's instant
+                        // moved, and no FS instant reaches this index: keep
+                        // the CPM instant, which may be held at a period's
+                        // end (an MFO, an SNET milestone).
+                        s_abs = start_bound;
                     }
                 }
                 let bounds = t.predecessors.iter().filter_map(|p| {
@@ -1805,8 +1816,11 @@ impl Scheduler<'_> {
                     ),
                 )
             };
-            if (s_abs, f_abs) != (cpm.early_start.minutes(), cpm.early_finish.minutes()) {
-                moved.insert(t.uid);
+            if s_abs != cpm.early_start.minutes() {
+                moved_start.insert(t.uid);
+            }
+            if f_abs != cpm.early_finish.minutes() {
+                moved_finish.insert(t.uid);
             }
             start.insert(t.uid, DateTime::from_minutes(s_abs));
             finish.insert(t.uid, DateTime::from_minutes(f_abs));
@@ -5271,9 +5285,31 @@ mod tests {
         h.predecessors = vec![Predecessor::fs(5)];
         let mut n = task(7, "N", 0);
         n.predecessors = vec![Predecessor::fs(3)];
+        // Milestones whose CPM instant is held at a period's end must keep
+        // it when their own index does not move: K by an MFO that no FS
+        // instant reaches, X by an SNET behind an SS link to G, whose start
+        // did not move.
+        let mut k = task(8, "K", 0);
+        k.predecessors = vec![Predecessor::fs(5)];
+        k.constraint = ConstraintType::MustFinishOn;
+        k.constraint_date = Some(at(13, 17));
+        let mut x = task(9, "X", 0);
+        x.predecessors = vec![Predecessor::working(5, LinkType::StartStart, 0)];
+        x.constraint = ConstraintType::StartNoEarlierThan;
+        x.constraint_date = Some(at(6, 17));
         let mut proj = Project {
             start_date: Some(at(2, 8)),
-            tasks: vec![task(4, "Busy", 480), task(1, "A", 3 * 480), d, m, g, h, n],
+            tasks: vec![
+                task(4, "Busy", 480),
+                task(1, "A", 3 * 480),
+                d,
+                m,
+                g,
+                h,
+                n,
+                k,
+                x,
+            ],
             ..Project::default()
         };
         proj.resources = vec![worker(1, "Shared", 1.0)];
@@ -5286,5 +5322,7 @@ mod tests {
         assert_eq!(dates(5), (at(6, 8), at(7, 17)));
         assert_eq!(dates(6), (at(7, 17), at(7, 17)));
         assert_eq!(dates(7), (at(7, 17), at(7, 17)));
+        assert_eq!(dates(8), (at(13, 17), at(13, 17)));
+        assert_eq!(dates(9), (at(6, 17), at(6, 17)));
     }
 }
