@@ -48,7 +48,8 @@ separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
 `stored_*` and used as an **oracle** for the scheduler. The editor rewrites them
 for a manual task whose dates it edits, so a save's `Start`/`Finish` agree with
 its `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
-open). Project-level options the model does not hold (`ScheduleFromStart`,
+open). A manual summary saves its own dates there too, as Project does; a
+summary switched back to auto saves its rolled-up span. Project-level options the model does not hold (`ScheduleFromStart`,
 currency, task defaults, file identity, ...) are kept verbatim in
 `Project::options` and written back on save; docxy does not act on them yet, so
 it still schedules forward even when `ScheduleFromStart` is 0.
@@ -71,9 +72,10 @@ clears history while retaining the find query and leveling preference.
   {manual: true}`) pins it at the start and finish it is shown at, the leveled
   ones while leveling is on, and stamps its saved Start/Finish; switching it
   to auto clears the pin and the scheduler places it by its links and
-  constraints again. Either is one undo step. A summary's mode switches, but
-  its dates still roll up from its subtasks. The status bar's `New Tasks: …`
-  (yppxy's `M`) switches the plan's default.
+  constraints again. Either is one undo step. A summary switched to manual
+  keeps the dates it shows instead of rolling up (see **Manual summaries**
+  below). The status bar's `New Tasks: …` (yppxy's `M`) switches the plan's
+  default.
 - **Dependencies** are the four link types with lag/lead: Finish-to-Start,
   Start-to-Start, Finish-to-Finish, Start-to-Finish. A lag is working time,
   **elapsed** calendar time (`+2ed`, counted from the predecessor's instant,
@@ -116,7 +118,8 @@ Wednesday 08:00" both come out right.
   total slack uses the link-driven start. Dates are limited by the timeline
   horizon; pre-start constraints do not pull unlinked tasks before the project
   start. Also computed: the **critical** flag (slack ≤ 0) and **summary
-  rollup** (a summary's dates derive from its descendants).
+  rollup** (a summary's dates derive from its descendants, unless it is a
+  manual summary).
 - **Manual tasks** stay at their pinned dates: the manual start (else the stored
   start) and the manual finish, else start + duration on the task calendar.
   Links and constraints never move them; auto successors schedule from the
@@ -124,6 +127,26 @@ Wednesday 08:00" both come out right.
   between the pinned and the link-driven start); an unlinked manual task gets no
   slack penalty, even before the project start. A manual task without any start
   schedules like an auto task.
+- **Manual summaries** (#124) keep their own dates instead of rolling up, as
+  measured in Project over COM: the manual start (else the stored start) and
+  the manual finish, else start + `ManualDuration` on the summary calendar.
+  Their subtasks' span stays available as the **rollup**
+  (`Schedule::rolled_up`, `Editor::disp_rollup`), and Project's **warning**
+  (`summary_warning`) flags subtasks finishing after the manual finish; a
+  rollup that starts before the manual start does not warn. The manual start
+  **floors** every ASAP auto subtask, from the nearest manual-summary ancestor
+  (auto summaries in between pass it on); a later link still wins, and a
+  subtask with any other constraint, even SNET, ignores it. The floor never
+  enters the backward pass or the slack's link-driven start. The manual finish
+  counts toward the project finish, so every task's slack is measured to it.
+  A manual summary's late window spans its subtasks' late dates, but never
+  starts before its own start nor finishes before its own finish; its slack is
+  the smaller of its start and finish slack, so it is never negative, and it is
+  critical only at zero (critical subtasks do not make it so). Its ancestors
+  roll up through its own span, which they see as fixed: an auto summary over
+  one measures its slack from that late window. A manual summary with no start
+  (TBD) rolls up as an auto summary. Links on summaries themselves are not
+  scheduled yet, for auto and manual summaries alike.
 
 Leaf tasks are ordered by a Kahn topological sort of the dependency graph;
 cycles fall back to input order.
@@ -131,14 +154,18 @@ cycles fall back to input order.
 ### Verification
 
 There's no free high-fidelity oracle for scheduling (Project isn't scriptable in
-CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds twenty tiny
+CI), so the corpus is **self-oracling**: `corpus/mspdi/` holds twenty-seven tiny
 one-feature MSPDI files, each embedding every task's `Start`/`Finish`,
 `TotalSlack` and `Critical`. In files 01–18 these are the values Microsoft
 Project 2024 computes: `corpus/tools/verify_mspdi_project.py` checked every
 one against Project over COM (#74), with the oracle elements removed from the
 copy Project schedules. Files 19 (manual tasks, #77) and 20 (stored task
 fields and a blank row, #80) are hand-derived from our scheduler and not yet
-verified in Project. Blank rows (`IsNull`) carry no oracle.
+verified in Project. File 27 (manual summaries, #124) was checked against
+the local Project by `verify_mspdi_project.py`, as generated and as
+`write_mspdi` writes it; the rollup and the warning have no MSPDI field, so
+unit tests check them against Project's COM values. Blank rows (`IsNull`)
+carry no oracle.
 `projcore/tests/corpus.rs` reads each file, runs the scheduler, and asserts the
 computed dates, slack and critical flags match — and also runs each file
 through **MSPDI → `.yppx` → back** to prove the writer and OPC container are
@@ -184,7 +211,11 @@ Predecessors, and Resource Names directly in the selected cell. Task Mode takes
 `Manually Scheduled` or `Auto Scheduled`, or any start of them (`m`, `auto`). Enter/F2 or a double-click opens
 the existing value; typing replaces it. Enter commits and moves down, Tab and
 Shift+Tab commit and move between columns, and Escape cancels. Invalid input
-stays open for correction. ID and summary dates/duration are read-only.
+stays open for correction. ID and an auto summary's dates/duration are
+read-only. A manual summary's Start, Finish and Duration set its own span as
+they do for a manual task, without touching its subtasks; its Gantt row adds
+the subtasks' rolled-up span as a thin bar above its own, the part past its
+finish in a warning colour (yppxy marks those days `╍`).
 
 As in Project, the blank row below the last task is the entry row: clicking any
 empty row below the tasks, or Down from the last task, puts the cell cursor

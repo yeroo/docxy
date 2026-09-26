@@ -263,6 +263,18 @@
         "lag-elapsed"
       ],
       "desc": "Percentage, elapsed and estimated-elapsed lags on FS, SS, FF and SF links, forwards and backwards across a weekend, as Project 2024 schedules them."
+    },
+    {
+      "file": "27-manual-summary.xml",
+      "category": "manual",
+      "tags": [
+        "manual",
+        "summary",
+        "manual-summary",
+        "link",
+        "constraint"
+      ],
+      "desc": "Manual summaries keep their own dates: a short one under an auto summary, one whose finish is the project finish, a start floor a link overrides and a constrained subtask ignores."
     }
   ]
 }

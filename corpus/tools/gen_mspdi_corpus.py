@@ -18,7 +18,8 @@ Project, as is file 23's derived calendar (#83). Files 24 and 25 (calendar
 exceptions, #126) were verified against Project Professional 2024 (build
 16.0.17932.21000), as generated and as projcore's write_mspdi writes them, as
 was file 26 (percentage and elapsed lags, #104), whose plan and values come
-from Project itself (gen_mpp_lag_cases.py).
+from Project itself (gen_mpp_lag_cases.py), and file 27 (manual summaries,
+#124).
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -723,6 +724,42 @@ def build():
             task(13, "W", D, dt(6, "11:00:00"), dt(9, "11:00:00"), slack=2220,
                  critical=False, preds=[(1, FS, 180 * 10, 5)]),
             task(14, "X", D, dt(13), dt(13, "17:00:00"), **CRIT, preds=[(9, SS, 150, 19)]),
+        ])))
+
+    # 27 — manually scheduled summaries (#124) keep their own dates instead
+    # of rolling up. S1 (3/2-3/4) is shorter than its subtasks A and B, which
+    # run on to 3/6 (Project's warning), and auto summary P rolls up through
+    # it: S1's own span is fixed, so P has no slack though S1 and its
+    # subtasks have 9 days. S2's manual finish (3/20) is the project finish, so every task is
+    # measured to it; its start (3/9) floors unconstrained D, E's link to Z
+    # pushes E past the floor, and F's must-start-on (3/3) ignores it. A
+    # manual summary's Start/Finish are its ManualStart/ManualFinish, and its
+    # <Duration> is the rolled-up span, as Project writes them.
+    add("27-manual-summary.xml", ["manual", "summary", "manual-summary", "link", "constraint"],
+        "Manual summaries keep their own dates: a short one under an auto summary, one "
+        "whose finish is the project finish, a start floor a link overrides and a "
+        "constrained subtask ignores.",
+        project("manual-summary", "\n".join([
+            task(1, "P", 5 * D, dt(2), dt(6, "17:00:00"), **CRIT, summary=True),
+            task(2, "S1", 5 * D, dt(2), dt(4, "17:00:00"), slack=9 * D, critical=False,
+                 outline=2, summary=True, manual=1, manual_start=dt(2),
+                 manual_finish=dt(4, "17:00:00"), manual_duration=3 * D),
+            task(3, "A", 2 * D, dt(2), dt(3, "17:00:00"), slack=9 * D, critical=False,
+                 outline=3),
+            task(4, "B", 3 * D, dt(4), dt(6, "17:00:00"), slack=9 * D, critical=False,
+                 outline=3, preds=[(3, FS, 0)]),
+            task(5, "C", D, dt(9), dt(9, "17:00:00"), slack=9 * D, critical=False,
+                 preds=[(4, FS, 0)]),
+            task(6, "S2", 10 * D, dt(9), dt(20, "17:00:00"), **CRIT, summary=True,
+                 manual=1, manual_start=dt(9), manual_finish=dt(20, "17:00:00"),
+                 manual_duration=10 * D),
+            task(7, "D", 2 * D, dt(9), dt(10, "17:00:00"), slack=8 * D, critical=False,
+                 outline=2),
+            task(8, "E", D, dt(16), dt(16, "17:00:00"), slack=4 * D, critical=False,
+                 outline=2, preds=[(10, FS, 0)]),
+            task(9, "F", 2 * D, dt(3), dt(4, "17:00:00"), **CRIT, outline=2, ctype=MSO,
+                 cdate=dt(3)),
+            task(10, "Z", 10 * D, dt(2), dt(13, "17:00:00"), slack=4 * D, critical=False),
         ])))
 
     manifest = {
