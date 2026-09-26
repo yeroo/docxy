@@ -678,6 +678,36 @@ fn a_short_plan_on_a_wide_window_has_days_across_the_whole_chart() {
 }
 
 #[test]
+fn a_manual_summary_bar_carries_its_rollup_and_warning() {
+    let mut ed = editor(vec![task(1, 0, 1), task(2, 1, 2), task(3, 4, 2)]);
+    assert_eq!(bar(&ed, 1).state(), "summary 0-3");
+    ed.set_manual(1, true).unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-3 rollup 0-3");
+    assert_eq!(bar(&ed, 1).late_rollup(), None);
+    // Shorter than its subtasks: they run past it, in the warning colour.
+    ed.set_duration(1, "1d").unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-0 rollup 0-3 warning");
+    assert_eq!(bar(&ed, 1).late_rollup(), Some((1, 3)));
+    // Longer: the rollup sits inside it and nothing warns.
+    ed.set_duration(1, "10d").unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-11 rollup 0-3");
+    // Made automatic again, it rolls up and draws no second bar.
+    ed.set_manual(1, false).unwrap();
+    assert_eq!(bar(&ed, 1).state(), "summary 0-3");
+    // A finish later on the summary's own last day warns on that day.
+    let same_day = GanttBar {
+        kind: BarKind::Summary,
+        start: 0,
+        end: 3,
+        baseline: None,
+        delay: None,
+        rollup: Some((0, 3)),
+        warning: true,
+    };
+    assert_eq!(same_day.late_rollup(), Some((3, 3)));
+}
+
+#[test]
 fn bar_styles_hide_critical_colour_and_baseline_only() {
     let base = GanttBar {
         kind: BarKind::Critical,
@@ -685,6 +715,8 @@ fn bar_styles_hide_critical_colour_and_baseline_only() {
         end: 5,
         baseline: Some((1, 4)),
         delay: Some((0, 2)),
+        rollup: None,
+        warning: false,
     };
     assert_eq!(styled_bar(base, true, true), base);
     assert_eq!(

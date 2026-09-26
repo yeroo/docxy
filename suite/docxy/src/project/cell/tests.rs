@@ -1,6 +1,6 @@
 use super::*;
 use core::prelude::v1::test;
-use projcore::ConstraintType;
+use projcore::{ConstraintType, DateTime};
 
 fn tab() -> DocTab {
     let p = Project {
@@ -401,6 +401,54 @@ fn summary_cells_are_read_only() {
         assert!(v(&t).cell.is_none());
         assert!(t.status.contains("read-only"));
     }
+}
+
+#[test]
+fn a_manual_summary_s_dates_and_duration_are_editable() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(20, 1).unwrap();
+    vm(&mut t).ed.set_manual(10, true).unwrap();
+    vm(&mut t).ed.select(0);
+    // Its duration cell opens on the span it shows, not the stored one.
+    vm(&mut t).ed.set_duration(10, "2d").unwrap();
+    vm(&mut t).col = COL_DURATION;
+    vm(&mut t).open_cell(None).unwrap();
+    assert_eq!(
+        v(&t).cell.as_ref().unwrap().initial,
+        format_duration_exact(960, v(&t).ed.project())
+    );
+    vm(&mut t).cell = None;
+    edit(&mut t, COL_DURATION, "3d");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.disp_duration_min(10), Some(3 * 480));
+    vm(&mut t).ed.select(0);
+    edit(&mut t, COL_FINISH, "2026-01-09");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    let ed = &v(&t).ed;
+    assert_eq!(
+        ed.disp_finish(10),
+        Some(DateTime::from_ymd_hm(2026, 1, 9, 17, 0))
+    );
+    vm(&mut t).ed.select(0);
+    edit(&mut t, COL_START, "2026-01-12");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    let ed = &v(&t).ed;
+    assert_eq!(
+        (ed.disp_start(10), ed.disp_finish(10)),
+        (
+            Some(DateTime::from_ymd_hm(2026, 1, 12, 8, 0)),
+            Some(DateTime::from_ymd_hm(2026, 1, 16, 17, 0))
+        )
+    );
+    // Its subtask starts no earlier than it does.
+    assert_eq!(
+        ed.disp_start(20),
+        Some(DateTime::from_ymd_hm(2026, 1, 12, 8, 0))
+    );
+    assert_eq!(ed.undo_depth(), 6);
 }
 
 #[test]

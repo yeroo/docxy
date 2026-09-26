@@ -115,7 +115,7 @@ impl ProjectView {
                 .tasks
                 .get(self.ed.sel())
                 .ok_or("No task selected")?;
-            if self.col == COL_ID || (task.summary && SUMMARY_READ_ONLY.contains(&self.col)) {
+            if self.col == COL_ID || summary_read_only(task, self.col) {
                 return Err(format!(
                     "{} is read-only{}",
                     COLUMNS[self.col],
@@ -127,10 +127,15 @@ impl ProjectView {
                 ));
             }
             let initial = if self.col == COL_DURATION {
-                if task.duration_min == 0 {
+                // A manual summary's duration is the span it shows.
+                let min = match task.summary {
+                    true => self.ed.disp_duration_min(task.uid).unwrap_or(0),
+                    false => task.duration_min,
+                };
+                if min == 0 {
                     "0".into()
                 } else {
-                    format_duration_exact(task.duration_min, self.ed.project())
+                    format_duration_exact(min, self.ed.project())
                 }
             } else {
                 project_row(&self.ed, task)[self.col].clone()
@@ -174,8 +179,13 @@ impl ProjectView {
     }
 }
 
-/// A summary's dates and duration roll up from its subtasks.
+/// An auto summary's dates and duration roll up from its subtasks; a manual
+/// summary's are its own, typed like a manual task's.
 const SUMMARY_READ_ONLY: std::ops::RangeInclusive<usize> = COL_DURATION..=COL_FINISH;
+
+fn summary_read_only(task: &Task, col: usize) -> bool {
+    task.summary && !task.manual && SUMMARY_READ_ONLY.contains(&col)
+}
 
 /// A typed Task Mode: Project's names, or any start of them (`m`, `auto`),
 /// ignoring case. `true` is Manually Scheduled.
@@ -200,7 +210,7 @@ fn apply_cell(
         .project()
         .task(uid)
         .ok_or("The edited task no longer exists")?;
-    if task.summary && SUMMARY_READ_ONLY.contains(&col) {
+    if summary_read_only(task, col) {
         return Err("Summary dates and duration are read-only".into());
     }
     match col {

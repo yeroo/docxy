@@ -18,6 +18,10 @@ pub(crate) struct GanttBar {
     pub end: i64,
     pub baseline: Option<(i64, i64)>,
     pub delay: Option<(i64, i64)>,
+    /// A manual summary's rolled-up span, drawn beside its own dates.
+    pub rollup: Option<(i64, i64)>,
+    /// Its subtasks finish after its own finish (Project's warning).
+    pub warning: bool,
 }
 
 impl GanttBar {
@@ -28,7 +32,26 @@ impl GanttBar {
             BarKind::Summary => "summary",
             BarKind::Milestone => "milestone",
         };
-        format!("{kind} {}-{}", self.start, self.end)
+        let mut state = format!("{kind} {}-{}", self.start, self.end);
+        if let Some((s, e)) = self.rollup {
+            state += &format!(" rollup {s}-{e}");
+        }
+        if self.warning {
+            state += " warning";
+        }
+        state
+    }
+
+    /// The days of a warned rollup drawn in the warning colour: those past
+    /// the summary's own finish, else (a finish later the same day) the
+    /// rollup's last day.
+    pub fn late_rollup(self) -> Option<(i64, i64)> {
+        let (s, e) = self.rollup.filter(|_| self.warning)?;
+        Some(if e > self.end {
+            (s.max(self.end + 1), e)
+        } else {
+            (e, e)
+        })
     }
 }
 
@@ -113,6 +136,11 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
             .map(|(s, e)| (day(s), day(e))),
         delay: (ed.leveled() && start > result.early_start)
             .then(|| (day(result.early_start), day(start))),
+        rollup: task
+            .manual_summary_dates()
+            .and(ed.disp_rollup(task.uid))
+            .map(|(s, e)| (day(s), day(e))),
+        warning: ed.summary_warning(task.uid),
     })
 }
 
@@ -380,6 +408,23 @@ pub(crate) fn gantt_strip(
     }
     if let Some((s, e)) = bar.baseline {
         strip = strip.child(span(s, e, 22., 4., pal.dim));
+    }
+    // A manual summary's rollup: a thin bar above its own, the part past its
+    // finish in the warning colour.
+    if let Some((s, e)) = bar.rollup {
+        strip = strip.child(span(
+            s,
+            e,
+            3.,
+            3.,
+            Hsla {
+                a: 0.6,
+                ..hsla_u(GANTT_SUMMARY)
+            },
+        ));
+    }
+    if let Some((s, e)) = bar.late_rollup() {
+        strip = strip.child(span(s, e, 3., 3., hsla_u(GANTT_WARNING)));
     }
     let marker = probe(probes, format!("bar:{id}"));
     let element = match bar.kind {
