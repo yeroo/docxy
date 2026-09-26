@@ -371,6 +371,22 @@ fn bar_style_toggles_change_the_drawn_bars_as_view_state_only() {
 }
 
 #[test]
+fn set_baseline_status_says_whether_baseline_bars_show() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::Baseline);
+    assert_eq!(
+        t.status.as_ref(),
+        "Baseline set — baseline bars now show under the current bars"
+    );
+    apply_project_act(&mut t, ProjectAct::BaselineBars);
+    apply_project_act(&mut t, ProjectAct::Baseline);
+    assert_eq!(
+        t.status.as_ref(),
+        "Baseline set — baseline bars are hidden (Gantt Chart Format › Baseline)"
+    );
+}
+
+#[test]
 fn timeline_toggles_the_pane_as_view_state_only() {
     let mut t = tab();
     assert!(v(&t).timeline, "a Project opens with its Timeline shown");
@@ -401,7 +417,7 @@ fn timeline_toggles_the_pane_as_view_state_only() {
 }
 
 #[test]
-fn project_act_active_checks_level_all_timeline_and_the_task_mode_only() {
+fn project_act_active_checks_level_all_timeline_bar_styles_and_the_task_mode_only() {
     use ProjectAct::*;
     let mut t = tab();
     assert!(!project_act_active(v(&t), LevelAll));

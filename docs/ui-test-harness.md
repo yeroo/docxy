@@ -252,7 +252,7 @@ State keys, as the app reports them after every driving verb:
 | `field`, `field_text` | the focused reference field, and its buffer |
 | `filling`, `fill_preview`, `dragging` | the auto-fill and the sweep |
 | `picking`, `range_preview`, `sel_hidden` | point mode |
-| `selected_task`, `tasks`, `bar_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's bar geometry by displayed ID |
+| `selected_task`, `tasks`, `bar_<id>`, `baseline_<id>` | Project: cell cursor's row (zero-based; equals `tasks` on the entry row below the last task), task count, and each task's drawn bar and baseline bar by displayed ID |
 | `prompt`, `selected_name`, `exported` | Project: `none` or `<kind>:<buffer>` for the open prompt, selected task name (empty on the entry row), and `none` or the filename of the last successful Gantt export |
 | `cell`, `cell_row`, `cell_edit` | Project: active column name, zero-based row index, and open cell editor buffer (`null` when closed) |
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
@@ -292,8 +292,8 @@ footer editor; `selection-set` refuses while it is open.
 | Call | Effect |
 |---|---|
 | `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; both offsets are validated before either changes |
-| `ribbon-read {}` | list File, ribbon tabs and contextual Table (while the caret is in a table), groups, commands, galleries and Quick Access Toolbar |
-| `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command id or unique label on a valid tab and invoke the same action handler as its button |
+| `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar |
+| `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command id or unique label on a valid tab, contextual tabs included, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
 
@@ -310,8 +310,12 @@ Settings; closing a dirty single tab always asks regardless of this window setti
 
 Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
 from the Gantt chart's scale origin, or `none` when the task has no schedule result.
-Kinds are `critical`, `on-track`, `summary`, and `milestone`. These state keys
-cover every task, including those outside the visible chart.
+Kinds are `critical`, `on-track`, `summary`, and `milestone`. The kind is the one
+drawn after the Gantt Chart Format toggles: with Bar Styles › Critical Tasks off,
+a critical task reads `on-track`. `baseline_<id>` is the drawn baseline bar,
+`<start>-<end>` on the same scale, or `none` when the task has no baseline or
+Bar Styles › Baseline is off. These state keys cover every task, including those
+outside the visible chart.
 
 Project `timeline` is `shown` or `hidden` (View > Split View > Timeline).
 `timeline_start` and `timeline_finish` are the Timeline's end labels in Project's

@@ -819,8 +819,14 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Baseline => {
                 if !v.ed.project().tasks.is_empty() {
                     v.ed.set_baseline();
-                    status =
-                        Some("Baseline set — baseline bars now show under the current bars".into());
+                    status = Some(
+                        if v.show_baseline {
+                            "Baseline set — baseline bars now show under the current bars"
+                        } else {
+                            "Baseline set — baseline bars are hidden (Gantt Chart Format › Baseline)"
+                        }
+                        .into(),
+                    );
                 }
             }
             ClearBaseline => {
