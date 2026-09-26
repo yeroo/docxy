@@ -705,6 +705,57 @@ fn a_manual_summary_bar_carries_its_rollup_and_warning() {
         warning: true,
     };
     assert_eq!(same_day.late_rollup(), Some((3, 3)));
+    // Without a rollup, a warned bar marks its own finish day.
+    let bare = GanttBar {
+        rollup: None,
+        ..same_day
+    };
+    assert_eq!(bare.late_rollup(), Some((3, 3)));
+    assert_eq!(
+        GanttBar {
+            warning: false,
+            ..bare
+        }
+        .late_rollup(),
+        None
+    );
+}
+
+/// A manual summary at `level` from `start` to `finish` (days of Jan 2026).
+fn manual_summary(uid: i32, level: u32, start: u32, finish: u32) -> Task {
+    Task {
+        summary: true,
+        manual: true,
+        manual_start: Some(projcore::DateTime::from_ymd_hm(2026, 1, start, 8, 0)),
+        manual_finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, finish, 17, 0)),
+        ..task(uid, 0, level)
+    }
+}
+
+#[test]
+fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
+    // O (1/5..1/16) > I (1/5..1/23) > A 1d: I's rollup is inside I, but I
+    // finishes after O. Day 0 is Monday 1/5.
+    let ed = editor(vec![
+        manual_summary(1, 1, 5, 16),
+        manual_summary(2, 2, 5, 23),
+        task(3, 1, 3),
+    ]);
+    let inner = bar(&ed, 2);
+    assert_eq!(inner.state(), "summary 0-18 rollup 0-0 warning");
+    assert_eq!(inner.late_rollup(), Some((18, 18)));
+    // O's rollup (through I's own span) runs past O's finish.
+    assert_eq!(bar(&ed, 1).state(), "summary 0-11 rollup 0-18 warning");
+    assert_eq!(bar(&ed, 1).late_rollup(), Some((12, 18)));
+    // O (1/5..1/6) > I (1/12..1/16) > A 2d, floored to 1/12.
+    let ed = editor(vec![
+        manual_summary(1, 1, 5, 6),
+        manual_summary(2, 2, 12, 16),
+        task(3, 2, 3),
+    ]);
+    let inner = bar(&ed, 2);
+    assert_eq!(inner.state(), "summary 7-11 rollup 7-8 warning");
+    assert_eq!(inner.late_rollup(), Some((11, 11)));
 }
 
 #[test]

@@ -202,7 +202,9 @@ impl Editor {
 
     /// Project's warning ([`crate::schedule::manual_warning`]) on the shown
     /// dates: a manual summary's subtasks finish after it, or a manual task
-    /// finishes after its manual parent summary.
+    /// finishes after its manual parent summary. It answers for manual leaves
+    /// too, but hosts show it on summary rows only (projctl's `warning`, the
+    /// docxy and yppxy summary bars); leaf rows do not show it yet.
     pub fn summary_warning(&self, uid: i32) -> bool {
         crate::schedule::manual_warning(
             &self.proj,

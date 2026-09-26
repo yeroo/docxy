@@ -20,7 +20,8 @@ pub(crate) struct GanttBar {
     pub delay: Option<(i64, i64)>,
     /// A manual summary's rolled-up span, drawn beside its own dates.
     pub rollup: Option<(i64, i64)>,
-    /// Its subtasks finish after its own finish (Project's warning).
+    /// Project's warning on a manual summary: its subtasks finish after its
+    /// own finish, or it finishes after its manual parent summary's.
     pub warning: bool,
 }
 
@@ -42,15 +43,17 @@ impl GanttBar {
         state
     }
 
-    /// The days of a warned rollup drawn in the warning colour: those past
-    /// the summary's own finish, else (a finish later the same day) the
-    /// rollup's last day.
+    /// The days a warned bar draws in the warning colour: its rollup's days
+    /// past its own finish, else its own finish day. That covers subtasks
+    /// finishing later on that same day, and a summary that warns because it
+    /// finishes after its manual parent while its rollup stays inside it.
     pub fn late_rollup(self) -> Option<(i64, i64)> {
-        let (s, e) = self.rollup.filter(|_| self.warning)?;
-        Some(if e > self.end {
-            (s.max(self.end + 1), e)
-        } else {
-            (e, e)
+        if !self.warning {
+            return None;
+        }
+        Some(match self.rollup {
+            Some((s, e)) if e > self.end => (s.max(self.end + 1), e),
+            _ => (self.end, self.end),
         })
     }
 }

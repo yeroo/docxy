@@ -135,7 +135,9 @@ Wednesday 08:00" both come out right.
   (`schedule::manual_warning`, `Editor::summary_warning`) flags a manual
   summary whose subtasks finish after its manual finish, and a manual task
   finishing after its direct parent when that parent is a manual summary (an
-  auto summary in between breaks this); starting early never warns. The manual start
+  auto summary in between breaks this); starting early never warns. Hosts
+  show it on manual summaries only (projctl's `warning`, the docxy and yppxy
+  summary bars); a manual leaf's row does not show it yet. The manual start
   **floors** every ASAP auto subtask, from the nearest manual-summary ancestor
   (auto summaries in between pass it on); a later link still wins, and a
   subtask with any other constraint, even SNET, ignores it. The floor never
