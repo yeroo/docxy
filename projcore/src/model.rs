@@ -344,9 +344,10 @@ pub struct Task {
     pub is_subproject_read_only: Option<bool>,
     /// Work (minutes), Cost and OverAllocated as Project last calculated
     /// them. docxy never computes them whole: they stay as read until an edit
-    /// changes the task's assignments (or a subtask's), then Work and Cost
-    /// move by that change, work resources' work only (`assign::refresh`);
-    /// an absent one stays absent.
+    /// changes the task's assignments (or a subtask's), or moves a subtask
+    /// with assignments in or out of the task in the outline; then Work and
+    /// Cost move by that change in assignment totals only, work resources'
+    /// work only (`assign::refresh`). An absent one stays absent.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
     pub over_allocated: Option<bool>,

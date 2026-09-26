@@ -39,6 +39,7 @@ Built bottom-up, each a pure module:
 | `model` | the pure domain: `Task`, `Predecessor`, `Resource`, `Assignment`, `Calendar`, `Project`; `LinkType`/`ConstraintType` with MSPDI's integer codes pinned once |
 | `mspdi` | read **and** write MS Project's MSPDI XML — the interop bridge |
 | `schedule` | the CPM engine + resource leveling |
+| `assign` | assignment dates and costs from the schedule and rate tables, and the refresh of stored totals an edit made stale |
 | `editor` | shared editing, selection, dirty tracking, undo/redo, and live scheduling |
 | `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`) |
@@ -49,7 +50,11 @@ separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
 for a manual task whose dates it edits, so a save's `Start`/`Finish` agree with
 its `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
 open). A manual summary saves its own dates there too, as Project does; a
-summary switched back to auto saves its rolled-up span. Project-level options the model does not hold (`ScheduleFromStart`,
+summary switched back to auto saves its rolled-up span. Likewise the editor
+refreshes the stored assignment dates, costs and remaining work, and the
+resource, task and summary totals, that an edit made stale
+(`assign::refresh`, run from `Editor::reschedule` during an edit); values no
+edit touched are saved exactly as read. Project-level options the model does not hold (`ScheduleFromStart`,
 currency, task defaults, file identity, ...) are kept verbatim in
 `Project::options` and written back on save; docxy does not act on them yet, so
 it still schedules forward even when `ScheduleFromStart` is 0.

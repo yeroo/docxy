@@ -361,8 +361,11 @@ fn ancestors(p: &Project, uid: i32) -> Vec<i32> {
 
 /// Refresh what an edit made stale. `prev` and `prev_sched` are the model and
 /// schedule before the edit; `proj` is the edited model and `sched` its
-/// schedule. The refresh reads only inputs, never the fields it writes, so
-/// running it again on the same edit changes nothing.
+/// schedule. Every field it writes is derived from the edit's inputs, from
+/// the pre-edit model, or from values this same refresh derived first (the
+/// resource totals sum the refreshed assignments); an unpriceable cost is
+/// kept as it was. So the result is a fixed point: running it again on the
+/// same edit changes nothing.
 ///
 /// - An assignment that is new, or whose inputs changed (see
 ///   [`inputs_changed`]), gets its `Start`/`Finish` from [`assignment_span`]
@@ -435,9 +438,10 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
 
     // Tasks: move the stored totals by the change in their assignments', and
     // every outline summary above them by the same. A task the edit moved in
-    // the outline (or deleted, or added) leaves its old summaries with all it
-    // had and joins its new ones with all it has, so each summary keeps its
-    // stored total's relation to its subtasks.
+    // the outline (or deleted, or added) takes its assignments' whole totals
+    // out of its old summaries and adds them to its new ones. Only
+    // assignment totals move: anything else in a stored total (a fixed cost,
+    // not modelled) stays with the summaries that had it.
     let changed: HashSet<i32> = prev
         .assignments
         .iter()
