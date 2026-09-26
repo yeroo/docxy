@@ -600,20 +600,26 @@ pub struct Assignment {
     pub extended_attributes: Vec<ExtendedAttributeValue>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     pub baselines: Vec<AssignmentBaseline>,
-    /// The work and cost spread over time, in file order. A units edit drops
-    /// the planned-work records (see [`Assignment::set_units`]) and keeps the
-    /// actuals and baselines; a duration edit or reschedule leaves it as stale
-    /// as `work_min`, `start` and `finish`, which it then still agrees with.
+    /// The work and cost spread over time, in file order. An edit that
+    /// rewrites `work_min` (units or duration) drops the planned-work records
+    /// (see [`Assignment::set_work`]) and keeps the actuals and baselines; a
+    /// reschedule leaves it as stale as `start` and `finish`.
     pub timephased_data: Vec<TimephasedValue>,
 }
 
 impl Assignment {
-    /// Change the units and the work they give, dropping what described the
-    /// old work: regular work, overtime, cost and the planned-work spread.
-    /// Keeping them would invent overtime or misprice the new work. Actuals,
-    /// baselines, delays, the rate table, notes and custom fields stay.
+    /// Change the units and the work they give; see [`Assignment::set_work`].
     pub fn set_units(&mut self, units: f64, work_min: i64) {
         self.units = units;
+        self.set_work(work_min);
+    }
+
+    /// Replace the work, dropping what described the old work: regular work,
+    /// overtime, cost and the planned-work spread. Keeping them would invent
+    /// overtime or misprice the new work. Actuals, baselines, delays, the rate
+    /// table, notes and custom fields stay. Every edit that rewrites the work
+    /// goes through here, so a field derived from it has one place to join.
+    pub fn set_work(&mut self, work_min: i64) {
         self.work_min = work_min;
         self.regular_work_min = None;
         self.overtime_work_min = None;
