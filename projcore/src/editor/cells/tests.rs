@@ -1098,12 +1098,15 @@ fn both_entry_points_assign_work_resources_at_capped_max_units() {
                 }
             }
             let case = format!("{kind:?} {max_units} cell={cell}");
-            assert_eq!(
-                allocation(&ed, 10, 1),
-                (units, (960. * units) as i64),
-                "{case}"
-            );
-            assert_eq!(allocation(&ed, 30, 1), (units, 0), "{case}");
+            // A material's work is its quantity in hours, whatever the
+            // duration (#269); a cost resource has none.
+            let work = |duration: f64| match kind {
+                Work => (duration * units) as i64,
+                Material => (60. * units) as i64,
+                Cost => 0,
+            };
+            assert_eq!(allocation(&ed, 10, 1), (units, work(960.)), "{case}");
+            assert_eq!(allocation(&ed, 30, 1), (units, work(0.)), "{case}");
         }
     }
     // A resource created by typing a new name is a 100% work resource.
@@ -1144,8 +1147,9 @@ fn resource_names_show_work_units_that_are_not_100_percent() {
     });
     ed.set_resources(10, &["Bob".into(), "Cement[50%]".into(), "Pool".into()])
         .unwrap();
-    // Explicit units apply to any kind; only work resources show them.
-    assert_eq!(allocation(&ed, 10, 2), (0.5, 480));
+    // Explicit units apply to any kind; only work resources show them. A
+    // material's work is its quantity: half a unit is 30 minutes (#269).
+    assert_eq!(allocation(&ed, 10, 2), (0.5, 30));
     assert_eq!(
         format_resource_names(&ed.proj, 10),
         "Bob[50%], Cement, Pool"
@@ -1201,7 +1205,7 @@ fn bracketed_units_round_trip_through_the_resource_names_text() {
     ed.set_resources(10, &["Bob".into(), "Cement".into()])
         .unwrap();
     assert_eq!(allocation(&ed, 10, 1), (1.0, 960));
-    assert_eq!(allocation(&ed, 10, 9), (0.4, 384));
+    assert_eq!(allocation(&ed, 10, 9), (0.4, 24));
     // An imported 0% assignment shows `[0%]` and survives an unchanged commit.
     ed.proj.assignments[0].units = 0.0;
     let before = ed.project().clone();
@@ -1934,19 +1938,37 @@ fn fixed_work_material_and_cost_work_survive_a_duration_change() {
     // A fixed-work task's work is not rewritten, so its overtime stays; what
     // derives from its schedule and rates is refreshed (#269).
     with_work_derived(&mut ed.proj.assignments[4]);
+    let fixed = ed.proj.assignments[4].clone();
     ed = Editor::new(ed.proj);
     ed.set_duration_min(10, 960).unwrap();
     ed.set_duration_min(20, 960).unwrap();
-    let fixed = &ed.proj.assignments[4];
+    let after = &ed.proj.assignments[4];
     assert_eq!(
         (
-            fixed.work_min,
-            fixed.overtime_work_min,
-            fixed.regular_work_min
+            after.work_min,
+            after.overtime_work_min,
+            after.regular_work_min
         ),
         (480, Some(60), Some(420))
     );
-    assert_eq!(fixed.cost.as_ref().map(Rate::as_str), Some("0"));
+    assert_eq!(after.cost.as_ref().map(Rate::as_str), Some("0"));
+    // The planned spread described its old dates; the actuals and the
+    // baseline curve stay. Nothing else changes.
+    let kinds: Vec<u8> = after.timephased_data.iter().map(|t| t.kind).collect();
+    assert_eq!(kinds, [2, 4]);
+    assert_eq!(
+        Assignment {
+            start: fixed.start,
+            finish: fixed.finish,
+            cost: fixed.cost.clone(),
+            regular_work_min: fixed.regular_work_min,
+            remaining_work_min: fixed.remaining_work_min,
+            remaining_cost: fixed.remaining_cost.clone(),
+            timephased_data: fixed.timephased_data.clone(),
+            ..after.clone()
+        },
+        fixed
+    );
     assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
     let works: Vec<_> = (1..=5).map(|uid| work(&ed, uid)).collect();
     assert_eq!(

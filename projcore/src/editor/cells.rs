@@ -328,7 +328,7 @@ impl Editor {
                 None => None,
             };
             if let Some(u) = units {
-                a.set_units(u, work_for(duration, u));
+                a.set_units(u, assigned_work(kind(a.resource_uid), duration, u));
                 changed = true;
             }
         }
@@ -344,7 +344,14 @@ impl Editor {
                 Some(u) => checked_units(u, raw)?,
                 None => default_units(resources.iter().find(|r| r.uid == rid).expect("staged")),
             };
-            assignments.push(new_assignment(&mut next_aid, uid, rid, units, duration)?);
+            assignments.push(new_assignment(
+                &mut next_aid,
+                uid,
+                rid,
+                kind(rid),
+                units,
+                duration,
+            )?);
             changed = true;
         }
         if !changed {

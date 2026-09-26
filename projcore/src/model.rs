@@ -342,14 +342,19 @@ pub struct Task {
     pub external_task: Option<bool>,
     pub is_subproject: Option<bool>,
     pub is_subproject_read_only: Option<bool>,
-    /// Stored values docxy does not compute: Work (minutes), Cost and
-    /// OverAllocated as Project last calculated them.
+    /// Work (minutes), Cost and OverAllocated as Project last calculated
+    /// them. docxy never computes them whole: they stay as read until an edit
+    /// changes the task's assignments (or a subtask's), then Work and Cost
+    /// move by that change, work resources' work only (`assign::refresh`);
+    /// an absent one stays absent.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
     // computes nor reconciles it: the scheduler ignores it and edits leave it
-    // as read. Durations and work are whole minutes, rounded from the source.
+    // as read, except that `remaining_work_min` and `remaining_cost` move with
+    // the task's assignments as `work_min` and `cost` do. Durations and work
+    // are whole minutes, rounded from the source.
     /// Percents, 0..=100.
     pub percent_complete: Option<u8>,
     pub percent_work_complete: Option<u8>,
@@ -524,6 +529,11 @@ impl Rate {
     /// Return the decimal text written to MSPDI.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// The rate as a number, `None` when it does not fit a finite `f64`.
+    pub fn to_f64(&self) -> Option<f64> {
+        self.0.parse::<f64>().ok().filter(|v| v.is_finite())
     }
 }
 
@@ -766,7 +776,10 @@ pub struct Assignment {
     /// Work in **minutes**.
     pub work_min: i64,
     // Recorded progress, kept as read so a save writes it back; see the same
-    // block on [`Task`]. Work is whole minutes, rounded from the source.
+    // block on [`Task`]. The actuals stay as read; an edit that changes the
+    // assignment's inputs derives `remaining_work_min` (work − actual work)
+    // and `remaining_cost` (cost − actual cost) again. Work is whole minutes,
+    // rounded from the source.
     /// 0..=100.
     pub percent_work_complete: Option<u8>,
     pub actual_start: Option<DateTime>,
@@ -893,6 +906,18 @@ impl Assignment {
             .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
     }
 
+    /// The `Delay` in whole working minutes (MSPDI stores tenths), never
+    /// negative.
+    pub fn delay_min(&self) -> i64 {
+        tenths_to_min(self.delay)
+    }
+
+    /// The `LevelingDelay` in whole minutes, in the unit kind its format
+    /// gives (working or elapsed), never negative.
+    pub fn leveling_delay_min(&self) -> i64 {
+        tenths_to_min(self.leveling_delay)
+    }
+
     pub fn baseline(&self, number: u8) -> Option<&AssignmentBaseline> {
         self.baselines.iter().find(|b| b.number == number)
     }
@@ -903,6 +928,11 @@ impl Assignment {
         self.baselines.push(baseline);
         self.baselines.sort_by_key(|b| b.number);
     }
+}
+
+/// An MSPDI delay (tenths of a minute) in whole minutes, never negative.
+fn tenths_to_min(tenths: Option<i64>) -> i64 {
+    (tenths.unwrap_or(0).max(0) + 5) / 10
 }
 
 /// A recorded plan in one MSPDI baseline slot of an assignment.

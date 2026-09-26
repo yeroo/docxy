@@ -876,8 +876,9 @@ impl Editor {
                 return Ok(AssignOutcome::AlreadyAssigned);
             };
             let u = checked_units(u, name)?;
+            let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
             self.edit_row(i, |proj, _| {
-                proj.assignments[k].set_units(u, work_for(duration, u));
+                proj.assignments[k].set_units(u, assigned_work(kind, duration, u));
             })?;
             return Ok(AssignOutcome::Assigned);
         }
@@ -892,7 +893,8 @@ impl Editor {
             .map(|a| a.uid)
             .max()
             .unwrap_or(0);
-        let assignment = new_assignment(&mut next_aid, uid, rid, units, duration)?;
+        let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
+        let assignment = new_assignment(&mut next_aid, uid, rid, kind, units, duration)?;
         self.edit_row(i, |proj, _| {
             proj.resources = resources;
             proj.assignments.push(assignment);
@@ -969,7 +971,7 @@ impl Editor {
             })
             .collect();
         for (k, b) in &recorded {
-            let cost = b.cost.as_ref().map(|c| crate::assign::value(Some(c)));
+            let cost = b.cost.as_ref().map(|c| c.to_f64().unwrap_or(0.0));
             let total = costs
                 .entry(proj.assignments[*k].resource_uid)
                 .or_insert(Some(0.0));
@@ -1122,6 +1124,18 @@ fn work_for(duration_min: i64, units: f64) -> i64 {
     (duration_min as f64 * units).round() as i64
 }
 
+/// The work an assignment is given at `units` on a task of `duration_min`,
+/// by its resource's kind: a work resource (or none) works the duration at
+/// its units; a material's work is its quantity, the units, in hours (Project
+/// 2024, paired corpus 21: 1 unit is `PT1H`); a cost resource has none.
+fn assigned_work(kind: Option<ResourceType>, duration_min: i64, units: f64) -> i64 {
+    match kind {
+        Some(ResourceType::Material) => (units * 60.0).round() as i64,
+        Some(ResourceType::Cost) => 0,
+        Some(ResourceType::Work) | None => work_for(duration_min, units),
+    }
+}
+
 /// A duration change on row `i` rescales its assignments' work to duration x
 /// units, as Project does for a fixed-units or fixed-duration task. A
 /// fixed-work task keeps its work, a summary's stored duration is not the one
@@ -1151,7 +1165,7 @@ fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
         }
         let work_min = match a.work_contour {
             // A delayed assignment works from its delay to the task finish.
-            None | Some(0) => work_for((new_min - crate::assign::delay_min(a)).max(0), a.units),
+            None | Some(0) => work_for((new_min - a.delay_min()).max(0), a.units),
             Some(_) if old_min > 0 && a.work_min > 0 => {
                 (a.work_min as f64 * new_min as f64 / old_min as f64).round() as i64
             }
@@ -1175,6 +1189,7 @@ fn new_assignment(
     next_uid: &mut i32,
     task_uid: i32,
     resource_uid: i32,
+    kind: Option<ResourceType>,
     units: f64,
     duration_min: i64,
 ) -> Result<Assignment, String> {
@@ -1186,7 +1201,7 @@ fn new_assignment(
         task_uid,
         resource_uid,
         units,
-        work_min: work_for(duration_min, units),
+        work_min: assigned_work(kind, duration_min, units),
         ..Assignment::default()
     })
 }

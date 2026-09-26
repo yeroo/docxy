@@ -1797,9 +1797,11 @@ impl Leveled {
 /// default calendar's working-minute space; resource occupation is the task's
 /// wall-clock span, from each assignment's `Delay` into it. A resource's
 /// capacity is its Max. Units, or over time its availability periods (none
-/// outside them). It only ever moves tasks *later*; a task that fits nowhere
-/// later stays at its earliest start. Multi-calendar leveling and task
-/// splitting are out of scope.
+/// outside them). It only ever moves tasks *later*. A resource that has no
+/// capacity for the task anywhere later is left overallocated: the task is
+/// placed at the earliest start where every *other* resource fits, and at its
+/// earliest start (CPM plus the delay its links inherit) when it has no
+/// other. Multi-calendar leveling and task splitting are out of scope.
 /// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
     Scheduler::new(&without_blank_rows(proj)).level()
@@ -1836,11 +1838,9 @@ fn capacity(r: &crate::model::Resource, tl: &Timeline) -> Capacity {
                 .map(|d| tl.to_index(d.minutes()))
                 .filter(|&to| to < tl.total)
                 .unwrap_or(i64::MAX);
-            let units = crate::assign::value(p.available_units.as_ref());
-            let units = if p.available_units.is_some() {
-                units
-            } else {
-                max
+            let units = match &p.available_units {
+                Some(units) => units.to_f64().unwrap_or(0.0),
+                None => max,
             };
             (from, to, units)
         })
@@ -1936,7 +1936,10 @@ fn earliest_feasible(
 /// A task's booking on one resource: its units and its delay into the task.
 type Demand = (i32, f64, i64);
 
-/// Earliest index ≥ `start` feasible for *all* of a task's resources at once.
+/// Earliest index ≥ `start` feasible for all of a task's resources at once,
+/// except that a resource with no capacity for it anywhere later (see
+/// [`earliest_feasible`]) accepts any index: the result is then the earliest
+/// where every other resource fits, which leaves that one overallocated.
 fn place_all(
     res: &[Demand],
     bookings: &HashMap<i32, Vec<Booking>>,
@@ -2070,7 +2073,7 @@ impl Scheduler<'_> {
                 assign.entry(a.task_uid).or_default().push((
                     a.resource_uid,
                     if a.units > 0.0 { a.units } else { 1.0 },
-                    crate::assign::delay_min(a),
+                    a.delay_min(),
                 ));
             }
         }

@@ -33,16 +33,6 @@ pub(crate) fn task_calendar(proj: &Project, task: &Task) -> WorkCalendar {
     }
 }
 
-/// An MSPDI delay (tenths of a minute) in whole minutes, never negative.
-pub(crate) fn tenths_to_min(tenths: Option<i64>) -> i64 {
-    (tenths.unwrap_or(0).max(0) + 5) / 10
-}
-
-/// The assignment's `Delay` in working minutes.
-pub fn delay_min(a: &Assignment) -> i64 {
-    tenths_to_min(a.delay)
-}
-
 /// `minutes` of working time on `cal` after `from`. As a start (`finish`
 /// false) an instant at the end of a working period moves on to the next
 /// period's start, as a task starting there starts the next morning; as a
@@ -79,15 +69,20 @@ fn advance(cal: &WorkCalendar, from: DateTime, minutes: i64, finish: bool) -> Op
 /// its start plus work ÷ units: a work resource (or none, like Project's
 /// unassigned -65535), no contour, positive units.
 fn is_flat_work(proj: &Project, a: &Assignment) -> bool {
-    let kind = proj
-        .resources
-        .iter()
-        .find(|r| r.uid == a.resource_uid)
-        .map_or(ResourceType::Work, |r| r.kind);
-    kind == ResourceType::Work
+    is_work(&proj.resources, a)
         && matches!(a.work_contour, None | Some(0))
         && a.units.is_finite()
         && a.units > 0.0
+}
+
+/// Whether an assignment's work is working time: a work resource's, or one
+/// without a resource (Project's unassigned -65535). A material's work is a
+/// quantity and a cost resource has none, so a task's Work leaves them out.
+fn is_work(resources: &[Resource], a: &Assignment) -> bool {
+    resources
+        .iter()
+        .find(|r| r.uid == a.resource_uid)
+        .is_none_or(|r| r.kind == ResourceType::Work)
 }
 
 /// Where the assignment starts on its task: the task's start advanced by the
@@ -95,11 +90,11 @@ fn is_flat_work(proj: &Project, a: &Assignment) -> bool {
 /// its format says).
 fn delayed_start(cal: &WorkCalendar, task_start: DateTime, a: &Assignment) -> Option<DateTime> {
     let mut start = task_start;
-    let delay = delay_min(a);
+    let delay = a.delay_min();
     if delay > 0 {
         start = advance(cal, start, delay, false)?;
     }
-    let leveling = tenths_to_min(a.leveling_delay);
+    let leveling = a.leveling_delay_min();
     if leveling > 0 {
         let elapsed = a
             .leveling_delay_format
@@ -145,9 +140,7 @@ pub fn assignment_span(
 
 /// A stored decimal as a number; absent or unreadable is 0.
 pub(crate) fn value(rate: Option<&Rate>) -> f64 {
-    rate.and_then(|r| r.as_str().parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(0.0)
+    rate.and_then(Rate::to_f64).unwrap_or(0.0)
 }
 
 /// A cost in whole hundredths, as the text a save writes.
@@ -166,13 +159,16 @@ struct RateRow<'a> {
 
 /// Table `table`'s rows by start date. Each row holds from its `RatesFrom`
 /// until the next row's, the first from the beginning of time and the last
-/// forever, so rows never leave a gap. A resource without rows for the table
-/// prices from its own rate fields.
+/// forever, so rows never leave a gap or overlap: of several rows without a
+/// `RatesFrom` (a malformed table) only the first counts. A resource without
+/// rows for the table prices from its own rate fields.
 fn rate_rows(r: &Resource, table: u8) -> Vec<RateRow<'_>> {
+    let mut open = false;
     let mut rows: Vec<RateRow<'_>> = r
         .rates
         .iter()
         .filter(|e| e.rate_table.unwrap_or(0) == table)
+        .filter(|e| e.rates_from.is_some() || !std::mem::replace(&mut open, true))
         .map(|e| RateRow {
             from: e.rates_from,
             standard: e.standard_rate.as_ref(),
@@ -321,7 +317,9 @@ fn remaining_cost(a: &Assignment) -> f64 {
 }
 
 /// Work, cost, remaining work and remaining cost of a group of assignments.
-fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> (i64, f64, i64, f64) {
+type Totals = (i64, f64, i64, f64);
+
+fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> Totals {
     assignments.fold((0, 0.0, 0, 0.0), |(w, c, rw, rc), a| {
         (
             w + a.work_min,
@@ -330,6 +328,35 @@ fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> (i64, f64, i
             rc + remaining_cost(a),
         )
     })
+}
+
+/// The totals a task's stored fields count of its own assignments: the cost
+/// of all of them, the work of those whose work is time ([`is_work`]).
+fn task_totals(p: &Project, uid: i32) -> Totals {
+    let mine = p.assignments.iter().filter(|a| a.task_uid == uid);
+    let (_, cost, _, remaining_cost) = totals(mine.clone());
+    let (work, _, remaining, _) = totals(mine.filter(|a| is_work(&p.resources, a)));
+    (work, cost, remaining, remaining_cost)
+}
+
+/// The UIDs of a task's outline ancestors, nearest first, up to and including
+/// the project summary (outline level 0) when the plan holds one.
+fn ancestors(p: &Project, uid: i32) -> Vec<i32> {
+    let Some(i) = p.tasks.iter().position(|t| t.uid == uid) else {
+        return Vec::new();
+    };
+    let mut level = p.tasks[i].outline_level;
+    let mut out = Vec::new();
+    for t in p.tasks[..i].iter().rev().filter(|t| !t.is_null) {
+        if level == 0 {
+            break;
+        }
+        if t.outline_level < level {
+            out.push(t.uid);
+            level = t.outline_level;
+        }
+    }
+    out
 }
 
 /// Refresh what an edit made stale. `prev` and `prev_sched` are the model and
@@ -344,9 +371,10 @@ fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> (i64, f64, i
 ///   `RemainingCost` = cost − actual cost. Its planned-work spread (Type 1)
 ///   is dropped when its dates or work moved.
 /// - A task keeps its stored `Work`, `Cost`, `RemainingWork` and
-///   `RemainingCost` but moves each by how much its assignments' total moved,
-///   so a fixed cost inside a stored task cost survives; an absent one stays
-///   absent.
+///   `RemainingCost` but moves each by how much its assignments' total moved
+///   (work counting work resources only), and so do its outline summaries;
+///   a fixed cost inside a stored task cost survives, and an absent total
+///   stays absent.
 /// - A resource whose assignments changed (added, removed or refreshed) gets
 ///   its work, cost and remaining totals and its `Start`/`Finish` from them.
 pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project, sched: &Schedule) {
@@ -401,30 +429,55 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         }
     }
 
-    // Tasks: move the stored totals by the change in their assignments'.
+    // Tasks: move the stored totals by the change in their assignments', and
+    // every outline summary above them by the same (a deleted task's by its
+    // old summaries), so a summary keeps equalling its subtasks.
+    let changed: HashSet<i32> = prev
+        .assignments
+        .iter()
+        .chain(&proj.assignments)
+        .map(|a| a.task_uid)
+        .collect();
+    let mut moved: HashMap<i32, Totals> = HashMap::new();
+    for uid in changed {
+        let (w0, c0, rw0, rc0) = task_totals(prev, uid);
+        let (w1, c1, rw1, rc1) = task_totals(proj, uid);
+        let delta = (w1 - w0, c1 - c0, rw1 - rw0, rc1 - rc0);
+        if delta == (0, 0.0, 0, 0.0) {
+            continue;
+        }
+        let targets = match proj.task(uid) {
+            Some(_) => [vec![uid], ancestors(proj, uid)].concat(),
+            None => ancestors(prev, uid),
+        };
+        for target in targets {
+            let sum = moved.entry(target).or_insert((0, 0.0, 0, 0.0));
+            *sum = (
+                sum.0 + delta.0,
+                sum.1 + delta.1,
+                sum.2 + delta.2,
+                sum.3 + delta.3,
+            );
+        }
+    }
     for t in &mut proj.tasks {
-        let Some(was) = prev.task(t.uid) else {
+        let (Some(&(dw, dc, drw, drc)), Some(was)) = (moved.get(&t.uid), prev.task(t.uid)) else {
             continue;
         };
-        let (w0, c0, rw0, rc0) = totals(prev.assignments.iter().filter(|a| a.task_uid == t.uid));
-        let (w1, c1, rw1, rc1) = totals(proj.assignments.iter().filter(|a| a.task_uid == t.uid));
-        if w1 != w0 {
-            t.work_min = was.work_min.map(|w| w + w1 - w0);
+        if dw != 0 {
+            t.work_min = was.work_min.map(|w| w + dw);
         }
-        if rw1 != rw0 {
-            t.remaining_work_min = was.remaining_work_min.map(|w| w + rw1 - rw0);
+        if drw != 0 {
+            t.remaining_work_min = was.remaining_work_min.map(|w| w + drw);
         }
-        if c1 != c0 {
-            t.cost = was
-                .cost
-                .as_ref()
-                .and_then(|c| money(value(Some(c)) + c1 - c0));
+        if dc != 0.0 {
+            t.cost = was.cost.as_ref().and_then(|c| money(value(Some(c)) + dc));
         }
-        if rc1 != rc0 {
+        if drc != 0.0 {
             t.remaining_cost = was
                 .remaining_cost
                 .as_ref()
-                .and_then(|c| money(value(Some(c)) + rc1 - rc0));
+                .and_then(|c| money(value(Some(c)) + drc));
         }
     }
 
@@ -652,6 +705,22 @@ mod tests {
         proj.resources = vec![r];
         let a = assignment(1, 1, 1.0, 48);
         assert_eq!(cost(&proj, &a).as_deref(), Some("732000"));
+    }
+
+    #[test]
+    fn only_the_first_row_without_a_start_date_counts() {
+        // A malformed table with two open-start rows must not price the work
+        // at the sum of both.
+        let mut proj = plan(at(2, 8), 5);
+        let mut r = resource(1, ResourceType::Work, "0", "0");
+        r.rates = vec![row(0, None, "50"), row(0, None, "70")];
+        proj.resources = vec![r];
+        let a = assignment(1, 1, 1.0, 40);
+        assert_eq!(cost(&proj, &a).as_deref(), Some("200000"));
+        // A dated row still takes over from its date.
+        proj.resources[0].rates.push(row(0, Some(at(5, 8)), "80"));
+        // 24h at $50, then 16h at $80.
+        assert_eq!(cost(&proj, &a).as_deref(), Some("248000"));
     }
 
     #[test]

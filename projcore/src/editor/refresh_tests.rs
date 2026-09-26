@@ -287,3 +287,105 @@ fn nothing_is_refreshed_without_an_edit_that_changes_it() {
     ed.toggle_level();
     assert_eq!(ed.project(), &after);
 }
+
+/// Cement at $5 a unit and $10 per use.
+fn cement() -> Resource {
+    Resource {
+        uid: 3,
+        id: 3,
+        name: "Cement".into(),
+        kind: ResourceType::Material,
+        max_units: 1.0,
+        standard_rate: Rate::parse("5"),
+        cost_per_use: Rate::parse("1000"),
+        ..Resource::default()
+    }
+}
+
+#[test]
+fn a_material_is_its_quantity_in_hours_and_priced_per_unit() {
+    let mut ed = Editor::new(Project {
+        start_date: Some(at(5, 8)),
+        tasks: vec![task(1, 5)],
+        resources: vec![cement()],
+        ..Project::default()
+    });
+    ed.assign_resource(1, "Cement").unwrap();
+    let a = &ed.project().assignments[0];
+    // One unit, not five days of it: $5 plus $10 per use.
+    assert_eq!((a.units, a.work_min), (1.0, 60));
+    assert_eq!(text(&a.cost), Some("1500"));
+    ed.assign_resource(1, "Cement[300%]").unwrap();
+    let a = &ed.project().assignments[0];
+    assert_eq!((a.work_min, text(&a.cost)), (180, Some("2500")));
+}
+
+#[test]
+fn a_material_moves_its_tasks_cost_but_not_its_work() {
+    let mut ed = staffed();
+    ed.proj.resources.push(cement());
+    ed.proj.tasks[0].work_min = Some(480);
+    ed.proj.tasks[0].remaining_work_min = Some(480);
+    ed.proj.tasks[0].cost = Rate::parse("2501");
+    ed = Editor::new(ed.proj);
+    ed.set_resources(1, &["Alice".into(), "Cement".into()])
+        .unwrap();
+    let t = &ed.project().tasks[0];
+    assert_eq!((t.work_min, t.remaining_work_min), (Some(480), Some(480)));
+    assert_eq!(text(&t.cost), Some("4001"));
+    ed.set_resources(1, &["Alice".into()]).unwrap();
+    let t = &ed.project().tasks[0];
+    assert_eq!((t.work_min, text(&t.cost)), (Some(480), Some("2501")));
+    // The material resource's own Work is its quantity, as in Project.
+    assert_eq!(ed.project().resources[1].work_min, Some(0));
+}
+
+#[test]
+fn summaries_move_with_their_subtasks() {
+    // The project summary (UID 0) over summary 3 over tasks 1 and 2.
+    let level = |mut t: Task, outline_level: u32, work: i64, cost: &str| {
+        t.outline_level = outline_level;
+        t.work_min = Some(work);
+        t.cost = Rate::parse(cost);
+        t
+    };
+    let mut ed = staffed();
+    ed.proj.tasks = vec![
+        level(task(0, 0), 0, 960, "3002"),
+        level(task(3, 0), 1, 960, "3002"),
+        level(task(1, 1), 2, 480, "1501"),
+        level(task(2, 1), 2, 480, "1501"),
+    ];
+    ed = Editor::new(ed.proj);
+    let totals = |ed: &Editor| -> Vec<(i32, Option<i64>, Option<String>)> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| (t.uid, t.work_min, text(&t.cost).map(String::from)))
+            .collect()
+    };
+    let row = |uid: i32, work: i64, cost: &str| (uid, Some(work), Some(cost.to_string()));
+    ed.set_duration_min(1, 960).unwrap();
+    // Task 1's assignment: work 480 → 960, cost 1 → 90000.
+    let edited = vec![
+        row(0, 1440, "93001"),
+        row(3, 1440, "93001"),
+        row(1, 960, "91500"),
+        row(2, 480, "1501"),
+    ];
+    assert_eq!(totals(&ed), edited);
+    // A second refresh of the same edit changes nothing.
+    ed.reschedule();
+    assert_eq!(totals(&ed), edited);
+    // Deleting task 2 takes its assignment (work 480, cost 1) out of the
+    // summaries above it.
+    ed.delete_task(2).unwrap();
+    assert_eq!(
+        totals(&ed),
+        [
+            row(0, 960, "93000"),
+            row(3, 960, "93000"),
+            row(1, 960, "91500")
+        ]
+    );
+}
