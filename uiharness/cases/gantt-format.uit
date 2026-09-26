@@ -1,0 +1,35 @@
+test gantt chart format bar styles toggle critical and baseline drawing
+  open ../fixtures/gantt-critical.xml
+  assert bar_2 is critical 1-2
+  assert baseline_2 is none
+  key alt o
+  assert ribbon_tab is Gantt Chart Format
+  key c
+  assert bar_2 is on-track 1-2
+  assert border bar:2 solid teal
+  shot gantt
+  key alt o c
+  assert bar_2 is critical 1-2
+  assert border bar:2 solid amber
+  assert dirty is false
+  assert undo_depth is 0
+  key alt p b
+  assert baseline_2 is 1-2
+  assert status is Baseline set — baseline bars now show under the current bars
+  assert undo_depth is 1
+  key alt o b
+  assert baseline_2 is none
+  assert bar_2 is critical 1-2
+  assert undo_depth is 1
+  key alt p b
+  assert status is Baseline set — baseline bars are hidden (Gantt Chart Format › Baseline)
+  assert baseline_2 is none
+  assert undo_depth is 2
+  key alt o b
+  assert baseline_2 is 1-2
+  assert undo_depth is 2
+  call ribbon-click {"tab":"Gantt Chart Format","command":"Critical Tasks"}
+  assert bar_2 is on-track 1-2
+  assert ribbon_tab is Gantt Chart Format
+  assert undo_depth is 2
+  shot window

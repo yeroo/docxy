@@ -228,6 +228,9 @@ enum RibbonTab {
     View,
     /// Contextual Table Tools tab — only reachable while the caret is in a table.
     Table,
+    /// Project's contextual Gantt Chart Format tab — only reachable while a
+    /// Project document's Gantt pane is showing.
+    GanttFormat,
 }
 
 #[derive(Clone, Copy)]
@@ -4324,6 +4327,20 @@ impl Docxy {
     fn select_ribbon_tab(&mut self, tab: RibbonTab, window: &mut Window, cx: &mut Context<Self>) {
         self.ribbon_tab = tab;
         self.refocus(window, cx);
+    }
+
+    /// The definition of the selected ribbon tab, contextual tabs included.
+    fn active_ribbon_tab_def(&self) -> rs::Tab<Act> {
+        match self.ribbon_tab {
+            RibbonTab::Table => table_tab(),
+            RibbonTab::GanttFormat => gantt_format_tab(),
+            tab => {
+                let kind = self.ribbon_kind();
+                ribbon_for(kind)
+                    .tabs
+                    .swap_remove(ribbon_tab_index(tab, kind))
+            }
+        }
     }
 
     fn backstage_rail_action(
@@ -13621,9 +13638,10 @@ fn ribbon_tab_set(kind: Kind) -> &'static [(Option<RibbonTab>, &'static str, &'s
         ]
     }
 }
-fn valid_ribbon_tab(kind: Kind, tab: RibbonTab, in_table: bool) -> RibbonTab {
+fn valid_ribbon_tab(kind: Kind, tab: RibbonTab, in_table: bool, in_gantt: bool) -> RibbonTab {
     if ribbon_tab_set(kind).iter().any(|(t, _, _)| *t == Some(tab))
         || (kind == Kind::Docx && tab == RibbonTab::Table && in_table)
+        || (kind == Kind::Project && tab == RibbonTab::GanttFormat && in_gantt)
     {
         tab
     } else if kind == Kind::Project {
@@ -13646,6 +13664,7 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
         RibbonTab::Review => "Review",
         RibbonTab::View => "View",
         RibbonTab::Table => "Table",
+        RibbonTab::GanttFormat => "Gantt Chart Format",
         RibbonTab::Task => "Task",
         RibbonTab::Resource => "Resource",
         RibbonTab::Report => "Report",
@@ -14961,6 +14980,34 @@ impl Docxy {
                     })),
             );
         }
+        // Contextual Gantt Chart Format tab — while a Project's Gantt pane shows.
+        if self.project_gantt_showing() {
+            let active = !self.backstage && self.ribbon_tab == RibbonTab::GanttFormat;
+            let accent = hsla_u(0xC0_5B_2E); // the same contextual accent as Table
+            let show_kt = self.keytips == KeyTip::Tabs;
+            strip = strip.child(
+                div()
+                    .id(("rtab", 98usize))
+                    .relative()
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .rounded_t_sm()
+                    .text_size(px(12.))
+                    .text_color(accent)
+                    .hover(|d| d.bg(Hsla { a: 0.10, ..accent }))
+                    .when(active, |d| {
+                        d.border_b_2()
+                            .border_color(accent)
+                            .font_weight(FontWeight::BOLD)
+                    })
+                    .child(ribbon_tab_name(RibbonTab::GanttFormat))
+                    .when(show_kt, |d| d.child(keytip_badge("O")))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.select_ribbon_tab(RibbonTab::GanttFormat, window, cx);
+                    })),
+            );
+        }
         // right side: the ribbon collapse/expand chevron
         strip = strip.child(div().flex_1());
         strip = strip.child(
@@ -15150,20 +15197,16 @@ impl Docxy {
                 } else if c.eq_ignore_ascii_case("T") && self.caret_table().is_some() {
                     self.select_ribbon_tab(RibbonTab::Table, window, cx);
                     self.keytips = KeyTip::Commands;
+                } else if c.eq_ignore_ascii_case("O") && self.project_gantt_showing() {
+                    self.select_ribbon_tab(RibbonTab::GanttFormat, window, cx);
+                    self.keytips = KeyTip::Commands;
                 } else {
                     self.keytips = KeyTip::Off;
                 }
                 cx.notify();
             }
             KeyTip::Commands => {
-                let ribbon = ribbon_for(self.ribbon_kind());
-                let table = table_tab();
-                let tab = if self.ribbon_tab == RibbonTab::Table {
-                    &table
-                } else {
-                    &ribbon.tabs[ribbon_tab_index(self.ribbon_tab, self.ribbon_kind())]
-                };
-                let act = tab_keytip_cmd(tab, c);
+                let act = tab_keytip_cmd(&self.active_ribbon_tab_def(), c);
                 self.keytips = KeyTip::Off;
                 if let Some(a) = act {
                     self.dispatch(a, window, cx);
@@ -15301,13 +15344,7 @@ impl Docxy {
     /// are dropped first, then the lowest-`priority` groups collapse into an
     /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
     fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let ribbon = ribbon_for(self.ribbon_kind());
-        let ctx_tab = table_tab();
-        let tab = if self.ribbon_tab == RibbonTab::Table {
-            &ctx_tab
-        } else {
-            &ribbon.tabs[ribbon_tab_index(self.ribbon_tab, self.ribbon_kind())]
-        };
+        let tab = &self.active_ribbon_tab_def();
         let avail = (width - 28.0).max(120.0);
 
         // 1) drop control labels if the full layout overflows.
@@ -17928,11 +17965,13 @@ impl Render for Docxy {
             self.tabs.get(self.active).map(|t| &t.surface),
             Some(Surface::Doc(_))
         );
-        // The contextual Table tab is only valid while the caret is in a table.
+        // The contextual tabs are only valid in their context: Table while the
+        // caret is in a table, Gantt Chart Format while a Project Gantt shows.
         self.ribbon_tab = valid_ribbon_tab(
             self.ribbon_kind(),
             self.ribbon_tab,
             self.caret_table().is_some(),
+            self.project_gantt_showing(),
         );
         let vw = f32::from(window.viewport_size().width);
         let ribbon_tabs = self.ribbon_tabs(fg, dim, panel, cx);

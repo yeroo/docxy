@@ -116,6 +116,21 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
     })
 }
 
+/// `bar` as drawn under Gantt Chart Format › Bar Styles: with Critical Tasks
+/// off a critical bar takes the normal bar colour, and with Baseline off no
+/// baseline is drawn. Summaries, milestones and the leveling delay are kept.
+pub(crate) fn styled_bar(bar: GanttBar, show_critical: bool, show_baseline: bool) -> GanttBar {
+    GanttBar {
+        kind: if bar.kind == BarKind::Critical && !show_critical {
+            BarKind::OnTrack
+        } else {
+            bar.kind
+        },
+        baseline: bar.baseline.filter(|_| show_baseline),
+        ..bar
+    }
+}
+
 pub(crate) fn table_pane_width(width: f32) -> f32 {
     (width * 0.5).clamp(320., TABLE_W).min(width.max(0.))
 }

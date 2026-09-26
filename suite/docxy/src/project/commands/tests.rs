@@ -127,8 +127,10 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
         r.tabs.iter().map(|t| t.name).collect::<Vec<_>>(),
         ["Task", "Resource", "Report", "Project", "View"]
     );
+    // The contextual Gantt Chart Format tab holds the rest of the inventory.
+    let fmt = gantt_format_tab();
     let mut acts = vec![];
-    for t in &r.tabs {
+    for t in r.tabs.iter().chain([&fmt]) {
         let mut keys = vec![];
         for g in &t.groups {
             for control in &g.items {
@@ -198,17 +200,24 @@ fn ribbon_context_survives_valid_switches_only() {
             .collect::<Vec<_>>(),
         ["F", "T", "U", "R", "P", "W"]
     );
-    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false) == RibbonTab::View);
-    assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false) == RibbonTab::Home);
-    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, true) == RibbonTab::Table);
-    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, false) == RibbonTab::Home);
-    assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Table, true) == RibbonTab::Task);
+    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::View, false, false) == RibbonTab::View);
+    assert!(valid_ribbon_tab(Kind::Xlsx, RibbonTab::Task, false, false) == RibbonTab::Home);
+    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, true, false) == RibbonTab::Table);
+    assert!(valid_ribbon_tab(Kind::Docx, RibbonTab::Table, false, false) == RibbonTab::Home);
+    assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Table, true, true) == RibbonTab::Task);
     for tab in [RibbonTab::Resource, RibbonTab::Report, RibbonTab::Project] {
-        assert!(valid_ribbon_tab(Kind::Project, tab, false) == tab);
-        assert!(valid_ribbon_tab(Kind::Docx, tab, false) == RibbonTab::Home);
-        assert!(valid_ribbon_tab(Kind::Xlsx, tab, false) == RibbonTab::Home);
+        assert!(valid_ribbon_tab(Kind::Project, tab, false, false) == tab);
+        assert!(valid_ribbon_tab(Kind::Docx, tab, false, false) == RibbonTab::Home);
+        assert!(valid_ribbon_tab(Kind::Xlsx, tab, false, false) == RibbonTab::Home);
     }
-    assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Home, false) == RibbonTab::Task);
+    assert!(valid_ribbon_tab(Kind::Project, RibbonTab::Home, false, false) == RibbonTab::Task);
+    // The contextual Gantt Chart Format tab: only a Project with its Gantt showing.
+    let fmt = RibbonTab::GanttFormat;
+    assert!(valid_ribbon_tab(Kind::Project, fmt, false, true) == fmt);
+    assert!(valid_ribbon_tab(Kind::Project, fmt, false, false) == RibbonTab::Task);
+    assert!(valid_ribbon_tab(Kind::Docx, fmt, false, true) == RibbonTab::Home);
+    assert!(valid_ribbon_tab(Kind::Xlsx, fmt, false, true) == RibbonTab::Home);
+    assert_eq!(ribbon_tab_name(fmt), "Gantt Chart Format");
     assert_eq!(ribbon_tab_index(RibbonTab::View, Kind::Project), 4);
     assert_eq!(ribbon_tab_index(RibbonTab::Project, Kind::Project), 3);
     assert_eq!(ribbon_tab_name(RibbonTab::Project), "Project");
@@ -222,8 +231,10 @@ fn ribbon_context_survives_valid_switches_only() {
 fn project_instruction_paths_exist() {
     use ProjectAct::*;
     let r = project_ribbon();
+    let fmt = gantt_format_tab();
+    let tabs: Vec<_> = r.tabs.iter().chain([&fmt]).collect();
     let mut paths = vec![];
-    for t in &r.tabs {
+    for t in &tabs {
         for g in &t.groups {
             for control in &g.items {
                 let cmds: Vec<_> = match control {
@@ -258,6 +269,13 @@ fn project_instruction_paths_exist() {
         ("Project", "Schedule", "Set Baseline", Baseline),
         ("Project", "Schedule", "Clear Baseline", ClearBaseline),
         ("View", "Split View", "Timeline", Timeline),
+        (
+            "Gantt Chart Format",
+            "Bar Styles",
+            "Critical Tasks",
+            CriticalTasks,
+        ),
+        ("Gantt Chart Format", "Bar Styles", "Baseline", BaselineBars),
     ] {
         let path = format!("{tab} > {group} > {label}");
         let Some((_, _, _, found, key)) = paths
@@ -267,7 +285,7 @@ fn project_instruction_paths_exist() {
             panic!("missing ribbon path {path}");
         };
         assert!(matches!(found, Act::Project(a) if *a == act), "{path}");
-        let t = r.tabs.iter().find(|t| t.name == tab).unwrap();
+        let t = tabs.iter().find(|t| t.name == tab).unwrap();
         assert!(
             matches!(tab_keytip_cmd(t, key), Some(Act::Project(a)) if a == act),
             "{path} KeyTip {key}"
@@ -296,6 +314,76 @@ fn large_and_small_buttons_show_the_same_tooltip() {
     );
     let bare = cmdt("x", "find", "Bare", Act::Project(ProjectAct::Find), "");
     assert_eq!(cmd_tip_text(&bare).as_ref(), "Bare");
+}
+
+#[test]
+fn bar_style_toggles_change_the_drawn_bars_as_view_state_only() {
+    use ctlcore::json::Json;
+    let mut t = tab();
+    // On a clean plan the toggles dirty nothing and add no undo step.
+    for act in [ProjectAct::CriticalTasks, ProjectAct::BaselineBars].repeat(2) {
+        apply_project_act(&mut t, act);
+        assert!(!t.dirty && !v(&t).ed.dirty(), "{act:?}");
+        assert_eq!(v(&t).ed.undo_depth(), 0, "{act:?}");
+    }
+    // The longer of two parallel tasks is critical; baseline the plan so
+    // there is a baseline bar to hide.
+    apply_project_act(&mut t, ProjectAct::Baseline);
+    let get = |t: &DocTab, key: &str| {
+        project_state(v(t), None)
+            .into_iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, j)| j)
+            .unwrap()
+    };
+    let (bar, baseline) = (get(&t, "bar_2"), get(&t, "baseline_2"));
+    let Json::Str(bar) = bar else { panic!() };
+    assert!(bar.starts_with("critical "), "{bar}");
+    let span = bar.trim_start_matches("critical ").to_string();
+    assert_eq!(baseline, Json::Str(span.clone()));
+    let before = (
+        t.dirty,
+        v(&t).ed.undo_depth(),
+        v(&t).ed.sel(),
+        v(&t).ed.project().clone(),
+    );
+    apply_project_act(&mut t, ProjectAct::CriticalTasks);
+    assert!(!v(&t).show_critical);
+    assert_eq!(get(&t, "bar_2"), Json::Str(format!("on-track {span}")));
+    apply_project_act(&mut t, ProjectAct::BaselineBars);
+    assert!(!v(&t).show_baseline);
+    assert_eq!(get(&t, "baseline_2"), Json::Str("none".into()));
+    for act in [ProjectAct::CriticalTasks, ProjectAct::BaselineBars] {
+        apply_project_act(&mut t, act);
+    }
+    assert_eq!(get(&t, "bar_2"), Json::Str(format!("critical {span}")));
+    assert_eq!(get(&t, "baseline_2"), Json::Str(span));
+    assert_eq!(take_reveal(&t), None);
+    assert_eq!(
+        before,
+        (
+            t.dirty,
+            v(&t).ed.undo_depth(),
+            v(&t).ed.sel(),
+            v(&t).ed.project().clone(),
+        )
+    );
+}
+
+#[test]
+fn set_baseline_status_says_whether_baseline_bars_show() {
+    let mut t = tab();
+    apply_project_act(&mut t, ProjectAct::Baseline);
+    assert_eq!(
+        t.status.as_ref(),
+        "Baseline set — baseline bars now show under the current bars"
+    );
+    apply_project_act(&mut t, ProjectAct::BaselineBars);
+    apply_project_act(&mut t, ProjectAct::Baseline);
+    assert_eq!(
+        t.status.as_ref(),
+        "Baseline set — baseline bars are hidden (Gantt Chart Format › Baseline)"
+    );
 }
 
 #[test]
@@ -329,18 +417,25 @@ fn timeline_toggles_the_pane_as_view_state_only() {
 }
 
 #[test]
-fn project_act_active_checks_level_all_timeline_and_the_task_mode_only() {
+fn project_act_active_checks_level_all_timeline_bar_styles_and_the_task_mode_only() {
     use ProjectAct::*;
     let mut t = tab();
     assert!(!project_act_active(v(&t), LevelAll));
     apply_project_act(&mut t, LevelAll);
     assert!(project_act_active(v(&t), LevelAll));
     assert!(project_act_active(v(&t), AutoSchedule));
-    for act in ProjectAct::RIBBON
-        .iter()
-        .copied()
-        .filter(|a| !matches!(a, LevelAll | Timeline | AutoSchedule))
-    {
+    for act in ProjectAct::RIBBON.iter().copied().filter(|a| {
+        !matches!(
+            a,
+            LevelAll | Timeline | AutoSchedule | CriticalTasks | BaselineBars
+        )
+    }) {
+        assert!(!project_act_active(v(&t), act), "{act:?}");
+    }
+    // The Gantt Chart Format toggles start on (today's drawing) and flip.
+    for act in [CriticalTasks, BaselineBars] {
+        assert!(project_act_active(v(&t), act), "{act:?}");
+        apply_project_act(&mut t, act);
         assert!(!project_act_active(v(&t), act), "{act:?}");
     }
 }

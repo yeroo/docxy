@@ -31,6 +31,10 @@ pub(crate) enum ProjectAct {
     Find,
     ScrollToTask,
     Timeline,
+    /// Gantt Chart Format › Bar Styles › Critical Tasks.
+    CriticalTasks,
+    /// Gantt Chart Format › Bar Styles › Baseline.
+    BaselineBars,
     // Keyboard/QAT/backstage/status bar only; excluded from the ribbon inventory.
     Level,
     /// The status bar's `New Tasks: …` item: the plan's mode for new tasks.
@@ -71,6 +75,8 @@ impl ProjectAct {
         Self::Find,
         Self::ScrollToTask,
         Self::Timeline,
+        Self::CriticalTasks,
+        Self::BaselineBars,
     ];
 }
 
@@ -385,11 +391,48 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
     ])
 }
 
+/// Project's contextual Gantt Chart Format tab, shown after View while a
+/// Project document's Gantt pane is showing (see `RibbonTab::GanttFormat`).
+pub(crate) fn gantt_format_tab() -> rs::Tab<Act> {
+    use ProjectAct::*;
+    let cmd = |id, icon, label, act, shortcut, key| {
+        cmdt(id, icon, label, Act::Project(act), shortcut).key(key)
+    };
+    rs::tab(
+        "Gantt Chart Format",
+        "O",
+        vec![rs::group(
+            "Bar Styles",
+            90,
+            vec![rs::column(vec![
+                cmd(
+                    "pr-fmt-critical",
+                    "highlight",
+                    "Critical Tasks",
+                    CriticalTasks,
+                    "Alt, O, C",
+                    "C",
+                ),
+                cmd(
+                    "pr-fmt-baseline",
+                    "rule",
+                    "Baseline",
+                    BaselineBars,
+                    "Alt, O, B",
+                    "B",
+                ),
+            ])],
+        )],
+    )
+}
+
 /// A Project command's checked state on the ribbon.
 pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
     match act {
         ProjectAct::LevelAll => v.ed.leveled(),
         ProjectAct::Timeline => v.timeline,
+        ProjectAct::CriticalTasks => v.show_critical,
+        ProjectAct::BaselineBars => v.show_baseline,
         // The selected task's mode, as Project highlights it; none on the
         // entry row or a blank row.
         ProjectAct::ManuallySchedule | ProjectAct::AutoSchedule => v
@@ -776,8 +819,14 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Baseline => {
                 if !v.ed.project().tasks.is_empty() {
                     v.ed.set_baseline();
-                    status =
-                        Some("Baseline set — baseline bars now show under the current bars".into());
+                    status = Some(
+                        if v.show_baseline {
+                            "Baseline set — baseline bars now show under the current bars"
+                        } else {
+                            "Baseline set — baseline bars are hidden (Gantt Chart Format › Baseline)"
+                        }
+                        .into(),
+                    );
                 }
             }
             ClearBaseline => {
@@ -839,6 +888,8 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             GoToStart => v.gantt_x.set(0.),
             ScrollToTask => v.scroll_to_task(),
             Timeline => v.timeline = !v.timeline,
+            CriticalTasks => v.show_critical = !v.show_critical,
+            BaselineBars => v.show_baseline = !v.show_baseline,
             Save | ExportGantt => {} // window-dependent host actions
         }
         Ok(())
@@ -939,6 +990,13 @@ impl Docxy {
             .get(self.active)
             .map(|t| t.kind)
             .unwrap_or(Kind::Docx)
+    }
+    /// Whether the active tab shows a Project Gantt pane, the context of the
+    /// Gantt Chart Format tab. A Project that failed to load has no Gantt.
+    pub(crate) fn project_gantt_showing(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .is_some_and(|t| t.kind == Kind::Project && matches!(t.surface, Surface::Project(_)))
     }
     pub(crate) fn project_prompt_open(&self) -> bool {
         self.tabs
