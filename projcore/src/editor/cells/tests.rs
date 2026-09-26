@@ -1571,6 +1571,21 @@ fn contoured_work_stretches_with_the_duration() {
 }
 
 #[test]
+fn a_contoured_assignment_gets_work_back_after_a_milestone_round_trip() {
+    let mut ed = editor();
+    ed.proj.assignments = vec![Assignment {
+        work_contour: Some(3),
+        ..imported(1, 10, -65535, 1.0, 240)
+    }];
+    ed = Editor::new(ed.proj);
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(work(&ed, 1), (0, None));
+    // Zero work gives nothing to stretch: it restarts at duration x units.
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(work(&ed, 1), (480, None));
+}
+
+#[test]
 fn milestone_toggles_rescale_work_and_undo_restores_it_with_the_duration() {
     let mut ed = editor();
     ed.set_resources(10, &["Alice[50%]".into()]).unwrap();
