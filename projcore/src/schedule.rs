@@ -1611,17 +1611,16 @@ fn place_all(
 
 impl Scheduler<'_> {
     /// A milestone that leveling leaves on its CPM working index, recomputed
-    /// only because a predecessor's instant moved (#104). It keeps its CPM
-    /// instant unless an FS link placed it there in CPM; then it follows
-    /// that predecessor's leveled instant on the same index. Constraints
-    /// hold it as the CPM pass does: an honored MSO/MFO keeps the CPM
-    /// instant, and an honored FNLT/SNLT caps it.
+    /// only because a predecessor's instant moved (#104). As in the CPM
+    /// pass, it takes the latest leveled FS instant on that index, never
+    /// earlier than its CPM instant; a non-FS link at an unchanged index
+    /// cannot move it. An honored MSO/MFO keeps the CPM instant, and an
+    /// honored FNLT/SNLT caps it, as the CPM pass does.
     fn releveled_milestone(
         &self,
         t: &Task,
         tl: &Timeline,
         cpm: &TaskResult,
-        base: &Schedule,
         finish: &HashMap<i32, DateTime>,
         linked: bool,
     ) -> i64 {
@@ -1637,16 +1636,12 @@ impl Scheduler<'_> {
             .iter()
             .filter(|p| p.link == LinkType::FinishStart)
         {
-            let (Some(was), Some(&now)) = (base.get(p.uid), finish.get(&p.uid)) else {
+            let Some(&now) = finish.get(&p.uid) else {
                 continue;
             };
-            let offset = self.offset(p);
-            let instant = |f: DateTime| {
-                let (f, lag) = offset.forward(f.minutes());
-                fs_milestone_instant(tl, f, lag)
-            };
-            let (was, now) = (instant(was.early_finish), instant(now));
-            if was == cpm_start && tl.to_index(now) == placed {
+            let (now, lag) = self.offset(p).forward(now.minutes());
+            let now = fs_milestone_instant(tl, now, lag);
+            if tl.to_index(now) == placed {
                 s_abs = s_abs.max(now);
             }
         }
@@ -1796,7 +1791,7 @@ impl Scheduler<'_> {
                 let mut s_abs = tl.abs_start(placed);
                 if t.duration_min == 0 && placed == cpm_start_idx {
                     let linked = t.predecessors.iter().any(|p| start.contains_key(&p.uid));
-                    s_abs = self.releveled_milestone(t, tl, cpm, &base, &finish, linked);
+                    s_abs = self.releveled_milestone(t, tl, cpm, &finish, linked);
                 } else if t.duration_min == 0 {
                     let mut fs_instant: Option<i64> = None;
                     let mut start_bound = cpm.early_start.minutes();
@@ -5372,6 +5367,20 @@ mod tests {
         let k4 = milestone(13, "K4", vec![Predecessor::fs(5)], mfo, at(6, 17));
         let f1 = milestone(14, "F1", vec![Predecessor::fs(5)], fnlt, at(13, 17));
         let f2 = milestone(15, "F2", vec![Predecessor::fs(5)], fnlt, at(6, 17));
+        // Two FS links: Q never moves and places Z at Sat 7 12:00 (19
+        // elapsed hours after Fri 6 17:00) in CPM, but G's leveled instant
+        // on the same index is later, so Z and Z2 (FNLT Fri 13) follow G,
+        // and Z3, on Q alone, stays.
+        let mut q = task(16, "Q", 480);
+        q.constraint = ConstraintType::StartNoEarlierThan;
+        q.constraint_date = Some(at(6, 8));
+        let eh19 = lag_link(16, LinkType::FinishStart, 19 * 60, 6);
+        let z_preds = vec![Predecessor::fs(5), eh19];
+        let mut z = task(17, "Z", 0);
+        z.predecessors = z_preds.clone();
+        let z2 = milestone(18, "Z2", z_preds, fnlt, at(13, 17));
+        let mut z3 = task(19, "Z3", 0);
+        z3.predecessors = vec![eh19];
         let mut proj = Project {
             start_date: Some(at(2, 8)),
             tasks: vec![
@@ -5390,6 +5399,10 @@ mod tests {
                 k4,
                 f1,
                 f2,
+                q,
+                z,
+                z2,
+                z3,
             ],
             ..Project::default()
         };
@@ -5411,5 +5424,9 @@ mod tests {
         }
         assert_eq!(dates(14), (at(7, 17), at(7, 17)), "F1");
         assert_eq!(dates(15), (at(6, 17), at(6, 17)), "F2");
+        assert_eq!(dates(16), (at(6, 8), at(6, 17)), "Q");
+        assert_eq!(dates(17), (at(7, 17), at(7, 17)), "Z");
+        assert_eq!(dates(18), (at(7, 17), at(7, 17)), "Z2");
+        assert_eq!(dates(19), (at(7, 12), at(7, 12)), "Z3");
     }
 }
