@@ -1507,7 +1507,7 @@ pub fn dispatch(
                 };
                 // The row just below the last task is the entry row.
                 let count = v.ed.project().tasks.len();
-                if cell.0 as usize > count || cell.1 >= 7 {
+                if cell.0 as usize > count || cell.1 as usize >= crate::COLUMN_COUNT {
                     return Err("Project cell is outside the entry table".into());
                 }
                 if (cell.0 as usize) < count {

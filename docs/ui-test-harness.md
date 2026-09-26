@@ -322,7 +322,7 @@ one while leveling is on.
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns;
 Up/Down/Home/End move between rows; Down from the last task, or a click below
-it, goes to the entry row, where typing appends a task (`click B<tasks+1>`
+it, goes to the entry row, where typing appends a task (`click C<tasks+1>`
 addresses it). Tab/Shift+Tab move between columns.
 Insert/Delete add/delete tasks (Delete on a summary asks first: Enter deletes it
 with its subtasks, Esc cancels, and typed text is ignored while that prompt is
@@ -357,7 +357,7 @@ cancels the prompt. The `project-cells`, `project-invalid`, `project-ribbon`, an
 `ribbon-kinds` cases exercise these routes, including Word/Sheet strip switching.
 
 `assert cell is Duration` checks the Project column state, while
-`assert cell C2 is 3d` reads the value displayed at that entry-table cell.
+`assert cell D2 is 3d` reads the value displayed at that entry-table cell.
 Project A1 references use row positions and columns A through H (ID, Task
 Mode, Name, Duration, Start, Finish, Predecessors, Resource Names), rather than
 task IDs.

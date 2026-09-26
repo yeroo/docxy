@@ -27,3 +27,5 @@ test project task mode switches from the cell and the ribbon
   key alt t a
   assert cell B3 is Auto Scheduled
   assert undo_depth is 2
+  click H2
+  assert cell is Resource Names

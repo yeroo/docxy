@@ -225,7 +225,7 @@ fn a_split_drag_does_not_reveal_the_selected_column() {
     // Scroll the Name column (178..418) out of view, then drag the split.
     v.table_x.set(TABLE_W - v.table_w);
     v.set_split(700.);
-    // Only clamped to the wider pane's range, not brought back to 48.
+    // Only clamped to the wider pane's range, not brought back to 178.
     assert_eq!(v.table_x.get(), TABLE_W - 700.);
     v.layout(1180.);
     assert_eq!(v.table_x.get(), TABLE_W - 700.);

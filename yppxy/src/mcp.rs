@@ -108,7 +108,8 @@ fn tool_defs() -> Json {
         tool(
             "yppxy_tasks",
             "List every task of the live schedule (including unsaved edits): uid, name, outline \
-             level, manual (true = Manually Scheduled), duration, scheduled start/finish, critical              flag, slack, and predecessors.",
+             level, manual (true = Manually Scheduled), duration, scheduled start/finish, critical \
+             flag, slack, and predecessors.",
             vec![target(), tab()],
             &[],
         ),
@@ -121,7 +122,9 @@ fn tool_defs() -> Json {
         tool(
             "yppxy_set",
             "Edit a task: rename, change duration (\"3d\", \"4h\", \"2w\"; \"0d\" = milestone), \
-             change outline level (1..20), or switch between Manually and Auto Scheduled              (\"manual\": true pins the task at its current dates; false lets the scheduler              place it). One undo step; the plan reschedules.",
+             change outline level (1..20), or switch between Manually and Auto Scheduled \
+             (\"manual\": true pins the task at its current dates; false lets the scheduler \
+             place it). One undo step; the plan reschedules.",
             vec![
                 uid(),
                 ("name", prop("string", "New task name.")),
@@ -365,6 +368,14 @@ mod tests {
                 Some("object")
             );
         }
+    }
+
+    #[test]
+    fn descriptions_carry_no_source_indentation() {
+        // A string broken across lines without a trailing `\` keeps the next
+        // line's indentation, which tools/list would send as it is.
+        let defs = tool_defs().to_string();
+        assert!(!defs.contains("  "), "{defs}");
     }
 
     #[test]
