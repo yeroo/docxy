@@ -6,8 +6,9 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Assignment, Baseline, ConstraintType, LagFormat, LagKind, LagUnit, LinkType, Predecessor,
-    Project, Resource, ResourceType, Task, TaskType, TimephasedValue,
+    Assignment, AssignmentBaseline, Baseline, ConstraintType, LagFormat, LagKind, LagUnit,
+    LinkType, Predecessor, Project, Resource, ResourceBaseline, ResourceType, Task, TaskType,
+    TimephasedValue,
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
@@ -899,6 +900,10 @@ impl Editor {
         Ok(AssignOutcome::Assigned)
     }
 
+    /// Project › Schedule › Set Baseline: record the plan as it is scheduled
+    /// now in the Baseline (slot 0) of every scheduled task, and of the
+    /// assignments and resources (see `baseline_assignments`), as one undo
+    /// step. Baseline1..10 stay.
     pub fn set_baseline(&mut self) {
         self.snapshot();
         let baselines: Vec<_> = self
@@ -927,7 +932,90 @@ impl Editor {
         for (i, baseline) in baselines {
             self.proj.tasks[i].set_baseline_slot(baseline);
         }
+        self.baseline_assignments();
         self.changed();
+    }
+
+    /// Set Baseline's part for assignments and resources, as Project writes
+    /// it: each assignment on a scheduled task records its span as the
+    /// schedule now places it and its stored work and cost (the cost priced
+    /// when it has none), and each resource with assignments records its
+    /// stored work and cost (else their sums), without earned value. Their
+    /// timephased Baseline records described the old plan and go, as Clear
+    /// Baseline drops them; none is synthesised. Baseline1..10 stay.
+    fn baseline_assignments(&mut self) {
+        let proj = &self.proj;
+        let mut costs: std::collections::HashMap<i32, Option<f64>> = Default::default();
+        let recorded: Vec<(usize, AssignmentBaseline)> = proj
+            .assignments
+            .iter()
+            .enumerate()
+            .filter_map(|(k, a)| {
+                let span = crate::assign::assignment_span(proj, &self.sched, a)?;
+                let cost = a
+                    .cost
+                    .clone()
+                    .or_else(|| crate::assign::assignment_cost(proj, a, span));
+                Some((
+                    k,
+                    AssignmentBaseline {
+                        number: 0,
+                        start: Some(span.0),
+                        finish: Some(span.1),
+                        work_min: Some(a.work_min),
+                        cost,
+                    },
+                ))
+            })
+            .collect();
+        for (k, b) in &recorded {
+            let cost = b.cost.as_ref().map(|c| crate::assign::value(Some(c)));
+            let total = costs
+                .entry(proj.assignments[*k].resource_uid)
+                .or_insert(Some(0.0));
+            *total = total.zip(cost).map(|(t, c)| t + c);
+        }
+        let resources: Vec<(usize, ResourceBaseline)> = proj
+            .resources
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| proj.assignments.iter().any(|a| a.resource_uid == r.uid))
+            .map(|(j, r)| {
+                let work: i64 = proj
+                    .assignments
+                    .iter()
+                    .filter(|a| a.resource_uid == r.uid)
+                    .map(|a| a.work_min)
+                    .sum();
+                let cost = r.cost.clone().or_else(|| {
+                    costs
+                        .get(&r.uid)
+                        .copied()
+                        .flatten()
+                        .and_then(crate::assign::money)
+                });
+                (
+                    j,
+                    ResourceBaseline {
+                        number: 0,
+                        work_min: Some(r.work_min.unwrap_or(work)),
+                        cost,
+                        bcws: None,
+                        bcwp: None,
+                    },
+                )
+            })
+            .collect();
+        for (k, baseline) in recorded {
+            let a = &mut self.proj.assignments[k];
+            a.set_baseline_slot(baseline);
+            a.timephased_data.retain(|t| !t.is_baseline_slot_zero());
+        }
+        for (j, baseline) in resources {
+            let r = &mut self.proj.resources[j];
+            r.set_baseline_slot(baseline);
+            r.timephased_data.retain(|t| !t.is_baseline_slot_zero());
+        }
     }
 
     /// Project › Schedule › Clear Baseline: remove the Baseline (slot 0) from
@@ -1333,6 +1421,117 @@ mod tests {
             ed.project().tasks[1].baseline(0).unwrap().duration_min,
             Some(960)
         );
+    }
+
+    #[test]
+    fn set_baseline_captures_assignments_and_resources() {
+        use crate::model::{AssignmentBaseline, Rate, ResourceBaseline};
+        let rate = |text: &str| Rate::parse(text);
+        let record = |kind| TimephasedValue {
+            kind,
+            value: Some("PT8H0M0S".into()),
+            ..TimephasedValue::default()
+        };
+        let resource = |uid, cost: Option<Rate>| Resource {
+            uid,
+            id: uid,
+            name: format!("R{uid}"),
+            max_units: 1.0,
+            standard_rate: rate("50"),
+            work_min: Some(7),
+            cost,
+            ..Resource::default()
+        };
+        let mut proj = editor().project().clone();
+        // R1 stores its totals; R2 stores none, so its cost is the sum.
+        proj.resources = vec![resource(1, rate("7")), resource(2, None)];
+        proj.resources[1].work_min = None;
+        let old_slot = ResourceBaseline {
+            number: 1,
+            work_min: Some(1),
+            ..ResourceBaseline::default()
+        };
+        for r in &mut proj.resources {
+            r.set_baseline_slot(old_slot.clone());
+            r.set_baseline_slot(ResourceBaseline {
+                number: 0,
+                bcws: rate("5"),
+                bcwp: rate("5"),
+                ..ResourceBaseline::default()
+            });
+            r.timephased_data = vec![record(7), record(8), record(20)];
+        }
+        let assignment = |uid, task_uid, resource_uid, cost: Option<Rate>| Assignment {
+            uid,
+            task_uid,
+            resource_uid,
+            units: 1.0,
+            work_min: 480,
+            // Stored dates the schedule would not give it.
+            start: Some(DateTime::from_ymd_hm(2026, 1, 1, 8, 0)),
+            finish: Some(DateTime::from_ymd_hm(2026, 1, 1, 9, 0)),
+            cost,
+            baselines: vec![AssignmentBaseline {
+                number: 1,
+                work_min: Some(1),
+                ..AssignmentBaseline::default()
+            }],
+            timephased_data: vec![record(1), record(4), record(5), record(16)],
+            ..Assignment::default()
+        };
+        proj.assignments = vec![
+            assignment(1, 1, 1, rate("1234")),
+            assignment(2, 2, 2, None),
+            assignment(3, 1, 2, rate("100")),
+        ];
+        let mut ed = Editor::new(proj);
+        let before = ed.project().clone();
+        ed.set_baseline();
+        let p = ed.project();
+        let monday = DateTime::from_ymd_hm(2026, 1, 5, 8, 0);
+        // The span as scheduled now (both tasks start Monday), the stored
+        // cost, else the priced one.
+        for (a, cost) in p.assignments.iter().zip(["1234", "40000", "100"]) {
+            let b = a.baseline(0).unwrap();
+            assert_eq!(b.start, Some(monday), "{}", a.uid);
+            assert_eq!(b.finish, Some(monday.add_minutes(9 * 60)), "{}", a.uid);
+            assert_eq!(b.work_min, Some(480));
+            assert_eq!(b.cost.as_ref().map(Rate::as_str), Some(cost), "{}", a.uid);
+            assert_eq!(a.baseline(1).unwrap().work_min, Some(1));
+            let kinds: Vec<u8> = a.timephased_data.iter().map(|t| t.kind).collect();
+            assert_eq!(kinds, [1, 16]);
+        }
+        // Stored totals, else the sums; no earned value.
+        let recorded: Vec<_> = p
+            .resources
+            .iter()
+            .map(|r| {
+                let b = r.baseline(0).unwrap();
+                (
+                    b.work_min,
+                    b.cost.as_ref().map(Rate::as_str),
+                    b.bcws.clone(),
+                    b.bcwp.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            recorded,
+            [
+                (Some(7), Some("7"), None, None),
+                (Some(960), Some("40100"), None, None)
+            ]
+        );
+        for r in &p.resources {
+            assert_eq!(r.baseline(1), Some(&old_slot));
+            let kinds: Vec<u8> = r.timephased_data.iter().map(|t| t.kind).collect();
+            assert_eq!(kinds, [20]);
+        }
+        // Setting a baseline changes no current value, and is one undo step.
+        assert_eq!(p.assignments[1].cost, None);
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
     }
 
     #[test]
