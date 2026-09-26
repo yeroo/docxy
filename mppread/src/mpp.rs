@@ -74,7 +74,11 @@ pub struct MppTask {
 pub struct MppPred {
     pub pred_uid: u32,
     pub kind: u8,
-    pub lag_min: i64,
+    /// Minutes of working or elapsed time, or a percentage, by `lag_format`
+    /// (see `projcore::mspdi::lag_from_link_lag`).
+    pub lag: i64,
+    /// MSPDI `LagFormat` code.
+    pub lag_format: u16,
 }
 
 /// A malformed or unrecognized task table is refused by the importer.
@@ -264,7 +268,8 @@ fn decode_links(cons: &[u8], fd: &[u8], rs: usize, tasks: &mut [MppTask]) {
             tasks[s].predecessors.push(MppPred {
                 pred_uid: l.pred_uid,
                 kind: l.kind as u8,
-                lag_min: 0,
+                lag: 0,
+                lag_format: 7,
             });
         }
     }
@@ -707,7 +712,8 @@ mod tests {
             vec![MppPred {
                 pred_uid: 10,
                 kind: 1,
-                lag_min: 0
+                lag: 0,
+                lag_format: 7,
             }]
         );
         assert_eq!(
@@ -715,7 +721,8 @@ mod tests {
             vec![MppPred {
                 pred_uid: 20,
                 kind: 1,
-                lag_min: 0
+                lag: 0,
+                lag_format: 7,
             }]
         );
     }

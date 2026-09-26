@@ -127,15 +127,139 @@ impl TaskType {
     }
 }
 
+/// What a link lag counts: working time on the successor's calendar, elapsed
+/// (24/7 calendar) time, or a percentage of the predecessor's duration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LagKind {
+    Working,
+    Elapsed,
+    Percent,
+}
+
+/// The unit a lag is entered and shown in (MSPDI `LagFormat` without its
+/// elapsed and estimated bits).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LagUnit {
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+    Percent,
+}
+
+/// A link lag's MSPDI `LagFormat`, limited to the codes docxy can schedule:
+/// 3-12 (m, em, h, eh, d, ed, w, ew, mo, emo), 19 (%), and their estimated
+/// variants 35-44 and 51. Elapsed percent (20/52) and the null formats are
+/// refused, never guessed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LagFormat(u8);
+
+impl LagFormat {
+    /// Working days, the format docxy wrote before lag formats were modelled.
+    pub const DAYS: LagFormat = LagFormat(7);
+    /// Offset of the estimated (`?`) variant of each format.
+    const ESTIMATED: u8 = 32;
+
+    pub fn from_code(code: i64) -> Option<LagFormat> {
+        match code {
+            3..=12 | 19 | 35..=44 | 51 => Some(LagFormat(code as u8)),
+            _ => None,
+        }
+    }
+
+    /// The format with this unit and flags, if docxy supports it.
+    pub fn new(unit: LagUnit, elapsed: bool, estimated: bool) -> Option<LagFormat> {
+        let base: i64 = match unit {
+            LagUnit::Minute => 3,
+            LagUnit::Hour => 5,
+            LagUnit::Day => 7,
+            LagUnit::Week => 9,
+            LagUnit::Month => 11,
+            LagUnit::Percent => 19,
+        };
+        let code = base + i64::from(elapsed) + if estimated { 32 } else { 0 };
+        LagFormat::from_code(code)
+    }
+
+    pub fn code(self) -> i64 {
+        i64::from(self.0)
+    }
+
+    fn base(self) -> u8 {
+        if self.estimated() {
+            self.0 - Self::ESTIMATED
+        } else {
+            self.0
+        }
+    }
+
+    pub fn estimated(self) -> bool {
+        self.0 > Self::ESTIMATED
+    }
+
+    pub fn kind(self) -> LagKind {
+        match self.base() {
+            19 => LagKind::Percent,
+            b if b % 2 == 0 => LagKind::Elapsed,
+            _ => LagKind::Working,
+        }
+    }
+
+    pub fn unit(self) -> LagUnit {
+        match self.base() {
+            3 | 4 => LagUnit::Minute,
+            5 | 6 => LagUnit::Hour,
+            7 | 8 => LagUnit::Day,
+            9 | 10 => LagUnit::Week,
+            11 | 12 => LagUnit::Month,
+            _ => LagUnit::Percent,
+        }
+    }
+}
+
 /// One predecessor link on a task.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Predecessor {
     /// UID of the predecessor task.
     pub uid: i32,
     pub link: LinkType,
-    /// Lag in **minutes**, already converted from MSPDI's tenths-of-a-minute.
-    /// Negative means lead (overlap).
-    pub lag_min: i64,
+    /// Lag in the unit its [`LagKind`] counts: working minutes (Working),
+    /// calendar minutes (Elapsed), or whole percent of the predecessor's
+    /// duration (Percent). Negative means lead (overlap).
+    pub lag: i64,
+    pub lag_format: LagFormat,
+}
+
+impl Predecessor {
+    /// A finish-to-start link without lag.
+    pub fn fs(uid: i32) -> Predecessor {
+        Predecessor::working(uid, LinkType::FinishStart, 0)
+    }
+
+    /// A link with a working-time lag in minutes, shown in days.
+    pub fn working(uid: i32, link: LinkType, lag_min: i64) -> Predecessor {
+        Predecessor {
+            uid,
+            link,
+            lag: lag_min,
+            lag_format: LagFormat::DAYS,
+        }
+    }
+
+    /// The lag in minutes of its own kind, given the predecessor's working
+    /// duration: a percent lag resolves to working minutes, rounded half away
+    /// from zero. `None` when that overflows.
+    pub fn lag_minutes(&self, pred_duration_min: i64) -> Option<i64> {
+        match self.lag_format.kind() {
+            LagKind::Working | LagKind::Elapsed => Some(self.lag),
+            LagKind::Percent => {
+                let product = i128::from(self.lag) * i128::from(pred_duration_min.max(0));
+                let half = if product < 0 { -50 } else { 50 };
+                i64::try_from((product + half) / 100).ok()
+            }
+        }
+    }
 }
 
 /// A recorded plan in one MSPDI baseline slot.
@@ -1325,5 +1449,93 @@ mod tests {
         let closed = proj.resolved_calendar(&closed);
         assert_eq!(closed.day(march(4)), hours(8, 17).times);
         assert!(!closed.has_working_time());
+    }
+
+    #[test]
+    fn lag_format_accepts_only_the_schedulable_codes() {
+        let accepted: Vec<i64> = (-5..=100)
+            .filter(|&c| LagFormat::from_code(c).is_some())
+            .collect();
+        let mut want: Vec<i64> = (3..=12).chain([19]).chain(35..=44).chain([51]).collect();
+        want.sort();
+        assert_eq!(accepted, want);
+        for code in want {
+            assert_eq!(LagFormat::from_code(code).unwrap().code(), code);
+        }
+        // Elapsed percent and the null formats are refused, not guessed.
+        for code in [0, 1, 2, 13, 20, 21, 52, 53, 99] {
+            assert_eq!(LagFormat::from_code(code), None, "{code}");
+        }
+    }
+
+    #[test]
+    fn lag_format_kind_unit_and_estimate() {
+        let f = |c| LagFormat::from_code(c).unwrap();
+        assert_eq!(
+            (f(7).kind(), f(7).unit(), f(7).estimated()),
+            (LagKind::Working, LagUnit::Day, false)
+        );
+        assert_eq!((f(8).kind(), f(8).unit()), (LagKind::Elapsed, LagUnit::Day));
+        assert_eq!(
+            (f(19).kind(), f(19).unit()),
+            (LagKind::Percent, LagUnit::Percent)
+        );
+        assert_eq!(
+            (f(42).kind(), f(42).unit(), f(42).estimated()),
+            (LagKind::Elapsed, LagUnit::Week, true)
+        );
+        assert_eq!((f(51).kind(), f(51).estimated()), (LagKind::Percent, true));
+        assert_eq!(
+            (f(3).unit(), f(12).unit(), f(12).kind()),
+            (LagUnit::Minute, LagUnit::Month, LagKind::Elapsed)
+        );
+        assert_eq!(LagFormat::DAYS, f(7));
+        assert_eq!(LagFormat::new(LagUnit::Week, true, true), Some(f(42)));
+        assert_eq!(LagFormat::new(LagUnit::Percent, false, true), Some(f(51)));
+        assert_eq!(LagFormat::new(LagUnit::Percent, true, false), None); // e% (20)
+        for code in (3..=12).chain([19]).chain(35..=44).chain([51]) {
+            let fmt = f(code);
+            let unit = fmt.unit();
+            let elapsed = fmt.kind() == LagKind::Elapsed;
+            assert_eq!(
+                LagFormat::new(unit, elapsed, fmt.estimated()),
+                Some(fmt),
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_lag_is_a_rounded_share_of_the_predecessor_duration() {
+        let pct = |lag| Predecessor {
+            uid: 1,
+            link: LinkType::FinishStart,
+            lag,
+            lag_format: LagFormat::from_code(19).unwrap(),
+        };
+        assert_eq!(pct(50).lag_minutes(1920), Some(960));
+        assert_eq!(pct(-25).lag_minutes(1920), Some(-480));
+        assert_eq!(pct(150).lag_minutes(2880), Some(4320));
+        // Half a minute rounds away from zero, both ways.
+        assert_eq!(pct(50).lag_minutes(1), Some(1));
+        assert_eq!(pct(-50).lag_minutes(1), Some(-1));
+        assert_eq!(pct(33).lag_minutes(10), Some(3));
+        // A milestone predecessor gives no lag; overflow is None, not a wrap.
+        assert_eq!(pct(50).lag_minutes(0), Some(0));
+        assert_eq!(pct(i64::MAX).lag_minutes(i64::MAX), None);
+        // Time lags are already minutes.
+        let elapsed = Predecessor {
+            lag_format: LagFormat::from_code(8).unwrap(),
+            ..pct(2880)
+        };
+        assert_eq!(elapsed.lag_minutes(1920), Some(2880));
+        assert_eq!(
+            Predecessor::working(1, LinkType::StartStart, -60).lag_minutes(0),
+            Some(-60)
+        );
+        assert_eq!(
+            Predecessor::fs(4),
+            Predecessor::working(4, LinkType::FinishStart, 0)
+        );
     }
 }

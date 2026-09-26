@@ -9,7 +9,9 @@
 //!
 //! Units, the way MSPDI encodes them (each a classic trap):
 //! - Durations/Work are ISO-8601 (`PT16H0M0S`) — converted to **minutes**.
-//! - `LinkLag` is **tenths of a minute**, regardless of `LagFormat`.
+//! - `LinkLag` is **tenths of a minute** of working or elapsed time, except
+//!   for a percentage `LagFormat` (19, estimated 51), where it is the
+//!   percentage itself (#104). An unsupported `LagFormat` fails the read.
 //! - `MinutesPerDay` sets the days↔minutes display factor.
 
 use crate::datetime::DateTime;
@@ -72,7 +74,7 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     // always declare them authoritative (see `header_text`);
                     // a source's value is never kept.
                     "ProjectExternallyEdited" => p.skip_element(),
-                    "Tasks" => parse_tasks(&mut p, &mut proj.tasks, &mut task_uids),
+                    "Tasks" => parse_tasks(&mut p, &mut proj.tasks, &mut task_uids)?,
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
                     "Calendars" => parse_calendars(&mut p, &mut proj.calendars),
@@ -188,12 +190,16 @@ fn normalize_task_uids(tasks: &mut [Task], uids: &[Option<i32>]) -> Result<(), S
     Ok(())
 }
 
-fn parse_tasks(p: &mut XmlParser, out: &mut Vec<Task>, uids: &mut Vec<Option<i32>>) {
+fn parse_tasks(
+    p: &mut XmlParser,
+    out: &mut Vec<Task>,
+    uids: &mut Vec<Option<i32>>,
+) -> Result<(), String> {
     loop {
         match p.next() {
             Event::Start => {
                 if p.name() == "Task" {
-                    let (task, uid) = parse_task(p);
+                    let (task, uid) = parse_task(p)?;
                     out.push(task);
                     uids.push(uid);
                 } else {
@@ -204,11 +210,15 @@ fn parse_tasks(p: &mut XmlParser, out: &mut Vec<Task>, uids: &mut Vec<Option<i32
             _ => {}
         }
     }
+    Ok(())
 }
 
-fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
+fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
     let mut t = Task::default();
     let mut uid = None;
+    // A link whose lag format docxy cannot schedule fails the read, never
+    // turning into minutes; reported once the task's UID is known.
+    let mut bad_lag_format = None;
     loop {
         match p.next() {
             Event::Start => {
@@ -232,11 +242,11 @@ fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
                     }
                     "ConstraintDate" => t.constraint_date = DateTime::parse_mspdi(&text_of(p)),
                     "CalendarUID" => t.calendar_uid = Some(int_of(p) as i32),
-                    "PredecessorLink" => {
-                        if let Some(pred) = parse_predecessor(p) {
-                            t.predecessors.push(pred);
-                        }
-                    }
+                    "PredecessorLink" => match parse_predecessor(p) {
+                        Ok(Some(pred)) => t.predecessors.push(pred),
+                        Ok(None) => {}
+                        Err(code) => bad_lag_format = bad_lag_format.or(Some(code)),
+                    },
                     "Baseline" => parse_baseline(p, &mut t),
                     "IsNull" => t.is_null = bool_of(p),
                     "GUID" => t.guid = Some(text_of(p)).filter(|g| !g.trim().is_empty()),
@@ -292,7 +302,13 @@ fn parse_task(p: &mut XmlParser) -> (Task, Option<i32>) {
             _ => {}
         }
     }
-    (t, uid)
+    if let Some(code) = bad_lag_format {
+        let uid = uid.map_or_else(|| "?".to_string(), |u| u.to_string());
+        return Err(format!(
+            "unsupported LagFormat {code} on a predecessor link of task UID {uid}"
+        ));
+    }
+    Ok((t, uid))
 }
 
 /// Parse a task's recorded plan without borrowing values from its current plan.
@@ -326,10 +342,13 @@ fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
     }
 }
 
-fn parse_predecessor(p: &mut XmlParser) -> Option<Predecessor> {
+/// One `<PredecessorLink>`; `Err` carries an unsupported `LagFormat` code.
+fn parse_predecessor(p: &mut XmlParser) -> Result<Option<Predecessor>, i64> {
     let mut uid: Option<i32> = None;
     let mut link = LinkType::FinishStart;
-    let mut lag_tenths: i64 = 0;
+    let mut link_lag: i64 = 0;
+    // An absent LagFormat is days, as docxy has always read it.
+    let mut format_code = LagFormat::DAYS.code();
     loop {
         match p.next() {
             Event::Start => {
@@ -339,7 +358,8 @@ fn parse_predecessor(p: &mut XmlParser) -> Option<Predecessor> {
                     "Type" => {
                         link = LinkType::from_code(int_of(p)).unwrap_or(LinkType::FinishStart)
                     }
-                    "LinkLag" => lag_tenths = int_of(p),
+                    "LinkLag" => link_lag = int_of(p),
+                    "LagFormat" => format_code = int_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -347,9 +367,31 @@ fn parse_predecessor(p: &mut XmlParser) -> Option<Predecessor> {
             _ => {}
         }
     }
-    // LinkLag is tenths of a minute; round to whole minutes.
-    let lag_min = (lag_tenths as f64 / 10.0).round() as i64;
-    uid.map(|uid| Predecessor { uid, link, lag_min })
+    let lag_format = LagFormat::from_code(format_code).ok_or(format_code)?;
+    let lag = lag_from_link_lag(link_lag, lag_format);
+    Ok(uid.map(|uid| Predecessor {
+        uid,
+        link,
+        lag,
+        lag_format,
+    }))
+}
+
+/// A `LinkLag` as the model holds it: a percentage as is, time from tenths of
+/// a minute to whole minutes. `.mpp` link records use the same encoding.
+pub fn lag_from_link_lag(link_lag: i64, format: LagFormat) -> i64 {
+    match format.kind() {
+        LagKind::Percent => link_lag,
+        LagKind::Working | LagKind::Elapsed => (link_lag as f64 / 10.0).round() as i64,
+    }
+}
+
+/// [`lag_from_link_lag`] inverted, for writing.
+fn link_lag_of(p: &Predecessor) -> i64 {
+    match p.lag_format.kind() {
+        LagKind::Percent => p.lag,
+        LagKind::Working | LagKind::Elapsed => p.lag.saturating_mul(10),
+    }
 }
 
 fn parse_resources(p: &mut XmlParser, out: &mut Vec<Resource>) {
@@ -1252,9 +1294,8 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         s.push_str("      <PredecessorLink>\n");
         tag(s, 4, "PredecessorUID", &p.uid.to_string());
         tag(s, 4, "Type", &p.link.code().to_string());
-        // model lag is minutes; MSPDI LinkLag is tenths of a minute.
-        tag(s, 4, "LinkLag", &(p.lag_min * 10).to_string());
-        tag(s, 4, "LagFormat", "7");
+        tag(s, 4, "LinkLag", &link_lag_of(p).to_string());
+        tag(s, 4, "LagFormat", &p.lag_format.code().to_string());
         s.push_str("      </PredecessorLink>\n");
     }
     let mut baselines: Vec<_> = t.baselines.iter().collect();
@@ -2135,7 +2176,7 @@ mod tests {
         let pred = b.predecessors[0];
         assert_eq!(pred.uid, 1);
         assert_eq!(pred.link, LinkType::FinishStart);
-        assert_eq!(pred.lag_min, 480); // 4800 tenths-of-min = 2 days = 8h/day
+        assert_eq!(pred.lag, 480); // 4800 tenths-of-min = 2 days = 8h/day
     }
 
     #[test]
@@ -3063,11 +3104,7 @@ mod tests {
                 ..Task::default()
             },
         );
-        proj.tasks[1].predecessors.push(Predecessor {
-            uid: 2,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        });
+        proj.tasks[1].predecessors.push(Predecessor::fs(2));
         let mut xml = String::new();
         let sched = crate::schedule::schedule(&proj);
         write_task(
@@ -4570,5 +4607,80 @@ mod tests {
         assert_eq!(exceptions.len(), 1);
         assert_eq!(exceptions[0].from, Some(march(7)));
         assert_eq!(exceptions[0].day, morning());
+    }
+
+    /// Tasks 1 and 2, with a link from 1 to 2 carrying this LinkLag and
+    /// LagFormat (the format element omitted when `None`).
+    fn lag_xml(link_lag: i64, format: Option<i64>) -> String {
+        let format = format.map_or(String::new(), |f| format!("<LagFormat>{f}</LagFormat>"));
+        uid_xml(&format!(
+            "<Task><UID>1</UID><ID>1</ID><Duration>PT32H0M0S</Duration></Task>             <Task><UID>2</UID><ID>2</ID><Duration>PT8H0M0S</Duration><PredecessorLink>             <PredecessorUID>1</PredecessorUID><Type>1</Type>             <LinkLag>{link_lag}</LinkLag>{format}</PredecessorLink></Task>"
+        ))
+    }
+
+    fn supported_lag_formats() -> impl Iterator<Item = LagFormat> {
+        (0..=64).filter_map(LagFormat::from_code)
+    }
+
+    #[test]
+    fn link_lag_is_read_in_its_formats_kind() {
+        // #104: a percentage is the LinkLag itself; time is tenths of a minute,
+        // of working or elapsed time. An absent LagFormat is days.
+        for (link_lag, format, lag) in [
+            (50, Some(19), 50),
+            (-25, Some(19), -25),
+            (-25, Some(51), -25),
+            (28800, Some(8), 2880),
+            (-14400, Some(8), -1440),
+            (100800, Some(42), 10080),
+            (1800, Some(5), 180),
+            (4800, None, 480),
+        ] {
+            let proj = read_mspdi(&lag_xml(link_lag, format)).unwrap();
+            let pred = proj.tasks[1].predecessors[0];
+            assert_eq!(pred.lag, lag, "{link_lag} {format:?}");
+            assert_eq!(pred.lag_format.code(), format.unwrap_or(7));
+        }
+    }
+
+    #[test]
+    fn every_supported_lag_format_survives_a_save() {
+        for format in supported_lag_formats() {
+            for link_lag in [0, 10, -10, 50, -25, 28800, -28800, 1234560] {
+                let proj = read_mspdi(&lag_xml(link_lag, Some(format.code()))).unwrap();
+                let pred = proj.tasks[1].predecessors[0];
+                assert_eq!(pred.lag_format, format);
+                let saved = write_mspdi(&proj);
+                assert!(
+                    saved.contains(&format!("<LagFormat>{}</LagFormat>", format.code())),
+                    "{format:?}"
+                );
+                let back = read_mspdi(&saved).unwrap();
+                assert_eq!(
+                    back.tasks[1].predecessors, proj.tasks[1].predecessors,
+                    "{format:?}"
+                );
+                // Whole minutes and percentages write back the LinkLag read.
+                if format.kind() == LagKind::Percent || link_lag % 10 == 0 {
+                    assert!(
+                        saved.contains(&format!("<LinkLag>{link_lag}</LinkLag>")),
+                        "{format:?} {link_lag}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_lag_formats_fail_the_read() {
+        // Never turned into minutes: elapsed percent (20, 52), the null
+        // formats (21, 53), and anything unknown.
+        for code in [0, 1, 2, 13, 20, 21, 52, 53, 99, -7] {
+            let err = read_mspdi(&lag_xml(50, Some(code))).unwrap_err();
+            assert_eq!(
+                err,
+                format!("unsupported LagFormat {code} on a predecessor link of task UID 2")
+            );
+        }
     }
 }

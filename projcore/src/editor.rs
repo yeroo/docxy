@@ -6,8 +6,8 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Assignment, Baseline, ConstraintType, LinkType, Predecessor, Project, Resource, ResourceType,
-    Task, TaskType,
+    Assignment, Baseline, ConstraintType, LagFormat, LagKind, LagUnit, LinkType, Predecessor,
+    Project, Resource, ResourceType, Task, TaskType,
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
@@ -15,8 +15,8 @@ const UNDO_CAP: usize = 100;
 
 mod cells;
 pub use cells::{
-    day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
-    parse_predecessors,
+    day_finish, format_duration_exact, format_lag, format_predecessors, format_resource_names,
+    parse_cell_date, parse_lag, parse_predecessors,
 };
 use cells::{format_units, parse_resource_token};
 mod moving;
@@ -678,6 +678,7 @@ impl Editor {
         self.reschedule();
     }
 
+    /// Link `pred` before `uid` with a working-time lag in minutes.
     pub fn add_predecessor(
         &mut self,
         uid: i32,
@@ -685,6 +686,12 @@ impl Editor {
         link: LinkType,
         lag_min: i64,
     ) -> Result<(), String> {
+        self.add_link(uid, Predecessor::working(pred, link, lag_min))
+    }
+
+    /// Add `link` to `uid`'s predecessors, keeping its lag format.
+    pub fn add_link(&mut self, uid: i32, link: Predecessor) -> Result<(), String> {
+        let pred = link.uid;
         let i = self.index(uid)?;
         if uid == pred || self.index(pred).is_err() || self.is_blank(pred) {
             return Err(format!("No other task with ID {pred}"));
@@ -697,11 +704,7 @@ impl Editor {
             return Err(format!("Already depends on {pred}"));
         }
         self.edit_row(i, |proj, _| {
-            proj.tasks[i].predecessors.push(Predecessor {
-                uid: pred,
-                link,
-                lag_min,
-            });
+            proj.tasks[i].predecessors.push(link);
         })
     }
 
@@ -2108,11 +2111,7 @@ mod tests {
                 calendar_uid: (uid != 1).then_some(3),
                 duration_min: if uid == 1 { 0 } else { 480 },
                 predecessors: if uid == 3 {
-                    vec![crate::model::Predecessor {
-                        uid: 2,
-                        link: LinkType::FinishStart,
-                        lag_min: 0,
-                    }]
+                    vec![crate::model::Predecessor::fs(2)]
                 } else {
                     vec![]
                 },
@@ -2288,11 +2287,7 @@ mod tests {
 
     #[test]
     fn every_edit_of_a_blank_row_makes_it_a_task() {
-        let fs1 = Predecessor {
-            uid: 1,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        };
+        let fs1 = Predecessor::fs(1);
         let day = DateTime::from_ymd_hm(2026, 1, 7, 0, 0);
         let edits: Vec<(&str, Box<Edit>)> = vec![
             ("indent", Box::new(|ed| ed.indent(3, 1))),
@@ -2377,11 +2372,7 @@ mod tests {
                 .unwrap_err(),
             "No other task with ID 3"
         );
-        let blank = Predecessor {
-            uid: 3,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        };
+        let blank = Predecessor::fs(3);
         assert_eq!(
             ed.set_predecessors(2, vec![blank]).unwrap_err(),
             "No task with ID 2"
@@ -2400,7 +2391,7 @@ mod tests {
         let links = ed.project().task(4).unwrap().predecessors.clone();
         assert_eq!(links.iter().map(|p| p.uid).collect::<Vec<_>>(), [2, 3]);
         let mut edited = links.clone();
-        edited[0].lag_min = 480;
+        edited[0].lag = 480;
         ed.set_predecessors(4, edited.clone()).unwrap();
         assert_eq!(ed.project().task(4).unwrap().predecessors, edited);
         // The blank row still does not drive Pour: only the new lag does.
@@ -3215,16 +3206,8 @@ mod tests {
         let mut ed = editor();
         let mut proj = ed.project().clone();
         proj.tasks[1].is_null = true;
-        proj.tasks[1].predecessors.push(Predecessor {
-            uid: 1,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        });
-        proj.tasks[0].predecessors.push(Predecessor {
-            uid: 2,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        });
+        proj.tasks[1].predecessors.push(Predecessor::fs(1));
+        proj.tasks[0].predecessors.push(Predecessor::fs(2));
         ed = Editor::new(proj);
         let blank = ed.project().tasks[1].clone();
         assert_eq!(ed.unlink_task(2), Ok(2));

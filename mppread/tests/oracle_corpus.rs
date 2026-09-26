@@ -107,12 +107,19 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         let mut got: Vec<_> = a
             .predecessors
             .iter()
-            .map(|p| (p.pred_uid as i32, p.kind as i64, p.lag_min))
+            .map(|p| {
+                (
+                    p.pred_uid as i32,
+                    p.kind as i64,
+                    p.lag,
+                    i64::from(p.lag_format),
+                )
+            })
             .collect();
         let mut want: Vec<_> = e
             .predecessors
             .iter()
-            .map(|p| (p.uid, p.link.code(), p.lag_min))
+            .map(|p| (p.uid, p.link.code(), p.lag, p.lag_format.code()))
             .collect();
         got.sort();
         want.sort();

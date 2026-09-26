@@ -2502,11 +2502,7 @@ mod tests {
             name: "Build".into(),
             outline_level: 1,
             duration_min: 960,
-            predecessors: vec![Predecessor {
-                uid: 1,
-                link: LinkType::FinishStart,
-                lag_min: 0,
-            }],
+            predecessors: vec![Predecessor::fs(1)],
             ..Task::default()
         });
         let mut app = App::new(proj, Some("plan.yppx".into()), false);

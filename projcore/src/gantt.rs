@@ -193,30 +193,11 @@ mod tests {
 
     fn diamond() -> Project {
         let mut b = task(2, "B", 1440);
-        b.predecessors = vec![Predecessor {
-            uid: 1,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        }];
+        b.predecessors = vec![Predecessor::fs(1)];
         let mut c = task(3, "C", 480);
-        c.predecessors = vec![Predecessor {
-            uid: 1,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        }];
+        c.predecessors = vec![Predecessor::fs(1)];
         let mut d = task(4, "D", 960);
-        d.predecessors = vec![
-            Predecessor {
-                uid: 2,
-                link: LinkType::FinishStart,
-                lag_min: 0,
-            },
-            Predecessor {
-                uid: 3,
-                link: LinkType::FinishStart,
-                lag_min: 0,
-            },
-        ];
+        d.predecessors = vec![Predecessor::fs(2), Predecessor::fs(3)];
         Project {
             name: "Demo".into(),
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
@@ -266,11 +247,7 @@ mod tests {
         let mut ms = task(3, "Sign-off", 0);
         ms.outline_level = 2;
         ms.milestone = true;
-        ms.predecessors = vec![Predecessor {
-            uid: 2,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        }];
+        ms.predecessors = vec![Predecessor::fs(2)];
         let proj = Project {
             name: "P".into(),
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
@@ -332,11 +309,7 @@ mod tests {
         nested.outline_level = 2;
         let mut b = task(4, "B", 480);
         b.outline_level = 3;
-        b.predecessors.push(Predecessor {
-            uid: 2,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        });
+        b.predecessors.push(Predecessor::fs(2));
         let mut empty = task(5, "Empty", 1);
         empty.summary = true;
         let proj = Project {
@@ -553,11 +526,7 @@ mod tests {
         phase.summary = true;
         let mut a = task(2, "A", 480);
         let mut b = task(3, "B", 480);
-        b.predecessors = vec![Predecessor {
-            uid: 2,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        }];
+        b.predecessors = vec![Predecessor::fs(2)];
         for leaf in [&mut a, &mut b] {
             leaf.outline_level = 2;
             leaf.calendar_uid = Some(3);

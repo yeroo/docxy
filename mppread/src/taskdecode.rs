@@ -4,6 +4,8 @@ use crate::{
     fixedmeta,
     mpp::{MppPred, MppTask, decode_timestamp},
 };
+use projcore::LagFormat;
+use projcore::mspdi::lag_from_link_lag;
 use std::collections::{HashMap, HashSet};
 
 fn u32_at(b: &[u8], o: usize) -> u32 {
@@ -43,19 +45,22 @@ const LEGACY: TaskLayout = TaskLayout {
 struct LinkLayout {
     lag: usize,
     format: usize,
-    formats: &'static [u16],
+    /// The lag formats this layout's offsets are validated for.
+    format_of: fn(u16) -> Option<LagFormat>,
 }
+// Lag and format encode as MSPDI's LinkLag and LagFormat, percentages and
+// elapsed lags included (#104); the formats projcore can schedule are read.
 const NEWEST_LINK: LinkLayout = LinkLayout {
     lag: 14,
     format: 18,
-    formats: &[3, 7],
+    format_of: |code| LagFormat::from_code(i64::from(code)),
 };
 // The three MPP9 corpus files have format 7 and zero lag throughout. The
 // +16/+14 positions follow their 20-byte records; nonzero lag has no oracle.
 const LEGACY_LINK: LinkLayout = LinkLayout {
     lag: 16,
     format: 14,
-    formats: &[7],
+    format_of: |code| (code == 7).then_some(LagFormat::DAYS),
 };
 
 fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Result<(), String> {
@@ -81,16 +86,17 @@ fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Re
                 "link refers to unknown UID {pred_uid} or {succ_uid}"
             ));
         }
-        if kind > 3 || !layout.formats.contains(&format) {
+        let Some(lag_format) = (layout.format_of)(format).filter(|_| kind <= 3) else {
             return Err(format!(
                 "unsupported link type {kind} or LagFormat {format}"
             ));
-        }
+        };
         let succ = positions[&succ_uid];
         out[succ].predecessors.push(MppPred {
             pred_uid,
             kind: kind as u8,
-            lag_min: (lag as f64 / 10.0).round() as i64,
+            lag: lag_from_link_lag(i64::from(lag), lag_format),
+            lag_format: format,
         });
     }
     Ok(())
@@ -663,9 +669,11 @@ mod tests {
         let mut s = fixture();
         s.cons = link(9, 1, 7);
         reject(&s); // unknown predecessor
-        let mut s = fixture();
-        s.cons = link(1, 1, 99);
-        reject(&s); // unknown lag format
+        for format in [0, 20, 21, 52, 53, 99] {
+            let mut s = fixture();
+            s.cons = link(1, 1, format);
+            reject(&s); // lag format projcore cannot schedule
+        }
         let mut s = fixture();
         s.cons = link(0, 1, 7);
         reject(&s); // project summary cannot be a link endpoint
@@ -809,6 +817,34 @@ mod tests {
         let (start, finish) = task.pinned_dates().unwrap();
         assert_eq!(start.to_mspdi(), "2026-03-02T08:00:00");
         assert_eq!(finish.unwrap().to_mspdi(), "2026-03-03T17:00:00");
+    }
+    #[test]
+    fn percent_elapsed_and_estimated_lags_decode_in_their_kind() {
+        // #104: the lag i32 at +14 is MSPDI's LinkLag: the percentage itself
+        // for format 19, tenths of a minute for time formats.
+        for (lag, format, want) in [
+            (50i32, 19, 50),
+            (-25, 19, -25),
+            (28800, 8, 2880),
+            (-14400, 8, -1440),
+            (100800, 42, 10080),
+            (1800, 5, 180),
+        ] {
+            let mut s = fixture();
+            s.cons = link(1, 1, format);
+            s.cons[14..18].copy_from_slice(&lag.to_le_bytes());
+            let tasks = decode(&file(&s, true)).unwrap();
+            assert_eq!(
+                tasks[1].predecessors,
+                vec![MppPred {
+                    pred_uid: 1,
+                    kind: 1,
+                    lag: want,
+                    lag_format: format,
+                }],
+                "{lag} format {format}"
+            );
+        }
     }
     fn link(pred: u32, succ: u32, format: u16) -> Vec<u8> {
         let mut r = vec![0u8; 20];

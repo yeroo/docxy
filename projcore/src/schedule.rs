@@ -34,8 +34,8 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Calendar, ConstraintType, LinkType, Project, ResourceType, Task, Week, WorkCalendar,
-    WorkingTime,
+    Calendar, ConstraintType, LagKind, LinkType, Predecessor, Project, ResourceType, Task, Week,
+    WorkCalendar, WorkingTime,
 };
 use std::collections::HashMap;
 
@@ -241,6 +241,8 @@ struct Scheduler<'a> {
     anchor: i64,
     /// No timeline starts before this day, however far back a date lies.
     earliest_origin: i64,
+    /// Each task's working duration, which a percent lag is a share of.
+    durations: HashMap<i32, i64>,
 }
 
 struct ConstraintDates {
@@ -285,13 +287,16 @@ impl<'a> Scheduler<'a> {
         // Horizon: enough working minutes for all work + lag, plus a wide
         // margin, and enough wall-clock reach to cover any far constraint date.
         let work: i64 = proj.tasks.iter().map(|t| t.duration_min.max(0)).sum();
+        let durations = durations(proj);
+        // Elapsed lag is calendar minutes, which over-estimates the working
+        // minutes it spans: safe for a working-minute budget.
         let lag: i64 = proj
             .tasks
             .iter()
             .flat_map(|t| &t.predecessors)
-            .map(|p| p.lag_min.abs())
-            .sum();
-        let min_total = work + lag + HORIZON_PADDING_MIN;
+            .map(|p| lag_minutes(p, &durations).saturating_abs())
+            .fold(0, i64::saturating_add);
+        let min_total = work.saturating_add(lag).saturating_add(HORIZON_PADDING_MIN);
 
         let leaf_uids: std::collections::HashSet<_> = proj
             .tasks
@@ -335,7 +340,7 @@ impl<'a> Scheduler<'a> {
             || proj.tasks.iter().filter(|t| !t.summary).any(|t| {
                 t.predecessors.iter().any(|p| {
                     leaf_uids.contains(&p.uid)
-                        && (p.lag_min < 0
+                        && (lag_minutes(p, &durations) < 0
                             || matches!(p.link, LinkType::StartFinish | LinkType::FinishFinish))
                 })
             });
@@ -416,6 +421,7 @@ impl<'a> Scheduler<'a> {
             default_cal,
             anchor,
             earliest_origin,
+            durations,
         }
     }
 
@@ -424,6 +430,15 @@ impl<'a> Scheduler<'a> {
         task.calendar_uid
             .filter(|uid| self.timelines.contains_key(uid))
             .unwrap_or(self.default_cal)
+    }
+
+    /// A link's lag as this run applies it.
+    fn offset(&self, p: &Predecessor) -> Offset {
+        let minutes = lag_minutes(p, &self.durations);
+        match p.lag_format.kind() {
+            LagKind::Elapsed => Offset::Elapsed(minutes),
+            LagKind::Working | LagKind::Percent => Offset::Working(minutes),
+        }
     }
 
     fn tl(&self, task: &Task) -> &Timeline {
@@ -533,7 +548,7 @@ impl<'a> Scheduler<'a> {
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
 
         // Successors of each leaf (for backward pass + free slack).
-        let mut succs: HashMap<i32, Vec<(i32, LinkType, i64)>> = HashMap::new();
+        let mut succs: HashMap<i32, Vec<(i32, LinkType, Offset)>> = HashMap::new();
         for &i in &leaves {
             let t = &self.proj.tasks[i];
             for p in &t.predecessors {
@@ -541,7 +556,7 @@ impl<'a> Scheduler<'a> {
                     succs
                         .entry(p.uid)
                         .or_default()
-                        .push((t.uid, p.link, p.lag_min));
+                        .push((t.uid, p.link, self.offset(p)));
                 }
             }
         }
@@ -558,7 +573,7 @@ impl<'a> Scheduler<'a> {
             let tl = self.tl(t);
             let mut linked_start: Option<i64> = None;
             let mut fs_milestone_start: Option<i64> = None;
-            let mut sf_bounds = Vec::new();
+            let mut finish_bounds = Vec::new();
             for p in &t.predecessors {
                 let Some(&pf_abs) = ef_abs.get(&p.uid) else {
                     continue;
@@ -566,22 +581,30 @@ impl<'a> Scheduler<'a> {
                 let Some(&ps_abs) = es_abs.get(&p.uid) else {
                     continue;
                 };
+                let offset = self.offset(p);
+                let (pf_abs, lag) = offset.forward(pf_abs);
+                let (ps_abs, _) = offset.forward(ps_abs);
                 let cand = match p.link {
                     LinkType::FinishStart if t.duration_min == 0 => {
-                        let instant = fs_milestone_instant(tl, pf_abs, p.lag_min);
+                        let instant = fs_milestone_instant(tl, pf_abs, lag);
                         fs_milestone_start =
                             Some(fs_milestone_start.map_or(instant, |s| s.max(instant)));
                         instant
                     }
-                    LinkType::FinishStart => tl.abs_start(tl.to_index(pf_abs) + p.lag_min),
-                    LinkType::StartStart => tl.abs_start(tl.to_index(ps_abs) + p.lag_min),
+                    LinkType::FinishStart => tl.abs_start(tl.to_index(pf_abs) + lag),
+                    LinkType::StartStart => tl.abs_start(tl.to_index(ps_abs) + lag),
                     LinkType::FinishFinish => {
-                        let cf = tl.abs_finish(tl.to_index(pf_abs) + p.lag_min);
+                        let cf = tl.abs_finish(tl.to_index(pf_abs) + lag);
+                        // An elapsed lag can end in nonworking time; the
+                        // finish keeps that instant, as Project's does (#104).
+                        if let Offset::Elapsed(_) = offset {
+                            finish_bounds.push((tl.to_index(pf_abs), pf_abs));
+                        }
                         tl.abs_start(tl.to_index(cf) - t.duration_min)
                     }
                     LinkType::StartFinish => {
-                        let bound = sf_bound(tl, ps_abs, p.lag_min);
-                        sf_bounds.push(bound);
+                        let bound = sf_bound(tl, ps_abs, lag);
+                        finish_bounds.push(bound);
                         tl.abs_start(bound.0 - t.duration_min)
                     }
                 };
@@ -706,7 +729,8 @@ impl<'a> Scheduler<'a> {
                 };
             let s_idx = tl.to_index(s_abs);
             let f_idx = s_idx + t.duration_min;
-            let f_abs = finish_instant(t, tl, s_abs, f_idx, sf_bounds.into_iter(), finish_bound);
+            let f_abs =
+                finish_instant(t, tl, s_abs, f_idx, finish_bounds.into_iter(), finish_bound);
             driven_es.insert(t.uid, tl.to_index(driven_start));
             es.insert(t.uid, s_idx);
             ef.insert(t.uid, f_idx);
@@ -742,9 +766,10 @@ impl<'a> Scheduler<'a> {
             // SF), even on the morning side of the index `finish_abs` holds.
             let mut bound_instant = project_finish_abs;
             if let Some(list) = succs.get(&t.uid) {
-                for &(suid, link, lag) in list {
-                    let sls = ls_abs.get(&suid).copied();
-                    let slf = lf_abs.get(&suid).copied();
+                for &(suid, link, offset) in list {
+                    let lag = offset.index_lag();
+                    let sls = ls_abs.get(&suid).map(|&x| offset.backward(x).0);
+                    let slf = lf_abs.get(&suid).map(|&x| offset.backward(x).0);
                     let cand = match link {
                         // this.finish ≤ succ.late_start − lag
                         LinkType::FinishStart => sls.map(|x| tl.abs_finish(tl.to_index(x) - lag)),
@@ -1028,16 +1053,16 @@ impl<'a> Scheduler<'a> {
         t: &Task,
         tl: &Timeline,
         es_abs: &HashMap<i32, i64>,
-        succs: &HashMap<i32, Vec<(i32, LinkType, i64)>>,
+        succs: &HashMap<i32, Vec<(i32, LinkType, Offset)>>,
     ) -> Option<i64> {
         let list = succs.get(&t.uid)?;
         let ef_idx = tl.to_index(es_abs[&t.uid]) + t.duration_min;
         let mut min_gap: Option<i64> = None;
-        for &(suid, link, lag) in list {
+        for &(suid, link, offset) in list {
             if link != LinkType::FinishStart {
                 continue;
             }
-            let succ_es = *es_abs.get(&suid)?;
+            let (succ_es, lag) = offset.backward(*es_abs.get(&suid)?);
             let gap = tl.to_index(succ_es) - lag - ef_idx;
             min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
         }
@@ -1100,6 +1125,70 @@ fn is_backward(constraint: ConstraintType) -> bool {
     )
 }
 
+/// A link's lag resolved for one run: working minutes on the successor's
+/// calendar (a percent lag resolves to these), or elapsed calendar minutes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Offset {
+    Working(i64),
+    Elapsed(i64),
+}
+
+impl Offset {
+    /// The predecessor-side instant a successor bound counts from, and the
+    /// working lag still to add in index space. Project applies an elapsed
+    /// lag as wall-clock time and then treats the link as a zero-lag one from
+    /// that instant, keeping it even in nonworking time (#104): an FS
+    /// milestone or an FF/SF finish sits there, other starts snap forward.
+    fn forward(self, abs: i64) -> (i64, i64) {
+        match self {
+            Offset::Working(lag) => (abs, lag),
+            Offset::Elapsed(lag) => (abs.saturating_add(lag), 0),
+        }
+    }
+
+    /// The lag left to apply in index space once the instant is shifted.
+    fn index_lag(self) -> i64 {
+        match self {
+            Offset::Working(lag) => lag,
+            Offset::Elapsed(_) => 0,
+        }
+    }
+
+    /// [`Self::forward`] mirrored for a successor's late instant: the lag is
+    /// still to be subtracted in index space.
+    fn backward(self, abs: i64) -> (i64, i64) {
+        match self {
+            Offset::Working(lag) => (abs, lag),
+            Offset::Elapsed(lag) => (abs.saturating_sub(lag), 0),
+        }
+    }
+}
+
+/// Each task's working duration by UID; the first of a duplicated UID wins,
+/// as [`Project::task`] finds it.
+fn durations(proj: &Project) -> HashMap<i32, i64> {
+    let mut out = HashMap::new();
+    for t in &proj.tasks {
+        out.entry(t.uid).or_insert(t.duration_min);
+    }
+    out
+}
+
+/// A link's lag in minutes of its kind (see [`Predecessor::lag_minutes`]); a
+/// percent of a missing predecessor is zero. No timeline spans more than
+/// [`MAX_LAG_MIN`], so a longer lag (an overflowing percent included) is
+/// clamped to it: it lands past either end all the same, and index and
+/// horizon arithmetic cannot overflow.
+fn lag_minutes(p: &Predecessor, durations: &HashMap<i32, i64>) -> i64 {
+    let duration = durations.get(&p.uid).copied().unwrap_or(0);
+    p.lag_minutes(duration)
+        .unwrap_or(if p.lag < 0 { i64::MIN } else { i64::MAX })
+        .clamp(-MAX_LAG_MIN, MAX_LAG_MIN)
+}
+
+/// Wall-clock minutes of the widest timeline, plus a day.
+const MAX_LAG_MIN: i64 = (2 * HORIZON_DAYS + 2) * 1440;
+
 /// Zero-lag FS milestones preserve the actual finish, including across
 /// calendars and SF morning endpoints. Nonzero lag uses the finish side of
 /// the successor's calendar; only zero lag is verified against Project (#59).
@@ -1130,7 +1219,7 @@ fn finish_instant(
     tl: &Timeline,
     start: i64,
     finish_index: i64,
-    sf_bounds: impl Iterator<Item = (i64, i64)>,
+    finish_bounds: impl Iterator<Item = (i64, i64)>,
     finish_bound: Option<i64>,
 ) -> i64 {
     if task.duration_min == 0 {
@@ -1139,7 +1228,7 @@ fn finish_instant(
     // A constraint's evening can share an index with an SF morning. Only
     // preserve SF instants allowed by the active finish bound; selecting an
     // instant never changes the task's working duration.
-    if let Some(instant) = sf_bounds
+    if let Some(instant) = finish_bounds
         .filter(|&(index, instant)| {
             index == finish_index && finish_bound.is_none_or(|bound| instant <= bound)
         })
@@ -1598,11 +1687,34 @@ impl Scheduler<'_> {
                 continue;
             }
             let cpm_start_idx = tl.to_index(cpm.early_start.minutes());
-            // Preserve every link's gap by inheriting the largest predecessor delay.
+            // Preserve every link's gap by inheriting the largest predecessor
+            // delay. An elapsed lag counts wall-clock time from the
+            // predecessor's leveled instant, so its gap is measured again
+            // there: a delay that ends in nonworking time can move the
+            // successor less than it moved the predecessor, or only its
+            // instant (#104).
+            let mut elapsed_moved = false;
             let floor = t
                 .predecessors
                 .iter()
-                .filter_map(|p| delay.get(&p.uid).copied())
+                .filter_map(|p| {
+                    let delay = *delay.get(&p.uid)?;
+                    let Offset::Elapsed(lag) = self.offset(p) else {
+                        return Some(delay);
+                    };
+                    let pred = base.get(p.uid)?;
+                    let (was, now) = match p.link {
+                        LinkType::FinishStart | LinkType::FinishFinish => {
+                            (pred.early_finish, *finish.get(&p.uid)?)
+                        }
+                        LinkType::StartStart | LinkType::StartFinish => {
+                            (pred.early_start, *start.get(&p.uid)?)
+                        }
+                    };
+                    elapsed_moved |= now != was;
+                    let bound = |at: DateTime| tl.to_index(at.minutes().saturating_add(lag));
+                    Some(bound(now) - bound(was))
+                })
                 .max()
                 .unwrap_or(0);
             let earliest = cpm_start_idx + floor;
@@ -1615,7 +1727,7 @@ impl Scheduler<'_> {
                     .or_default()
                     .push((placed, placed + t.duration_min, *units));
             }
-            let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 {
+            let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 && !elapsed_moved {
                 (cpm.early_start.minutes(), cpm.early_finish.minutes())
             } else {
                 let mut s_abs = tl.abs_start(placed);
@@ -1626,8 +1738,11 @@ impl Scheduler<'_> {
                         let (Some(ps), Some(pf)) = (start.get(&p.uid), finish.get(&p.uid)) else {
                             continue;
                         };
+                        let offset = self.offset(p);
+                        let (pf, lag) = offset.forward(pf.minutes());
+                        let (ps, _) = offset.forward(ps.minutes());
                         if p.link == LinkType::FinishStart {
-                            let instant = fs_milestone_instant(tl, pf.minutes(), p.lag_min);
+                            let instant = fs_milestone_instant(tl, pf, lag);
                             if tl.to_index(instant) == placed {
                                 fs_instant = Some(fs_instant.map_or(instant, |s| s.max(instant)));
                             }
@@ -1639,7 +1754,7 @@ impl Scheduler<'_> {
                             } else {
                                 ps
                             };
-                            let index = tl.to_index(endpoint.minutes()) + p.lag_min;
+                            let index = tl.to_index(endpoint) + lag;
                             if index == placed {
                                 start_bound = start_bound.max(tl.abs_start(index));
                             }
@@ -1653,15 +1768,23 @@ impl Scheduler<'_> {
                         s_abs = instant.max(start_bound);
                     }
                 }
-                let bounds = t
-                    .predecessors
-                    .iter()
-                    .filter(|p| p.link == LinkType::StartFinish)
-                    .filter_map(|p| {
-                        start
-                            .get(&p.uid)
-                            .map(|s| sf_bound(tl, s.minutes(), p.lag_min))
-                    });
+                let bounds = t.predecessors.iter().filter_map(|p| {
+                    let offset = self.offset(p);
+                    match p.link {
+                        LinkType::StartFinish => start.get(&p.uid).map(|s| {
+                            let (s, lag) = offset.forward(s.minutes());
+                            sf_bound(tl, s, lag)
+                        }),
+                        // An elapsed FF lag keeps its instant, as in CPM.
+                        LinkType::FinishFinish if matches!(offset, Offset::Elapsed(_)) => {
+                            finish.get(&p.uid).map(|f| {
+                                let (f, _) = offset.forward(f.minutes());
+                                (tl.to_index(f), f)
+                            })
+                        }
+                        _ => None,
+                    }
+                });
                 (
                     s_abs,
                     finish_instant(
@@ -1727,11 +1850,7 @@ mod tests {
         }
     }
     fn fs(uid: i32) -> Predecessor {
-        Predecessor {
-            uid,
-            link: LinkType::FinishStart,
-            lag_min: 0,
-        }
+        Predecessor::fs(uid)
     }
 
     /// Phase (summary) over A and B, B after A, then C after B. With
@@ -2046,11 +2165,8 @@ mod tests {
             proj.tasks.push(task(3, "C", 2400));
             if ff_successor {
                 let mut d = task(4, "D", 480);
-                d.predecessors.push(Predecessor {
-                    uid: 2,
-                    link: LinkType::FinishFinish,
-                    lag_min: 0,
-                });
+                d.predecessors
+                    .push(Predecessor::working(2, LinkType::FinishFinish, 0));
                 proj.tasks.push(d);
             }
             let sched = schedule(&proj);
@@ -2087,11 +2203,7 @@ mod tests {
                 true,
             );
             let mut b = task(3, "B", 480);
-            b.predecessors.push(Predecessor {
-                uid: 2,
-                link,
-                lag_min: 0,
-            });
+            b.predecessors.push(Predecessor::working(2, link, 0));
             proj.tasks.push(b);
             let sched = schedule(&proj);
             let m = sched.get(2).unwrap();
@@ -2157,11 +2269,9 @@ mod tests {
         let mut proj = fs_milestone_project(960);
         let mut r = task(3, "Start driver", 480);
         r.predecessors.push(fs(1));
-        proj.tasks[1].predecessors.push(Predecessor {
-            uid: 3,
-            link: LinkType::StartStart,
-            lag_min: 0,
-        });
+        proj.tasks[1]
+            .predecessors
+            .push(Predecessor::working(3, LinkType::StartStart, 0));
         proj.tasks.push(r);
         let sched = schedule(&proj);
         assert_eq!(sched.get(2).unwrap().early_start, morning);
@@ -2237,7 +2347,7 @@ mod tests {
         // the finish side of the successor calendar's working-time boundary.
         for (lag, day) in [(480, 4), (-480, 2)] {
             let mut proj = fs_milestone_project(960);
-            proj.tasks[1].predecessors[0].lag_min = lag;
+            proj.tasks[1].predecessors[0].lag = lag;
             let sched = schedule(&proj);
             let expected = DateTime::from_ymd_hm(2026, 3, day, 17, 0);
             assert_eq!(sched.get(2).unwrap().early_start, expected);
@@ -2257,7 +2367,7 @@ mod tests {
     fn leveling_delayed_fs_milestone_lands_at_leveled_finish() {
         for (lag, day) in [(0, 3), (480, 4), (-480, 2)] {
             let mut proj = delayed_fs_milestone_project();
-            proj.tasks[2].predecessors[0].lag_min = lag;
+            proj.tasks[2].predecessors[0].lag = lag;
             let leveled = level(&proj);
             let expected = DateTime::from_ymd_hm(2026, 3, day, 17, 0);
             assert_eq!(
@@ -2297,11 +2407,9 @@ mod tests {
         let mut r = task(3, "Undelayed start driver", 480);
         r.predecessors.push(fs(5));
         proj.tasks.extend([q, r]);
-        proj.tasks[2].predecessors.push(Predecessor {
-            uid: 3,
-            link: LinkType::StartStart,
-            lag_min: 0,
-        });
+        proj.tasks[2]
+            .predecessors
+            .push(Predecessor::working(3, LinkType::StartStart, 0));
         let sched = schedule(&proj);
         let morning = DateTime::from_ymd_hm(2026, 3, 3, 8, 0);
         assert_eq!(sched.get(2).unwrap().early_start, morning);
@@ -2320,11 +2428,9 @@ mod tests {
         let mut r = task(3, "Start driver", 480);
         r.predecessors.push(fs(1));
         proj.tasks.push(r);
-        proj.tasks[2].predecessors.push(Predecessor {
-            uid: 3,
-            link: LinkType::StartStart,
-            lag_min: 0,
-        });
+        proj.tasks[2]
+            .predecessors
+            .push(Predecessor::working(3, LinkType::StartStart, 0));
         let sched = schedule(&proj);
         assert_eq!(
             sched.get(2).unwrap().early_start,
@@ -2432,11 +2538,9 @@ mod tests {
         invalid.predecessors.push(fs(1));
         let mut successor = task(4, "After closed", 480);
         // Also exercise the backward-horizon path with an unresolved SF link.
-        successor.predecessors.push(Predecessor {
-            uid: 2,
-            link: LinkType::StartFinish,
-            lag_min: -60,
-        });
+        successor
+            .predecessors
+            .push(Predecessor::working(2, LinkType::StartFinish, -60));
         let mut proj = Project {
             tasks: vec![summary, task(1, "Valid", 480), invalid, successor],
             calendars: vec![Calendar::standard(1), closed_calendar(3)],
@@ -2536,11 +2640,8 @@ mod tests {
     fn ss_predecessor_finishing_last_is_critical() {
         let a = task(1, "A", 960);
         let mut b = task(2, "B", 480);
-        b.predecessors.push(Predecessor {
-            uid: 1,
-            link: LinkType::StartStart,
-            lag_min: 0,
-        });
+        b.predecessors
+            .push(Predecessor::working(1, LinkType::StartStart, 0));
         let proj = Project {
             tasks: vec![a, b],
             ..Project::default()
@@ -2557,11 +2658,8 @@ mod tests {
         a.constraint = ConstraintType::StartNoEarlierThan;
         a.constraint_date = Some(DateTime::from_ymd_hm(2026, 3, 4, 8, 0));
         let mut b = task(2, "B", 480);
-        b.predecessors.push(Predecessor {
-            uid: 1,
-            link: LinkType::StartFinish,
-            lag_min: 0,
-        });
+        b.predecessors
+            .push(Predecessor::working(1, LinkType::StartFinish, 0));
         Project {
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
             tasks: vec![a, b],
@@ -2578,7 +2676,7 @@ mod tests {
             (120, 3, 10, 4, 10),
         ] {
             let mut proj = sf_project();
-            proj.tasks[1].predecessors[0].lag_min = lag;
+            proj.tasks[1].predecessors[0].lag = lag;
             let sched = schedule(&proj);
             let b = sched.get(2).unwrap();
             assert_eq!(
@@ -2650,11 +2748,8 @@ mod tests {
 
     fn before_start_project() -> Project {
         let mut a = task(1, "A", 960);
-        a.predecessors.push(Predecessor {
-            uid: 2,
-            link: LinkType::StartFinish,
-            lag_min: 0,
-        });
+        a.predecessors
+            .push(Predecessor::working(2, LinkType::StartFinish, 0));
         Project {
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
             tasks: vec![a, task(2, "B", 480)],
@@ -2683,7 +2778,7 @@ mod tests {
     fn fs_lead_can_start_before_anchor() {
         let mut proj = before_start_project();
         proj.tasks[0].predecessors[0].link = LinkType::FinishStart;
-        proj.tasks[0].predecessors[0].lag_min = -960;
+        proj.tasks[0].predecessors[0].lag = -960;
         let sched = schedule(&proj);
         assert_eq!(
             sched.get(1).unwrap().early_start,
@@ -2725,11 +2820,9 @@ mod tests {
                 if linked {
                     // Keep a backward horizon even after the no-links fast path.
                     let mut successor = task(12, "SF successor", 480);
-                    successor.predecessors.push(Predecessor {
-                        uid: 11,
-                        link: LinkType::StartFinish,
-                        lag_min: 0,
-                    });
+                    successor
+                        .predecessors
+                        .push(Predecessor::working(11, LinkType::StartFinish, 0));
                     proj.tasks
                         .extend([task(11, "Anchor milestone", 0), successor]);
                 }
@@ -2931,11 +3024,7 @@ mod tests {
         for link in [LinkType::FinishStart, LinkType::StartStart] {
             for lag_min in [0, 480] {
                 let mut proj = before_start_project();
-                proj.tasks[0].predecessors[0] = Predecessor {
-                    uid: 2,
-                    link,
-                    lag_min,
-                };
+                proj.tasks[0].predecessors[0] = Predecessor::working(2, link, lag_min);
                 let engine = Scheduler::new(&proj);
                 assert_eq!(engine.tl(&proj.tasks[0]).segs[0].start, engine.anchor);
             }
@@ -2987,11 +3076,11 @@ mod tests {
             proj.tasks[0].predecessors.clear();
             proj.tasks[1].summary = true;
             if let Some(uid) = predecessor {
-                proj.tasks[0].predecessors.push(Predecessor {
+                proj.tasks[0].predecessors.push(Predecessor::working(
                     uid,
-                    link: LinkType::StartFinish,
-                    lag_min: 0,
-                });
+                    LinkType::StartFinish,
+                    0,
+                ));
             }
             let engine = Scheduler::new(&proj);
             assert_eq!(engine.tl(&proj.tasks[0]).segs[0].start, engine.anchor);
@@ -3985,11 +4074,7 @@ mod tests {
         let mut a = task(1, "A", 480);
         a.id = 1;
         let mut b = task(2, "B", 480);
-        b.predecessors = vec![Predecessor {
-            uid: 1,
-            link: LinkType::FinishStart,
-            lag_min: 480,
-        }];
+        b.predecessors = vec![Predecessor::working(1, LinkType::FinishStart, 480)];
         let proj = Project {
             start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
             tasks: vec![a, b],
@@ -5058,5 +5143,132 @@ mod tests {
             reach_after(&closed, at(6, 10).minutes(), 480),
             at(6, 10).minutes() + HORIZON_DAYS * 1440
         );
+    }
+
+    /// A link from `uid` with this MSPDI lag format code and lag.
+    fn lag_link(uid: i32, link: LinkType, lag: i64, code: i64) -> Predecessor {
+        Predecessor {
+            uid,
+            link,
+            lag,
+            lag_format: LagFormat::from_code(code).unwrap(),
+        }
+    }
+
+    /// A (4d) from Mon 2 and one successor per link; every expected value is
+    /// Project 2024's (corpus/tools/gen_mpp_lag_cases.py, #104).
+    #[test]
+    fn percent_and_elapsed_lags_schedule_as_project_does() {
+        use LinkType::*;
+        let ed = 1440;
+        let cases = [
+            // (link, lag, format, duration, start, finish)
+            (FinishStart, 50, 19, 480, at(10, 8), at(10, 17)),
+            (FinishStart, -25, 19, 480, at(5, 8), at(5, 17)),
+            (FinishStart, 2 * ed, 8, 480, at(9, 8), at(9, 17)),
+            (FinishStart, -ed, 8, 480, at(5, 8), at(5, 17)),
+            (StartStart, 5 * ed, 8, 480, at(9, 8), at(9, 17)),
+            (FinishFinish, 2 * ed, 8, 480, at(6, 8), at(7, 17)),
+            (FinishStart, 7 * ed, 42, 480, at(13, 8), at(13, 17)),
+            (FinishStart, 2 * ed, 8, 0, at(7, 17), at(7, 17)),
+            (StartFinish, 2 * ed, 8, 480, at(3, 8), at(4, 8)),
+            (FinishStart, 180, 5, 480, at(6, 11), at(9, 11)),
+        ];
+        for (link, lag, code, duration, start, finish) in cases {
+            let mut b = task(2, "B", duration);
+            b.predecessors = vec![lag_link(1, link, lag, code)];
+            let proj = Project {
+                start_date: Some(at(2, 8)),
+                tasks: vec![task(1, "A", 4 * 480), b],
+                ..Project::default()
+            };
+            let r = schedule(&proj);
+            let r = r.get(2).unwrap();
+            let label = format!("{link:?} {lag} format {code}");
+            assert_eq!((r.early_start, r.early_finish), (start, finish), "{label}");
+        }
+    }
+
+    #[test]
+    fn elapsed_lead_crosses_a_weekend_backwards_and_percent_uses_its_own_predecessor() {
+        // P (6d) finishes Mon 9 17:00; -2ed is Sat 7 17:00, so Q starts Mon 9.
+        // X is 150% of P's 6 days after P's start: Fri 13 (Project 2024).
+        let mut q = task(2, "Q", 480);
+        q.predecessors = vec![lag_link(1, LinkType::FinishStart, -2880, 8)];
+        let mut x = task(3, "X", 480);
+        x.predecessors = vec![lag_link(1, LinkType::StartStart, 150, 19)];
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "P", 6 * 480), q, x],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        assert_eq!(s.get(2).unwrap().early_start, at(9, 8));
+        assert_eq!(s.get(3).unwrap().early_start, at(13, 8));
+        // A percent lag follows the predecessor's duration.
+        let mut longer = proj.clone();
+        longer.tasks[0].duration_min = 2 * 480;
+        assert_eq!(schedule(&longer).get(3).unwrap().early_start, at(5, 8));
+    }
+
+    #[test]
+    fn slack_across_an_elapsed_lag_matches_project() {
+        // Project 2024 (l2-elapsed-free-slack): A (4d), D 1FS+2ed, and an
+        // unrelated Z (10d) that sets the finish. A can slip one day (to Fri
+        // 17:00, still before Sat 08:00 = Mon 08:00 - 2ed) before D moves,
+        // and three in all.
+        let mut d = task(2, "D", 480);
+        d.predecessors = vec![lag_link(1, LinkType::FinishStart, 2880, 8)];
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "A", 4 * 480), d, task(3, "Z", 10 * 480)],
+            ..Project::default()
+        };
+        let s = schedule(&proj);
+        let a = s.get(1).unwrap();
+        assert_eq!((a.free_slack_min, a.total_slack_min), (480, 1440));
+        let d = s.get(2).unwrap();
+        assert_eq!((d.free_slack_min, d.total_slack_min), (1920, 1920));
+    }
+
+    #[test]
+    fn huge_percent_lags_saturate_instead_of_overflowing() {
+        let mut b = task(2, "B", 480);
+        b.predecessors = vec![lag_link(1, LinkType::FinishStart, i64::MAX, 19)];
+        let proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(1, "A", 480), b],
+            ..Project::default()
+        };
+        let _ = schedule(&proj); // must not panic
+        let _ = level(&proj);
+    }
+
+    #[test]
+    fn leveling_measures_an_elapsed_gap_from_the_leveled_instant() {
+        // Busy and A share a resource, so leveling moves A (3d) to Tue 3 - Thu
+        // 5 17:00. Two elapsed days later is Sat 7 17:00: D still starts Mon
+        // 9, while the milestone M and G's FF finish take that Saturday
+        // instant. Project 2024's LevelNow, with Busy at priority 1000, gives
+        // the same dates; inheriting A's one-day working delay would not.
+        let mut d = task(2, "D", 480);
+        d.predecessors = vec![lag_link(1, LinkType::FinishStart, 2880, 8)];
+        let mut m = task(3, "M", 0);
+        m.predecessors = vec![lag_link(1, LinkType::FinishStart, 2880, 8)];
+        let mut g = task(5, "G", 480);
+        g.predecessors = vec![lag_link(1, LinkType::FinishFinish, 2880, 8)];
+        let mut proj = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![task(4, "Busy", 480), task(1, "A", 3 * 480), d, m, g],
+            ..Project::default()
+        };
+        proj.resources = vec![worker(1, "Shared", 1.0)];
+        proj.assignments = vec![assign(1, 4, 1, 1.0), assign(2, 1, 1, 1.0)];
+        let leveled = level(&proj);
+        let dates = |uid| (leveled.start(uid).unwrap(), leveled.finish(uid).unwrap());
+        assert_eq!(dates(1), (at(3, 8), at(5, 17)));
+        assert_eq!(dates(2), (at(9, 8), at(9, 17)));
+        assert_eq!(dates(3), (at(7, 17), at(7, 17)));
+        assert_eq!(dates(5), (at(6, 8), at(7, 17)));
     }
 }
