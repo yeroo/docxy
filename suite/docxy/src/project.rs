@@ -37,9 +37,10 @@ pub(super) struct ProjectView {
     pub width: f32,
     /// Whether the Timeline pane is shown: window view state, never saved.
     pub timeline: bool,
-    /// The last press on the Timeline's view box: the pointer's x and the
-    /// chart offset then. A drag of the box is measured from it.
-    pub timeline_press: Rc<Cell<(f32, f32)>>,
+    /// The press on the Timeline's view box while its button is held: the
+    /// pointer's x and the chart offset then. A drag of the box is measured
+    /// from it; `None` when no press is held, and a drag without one does nothing.
+    pub timeline_press: Option<(f32, f32)>,
     /// Gantt Chart Format › Bar Styles › Critical Tasks: critical bars drawn in
     /// the critical colour. Window view state, never saved.
     pub show_critical: bool,
@@ -72,7 +73,7 @@ impl ProjectView {
             exported: None,
             width: 590. + SCROLLBAR_W,
             timeline: true,
-            timeline_press: Rc::default(),
+            timeline_press: None,
             show_critical: true,
             show_baseline: true,
             split: None,

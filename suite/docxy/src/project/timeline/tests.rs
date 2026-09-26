@@ -276,6 +276,15 @@ fn dragging_the_box_moves_only_the_chart() {
     v.drag_timeline(press + 1e6);
     let (_, f1) = v.timeline_box();
     assert!((f1 - 1.).abs() < 1e-4, "stops at the finish: {f1}");
+    // Back to where it was 5 days in: measured from the press, the clamp at
+    // the finish is forgotten; stepping from the last move would not be.
+    v.drag_timeline(press + 5. * px_per_day);
+    assert!(
+        (v.gantt_x.get() - 5. * DAY_W).abs() < 1e-3,
+        "{}",
+        v.gantt_x.get()
+    );
+    v.drag_timeline(press + 1e6);
     // A new press starts from where the chart is now.
     let end = v.gantt_x.get();
     v.press_timeline(100.);
@@ -285,6 +294,23 @@ fn dragging_the_box_moves_only_the_chart() {
     assert_eq!(v.gantt_x.get(), 0.);
     assert!(!v.ed.dirty());
     assert_eq!(v.ed.undo_depth(), 0);
+}
+
+#[test]
+fn without_a_held_press_a_drag_moves_nothing() {
+    let mut t = long_tab();
+    let v = vm(&mut t);
+    // A drag reaching a tab that never took the press (the user switched tabs
+    // with the button held) has nothing to measure from.
+    v.drag_timeline(500.);
+    assert_eq!(v.gantt_x.get(), 0.);
+    v.press_timeline(100.);
+    v.drag_timeline(150.);
+    let moved = v.gantt_x.get();
+    assert!(moved > 0.);
+    v.release_timeline();
+    v.drag_timeline(900.);
+    assert_eq!(v.gantt_x.get(), moved, "released");
 }
 
 #[test]

@@ -69,6 +69,11 @@ impl GanttScale {
         self.days as f32 * DAY_W
     }
 
+    /// The chart offset at which day number `day` starts.
+    pub fn x(self, day: i64) -> f32 {
+        (day - self.origin_day) as f32 * DAY_W
+    }
+
     fn date(self, day: i64) -> projcore::DateTime {
         projcore::DateTime::from_minutes((self.origin_day + day) * 1440)
     }

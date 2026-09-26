@@ -91,8 +91,10 @@ pub(crate) struct TimelineRuler {
     pub ticks: Vec<(f32, String)>,
 }
 
-/// The ruler for the plan as displayed: from the earliest date the Gantt draws
-/// to the latest (leveled when leveling is on).
+/// The ruler for the plan as displayed: from its earliest displayed start to its
+/// latest displayed finish (leveled when leveling is on). Like [`TimelineSpan`]
+/// it leaves out what only the Gantt scale adds: baseline dates outside the
+/// plan and the padding past the finish.
 pub(crate) fn timeline_ruler(ed: &ProjectEditor, width: f32) -> TimelineRuler {
     ruler(ed.disp_project_start(), ed.disp_project_finish(), width)
 }
@@ -174,11 +176,6 @@ impl TimelineSpan {
         Self::new(ed.disp_project_start(), ed.disp_project_finish())
     }
 
-    /// The chart offset at which `day` starts.
-    fn x(self, scale: GanttScale, day: i64) -> f32 {
-        (day - scale.origin_day) as f32 * DAY_W
-    }
-
     /// Days since the span's first, where chart offset `x` falls.
     fn day_at(self, scale: GanttScale, x: f32) -> f32 {
         (scale.origin_day - self.first) as f32 + x / DAY_W
@@ -239,8 +236,8 @@ pub(crate) fn drag_gantt_x(
     start_x: f32,
     dx: f32,
 ) -> f32 {
-    let lo = span.x(scale, span.first).max(0.);
-    let hi = (span.x(scale, span.first + span.days) - gantt_w).min(scale.width() - gantt_w);
+    let lo = scale.x(span.first).max(0.);
+    let hi = (scale.x(span.first + span.days) - gantt_w).min(scale.width() - gantt_w);
     if w <= 0. || lo > hi {
         return start_x;
     }
@@ -260,15 +257,23 @@ impl ProjectView {
 
     /// Mouse-down on the view box: remember the pointer's `x` and the chart
     /// offset, which every move of a drag that follows is measured from.
-    pub fn press_timeline(&self, x: f32) {
-        self.timeline_press.set((x, self.gantt_x.get()));
+    pub fn press_timeline(&mut self, x: f32) {
+        self.timeline_press = Some((x, self.gantt_x.get()));
+    }
+
+    /// The button came up: the press, and any drag, is over.
+    pub fn release_timeline(&mut self) {
+        self.timeline_press = None;
     }
 
     /// The pointer is at `x` in a drag of the view box: move the chart by the
     /// days the box has covered since the press. Absolute from the press, so
-    /// nothing accumulates and nothing drifts. View state only.
+    /// nothing accumulates and nothing drifts. Without a press, nothing moves.
+    /// View state only.
     pub fn drag_timeline(&mut self, x: f32) {
-        let (press, start_x) = self.timeline_press.get();
+        let Some((press, start_x)) = self.timeline_press else {
+            return;
+        };
         self.gantt_x.set(drag_gantt_x(
             TimelineSpan::of(&self.ed),
             self.scale,
@@ -303,15 +308,29 @@ pub(crate) fn timeline_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Jso
     ]
 }
 
-/// The drag payload for the Timeline's view box. It carries nothing: the press
-/// it is measured from is [`ProjectView::timeline_press`], because the frame
-/// that takes the mouse-down need not be the one whose payload the drag uses.
-struct TimelineDrag;
+/// The drag payload for the Timeline's view box: the index of the tab whose box
+/// it is, so a drag begun on one tab never scrolls another's chart. The press it
+/// is measured from is [`ProjectView::timeline_press`], not a field here, because
+/// the frame that takes the mouse-down need not be the one whose payload the
+/// drag uses.
+#[derive(Clone, Copy)]
+struct TimelineDrag(usize);
 
 impl Render for TimelineDrag {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
+}
+
+fn release_timeline(
+    index: usize,
+    cx: &mut Context<Docxy>,
+) -> impl Fn(&MouseUpEvent, &mut Window, &mut App) + 'static {
+    cx.listener(move |this, _: &MouseUpEvent, _, _| {
+        if let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface) {
+            v.release_timeline();
+        }
+    })
 }
 
 pub(crate) fn timeline_el(
@@ -375,6 +394,9 @@ pub(crate) fn timeline_el(
         .on_drag_move::<TimelineDrag>(cx.listener(
             move |this, e: &DragMoveEvent<TimelineDrag>, window, cx| {
                 cx.set_active_drag_cursor_style(CursorStyle::ClosedHand, window);
+                if e.drag(cx).0 != index {
+                    return;
+                }
                 if let Some(Surface::Project(v)) = this.tabs.get_mut(index).map(|t| &mut t.surface)
                 {
                     v.drag_timeline(f32::from(e.event.position.x));
@@ -433,13 +455,16 @@ pub(crate) fn timeline_el(
                                     MouseButton::Left,
                                     cx.listener(move |this, e: &MouseDownEvent, _, _| {
                                         if let Some(Surface::Project(v)) =
-                                            this.tabs.get(index).map(|t| &t.surface)
+                                            this.tabs.get_mut(index).map(|t| &mut t.surface)
                                         {
                                             v.press_timeline(f32::from(e.position.x));
                                         }
                                     }),
                                 )
-                                .on_drag(TimelineDrag, |_, _, _, cx| cx.new(|_| TimelineDrag)),
+                                // Wherever the button comes up, on the box or off it.
+                                .on_mouse_up(MouseButton::Left, release_timeline(index, cx))
+                                .on_mouse_up_out(MouseButton::Left, release_timeline(index, cx))
+                                .on_drag(TimelineDrag(index), |d, _, _, cx| cx.new(|_| *d)),
                         ),
                 )
                 .child(
