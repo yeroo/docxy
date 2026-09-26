@@ -178,7 +178,8 @@ impl LagFormat {
             LagUnit::Month => 11,
             LagUnit::Percent => 19,
         };
-        let code = base + i64::from(elapsed) + if estimated { 32 } else { 0 };
+        let estimated = if estimated { Self::ESTIMATED } else { 0 };
+        let code = base + i64::from(elapsed) + i64::from(estimated);
         LagFormat::from_code(code)
     }
 
