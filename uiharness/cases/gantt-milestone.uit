@@ -1,5 +1,11 @@
+# Task 1 (16h from Mon 08:00) finishes Tue 17:00, and a zero-lag FS milestone
+# sits at its predecessor's finish instant, so Task 3 is on day 1 (Tue), not on
+# the next working start (Wed). Project agrees: corpus/mspdi/18-milestone-after-fs.xml
+# "A" -> "Sign-off" is this shape (see fs_milestone_instant in projcore, #59).
+# bar_1 pins the scale: the milestone is on its predecessor's finish day.
 test gantt milestone is a diamond
   open ../fixtures/gantt-milestone.xml
-  assert bar_3 is milestone 2-2
+  assert bar_1 is critical 0-1
+  assert bar_3 is milestone 1-1
   shot bar:3
   shot gantt
