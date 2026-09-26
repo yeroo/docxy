@@ -593,6 +593,52 @@ pub struct Resource {
     /// `overtime_rate` and `cost_per_use`, so an edit of those must also
     /// update that entry.
     pub rates: Vec<RateEntry>,
+    // The rest of Microsoft's Resource children, stored as read so a save
+    // writes them back. Nothing schedules, levels or costs with them, and no
+    // edit refreshes them: the totals, actuals and earned value go stale after
+    // an assignment edit, as `work_min` and `cost` already do. Text is kept as
+    // written (an empty GUID is dropped, as on Task), costs and earned value
+    // as decimal text, work in whole minutes.
+    pub guid: Option<String>,
+    pub is_null: Option<bool>,
+    pub phonetics: Option<String>,
+    pub nt_account: Option<String>,
+    pub hyperlink: Option<String>,
+    pub hyperlink_address: Option<String>,
+    pub hyperlink_sub_address: Option<String>,
+    pub start: Option<DateTime>,
+    pub finish: Option<DateTime>,
+    pub actual_work_min: Option<i64>,
+    pub actual_overtime_work_min: Option<i64>,
+    pub remaining_overtime_work_min: Option<i64>,
+    /// 0..=100.
+    pub percent_work_complete: Option<u8>,
+    pub overtime_cost: Option<Rate>,
+    pub actual_cost: Option<Rate>,
+    pub actual_overtime_cost: Option<Rate>,
+    pub remaining_cost: Option<Rate>,
+    pub remaining_overtime_cost: Option<Rate>,
+    /// Variances and earned value as MSPDI stores them, not interpreted.
+    pub work_variance: Option<Rate>,
+    pub cost_variance: Option<Rate>,
+    pub sv: Option<Rate>,
+    pub cv: Option<Rate>,
+    pub acwp: Option<Rate>,
+    pub bcws: Option<Rate>,
+    pub bcwp: Option<Rate>,
+    pub is_enterprise: Option<bool>,
+    pub actual_work_protected_min: Option<i64>,
+    pub actual_overtime_work_protected_min: Option<i64>,
+    pub active_directory_guid: Option<String>,
+    pub creation_date: Option<DateTime>,
+    pub cost_center: Option<String>,
+    pub assn_owner: Option<String>,
+    pub assn_owner_guid: Option<String>,
+    /// Outline code values, in file order.
+    pub outline_codes: Vec<OutlineCodeValue>,
+    /// The resource's work and cost spread over time, in file order. Clear
+    /// Baseline drops its Baseline (slot 0) records.
+    pub timephased_data: Vec<TimephasedValue>,
 }
 
 impl Resource {
@@ -656,14 +702,26 @@ pub struct ExtendedAttributeValue {
     pub duration_format: Option<u8>,
 }
 
-/// One record of an assignment's work or cost spread over time (MSPDI
-/// `TimephasedData`), kept as written. `value` is a duration for the work
-/// types and a decimal for the cost types; it is not interpreted.
+/// An outline code's value on a resource (MSPDI `OutlineCode`). The code's
+/// definition is not modeled.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct OutlineCodeValue {
+    /// The field's ID, kept as written.
+    pub field_id: String,
+    pub value_id: Option<String>,
+    pub value_guid: Option<String>,
+}
+
+/// One record of a resource's or assignment's work or cost spread over time
+/// (MSPDI `TimephasedData`), kept as written. `value` is a duration for the
+/// work types and a decimal for the cost types; it is not interpreted.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct TimephasedValue {
-    /// The MSPDI `Type` code, e.g. 1 assignment remaining work, 2 actual work.
+    /// The MSPDI `Type` code. Assignments carry 1-6 and their baseline codes
+    /// (e.g. 1 remaining work, 2 actual work); resources carry their baseline
+    /// codes (7/8, 20/21, ...). The two owners' codes never overlap.
     pub kind: u8,
-    /// The owning assignment's UID, as written.
+    /// The owning resource's or assignment's UID, as written.
     pub uid: Option<i32>,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
@@ -679,10 +737,21 @@ impl TimephasedValue {
     /// Baseline1..10 have their own codes from 16 up.
     pub const BASELINE_WORK: u8 = 4;
     pub const BASELINE_COST: u8 = 5;
+    /// `Type` 7 and 8: the resource's Baseline (slot 0) work and cost.
+    /// Baseline1..10 have their own codes from 20 up (20/21, 26/27, ...).
+    pub const RESOURCE_BASELINE_WORK: u8 = 7;
+    pub const RESOURCE_BASELINE_COST: u8 = 8;
 
-    /// Whether this record belongs to the Baseline (slot 0).
+    /// Whether this record belongs to the Baseline (slot 0): 4/5 on an
+    /// assignment, 7/8 on a resource.
     pub fn is_baseline_slot_zero(&self) -> bool {
-        matches!(self.kind, Self::BASELINE_WORK | Self::BASELINE_COST)
+        matches!(
+            self.kind,
+            Self::BASELINE_WORK
+                | Self::BASELINE_COST
+                | Self::RESOURCE_BASELINE_WORK
+                | Self::RESOURCE_BASELINE_COST
+        )
     }
 }
 
@@ -747,24 +816,70 @@ pub struct Assignment {
     /// (see [`Assignment::set_work`]) and keeps the actuals and baselines; a
     /// reschedule leaves it as stale as `start` and `finish`.
     pub timephased_data: Vec<TimephasedValue>,
+    // The rest of Microsoft's Assignment children, stored as read like the
+    // fields above. The overtime cost and remaining overtime describe the
+    // work, so `set_work` clears them, and `set_units` clears the peak units;
+    // actuals, earned value and the budget stay, as stale as the variances.
+    // An empty GUID is dropped, as on Task.
+    pub guid: Option<String>,
+    pub actual_overtime_cost: Option<Rate>,
+    pub actual_overtime_work_min: Option<i64>,
+    pub acwp: Option<Rate>,
+    pub confirmed: Option<bool>,
+    /// The time unit the rate is scaled to, as the MSPDI code.
+    pub rate_scale: Option<u8>,
+    pub cv: Option<Rate>,
+    pub hyperlink: Option<String>,
+    pub hyperlink_address: Option<String>,
+    pub hyperlink_sub_address: Option<String>,
+    pub linked_fields: Option<bool>,
+    pub milestone: Option<bool>,
+    pub overallocated: Option<bool>,
+    pub overtime_cost: Option<Rate>,
+    /// Decimal text, e.g. `1` = 100%.
+    pub peak_units: Option<Rate>,
+    pub remaining_overtime_cost: Option<Rate>,
+    pub remaining_overtime_work_min: Option<i64>,
+    pub response_pending: Option<bool>,
+    pub summary: Option<bool>,
+    pub sv: Option<Rate>,
+    pub update_needed: Option<bool>,
+    pub vac: Option<Rate>,
+    pub bcws: Option<Rate>,
+    pub bcwp: Option<Rate>,
+    /// 0 committed, 1 proposed.
+    pub booking_type: Option<u8>,
+    pub actual_work_protected_min: Option<i64>,
+    pub actual_overtime_work_protected_min: Option<i64>,
+    pub creation_date: Option<DateTime>,
+    pub assn_owner: Option<String>,
+    pub assn_owner_guid: Option<String>,
+    pub budget_cost: Option<Rate>,
+    pub budget_work_min: Option<i64>,
 }
 
 impl Assignment {
     /// Change the units and the work they give; see [`Assignment::set_work`].
+    /// The peak units go too: a kept peak below the new units would be false.
     pub fn set_units(&mut self, units: f64, work_min: i64) {
         self.units = units;
+        self.peak_units = None;
         self.set_work(work_min);
     }
 
     /// Replace the work, dropping what described the old work: regular work,
-    /// overtime, cost and the planned-work spread. Keeping them would invent
-    /// overtime or misprice the new work. Actuals, baselines, delays, the rate
-    /// table, notes and custom fields stay. Every edit that rewrites the work
-    /// goes through here, so a field derived from it has one place to join.
+    /// overtime (its work, cost and remaining part), cost and the planned-work
+    /// spread. Keeping them would invent overtime or misprice the new work.
+    /// Actuals, earned value, the budget, baselines, delays, the rate table,
+    /// notes and custom fields stay. Every edit that rewrites the work goes
+    /// through here, so a field derived from it has one place to join.
     pub fn set_work(&mut self, work_min: i64) {
         self.work_min = work_min;
         self.regular_work_min = None;
         self.overtime_work_min = None;
+        self.overtime_cost = None;
+        self.remaining_overtime_work_min = None;
+        self.remaining_overtime_cost = None;
         self.cost = None;
         self.timephased_data
             .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);

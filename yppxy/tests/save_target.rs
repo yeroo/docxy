@@ -293,7 +293,9 @@ fn valued_leaves(xml: &str) -> Vec<&str> {
 /// resource and assignment elements carrying a value in the input that are
 /// missing from the output. Rate tables, availability periods, delays,
 /// overtime, costs, notes, custom fields, resource baselines and timephased
-/// data were all on that list.
+/// data were all on that list. Issue #267 extended file 13 to every other
+/// Resource and Assignment child (GUIDs, hyperlinks, earned value, outline
+/// codes, resource timephased data, budget, ...).
 #[test]
 fn headless_save_keeps_every_valued_resource_and_assignment_element() {
     let dir = std::env::temp_dir().join(format!("yppxy-cli-save-issue199-{}", std::process::id()));
@@ -326,13 +328,21 @@ fn headless_save_keeps_every_valued_resource_and_assignment_element() {
                 [
                     "<RateTable>1</RateTable>",
                     "<AvailableUnits>1</AvailableUnits>",
+                    // #267: a nested outline code and timephased Baseline
+                    // cost, and a plain scalar.
+                    "<ValueID>3</ValueID>",
+                    "<Value>485</Value>",
+                    "<GUID>0B7E4C2A-1D3F-4E5A-8B6C-7D8E9F0A1B2C</GUID>",
                 ],
             ),
             (
                 "Assignments",
                 [
-                    "<CostRateTable>1</CostRateTable>",
+                    "<CostRateTable>2</CostRateTable>",
                     "<Value>PT8H0M0S</Value>",
+                    "<RateScale>3</RateScale>",
+                    "<BudgetWork>PT18H0M0S</BudgetWork>",
+                    "<GUID>5D6E7F80-9A1B-4C2D-8E3F-405162738495</GUID>",
                 ],
             ),
         ] {

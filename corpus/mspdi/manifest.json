@@ -118,7 +118,7 @@
         "resource-fields",
         "round-trip"
       ],
-      "desc": "Work resource identity, rates and their display units, booking type and flags, availability and cost rate tables, Cost and Material resources, and an assignment's contour, flags, dates, delays, cost and timephased work survive saving."
+      "desc": "Work resource identity, rates and their display units, booking type and flags, availability and cost rate tables, Cost and Material resources, and an assignment's contour, flags, dates, delays, cost and timephased work survive saving, with every other Resource and Assignment child (GUIDs, hyperlinks, overtime, earned value, owners, outline codes, budget, timephased Baseline)."
     },
     {
       "file": "14-link-sf-before-start.xml",
