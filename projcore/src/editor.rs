@@ -786,15 +786,7 @@ impl Editor {
             };
             let u = checked_units(u, name)?;
             self.edit_row(i, |proj, _| {
-                let a = &mut proj.assignments[k];
-                a.units = u;
-                a.work_min = work_for(duration, u);
-                // Regular work, overtime, cost and the timephased spread all describe the
-                // old work; keeping them would invent overtime or misprice it.
-                a.regular_work_min = None;
-                a.overtime_work_min = None;
-                a.cost = None;
-                a.timephased_data.clear();
+                proj.assignments[k].set_units(u, work_for(duration, u));
             })?;
             return Ok(AssignOutcome::Assigned);
         }

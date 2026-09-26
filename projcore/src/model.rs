@@ -530,6 +530,20 @@ pub struct TimephasedValue {
     pub value: Option<String>,
 }
 
+impl TimephasedValue {
+    /// `Type` 1: the assignment's planned (remaining) work.
+    pub const REMAINING_WORK: u8 = 1;
+    /// `Type` 4 and 5: the assignment's Baseline (slot 0) work and cost.
+    /// Baseline1..10 have their own codes from 16 up.
+    pub const BASELINE_WORK: u8 = 4;
+    pub const BASELINE_COST: u8 = 5;
+
+    /// Whether this record belongs to the Baseline (slot 0).
+    pub fn is_baseline_slot_zero(&self) -> bool {
+        matches!(self.kind, Self::BASELINE_WORK | Self::BASELINE_COST)
+    }
+}
+
 /// An assignment of a resource to a task.
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct Assignment {
@@ -586,13 +600,28 @@ pub struct Assignment {
     pub extended_attributes: Vec<ExtendedAttributeValue>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     pub baselines: Vec<AssignmentBaseline>,
-    /// The work and cost spread over time, in file order. A units edit clears
-    /// it; a duration edit or reschedule leaves it as stale as `work_min`,
-    /// `start` and `finish`, which it then still agrees with.
+    /// The work and cost spread over time, in file order. A units edit drops
+    /// the planned-work records (see [`Assignment::set_units`]) and keeps the
+    /// actuals and baselines; a duration edit or reschedule leaves it as stale
+    /// as `work_min`, `start` and `finish`, which it then still agrees with.
     pub timephased_data: Vec<TimephasedValue>,
 }
 
 impl Assignment {
+    /// Change the units and the work they give, dropping what described the
+    /// old work: regular work, overtime, cost and the planned-work spread.
+    /// Keeping them would invent overtime or misprice the new work. Actuals,
+    /// baselines, delays, the rate table, notes and custom fields stay.
+    pub fn set_units(&mut self, units: f64, work_min: i64) {
+        self.units = units;
+        self.work_min = work_min;
+        self.regular_work_min = None;
+        self.overtime_work_min = None;
+        self.cost = None;
+        self.timephased_data
+            .retain(|t| t.kind != TimephasedValue::REMAINING_WORK);
+    }
+
     pub fn baseline(&self, number: u8) -> Option<&AssignmentBaseline> {
         self.baselines.iter().find(|b| b.number == number)
     }
