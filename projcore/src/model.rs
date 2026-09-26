@@ -301,6 +301,8 @@ pub struct Task {
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     /// Use set_baseline_slot to replace a slot; UI variance uses slot 0.
     pub baselines: Vec<Baseline>,
+    /// Custom field values (MSPDI `ExtendedAttribute`), in file order.
+    pub extended_attributes: Vec<ExtendedAttributeValue>,
     /// Manually scheduled (MSPDI `Manual`): the task stays at the dates the
     /// user gave it instead of moving with its links and constraints.
     pub manual: bool,
@@ -642,8 +644,9 @@ pub struct RateEntry {
     pub cost_per_use: Option<Rate>,
 }
 
-/// A custom field's value on a resource or assignment (MSPDI
-/// `ExtendedAttribute`). The field's definition is not modeled.
+/// A custom field's value on a task, resource or assignment (MSPDI
+/// `ExtendedAttribute`). The field's definition is kept, unmodeled, in
+/// [`Project::extended_attribute_definitions`].
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct ExtendedAttributeValue {
     /// The field's ID, kept as written.
@@ -1157,6 +1160,17 @@ fn merge(times: impl Iterator<Item = WorkingTime>) -> Vec<WorkingTime> {
     merged
 }
 
+/// An XML element kept as read: its name, its decoded text when it is a
+/// leaf, and its child elements in order. Holds content docxy preserves
+/// without modeling; attributes and namespace prefixes are not kept.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct XmlElement {
+    pub name: String,
+    /// The text of a leaf; empty for an element with children.
+    pub text: String,
+    pub children: Vec<XmlElement>,
+}
+
 /// A whole project: tasks, staffing, and the calendars they schedule against.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Project {
@@ -1178,6 +1192,10 @@ pub struct Project {
     /// text) in read order. A save writes each back verbatim, so an unsupported
     /// setting survives rather than resetting to Project's default.
     pub options: Vec<(String, String)>,
+    /// The custom field definitions (each an MSPDI `<ExtendedAttribute>` of
+    /// the project's `<ExtendedAttributes>` block: alias, lookup table,
+    /// formula, ...), in read order. Not modeled; a save writes them back.
+    pub extended_attribute_definitions: Vec<XmlElement>,
     /// Tasks in outline order. UIDs are unique: the readers reject duplicates,
     /// and the scheduler, links and assignments all look tasks up by UID.
     pub tasks: Vec<Task>,
@@ -1198,6 +1216,7 @@ impl Default for Project {
             hours_per_week: 40.0,
             default_calendar_uid: 1,
             options: Vec::new(),
+            extended_attribute_definitions: Vec::new(),
             tasks: Vec::new(),
             resources: Vec::new(),
             assignments: Vec::new(),
