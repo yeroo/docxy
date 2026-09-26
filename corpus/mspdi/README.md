@@ -76,7 +76,8 @@ sequence: GUIDs, hyperlinks, phonetics and account, the resource's own dates,
 actual and remaining overtime, percent work complete, the cost breakdown and
 earned value (SV, CV, ACWP, BCWS, BCWP, VAC), enterprise flags, protected
 actuals, creation dates, cost center and assignment owners, an outline code and
-timephased Baseline work and cost (types 7 and 8) on the resource; and on the
+timephased Baseline work and cost (types 7 and 8) and a cost rate table C,
+which the assignment now names, on the resource; and on the
 assignment its actuals, stop/resume, variances, rate scale, confirmation and
 response flags, peak units, budget cost and work and a Baseline. These values
 are synthetic and not mutually consistent (e.g. actuals on a 0% assignment);

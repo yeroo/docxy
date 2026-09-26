@@ -1469,8 +1469,8 @@ fn opt_text(s: &mut String, name: &str, value: Option<impl ToString>) {
     }
 }
 
-fn opt_rate(s: &mut String, name: &str, value: &Option<Rate>) {
-    opt_text(s, name, value.as_ref().map(Rate::as_str));
+fn opt_rate(s: &mut String, name: &str, value: Option<&Rate>) {
+    opt_text(s, name, value.map(Rate::as_str));
 }
 
 fn opt_work(s: &mut String, name: &str, value: Option<i64>) {
@@ -1645,7 +1645,7 @@ fn write_resource(s: &mut String, r: &Resource) {
     opt_text(s, "HyperlinkAddress", r.hyperlink_address.as_deref());
     opt_text(s, "HyperlinkSubAddress", r.hyperlink_sub_address.as_deref());
     tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
-    opt_rate(s, "PeakUnits", &r.peak_units);
+    opt_rate(s, "PeakUnits", r.peak_units.as_ref());
     opt_flag(s, "OverAllocated", r.over_allocated);
     opt_date(s, "AvailableFrom", r.available_from);
     opt_date(s, "AvailableTo", r.available_to);
@@ -1663,28 +1663,32 @@ fn write_resource(s: &mut String, r: &Resource) {
     opt_work(s, "ActualOvertimeWork", r.actual_overtime_work_min);
     opt_work(s, "RemainingOvertimeWork", r.remaining_overtime_work_min);
     opt_text(s, "PercentWorkComplete", r.percent_work_complete);
-    opt_rate(s, "StandardRate", &r.standard_rate);
+    opt_rate(s, "StandardRate", r.standard_rate.as_ref());
     opt_text(s, "StandardRateFormat", r.standard_rate_format);
-    opt_rate(s, "Cost", &r.cost);
-    opt_rate(s, "OvertimeRate", &r.overtime_rate);
+    opt_rate(s, "Cost", r.cost.as_ref());
+    opt_rate(s, "OvertimeRate", r.overtime_rate.as_ref());
     opt_text(s, "OvertimeRateFormat", r.overtime_rate_format);
-    opt_rate(s, "OvertimeCost", &r.overtime_cost);
-    opt_rate(s, "CostPerUse", &r.cost_per_use);
-    opt_rate(s, "ActualCost", &r.actual_cost);
-    opt_rate(s, "ActualOvertimeCost", &r.actual_overtime_cost);
-    opt_rate(s, "RemainingCost", &r.remaining_cost);
-    opt_rate(s, "RemainingOvertimeCost", &r.remaining_overtime_cost);
-    opt_rate(s, "WorkVariance", &r.work_variance);
-    opt_rate(s, "CostVariance", &r.cost_variance);
-    opt_rate(s, "SV", &r.sv);
-    opt_rate(s, "CV", &r.cv);
-    opt_rate(s, "ACWP", &r.acwp);
+    opt_rate(s, "OvertimeCost", r.overtime_cost.as_ref());
+    opt_rate(s, "CostPerUse", r.cost_per_use.as_ref());
+    opt_rate(s, "ActualCost", r.actual_cost.as_ref());
+    opt_rate(s, "ActualOvertimeCost", r.actual_overtime_cost.as_ref());
+    opt_rate(s, "RemainingCost", r.remaining_cost.as_ref());
+    opt_rate(
+        s,
+        "RemainingOvertimeCost",
+        r.remaining_overtime_cost.as_ref(),
+    );
+    opt_rate(s, "WorkVariance", r.work_variance.as_ref());
+    opt_rate(s, "CostVariance", r.cost_variance.as_ref());
+    opt_rate(s, "SV", r.sv.as_ref());
+    opt_rate(s, "CV", r.cv.as_ref());
+    opt_rate(s, "ACWP", r.acwp.as_ref());
     if let Some(c) = r.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
     }
     opt_text(s, "Notes", r.notes.as_deref());
-    opt_rate(s, "BCWS", &r.bcws);
-    opt_rate(s, "BCWP", &r.bcwp);
+    opt_rate(s, "BCWS", r.bcws.as_ref());
+    opt_rate(s, "BCWP", r.bcwp.as_ref());
     opt_flag(s, "IsGeneric", r.is_generic);
     opt_flag(s, "IsInactive", r.is_inactive);
     opt_flag(s, "IsEnterprise", r.is_enterprise);
@@ -1817,26 +1821,26 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     tag(s, 3, "TaskUID", &a.task_uid.to_string());
     tag(s, 3, "ResourceUID", &a.resource_uid.to_string());
     opt_text(s, "PercentWorkComplete", a.percent_work_complete);
-    opt_rate(s, "ActualCost", &a.actual_cost);
+    opt_rate(s, "ActualCost", a.actual_cost.as_ref());
     opt_date(s, "ActualFinish", a.actual_finish);
-    opt_rate(s, "ActualOvertimeCost", &a.actual_overtime_cost);
+    opt_rate(s, "ActualOvertimeCost", a.actual_overtime_cost.as_ref());
     opt_work(s, "ActualOvertimeWork", a.actual_overtime_work_min);
     opt_date(s, "ActualStart", a.actual_start);
     opt_work(s, "ActualWork", a.actual_work_min);
-    opt_rate(s, "ACWP", &a.acwp);
+    opt_rate(s, "ACWP", a.acwp.as_ref());
     opt_flag(s, "Confirmed", a.confirmed);
-    opt_rate(s, "Cost", &a.cost);
+    opt_rate(s, "Cost", a.cost.as_ref());
     opt_text(s, "CostRateTable", a.cost_rate_table);
     opt_text(s, "RateScale", a.rate_scale);
-    opt_rate(s, "CostVariance", &a.cost_variance);
-    opt_rate(s, "CV", &a.cv);
+    opt_rate(s, "CostVariance", a.cost_variance.as_ref());
+    opt_rate(s, "CV", a.cv.as_ref());
     opt_text(s, "Delay", a.delay);
     opt_date(s, "Finish", a.finish);
     opt_text(s, "FinishVariance", a.finish_variance);
     opt_text(s, "Hyperlink", a.hyperlink.as_deref());
     opt_text(s, "HyperlinkAddress", a.hyperlink_address.as_deref());
     opt_text(s, "HyperlinkSubAddress", a.hyperlink_sub_address.as_deref());
-    opt_rate(s, "WorkVariance", &a.work_variance);
+    opt_rate(s, "WorkVariance", a.work_variance.as_ref());
     opt_flag(s, "HasFixedRateUnits", a.has_fixed_rate_units);
     opt_flag(s, "FixedMaterial", a.fixed_material);
     opt_text(s, "LevelingDelay", a.leveling_delay);
@@ -1845,12 +1849,16 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     opt_flag(s, "Milestone", a.milestone);
     opt_text(s, "Notes", a.notes.as_deref());
     opt_flag(s, "Overallocated", a.overallocated);
-    opt_rate(s, "OvertimeCost", &a.overtime_cost);
+    opt_rate(s, "OvertimeCost", a.overtime_cost.as_ref());
     opt_work(s, "OvertimeWork", a.overtime_work_min);
-    opt_rate(s, "PeakUnits", &a.peak_units);
+    opt_rate(s, "PeakUnits", a.peak_units.as_ref());
     opt_work(s, "RegularWork", a.regular_work_min);
-    opt_rate(s, "RemainingCost", &a.remaining_cost);
-    opt_rate(s, "RemainingOvertimeCost", &a.remaining_overtime_cost);
+    opt_rate(s, "RemainingCost", a.remaining_cost.as_ref());
+    opt_rate(
+        s,
+        "RemainingOvertimeCost",
+        a.remaining_overtime_cost.as_ref(),
+    );
     opt_work(s, "RemainingOvertimeWork", a.remaining_overtime_work_min);
     opt_work(s, "RemainingWork", a.remaining_work_min);
     opt_flag(s, "ResponsePending", a.response_pending);
@@ -1859,14 +1867,14 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     opt_date(s, "Resume", a.resume);
     opt_text(s, "StartVariance", a.start_variance);
     opt_flag(s, "Summary", a.summary);
-    opt_rate(s, "SV", &a.sv);
+    opt_rate(s, "SV", a.sv.as_ref());
     tag(s, 3, "Units", &fmt_f(a.units));
     opt_flag(s, "UpdateNeeded", a.update_needed);
-    opt_rate(s, "VAC", &a.vac);
+    opt_rate(s, "VAC", a.vac.as_ref());
     tag(s, 3, "Work", &min_to_iso(a.work_min));
     opt_text(s, "WorkContour", a.work_contour);
-    opt_rate(s, "BCWS", &a.bcws);
-    opt_rate(s, "BCWP", &a.bcwp);
+    opt_rate(s, "BCWS", a.bcws.as_ref());
+    opt_rate(s, "BCWP", a.bcwp.as_ref());
     opt_text(s, "BookingType", a.booking_type);
     opt_work(s, "ActualWorkProtected", a.actual_work_protected_min);
     opt_work(
@@ -1877,7 +1885,7 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     opt_date(s, "CreationDate", a.creation_date);
     opt_text(s, "AssnOwner", a.assn_owner.as_deref());
     opt_text(s, "AssnOwnerGuid", a.assn_owner_guid.as_deref());
-    opt_rate(s, "BudgetCost", &a.budget_cost);
+    opt_rate(s, "BudgetCost", a.budget_cost.as_ref());
     opt_work(s, "BudgetWork", a.budget_work_min);
     write_extended_attributes(s, &a.extended_attributes);
     for baseline in &a.baselines {
@@ -5878,9 +5886,80 @@ mod tests {
         );
     }
 
+    /// Each `element`'s direct leaf children as (name, text), in written
+    /// order; blocks such as `Baseline` are left out.
+    fn leaf_children<'a>(xml: &'a str, element: &str) -> Vec<Vec<(&'a str, &'a str)>> {
+        let (open, close) = (format!("    <{element}>"), format!("    </{element}>"));
+        let mut out = Vec::new();
+        let mut leaves: Option<Vec<_>> = None;
+        for line in xml.lines() {
+            if line == open {
+                leaves = Some(Vec::new());
+            } else if line == close {
+                out.extend(leaves.take());
+            } else if let Some(leaves) = &mut leaves {
+                let Some(tag) = line.strip_prefix("      <") else {
+                    continue;
+                };
+                if let Some((name, rest)) = tag.split_once('>') {
+                    if let Some(text) = rest.strip_suffix(&format!("</{name}>")) {
+                        leaves.push((name, text));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// #267: a new element whose value a sibling shares would hide a
+    /// reader or writer swap between the two, so fixture 13 gives each its
+    /// own. Flags and BookingType, whose only codes 0 and 1 every flag shares,
+    /// are left to the one-flag-at-a-time test.
+    #[test]
+    fn fixture_13_gives_each_new_value_its_own_text() {
+        #[rustfmt::skip]
+        let new_resource = [
+            "GUID", "Phonetics", "NTAccount", "Hyperlink", "HyperlinkAddress",
+            "HyperlinkSubAddress", "Start", "Finish", "ActualWork", "ActualOvertimeWork",
+            "RemainingOvertimeWork", "PercentWorkComplete", "OvertimeCost", "ActualCost",
+            "ActualOvertimeCost", "RemainingCost", "RemainingOvertimeCost", "WorkVariance",
+            "CostVariance", "SV", "CV", "ACWP", "BCWS", "BCWP", "ActualWorkProtected",
+            "ActualOvertimeWorkProtected", "ActiveDirectoryGUID", "CreationDate", "CostCenter",
+            "AssnOwner", "AssnOwnerGuid",
+        ];
+        #[rustfmt::skip]
+        let new_assignment = [
+            "GUID", "ActualOvertimeCost", "ActualOvertimeWork", "ACWP", "RateScale", "CV",
+            "Hyperlink", "HyperlinkAddress", "HyperlinkSubAddress", "OvertimeCost", "PeakUnits",
+            "RemainingOvertimeCost", "RemainingOvertimeWork", "SV", "VAC", "BCWS", "BCWP",
+            "ActualWorkProtected", "ActualOvertimeWorkProtected", "CreationDate",
+            "AssnOwner", "AssnOwnerGuid", "BudgetCost", "BudgetWork",
+        ];
+        let xml = write_mspdi(&read_mspdi(FIXTURE_13).unwrap());
+        for (element, new) in [
+            ("Resource", &new_resource[..]),
+            ("Assignment", &new_assignment[..]),
+        ] {
+            for leaves in leaf_children(&xml, element) {
+                for &(name, text) in leaves.iter().filter(|(name, _)| new.contains(name)) {
+                    let shared: Vec<_> = leaves
+                        .iter()
+                        .filter(|&&(other, value)| other != name && value == text)
+                        .map(|(other, _)| other)
+                        .collect();
+                    assert!(
+                        shared.is_empty(),
+                        "{element} {name} shares {text:?} with {shared:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// #267: two values cannot tell seven flags apart in one fixture, so a
     /// reader or writer swap between two flags of equal value would pass the
     /// fixture tests. Set one flag at a time: it alone must come back set.
+    /// BookingType's codes are 0 and 1 too, so it joins the flags.
     #[test]
     fn each_resource_and_assignment_flag_round_trips_as_itself() {
         let one_set = |flags: &[&str], set: &str| -> String {
@@ -5897,6 +5976,7 @@ mod tests {
             "IsInactive",
             "IsEnterprise",
             "IsBudget",
+            "BookingType",
         ];
         for set in resource_flags {
             let proj = resource_project(&format!(
@@ -5922,6 +6002,7 @@ mod tests {
             "ResponsePending",
             "Summary",
             "UpdateNeeded",
+            "BookingType",
         ];
         for set in assignment_flags {
             let proj = assignment_project(&format!(

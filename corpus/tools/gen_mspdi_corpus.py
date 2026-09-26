@@ -343,7 +343,8 @@ def build():
     # notes, overtime, custom field and timephased work (#199); and every other
     # child of Microsoft's Resource and Assignment (#267): GUIDs, hyperlinks,
     # actual and remaining overtime, earned value, owners, an outline code and
-    # timephased Baseline work on the resource, and the assignment's progress,
+    # timephased Baseline work and rate table C on the resource (the
+    # assignment is priced from C), and the assignment's progress,
     # flags, budget and a Baseline. The #267 values are synthetic (not
     # re-verified in Project) and only stored, so the schedule is unchanged:
     # the delays are zero, the period covers the whole plan, and the resource
@@ -373,7 +374,7 @@ def build():
         "<OvertimeRate>75</OvertimeRate><OvertimeRateFormat>4</OvertimeRateFormat>"
         "<OvertimeCost>150</OvertimeCost>"
         "<CostPerUse>10</CostPerUse>"
-        "<ActualCost>210</ActualCost><ActualOvertimeCost>75</ActualOvertimeCost>"
+        "<ActualCost>210</ActualCost><ActualOvertimeCost>72.5</ActualOvertimeCost>"
         "<RemainingCost>760</RemainingCost><RemainingOvertimeCost>155</RemainingOvertimeCost>"
         "<WorkVariance>60000</WorkVariance><CostVariance>12.5</CostVariance>"
         "<SV>-25</SV><CV>5</CV><ACWP>205</ACWP>"
@@ -387,7 +388,7 @@ def build():
         "<ActiveDirectoryGUID>7C9E6679-7425-40DE-944B-E07FC1F90AE7</ActiveDirectoryGUID>"
         "<CreationDate>2026-02-20T09:15:00</CreationDate>"
         "<CostCenter>CC-410</CostCenter>"
-        "<AssnOwner>Alice</AssnOwner>"
+        "<AssnOwner>Site manager</AssnOwner>"
         "<AssnOwnerGuid>1C8F5D3B-2E40-4F6B-9C7D-8E9FA0B1C2D3</AssnOwnerGuid>"
         "<ExtendedAttribute><FieldID>205520904</FieldID><Value>Ops</Value></ExtendedAttribute>"
         "<Baseline><Number>0</Number><Work>PT16H0M0S</Work><Cost>970</Cost></Baseline>"
@@ -405,6 +406,10 @@ def build():
         "<Rate><RatesFrom>1984-01-01T00:00:00</RatesFrom><RatesTo>2049-12-31T23:59:00</RatesTo>"
         "<RateTable>1</RateTable><StandardRate>60</StandardRate>"
         "<StandardRateFormat>2</StandardRateFormat><OvertimeRate>90</OvertimeRate>"
+        "<OvertimeRateFormat>2</OvertimeRateFormat><CostPerUse>10</CostPerUse></Rate>"
+        "<Rate><RatesFrom>1984-01-01T00:00:00</RatesFrom><RatesTo>2049-12-31T23:59:00</RatesTo>"
+        "<RateTable>2</RateTable><StandardRate>65</StandardRate>"
+        "<StandardRateFormat>2</StandardRateFormat><OvertimeRate>95</OvertimeRate>"
         "<OvertimeRateFormat>2</OvertimeRateFormat><CostPerUse>10</CostPerUse></Rate>"
         "</Rates>"
         f"<TimephasedData><Type>7</Type><UID>1</UID><Start>{dt(2)}</Start>"
@@ -428,7 +433,7 @@ def build():
                 "<ActualOvertimeWork>PT0H45M0S</ActualOvertimeWork>"
                 f"<ActualStart>{dt(2, '09:00:00')}</ActualStart><ActualWork>PT3H0M0S</ActualWork>"
                 "<ACWP>200</ACWP><Confirmed>1</Confirmed>"
-                "<Cost>970</Cost><CostRateTable>1</CostRateTable><RateScale>2</RateScale>"
+                "<Cost>970</Cost><CostRateTable>2</CostRateTable><RateScale>3</RateScale>"
                 "<CostVariance>-7.5</CostVariance><CV>2.5</CV><Delay>0</Delay>"
                 f"<Finish>{dt(3, '17:00:00')}</Finish><FinishVariance>480</FinishVariance>"
                 "<Hyperlink>Pour plan</Hyperlink>"
@@ -441,7 +446,7 @@ def build():
                 "<LinkedFields>1</LinkedFields><Milestone>0</Milestone>"
                 "<Notes>Pour on day one</Notes><Overallocated>1</Overallocated>"
                 "<OvertimeCost>140</OvertimeCost><OvertimeWork>PT0H0M0S</OvertimeWork>"
-                "<PeakUnits>1</PeakUnits>"
+                "<PeakUnits>1.5</PeakUnits>"
                 "<RegularWork>PT16H0M0S</RegularWork>"
                 "<RemainingCost>765</RemainingCost>"
                 "<RemainingOvertimeCost>145</RemainingOvertimeCost>"

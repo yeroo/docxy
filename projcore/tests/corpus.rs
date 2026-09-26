@@ -651,7 +651,7 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     // #199: rate tables, availability and the rest of the resource.
     assert_eq!(
         alice.rates.iter().map(|r| r.rate_table).collect::<Vec<_>>(),
-        [Some(0), Some(1)]
+        [Some(0), Some(1), Some(2)]
     );
     assert_eq!(alice.rates[1].standard_rate, Rate::parse("60"));
     assert_eq!(alice.availability_periods.len(), 1);
@@ -685,7 +685,7 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     // #199: the assignment's cost, table, delays, notes and timephased work.
     assert_eq!(
         (&a.cost, a.cost_rate_table, a.overtime_work_min),
-        (&Rate::parse("970"), Some(1), Some(0))
+        (&Rate::parse("970"), Some(2), Some(0))
     );
     assert_eq!(
         (a.delay, a.leveling_delay, a.leveling_delay_format),
@@ -755,7 +755,7 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
                 "<RemainingWork>PT16H0M0S</RemainingWork>",
                 "<PercentWorkComplete>0</PercentWorkComplete>",
                 "<Cost>970</Cost>",
-                "<CostRateTable>1</CostRateTable>",
+                "<CostRateTable>2</CostRateTable>",
                 "<Delay>0</Delay>",
                 "<LevelingDelay>0</LevelingDelay>",
                 "<LevelingDelayFormat>7</LevelingDelayFormat>",

@@ -338,9 +338,9 @@ fn headless_save_keeps_every_valued_resource_and_assignment_element() {
             (
                 "Assignments",
                 [
-                    "<CostRateTable>1</CostRateTable>",
+                    "<CostRateTable>2</CostRateTable>",
                     "<Value>PT8H0M0S</Value>",
-                    "<RateScale>2</RateScale>",
+                    "<RateScale>3</RateScale>",
                     "<BudgetWork>PT18H0M0S</BudgetWork>",
                     "<GUID>5D6E7F80-9A1B-4C2D-8E3F-405162738495</GUID>",
                 ],
