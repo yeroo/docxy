@@ -645,6 +645,58 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
         (a.percent_work_complete, a.remaining_work_min),
         (Some(0), Some(960))
     );
+    // #199: rate tables, availability and the rest of the resource.
+    assert_eq!(
+        alice.rates.iter().map(|r| r.rate_table).collect::<Vec<_>>(),
+        [Some(0), Some(1)]
+    );
+    assert_eq!(alice.rates[1].standard_rate, Rate::parse("60"));
+    assert_eq!(alice.availability_periods.len(), 1);
+    assert_eq!(
+        alice.availability_periods[0].available_units,
+        Rate::parse("1")
+    );
+    assert_eq!(
+        (
+            alice.email_address.as_deref(),
+            alice.notes.as_deref(),
+            &alice.cost,
+            alice.overtime_work_min
+        ),
+        (
+            Some("alice@example.com"),
+            Some("Site lead & first aider"),
+            &Rate::parse("970"),
+            Some(0)
+        )
+    );
+    assert_eq!(
+        (alice.available_from, alice.available_to),
+        (
+            Some(DateTime::from_ymd_hm(1984, 1, 1, 0, 0)),
+            Some(DateTime::from_ymd_hm(2049, 12, 31, 23, 59))
+        )
+    );
+    assert_eq!(alice.extended_attributes[0].field_id, "205520904");
+    assert_eq!(alice.baseline(0).unwrap().cost, Rate::parse("970"));
+    // #199: the assignment's cost, table, delays, notes and timephased work.
+    assert_eq!(
+        (&a.cost, a.cost_rate_table, a.overtime_work_min),
+        (&Rate::parse("970"), Some(1), Some(0))
+    );
+    assert_eq!(
+        (a.delay, a.leveling_delay, a.leveling_delay_format),
+        (Some(0), Some(0), Some(7))
+    );
+    assert_eq!(a.notes.as_deref(), Some("Pour on day one"));
+    assert_eq!(a.extended_attributes[0].value.as_deref(), Some("12.5"));
+    assert_eq!(
+        a.timephased_data
+            .iter()
+            .map(|t| t.value.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("PT8H0M0S"), Some("PT8H0M0S")]
+    );
     // What the issue saw dropped comes back from a save, element for element.
     let saved = write_mspdi(&proj);
     let section = |xml: &str, name: &str| {
@@ -668,6 +720,18 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
                 "<Work>PT16H0M0S</Work>",
                 "<RegularWork>PT16H0M0S</RegularWork>",
                 "<RemainingWork>PT16H0M0S</RemainingWork>",
+                "<EmailAddress>alice@example.com</EmailAddress>",
+                "<AvailableFrom>1984-01-01T00:00:00</AvailableFrom>",
+                "<AvailableTo>2049-12-31T23:59:00</AvailableTo>",
+                "<OvertimeWork>PT0H0M0S</OvertimeWork>",
+                "<Cost>970</Cost>",
+                "<Notes>Site lead &amp; first aider</Notes>",
+                "<FieldID>205520904</FieldID>",
+                "<Baseline>",
+                "<AvailableUnits>1</AvailableUnits>",
+                "<RateTable>1</RateTable>",
+                "<StandardRate>60</StandardRate>",
+                "<CostPerUse>10</CostPerUse>",
             ][..],
         ),
         (
@@ -681,6 +745,16 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
                 "<RegularWork>PT16H0M0S</RegularWork>",
                 "<RemainingWork>PT16H0M0S</RemainingWork>",
                 "<PercentWorkComplete>0</PercentWorkComplete>",
+                "<Cost>970</Cost>",
+                "<CostRateTable>1</CostRateTable>",
+                "<Delay>0</Delay>",
+                "<LevelingDelay>0</LevelingDelay>",
+                "<LevelingDelayFormat>7</LevelingDelayFormat>",
+                "<Notes>Pour on day one</Notes>",
+                "<OvertimeWork>PT0H0M0S</OvertimeWork>",
+                "<FieldID>255852547</FieldID>",
+                "<TimephasedData>",
+                "<Value>PT8H0M0S</Value>",
             ][..],
         ),
     ] {

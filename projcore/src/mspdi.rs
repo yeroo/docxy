@@ -408,6 +408,19 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "Work" => r.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "RegularWork" => r.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
                     "RemainingWork" => r.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "OvertimeWork" => r.overtime_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => r.cost = rate_of(p),
+                    "EmailAddress" => r.email_address = Some(text_of(p)),
+                    "Notes" => r.notes = Some(text_of(p)),
+                    "AvailableFrom" => r.available_from = DateTime::parse_mspdi(&text_of(p)),
+                    "AvailableTo" => r.available_to = DateTime::parse_mspdi(&text_of(p)),
+                    "ExtendedAttribute" => {
+                        r.extended_attributes.extend(parse_extended_attribute(p));
+                    }
+                    // Its Work/Cost are the recorded plan's, not the resource's.
+                    "Baseline" => parse_resource_baseline(p, &mut r),
+                    "AvailabilityPeriods" => parse_availability_periods(p, &mut r),
+                    "Rates" => parse_rates(p, &mut r),
                     _ => p.skip_element(),
                 }
             }
@@ -478,8 +491,19 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
                     "Start" => a.start = DateTime::parse_mspdi(&text_of(p)),
                     "Finish" => a.finish = DateTime::parse_mspdi(&text_of(p)),
                     "RegularWork" => a.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "OvertimeWork" => a.overtime_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => a.cost = rate_of(p),
+                    "CostRateTable" => a.cost_rate_table = opt_u8_of(p),
+                    "Delay" => a.delay = opt_int_of(p),
+                    "LevelingDelay" => a.leveling_delay = opt_int_of(p),
+                    "LevelingDelayFormat" => a.leveling_delay_format = opt_u8_of(p),
+                    "Notes" => a.notes = Some(text_of(p)),
+                    "ExtendedAttribute" => {
+                        a.extended_attributes.extend(parse_extended_attribute(p));
+                    }
                     // Its Start/Finish/Work/Cost are the recorded plan's, not the assignment's.
                     "Baseline" => parse_assignment_baseline(p, &mut a),
+                    "TimephasedData" => a.timephased_data.extend(parse_timephased_data(p)),
                     _ => p.skip_element(),
                 }
             }
@@ -519,6 +543,161 @@ fn parse_assignment_baseline(p: &mut XmlParser, a: &mut Assignment) {
             a.set_baseline_slot(baseline);
         }
     }
+}
+
+/// Parse a resource's recorded plan; the same slot rules as [`parse_baseline`].
+fn parse_resource_baseline(p: &mut XmlParser, r: &mut Resource) {
+    let mut baseline = ResourceBaseline::default();
+    let mut number = Some(0);
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "Number" => {
+                        number = text_of(p).trim().parse::<u8>().ok().filter(|n| *n <= 10);
+                    }
+                    "Work" => baseline.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => baseline.cost = rate_of(p),
+                    "BCWS" => baseline.bcws = rate_of(p),
+                    "BCWP" => baseline.bcwp = rate_of(p),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    if let Some(number) = number {
+        if baseline != ResourceBaseline::default() {
+            baseline.number = number;
+            r.set_baseline_slot(baseline);
+        }
+    }
+}
+
+/// Parse `AvailabilityPeriods`; a period with no valid child is dropped.
+fn parse_availability_periods(p: &mut XmlParser, r: &mut Resource) {
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "AvailabilityPeriod" => {
+                let mut period = AvailabilityPeriod::default();
+                loop {
+                    match p.next() {
+                        Event::Start => {
+                            let name = p.name().to_string();
+                            match name.as_str() {
+                                "AvailableFrom" => {
+                                    period.available_from = DateTime::parse_mspdi(&text_of(p));
+                                }
+                                "AvailableTo" => {
+                                    period.available_to = DateTime::parse_mspdi(&text_of(p));
+                                }
+                                "AvailableUnits" => period.available_units = rate_of(p),
+                                _ => p.skip_element(),
+                            }
+                        }
+                        Event::End | Event::Eof => break,
+                        _ => {}
+                    }
+                }
+                if period != AvailabilityPeriod::default() {
+                    r.availability_periods.push(period);
+                }
+            }
+            Event::Start => p.skip_element(),
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+}
+
+/// Parse `Rates`; an entry with no valid child is dropped.
+fn parse_rates(p: &mut XmlParser, r: &mut Resource) {
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "Rate" => {
+                let mut rate = RateEntry::default();
+                loop {
+                    match p.next() {
+                        Event::Start => {
+                            let name = p.name().to_string();
+                            match name.as_str() {
+                                "RatesFrom" => rate.rates_from = DateTime::parse_mspdi(&text_of(p)),
+                                "RatesTo" => rate.rates_to = DateTime::parse_mspdi(&text_of(p)),
+                                "RateTable" => rate.rate_table = opt_u8_of(p),
+                                "StandardRate" => rate.standard_rate = rate_of(p),
+                                "StandardRateFormat" => rate.standard_rate_format = opt_u8_of(p),
+                                "OvertimeRate" => rate.overtime_rate = rate_of(p),
+                                "OvertimeRateFormat" => rate.overtime_rate_format = opt_u8_of(p),
+                                "CostPerUse" => rate.cost_per_use = rate_of(p),
+                                _ => p.skip_element(),
+                            }
+                        }
+                        Event::End | Event::Eof => break,
+                        _ => {}
+                    }
+                }
+                if rate != RateEntry::default() {
+                    r.rates.push(rate);
+                }
+            }
+            Event::Start => p.skip_element(),
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+}
+
+/// Parse one custom field value; `None` without a `FieldID`, which names it.
+fn parse_extended_attribute(p: &mut XmlParser) -> Option<ExtendedAttributeValue> {
+    let mut field_id = None;
+    let mut attribute = ExtendedAttributeValue::default();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "FieldID" => field_id = leaf_text_of(p),
+                    "Value" => attribute.value = leaf_text_of(p),
+                    "ValueGUID" => attribute.value_guid = leaf_text_of(p),
+                    "DurationFormat" => attribute.duration_format = opt_u8_of(p),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    attribute.field_id = field_id?;
+    Some(attribute)
+}
+
+/// Parse one timephased record; `None` without a valid `Type`, which says
+/// what its value measures.
+fn parse_timephased_data(p: &mut XmlParser) -> Option<TimephasedValue> {
+    let mut kind = None;
+    let mut record = TimephasedValue::default();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "Type" => kind = opt_u8_of(p),
+                    "UID" => record.uid = opt_i32_of(p),
+                    "Start" => record.start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => record.finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Unit" => record.unit = opt_u8_of(p),
+                    "Value" => record.value = leaf_text_of(p),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    record.kind = kind?;
+    Some(record)
 }
 
 fn parse_calendars(p: &mut XmlParser, out: &mut Vec<Calendar>) {
@@ -906,8 +1085,8 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Emits the fields projcore models — enough for MS Project to open the file
 /// and for our own reader to round-trip — plus every project-level option the
 /// reader kept verbatim in [`Project::options`]: the schema's in
-/// [`PROJECT_HEADER`] order, then any others in read order. Other elements outside the model (custom fields,
-/// views, extended attributes, outline codes) are not preserved: this is a
+/// [`PROJECT_HEADER`] order, then any others in read order. Other elements outside the model (custom field definitions,
+/// views, task extended attributes, outline codes) are not preserved: this is a
 /// model-faithful writer, not a byte-faithful one. Each task's stored
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
 /// stamping them back), so a scheduled project exports with dates Project can
@@ -1295,15 +1474,19 @@ fn write_resource(s: &mut String, r: &Resource) {
         }
     }
     opt_text(s, "WorkGroup", r.work_group);
+    opt_text(s, "EmailAddress", r.email_address.as_deref());
     tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
     opt_text(s, "PeakUnits", r.peak_units.as_ref().map(Rate::as_str));
     opt_flag(s, "OverAllocated", r.over_allocated);
+    opt_date(s, "AvailableFrom", r.available_from);
+    opt_date(s, "AvailableTo", r.available_to);
     opt_flag(s, "CanLevel", r.can_level);
     if let Some(accrue_at) = r.accrue_at {
         tag(s, 3, "AccrueAt", &accrue_at.code().to_string());
     }
     opt_text(s, "Work", r.work_min.map(min_to_iso));
     opt_text(s, "RegularWork", r.regular_work_min.map(min_to_iso));
+    opt_text(s, "OvertimeWork", r.overtime_work_min.map(min_to_iso));
     opt_text(s, "RemainingWork", r.remaining_work_min.map(min_to_iso));
     opt_text(
         s,
@@ -1311,6 +1494,7 @@ fn write_resource(s: &mut String, r: &Resource) {
         r.standard_rate.as_ref().map(Rate::as_str),
     );
     opt_text(s, "StandardRateFormat", r.standard_rate_format);
+    opt_text(s, "Cost", r.cost.as_ref().map(Rate::as_str));
     opt_text(
         s,
         "OvertimeRate",
@@ -1321,6 +1505,7 @@ fn write_resource(s: &mut String, r: &Resource) {
     if let Some(c) = r.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
     }
+    opt_text(s, "Notes", r.notes.as_deref());
     opt_flag(s, "IsGeneric", r.is_generic);
     opt_flag(s, "IsInactive", r.is_inactive);
     opt_text(s, "BookingType", r.booking_type);
@@ -1328,7 +1513,96 @@ fn write_resource(s: &mut String, r: &Resource) {
         tag(s, 3, "IsCostResource", "1");
     }
     opt_flag(s, "IsBudget", r.is_budget);
+    write_extended_attributes(s, &r.extended_attributes);
+    for baseline in &r.baselines {
+        s.push_str("      <Baseline>\n");
+        tag(s, 4, "Number", &baseline.number.to_string());
+        if let Some(work) = baseline.work_min {
+            tag(s, 4, "Work", &min_to_iso(work));
+        }
+        for (name, value) in [
+            ("Cost", &baseline.cost),
+            ("BCWS", &baseline.bcws),
+            ("BCWP", &baseline.bcwp),
+        ] {
+            if let Some(value) = value {
+                tag(s, 4, name, value.as_str());
+            }
+        }
+        s.push_str("      </Baseline>\n");
+    }
+    if !r.availability_periods.is_empty() {
+        s.push_str("      <AvailabilityPeriods>\n");
+        for period in &r.availability_periods {
+            s.push_str("        <AvailabilityPeriod>\n");
+            if let Some(from) = period.available_from {
+                tag(s, 5, "AvailableFrom", &from.to_mspdi());
+            }
+            if let Some(to) = period.available_to {
+                tag(s, 5, "AvailableTo", &to.to_mspdi());
+            }
+            if let Some(units) = &period.available_units {
+                tag(s, 5, "AvailableUnits", units.as_str());
+            }
+            s.push_str("        </AvailabilityPeriod>\n");
+        }
+        s.push_str("      </AvailabilityPeriods>\n");
+    }
+    if !r.rates.is_empty() {
+        s.push_str("      <Rates>\n");
+        for rate in &r.rates {
+            s.push_str("        <Rate>\n");
+            if let Some(from) = rate.rates_from {
+                tag(s, 5, "RatesFrom", &from.to_mspdi());
+            }
+            if let Some(to) = rate.rates_to {
+                tag(s, 5, "RatesTo", &to.to_mspdi());
+            }
+            let codes = |code: Option<u8>| code.map(|c| c.to_string());
+            for (name, value) in [
+                ("RateTable", codes(rate.rate_table)),
+                (
+                    "StandardRate",
+                    rate.standard_rate.as_ref().map(|r| r.as_str().to_owned()),
+                ),
+                ("StandardRateFormat", codes(rate.standard_rate_format)),
+                (
+                    "OvertimeRate",
+                    rate.overtime_rate.as_ref().map(|r| r.as_str().to_owned()),
+                ),
+                ("OvertimeRateFormat", codes(rate.overtime_rate_format)),
+                (
+                    "CostPerUse",
+                    rate.cost_per_use.as_ref().map(|r| r.as_str().to_owned()),
+                ),
+            ] {
+                if let Some(value) = value {
+                    tag(s, 5, name, &value);
+                }
+            }
+            s.push_str("        </Rate>\n");
+        }
+        s.push_str("      </Rates>\n");
+    }
     s.push_str("    </Resource>\n");
+}
+
+/// Custom field values, in the schema's child order.
+fn write_extended_attributes(s: &mut String, attributes: &[ExtendedAttributeValue]) {
+    for attribute in attributes {
+        s.push_str("      <ExtendedAttribute>\n");
+        tag(s, 4, "FieldID", &attribute.field_id);
+        if let Some(value) = &attribute.value {
+            tag(s, 4, "Value", value);
+        }
+        if let Some(guid) = &attribute.value_guid {
+            tag(s, 4, "ValueGUID", guid);
+        }
+        if let Some(format) = attribute.duration_format {
+            tag(s, 4, "DurationFormat", &format.to_string());
+        }
+        s.push_str("      </ExtendedAttribute>\n");
+    }
 }
 
 fn write_assignment(s: &mut String, a: &Assignment) {
@@ -1342,11 +1616,14 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     opt_date(s, "ActualFinish", a.actual_finish);
     opt_date(s, "ActualStart", a.actual_start);
     opt_text(s, "ActualWork", a.actual_work_min.map(min_to_iso));
+    opt_text(s, "Cost", a.cost.as_ref().map(Rate::as_str));
+    opt_text(s, "CostRateTable", a.cost_rate_table);
     opt_text(
         s,
         "CostVariance",
         a.cost_variance.as_ref().map(Rate::as_str),
     );
+    opt_text(s, "Delay", a.delay);
     opt_date(s, "Finish", a.finish);
     opt_text(s, "FinishVariance", a.finish_variance);
     opt_text(
@@ -1356,6 +1633,10 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     );
     opt_flag(s, "HasFixedRateUnits", a.has_fixed_rate_units);
     opt_flag(s, "FixedMaterial", a.fixed_material);
+    opt_text(s, "LevelingDelay", a.leveling_delay);
+    opt_text(s, "LevelingDelayFormat", a.leveling_delay_format);
+    opt_text(s, "Notes", a.notes.as_deref());
+    opt_text(s, "OvertimeWork", a.overtime_work_min.map(min_to_iso));
     opt_text(s, "RegularWork", a.regular_work_min.map(min_to_iso));
     opt_text(
         s,
@@ -1370,6 +1651,7 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     tag(s, 3, "Units", &fmt_f(a.units));
     tag(s, 3, "Work", &min_to_iso(a.work_min));
     opt_text(s, "WorkContour", a.work_contour);
+    write_extended_attributes(s, &a.extended_attributes);
     for baseline in &a.baselines {
         s.push_str("      <Baseline>\n");
         tag(s, 4, "Number", &baseline.number.to_string());
@@ -1386,6 +1668,26 @@ fn write_assignment(s: &mut String, a: &Assignment) {
             tag(s, 4, "Cost", cost.as_str());
         }
         s.push_str("      </Baseline>\n");
+    }
+    for record in &a.timephased_data {
+        s.push_str("      <TimephasedData>\n");
+        tag(s, 4, "Type", &record.kind.to_string());
+        if let Some(uid) = record.uid {
+            tag(s, 4, "UID", &uid.to_string());
+        }
+        if let Some(start) = record.start {
+            tag(s, 4, "Start", &start.to_mspdi());
+        }
+        if let Some(finish) = record.finish {
+            tag(s, 4, "Finish", &finish.to_mspdi());
+        }
+        if let Some(unit) = record.unit {
+            tag(s, 4, "Unit", &unit.to_string());
+        }
+        if let Some(value) = &record.value {
+            tag(s, 4, "Value", value);
+        }
+        s.push_str("      </TimephasedData>\n");
     }
     s.push_str("    </Assignment>\n");
 }
@@ -1543,6 +1845,8 @@ fn esc_into(text: &str, out: &mut String) {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
+            // A conformant reader turns a raw CR (or CR LF) into LF.
+            '\r' => out.push_str("&#13;"),
             _ => out.push(c),
         }
     }
@@ -2028,6 +2332,40 @@ mod tests {
             is_inactive: Some(false),
             booking_type: Some(0),
             is_budget: Some(true),
+            email_address: Some("a@example.com".into()),
+            available_from: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            available_to: Some(DateTime::from_ymd_hm(2026, 12, 31, 17, 0)),
+            overtime_work_min: Some(60),
+            cost: Rate::parse("400"),
+            notes: Some("note".into()),
+            extended_attributes: vec![ExtendedAttributeValue {
+                field_id: "205520904".into(),
+                value: Some("x".into()),
+                value_guid: Some("{0}".into()),
+                duration_format: Some(7),
+            }],
+            baselines: vec![ResourceBaseline {
+                number: 0,
+                work_min: Some(480),
+                cost: Rate::parse("400"),
+                bcws: Rate::parse("1"),
+                bcwp: Rate::parse("2"),
+            }],
+            availability_periods: vec![AvailabilityPeriod {
+                available_from: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                available_to: Some(DateTime::from_ymd_hm(2026, 12, 31, 17, 0)),
+                available_units: Rate::parse("0.5"),
+            }],
+            rates: vec![RateEntry {
+                rates_from: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                rates_to: Some(DateTime::from_ymd_hm(2026, 12, 31, 17, 0)),
+                rate_table: Some(1),
+                standard_rate: Rate::parse("60"),
+                standard_rate_format: Some(2),
+                overtime_rate: Rate::parse("90"),
+                overtime_rate_format: Some(2),
+                cost_per_use: Rate::parse("5"),
+            }],
             ..Resource::default()
         };
         for r in [full(ResourceType::Cost), full(ResourceType::Work)] {
@@ -2044,25 +2382,57 @@ mod tests {
                 "Code",
                 "Group",
                 "WorkGroup",
+                "EmailAddress",
                 "MaxUnits",
                 "PeakUnits",
                 "OverAllocated",
+                "AvailableFrom",
+                "AvailableTo",
                 "CanLevel",
                 "AccrueAt",
                 "Work",
                 "RegularWork",
+                "OvertimeWork",
                 "RemainingWork",
                 "StandardRate",
                 "StandardRateFormat",
+                "Cost",
                 "OvertimeRate",
                 "OvertimeRateFormat",
                 "CostPerUse",
                 "CalendarUID",
+                "Notes",
                 "IsGeneric",
                 "IsInactive",
                 "BookingType",
                 "IsCostResource",
                 "IsBudget",
+                "ExtendedAttribute",
+                "FieldID",
+                "Value",
+                "ValueGUID",
+                "DurationFormat",
+                "Baseline",
+                "Number",
+                "Work",
+                "Cost",
+                "BCWS",
+                "BCWP",
+                "AvailabilityPeriods",
+                "AvailabilityPeriod",
+                "AvailableFrom",
+                "AvailableTo",
+                "AvailableUnits",
+                "Rates",
+                "Rate",
+                "RatesFrom",
+                "RatesTo",
+                "RateTable",
+                "StandardRate",
+                "StandardRateFormat",
+                "OvertimeRate",
+                "OvertimeRateFormat",
+                "CostPerUse",
             ];
             if r.kind != ResourceType::Cost {
                 expected.retain(|name| *name != "IsCostResource");
@@ -3775,6 +4145,16 @@ mod tests {
                 start: None,
                 finish: None,
                 regular_work_min: None,
+                // Nor is the baseline's Cost.
+                overtime_work_min: None,
+                cost: None,
+                cost_rate_table: None,
+                delay: None,
+                leveling_delay: None,
+                leveling_delay_format: None,
+                notes: None,
+                extended_attributes: vec![],
+                timephased_data: vec![],
                 baselines: vec![
                     AssignmentBaseline {
                         number: 0,
@@ -4059,6 +4439,27 @@ mod tests {
         a.regular_work_min = Some(1920);
         a.start = d(2, 8);
         a.work_contour = Some(1);
+        a.cost = Rate::parse("800");
+        a.cost_rate_table = Some(2);
+        a.delay = Some(4800);
+        a.leveling_delay = Some(9600);
+        a.leveling_delay_format = Some(7);
+        a.notes = Some("note".into());
+        a.overtime_work_min = Some(60);
+        a.extended_attributes = vec![ExtendedAttributeValue {
+            field_id: "255852547".into(),
+            value: Some("x".into()),
+            value_guid: Some("{0}".into()),
+            duration_format: Some(7),
+        }];
+        a.timephased_data = vec![TimephasedValue {
+            kind: 1,
+            uid: Some(1),
+            start: d(2, 8),
+            finish: d(3, 8),
+            unit: Some(2),
+            value: Some("PT8H0M0S".into()),
+        }];
         let mut xml = String::new();
         write_assignment(&mut xml, &proj.assignments[0]);
         assert_eq!(
@@ -4073,12 +4474,19 @@ mod tests {
                 "ActualFinish",
                 "ActualStart",
                 "ActualWork",
+                "Cost",
+                "CostRateTable",
                 "CostVariance",
+                "Delay",
                 "Finish",
                 "FinishVariance",
                 "WorkVariance",
                 "HasFixedRateUnits",
                 "FixedMaterial",
+                "LevelingDelay",
+                "LevelingDelayFormat",
+                "Notes",
+                "OvertimeWork",
                 "RegularWork",
                 "RemainingCost",
                 "RemainingWork",
@@ -4089,6 +4497,11 @@ mod tests {
                 "Units",
                 "Work",
                 "WorkContour",
+                "ExtendedAttribute",
+                "FieldID",
+                "Value",
+                "ValueGUID",
+                "DurationFormat",
                 "Baseline",
                 "Number",
                 "Start",
@@ -4098,7 +4511,19 @@ mod tests {
                 "Baseline",
                 "Number",
                 "Work",
+                "TimephasedData",
+                "Type",
+                "UID",
+                "Start",
+                "Finish",
+                "Unit",
+                "Value",
             ]
+        );
+        assert_eq!(
+            assignment_project(&xml).assignments,
+            proj.assignments,
+            "the written children read back"
         );
     }
 
@@ -4340,6 +4765,425 @@ mod tests {
                 "{element}"
             );
         }
+    }
+
+    /// A work resource carrying every field #199 keeps: two rate tables, two
+    /// availability periods, two baselines and two custom field values, with
+    /// XML specials and a CR LF in its text.
+    const RESOURCE_RATES: &str = "<Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>\
+        <Type>1</Type><EmailAddress>a&amp;b@example.com</EmailAddress><MaxUnits>1</MaxUnits>\
+        <AvailableFrom>2026-03-02T08:00:00</AvailableFrom><AvailableTo>2049-12-31T23:59:00</AvailableTo>\
+        <Work>PT40H0M0S</Work><OvertimeWork>PT8H0M0S</OvertimeWork><StandardRate>50</StandardRate>\
+        <Cost>2000.50</Cost><Notes>Keys &lt;desk&gt;&#13;&#10;Badge</Notes>\
+        <ExtendedAttribute><FieldID>205520904</FieldID><Value>Ops</Value></ExtendedAttribute>\
+        <ExtendedAttribute><FieldID>205521121</FieldID><Value>PT8H0M0S</Value>\
+          <ValueGUID>{8C2A3B1E-0000-4000-8000-000000000001}</ValueGUID><DurationFormat>7</DurationFormat>\
+        </ExtendedAttribute>\
+        <Baseline><Number>0</Number><Work>PT40H0M0S</Work><Cost>2000</Cost><BCWS>1000</BCWS><BCWP>500</BCWP></Baseline>\
+        <Baseline><Number>2</Number><Cost>0</Cost></Baseline>\
+        <AvailabilityPeriods>\
+          <AvailabilityPeriod><AvailableFrom>2026-03-02T08:00:00</AvailableFrom>\
+            <AvailableTo>2026-03-31T17:00:00</AvailableTo><AvailableUnits>1</AvailableUnits></AvailabilityPeriod>\
+          <AvailabilityPeriod><AvailableFrom>2026-04-01T08:00:00</AvailableFrom>\
+            <AvailableTo>2049-12-31T23:59:00</AvailableTo><AvailableUnits>0.5</AvailableUnits></AvailabilityPeriod>\
+        </AvailabilityPeriods>\
+        <Rates>\
+          <Rate><RatesFrom>1984-01-01T00:00:00</RatesFrom><RatesTo>2049-12-31T23:59:00</RatesTo>\
+            <RateTable>0</RateTable><StandardRate>50</StandardRate><StandardRateFormat>2</StandardRateFormat>\
+            <OvertimeRate>75</OvertimeRate><OvertimeRateFormat>2</OvertimeRateFormat><CostPerUse>0</CostPerUse></Rate>\
+          <Rate><RatesFrom>1984-01-01T00:00:00</RatesFrom><RatesTo>2049-12-31T23:59:00</RatesTo>\
+            <RateTable>1</RateTable><StandardRate>80.25</StandardRate><StandardRateFormat>3</StandardRateFormat>\
+            <OvertimeRate>0</OvertimeRate><OvertimeRateFormat>2</OvertimeRateFormat><CostPerUse>15</CostPerUse></Rate>\
+        </Rates></Resource>";
+
+    /// Resource elements #199 keeps, besides those inside its blocks.
+    const RESOURCE_RATE_ELEMENTS: [&str; 10] = [
+        "EmailAddress",
+        "AvailableFrom",
+        "AvailableTo",
+        "OvertimeWork",
+        "Cost",
+        "Notes",
+        "ExtendedAttribute",
+        "Baseline",
+        "AvailabilityPeriods",
+        "Rates",
+    ];
+
+    /// An assignment carrying every field #199 keeps: a delay, a leveling
+    /// delay, table C, two custom field values and two timephased records.
+    const DELAY_ASSIGNMENT: &str = "<Assignment><UID>1</UID><TaskUID>1</TaskUID>\
+        <ResourceUID>1</ResourceUID><Cost>1650.5</Cost><CostRateTable>2</CostRateTable>\
+        <Delay>4800</Delay><LevelingDelay>9600</LevelingDelay><LevelingDelayFormat>7</LevelingDelayFormat>\
+        <Notes>Night &amp; weekend</Notes><OvertimeWork>PT4H0M0S</OvertimeWork>\
+        <Units>1</Units><Work>PT32H0M0S</Work>\
+        <ExtendedAttribute><FieldID>255852547</FieldID><Value>12.5</Value></ExtendedAttribute>\
+        <ExtendedAttribute><FieldID>255852548</FieldID><Value></Value></ExtendedAttribute>\
+        <TimephasedData><Type>1</Type><UID>1</UID><Start>2026-03-02T08:00:00</Start>\
+          <Finish>2026-03-03T08:00:00</Finish><Unit>2</Unit><Value>PT8H0M0S</Value></TimephasedData>\
+        <TimephasedData><Type>1</Type><UID>1</UID><Start>2026-03-03T08:00:00</Start>\
+          <Finish>2026-03-06T17:00:00</Finish><Unit>2</Unit><Value>PT24H0M0S</Value></TimephasedData>\
+        </Assignment>";
+
+    /// Assignment elements #199 keeps.
+    const DELAY_ASSIGNMENT_ELEMENTS: [&str; 9] = [
+        "Cost",
+        "CostRateTable",
+        "Delay",
+        "LevelingDelay",
+        "LevelingDelayFormat",
+        "Notes",
+        "OvertimeWork",
+        "ExtendedAttribute",
+        "TimephasedData",
+    ];
+
+    fn at(y: i64, mo: u32, day: u32, h: u32, mi: u32) -> Option<DateTime> {
+        Some(DateTime::from_ymd_hm(y, mo, day, h, mi))
+    }
+
+    #[test]
+    fn resource_rates_availability_and_notes_are_read() {
+        let rate = |table, standard, format, overtime, per_use| RateEntry {
+            rates_from: at(1984, 1, 1, 0, 0),
+            rates_to: at(2049, 12, 31, 23, 59),
+            rate_table: Some(table),
+            standard_rate: Rate::parse(standard),
+            standard_rate_format: Some(format),
+            overtime_rate: Rate::parse(overtime),
+            overtime_rate_format: Some(2),
+            cost_per_use: Rate::parse(per_use),
+        };
+        assert_eq!(
+            resource_project(RESOURCE_RATES).resources,
+            [Resource {
+                uid: 1,
+                id: 1,
+                name: "Alice".into(),
+                kind: ResourceType::Work,
+                max_units: 1.0,
+                standard_rate: Rate::parse("50"),
+                work_min: Some(2400),
+                overtime_work_min: Some(480),
+                cost: Rate::parse("2000.50"),
+                email_address: Some("a&b@example.com".into()),
+                notes: Some("Keys <desk>\r\nBadge".into()),
+                available_from: at(2026, 3, 2, 8, 0),
+                available_to: at(2049, 12, 31, 23, 59),
+                extended_attributes: vec![
+                    ExtendedAttributeValue {
+                        field_id: "205520904".into(),
+                        value: Some("Ops".into()),
+                        ..ExtendedAttributeValue::default()
+                    },
+                    ExtendedAttributeValue {
+                        field_id: "205521121".into(),
+                        value: Some("PT8H0M0S".into()),
+                        value_guid: Some("{8C2A3B1E-0000-4000-8000-000000000001}".into()),
+                        duration_format: Some(7),
+                    },
+                ],
+                baselines: vec![
+                    ResourceBaseline {
+                        number: 0,
+                        work_min: Some(2400),
+                        cost: Rate::parse("2000"),
+                        bcws: Rate::parse("1000"),
+                        bcwp: Rate::parse("500"),
+                    },
+                    ResourceBaseline {
+                        number: 2,
+                        cost: Rate::parse("0"),
+                        ..ResourceBaseline::default()
+                    },
+                ],
+                availability_periods: vec![
+                    AvailabilityPeriod {
+                        available_from: at(2026, 3, 2, 8, 0),
+                        available_to: at(2026, 3, 31, 17, 0),
+                        available_units: Rate::parse("1"),
+                    },
+                    AvailabilityPeriod {
+                        available_from: at(2026, 4, 1, 8, 0),
+                        available_to: at(2049, 12, 31, 23, 59),
+                        available_units: Rate::parse("0.5"),
+                    },
+                ],
+                rates: vec![rate(0, "50", 2, "75", "0"), rate(1, "80.25", 3, "0", "15"),],
+                ..Resource::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn resource_rates_availability_and_notes_survive_mspdi_and_native_package_round_trips() {
+        let proj = resource_project(RESOURCE_RATES);
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<EmailAddress>a&amp;b@example.com</EmailAddress>",
+            "<AvailableFrom>2026-03-02T08:00:00</AvailableFrom>",
+            "<AvailableTo>2049-12-31T23:59:00</AvailableTo>",
+            "<OvertimeWork>PT8H0M0S</OvertimeWork>",
+            "<Cost>2000.50</Cost>",
+            // The CR is escaped, or a conformant reader would drop it.
+            "<Notes>Keys &lt;desk&gt;&#13;\nBadge</Notes>",
+            "<FieldID>205520904</FieldID>",
+            "<Value>Ops</Value>",
+            "<ValueGUID>{8C2A3B1E-0000-4000-8000-000000000001}</ValueGUID>",
+            "<DurationFormat>7</DurationFormat>",
+            "<BCWS>1000</BCWS>",
+            "<BCWP>500</BCWP>",
+            "<Number>2</Number>",
+            "<AvailableUnits>0.5</AvailableUnits>",
+            "<AvailableTo>2026-03-31T17:00:00</AvailableTo>",
+            "<RatesFrom>1984-01-01T00:00:00</RatesFrom>",
+            "<RateTable>1</RateTable>",
+            "<StandardRate>80.25</StandardRate>",
+            "<CostPerUse>15</CostPerUse>",
+        ] {
+            assert!(xml.contains(element), "missing {element}");
+        }
+        let read = read_mspdi(&xml).unwrap().resources;
+        assert_eq!(read, proj.resources);
+        assert_eq!(read[0].rates.len(), 2);
+        assert_eq!(read[0].availability_periods.len(), 2);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.resources, proj.resources);
+    }
+
+    #[test]
+    fn assignment_delay_overtime_cost_and_timephased_data_are_read() {
+        let record = |start, finish, value: &str| TimephasedValue {
+            kind: 1,
+            uid: Some(1),
+            start,
+            finish,
+            unit: Some(2),
+            value: Some(value.into()),
+        };
+        assert_eq!(
+            assignment_project(DELAY_ASSIGNMENT).assignments,
+            [Assignment {
+                uid: 1,
+                task_uid: 1,
+                resource_uid: 1,
+                units: 1.0,
+                work_min: 1920,
+                cost: Rate::parse("1650.5"),
+                cost_rate_table: Some(2),
+                delay: Some(4800),
+                leveling_delay: Some(9600),
+                leveling_delay_format: Some(7),
+                notes: Some("Night & weekend".into()),
+                overtime_work_min: Some(240),
+                extended_attributes: vec![
+                    ExtendedAttributeValue {
+                        field_id: "255852547".into(),
+                        value: Some("12.5".into()),
+                        ..ExtendedAttributeValue::default()
+                    },
+                    // An empty value is kept, not confused with an absent one.
+                    ExtendedAttributeValue {
+                        field_id: "255852548".into(),
+                        value: Some(String::new()),
+                        ..ExtendedAttributeValue::default()
+                    },
+                ],
+                timephased_data: vec![
+                    record(d(2, 8), d(3, 8), "PT8H0M0S"),
+                    record(d(3, 8), d(6, 17), "PT24H0M0S"),
+                ],
+                ..Assignment::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn assignment_delay_overtime_cost_and_timephased_data_survive_mspdi_and_native_package_round_trips()
+     {
+        let proj = assignment_project(DELAY_ASSIGNMENT);
+        let xml = write_mspdi(&proj);
+        for element in [
+            "<Cost>1650.5</Cost>",
+            "<CostRateTable>2</CostRateTable>",
+            "<Delay>4800</Delay>",
+            "<LevelingDelay>9600</LevelingDelay>",
+            "<LevelingDelayFormat>7</LevelingDelayFormat>",
+            "<Notes>Night &amp; weekend</Notes>",
+            "<OvertimeWork>PT4H0M0S</OvertimeWork>",
+            "<FieldID>255852547</FieldID>",
+            "<Value>12.5</Value>",
+            "<Value></Value>",
+            "<Type>1</Type>",
+            "<Start>2026-03-03T08:00:00</Start>",
+            "<Finish>2026-03-06T17:00:00</Finish>",
+            "<Unit>2</Unit>",
+            "<Value>PT24H0M0S</Value>",
+        ] {
+            assert!(assignment_xml(&xml).contains(element), "missing {element}");
+        }
+        let read = read_mspdi(&xml).unwrap().assignments;
+        assert_eq!(read, proj.assignments);
+        assert_eq!(read[0].timephased_data.len(), 2);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.assignments, proj.assignments);
+    }
+
+    #[test]
+    fn empty_resource_and_assignment_text_stays_distinct_from_absent() {
+        let resource = &resource_project(
+            "<Resource><UID>1</UID><ID>1</ID><Name>A</Name>\
+             <EmailAddress></EmailAddress><Notes/></Resource>",
+        )
+        .resources[0];
+        assert_eq!(
+            (resource.email_address.as_deref(), resource.notes.as_deref()),
+            (Some(""), Some(""))
+        );
+        let proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <Notes></Notes></Assignment>",
+        );
+        assert_eq!(proj.assignments[0].notes.as_deref(), Some(""));
+        let xml = write_mspdi(&proj);
+        assert!(assignment_xml(&xml).contains("<Notes></Notes>"));
+        assert_eq!(read_mspdi(&xml).unwrap().assignments, proj.assignments);
+    }
+
+    #[test]
+    fn absent_rate_availability_delay_and_timephased_fields_stay_absent() {
+        let proj = assignment_project(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+             <Units>1</Units><Work>PT32H0M0S</Work></Assignment>",
+        );
+        let xml = write_mspdi(&proj);
+        let resources = &xml[xml.find("<Resources>").unwrap()..xml.find("</Resources>").unwrap()];
+        for name in RESOURCE_RATE_ELEMENTS {
+            assert!(!resources.contains(&format!("<{name}>")), "{name}");
+        }
+        for name in DELAY_ASSIGNMENT_ELEMENTS {
+            assert!(
+                !assignment_xml(&xml).contains(&format!("<{name}>")),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_rate_availability_and_delay_fields_stay_absent() {
+        for element in [
+            "<OvertimeWork>8h</OvertimeWork>",
+            "<Cost>lots</Cost>",
+            "<AvailableFrom>soon</AvailableFrom>",
+            "<AvailableTo/>",
+            // Blocks whose every child is invalid, or that name no field, are dropped.
+            "<ExtendedAttribute><Value>x</Value></ExtendedAttribute>",
+            "<ExtendedAttribute><FieldID><x/></FieldID><Value>x</Value></ExtendedAttribute>",
+            "<Baseline><Number>11</Number><Cost>1</Cost></Baseline>",
+            "<Baseline><Number>x</Number><Cost>1</Cost></Baseline>",
+            "<Baseline><Number>1</Number><Cost>free</Cost></Baseline>",
+            "<AvailabilityPeriods/>",
+            "<AvailabilityPeriods><AvailabilityPeriod><AvailableUnits>half</AvailableUnits>\
+             <AvailableFrom>x</AvailableFrom></AvailabilityPeriod></AvailabilityPeriods>",
+            "<Rates/>",
+            "<Rates><Rate><RateTable>256</RateTable><StandardRate>x</StandardRate>\
+             <RatesTo>never</RatesTo></Rate></Rates>",
+        ] {
+            let proj = resource_project(&format!(
+                "<Resource><UID>1</UID><ID>1</ID><Name>A</Name>{element}</Resource>"
+            ));
+            assert_eq!(
+                proj.resources,
+                [Resource {
+                    uid: 1,
+                    id: 1,
+                    name: "A".into(),
+                    max_units: 1.0,
+                    ..Resource::default()
+                }],
+                "{element}"
+            );
+        }
+        for element in [
+            "<Cost>x</Cost>",
+            "<CostRateTable>-1</CostRateTable>",
+            "<Delay>soon</Delay>",
+            "<LevelingDelay>1.5</LevelingDelay>",
+            "<LevelingDelayFormat>256</LevelingDelayFormat>",
+            "<OvertimeWork>PT</OvertimeWork>",
+            "<ExtendedAttribute><Value>x</Value></ExtendedAttribute>",
+            "<TimephasedData><UID>1</UID><Value>PT8H0M0S</Value></TimephasedData>",
+            "<TimephasedData><Type>x</Type><Value>PT8H0M0S</Value></TimephasedData>",
+        ] {
+            let proj = assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 {element}</Assignment>"
+            ));
+            assert_eq!(
+                proj.assignments,
+                [Assignment {
+                    uid: 1,
+                    task_uid: 1,
+                    resource_uid: 1,
+                    units: 1.0,
+                    ..Assignment::default()
+                }],
+                "{element}"
+            );
+        }
+    }
+
+    #[test]
+    fn rate_and_availability_entries_keep_their_valid_children() {
+        // One valid child keeps the entry; the invalid ones beside it stay absent.
+        let r = &resource_project(
+            "<Resource><UID>1</UID><ID>1</ID><Name>A</Name>\
+             <AvailabilityPeriods><AvailabilityPeriod><AvailableFrom>x</AvailableFrom>\
+             <AvailableUnits>0</AvailableUnits></AvailabilityPeriod></AvailabilityPeriods>\
+             <Rates><Rate><RateTable>4</RateTable><StandardRate>x</StandardRate></Rate></Rates>\
+             <Baseline><Work>PT1H0M0S</Work></Baseline></Resource>",
+        )
+        .resources[0];
+        assert_eq!(
+            r.availability_periods,
+            [AvailabilityPeriod {
+                available_units: Rate::parse("0"),
+                ..AvailabilityPeriod::default()
+            }]
+        );
+        assert_eq!(
+            r.rates,
+            [RateEntry {
+                rate_table: Some(4),
+                ..RateEntry::default()
+            }]
+        );
+        // A missing Number is slot 0, as on an assignment.
+        assert_eq!(
+            r.baselines,
+            [ResourceBaseline {
+                work_min: Some(60),
+                ..ResourceBaseline::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn resource_baseline_slots_are_sorted_and_a_duplicate_replaces_the_record() {
+        let r = &resource_project(
+            "<Resource><UID>1</UID><ID>1</ID><Name>A</Name>\
+             <Baseline><Number>10</Number><Cost>1</Cost></Baseline>\
+             <Baseline><Number>3</Number><Cost>2</Cost><BCWS>5</BCWS></Baseline>\
+             <Baseline><Number>3</Number><Cost>3</Cost></Baseline></Resource>",
+        )
+        .resources[0];
+        let cost = |number, cost| ResourceBaseline {
+            number,
+            cost: Rate::parse(cost),
+            ..ResourceBaseline::default()
+        };
+        assert_eq!(r.baselines, [cost(3, "3"), cost(10, "1")]);
+        assert_eq!(r.baseline(10), Some(&cost(10, "1")));
     }
 
     /// A plan whose Standard calendar carries `standard_extra` (legacy weekday

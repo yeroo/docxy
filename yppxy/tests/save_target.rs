@@ -265,3 +265,89 @@ fn headless_save_keeps_resource_and_assignment_fields() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// The `<Name>value</Name>` leaves carrying a value, in document order.
+fn valued_leaves(xml: &str) -> Vec<&str> {
+    let mut leaves = Vec::new();
+    let mut rest = xml;
+    while let Some(open) = rest.find('<') {
+        rest = &rest[open..];
+        let Some(end) = rest.find('>') else { break };
+        let name = &rest[1..end];
+        let close = format!("</{name}>");
+        let body = &rest[end + 1..];
+        match body.find('<') {
+            Some(next) if !name.starts_with('/') && body[next..].starts_with(&close) => {
+                if next > 0 {
+                    leaves.push(&rest[..end + 1 + next + close.len()]);
+                }
+                rest = &body[next + close.len()..];
+            }
+            _ => rest = body,
+        }
+    }
+    leaves
+}
+
+/// Issue #199, by its own method: save file 13 with `--save` and list the
+/// resource and assignment elements carrying a value in the input that are
+/// missing from the output. Rate tables, availability periods, delays,
+/// overtime, costs, notes, custom fields, resource baselines and timephased
+/// data were all on that list.
+#[test]
+fn headless_save_keeps_every_valued_resource_and_assignment_element() {
+    let dir = std::env::temp_dir().join(format!("yppxy-cli-save-issue199-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let input =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mspdi/13-resource-fields.xml");
+    let source = std::fs::read_to_string(&input).unwrap();
+    let section = |xml: &str, name: &str| {
+        let open = xml.find(&format!("<{name}>")).unwrap();
+        xml[open..xml.find(&format!("</{name}>")).unwrap()].to_string()
+    };
+    for name in ["out.xml", "out.yppx"] {
+        let target = dir.join(name);
+        let result = yppxy_save(Some(&input), &target);
+        assert!(
+            result.status.success(),
+            "{name}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let bytes = std::fs::read(&target).unwrap();
+        let xml = if name.ends_with(".xml") {
+            String::from_utf8(bytes).unwrap()
+        } else {
+            projcore::mspdi::write_mspdi(&projcore::yppx::read_yppx(&bytes).unwrap())
+        };
+        for (section_name, samples) in [
+            (
+                "Resources",
+                [
+                    "<RateTable>1</RateTable>",
+                    "<AvailableUnits>1</AvailableUnits>",
+                ],
+            ),
+            (
+                "Assignments",
+                [
+                    "<CostRateTable>1</CostRateTable>",
+                    "<Value>PT8H0M0S</Value>",
+                ],
+            ),
+        ] {
+            let (before, after) = (section(&source, section_name), section(&xml, section_name));
+            let leaves = valued_leaves(&before);
+            // Guard the scan itself: it must see leaves nested in blocks.
+            for sample in samples {
+                assert!(leaves.contains(&sample), "scan missed {sample}");
+            }
+            let missing: Vec<_> = leaves
+                .iter()
+                .filter(|leaf| after.matches(*leaf).count() < before.matches(*leaf).count())
+                .collect();
+            assert!(missing.is_empty(), "{name} {section_name} lost {missing:?}");
+        }
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
