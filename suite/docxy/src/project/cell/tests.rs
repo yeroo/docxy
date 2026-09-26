@@ -828,3 +828,25 @@ fn a_summary_and_the_entry_row_take_a_task_mode() {
     );
     assert_eq!(ed.undo_depth(), 1);
 }
+
+#[test]
+fn retyping_a_predecessors_cell_keeps_a_link_shown_in_a_fallback_unit() {
+    // #104 r1: a working-month lag shows in days. Retyping the cell with
+    // another link added keeps its format; only the new link takes its own.
+    let lag = |uid, lag, code| projcore::Predecessor {
+        uid,
+        link: projcore::LinkType::FinishStart,
+        lag,
+        lag_format: projcore::LagFormat::from_code(code).unwrap(),
+    };
+    let mut t = tab();
+    let month = lag(20, 20 * 480, 11);
+    vm(&mut t).ed.set_predecessors(10, vec![month]).unwrap();
+    edit(&mut t, COL_PREDECESSORS, "2FS+20d, 3FS+2ed");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(
+        v(&t).ed.project().task(10).unwrap().predecessors,
+        vec![month, lag(30, 2880, 8)]
+    );
+}

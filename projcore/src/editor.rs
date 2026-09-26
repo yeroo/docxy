@@ -15,8 +15,8 @@ const UNDO_CAP: usize = 100;
 
 mod cells;
 pub use cells::{
-    day_finish, format_duration_exact, format_lag, format_predecessors, format_resource_names,
-    parse_cell_date, parse_lag, parse_predecessors,
+    day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
+    parse_lag, parse_predecessors, parse_task_predecessors,
 };
 use cells::{format_units, parse_resource_token};
 mod moving;

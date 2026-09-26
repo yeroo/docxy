@@ -581,42 +581,69 @@ pub fn format_lag(p: &Predecessor, proj: &Project) -> String {
     text(p.lag.to_string(), LagUnit::Minute)
 }
 
+/// One link as the Predecessors cell shows it.
+fn format_link(p: &Predecessor, proj: &Project) -> String {
+    let id = proj
+        .task(p.uid)
+        .map(|t| t.id.to_string())
+        .unwrap_or_else(|| format!("?{}", p.uid));
+    // A zero lag in days is the default and shows nothing; any other
+    // format shows, so re-entering the cell keeps it.
+    let plain = p.lag == 0 && p.lag_format == LagFormat::DAYS;
+    let kind = match p.link {
+        LinkType::FinishStart if plain => "",
+        LinkType::FinishStart => "FS",
+        LinkType::StartStart => "SS",
+        LinkType::FinishFinish => "FF",
+        LinkType::StartFinish => "SF",
+    };
+    let lag = if plain {
+        String::new()
+    } else {
+        format_lag(p, proj)
+    };
+    format!("{id}{kind}{lag}")
+}
+
 pub fn format_predecessors(task: &Task, proj: &Project) -> String {
     task.predecessors
         .iter()
-        .map(|p| {
-            let id = proj
-                .task(p.uid)
-                .map(|t| t.id.to_string())
-                .unwrap_or_else(|| format!("?{}", p.uid));
-            // A zero lag in days is the default and shows nothing; any other
-            // format shows, so re-entering the cell keeps it.
-            let plain = p.lag == 0 && p.lag_format == LagFormat::DAYS;
-            let kind = match p.link {
-                LinkType::FinishStart if plain => "",
-                LinkType::FinishStart => "FS",
-                LinkType::StartStart => "SS",
-                LinkType::FinishFinish => "FF",
-                LinkType::StartFinish => "SF",
-            };
-            let lag = if plain {
-                String::new()
-            } else {
-                format_lag(p, proj)
-            };
-            format!("{id}{kind}{lag}")
-        })
+        .map(|p| format_link(p, proj))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
 pub fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Predecessor>, String> {
+    parse_predecessors_keeping(text, proj, &[])
+}
+
+/// [`parse_predecessors`] for re-entering `task`'s Predecessors cell: an
+/// entry spelled exactly as the cell shows one of the task's links keeps
+/// that link as it is. A lag shown in a fallback unit (a working month in
+/// days, a fraction of a day in minutes) keeps its format unless it is
+/// edited.
+pub fn parse_task_predecessors(
+    text: &str,
+    task: &Task,
+    proj: &Project,
+) -> Result<Vec<Predecessor>, String> {
+    parse_predecessors_keeping(text, proj, &task.predecessors)
+}
+
+fn parse_predecessors_keeping(
+    text: &str,
+    proj: &Project,
+    existing: &[Predecessor],
+) -> Result<Vec<Predecessor>, String> {
     if text.trim().is_empty() {
         return Ok(Vec::new());
     }
     let mut out = Vec::new();
     for entry in text.split(',') {
         let entry = entry.trim().to_ascii_uppercase();
+        let shown = existing
+            .iter()
+            .find(|p| format_link(p, proj).to_ascii_uppercase() == entry);
         let end = entry.bytes().take_while(u8::is_ascii_digit).count();
         let id: i32 = entry[..end]
             .parse()
@@ -654,11 +681,17 @@ pub fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Predecessor>
             }
             parse_lag(rest, proj).ok_or("Invalid predecessor lag")?
         };
-        out.push(Predecessor {
+        let parsed = Predecessor {
             uid,
             link,
             lag,
             lag_format,
+        };
+        // The shown text parses to the same task, link and lag; only a
+        // fallback display can differ in format.
+        out.push(match shown {
+            Some(p) if (p.uid, p.link, p.lag) == (uid, link, lag) => *p,
+            _ => parsed,
         });
     }
     Ok(out)

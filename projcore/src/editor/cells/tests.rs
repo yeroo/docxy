@@ -1848,3 +1848,41 @@ fn add_link_refuses_a_lag_beyond_the_scheduling_range() {
     );
     ed.rename(30, "still editable").unwrap();
 }
+
+#[test]
+fn re_entering_a_cell_keeps_links_shown_in_a_fallback_unit() {
+    // r1: a working month shows in days and a fraction of a day in minutes.
+    // Editing another link in the same cell keeps both formats; editing the
+    // fallback text itself takes the typed unit.
+    let mut ed = editor();
+    let month = lag_pred(10, 20 * 480, 11);
+    let odd = Predecessor {
+        uid: 20,
+        ..lag_pred(20, 100, 7)
+    };
+    ed.set_predecessors(30, vec![month, odd]).unwrap();
+    let task = &ed.project().tasks[2];
+    let text = format_predecessors(task, ed.project());
+    assert_eq!(text, "1FS+20d, 2FS+100m");
+    // Unchanged text is no edit.
+    let depth = ed.undo_depth();
+    let same = parse_task_predecessors(&text, task, ed.project()).unwrap();
+    assert_eq!(same, vec![month, odd]);
+    ed.set_predecessors(30, same).unwrap();
+    assert_eq!(ed.undo_depth(), depth);
+    // Add an elapsed lag to a third link: the other two keep their formats.
+    let mut ed2 = editor();
+    ed2.set_predecessors(30, vec![month]).unwrap();
+    let task = &ed2.project().tasks[2];
+    let edited = format!("{}, 2FS+2ed", format_predecessors(task, ed2.project()));
+    let parsed = parse_task_predecessors(&edited, task, ed2.project()).unwrap();
+    assert_eq!(parsed, vec![month, lag_pred(20, 2880, 8)]);
+    // Spelling the month link differently is an edit in that unit.
+    let task = &ed2.project().tasks[2];
+    let parsed = parse_task_predecessors("1FS+4w", task, ed2.project()).unwrap();
+    assert_eq!(parsed, vec![lag_pred(10, 20 * 480, 9)]);
+    // Without the task, the fallback text reads in its shown unit.
+    let plain = parse_predecessors(&text, ed.project()).unwrap();
+    assert_eq!(plain[0].lag_format, LagFormat::DAYS);
+    assert_eq!(plain[1].lag_format.code(), 3);
+}
