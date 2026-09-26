@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::{AssignmentBaseline, Rate};
+use crate::model::{AssignmentBaseline, ExtendedAttributeValue, Rate, TimephasedValue};
 
 fn editor() -> Editor {
     let mut p = untitled_project();
@@ -1294,7 +1294,7 @@ fn duplicate_assignments_of_one_resource_survive_an_unchanged_commit() {
 }
 
 #[test]
-fn units_edits_keep_imported_assignment_fields_but_clear_regular_work() {
+fn units_edits_keep_imported_assignment_fields_but_clear_the_old_work() {
     for prompt in [false, true] {
         let mut ed = editor();
         ed.set_resources(10, &["Alice".into()]).unwrap();
@@ -1305,20 +1305,50 @@ fn units_edits_keep_imported_assignment_fields_but_clear_regular_work() {
         a.start = Some(DateTime::from_ymd_hm(2026, 3, 3, 8, 0));
         a.finish = Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0));
         a.regular_work_min = Some(480);
+        a.overtime_work_min = Some(60);
+        a.cost = Rate::parse("400");
+        a.timephased_data = vec![TimephasedValue {
+            kind: 1,
+            uid: Some(a.uid),
+            value: Some("PT8H0M0S".into()),
+            ..TimephasedValue::default()
+        }];
+        a.cost_rate_table = Some(2);
+        a.delay = Some(4800);
+        a.leveling_delay = Some(9600);
+        a.leveling_delay_format = Some(7);
+        a.notes = Some("night shift".into());
+        a.extended_attributes = vec![ExtendedAttributeValue {
+            field_id: "255852547".into(),
+            value: Some("x".into()),
+            ..ExtendedAttributeValue::default()
+        }];
+        a.set_baseline_slot(AssignmentBaseline {
+            number: 1,
+            work_min: Some(480),
+            ..AssignmentBaseline::default()
+        });
         let imported = a.clone();
         if prompt {
             ed.assign_resource(10, "Alice[50%]").unwrap();
         } else {
             ed.set_resources(10, &["Alice[50%]".into()]).unwrap();
         }
-        // Regular work was the old Work less overtime; kept, it would invent overtime.
+        // Regular work, overtime, cost and the timephased spread described the
+        // old Work; kept, they would invent overtime or misprice the new one.
         let a = &ed.proj.assignments[0];
         assert_eq!((a.units, a.work_min, a.regular_work_min), (0.5, 240, None));
+        assert_eq!((a.overtime_work_min, &a.cost), (None, &None));
+        assert!(a.timephased_data.is_empty());
+        // Delays, the rate table, notes, custom fields and baselines are kept.
         assert_eq!(
             Assignment {
                 units: imported.units,
                 work_min: imported.work_min,
                 regular_work_min: imported.regular_work_min,
+                overtime_work_min: imported.overtime_work_min,
+                cost: imported.cost.clone(),
+                timephased_data: imported.timephased_data.clone(),
                 ..a.clone()
             },
             imported,
@@ -1353,6 +1383,16 @@ fn new_resources_and_assignments_write_none_of_the_imported_fields() {
         "IsInactive",
         "BookingType",
         "IsBudget",
+        "EmailAddress",
+        "AvailableFrom",
+        "AvailableTo",
+        "OvertimeWork",
+        "Cost",
+        "Notes",
+        "ExtendedAttribute",
+        "Baseline",
+        "AvailabilityPeriods",
+        "Rates",
     ] {
         assert!(
             !section("Resources").contains(&format!("<{name}>")),
@@ -1366,6 +1406,15 @@ fn new_resources_and_assignments_write_none_of_the_imported_fields() {
         "RegularWork",
         "Start",
         "WorkContour",
+        "Cost",
+        "CostRateTable",
+        "Delay",
+        "LevelingDelay",
+        "LevelingDelayFormat",
+        "Notes",
+        "OvertimeWork",
+        "ExtendedAttribute",
+        "TimephasedData",
     ] {
         assert!(
             !section("Assignments").contains(&format!("<{name}>")),

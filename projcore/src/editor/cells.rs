@@ -272,8 +272,12 @@ impl Editor {
             if let Some(u) = units {
                 a.units = u;
                 a.work_min = work_for(duration, u);
-                // Regular work is Work less overtime; a stale value would invent overtime.
+                // Regular work, overtime, cost and the timephased spread all describe the
+                // old work; keeping them would invent overtime or misprice it.
                 a.regular_work_min = None;
+                a.overtime_work_min = None;
+                a.cost = None;
+                a.timephased_data.clear();
                 changed = true;
             }
         }
