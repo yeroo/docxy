@@ -788,7 +788,7 @@ fn manual_dates_outside_the_scheduling_range_are_rejected() {
 }
 
 #[test]
-fn manual_summary_is_not_pinned_and_keeps_its_file_dates() {
+fn manual_summary_shows_its_own_dates_and_a_rename_keeps_its_file_dates() {
     let mut ed = editor();
     let file_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
     let file_finish = Some(DateTime::from_ymd_hm(2026, 1, 7, 17, 0));
@@ -802,17 +802,165 @@ fn manual_summary_is_not_pinned_and_keeps_its_file_dates() {
     ed.proj.tasks[1].outline_level = 2;
     ed.reschedule();
     assert!(ed.project().tasks[0].summary);
+    // Not pinned as a leaf is, but it keeps its ManualStart.
     assert_eq!(ed.project().tasks[0].pinned_dates(), None);
-    // The summary rolls up from its child, not from its ManualStart.
     assert_eq!(
         mspdi(ed.disp_start(10)).unwrap(),
-        "2026-01-05T08:00:00".to_string()
+        "2026-03-02T08:00:00".to_string()
+    );
+    assert_eq!(
+        mspdi(ed.disp_rollup(10).map(|(start, _)| start)).unwrap(),
+        "2026-03-02T08:00:00".to_string(),
+        "its subtask starts no earlier"
     );
     ed.rename(10, "Phase").unwrap();
     assert_eq!(
         (saved(&ed, 10).0, saved(&ed, 10).1),
         (mspdi(file_start), mspdi(file_finish))
     );
+}
+
+fn jan(day: u32, hour: u32) -> DateTime {
+    DateTime::from_ymd_hm(2026, 1, day, hour, 0)
+}
+
+/// Task 10 is a manual summary, from Monday 1/5, over Tasks 20 and 30 (1d
+/// each, in parallel).
+fn manual_summary_editor() -> Editor {
+    let mut ed = editor();
+    for (task, level) in ed.proj.tasks.iter_mut().zip([1, 2, 2]) {
+        task.outline_level = level;
+    }
+    ed.reschedule();
+    ed.set_manual(10, true).unwrap();
+    assert_eq!(
+        (ed.disp_start(10), ed.disp_finish(10)),
+        (Some(jan(5, 8)), Some(jan(5, 17)))
+    );
+    ed
+}
+
+/// Runs `edit` and checks that it made exactly one undo step, which undoes it.
+fn one_step(ed: &mut Editor, edit: impl FnOnce(&mut Editor)) {
+    let (before, depth) = (ed.project().clone(), ed.undo_depth());
+    edit(ed);
+    let after = ed.project().clone();
+    assert_ne!(after, before);
+    assert_eq!(ed.undo_depth(), depth + 1);
+    assert!(ed.undo());
+    assert_eq!(ed.project(), &before);
+    assert!(ed.redo());
+    assert_eq!(ed.project(), &after);
+}
+
+#[test]
+fn a_manual_summary_s_duration_is_its_own_span() {
+    let mut ed = manual_summary_editor();
+    let (summary, kids) = (
+        ed.project().tasks[0].clone(),
+        ed.project().tasks[1..].to_vec(),
+    );
+    one_step(&mut ed, |e| e.set_duration(10, "3d").unwrap());
+    let t = ed.project().tasks[0].clone();
+    assert_eq!(
+        (t.manual_start, t.manual_finish, t.manual_duration_min),
+        (Some(jan(5, 8)), None, Some(3 * 480))
+    );
+    // The stored duration, milestone flag, estimate and work are the rollup's.
+    assert_eq!(
+        (t.duration_min, t.milestone, t.estimated),
+        (summary.duration_min, summary.milestone, summary.estimated)
+    );
+    assert_eq!(ed.project().tasks[1..], kids[..]);
+    assert_eq!(ed.disp_finish(10), Some(jan(7, 17)));
+    assert_eq!(ed.disp_duration_min(10), Some(3 * 480));
+    assert_eq!(ed.disp_rollup(10), Some((jan(5, 8), jan(5, 17))));
+    assert!(!ed.summary_warning(10));
+    assert_eq!(
+        saved(&ed, 10),
+        (
+            mspdi(Some(jan(5, 8))),
+            mspdi(Some(jan(7, 17))),
+            mspdi(Some(jan(5, 8)))
+        )
+    );
+    // Zero: the span ends where it starts, and the subtasks run past it.
+    ed.set_duration(10, "0d").unwrap();
+    assert_eq!(
+        (ed.disp_start(10), ed.disp_finish(10)),
+        (Some(jan(5, 8)), Some(jan(5, 8)))
+    );
+    assert!(!ed.project().tasks[0].milestone);
+    assert!(ed.summary_warning(10));
+    // Repeating the shown duration changes nothing.
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    let before = ed.project().clone();
+    ed.set_duration(10, "0d").unwrap();
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn typed_dates_set_a_manual_summary_s_own_span() {
+    let mut ed = manual_summary_editor();
+    // A typed start a week later keeps the 1d span and floors the subtasks.
+    one_step(&mut ed, |e| e.set_start(10, jan(12, 0)).unwrap());
+    let t = ed.project().tasks[0].clone();
+    assert_eq!(
+        (t.manual_start, t.manual_finish, t.manual_duration_min),
+        (Some(jan(12, 8)), None, Some(480))
+    );
+    assert_eq!(
+        (ed.disp_start(10), ed.disp_finish(10)),
+        (Some(jan(12, 8)), Some(jan(12, 17)))
+    );
+    assert_eq!(ed.disp_start(20), Some(jan(12, 8)));
+    assert_eq!(ed.project().task(20).unwrap().constraint_date, None);
+    assert_eq!(
+        saved(&ed, 10),
+        (
+            mspdi(Some(jan(12, 8))),
+            mspdi(Some(jan(12, 17))),
+            mspdi(Some(jan(12, 8)))
+        )
+    );
+    // A typed finish sets the span's end; the duration is the working time.
+    one_step(&mut ed, |e| e.set_finish(10, jan(16, 0)).unwrap());
+    let t = ed.project().tasks[0].clone();
+    assert_eq!(
+        (t.manual_start, t.manual_finish, t.manual_duration_min),
+        (Some(jan(12, 8)), Some(jan(16, 17)), Some(5 * 480))
+    );
+    assert_eq!(t.duration_min, 480, "the stored duration is the rollup's");
+    assert_eq!(ed.disp_duration_min(10), Some(5 * 480));
+    assert_eq!(
+        saved(&ed, 10),
+        (
+            mspdi(Some(jan(12, 8))),
+            mspdi(Some(jan(16, 17))),
+            mspdi(Some(jan(12, 8)))
+        )
+    );
+    // A finish before the start is refused, changing nothing.
+    let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
+    let before = ed.project().clone();
+    assert!(ed.set_finish(10, jan(9, 0)).is_err());
+    unchanged(&ed, &before, history);
+}
+
+#[test]
+fn typed_dates_on_an_auto_summary_are_unchanged() {
+    let mut ed = editor();
+    for (task, level) in ed.proj.tasks.iter_mut().zip([1, 2, 2]) {
+        task.outline_level = level;
+    }
+    ed.reschedule();
+    ed.set_start(10, jan(12, 0)).unwrap();
+    let t = ed.project().tasks[0].clone();
+    assert_eq!(
+        (t.constraint, t.manual_start, t.manual_duration_min),
+        (ConstraintType::StartNoEarlierThan, None, None)
+    );
+    assert_eq!(ed.disp_start(10), Some(jan(5, 8)));
 }
 
 #[test]

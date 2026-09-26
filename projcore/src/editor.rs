@@ -191,6 +191,27 @@ impl Editor {
             .fold(finish, DateTime::max)
     }
 
+    /// A summary's rolled-up span (see [`Schedule::rolled_up`]), leveled when
+    /// leveling is on. For a manual summary it differs from its shown dates.
+    pub fn disp_rollup(&self, uid: i32) -> Option<(DateTime, DateTime)> {
+        match &self.level {
+            Some(lv) => lv.rolled_up(uid),
+            None => self.sched.rolled_up(uid),
+        }
+    }
+
+    /// Project's warning on a manual summary: its shown subtasks finish after
+    /// its own finish.
+    pub fn summary_warning(&self, uid: i32) -> bool {
+        self.proj
+            .task(uid)
+            .is_some_and(|t| t.manual_summary_dates().is_some())
+            && self
+                .disp_rollup(uid)
+                .zip(self.disp_finish(uid))
+                .is_some_and(|((_, rolled), finish)| rolled > finish)
+    }
+
     /// The duration shown alongside [`Self::disp_start`]/[`Self::disp_finish`]:
     /// a leaf's own duration, or a summary's working time between its displayed
     /// (leveled when leveling is on) dates. `None` for an unknown or
@@ -592,13 +613,19 @@ impl Editor {
             self.validate_cell_horizon(uid, patch.duration_min, None)?;
         }
         let t = &self.proj.tasks[i];
-        let duration_changed = patch.duration_min.is_some_and(|min| min != t.duration_min);
+        // A manual summary's duration is its own span, not its stored one.
+        let manual_summary = t.summary && t.manual && patch.manual.is_none_or(|m| m);
+        let (current, milestone) = match manual_summary {
+            true => (self.disp_duration_min(uid).unwrap_or(t.duration_min), None),
+            false => (t.duration_min, Some(t.milestone)),
+        };
+        let duration_changed = patch.duration_min.is_some_and(|min| min != current);
         // A blank row always becomes a task: a mode is an edit of it too.
         let mode_changed = patch.manual.is_some_and(|m| m != t.manual || t.is_null);
         if patch.name.as_ref().is_none_or(|name| *name == t.name)
             && patch
                 .duration_min
-                .is_none_or(|min| min == t.duration_min && (min == 0) == t.milestone)
+                .is_none_or(|min| min == current && milestone.is_none_or(|m| (min == 0) == m))
             && patch.level.is_none_or(|lv| lv == t.outline_level)
             && !mode_changed
         {
@@ -623,7 +650,13 @@ impl Editor {
                 t.manual_finish = finish.filter(|_| manual);
                 t.manual_duration_min = manual.then(|| duration.unwrap_or(t.duration_min));
             }
-            if let Some(min) = patch.duration_min {
+            if let Some(min) = patch.duration_min.filter(|_| t.summary && t.manual) {
+                // A manual summary's own span: its start stays and its
+                // finish follows. Its stored duration, milestone flag and
+                // work belong to the rollup and are left alone.
+                t.manual_duration_min = Some(min);
+                t.manual_finish = None;
+            } else if let Some(min) = patch.duration_min {
                 // Against the row as materialized: a blank row's default
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
                 let changed = was_blank || min != t.duration_min;
@@ -656,28 +689,46 @@ impl Editor {
         if duration_changed || (mode_changed && patch.manual == Some(true)) {
             self.stamp_pinned_dates(uid);
         }
+        // A summary made automatic saves the span it now rolls up to, not
+        // the manual dates stamped on it.
+        if mode_changed && patch.manual == Some(false) && self.proj.tasks[i].summary {
+            self.stamp_dates(i);
+        }
         Ok(())
     }
 
     /// After an edit to a manual task's dates, record its pinned start and
     /// scheduled finish as the Start/Finish a save writes. Project does not
     /// reschedule manual tasks on open, so they must agree with
-    /// ManualStart/Duration. Stored dates do feed the scheduler (the anchor
-    /// of a plan without a start date, and the timeline reach), so reschedule
-    /// after stamping to keep the schedule in step with the model.
+    /// ManualStart/Duration. A manual summary saves its manual dates too, as
+    /// Project does. Stored dates do feed the scheduler (the anchor of a plan
+    /// without a start date, and the timeline reach), so reschedule after
+    /// stamping to keep the schedule in step with the model.
     fn stamp_pinned_dates(&mut self, uid: i32) {
         let Ok(i) = self.index(uid) else {
             return;
         };
-        let Some((start, _)) = self.proj.tasks[i].pinned_dates() else {
-            return;
-        };
-        let finish = self.sched.get(uid).map(|r| r.early_finish);
-        let task = &mut self.proj.tasks[i];
-        if (task.stored_start, task.stored_finish) == (Some(start), finish) {
+        let task = &self.proj.tasks[i];
+        if task.pinned_dates().is_none() && task.manual_summary_dates().is_none() {
             return;
         }
-        task.stored_start = Some(start);
+        self.stamp_dates(i);
+    }
+
+    /// Record row `i`'s scheduled start and finish as its stored dates.
+    fn stamp_dates(&mut self, i: usize) {
+        let task = &self.proj.tasks[i];
+        let start = task
+            .pinned_dates()
+            .or_else(|| task.manual_summary_dates())
+            .map(|(start, _)| start)
+            .or_else(|| self.sched.get(task.uid).map(|r| r.early_start));
+        let finish = self.sched.get(task.uid).map(|r| r.early_finish);
+        let task = &mut self.proj.tasks[i];
+        if (task.stored_start, task.stored_finish) == (start, finish) {
+            return;
+        }
+        task.stored_start = start;
         task.stored_finish = finish;
         self.reschedule();
     }
@@ -3053,7 +3104,7 @@ mod tests {
     }
 
     #[test]
-    fn a_summary_switches_mode_but_keeps_rolling_up() {
+    fn a_summary_switched_to_manual_keeps_its_own_dates() {
         let mut ed = outline(&[(1, "Phase", 1), (2, "A", 2), (3, "B", 2)]);
         ed.add_predecessor(3, 2, LinkType::FinishStart, 0).unwrap();
         let dates = |ed: &Editor| -> Vec<_> {
@@ -3070,13 +3121,22 @@ mod tests {
         assert!(ed.project().tasks[0].summary);
         assert_eq!(mode(&ed, 1), (true, start, finish, span));
         assert_eq!(dates(&ed), before);
+        assert_eq!(saved(&ed, 1), (start, finish));
+        assert!(!ed.summary_warning(1));
         let reread = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
         assert!(reread.tasks[0].manual);
-        // Its subtasks still move it.
+        // Its subtasks no longer move it: they run past it, and it warns.
         ed.set_duration(3, "3d").unwrap();
-        assert!(ed.disp_finish(1) > finish);
-        ed.set_manual(1, false).unwrap();
+        assert_eq!(shown(&ed, 1), (start, finish));
+        let rolled = (start.unwrap(), DateTime::from_ymd_hm(2026, 1, 8, 17, 0));
+        assert_eq!(ed.disp_rollup(1), Some(rolled));
+        assert!(ed.summary_warning(1));
+        // Made automatic again, it rolls up and saves that span.
+        assert_edit(&mut ed, |e| e.set_manual(1, false).unwrap());
         assert_eq!(mode(&ed, 1), (false, None, None, None));
+        assert_eq!(shown(&ed, 1), (Some(rolled.0), Some(rolled.1)));
+        assert_eq!(saved(&ed, 1), (Some(rolled.0), Some(rolled.1)));
+        assert!(!ed.summary_warning(1));
     }
 
     #[test]
