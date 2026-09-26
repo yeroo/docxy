@@ -41,6 +41,9 @@ pub struct TaskPatch {
     pub name: Option<String>,
     pub duration_min: Option<i64>,
     pub level: Option<u32>,
+    /// Manually (`true`) or automatically (`false`) scheduled; see
+    /// [`Editor::set_manual`].
+    pub manual: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -519,10 +522,61 @@ impl Editor {
         )
     }
 
+    /// Switch a task between manually and automatically scheduled, as
+    /// Project's Task Mode does. A task that becomes manual is pinned where it
+    /// is shown now (leveled dates while leveling is on), so the switch moves
+    /// nothing; one that becomes automatic drops its pin and the scheduler
+    /// places it by its links and constraints again. A blank row becomes a
+    /// task with that mode. Setting the mode a task already has is a no-op.
+    pub fn set_manual(&mut self, uid: i32, manual: bool) -> Result<(), String> {
+        self.update_task(
+            uid,
+            TaskPatch {
+                manual: Some(manual),
+                ..TaskPatch::default()
+            },
+        )
+    }
+
+    /// Set the plan's mode for new tasks (MSPDI `NewTasksAreManual`), as one
+    /// undo step. Existing tasks keep their own mode.
+    pub fn set_new_tasks_manual(&mut self, manual: bool) {
+        if self.proj.new_tasks_are_manual == manual {
+            return;
+        }
+        self.snapshot();
+        self.proj.new_tasks_are_manual = manual;
+        self.changed();
+    }
+
+    /// Where [`Self::set_manual`] pins task `i`: its shown start and finish
+    /// and its shown duration. A blank row starts where a new manual task
+    /// does and keeps the duration it is given; a task the schedule skips (a
+    /// calendar without working time) keeps its saved start, else the new
+    /// task start, and gets no pinned finish.
+    fn pin_at(&self, i: usize) -> (DateTime, Option<DateTime>, Option<i64>) {
+        let t = &self.proj.tasks[i];
+        if t.is_null {
+            return (self.new_task_start(), None, None);
+        }
+        let start = self
+            .disp_start(t.uid)
+            .or(t.stored_start)
+            .unwrap_or_else(|| self.new_task_start());
+        let finish = self.disp_finish(t.uid);
+        (start, finish, self.disp_duration_min(t.uid))
+    }
+
     pub fn update_task(&mut self, uid: i32, patch: TaskPatch) -> Result<(), String> {
         let i = self.index(uid)?;
-        if patch.name.is_none() && patch.duration_min.is_none() && patch.level.is_none() {
-            return Err("task.set needs at least one of 'name', 'duration', 'level'".into());
+        if patch.name.is_none()
+            && patch.duration_min.is_none()
+            && patch.level.is_none()
+            && patch.manual.is_none()
+        {
+            return Err(
+                "task.set needs at least one of 'name', 'duration', 'level', 'manual'".into(),
+            );
         }
         if patch.level.is_some_and(|lv| !(1..=20).contains(&lv)) {
             return Err("'level' must be 1..=20".into());
@@ -535,14 +589,19 @@ impl Editor {
         }
         let t = &self.proj.tasks[i];
         let duration_changed = patch.duration_min.is_some_and(|min| min != t.duration_min);
+        // A blank row always becomes a task: a mode is an edit of it too.
+        let mode_changed = patch.manual.is_some_and(|m| m != t.manual || t.is_null);
         if patch.name.as_ref().is_none_or(|name| *name == t.name)
             && patch
                 .duration_min
                 .is_none_or(|min| min == t.duration_min && (min == 0) == t.milestone)
             && patch.level.is_none_or(|lv| lv == t.outline_level)
+            && !mode_changed
         {
             return Ok(());
         }
+        // Read before the edit: the pin is where the task is shown now.
+        let pin = self.pin_at(i);
         self.edit_row(i, |proj, was_blank| {
             // A blank row's `1 day?` is a default, not a duration the user
             // typed: typing any duration into it commits it.
@@ -551,6 +610,15 @@ impl Editor {
                 t.name = name;
             }
             let mut rescale = None;
+            // The mode before the duration: a new duration then updates the
+            // pin as it does for any manual task.
+            if let Some(manual) = patch.manual.filter(|&m| m != t.manual) {
+                let (start, finish, duration) = pin;
+                t.manual = manual;
+                t.manual_start = manual.then_some(start);
+                t.manual_finish = finish.filter(|_| manual);
+                t.manual_duration_min = manual.then(|| duration.unwrap_or(t.duration_min));
+            }
             if let Some(min) = patch.duration_min {
                 // Against the row as materialized: a blank row's default
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
@@ -580,8 +648,8 @@ impl Editor {
         // Only a date change restamps: a rename or a level change keeps the
         // Finish Project wrote, which our schedule can still differ from
         // (recurring calendar exceptions are not scheduled). A blank row's
-        // new dates are stamped by edit_row.
-        if duration_changed {
+        // new dates are stamped by edit_row; a newly pinned task's here.
+        if duration_changed || (mode_changed && patch.manual == Some(true)) {
             self.stamp_pinned_dates(uid);
         }
         Ok(())
@@ -1475,6 +1543,7 @@ mod tests {
                     name: Some("Release".into()),
                     duration_min: Some(0),
                     level: Some(2),
+                    manual: None,
                 },
             )
             .unwrap();
@@ -2857,6 +2926,234 @@ mod tests {
         assert_eq!(ed.undo_depth(), 1);
         assert!(ed.undo());
         assert!(ed.project().tasks.is_empty());
+    }
+
+    /// Task 2 follows task 1 (FS): an auto task placed by its link.
+    fn linked_editor() -> Editor {
+        let mut ed = editor();
+        ed.add_predecessor(2, 1, LinkType::FinishStart, 0).unwrap();
+        ed.mark_saved();
+        ed
+    }
+
+    type Mode = (bool, Option<DateTime>, Option<DateTime>, Option<i64>);
+
+    fn mode(ed: &Editor, uid: i32) -> Mode {
+        let t = ed.project().task(uid).unwrap();
+        (
+            t.manual,
+            t.manual_start,
+            t.manual_finish,
+            t.manual_duration_min,
+        )
+    }
+
+    fn shown(ed: &Editor, uid: i32) -> (Option<DateTime>, Option<DateTime>) {
+        (ed.disp_start(uid), ed.disp_finish(uid))
+    }
+
+    fn saved(ed: &Editor, uid: i32) -> (Option<DateTime>, Option<DateTime>) {
+        let t = ed.project().task(uid).unwrap();
+        (t.stored_start, t.stored_finish)
+    }
+
+    #[test]
+    fn switching_to_manual_pins_the_task_where_it_is_shown() {
+        let mut ed = linked_editor();
+        let (start, finish) = (ed.disp_start(2).unwrap(), ed.disp_finish(2).unwrap());
+        assert_eq!(start, DateTime::from_ymd_hm(2026, 1, 6, 8, 0));
+        assert_edit(&mut ed, |e| e.set_manual(2, true).unwrap());
+        assert_eq!(mode(&ed, 2), (true, Some(start), Some(finish), Some(480)));
+        assert_eq!(shown(&ed, 2), (Some(start), Some(finish)));
+        assert_eq!(saved(&ed, 2), (Some(start), Some(finish)));
+        // Pinned: its predecessor growing no longer moves it.
+        ed.set_duration(1, "3d").unwrap();
+        assert_eq!(shown(&ed, 2), (Some(start), Some(finish)));
+    }
+
+    #[test]
+    fn switching_to_auto_releases_the_pin_to_the_links() {
+        // Pinned before its predecessor ends, and well after it.
+        for day in [5, 14] {
+            let mut ed = linked_editor();
+            let linked = ed.disp_start(2);
+            ed.set_manual(2, true).unwrap();
+            ed.set_start(2, DateTime::from_ymd_hm(2026, 1, day, 0, 0))
+                .unwrap();
+            assert_eq!(
+                ed.disp_start(2),
+                Some(DateTime::from_ymd_hm(2026, 1, day, 8, 0))
+            );
+            assert_edit(&mut ed, |e| e.set_manual(2, false).unwrap());
+            assert_eq!(mode(&ed, 2), (false, None, None, None));
+            assert_eq!(ed.disp_start(2), linked, "placed by its link again");
+        }
+    }
+
+    #[test]
+    fn setting_the_mode_a_task_has_changes_nothing() {
+        let mut ed = linked_editor();
+        assert_unchanged(&mut ed, |e| e.set_manual(2, false).unwrap());
+        ed.set_manual(2, true).unwrap();
+        ed.mark_saved();
+        assert_unchanged(&mut ed, |e| e.set_manual(2, true).unwrap());
+        assert_unchanged(&mut ed, |e| {
+            assert_eq!(e.set_manual(99, true).unwrap_err(), "no task with uid 99")
+        });
+    }
+
+    #[test]
+    fn switching_under_leveling_pins_the_leveled_dates() {
+        let mut ed = editor();
+        ed.assign_resource(1, "Alice").unwrap();
+        ed.assign_resource(2, "Alice").unwrap();
+        ed.toggle_level();
+        let (start, finish) = (ed.disp_start(2).unwrap(), ed.disp_finish(2).unwrap());
+        assert!(
+            start > ed.schedule().get(2).unwrap().early_start,
+            "leveled later"
+        );
+        assert_edit(&mut ed, |e| e.set_manual(2, true).unwrap());
+        assert_eq!(mode(&ed, 2), (true, Some(start), Some(finish), Some(480)));
+        assert_eq!(shown(&ed, 2), (Some(start), Some(finish)));
+        assert_eq!(saved(&ed, 2), (Some(start), Some(finish)));
+        // With leveling off, the pinned task stays where leveling put it.
+        ed.toggle_level();
+        assert_eq!(shown(&ed, 2), (Some(start), Some(finish)));
+    }
+
+    #[test]
+    fn a_blank_row_becomes_a_task_with_the_mode() {
+        let start = blank_row_editor().project().start_date.unwrap();
+        let mut ed = blank_row_editor();
+        ed.set_manual(3, true).unwrap();
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(!ed.project().tasks[1].is_null);
+        assert_eq!(mode(&ed, 3), (true, Some(start), None, Some(480)));
+        let r = *ed.schedule().get(3).unwrap();
+        assert_eq!(r.early_start, start);
+        assert_eq!(saved(&ed, 3), (Some(start), Some(r.early_finish)));
+        // Auto in an auto plan still makes the row a task.
+        let mut ed = blank_row_editor();
+        ed.set_manual(3, false).unwrap();
+        assert!(!ed.project().tasks[1].is_null);
+        assert_eq!(mode(&ed, 3), (false, None, None, None));
+        assert_eq!(ed.undo_depth(), 1);
+        // Auto in a manual plan overrides the plan's default.
+        let mut proj = blank_row_editor().project().clone();
+        proj.new_tasks_are_manual = true;
+        let mut ed = Editor::new(proj);
+        ed.set_manual(3, false).unwrap();
+        assert!(!ed.project().tasks[1].is_null);
+        assert_eq!(mode(&ed, 3), (false, None, None, None));
+        assert_eq!(ed.undo_depth(), 1);
+    }
+
+    #[test]
+    fn a_summary_switches_mode_but_keeps_rolling_up() {
+        let mut ed = outline(&[(1, "Phase", 1), (2, "A", 2), (3, "B", 2)]);
+        ed.add_predecessor(3, 2, LinkType::FinishStart, 0).unwrap();
+        let dates = |ed: &Editor| -> Vec<_> {
+            ed.project()
+                .tasks
+                .iter()
+                .map(|t| shown(ed, t.uid))
+                .collect()
+        };
+        let before = dates(&ed);
+        let (start, finish) = before[0];
+        let span = ed.disp_duration_min(1);
+        assert_edit(&mut ed, |e| e.set_manual(1, true).unwrap());
+        assert!(ed.project().tasks[0].summary);
+        assert_eq!(mode(&ed, 1), (true, start, finish, span));
+        assert_eq!(dates(&ed), before);
+        let reread = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
+        assert!(reread.tasks[0].manual);
+        // Its subtasks still move it.
+        ed.set_duration(3, "3d").unwrap();
+        assert!(ed.disp_finish(1) > finish);
+        ed.set_manual(1, false).unwrap();
+        assert_eq!(mode(&ed, 1), (false, None, None, None));
+    }
+
+    #[test]
+    fn the_new_task_mode_is_one_undo_step_and_new_tasks_follow_it() {
+        let mut ed = editor();
+        assert_unchanged(&mut ed, |e| e.set_new_tasks_manual(false));
+        assert_edit(&mut ed, |e| e.set_new_tasks_manual(true));
+        assert!(ed.project().new_tasks_are_manual);
+        let at = ed.add_task(None, "Pinned", 480).unwrap();
+        assert!(ed.project().tasks[at].manual);
+        ed.set_new_tasks_manual(false);
+        let at = ed.add_task(None, "Auto", 480).unwrap();
+        assert!(!ed.project().tasks[at].manual);
+        // A blank row follows the plan's mode as it is when it is typed into.
+        let mut ed = blank_row_editor();
+        ed.set_new_tasks_manual(true);
+        ed.rename(3, "Typed").unwrap();
+        assert!(ed.project().tasks[1].manual);
+    }
+
+    #[test]
+    fn a_switched_task_and_the_new_task_mode_survive_a_save() {
+        let reopen = |ed: &Editor| {
+            crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap()
+        };
+        let mut ed = linked_editor();
+        ed.set_manual(2, true).unwrap();
+        ed.set_new_tasks_manual(true);
+        let reread = reopen(&ed);
+        assert!(reread.new_tasks_are_manual);
+        let b = reread.task(2).unwrap();
+        assert_eq!(
+            (
+                b.manual,
+                b.manual_start,
+                b.manual_finish,
+                b.manual_duration_min
+            ),
+            mode(&ed, 2)
+        );
+        assert_eq!((b.stored_start, b.stored_finish), saved(&ed, 2));
+        ed.set_manual(2, false).unwrap();
+        ed.set_new_tasks_manual(false);
+        let reread = reopen(&ed);
+        assert!(!reread.new_tasks_are_manual);
+        let b = reread.task(2).unwrap();
+        assert_eq!(
+            (
+                b.manual,
+                b.manual_start,
+                b.manual_finish,
+                b.manual_duration_min
+            ),
+            (false, None, None, None)
+        );
+    }
+
+    #[test]
+    fn a_patch_switches_the_mode_with_other_fields_in_one_step() {
+        let mut ed = linked_editor();
+        let start = ed.disp_start(2).unwrap();
+        assert_edit(&mut ed, |e| {
+            e.update_task(
+                2,
+                TaskPatch {
+                    name: Some("Pinned".into()),
+                    duration_min: Some(960),
+                    manual: Some(true),
+                    ..TaskPatch::default()
+                },
+            )
+            .unwrap()
+        });
+        // Pinned at its start; the new duration moves the finish, as it does
+        // for any manual task.
+        assert_eq!(mode(&ed, 2), (true, Some(start), None, Some(960)));
+        assert_eq!(ed.project().task(2).unwrap().name, "Pinned");
+        let finish = Some(DateTime::from_ymd_hm(2026, 1, 7, 17, 0));
+        assert_eq!(shown(&ed, 2), (Some(start), finish));
+        assert_eq!(saved(&ed, 2), (Some(start), finish));
     }
 
     fn state(ed: &Editor) -> (Project, usize, usize, bool) {

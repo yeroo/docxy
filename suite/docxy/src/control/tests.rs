@@ -31,7 +31,7 @@ fn word() -> DocTab {
 #[test]
 fn cell_state_is_reported_and_only_successful_agent_changes_cancel_it() {
     let mut tabs = vec![tab()];
-    vm(&mut tabs[0]).col = 1;
+    vm(&mut tabs[0]).col = COL_NAME;
     vm(&mut tabs[0]).open_cell(Some("Pending")).unwrap();
     let (info, _) = call(&mut tabs, 0, "proj.path", Json::Null).unwrap();
     assert_eq!(info.get_str("cell"), Some("Name"));
@@ -313,7 +313,7 @@ fn agent_save_commits_pending_cell_before_destination_validation() {
         let mut tabs = vec![word(), tab()];
         tabs[1].path = None;
         tabs[1].status = "Existing status".into();
-        vm(&mut tabs[1]).col = 1;
+        vm(&mut tabs[1]).col = COL_NAME;
         vm(&mut tabs[1]).open_cell(Some("Pending name")).unwrap();
         let before = snapshot(&tabs[1]);
         let mut fields = match save_args {
@@ -359,7 +359,7 @@ fn agent_save_reports_cell_error_before_missing_or_invalid_destination() {
         let mut tabs = vec![tab()];
         tabs[0].path = None;
         tabs[0].status = "Existing status".into();
-        vm(&mut tabs[0]).col = 2;
+        vm(&mut tabs[0]).col = COL_DURATION;
         vm(&mut tabs[0]).open_cell(Some("bad duration")).unwrap();
         let before = snapshot(&tabs[0]);
         assert_eq!(
@@ -475,7 +475,7 @@ fn reload_commits_only_a_successful_load() {
     assert!(v.table_x.get() > 0. && v.table_x.get() < f32::MAX);
     assert_eq!(v.gantt_x.get(), (v.scale.width() - v.gantt_w).max(0.));
     let offsets = (v.table_x.get(), v.gantt_x.get());
-    vm(&mut tabs[0]).col = 6;
+    vm(&mut tabs[0]).col = COLUMN_COUNT - 1;
     vm(&mut tabs[0]).key("right", false);
     vm(&mut tabs[0]).pan_gantt(true);
     assert_eq!(

@@ -93,7 +93,7 @@ fn sheet_pending_edit_commits_before_asking_and_is_undoable() {
 #[test]
 fn valid_project_buffer_commits_before_asking() {
     let mut t = tab(Kind::Project);
-    project_cell_click(&mut t, 1, Some(1), false);
+    project_cell_click(&mut t, 1, Some(COL_NAME), false);
     project_input(&mut t, "text", Some("Pending name"), Modifiers::default());
     assert!(!t.dirty);
     assert_eq!(
@@ -113,7 +113,7 @@ fn valid_project_buffer_commits_before_asking() {
 #[test]
 fn invalid_project_buffer_refuses_even_discard_and_correction_clears_status() {
     let mut t = tab(Kind::Project);
-    project_cell_click(&mut t, 1, Some(2), false);
+    project_cell_click(&mut t, 1, Some(COL_DURATION), false);
     project_input(&mut t, "text", Some("banana"), Modifiers::default());
     let step = close_step(&mut t, |_| panic!("invalid buffer asked"));
     assert_eq!(
@@ -286,7 +286,7 @@ fn window_close_flushes_open_header_and_footer_on_every_tab() {
 #[test]
 fn window_close_does_not_stop_at_an_invalid_project_buffer() {
     let mut project = tab(Kind::Project);
-    project_cell_click(&mut project, 1, Some(2), false);
+    project_cell_click(&mut project, 1, Some(COL_DURATION), false);
     project_input(&mut project, "text", Some("banana"), Modifiers::default());
     let mut doc = tab(Kind::Docx);
     let header = open_hf(&mut doc, true, "After invalid");

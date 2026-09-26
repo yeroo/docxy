@@ -355,6 +355,8 @@ struct App {
     list_left_w: u16, // width of the task pane (left of the gantt)
     gantt_x0: u16,    // absolute x where the gantt inner area begins
     screen_w: u16,    // terminal width, for the tab-strip Theme button
+    /// The status line's `New Tasks: …` segment: its row and end column.
+    new_tasks_hit: Option<(u16, u16)>,
 }
 
 const RIBBON_H: u16 = 7; // tab strip (1) + body (6: border, 2 rows, separator, titles, border)
@@ -413,6 +415,7 @@ impl App {
             list_left_w: 0,
             gantt_x0: 0,
             screen_w: 0,
+            new_tasks_hit: None,
             vim,
         }
     }
@@ -516,6 +519,33 @@ impl App {
                 self.status = message;
             }
         }
+    }
+
+    /// Switch the selected task between Manually and Auto Scheduled.
+    fn set_manual(&mut self, manual: bool) {
+        let Some(uid) = self.ed.selected_uid() else {
+            return;
+        };
+        self.status = match self.ed.set_manual(uid, manual) {
+            Ok(()) => mode_name(manual).into(),
+            Err(message) => message,
+        };
+    }
+
+    /// `m`: the selected task's other mode (a blank row becomes manual).
+    fn toggle_manual(&mut self) {
+        if let Some(t) = self.ed.project().tasks.get(self.ed.sel()) {
+            let manual = t.is_null || !t.manual;
+            self.set_manual(manual);
+        }
+    }
+
+    /// `M` and a click on the status line's segment: the plan's mode for new
+    /// tasks, as Project's status bar switches it.
+    fn toggle_new_tasks_manual(&mut self) {
+        let manual = !self.ed.project().new_tasks_are_manual;
+        self.ed.set_new_tasks_manual(manual);
+        self.status = format!("New tasks: {}", mode_name(manual));
     }
 
     fn theme_toggle(&mut self) {
@@ -623,6 +653,8 @@ impl App {
             Act::AddTask => self.add_task(),
             Act::DeleteTask => self.delete_task(),
             Act::Milestone => self.toggle_milestone(),
+            Act::ManuallySchedule => self.set_manual(true),
+            Act::AutoSchedule => self.set_manual(false),
             Act::Indent => self.indent(1),
             Act::Outdent => self.indent(-1),
             Act::Rename => {
@@ -1267,6 +1299,13 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                 }
                 return;
             }
+            if app
+                .new_tasks_hit
+                .is_some_and(|(row, end)| y == row && x < end)
+            {
+                app.toggle_new_tasks_manual();
+                return;
+            }
             // Click a task row to select it.
             if x < app.list_left_w && y >= app.list_y0 {
                 let idx = app.top + (y - app.list_y0) as usize;
@@ -1420,6 +1459,8 @@ fn on_key(app: &mut App, k: KeyEvent) {
         }
         KeyCode::Char('b') => app.set_baseline(),
         KeyCode::Char('L') => app.toggle_level(),
+        KeyCode::Char('m') => app.toggle_manual(),
+        KeyCode::Char('M') => app.toggle_new_tasks_manual(),
         KeyCode::Char('T') => app.theme_toggle(),
         KeyCode::Char('a') => {
             app.prompt = Some(Prompt {
@@ -1558,6 +1599,16 @@ fn draw(f: &mut Frame, app: &mut App) {
     if app.ed.leveled() {
         toggles.push(Act::LevelAll);
     }
+    // The selected task's mode, as Project highlights it.
+    if let Some(t) = app.ed.project().tasks.get(app.ed.sel()) {
+        if !t.is_null {
+            toggles.push(if t.manual {
+                Act::ManuallySchedule
+            } else {
+                Act::AutoSchedule
+            });
+        }
+    }
     app.ribbon.set_toggles(toggles);
 
     let rows = Layout::default()
@@ -1585,6 +1636,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     f.render_widget(Paragraph::new(app.ribbon.render_body(app.rfocus)), rows[1]);
     draw_header(f, rows[2], app);
     draw_body(f, rows[3], app);
+    app.new_tasks_hit = Some((rows[4].y, rows[4].x + new_tasks_label(app).width() as u16));
     draw_status(f, rows[4], app);
     if app.prompt.is_some() {
         draw_prompt(f, area, app);
@@ -1672,7 +1724,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     // ---- left: task table ----
     let mut left_lines: Vec<Line> = Vec::new();
     left_lines.push(Line::from(Span::styled(
-        format!(" {:<26} {:>5} {:>6}", "Task", "Dur", "Slack"),
+        format!(" {:<2}{:<24} {:>5} {:>6}", "", "Task", "Dur", "Slack"),
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     )));
     for i in app.top..end {
@@ -1704,7 +1756,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             let inits: String = res.iter().filter_map(|r| r.chars().next()).collect();
             format!("{base} ·{inits}")
         };
-        let namecol = truncate(&full, 26);
+        let namecol = truncate(&full, 24);
         let dur = if t.summary {
             // The stored summary duration is stale; derive it from the shown dates.
             app.ed.disp_duration_min(t.uid).map_or_else(
@@ -1729,7 +1781,10 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         }
         let mut line = Line::from(vec![
             Span::raw(" "),
-            Span::styled(format!("{namecol:<26}"), style),
+            // The Task Mode cell, its own span: `format!` pads by chars,
+            // and the pin is two columns wide.
+            Span::styled(mode_marker(t), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{namecol:<24}"), style),
             Span::styled(format!(" {dur:>5}"), Style::default().fg(Color::Gray)),
             Span::styled(format!(" {slack:>6}"), Style::default().fg(Color::DarkGray)),
         ]);
@@ -1871,14 +1926,41 @@ fn build_gantt_row(
     Line::from(spans)
 }
 
+/// A task's mode as Project names it.
+fn mode_name(manual: bool) -> &'static str {
+    if manual {
+        "Manually Scheduled"
+    } else {
+        "Auto Scheduled"
+    }
+}
+
+/// The Task Mode cell: a pin for a manually scheduled task, two columns
+/// either way (the pin is a wide character).
+fn mode_marker(t: &Task) -> &'static str {
+    if t.manual { "📌" } else { "  " }
+}
+
+/// The status line's first segment, as Project's status bar shows it; a
+/// click on it (or `M`) switches the mode for new tasks.
+fn new_tasks_label(app: &App) -> String {
+    format!(
+        " New Tasks: {} │",
+        mode_name(app.ed.project().new_tasks_are_manual)
+    )
+}
+
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let help = "n add · d dur · p dep · Tab indent · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · T theme · q quit";
+    let help = "n add · d dur · p dep · m manual/auto · Tab indent · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · T theme · q quit";
     let text = if app.status.is_empty() {
         help.to_string()
     } else {
         app.status.clone()
     };
-    let mut spans = Vec::new();
+    let mut spans = vec![Span::styled(
+        new_tasks_label(app),
+        Style::default().fg(Color::Yellow),
+    )];
     if app.vim {
         spans.push(Span::styled(
             " -- VIM -- ",
@@ -2956,5 +3038,107 @@ mod tests {
         let p = app.prompt.as_ref().expect("Find prompt");
         assert!(matches!(p.kind, PromptKind::Find));
         assert_eq!(p.label, "Find");
+    }
+
+    fn press(app: &mut App, c: char) {
+        let m = if c.is_uppercase() {
+            KeyModifiers::SHIFT
+        } else {
+            KeyModifiers::NONE
+        };
+        on_key(app, KeyEvent::new(KeyCode::Char(c), m));
+    }
+
+    fn two_tasks() -> App {
+        let mut proj = new_project();
+        proj.tasks.push(Task {
+            uid: 2,
+            id: 2,
+            name: "Build".into(),
+            outline_level: 1,
+            duration_min: 960,
+            ..Task::default()
+        });
+        App::new(proj, Some("plan.yppx".into()), false)
+    }
+
+    #[test]
+    fn m_switches_the_selected_task_between_manual_and_auto() {
+        let mut app = two_tasks();
+        app.ed.select(1);
+        let start = app.ed.disp_start(2);
+        press(&mut app, 'm');
+        let t = app.ed.project().task(2).unwrap();
+        assert!(t.manual);
+        assert_eq!(t.manual_start, start);
+        assert_eq!(app.status, "Manually Scheduled");
+        assert_eq!(app.ed.undo_depth(), 1);
+        press(&mut app, 'm');
+        assert!(!app.ed.project().task(2).unwrap().manual);
+        assert_eq!(app.status, "Auto Scheduled");
+        app.undo();
+        assert!(app.ed.project().task(2).unwrap().manual);
+        assert!(!app.ed.project().task(1).unwrap().manual);
+    }
+
+    #[test]
+    fn ribbon_schedules_the_task_and_shows_its_mode() {
+        let mut app = two_tasks();
+        app.apply_act(Act::ManuallySchedule);
+        assert!(app.ed.project().task(1).unwrap().manual);
+        buffer_text(&mut app, 110, 24);
+        assert!(app.ribbon.toggle_on(Act::ManuallySchedule));
+        assert!(!app.ribbon.toggle_on(Act::AutoSchedule));
+        app.apply_act(Act::AutoSchedule);
+        assert!(!app.ed.project().task(1).unwrap().manual);
+        buffer_text(&mut app, 110, 24);
+        assert!(app.ribbon.toggle_on(Act::AutoSchedule));
+        assert!(!app.ribbon.toggle_on(Act::ManuallySchedule));
+    }
+
+    #[test]
+    fn a_manual_task_shows_a_pin_and_the_columns_stay_aligned() {
+        let mut app = two_tasks();
+        app.ed.set_manual(2, true).unwrap();
+        let (w, h) = (110u16, 22u16);
+        let text = buffer_text(&mut app, w, h);
+        let rows: Vec<String> = (0..h as usize)
+            .map(|y| text.chars().skip(y * w as usize).take(w as usize).collect())
+            .collect();
+        let row = |needle: &str| rows.iter().find(|r| r.contains(needle)).unwrap().clone();
+        let (auto, manual) = (row("New task"), row("Build"));
+        assert!(manual.contains("📌") && !auto.contains("📌"));
+        // The name starts in the same column either way, and the Dur column
+        // lines up with its header. A buffer cell holds one symbol, so a
+        // char index is a column here.
+        let col = |r: &str, s: &str| r.find(s).map(|b| r[..b].chars().count()).unwrap();
+        let header = row("Slack");
+        assert_eq!(col(&auto, "New task"), col(&manual, "Build"));
+        assert_eq!(col(&header, "Task"), col(&auto, "New task") - 2);
+        assert_eq!(col(&auto, "1d"), col(&manual, "2d"));
+        // Right-aligned: "Dur" and "1d" end in the same column.
+        assert_eq!(col(&header, "Dur") + 3, col(&auto, "1d") + 2);
+    }
+
+    #[test]
+    fn the_status_line_shows_and_switches_the_new_task_mode() {
+        let mut app = two_tasks();
+        let (w, h) = (110u16, 22u16);
+        assert!(frame_row(&mut app, w, h - 1).starts_with(" New Tasks: Auto Scheduled"));
+        press(&mut app, 'M');
+        assert!(app.ed.project().new_tasks_are_manual);
+        assert_eq!(app.ed.undo_depth(), 1);
+        assert!(frame_row(&mut app, w, h - 1).starts_with(" New Tasks: Manually Scheduled"));
+        // A new task follows the plan's mode.
+        app.add_task();
+        assert!(app.ed.project().tasks[app.ed.sel()].manual);
+        // A click on the segment switches it back.
+        frame_row(&mut app, w, h - 1);
+        click(&mut app, 3, h - 1);
+        assert!(!app.ed.project().new_tasks_are_manual);
+        // A click past it does not.
+        frame_row(&mut app, w, h - 1);
+        click(&mut app, w - 2, h - 1);
+        assert!(!app.ed.project().new_tasks_are_manual);
     }
 }

@@ -66,7 +66,14 @@ clears history while retaining the find query and leveling preference.
   tasks own the deeper rows below them), and may be milestones (zero duration).
   A task is auto-scheduled or **manually scheduled** (MSPDI `Manual`, with
   `ManualStart`/`ManualFinish`/`ManualDuration`); tasks added to a plan follow
-  its `NewTasksAreManual` default.
+  its `NewTasksAreManual` default. Switching a task to manual (Task ▸ Tasks ▸
+  Manually Schedule, the Task Mode column, yppxy's `m`, or `task.set
+  {manual: true}`) pins it at the start and finish it is shown at, the leveled
+  ones while leveling is on, and stamps its saved Start/Finish; switching it
+  to auto clears the pin and the scheduler places it by its links and
+  constraints again. Either is one undo step. A summary's mode switches, but
+  its dates still roll up from its subtasks. The status bar's `New Tasks: …`
+  (yppxy's `M`) switches the plan's default.
 - **Dependencies** are the four link types with lag/lead: Finish-to-Start,
   Start-to-Start, Finish-to-Finish, Start-to-Finish. Lag is stored in MSPDI as
   *tenths of a minute* — one of several unit traps the reader normalizes.
@@ -167,8 +174,9 @@ task: its bookings are placed first, and auto tasks level around them.
 
 ## Desktop suite entry table
 
-The suite's Project tab edits Name, Duration, Start, Finish, Predecessors, and
-Resource Names directly in the selected cell. Enter/F2 or a double-click opens
+The suite's Project tab edits Task Mode, Name, Duration, Start, Finish,
+Predecessors, and Resource Names directly in the selected cell. Task Mode takes
+`Manually Scheduled` or `Auto Scheduled`, or any start of them (`m`, `auto`). Enter/F2 or a double-click opens
 the existing value; typing replaces it. Enter commits and moves down, Tab and
 Shift+Tab commit and move between columns, and Escape cancels. Invalid input
 stays open for correction. ID and summary dates/duration are read-only.

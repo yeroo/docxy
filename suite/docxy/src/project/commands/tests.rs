@@ -242,6 +242,8 @@ fn project_instruction_paths_exist() {
         ("Task", "Schedule", "Outdent Task", Outdent),
         ("Task", "Schedule", "Link the Selected Tasks", AddLink),
         ("Task", "Schedule", "Unlink Tasks", UnlinkTasks),
+        ("Task", "Tasks", "Manually Schedule", ManuallySchedule),
+        ("Task", "Tasks", "Auto Schedule", AutoSchedule),
         ("Task", "Tasks", "Move", MoveTask),
         ("Task", "Insert", "Task", AddTask),
         ("Task", "Insert", "Milestone", Milestone),
@@ -327,15 +329,17 @@ fn timeline_toggles_the_pane_as_view_state_only() {
 }
 
 #[test]
-fn project_act_active_checks_level_all_and_timeline_only() {
+fn project_act_active_checks_level_all_timeline_and_the_task_mode_only() {
+    use ProjectAct::*;
     let mut t = tab();
-    assert!(!project_act_active(v(&t), ProjectAct::LevelAll));
-    apply_project_act(&mut t, ProjectAct::LevelAll);
-    assert!(project_act_active(v(&t), ProjectAct::LevelAll));
+    assert!(!project_act_active(v(&t), LevelAll));
+    apply_project_act(&mut t, LevelAll);
+    assert!(project_act_active(v(&t), LevelAll));
+    assert!(project_act_active(v(&t), AutoSchedule));
     for act in ProjectAct::RIBBON
         .iter()
         .copied()
-        .filter(|a| !matches!(a, ProjectAct::LevelAll | ProjectAct::Timeline))
+        .filter(|a| !matches!(a, LevelAll | Timeline | AutoSchedule))
     {
         assert!(!project_act_active(v(&t), act), "{act:?}");
     }
@@ -906,7 +910,7 @@ fn f3_from_the_entry_row_starts_at_the_first_task_after_undo_and_redo() {
     project_entry_click(&mut t, None, false);
     commit(&mut t, ProjectAct::Find, "ir");
     assert_eq!(v(&t).ed.sel(), 0);
-    project_entry_click(&mut t, Some(1), false);
+    project_entry_click(&mut t, Some(COL_NAME), false);
     project_input(&mut t, "t", Some("Third"), Modifiers::default());
     project_input(&mut t, "enter", None, Modifiers::default());
     assert_eq!(v(&t).ed.project().tasks[2].name, "Third");
@@ -935,6 +939,57 @@ fn deleting_every_task_latches_the_entry_row_through_undo() {
     assert_eq!(v(&t).ed.project().tasks.len(), 1);
     assert!(v(&t).on_entry_row());
     assert_eq!(v(&t).cursor_row(), 1);
+}
+
+#[test]
+fn manually_and_auto_schedule_switch_the_selected_task_as_one_step() {
+    use ProjectAct::*;
+    let mut t = tab();
+    let uid = v(&t).selected_uid().unwrap();
+    let start = v(&t).ed.disp_start(uid);
+    apply_project_act(&mut t, ManuallySchedule);
+    let task = v(&t).ed.project().task(uid).unwrap();
+    assert!(task.manual);
+    assert_eq!(task.manual_start, start);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert!(t.dirty);
+    assert!(project_act_active(v(&t), ManuallySchedule));
+    assert!(!project_act_active(v(&t), AutoSchedule));
+    // Again: the task already has that mode.
+    apply_project_act(&mut t, ManuallySchedule);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    apply_project_act(&mut t, AutoSchedule);
+    assert!(!v(&t).ed.project().task(uid).unwrap().manual);
+    assert!(project_act_active(v(&t), AutoSchedule));
+    apply_project_act(&mut t, Undo);
+    assert!(v(&t).ed.project().task(uid).unwrap().manual);
+    // The entry row has no task: neither is active, and neither changes anything.
+    project_entry_click(&mut t, None, false);
+    let before = v(&t).ed.project().clone();
+    for act in [ManuallySchedule, AutoSchedule] {
+        assert!(!project_act_active(v(&t), act), "{act:?}");
+        apply_project_act(&mut t, act);
+        assert_eq!(v(&t).ed.project(), &before, "{act:?}");
+    }
+}
+
+#[test]
+fn the_status_bar_item_switches_the_mode_for_new_tasks() {
+    let mut t = tab();
+    t.dirty = false;
+    vm(&mut t).ed.mark_saved();
+    apply_project_act(&mut t, ProjectAct::NewTasksMode);
+    assert!(v(&t).ed.project().new_tasks_are_manual);
+    assert_eq!(t.status.as_ref(), "New tasks: Manually Scheduled");
+    assert!(t.dirty);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    apply_project_act(&mut t, ProjectAct::AddTask);
+    assert!(v(&t).ed.project().tasks[v(&t).ed.sel()].manual);
+    apply_project_act(&mut t, ProjectAct::NewTasksMode);
+    assert!(!v(&t).ed.project().new_tasks_are_manual);
+    assert_eq!(t.status.as_ref(), "New tasks: Auto Scheduled");
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert!(v(&t).ed.project().new_tasks_are_manual);
 }
 
 // ---- Project commands added for #118 ----
