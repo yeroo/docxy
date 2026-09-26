@@ -249,7 +249,7 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     },
                     "Baseline" => parse_baseline(p, &mut t),
                     "IsNull" => t.is_null = bool_of(p),
-                    "GUID" => t.guid = Some(text_of(p)).filter(|g| !g.trim().is_empty()),
+                    "GUID" => t.guid = guid_of(p),
                     "CreateDate" => t.create_date = DateTime::parse_mspdi(&text_of(p)),
                     "WBS" => t.wbs = Some(text_of(p)),
                     "Type" => t.task_type = opt_int_of(p).and_then(TaskType::from_code),
@@ -463,6 +463,49 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "Baseline" => parse_resource_baseline(p, &mut r),
                     "AvailabilityPeriods" => parse_availability_periods(p, &mut r),
                     "Rates" => parse_rates(p, &mut r),
+                    "GUID" => r.guid = guid_of(p),
+                    "IsNull" => r.is_null = opt_bool_of(p),
+                    "Phonetics" => r.phonetics = Some(text_of(p)),
+                    "NTAccount" => r.nt_account = Some(text_of(p)),
+                    "Hyperlink" => r.hyperlink = Some(text_of(p)),
+                    "HyperlinkAddress" => r.hyperlink_address = Some(text_of(p)),
+                    "HyperlinkSubAddress" => r.hyperlink_sub_address = Some(text_of(p)),
+                    "Start" => r.start = DateTime::parse_mspdi(&text_of(p)),
+                    "Finish" => r.finish = DateTime::parse_mspdi(&text_of(p)),
+                    "ActualWork" => r.actual_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "ActualOvertimeWork" => {
+                        r.actual_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "RemainingOvertimeWork" => {
+                        r.remaining_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "PercentWorkComplete" => r.percent_work_complete = percent_of(p),
+                    "OvertimeCost" => r.overtime_cost = rate_of(p),
+                    "ActualCost" => r.actual_cost = rate_of(p),
+                    "ActualOvertimeCost" => r.actual_overtime_cost = rate_of(p),
+                    "RemainingCost" => r.remaining_cost = rate_of(p),
+                    "RemainingOvertimeCost" => r.remaining_overtime_cost = rate_of(p),
+                    "WorkVariance" => r.work_variance = rate_of(p),
+                    "CostVariance" => r.cost_variance = rate_of(p),
+                    "SV" => r.sv = rate_of(p),
+                    "CV" => r.cv = rate_of(p),
+                    "ACWP" => r.acwp = rate_of(p),
+                    "BCWS" => r.bcws = rate_of(p),
+                    "BCWP" => r.bcwp = rate_of(p),
+                    "IsEnterprise" => r.is_enterprise = opt_bool_of(p),
+                    "ActualWorkProtected" => {
+                        r.actual_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ActualOvertimeWorkProtected" => {
+                        r.actual_overtime_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ActiveDirectoryGUID" => r.active_directory_guid = Some(text_of(p)),
+                    "CreationDate" => r.creation_date = DateTime::parse_mspdi(&text_of(p)),
+                    "CostCenter" => r.cost_center = Some(text_of(p)),
+                    "AssnOwner" => r.assn_owner = Some(text_of(p)),
+                    "AssnOwnerGuid" => r.assn_owner_guid = guid_of(p),
+                    "OutlineCode" => r.outline_codes.extend(parse_outline_code(p)),
+                    "TimephasedData" => r.timephased_data.extend(parse_timephased_data(p)),
                     _ => p.skip_element(),
                 }
             }
@@ -546,6 +589,46 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
                     // Its Start/Finish/Work/Cost are the recorded plan's, not the assignment's.
                     "Baseline" => parse_assignment_baseline(p, &mut a),
                     "TimephasedData" => a.timephased_data.extend(parse_timephased_data(p)),
+                    "GUID" => a.guid = guid_of(p),
+                    "ActualOvertimeCost" => a.actual_overtime_cost = rate_of(p),
+                    "ActualOvertimeWork" => {
+                        a.actual_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ACWP" => a.acwp = rate_of(p),
+                    "Confirmed" => a.confirmed = opt_bool_of(p),
+                    "RateScale" => a.rate_scale = opt_u8_of(p),
+                    "CV" => a.cv = rate_of(p),
+                    "Hyperlink" => a.hyperlink = Some(text_of(p)),
+                    "HyperlinkAddress" => a.hyperlink_address = Some(text_of(p)),
+                    "HyperlinkSubAddress" => a.hyperlink_sub_address = Some(text_of(p)),
+                    "LinkedFields" => a.linked_fields = opt_bool_of(p),
+                    "Milestone" => a.milestone = opt_bool_of(p),
+                    "Overallocated" => a.overallocated = opt_bool_of(p),
+                    "OvertimeCost" => a.overtime_cost = rate_of(p),
+                    "PeakUnits" => a.peak_units = rate_of(p),
+                    "RemainingOvertimeCost" => a.remaining_overtime_cost = rate_of(p),
+                    "RemainingOvertimeWork" => {
+                        a.remaining_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ResponsePending" => a.response_pending = opt_bool_of(p),
+                    "Summary" => a.summary = opt_bool_of(p),
+                    "SV" => a.sv = rate_of(p),
+                    "UpdateNeeded" => a.update_needed = opt_bool_of(p),
+                    "VAC" => a.vac = rate_of(p),
+                    "BCWS" => a.bcws = rate_of(p),
+                    "BCWP" => a.bcwp = rate_of(p),
+                    "BookingType" => a.booking_type = opt_u8_of(p),
+                    "ActualWorkProtected" => {
+                        a.actual_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ActualOvertimeWorkProtected" => {
+                        a.actual_overtime_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "CreationDate" => a.creation_date = DateTime::parse_mspdi(&text_of(p)),
+                    "AssnOwner" => a.assn_owner = Some(text_of(p)),
+                    "AssnOwnerGuid" => a.assn_owner_guid = guid_of(p),
+                    "BudgetCost" => a.budget_cost = rate_of(p),
+                    "BudgetWork" => a.budget_work_min = try_iso8601_to_minutes(&text_of(p)),
                     _ => p.skip_element(),
                 }
             }
@@ -713,6 +796,30 @@ fn parse_extended_attribute(p: &mut XmlParser) -> Option<ExtendedAttributeValue>
     }
     attribute.field_id = field_id?;
     Some(attribute)
+}
+
+/// Parse one resource outline code value; `None` without a `FieldID`, which
+/// names it.
+fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
+    let mut field_id = None;
+    let mut code = OutlineCodeValue::default();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "FieldID" => field_id = leaf_text_of(p),
+                    "ValueID" => code.value_id = leaf_text_of(p),
+                    "ValueGUID" => code.value_guid = leaf_text_of(p),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    code.field_id = field_id?;
+    Some(code)
 }
 
 /// Parse one timephased record; `None` without a valid `Type`, which says
@@ -997,6 +1104,11 @@ fn float_of(p: &mut XmlParser) -> f64 {
 }
 
 /// Invalid optional rates stay absent; nonfinite floats are not XML decimals.
+/// A GUID's text; an empty one is no GUID.
+fn guid_of(p: &mut XmlParser) -> Option<String> {
+    Some(text_of(p)).filter(|g| !g.trim().is_empty())
+}
+
 fn rate_of(p: &mut XmlParser) -> Option<Rate> {
     Rate::parse(&text_of(p))
 }
@@ -1357,6 +1469,14 @@ fn opt_text(s: &mut String, name: &str, value: Option<impl ToString>) {
     }
 }
 
+fn opt_rate(s: &mut String, name: &str, value: &Option<Rate>) {
+    opt_text(s, name, value.as_ref().map(Rate::as_str));
+}
+
+fn opt_work(s: &mut String, name: &str, value: Option<i64>) {
+    opt_text(s, name, value.map(min_to_iso));
+}
+
 /// Write one task's children in the MSPDI `Task` sequence (the order Project
 /// 2024 writes them). A blank row writes only what it stores: no computed
 /// fields and none of the elements every task otherwise states.
@@ -1498,14 +1618,19 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
 
 fn write_resource(s: &mut String, r: &Resource) {
     s.push_str("    <Resource>\n");
+    // Microsoft's Resource sequence as Project 2010+ writes it (Project 2024
+    // exports agree), including IsCostResource after CostCenter (Type itself
+    // only permits 0 and 1).
     tag(s, 3, "UID", &r.uid.to_string());
+    opt_text(s, "GUID", r.guid.as_ref());
     tag(s, 3, "ID", &r.id.to_string());
     tag(s, 3, "Name", &r.name);
     tag(s, 3, "Type", &r.kind.code().to_string());
-    // Keep the relative sequence from Microsoft's Resource XSD, including
-    // IsCostResource after CalendarUID (Type itself only permits 0 and 1).
+    opt_flag(s, "IsNull", r.is_null);
     for (name, value) in [
         ("Initials", &r.initials),
+        ("Phonetics", &r.phonetics),
+        ("NTAccount", &r.nt_account),
         ("MaterialLabel", &r.material_label),
         ("Code", &r.code),
         ("Group", &r.group),
@@ -1516,43 +1641,68 @@ fn write_resource(s: &mut String, r: &Resource) {
     }
     opt_text(s, "WorkGroup", r.work_group);
     opt_text(s, "EmailAddress", r.email_address.as_deref());
+    opt_text(s, "Hyperlink", r.hyperlink.as_deref());
+    opt_text(s, "HyperlinkAddress", r.hyperlink_address.as_deref());
+    opt_text(s, "HyperlinkSubAddress", r.hyperlink_sub_address.as_deref());
     tag(s, 3, "MaxUnits", &fmt_f(r.max_units));
-    opt_text(s, "PeakUnits", r.peak_units.as_ref().map(Rate::as_str));
+    opt_rate(s, "PeakUnits", &r.peak_units);
     opt_flag(s, "OverAllocated", r.over_allocated);
     opt_date(s, "AvailableFrom", r.available_from);
     opt_date(s, "AvailableTo", r.available_to);
+    opt_date(s, "Start", r.start);
+    opt_date(s, "Finish", r.finish);
     opt_flag(s, "CanLevel", r.can_level);
     if let Some(accrue_at) = r.accrue_at {
         tag(s, 3, "AccrueAt", &accrue_at.code().to_string());
     }
-    opt_text(s, "Work", r.work_min.map(min_to_iso));
-    opt_text(s, "RegularWork", r.regular_work_min.map(min_to_iso));
-    opt_text(s, "OvertimeWork", r.overtime_work_min.map(min_to_iso));
-    opt_text(s, "RemainingWork", r.remaining_work_min.map(min_to_iso));
-    opt_text(
-        s,
-        "StandardRate",
-        r.standard_rate.as_ref().map(Rate::as_str),
-    );
+    opt_work(s, "Work", r.work_min);
+    opt_work(s, "RegularWork", r.regular_work_min);
+    opt_work(s, "OvertimeWork", r.overtime_work_min);
+    opt_work(s, "ActualWork", r.actual_work_min);
+    opt_work(s, "RemainingWork", r.remaining_work_min);
+    opt_work(s, "ActualOvertimeWork", r.actual_overtime_work_min);
+    opt_work(s, "RemainingOvertimeWork", r.remaining_overtime_work_min);
+    opt_text(s, "PercentWorkComplete", r.percent_work_complete);
+    opt_rate(s, "StandardRate", &r.standard_rate);
     opt_text(s, "StandardRateFormat", r.standard_rate_format);
-    opt_text(s, "Cost", r.cost.as_ref().map(Rate::as_str));
-    opt_text(
-        s,
-        "OvertimeRate",
-        r.overtime_rate.as_ref().map(Rate::as_str),
-    );
+    opt_rate(s, "Cost", &r.cost);
+    opt_rate(s, "OvertimeRate", &r.overtime_rate);
     opt_text(s, "OvertimeRateFormat", r.overtime_rate_format);
-    opt_text(s, "CostPerUse", r.cost_per_use.as_ref().map(Rate::as_str));
+    opt_rate(s, "OvertimeCost", &r.overtime_cost);
+    opt_rate(s, "CostPerUse", &r.cost_per_use);
+    opt_rate(s, "ActualCost", &r.actual_cost);
+    opt_rate(s, "ActualOvertimeCost", &r.actual_overtime_cost);
+    opt_rate(s, "RemainingCost", &r.remaining_cost);
+    opt_rate(s, "RemainingOvertimeCost", &r.remaining_overtime_cost);
+    opt_rate(s, "WorkVariance", &r.work_variance);
+    opt_rate(s, "CostVariance", &r.cost_variance);
+    opt_rate(s, "SV", &r.sv);
+    opt_rate(s, "CV", &r.cv);
+    opt_rate(s, "ACWP", &r.acwp);
     if let Some(c) = r.calendar_uid {
         tag(s, 3, "CalendarUID", &c.to_string());
     }
     opt_text(s, "Notes", r.notes.as_deref());
+    opt_rate(s, "BCWS", &r.bcws);
+    opt_rate(s, "BCWP", &r.bcwp);
     opt_flag(s, "IsGeneric", r.is_generic);
     opt_flag(s, "IsInactive", r.is_inactive);
+    opt_flag(s, "IsEnterprise", r.is_enterprise);
     opt_text(s, "BookingType", r.booking_type);
+    opt_work(s, "ActualWorkProtected", r.actual_work_protected_min);
+    opt_work(
+        s,
+        "ActualOvertimeWorkProtected",
+        r.actual_overtime_work_protected_min,
+    );
+    opt_text(s, "ActiveDirectoryGUID", r.active_directory_guid.as_deref());
+    opt_date(s, "CreationDate", r.creation_date);
+    opt_text(s, "CostCenter", r.cost_center.as_deref());
     if r.kind == ResourceType::Cost {
         tag(s, 3, "IsCostResource", "1");
     }
+    opt_text(s, "AssnOwner", r.assn_owner.as_deref());
+    opt_text(s, "AssnOwnerGuid", r.assn_owner_guid.as_deref());
     opt_flag(s, "IsBudget", r.is_budget);
     write_extended_attributes(s, &r.extended_attributes);
     for baseline in &r.baselines {
@@ -1571,6 +1721,17 @@ fn write_resource(s: &mut String, r: &Resource) {
             }
         }
         s.push_str("      </Baseline>\n");
+    }
+    for code in &r.outline_codes {
+        s.push_str("      <OutlineCode>\n");
+        tag(s, 4, "FieldID", &code.field_id);
+        if let Some(value_id) = &code.value_id {
+            tag(s, 4, "ValueID", value_id);
+        }
+        if let Some(guid) = &code.value_guid {
+            tag(s, 4, "ValueGUID", guid);
+        }
+        s.push_str("      </OutlineCode>\n");
     }
     if !r.availability_periods.is_empty() {
         s.push_str("      <AvailabilityPeriods>\n");
@@ -1625,6 +1786,7 @@ fn write_resource(s: &mut String, r: &Resource) {
         }
         s.push_str("      </Rates>\n");
     }
+    write_timephased_data(s, &r.timephased_data);
     s.push_str("    </Resource>\n");
 }
 
@@ -1648,50 +1810,75 @@ fn write_extended_attributes(s: &mut String, attributes: &[ExtendedAttributeValu
 
 fn write_assignment(s: &mut String, a: &Assignment) {
     s.push_str("    <Assignment>\n");
+    // Microsoft's Assignment sequence as Project 2010+ writes it (Project
+    // 2024 exports agree).
     tag(s, 3, "UID", &a.uid.to_string());
+    opt_text(s, "GUID", a.guid.as_ref());
     tag(s, 3, "TaskUID", &a.task_uid.to_string());
     tag(s, 3, "ResourceUID", &a.resource_uid.to_string());
-    // Microsoft's Assignment sequence, as Project 2024 writes it.
     opt_text(s, "PercentWorkComplete", a.percent_work_complete);
-    opt_text(s, "ActualCost", a.actual_cost.as_ref().map(Rate::as_str));
+    opt_rate(s, "ActualCost", &a.actual_cost);
     opt_date(s, "ActualFinish", a.actual_finish);
+    opt_rate(s, "ActualOvertimeCost", &a.actual_overtime_cost);
+    opt_work(s, "ActualOvertimeWork", a.actual_overtime_work_min);
     opt_date(s, "ActualStart", a.actual_start);
-    opt_text(s, "ActualWork", a.actual_work_min.map(min_to_iso));
-    opt_text(s, "Cost", a.cost.as_ref().map(Rate::as_str));
+    opt_work(s, "ActualWork", a.actual_work_min);
+    opt_rate(s, "ACWP", &a.acwp);
+    opt_flag(s, "Confirmed", a.confirmed);
+    opt_rate(s, "Cost", &a.cost);
     opt_text(s, "CostRateTable", a.cost_rate_table);
-    opt_text(
-        s,
-        "CostVariance",
-        a.cost_variance.as_ref().map(Rate::as_str),
-    );
+    opt_text(s, "RateScale", a.rate_scale);
+    opt_rate(s, "CostVariance", &a.cost_variance);
+    opt_rate(s, "CV", &a.cv);
     opt_text(s, "Delay", a.delay);
     opt_date(s, "Finish", a.finish);
     opt_text(s, "FinishVariance", a.finish_variance);
-    opt_text(
-        s,
-        "WorkVariance",
-        a.work_variance.as_ref().map(Rate::as_str),
-    );
+    opt_text(s, "Hyperlink", a.hyperlink.as_deref());
+    opt_text(s, "HyperlinkAddress", a.hyperlink_address.as_deref());
+    opt_text(s, "HyperlinkSubAddress", a.hyperlink_sub_address.as_deref());
+    opt_rate(s, "WorkVariance", &a.work_variance);
     opt_flag(s, "HasFixedRateUnits", a.has_fixed_rate_units);
     opt_flag(s, "FixedMaterial", a.fixed_material);
     opt_text(s, "LevelingDelay", a.leveling_delay);
     opt_text(s, "LevelingDelayFormat", a.leveling_delay_format);
+    opt_flag(s, "LinkedFields", a.linked_fields);
+    opt_flag(s, "Milestone", a.milestone);
     opt_text(s, "Notes", a.notes.as_deref());
-    opt_text(s, "OvertimeWork", a.overtime_work_min.map(min_to_iso));
-    opt_text(s, "RegularWork", a.regular_work_min.map(min_to_iso));
-    opt_text(
-        s,
-        "RemainingCost",
-        a.remaining_cost.as_ref().map(Rate::as_str),
-    );
-    opt_text(s, "RemainingWork", a.remaining_work_min.map(min_to_iso));
+    opt_flag(s, "Overallocated", a.overallocated);
+    opt_rate(s, "OvertimeCost", &a.overtime_cost);
+    opt_work(s, "OvertimeWork", a.overtime_work_min);
+    opt_rate(s, "PeakUnits", &a.peak_units);
+    opt_work(s, "RegularWork", a.regular_work_min);
+    opt_rate(s, "RemainingCost", &a.remaining_cost);
+    opt_rate(s, "RemainingOvertimeCost", &a.remaining_overtime_cost);
+    opt_work(s, "RemainingOvertimeWork", a.remaining_overtime_work_min);
+    opt_work(s, "RemainingWork", a.remaining_work_min);
+    opt_flag(s, "ResponsePending", a.response_pending);
     opt_date(s, "Start", a.start);
     opt_date(s, "Stop", a.stop);
     opt_date(s, "Resume", a.resume);
     opt_text(s, "StartVariance", a.start_variance);
+    opt_flag(s, "Summary", a.summary);
+    opt_rate(s, "SV", &a.sv);
     tag(s, 3, "Units", &fmt_f(a.units));
+    opt_flag(s, "UpdateNeeded", a.update_needed);
+    opt_rate(s, "VAC", &a.vac);
     tag(s, 3, "Work", &min_to_iso(a.work_min));
     opt_text(s, "WorkContour", a.work_contour);
+    opt_rate(s, "BCWS", &a.bcws);
+    opt_rate(s, "BCWP", &a.bcwp);
+    opt_text(s, "BookingType", a.booking_type);
+    opt_work(s, "ActualWorkProtected", a.actual_work_protected_min);
+    opt_work(
+        s,
+        "ActualOvertimeWorkProtected",
+        a.actual_overtime_work_protected_min,
+    );
+    opt_date(s, "CreationDate", a.creation_date);
+    opt_text(s, "AssnOwner", a.assn_owner.as_deref());
+    opt_text(s, "AssnOwnerGuid", a.assn_owner_guid.as_deref());
+    opt_rate(s, "BudgetCost", &a.budget_cost);
+    opt_work(s, "BudgetWork", a.budget_work_min);
     write_extended_attributes(s, &a.extended_attributes);
     for baseline in &a.baselines {
         s.push_str("      <Baseline>\n");
@@ -1710,7 +1897,13 @@ fn write_assignment(s: &mut String, a: &Assignment) {
         }
         s.push_str("      </Baseline>\n");
     }
-    for record in &a.timephased_data {
+    write_timephased_data(s, &a.timephased_data);
+    s.push_str("    </Assignment>\n");
+}
+
+/// Timephased records, in the schema's child order.
+fn write_timephased_data(s: &mut String, records: &[TimephasedValue]) {
+    for record in records {
         s.push_str("      <TimephasedData>\n");
         tag(s, 4, "Type", &record.kind.to_string());
         if let Some(uid) = record.uid {
@@ -1730,7 +1923,6 @@ fn write_assignment(s: &mut String, a: &Assignment) {
         }
         s.push_str("      </TimephasedData>\n");
     }
-    s.push_str("    </Assignment>\n");
 }
 
 fn write_calendar(s: &mut String, c: &Calendar) {
@@ -4206,6 +4398,8 @@ mod tests {
                         ..AssignmentBaseline::default()
                     },
                 ],
+                // The #267 fields: no Baseline child shares their names.
+                ..Assignment::default()
             }]
         );
     }
@@ -5526,5 +5720,155 @@ mod tests {
                 format!("unsupported LagFormat {code} on a predecessor link of task UID 2")
             );
         }
+    }
+
+    /// Fixture 13 carries a value for every Resource and Assignment child.
+    const FIXTURE_13: &str = include_str!("../../corpus/mspdi/13-resource-fields.xml");
+
+    /// Microsoft's Resource children in the Project 2010+ sequence, as Project
+    /// 2024 writes it. Not the 2007 pj12 XSD, which has no GUID, CostCenter or
+    /// RateScale and puts ExtendedAttribute..OutlineCode before IsCostResource.
+    #[rustfmt::skip]
+    const RESOURCE_SEQUENCE: &[&str] = &[
+        "UID", "GUID", "ID", "Name", "Type", "IsNull", "Initials", "Phonetics",
+        "NTAccount", "MaterialLabel", "Code", "Group", "WorkGroup", "EmailAddress",
+        "Hyperlink", "HyperlinkAddress", "HyperlinkSubAddress", "MaxUnits", "PeakUnits",
+        "OverAllocated", "AvailableFrom", "AvailableTo", "Start", "Finish", "CanLevel",
+        "AccrueAt", "Work", "RegularWork", "OvertimeWork", "ActualWork", "RemainingWork",
+        "ActualOvertimeWork", "RemainingOvertimeWork", "PercentWorkComplete",
+        "StandardRate", "StandardRateFormat", "Cost", "OvertimeRate", "OvertimeRateFormat",
+        "OvertimeCost", "CostPerUse", "ActualCost", "ActualOvertimeCost", "RemainingCost",
+        "RemainingOvertimeCost", "WorkVariance", "CostVariance", "SV", "CV", "ACWP",
+        "CalendarUID", "Notes", "BCWS", "BCWP", "IsGeneric", "IsInactive", "IsEnterprise",
+        "BookingType", "ActualWorkProtected", "ActualOvertimeWorkProtected",
+        "ActiveDirectoryGUID", "CreationDate", "CostCenter", "IsCostResource", "AssnOwner",
+        "AssnOwnerGuid", "IsBudget", "ExtendedAttribute", "Baseline", "OutlineCode",
+        "AvailabilityPeriods", "Rates", "TimephasedData",
+    ];
+
+    /// Microsoft's Assignment children in the same Project 2010+ sequence.
+    #[rustfmt::skip]
+    const ASSIGNMENT_SEQUENCE: &[&str] = &[
+        "UID", "GUID", "TaskUID", "ResourceUID", "PercentWorkComplete", "ActualCost",
+        "ActualFinish", "ActualOvertimeCost", "ActualOvertimeWork", "ActualStart",
+        "ActualWork", "ACWP", "Confirmed", "Cost", "CostRateTable", "RateScale",
+        "CostVariance", "CV", "Delay", "Finish", "FinishVariance", "Hyperlink",
+        "HyperlinkAddress", "HyperlinkSubAddress", "WorkVariance", "HasFixedRateUnits",
+        "FixedMaterial", "LevelingDelay", "LevelingDelayFormat", "LinkedFields", "Milestone",
+        "Notes", "Overallocated", "OvertimeCost", "OvertimeWork", "PeakUnits", "RegularWork",
+        "RemainingCost", "RemainingOvertimeCost", "RemainingOvertimeWork", "RemainingWork",
+        "ResponsePending", "Start", "Stop", "Resume", "StartVariance", "Summary", "SV",
+        "Units", "UpdateNeeded", "VAC", "Work", "WorkContour", "BCWS", "BCWP", "BookingType",
+        "ActualWorkProtected", "ActualOvertimeWorkProtected", "CreationDate", "AssnOwner",
+        "AssnOwnerGuid", "BudgetCost", "BudgetWork", "ExtendedAttribute", "Baseline",
+        "TimephasedData",
+    ];
+
+    /// Each `element`'s direct children in written order, a repeated child
+    /// (e.g. `ExtendedAttribute`) once per run. The writer puts one child per
+    /// line three levels deep, so a deeper `Start` is not the element's own.
+    fn child_names<'a>(xml: &'a str, element: &str) -> Vec<Vec<&'a str>> {
+        let (open, close) = (format!("    <{element}>"), format!("    </{element}>"));
+        let mut out = Vec::new();
+        let mut names: Option<Vec<&str>> = None;
+        for line in xml.lines() {
+            if line == open {
+                names = Some(Vec::new());
+            } else if line == close {
+                out.extend(names.take());
+            } else if let Some(names) = &mut names {
+                let Some(tag) = line.strip_prefix("      <") else {
+                    continue;
+                };
+                if tag.starts_with([' ', '/']) {
+                    continue;
+                }
+                let name = &tag[..tag.find(['>', ' ']).unwrap()];
+                if names.last() != Some(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// #267: every Resource and Assignment child survives a save, in the
+    /// schema's sequence. A child missing from the output is either dropped
+    /// by the reader or writer, or absent from fixture 13.
+    #[test]
+    fn resource_and_assignment_children_are_written_complete_and_in_schema_order() {
+        let xml = write_mspdi(&read_mspdi(FIXTURE_13).unwrap());
+        for (element, sequence) in [
+            ("Resource", RESOURCE_SEQUENCE),
+            ("Assignment", ASSIGNMENT_SEQUENCE),
+        ] {
+            let written = child_names(&xml, element);
+            assert!(!written.is_empty(), "no {element} written");
+            for names in &written {
+                // A subsequence: each name found after the previous one.
+                let mut rest = sequence.iter();
+                for name in names {
+                    assert!(
+                        rest.any(|s| s == name),
+                        "{element}: {name} out of sequence in {names:?}"
+                    );
+                }
+            }
+            let missing: Vec<_> = sequence
+                .iter()
+                .filter(|name| !written.iter().any(|names| names.contains(name)))
+                .collect();
+            assert!(missing.is_empty(), "{element}: none writes {missing:?}");
+        }
+    }
+
+    /// #267: a work edit drops what described the old work's overtime, and a
+    /// units edit also the peak units; every other stored field stays.
+    #[test]
+    fn work_and_units_edits_clear_only_what_described_the_old_work() {
+        let imported = read_mspdi(FIXTURE_13).unwrap().assignments[0].clone();
+        for field in [
+            imported.overtime_cost.is_some(),
+            imported.remaining_overtime_work_min.is_some(),
+            imported.remaining_overtime_cost.is_some(),
+            imported.peak_units.is_some(),
+            imported.actual_overtime_cost.is_some(),
+            imported.budget_work_min.is_some(),
+        ] {
+            assert!(field, "fixture 13 must set the fields this test watches");
+        }
+        let cleared_by_work = |a: &Assignment| Assignment {
+            work_min: a.work_min,
+            regular_work_min: None,
+            overtime_work_min: None,
+            overtime_cost: None,
+            remaining_overtime_work_min: None,
+            remaining_overtime_cost: None,
+            cost: None,
+            timephased_data: a
+                .timephased_data
+                .iter()
+                .filter(|t| t.kind != TimephasedValue::REMAINING_WORK)
+                .cloned()
+                .collect(),
+            ..imported.clone()
+        };
+        let mut a = imported.clone();
+        a.set_work(240);
+        assert_eq!(a.work_min, 240);
+        // Actual overtime, earned value, the budget and the peak units stay.
+        assert_eq!(a, cleared_by_work(&a));
+        assert_eq!(a.peak_units, imported.peak_units);
+        let mut a = imported.clone();
+        a.set_units(0.5, 480);
+        assert_eq!((a.units, a.work_min), (0.5, 480));
+        assert_eq!(
+            a,
+            Assignment {
+                units: 0.5,
+                peak_units: None,
+                ..cleared_by_work(&a)
+            }
+        );
     }
 }
