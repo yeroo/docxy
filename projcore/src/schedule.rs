@@ -31,7 +31,7 @@
 //! Summary tasks roll up from their descendants, except that a manually
 //! scheduled summary keeps its own dates: they floor its unconstrained
 //! subtasks' starts and extend the project finish (see [`Schedule::rolled_up`]
-//! and [`Schedule::summary_warning`]). Resource
+//! and [`manual_warning`]). Resource
 //! leveling is separate from CPM. Free slack is computed precisely for
 //! finish-to-start successors and falls back to total slack otherwise.
 
@@ -40,7 +40,7 @@ use crate::model::{
     Calendar, ConstraintType, LagKind, LinkType, Predecessor, Project, ResourceType, Task, Week,
     WorkCalendar, WorkingTime,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 /// Maximum calendar days on either side of the scheduling anchor.
 pub(crate) const HORIZON_DAYS: i64 = 366 * 100;
@@ -79,8 +79,6 @@ pub struct Schedule {
     results: HashMap<i32, TaskResult>,
     /// Each summary's rolled-up span, see [`Schedule::rolled_up`].
     rollups: HashMap<i32, (DateTime, DateTime)>,
-    /// Manual summaries whose subtasks finish after their manual finish.
-    warnings: HashSet<i32>,
     pub project_start: DateTime,
     pub project_finish: DateTime,
 }
@@ -98,13 +96,6 @@ impl Schedule {
     /// summary with nothing scheduled below it.
     pub fn rolled_up(&self, uid: i32) -> Option<(DateTime, DateTime)> {
         self.rollups.get(&uid).copied()
-    }
-
-    /// Project's warning on a manual summary: its subtasks finish after its
-    /// manual finish. A rollup that starts before the manual start does not
-    /// warn.
-    pub fn summary_warning(&self, uid: i32) -> bool {
-        self.warnings.contains(&uid)
     }
 
     /// Every task's computed result, in unspecified order.
@@ -1072,15 +1063,15 @@ impl<'a> Scheduler<'a> {
             if late < early { -gap } else { gap }
         };
         let mut rollups = HashMap::new();
-        let mut warnings = HashSet::new();
         for i in summaries_deepest_first(self.proj) {
             let t = &self.proj.tasks[i];
             let nodes: Vec<Node> = rollup_nodes(self.proj, i, &leaves)
                 .filter_map(|k| {
                     let r = results.get(&self.proj.tasks[k].uid)?;
                     Some(if self.proj.tasks[k].summary {
-                        // Its ancestors see a manual summary's own span as
-                        // fixed: its late window is its early one.
+                        // Every ancestor, manual or auto, sees a manual
+                        // summary's own span as fixed: its late window is its
+                        // early one (Project, probes r1 and r1b).
                         Node {
                             late_start: r.early_start,
                             late_finish: r.early_finish,
@@ -1139,9 +1130,6 @@ impl<'a> Scheduler<'a> {
                     let (start_slack, finish_slack) =
                         (slack(start, late_start), slack(finish, late_finish));
                     let total = start_slack.min(finish_slack);
-                    if span.1.is_some_and(|rolled| rolled > finish) {
-                        warnings.insert(t.uid);
-                    }
                     TaskResult {
                         uid: t.uid,
                         early_start: start,
@@ -1195,7 +1183,6 @@ impl<'a> Scheduler<'a> {
         Schedule {
             results,
             rollups,
-            warnings,
             project_start: DateTime::from_minutes(self.anchor),
             project_finish: DateTime::from_minutes(project_finish_abs),
         }
@@ -1523,10 +1510,41 @@ fn topo_order(
     order
 }
 
-/// UIDs of the scheduled leaves nested under the summary at position `sidx`
-/// (following rows with a deeper outline level, until the level returns).
-/// Membership is by position in `leaves` (sorted), so a dropped leaf cannot
-/// pull in a scheduled task elsewhere that shares its UID.
+/// Project's warning on a manually scheduled task, from its shown finishes
+/// and rollups: a manual summary whose subtasks finish after its own finish,
+/// or a manual task (summary or leaf) finishing after its direct parent when
+/// that parent is a manual summary. An auto summary in between is a direct
+/// parent that never warns, and starting early never warns.
+pub fn manual_warning(
+    proj: &Project,
+    uid: i32,
+    finish: impl Fn(i32) -> Option<DateTime>,
+    rollup: impl Fn(i32) -> Option<(DateTime, DateTime)>,
+) -> bool {
+    let Some(i) = proj.tasks.iter().position(|t| t.uid == uid && !t.is_null) else {
+        return false;
+    };
+    let task = &proj.tasks[i];
+    let summary = task.manual_summary_dates().is_some();
+    if !summary && task.pinned_dates().is_none() {
+        return false;
+    }
+    let Some(own) = finish(uid) else {
+        return false;
+    };
+    if summary && rollup(uid).is_some_and(|(_, rolled)| rolled > own) {
+        return true;
+    }
+    proj.tasks[..i]
+        .iter()
+        .rev()
+        .filter(|p| !p.is_null)
+        .find(|p| p.outline_level < task.outline_level)
+        .filter(|p| p.manual_summary_dates().is_some())
+        .and_then(|p| finish(p.uid))
+        .is_some_and(|parent| own > parent)
+}
+
 /// Summary task indices, deepest outline level first.
 fn summaries_deepest_first(proj: &Project) -> Vec<usize> {
     let mut out: Vec<usize> = (0..proj.tasks.len())
@@ -1539,6 +1557,8 @@ fn summaries_deepest_first(proj: &Project) -> Vec<usize> {
 /// What summary `sidx` rolls up: the indices of its descendant scheduled
 /// `leaves` and of its descendant manual summaries (with a start), including
 /// leaves under those. Auto summaries in between are looked through.
+/// Leaf membership is by position in `leaves` (sorted), so a dropped leaf
+/// cannot pull in a scheduled task elsewhere that shares its UID.
 fn rollup_nodes<'a>(
     proj: &'a Project,
     sidx: usize,
@@ -1689,8 +1709,8 @@ pub(crate) fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: Da
 }
 
 /// A task's scheduled duration in working minutes: a leaf's own
-/// `duration_min`, or for a summary the working time spanned by its rolled-up
-/// early start/finish. The stored `duration_min` of a summary is never
+/// `duration_min`, or for a summary the working time spanned by its scheduled
+/// early start/finish (rolled up, or a manual summary's own span). The stored `duration_min` of a summary is never
 /// recomputed, so every surface that shows one must derive it here. `None` when
 /// the task has no schedule result.
 pub fn task_duration_min(proj: &Project, sched: &Schedule, task: &Task) -> Option<i64> {
@@ -5750,6 +5770,16 @@ mod tests {
         );
     }
 
+    /// [`manual_warning`] on the scheduled dates.
+    fn warns(proj: &Project, s: &Schedule, uid: i32) -> bool {
+        manual_warning(
+            proj,
+            uid,
+            |u| s.get(u).map(|r| r.early_finish),
+            |u| s.rolled_up(u),
+        )
+    }
+
     fn late(s: &Schedule, uid: i32) -> (DateTime, DateTime) {
         let r = s.get(uid).unwrap();
         (r.late_start, r.late_finish)
@@ -5767,11 +5797,12 @@ mod tests {
 
     #[test]
     fn manual_summary_shorter_than_its_subtasks_keeps_its_dates_and_warns() {
-        let s = schedule(&c_base(at(4, 17)));
+        let proj = c_base(at(4, 17));
+        let s = schedule(&proj);
         expect(&s, 1, (2, 8), (4, 17), 0, true);
         assert_eq!(late(&s, 1), (at(2, 8), at(6, 17)));
         assert_eq!(s.rolled_up(1), Some((at(2, 8), at(6, 17))));
-        assert!(s.summary_warning(1));
+        assert!(warns(&proj, &s, 1));
         expect(&s, 2, (2, 8), (3, 17), 0, true);
         expect(&s, 3, (4, 8), (6, 17), 0, true);
         expect(&s, 4, (9, 8), (9, 17), 0, true);
@@ -5780,11 +5811,12 @@ mod tests {
 
     #[test]
     fn manual_summary_finish_extends_the_project_finish() {
-        let s = schedule(&c_base(at(20, 17)));
+        let proj = c_base(at(20, 17));
+        let s = schedule(&proj);
         expect(&s, 1, (2, 8), (20, 17), 0, true);
         assert_eq!(late(&s, 1), (at(13, 8), at(20, 17)));
         assert_eq!(s.rolled_up(1), Some((at(2, 8), at(6, 17))));
-        assert!(!s.summary_warning(1));
+        assert!(!warns(&proj, &s, 1));
         expect(&s, 2, (2, 8), (3, 17), 9, false);
         expect(&s, 3, (4, 8), (6, 17), 9, false);
         expect(&s, 4, (9, 8), (9, 17), 9, false);
@@ -5806,7 +5838,7 @@ mod tests {
         assert_eq!(late(&s, 1), (at(16, 8), at(20, 17)));
         assert_eq!(s.get(1).unwrap().free_slack_min, 5 * DAY);
         assert_eq!(s.rolled_up(1), Some((at(16, 8), at(20, 17))));
-        assert!(s.summary_warning(1));
+        assert!(warns(&proj, &s, 1));
         expect(&s, 2, (16, 8), (17, 17), 0, true);
         expect(&s, 3, (18, 8), (20, 17), 0, true);
         expect(&s, 4, (23, 8), (23, 17), 0, true);
@@ -5828,7 +5860,7 @@ mod tests {
         expect(&s, 1, (2, 8), (4, 17), 3, false);
         assert_eq!(late(&s, 1), (at(5, 8), at(11, 17)));
         assert_eq!(s.rolled_up(1), Some((at(5, 8), at(11, 17))));
-        assert!(s.summary_warning(1));
+        assert!(warns(&proj, &s, 1));
         expect(&s, 2, (5, 8), (6, 17), 0, true);
         expect(&s, 3, (9, 8), (11, 17), 0, true);
         expect(&s, 4, (12, 8), (12, 17), 0, true);
@@ -5850,7 +5882,7 @@ mod tests {
         expect(&s, 2, (9, 8), (10, 17), 0, true);
         expect(&s, 3, (11, 8), (13, 17), 0, true);
         expect(&s, 4, (16, 8), (16, 17), 0, true);
-        assert!(!s.summary_warning(1));
+        assert!(!warns(&proj, &s, 1));
     }
 
     fn p1(finish: DateTime) -> Project {
@@ -5865,13 +5897,14 @@ mod tests {
 
     #[test]
     fn auto_summary_rolls_up_through_a_short_manual_summary() {
-        let s = schedule(&p1(at(4, 17)));
+        let proj = p1(at(4, 17));
+        let s = schedule(&proj);
         expect(&s, 1, (2, 8), (6, 17), 0, true);
         assert_eq!(s.rolled_up(1), Some((at(2, 8), at(6, 17))));
         expect(&s, 2, (2, 8), (4, 17), 0, true);
         assert_eq!(s.rolled_up(2), Some((at(2, 8), at(6, 17))));
-        assert!(!s.summary_warning(1));
-        assert!(s.summary_warning(2));
+        assert!(!warns(&proj, &s, 1));
+        assert!(warns(&proj, &s, 2));
         assert_eq!(s.project_finish, at(9, 17));
     }
 
@@ -5889,7 +5922,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_summary_is_critical_through_its_subtasks_not_its_manual_summary() {
+    fn auto_summary_over_a_manual_summary_is_critical_through_its_fixed_span() {
         // p1b: P over S (3/2..3/4, 3d of slack) whose A follows Z.
         let proj = march2(vec![
             asum(1, 1),
@@ -5972,9 +6005,101 @@ mod tests {
         expect(&s, 2, (2, 8), (20, 17), 0, true);
         assert_eq!(late(&s, 2), (at(16, 8), at(20, 17)));
         assert_eq!(s.rolled_up(2), Some((at(2, 8), at(6, 17))));
+        // I finishes after O, its manual parent: Project warns on both.
+        assert!(warns(&proj, &s, 1));
+        assert!(warns(&proj, &s, 2));
         expect(&s, 3, (2, 8), (3, 17), 10, false);
         expect(&s, 4, (4, 8), (6, 17), 10, false);
         assert_eq!(s.project_finish, at(20, 17));
+    }
+
+    #[test]
+    fn a_manual_parent_sees_a_nested_manual_summary_as_fixed() {
+        // r1: O (3/2..3/3) > I (3/9..3/10) > A; Z 15d sets the finish.
+        let proj = march2(vec![
+            msum(1, 1, at(2, 8), Some(at(3, 17))),
+            msum(2, 2, at(9, 8), Some(at(10, 17))),
+            sub(3, 2, 3, &[]),
+            sub(4, 15, 1, &[]),
+        ]);
+        let s = schedule(&proj);
+        expect(&s, 1, (2, 8), (3, 17), 5, false);
+        assert_eq!(late(&s, 1), (at(9, 8), at(20, 17)));
+        assert_eq!(s.rolled_up(1), Some((at(9, 8), at(10, 17))));
+        expect(&s, 2, (9, 8), (10, 17), 8, false);
+        assert_eq!(late(&s, 2), (at(19, 8), at(20, 17)));
+        assert_eq!(s.rolled_up(2), Some((at(9, 8), at(10, 17))));
+        expect(&s, 3, (9, 8), (10, 17), 8, false);
+        expect(&s, 4, (2, 8), (20, 17), 0, true);
+        assert_eq!(s.project_finish, at(20, 17));
+        // O's subtasks run past it; I runs past O, though not past itself.
+        assert!(warns(&proj, &s, 1));
+        assert!(warns(&proj, &s, 2));
+
+        // r1b: O (3/2..3/13) > I (3/4..3/5) > A.
+        let proj = march2(vec![
+            msum(1, 1, at(2, 8), Some(at(13, 17))),
+            msum(2, 2, at(4, 8), Some(at(5, 17))),
+            sub(3, 2, 3, &[]),
+            sub(4, 15, 1, &[]),
+        ]);
+        let s = schedule(&proj);
+        expect(&s, 1, (2, 8), (13, 17), 2, false);
+        assert_eq!(late(&s, 1), (at(4, 8), at(20, 17)));
+        assert_eq!(s.rolled_up(1), Some((at(4, 8), at(5, 17))));
+        expect(&s, 2, (4, 8), (5, 17), 11, false);
+        assert_eq!(s.rolled_up(2), Some((at(4, 8), at(5, 17))));
+        expect(&s, 3, (4, 8), (5, 17), 11, false);
+        expect(&s, 4, (2, 8), (20, 17), 0, true);
+        assert!(!warns(&proj, &s, 1));
+        assert!(!warns(&proj, &s, 2));
+    }
+
+    #[test]
+    fn a_manual_task_warns_only_past_its_direct_manual_parent() {
+        // w1: a manual leaf finishing after its manual summary.
+        let proj = march2(vec![
+            msum(1, 1, at(2, 8), Some(at(3, 17))),
+            Task {
+                outline_level: 2,
+                manual_finish: Some(at(6, 17)),
+                ..manual(2, "M", 5 * DAY, at(2, 8))
+            },
+        ]);
+        let s = schedule(&proj);
+        expect(&s, 1, (2, 8), (3, 17), 0, true);
+        expect(&s, 2, (2, 8), (6, 17), 0, true);
+        assert!(warns(&proj, &s, 1));
+        assert!(warns(&proj, &s, 2));
+        // w2: an auto summary between them: I is not O's direct subtask.
+        let proj = march2(vec![
+            msum(1, 1, at(2, 8), Some(at(13, 17))),
+            asum(2, 2),
+            msum(3, 3, at(2, 8), Some(at(20, 17))),
+            sub(4, 1, 4, &[]),
+        ]);
+        let s = schedule(&proj);
+        expect(&s, 1, (2, 8), (13, 17), 0, true);
+        expect(&s, 2, (2, 8), (20, 17), 0, true);
+        expect(&s, 3, (2, 8), (20, 17), 0, true);
+        assert_eq!(late(&s, 3), (at(20, 8), at(20, 17)));
+        expect(&s, 4, (2, 8), (2, 17), 14, false);
+        assert!(warns(&proj, &s, 1));
+        assert!(!warns(&proj, &s, 3));
+        // w3: I starts before O and finishes within it.
+        let proj = march2(vec![
+            msum(1, 1, at(4, 8), Some(at(10, 17))),
+            msum(2, 2, at(2, 8), Some(at(3, 17))),
+            sub(3, 1, 3, &[]),
+        ]);
+        let s = schedule(&proj);
+        expect(&s, 1, (4, 8), (10, 17), 0, true);
+        expect(&s, 2, (2, 8), (3, 17), 5, false);
+        expect(&s, 3, (2, 8), (2, 17), 6, false);
+        assert!(!warns(&proj, &s, 1));
+        assert!(!warns(&proj, &s, 2));
+        // Auto tasks and auto summaries never warn.
+        assert!(!warns(&proj, &s, 3));
     }
 
     #[test]
@@ -5992,8 +6117,8 @@ mod tests {
         expect(&s, 2, (4, 8), (5, 17), 3, false);
         assert_eq!(late(&s, 2), (at(9, 8), at(10, 17)));
         expect(&s, 3, (4, 8), (5, 17), 3, false);
-        assert!(!s.summary_warning(1));
-        assert!(!s.summary_warning(2));
+        assert!(!warns(&proj, &s, 1));
+        assert!(!warns(&proj, &s, 2));
         assert_eq!(s.project_finish, at(10, 17));
 
         // q1: an auto summary between them passes the floor through.
@@ -6010,33 +6135,35 @@ mod tests {
     }
 
     /// f1/f4: S from 3/9 over A 2d with `constraint` on 3/3, and B 1d.
-    fn constrained_under_floor(constraint: ConstraintType) -> Schedule {
+    fn constrained_under_floor(constraint: ConstraintType) -> (Project, Schedule) {
         let mut a = sub(2, 2, 2, &[]);
         a.constraint = constraint;
         a.constraint_date = Some(at(3, 8));
-        schedule(&march2(vec![
+        let proj = march2(vec![
             msum(1, 1, at(9, 8), Some(at(10, 17))),
             a,
             sub(3, 1, 2, &[]),
-        ]))
+        ]);
+        let s = schedule(&proj);
+        (proj, s)
     }
 
     #[test]
     fn a_constrained_subtask_ignores_the_floor() {
         // f1: MSO 3/3. The summary's late start never precedes its start.
-        let s = constrained_under_floor(ConstraintType::MustStartOn);
+        let (proj, s) = constrained_under_floor(ConstraintType::MustStartOn);
         expect(&s, 1, (9, 8), (10, 17), 0, true);
         assert_eq!(late(&s, 1), (at(9, 8), at(10, 17)));
         assert_eq!(s.rolled_up(1), Some((at(3, 8), at(9, 17))));
-        assert!(!s.summary_warning(1));
+        assert!(!warns(&proj, &s, 1));
         expect(&s, 2, (3, 8), (4, 17), 0, true);
         expect(&s, 3, (9, 8), (9, 17), 1, false);
         assert_eq!(s.project_finish, at(10, 17));
 
         // f4: even a start-no-earlier-than before the floor wins.
-        let s = constrained_under_floor(ConstraintType::StartNoEarlierThan);
+        let (proj, s) = constrained_under_floor(ConstraintType::StartNoEarlierThan);
         expect(&s, 1, (9, 8), (10, 17), 0, true);
-        assert!(!s.summary_warning(1));
+        assert!(!warns(&proj, &s, 1));
         expect(&s, 2, (3, 8), (4, 17), 4, false);
         expect(&s, 3, (9, 8), (9, 17), 1, false);
 
@@ -6102,7 +6229,7 @@ mod tests {
         );
         assert_eq!((r.total_slack_min, r.critical), (0, false));
         assert_eq!(s.rolled_up(1), None);
-        assert!(!s.summary_warning(1));
+        assert!(!warns(&proj, &s, 1));
         assert_eq!(s.project_finish, at(10, 17));
     }
 
@@ -6126,7 +6253,6 @@ mod tests {
             assert_eq!(tbd.rolled_up(uid), auto.rolled_up(uid), "task {uid}");
         }
         assert_eq!(auto.rolled_up(1), Some((at(2, 8), at(6, 17))));
-        assert!(!tbd.summary_warning(1));
         // Nor does it floor anything: an outer manual summary's start does.
         let s = schedule(&march2(vec![
             msum(1, 1, at(9, 8), Some(at(13, 17))),

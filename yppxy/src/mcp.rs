@@ -111,7 +111,8 @@ fn tool_defs() -> Json {
              level, manual (true = Manually Scheduled), duration, scheduled start/finish, critical \
              flag, slack, and predecessors. Summaries add rollup_start/rollup_finish, the span of \
              their subtasks; a manually scheduled summary keeps its own start/finish and adds \
-             warning (true when its subtasks finish after it).",
+             warning (true when its subtasks finish after it, or it finishes after its parent \
+             manual summary).",
             vec![target(), tab()],
             &[],
         ),

@@ -30,7 +30,8 @@ use its tools:
   start/finish, critical flag, slack, predecessors. Summaries also have
   `rollup_start`/`rollup_finish` (their subtasks' span); a manually scheduled
   summary keeps its own start/finish, which can differ, and has `warning`
-  (true when its subtasks finish after it). Setting a manual summary's
+  (true when its subtasks finish after it, or it finishes after its parent
+  manual summary). Setting a manual summary's
   duration sets its own span.
 - `yppxy_get` `{uid}` — one task
 - `yppxy_set` `{uid, name?, duration?, level?, manual?}` — edit a task (duration like

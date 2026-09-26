@@ -141,7 +141,8 @@ fn task_json(ed: &Editor, t: &Task) -> Json {
         fields.push(("finish", Json::Str(dt_str(f))));
     }
     // A summary's rolled-up span. A manual summary keeps its own start and
-    // finish, and warns when its subtasks finish after it.
+    // finish, and warns when its subtasks finish after it or it finishes
+    // after its parent manual summary.
     if let Some((start, finish)) = ed.disp_rollup(t.uid) {
         fields.push(("rollup_start", Json::Str(dt_str(start))));
         fields.push(("rollup_finish", Json::Str(dt_str(finish))));

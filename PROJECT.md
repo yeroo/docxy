@@ -131,9 +131,11 @@ Wednesday 08:00" both come out right.
   measured in Project over COM: the manual start (else the stored start) and
   the manual finish, else start + `ManualDuration` on the summary calendar.
   Their subtasks' span stays available as the **rollup**
-  (`Schedule::rolled_up`, `Editor::disp_rollup`), and Project's **warning**
-  (`summary_warning`) flags subtasks finishing after the manual finish; a
-  rollup that starts before the manual start does not warn. The manual start
+  (`Schedule::rolled_up`, `Editor::disp_rollup`). Project's **warning**
+  (`schedule::manual_warning`, `Editor::summary_warning`) flags a manual
+  summary whose subtasks finish after its manual finish, and a manual task
+  finishing after its direct parent when that parent is a manual summary (an
+  auto summary in between breaks this); starting early never warns. The manual start
   **floors** every ASAP auto subtask, from the nearest manual-summary ancestor
   (auto summaries in between pass it on); a later link still wins, and a
   subtask with any other constraint, even SNET, ignores it. The floor never
@@ -142,9 +144,10 @@ Wednesday 08:00" both come out right.
   A manual summary's late window spans its subtasks' late dates, but never
   starts before its own start nor finishes before its own finish; its slack is
   the smaller of its start and finish slack, so it is never negative, and it is
-  critical only at zero (critical subtasks do not make it so). Its ancestors
-  roll up through its own span, which they see as fixed: an auto summary over
-  one measures its slack from that late window. A manual summary with no start
+  critical only at zero (critical subtasks do not make it so). Every ancestor,
+  manual or auto, rolls up through its own span and sees it as fixed: the
+  nested summary's late window is its own span, and an auto summary over one
+  measures its slack from its late window. A manual summary with no start
   (TBD) rolls up as an auto summary. Links on summaries themselves are not
   scheduled yet, for auto and manual summaries alike.
 

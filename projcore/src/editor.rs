@@ -200,16 +200,16 @@ impl Editor {
         }
     }
 
-    /// Project's warning on a manual summary: its shown subtasks finish after
-    /// its own finish.
+    /// Project's warning ([`crate::schedule::manual_warning`]) on the shown
+    /// dates: a manual summary's subtasks finish after it, or a manual task
+    /// finishes after its manual parent summary.
     pub fn summary_warning(&self, uid: i32) -> bool {
-        self.proj
-            .task(uid)
-            .is_some_and(|t| t.manual_summary_dates().is_some())
-            && self
-                .disp_rollup(uid)
-                .zip(self.disp_finish(uid))
-                .is_some_and(|((_, rolled), finish)| rolled > finish)
+        crate::schedule::manual_warning(
+            &self.proj,
+            uid,
+            |u| self.disp_finish(u),
+            |u| self.disp_rollup(u),
+        )
     }
 
     /// The duration shown alongside [`Self::disp_start`]/[`Self::disp_finish`]:

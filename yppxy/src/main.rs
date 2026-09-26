@@ -1834,6 +1834,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             t.summary,
             t.is_milestone(),
             rollup,
+            t.summary && app.ed.summary_warning(t.uid),
         );
         if i == app.ed.sel() {
             line.style = Style::default().bg(app.sel_bg());
@@ -1889,7 +1890,9 @@ fn build_scale(width: usize, hscroll: i64, base_day: i64) -> Line<'static> {
 /// offsets from the gantt origin (the earliest displayed or project start day).
 /// `rollup` is a manual summary's rolled-up span in the same offsets: the days
 /// of it outside the summary's own span are marked, those past its finish in
-/// the warning colour.
+/// the warning colour. A `warning` with no rollup day past the finish (an
+/// overrun within the finish day, or a finish past a manual parent's) puts the
+/// finish day's cell in the warning colour instead.
 #[allow(clippy::too_many_arguments)]
 fn build_gantt_row(
     width: usize,
@@ -1901,8 +1904,10 @@ fn build_gantt_row(
     is_summary: bool,
     milestone: bool,
     rollup: Option<(i64, i64)>,
+    warning: bool,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::with_capacity(width);
+    let warn_finish = warning && !rollup.is_some_and(|(_, r_e)| r_e > e_day);
     let milestone = milestone && !is_summary;
     let bar_color = if crit { CRIT } else { ONTRACK };
     for col in 0..width {
@@ -1922,9 +1927,14 @@ fn build_gantt_row(
             } else {
                 "▬"
             };
+            let color = if warn_finish && day == e_day {
+                WARNING
+            } else {
+                SUMMARY
+            };
             spans.push(Span::styled(
                 ch,
-                Style::default().fg(SUMMARY).add_modifier(Modifier::BOLD),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
             ));
         } else if rollup.is_some_and(|(r_s, r_e)| day >= r_s && day <= r_e) {
             let style = if day > e_day {
@@ -2301,6 +2311,7 @@ mod tests {
             false,
             false,
             None,
+            false,
         );
         assert_eq!(row.spans[0].content, "█");
         let app = App::new(new_project(), None, false);
@@ -2315,7 +2326,7 @@ mod tests {
         // Monday 2026-01-05 origin; the summary spans days 2..=3, its
         // subtasks days 1..=6.
         let origin = DateTime::from_ymd_hm(2026, 1, 5, 8, 0).day_number();
-        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((1, 6)));
+        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((1, 6)), true);
         let cells: Vec<&str> = row.spans.iter().map(|s| &*s.content).collect();
         assert_eq!(cells, [" ", "╍", "▟", "▟", "╍", "╍", "╍", " ", " "]);
         let fg = |col: usize| row.spans[col].style.fg;
@@ -2326,7 +2337,17 @@ mod tests {
         // Weekend days inside the late rollup are marked too.
         assert_ne!(cells[5], "·");
         // An auto summary (or one within its own span) draws no rollup.
-        let row = build_gantt_row(9, 0, origin, 1, 6, false, true, false, None);
+        let row = build_gantt_row(9, 0, origin, 1, 6, false, true, false, None, false);
+        assert!(row.spans.iter().all(|s| s.style.fg != Some(WARNING)));
+        // An overrun within the finish day warns on that day's cell.
+        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((2, 3)), true);
+        let warned: Vec<usize> = (0..9)
+            .filter(|&col| row.spans[col].style.fg == Some(WARNING))
+            .collect();
+        assert_eq!(warned, [3]);
+        assert_eq!(row.spans[3].content, "▟");
+        // Unwarned, the same row is clean.
+        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((2, 3)), false);
         assert!(row.spans.iter().all(|s| s.style.fg != Some(WARNING)));
     }
 
