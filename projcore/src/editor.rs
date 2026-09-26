@@ -7,7 +7,7 @@
 use crate::datetime::DateTime;
 use crate::model::{
     Assignment, Baseline, ConstraintType, LinkType, Predecessor, Project, Resource, ResourceType,
-    Task,
+    Task, TimephasedValue,
 };
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
@@ -841,24 +841,32 @@ impl Editor {
     }
 
     /// Project › Schedule › Clear Baseline: remove the Baseline (slot 0) from
-    /// every task and assignment as one undo step; Baseline1..10 stay.
-    /// `false`, with history untouched, when there is none to clear.
+    /// every task, resource and assignment, including the assignments'
+    /// timephased Baseline work and cost, as one undo step; Baseline1..10
+    /// stay. `false`, with history untouched, when there is none to clear.
     pub fn clear_baseline(&mut self) -> Result<bool, String> {
-        let has_task = self.proj.tasks.iter().any(|t| t.baseline(0).is_some());
-        let has_assignment = self
-            .proj
-            .assignments
-            .iter()
-            .any(|a| a.baseline(0).is_some());
-        if !has_task && !has_assignment {
+        let proj = &self.proj;
+        let has_task = proj.tasks.iter().any(|t| t.baseline(0).is_some());
+        let has_resource = proj.resources.iter().any(|r| r.baseline(0).is_some());
+        let has_assignment = proj.assignments.iter().any(|a| {
+            a.baseline(0).is_some()
+                || a.timephased_data
+                    .iter()
+                    .any(TimephasedValue::is_baseline_slot_zero)
+        });
+        if !has_task && !has_resource && !has_assignment {
             return Ok(false);
         }
         self.edit_structure(|proj| {
             for t in &mut proj.tasks {
                 t.baselines.retain(|b| b.number != 0);
             }
+            for r in &mut proj.resources {
+                r.baselines.retain(|b| b.number != 0);
+            }
             for a in &mut proj.assignments {
                 a.baselines.retain(|b| b.number != 0);
+                a.timephased_data.retain(|t| !t.is_baseline_slot_zero());
             }
         })?;
         Ok(true)
@@ -3201,12 +3209,20 @@ mod tests {
         proj.tasks[0].set_baseline_slot(slot(0));
         proj.tasks[0].set_baseline_slot(slot(1));
         proj.tasks[1].set_baseline_slot(slot(0));
-        proj.resources.push(Resource {
+        let mut crew = Resource {
             uid: 1,
             id: 1,
             name: "Crew".into(),
             ..Resource::default()
-        });
+        };
+        for number in [0, 1] {
+            crew.set_baseline_slot(crate::model::ResourceBaseline {
+                number,
+                work_min: Some(480),
+                ..Default::default()
+            });
+        }
+        proj.resources.push(crew);
         let mut a = Assignment {
             uid: 1,
             task_uid: 2,
@@ -3222,8 +3238,31 @@ mod tests {
                 ..Default::default()
             });
         }
+        // Planned work, Baseline work and cost, and Baseline1 work by day.
+        a.timephased_data = [1, 4, 5, 16]
+            .map(|kind| TimephasedValue {
+                kind,
+                uid: Some(1),
+                value: Some("PT8H0M0S".into()),
+                ..TimephasedValue::default()
+            })
+            .into();
         proj.assignments.push(a);
         proj
+    }
+
+    /// Resource baseline slots and assignment timephased kinds.
+    fn resource_slots_and_timephased(proj: &Project) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (
+            proj.resources
+                .iter()
+                .map(|r| r.baselines.iter().map(|b| b.number).collect())
+                .collect(),
+            proj.assignments
+                .iter()
+                .map(|a| a.timephased_data.iter().map(|t| t.kind).collect())
+                .collect(),
+        )
     }
 
     fn slots(proj: &Project) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
@@ -3245,13 +3284,18 @@ mod tests {
         let before = ed.project().clone();
         assert_eq!(ed.clear_baseline(), Ok(true));
         let cleared = (vec![vec![1], vec![]], vec![vec![3]]);
+        // The resource keeps Baseline1; the assignment its planned work and
+        // Baseline1 curve, not the Baseline work and cost (4, 5).
+        let cleared_rest = (vec![vec![1]], vec![vec![1, 16]]);
         assert_eq!(slots(ed.project()), cleared);
+        assert_eq!(resource_slots_and_timephased(ed.project()), cleared_rest);
         assert_eq!(ed.undo_depth(), 1);
         assert!(ed.dirty());
         // A save and reopen keeps Baseline1..10 and not the cleared slot.
         let xml = crate::mspdi::write_mspdi(ed.project());
         let back = crate::mspdi::read_mspdi(&xml).unwrap();
         assert_eq!(slots(&back), cleared);
+        assert_eq!(resource_slots_and_timephased(&back), cleared_rest);
         assert!(ed.undo());
         assert_eq!(ed.project(), &before);
         // Only an assignment's slot 0 left: still cleared.
@@ -3262,6 +3306,29 @@ mod tests {
         let mut ed = Editor::new(proj);
         assert_eq!(ed.clear_baseline(), Ok(true));
         assert_eq!(slots(ed.project()), cleared);
+        // Only a resource's slot 0, or only an assignment's timephased
+        // Baseline, left: still cleared.
+        for keep_resource in [true, false] {
+            let mut proj = baselined();
+            for t in &mut proj.tasks {
+                t.baselines.retain(|b| b.number != 0);
+            }
+            proj.assignments[0].baselines.retain(|b| b.number != 0);
+            if keep_resource {
+                proj.assignments[0]
+                    .timephased_data
+                    .retain(|t| !t.is_baseline_slot_zero());
+            } else {
+                proj.resources[0].baselines.retain(|b| b.number != 0);
+            }
+            let mut ed = Editor::new(proj);
+            assert_eq!(ed.clear_baseline(), Ok(true), "resource: {keep_resource}");
+            assert_eq!(
+                resource_slots_and_timephased(ed.project()),
+                cleared_rest,
+                "resource: {keep_resource}"
+            );
+        }
     }
 
     #[test]
@@ -3270,6 +3337,10 @@ mod tests {
         proj.tasks[1].baselines.clear();
         proj.tasks[0].baselines.retain(|b| b.number != 0);
         proj.assignments[0].baselines.retain(|b| b.number != 0);
+        proj.resources[0].baselines.retain(|b| b.number != 0);
+        proj.assignments[0]
+            .timephased_data
+            .retain(|t| !t.is_baseline_slot_zero());
         let mut ed = Editor::new(proj);
         let before = state(&ed);
         assert_eq!(ed.clear_baseline(), Ok(false));
