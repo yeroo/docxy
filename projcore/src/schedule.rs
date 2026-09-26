@@ -1079,15 +1079,12 @@ impl<'a> Scheduler<'a> {
                 .filter_map(|k| {
                     let r = results.get(&self.proj.tasks[k].uid)?;
                     Some(if self.proj.tasks[k].summary {
-                        // A manual summary's late window, as its ancestors
-                        // see it, is its own span shifted by its slack.
-                        let shift = |at: DateTime| match r.total_slack_min {
-                            s if s <= 0 => at,
-                            s => DateTime::from_minutes(reach_after(cal, at.minutes(), s)),
-                        };
+                        // Its ancestors see a manual summary's own span as
+                        // fixed: its late window is its early one.
                         Node {
-                            late_start: shift(r.early_start),
-                            late_finish: shift(r.early_finish),
+                            late_start: r.early_start,
+                            late_finish: r.early_finish,
+                            fixed: true,
                             ..Node::from(r)
                         }
                     } else {
@@ -1164,7 +1161,20 @@ impl<'a> Scheduler<'a> {
                     };
                     let ls_min = nodes.iter().map(|n| n.late_start).min().unwrap();
                     let lf_max = nodes.iter().map(|n| n.late_finish).max().unwrap();
-                    let total = nodes.iter().map(|n| n.total).min().unwrap();
+                    let (start_slack, finish_slack) =
+                        (slack(es_min, ls_min), slack(ef_max, lf_max));
+                    // Over a manual summary, Project measures the slack of
+                    // this late window, which the manual summary's fixed span
+                    // bounds: its subtasks' slack does not free it.
+                    let (total, critical) = if nodes.iter().any(|n| n.fixed) {
+                        let total = start_slack.min(finish_slack);
+                        (total, total <= 0)
+                    } else {
+                        (
+                            nodes.iter().map(|n| n.total).min().unwrap(),
+                            nodes.iter().any(|n| n.critical),
+                        )
+                    };
                     TaskResult {
                         uid: t.uid,
                         early_start: es_min,
@@ -1173,9 +1183,9 @@ impl<'a> Scheduler<'a> {
                         late_finish: lf_max,
                         total_slack_min: total,
                         free_slack_min: total.max(0),
-                        start_slack_min: slack(es_min, ls_min),
-                        finish_slack_min: slack(ef_max, lf_max),
-                        critical: nodes.iter().any(|n| n.critical),
+                        start_slack_min: start_slack,
+                        finish_slack_min: finish_slack,
+                        critical,
                     }
                 }
             };
@@ -1558,6 +1568,8 @@ struct Node {
     late_finish: DateTime,
     total: i64,
     critical: bool,
+    /// A nested manual summary, whose span does not move.
+    fixed: bool,
 }
 
 impl From<&TaskResult> for Node {
@@ -1569,6 +1581,7 @@ impl From<&TaskResult> for Node {
             late_finish: r.late_finish,
             total: r.total_slack_min,
             critical: r.critical,
+            fixed: false,
         }
     }
 }
@@ -5892,6 +5905,36 @@ mod tests {
         expect(&s, 4, (9, 8), (11, 17), 0, true);
         expect(&s, 5, (2, 8), (4, 17), 0, true);
         assert_eq!(s.project_finish, at(11, 17));
+    }
+
+    #[test]
+    fn auto_summary_over_a_manual_summary_is_bound_by_its_fixed_span() {
+        // Fixture 27's P: S1 (3/2..3/4) and its subtasks all have 9d of
+        // slack, but P's late start is S1's own start, so P has none.
+        let proj = march2(vec![
+            asum(1, 1),
+            msum(2, 2, at(2, 8), Some(at(4, 17))),
+            sub(3, 2, 3, &[]),
+            sub(4, 3, 3, &[3]),
+            sub(5, 1, 1, &[4]),
+            msum(6, 1, at(9, 8), Some(at(20, 17))),
+        ]);
+        let s = schedule(&proj);
+        expect(&s, 1, (2, 8), (6, 17), 0, true);
+        assert_eq!(late(&s, 1), (at(2, 8), at(19, 17)));
+        expect(&s, 2, (2, 8), (4, 17), 9, false);
+        for uid in [3, 4, 5] {
+            assert_eq!(s.get(uid).unwrap().total_slack_min, 9 * DAY, "task {uid}");
+        }
+        // p1b's late window: S's own start, B's late finish.
+        let proj = march2(vec![
+            asum(1, 1),
+            msum(2, 2, at(2, 8), Some(at(4, 17))),
+            sub(3, 2, 3, &[5]),
+            sub(4, 3, 3, &[3]),
+            sub(5, 3, 1, &[]),
+        ]);
+        assert_eq!(late(&schedule(&proj), 1), (at(2, 8), at(11, 17)));
     }
 
     #[test]
