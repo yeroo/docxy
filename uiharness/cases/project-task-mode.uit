@@ -21,7 +21,7 @@ test project task mode switches from the cell and the ribbon
   key escape
   assert cell_edit is none
   click C3
-  key alt t u
+  key alt t h
   assert cell B3 is Manually Scheduled
   assert undo_depth is 1
   key alt t a

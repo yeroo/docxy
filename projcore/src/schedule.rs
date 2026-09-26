@@ -591,7 +591,7 @@ impl<'a> Scheduler<'a> {
             let mut start_abs = linked_start.unwrap_or(self.anchor);
             let mut driven_start = start_abs;
             let mut finish_bound = None;
-            let mut milestone_finish: Option<i64> = None;
+            let mut held_milestone: Option<i64> = None;
             if linked_start.is_some() {
                 linked_tasks.insert(t.uid);
             }
@@ -642,7 +642,18 @@ impl<'a> Scheduler<'a> {
                             start_abs.max(ds)
                         };
                     }
-                    ConstraintType::StartNoEarlierThan => start_abs = start_abs.max(ds),
+                    ConstraintType::StartNoEarlierThan => {
+                        // A milestone dated at the end of a working period
+                        // occupies that instant, as a finish-constrained one
+                        // does, not the next morning that shares its index.
+                        let bound = if t.duration_min == 0 && milestone == dates.raw.max(floor) {
+                            held_milestone = Some(milestone);
+                            milestone
+                        } else {
+                            ds
+                        };
+                        start_abs = start_abs.max(bound);
+                    }
                     ConstraintType::FinishNoEarlierThan => {
                         start_abs = start_abs
                             .max(tl.abs_start(tl.to_index(df) - t.duration_min).max(floor));
@@ -655,7 +666,7 @@ impl<'a> Scheduler<'a> {
                         // A milestone occupies the constraint's own instant,
                         // not the next morning that shares its index.
                         start_abs = if t.duration_min == 0 {
-                            milestone_finish = Some(milestone);
+                            held_milestone = Some(milestone);
                             milestone
                         } else {
                             tl.abs_start(tl.to_index(df) - t.duration_min)
@@ -684,10 +695,11 @@ impl<'a> Scheduler<'a> {
                 }
             }
             // A binding FS milestone occupies the finish instant, even in a
-            // nonworking gap, as does a binding MFO/FNLT milestone. Later
-            // start-type links/constraints still snap.
+            // nonworking gap, as does a binding MFO/FNLT milestone or one with
+            // an SNET at a period's end. Later start-type links/constraints
+            // still snap.
             let s_abs =
-                if fs_milestone_start == Some(start_abs) || milestone_finish == Some(start_abs) {
+                if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
                     start_abs
                 } else {
                     tl.snap(start_abs)
@@ -1923,6 +1935,42 @@ mod tests {
             let proj = finish_constrained_milestone(duration, constraint, friday, honor, linked);
             let case = format!("{duration} {constraint:?} honor={honor} linked={linked}");
             assert_milestone_at(&proj, friday, slack, &case);
+        }
+    }
+
+    #[test]
+    fn snet_milestone_at_a_working_period_end_stays_on_that_instant() {
+        let at = |day, hour| DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+        // (A duration, linked, SNET, expected milestone instant)
+        for (duration, linked, snet, expected) in [
+            // The evening, not the next morning that shares its index.
+            (480, false, at(3, 17), at(3, 17)),
+            (480, true, at(3, 17), at(3, 17)),
+            // The end of the morning period, likewise.
+            (480, false, at(3, 12), at(3, 12)),
+            // Not a period end: the next working start, as before.
+            (480, false, at(3, 19), at(4, 8)),
+            (480, false, at(3, 10), at(3, 10)),
+            // A later FS link still wins.
+            (1440, true, at(3, 17), at(4, 17)),
+        ] {
+            let mut proj = fs_milestone_project(duration);
+            let milestone = &mut proj.tasks[1];
+            if !linked {
+                milestone.predecessors.clear();
+            }
+            milestone.constraint = ConstraintType::StartNoEarlierThan;
+            milestone.constraint_date = Some(snet);
+            let case = format!("{duration} linked={linked} {snet:?}");
+            let m = *schedule(&proj).get(2).unwrap();
+            assert_eq!(
+                (m.early_start, m.early_finish),
+                (expected, expected),
+                "{case}"
+            );
+            let leveled = level(&proj);
+            assert_eq!(leveled.start(2), Some(expected), "{case}");
+            assert_eq!(leveled.finish(2), Some(expected), "{case}");
         }
     }
 

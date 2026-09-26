@@ -19,6 +19,7 @@ pub use cells::{
     parse_predecessors,
 };
 use cells::{format_units, parse_resource_token};
+mod moving;
 
 /// A fixed Monday anchor, shared by new schedules and undated imports.
 pub fn default_anchor() -> DateTime {
@@ -713,6 +714,36 @@ impl Editor {
         Ok(())
     }
 
+    /// Task › Schedule › Unlink Tasks: remove every link touching `uid`, its
+    /// predecessors and its successors, as one undo step. A blank row keeps
+    /// being blank. Returns how many links were removed; none leaves history
+    /// untouched.
+    pub fn unlink_task(&mut self, uid: i32) -> Result<usize, String> {
+        let i = self.index(uid)?;
+        let links = self.proj.tasks[i].predecessors.len()
+            + self
+                .proj
+                .tasks
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, t)| t.predecessors.iter().filter(|p| p.uid == uid).count())
+                .sum::<usize>();
+        if links == 0 {
+            return Ok(0);
+        }
+        self.edit_structure(|proj| {
+            for (j, t) in proj.tasks.iter_mut().enumerate() {
+                if j == i {
+                    t.predecessors.clear();
+                } else {
+                    t.predecessors.retain(|p| p.uid != uid);
+                }
+            }
+        })?;
+        Ok(links)
+    }
+
     pub fn set_constraint(&mut self, uid: i32, text: &str) -> Result<(), String> {
         let (constraint, constraint_date) = parse_constraint(text)?;
         self.set_constraint_typed(uid, constraint, constraint_date)
@@ -811,6 +842,30 @@ impl Editor {
             self.proj.tasks[i].set_baseline_slot(baseline);
         }
         self.changed();
+    }
+
+    /// Project › Schedule › Clear Baseline: remove the Baseline (slot 0) from
+    /// every task and assignment as one undo step; Baseline1..10 stay.
+    /// `false`, with history untouched, when there is none to clear.
+    pub fn clear_baseline(&mut self) -> Result<bool, String> {
+        let has_task = self.proj.tasks.iter().any(|t| t.baseline(0).is_some());
+        let has_assignment = self
+            .proj
+            .assignments
+            .iter()
+            .any(|a| a.baseline(0).is_some());
+        if !has_task && !has_assignment {
+            return Ok(false);
+        }
+        self.edit_structure(|proj| {
+            for t in &mut proj.tasks {
+                t.baselines.retain(|b| b.number != 0);
+            }
+            for a in &mut proj.assignments {
+                a.baselines.retain(|b| b.number != 0);
+            }
+        })?;
+        Ok(true)
     }
 
     pub fn toggle_milestone(&mut self, uid: i32) -> Result<(), String> {
@@ -3056,5 +3111,172 @@ mod tests {
         let finish = Some(DateTime::from_ymd_hm(2026, 1, 7, 17, 0));
         assert_eq!(shown(&ed, 2), (Some(start), finish));
         assert_eq!(saved(&ed, 2), (Some(start), finish));
+    }
+
+    fn state(ed: &Editor) -> (Project, usize, usize, bool) {
+        (
+            ed.project().clone(),
+            ed.undo_depth(),
+            ed.redo_depth(),
+            ed.dirty(),
+        )
+    }
+
+    fn links(ed: &Editor) -> Vec<(i32, Vec<i32>)> {
+        ed.project()
+            .tasks
+            .iter()
+            .map(|t| (t.uid, t.predecessors.iter().map(|p| p.uid).collect()))
+            .collect()
+    }
+
+    #[test]
+    fn unlink_removes_predecessors_and_successors_in_one_step() {
+        let mut ed = editor();
+        for uid in 3..=4 {
+            ed.add_task(None, &format!("Task {uid}"), 480).unwrap();
+        }
+        // 1 -> 2 -> 3, and 2 -> 4 with 1 -> 4: unlinking 2 leaves only 1 -> 4.
+        ed.add_predecessor(2, 1, LinkType::FinishStart, 0).unwrap();
+        ed.add_predecessor(3, 2, LinkType::StartStart, 0).unwrap();
+        ed.add_predecessor(4, 2, LinkType::FinishStart, 60).unwrap();
+        ed.add_predecessor(4, 1, LinkType::FinishStart, 0).unwrap();
+        let before = links(&ed);
+        let depth = ed.undo_depth();
+        assert_eq!(ed.unlink_task(2), Ok(3));
+        assert_eq!(
+            links(&ed),
+            [(1, vec![]), (2, vec![]), (3, vec![]), (4, vec![1])]
+        );
+        assert_eq!(ed.undo_depth(), depth + 1);
+        assert_schedule(&ed);
+        assert!(ed.undo());
+        assert_eq!(links(&ed), before, "one undo restores every link");
+    }
+
+    #[test]
+    fn unlinking_a_task_without_links_changes_nothing() {
+        let mut ed = editor();
+        ed.rename(1, "x").unwrap();
+        ed.undo();
+        ed.mark_saved();
+        let before = state(&ed);
+        assert_eq!(ed.unlink_task(1), Ok(0));
+        assert_eq!(state(&ed), before);
+        assert!(ed.unlink_task(99).is_err());
+        assert_eq!(state(&ed), before);
+    }
+
+    #[test]
+    fn unlinking_a_blank_row_keeps_it_blank() {
+        let mut ed = editor();
+        let mut proj = ed.project().clone();
+        proj.tasks[1].is_null = true;
+        proj.tasks[1].predecessors.push(Predecessor {
+            uid: 1,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        });
+        proj.tasks[0].predecessors.push(Predecessor {
+            uid: 2,
+            link: LinkType::FinishStart,
+            lag_min: 0,
+        });
+        ed = Editor::new(proj);
+        let blank = ed.project().tasks[1].clone();
+        assert_eq!(ed.unlink_task(2), Ok(2));
+        let t = &ed.project().tasks[1];
+        assert!(t.is_null, "not materialized");
+        assert_eq!(
+            (t.outline_level, t.duration_min, t.manual),
+            (blank.outline_level, blank.duration_min, blank.manual)
+        );
+        assert_eq!(links(&ed), [(1, vec![]), (2, vec![])]);
+    }
+
+    fn baselined() -> Project {
+        let mut proj = editor().project().clone();
+        let slot = |number| Baseline {
+            number,
+            start: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            finish: Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0)),
+            duration_min: Some(480),
+        };
+        proj.tasks[0].set_baseline_slot(slot(0));
+        proj.tasks[0].set_baseline_slot(slot(1));
+        proj.tasks[1].set_baseline_slot(slot(0));
+        proj.resources.push(Resource {
+            uid: 1,
+            id: 1,
+            name: "Crew".into(),
+            ..Resource::default()
+        });
+        let mut a = Assignment {
+            uid: 1,
+            task_uid: 2,
+            resource_uid: 1,
+            units: 1.0,
+            work_min: 480,
+            ..Assignment::default()
+        };
+        for number in [0, 3] {
+            a.set_baseline_slot(crate::model::AssignmentBaseline {
+                number,
+                work_min: Some(480),
+                ..Default::default()
+            });
+        }
+        proj.assignments.push(a);
+        proj
+    }
+
+    fn slots(proj: &Project) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (
+            proj.tasks
+                .iter()
+                .map(|t| t.baselines.iter().map(|b| b.number).collect())
+                .collect(),
+            proj.assignments
+                .iter()
+                .map(|a| a.baselines.iter().map(|b| b.number).collect())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn clear_baseline_removes_slot_zero_from_tasks_and_assignments() {
+        let mut ed = Editor::new(baselined());
+        let before = ed.project().clone();
+        assert_eq!(ed.clear_baseline(), Ok(true));
+        let cleared = (vec![vec![1], vec![]], vec![vec![3]]);
+        assert_eq!(slots(ed.project()), cleared);
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.dirty());
+        // A save and reopen keeps Baseline1..10 and not the cleared slot.
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        let back = crate::mspdi::read_mspdi(&xml).unwrap();
+        assert_eq!(slots(&back), cleared);
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &before);
+        // Only an assignment's slot 0 left: still cleared.
+        let mut proj = baselined();
+        for t in &mut proj.tasks {
+            t.baselines.retain(|b| b.number != 0);
+        }
+        let mut ed = Editor::new(proj);
+        assert_eq!(ed.clear_baseline(), Ok(true));
+        assert_eq!(slots(ed.project()), cleared);
+    }
+
+    #[test]
+    fn clearing_without_a_baseline_changes_nothing() {
+        let mut proj = baselined();
+        proj.tasks[1].baselines.clear();
+        proj.tasks[0].baselines.retain(|b| b.number != 0);
+        proj.assignments[0].baselines.retain(|b| b.number != 0);
+        let mut ed = Editor::new(proj);
+        let before = state(&ed);
+        assert_eq!(ed.clear_baseline(), Ok(false));
+        assert_eq!(state(&ed), before);
     }
 }

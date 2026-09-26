@@ -72,13 +72,27 @@ impl Editor {
     /// the task the edit makes it (manual in a plan whose new tasks are).
     pub fn set_start(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
-        let blank = self.proj.tasks[i].is_null;
         let task = &self.row_as_edited(i);
         if !task.manual {
-            return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(day));
+            return self.set_start_at(uid, day);
         }
         self.validate_pinned_day(day)?;
         let start = day_start(&self.proj, task, day);
+        self.set_start_at(uid, start)
+    }
+
+    /// Set a task's start to an exact instant, as [`Self::set_start`] does
+    /// for a day: a manual task's pinned start moves there, keeping its
+    /// duration; an auto task gets a Start-No-Earlier-Than constraint there,
+    /// replacing any other constraint.
+    pub fn set_start_at(&mut self, uid: i32, start: DateTime) -> Result<(), String> {
+        let i = self.index(uid)?;
+        let blank = self.proj.tasks[i].is_null;
+        let task = &self.row_as_edited(i);
+        if !task.manual {
+            return self.set_constraint_typed(uid, ConstraintType::StartNoEarlierThan, Some(start));
+        }
+        self.validate_pinned_day(start)?;
         if !blank && task.manual_start == Some(start) && task.manual_finish.is_none() {
             return Ok(());
         }
@@ -141,7 +155,7 @@ impl Editor {
 
     /// A pinned date must lie within the scheduler's timeline around the
     /// project start, or its finish could not be derived from it.
-    fn validate_pinned_day(&self, day: DateTime) -> Result<(), String> {
+    pub(super) fn validate_pinned_day(&self, day: DateTime) -> Result<(), String> {
         let offset = day.minutes() - self.sched.project_start.minutes();
         if offset.abs() > HORIZON_DAYS * 1440 {
             return Err(
@@ -532,7 +546,7 @@ pub fn parse_cell_date(text: &str) -> Result<DateTime, String> {
 
 /// A task's working time by date, exceptions included, with exactly the
 /// scheduler's fallback and base-chain resolution.
-fn task_calendar(proj: &Project, task: &Task) -> WorkCalendar {
+pub(super) fn task_calendar(proj: &Project, task: &Task) -> WorkCalendar {
     match proj
         .calendar(task.calendar_uid.unwrap_or(proj.default_calendar_uid))
         .or_else(|| proj.calendar(proj.default_calendar_uid))
