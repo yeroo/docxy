@@ -497,16 +497,20 @@ def build():
     # schedules the inactive task, and the blank row's shape is ours.
     # Custom fields (#268): a Text1 "Trade" lookup table and a Duration1
     # formula, and task values for them, one picked from the table by its
-    # ValueGUID. The definition shapes follow Project's MSPDI schema.
+    # ValueGUID. Each definition's children follow the schema's sequence
+    # (FieldID, FieldName, CFType, Guid, ..., Alias, SecondaryPID, ..., Ltuid,
+    # SecondaryGuid, ..., Formula, ..., AppendNewValues, Default, ValueList).
     definitions = "\n".join([
         "    <ExtendedAttribute>",
         "      <FieldID>188743731</FieldID>",
         "      <FieldName>Text1</FieldName>",
         "      <CFType>21</CFType>",
         "      <Guid>000039B7-8BBE-4CEB-82C4-FA8C0B400033</Guid>",
+        "      <Alias>Trade</Alias>",
         "      <SecondaryPID>255868938</SecondaryPID>",
-        "      <SecondaryGuid>000039B7-8BBE-4CEB-82C4-FA8C0F40400A</SecondaryGuid>",
         "      <Ltuid>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E001</Ltuid>",
+        "      <SecondaryGuid>000039B7-8BBE-4CEB-82C4-FA8C0F40400A</SecondaryGuid>",
+        "      <AppendNewValues>0</AppendNewValues>",
         "      <ValueList>",
         "        <Value>",
         "          <ID>1</ID>",
@@ -521,16 +525,14 @@ def build():
         "          <FieldGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102</FieldGUID>",
         "        </Value>",
         "      </ValueList>",
-        "      <Alias>Trade</Alias>",
-        "      <AppendNewValues>0</AppendNewValues>",
         "    </ExtendedAttribute>",
         "    <ExtendedAttribute>",
         "      <FieldID>188743783</FieldID>",
         "      <FieldName>Duration1</FieldName>",
         "      <Guid>000039B7-8BBE-4CEB-82C4-FA8C0B400067</Guid>",
+        "      <Alias>Buffer</Alias>",
         "      <SecondaryPID>255868966</SecondaryPID>",
         "      <Formula>[Duration]*2</Formula>",
-        "      <Alias>Buffer</Alias>",
         "    </ExtendedAttribute>",
     ])
     common = [("LevelAssignments", 1), ("LevelingCanSplit", 1),
