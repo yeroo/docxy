@@ -16,8 +16,12 @@ const UNDO_CAP: usize = 100;
 mod cells;
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
-    parse_lag, parse_predecessors, parse_task_predecessors,
+    parse_lag, parse_task_predecessors,
 };
+// Re-entering a task's cell goes through `parse_task_predecessors`, which
+// keeps links shown in a fallback unit; the plain parser stays internal.
+#[cfg(test)]
+use cells::parse_predecessors;
 use cells::{format_units, parse_resource_token};
 mod moving;
 

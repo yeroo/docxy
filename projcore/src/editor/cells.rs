@@ -613,7 +613,10 @@ pub fn format_predecessors(task: &Task, proj: &Project) -> String {
         .join(", ")
 }
 
-pub fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Predecessor>, String> {
+/// Parse Predecessors cell text on its own, for tests. Re-entering a task's
+/// cell uses [`parse_task_predecessors`], which keeps fallback formats.
+#[cfg(test)]
+pub(crate) fn parse_predecessors(text: &str, proj: &Project) -> Result<Vec<Predecessor>, String> {
     parse_predecessors_keeping(text, proj, &[])
 }
 
