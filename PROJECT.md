@@ -179,13 +179,21 @@ lossless. Regenerate with `python3 corpus/tools/gen_mspdi_corpus.py`.
 ## Resource leveling
 
 `schedule::level(proj)` runs CPM, then delays tasks so no work resource is
-booked beyond its capacity. It processes tasks in topological order; each task
+booked beyond its capacity. A resource's capacity is its Max. Units, or, when it
+has availability periods, each period's units over its dates and none outside
+them (as Project 2024 does). It processes tasks in topological order; each task
 starts no earlier than (a) its CPM early start and (b) the earliest time all its
-resources have free capacity for its whole duration (a sweep-based peak-load
-check that supports fractional units). A predecessor's leveling delay propagates
-to its successors, preserving every link's gap. v1 is single-calendar,
-delay-only, and treats a task's occupation as its wall-clock span; multi-calendar
-leveling and task splitting are future work. Leveling never moves a manual
+resources have capacity for it: every stretch between booking and capacity
+changes must hold the load plus the task's units (fractional units allowed),
+and the search jumps to the next booking end or capacity change. Each
+assignment books its resource from its `Delay` into the task to the task's
+finish; a stored `LevelingDelay`, Project's last leveling, is not added. A
+resource that is free and available somewhere takes a task above its capacity
+there, and one with no capacity anywhere later is left overallocated, the task
+keeping its earliest start. A predecessor's leveling delay propagates to its
+successors, preserving every link's gap. v1 is single-calendar and delay-only,
+and treats a task's occupation as its wall-clock span; multi-calendar leveling
+and task splitting are future work. Leveling never moves a manual
 task: its bookings are placed first, and auto tasks level around them.
 `yppxy` toggles the overlay with `L` (View ▸ Level).
 
