@@ -703,8 +703,11 @@ impl Editor {
         {
             return Err(format!("Already depends on {pred}"));
         }
+        let mut predecessors = self.proj.tasks[i].predecessors.clone();
+        predecessors.push(link);
+        self.validate_cell_horizon(uid, None, Some(&predecessors))?;
         self.edit_row(i, |proj, _| {
-            proj.tasks[i].predecessors.push(link);
+            proj.tasks[i].predecessors = predecessors;
         })
     }
 

@@ -1825,3 +1825,26 @@ fn a_percent_lag_counts_against_the_range_with_its_predecessors_duration() {
     );
     unchanged(&ed, &before, history);
 }
+
+#[test]
+fn add_link_refuses_a_lag_beyond_the_scheduling_range() {
+    // r1: a link added on its own is checked like a whole cell, so an
+    // overflowing percent lag cannot be stored and wedge later edits.
+    let mut ed = editor();
+    let before = ed.project().clone();
+    for (uid, lag, code) in [(10, i64::MAX, 19), (10, i64::MIN, 19), (10, i64::MAX, 7)] {
+        let link = lag_pred(uid, lag, code);
+        assert!(
+            ed.add_link(20, link)
+                .unwrap_err()
+                .contains("scheduling range")
+        );
+        unchanged(&ed, &before, (0, 0, false));
+    }
+    ed.add_link(20, lag_pred(10, 50, 19)).unwrap();
+    assert_eq!(
+        ed.project().tasks[1].predecessors,
+        vec![lag_pred(10, 50, 19)]
+    );
+    ed.rename(30, "still editable").unwrap();
+}
