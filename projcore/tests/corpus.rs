@@ -696,9 +696,15 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     assert_eq!(
         a.timephased_data
             .iter()
-            .map(|t| t.value.as_deref())
+            .map(|t| (t.kind, t.value.as_deref()))
             .collect::<Vec<_>>(),
-        [Some("PT8H0M0S"), Some("PT8H0M0S")]
+        // Planned work by day, then #267's actual and Baseline work.
+        [
+            (1, Some("PT8H0M0S")),
+            (1, Some("PT8H0M0S")),
+            (2, Some("PT3H0M0S")),
+            (4, Some("PT16H0M0S"))
+        ]
     );
     // What the issue saw dropped comes back from a save, element for element.
     let saved = write_mspdi(&proj);

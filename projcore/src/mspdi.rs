@@ -1103,12 +1103,12 @@ fn float_of(p: &mut XmlParser) -> f64 {
     text_of(p).trim().parse().unwrap_or(0.0)
 }
 
-/// Invalid optional rates stay absent; nonfinite floats are not XML decimals.
 /// A GUID's text; an empty one is no GUID.
 fn guid_of(p: &mut XmlParser) -> Option<String> {
     Some(text_of(p)).filter(|g| !g.trim().is_empty())
 }
 
+/// Invalid optional rates stay absent; nonfinite floats are not XML decimals.
 fn rate_of(p: &mut XmlParser) -> Option<Rate> {
     Rate::parse(&text_of(p))
 }
@@ -4398,7 +4398,8 @@ mod tests {
                         ..AssignmentBaseline::default()
                     },
                 ],
-                // The #267 fields: no Baseline child shares their names.
+                // The #267 fields stay unset: this fixture's Baselines carry
+                // none of their names.
                 ..Assignment::default()
             }]
         );
@@ -5834,6 +5835,11 @@ mod tests {
             imported.peak_units.is_some(),
             imported.actual_overtime_cost.is_some(),
             imported.budget_work_min.is_some(),
+            // Records the planned-work filter must keep (actuals, Baseline).
+            imported
+                .timephased_data
+                .iter()
+                .any(|t| t.kind != TimephasedValue::REMAINING_WORK),
         ] {
             assert!(field, "fixture 13 must set the fields this test watches");
         }
@@ -5845,7 +5851,7 @@ mod tests {
             remaining_overtime_work_min: None,
             remaining_overtime_cost: None,
             cost: None,
-            timephased_data: a
+            timephased_data: imported
                 .timephased_data
                 .iter()
                 .filter(|t| t.kind != TimephasedValue::REMAINING_WORK)
@@ -5870,5 +5876,67 @@ mod tests {
                 ..cleared_by_work(&a)
             }
         );
+    }
+
+    /// #267: two values cannot tell seven flags apart in one fixture, so a
+    /// reader or writer swap between two flags of equal value would pass the
+    /// fixture tests. Set one flag at a time: it alone must come back set.
+    #[test]
+    fn each_resource_and_assignment_flag_round_trips_as_itself() {
+        let one_set = |flags: &[&str], set: &str| -> String {
+            flags
+                .iter()
+                .map(|f| format!("<{f}>{}</{f}>", u8::from(*f == set)))
+                .collect()
+        };
+        let resource_flags = [
+            "IsNull",
+            "OverAllocated",
+            "CanLevel",
+            "IsGeneric",
+            "IsInactive",
+            "IsEnterprise",
+            "IsBudget",
+        ];
+        for set in resource_flags {
+            let proj = resource_project(&format!(
+                "<Resource><UID>1</UID><ID>1</ID><Name>A</Name>{}</Resource>",
+                one_set(&resource_flags, set)
+            ));
+            let xml = write_mspdi(&proj);
+            for flag in resource_flags {
+                let value = u8::from(flag == set);
+                assert!(
+                    xml.contains(&format!("<{flag}>{value}</{flag}>")),
+                    "{set} set: {flag} not {value}"
+                );
+            }
+        }
+        let assignment_flags = [
+            "Confirmed",
+            "HasFixedRateUnits",
+            "FixedMaterial",
+            "LinkedFields",
+            "Milestone",
+            "Overallocated",
+            "ResponsePending",
+            "Summary",
+            "UpdateNeeded",
+        ];
+        for set in assignment_flags {
+            let proj = assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>                 {}</Assignment>",
+                one_set(&assignment_flags, set)
+            ));
+            let xml = write_mspdi(&proj);
+            let assignments = &xml[xml.find("<Assignments>").unwrap()..];
+            for flag in assignment_flags {
+                let value = u8::from(flag == set);
+                assert!(
+                    assignments.contains(&format!("<{flag}>{value}</{flag}>")),
+                    "{set} set: {flag} not {value}"
+                );
+            }
+        }
     }
 }
