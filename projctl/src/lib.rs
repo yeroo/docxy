@@ -15,9 +15,9 @@
 //! | Verb | Args | Result |
 //! |---|---|---|
 //! | `proj.path` | — | `{path, modified, name, tasks, start, finish}` |
-//! | `task.list` | — | `{count, tasks:[{uid, name, level, duration, start, finish, critical, …}]}` |
+//! | `task.list` | — | `{count, tasks:[{uid, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid}` | one task |
-//! | `task.set` | `{uid, name?, duration?, level?}` | the updated task |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
 //! | `task.add` | `{after?, name?, duration?}` | the new task |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
@@ -123,6 +123,7 @@ fn task_json(ed: &Editor, t: &Task) -> Json {
         ("level", Json::Num(t.outline_level as f64)),
         ("summary", Json::Bool(t.summary)),
         ("milestone", Json::Bool(t.is_milestone())),
+        ("manual", Json::Bool(t.manual)),
         (
             "duration_days",
             Json::Num(ed.project().minutes_to_days(t.duration_min)),
@@ -217,12 +218,17 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
                 .ok_or("'level' must be 1..=20")
         })
         .transpose()?;
+    let manual = args
+        .get("manual")
+        .map(|m| m.as_bool().ok_or("'manual' must be true or false"))
+        .transpose()?;
     ed.update_task(
         uid,
         TaskPatch {
             name: args.get_str("name").map(str::to_string),
             duration_min,
             level,
+            manual,
         },
     )?;
     task_get(ed, args)
@@ -616,6 +622,69 @@ mod tests {
             assert!(!ed.dirty());
         }
     }
+    #[test]
+    fn task_set_switches_the_mode_in_one_undo_step() {
+        let mut a = app();
+        let uid = add(&mut a, "Design", "3d");
+        let get =
+            |a: &Editor| task_get(a, &Json::obj(vec![("uid", Json::Num(uid as f64))])).unwrap();
+        assert_eq!(get(&a).get("manual"), Some(&Json::Bool(false)));
+        let start = get(&a).get_str("start").unwrap().to_string();
+        let depth = a.undo_depth();
+        let r = dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("name", Json::Str("Pinned".into())),
+                ("manual", Json::Bool(true)),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.get("manual"), Some(&Json::Bool(true)));
+        assert_eq!(r.get_str("name"), Some("Pinned"));
+        assert_eq!(r.get_str("start"), Some(start.as_str()));
+        assert_eq!(a.undo_depth(), depth + 1, "rename and switch are one step");
+        let task = a.project().task(uid as i32).unwrap();
+        assert!(task.manual && task.manual_start.is_some());
+        let r = dispatch_editor(
+            &mut a,
+            "task.set",
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("manual", Json::Bool(false)),
+            ]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(r.get("manual"), Some(&Json::Bool(false)));
+        assert_eq!(a.project().task(uid as i32).unwrap().manual_start, None);
+        assert!(a.undo());
+        assert!(a.project().task(uid as i32).unwrap().manual);
+    }
+
+    #[test]
+    fn task_set_rejects_a_mode_that_is_not_a_bool() {
+        let mut ed = app();
+        ed.mark_saved();
+        let before = ed.project().clone();
+        for manual in [Json::Str("true".into()), Json::Num(1.0), Json::Null] {
+            let args = Json::obj(vec![
+                ("uid", Json::Num(1.0)),
+                ("name", Json::Str("must not rename".into())),
+                ("manual", manual),
+            ]);
+            let err = dispatch_editor(&mut ed, "task.set", &args)
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(err, "'manual' must be true or false");
+            assert_eq!(ed.project(), &before);
+            assert_eq!(ed.undo_depth(), 0);
+            assert!(!ed.dirty());
+        }
+    }
+
     #[test]
     fn path_info_preserves_the_tui_wire_representation() {
         let ed = app();

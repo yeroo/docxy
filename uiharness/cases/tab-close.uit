@@ -46,7 +46,7 @@ test saving inactive last tab preserves first active tab
   open ../fixtures/basic.docx
   open ../fixtures/basic.xlsx
   open copy:../fixtures/gantt-summary.xml
-  click B2
+  click C2
   type Saved inactive last
   open ../fixtures/basic.docx
   assert tab is 0
@@ -74,7 +74,7 @@ test saving inactive first tab preserves last active tab
 
 test inactive invalid Project edit refuses and correction clears the error
   open ../fixtures/gantt-summary.xml
-  click C2
+  click D2
   type banana
   open ../fixtures/basic.docx
   call close-tab {"index":0,"answer":"discard"}
@@ -87,14 +87,14 @@ test inactive invalid Project edit refuses and correction clears the error
   key enter
   assert cell_edit is none
   assert status is Ready
-  assert cell C2 is 2d
+  assert cell D2 is 2d
   call close-tab {"answer":"discard"}
   call close-tab {}
   assert tabs is 0
 
 test inactive valid Project edit commits before Cancel
   open ../fixtures/gantt-summary.xml
-  click B2
+  click C2
   type Pending inactive
   open ../fixtures/basic.docx
   call close-tab {"index":0,"answer":"cancel"}
@@ -102,7 +102,7 @@ test inactive valid Project edit commits before Cancel
   assert tab is 0
   assert dirty is true
   assert cell_edit is none
-  assert cell B2 is Pending inactive
+  assert cell C2 is Pending inactive
   call close-tab {"answer":"discard"}
   call close-tab {}
   assert tabs is 0
@@ -185,19 +185,19 @@ test project answers with window ask true
   call ask-on-close {"on":true}
   assert ask_on_close is true
   open copy:../fixtures/gantt-summary.xml
-  click B2
+  click C2
   type CloseCancelMarker
   call close-tab {"answer":"cancel"}
   assert tabs is 1
   assert dirty is true
-  assert cell B2 is CloseCancelMarker
+  assert cell C2 is CloseCancelMarker
   assert cell_edit is none
-  click B2
+  click C2
   type CloseSavedMarker
   call close-tab {"answer":"save"}
   assert tabs is 0
   open ../fixtures/gantt-summary.xml
-  click B2
+  click C2
   type CloseDiscardMarker
   call close-tab {"answer":"discard"}
   assert tabs is 0
@@ -206,19 +206,19 @@ test project answers with window ask false
   call ask-on-close {"on":false}
   assert ask_on_close is false
   open copy:../fixtures/gantt-summary.xml
-  click B2
+  click C2
   type CloseCancelMarker
   call close-tab {"answer":"cancel"}
   assert tabs is 1
   assert dirty is true
-  assert cell B2 is CloseCancelMarker
+  assert cell C2 is CloseCancelMarker
   assert cell_edit is none
-  click B2
+  click C2
   type CloseSavedMarker
   call close-tab {"answer":"save"}
   assert tabs is 0
   open ../fixtures/gantt-summary.xml
-  click B2
+  click C2
   type CloseDiscardMarker
   call close-tab {"answer":"discard"}
   assert tabs is 0

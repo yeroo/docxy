@@ -15,6 +15,8 @@ pub enum Act {
     Indent,
     Outdent,
     AddLink,
+    ManuallySchedule,
+    AutoSchedule,
     AddTask,
     Milestone,
     Constraint,
@@ -117,6 +119,22 @@ fn task_groups() -> Vec<Group> {
                     "🔗 Link the Selected Tasks",
                     AddLink,
                     "Add a predecessor by task ID (p)",
+                )],
+            ],
+        },
+        Group {
+            title: "Tasks",
+            width: 20,
+            rows: [
+                vec![btn(
+                    "📌 Manually Schedule",
+                    ManuallySchedule,
+                    "Pin the task at its current dates (m toggles)",
+                )],
+                vec![btn(
+                    "⟳ Auto Schedule",
+                    AutoSchedule,
+                    "Let the scheduler place the task by its links (m toggles)",
                 )],
             ],
         },
@@ -275,9 +293,13 @@ mod tests {
             .sum()
     }
 
-    /// The widest tab body before #110 (the old Task tab: 1 + Σ(width + 3)).
-    /// The Project tabs must not make the ribbon any wider than that.
-    const BODY_BUDGET: usize = 89;
+    /// The widest tab body: the Task tab (1 + Σ(width + 3)). Project's
+    /// Task › Tasks › Manually/Auto Schedule path (#121) took it past the
+    /// old 89-column budget; no layout keeps Project's names and groups in
+    /// 89. A narrower terminal clips the body on the right (the body is a
+    /// non-wrapping Paragraph); the clipped buttons keep their keys. Raise
+    /// this only deliberately.
+    const BODY_BUDGET: usize = 109;
 
     #[test]
     fn tabs_are_microsoft_projects() {
@@ -297,6 +319,8 @@ mod tests {
             ("Task", "Schedule", "Indent Task", Indent),
             ("Task", "Schedule", "Outdent Task", Outdent),
             ("Task", "Schedule", "Link the Selected Tasks", AddLink),
+            ("Task", "Tasks", "Manually Schedule", ManuallySchedule),
+            ("Task", "Tasks", "Auto Schedule", AutoSchedule),
             ("Task", "Insert", "Task", AddTask),
             ("Task", "Insert", "Milestone", Milestone),
             ("Task", "Properties", "Information", Constraint),

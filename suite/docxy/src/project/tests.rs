@@ -353,7 +353,7 @@ fn hot_exit_commits_all_valid_buffers_and_preserves_models_on_invalid_input() {
     {
         view_mut(tab).open_cell(Some(name)).unwrap();
     }
-    view_mut(&mut tabs[2]).col = 2;
+    view_mut(&mut tabs[2]).col = COL_DURATION;
     view_mut(&mut tabs[2]).open_cell(Some("invalid")).unwrap();
     let invalid_model = view(&tabs[2]).ed.project().clone();
     crate::close::commit_pending_for_exit(&mut tabs);
@@ -505,16 +505,19 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
     ] {
         ed.add_predecessor(9, 7, link, lag).unwrap();
         let row = project_row(&ed, ed.project().task(9).unwrap());
-        assert_eq!(row[0], "4");
-        assert_eq!(row[1], "Child");
-        assert_eq!(row[2], "1d");
-        assert_eq!(row[5], expected);
-        assert_eq!(row[6], "Alice");
-        assert_eq!(row[3].len(), 10);
+        assert_eq!(row[COL_ID], "4");
+        assert_eq!(row[COL_NAME], "Child");
+        assert_eq!(row[COL_DURATION], "1d");
+        assert_eq!(row[COL_PREDECESSORS], expected);
+        assert_eq!(row[COL_RESOURCES], "Alice");
+        assert_eq!(row[COL_START].len(), 10);
         ed.remove_predecessor(9, 7).unwrap();
     }
     ed.toggle_milestone(9).unwrap();
-    assert_eq!(project_row(&ed, ed.project().task(9).unwrap())[2], "—");
+    assert_eq!(
+        project_row(&ed, ed.project().task(9).unwrap())[COL_DURATION],
+        "—"
+    );
     let mut p = ed.project().clone();
     p.tasks[1].predecessors.push(projcore::Predecessor {
         uid: 999,
@@ -522,7 +525,10 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
         lag_min: 0,
     });
     let ed = ProjectEditor::new(p);
-    assert_eq!(project_row(&ed, ed.project().task(9).unwrap())[5], "?999");
+    assert_eq!(
+        project_row(&ed, ed.project().task(9).unwrap())[COL_PREDECESSORS],
+        "?999"
+    );
 }
 
 #[test]
@@ -531,11 +537,14 @@ fn a_blank_row_shows_only_its_id() {
     let ed = ProjectEditor::new(mspdi::read_mspdi(&xml).unwrap());
     let blank = ed.project().task(3).unwrap();
     assert!(blank.is_null);
-    assert_eq!(project_row(&ed, blank), ["3", "", "", "", "", "", ""]);
+    assert_eq!(project_row(&ed, blank), ["3", "", "", "", "", "", "", ""]);
     let pour = project_row(&ed, ed.project().task(4).unwrap());
     // Pour's link from the blank row is kept but does not drive it.
-    assert_eq!((pour[1].as_str(), pour[5].as_str()), ("Pour", "2, 3"));
-    assert_eq!(pour[3], "2026-03-04");
+    assert_eq!(
+        (pour[COL_NAME].as_str(), pour[COL_PREDECESSORS].as_str()),
+        ("Pour", "2, 3")
+    );
+    assert_eq!(pour[COL_START], "2026-03-04");
 }
 
 fn summary_fixture(stored_summary_min: Option<i64>) -> ProjectEditor {
@@ -554,10 +563,13 @@ fn summary_duration_follows_child_edits_and_matches_the_gantt_export() {
     let phase = ed.project().tasks[0].uid;
     let b = ed.project().tasks[2].uid;
     assert_eq!(ed.project().tasks[2].name, "B");
-    assert_eq!(project_row(&ed, ed.project().task(phase).unwrap())[2], "2d");
+    assert_eq!(
+        project_row(&ed, ed.project().task(phase).unwrap())[COL_DURATION],
+        "2d"
+    );
     ed.set_duration_min(b, 1440).unwrap();
     let row = project_row(&ed, ed.project().task(phase).unwrap());
-    assert_eq!(row[2], "4d");
+    assert_eq!(row[COL_DURATION], "4d");
     let md = projcore::gantt::to_markdown(ed.project(), ed.schedule());
     let exported = md
         .lines()
@@ -567,7 +579,7 @@ fn summary_duration_follows_child_edits_and_matches_the_gantt_export() {
         .map(str::trim)
         .nth(4)
         .unwrap();
-    assert_eq!(row[2], exported);
+    assert_eq!(row[COL_DURATION], exported);
 }
 
 #[test]
@@ -575,7 +587,7 @@ fn summary_with_zero_stored_duration_is_not_shown_as_a_milestone() {
     let ed = summary_fixture(Some(0));
     let phase = ed.project().task(ed.project().tasks[0].uid).unwrap();
     assert!(phase.is_milestone());
-    assert_eq!(project_row(&ed, phase)[2], "2d");
+    assert_eq!(project_row(&ed, phase)[COL_DURATION], "2d");
 }
 
 #[test]
@@ -618,4 +630,24 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
     }
     assert!(view(&t).ed.dirty());
     assert!(!view_mut(&mut t).key("d", false));
+}
+
+#[test]
+fn the_task_mode_column_names_each_tasks_mode_and_is_blank_on_a_blank_row() {
+    let xml = std::fs::read_to_string(corpus("20-task-fields.xml")).unwrap();
+    let mut ed = ProjectEditor::new(mspdi::read_mspdi(&xml).unwrap());
+    let pour = ed.project().task(4).unwrap().uid;
+    assert_eq!(
+        project_row(&ed, ed.project().task(pour).unwrap())[COL_MODE],
+        "Auto Scheduled"
+    );
+    ed.set_manual(pour, true).unwrap();
+    assert_eq!(
+        project_row(&ed, ed.project().task(pour).unwrap())[COL_MODE],
+        "Manually Scheduled"
+    );
+    assert_eq!(
+        project_row(&ed, ed.project().task(3).unwrap())[COL_MODE],
+        ""
+    );
 }

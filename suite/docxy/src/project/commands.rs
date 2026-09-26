@@ -13,6 +13,8 @@ pub(crate) enum ProjectAct {
     Duration,
     AddLink,
     UnlinkTasks,
+    ManuallySchedule,
+    AutoSchedule,
     MoveTask,
     Constraint,
     Baseline,
@@ -29,8 +31,10 @@ pub(crate) enum ProjectAct {
     Find,
     ScrollToTask,
     Timeline,
-    // Keyboard/QAT/backstage only; excluded from the ribbon inventory.
+    // Keyboard/QAT/backstage/status bar only; excluded from the ribbon inventory.
     Level,
+    /// The status bar's `New Tasks: …` item: the plan's mode for new tasks.
+    NewTasksMode,
     Save,
     Undo,
     Redo,
@@ -49,6 +53,8 @@ impl ProjectAct {
         Self::Duration,
         Self::AddLink,
         Self::UnlinkTasks,
+        Self::ManuallySchedule,
+        Self::AutoSchedule,
         Self::MoveTask,
         Self::Constraint,
         Self::Baseline,
@@ -123,15 +129,36 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 ),
                 rs::group(
                     "Tasks",
-                    75,
-                    vec![Control::Large(cmd(
-                        "pr-move",
-                        "indent-increase",
-                        "Move",
-                        MoveTask,
-                        "Alt, T, V",
-                        "V",
-                    ))],
+                    190,
+                    vec![
+                        // Project's order: the two modes, then Move.
+                        rs::column(vec![
+                            cmd(
+                                "pr-manual",
+                                "lock",
+                                "Manually Schedule",
+                                ManuallySchedule,
+                                "Alt, T, H",
+                                "H",
+                            ),
+                            cmd(
+                                "pr-auto",
+                                "redo",
+                                "Auto Schedule",
+                                AutoSchedule,
+                                "Alt, T, A",
+                                "A",
+                            ),
+                        ]),
+                        Control::Large(cmd(
+                            "pr-move",
+                            "indent-increase",
+                            "Move",
+                            MoveTask,
+                            "Alt, T, V",
+                            "V",
+                        )),
+                    ],
                 ),
                 rs::group(
                     "Insert",
@@ -363,6 +390,12 @@ pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
     match act {
         ProjectAct::LevelAll => v.ed.leveled(),
         ProjectAct::Timeline => v.timeline,
+        // The selected task's mode, as Project highlights it; none on the
+        // entry row or a blank row.
+        ProjectAct::ManuallySchedule | ProjectAct::AutoSchedule => v
+            .selected_uid()
+            .and_then(|uid| v.ed.project().task(uid))
+            .is_some_and(|t| !t.is_null && t.manual == (act == ProjectAct::ManuallySchedule)),
         _ => false,
     }
 }
@@ -706,6 +739,17 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 if let Some(uid) = v.selected_uid() {
                     v.ed.toggle_milestone(uid)?;
                 }
+            }
+            ManuallySchedule | AutoSchedule => {
+                // Nothing on the entry row: there is no task to switch.
+                if let Some(uid) = v.selected_uid() {
+                    v.ed.set_manual(uid, act == ManuallySchedule)?;
+                }
+            }
+            NewTasksMode => {
+                let manual = !v.ed.project().new_tasks_are_manual;
+                v.ed.set_new_tasks_manual(manual);
+                status = Some(format!("New tasks: {}", task_mode_name(manual)));
             }
             Indent | Outdent => {} // shared no-op-at-limit policy below
             Rename => v.open_prompt(PromptKind::Rename),

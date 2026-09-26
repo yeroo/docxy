@@ -26,11 +26,12 @@ If the `yppxy` MCP server is configured (`claude mcp add yppxy -- yppxy --mcp`),
 use its tools:
 - `yppxy_list` — which yppxy editors are running
 - `yppxy_status` — path, modified flag, task count, project start/finish
-- `yppxy_tasks` — every task: uid, name, outline level, duration, scheduled
+- `yppxy_tasks` — every task: uid, name, outline level, manual, duration, scheduled
   start/finish, critical flag, slack, predecessors
 - `yppxy_get` `{uid}` — one task
-- `yppxy_set` `{uid, name?, duration?, level?}` — edit a task (duration like
-  "3d", "4h", "2w"; level = outline depth 1..20)
+- `yppxy_set` `{uid, name?, duration?, level?, manual?}` — edit a task (duration like
+  "3d", "4h", "2w"; level = outline depth 1..20; manual = true pins the task at
+  its current dates as Manually Scheduled, false makes it Auto Scheduled)
 - `yppxy_add` `{after?, name?, duration?}` — insert a task after uid `after`
   (or append); returns the new task with its uid
 - `yppxy_del` `{uid}` — delete a task; a summary takes its subtasks with it

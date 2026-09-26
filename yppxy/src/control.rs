@@ -15,9 +15,9 @@
 //! | Verb | Args | Result |
 //! |---|---|---|
 //! | `proj.path` | — | `{path, modified, name, tasks, start, finish}` |
-//! | `task.list` | — | `{count, tasks:[{uid, name, level, duration, start, finish, critical, …}]}` |
+//! | `task.list` | — | `{count, tasks:[{uid, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid}` | one task |
-//! | `task.set` | `{uid, name?, duration?, level?}` | the updated task |
+//! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
 //! | `task.add` | `{after?, name?, duration?}` | the new task |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
