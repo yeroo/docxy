@@ -78,16 +78,20 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
                     "Calendars" => parse_calendars(&mut p, &mut proj.calendars),
+                    "ExtendedAttributes" => parse_extended_attribute_definitions(
+                        &mut p,
+                        &mut proj.extended_attribute_definitions,
+                    ),
                     // Any other leaf is a project option docxy does not model:
                     // keep its text so a save writes it back. A block with
-                    // child elements (OutlineCodes, ExtendedAttributes, ...) is
+                    // child elements (OutlineCodes, WBSMasks, ...) is
                     // consumed whole so its children can't be mistaken for
                     // header fields. So is a prefixed element or one carrying
                     // attributes: an option stores only a name and text, so
                     // writing it back would lose its namespace binding (an
                     // unbound `x:` prefix, or a foreign `xmlns` moved into
                     // MSPDI's) or attributes such as `xsi:nil`.
-                    _ if name.contains(':') || !p.attrs().is_empty() => p.skip_element(),
+                    _ if !kept_as_element(&p) => p.skip_element(),
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
                             set_option(&mut proj.options, name, text);
@@ -248,6 +252,9 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                         Err(code) => bad_lag_format = bad_lag_format.or(Some(code)),
                     },
                     "Baseline" => parse_baseline(p, &mut t),
+                    "ExtendedAttribute" => {
+                        t.extended_attributes.extend(parse_extended_attribute(p));
+                    }
                     "IsNull" => t.is_null = bool_of(p),
                     "GUID" => t.guid = guid_of(p),
                     "CreateDate" => t.create_date = DateTime::parse_mspdi(&text_of(p)),
@@ -822,6 +829,65 @@ fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
     Some(code)
 }
 
+/// Collect the custom field definitions of an `<ExtendedAttributes>` block,
+/// each `<ExtendedAttribute>` kept whole; any other child is skipped.
+fn parse_extended_attribute_definitions(p: &mut XmlParser, out: &mut Vec<XmlElement>) {
+    loop {
+        match p.next() {
+            Event::Start if p.name() == "ExtendedAttribute" && kept_as_element(p) => {
+                out.push(parse_element(p, 1));
+            }
+            Event::Start => p.skip_element(),
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+}
+
+/// Whether an element can be kept as an [`XmlElement`]: one that is neither
+/// prefixed nor carries attributes, since the tree keeps only names and text
+/// (the rule the header options follow).
+fn kept_as_element(p: &XmlParser) -> bool {
+    !p.name().contains(':') && p.attrs().is_empty()
+}
+
+/// How deep a kept definition goes, counting its `<ExtendedAttribute>` as 1.
+/// Project's deepest is 4 (`ExtendedAttribute/ValueList/Value/ID`); the bound
+/// keeps a crafted file from overflowing the stack of the recursive reader,
+/// writer, and the tree's derived `Clone`/`PartialEq`/`Drop`.
+const MAX_DEFINITION_DEPTH: usize = 32;
+
+/// Read the element whose `Start` was just consumed, at `depth`, and its
+/// children, as an [`XmlElement`]. A leaf keeps its decoded text verbatim; the
+/// text between an element's children is dropped (even when every child
+/// was), and so is a child [`kept_as_element`] refuses, or one past
+/// [`MAX_DEFINITION_DEPTH`], with its whole subtree.
+fn parse_element(p: &mut XmlParser, depth: usize) -> XmlElement {
+    let mut element = XmlElement {
+        name: p.name().to_string(),
+        ..XmlElement::default()
+    };
+    let mut leaf = true;
+    loop {
+        match p.next() {
+            Event::Text => XmlParser::append_decoded(p.text(), &mut element.text),
+            Event::Start => {
+                leaf = false;
+                if depth < MAX_DEFINITION_DEPTH && kept_as_element(p) {
+                    element.children.push(parse_element(p, depth + 1));
+                } else {
+                    p.skip_element();
+                }
+            }
+            Event::End | Event::Eof => break,
+        }
+    }
+    if !leaf {
+        element.text.clear();
+    }
+    element
+}
+
 /// Parse one timephased record; `None` without a valid `Type`, which says
 /// what its value measures.
 fn parse_timephased_data(p: &mut XmlParser) -> Option<TimephasedValue> {
@@ -1239,9 +1305,11 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Emits the fields projcore models — enough for MS Project to open the file
 /// and for our own reader to round-trip — plus every project-level option the
 /// reader kept verbatim in [`Project::options`]: the schema's in
-/// [`PROJECT_HEADER`] order, then any others in read order. Other elements outside the model (custom field definitions,
-/// views, task extended attributes, outline codes) are not preserved: this is a
-/// model-faithful writer, not a byte-faithful one. Each task's stored
+/// [`PROJECT_HEADER`] order, then any others in read order. The custom field
+/// definitions in [`Project::extended_attribute_definitions`] follow, as one
+/// `<ExtendedAttributes>` block. Other elements outside the model (views,
+/// outline codes, WBS masks) are not preserved: this is a model-faithful
+/// writer, not a byte-faithful one. Each task's stored
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
 /// stamping them back), so a scheduled project exports with dates Project can
 /// display without recalculating.
@@ -1271,6 +1339,15 @@ pub fn write_mspdi(proj: &Project) -> String {
         if !PROJECT_HEADER.contains(&name.as_str()) {
             tag(&mut s, 1, name, text);
         }
+    }
+    // After the header leaves (and the schema's OutlineCodes and WBSMasks,
+    // which docxy does not keep), before Calendars and Tasks.
+    if !proj.extended_attribute_definitions.is_empty() {
+        s.push_str("  <ExtendedAttributes>\n");
+        for definition in &proj.extended_attribute_definitions {
+            write_element(&mut s, 2, definition);
+        }
+        s.push_str("  </ExtendedAttributes>\n");
     }
 
     s.push_str("  <Tasks>\n");
@@ -1597,6 +1674,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 4, "LagFormat", &p.lag_format.code().to_string());
         s.push_str("      </PredecessorLink>\n");
     }
+    write_extended_attributes(s, &t.extended_attributes);
     let mut baselines: Vec<_> = t.baselines.iter().collect();
     baselines.sort_by_key(|b| b.number);
     for baseline in baselines {
@@ -2063,6 +2141,21 @@ fn write_working_times(s: &mut String, day: &DayWorking) {
         s.push_str("</WorkingTime>\n");
     }
     s.push_str("          </WorkingTimes>\n");
+}
+
+/// Write an element kept as read: a leaf as `<Name>text</Name>`, else its
+/// children one level deeper.
+fn write_element(s: &mut String, depth: usize, element: &XmlElement) {
+    if element.children.is_empty() {
+        tag(s, depth, &element.name, &element.text);
+        return;
+    }
+    let indent = "  ".repeat(depth);
+    s.push_str(&format!("{indent}<{}>\n", element.name));
+    for child in &element.children {
+        write_element(s, depth + 1, child);
+    }
+    s.push_str(&format!("{indent}</{}>\n", element.name));
 }
 
 /// Write `<Name>text</Name>` at the given indent depth (2 spaces each), with the
@@ -3647,6 +3740,12 @@ mod tests {
             duration_min: Some(480),
             ..Baseline::default()
         });
+        t.extended_attributes = vec![ExtendedAttributeValue {
+            field_id: "188743731".into(),
+            value: Some("A".into()),
+            value_guid: Some("C8A6D07D-4E0D-4F63-9A8B-0D1E2F3A4B5C".into()),
+            duration_format: Some(7),
+        }];
         let progress = task_project(PROGRESS).tasks.remove(0);
         let t = &mut proj.tasks[0];
         t.percent_complete = progress.percent_complete;
@@ -3762,6 +3861,11 @@ mod tests {
                 "Type",
                 "LinkLag",
                 "LagFormat",
+                "ExtendedAttribute",
+                "FieldID",
+                "Value",
+                "ValueGUID",
+                "DurationFormat",
                 "Baseline",
                 "Number",
                 "Duration",
@@ -4146,18 +4250,226 @@ mod tests {
                 "ZzFutureOption",
                 "ZzRepeat",
                 "ZzOther",
+                "ExtendedAttributes",
             ]
         );
         // A repeat keeps its first place and takes the later value.
         assert_eq!(
-            header[8..],
+            header[8..11],
             [
                 ("ZzFutureOption".to_string(), "7".to_string()),
                 ("ZzRepeat".to_string(), "b".to_string()),
                 ("ZzOther".to_string(), "x".to_string()),
             ]
         );
-        assert!(!xml.contains("ZzBlock") && !xml.contains("<A>") && !xml.contains("FieldID"));
+        assert!(!xml.contains("ZzBlock") && !xml.contains("<A>"));
+        // The definitions block is kept as definitions, never as an option.
+        assert!(proj.option("ExtendedAttributes").is_none() && proj.option("FieldID").is_none());
+        assert_eq!(proj.extended_attribute_definitions.len(), 1);
+    }
+
+    fn leaf(name: &str, text: &str) -> XmlElement {
+        XmlElement {
+            name: name.into(),
+            text: text.into(),
+            children: Vec::new(),
+        }
+    }
+
+    fn node(name: &str, children: Vec<XmlElement>) -> XmlElement {
+        XmlElement {
+            name: name.into(),
+            text: String::new(),
+            children,
+        }
+    }
+
+    #[test]
+    fn task_extended_attributes_round_trip() {
+        let proj = task_project(
+            "<Task><UID>1</UID><Name>Pour</Name><OutlineLevel>1</OutlineLevel>\
+             <Duration>PT8H0M0S</Duration>\
+             <ExtendedAttribute><FieldID>188743731</FieldID><Value>R&amp;D &lt;1&gt;</Value>\
+             </ExtendedAttribute>\
+             <ExtendedAttribute><Value>orphan</Value></ExtendedAttribute>\
+             <ExtendedAttribute><FieldID>188743783</FieldID><Value>2</Value>\
+             <ValueGUID>C8A6D07D-4E0D-4F63-9A8B-0D1E2F3A4B5C</ValueGUID></ExtendedAttribute>\
+             <ExtendedAttribute><FieldID>188743783</FieldID><Value>PT16H0M0S</Value>\
+             <DurationFormat>7</DurationFormat></ExtendedAttribute></Task>",
+        );
+        let expected = vec![
+            ExtendedAttributeValue {
+                field_id: "188743731".into(),
+                value: Some("R&D <1>".into()),
+                ..ExtendedAttributeValue::default()
+            },
+            // One without a FieldID names no field and is dropped.
+            ExtendedAttributeValue {
+                field_id: "188743783".into(),
+                value: Some("2".into()),
+                value_guid: Some("C8A6D07D-4E0D-4F63-9A8B-0D1E2F3A4B5C".into()),
+                duration_format: None,
+            },
+            ExtendedAttributeValue {
+                field_id: "188743783".into(),
+                value: Some("PT16H0M0S".into()),
+                value_guid: None,
+                duration_format: Some(7),
+            },
+        ];
+        assert_eq!(proj.tasks[0].extended_attributes, expected);
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Value>R&amp;D &lt;1&gt;</Value>"), "{xml}");
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks[0].extended_attributes,
+            expected
+        );
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(back.tasks[0].extended_attributes, expected);
+    }
+
+    #[test]
+    fn extended_attribute_definitions_round_trip() {
+        let proj = read_mspdi(
+            "<Project><Author>Me</Author>\
+             <ExtendedAttributes>\
+               <ExtendedAttribute><FieldID>188743731</FieldID><FieldName>Text1</FieldName>\
+                 <Alias>Trade &amp; crew</Alias><Ltuid>8A3C</Ltuid>\
+                 <ValueList>\
+                   <Value><ID>1</ID><Value>A</Value><Description/></Value>\
+                   <Value><ID>2</ID><Value>&lt;B&gt;</Value><Description> two </Description></Value>\
+                 </ValueList>\
+               </ExtendedAttribute>\
+               <Other>skipped</Other>\
+             </ExtendedAttributes>\
+             <ExtendedAttributes>\
+               <ExtendedAttribute><FieldID>188743783</FieldID>\
+                 <Formula>[Duration]*2</Formula></ExtendedAttribute>\
+             </ExtendedAttributes><Tasks/></Project>",
+        )
+        .unwrap();
+        let expected = vec![
+            node(
+                "ExtendedAttribute",
+                vec![
+                    leaf("FieldID", "188743731"),
+                    leaf("FieldName", "Text1"),
+                    leaf("Alias", "Trade & crew"),
+                    leaf("Ltuid", "8A3C"),
+                    node(
+                        "ValueList",
+                        vec![
+                            node(
+                                "Value",
+                                vec![leaf("ID", "1"), leaf("Value", "A"), leaf("Description", "")],
+                            ),
+                            node(
+                                "Value",
+                                vec![
+                                    leaf("ID", "2"),
+                                    leaf("Value", "<B>"),
+                                    leaf("Description", " two "),
+                                ],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            node(
+                "ExtendedAttribute",
+                vec![
+                    leaf("FieldID", "188743783"),
+                    leaf("Formula", "[Duration]*2"),
+                ],
+            ),
+        ];
+        assert_eq!(proj.extended_attribute_definitions, expected);
+        assert_eq!(proj.options, [("Author".to_string(), "Me".to_string())]);
+
+        let xml = write_mspdi(&proj);
+        // One block, after the header and before the tasks.
+        assert_eq!(xml.matches("<ExtendedAttributes>").count(), 1);
+        let block = xml.find("<ExtendedAttributes>").unwrap();
+        assert!(xml.find("<Author>").unwrap() < block && block < xml.find("<Tasks>").unwrap());
+        assert!(xml.contains("<Alias>Trade &amp; crew</Alias>"), "{xml}");
+        assert!(!xml.contains("<Other>"));
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(back.extended_attribute_definitions, expected);
+        assert_eq!(back.options, proj.options);
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(back.extended_attribute_definitions, expected);
+    }
+
+    #[test]
+    fn no_definitions_writes_no_block() {
+        let plain = task_project("<Task><UID>1</UID></Task>");
+        assert!(plain.extended_attribute_definitions.is_empty());
+        assert!(!write_mspdi(&plain).contains("ExtendedAttributes"));
+        // An empty block is consumed: no definitions, and not an option.
+        let empty = read_mspdi("<Project><ExtendedAttributes/><Tasks/></Project>").unwrap();
+        assert!(empty.extended_attribute_definitions.is_empty());
+        assert!(empty.options.is_empty());
+        assert!(!write_mspdi(&empty).contains("ExtendedAttributes"));
+    }
+
+    #[test]
+    fn definitions_past_the_depth_bound_are_dropped_not_overflowed() {
+        let deep = 10_000;
+        let xml = format!(
+            "<Project><ExtendedAttributes><ExtendedAttribute><FieldID>1</FieldID>\
+             {}x{}</ExtendedAttribute></ExtendedAttributes><Tasks/></Project>",
+            "<a>".repeat(deep),
+            "</a>".repeat(deep)
+        );
+        let proj = read_mspdi(&xml).unwrap();
+        let definition = &proj.extended_attribute_definitions[0];
+        assert_eq!(definition.children[0], leaf("FieldID", "1"));
+        // The chain of <a> stops at the bound (the ExtendedAttribute is depth
+        // 1, its first <a> depth 2). The last kept one had a child, so it is
+        // not a leaf and keeps no text.
+        let mut depth = 2;
+        let mut element = &definition.children[1];
+        while let Some(child) = element.children.first() {
+            element = child;
+            depth += 1;
+        }
+        assert_eq!((depth, element.text.as_str()), (MAX_DEFINITION_DEPTH, ""));
+        let back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        assert_eq!(
+            back.extended_attribute_definitions,
+            proj.extended_attribute_definitions
+        );
+    }
+
+    #[test]
+    fn prefixed_or_attributed_definition_children_are_dropped() {
+        let proj = read_mspdi(
+            r#"<Project xmlns="http://schemas.microsoft.com/project" xmlns:x="urn:x">
+                 <ExtendedAttributes>
+                   <ExtendedAttribute>
+                     <FieldID>188743731</FieldID>
+                     <x:Ext><Inner>1</Inner></x:Ext>
+                     <Alias xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:nil="true"/>
+                     <Wrapper> <Other xmlns="urn:other">2</Other> </Wrapper>
+                   </ExtendedAttribute>
+                   <ExtendedAttribute kind="foreign"><FieldID>1</FieldID></ExtendedAttribute>
+                 </ExtendedAttributes>
+                 <Tasks/>
+               </Project>"#,
+        )
+        .unwrap();
+        // A child whose children were all dropped is still not a leaf: its
+        // text (the whitespace around them) is not kept.
+        assert_eq!(
+            proj.extended_attribute_definitions,
+            [node(
+                "ExtendedAttribute",
+                vec![leaf("FieldID", "188743731"), leaf("Wrapper", "")]
+            )]
+        );
+        let xml = write_mspdi(&proj);
+        assert!(!xml.contains("x:") && !xml.contains("urn:other") && !xml.contains("Inner"));
+        assert!(!xml.contains("<Alias") && !xml.contains("<FieldID>1<"));
     }
 
     #[test]

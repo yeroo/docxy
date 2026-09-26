@@ -56,7 +56,12 @@ display flags, WBS, `GUID`/`CreateDate` and the stored `Work`/`Cost`. Like
 file 19 it is **not** verified against Project 2024, for two reasons: docxy
 still schedules its inactive task (Project would drop it), and its blank row
 (`<IsNull>1</IsNull>`, between two linked tasks under a summary) has a shape
-of our own, because no Project file with a blank row was available.
+of our own, because no Project file with a blank row was available. It also
+carries task custom field values and the custom field definitions
+([issue #268](https://github.com/yeroo/docxy/issues/268)): a Text1 field
+aliased "Trade" with a two-entry lookup table, and a Duration1 field with a
+formula. These are ours too, with children in the schema's sequence, and not
+verified in Project.
 File 21 records a missed task Deadline
 ([issue #100](https://github.com/yeroo/docxy/issues/100)): B's deadline is
 five days before its finish, so A and B both carry -5 days total slack and no
@@ -166,7 +171,7 @@ Project's warning have no MSPDI field; projcore's unit tests check them.
 | `17-constraint-fnlt-conflict` | FNLT versus FS link | default constraint precedence and -5 days total slack on both tasks |
 | `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
 | `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
-| `20-task-fields` | stored task fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`; the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
+| `20-task-fields` | stored task fields, custom fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`, as do task custom field values and the custom field definitions (a lookup table and a formula, #268); the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
 | `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
 | `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx` |
 | `23-derived-calendar` | derived calendar | `BaseCalendarUID`, `IsBaselineCalendar` and only the calendar's own weekday survive MSPDI and `.yppx`; a task on it inherits Standard's week, skips its own Friday off and finishes Mon 9 |
