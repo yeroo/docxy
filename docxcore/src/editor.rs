@@ -437,9 +437,21 @@ impl Editor {
     /// Insert a tab (`<w:tab/>`) at the caret. A tab is its own inline in the
     /// model (not a `\t` character in run text), so it advances to the next tab
     /// stop when rendered — a literal `\t` would collapse to nothing.
+    ///
+    /// The tab takes the formatting typing at the caret would (a tab typed in
+    /// bold text is bold, as in Word), so text typed after it keeps that too,
+    /// except next to a hyperlink: the tab never lands inside the link, so it
+    /// takes the formatting before the link, not the link's style (see
+    /// `tab_props_at`).
     pub fn insert_tab(&mut self) {
+        if self.has_selection() {
+            self.delete_selection();
+        }
+        let props = resolve_para(&self.doc.body, &self.caret.path)
+            .map(|p| tab_props_at(&p.content, self.caret.offset))
+            .unwrap_or_default();
         self.paste(&Clip {
-            paras: vec![vec![Inline::Tab(crate::model::RunProps::default())]],
+            paras: vec![vec![Inline::Tab(props)]],
         });
     }
 
@@ -2091,8 +2103,9 @@ fn editor_text(content: &[Inline]) -> String {
 /// …). When that inline is a run or hyperlink, the replacement lands in it and
 /// takes its formatting (as Word does), and it never goes empty mid-edit.
 /// When it is a tab or break (a match starting with `\t`/`\n`), there is no
-/// run to take: the replacement goes into the following run, or a new
-/// unformatted run, right where the tab or break was.
+/// run to take: the replacement takes the formatting typing there would (see
+/// [`typing_props`]: a tab's own), joining the following run only when that
+/// matches, right where the tab or break was.
 fn replace_range_in_content(content: &mut Vec<Inline>, start: usize, end: usize, with: &str) {
     if end <= start {
         for (k, ch) in with.chars().enumerate() {
@@ -2273,75 +2286,126 @@ fn runs_delete(runs: &mut Vec<Run>, idx: usize) {
 }
 
 fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
-    let mut acc = 0;
-    for i in 0..content.len() {
-        let l = inline_len(&content[i]);
-        if o <= acc + l {
-            let local = o - acc;
-            match &mut content[i] {
-                Inline::Run(r) => {
-                    run_insert(r, local, ch);
-                    return;
-                }
-                Inline::Hyperlink(h) => {
-                    runs_insert(&mut h.runs, local, ch);
-                    return;
-                }
-                Inline::Tab(_)
-                | Inline::Break(_)
-                | Inline::SmartArt { .. }
-                | Inline::Chart { .. }
-                | Inline::Equation { .. }
-                | Inline::Field { .. }
-                | Inline::TextBox { .. }
-                | Inline::Revision { .. }
-                | Inline::UnsupportedRevision { .. }
-                | Inline::FootnoteRef { .. }
-                | Inline::Raw(_) => {
-                    if local == 0 {
-                        if i > 0 {
-                            if let Inline::Run(r) = &mut content[i - 1] {
-                                let rl = r.text.chars().count();
-                                run_insert(r, rl, ch);
-                                return;
-                            }
-                        }
-                        content.insert(
-                            i,
-                            Inline::Run(Run {
-                                text: ch.to_string(),
-                                props: RunProps::default(),
-                            }),
-                        );
-                        return;
-                    } else {
-                        if let Some(Inline::Run(r)) = content.get_mut(i + 1) {
-                            run_insert(r, 0, ch);
-                            return;
-                        }
-                        content.insert(
-                            i + 1,
-                            Inline::Run(Run {
-                                text: ch.to_string(),
-                                props: RunProps::default(),
-                            }),
-                        );
+    let Some((i, local)) = locate(content, o) else {
+        if let Some(Inline::Run(r)) = content.last_mut() {
+            let rl = r.text.chars().count();
+            run_insert(r, rl, ch);
+        } else {
+            let props = end_props(content);
+            content.push(Inline::Run(Run {
+                text: ch.to_string(),
+                props,
+            }));
+        }
+        return;
+    };
+    match &mut content[i] {
+        Inline::Run(r) => run_insert(r, local, ch),
+        Inline::Hyperlink(h) => runs_insert(&mut h.runs, local, ch),
+        Inline::Tab(_)
+        | Inline::Break(_)
+        | Inline::SmartArt { .. }
+        | Inline::Chart { .. }
+        | Inline::Equation { .. }
+        | Inline::Field { .. }
+        | Inline::TextBox { .. }
+        | Inline::Revision { .. }
+        | Inline::UnsupportedRevision { .. }
+        | Inline::FootnoteRef { .. }
+        | Inline::Raw(_) => {
+            let props = typing_props(content, i, local);
+            // `local == 0` only happens at `i == 0`: any later caret at an
+            // inline's start is claimed by the inline before it.
+            let at = if local == 0 { i } else { i + 1 };
+            if local > 0 {
+                if let Some(Inline::Run(r)) = content.get_mut(at) {
+                    if r.props == props {
+                        run_insert(r, 0, ch);
                         return;
                     }
                 }
             }
+            content.insert(
+                at,
+                Inline::Run(Run {
+                    text: ch.to_string(),
+                    props,
+                }),
+            );
+        }
+    }
+}
+
+/// The inline holding caret offset `o`, and the offset within it: the first
+/// inline whose end is at or past `o`, so a caret between two inlines belongs
+/// to the one before it. `None` past the end of the content.
+fn locate(content: &[Inline], o: usize) -> Option<(usize, usize)> {
+    let mut acc = 0;
+    for (i, inline) in content.iter().enumerate() {
+        let l = inline_len(inline);
+        if o <= acc + l {
+            return Some((i, o - acc));
         }
         acc += l;
     }
-    if let Some(Inline::Run(r)) = content.last_mut() {
-        let rl = r.text.chars().count();
-        run_insert(r, rl, ch);
-    } else {
-        content.push(Inline::Run(Run {
-            text: ch.to_string(),
-            props: RunProps::default(),
-        }));
+    None
+}
+
+/// The formatting an inline hands to text typed next to it: a run's, or a
+/// tab's (a tab is a run in OOXML and keeps its `w:rPr`). Hyperlinks, breaks
+/// and zero-width inlines are not sources; a link's style is not extended to
+/// text typed outside the link.
+fn source_props(inline: &Inline) -> Option<&RunProps> {
+    match inline {
+        Inline::Run(r) => Some(&r.props),
+        Inline::Tab(props) => Some(props),
+        _ => None,
     }
+}
+
+/// The nearest formatting source before inline `i`.
+fn source_before(content: &[Inline], i: usize) -> Option<&RunProps> {
+    content[..i.min(content.len())]
+        .iter()
+        .rev()
+        .find_map(source_props)
+}
+
+/// The nearest formatting source at or after inline `i`.
+fn source_from(content: &[Inline], i: usize) -> Option<&RunProps> {
+    content.iter().skip(i).find_map(source_props)
+}
+
+/// Run properties a character typed at `local` within the non-run inline at
+/// `i` takes, following Word (the formatting of the character before it; at
+/// the paragraph start, of the character after it):
+/// - at the paragraph start (`local == 0`): the nearest source at or after `i`;
+/// - after a tab: the tab's own formatting;
+/// - after a break (which records none): the run or tab right after it, the
+///   rest of the break's own run in a loaded document; failing that, the
+///   nearest source before, then after, the break.
+fn typing_props(content: &[Inline], i: usize, local: usize) -> RunProps {
+    if local == 0 {
+        return source_from(content, i).cloned().unwrap_or_default();
+    }
+    if let Inline::Tab(props) = &content[i] {
+        return props.clone();
+    }
+    content
+        .get(i + 1)
+        .and_then(source_props)
+        .or_else(|| source_before(content, i))
+        .or_else(|| source_from(content, i + 1))
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Run properties a character typed past the end of `content` takes, when the
+/// last inline is not a run.
+fn end_props(content: &[Inline]) -> RunProps {
+    source_before(content, content.len())
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn content_delete(content: &mut Vec<Inline>, idx: usize) {
@@ -2444,7 +2508,13 @@ fn range_all_have(
                     }
                 }
             }
-            Inline::Tab(_) | Inline::Break(_) => pos += 1,
+            // A tab is a formatted character (see `edit_run_range`).
+            Inline::Tab(props) => {
+                if !check(props, 1, &mut pos) {
+                    return false;
+                }
+            }
+            Inline::Break(_) => pos += 1,
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -2528,7 +2598,15 @@ fn edit_run_range(
                 pos = p;
                 out.push(Inline::Hyperlink(h));
             }
+            // A tab is a run in OOXML: formatting applies to it like to any
+            // character, and typing after it takes its props. Only the props
+            // of `mid_fn`'s result are kept; its text stays a tab.
             Inline::Tab(rp) => {
+                let rp = if (start..end).contains(&pos) {
+                    mid_fn("\t", &rp).props
+                } else {
+                    rp
+                };
                 out.push(Inline::Tab(rp));
                 pos += 1;
             }
@@ -2602,47 +2680,40 @@ fn title_case(s: &str) -> String {
 
 /// Run properties that `content_insert` will give a character at this caret.
 fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
-    let mut acc = 0;
-    for (i, inline) in content.iter().enumerate() {
-        let len = inline_len(inline);
-        if offset <= acc + len {
-            let local = offset - acc;
-            return match inline {
-                Inline::Run(r) => r.props.clone(),
-                Inline::Hyperlink(h) => {
-                    let mut run_acc = 0;
-                    h.runs
-                        .iter()
-                        .find(|r| {
-                            let found = local <= run_acc + r.text.chars().count();
-                            run_acc += r.text.chars().count();
-                            found
-                        })
-                        .or_else(|| h.runs.last())
-                        .map(|r| r.props.clone())
-                        .unwrap_or_default()
-                }
-                _ if local == 0 => content
-                    .get(i.wrapping_sub(1))
-                    .and_then(|prev| match prev {
-                        Inline::Run(r) => Some(r.props.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
-                _ => content
-                    .get(i + 1)
-                    .and_then(|next| match next {
-                        Inline::Run(r) => Some(r.props.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
-            };
+    let Some((i, local)) = locate(content, offset) else {
+        return match content.last() {
+            Some(Inline::Run(r)) => r.props.clone(),
+            _ => end_props(content),
+        };
+    };
+    match &content[i] {
+        Inline::Run(r) => r.props.clone(),
+        Inline::Hyperlink(h) => {
+            let mut run_acc = 0;
+            h.runs
+                .iter()
+                .find(|r| {
+                    let found = local <= run_acc + r.text.chars().count();
+                    run_acc += r.text.chars().count();
+                    found
+                })
+                .or_else(|| h.runs.last())
+                .map(|r| r.props.clone())
+                .unwrap_or_default()
         }
-        acc += len;
+        _ => typing_props(content, i, local),
     }
-    match content.last() {
-        Some(Inline::Run(r)) => r.props.clone(),
-        _ => RunProps::default(),
+}
+
+/// Run properties a tab inserted at this caret takes: what typing there would
+/// give, except next to a hyperlink. The tab never lands inside the link, so
+/// it takes the nearest source before the link rather than the link's style.
+fn tab_props_at(content: &[Inline], offset: usize) -> RunProps {
+    match locate(content, offset) {
+        Some((i, _)) if matches!(content[i], Inline::Hyperlink(_)) => {
+            source_before(content, i).cloned().unwrap_or_default()
+        }
+        _ => run_props_at(content, offset),
     }
 }
 
@@ -2674,8 +2745,9 @@ mod tests {
         ];
         assert!(!run_props_at(&with_tab, 0).bold);
         assert!(!run_props_at(&with_tab, 1).bold);
+        // No run before the break: typing takes the next text run's props (#120).
         let with_break = vec![Inline::Break(BreakKind::Line), content[1].clone()];
-        assert!(!run_props_at(&with_break, 0).bold);
+        assert!(run_props_at(&with_break, 0).bold);
         assert!(run_props_at(&with_break, 1).bold);
         let with_empty = vec![
             Inline::Run(Run {
@@ -2727,6 +2799,392 @@ mod tests {
             assert!(inserted.text.starts_with('z'));
             assert_eq!(inserted.props, expected);
         }
+    }
+
+    /// Word's rule next to a tab, break or zero-width inline (#120): a typed
+    /// character takes the formatting of the character before it (a tab's own,
+    /// or for a break the rest of its run after it); at the paragraph start,
+    /// that of the character after it. `run_props_at` must predict exactly what
+    /// the insert produces.
+    #[test]
+    fn typing_next_to_a_non_run_follows_words_rule_120() {
+        let go_back = || Inline::Raw(r#"<w:bookmarkStart w:id="0" w:name="_GoBack"/>"#.into());
+        let plain = RunProps::default;
+        let cases: Vec<(&str, Vec<Inline>, usize, bool)> = vec![
+            (
+                "after a trailing bold tab",
+                vec![run("Name:", bold()), Inline::Tab(bold())],
+                6,
+                true,
+            ),
+            (
+                "after a trailing plain tab: the tab's own formatting wins",
+                vec![run("Name:", bold()), Inline::Tab(plain())],
+                6,
+                false,
+            ),
+            (
+                "after a trailing line break",
+                vec![run("Name", bold()), Inline::Break(BreakKind::Line)],
+                5,
+                true,
+            ),
+            (
+                "after a break, the rest of its own run follows (r1)",
+                vec![
+                    run("a", plain()),
+                    Inline::Break(BreakKind::Line),
+                    run("b", bold()),
+                ],
+                2,
+                true,
+            ),
+            (
+                "after a break, a tab from its own run follows",
+                vec![
+                    run("a", plain()),
+                    Inline::Break(BreakKind::Line),
+                    Inline::Tab(bold()),
+                    run("x", bold()),
+                ],
+                2,
+                true,
+            ),
+            (
+                "after a bold tab starting a bold run (r1)",
+                vec![
+                    run("Name:", plain()),
+                    Inline::Tab(bold()),
+                    run("John", bold()),
+                ],
+                6,
+                true,
+            ),
+            (
+                "after a bold tab, before a zero-width inline",
+                vec![Inline::Tab(bold()), go_back(), run("b", plain())],
+                1,
+                true,
+            ),
+            (
+                "before a leading raw bookmark",
+                vec![go_back(), run("x", bold())],
+                0,
+                true,
+            ),
+            (
+                "before a leading field",
+                vec![field("F"), run("x", bold())],
+                0,
+                true,
+            ),
+            (
+                "before a leading bold tab",
+                vec![Inline::Tab(bold()), run("x", plain())],
+                0,
+                true,
+            ),
+            (
+                "before a leading plain tab: the tab is the character after",
+                vec![Inline::Tab(plain()), run("x", bold())],
+                0,
+                false,
+            ),
+            (
+                "before a leading break, skipped",
+                vec![Inline::Break(BreakKind::Line), run("x", bold())],
+                0,
+                true,
+            ),
+        ];
+        for (name, mut content, offset, want_bold) in cases {
+            let expected = run_props_at(&content, offset);
+            content_insert(&mut content, offset, 'z');
+            assert_eq!(
+                editor_text(&content).chars().nth(offset),
+                Some('z'),
+                "{name}"
+            );
+            let inserted = content
+                .iter()
+                .find_map(|i| match i {
+                    Inline::Run(r) if r.text.contains('z') => Some(r),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name}: no run holds the typed char"));
+            assert_eq!(
+                inserted.props, expected,
+                "{name}: run_props_at mispredicted"
+            );
+            assert_eq!(inserted.props.bold, want_bold, "{name}");
+        }
+    }
+
+    #[test]
+    fn typing_after_a_tab_or_break_joins_the_next_run_only_when_props_match_120() {
+        let plain = RunProps::default;
+        let mut same = vec![run("a", plain()), Inline::Tab(plain()), run("b", plain())];
+        content_insert(&mut same, 2, 'z');
+        assert_eq!(
+            same,
+            vec![run("a", plain()), Inline::Tab(plain()), run("zb", plain())]
+        );
+        let mut differs = vec![
+            run("Name:", bold()),
+            Inline::Tab(bold()),
+            run("John", plain()),
+        ];
+        content_insert(&mut differs, 6, 'z');
+        assert_eq!(
+            differs,
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(bold()),
+                run("z", bold()),
+                run("John", plain()),
+            ]
+        );
+        let mut after_break = vec![
+            run("a", plain()),
+            Inline::Break(BreakKind::Line),
+            run("b", bold()),
+        ];
+        content_insert(&mut after_break, 2, 'z');
+        assert_eq!(
+            after_break,
+            vec![
+                run("a", plain()),
+                Inline::Break(BreakKind::Line),
+                run("zb", bold()),
+            ]
+        );
+    }
+
+    #[test]
+    fn typing_after_an_inserted_tab_keeps_bold_120() {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content: vec![run("Name:", bold())],
+            })],
+        });
+        ed.caret = Caret::at(vec![0], 5);
+        ed.insert_tab();
+        assert_eq!(
+            first_para(&ed).content[1],
+            Inline::Tab(bold()),
+            "a tab typed in bold text is bold"
+        );
+        assert!(ed.caret_props().bold, "the ribbon shows Bold after the tab");
+        ed.insert_char('x');
+        assert_eq!(etext(&ed), "Name:\tx");
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("Name:", bold()), Inline::Tab(bold()), run("x", bold())]
+        );
+    }
+
+    #[test]
+    fn a_tab_inserted_next_to_a_hyperlink_does_not_take_its_style_120() {
+        let link_props = RunProps {
+            underline: true,
+            color: Some("0563C1".into()),
+            style_id: Some("Hyperlink".into()),
+            ..Default::default()
+        };
+        let link = Inline::Hyperlink(Hyperlink {
+            target: Some("https://example.com".into()),
+            anchor: None,
+            rel_id: None,
+            runs: vec![Run {
+                text: "site".into(),
+                props: link_props.clone(),
+            }],
+            content: Vec::new(),
+            raw: None,
+            content_changed: false,
+        });
+        for (content, caret, want) in [
+            (vec![link.clone()], 4, RunProps::default()),
+            (vec![run("see ", bold()), link.clone()], 8, bold()),
+        ] {
+            let mut ed = Editor::new(Document {
+                body: vec![Block::Paragraph(Paragraph {
+                    props: ParProps::default(),
+                    content,
+                })],
+            });
+            ed.caret = Caret::at(vec![0], caret);
+            assert_eq!(ed.caret_props(), link_props, "typing here extends the link");
+            ed.insert_tab();
+            ed.insert_char('x');
+            let tab = first_para(&ed)
+                .content
+                .iter()
+                .find_map(|i| match i {
+                    Inline::Tab(props) => Some(props.clone()),
+                    _ => None,
+                })
+                .expect("a tab was inserted");
+            assert_eq!(tab, want, "the tab outside the link");
+            let x = first_para(&ed)
+                .content
+                .iter()
+                .find_map(|i| match i {
+                    Inline::Run(r) if r.text.contains('x') => Some(r.props.clone()),
+                    _ => None,
+                })
+                .expect("x is in a plain run outside the link");
+            assert_eq!(x, want, "text typed after the tab");
+        }
+    }
+
+    /// An editor over one paragraph holding `content`, with `[start, end)`
+    /// selected.
+    fn selected(content: Vec<Inline>, start: usize, end: usize) -> Editor {
+        let mut ed = Editor::new(Document {
+            body: vec![Block::Paragraph(Paragraph {
+                props: ParProps::default(),
+                content,
+            })],
+        });
+        ed.anchor = Some(Caret::at(vec![0], start));
+        ed.caret = Caret::at(vec![0], end);
+        ed
+    }
+
+    /// Formatting a selection formats the tabs in it too (a tab is a run in
+    /// OOXML), so typing after a tab keeps the line's formatting (#120 r2).
+    #[test]
+    fn bolding_a_line_bolds_its_tab_and_typing_after_it_is_bold_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(
+            vec![
+                run("Name:", plain()),
+                Inline::Tab(plain()),
+                run("John", plain()),
+            ],
+            0,
+            10,
+        );
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(bold()),
+                run("John", bold())
+            ]
+        );
+        ed.anchor = None;
+        ed.caret = Caret::at(vec![0], 6);
+        assert!(ed.caret_props().bold);
+        ed.insert_char('x');
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(bold()),
+                run("xJohn", bold())
+            ]
+        );
+    }
+
+    #[test]
+    fn unbolding_a_line_unbolds_its_tab_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(vec![run("Name:", bold()), Inline::Tab(bold())], 0, 6);
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("Name:", plain()), Inline::Tab(plain())]
+        );
+        ed.anchor = None;
+        ed.caret = Caret::at(vec![0], 6);
+        ed.insert_char('x');
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", plain()),
+                Inline::Tab(plain()),
+                run("x", plain())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plain_tab_in_bold_text_makes_the_toggle_bold_everything_120() {
+        let mut ed = selected(
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(RunProps::default()),
+                run("John", bold()),
+            ],
+            0,
+            10,
+        );
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("Name:", bold()),
+                Inline::Tab(bold()),
+                run("John", bold())
+            ],
+            "not every selected character was bold, so Ctrl+B turns bold on"
+        );
+    }
+
+    #[test]
+    fn a_tab_only_selection_formats_just_the_tab_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(
+            vec![run("a", plain()), Inline::Tab(plain()), run("b", plain())],
+            1,
+            2,
+        );
+        ed.toggle_bold();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("a", plain()), Inline::Tab(bold()), run("b", plain())]
+        );
+        ed.set_font_size(28);
+        ed.set_color(Some("FF0000".into()));
+        let Inline::Tab(props) = &first_para(&ed).content[1] else {
+            panic!("the tab is still a tab")
+        };
+        assert_eq!(props.size_half_pts, Some(28));
+        assert_eq!(props.color.as_deref(), Some("FF0000"));
+        assert_eq!(first_para(&ed).content[0], run("a", plain()));
+        assert_eq!(first_para(&ed).content[2], run("b", plain()));
+    }
+
+    #[test]
+    fn clearing_formatting_clears_a_tabs_props_120() {
+        let mut ed = selected(vec![run("a", bold()), Inline::Tab(bold())], 0, 2);
+        ed.clear_run_formatting();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![
+                run("a", RunProps::default()),
+                Inline::Tab(RunProps::default())
+            ]
+        );
+    }
+
+    #[test]
+    fn changing_case_over_a_tab_keeps_it_a_tab_120() {
+        let plain = RunProps::default;
+        let mut ed = selected(
+            vec![run("ab", plain()), Inline::Tab(plain()), run("cd", plain())],
+            0,
+            5,
+        );
+        ed.cycle_case();
+        assert_eq!(
+            first_para(&ed).content,
+            vec![run("Ab", plain()), Inline::Tab(plain()), run("Cd", plain())]
+        );
     }
 
     fn para(text: &str) -> Block {
@@ -3544,10 +4002,16 @@ mod tests {
         assert_eq!((ms[0].start, ms[0].end), (1, 3));
         assert_eq!(ed.replace_all("\tb", "X", false), 1);
         assert_eq!(etext(&ed), "aX c");
-        // No run to inherit from at a tab: the replacement joins the next run.
+        // No run to inherit from at a tab: the replacement takes the props typing
+        // there would, the tab's own (#120; Word's replace takes the first matched
+        // character's formatting), not the next run's.
         assert_eq!(
             first_para(&ed).content,
-            vec![run("a", RunProps::default()), run("X c", bold())]
+            vec![
+                run("a", RunProps::default()),
+                run("X", RunProps::default()),
+                run(" c", bold())
+            ]
         );
         // A tab with nothing after it: a new run in the tab's place.
         let mut content = vec![
