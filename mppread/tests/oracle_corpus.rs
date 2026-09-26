@@ -232,6 +232,16 @@ fn project_2024_oracles() {
             check_pair(mpp, xml, false);
         }
     }
+    // Percentage, elapsed and estimated lags (#104): each is compared in its
+    // own kind and format, not only as minutes.
+    let lag = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/lag");
+    if lag.exists() {
+        let cases = pairs(&lag, "");
+        assert_eq!(cases.len(), 2);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false);
+        }
+    }
     let manual = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/manual");
     if manual.exists() {
         let cases = pairs(&manual, "");

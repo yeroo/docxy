@@ -55,6 +55,20 @@ def text(el, tag, default=None):
     return default if child is None else child.text
 
 
+# LagFormats whose LinkLag is the percentage itself, not tenths of a minute
+# (#104); COM's TaskDependency.Lag is that percentage too.
+PERCENT_FORMATS = (19, 51)
+
+
+def pred_of(link):
+    """(predecessor UID, type code, lag, LagFormat): the lag in minutes of
+    working or elapsed time, or a percentage, as COM reports it."""
+    fmt = int(text(link, "LagFormat", "7"))
+    lag = int(text(link, "LinkLag", "0"))
+    return (int(text(link, "PredecessorUID")), int(text(link, "Type")),
+            lag if fmt in PERCENT_FORMATS else lag // 10, fmt)
+
+
 def read_fixture(path):
     """The tasks as the file states them: inputs and embedded oracle."""
     root = ET.parse(path).getroot()
@@ -76,10 +90,7 @@ def read_fixture(path):
             "ctype": int(text(t, "ConstraintType", "0")),
             "cdate": text(t, "ConstraintDate"),
             "calendar": "None" if cal is None else calendars[cal],
-            # (predecessor UID, type code, lag in minutes); LinkLag is tenths.
-            "preds": sorted((int(text(l, "PredecessorUID")), int(text(l, "Type")),
-                             int(text(l, "LinkLag", "0")) // 10)
-                            for l in t.findall("p:PredecessorLink", NS)),
+            "preds": sorted(pred_of(l) for l in t.findall("p:PredecessorLink", NS)),
             "start": text(t, "Start"),
             "finish": text(t, "Finish"),
             "slack": int(text(t, "TotalSlack")) // 10,
@@ -140,7 +151,7 @@ def when(value):
 
 
 def pred_text(preds):
-    return ",".join(f"{u}{LINK.get(k, k)}{lag:+d}m" for u, k, lag in preds) or "-"
+    return ",".join(f"{u}{LINK.get(k, k)}{lag:+d}/{fmt}" for u, k, lag, fmt in preds) or "-"
 
 
 def check(app, path, tmpdir):
@@ -194,7 +205,7 @@ def check(app, path, tmpdir):
             if exp is None:
                 continue
             label = f"{t.UniqueID} {t.Name}"
-            got_preds = sorted((d.From.UniqueID, d.Type, d.Lag)
+            got_preds = sorted((d.From.UniqueID, d.Type, d.Lag, d.LagType)
                                for d in t.TaskDependencies if d.To.UniqueID == t.UniqueID)
             inputs = [
                 ("preds", pred_text(exp["preds"]), pred_text(got_preds)),

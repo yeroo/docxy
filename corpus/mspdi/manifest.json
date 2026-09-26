@@ -252,6 +252,17 @@
         "link-fs"
       ],
       "desc": "A resource calendar derived from Standard keeps Standard's holiday on a weekday it states itself, and its own exception overrides Standard's."
+    },
+    {
+      "file": "26-lag-percent-elapsed.xml",
+      "category": "link",
+      "tags": [
+        "link",
+        "lag",
+        "lag-percent",
+        "lag-elapsed"
+      ],
+      "desc": "Percentage, elapsed and estimated-elapsed lags on FS, SS, FF and SF links, forwards and backwards across a weekend, as Project 2024 schedules them."
     }
   ]
 }

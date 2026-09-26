@@ -18,7 +18,9 @@
 //! file 13's resource and assignment fields of issue #84, chosen to leave its
 //! schedule unchanged. Files 24 and 25 (calendar exceptions, issue #126) were
 //! checked against Project 2024 by `verify_mspdi_project.py`, both as
-//! generated and as `write_mspdi` writes them back. Slack invariants below also check
+//! generated and as `write_mspdi` writes them back, as was file 26 (percentage
+//! and elapsed lags, issue #104), whose plan and values Project itself
+//! produced (`corpus/tools/gen_mpp_lag_cases.py`). Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
