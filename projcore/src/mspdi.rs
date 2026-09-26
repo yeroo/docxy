@@ -91,7 +91,7 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     // writing it back would lose its namespace binding (an
                     // unbound `x:` prefix, or a foreign `xmlns` moved into
                     // MSPDI's) or attributes such as `xsi:nil`.
-                    _ if name.contains(':') || !p.attrs().is_empty() => p.skip_element(),
+                    _ if !kept_as_element(&p) => p.skip_element(),
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
                             set_option(&mut proj.options, name, text);
@@ -728,7 +728,7 @@ fn parse_extended_attribute_definitions(p: &mut XmlParser, out: &mut Vec<XmlElem
     loop {
         match p.next() {
             Event::Start if p.name() == "ExtendedAttribute" && kept_as_element(p) => {
-                out.push(parse_element(p));
+                out.push(parse_element(p, 1));
             }
             Event::Start => p.skip_element(),
             Event::End | Event::Eof => break,
@@ -744,11 +744,18 @@ fn kept_as_element(p: &XmlParser) -> bool {
     !p.name().contains(':') && p.attrs().is_empty()
 }
 
-/// Read the element whose `Start` was just consumed, and its children, as an
-/// [`XmlElement`]. A leaf keeps its decoded text verbatim; the text between an
-/// element's children is dropped (even when every child was), and so is a
-/// child [`kept_as_element`] refuses, with its whole subtree.
-fn parse_element(p: &mut XmlParser) -> XmlElement {
+/// How deep a kept definition goes, counting its `<ExtendedAttribute>` as 1.
+/// Project's deepest is 4 (`ExtendedAttribute/ValueList/Value/ID`); the bound
+/// keeps a crafted file from overflowing the stack of the recursive reader,
+/// writer, and the tree's derived `Clone`/`PartialEq`/`Drop`.
+const MAX_DEFINITION_DEPTH: usize = 32;
+
+/// Read the element whose `Start` was just consumed, at `depth`, and its
+/// children, as an [`XmlElement`]. A leaf keeps its decoded text verbatim; the
+/// text between an element's children is dropped (even when every child
+/// was), and so is a child [`kept_as_element`] refuses, or one past
+/// [`MAX_DEFINITION_DEPTH`], with its whole subtree.
+fn parse_element(p: &mut XmlParser, depth: usize) -> XmlElement {
     let mut element = XmlElement {
         name: p.name().to_string(),
         ..XmlElement::default()
@@ -759,8 +766,8 @@ fn parse_element(p: &mut XmlParser) -> XmlElement {
             Event::Text => XmlParser::append_decoded(p.text(), &mut element.text),
             Event::Start => {
                 leaf = false;
-                if kept_as_element(p) {
-                    element.children.push(parse_element(p));
+                if depth < MAX_DEFINITION_DEPTH && kept_as_element(p) {
+                    element.children.push(parse_element(p, depth + 1));
                 } else {
                     p.skip_element();
                 }
@@ -4203,6 +4210,35 @@ mod tests {
         assert!(empty.extended_attribute_definitions.is_empty());
         assert!(empty.options.is_empty());
         assert!(!write_mspdi(&empty).contains("ExtendedAttributes"));
+    }
+
+    #[test]
+    fn definitions_past_the_depth_bound_are_dropped_not_overflowed() {
+        let deep = 10_000;
+        let xml = format!(
+            "<Project><ExtendedAttributes><ExtendedAttribute><FieldID>1</FieldID>\
+             {}x{}</ExtendedAttribute></ExtendedAttributes><Tasks/></Project>",
+            "<a>".repeat(deep),
+            "</a>".repeat(deep)
+        );
+        let proj = read_mspdi(&xml).unwrap();
+        let definition = &proj.extended_attribute_definitions[0];
+        assert_eq!(definition.children[0], leaf("FieldID", "1"));
+        // The chain of <a> stops at the bound (the ExtendedAttribute is depth
+        // 1, its first <a> depth 2). The last kept one had a child, so it is
+        // not a leaf and keeps no text.
+        let mut depth = 2;
+        let mut element = &definition.children[1];
+        while let Some(child) = element.children.first() {
+            element = child;
+            depth += 1;
+        }
+        assert_eq!((depth, element.text.as_str()), (MAX_DEFINITION_DEPTH, ""));
+        let back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        assert_eq!(
+            back.extended_attribute_definitions,
+            proj.extended_attribute_definitions
+        );
     }
 
     #[test]
