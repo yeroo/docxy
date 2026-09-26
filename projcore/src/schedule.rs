@@ -5381,6 +5381,12 @@ mod tests {
         let z2 = milestone(18, "Z2", z_preds, fnlt, at(13, 17));
         let mut z3 = task(19, "Z3", 0);
         z3.predecessors = vec![eh19];
+        // Both FS predecessors (G and M) move to Sat 7 17:00: Z6 follows,
+        // and Z7's FNLT Fri 6 17:00 holds it.
+        let both = vec![Predecessor::fs(5), Predecessor::fs(3)];
+        let mut z6 = task(20, "Z6", 0);
+        z6.predecessors = both.clone();
+        let z7 = milestone(21, "Z7", both, fnlt, at(6, 17));
         let mut proj = Project {
             start_date: Some(at(2, 8)),
             tasks: vec![
@@ -5403,6 +5409,8 @@ mod tests {
                 z,
                 z2,
                 z3,
+                z6,
+                z7,
             ],
             ..Project::default()
         };
@@ -5428,5 +5436,7 @@ mod tests {
         assert_eq!(dates(17), (at(7, 17), at(7, 17)), "Z");
         assert_eq!(dates(18), (at(7, 17), at(7, 17)), "Z2");
         assert_eq!(dates(19), (at(7, 12), at(7, 12)), "Z3");
+        assert_eq!(dates(20), (at(7, 17), at(7, 17)), "Z6");
+        assert_eq!(dates(21), (at(6, 17), at(6, 17)), "Z7");
     }
 }
