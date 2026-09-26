@@ -431,6 +431,103 @@ pub struct Resource {
     pub work_min: Option<i64>,
     pub regular_work_min: Option<i64>,
     pub remaining_work_min: Option<i64>,
+    pub overtime_work_min: Option<i64>,
+    pub cost: Option<Rate>,
+    pub email_address: Option<String>,
+    pub notes: Option<String>,
+    /// The first and last dates the resource is available, as Project
+    /// derives them from `availability_periods`.
+    pub available_from: Option<DateTime>,
+    pub available_to: Option<DateTime>,
+    /// Custom field values, in file order.
+    pub extended_attributes: Vec<ExtendedAttributeValue>,
+    /// Saved plans, sorted by number with at most one record per slot (0..=10).
+    pub baselines: Vec<ResourceBaseline>,
+    /// Units available over date ranges, in file order. Project takes capacity
+    /// from these over `max_units`, so an edit that changes `max_units` must
+    /// also update the period it falls in.
+    pub availability_periods: Vec<AvailabilityPeriod>,
+    /// Cost rate tables A-E over date ranges, in file order. Project costs
+    /// from these: table A's current entry mirrors `standard_rate`,
+    /// `overtime_rate` and `cost_per_use`, so an edit of those must also
+    /// update that entry.
+    pub rates: Vec<RateEntry>,
+}
+
+impl Resource {
+    pub fn baseline(&self, number: u8) -> Option<&ResourceBaseline> {
+        self.baselines.iter().find(|b| b.number == number)
+    }
+
+    /// Replace the whole record for a slot, maintaining unique, sorted slots.
+    pub fn set_baseline_slot(&mut self, baseline: ResourceBaseline) {
+        self.baselines.retain(|b| b.number != baseline.number);
+        self.baselines.push(baseline);
+        self.baselines.sort_by_key(|b| b.number);
+    }
+}
+
+/// A recorded plan in one MSPDI baseline slot of a resource.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ResourceBaseline {
+    /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
+    pub number: u8,
+    /// Recorded work in whole minutes; None when omitted or invalid.
+    pub work_min: Option<i64>,
+    pub cost: Option<Rate>,
+    pub bcws: Option<Rate>,
+    pub bcwp: Option<Rate>,
+}
+
+/// A resource's units over a date range (MSPDI `AvailabilityPeriod`).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct AvailabilityPeriod {
+    pub available_from: Option<DateTime>,
+    pub available_to: Option<DateTime>,
+    /// Decimal text, e.g. `0.5` = 50%.
+    pub available_units: Option<Rate>,
+}
+
+/// One entry of a resource's cost rate tables (MSPDI `Rates/Rate`).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct RateEntry {
+    pub rates_from: Option<DateTime>,
+    pub rates_to: Option<DateTime>,
+    /// 0 = table A .. 4 = table E.
+    pub rate_table: Option<u8>,
+    pub standard_rate: Option<Rate>,
+    /// The display unit code, as on [`Resource::standard_rate_format`].
+    pub standard_rate_format: Option<u8>,
+    pub overtime_rate: Option<Rate>,
+    pub overtime_rate_format: Option<u8>,
+    pub cost_per_use: Option<Rate>,
+}
+
+/// A custom field's value on a resource or assignment (MSPDI
+/// `ExtendedAttribute`). The field's definition is not modeled.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ExtendedAttributeValue {
+    /// The field's ID, kept as written.
+    pub field_id: String,
+    pub value: Option<String>,
+    pub value_guid: Option<String>,
+    pub duration_format: Option<u8>,
+}
+
+/// One record of an assignment's work or cost spread over time (MSPDI
+/// `TimephasedData`), kept as written. `value` is a duration for the work
+/// types and a decimal for the cost types; it is not interpreted.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct TimephasedValue {
+    /// The MSPDI `Type` code, e.g. 1 assignment remaining work, 2 actual work.
+    pub kind: u8,
+    /// The owning assignment's UID, as written.
+    pub uid: Option<i32>,
+    pub start: Option<DateTime>,
+    pub finish: Option<DateTime>,
+    /// The time unit code.
+    pub unit: Option<u8>,
+    pub value: Option<String>,
 }
 
 /// An assignment of a resource to a task.
@@ -473,8 +570,26 @@ pub struct Assignment {
     /// Work less overtime, in whole minutes. An edit that changes `work_min`
     /// clears it, since keeping it would assert overtime nobody entered.
     pub regular_work_min: Option<i64>,
+    /// Overtime work in whole minutes and the assignment's cost. Like
+    /// `regular_work_min`, a units edit clears them.
+    pub overtime_work_min: Option<i64>,
+    pub cost: Option<Rate>,
+    /// Which of the resource's rate tables prices it: 0 = A .. 4 = E.
+    pub cost_rate_table: Option<u8>,
+    /// Delays as MSPDI stores them (tenths of a minute), not converted and not
+    /// applied by the scheduler. The format is a duration unit code.
+    pub delay: Option<i64>,
+    pub leveling_delay: Option<i64>,
+    pub leveling_delay_format: Option<u8>,
+    pub notes: Option<String>,
+    /// Custom field values, in file order.
+    pub extended_attributes: Vec<ExtendedAttributeValue>,
     /// Saved plans, sorted by number with at most one record per slot (0..=10).
     pub baselines: Vec<AssignmentBaseline>,
+    /// The work and cost spread over time, in file order. A units edit clears
+    /// it; a duration edit or reschedule leaves it as stale as `work_min`,
+    /// `start` and `finish`, which it then still agrees with.
+    pub timephased_data: Vec<TimephasedValue>,
 }
 
 impl Assignment {
