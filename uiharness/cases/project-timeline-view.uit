@@ -1,0 +1,17 @@
+test project timeline highlights the chart's visible range and follows its scroll
+  # 82 days of plan; the chart shows about 26 of them.
+  open ../fixtures/project-timeline-view.xml
+  assert timeline_start is Mon 1/5/26
+  assert timeline_finish is Fri 3/27/26
+  assert timeline_view_start is Mon 1/5/26
+  assert timeline_view_finish is Fri 1/30/26
+  shot project-timeline
+  key end alt t s
+  assert selected_name is Late
+  assert timeline_view_start is Sun 3/1/26
+  assert timeline_view_finish is Thu 3/26/26
+  assert dirty is false
+  shot project-timeline
+  key alt w g
+  assert timeline_view_start is Mon 1/5/26
+  shot window
