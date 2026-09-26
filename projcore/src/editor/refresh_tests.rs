@@ -235,6 +235,19 @@ fn removing_assignments_lowers_the_resource_totals() {
     assert_eq!((r.start, r.finish), (None, None));
 }
 
+#[test]
+fn a_delayed_assignment_still_finishes_with_its_task_after_a_duration_edit() {
+    let mut ed = staffed();
+    ed.proj.assignments[0].delay = Some(480 * 10);
+    ed = Editor::new(ed.proj);
+    ed.set_duration_min(1, 3 * 480).unwrap();
+    let a = assignment(&ed, 1);
+    // A day's delay leaves two days of work in a three-day task.
+    assert_eq!(a.work_min, 960);
+    assert_eq!((a.start, a.finish), (Some(at(6, 8)), Some(at(7, 17))));
+    assert_eq!(a.finish, Some(ed.schedule().get(1).unwrap().early_finish));
+}
+
 /// The `<name>` section of a saved plan.
 fn section<'a>(xml: &'a str, name: &str) -> &'a str {
     let open = xml.find(&format!("<{name}>")).unwrap();

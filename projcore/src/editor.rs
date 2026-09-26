@@ -1043,7 +1043,8 @@ fn work_for(duration_min: i64, units: f64) -> i64 {
 /// from, its work is duration x units once it has none (as after a milestone),
 /// and stays as read when a zero duration holds some. What described the old
 /// work is dropped as a units edit drops it ([`Assignment::set_work`]);
-/// progress is kept.
+/// progress is kept. A flat assignment delayed into its task works only from
+/// its `Delay` on, so it still finishes with the task.
 fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
     let t = &proj.tasks[i];
     if t.task_type == Some(TaskType::FixedWork) || proj.is_outline_summary(i) {
@@ -1061,7 +1062,8 @@ fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
             continue;
         }
         let work_min = match a.work_contour {
-            None | Some(0) => work_for(new_min, a.units),
+            // A delayed assignment works from its delay to the task finish.
+            None | Some(0) => work_for((new_min - crate::assign::delay_min(a)).max(0), a.units),
             Some(_) if old_min > 0 && a.work_min > 0 => {
                 (a.work_min as f64 * new_min as f64 / old_min as f64).round() as i64
             }
