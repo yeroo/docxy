@@ -634,7 +634,8 @@ pub struct Resource {
     pub assn_owner_guid: Option<String>,
     /// Outline code values, in file order.
     pub outline_codes: Vec<OutlineCodeValue>,
-    /// The resource's work and cost spread over time, in file order.
+    /// The resource's work and cost spread over time, in file order. Clear
+    /// Baseline drops its Baseline (slot 0) records.
     pub timephased_data: Vec<TimephasedValue>,
 }
 
@@ -733,10 +734,21 @@ impl TimephasedValue {
     /// Baseline1..10 have their own codes from 16 up.
     pub const BASELINE_WORK: u8 = 4;
     pub const BASELINE_COST: u8 = 5;
+    /// `Type` 7 and 8: the resource's Baseline (slot 0) work and cost.
+    /// Baseline1..10 have their own codes from 20 up (20/21, 26/27, ...).
+    pub const RESOURCE_BASELINE_WORK: u8 = 7;
+    pub const RESOURCE_BASELINE_COST: u8 = 8;
 
-    /// Whether this record belongs to the Baseline (slot 0).
+    /// Whether this record belongs to the Baseline (slot 0): 4/5 on an
+    /// assignment, 7/8 on a resource.
     pub fn is_baseline_slot_zero(&self) -> bool {
-        matches!(self.kind, Self::BASELINE_WORK | Self::BASELINE_COST)
+        matches!(
+            self.kind,
+            Self::BASELINE_WORK
+                | Self::BASELINE_COST
+                | Self::RESOURCE_BASELINE_WORK
+                | Self::RESOURCE_BASELINE_COST
+        )
     }
 }
 

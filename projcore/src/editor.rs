@@ -911,13 +911,19 @@ impl Editor {
     }
 
     /// Project › Schedule › Clear Baseline: remove the Baseline (slot 0) from
-    /// every task, resource and assignment, including the assignments'
-    /// timephased Baseline work and cost, as one undo step; Baseline1..10
-    /// stay. `false`, with history untouched, when there is none to clear.
+    /// every task, resource and assignment, including the resources' and
+    /// assignments' timephased Baseline work and cost, as one undo step;
+    /// Baseline1..10 stay. `false`, with history untouched, when there is
+    /// none to clear.
     pub fn clear_baseline(&mut self) -> Result<bool, String> {
         let proj = &self.proj;
         let has_task = proj.tasks.iter().any(|t| t.baseline(0).is_some());
-        let has_resource = proj.resources.iter().any(|r| r.baseline(0).is_some());
+        let has_resource = proj.resources.iter().any(|r| {
+            r.baseline(0).is_some()
+                || r.timephased_data
+                    .iter()
+                    .any(TimephasedValue::is_baseline_slot_zero)
+        });
         let has_assignment = proj.assignments.iter().any(|a| {
             a.baseline(0).is_some()
                 || a.timephased_data
@@ -933,6 +939,7 @@ impl Editor {
             }
             for r in &mut proj.resources {
                 r.baselines.retain(|b| b.number != 0);
+                r.timephased_data.retain(|t| !t.is_baseline_slot_zero());
             }
             for a in &mut proj.assignments {
                 a.baselines.retain(|b| b.number != 0);
@@ -3442,5 +3449,39 @@ mod tests {
         let before = state(&ed);
         assert_eq!(ed.clear_baseline(), Ok(false));
         assert_eq!(state(&ed), before);
+    }
+
+    /// #267: a resource's timephased Baseline (7 work, 8 cost) is its slot 0
+    /// too; Baseline1's (20) stays. It alone is enough to clear.
+    #[test]
+    fn clear_baseline_removes_resource_timephased_slot_zero() {
+        let mut proj = editor().project().clone();
+        proj.resources.push(Resource {
+            uid: 1,
+            id: 1,
+            name: "Crew".into(),
+            timephased_data: [7, 8, 20]
+                .map(|kind| TimephasedValue {
+                    kind,
+                    uid: Some(1),
+                    value: Some("PT8H0M0S".into()),
+                    ..TimephasedValue::default()
+                })
+                .into(),
+            ..Resource::default()
+        });
+        let kinds = |proj: &Project| -> Vec<u8> {
+            proj.resources[0]
+                .timephased_data
+                .iter()
+                .map(|t| t.kind)
+                .collect()
+        };
+        let mut ed = Editor::new(proj);
+        assert_eq!(ed.clear_baseline(), Ok(true));
+        assert_eq!(kinds(ed.project()), [20]);
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        assert_eq!(kinds(&crate::mspdi::read_mspdi(&xml).unwrap()), [20]);
+        assert_eq!(ed.clear_baseline(), Ok(false));
     }
 }
