@@ -189,8 +189,9 @@ and the search jumps to the next booking end or capacity change. Each
 assignment books its resource from its `Delay` into the task to the task's
 finish; a stored `LevelingDelay`, Project's last leveling, is not added. A
 resource that is free and available somewhere takes a task above its capacity
-there, and one with no capacity anywhere later is left overallocated, the task
-keeping its earliest start. A predecessor's leveling delay propagates to its
+there, and one with no capacity anywhere later is left overallocated: the task
+goes where every other resource fits, or keeps its earliest start when it has
+no other. A predecessor's leveling delay propagates to its
 successors, preserving every link's gap. v1 is single-calendar and delay-only,
 and treats a task's occupation as its wall-clock span; multi-calendar leveling
 and task splitting are future work. Leveling never moves a manual

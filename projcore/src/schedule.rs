@@ -1947,13 +1947,13 @@ fn place_all(
     start: i64,
     dur: i64,
 ) -> i64 {
-    let always = vec![(i64::MIN, 1.0)];
     let mut cand = start;
     loop {
         let mut next: Option<i64> = None;
         for &(rid, units, from) in res {
             let bk = bookings.get(&rid).map(|v| v.as_slice()).unwrap_or(&[]);
-            let cap = caps.get(&rid).unwrap_or(&always);
+            // Every work resource has a capacity; nothing else is booked.
+            let cap = &caps[&rid];
             let c = earliest_feasible(bk, cap, units, cand, from, dur);
             if c > cand {
                 next = Some(next.map_or(c, |n: i64| n.min(c)));
