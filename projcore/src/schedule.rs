@@ -1657,6 +1657,8 @@ impl Scheduler<'_> {
         let mut bookings: HashMap<i32, Vec<(i64, i64, f64)>> = HashMap::new();
         let mut start: HashMap<i32, DateTime> = HashMap::new();
         let mut finish: HashMap<i32, DateTime> = HashMap::new();
+        // Auto tasks whose leveled dates differ from their CPM dates.
+        let mut moved = std::collections::HashSet::new();
 
         // Manual tasks never move, so book them before placing anything else:
         // auto tasks earlier in topological order must level around them.
@@ -1693,7 +1695,6 @@ impl Scheduler<'_> {
             // there: a delay that ends in nonworking time can move the
             // successor less than it moved the predecessor, or only its
             // instant (#104).
-            let mut elapsed_moved = false;
             let floor = t
                 .predecessors
                 .iter()
@@ -1711,7 +1712,6 @@ impl Scheduler<'_> {
                             (pred.early_start, *start.get(&p.uid)?)
                         }
                     };
-                    elapsed_moved |= now != was;
                     let bound = |at: DateTime| tl.to_index(at.minutes().saturating_add(lag));
                     Some(bound(now) - bound(was))
                 })
@@ -1727,7 +1727,11 @@ impl Scheduler<'_> {
                     .or_default()
                     .push((placed, placed + t.duration_min, *units));
             }
-            let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 && !elapsed_moved {
+            // A predecessor can move only its instant, keeping its working
+            // index (an elapsed lag into nonworking time, #104); a successor
+            // that keeps that instant (a milestone, an SF finish) must follow.
+            let pred_moved = t.predecessors.iter().any(|p| moved.contains(&p.uid));
+            let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 && !pred_moved {
                 (cpm.early_start.minutes(), cpm.early_finish.minutes())
             } else {
                 let mut s_abs = tl.abs_start(placed);
@@ -1801,6 +1805,9 @@ impl Scheduler<'_> {
                     ),
                 )
             };
+            if (s_abs, f_abs) != (cpm.early_start.minutes(), cpm.early_finish.minutes()) {
+                moved.insert(t.uid);
+            }
             start.insert(t.uid, DateTime::from_minutes(s_abs));
             finish.insert(t.uid, DateTime::from_minutes(f_abs));
         }
@@ -5257,9 +5264,16 @@ mod tests {
         m.predecessors = vec![lag_link(1, LinkType::FinishStart, 2880, 8)];
         let mut g = task(5, "G", 480);
         g.predecessors = vec![lag_link(1, LinkType::FinishFinish, 2880, 8)];
+        // Zero-lag milestones after G and after M: only G's and M's instants
+        // move, not their working indices, and they must follow: Project's
+        // LevelNow puts both at Sat 7 17:00 too.
+        let mut h = task(6, "H", 0);
+        h.predecessors = vec![Predecessor::fs(5)];
+        let mut n = task(7, "N", 0);
+        n.predecessors = vec![Predecessor::fs(3)];
         let mut proj = Project {
             start_date: Some(at(2, 8)),
-            tasks: vec![task(4, "Busy", 480), task(1, "A", 3 * 480), d, m, g],
+            tasks: vec![task(4, "Busy", 480), task(1, "A", 3 * 480), d, m, g, h, n],
             ..Project::default()
         };
         proj.resources = vec![worker(1, "Shared", 1.0)];
@@ -5270,5 +5284,7 @@ mod tests {
         assert_eq!(dates(2), (at(9, 8), at(9, 17)));
         assert_eq!(dates(3), (at(7, 17), at(7, 17)));
         assert_eq!(dates(5), (at(6, 8), at(7, 17)));
+        assert_eq!(dates(6), (at(7, 17), at(7, 17)));
+        assert_eq!(dates(7), (at(7, 17), at(7, 17)));
     }
 }
