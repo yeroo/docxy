@@ -37,6 +37,12 @@ pub(super) struct ProjectView {
     pub width: f32,
     /// Whether the Timeline pane is shown: window view state, never saved.
     pub timeline: bool,
+    /// Gantt Chart Format › Bar Styles › Critical Tasks: critical bars drawn in
+    /// the critical colour. Window view state, never saved.
+    pub show_critical: bool,
+    /// Gantt Chart Format › Bar Styles › Baseline: baseline bars drawn under
+    /// the current bars. Window view state, never saved.
+    pub show_baseline: bool,
     /// The table pane width the user dragged the split bar to; `None` is the
     /// default. Window view state, never saved.
     pub split: Option<f32>,
@@ -63,8 +69,15 @@ impl ProjectView {
             exported: None,
             width: 590. + SCROLLBAR_W,
             timeline: true,
+            show_critical: true,
+            show_baseline: true,
             split: None,
         }
+    }
+
+    /// `bar` as the Gantt draws it under the Gantt Chart Format toggles.
+    pub fn styled_bar(&self, bar: GanttBar) -> GanttBar {
+        styled_bar(bar, self.show_critical, self.show_baseline)
     }
 
     /// Runs every frame, so it reveals the selected column only when the table
@@ -428,15 +441,22 @@ pub(super) fn project_state(
         ("table_w".into(), Json::Num(f64::from(v.table_w))),
         ("gantt_w".into(), Json::Num(f64::from(v.gantt_w))),
     ];
-    entries.extend(v.ed.project().tasks.iter().map(|t| {
-        (
-            format!("bar_{}", t.id),
-            Json::Str(
-                gantt_bar(&v.ed, t, scale)
-                    .map(GanttBar::state)
-                    .unwrap_or_else(|| "none".into()),
+    // What the Gantt draws, after the Gantt Chart Format toggles.
+    entries.extend(v.ed.project().tasks.iter().flat_map(|t| {
+        let bar = gantt_bar(&v.ed, t, scale).map(|b| v.styled_bar(b));
+        [
+            (
+                format!("bar_{}", t.id),
+                Json::Str(bar.map_or_else(|| "none".into(), GanttBar::state)),
             ),
-        )
+            (
+                format!("baseline_{}", t.id),
+                Json::Str(
+                    bar.and_then(|b| b.baseline)
+                        .map_or_else(|| "none".into(), |(s, e)| format!("{s}-{e}")),
+                ),
+            ),
+        ]
     }));
     entries.extend(project_cell_state(v));
     entries.extend(timeline_state(v));
@@ -1019,7 +1039,8 @@ pub(super) fn project_el(
                                                         gantt_strip(
                                                             task.and_then(|t| {
                                                                 gantt_bar(&v.ed, t, scale)
-                                                            }),
+                                                            })
+                                                            .map(|b| v.styled_bar(b)),
                                                             task.map_or(0, |t| t.id),
                                                             scale,
                                                             pal,

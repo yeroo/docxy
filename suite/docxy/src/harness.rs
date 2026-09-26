@@ -1113,10 +1113,11 @@ fn tab_json(tab: &crate::rs::Tab<crate::Act>, checked: &impl Fn(&RibbonCommand) 
     ])
 }
 
-/// Pure ribbon snapshot for a tab kind and table context.
+/// Pure ribbon snapshot for a tab kind and its table and Gantt contexts.
 fn ribbon_json_for(
     kind: crate::Kind,
     in_table: bool,
+    in_gantt: bool,
     checked: impl Fn(&RibbonCommand) -> bool,
 ) -> Json {
     let ribbon = crate::ribbon_for(kind);
@@ -1130,6 +1131,9 @@ fn ribbon_json_for(
     tabs.extend(ribbon.tabs.iter().map(|t| tab_json(t, &checked)));
     if kind == crate::Kind::Docx && in_table {
         tabs.push(tab_json(&crate::table_tab(), &checked));
+    }
+    if kind == crate::Kind::Project && in_gantt {
+        tabs.push(tab_json(&crate::gantt_format_tab(), &checked));
     }
     let tab_count = tabs.len();
     let qat = crate::QAT_ITEMS
@@ -1159,7 +1163,8 @@ fn ribbon_json_for(
 
 /// Ribbon snapshot using the active tab and live checked states.
 fn ribbon_json(app: &crate::Docxy) -> Json {
-    ribbon_json_for(app.ribbon_kind(), app.caret_table().is_some(), |command| {
+    let (kind, in_table) = (app.ribbon_kind(), app.caret_table().is_some());
+    ribbon_json_for(kind, in_table, app.project_gantt_showing(), |command| {
         if command.gallery {
             app.gallery_item_selected(command.act)
         } else {
@@ -1175,6 +1180,11 @@ fn ribbon_tab_by_name(kind: crate::Kind, name: &str) -> Result<crate::RibbonTab,
         .find_map(|(tab, label, _)| (*label == name).then_some(*tab).flatten())
         .or_else(|| {
             (kind == crate::Kind::Docx && name == "Table").then_some(crate::RibbonTab::Table)
+        })
+        .or_else(|| {
+            (kind == crate::Kind::Project
+                && name == crate::ribbon_tab_name(crate::RibbonTab::GanttFormat))
+            .then_some(crate::RibbonTab::GanttFormat)
         })
         .ok_or_else(|| format!("'{name}' is not a ribbon tab for the active document"))
 }
@@ -1196,6 +1206,11 @@ fn resolve_ribbon_command(
             return Err("Table tab is not active outside a table".into());
         }
         crate::table_tab()
+    } else if tab_name == crate::ribbon_tab_name(crate::RibbonTab::GanttFormat) {
+        if !app.project_gantt_showing() {
+            return Err("Gantt Chart Format tab is not active without a Gantt view".into());
+        }
+        crate::gantt_format_tab()
     } else {
         crate::ribbon_for(kind)
             .tabs
@@ -1278,6 +1293,7 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
                     app.ribbon_kind(),
                     app.ribbon_tab,
                     app.caret_table().is_some(),
+                    app.project_gantt_showing(),
                 ))
                 .into(),
             ),
@@ -2049,8 +2065,8 @@ mod tests {
 
     #[test]
     fn ribbon_reflects_definition_and_checked_state() {
-        let off = ribbon_json_for(crate::Kind::Docx, false, |_| false);
-        let on = ribbon_json_for(crate::Kind::Docx, true, |c| {
+        let off = ribbon_json_for(crate::Kind::Docx, false, false, |_| false);
+        let on = ribbon_json_for(crate::Kind::Docx, true, false, |c| {
             matches!(c.act, crate::Act::Bold)
         });
         let tabs = off.get("tabs").unwrap().as_array().unwrap();
@@ -2086,11 +2102,65 @@ mod tests {
     }
 
     #[test]
+    fn ribbon_lists_gantt_chart_format_only_with_a_project_gantt() {
+        let names = |ribbon: &Json| {
+            ribbon
+                .get("tabs")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.get_str("name").unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let on = ribbon_json_for(crate::Kind::Project, false, true, |c| {
+            matches!(c.act, crate::Act::Project(crate::ProjectAct::CriticalTasks))
+        });
+        assert_eq!(
+            names(&on),
+            [
+                "File",
+                "Task",
+                "Resource",
+                "Report",
+                "Project",
+                "View",
+                "Gantt Chart Format"
+            ]
+        );
+        let tab = on.get("tabs").unwrap().as_array().unwrap().last().unwrap();
+        assert_eq!(tab.get_str("key_tip"), Some("O"));
+        let group = &tab.get("groups").unwrap().as_array().unwrap()[0];
+        assert_eq!(group.get_str("title"), Some("Bar Styles"));
+        let checked = group
+            .get("commands")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c.get_str("label").unwrap(), c.get("checked").cloned()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            checked,
+            [
+                ("Critical Tasks", Some(Json::Bool(true))),
+                ("Baseline", Some(Json::Bool(false)))
+            ]
+        );
+        let off = ribbon_json_for(crate::Kind::Project, false, false, |_| false);
+        assert!(!names(&off).iter().any(|n| n == "Gantt Chart Format"));
+        let docx = ribbon_json_for(crate::Kind::Docx, false, true, |_| false);
+        assert!(!names(&docx).iter().any(|n| n == "Gantt Chart Format"));
+        assert!(ribbon_tab_by_name(crate::Kind::Project, "Gantt Chart Format").is_ok());
+        assert!(ribbon_tab_by_name(crate::Kind::Docx, "Gantt Chart Format").is_err());
+    }
+
+    #[test]
     fn style_gallery_checked_matches_heading_preview() {
         let mut props = ParProps::default();
         props.style_id = Some("Heading1".into());
         let editor = editor(props, RunProps::default());
-        let ribbon = ribbon_json_for(crate::Kind::Docx, false, |c| {
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, false, |c| {
             c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
         });
         let tabs = ribbon.get("tabs").unwrap().as_array().unwrap();
@@ -2116,7 +2186,7 @@ mod tests {
     #[test]
     fn normal_paragraph_selects_only_normal_gallery_item() {
         let mut editor = editor(ParProps::default(), RunProps::default());
-        let ribbon = ribbon_json_for(crate::Kind::Docx, false, |c| {
+        let ribbon = ribbon_json_for(crate::Kind::Docx, false, false, |c| {
             c.gallery && crate::gallery_style_selected(&editor.caret_para_props(), c.act)
         });
         let commands = ribbon.get("tabs").unwrap().as_array().unwrap()[1]

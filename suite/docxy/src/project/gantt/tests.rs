@@ -676,3 +676,36 @@ fn a_short_plan_on_a_wide_window_has_days_across_the_whole_chart() {
     v.layout(1180.);
     assert_eq!(v.chart_scale(), v.scale);
 }
+
+#[test]
+fn bar_styles_hide_critical_colour_and_baseline_only() {
+    let base = GanttBar {
+        kind: BarKind::Critical,
+        start: 2,
+        end: 5,
+        baseline: Some((1, 4)),
+        delay: Some((0, 2)),
+    };
+    assert_eq!(styled_bar(base, true, true), base);
+    assert_eq!(
+        styled_bar(base, false, true),
+        GanttBar {
+            kind: BarKind::OnTrack,
+            ..base
+        }
+    );
+    assert_eq!(
+        styled_bar(base, true, false),
+        GanttBar {
+            baseline: None,
+            ..base
+        }
+    );
+    // Summaries, milestones and the leveling delay are not bar styles here.
+    for kind in [BarKind::Summary, BarKind::Milestone, BarKind::OnTrack] {
+        let bar = GanttBar { kind, ..base };
+        assert_eq!(styled_bar(bar, false, true), bar);
+        assert_eq!(styled_bar(bar, false, false).kind, kind);
+        assert_eq!(styled_bar(bar, false, false).delay, base.delay);
+    }
+}
