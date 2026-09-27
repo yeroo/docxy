@@ -336,6 +336,27 @@ mod tests {
     fn app() -> Editor {
         Editor::new(new_project())
     }
+
+    #[test]
+    fn link_add_rejects_summary_subtask_links_from_the_control_fixture() {
+        let project =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/10-summary.xml")).unwrap();
+        let mut ed = Editor::new(project);
+        for (uid, pred) in [(2, 1), (1, 3)] {
+            let before = ed.project().clone();
+            let depth = ed.undo_depth();
+            let args = Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("pred", Json::Num(pred as f64)),
+            ]);
+            let err = dispatch_editor(&mut ed, "link.add", &args)
+                .unwrap()
+                .unwrap_err();
+            assert!(err.contains("summary and its subtask"), "{err}");
+            assert_eq!(ed.project(), &before);
+            assert_eq!(ed.undo_depth(), depth);
+        }
+    }
     fn add(ed: &mut Editor, name: &str, dur: &str) -> i64 {
         task_add(
             ed,

@@ -249,6 +249,11 @@ impl Editor {
         if self.proj.tasks[i].predecessors == predecessors {
             return Ok(());
         }
+        for p in &predecessors {
+            if !current.iter().any(|c| c.uid == p.uid) {
+                self.check_link(i, p.uid, &predecessors)?;
+            }
+        }
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;
         self.edit_row(i, |proj, _| {
             proj.tasks[i].predecessors = predecessors;
