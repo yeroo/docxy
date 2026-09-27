@@ -42,7 +42,95 @@ fn pairs(dir: &Path, suffix: &str) -> Vec<(PathBuf, PathBuf)> {
     out
 }
 
-fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
+/// Who wrote a pair's XML: Project itself, or MPXJ (the external paired
+/// corpus), which omits zero-valued progress elements.
+#[derive(Clone, Copy, PartialEq)]
+enum Oracle {
+    Project,
+    Mpxj,
+}
+
+/// Compare a task's decoded progress with its XML export, field by field.
+/// Project writes every numeric progress element, zeros included, and omits
+/// a date that is NA; MPXJ also omits zero numbers, which then count as 0.
+fn check_progress(
+    a: &mppread::mpp::MppTask,
+    e: &projcore::Task,
+    oracle: Oracle,
+    at: &dyn Fn(&str) -> String,
+) {
+    let p = a
+        .progress
+        .as_ref()
+        .unwrap_or_else(|| panic!("{}", at("progress")));
+    let zero = |v: Option<i64>| match (v, oracle) {
+        (None, Oracle::Mpxj) => Some(0),
+        _ => v,
+    };
+    let zero_pct = |v: Option<u8>| match (v, oracle) {
+        (None, Oracle::Mpxj) => Some(0),
+        _ => v,
+    };
+    let zero_cost = |v: &Option<projcore::Rate>| match (v, oracle) {
+        (None, Oracle::Mpxj) => projcore::Rate::parse("0"),
+        _ => v.clone(),
+    };
+    let dt =
+        |d: Option<projcore::DateTime>| d.map(|d| d.to_mspdi().replace('T', " ")[..16].to_string());
+    let percents = [
+        ("percent complete", p.percent_complete, e.percent_complete),
+        (
+            "percent work complete",
+            p.percent_work_complete,
+            e.percent_work_complete,
+        ),
+        (
+            "physical percent complete",
+            p.physical_percent_complete,
+            e.physical_percent_complete,
+        ),
+    ];
+    for (what, got, want) in percents {
+        assert_eq!(Some(got), zero_pct(want), "{}", at(what));
+    }
+    let dates = [
+        ("actual start", &p.actual_start, e.actual_start),
+        ("actual finish", &p.actual_finish, e.actual_finish),
+        ("stop", &p.stop, e.stop),
+        ("resume", &p.resume, e.resume),
+    ];
+    for (what, got, want) in dates {
+        assert_eq!(got.clone(), dt(want), "{}", at(what));
+    }
+    let minutes = [
+        (
+            "actual duration",
+            p.actual_duration_min,
+            e.actual_duration_min,
+        ),
+        (
+            "remaining duration",
+            p.remaining_duration_min,
+            e.remaining_duration_min,
+        ),
+        ("work", p.work_min, e.work_min),
+        ("actual work", p.actual_work_min, e.actual_work_min),
+        ("remaining work", p.remaining_work_min, e.remaining_work_min),
+    ];
+    for (what, got, want) in minutes {
+        assert_eq!(Some(got), zero(want), "{}", at(what));
+    }
+    let costs = [
+        ("cost", &p.cost, &e.cost),
+        ("actual cost", &p.actual_cost, &e.actual_cost),
+        ("remaining cost", &p.remaining_cost, &e.remaining_cost),
+    ];
+    for (what, got, want) in costs {
+        assert_eq!(Some(got.clone()), zero_cost(want), "{}", at(what));
+    }
+}
+
+fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool {
     let bytes = std::fs::read(mpp).unwrap();
     let xml_text = std::fs::read_to_string(xml).unwrap();
     let oracle = projcore::mspdi::read_mspdi(&xml_text).unwrap();
@@ -125,6 +213,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool) -> bool {
         want.sort();
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
+        check_progress(a, e, source, &at);
         assert_eq!(a.manual, e.manual, "{}", at("manual"));
         if e.manual {
             assert_eq!(
@@ -216,11 +305,11 @@ fn project_2024_oracles() {
         assert_eq!(newest.len(), 46);
         assert_eq!(older.len(), 46);
         for (mpp, xml) in &newest {
-            check_pair(mpp, xml, false);
+            check_pair(mpp, xml, false, Oracle::Project);
         }
         let matched = older
             .iter()
-            .filter(|(mpp, xml)| check_pair(mpp, xml, true))
+            .filter(|(mpp, xml)| check_pair(mpp, xml, true, Oracle::Project))
             .count();
         eprintln!("MPP12 matched {matched}, refused {}", older.len() - matched);
     }
@@ -229,7 +318,7 @@ fn project_2024_oracles() {
         let cases = pairs(&order, "");
         assert_eq!(cases.len(), 5);
         for (mpp, xml) in &cases {
-            check_pair(mpp, xml, false);
+            check_pair(mpp, xml, false, Oracle::Project);
         }
     }
     // Percentage, elapsed and estimated lags (#104): each is compared in its
@@ -239,7 +328,7 @@ fn project_2024_oracles() {
         let cases = pairs(&lag, "");
         assert_eq!(cases.len(), 2);
         for (mpp, xml) in &cases {
-            check_pair(mpp, xml, false);
+            check_pair(mpp, xml, false, Oracle::Project);
         }
     }
     let manual = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/manual");
@@ -247,7 +336,17 @@ fn project_2024_oracles() {
         let cases = pairs(&manual, "");
         assert_eq!(cases.len(), 8);
         for (mpp, xml) in &cases {
-            check_pair(mpp, xml, false);
+            check_pair(mpp, xml, false, Oracle::Project);
+        }
+    }
+    // Recorded progress (#181): states, work, costs, variances after a
+    // baseline, a split, and fractional values.
+    let progress = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/progress");
+    if progress.exists() {
+        let cases = pairs(&progress, "");
+        assert_eq!(cases.len(), 6);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
         }
     }
     if let Ok(paired) = std::env::var("MPP_PAIRED_CORPUS") {
@@ -260,7 +359,7 @@ fn project_2024_oracles() {
         let cases = pairs(dir, "");
         assert_eq!(cases.len(), 27);
         for (mpp, xml) in &cases {
-            check_pair(mpp, xml, false);
+            check_pair(mpp, xml, false, Oracle::Mpxj);
         }
     }
 }

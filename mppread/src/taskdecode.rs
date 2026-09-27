@@ -2,10 +2,10 @@
 use crate::{
     cfb::Cfb,
     fixedmeta,
-    mpp::{MppPred, MppTask, decode_timestamp},
+    mpp::{MppPred, MppProgress, MppTask, decode_timestamp},
 };
-use projcore::LagFormat;
 use projcore::mspdi::lag_from_link_lag;
+use projcore::{LagFormat, Rate};
 use std::collections::{HashMap, HashSet};
 
 fn u32_at(b: &[u8], o: usize) -> u32 {
@@ -36,6 +36,48 @@ const MANUAL_START: usize = 50;
 const MANUAL_FINISH: usize = 54;
 const MANUAL_DURATION: usize = 58;
 const MANUAL_DURATION_FORMAT: usize = 62;
+/// Recorded progress in the newest layout's 202-byte FixedData record, found
+/// by diffing Project's progress cases (corpus/tools/gen_mpp_progress_cases.py)
+/// and checked against its MSPDI export of every snapshot, paired plan and
+/// progress case. Percents are u16; dates are timestamps (NA = no date);
+/// durations are i32 tenths of a minute; work is an f64 in thousandths of a
+/// minute; costs are f64s in MSPDI's units. The Start/Finish/Work variances
+/// are not stored: Project derives them from the baseline at export.
+struct ProgressLayout {
+    work: usize,
+    actual_work: usize,
+    remaining_work: usize,
+    cost: usize,
+    actual_cost: usize,
+    remaining_cost: usize,
+    actual_duration: usize,
+    remaining_duration: usize,
+    percent_complete: usize,
+    percent_work_complete: usize,
+    actual_start: usize,
+    actual_finish: usize,
+    resume: usize,
+    stop: usize,
+}
+const NEWEST_PROGRESS: ProgressLayout = ProgressLayout {
+    work: 8,
+    actual_work: 16,
+    remaining_work: 24,
+    cost: 32,
+    actual_cost: 40,
+    remaining_cost: 56,
+    actual_duration: 80,
+    remaining_duration: 88,
+    percent_complete: 92,
+    percent_work_complete: 94,
+    actual_start: 120,
+    actual_finish: 124,
+    resume: 132,
+    stop: 136,
+};
+/// PhysicalPercentComplete is a keyed Var2Data block holding a u16. Project
+/// writes the block only for a task that has one; without it the value is 0.
+const PHYSICAL_PERCENT_KEY: u16 = 0x045f;
 const LEGACY: TaskLayout = TaskLayout {
     length: 264,
     start: 88,
@@ -143,7 +185,13 @@ fn validate_legacy_level(index: usize, uid: u32, level: u32, previous: u32) -> R
     Ok(())
 }
 
-fn names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, String>, String> {
+/// Keyed Var2Data values of the newest layout's tasks.
+struct VarFields {
+    names: HashMap<u32, String>,
+    physical_percent: HashMap<u32, u8>,
+}
+
+fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, String> {
     if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
         return Err("invalid VarMeta header".into());
     }
@@ -157,6 +205,7 @@ fn names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, Strin
     }
     let mut seen = HashSet::new();
     let mut names = HashMap::new();
+    let mut physical_percent = HashMap::new();
     for i in 0..count {
         let e = &vm[24 + i * 12..24 + (i + 1) * 12];
         let uid = u32_at(e, 0);
@@ -172,17 +221,27 @@ fn names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, Strin
             return Err(format!("Var2Data offset out of range at entry {i}"));
         };
         let len = u32_at(v2, off) as usize;
-        let Some(_end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
+        let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
             return Err(format!("Var2Data block out of range at entry {i}"));
         };
         if key == 0x000e {
             names.insert(uid, decode_name(v2, off, uid)?);
+        } else if key == PHYSICAL_PERCENT_KEY {
+            let value = &v2[header_end..end];
+            let percent = (value.len() == 2)
+                .then(|| u16_at(value, 0))
+                .filter(|&p| p <= 100)
+                .ok_or_else(|| format!("invalid physical percent complete for UID {uid}"))?;
+            physical_percent.insert(uid, percent as u8);
         }
     }
     if names.len() != uids.len() {
         return Err("task names do not cover the FixedMeta UIDs".into());
     }
-    Ok(names)
+    Ok(VarFields {
+        names,
+        physical_percent,
+    })
 }
 
 fn legacy_names(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<HashMap<u32, String>, String> {
@@ -272,6 +331,76 @@ fn manual_fields(rec: &[u8], uid: u32) -> Result<ManualFields, String> {
     Ok((start, finish, duration))
 }
 
+fn tenths_to_minutes(tenths: i32) -> i64 {
+    // Round half away from zero, as MSPDI import rounds a duration's seconds.
+    (f64::from(tenths) / 10.0).round() as i64
+}
+
+fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProgress, String> {
+    let at = NEWEST_PROGRESS;
+    let percent = |off: usize, what: &str| {
+        let value = u16_at(rec, off);
+        (value <= 100)
+            .then_some(value as u8)
+            .ok_or_else(|| format!("invalid {what} {value} for UID {uid}"))
+    };
+    let f64_at = |off: usize| f64::from_le_bytes(rec[off..off + 8].try_into().unwrap());
+    let duration = |off: usize, what: &str| {
+        let tenths = i32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
+        (tenths >= 0)
+            .then(|| tenths_to_minutes(tenths))
+            .ok_or_else(|| format!("negative {what} for UID {uid}"))
+    };
+    let work = |off: usize, what: &str| {
+        let value = f64_at(off);
+        (value.is_finite() && value >= 0.0)
+            .then(|| (value / 1000.0).round() as i64)
+            .ok_or_else(|| format!("invalid {what} for UID {uid}"))
+    };
+    let cost = |off: usize, what: &str| {
+        cost_rate(f64_at(off)).ok_or_else(|| format!("invalid {what} for UID {uid}"))
+    };
+    let actual_start = decode_timestamp(rec, at.actual_start);
+    let actual_finish = decode_timestamp(rec, at.actual_finish);
+    if actual_finish.is_some()
+        && actual_start
+            .as_ref()
+            .is_none_or(|s| Some(s) > actual_finish.as_ref())
+    {
+        return Err(format!(
+            "actual finish without an earlier actual start for UID {uid}"
+        ));
+    }
+    Ok(MppProgress {
+        percent_complete: percent(at.percent_complete, "percent complete")?,
+        percent_work_complete: percent(at.percent_work_complete, "percent work complete")?,
+        physical_percent_complete: physical_percent,
+        actual_start,
+        actual_finish,
+        stop: decode_timestamp(rec, at.stop),
+        resume: decode_timestamp(rec, at.resume),
+        actual_duration_min: duration(at.actual_duration, "actual duration")?,
+        remaining_duration_min: duration(at.remaining_duration, "remaining duration")?,
+        work_min: work(at.work, "work")?,
+        actual_work_min: work(at.actual_work, "actual work")?,
+        remaining_work_min: work(at.remaining_work, "remaining work")?,
+        cost: cost(at.cost, "cost")?,
+        actual_cost: cost(at.actual_cost, "actual cost")?,
+        remaining_cost: cost(at.remaining_cost, "remaining cost")?,
+    })
+}
+
+/// A stored cost as Project's MSPDI export writes it: rounded to two
+/// decimals, without trailing zeros (`9319.5`, `3406`).
+fn cost_rate(value: f64) -> Option<Rate> {
+    if !value.is_finite() {
+        return None;
+    }
+    let text = format!("{value:.2}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    Rate::parse(if text == "-0" { "0" } else { text })
+}
+
 /// A validated task table and the project's new-task mode. The mode is kept
 /// as its own result so a bad project option refuses an import but not
 /// [`decode`].
@@ -354,7 +483,7 @@ fn decode_current(
         .filter(|r| !r.is_null)
         .map(|r| r.uid)
         .collect();
-    let named = names(vm, v2, &uids)?;
+    let var = var_fields(vm, v2, &uids)?;
     let mut out = Vec::new();
     for (row, fixed2) in indexed.into_iter().zip(fixed2) {
         if row.is_null {
@@ -386,10 +515,12 @@ fn decode_current(
         } else {
             (None, None, None)
         };
+        let physical_percent = var.physical_percent.get(&row.uid).copied().unwrap_or(0);
+        let progress = progress_fields(rec, physical_percent, row.uid)?;
         out.push(MppTask {
             id: row.id,
             uid: row.uid,
-            name: named[&row.uid].clone(),
+            name: var.names[&row.uid].clone(),
             start,
             finish,
             outline_level: Some(level),
@@ -398,6 +529,7 @@ fn decode_current(
             manual_start,
             manual_finish,
             manual_duration_min,
+            progress: Some(progress),
         });
     }
     links(cfb, prefix, &mut out, NEWEST_LINK)?;
@@ -845,6 +977,161 @@ mod tests {
                 "{lag} format {format}"
             );
         }
+    }
+    /// Add a keyed Var2Data block for `uid`.
+    fn add_var(s: &mut Streams, uid: u32, key: u16, value: &[u8]) {
+        let off = s.v2.len() as u32;
+        s.v2.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        s.v2.extend_from_slice(value);
+        s.vm.extend_from_slice(&uid.to_le_bytes());
+        s.vm.extend_from_slice(&off.to_le_bytes());
+        s.vm.extend_from_slice(&key.to_le_bytes());
+        s.vm.extend_from_slice(&0x0b40u16.to_le_bytes());
+        let count = u32_at(&s.vm, 8) + 1;
+        s.vm[8..12].copy_from_slice(&count.to_le_bytes());
+        let len = s.v2.len() as u32;
+        s.vm[20..24].copy_from_slice(&len.to_le_bytes());
+    }
+    /// Task B (UID 1, FixedData record at 250) a quarter done: started
+    /// 2026-03-02 08:00, stopped 17:00, resuming the next morning.
+    const B: usize = 250;
+    fn put(s: &mut Streams, off: usize, bytes: &[u8]) {
+        s.fd[B + off..B + off + bytes.len()].copy_from_slice(bytes);
+    }
+    fn make_progress(s: &mut Streams) {
+        put(s, 8, &1_440_000f64.to_le_bytes()); // 24h of work
+        put(s, 16, &360_000f64.to_le_bytes());
+        put(s, 24, &1_080_000f64.to_le_bytes());
+        put(s, 32, &120_000f64.to_le_bytes());
+        put(s, 40, &30_000.000_000_000_004f64.to_le_bytes());
+        put(s, 56, &5913.505f64.to_le_bytes());
+        put(s, 80, &2327i32.to_le_bytes()); // 232.7 minutes
+        put(s, 88, &9600i32.to_le_bytes());
+        put(s, 92, &25u16.to_le_bytes());
+        put(s, 94, &37u16.to_le_bytes());
+        put(s, 120, &[0xc0, 0x12, 0x2a, 0x3c]);
+        put(s, 124, &[0xff; 4]); // NA: not finished
+        put(s, 132, &[0xc0, 0x12, 0x2b, 0x3c]);
+        put(s, 136, &[0xd8, 0x27, 0x2a, 0x3c]);
+        add_var(s, 1, PHYSICAL_PERCENT_KEY, &40u16.to_le_bytes());
+    }
+    #[test]
+    fn progress_decodes_in_mspdi_units_and_imports_as_read() {
+        let mut s = fixture();
+        make_progress(&mut s);
+        let tasks = decode(&file(&s, true)).unwrap();
+        let rate = |text| Rate::parse(text).unwrap();
+        assert_eq!(
+            tasks[1].progress,
+            Some(MppProgress {
+                percent_complete: 25,
+                percent_work_complete: 37,
+                physical_percent_complete: 40,
+                actual_start: Some("2026-03-02 08:00".into()),
+                actual_finish: None,
+                stop: Some("2026-03-02 17:00".into()),
+                resume: Some("2026-03-03 08:00".into()),
+                actual_duration_min: 233,
+                remaining_duration_min: 960,
+                work_min: 1440,
+                actual_work_min: 360,
+                remaining_work_min: 1080,
+                cost: rate("120000"),
+                actual_cost: rate("30000"),
+                remaining_cost: rate("5913.51"),
+            })
+        );
+        // A task without a physical-percent block has none.
+        assert_eq!(
+            tasks[0]
+                .progress
+                .as_ref()
+                .unwrap()
+                .physical_percent_complete,
+            0
+        );
+        let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let t = &project.tasks[0];
+        let dt = |d: Option<projcore::DateTime>| d.map(|d| d.to_mspdi());
+        assert_eq!(
+            (
+                t.percent_complete,
+                t.percent_work_complete,
+                t.physical_percent_complete
+            ),
+            (Some(25), Some(37), Some(40))
+        );
+        assert_eq!(dt(t.actual_start).as_deref(), Some("2026-03-02T08:00:00"));
+        assert_eq!(t.actual_finish, None);
+        assert_eq!(dt(t.stop).as_deref(), Some("2026-03-02T17:00:00"));
+        assert_eq!(dt(t.resume).as_deref(), Some("2026-03-03T08:00:00"));
+        assert_eq!(
+            (t.actual_duration_min, t.remaining_duration_min),
+            (Some(233), Some(960))
+        );
+        assert_eq!(
+            (t.work_min, t.actual_work_min, t.remaining_work_min),
+            (Some(1440), Some(360), Some(1080))
+        );
+        assert_eq!(
+            (&t.cost, &t.actual_cost, &t.remaining_cost),
+            (
+                &Some(rate("120000")),
+                &Some(rate("30000")),
+                &Some(rate("5913.51"))
+            )
+        );
+        assert_eq!((t.start_variance, t.finish_variance), (None, None));
+        assert_eq!(t.work_variance, None);
+        // Progress is kept, not scheduled from: the leaf stays pinned.
+        assert_eq!(t.constraint, projcore::ConstraintType::MustStartOn);
+    }
+    #[test]
+    fn refuses_progress_outside_its_range() {
+        let refused = |edit: &dyn Fn(&mut Streams)| {
+            let mut s = fixture();
+            make_progress(&mut s);
+            assert!(decode(&file(&s, true)).is_ok());
+            edit(&mut s);
+            reject(&s);
+        };
+        refused(&|s| put(s, 92, &101u16.to_le_bytes()));
+        refused(&|s| put(s, 94, &0xffffu16.to_le_bytes()));
+        refused(&|s| put(s, 80, &(-10i32).to_le_bytes()));
+        refused(&|s| put(s, 16, &f64::NAN.to_le_bytes()));
+        refused(&|s| put(s, 24, &(-1f64).to_le_bytes()));
+        refused(&|s| put(s, 40, &f64::INFINITY.to_le_bytes()));
+        // An actual finish before the actual start, or without one.
+        refused(&|s| put(s, 124, &[0xd8, 0x27, 0x29, 0x3c]));
+        let mut s = fixture();
+        make_progress(&mut s);
+        put(&mut s, 120, &[0xff; 4]);
+        put(&mut s, 124, &[0xd8, 0x27, 0x2a, 0x3c]);
+        reject(&s);
+        // Physical percent complete: a 2-byte percentage.
+        let mut s = fixture();
+        add_var(&mut s, 1, PHYSICAL_PERCENT_KEY, &101u16.to_le_bytes());
+        reject(&s);
+        let mut s = fixture();
+        add_var(&mut s, 1, PHYSICAL_PERCENT_KEY, &40u32.to_le_bytes());
+        reject(&s);
+    }
+    #[test]
+    fn costs_round_to_cents_as_project_writes_them() {
+        for (value, text) in [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (100_000.0, "100000"),
+            (9319.5, "9319.5"),
+            (3405.9950000000003, "3406"),
+            (348.315, "348.31"),
+            (707.185, "707.18"),
+            (5913.505, "5913.51"),
+            (-12.5, "-12.5"),
+        ] {
+            assert_eq!(cost_rate(value).unwrap().as_str(), text, "{value}");
+        }
+        assert_eq!(cost_rate(f64::NAN), None);
     }
     fn link(pred: u32, succ: u32, format: u16) -> Vec<u8> {
         let mut r = vec![0u8; 20];

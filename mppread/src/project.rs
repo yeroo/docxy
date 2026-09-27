@@ -13,7 +13,10 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// constraint; the project's new-task mode comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
 /// rollup come through, and the **predecessor links** decode from the `TBkndCons`
-/// table. Save As converts it to `.yppx`/MSPDI.
+/// table. Each task's recorded **progress**, work and cost come through as
+/// read (the scheduler ignores them, as it does for MSPDI); Project's
+/// variances are not stored in the file and stay absent. Save As converts it
+/// to `.yppx`/MSPDI.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)
@@ -98,6 +101,31 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             task.manual_start = manual_date(&t.manual_start, "start")?;
             task.manual_finish = manual_date(&t.manual_finish, "finish")?;
             task.manual_duration_min = t.manual_duration_min;
+            if let Some(p) = &t.progress {
+                let date = |d: &Option<String>, what: &str| {
+                    d.as_deref()
+                        .map(|d| {
+                            parse_mpp_dt(d)
+                                .ok_or_else(|| format!("invalid {what} for UID {}", t.uid))
+                        })
+                        .transpose()
+                };
+                task.percent_complete = Some(p.percent_complete);
+                task.percent_work_complete = Some(p.percent_work_complete);
+                task.physical_percent_complete = Some(p.physical_percent_complete);
+                task.actual_start = date(&p.actual_start, "actual start")?;
+                task.actual_finish = date(&p.actual_finish, "actual finish")?;
+                task.stop = date(&p.stop, "stop")?;
+                task.resume = date(&p.resume, "resume")?;
+                task.actual_duration_min = Some(p.actual_duration_min);
+                task.remaining_duration_min = Some(p.remaining_duration_min);
+                task.work_min = Some(p.work_min);
+                task.actual_work_min = Some(p.actual_work_min);
+                task.remaining_work_min = Some(p.remaining_work_min);
+                task.cost = Some(p.cost.clone());
+                task.actual_cost = Some(p.actual_cost.clone());
+                task.remaining_cost = Some(p.remaining_cost.clone());
+            }
             // Pin only leaf tasks; a summary's dates roll up from its
             // children, so a constraint on it would fight the rollup. A
             // manual leaf is held by its pinned dates, not a constraint.
