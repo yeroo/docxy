@@ -657,6 +657,7 @@ impl App {
         self.status.clear();
         match act {
             Act::AddTask => self.add_task(),
+            Act::InsertBlankRow => self.insert_blank_row(),
             Act::DeleteTask => self.delete_task(),
             Act::Milestone => self.toggle_milestone(),
             Act::ManuallySchedule => self.set_manual(true),
@@ -791,6 +792,15 @@ impl App {
 
     fn add_task(&mut self) {
         match self.ed.add_task(self.ed.selected_uid(), "New task", 480) {
+            Ok(at) => self.ed.select(at),
+            Err(message) => self.status = message,
+        }
+    }
+
+    /// Insert a blank row above the selected row (Project's Insert Task ›
+    /// Blank Row) and select it, so typing into it makes a task there.
+    fn insert_blank_row(&mut self) {
+        match self.ed.insert_blank_row(self.ed.selected_uid()) {
             Ok(at) => self.ed.select(at),
             Err(message) => self.status = message,
         }
@@ -1453,6 +1463,7 @@ fn on_key(app: &mut App, k: KeyEvent) {
         KeyCode::Left | KeyCode::Char('h') => app.hscroll -= 1,
         KeyCode::Right | KeyCode::Char('l') => app.hscroll += 1,
         KeyCode::Char('n') | KeyCode::Insert => app.add_task(),
+        KeyCode::Char('N') => app.insert_blank_row(),
         KeyCode::Delete | KeyCode::Char('x') => app.delete_task(),
         KeyCode::Tab | KeyCode::Char('>') => app.indent(1),
         KeyCode::BackTab | KeyCode::Char('<') => app.indent(-1),
@@ -2029,7 +2040,7 @@ fn new_tasks_label(app: &App) -> String {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let help = "n add · d dur · p dep · m manual/auto · Tab indent · -/+ hide/show subtasks · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · T theme · q quit";
+    let help = "n add · N blank · d dur · p dep · m manual/auto · Tab indent · -/+ hide/show subtasks · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · T theme · q quit";
     let text = if app.status.is_empty() {
         help.to_string()
     } else {
@@ -2939,6 +2950,49 @@ mod tests {
             .collect();
         assert_eq!(rows, [(1, 1, true), (3, 2, false), (2, 2, false)]);
         assert_eq!(app.ed.selected_uid(), Some(3));
+    }
+
+    #[test]
+    fn shift_n_and_the_ribbon_insert_a_blank_row_above_and_select_it() {
+        let key = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT);
+        let mut app = App::new(new_project(), Some("plan.yppx".into()), false);
+        app.add_task();
+        app.indent(1); // task 2 under task 1
+        let depth = app.ed.undo_depth();
+        on_key(&mut app, key('N'));
+        let rows: Vec<_> = app
+            .ed
+            .project()
+            .tasks
+            .iter()
+            .map(|t| (t.uid, t.is_null))
+            .collect();
+        assert_eq!(rows, [(1, false), (3, true), (2, false)]);
+        assert_eq!(app.ed.sel(), 1, "the blank row is selected");
+        assert_eq!(app.ed.undo_depth(), depth + 1);
+        // Typing into it (Enter renames) makes Task 1's first subtask.
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        for c in "Typed".chars() {
+            on_key(
+                &mut app,
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            );
+        }
+        on_key(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let t = &app.ed.project().tasks[1];
+        assert_eq!((&*t.name, t.outline_level, t.is_null), ("Typed", 2, false));
+        // One undo each: the typing, then the blank row.
+        assert!(app.ed.undo() && app.ed.undo());
+        assert_eq!(app.ed.project().tasks.len(), 2);
+        // The ribbon act does the same; on an empty plan it appends.
+        app.ed.select(0);
+        app.apply_act(Act::InsertBlankRow);
+        assert!(app.ed.project().tasks[0].is_null);
+        assert_eq!(app.ed.sel(), 0);
+        app.ed.replace_project(Project::default());
+        app.apply_act(Act::InsertBlankRow);
+        assert_eq!(app.ed.project().tasks.len(), 1);
+        assert!(app.ed.project().tasks[0].is_null && app.status.is_empty());
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub enum Act {
     ManuallySchedule,
     AutoSchedule,
     AddTask,
+    InsertBlankRow,
     Milestone,
     Constraint,
     Rename,
@@ -142,9 +143,17 @@ fn task_groups() -> Vec<Group> {
         },
         Group {
             title: "Insert",
-            width: 11,
+            width: 20,
             rows: [
-                vec![btn("＋ Task", AddTask, "Add a task below (n)")],
+                vec![
+                    btn("＋ Task", AddTask, "Add a task below (n)"),
+                    Seg::Gap("  "),
+                    btn(
+                        "▭ Blank Row",
+                        InsertBlankRow,
+                        "Insert a blank row above (N)",
+                    ),
+                ],
                 vec![btn(
                     "◆ Milestone",
                     Milestone,
@@ -318,8 +327,9 @@ mod tests {
     /// old 89-column budget; no layout keeps Project's names and groups in
     /// 89. A narrower terminal clips the body on the right (the body is a
     /// non-wrapping Paragraph); the clipped buttons keep their keys. Raise
-    /// this only deliberately.
-    const BODY_BUDGET: usize = 109;
+    /// this only deliberately: #158's Task › Insert › Blank Row took it from
+    /// 109 to 118.
+    const BODY_BUDGET: usize = 118;
 
     #[test]
     fn tabs_are_microsoft_projects() {
@@ -342,6 +352,7 @@ mod tests {
             ("Task", "Tasks", "Manually Schedule", ManuallySchedule),
             ("Task", "Tasks", "Auto Schedule", AutoSchedule),
             ("Task", "Insert", "Task", AddTask),
+            ("Task", "Insert", "Blank Row", InsertBlankRow),
             ("Task", "Insert", "Milestone", Milestone),
             ("Task", "Properties", "Information", Constraint),
             ("Task", "Properties", "Rename", Rename),
