@@ -2011,7 +2011,9 @@ mod tests {
                 ..Task::default()
             }
         );
-        assert_eq!(ed.sel(), 1, "the host selects the new row");
+        // The editor leaves the selection index alone, so it lands on the new
+        // row; the host selects it explicitly.
+        assert_eq!((ed.sel(), ed.selected_uid()), (1, Some(3)));
         // Every task keeps its schedule: the scheduler skips blank rows.
         assert_eq!(results(ed.schedule()), sched);
         assert!(ed.schedule().get(3).is_none());
