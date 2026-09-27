@@ -181,7 +181,9 @@ test('the Styles gallery tiles are the suite table, in light and dark', async ({
     await expect.poll(() => page.evaluate(() => document.documentElement.dataset.theme)).toBe(mode);
     const well = page.locator('#gallery-' + gallery.id);
     const wb = await well.boundingBox();
-    expect([wb.width, wb.height], 'well').toEqual([t.wellWidth, t.wellHeight]);
+    // Layout sizes within 0.05px: Firefox snaps to 1/60px (465.99994 for 466).
+    expect(wb.width, 'well width').toBeCloseTo(t.wellWidth, 1);
+    expect(wb.height, 'well height').toBeCloseTo(t.wellHeight, 1);
     const tokens = snapshot.theme[mode];
     const fg = hexRgb(tokens.foreground);
     const surface = mix(hexRgb(tokens.background), fg, t.surfaceMix[mode]);
@@ -200,7 +202,8 @@ test('the Styles gallery tiles are the suite table, in light and dark', async ({
       const it = gallery.items[i];
       const look = it.look[mode];
       const what = `${mode} ${it.label}`;
-      expect([got.w, got.h], what).toEqual([t.w, t.h]);
+      expect(got.w, what + ' width').toBeCloseTo(t.w, 1);
+      expect(got.h, what + ' height').toBeCloseTo(t.h, 1);
       expect(got.sample, what).toBe(t.sample);
       expect(got.name, what).toBe(it.label);
       expect(got.nameSize, what).toBe(t.nameSize + 'px');
