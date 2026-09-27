@@ -334,7 +334,7 @@ fn project_2024_oracles() {
     let manual = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/manual");
     if manual.exists() {
         let cases = pairs(&manual, "");
-        assert_eq!(cases.len(), 8);
+        assert_eq!(cases.len(), 9);
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);
         }

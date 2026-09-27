@@ -108,10 +108,11 @@ with a licensed Project desktop install and pywin32:
 python corpus/tools/gen_mpp_order_cases.py
 ```
 
-The test also checks eight task-mode cases in `manual/` when present: one
+The test also checks nine task-mode cases in `manual/` when present: one
 task switched auto to manual, a manual task beside auto ones, the new-task
-default set to manual, and attempts to make manual dates differ from the
-scheduled ones. Generate them the same way:
+default set to manual, a plan saved with the new-task default untouched, and
+attempts to make manual dates differ from the scheduled ones. Generate them
+the same way:
 
 ```powershell
 python corpus/tools/gen_mpp_manual_cases.py
@@ -208,8 +209,10 @@ moved row keeps them with a zero duration), and Project's MSPDI export derives
 its ManualStart/Finish/Duration from Start/Finish/Duration, so they are not
 decoded. None of the `manual/` attempts saved manual dates that differ from the
 scheduled ones. The project's `NewTasksAreManual` is the 2-byte `Props` entry
-`0x024013C8` (`0000` or `ff00`). Legacy MPP9 files have no manual tasks. MPP9
-link records in the local samples all have zero lag and LagFormat 7, so nonzero
+`0x024013C8`: `0000` when set to auto, `ff00` when explicitly set to manual,
+and `0100` when Project's manual default is left untouched. Legacy MPP9 files
+have no manual tasks. MPP9 link records in the local samples all have zero lag
+and LagFormat 7, so nonzero
 legacy lag has no oracle yet. Newest Project links have positive and negative
 lag examples checked against MSPDI. Their lag i32 at +14 and LagFormat u16 at
 +18 encode exactly as MSPDI's `LinkLag` and `LagFormat`: tenths of a minute of

@@ -10,6 +10,8 @@
   to manual;
 - m3*: attempts to make ManualStart/ManualFinish/ManualDuration differ from
   Start/Finish/Duration.
+- m4-default-new-task-mode: a new plan saved with Project's untouched
+  new-task default and one task.
 
 DIVERGENCE: Project 2024 normalized every m3 attempt. Its XML writes the
 manual fields equal to Start/Finish/Duration for a manual task switched back to
@@ -44,7 +46,8 @@ def new_plan(app, manual_default=False):
     app.FileNew()  # NO arguments: a False here is read as a filename
     p = app.ActiveProject
     p.ProjectStart = ANCHOR
-    p.NewTasksCreatedAsManual = manual_default
+    if manual_default is not None:
+        p.NewTasksCreatedAsManual = manual_default
     return p
 
 
@@ -74,6 +77,12 @@ def toggle(app):
         if manual:
             b.Manual = True
         save(app, slug)
+
+
+def default_new_task_mode(app):
+    p = new_plan(app, manual_default=None)
+    add(p, "Default mode", 1)
+    save(app, "m4-default-new-task-mode")
 
 
 def manual_and_auto(app, slug, manual_default):
@@ -134,6 +143,7 @@ def main():
     try:
         app.Visible = False
         app.DisplayAlerts = False
+        default_new_task_mode(app)
         toggle(app)
         manual_and_auto(app, "m1-manual-and-auto", False)
         manual_and_auto(app, "m2-new-tasks-manual", True)

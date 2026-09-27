@@ -43,13 +43,13 @@ pub(crate) fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
     Ok(out)
 }
 
-/// `NewTasksAreManual`: a 2-byte value, `0` or `0x00ff`.
+/// `NewTasksAreManual`: a 2-byte value, `0`, `1`, or `0x00ff`.
 pub(crate) const NEW_TASKS_ARE_MANUAL: u32 = 0x0240_13c8;
 
 pub(crate) fn new_tasks_are_manual(b: &[u8]) -> Result<bool, String> {
     match entries(b)?.get(&NEW_TASKS_ARE_MANUAL) {
         Some([0, 0]) => Ok(false),
-        Some([0xff, 0]) => Ok(true),
+        Some([1, 0] | [0xff, 0]) => Ok(true),
         Some(v) => Err(format!("unrecognized NewTasksAreManual value {v:02x?}")),
         None => Err("project Props has no NewTasksAreManual".into()),
     }
@@ -88,7 +88,16 @@ mod tests {
         assert_eq!(new_tasks_are_manual(&off), Ok(false));
         let on = stream(&[(NEW_TASKS_ARE_MANUAL, &[0xff, 0])]);
         assert_eq!(new_tasks_are_manual(&on), Ok(true));
-        assert!(new_tasks_are_manual(&stream(&[(NEW_TASKS_ARE_MANUAL, &[1, 0])])).is_err());
+        assert_eq!(
+            new_tasks_are_manual(&stream(&[(NEW_TASKS_ARE_MANUAL, &[1, 0])])),
+            Ok(true)
+        );
+        for value in [&[1, 1][..], &[2, 0], &[0, 1], &[1], &[1, 0, 0]] {
+            assert!(
+                new_tasks_are_manual(&stream(&[(NEW_TASKS_ARE_MANUAL, value)])).is_err(),
+                "accepted {value:02x?}"
+            );
+        }
         assert!(new_tasks_are_manual(&stream(&[(1, &[0, 0])])).is_err());
         let mut short = on.clone();
         short.pop();

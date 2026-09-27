@@ -898,6 +898,10 @@ mod tests {
         assert_eq!(new_tasks_are_manual(&file(&s, true)), Ok(true));
         let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         assert!(project.new_tasks_are_manual);
+        s.props = props(&[1, 0]);
+        assert_eq!(new_tasks_are_manual(&file(&s, true)), Ok(true));
+        let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert!(project.new_tasks_are_manual);
         s.props = props(&[1, 1]);
         assert!(new_tasks_are_manual(&file(&s, true)).is_err());
         assert!(crate::project::project_from_mpp(&file(&s, true)).is_err());
