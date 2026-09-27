@@ -55,9 +55,16 @@ refreshes the stored assignment dates, costs and remaining work, and the
 resource, task and summary totals, that an edit made stale
 (`assign::refresh`, run from `Editor::reschedule` during an edit); values no
 edit touched are saved exactly as read. Project-level options the model does not hold (`ScheduleFromStart`,
-currency, task defaults, file identity, ...) are kept verbatim in
+currency, file identity, ...) are kept verbatim in
 `Project::options` and written back on save; docxy does not act on them yet, so
-it still schedules forward even when `ScheduleFromStart` is 0.
+it still schedules forward even when `ScheduleFromStart` is 0. Six options are
+typed when their text parses: `NewTasksEffortDriven`, `NewTasksEstimated`,
+`DefaultTaskType`, `Autolink`, `CriticalSlackLimit` and `MultipleCriticalPaths`.
+A save writes them in canonical form (`true` as `1`), keeps unparseable text
+verbatim, and leaves an option the file did not state absent. docxy acts on
+them: new tasks take the stated task type, effort-driven default and estimated
+default duration, Insert autolinks, and the critical flag follows the slack
+limit and multiple critical paths (Project's defaults apply when absent).
 
 `projcore::editor::Editor` owns the editable project, its 100-entry undo history,
 selection, dirty flag, computed schedule and optional leveling overlay. Validated
@@ -122,7 +129,10 @@ Wednesday 08:00" both come out right.
   precedence modes. When a constraint moves a task earlier than its links allow,
   total slack uses the link-driven start. Dates are limited by the timeline
   horizon; pre-start constraints do not pull unlinked tasks before the project
-  start. Also computed: the **critical** flag (slack ≤ 0) and **summary
+  start. Also computed: the **critical** flag (total slack at or below the plan's
+  `CriticalSlackLimit`, 0 days by default; with `MultipleCriticalPaths`, a leaf
+  without successors is measured to its own early finish rather than the
+  project finish, so each such chain is a critical path) and **summary
   rollup** (a summary's dates derive from its descendants, unless it is a
   manual summary).
 - **Manual tasks** stay at their pinned dates: the manual start (else the stored
@@ -151,7 +161,8 @@ Wednesday 08:00" both come out right.
   A manual summary's late window spans its subtasks' late dates, but never
   starts before its own start nor finishes before its own finish; its slack is
   the smaller of its start and finish slack, so it is never negative, and it is
-  critical only at zero (critical subtasks do not make it so). Every ancestor,
+  critical only when that slack is at or below the plan's `CriticalSlackLimit`
+  (0 days by default; critical subtasks do not make it so). Every ancestor,
   manual or auto, rolls up through its own span and sees it as fixed: the
   nested summary's late window is its own span, and an auto summary over one
   measures its slack from its late window. A manual summary with no start
@@ -257,9 +268,10 @@ indicator yet.
 
 As in Project, the blank row below the last task is the entry row: clicking any
 empty row below the tasks, or Down from the last task, puts the cell cursor
-there, and typing into it then committing appends a task (`1 day?` unless a
-duration is typed), as one undo step. A new plan starts there, so typing a name
-creates its first task. Commands that act on the selected task (Delete,
+there, and typing into it then committing appends a task (`1 day?`, or
+`1 day` when the plan's `NewTasksEstimated` is off, unless a duration is
+typed), as one undo step. A new plan starts there, so typing a name creates its
+first task. Commands that act on the selected task (Delete,
 milestone, indent/outdent, clear resources, the task prompts) do nothing on the
 entry row; Insert appends, and Find searches from the first task.
 
@@ -271,8 +283,12 @@ of the task above where it sits (a summary's first child). yppxy has the same
 command on its ribbon and on `N`.
 
 Arrow keys move the cell cursor. Insert/Delete add/delete tasks (Delete on a
-summary asks first: Enter deletes it with its subtasks, Esc cancels);
-Alt+Shift+Right/Left indent/outdent; Alt+Right/Left pan the Gantt;
+summary asks first: Enter deletes it with its subtasks, Esc cancels). An
+inserted task (here, in yppxy and through projctl's `task.add`) is 1 day,
+estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
+`Autolink` on (the default) it is linked into the finish-to-start chain it
+splits: A→B becomes A→N→B, N→B keeping the lag. Alt+Shift+Right/Left
+indent/outdent; Alt+Right/Left pan the Gantt;
 Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find,
 undo/redo, save, and export. The former bare-letter commands are available on
 the ribbon; letters now start cell edits. Ribbon Rename still opens its Name prompt.
