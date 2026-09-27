@@ -46,6 +46,11 @@
 //! remaining work, is not modeled: the remaining work never moves. Resource
 //! leveling is separate from CPM. Free slack is computed precisely for
 //! finish-to-start successors and falls back to total slack otherwise.
+//!
+//! A task is critical when its total slack is at most the plan's
+//! `CriticalSlackLimit` (0 days by default). With `MultipleCriticalPaths`, a
+//! leaf without successor links is late by its own early finish rather than
+//! the project finish, so it and its drivers each form a critical path.
 
 use crate::datetime::DateTime;
 use crate::model::{
@@ -68,7 +73,8 @@ pub struct TaskResult {
     pub late_finish: DateTime,
     /// Total slack in working minutes. Late start minus the later of scheduled
     /// and link-driven start, so overriding a link still exposes the conflict.
-    /// ≤ 0 ⇒ critical.
+    /// At or below the plan's critical slack limit (0 days unless the file's
+    /// `CriticalSlackLimit` says otherwise) ⇒ critical.
     pub total_slack_min: i64,
     /// Free slack in working minutes (delay possible without moving any
     /// successor), floored at zero. For leaves, uses the minimum gap to FS
@@ -853,6 +859,11 @@ impl<'a> Scheduler<'a> {
             .max()
             .unwrap_or(self.anchor);
         let pre_start = self.pre_start_timelines(&leaves, &linked_tasks);
+        // A task is critical at or below this much total slack
+        // (`CriticalSlackLimit`), and with `MultipleCriticalPaths` each task
+        // without successors ends a critical path of its own.
+        let critical_limit = self.proj.critical_slack_limit_min();
+        let multiple_paths = self.proj.multiple_critical_paths();
 
         // ---- backward pass: late finish / late start ----
         let mut lf_abs: HashMap<i32, i64> = HashMap::new();
@@ -873,13 +884,20 @@ impl<'a> Scheduler<'a> {
                 t.duration_min
             };
             // Every task must finish by the project finish, even when an
-            // SS/SF successor only bounds its start.
-            let mut finish_abs = project_finish_abs;
+            // SS/SF successor only bounds its start. With multiple critical
+            // paths, one without successors must finish by its own early
+            // finish instead.
+            let end_abs = if multiple_paths && !succs.contains_key(&t.uid) {
+                ef_abs[&t.uid]
+            } else {
+                project_finish_abs
+            };
+            let mut finish_abs = end_abs;
             // The latest instant the successor bounds allow. A milestone's
             // start and finish are one instant, so a zero-lag link bounds it
             // by the successor's own late start (FS, SS) or late finish (FF,
             // SF), even on the morning side of the index `finish_abs` holds.
-            let mut bound_instant = project_finish_abs;
+            let mut bound_instant = end_abs;
             if let Some(list) = succs.get(&t.uid) {
                 for &(suid, link, offset) in list {
                     let lag = offset.index_lag();
@@ -1126,7 +1144,8 @@ impl<'a> Scheduler<'a> {
                     start_slack_min: total,
                     finish_slack_min: total + span_gap,
                     // A complete task is never critical (Project 2024).
-                    critical: total <= 0 && !matches!(tracked, Some(Tracked::Complete { .. })),
+                    critical: total <= critical_limit
+                        && !matches!(tracked, Some(Tracked::Complete { .. })),
                 },
             );
         }
@@ -1190,8 +1209,9 @@ impl<'a> Scheduler<'a> {
                 // A manual summary keeps its dates. Its late window spans its
                 // subtasks' late dates, never starting before its own start
                 // nor finishing before its own finish, so its slack is never
-                // negative. It is critical only when that slack is zero:
-                // subtasks on the critical path do not make it so.
+                // negative. It is critical only when that slack is within the
+                // critical slack limit: subtasks on the critical path do not
+                // make it so.
                 Some(&(start, finish)) => {
                     let (start, finish) = (
                         DateTime::from_minutes(start),
@@ -1217,7 +1237,7 @@ impl<'a> Scheduler<'a> {
                         free_slack_min: total.max(0),
                         start_slack_min: start_slack,
                         finish_slack_min: finish_slack,
-                        critical: total <= 0,
+                        critical: total <= critical_limit,
                     }
                 }
                 None => {
@@ -1233,7 +1253,7 @@ impl<'a> Scheduler<'a> {
                     // bounds: its subtasks' slack does not free it.
                     let (total, critical) = if nodes.iter().any(|n| n.fixed) {
                         let total = start_slack.min(finish_slack);
-                        (total, total <= 0)
+                        (total, total <= critical_limit)
                     } else {
                         (
                             nodes.iter().map(|n| n.total).min().unwrap(),
@@ -6208,6 +6228,108 @@ mod tests {
         expect(&s, 4, (12, 8), (12, 17), 0, true);
         expect(&s, 5, (2, 8), (4, 17), 0, true);
         assert_eq!(s.project_finish, at(12, 17));
+    }
+
+    /// A 3d -> B 2d, and a shorter chain C 2d -> D 2d with 1d of slack.
+    fn two_chains() -> Project {
+        march2(vec![
+            sub(1, 3, 1, &[]),
+            sub(2, 2, 1, &[1]),
+            sub(3, 2, 1, &[]),
+            sub(4, 2, 1, &[3]),
+        ])
+    }
+
+    #[test]
+    fn the_critical_slack_limit_widens_the_critical_path() {
+        for (limit, short_critical) in [(None, false), (Some(0), false), (Some(1), true)] {
+            let proj = Project {
+                critical_slack_limit_days: limit,
+                ..two_chains()
+            };
+            let s = schedule(&proj);
+            for uid in [1, 2] {
+                assert!(s.get(uid).unwrap().critical, "{uid} {limit:?}");
+            }
+            for uid in [3, 4] {
+                let r = s.get(uid).unwrap();
+                assert_eq!(r.total_slack_min, DAY, "{uid} {limit:?}");
+                assert_eq!(r.critical, short_critical, "{uid} {limit:?}");
+            }
+        }
+        // A negative limit leaves even zero slack off the critical path.
+        let proj = Project {
+            critical_slack_limit_days: Some(-1),
+            ..two_chains()
+        };
+        let s = schedule(&proj);
+        assert!((1..=4).all(|uid| !s.get(uid).unwrap().critical));
+    }
+
+    #[test]
+    fn the_critical_slack_limit_applies_to_manual_summaries_and_their_parents() {
+        // As in manual_summary_off_the_critical_path_of_its_subtasks: the
+        // manual summary S has 3d of slack.
+        let manual = |limit| Project {
+            critical_slack_limit_days: limit,
+            ..march2(vec![
+                msum(1, 1, at(2, 8), Some(at(4, 17))),
+                sub(2, 2, 2, &[5]),
+                sub(3, 3, 2, &[2]),
+                sub(4, 1, 1, &[3]),
+                sub(5, 3, 1, &[]),
+            ])
+        };
+        expect(&schedule(&manual(Some(2))), 1, (2, 8), (4, 17), 3, false);
+        expect(&schedule(&manual(Some(3))), 1, (2, 8), (4, 17), 3, true);
+        // An auto summary P over a manual summary S measures its own late
+        // window. Here P starts with its leaf X, ahead of S, and a later
+        // unrelated task leaves both with slack.
+        let over = |limit| Project {
+            critical_slack_limit_days: limit,
+            ..march2(vec![
+                asum(1, 1),
+                sub(6, 1, 2, &[]),
+                msum(2, 2, at(4, 8), Some(at(5, 17))),
+                sub(3, 1, 3, &[]),
+                sub(4, 20, 1, &[]),
+            ])
+        };
+        let p = schedule(&over(None)).get(1).copied().unwrap();
+        assert!(p.total_slack_min > 0 && !p.critical, "{p:?}");
+        let days = p.total_slack_min / DAY;
+        assert!(!schedule(&over(Some(days - 1))).get(1).unwrap().critical);
+        assert!(schedule(&over(Some(days))).get(1).unwrap().critical);
+    }
+
+    #[test]
+    fn multiple_critical_paths_end_one_at_each_task_without_successors() {
+        for (multiple, short_critical) in [(None, false), (Some(false), false), (Some(true), true)]
+        {
+            let proj = Project {
+                multiple_critical_paths: multiple,
+                ..two_chains()
+            };
+            let s = schedule(&proj);
+            for uid in [1, 2] {
+                let r = s.get(uid).unwrap();
+                assert!(r.critical && r.total_slack_min == 0, "{uid} {multiple:?}");
+            }
+            for uid in [3, 4] {
+                let r = s.get(uid).unwrap();
+                assert_eq!(r.critical, short_critical, "{uid} {multiple:?}");
+                assert_eq!(r.total_slack_min == 0, short_critical, "{uid} {multiple:?}");
+            }
+            // D is late by its own finish, or by the project finish.
+            let d = s.get(4).unwrap();
+            let end = if short_critical {
+                d.early_finish
+            } else {
+                s.project_finish
+            };
+            assert_eq!(d.late_finish, end, "{multiple:?}");
+            assert_eq!(s.project_finish, s.get(2).unwrap().early_finish);
+        }
     }
 
     #[test]
