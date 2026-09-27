@@ -301,6 +301,14 @@ struct ConstraintDates {
 }
 
 impl<'a> Scheduler<'a> {
+    /// The same exception-aware leaf test used by the CPM and leveling passes.
+    fn has_leaf(&self) -> bool {
+        self.proj
+            .tasks
+            .iter()
+            .any(|task| !task.summary && self.tl(task).total > 0)
+    }
+
     fn new(proj: &'a Project) -> Scheduler<'a> {
         // Anchor: explicit project start, else the earliest stored, pinned or
         // actual start of a leaf `run()` schedules, else a fixed Monday,
@@ -1828,14 +1836,10 @@ pub fn schedule(proj: &Project) -> Schedule {
         return Scheduler::new(&clean).run();
     }
     let active = without_tasks(&clean, &dormant);
-    let mut main = Scheduler::new(&active).run();
-    let active_schedulable = has_schedulable_task(&active);
-    let mut dormant_view = dormant_view(&clean, &dormant);
-    if active_schedulable {
-        dormant_view.start_date.get_or_insert(main.project_start);
-    }
-    let other = Scheduler::new(&dormant_view).run();
-    if !active_schedulable {
+    let active_scheduler = Scheduler::new(&active);
+    let mut main = active_scheduler.run();
+    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler);
+    if dormant_bounds {
         main.project_start = other.project_start;
         main.project_finish = other.project_finish;
     }
@@ -1851,9 +1855,31 @@ pub fn schedule(proj: &Project) -> Schedule {
     main
 }
 
-fn has_schedulable_task(proj: &Project) -> bool {
-    let calendars = CalendarResolver::new(proj);
-    proj.tasks.iter().any(|task| calendars.schedulable(task))
+/// Schedule dormant tasks on the active pass's timeline when that pass has a
+/// schedulable leaf. Otherwise their own pass supplies project bounds.
+fn dormant_pass(
+    clean: &Project,
+    dormant: &std::collections::HashSet<i32>,
+    active: &Scheduler<'_>,
+) -> (Schedule, bool) {
+    let dormant_bounds = !active.has_leaf();
+    let mut view = dormant_view(clean, dormant);
+    if dormant_bounds && view.start_date.is_none() {
+        // An active leaf with no working time can still have a stored start.
+        // It must not anchor the dormant pass when it contributes no result.
+        let non_dormant = clean
+            .tasks
+            .iter()
+            .filter(|task| !dormant.contains(&task.uid))
+            .map(|task| task.uid)
+            .collect();
+        let dormant_only = without_tasks(clean, &non_dormant);
+        view.start_date = Some(DateTime::from_minutes(Scheduler::new(&dormant_only).anchor));
+    } else if !dormant_bounds {
+        view.start_date
+            .get_or_insert(DateTime::from_minutes(active.anchor));
+    }
+    (Scheduler::new(&view).run(), dormant_bounds)
 }
 
 /// Inactive tasks and summaries with no active descendants have no effect on
@@ -2051,16 +2077,10 @@ pub fn level(proj: &Project) -> Leveled {
         return Scheduler::new(&clean).level();
     }
     let active = without_tasks(&clean, &dormant);
-    let active_schedulable = has_schedulable_task(&active);
     let active_scheduler = Scheduler::new(&active);
-    let active_start = DateTime::from_minutes(active_scheduler.anchor);
     let mut main = active_scheduler.level();
-    let mut dormant_view = dormant_view(&clean, &dormant);
-    if active_schedulable {
-        dormant_view.start_date.get_or_insert(active_start);
-    }
-    let other = Scheduler::new(&dormant_view).run();
-    if !active_schedulable {
+    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler);
+    if dormant_bounds {
         main.project_finish = other.project_finish;
     }
     for uid in &dormant {
@@ -2719,16 +2739,42 @@ mod tests {
             tasks: vec![summary, dormant],
             ..Project::default()
         };
-        assert!(!has_schedulable_task(&without_tasks(
-            &proj,
-            &dormant_uids(&proj)
-        )));
+        assert!(!Scheduler::new(&without_tasks(&proj, &dormant_uids(&proj))).has_leaf());
         let sched = schedule(&proj);
         assert_eq!(sched.project_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
         assert_eq!(sched.project_finish, sched.get(2).unwrap().early_finish);
         let leveled = level(&proj);
         assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
         assert_eq!(leveled.project_finish, sched.project_finish);
+    }
+
+    #[test]
+    fn exception_closed_active_leaf_does_not_anchor_dormant_dates() {
+        let mut closed = Calendar::standard(2);
+        closed.exceptions.push(CalendarException::date_range(
+            DateTime::from_ymd_hm(2019, 1, 1, 0, 0),
+            DateTime::from_ymd_hm(2200, 12, 31, 23, 59),
+            DayWorking::default(),
+        ));
+        let mut active = task(1, "Exception-closed", 480);
+        active.calendar_uid = Some(2);
+        active.stored_start = Some(DateTime::from_ymd_hm(2020, 1, 6, 8, 0));
+        let mut dormant = task(2, "Dormant", 480);
+        dormant.active = Some(false);
+        dormant.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        let proj = Project {
+            tasks: vec![active, dormant],
+            calendars: vec![Calendar::standard(1), closed],
+            ..Project::default()
+        };
+        let active_view = without_tasks(&proj, &dormant_uids(&proj));
+        assert!(!Scheduler::new(&active_view).has_leaf());
+        let sched = schedule(&proj);
+        assert_eq!(sched.project_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        assert_eq!(sched.project_finish, sched.get(2).unwrap().early_finish);
+        let leveled = level(&proj);
+        assert_eq!(leveled.project_finish, sched.project_finish);
+        assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
     }
 
     #[test]
