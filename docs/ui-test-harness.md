@@ -258,6 +258,7 @@ State keys, as the app reports them after every driving verb:
 | `undo_depth`, `redo_depth` | Project: number of available undo and redo steps |
 | `table_w`, `gantt_w` | Project: entry-table pane and Gantt chart widths in px. Split-bar drags move them; `table_w + 6 + gantt_w + 16` is the window width |
 | `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |
+| `timeline_view_start`, `timeline_view_finish` | Project: the first and last day the Gantt chart shows, which the Timeline's view box highlights, clamped to the Timeline's span (`Mon 3/2/26`) |
 | `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
 
@@ -322,6 +323,11 @@ Project `timeline` is `shown` or `hidden` (View > Split View > Timeline).
 date form, for example `Mon 3/2/26`. They span every displayed bar: a task shown
 before the project start moves the start earlier, and the finish is the leveled
 one while leveling is on.
+`timeline_view_start` and `timeline_view_finish` are the first and last day
+the chart shows (a day partly in view counts), clamped to that span; they are
+what the Timeline's view box covers. Dragging the box scrolls the chart, but
+the harness has no pointer-drag verb for it, so cases move the chart with keys
+(Scroll to Task, Go to Start) instead.
 
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns;
