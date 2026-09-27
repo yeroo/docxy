@@ -3239,6 +3239,9 @@ mod tests {
                 .unwrap()
                 .critical
         );
+        let mut summary = back;
+        summary.tasks[0].summary = true;
+        assert!(read_mspdi(&write_mspdi(&summary)).is_ok());
     }
 
     #[test]

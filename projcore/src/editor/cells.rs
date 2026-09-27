@@ -57,6 +57,9 @@ impl Editor {
         date: Option<DateTime>,
     ) -> Result<(), String> {
         let i = self.index(uid)?;
+        if self.proj.tasks[i].is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         let needs_date = !matches!(
             constraint,
             ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible
@@ -80,6 +83,9 @@ impl Editor {
     /// the task the edit makes it (manual in a plan whose new tasks are).
     pub fn set_start(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
+        if self.proj.tasks[i].is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         let task = &self.row_as_edited(i);
         if !task.manual {
             return self.set_start_at(uid, day);
@@ -96,6 +102,9 @@ impl Editor {
     /// shows as its manual duration.
     pub fn set_start_at(&mut self, uid: i32, start: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
+        if self.proj.tasks[i].is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         let blank = self.proj.tasks[i].is_null;
         let task = &self.row_as_edited(i);
         if !task.manual {
@@ -133,6 +142,9 @@ impl Editor {
     /// row is judged as the task the edit makes it, as in [`Self::set_start`].
     pub fn set_finish(&mut self, uid: i32, day: DateTime) -> Result<(), String> {
         let i = self.index(uid)?;
+        if self.proj.tasks[i].is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         let blank = self.proj.tasks[i].is_null;
         let task = &self.row_as_edited(i);
         if !task.manual {

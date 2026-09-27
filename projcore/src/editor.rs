@@ -13,6 +13,7 @@ use crate::model::{
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
+const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
 
 mod cells;
 mod effort;
@@ -709,6 +710,9 @@ impl Editor {
 
     pub fn update_task(&mut self, uid: i32, patch: TaskPatch) -> Result<(), String> {
         let i = self.index(uid)?;
+        if patch.duration_min.is_some() && self.proj.tasks[i].is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         if patch.name.is_none()
             && patch.duration_min.is_none()
             && patch.level.is_none()
@@ -842,6 +846,9 @@ impl Editor {
     /// Record row `i`'s scheduled start and finish as its stored dates.
     fn stamp_dates(&mut self, i: usize) {
         let task = &self.proj.tasks[i];
+        if task.is_external_leaf() {
+            return;
+        }
         let start = task
             .pinned_dates()
             .or_else(|| task.manual_summary_dates())
@@ -1765,6 +1772,55 @@ mod tests {
                 .collect(),
             ..Project::default()
         })
+    }
+
+    #[test]
+    fn external_task_date_edits_are_refused_without_stamping() {
+        for manual in [false, true] {
+            let mut proj = editor().project().clone();
+            let task = &mut proj.tasks[0];
+            task.external_task = Some(true);
+            task.manual = manual;
+            task.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+            task.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+            if manual {
+                task.manual_start = task.stored_start;
+                task.manual_finish = task.stored_finish;
+            }
+            let mut ed = Editor::new(proj);
+            let before = ed.project().task(1).unwrap().clone();
+            let depth = ed.undo_depth();
+            let day = DateTime::from_ymd_hm(2026, 3, 16, 8, 0);
+            let results = [
+                ed.set_start(1, day),
+                ed.set_start_at(1, day),
+                ed.set_finish(1, day),
+                ed.set_duration(1, "2d"),
+                ed.set_duration_min(1, 960, false),
+                ed.set_constraint(1, "SNET 2026-03-16"),
+                ed.move_task(1, "5d").map(|_| ()),
+            ];
+            for result in results {
+                assert_eq!(result.unwrap_err(), EXTERNAL_TASK_DATES);
+            }
+            assert_eq!(ed.undo_depth(), depth);
+            assert_eq!(ed.project().task(1).unwrap(), &before);
+            let saved = crate::mspdi::write_mspdi(ed.project());
+            let back = crate::mspdi::read_mspdi(&saved).unwrap();
+            assert_eq!(back.task(1).unwrap().stored_start, before.stored_start);
+            assert_eq!(back.task(1).unwrap().stored_finish, before.stored_finish);
+            if !manual {
+                ed.set_manual(1, true).unwrap();
+                assert_eq!(
+                    ed.project().task(1).unwrap().stored_start,
+                    before.stored_start
+                );
+                assert_eq!(
+                    ed.project().task(1).unwrap().stored_finish,
+                    before.stored_finish
+                );
+            }
+        }
     }
 
     #[test]

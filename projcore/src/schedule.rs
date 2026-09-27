@@ -1608,7 +1608,10 @@ impl<'a> CalendarResolver<'a> {
 pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
     let calendars = CalendarResolver::new(proj);
     for (i, task) in proj.tasks.iter().enumerate() {
-        if task.is_null || task.is_external_leaf() || (task.summary && proj.is_outline_summary(i)) {
+        if task.is_null
+            || task.external_task == Some(true)
+            || (task.summary && proj.is_outline_summary(i))
+        {
             continue;
         }
         let Some(cal) = calendars.resolve(task.calendar_uid) else {
@@ -5548,6 +5551,43 @@ mod tests {
                 lv.finish(1).unwrap()
             ),
             960
+        );
+    }
+
+    #[test]
+    fn external_calendar_does_not_widen_local_summary_duration() {
+        let mut proj = closed_default(
+            vec![phase(1), child(2, "A", 480, 3), child(3, "B", 480, 3)],
+            vec![Calendar::standard(3)],
+        );
+        proj.tasks[2].predecessors.push(fs(2));
+        let plain = schedule(&proj);
+        let expected = task_duration_min(&proj, &plain, &proj.tasks[0]);
+        assert_eq!(expected, Some(960));
+
+        let all_day = weekly(
+            4,
+            &[
+                (0, 0, 1440),
+                (1, 0, 1440),
+                (2, 0, 1440),
+                (3, 0, 1440),
+                (4, 0, 1440),
+                (5, 0, 1440),
+                (6, 0, 1440),
+            ],
+        );
+        proj.calendars.push(all_day);
+        let mut external = child(4, "External", 480, 4);
+        external.external_task = Some(true);
+        external.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        external.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+        proj.tasks.push(external);
+        let with_external = schedule(&proj);
+        assert_eq!(with_external.rolled_up(1), plain.rolled_up(1));
+        assert_eq!(
+            task_duration_min(&proj, &with_external, &proj.tasks[0]),
+            expected
         );
     }
 
