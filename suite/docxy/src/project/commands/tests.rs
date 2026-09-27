@@ -1591,6 +1591,25 @@ fn delete_on_predecessors_and_resources_clears_only_that_field() {
 }
 
 #[test]
+fn delete_on_resources_clears_an_assignment_with_no_displayed_name() {
+    let mut t = tab();
+    vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+    let mut project = v(&t).ed.project().clone();
+    project.resources.clear();
+    vm(&mut t).ed = ProjectEditor::new(project);
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_RESOURCES;
+    let before = v(&t).ed.project().clone();
+    assert!(project_row(&v(&t).ed, &before.tasks[1])[COL_RESOURCES].is_empty());
+    assert_eq!(before.assignments.len(), 1);
+    press(&mut t, "delete");
+    assert!(v(&t).ed.project().assignments.is_empty());
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project(), &before);
+}
+
+#[test]
 fn delete_on_id_deletes_the_task_and_a_summary_asks_first() {
     let mut t = tab();
     vm(&mut t).col = COL_ID;
