@@ -26981,7 +26981,7 @@ mod config_root_tests {
 #[cfg(test)]
 mod ribbon_fit_tests {
     // Not `super::*`: that brings gpui's `test` attribute in over the std one.
-    use super::{ROW_BTN_PITCH, docxy_ribbon, group_est, ribbon_fit};
+    use super::{docxy_ribbon, group_est, ribbon_fit};
 
     fn home_titles(width: f32) -> (bool, Vec<&'static str>) {
         let ribbon = docxy_ribbon();
@@ -27021,6 +27021,12 @@ mod ribbon_fit_tests {
         let ribbon = docxy_ribbon();
         let home = ribbon.tabs.iter().find(|t| t.name == "Home").unwrap();
         let para = home.groups.iter().find(|g| g.title == "Paragraph").unwrap();
-        assert_eq!(group_est(para, true), 22. + 7. * ROW_BTN_PITCH);
+        // `icon_btn` without its label: border 1 + `px_2` 8 + icon 16 + `px_2`
+        // 8 + border 1, then the row's 1px gap. Written out, not the constant,
+        // so changing the estimate means changing this too.
+        assert_eq!(
+            group_est(para, true),
+            22. + 7. * (1. + 8. + 16. + 8. + 1. + 1.)
+        );
     }
 }
