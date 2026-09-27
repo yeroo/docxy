@@ -40,6 +40,12 @@ fn commit(t: &mut DocTab, act: ProjectAct, text: &str) {
     commit_prompt(t, p);
 }
 
+fn press(t: &mut DocTab, key: &str) {
+    if let Some(act) = project_input(t, key, None, Modifiers::default()) {
+        apply_project_act(t, act);
+    }
+}
+
 fn take_reveal(t: &DocTab) -> Option<usize> {
     v(t).scroll
         .0
@@ -464,11 +470,7 @@ fn level_all_and_clear_leveling_are_idempotent() {
 #[test]
 fn keys_and_whole_route_enforce_modifiers() {
     use ProjectAct::*;
-    for (key, act) in [
-        ("insert", AddTask),
-        ("delete", DeleteTask),
-        ("f3", FindNext),
-    ] {
+    for (key, act) in [("insert", AddTask), ("delete", ClearCell), ("f3", FindNext)] {
         assert_eq!(key_act(key, Modifiers::default()), Some(act));
     }
     for (key, act) in [
@@ -1507,4 +1509,217 @@ fn indenting_under_a_collapsed_summary_scrolls_to_the_task() {
         ),
         Some(Indent)
     );
+}
+
+#[test]
+fn delete_on_name_clears_the_name_and_keeps_the_task() {
+    let mut t = tab();
+    vm(&mut t).ed.set_duration_min(1, 960, false).unwrap();
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
+    vm(&mut t).ed.assign_resource(1, "Alice").unwrap();
+    let before = v(&t).ed.project().clone();
+    vm(&mut t).ed.mark_saved();
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_NAME;
+    let depth = v(&t).ed.undo_depth();
+    press(&mut t, "delete");
+    let after = v(&t).ed.project().clone();
+    assert_eq!(after.tasks.len(), 2);
+    assert_eq!(after.tasks[0].name, "");
+    assert_eq!(after.tasks[0].duration_min, 960);
+    assert_eq!(after.tasks[1], before.tasks[1]);
+    assert_eq!(after.assignments, before.assignments);
+    assert_eq!(after.resources, before.resources);
+    assert_eq!(after.tasks[0].predecessors, before.tasks[0].predecessors);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(t.dirty);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project(), &before);
+    apply_project_act(&mut t, ProjectAct::Redo);
+    assert_eq!(v(&t).ed.project(), &after);
+}
+
+#[test]
+fn delete_on_predecessors_and_resources_clears_only_that_field() {
+    for col in [COL_PREDECESSORS, COL_RESOURCES] {
+        let mut t = tab();
+        vm(&mut t)
+            .ed
+            .add_predecessor(2, 1, LinkType::FinishStart, 0)
+            .unwrap();
+        vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+        vm(&mut t).ed.mark_saved();
+        vm(&mut t).col = col;
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        press(&mut t, "delete");
+        let after = v(&t).ed.project();
+        assert_eq!(after.tasks.len(), 2);
+        assert_eq!(after.tasks[0], before.tasks[0]);
+        assert_eq!(after.tasks[1].name, before.tasks[1].name);
+        assert_eq!(after.tasks[1].duration_min, before.tasks[1].duration_min);
+        if col == COL_PREDECESSORS {
+            assert!(after.tasks[1].predecessors.is_empty());
+            assert_eq!(after.assignments.len(), before.assignments.len());
+            for (actual, original) in after.assignments.iter().zip(&before.assignments) {
+                assert_eq!(
+                    (
+                        actual.uid,
+                        actual.task_uid,
+                        actual.resource_uid,
+                        actual.units
+                    ),
+                    (
+                        original.uid,
+                        original.task_uid,
+                        original.resource_uid,
+                        original.units
+                    )
+                );
+            }
+        } else {
+            assert_eq!(after.tasks[1].predecessors, before.tasks[1].predecessors);
+            assert!(after.assignments.is_empty());
+        }
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        apply_project_act(&mut t, ProjectAct::Undo);
+        assert_eq!(v(&t).ed.project(), &before);
+    }
+}
+
+#[test]
+fn delete_on_resources_clears_an_assignment_with_no_displayed_name() {
+    let mut t = tab();
+    vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+    let mut project = v(&t).ed.project().clone();
+    project.resources.clear();
+    vm(&mut t).ed = ProjectEditor::new(project);
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_RESOURCES;
+    let before = v(&t).ed.project().clone();
+    assert!(project_row(&v(&t).ed, &before.tasks[1])[COL_RESOURCES].is_empty());
+    assert_eq!(before.assignments.len(), 1);
+    press(&mut t, "delete");
+    assert!(v(&t).ed.project().assignments.is_empty());
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(v(&t).ed.project(), &before);
+}
+
+#[test]
+fn delete_on_id_deletes_the_task_and_a_summary_asks_first() {
+    let mut t = tab();
+    vm(&mut t).col = COL_ID;
+    press(&mut t, "delete");
+    assert_eq!(v(&t).ed.project().tasks.len(), 1);
+    assert_eq!(v(&t).ed.project().tasks[0].name, "First");
+
+    let mut t = summary_tab();
+    vm(&mut t).col = COL_ID;
+    press(&mut t, "delete");
+    assert_eq!(
+        v(&t).prompt.as_ref().unwrap().kind,
+        PromptKind::ConfirmDelete
+    );
+    assert_eq!(v(&t).ed.project().tasks.len(), 2);
+}
+
+#[test]
+fn delete_on_unclearable_columns_changes_nothing() {
+    for col in [COL_MODE, COL_DURATION, COL_START, COL_FINISH] {
+        let mut t = tab();
+        vm(&mut t).col = col;
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        press(&mut t, "delete");
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), depth);
+        assert!(!t.dirty);
+        assert_eq!(
+            t.status.as_ref(),
+            format!("{} can't be cleared", COLUMNS[col])
+        );
+    }
+}
+
+#[test]
+fn delete_on_an_empty_field_blank_row_or_entry_row_is_a_no_op() {
+    let mut t = tab();
+    vm(&mut t).ed.rename(2, "").unwrap();
+    vm(&mut t).ed.mark_saved();
+    for col in [COL_NAME, COL_PREDECESSORS, COL_RESOURCES] {
+        vm(&mut t).col = col;
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        press(&mut t, "delete");
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), depth);
+        assert!(!t.dirty);
+    }
+
+    vm(&mut t).ed.insert_blank_row(Some(2)).unwrap();
+    vm(&mut t).ed.mark_saved();
+    vm(&mut t).ed.select(1);
+    for col in [COL_NAME, COL_PREDECESSORS, COL_RESOURCES] {
+        vm(&mut t).col = col;
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        press(&mut t, "delete");
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), depth);
+        assert!(!t.dirty);
+    }
+    vm(&mut t).col = COL_ID;
+    press(&mut t, "delete");
+    assert_eq!(v(&t).ed.project().tasks.len(), 2);
+
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    press(&mut t, "delete");
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+}
+
+#[test]
+fn ribbon_delete_task_from_name_still_deletes() {
+    let mut t = tab();
+    vm(&mut t).col = COL_NAME;
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    assert_eq!(v(&t).ed.project().tasks.len(), 1);
+}
+
+#[test]
+fn delete_inside_an_open_cell_edit_edits_the_buffer() {
+    let mut t = tab();
+    vm(&mut t).col = COL_NAME;
+    let before = v(&t).ed.project().clone();
+    vm(&mut t).open_cell(None).unwrap();
+    vm(&mut t).cell.as_mut().unwrap().caret = 0;
+    press(&mut t, "delete");
+    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "econd");
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+}
+
+#[test]
+fn ribbon_delete_task_shortcut_names_the_id_column() {
+    let ribbon = project_ribbon();
+    let command = ribbon
+        .tabs
+        .iter()
+        .flat_map(|t| &t.groups)
+        .flat_map(|g| &g.items)
+        .flat_map(|item| match item {
+            Control::Large(c) | Control::Toggle(c) => vec![c],
+            Control::Column(commands) => commands.iter().collect(),
+            _ => vec![],
+        })
+        .find(|c| c.id == "pr-delete")
+        .unwrap();
+    assert!(matches!(command.act, Act::Project(ProjectAct::DeleteTask)));
+    assert_eq!(command.tip.shortcut, "Delete on the ID column");
 }

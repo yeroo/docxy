@@ -4,6 +4,13 @@ test project editing keys and prompts
   assert tasks is 4
   assert selected_name is New task
   key delete
+  assert tasks is 4
+  assert selected_name is empty
+  key ctrl+z
+  assert selected_name is New task
+  key left left
+  assert cell is ID
+  key delete
   assert tasks is 3
   key home down alt t r
   assert prompt is rename:Task 2

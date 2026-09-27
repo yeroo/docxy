@@ -335,9 +335,11 @@ any printable character replaces it. Left/Right move between columns;
 Up/Down/Home/End move between rows; Down from the last task, or a click below
 it, goes to the entry row, where typing appends a task (`click C<tasks+1>`
 addresses it). Tab/Shift+Tab move between columns.
-Insert/Delete add/delete tasks (Delete on a summary asks first: Enter deletes it
+Insert adds a task. Delete clears the active Name, Predecessors, or Resource Names
+cell; on Task Mode, Duration, Start, or Finish it reports `<column> can't be cleared`.
+On the ID column Delete deletes the task (a summary asks first: Enter deletes it
 with its subtasks, Esc cancels, and typed text is ignored while that prompt is
-open; the state's `prompt` reads `delete:`), Alt+Shift+Right/Left indent/outdent,
+open; the state's `prompt` reads `delete:`). Alt+Shift+Right/Left indent/outdent,
 Alt+Right/Left pan the Gantt, and Ctrl+Shift+L toggles leveling. Former bare-letter
 commands (`n x d p c a b L`) now type into cells. Duration, predecessor, constraint,
 resource, baseline, and Rename commands remain on the ribbon; ribbon Rename

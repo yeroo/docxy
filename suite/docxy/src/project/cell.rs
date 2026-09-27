@@ -207,7 +207,7 @@ pub(crate) fn parse_task_mode(text: &str) -> Result<bool, String> {
 }
 
 /// Apply a typed cell value to task `uid`; a status line on success.
-fn apply_cell(
+pub(crate) fn apply_cell(
     ed: &mut ProjectEditor,
     uid: i32,
     col: usize,

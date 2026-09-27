@@ -271,7 +271,7 @@ empty row below the tasks, or Down from the last task, puts the cell cursor
 there, and typing into it then committing appends a task (`1 day?`, or
 `1 day` when the plan's `NewTasksEstimated` is off, unless a duration is
 typed), as one undo step. A new plan starts there, so typing a name creates its
-first task. Commands that act on the selected task (Delete,
+first task. Commands that act on the selected task (Delete on ID,
 milestone, indent/outdent, clear resources, the task prompts) do nothing on the
 entry row; Insert appends, and Find searches from the first task.
 
@@ -282,8 +282,10 @@ schedule until something is typed into it; then it becomes a task at the level
 of the task above where it sits (a summary's first child). yppxy has the same
 command on its ribbon and on `N`.
 
-Arrow keys move the cell cursor. Insert/Delete add/delete tasks (Delete on a
-summary asks first: Enter deletes it with its subtasks, Esc cancels). An
+Arrow keys move the cell cursor. Insert adds a task. Delete clears the active
+Name, Predecessors, or Resource Names cell; on the ID column, it deletes the
+task (a summary asks first: Enter deletes it with its subtasks, Esc cancels).
+Task › Editing › Delete Task deletes the selected task from any column. An
 inserted task (here, in yppxy and through projctl's `task.add`) is 1 day,
 estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
 `Autolink` on (the default) it is linked into the finish-to-start chain it

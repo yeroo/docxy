@@ -48,6 +48,8 @@ pub(crate) enum ProjectAct {
     Undo,
     Redo,
     FindNext,
+    /// Delete key: clear the active cell (the task itself on the ID column).
+    ClearCell,
 }
 
 impl ProjectAct {
@@ -241,7 +243,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "table-delete-row",
                             "Delete Task",
                             DeleteTask,
-                            "Delete",
+                            "Delete on the ID column",
                             "X",
                         ),
                         cmd(
@@ -624,7 +626,7 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
     }
     match key {
         "insert" => Some(AddTask),
-        "delete" => Some(DeleteTask),
+        "delete" => Some(ClearCell),
         "f3" => Some(FindNext),
         _ => None,
     }
@@ -800,6 +802,18 @@ pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
     }
 }
 
+fn delete_selected_task(v: &mut ProjectView) -> Result<(), String> {
+    if let Some(uid) = v.selected_uid() {
+        // A summary takes its subtasks with it, so ask first.
+        if v.ed.subtree_len(uid)? > 0 {
+            v.open_prompt(PromptKind::ConfirmDelete);
+        } else {
+            v.ed.delete_task(uid)?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     if !commit_project_cell(tab) {
         return;
@@ -811,6 +825,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     v.cancel_prompt();
     let before = (v.cursor_row(), v.display_row());
     let mut status = None;
+    let mut reveal_clear = false;
     let result: Result<(), String> = (|| {
         match act {
             AddTask => {
@@ -827,13 +842,20 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 let at = v.ed.insert_blank_row(v.selected_uid())?;
                 v.select_row(at);
             }
-            DeleteTask => {
+            DeleteTask => delete_selected_task(v)?,
+            ClearCell => {
                 if let Some(uid) = v.selected_uid() {
-                    // A summary takes its subtasks with it, so ask first.
-                    if v.ed.subtree_len(uid)? > 0 {
-                        v.open_prompt(PromptKind::ConfirmDelete);
-                    } else {
-                        v.ed.delete_task(uid)?;
+                    match v.col {
+                        COL_ID => {
+                            delete_selected_task(v)?;
+                            reveal_clear = true;
+                        }
+                        COL_NAME | COL_PREDECESSORS | COL_RESOURCES => {
+                            if !v.ed.project().task(uid).ok_or("No task selected")?.is_null {
+                                apply_cell(&mut v.ed, uid, v.col, "")?;
+                            }
+                        }
+                        _ => status = Some(format!("{} can't be cleared", COLUMNS[v.col])),
                     }
                 }
             }
@@ -985,7 +1007,8 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
         matches!(
             act,
             AddTask | InsertBlankRow | DeleteTask | FindNext | Undo | Redo
-        ) || moved,
+        ) || reveal_clear
+            || moved,
     );
 }
 
