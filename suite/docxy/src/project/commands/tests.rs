@@ -56,7 +56,7 @@ fn completion_reveals_selection_changes_without_disturbing_other_inputs() {
     for act in ProjectAct::RIBBON
         .iter()
         .copied()
-        .filter(|a| !matches!(a, AddTask | DeleteTask))
+        .filter(|a| !matches!(a, AddTask | InsertBlankRow | DeleteTask))
     {
         apply_project_act(&mut t, act);
         assert_eq!(take_reveal(&t), None, "{act:?}");
@@ -257,6 +257,7 @@ fn project_instruction_paths_exist() {
         ("Task", "Tasks", "Auto Schedule", AutoSchedule),
         ("Task", "Tasks", "Move", MoveTask),
         ("Task", "Insert", "Task", AddTask),
+        ("Task", "Insert", "Blank Row", InsertBlankRow),
         ("Task", "Insert", "Milestone", Milestone),
         ("Task", "Properties", "Information", Constraint),
         ("Task", "Editing", "Find", Find),
@@ -980,6 +981,44 @@ fn insert_on_the_entry_row_appends_and_selects_a_new_task() {
     assert!(!v(&t).on_entry_row());
     assert_eq!(v(&t).cursor_row(), 2);
     assert_eq!(take_reveal(&t), Some(2));
+}
+
+#[test]
+fn blank_row_goes_above_the_selected_row_or_the_entry_row_and_is_selected() {
+    let mut t = tab();
+    t.dirty = false;
+    // On "Second": the blank row goes above it and takes the cursor.
+    project_cell_click(&mut t, 1, None, false);
+    apply_project_act(&mut t, ProjectAct::InsertBlankRow);
+    let rows = |t: &DocTab| -> Vec<(String, bool)> {
+        v(t).ed
+            .project()
+            .tasks
+            .iter()
+            .map(|t| (t.name.clone(), t.is_null))
+            .collect()
+    };
+    let row = |name: &str, blank| (name.to_string(), blank);
+    assert_eq!(
+        rows(&t),
+        [row("First", false), row("", true), row("Second", false)]
+    );
+    assert_eq!(v(&t).cursor_row(), 1);
+    assert_eq!(take_reveal(&t), Some(1));
+    assert!(t.dirty);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    // On the entry row it appends: just above the entry row.
+    project_entry_click(&mut t, None, false);
+    apply_project_act(&mut t, ProjectAct::InsertBlankRow);
+    assert_eq!(rows(&t).len(), 4);
+    assert!(v(&t).ed.project().tasks[3].is_null);
+    assert!(!v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 3);
+    assert_eq!(take_reveal(&t), Some(3));
+    // One Undo each.
+    apply_project_act(&mut t, ProjectAct::Undo);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(rows(&t), [row("First", false), row("Second", false)]);
 }
 
 #[test]

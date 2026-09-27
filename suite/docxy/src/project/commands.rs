@@ -5,6 +5,8 @@ use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectAct {
     AddTask,
+    /// Task › Insert › Blank Row: an empty row above the selected one.
+    InsertBlankRow,
     DeleteTask,
     Milestone,
     Indent,
@@ -49,6 +51,7 @@ impl ProjectAct {
     #[cfg(test)]
     pub const RIBBON: &[Self] = &[
         Self::AddTask,
+        Self::InsertBlankRow,
         Self::DeleteTask,
         Self::Milestone,
         Self::Indent,
@@ -178,14 +181,24 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "Insert",
                             "N",
                         )),
-                        rs::column(vec![cmd(
-                            "pr-milestone",
-                            "symbol",
-                            "Milestone",
-                            Milestone,
-                            "Alt, T, M",
-                            "M",
-                        )]),
+                        rs::column(vec![
+                            cmd(
+                                "pr-milestone",
+                                "symbol",
+                                "Milestone",
+                                Milestone,
+                                "Alt, T, M",
+                                "M",
+                            ),
+                            cmd(
+                                "pr-blank-row",
+                                "table-insert-row",
+                                "Blank Row",
+                                InsertBlankRow,
+                                "Alt, T, B",
+                                "B",
+                            ),
+                        ]),
                     ],
                 ),
                 rs::group(
@@ -768,6 +781,11 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 let at = v.ed.add_task(v.selected_uid(), "New task", 480)?;
                 v.select_row(at);
             }
+            InsertBlankRow => {
+                // Above the selected row; on the entry row, just above it.
+                let at = v.ed.insert_blank_row(v.selected_uid())?;
+                v.select_row(at);
+            }
             DeleteTask => {
                 if let Some(uid) = v.selected_uid() {
                     // A summary takes its subtasks with it, so ask first.
@@ -905,7 +923,10 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     }
     complete_project(
         tab,
-        matches!(act, AddTask | DeleteTask | FindNext | Undo | Redo),
+        matches!(
+            act,
+            AddTask | InsertBlankRow | DeleteTask | FindNext | Undo | Redo
+        ),
     );
 }
 
