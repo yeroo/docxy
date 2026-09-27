@@ -66,6 +66,33 @@ pub struct MppTask {
     pub manual_start: Option<String>,
     pub manual_finish: Option<String>,
     pub manual_duration_min: Option<i64>,
+    /// Recorded progress as Project stored it. `None` for a layout whose
+    /// progress fields are not validated (MPP9).
+    pub progress: Option<MppProgress>,
+}
+
+/// A task's recorded progress, work and cost, in MSPDI's units: whole minutes
+/// (rounded from Project's tenths of a minute, or thousandths for work), and
+/// costs as MSPDI writes them. Dates are `None` where Project stores NA,
+/// which is where its MSPDI export omits them. Variances are not stored in
+/// the file; Project derives them from the baseline when it exports.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MppProgress {
+    pub percent_complete: u8,
+    pub percent_work_complete: u8,
+    pub physical_percent_complete: u8,
+    pub actual_start: Option<String>,
+    pub actual_finish: Option<String>,
+    pub stop: Option<String>,
+    pub resume: Option<String>,
+    pub actual_duration_min: i64,
+    pub remaining_duration_min: i64,
+    pub work_min: i64,
+    pub actual_work_min: i64,
+    pub remaining_work_min: i64,
+    pub cost: projcore::Rate,
+    pub actual_cost: projcore::Rate,
+    pub remaining_cost: projcore::Rate,
 }
 
 /// A predecessor link with Project's stable UID and MSPDI kind code

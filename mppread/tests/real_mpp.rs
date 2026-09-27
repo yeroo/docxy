@@ -315,3 +315,46 @@ fn new_task_default_decodes_when_present() {
         assert!(mppread::mpp::decode_new_tasks_are_manual(&bytes).is_err());
     }
 }
+
+/// #181: a tracked plan's progress survives `.mpp` → MSPDI. Every task field
+/// the decoder reads equals Project's own export after a save and re-read;
+/// the variances, which the file does not store, stay absent.
+#[test]
+fn progress_survives_save_as_mspdi_when_present() {
+    let Ok(bytes) = std::fs::read(corpus("corpus/mpp/snapshots/46-progress.mpp")) else {
+        return;
+    };
+    let xml = std::fs::read_to_string(corpus("corpus/mpp/snapshots/46-progress.xml")).unwrap();
+    let oracle = projcore::mspdi::read_mspdi(&xml).unwrap();
+    let imported = mppread::project::project_from_mpp(&bytes).unwrap();
+    let saved = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();
+    assert_eq!(saved.tasks.len(), imported.tasks.len());
+    let mut in_progress = 0;
+    for t in &saved.tasks {
+        let e = oracle.tasks.iter().find(|e| e.uid == t.uid).unwrap();
+        let fields = |t: &projcore::Task| {
+            (
+                (t.percent_complete, t.percent_work_complete),
+                t.physical_percent_complete,
+                (t.actual_start, t.actual_finish, t.stop, t.resume),
+                (t.actual_duration_min, t.remaining_duration_min),
+                (t.work_min, t.actual_work_min, t.remaining_work_min),
+                (
+                    t.cost.clone(),
+                    t.actual_cost.clone(),
+                    t.remaining_cost.clone(),
+                ),
+            )
+        };
+        assert_eq!(fields(t), fields(e), "uid {} progress", t.uid);
+        assert_eq!(
+            (t.start_variance, t.finish_variance, &t.work_variance),
+            (None, None, &None),
+            "uid {} variances are not stored in the .mpp",
+            t.uid
+        );
+        in_progress += usize::from(t.actual_start.is_some());
+    }
+    // UID 34 is complete and UID 50 half done in this step.
+    assert_eq!(in_progress, 2);
+}

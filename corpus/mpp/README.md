@@ -117,7 +117,8 @@ scheduled ones. Generate them the same way:
 python corpus/tools/gen_mpp_manual_cases.py
 ```
 
-It also checks two link-lag cases in `lag/` when present
+It also checks six task-progress cases in `progress/` when present (see
+Known decode gaps). It also checks two link-lag cases in `lag/` when present
 ([#104](https://github.com/yeroo/docxy/issues/104)): percentage, elapsed and
 estimated-elapsed lags on every link type, and a predecessor's free slack
 across an elapsed lag. The lag is compared with its LagFormat, not only as
@@ -192,8 +193,9 @@ field map before it can be imported.
 Current Project blank rows are identified by their short FixedMeta record and
 omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
-row ID order. Resources, assignments, calendars, baselines, progress,
-constraints, and custom fields are not imported.
+row ID order. Resources, assignments, calendars, baselines, constraints, and
+custom fields are not imported. Task progress is (see below); assignment
+progress needs assignments first.
 
 Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
 byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and
@@ -214,6 +216,39 @@ lag examples checked against MSPDI. Their lag i32 at +14 and LagFormat u16 at
 working or elapsed time, or the percentage itself for format 19. The importer
 reads the formats projcore schedules (3-12, 19 and their estimated variants
 35-44 and 51) and refuses the others, elapsed percent (20, 52) included.
+
+Task progress, work and cost are decoded for the newest layout
+([#181](https://github.com/yeroo/docxy/issues/181)) and imported as read; the
+scheduler ignores them, as it does for MSPDI. They sit in the task's 202-byte
+FixedData record, and each is checked against Project's MSPDI export of every
+snapshot and progress case, and MPXJ's of the paired corpus (which omits zero
+values):
+
+| Field | Offset | Stored as |
+|---|---|---|
+| Work, ActualWork, RemainingWork | +8, +16, +24 | f64, thousandths of a minute |
+| Cost, ActualCost, RemainingCost | +32, +40, +56 | f64 in MSPDI's units, which Project's export rounds to two decimals |
+| ActualDuration, RemainingDuration | +80, +88 | i32, tenths of a minute |
+| PercentComplete, PercentWorkComplete | +92, +94 | u16 |
+| ActualStart, ActualFinish | +120, +124 | timestamp; NA (no date) before the task starts or finishes |
+| Resume, Stop | +132, +136 | timestamp; NA on a task not started |
+| PhysicalPercentComplete | Var2Data key `0x045f` | u16 block, written only when nonzero |
+
+Durations and work are rounded to whole minutes, as MSPDI import rounds
+seconds. Every numeric field is present on every task, zero included, since
+Project's export writes them all; only the four dates can be absent.
+StartVariance, FinishVariance and WorkVariance are **not stored**: Project
+derives them at export from the baseline (Var2Data keeps the baseline
+duration, start and finish under keys `0x001b`, `0x002b` and `0x002c`), and
+baselines are not imported, so they stay absent. The `progress/` cases add
+states, work, physical percent complete, costs, variances of both signs, a
+split and fractional values. Generate them the same way:
+
+```powershell
+python corpus/tools/gen_mpp_progress_cases.py
+```
+
+MPP9 progress has no oracle in the legacy samples and is not read.
 
 The older `mppread::mpp::tasks` and `task_names` functions remain exploratory
 heuristic probes. They are not used by the importer. Their output may be
