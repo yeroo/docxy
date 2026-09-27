@@ -15,8 +15,8 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Assignment, Calendar, LagFormat, LagKind, Project, Rate, Resource, ResourceType, Task,
-    TimephasedValue, WorkCalendar,
+    AccrueAt, Assignment, Calendar, LagFormat, LagKind, Project, Rate, Resource, ResourceType,
+    Task, TimephasedValue, WorkCalendar,
 };
 use crate::schedule::{HORIZON_DAYS, Schedule, working_minutes_on};
 use std::collections::{HashMap, HashSet};
@@ -332,33 +332,78 @@ fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> Totals {
     })
 }
 
-/// The totals a task's stored fields count of its own assignments: the cost
-/// of all of them, the work of those whose work is time ([`is_work`]).
+/// The task's own contribution to stored totals: its assignments and fixed
+/// cost, with work counting only assignments whose work is time ([`is_work`]).
 fn task_totals(p: &Project, uid: i32) -> Totals {
     let mine = p.assignments.iter().filter(|a| a.task_uid == uid);
     let (_, cost, _, remaining_cost) = totals(mine.clone());
     let (work, _, remaining, _) = totals(mine.filter(|a| is_work(&p.resources, a)));
-    (work, cost, remaining, remaining_cost)
+    let (fixed, fixed_remaining) = p.task(uid).map_or((0.0, 0.0), |t| {
+        let amount = value(t.fixed_cost.as_ref());
+        let pct = t.percent_complete.unwrap_or(0).min(100);
+        let share = match t.fixed_cost_accrual {
+            Some(AccrueAt::Start) => f64::from(pct == 0),
+            Some(AccrueAt::End) => f64::from(pct < 100),
+            // Invalid and absent use the Prorated default from CST-082.
+            _ => f64::from(100 - pct) / 100.0,
+        };
+        // Stored costs are whole hundredths. Avoid writing negative zero.
+        (amount, (amount * share).round() + 0.0)
+    });
+    (
+        work,
+        cost + fixed,
+        remaining,
+        remaining_cost + fixed_remaining,
+    )
 }
 
-/// The UIDs of a task's outline ancestors, nearest first, up to and including
-/// the project summary (outline level 0) when the plan holds one.
-fn ancestors(p: &Project, uid: i32) -> Vec<i32> {
-    let Some(i) = p.tasks.iter().position(|t| t.uid == uid) else {
-        return Vec::new();
-    };
-    let mut level = p.tasks[i].outline_level;
-    let mut out = Vec::new();
-    for t in p.tasks[..i].iter().rev().filter(|t| !t.is_null) {
-        if level == 0 {
-            break;
+/// Task positions and outline ancestors, nearest first. A blank row has no
+/// children and never changes the ancestry of following tasks.
+struct OutlineIndex {
+    positions: HashMap<i32, usize>,
+    ancestors: HashMap<i32, Vec<i32>>,
+}
+
+impl OutlineIndex {
+    fn new(p: &Project) -> Self {
+        let mut positions = HashMap::with_capacity(p.tasks.len());
+        let mut ancestors = HashMap::with_capacity(p.tasks.len());
+        let mut stack: Vec<(u32, i32)> = Vec::new();
+        for (i, task) in p.tasks.iter().enumerate() {
+            let parent = stack
+                .iter()
+                .rev()
+                .filter(|(level, _)| *level < task.outline_level)
+                .map(|(_, uid)| *uid)
+                .collect();
+            if let std::collections::hash_map::Entry::Vacant(entry) = positions.entry(task.uid) {
+                entry.insert(i);
+                ancestors.insert(task.uid, parent);
+            }
+            if !task.is_null {
+                while stack
+                    .last()
+                    .is_some_and(|(level, _)| *level >= task.outline_level)
+                {
+                    stack.pop();
+                }
+                stack.push((task.outline_level, task.uid));
+            }
         }
-        if t.outline_level < level {
-            out.push(t.uid);
-            level = t.outline_level;
+        Self {
+            positions,
+            ancestors,
         }
     }
-    out
+
+    fn task<'a>(&self, p: &'a Project, uid: i32) -> Option<&'a Task> {
+        self.positions.get(&uid).map(|&i| &p.tasks[i])
+    }
+
+    fn ancestors(&self, uid: i32) -> &[i32] {
+        self.ancestors.get(&uid).map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 /// Refresh what an edit made stale. `prev` and `prev_sched` are the model and
@@ -376,11 +421,10 @@ fn ancestors(p: &Project, uid: i32) -> Vec<i32> {
 ///   `RemainingCost` = cost − actual cost. Its planned-work spread (Type 1)
 ///   is dropped when its dates or work moved.
 /// - A task keeps its stored `Work`, `Cost`, `RemainingWork` and
-///   `RemainingCost` but moves each by how much its assignments' total moved
+///   `RemainingCost` but moves each by how much its own contribution changed
 ///   (work counting work resources only), and so do its outline summaries; a
-///   task moved in the outline takes its assignments' totals from its old
-///   summaries to its new ones. A fixed cost inside a stored task cost
-///   survives, and an absent total stays absent.
+///   task moved in the outline takes its assignments and its own fixed cost
+///   from its old summaries to its new ones. An absent total stays absent.
 /// - A resource whose assignments changed (added, removed or refreshed) gets
 ///   its work, cost and remaining totals and its `Start`/`Finish` from them.
 pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project, sched: &Schedule) {
@@ -438,18 +482,38 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         }
     }
 
-    // Tasks: move the stored totals by the change in their assignments', and
+    // Tasks: move the stored totals by the change in their contributions, and
     // every outline summary above them by the same. A task the edit moved in
-    // the outline (or deleted, or added) takes its assignments' whole totals
-    // out of its old summaries and adds them to its new ones. Only
-    // assignment totals move: anything else in a stored total (a fixed cost,
-    // not modelled) stays with the summaries that had it.
-    let changed: HashSet<i32> = prev
+    // the outline (or deleted, or added) takes its whole contribution out of
+    // its old summaries and adds it to its new ones.
+    let prev_index = OutlineIndex::new(prev);
+    let now_index = OutlineIndex::new(proj);
+    let mut changed: HashSet<i32> = prev
         .assignments
         .iter()
         .chain(&proj.assignments)
         .map(|a| a.task_uid)
         .collect();
+    let task_uids: HashSet<i32> = prev
+        .tasks
+        .iter()
+        .chain(&proj.tasks)
+        .map(|t| t.uid)
+        .collect();
+    for uid in task_uids {
+        let (before, after) = (prev_index.task(prev, uid), now_index.task(proj, uid));
+        if before.is_none()
+            || after.is_none()
+            || prev_index.ancestors(uid) != now_index.ancestors(uid)
+            || before.zip(after).is_some_and(|(a, b)| {
+                a.fixed_cost != b.fixed_cost
+                    || a.fixed_cost_accrual != b.fixed_cost_accrual
+                    || a.percent_complete != b.percent_complete
+            })
+        {
+            changed.insert(uid);
+        }
+    }
     let mut moved: HashMap<i32, Totals> = HashMap::new();
     let mut add = |uid: i32, (w, c, rw, rc): Totals, sign: i64| {
         let sum = moved.entry(uid).or_insert((0, 0.0, 0, 0.0));
@@ -465,26 +529,28 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         let (w0, c0, rw0, rc0) = task_totals(prev, uid);
         let (w1, c1, rw1, rc1) = task_totals(proj, uid);
         let delta = (w1 - w0, c1 - c0, rw1 - rw0, rc1 - rc0);
-        let (was_under, now_under) = (ancestors(prev, uid), ancestors(proj, uid));
+        let (was_under, now_under) = (prev_index.ancestors(uid), now_index.ancestors(uid));
         if was_under == now_under {
             if delta == (0, 0.0, 0, 0.0) {
                 continue;
             }
-            for target in std::iter::once(uid).chain(now_under) {
+            for target in std::iter::once(uid).chain(now_under.iter().copied()) {
                 add(target, delta, 1);
             }
         } else {
             add(uid, delta, 1);
-            for target in was_under {
+            for &target in was_under {
                 add(target, (w0, c0, rw0, rc0), -1);
             }
-            for target in now_under {
+            for &target in now_under {
                 add(target, (w1, c1, rw1, rc1), 1);
             }
         }
     }
     for t in &mut proj.tasks {
-        let (Some(&(dw, dc, drw, drc)), Some(was)) = (moved.get(&t.uid), prev.task(t.uid)) else {
+        let (Some(&(dw, dc, drw, drc)), Some(was)) =
+            (moved.get(&t.uid), prev_index.task(prev, t.uid))
+        else {
             continue;
         };
         if dw != 0 {

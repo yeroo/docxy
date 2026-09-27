@@ -347,16 +347,21 @@ pub struct Task {
     /// Work (minutes), Cost and OverAllocated as Project last calculated
     /// them. docxy never computes them whole: they stay as read until an edit
     /// changes the task's assignments (or a subtask's), or moves a subtask
-    /// with assignments in or out of the task in the outline; then Work and
-    /// Cost move by that change in assignment totals only, work resources'
-    /// work only (`assign::refresh`). An absent one stays absent.
+    /// in or out of the task in the outline; then totals move by the change
+    /// in assignment totals and the moved task's own fixed cost, with work
+    /// counting work resources only (`assign::refresh`). An absent one stays absent.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
+    /// This task's own fixed cost in hundredths; summary fixed costs are
+    /// independent of their children's and are kept exactly as read.
+    pub fixed_cost: Option<Rate>,
+    /// When this task's fixed cost accrues, kept as read.
+    pub fixed_cost_accrual: Option<AccrueAt>,
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
     // computes nor reconciles it: edits leave it as read, except that
     // `remaining_work_min` and `remaining_cost` move with the task's
-    // assignments as `work_min` and `cost` do. The scheduler reads a leaf's
+    // assignments and fixed cost as `work_min` and `cost` do. The scheduler reads a leaf's
     // actual dates, `Stop`/`Resume` and durations through [`Task::tracked`].
     // Durations and work are whole minutes, rounded from the source.
     /// Percents, 0..=100.
@@ -520,7 +525,7 @@ impl ResourceType {
     }
 }
 
-/// When resource costs accrue, including the schema's explicit Invalid value.
+/// When a resource's costs or a task's fixed cost accrue, including the schema's explicit Invalid value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccrueAt {
     Start,

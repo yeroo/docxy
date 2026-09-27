@@ -360,6 +360,10 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "IsSubprojectReadOnly" => t.is_subproject_read_only = opt_bool_of(p),
                     "Work" => t.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => t.cost = rate_of(p),
+                    "FixedCost" => t.fixed_cost = rate_of(p),
+                    "FixedCostAccrual" => {
+                        t.fixed_cost_accrual = opt_int_of(p).and_then(AccrueAt::from_code);
+                    }
                     "OverAllocated" => t.over_allocated = opt_bool_of(p),
                     "PercentComplete" => t.percent_complete = percent_of(p),
                     "PercentWorkComplete" => t.percent_work_complete = percent_of(p),
@@ -1726,6 +1730,12 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
             tag(s, 3, name, &(min * 10).to_string());
         }
     }
+    opt_text(s, "FixedCost", t.fixed_cost.as_ref().map(Rate::as_str));
+    opt_text(
+        s,
+        "FixedCostAccrual",
+        t.fixed_cost_accrual.map(AccrueAt::code),
+    );
     opt_text(s, "PercentComplete", t.percent_complete);
     opt_text(s, "PercentWorkComplete", t.percent_work_complete);
     opt_text(s, "Cost", t.cost.as_ref().map(Rate::as_str));
@@ -3692,7 +3702,7 @@ mod tests {
 
     /// Optional task elements #80 keeps. IsNull is not among them: every row
     /// states it.
-    const NEW_TASK_ELEMENTS: [&str; 24] = [
+    const NEW_TASK_ELEMENTS: [&str; 26] = [
         "GUID",
         "Active",
         "Type",
@@ -3707,6 +3717,8 @@ mod tests {
         "IsSubproject",
         "IsSubprojectReadOnly",
         "ExternalTask",
+        "FixedCost",
+        "FixedCostAccrual",
         "Cost",
         "Deadline",
         "LevelAssignments",
@@ -3748,6 +3760,35 @@ mod tests {
         }
         assert!(xml.contains("<IsNull>0</IsNull>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+    }
+
+    #[test]
+    fn fixed_cost_and_accrual_round_trip_for_tasks_and_summaries() {
+        let proj = task_project(
+            "<Task><UID>0</UID><ID>0</ID><OutlineLevel>0</OutlineLevel><Summary>1</Summary><FixedCost>1200</FixedCost><FixedCostAccrual>1</FixedCostAccrual><Cost>51200</Cost><RemainingCost>51200</RemainingCost></Task>\
+             <Task><UID>2</UID><ID>1</ID><OutlineLevel>1</OutlineLevel><Summary>1</Summary><FixedCost>300</FixedCost><FixedCostAccrual>2</FixedCostAccrual><Cost>50300</Cost><RemainingCost>50300</RemainingCost></Task>\
+             <Task><UID>1</UID><ID>2</ID><OutlineLevel>2</OutlineLevel><FixedCost>50000</FixedCost><FixedCostAccrual>3</FixedCostAccrual><Cost>50000</Cost><RemainingCost>50000</RemainingCost></Task>",
+        );
+        for (task, cost, accrual, total) in [
+            (&proj.tasks[0], "1200", AccrueAt::Start, "51200"),
+            (&proj.tasks[1], "300", AccrueAt::End, "50300"),
+            (&proj.tasks[2], "50000", AccrueAt::Prorated, "50000"),
+        ] {
+            assert_eq!(task.fixed_cost.as_ref().map(Rate::as_str), Some(cost));
+            assert_eq!(task.fixed_cost_accrual, Some(accrual));
+            assert_eq!(task.cost.as_ref().map(Rate::as_str), Some(total));
+            assert_eq!(task.remaining_cost.as_ref().map(Rate::as_str), Some(total));
+        }
+        let xml = write_mspdi(&proj);
+        let back = read_mspdi(&xml).unwrap();
+        for (before, after) in proj.tasks.iter().zip(&back.tasks) {
+            assert_eq!(after.fixed_cost, before.fixed_cost);
+            assert_eq!(after.fixed_cost_accrual, before.fixed_cost_accrual);
+            assert_eq!(after.cost, before.cost);
+            assert_eq!(after.remaining_cost, before.remaining_cost);
+        }
+        assert_eq!(xml.matches("<FixedCost>").count(), 3);
+        assert_eq!(xml.matches("<FixedCostAccrual>").count(), 3);
     }
 
     #[test]
@@ -3826,6 +3867,8 @@ mod tests {
         t.manual_start = t.stored_start;
         t.manual_finish = t.stored_finish;
         t.manual_duration_min = Some(480);
+        t.fixed_cost = Rate::parse("50000");
+        t.fixed_cost_accrual = Some(AccrueAt::Prorated);
         t.calendar_uid = Some(1);
         t.constraint = ConstraintType::StartNoEarlierThan;
         t.constraint_date = t.stored_start;
@@ -3926,6 +3969,8 @@ mod tests {
                 "TotalSlack",
                 "StartSlack",
                 "FinishSlack",
+                "FixedCost",
+                "FixedCostAccrual",
                 "PercentComplete",
                 "PercentWorkComplete",
                 "Cost",
