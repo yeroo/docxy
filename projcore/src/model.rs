@@ -339,6 +339,10 @@ pub struct Task {
     /// MSPDI `LevelingDelay`, raw (tenths of a minute), with its display format.
     pub leveling_delay: Option<i64>,
     pub leveling_delay_format: Option<i32>,
+    /// MSPDI task hyperlink display text, address, and in-file location.
+    pub hyperlink: Option<String>,
+    pub hyperlink_address: Option<String>,
+    pub hyperlink_sub_address: Option<String>,
     pub ignore_resource_calendar: Option<bool>,
     pub earned_value_method: Option<i32>,
     pub recurring: Option<bool>,

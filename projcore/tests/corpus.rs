@@ -541,6 +541,12 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
         (pour.leveling_delay, pour.leveling_delay_format),
         (Some(4800), Some(7))
     );
+    assert_eq!(pour.hyperlink.as_deref(), Some("Pour instructions"));
+    assert_eq!(
+        pour.hyperlink_address.as_deref(),
+        Some("https://example.com/a?x=1&y=2")
+    );
+    assert_eq!(pour.hyperlink_sub_address.as_deref(), Some("Gantt Chart!4"));
     assert_eq!(proj.task(2).unwrap().work_min, Some(960));
     let blank = proj.task(3).unwrap();
     assert!(blank.is_null);

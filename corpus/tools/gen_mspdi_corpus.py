@@ -632,7 +632,7 @@ def build():
 
     add("20-task-fields.xml", ["task-fields", "round-trip", "blank-row", "summary", "link",
                                "link-fs", "custom-fields"],
-        "Task type, estimate, active, deadline, levelling, custom fields and a blank row "
+        "Task type, estimate, active, deadline, levelling, hyperlink, custom fields and a blank row "
         "survive saves.",
         project("task-fields", "\n".join([
             task(1, "Phase", 3 * D, dt(2), dt(4, "17:00:00"), **CRIT, summary=True,
@@ -658,6 +658,9 @@ def build():
                                     ("Deadline", dt(20, "17:00:00")),
                                     ("LevelAssignments", 0), ("LevelingCanSplit", 0),
                                     ("LevelingDelay", 4800), ("LevelingDelayFormat", 7),
+                                    ("Hyperlink", "Pour instructions"),
+                                    ("HyperlinkAddress", "https://example.com/a?x=1&amp;y=2"),
+                                    ("HyperlinkSubAddress", "Gantt Chart!4"),
                                     ("IgnoreResourceCalendar", 1), ("HideBar", 1),
                                     ("EarnedValueMethod", 1), ("Rollup", 0)],
                  ext=[[("FieldID", 188743731), ("Value", "M&amp;E")]]),
