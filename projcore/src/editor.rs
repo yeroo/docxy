@@ -1035,6 +1035,7 @@ impl Editor {
                             r.early_start,
                             r.early_finish,
                         )),
+                        ..Baseline::default()
                     },
                 ))
             })
@@ -1766,7 +1767,7 @@ mod tests {
             },
         ];
         for task in &mut proj.tasks {
-            task.set_baseline_slot(saved);
+            task.set_baseline_slot(saved.clone());
             task.set_baseline_slot(Baseline {
                 duration_min: Some(60),
                 ..Baseline::default()
@@ -4649,6 +4650,7 @@ mod tests {
             start: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
             finish: Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0)),
             duration_min: Some(480),
+            ..Baseline::default()
         };
         proj.tasks[0].set_baseline_slot(slot(0));
         proj.tasks[0].set_baseline_slot(slot(1));

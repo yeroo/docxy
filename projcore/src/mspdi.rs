@@ -414,6 +414,9 @@ fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
                     "Start" => baseline.start = DateTime::parse_mspdi(&text_of(p)),
                     "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
                     "Duration" => baseline.duration_min = try_iso8601_to_minutes(&text_of(p)),
+                    "DurationFormat" => baseline.duration_format = opt_u8_of(p),
+                    "Work" => baseline.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => baseline.cost = rate_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -422,8 +425,7 @@ fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
         }
     }
     if let Some(number) = number {
-        if baseline.start.is_some() || baseline.finish.is_some() || baseline.duration_min.is_some()
-        {
+        if baseline != Baseline::default() {
             baseline.number = number;
             t.set_baseline_slot(baseline);
         }
@@ -1792,6 +1794,15 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         }
         if let Some(duration) = baseline.duration_min {
             tag(s, 4, "Duration", &min_to_iso(duration));
+        }
+        if let Some(format) = baseline.duration_format {
+            tag(s, 4, "DurationFormat", &format.to_string());
+        }
+        if let Some(work) = baseline.work_min {
+            tag(s, 4, "Work", &min_to_iso(work));
+        }
+        if let Some(cost) = baseline.cost.as_ref() {
+            tag(s, 4, "Cost", cost.as_str());
         }
         s.push_str("      </Baseline>\n");
     }
@@ -3354,8 +3365,9 @@ mod tests {
             start: Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
             finish: Some(DateTime::from_ymd_hm(2026, 3, 13, 17, 0)),
             duration_min: Some(2400),
+            ..Baseline::default()
         };
-        assert_eq!(proj.tasks[0].baselines, vec![expected]);
+        assert_eq!(proj.tasks[0].baselines, vec![expected.clone()]);
         let xml = write_mspdi(&proj);
         let baseline = xml
             .split("<Baseline>")
@@ -3369,6 +3381,79 @@ mod tests {
             "<Number>1</Number>\n        <Start>2026-03-09T08:00:00</Start>\n        <Finish>2026-03-13T17:00:00</Finish>\n        <Duration>PT40H0M0S</Duration>"
         );
         assert_eq!(read_mspdi(&xml).unwrap().tasks[0].baselines, vec![expected]);
+    }
+
+    #[test]
+    fn task_baseline_work_and_cost_survive_issue_round_trip() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml").replacen(
+            "    </Task>",
+            "      <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish><Duration>PT8H0M0S</Duration><Work>PT8H0M0S</Work><Cost>100000</Cost></Baseline>\n    </Task>",
+            1,
+        );
+        let proj = read_mspdi(&source).unwrap();
+        let expected = Baseline {
+            start: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            finish: Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0)),
+            duration_min: Some(480),
+            work_min: Some(480),
+            cost: Rate::parse("100000"),
+            ..Baseline::default()
+        };
+        assert_eq!(proj.tasks[0].baseline(0), Some(&expected));
+        let xml = write_mspdi(&proj);
+        let baseline = xml
+            .split("<Baseline>")
+            .nth(1)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            baseline.trim(),
+            "<Number>0</Number>\n        <Start>2026-03-02T08:00:00</Start>\n        <Finish>2026-03-03T17:00:00</Finish>\n        <Duration>PT8H0M0S</Duration>\n        <Work>PT8H0M0S</Work>\n        <Cost>100000</Cost>"
+        );
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks[0].baseline(0),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn task_baseline_new_fields_keep_their_slots_and_yppx_values() {
+        let proj = project_with_baselines(
+            "<Baseline><Number>0</Number><DurationFormat>7</DurationFormat><Work>PT0H0M0S</Work><Cost>0</Cost></Baseline>\
+             <Baseline><Number>3</Number><DurationFormat>8</DurationFormat><Work>PT8H0M0S</Work><Cost>+001000.50</Cost></Baseline>",
+        );
+        assert_eq!(proj.tasks[0].baseline(0).unwrap().duration_format, Some(7));
+        assert_eq!(proj.tasks[0].baseline(0).unwrap().work_min, Some(0));
+        assert_eq!(
+            proj.tasks[0]
+                .baseline(0)
+                .unwrap()
+                .cost
+                .as_ref()
+                .map(Rate::as_str),
+            Some("0")
+        );
+        assert_eq!(proj.tasks[0].baseline(3).unwrap().duration_format, Some(8));
+        assert_eq!(proj.tasks[0].baseline(3).unwrap().work_min, Some(480));
+        assert_eq!(
+            proj.tasks[0]
+                .baseline(3)
+                .unwrap()
+                .cost
+                .as_ref()
+                .map(Rate::as_str),
+            Some("+001000.50")
+        );
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Number>3</Number>\n        <DurationFormat>8</DurationFormat>\n        <Work>PT8H0M0S</Work>\n        <Cost>+001000.50</Cost>"));
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks[0].baselines,
+            proj.tasks[0].baselines
+        );
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(back.tasks[0].baselines, proj.tasks[0].baselines);
     }
 
     #[test]
@@ -3401,6 +3486,9 @@ mod tests {
             "<Start>2026-03-09T08:00:00</Start>",
             "<Finish>2026-03-13T17:00:00</Finish>",
             "<Duration>PT0H0M0S</Duration>",
+            "<DurationFormat>0</DurationFormat>",
+            "<Work>PT0H0M0S</Work>",
+            "<Cost>0</Cost>",
         ] {
             let proj =
                 project_with_baselines(&format!("<Baseline><Number>1</Number>{field}</Baseline>"));
@@ -3420,6 +3508,32 @@ mod tests {
                 read_mspdi(&xml).unwrap().tasks[0].baselines,
                 proj.tasks[0].baselines
             );
+        }
+    }
+
+    #[test]
+    fn invalid_task_baseline_fields_do_not_create_a_slot() {
+        for field in [
+            "<DurationFormat/>",
+            "<DurationFormat>256</DurationFormat>",
+            "<Work/>",
+            "<Work>invalid</Work>",
+            "<Cost/>",
+            "<Cost>invalid</Cost>",
+        ] {
+            let proj =
+                project_with_baselines(&format!("<Baseline><Number>3</Number>{field}</Baseline>"));
+            assert!(proj.tasks[0].baselines.is_empty(), "{field}");
+            let proj = project_with_baselines(&format!(
+                "<Baseline><Number>3</Number><Start>2026-03-02T08:00:00</Start>{field}</Baseline>"
+            ));
+            assert_eq!(
+                proj.tasks[0].baseline(3).unwrap().start,
+                Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0))
+            );
+            assert_eq!(proj.tasks[0].baseline(3).unwrap().duration_format, None);
+            assert_eq!(proj.tasks[0].baseline(3).unwrap().work_min, None);
+            assert_eq!(proj.tasks[0].baseline(3).unwrap().cost, None);
         }
     }
 
