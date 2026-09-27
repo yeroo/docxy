@@ -818,7 +818,8 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 // The default duration is estimated when the plan's new
                 // tasks are.
                 let estimated = v.ed.project().new_tasks_estimated();
-                let at = v.ed.add_task(v.selected_uid(), "New task", 480, estimated)?;
+                let at =
+                    v.ed.add_task(v.selected_uid(), "New task", 480, estimated)?;
                 v.select_row(at);
             }
             InsertBlankRow => {
