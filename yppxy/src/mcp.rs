@@ -147,8 +147,10 @@ fn tool_defs() -> Json {
         ),
         tool(
             "yppxy_add",
-            "Insert a new task after the task with uid `after` (or append at the end). Returns \
-             the new task with its uid. Undoable.",
+            "Insert a new task after the task with uid `after` (or append at the end). When a \
+             finish-to-start link joins `after` to the next task, the new task is linked into \
+             that chain (A->B becomes A->N->B) while the plan's Autolink is on (the default). \
+             Returns the new task with its uid. Undoable.",
             vec![
                 (
                     "after",
@@ -160,7 +162,11 @@ fn tool_defs() -> Json {
                 ("name", prop("string", "Task name (default \"New task\").")),
                 (
                     "duration",
-                    prop("string", "Duration, e.g. \"3d\" (default 1 day)."),
+                    prop(
+                        "string",
+                        "Duration, e.g. \"3d\" (default 1 day, estimated unless the plan's \
+                         NewTasksEstimated is off).",
+                    ),
                 ),
                 target(),
                 tab(),

@@ -1399,11 +1399,10 @@ pub struct Project {
     /// Whether tasks added to this plan start out manually scheduled (MSPDI
     /// `NewTasksAreManual`).
     pub new_tasks_are_manual: bool,
-    /// The task-default and critical-path options below are `None` when the
-    /// file does not state them, so a save leaves them absent; their effective
-    /// values (Project's defaults when absent) come from the accessors of the
-    /// same name.
-    ///
+    // The task-default and critical-path options below are `None` when the
+    // file does not state them, so a save leaves them absent; their effective
+    // values (Project's defaults when absent) come from the accessors of the
+    // same name.
     /// Whether new tasks are effort driven (MSPDI `NewTasksEffortDriven`).
     pub new_tasks_effort_driven: Option<bool>,
     /// Whether a new task's default duration is estimated (MSPDI
