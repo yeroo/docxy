@@ -2007,14 +2007,14 @@ fn mode_name(manual: bool) -> &'static str {
     }
 }
 
-/// The Task Mode cell: a pin for a manually scheduled task, two columns
-/// either way (the pin is a wide character).
 /// The column of a task row's bullet (`▾`/`▸` on a summary): after the
 /// leading space, the two-column Task Mode cell and the outline indent.
 fn bullet_x(list_x0: u16, t: &Task) -> u16 {
     list_x0 + 3 + 2 * t.outline_level.saturating_sub(1).min(20) as u16
 }
 
+/// The Task Mode cell: a pin for a manually scheduled task, two columns
+/// either way (the pin is a wide character).
 fn mode_marker(t: &Task) -> &'static str {
     if t.manual { "📌" } else { "  " }
 }

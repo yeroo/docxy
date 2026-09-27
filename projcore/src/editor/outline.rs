@@ -72,10 +72,6 @@ impl Editor {
             .collect()
     }
 
-    pub fn is_hidden(&self, index: usize) -> bool {
-        self.hidden_owners().get(index).is_some_and(Option::is_some)
-    }
-
     /// The visible row `delta` visible rows from `from`, stopping at the first
     /// and last. 0 in a plan without tasks.
     pub fn visible_step(&self, from: usize, delta: isize) -> usize {
