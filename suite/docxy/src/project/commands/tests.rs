@@ -988,6 +988,21 @@ fn insert_on_the_entry_row_appends_and_selects_a_new_task() {
 }
 
 #[test]
+fn insert_task_follows_the_plans_new_tasks_estimated() {
+    for (stated, estimated) in [(None, Some(true)), (Some(false), None)] {
+        let mut t = tab();
+        let mut p = v(&t).ed.project().clone();
+        p.new_tasks_estimated = stated;
+        t.surface = Surface::Project(ProjectView::new(p, false));
+        vm(&mut t).ed.select(0);
+        apply_project_act(&mut t, ProjectAct::AddTask);
+        let task = &v(&t).ed.project().tasks[1];
+        assert_eq!(task.name, "New task");
+        assert_eq!(task.estimated, estimated, "{stated:?}");
+    }
+}
+
+#[test]
 fn blank_row_goes_above_the_selected_row_or_the_entry_row_and_is_selected() {
     let mut t = tab();
     t.dirty = false;

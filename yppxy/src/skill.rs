@@ -38,7 +38,11 @@ use its tools:
   "3d", "4h", "2w"; level = outline depth 1..20; manual = true pins the task at
   its current dates as Manually Scheduled, false makes it Auto Scheduled)
 - `yppxy_add` `{after?, name?, duration?}` — insert a task after uid `after`
-  (or append); returns the new task with its uid
+  (or append); returns the new task with its uid. Without `duration` it is
+  1 day, estimated unless the plan's NewTasksEstimated is off. When a
+  finish-to-start link joins `after` to the next task, the new task is linked
+  into that chain (A->B becomes A->N->B) while the plan's Autolink is on (the
+  default)
 - `yppxy_del` `{uid}` — delete a task; a summary takes its subtasks with it
   (the reply's `removed` lists every UID; dangling links are dropped)
 - `yppxy_link` `{uid, pred, type?, lag?}` — make task `uid` depend on `pred`

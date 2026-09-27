@@ -18,7 +18,7 @@
 //! | `task.list` | — | `{count, tasks:[{uid, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid}` | one task |
 //! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
-//! | `task.add` | `{after?, name?, duration?}` | the new task |
+//! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated unless the plan's `NewTasksEstimated` is off; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain, A->B becoming A->N->B, while the plan's `Autolink` is on, the default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task |
 //! | `link.del` | `{uid, pred}` | the updated task |

@@ -1399,15 +1399,37 @@ pub struct Project {
     /// Whether tasks added to this plan start out manually scheduled (MSPDI
     /// `NewTasksAreManual`).
     pub new_tasks_are_manual: bool,
+    // The task-default and critical-path options below are `None` when the
+    // file does not state them, so a save leaves them absent; their effective
+    // values (Project's defaults when absent) come from the accessors of the
+    // same name.
+    /// Whether new tasks are effort driven (MSPDI `NewTasksEffortDriven`).
+    pub new_tasks_effort_driven: Option<bool>,
+    /// Whether a new task's default duration is estimated (MSPDI
+    /// `NewTasksEstimated`).
+    pub new_tasks_estimated: Option<bool>,
+    /// The type new tasks take (MSPDI `DefaultTaskType`).
+    pub default_task_type: Option<TaskType>,
+    /// Whether inserting a task into a finish-to-start chain links it in
+    /// (MSPDI `Autolink`).
+    pub autolink: Option<bool>,
+    /// Total slack, in days, at or below which a task is critical (MSPDI
+    /// `CriticalSlackLimit`).
+    pub critical_slack_limit_days: Option<i64>,
+    /// Whether each task without successors ends its own critical path
+    /// (MSPDI `MultipleCriticalPaths`).
+    pub multiple_critical_paths: Option<bool>,
     /// Conversion factor for rendering durations (MSPDI `HoursPerDay`).
     pub hours_per_day: f64,
     pub hours_per_week: f64,
     /// UID of the project's default calendar.
     pub default_calendar_uid: i32,
     /// Project-level MSPDI options docxy stores but does not model
-    /// (`ScheduleFromStart`, currency, task defaults, ...), as (element name,
-    /// text) in read order. A save writes each back verbatim, so an unsupported
-    /// setting survives rather than resetting to Project's default.
+    /// (`ScheduleFromStart`, currency, ...), as (element name, text) in read
+    /// order. A save writes each back verbatim, so an unsupported setting
+    /// survives rather than resetting to Project's default. A modeled option
+    /// lands here only when its text does not parse; one that parses is kept
+    /// in its field and saved in canonical form (`true` saves as `1`).
     pub options: Vec<(String, String)>,
     /// The custom field definitions (each an MSPDI `<ExtendedAttribute>` of
     /// the project's `<ExtendedAttributes>` block: alias, lookup table,
@@ -1429,6 +1451,12 @@ impl Default for Project {
             start_date: None,
             honor_constraints: true,
             new_tasks_are_manual: false,
+            new_tasks_effort_driven: None,
+            new_tasks_estimated: None,
+            default_task_type: None,
+            autolink: None,
+            critical_slack_limit_days: None,
+            multiple_critical_paths: None,
             hours_per_day: 8.0,
             hours_per_week: 40.0,
             default_calendar_uid: 1,
@@ -1449,6 +1477,40 @@ impl Project {
             .iter()
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
+    }
+
+    /// Whether new tasks are effort driven; Project's default is no.
+    pub fn new_tasks_effort_driven(&self) -> bool {
+        self.new_tasks_effort_driven.unwrap_or(false)
+    }
+
+    /// Whether a new task's default duration is estimated (`1 day?`);
+    /// Project's default is yes.
+    pub fn new_tasks_estimated(&self) -> bool {
+        self.new_tasks_estimated.unwrap_or(true)
+    }
+
+    /// The type new tasks take; Project's default is fixed units.
+    pub fn default_task_type(&self) -> TaskType {
+        self.default_task_type.unwrap_or(TaskType::FixedUnits)
+    }
+
+    /// Whether an inserted task is linked into the chain it lands in;
+    /// Project's default is yes.
+    pub fn autolink(&self) -> bool {
+        self.autolink.unwrap_or(true)
+    }
+
+    /// The total slack, in working minutes, at or below which a task is
+    /// critical; Project's default is 0 days.
+    pub fn critical_slack_limit_min(&self) -> i64 {
+        self.days_to_minutes(self.critical_slack_limit_days.unwrap_or(0) as f64)
+    }
+
+    /// Whether each task without successors ends its own critical path;
+    /// Project's default is no.
+    pub fn multiple_critical_paths(&self) -> bool {
+        self.multiple_critical_paths.unwrap_or(false)
     }
 
     /// Whether this row has outline children, independently of its stored flag.

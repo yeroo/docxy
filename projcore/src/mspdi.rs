@@ -57,6 +57,43 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "StartDate" => proj.start_date = DateTime::parse_mspdi(&text_of(&mut p)),
                     "HonorConstraints" => proj.honor_constraints = bool_of(&mut p),
                     "NewTasksAreManual" => proj.new_tasks_are_manual = bool_of(&mut p),
+                    // Modeled options: a value that parses fills the field; one
+                    // that does not is kept verbatim. Of repeated leaves, the
+                    // later wins, as `set_option` has it; a block or an
+                    // attributed or prefixed repeat is skipped (see
+                    // `read_option`).
+                    "NewTasksEffortDriven" => {
+                        read_option(&mut p, &mut proj, name, parse_bool, |proj| {
+                            &mut proj.new_tasks_effort_driven
+                        })
+                    }
+                    "NewTasksEstimated" => {
+                        read_option(&mut p, &mut proj, name, parse_bool, |proj| {
+                            &mut proj.new_tasks_estimated
+                        })
+                    }
+                    "DefaultTaskType" => read_option(
+                        &mut p,
+                        &mut proj,
+                        name,
+                        |text| text.parse().ok().and_then(TaskType::from_code),
+                        |proj| &mut proj.default_task_type,
+                    ),
+                    "Autolink" => read_option(&mut p, &mut proj, name, parse_bool, |proj| {
+                        &mut proj.autolink
+                    }),
+                    "CriticalSlackLimit" => read_option(
+                        &mut p,
+                        &mut proj,
+                        name,
+                        |text| text.parse().ok(),
+                        |proj| &mut proj.critical_slack_limit_days,
+                    ),
+                    "MultipleCriticalPaths" => {
+                        read_option(&mut p, &mut proj, name, parse_bool, |proj| {
+                            &mut proj.multiple_critical_paths
+                        })
+                    }
                     "MinutesPerDay" => minutes_per_day = text_of(&mut p).trim().parse().ok(),
                     "MinutesPerWeek" => minutes_per_week = text_of(&mut p).trim().parse().ok(),
                     // Some emitters use HoursPerDay directly; honor it too.
@@ -151,6 +188,46 @@ fn element_text(p: &mut XmlParser) -> (String, bool) {
         }
     }
     (s, leaf)
+}
+
+/// Read a modeled project option into its field. Text that parses sets the
+/// field and drops any stored text of an earlier repeat; text that does not
+/// clears the field and is stored verbatim. A block, a prefixed element or one
+/// with attributes is skipped, as an unmodeled option's is, and leaves an
+/// earlier repeat's value in place.
+fn read_option<T>(
+    p: &mut XmlParser,
+    proj: &mut Project,
+    name: String,
+    parse: impl Fn(&str) -> Option<T>,
+    field: impl Fn(&mut Project) -> &mut Option<T>,
+) {
+    if !kept_as_element(p) {
+        p.skip_element();
+        return;
+    }
+    let Some(text) = leaf_text_of(p) else {
+        return;
+    };
+    match parse(text.trim()) {
+        Some(value) => {
+            *field(proj) = Some(value);
+            proj.options.retain(|(n, _)| *n != name);
+        }
+        None => {
+            *field(proj) = None;
+            set_option(&mut proj.options, name, text);
+        }
+    }
+}
+
+/// An `xsd:boolean` spelling, as [`opt_bool_of`] reads it.
+fn parse_bool(text: &str) -> Option<bool> {
+    match text {
+        "1" | "true" | "True" => Some(true),
+        "0" | "false" | "False" => Some(false),
+        _ => None,
+    }
 }
 
 /// Store an unmodeled project option. A repeated name keeps its first
@@ -1185,11 +1262,7 @@ fn bool_of(p: &mut XmlParser) -> bool {
 
 /// An optional flag: anything but an `xsd:boolean` spelling stays absent.
 fn opt_bool_of(p: &mut XmlParser) -> Option<bool> {
-    match text_of(p).trim() {
-        "1" | "true" | "True" => Some(true),
-        "0" | "false" | "False" => Some(false),
-        _ => None,
-    }
+    parse_bool(text_of(p).trim())
 }
 
 /// An optional integer: unparseable text stays absent instead of reading as 0.
@@ -1471,6 +1544,7 @@ const PROJECT_HEADER: &[&str] = &[
 /// `None` for the fields always written), else the option stored verbatim.
 fn header_text(proj: &Project, name: &str) -> Option<String> {
     let flag = |on: bool| Some(if on { "1" } else { "0" }.to_string());
+    let stored = || proj.option(name).map(str::to_string);
     match name {
         "Name" => Some(proj.name.clone()),
         "Title" => (!proj.title.is_empty()).then(|| proj.title.clone()),
@@ -1480,10 +1554,24 @@ fn header_text(proj: &Project, name: &str) -> Option<String> {
         "MinutesPerWeek" => Some(((proj.hours_per_week * 60.0).round() as i64).to_string()),
         "HonorConstraints" => flag(proj.honor_constraints),
         "NewTasksAreManual" => flag(proj.new_tasks_are_manual),
+        // The options below are written only when the file stated them (or
+        // an edit set them); unparseable text falls back to the stored option.
+        "NewTasksEffortDriven" => proj.new_tasks_effort_driven.and_then(flag).or_else(stored),
+        "NewTasksEstimated" => proj.new_tasks_estimated.and_then(flag).or_else(stored),
+        "DefaultTaskType" => proj
+            .default_task_type
+            .map(|t| t.code().to_string())
+            .or_else(stored),
+        "Autolink" => proj.autolink.and_then(flag).or_else(stored),
+        "CriticalSlackLimit" => proj
+            .critical_slack_limit_days
+            .map(|d| d.to_string())
+            .or_else(stored),
+        "MultipleCriticalPaths" => proj.multiple_critical_paths.and_then(flag).or_else(stored),
         // Without `0`, Project treats the file as edited outside Project,
         // ignores each `<Duration>` and recomputes it from Start/Finish (#111).
         "ProjectExternallyEdited" => Some("0".into()),
-        _ => proj.option(name).map(str::to_string),
+        _ => stored(),
     }
 }
 
@@ -4175,6 +4263,13 @@ mod tests {
                     "NewTasksAreManual" => "1".to_string(),
                     "ScheduleFromStart" => "0".to_string(),
                     "ProjectExternallyEdited" => "0".to_string(),
+                    // Modeled options (#187), each off its default.
+                    "NewTasksEffortDriven" => "1".to_string(),
+                    "NewTasksEstimated" => "0".to_string(),
+                    "DefaultTaskType" => "2".to_string(),
+                    "Autolink" => "0".to_string(),
+                    "CriticalSlackLimit" => "3".to_string(),
+                    "MultipleCriticalPaths" => "1".to_string(),
                     _ => format!("{name}-value"),
                 };
                 (name.to_string(), text)
@@ -4208,6 +4303,130 @@ mod tests {
         // to the same header.
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
         assert_eq!(header_of(&write_mspdi(&package)), expected);
+    }
+
+    /// The six options #187 models, each with a non-default value.
+    const MODELED_OPTIONS: &str = "<NewTasksEffortDriven>1</NewTasksEffortDriven>        <NewTasksEstimated>0</NewTasksEstimated><DefaultTaskType>2</DefaultTaskType>        <Autolink>0</Autolink><CriticalSlackLimit>3</CriticalSlackLimit>        <MultipleCriticalPaths>1</MultipleCriticalPaths>";
+
+    fn modeled_options(proj: &Project) -> ModeledOptions {
+        (
+            proj.new_tasks_effort_driven,
+            proj.new_tasks_estimated,
+            proj.default_task_type,
+            proj.autolink,
+            proj.critical_slack_limit_days,
+            proj.multiple_critical_paths,
+        )
+    }
+
+    type ModeledOptions = (
+        Option<bool>,
+        Option<bool>,
+        Option<TaskType>,
+        Option<bool>,
+        Option<i64>,
+        Option<bool>,
+    );
+
+    #[test]
+    fn task_default_and_critical_path_options_read_into_typed_fields() {
+        let proj = read_mspdi(&format!("<Project>{MODELED_OPTIONS}</Project>")).unwrap();
+        let expected = (
+            Some(true),
+            Some(false),
+            Some(TaskType::FixedWork),
+            Some(false),
+            Some(3),
+            Some(true),
+        );
+        assert_eq!(modeled_options(&proj), expected);
+        // A parsed option is kept in its field only.
+        assert!(proj.options.is_empty(), "{:?}", proj.options);
+        let xml = write_mspdi(&proj);
+        assert_eq!(modeled_options(&read_mspdi(&xml).unwrap()), expected);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(modeled_options(&package), expected);
+        // The effective values follow the file.
+        assert!(proj.new_tasks_effort_driven() && !proj.new_tasks_estimated());
+        assert_eq!(proj.default_task_type(), TaskType::FixedWork);
+        assert!(!proj.autolink() && proj.multiple_critical_paths());
+        assert_eq!(proj.critical_slack_limit_min(), 3 * 480);
+    }
+
+    #[test]
+    fn absent_task_default_options_stay_absent_and_take_projects_defaults() {
+        let proj = read_mspdi("<Project><Tasks/></Project>").unwrap();
+        assert_eq!(modeled_options(&proj), (None, None, None, None, None, None));
+        assert!(!proj.new_tasks_effort_driven() && proj.new_tasks_estimated());
+        assert_eq!(proj.default_task_type(), TaskType::FixedUnits);
+        assert!(proj.autolink() && !proj.multiple_critical_paths());
+        assert_eq!(proj.critical_slack_limit_min(), 0);
+        let xml = write_mspdi(&proj);
+        for name in [
+            "NewTasksEffortDriven",
+            "NewTasksEstimated",
+            "DefaultTaskType",
+            "Autolink",
+            "CriticalSlackLimit",
+            "MultipleCriticalPaths",
+        ] {
+            assert!(!xml.contains(name), "{name} written");
+        }
+    }
+
+    #[test]
+    fn a_modeled_option_saves_in_canonical_form_in_schema_position() {
+        let proj = read_mspdi("<Project><Autolink>true</Autolink><Tasks/></Project>").unwrap();
+        assert_eq!(proj.autolink, Some(true));
+        let names: Vec<String> = header_of(&write_mspdi(&proj))
+            .into_iter()
+            .map(|(n, t)| format!("{n}={t}"))
+            .collect();
+        // After StatusDate/CurrentDate's slot, before NewTasksAreManual.
+        let at = |entry: &str| names.iter().position(|n| n == entry).unwrap();
+        assert!(at("Autolink=1") < at("NewTasksAreManual=0"), "{names:?}");
+        assert!(at("HonorConstraints=1") < at("Autolink=1"), "{names:?}");
+    }
+
+    #[test]
+    fn an_unparseable_modeled_option_is_kept_verbatim() {
+        let names = [
+            "NewTasksEffortDriven",
+            "NewTasksEstimated",
+            "DefaultTaskType",
+            "Autolink",
+            "CriticalSlackLimit",
+            "MultipleCriticalPaths",
+        ];
+        let header: String = names
+            .iter()
+            .map(|n| format!("<{n}>{n}-value</{n}>"))
+            .collect();
+        let proj = read_mspdi(&format!("<Project>{header}<Tasks/></Project>")).unwrap();
+        assert_eq!(modeled_options(&proj), (None, None, None, None, None, None));
+        let xml = write_mspdi(&proj);
+        for n in names {
+            assert!(xml.contains(&format!("<{n}>{n}-value</{n}>")), "{n}: {xml}");
+        }
+        // Out of range is unparseable too.
+        let proj = read_mspdi("<Project><DefaultTaskType>7</DefaultTaskType></Project>").unwrap();
+        assert_eq!(proj.default_task_type, None);
+        assert!(write_mspdi(&proj).contains("<DefaultTaskType>7</DefaultTaskType>"));
+    }
+
+    #[test]
+    fn the_later_of_a_repeated_modeled_option_wins() {
+        let proj = read_mspdi("<Project><Autolink>1</Autolink><Autolink>junk</Autolink></Project>")
+            .unwrap();
+        assert_eq!(proj.autolink, None);
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Autolink>junk</Autolink>") && !xml.contains("<Autolink>1"));
+        let proj = read_mspdi("<Project><Autolink>junk</Autolink><Autolink>1</Autolink></Project>")
+            .unwrap();
+        assert_eq!(proj.autolink, Some(true));
+        assert_eq!(proj.option("Autolink"), None);
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Autolink>1</Autolink>") && !xml.contains("junk"));
     }
 
     #[test]
