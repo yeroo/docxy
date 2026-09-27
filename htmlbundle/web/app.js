@@ -114,6 +114,56 @@
     if (el.themeBtn) el.themeBtn.textContent = THEME_LABELS[S.themePref];
   }
 
+  // ---- the Styles gallery's tiles, from the suite's table -----------------
+  // The snapshot carries the suite's tile geometry, state mixes and each
+  // style's look per theme (suite/docxy/src/style_gallery.rs), so the page
+  // draws its gallery from those numbers rather than a copy of them. One
+  // stylesheet, built once: the looks are keyed by data-theme, so a theme
+  // switch is pure CSS.
+  function galleryCss(c) {
+    var t = c.tile;
+    var g = '#gallery-' + c.id;
+    var ink = function (v) { return v === 'fg' ? 'var(--fg)' : v; };
+    var rules = [
+      g + ' { gap: ' + t.gap + 'px; padding: ' + t.wellPad + 'px; border: ' + t.wellBorder +
+        'px solid var(--border); border-radius: ' + t.wellRadius + 'px; width: ' + t.wellWidth +
+        'px; height: ' + t.wellHeight + 'px; background: var(--bg); }',
+      g + ' .gitem { width: ' + t.w + 'px; height: ' + t.h + 'px; padding: ' + t.pad +
+        'px; border: ' + t.border + 'px solid transparent; border-radius: ' + t.radius +
+        'px; background: var(--g-surface); }',
+      g + ' .gitem:hover { background: color-mix(in srgb, var(--fg) ' + t.hoverMix + '%, var(--g-surface)); }',
+      // After :hover, so a selected tile keeps its fill under the pointer.
+      g + ' .gitem.checked { border-color: var(--brand); background: color-mix(in srgb, var(--brand) ' +
+        t.checkedMix + '%, var(--g-surface)); }',
+      g + ' .gitem .sample { font-family: "' + t.sampleFamily + '", var(--doc-font); }',
+      g + ' .gitem .name { font-size: ' + t.nameSize + 'px; }',
+    ];
+    ['light', 'dark'].forEach(function (mode) {
+      var root = ':root[data-theme="' + mode + '"] ';
+      rules.push(root + g + ' { --g-surface: color-mix(in srgb, var(--fg) ' + t.surfaceMix[mode] + '%, var(--bg)); }');
+      var done = {};
+      c.items.forEach(function (it) {
+        if (done[it.preview]) return;
+        done[it.preview] = true;
+        var l = it.look[mode];
+        rules.push(root + g + ' .sample.' + it.preview + ' { font-size: ' + l.size + 'px; font-weight: ' +
+          l.weight + '; color: ' + ink(l.ink) + '; }');
+      });
+    });
+    return rules.join('\n');
+  }
+
+  function installGalleryStyle() {
+    var css = [];
+    (S.ribbon.tabs || []).concat(S.ribbon.contextual || []).forEach(function (tab) {
+      (tab.groups || []).forEach(function (g) {
+        g.items.forEach(function (c) { if (c.kind === 'gallery' && c.tile) css.push(galleryCss(c)); });
+      });
+    });
+    if (!css.length) return;
+    document.head.appendChild(h('style', { id: 'gallery-style', text: css.join('\n') }));
+  }
+
   function cycleTheme() {
     S.themePref = { auto: 'light', light: 'dark', dark: 'auto' }[S.themePref];
     try { localStorage.setItem('docxy.theme', S.themePref); } catch (e) { /* private mode */ }
@@ -304,7 +354,7 @@
           var b = h('button', {
             class: 'gitem', dataset: { act: it.act }, role: 'option', 'aria-label': it.label,
             onmousedown: keepFocus, onclick: function () { runAct(it.act, b); },
-          }, [h('span', { class: 'sample ' + it.preview, text: 'AaBbCc' }), h('span', { class: 'name', text: it.label })]);
+          }, [h('span', { class: 'sample ' + it.preview, text: c.tile.sample }), h('span', { class: 'name', text: it.label })]);
           b._tip = { title: it.label, body: '', shortcut: '' };
           return b;
         }));
@@ -1360,6 +1410,7 @@
     var payload;
     try {
       S.ribbon = JSON.parse(textOf('docxy-ribbon'));
+      installGalleryStyle();
       applyTheme();
       payload = E.readPayload(textOf('docxy-payload'));
     } catch (err) {

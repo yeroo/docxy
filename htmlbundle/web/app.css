@@ -146,26 +146,16 @@ svg.icon * { fill: currentColor; }
 .combo .caret { color: var(--dim); font-size: 9px; }
 .sep { width: 1px; align-self: stretch; margin: 4px 3px; background: var(--border); }
 
-.gallery { display: flex; gap: 2px; padding: 2px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg); height: 68px; overflow: hidden; }
+/* The Styles gallery: layout only. Sizes, spacing, state fills and each
+   style's look come from the suite's table in the ribbon snapshot; app.js
+   builds them into #gallery-style (installGalleryStyle). */
+.gallery { display: flex; flex: none; overflow: hidden; }
 .gitem {
-  width: 64px; height: 62px; padding: 4px; border: 1px solid transparent; border-radius: 3px;
   display: flex; flex-direction: column; justify-content: space-between; align-items: flex-start;
-  color: var(--fg); overflow: hidden;
+  flex: none; color: var(--fg); overflow: hidden;
 }
-.gitem:hover { background: var(--hover); }
-.gitem.checked { border-color: var(--brand); background: var(--checked); }
-.gitem .sample { font-family: var(--doc-font); white-space: nowrap; }
-.gitem .name { font-size: 10px; color: var(--dim); white-space: nowrap; }
-.gitem .sample.normal { font-size: 13px; }
-.gitem .sample.h1 { font-size: 16px; color: #2f5496; }
-.gitem .sample.h2 { font-size: 14px; color: #2f5496; }
-.gitem .sample.h3 { font-size: 13px; color: #1f3763; }
-.gitem .sample.title { font-size: 18px; letter-spacing: -0.5px; }
-.gitem .sample.subtitle { font-size: 12px; color: #5a5a5a; }
-:root[data-theme="dark"] .gitem .sample.h1,
-:root[data-theme="dark"] .gitem .sample.h2,
-:root[data-theme="dark"] .gitem .sample.h3 { color: #8fb4f0; }
-:root[data-theme="dark"] .gitem .sample.subtitle { color: var(--dim); }
+.gitem .sample, .gitem .name { white-space: nowrap; }
+.gitem .name { color: var(--dim); }
 
 /* key tips: the yellow access-key badges */
 .keytip {
