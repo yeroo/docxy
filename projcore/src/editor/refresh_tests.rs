@@ -315,7 +315,7 @@ fn a_material_is_its_quantity_in_hours_and_priced_per_unit() {
     // One unit, not five days of it: $5 plus $10 per use.
     assert_eq!((a.units, a.work_min), (1.0, 60));
     assert_eq!(text(&a.cost), Some("1500"));
-    ed.assign_resource(1, "Cement[300%]").unwrap();
+    ed.assign_resource(1, "Cement[3]").unwrap();
     let a = &ed.project().assignments[0];
     assert_eq!((a.work_min, text(&a.cost)), (180, Some("2500")));
 }

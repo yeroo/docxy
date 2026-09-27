@@ -258,9 +258,10 @@ impl Editor {
     /// Replace membership while preserving allocation data for retained resources.
     /// Prefer an already assigned namesake; otherwise duplicate names are ambiguous.
     ///
-    /// Tokens are Resource Names cell text: `Name[NN%]` sets explicit units. The
-    /// cell is WYSIWYG, so a retained assignment changes only when its text does:
-    /// different bracketed units, or a bare work resource that was shown bracketed.
+    /// Tokens are Resource Names cell text: `Name[NN%]` sets explicit units, and
+    /// `Name[<qty> <label>]` a material's quantity. The cell is WYSIWYG, so a
+    /// retained assignment changes only when its text does: different bracketed
+    /// units, or a bare name for one that was shown bracketed.
     pub fn set_resources(&mut self, uid: i32, names: &[String]) -> Result<(), String> {
         let i = self.index(uid)?;
         // Stage every allocation before touching the project or history, including ID exhaustion.
@@ -278,8 +279,8 @@ impl Editor {
             let (rid, units) = match self.match_resource(uid, &resources, raw)? {
                 Some(found) => found,
                 None => {
-                    let (name, units) = parse_resource_token(raw)?;
-                    let matched = match units {
+                    let (name, inner) = parse_resource_token(raw)?;
+                    let matched = match inner {
                         Some(_) => self.match_resource(uid, &resources, name)?.map(|m| m.0),
                         None => None,
                     };
@@ -288,7 +289,8 @@ impl Editor {
                         None if name.trim().is_empty() => continue,
                         None => find_or_stage_resource(&mut resources, name.trim())?,
                     };
-                    (rid, units)
+                    let r = resources.iter().find(|r| r.uid == rid).expect("staged");
+                    (rid, bracket_units(inner, r, raw)?)
                 }
             };
             if !wanted.iter().any(|w| w.0 == rid) {
@@ -317,14 +319,10 @@ impl Editor {
                 .find(|w| w.0 == a.resource_uid)
                 .expect("retained");
             let units = match explicit {
-                Some(u) if format_units(u) == format_units(a.units) => None,
+                Some(u) if same_shown_units(kind(a.resource_uid), u, a.units) => None,
                 Some(u) => Some(checked_units(u, raw)?),
-                // The cell showed `Name[NN%]` and the user deleted the bracket.
-                None if kind(a.resource_uid) == Some(ResourceType::Work)
-                    && units_bracket(a.units).is_some() =>
-                {
-                    Some(1.0)
-                }
+                // The cell showed a bracket and the user deleted it.
+                None if bare_resets_units(kind(a.resource_uid), a.units) => Some(1.0),
                 None => None,
             };
             if let Some(u) = units {
@@ -430,10 +428,11 @@ impl Editor {
     }
 }
 
-/// Split a Resource Names token `Name[NN%]` into its name and units (`NN/100`).
-/// A token without a trailing bracket is all name. The name keeps its raw
+/// Split a Resource Names token `Name[...]` into its name and the bracket's
+/// inner text, which [`bracket_units`] reads once the name has resolved. A
+/// token without a trailing bracket is all name. The name keeps its raw
 /// spelling so it resolves like a bare token.
-pub(super) fn parse_resource_token(raw: &str) -> Result<(&str, Option<f64>), String> {
+pub(super) fn parse_resource_token(raw: &str) -> Result<(&str, Option<&str>), String> {
     let Some((name, inner)) = raw
         .trim_end()
         .strip_suffix(']')
@@ -441,22 +440,79 @@ pub(super) fn parse_resource_token(raw: &str) -> Result<(&str, Option<f64>), Str
     else {
         return Ok((raw, None));
     };
-    let percent = inner
-        .trim()
-        .strip_suffix('%')
-        .and_then(|n| n.trim_end().parse::<f64>().ok())
-        .filter(|n| n.is_finite());
-    match percent {
-        Some(n) if !name.trim().is_empty() => Ok((name, Some(n / 100.))),
-        _ => Err(format!("Invalid units in '{}'", raw.trim())),
+    if name.trim().is_empty() {
+        return Err(invalid_units(raw));
     }
+    Ok((name, Some(inner)))
+}
+
+fn invalid_units(token: &str) -> String {
+    format!("Invalid units in '{}'", token.trim())
+}
+
+/// Read a bracket's inner text as units for resource `r`, as its cell shows
+/// them: `NN%` (`NN/100`) for work and cost resources, and for a material its
+/// quantity with its material label optional, `<qty>[ <label>]` (Project's
+/// `Cement[5 tons]`). The label matches case-insensitively; no bracket is
+/// no units. `token` is the whole token, for the error.
+pub(super) fn bracket_units(
+    inner: Option<&str>,
+    r: &Resource,
+    token: &str,
+) -> Result<Option<f64>, String> {
+    let Some(inner) = inner.map(str::trim) else {
+        return Ok(None);
+    };
+    let units = match r.kind {
+        ResourceType::Material => {
+            let (qty, label) = inner.split_once(char::is_whitespace).unwrap_or((inner, ""));
+            let label = label.trim();
+            let known = shown_label(r).unwrap_or("");
+            qty.parse::<f64>()
+                .ok()
+                .filter(|_| label.is_empty() || label.eq_ignore_ascii_case(known))
+        }
+        ResourceType::Work | ResourceType::Cost => inner
+            .strip_suffix('%')
+            .and_then(|n| n.trim_end().parse::<f64>().ok())
+            .map(|n| n / 100.),
+    };
+    match units.filter(|u| u.is_finite()) {
+        Some(u) => Ok(Some(u)),
+        None => Err(invalid_units(token)),
+    }
+}
+
+/// A number as the cell shows it: two decimals, trailing zeros trimmed (`5`, `0.33`).
+fn format_quantity(n: f64) -> String {
+    let text = format!("{n:.2}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" { "0" } else { text }.to_owned()
 }
 
 /// Assignment units as percent text: two decimals, trailing zeros trimmed (`50%`, `33.33%`).
 pub(super) fn format_units(units: f64) -> String {
-    let text = format!("{:.2}", units * 100.);
-    let text = text.trim_end_matches('0').trim_end_matches('.');
-    format!("{}%", if text == "-0" { "0" } else { text })
+    format!("{}%", format_quantity(units * 100.))
+}
+
+/// Whether two units read the same in the cell for a resource of `kind`: as
+/// a material's quantity, else as percent.
+pub(super) fn same_shown_units(kind: Option<ResourceType>, a: f64, b: f64) -> bool {
+    match kind {
+        Some(ResourceType::Material) => format_quantity(a) == format_quantity(b),
+        _ => format_units(a) == format_units(b),
+    }
+}
+
+/// Whether a bare token deletes a bracket the cell shows: a work assignment
+/// not at 100%, or a material whose quantity does not read `1`. Either goes
+/// back to 1.
+fn bare_resets_units(kind: Option<ResourceType>, units: f64) -> bool {
+    match kind {
+        Some(ResourceType::Work) => units_bracket(units).is_some(),
+        Some(ResourceType::Material) => units.is_finite() && format_quantity(units) != "1",
+        _ => false,
+    }
 }
 
 /// The bracket a work assignment shows after its name, or `None` at 100%.
@@ -464,8 +520,25 @@ fn units_bracket(units: f64) -> Option<String> {
     (units.is_finite() && (units - 1.).abs() > 1e-9).then(|| format!("[{}]", format_units(units)))
 }
 
-/// The task's Resource Names cell, in assignment order: `Bob[50%], Alice`.
-/// Only work resources show their units, as in Project.
+/// A material's label as the cell shows it: trimmed, `None` when blank.
+fn shown_label(r: &Resource) -> Option<&str> {
+    r.material_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+}
+
+/// The bracket a material assignment always shows: its quantity and label.
+fn quantity_bracket(r: &Resource, units: f64) -> Option<String> {
+    let qty = format_quantity(units);
+    units.is_finite().then(|| match shown_label(r) {
+        Some(label) => format!("[{qty} {label}]"),
+        None => format!("[{qty}]"),
+    })
+}
+
+/// The task's Resource Names cell, in assignment order: `Bob[50%], Cement[5 tons], Alice`.
+/// As in Project, work resources show their units and materials their quantity.
 pub fn format_resource_names(proj: &Project, task_uid: i32) -> String {
     proj.assignments
         .iter()
@@ -478,11 +551,13 @@ pub fn format_resource_names(proj: &Project, task_uid: i32) -> String {
         .join(", ")
 }
 
-/// One assignment's Resource Names text; only work resources show their units.
+/// One assignment's Resource Names text: a work resource's units, a
+/// material's quantity, a cost resource's bare name.
 fn cell_text(r: &Resource, a: &Assignment) -> String {
     let units = match r.kind {
         ResourceType::Work => units_bracket(a.units),
-        _ => None,
+        ResourceType::Material => quantity_bracket(r, a.units),
+        ResourceType::Cost => None,
     };
     format!("{}{}", r.name, units.unwrap_or_default())
 }
