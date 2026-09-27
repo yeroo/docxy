@@ -1239,9 +1239,13 @@ fn level_at(proj: &Project, at: usize, collapsed: &std::collections::BTreeSet<i3
     let Some(above) = proj.tasks[..at].iter().rposition(|t| !t.is_null) else {
         return 1;
     };
-    // Below a collapsed summary's hidden rows, the row shown above is the
+    // Past a collapsed summary's hidden rows, the row shown above is the
     // summary, so the new task is its sibling (see `outline::hidden_owners`).
-    if let Some(owner) = outline::hidden_owners(proj, collapsed)[above] {
+    // Inside them the outline decides as if expanded: view state never
+    // changes the plan's structure.
+    if let Some(owner) = outline::hidden_owners(proj, collapsed)[above]
+        && at >= subtree_end(proj, owner)
+    {
         return proj.tasks[owner].outline_level.max(1);
     }
     let level = proj.tasks[above].outline_level;

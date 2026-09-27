@@ -20,6 +20,10 @@ fn outline(rows: &[(i32, &str, u32)]) -> Editor {
     })
 }
 
+fn hidden(ed: &Editor, index: usize) -> bool {
+    !ed.visible_rows().contains(&index)
+}
+
 /// A, then S { S1, T { T1 }, blank, S2 }, then B.
 fn plan() -> Editor {
     outline(&[
@@ -42,7 +46,7 @@ fn visible_rows_skip_collapsed_subtrees() {
     // The blank row after T's last descendant is S's, not T's.
     assert_eq!(ed.set_collapsed(4, true), Ok(true));
     assert_eq!(ed.visible_rows(), [0, 1, 2, 3, 5, 6, 7]);
-    assert!(ed.is_hidden(4) && !ed.is_hidden(5));
+    assert!(hidden(&ed, 4) && !hidden(&ed, 5));
 
     // S hides everything under it, the blank row between its children too.
     assert_eq!(ed.set_collapsed(2, true), Ok(true));
@@ -126,7 +130,7 @@ fn selecting_or_finding_a_hidden_row_expands_its_summaries() {
     ed.set_collapsed(2, true).unwrap();
     assert_eq!(ed.find("t1"), FindOutcome::Found(4));
     assert!(!ed.is_collapsed(2) && !ed.is_collapsed(4));
-    assert!(!ed.is_hidden(4));
+    assert!(!hidden(&ed, 4));
 
     let mut ed = plan();
     ed.set_collapsed(2, true).unwrap();
@@ -151,7 +155,7 @@ fn indenting_the_selected_task_under_a_collapsed_summary_expands_it() {
     ed.indent(3, 1).unwrap();
     assert_eq!(ed.selected_uid(), Some(3));
     assert!(!ed.is_collapsed(1));
-    assert!(!ed.is_hidden(2));
+    assert!(!hidden(&ed, 2));
 }
 
 #[test]
@@ -246,4 +250,30 @@ fn hide_subtasks_on_a_subtask_collapses_its_summary() {
         "a top-level task has no summary"
     );
     assert!(ed.hide_subtasks(6).is_err(), "a blank row");
+}
+
+#[test]
+fn inserting_inside_a_hidden_subtree_keeps_the_outline() {
+    // An agent can insert after a hidden task (`task.add --after`).
+    let mut ed = outline(&[(1, "S", 1), (2, "S1", 2), (3, "S2", 2), (4, "B", 1)]);
+    ed.set_collapsed(1, true).unwrap();
+    let at = ed.add_task(Some(2), "N", 480).unwrap();
+    assert_eq!((at, ed.project().tasks[at].outline_level), (2, 2));
+    let s2 = ed.project().tasks.iter().position(|t| t.uid == 3).unwrap();
+    assert_eq!(ed.project().tasks[s2].outline_level, 2);
+    assert_eq!(ed.subtree_len(1), Ok(3), "S keeps S1, N and S2");
+    assert!(ed.is_collapsed(1));
+}
+
+#[test]
+fn a_hidden_blank_row_becomes_a_task_at_its_expanded_level() {
+    // The blank row between S1 and S2 is S's, hidden while S is collapsed.
+    let rows = [(1, "S", 1), (2, "S1", 2), (3, "", 0), (4, "S2", 2)];
+    let mut expanded = outline(&rows);
+    expanded.rename(3, "Filled").unwrap();
+    let mut ed = outline(&rows);
+    ed.set_collapsed(1, true).unwrap();
+    ed.rename(3, "Filled").unwrap();
+    assert_eq!(ed.project().tasks[2].outline_level, 2);
+    assert_eq!(ed.project(), expanded.project());
 }
