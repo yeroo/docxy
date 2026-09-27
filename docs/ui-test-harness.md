@@ -297,6 +297,7 @@ footer editor; `selection-set` refuses while it is open.
 | `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command id or unique label on a valid tab, contextual tabs included, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
+| `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 
 `ribbon-read` and `ribbon-click` work on document and Project tabs. The app
 does not model command enabled states. Extend Selection mode, native prompts,
@@ -380,14 +381,16 @@ Comparison is case-insensitive, and `is not` negates.
 
 `window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
 `bar:<id>` (for example `bar:3`), `project-hbar-table`, `project-hbar-chart`,
-`project-vbar`, `project-timeline`, `project-split`. `gantt` is the visible Project Gantt chart body,
+`project-vbar`, `project-timeline`, `project-split`, `gallery`. `gantt` is the visible Project Gantt chart body,
 excluding its header, divider and vertical scrollbar; `bar:<id>` addresses a task by
 displayed ID. The `project-hbar-*` and `project-vbar` regions are the Project tab's three
 scrollbar strips: under the table, under the chart, and down the right edge of the rows.
 `project-timeline` is the Timeline pane above the Gantt view, and is an error while
 View > Split View > Timeline has it hidden. `project-split` is the draggable bar
 between the entry table and the chart; its drags show in the `table_w` and `gantt_w`
-state entries. Inside a
+state entries. `gallery` is the Home ribbon's Styles gallery well on a
+document tab, and is an error while another ribbon tab, the Backstage or a
+collapsed ribbon hides it. Inside a
 border assertion the `cell:` may be dropped — `border A1:C5 solid` — because an
 assertion about a selection should read like the selection.
 

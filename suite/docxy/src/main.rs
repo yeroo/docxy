@@ -16,6 +16,7 @@ mod html_bundle;
 mod project;
 #[cfg(test)]
 mod ribbon_export;
+mod style_gallery;
 use project::*;
 
 use std::path::PathBuf;
@@ -114,7 +115,7 @@ impl Kind {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
 enum ThemePref {
     #[default]
     Auto,
@@ -4426,7 +4427,11 @@ impl Docxy {
     }
 
     fn cycle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.theme_pref = self.theme_pref.next();
+        self.set_theme_pref(self.theme_pref.next(), window, cx);
+    }
+
+    fn set_theme_pref(&mut self, pref: ThemePref, window: &mut Window, cx: &mut Context<Self>) {
+        self.theme_pref = pref;
         self.applied = None; // force re-apply on next render
         self.persist();
         self.refocus(window, cx);
@@ -5776,6 +5781,10 @@ impl Docxy {
             | Region::ProjectTimeline
             | Region::ProjectSplit => self.project_region_bounds(region),
             Region::Grid => self.grid_bounds(),
+            Region::Gallery => self.probes.borrow().get("gallery").ok_or_else(|| {
+                "the Styles gallery is not shown (it is on a document's Home tab, with the ribbon expanded)"
+                    .to_string()
+            }),
             Region::Cells(_, _, _, _) if self.active_is_project() => {
                 self.project_region_bounds(region)
             }
@@ -13830,6 +13839,31 @@ fn table_tab() -> rs::Tab<Act> {
     )
 }
 
+/// One icon button's share of a ribbon row, in px (see `group_est`).
+const ROW_BTN_PITCH: f32 = 35.0;
+
+/// Which of a ribbon tab's groups fit `width`: whether labels are dropped, and
+/// the groups still shown after the lowest priorities collapse.
+fn ribbon_fit(groups: &[rs::Group<Act>], width: f32) -> (bool, Vec<usize>) {
+    let avail = (width - 28.0).max(120.0);
+    // 1) drop control labels if the full layout overflows.
+    let icon_only = groups.iter().map(|g| group_est(g, false)).sum::<f32>() > avail;
+    // 2) collapse lowest-priority groups until what remains fits.
+    let mut shown: Vec<usize> = (0..groups.len()).collect();
+    loop {
+        let total: f32 = shown
+            .iter()
+            .map(|&i| group_est(&groups[i], icon_only))
+            .sum();
+        if total <= avail || shown.len() <= 1 {
+            break;
+        }
+        let victim = *shown.iter().min_by_key(|&&i| groups[i].priority).unwrap();
+        shown.retain(|&i| i != victim);
+    }
+    (icon_only, shown)
+}
+
 /// Rough natural width (px) of a group, for responsive collapse decisions.
 fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
     let mut w: f32 = 22.0;
@@ -13857,12 +13891,17 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
                                     48.0
                                 }
                             }
-                            rs::Cell::Btn(_) => 25.0,
+                            // `icon_btn` without its label: 1px border and
+                            // `px_2` each side around a 16px icon (34px), plus
+                            // the row's 1px gap. At 25 the Font and Paragraph
+                            // rows underran by ~70px, and at the default
+                            // 1180px window the Home tab clipped Editing.
+                            rs::Cell::Btn(_) => ROW_BTN_PITCH,
                         })
                         .sum::<f32>()
                 })
                 .fold(0.0_f32, f32::max),
-            Control::Gallery(gal) => gal.items.len() as f32 * 80.0,
+            Control::Gallery(gal) => style_gallery::well_width(gal.items.len()),
             Control::Separator => 10.0,
             _ => 30.0,
         };
@@ -15412,26 +15451,7 @@ impl Docxy {
     /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
     fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.active_ribbon_tab_def();
-        let avail = (width - 28.0).max(120.0);
-
-        // 1) drop control labels if the full layout overflows.
-        let icon_only = tab.groups.iter().map(|g| group_est(g, false)).sum::<f32>() > avail;
-        // 2) collapse lowest-priority groups until what remains fits.
-        let mut shown: Vec<usize> = (0..tab.groups.len()).collect();
-        loop {
-            let total: f32 = shown
-                .iter()
-                .map(|&i| group_est(&tab.groups[i], icon_only))
-                .sum();
-            if total <= avail || shown.len() <= 1 {
-                break;
-            }
-            let victim = *shown
-                .iter()
-                .min_by_key(|&&i| tab.groups[i].priority)
-                .unwrap();
-            shown.retain(|&i| i != victim);
-        }
+        let (icon_only, shown) = ribbon_fit(&tab.groups, width);
         let hidden = tab.groups.len() - shown.len();
 
         let mut groups: Vec<AnyElement> = shown
@@ -17323,49 +17343,68 @@ impl Docxy {
         gallery_style_selected(&editor.caret_para_props(), act)
     }
 
-    /// The Styles gallery: a row of thumbnail boxes, each showing its name in that
-    /// style's own weight/size (Word's Style gallery).
+    /// The Styles gallery: a well of fixed-size tiles, each a live "AaBbCc" in
+    /// that style's size, weight and colour with the style's name under it
+    /// (Word's Style gallery). Geometry, looks and state colours all come from
+    /// `style_gallery`, the table the editable-HTML page draws from too.
     fn style_gallery(
         &self,
         gal: &rs::Gallery<Act>,
         pal: Pal,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let boxes: Vec<AnyElement> = gal
+        use style_gallery as sg;
+        let g = sg::TILE;
+        let dark = self.applied == Some(ThemeMode::Dark);
+        let t = cx.theme();
+        let fg = t.foreground.to_rgb();
+        let colors = sg::tile_colors(t.background.to_rgb(), fg, rgb(BRAND), dark);
+        let tiles: Vec<AnyElement> = gal
             .items
             .iter()
             .map(|it| {
                 let act = it.act;
-                // Map the preview hint to a thumbnail appearance.
-                let (size, weight) = match it.preview {
-                    "title" => (16.0, FontWeight::BOLD),
-                    "subtitle" => (12.0, FontWeight::NORMAL),
-                    "h1" => (14.0, FontWeight::BOLD),
-                    "h2" => (13.0, FontWeight::BOLD),
-                    "h3" => (12.0, FontWeight::SEMIBOLD),
-                    _ => (11.0, FontWeight::NORMAL),
-                };
+                let look = sg::sample_look(it.preview, dark);
                 let selected = self.gallery_item_selected(it.act);
-                div()
+                let hover = Hsla::from(colors.hover);
+                v_flex()
                     .id(it.label)
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w(px(76.))
-                    .h(px(40.))
-                    .px_1()
-                    .rounded(px(3.))
-                    .border_1()
-                    .border_color(if selected { hsla_u(BRAND) } else { pal.border })
-                    .bg(pal.panel)
+                    .flex_none()
+                    .justify_between()
+                    .items_start()
+                    .w(px(g.w))
+                    .h(px(g.h))
+                    .p(px(g.pad))
+                    .rounded(px(g.radius))
+                    .border(px(g.border))
+                    .overflow_hidden()
+                    .border_color(if selected {
+                        hsla_u(BRAND)
+                    } else {
+                        gpui::transparent_black()
+                    })
+                    .bg(Hsla::from(if selected {
+                        colors.checked
+                    } else {
+                        colors.surface
+                    }))
                     .cursor_pointer()
-                    .hover(|d| d.border_color(hsla_u(BRAND)))
+                    // A selected tile keeps its checked fill under the pointer.
+                    .when(!selected, |d| d.hover(move |d| d.bg(hover)))
                     .child(
                         div()
-                            .text_size(px(size))
-                            .font_weight(weight)
-                            .text_color(pal.fg)
-                            .overflow_hidden()
+                            .font_family(sg::SAMPLE_FAMILY)
+                            .text_size(px(look.size))
+                            .font_weight(FontWeight(look.weight as f32))
+                            .text_color(Hsla::from(sg::ink_rgba(look.ink, fg)))
+                            .whitespace_nowrap()
+                            .child(g.sample),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(g.name_size))
+                            .text_color(pal.dim)
+                            .whitespace_nowrap()
                             .child(SharedString::from(it.label)),
                     )
                     .tooltip({
@@ -17378,10 +17417,25 @@ impl Docxy {
                     .into_any_element()
             })
             .collect();
-        h_flex()
-            .items_center()
-            .gap_1()
-            .children(boxes)
+        let well = h_flex()
+            .flex_none()
+            .gap(px(g.gap))
+            .p(px(g.well_pad))
+            .w(px(sg::well_width(gal.items.len())))
+            .h(px(sg::well_height()))
+            .rounded(px(g.well_radius))
+            .border(px(g.well_border))
+            .border_color(pal.border)
+            .bg(Hsla::from(colors.well))
+            .overflow_hidden()
+            .children(tiles);
+        // The probe sits beside the well, not in it: inside, it would measure
+        // the padding box and the harness's `gallery` shot would lose the border.
+        div()
+            .relative()
+            .flex_none()
+            .child(well)
+            .child(probe(&self.probes, "gallery"))
             .into_any_element()
     }
 
@@ -26942,6 +26996,59 @@ mod config_root_tests {
         assert_eq!(hot_dir(), real.join("docxy").join("hot"));
         assert!(!session_path().starts_with(over));
         assert!(!hot_dir().starts_with(over));
+    }
+}
+
+#[cfg(test)]
+mod ribbon_fit_tests {
+    // Not `super::*`: that brings gpui's `test` attribute in over the std one.
+    use super::{docxy_ribbon, group_est, ribbon_fit};
+
+    fn home_titles(width: f32) -> (bool, Vec<&'static str>) {
+        let ribbon = docxy_ribbon();
+        let home = ribbon.tabs.iter().find(|t| t.name == "Home").unwrap();
+        let (icon_only, shown) = ribbon_fit(&home.groups, width);
+        (
+            icon_only,
+            shown.iter().map(|&i| home.groups[i].title).collect(),
+        )
+    }
+
+    // At the suite's default 1180px window the Home tab drops its labels
+    // and collapses Clipboard, the lowest priority. Editing stays, and the
+    // window shot shows it whole: the estimates are the rendered widths, so
+    // what fits here fits on screen. (Issue 215, review r1: at 25px a row
+    // button the estimate said Clipboard fit too, and Editing was clipped.)
+    #[test]
+    fn home_at_the_default_window_collapses_clipboard_and_keeps_editing() {
+        let (icon_only, shown) = home_titles(1180.);
+        assert!(icon_only);
+        assert_eq!(shown, ["Font", "Paragraph", "Styles", "Editing"]);
+    }
+
+    #[test]
+    fn a_wide_window_shows_every_home_group() {
+        let (_, shown) = home_titles(1600.);
+        assert_eq!(
+            shown,
+            ["Clipboard", "Font", "Paragraph", "Styles", "Editing"]
+        );
+    }
+
+    /// The Paragraph group's two rows are all icon buttons; the wider row
+    /// (7) sets the width, each at `icon_btn`'s rendered pitch.
+    #[test]
+    fn a_row_of_icon_buttons_is_estimated_at_their_rendered_pitch() {
+        let ribbon = docxy_ribbon();
+        let home = ribbon.tabs.iter().find(|t| t.name == "Home").unwrap();
+        let para = home.groups.iter().find(|g| g.title == "Paragraph").unwrap();
+        // `icon_btn` without its label: border 1 + `px_2` 8 + icon 16 + `px_2`
+        // 8 + border 1, then the row's 1px gap. Written out, not the constant,
+        // so changing the estimate means changing this too.
+        assert_eq!(
+            group_est(para, true),
+            22. + 7. * (1. + 8. + 16. + 8. + 1. + 1.)
+        );
     }
 }
 

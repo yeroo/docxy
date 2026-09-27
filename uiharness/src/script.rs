@@ -593,7 +593,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), Scri
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-const REGION_WORDS: &str = "window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split";
+pub const REGION_WORDS: &str = "window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).
@@ -610,7 +610,8 @@ pub fn validate_region(name: &str) -> Result<String, String> {
     };
     match head.to_ascii_lowercase().as_str() {
         "window" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
-        | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split" => {
+        | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split"
+        | "gallery" => {
             if arg.is_some() {
                 return Err(format!("'{head}' takes no argument"));
             }
@@ -1319,6 +1320,7 @@ test Smoke-Case
             ("project-vbar", "project-vbar"),
             ("project-timeline", "project-timeline"),
             ("project-split", "project-split"),
+            ("gallery", "gallery"),
         ] {
             assert_eq!(validate_region(written).unwrap(), normalized, "{written}");
         }
@@ -1328,5 +1330,10 @@ test Smoke-Case
         assert!(validate_region("bar:abc").is_err());
         assert!(validate_region("gantt:1").is_err());
         assert!(validate_region("grid:1").is_err(), "grid takes no argument");
+        assert!(
+            validate_region("gallery:1").is_err(),
+            "gallery takes no argument"
+        );
+        assert!(validate_region("galery").is_err());
     }
 }

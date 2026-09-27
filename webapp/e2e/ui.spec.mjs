@@ -149,6 +149,84 @@ test('themes follow prefers-color-scheme and the toggle', async ({ page, guard }
   await guard.check();
 });
 
+// #215: the gallery is drawn from the suite's table (style_gallery.rs) as
+// exported into the snapshot — tile size, well, state fills and each style's
+// look, in both themes.
+const gallery = snapshot.tabs.flatMap((t) => t.groups || []).flatMap((g) => g.items)
+  .find((c) => c.kind === 'gallery');
+
+function hexRgb(hex) {
+  const n = parseInt(hex.slice(1, 7), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+// A computed colour, `rgb(...)` or `color(srgb ...)` (what color-mix computes to), as 0-255.
+function parseColor(css) {
+  let m = css.match(/^rgba?\(([\d.]+),\s*([\d.]+),\s*([\d.]+)/);
+  if (m) return m.slice(1, 4).map(Number);
+  m = css.match(/^color\(srgb\s+([\d.e-]+)\s+([\d.e-]+)\s+([\d.e-]+)/);
+  if (m) return m.slice(1, 4).map((v) => Number(v) * 255);
+  throw new Error('unparsed colour ' + css);
+}
+const mix = (a, b, pct) => a.map((x, i) => x + (b[i] - x) * pct / 100);
+function expectColor(got, want, what) {
+  const g = parseColor(got);
+  g.forEach((v, i) => expect(Math.abs(v - want[i]), `${what}: ${got} vs rgb(${want.map(Math.round)})`).toBeLessThanOrEqual(1.5));
+}
+
+test('the Styles gallery tiles are the suite table, in light and dark', async ({ page, guard }, testInfo) => {
+  const t = gallery.tile;
+  for (const mode of ['light', 'dark']) {
+    await page.emulateMedia({ colorScheme: mode });
+    await openBundle(page, bundleCopy(testInfo, 'sample.docx'));
+    await expect.poll(() => page.evaluate(() => document.documentElement.dataset.theme)).toBe(mode);
+    const well = page.locator('#gallery-' + gallery.id);
+    const wb = await well.boundingBox();
+    // Layout sizes within 0.05px: Firefox snaps to 1/60px (465.99994 for 466).
+    expect(wb.width, 'well width').toBeCloseTo(t.wellWidth, 1);
+    expect(wb.height, 'well height').toBeCloseTo(t.wellHeight, 1);
+    const tokens = snapshot.theme[mode];
+    const fg = hexRgb(tokens.foreground);
+    const surface = mix(hexRgb(tokens.background), fg, t.surfaceMix[mode]);
+    const items = await page.locator('.gitem').evaluateAll((bs) => bs.map((b) => {
+      const s = getComputedStyle(b.querySelector('.sample'));
+      const n = getComputedStyle(b.querySelector('.name'));
+      const r = b.getBoundingClientRect();
+      return {
+        w: r.width, h: r.height, checked: b.classList.contains('checked'), bg: getComputedStyle(b).backgroundColor,
+        sample: b.querySelector('.sample').textContent, size: s.fontSize, weight: s.fontWeight, color: s.color,
+        nameSize: n.fontSize, name: b.querySelector('.name').textContent,
+      };
+    }));
+    expect(items.length).toBe(gallery.items.length);
+    items.forEach((got, i) => {
+      const it = gallery.items[i];
+      const look = it.look[mode];
+      const what = `${mode} ${it.label}`;
+      expect(got.w, what + ' width').toBeCloseTo(t.w, 1);
+      expect(got.h, what + ' height').toBeCloseTo(t.h, 1);
+      expect(got.sample, what).toBe(t.sample);
+      expect(got.name, what).toBe(it.label);
+      expect(got.nameSize, what).toBe(t.nameSize + 'px');
+      expect(got.size, what).toBe(look.size + 'px');
+      expect(got.weight, what).toBe(String(look.weight));
+      expectColor(got.color, look.ink === 'fg' ? fg : hexRgb(look.ink), what + ' ink');
+      const fill = got.checked ? mix(surface, hexRgb(snapshot.theme.brand), t.checkedMix) : surface;
+      expectColor(got.bg, fill, what + (got.checked ? ' checked fill' : ' surface'));
+    });
+    expect(items.filter((x) => x.checked).length, 'one style is selected').toBe(1);
+    // Hover: an unselected tile lightens toward the foreground; the selected
+    // one keeps its checked fill.
+    const plain = page.locator('.gitem:not(.checked)').first();
+    await plain.hover();
+    expectColor(await plain.evaluate((b) => getComputedStyle(b).backgroundColor), mix(surface, fg, t.hoverMix), mode + ' hover');
+    const checked = page.locator('.gitem.checked');
+    await checked.hover();
+    expectColor(await checked.evaluate((b) => getComputedStyle(b).backgroundColor),
+      mix(surface, hexRgb(snapshot.theme.brand), t.checkedMix), mode + ' checked under the pointer');
+    await guard.check();
+  }
+});
+
 test('the Backstage rail is the suite rail', async ({ page, guard }, testInfo) => {
   await openBundle(page, bundleCopy(testInfo));
   await page.locator('.rtab.file').click();

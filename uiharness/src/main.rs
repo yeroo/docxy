@@ -66,7 +66,7 @@ options for run:
 regions:
   window  grid  chart-panel  cell:B3  cell:A1:C5  chart:0  gantt  bar:3
   project-hbar-table  project-hbar-chart  project-vbar  project-timeline
-  project-split
+  project-split  gallery
 ";
 
 fn main() -> ExitCode {
@@ -421,6 +421,24 @@ fn save(a: &Args, region: &str, img: &uiharness::Image) -> Result<PathBuf, Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The region names are listed in three places: the script parser's
+    /// refusal, the `border` expectation's refusal and this usage text. A
+    /// region added to one (as `gallery` was) must reach all three.
+    #[test]
+    fn every_region_list_names_the_same_regions() {
+        assert_eq!(
+            uiharness::script::REGION_WORDS,
+            uiharness::expect::REGION_WORDS
+        );
+        let regions = USAGE.split("regions:").nth(1).unwrap();
+        for word in uiharness::script::REGION_WORDS.split(", ") {
+            assert!(
+                regions.split_whitespace().any(|w| w == word),
+                "usage lacks {word}"
+            );
+        }
+    }
 
     fn parsed(words: &[&str]) -> Args {
         parse_from(words.iter().map(|word| (*word).to_string())).unwrap()

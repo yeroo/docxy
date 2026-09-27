@@ -500,41 +500,147 @@
                 "body": "",
                 "shortcut": ""
               },
+              "tile": {
+                "w": 64.0,
+                "h": 62.0,
+                "pad": 4.0,
+                "radius": 3.0,
+                "border": 1.0,
+                "gap": 2.0,
+                "wellPad": 2.0,
+                "wellRadius": 4.0,
+                "wellBorder": 1.0,
+                "wellWidth": 466.0,
+                "wellHeight": 68.0,
+                "nameSize": 10.0,
+                "sample": "AaBbCc",
+                "sampleFamily": "Calibri",
+                "surfaceMix": {
+                  "light": 6.0,
+                  "dark": 16.0
+                },
+                "hoverMix": 12.0,
+                "checkedMix": 20.0
+              },
               "items": [
                 {
                   "label": "Normal",
                   "preview": "normal",
-                  "act": "Normal"
+                  "act": "Normal",
+                  "look": {
+                    "light": {
+                      "size": 13.0,
+                      "weight": 400,
+                      "ink": "fg"
+                    },
+                    "dark": {
+                      "size": 13.0,
+                      "weight": 400,
+                      "ink": "fg"
+                    }
+                  }
                 },
                 {
                   "label": "No Spacing",
                   "preview": "normal",
-                  "act": "NoSpacing"
+                  "act": "NoSpacing",
+                  "look": {
+                    "light": {
+                      "size": 13.0,
+                      "weight": 400,
+                      "ink": "fg"
+                    },
+                    "dark": {
+                      "size": 13.0,
+                      "weight": 400,
+                      "ink": "fg"
+                    }
+                  }
                 },
                 {
                   "label": "Heading 1",
                   "preview": "h1",
-                  "act": "H1"
+                  "act": "H1",
+                  "look": {
+                    "light": {
+                      "size": 16.0,
+                      "weight": 300,
+                      "ink": "#2f5496"
+                    },
+                    "dark": {
+                      "size": 16.0,
+                      "weight": 300,
+                      "ink": "#9ec1f7"
+                    }
+                  }
                 },
                 {
                   "label": "Heading 2",
                   "preview": "h2",
-                  "act": "H2"
+                  "act": "H2",
+                  "look": {
+                    "light": {
+                      "size": 14.0,
+                      "weight": 300,
+                      "ink": "#2f5496"
+                    },
+                    "dark": {
+                      "size": 14.0,
+                      "weight": 300,
+                      "ink": "#9ec1f7"
+                    }
+                  }
                 },
                 {
                   "label": "Heading 3",
                   "preview": "h3",
-                  "act": "H3"
+                  "act": "H3",
+                  "look": {
+                    "light": {
+                      "size": 13.0,
+                      "weight": 300,
+                      "ink": "#1f3763"
+                    },
+                    "dark": {
+                      "size": 13.0,
+                      "weight": 300,
+                      "ink": "#9ec1f7"
+                    }
+                  }
                 },
                 {
                   "label": "Title",
                   "preview": "title",
-                  "act": "Title"
+                  "act": "Title",
+                  "look": {
+                    "light": {
+                      "size": 18.0,
+                      "weight": 300,
+                      "ink": "fg"
+                    },
+                    "dark": {
+                      "size": 18.0,
+                      "weight": 300,
+                      "ink": "fg"
+                    }
+                  }
                 },
                 {
                   "label": "Subtitle",
                   "preview": "subtitle",
-                  "act": "Subtitle"
+                  "act": "Subtitle",
+                  "look": {
+                    "light": {
+                      "size": 12.0,
+                      "weight": 400,
+                      "ink": "#5a5a5a"
+                    },
+                    "dark": {
+                      "size": 12.0,
+                      "weight": 400,
+                      "ink": "#bcbcbc"
+                    }
+                  }
                 }
               ]
             }

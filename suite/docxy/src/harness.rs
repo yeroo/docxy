@@ -526,6 +526,27 @@ pub fn typed_keys(text: &str) -> Result<Vec<Keystroke>, String> {
     Ok(out)
 }
 
+// ---- theme preference (pure) -----------------------------------------------
+
+/// The `theme-set` verb's `theme`: `light`, `dark` or `auto` (follow the OS).
+pub(crate) fn parse_theme_pref(name: &str) -> Result<crate::ThemePref, String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "light" => Ok(crate::ThemePref::Light),
+        "dark" => Ok(crate::ThemePref::Dark),
+        "auto" => Ok(crate::ThemePref::Auto),
+        other => Err(format!("unknown theme '{other}' (light, dark or auto)")),
+    }
+}
+
+/// [`parse_theme_pref`]'s inverse.
+pub(crate) fn theme_pref_name(pref: crate::ThemePref) -> &'static str {
+    match pref {
+        crate::ThemePref::Light => "light",
+        crate::ThemePref::Dark => "dark",
+        crate::ThemePref::Auto => "auto",
+    }
+}
+
 // ---- regions and their geometry (pure) ------------------------------------
 
 /// A named piece of the window a test can ask for the rectangle of.
@@ -564,11 +585,14 @@ pub enum Region {
     ProjectTimeline,
     /// The Project split bar between the entry table and the Gantt chart.
     ProjectSplit,
+    /// The Home ribbon's Styles gallery: the well its tiles sit in.
+    Gallery,
 }
 
 /// Parse a region name: `window`, `grid`, `chart-panel`, `cell:B3`,
 /// `cell:A1:C5`, `chart:0`, `gantt`, `bar:3`, `project-hbar-table`,
-/// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`.
+/// `project-hbar-chart`, `project-vbar`, `project-timeline`, `project-split`,
+/// `gallery`.
 ///
 /// `cell:` takes a range as readily as a single cell, so an assertion about a
 /// selection border names the selection rather than its two corners.
@@ -588,10 +612,10 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-vbar" if arg.is_none() => Ok(Region::ProjectVbar),
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
         "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
+        "gallery" if arg.is_none() => Ok(Region::Gallery),
         "window" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
-        | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split" => {
-            Err(format!("'{head}' does not take an argument; use '{head}'"))
-        }
+        | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split"
+        | "gallery" => Err(format!("'{head}' does not take an argument; use '{head}'")),
         "cell" | "cells" => {
             let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
                 format!("'{head}' needs a cell or a range, e.g. {head}:B3 or {head}:A1:C5")
@@ -621,7 +645,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split)"
+            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery)"
         )),
     }
 }
@@ -642,6 +666,7 @@ pub fn region_name(region: Region) -> String {
         Region::ProjectVbar => "project-vbar".into(),
         Region::ProjectTimeline => "project-timeline".into(),
         Region::ProjectSplit => "project-split".into(),
+        Region::Gallery => "gallery".into(),
     }
 }
 
@@ -1434,6 +1459,24 @@ pub fn dispatch(
                 ),
             ]))
         }
+        "theme-set" => {
+            let pref = parse_theme_pref(arg_str(args, "theme")?)?;
+            app.set_theme_pref(pref, window, cx);
+            Done::ok(Json::obj(vec![
+                ("theme", Json::Str(theme_pref_name(pref).into())),
+                (
+                    "resolved",
+                    Json::Str(
+                        if pref.resolve(window.appearance()) == gpui_component::ThemeMode::Dark {
+                            "dark"
+                        } else {
+                            "light"
+                        }
+                        .into(),
+                    ),
+                ),
+            ]))
+        }
         "ribbon-read" => {
             ribbon_surface(app)?;
             Done::ok(ribbon_json(app))
@@ -1808,6 +1851,23 @@ mod tests {
                 })],
             })],
         })
+    }
+
+    #[test]
+    fn theme_set_names_parse_and_round_trip() {
+        for pref in [
+            crate::ThemePref::Light,
+            crate::ThemePref::Dark,
+            crate::ThemePref::Auto,
+        ] {
+            assert_eq!(parse_theme_pref(theme_pref_name(pref)), Ok(pref));
+        }
+        assert_eq!(parse_theme_pref(" Dark "), Ok(crate::ThemePref::Dark));
+        let e = parse_theme_pref("dim").unwrap_err();
+        assert!(
+            e.contains("dim") && e.contains("light, dark or auto"),
+            "{e}"
+        );
     }
 
     #[test]
@@ -2919,6 +2979,12 @@ mod tests {
         assert_eq!(parse_region("chart-panel"), Ok(Region::ChartPanel));
         // Case and surrounding space are noise, as everywhere else here.
         assert_eq!(parse_region("  Chart-Panel "), Ok(Region::ChartPanel));
+        assert_eq!(parse_region("gallery"), Ok(Region::Gallery));
+        assert!(
+            parse_region("gallery:1")
+                .unwrap_err()
+                .contains("does not take an argument")
+        );
     }
 
     #[test]
@@ -2989,6 +3055,7 @@ mod tests {
             Region::ProjectVbar,
             Region::ProjectTimeline,
             Region::ProjectSplit,
+            Region::Gallery,
         ] {
             assert_eq!(parse_region(&region_name(r)), Ok(r));
         }
