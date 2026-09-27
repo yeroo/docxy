@@ -41,7 +41,7 @@ Built bottom-up, each a pure module:
 | `schedule` | the CPM engine + resource leveling |
 | `assign` | assignment dates and costs from the schedule and rate tables, and the refresh of stored totals an edit made stale |
 | `editor` | shared editing, selection, dirty tracking, undo/redo, and live scheduling |
-| `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart |
+| `gantt` | export a scheduled project as a Markdown/Mermaid Gantt chart, with a task table (dates, Deadline with a missed-deadline `⚠`, duration, slack) |
 | `yppx` | the native `.yppx` OPC package (ZIP + `[Content_Types].xml` + `project.xml`) |
 
 The model is **pure input** — the scheduler never mutates it; it returns a
@@ -244,6 +244,16 @@ even at the same duration (`1d` over `1d?`), as one undo step. A task never
 marked estimated stays unmarked. A summary shows `?` when any task below it is
 estimated; that rollup is shown, not saved, and a summary takes no `?` of its
 own.
+
+A task that finishes after its Deadline gets Project's missed-deadline
+indicator (#170), judged by `Task::misses_deadline`: Finish later than the
+Deadline instant, as stored. yppxy's grid shows a `⚠` at the end of the task's
+row (after Slack) when its displayed, possibly leveled, finish misses it, and
+the header then names it for the selected task (`⚠ B: finishes after its
+deadline 2026-03-06`), the text Project gives in the indicator's tooltip. The
+Markdown Gantt export's table has a Deadline column: the task's deadline,
+followed by `⚠` when the row's own Finish is after it. The suite's grid has no
+indicator yet.
 
 As in Project, the blank row below the last task is the entry row: clicking any
 empty row below the tasks, or Down from the last task, puts the cell cursor

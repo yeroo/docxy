@@ -9,11 +9,13 @@
 //! carries `excludes weekends` so the bars skip non-working days the way the
 //! schedule does.
 //! The accompanying table includes bold summary rows with rolled-up dates (a
-//! manually scheduled summary's own dates) and working durations, signed total
-//! slack, and the scheduler's free slack.
+//! manually scheduled summary's own dates) and working durations, each task's
+//! Deadline (marked `⚠` when the row's Finish is after it), signed total slack,
+//! and the scheduler's free slack.
 //!
 //! [Mermaid `gantt`]: https://mermaid.js.org/syntax/gantt.html
 
+use crate::datetime::DateTime;
 use crate::model::Project;
 use crate::schedule::Schedule;
 
@@ -77,7 +79,7 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
 }
 
 /// Render a full Markdown document: a heading, the fenced Mermaid chart, and a
-/// task table (start, finish, duration, total/free slack, critical) as a text
+/// task table (start, finish, deadline, duration, total/free slack, critical) as a text
 /// fallback for viewers that don't render Mermaid. Summary names are bold and
 /// their durations are the working time between their scheduled dates (rolled
 /// up, or a manual summary's own), measured
@@ -93,8 +95,12 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         to_mermaid(proj, sched)
     );
 
-    out.push_str("| Task | Start | Finish | Duration | Total slack | Free slack | Critical |\n");
-    out.push_str("|------|-------|--------|----------|-------------|------------|----------|\n");
+    out.push_str(
+        "| Task | Start | Finish | Deadline | Duration | Total slack | Free slack | Critical |\n",
+    );
+    out.push_str(
+        "|------|-------|--------|----------|----------|-------------|------------|----------|\n",
+    );
     for task in &proj.tasks {
         let Some(r) = sched.get(task.uid) else {
             continue;
@@ -111,11 +117,22 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         let dur = duration_str(proj, duration_min);
         let slack = fmt_days(proj.minutes_to_days(r.total_slack_min));
         let free_slack = fmt_days(proj.minutes_to_days(r.free_slack_min));
+        // Judged on this row's own (CPM) Finish cell; yppxy's grid judges
+        // its displayed, possibly leveled, finish instead.
+        let deadline = task.deadline.map_or_else(String::new, |deadline| {
+            let date = cell_date(deadline);
+            if task.misses_deadline(r.early_finish) {
+                format!("{date} ⚠")
+            } else {
+                date
+            }
+        });
         out.push_str(&format!(
-            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            "| {} | {} | {} | {} | {} | {} | {} | {} |\n",
             name,
-            r.early_start.to_mspdi().replace('T', " "),
-            r.early_finish.to_mspdi().replace('T', " "),
+            cell_date(r.early_start),
+            cell_date(r.early_finish),
+            deadline,
             dur,
             slack,
             free_slack,
@@ -123,6 +140,11 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         ));
     }
     out
+}
+
+/// A table cell's date and time, `YYYY-MM-DD HH:MM:SS`.
+fn cell_date(date: DateTime) -> String {
+    date.to_mspdi().replace('T', " ")
 }
 
 /// A Mermaid duration token (`2d`, `4h`, `30m`) from working minutes.
@@ -327,6 +349,7 @@ mod tests {
                     "**P**",
                     "2026-03-05 08:00:00",
                     "2026-03-10 17:00:00",
+                    "",
                     "4d",
                     "0d",
                     "0d",
@@ -336,6 +359,7 @@ mod tests {
                     "A",
                     "2026-03-05 08:00:00",
                     "2026-03-09 17:00:00",
+                    "",
                     "3d",
                     "0d",
                     "0d",
@@ -345,6 +369,7 @@ mod tests {
                     "**Nested**",
                     "2026-03-10 08:00:00",
                     "2026-03-10 17:00:00",
+                    "",
                     "1d",
                     "0d",
                     "0d",
@@ -354,6 +379,7 @@ mod tests {
                     "B",
                     "2026-03-10 08:00:00",
                     "2026-03-10 17:00:00",
+                    "",
                     "1d",
                     "0d",
                     "0d",
@@ -384,6 +410,7 @@ mod tests {
                 "**P**",
                 "2026-03-05 08:00:00",
                 "2026-03-06 17:00:00",
+                "",
                 "2d",
                 "0d",
                 "0d",
@@ -417,6 +444,7 @@ mod tests {
                     "Late",
                     "2026-02-26 08:00:00",
                     "2026-03-02 08:00:00",
+                    "",
                     "2d",
                     expected,
                     "0d",
@@ -427,7 +455,7 @@ mod tests {
     }
 
     #[test]
-    fn markdown_reports_a_missed_deadline_as_negative_total_slack() {
+    fn markdown_marks_a_missed_deadline_and_reports_negative_total_slack() {
         let proj =
             crate::mspdi::read_mspdi(include_str!("../../corpus/mspdi/21-deadline-missed.xml"))
                 .unwrap();
@@ -440,6 +468,7 @@ mod tests {
                     "A",
                     "2026-03-02 08:00:00",
                     "2026-03-06 17:00:00",
+                    "",
                     "5d",
                     "-5d",
                     "0d",
@@ -449,6 +478,7 @@ mod tests {
                     "B",
                     "2026-03-09 08:00:00",
                     "2026-03-13 17:00:00",
+                    "2026-03-06 17:00:00 ⚠",
                     "5d",
                     "-5d",
                     "0d",
@@ -457,6 +487,19 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn markdown_shows_a_met_deadline_without_the_marker() {
+        let proj = crate::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-task-fields.xml"))
+            .unwrap();
+        let md = to_markdown(&proj, &schedule(&proj));
+        let pour = table_rows(&md)
+            .into_iter()
+            .find(|row| row[0] == "Pour")
+            .unwrap();
+        assert_eq!(pour[2..4], ["2026-03-04 17:00:00", "2026-03-20 17:00:00"]);
+    }
+
     #[test]
     fn markdown_reports_free_slack() {
         let proj = diamond();
@@ -468,6 +511,7 @@ mod tests {
                 "Task",
                 "Start",
                 "Finish",
+                "Deadline",
                 "Duration",
                 "Total slack",
                 "Free slack",
@@ -477,7 +521,7 @@ mod tests {
         assert_eq!(
             rows[1..]
                 .iter()
-                .map(|row| (row[0], row[5]))
+                .map(|row| (row[0], row[6]))
                 .collect::<Vec<_>>(),
             [("A", "0d"), ("B", "0d"), ("C", "2d"), ("D", "0d")]
         );
@@ -501,6 +545,7 @@ mod tests {
                 "A",
                 "2026-03-02 08:00:00",
                 "2026-03-02 17:00:00",
+                "",
                 "1d",
                 "2d",
                 "0d",
@@ -529,6 +574,7 @@ mod tests {
                     r"**P \| Q**",
                     "2026-03-02 08:00:00",
                     "2026-03-02 17:00:00",
+                    "",
                     "1d",
                     "0d",
                     "0d",
@@ -538,6 +584,7 @@ mod tests {
                     r"A \| B",
                     "2026-03-02 08:00:00",
                     "2026-03-02 17:00:00",
+                    "",
                     "1d",
                     "0d",
                     "0d",
@@ -573,11 +620,12 @@ mod tests {
         };
         let md = to_markdown(&proj, &schedule(&proj));
         assert_eq!(
-            table_rows(&md)[1][..4],
+            table_rows(&md)[1][..5],
             [
                 "**Phase**",
                 "2026-03-02 08:00:00",
                 "2026-03-03 17:00:00",
+                "",
                 "2d"
             ]
         );
