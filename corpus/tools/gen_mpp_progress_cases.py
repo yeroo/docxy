@@ -54,6 +54,8 @@ def new_plan(app):
     app.FileNew()  # NO arguments: a False here is read as a filename
     p = app.ActiveProject
     p.ProjectStart = ANCHOR
+    # Project's own default here is manual; every case but p1's M is auto.
+    p.NewTasksCreatedAsManual = False
     return p
 
 
