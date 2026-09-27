@@ -29,7 +29,7 @@
 
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
-use projcore::editor::{Editor, TaskPatch, parse_duration, parse_lag};
+use projcore::editor::{Editor, TaskPatch, parse_duration, parse_lag, parse_task_duration};
 use projcore::model::{LagFormat, LinkType, Predecessor, Task};
 
 /// Successful calls to these verbs signal agent editing activity.
@@ -132,6 +132,11 @@ fn task_json(ed: &Editor, t: &Task) -> Json {
             "duration_days",
             Json::Num(ed.project().minutes_to_days(t.duration_min)),
         ),
+        // As the duration shows it (`1d?`); a summary rolls it up.
+        (
+            "estimated",
+            Json::Bool(!projcore::editor::duration_suffix(ed.project(), t.uid).is_empty()),
+        ),
         ("predecessors", Json::Arr(preds)),
     ];
     if let Some(s) = ed.disp_start(t.uid) {
@@ -217,10 +222,10 @@ fn task_get(ed: &Editor, args: &Json) -> Result<Json, String> {
 
 fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let uid = uid_arg(args, "uid")?;
-    let duration_min = args
+    let duration = args
         .get_str("duration")
         .map(|d| {
-            parse_duration(d, ed.project())
+            parse_task_duration(d, ed.project())
                 .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w)"))
         })
         .transpose()?;
@@ -240,9 +245,10 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         uid,
         TaskPatch {
             name: args.get_str("name").map(str::to_string),
-            duration_min,
+            duration_min: duration.map(|d| d.0),
             level,
             manual,
+            estimated: duration.map(|d| d.1),
         },
     )?;
     task_get(ed, args)
@@ -253,15 +259,16 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get("after")
         .map(|_| uid_arg(args, "after"))
         .transpose()?;
-    let duration_min = match args.get_str("duration") {
-        Some(d) => parse_duration(d, ed.project())
+    let (duration_min, estimated) = match args.get_str("duration") {
+        Some(d) => parse_task_duration(d, ed.project())
             .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w)"))?,
-        None => 480,
+        None => (480, false),
     };
     let at = ed.add_task(
         after,
         args.get_str("name").unwrap_or("New task"),
         duration_min,
+        estimated,
     )?;
     Ok(task_json(ed, &ed.project().tasks[at]))
 }
@@ -400,6 +407,36 @@ mod tests {
         .unwrap();
         assert_eq!(r.get_str("name"), Some("Design v2"));
         assert_eq!(r.get("duration_days").unwrap().as_f64(), Some(5.0));
+    }
+
+    #[test]
+    fn durations_take_and_report_an_estimate() {
+        let mut a = app();
+        let uid = add(&mut a, "Guess", "3d?");
+        let get =
+            |a: &Editor| task_get(a, &Json::obj(vec![("uid", Json::Num(uid as f64))])).unwrap();
+        assert_eq!(get(&a).get("estimated"), Some(&Json::Bool(true)));
+        assert_eq!(get(&a).get("duration_days").unwrap().as_f64(), Some(3.0));
+        // The same duration without `?` commits it.
+        let r = task_set(
+            &mut a,
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("duration", Json::Str("3d".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get("estimated"), Some(&Json::Bool(false)));
+        let r = task_set(
+            &mut a,
+            &Json::obj(vec![
+                ("uid", Json::Num(uid as f64)),
+                ("duration", Json::Str("4d?".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(r.get("estimated"), Some(&Json::Bool(true)));
+        assert_eq!(r.get("duration_days").unwrap().as_f64(), Some(4.0));
     }
 
     #[test]
@@ -681,7 +718,7 @@ mod tests {
     #[test]
     fn control_find_does_not_change_selection_query_or_history() {
         let mut ed = Editor::new(new_project());
-        ed.add_task(None, "Another task", 480).unwrap();
+        ed.add_task(None, "Another task", 480, false).unwrap();
         ed.find("another");
         ed.rename(1, "Rename").unwrap();
         ed.undo();

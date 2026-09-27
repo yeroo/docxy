@@ -898,3 +898,86 @@ fn retyping_a_predecessors_cell_keeps_a_link_shown_in_a_fallback_unit() {
         vec![month, lag(30, 2880, 8)]
     );
 }
+
+// ---- estimated durations (#159) ----
+
+fn duration_text(t: &DocTab, uid: i32) -> String {
+    let ed = &v(t).ed;
+    project_row(ed, ed.project().task(uid).unwrap())[COL_DURATION].clone()
+}
+
+#[test]
+fn an_estimated_duration_shows_and_reopens_with_a_question_mark() {
+    let mut p = v(&tab()).ed.project().clone();
+    p.tasks[0].estimated = Some(true);
+    p.tasks[1].duration_min = 1200;
+    p.tasks[1].estimated = Some(true);
+    p.tasks[2].estimated = Some(false);
+    let mut t = project_tab(
+        "test.yppx".into(),
+        None,
+        Surface::Project(ProjectView::new(p, false)),
+        false,
+        "loaded".into(),
+    );
+    assert_eq!(duration_text(&t, 10), "1d?");
+    assert_eq!(duration_text(&t, 20), "2.5d?");
+    assert_eq!(duration_text(&t, 30), "1d");
+    // The cell opens as it shows; committing it unchanged is no edit.
+    vm(&mut t).ed.select(0);
+    vm(&mut t).col = COL_DURATION;
+    vm(&mut t).open_cell(None).unwrap();
+    assert_eq!(v(&t).cell.as_ref().unwrap().initial, "1d?");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!((v(&t).ed.undo_depth(), t.dirty), (0, false));
+    // Retyping it without `?` commits the estimate.
+    vm(&mut t).ed.select(0);
+    edit(&mut t, COL_DURATION, "1d");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.project().task(10).unwrap().estimated, Some(false));
+    assert_eq!(duration_text(&t, 10), "1d");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    // And `?` marks one.
+    vm(&mut t).ed.select(2);
+    edit(&mut t, COL_DURATION, "3d?");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(duration_text(&t, 30), "3d?");
+}
+
+#[test]
+fn the_entry_row_takes_an_estimated_duration() {
+    let mut t = tab();
+    project_entry_click(&mut t, Some(COL_DURATION), false);
+    edit(&mut t, COL_DURATION, "2d?");
+    key(&mut t, "enter");
+    let ed = &v(&t).ed;
+    let new = &ed.project().tasks[3];
+    assert_eq!((new.duration_min, new.estimated), (960, Some(true)));
+    assert_eq!(project_row(ed, new)[COL_DURATION], "2d?");
+    assert_eq!(ed.undo_depth(), 1);
+}
+
+#[test]
+fn a_summary_shows_the_estimate_of_its_subtasks() {
+    let mut p = v(&tab()).ed.project().clone();
+    p.tasks[0].outline_level = 1;
+    p.tasks[1].outline_level = 2;
+    p.tasks[2].outline_level = 2;
+    p.tasks[2].estimated = Some(true);
+    let t = project_tab(
+        "test.yppx".into(),
+        None,
+        Surface::Project(ProjectView::new(p, false)),
+        false,
+        "loaded".into(),
+    );
+    assert!(
+        duration_text(&t, 10).ends_with("d?"),
+        "{}",
+        duration_text(&t, 10)
+    );
+    assert_eq!(duration_text(&t, 20), "1d");
+}

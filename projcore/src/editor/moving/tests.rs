@@ -81,7 +81,7 @@ fn move_skips_a_holiday_on_the_tasks_calendar() {
 fn move_keeps_the_time_of_day() {
     // A 4h predecessor ends at noon, so after lunch the task starts at 13:00.
     let mut ed = editor();
-    ed.set_duration_min(10, 240).unwrap();
+    ed.set_duration_min(10, 240, false).unwrap();
     ed.add_predecessor(20, 10, LinkType::FinishStart, 0)
         .unwrap();
     assert_eq!(ed.schedule().get(20).unwrap().early_start, at(0, 13));
@@ -237,7 +237,7 @@ fn a_milestone_at_the_end_of_the_day_moves_by_one_date() {
     // A milestone after a 1-day task sits at its finish instant, Mon 17:00;
     // task 30 follows it, starting Tue 08:00.
     let mut ed = editor();
-    ed.set_duration_min(20, 0).unwrap();
+    ed.set_duration_min(20, 0, false).unwrap();
     ed.add_predecessor(20, 10, LinkType::FinishStart, 0)
         .unwrap();
     ed.add_predecessor(30, 20, LinkType::FinishStart, 0)
@@ -255,7 +255,7 @@ fn a_milestone_at_the_end_of_the_day_moves_by_one_date() {
 #[test]
 fn an_unlinked_evening_milestone_moves_there_and_back() {
     let mut ed = editor();
-    ed.set_duration_min(20, 0).unwrap();
+    ed.set_duration_min(20, 0, false).unwrap();
     ed.set_constraint(20, "mfo 2026-01-05T17:00:00").unwrap();
     ed.add_predecessor(30, 20, LinkType::FinishStart, 0)
         .unwrap();
@@ -293,7 +293,7 @@ fn a_start_after_the_target_days_hours_stays_on_that_date() {
     ed.set_start_at(10, at(3, 10)).unwrap();
     assert_eq!(ed.move_task(10, "1d"), Ok(at(4, 10)));
     // A milestone at Thu 17:00 ends Friday's working time.
-    ed.set_duration_min(20, 0).unwrap();
+    ed.set_duration_min(20, 0, false).unwrap();
     ed.set_start_at(20, at(3, 17)).unwrap();
     assert_eq!(ed.schedule().get(20).unwrap().early_start, at(3, 17));
     assert_eq!(ed.move_task(20, "1d"), Ok(at(4, 12)));

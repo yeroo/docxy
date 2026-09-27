@@ -1,7 +1,7 @@
 //! Project tab: file/session policy and the Gantt view over the shared editor.
 use super::*;
 use gpui_component::scroll::{Scrollbar, ScrollbarHandle, ScrollbarShow};
-use projcore::editor::{Editor as ProjectEditor, untitled_project};
+use projcore::editor::{Editor as ProjectEditor, duration_suffix, untitled_project};
 use projcore::{LinkType, Project, Task, mspdi, yppx};
 use std::cell::Cell;
 use std::path::Path;
@@ -804,12 +804,14 @@ pub(crate) fn project_row(ed: &ProjectEditor, task: &Task) -> [String; COLUMN_CO
         // Summaries first: their stored duration is stale (and may be 0, which
         // `is_milestone` would misread), so derive it from the shown dates.
         if task.summary {
-            ed.disp_duration_min(task.uid)
-                .map_or_else(|| "?".into(), |min| days(project, min))
+            ed.disp_duration_min(task.uid).map_or_else(
+                || "?".into(),
+                |min| days(project, min) + duration_suffix(project, task.uid),
+            )
         } else if task.is_milestone() {
             "—".into()
         } else {
-            days(project, task.duration_min)
+            days(project, task.duration_min) + duration_suffix(project, task.uid)
         },
         date(ed.disp_start(task.uid)),
         date(ed.disp_finish(task.uid)),
