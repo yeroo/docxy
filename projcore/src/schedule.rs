@@ -630,13 +630,20 @@ impl<'a> Scheduler<'a> {
         let mut ef_abs: HashMap<i32, i64> = HashMap::new();
         let mut es_abs: HashMap<i32, i64> = HashMap::new();
         let mut driven_es: HashMap<i32, i64> = HashMap::new();
-        // Where each in-progress task's remaining work resumes (index).
+        // Where each in-progress task's remaining work resumes, and the
+        // finish its FF/SF links drive for a tracked task (indices).
         let mut resume_idx: HashMap<i32, i64> = HashMap::new();
+        let mut driven_ef: HashMap<i32, i64> = HashMap::new();
         let mut linked_tasks = std::collections::HashSet::new();
         for &i in &order {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
             let mut linked_start: Option<i64> = None;
+            // A tracked task's slack compares start links with its start (or
+            // resume) and finish links with its finish (index), not with a
+            // start derived from its duration.
+            let mut start_link: Option<i64> = None;
+            let mut finish_link: Option<i64> = None;
             let mut fs_milestone_start: Option<i64> = None;
             let mut finish_bounds = Vec::new();
             for p in &t.predecessors {
@@ -665,14 +672,19 @@ impl<'a> Scheduler<'a> {
                         if let Offset::Elapsed(_) = offset {
                             finish_bounds.push((tl.to_index(pf_abs), pf_abs));
                         }
+                        finish_link = finish_link.max(Some(tl.to_index(cf)));
                         tl.abs_start(tl.to_index(cf) - t.duration_min)
                     }
                     LinkType::StartFinish => {
                         let bound = sf_bound(tl, ps_abs, lag);
                         finish_bounds.push(bound);
+                        finish_link = finish_link.max(Some(bound.0));
                         tl.abs_start(bound.0 - t.duration_min)
                     }
                 };
+                if matches!(p.link, LinkType::FinishStart | LinkType::StartStart) {
+                    start_link = start_link.max(Some(cand));
+                }
                 linked_start = Some(linked_start.map_or(cand, |s| s.max(cand)));
             }
             // Only resolved leaf links may schedule a task before the anchor.
@@ -689,7 +701,10 @@ impl<'a> Scheduler<'a> {
             // shows a violated link (see the results below).
             if let Some(tracked) = t.tracked() {
                 let (s_abs, resume, f_abs) = tracked_span(tl, tracked);
-                driven_es.insert(t.uid, tl.to_index(linked_start.unwrap_or(s_abs)));
+                driven_es.insert(t.uid, tl.to_index(start_link.unwrap_or(s_abs)));
+                if let Some(finish) = finish_link {
+                    driven_ef.insert(t.uid, finish);
+                }
                 if let Some(resume) = resume {
                     resume_idx.insert(t.uid, tl.to_index(resume));
                 }
@@ -1078,19 +1093,19 @@ impl<'a> Scheduler<'a> {
             };
             // A manual task pinned before its link-driven start violates the
             // link: report at least that gap as negative slack, even off the
-            // critical path. So does a complete task started before it. An
-            // in-progress task violates it only by as much as its remaining
-            // work, from its resume, precedes the link-driven start.
+            // critical path. So does a tracked task, by the most that a start
+            // link overruns its start (an in-progress task's resume: only its
+            // remaining work can violate it) or a finish link its finish.
             let tracked = t.tracked();
-            let driven = match (tracked, resume_idx.get(&t.uid)) {
-                (Some(Tracked::InProgress { .. }), Some(&resume)) => {
-                    let overrun = (driven - resume).max(0);
-                    total = tl.to_index(l_s) - early - overrun;
-                    early + overrun
+            if tracked.is_some() {
+                let from = resume_idx.get(&t.uid).copied().unwrap_or(early);
+                let finish_overrun = driven_ef.get(&t.uid).map_or(0, |&f| f - tl.to_index(e_f));
+                let overrun = (driven - from).max(finish_overrun).max(0);
+                total = tl.to_index(l_s) - early - overrun;
+                if overrun > 0 {
+                    total = total.min(-overrun);
                 }
-                _ => driven,
-            };
-            if fixed(t) && driven > early {
+            } else if t.pinned_dates().is_some() && driven > early {
                 total = total.min(early - driven);
             }
             // A tracked task finishes where its actuals put it, not at its
@@ -6772,6 +6787,19 @@ mod tests {
         let mut t = in_progress(1, "T", 2400, at(2, 8), (None, None), None);
         t.remaining_duration_min = Some(960);
         assert_eq!(span(&schedule(&march2(vec![t])), 1), (at(2, 8), at(3, 17)));
+        // Nothing left after a Stop in nonworking time: it finishes there.
+        let t = in_progress(1, "T", 960, at(6, 8), (Some(at(7, 10)), None), Some(960));
+        assert_eq!(span(&schedule(&march2(vec![t])), 1), (at(6, 8), at(7, 10)));
+        // More actual than planned duration leaves nothing, not negative work.
+        let t = in_progress(
+            1,
+            "T",
+            960,
+            at(2, 8),
+            (Some(at(3, 17)), Some(at(3, 17))),
+            Some(1200),
+        );
+        assert_eq!(span(&schedule(&march2(vec![t])), 1), (at(2, 8), at(3, 17)));
         // Actual dates are instants that happened: weekend work stays put.
         let t = complete(1, "T", 480, at(7, 10), at(7, 12));
         let s = schedule(&march2(vec![t]));
@@ -6806,6 +6834,74 @@ mod tests {
         assert_eq!(span(&s, 2), (at(4, 8), at(9, 17)));
         assert_eq!(s.get(2).unwrap().total_slack_min, -960);
         assert!(s.get(2).unwrap().critical);
+    }
+
+    /// A finish link bounds a tracked task's finish, where its actuals and
+    /// remaining work put it, not a start derived from its whole duration.
+    #[test]
+    fn tracked_task_violates_a_finish_link_by_its_own_finish() {
+        let link = |uid, link| Predecessor { link, ..fs(uid) };
+        // T (5 days) did 3 by Wed 4 and finishes Fri 6; A (planned 5 days)
+        // was done on Mon 2.
+        let t = in_progress(
+            2,
+            "T",
+            2400,
+            at(2, 8),
+            (Some(at(4, 17)), Some(at(4, 17))),
+            Some(1440),
+        );
+        let a = complete(2, "A", 2400, at(2, 8), at(2, 17));
+        // P runs Mon 2 to Tue 10 (FF); P runs Wed 11 after Q (SF).
+        let ff = || vec![task(1, "P", 3360)];
+        let sf = || {
+            let mut p = task(1, "P", 480);
+            p.predecessors.push(fs(3));
+            vec![p, task(3, "Q", 3360)]
+        };
+        let cases = [
+            (
+                "in progress, FF",
+                t.clone(),
+                LinkType::FinishFinish,
+                ff(),
+                -960,
+            ),
+            (
+                "in progress, SF",
+                t.clone(),
+                LinkType::StartFinish,
+                sf(),
+                -960,
+            ),
+            (
+                "complete, FF",
+                a.clone(),
+                LinkType::FinishFinish,
+                ff(),
+                -2880,
+            ),
+            ("complete, SF", a, LinkType::StartFinish, sf(), -2880),
+        ];
+        for (case, mut tracked, kind, mut tasks, slack) in cases {
+            tracked.predecessors.push(link(1, kind));
+            let complete = tracked.actual_finish.is_some();
+            let dates = (tracked.actual_start.unwrap(), tracked.actual_finish);
+            tasks.push(tracked);
+            let s = schedule(&march2(tasks));
+            let r = s.get(2).unwrap();
+            assert_eq!(r.early_start, dates.0, "{case}");
+            if let Some(finish) = dates.1 {
+                assert_eq!(r.early_finish, finish, "{case}");
+            }
+            assert_eq!(r.total_slack_min, slack, "{case}");
+            assert_eq!(r.critical, !complete, "{case}");
+        }
+        // A finish link it meets leaves its slack alone.
+        let mut ok = t;
+        ok.predecessors.push(link(1, LinkType::FinishFinish));
+        let s = schedule(&march2(vec![task(1, "P", 1440), ok]));
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
     }
 
     #[test]
