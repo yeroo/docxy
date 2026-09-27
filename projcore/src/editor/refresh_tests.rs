@@ -1,7 +1,7 @@
 //! #269: an edit refreshes the assignment, task and resource fields derived
 //! from what it changed, and nothing else.
 use super::*;
-use crate::model::Rate;
+use crate::model::{AccrueAt, Rate};
 
 fn at(day: u32, hour: u32) -> DateTime {
     DateTime::from_ymd_hm(2026, 1, day, hour, 0)
@@ -262,6 +262,10 @@ fn nothing_is_refreshed_without_an_edit_that_changes_it() {
     // Stored values no rate or schedule would produce survive opening,
     // saving, and an edit that changes none of their inputs.
     let mut proj = staffed().project().clone();
+    proj.tasks[0].fixed_cost = Rate::parse("2500");
+    proj.tasks[0].fixed_cost_accrual = Some(AccrueAt::Prorated);
+    proj.tasks[0].cost = Rate::parse("2501");
+    proj.tasks[0].remaining_cost = Rate::parse("2501");
     proj.resources[0].work_min = Some(7);
     proj.resources[0].cost = Rate::parse("7");
     proj.resources[0].start = Some(at(1, 8));
@@ -272,6 +276,10 @@ fn nothing_is_refreshed_without_an_edit_that_changes_it() {
         assert_eq!(section(&saved, name), section(&xml, name), "{name}");
     }
     ed.rename(1, "Renamed").unwrap();
+    let untouched = &ed.project().tasks[0];
+    assert_eq!(text(&untouched.fixed_cost), Some("2500"));
+    assert_eq!(text(&untouched.cost), Some("2501"));
+    assert_eq!(text(&untouched.remaining_cost), Some("2501"));
     let saved = crate::mspdi::write_mspdi(ed.project());
     for name in ["Resources", "Assignments"] {
         assert_eq!(section(&saved, name), section(&xml, name), "{name}");
@@ -441,6 +449,115 @@ fn a_task_moved_in_the_outline_takes_its_totals_along() {
     );
     ed.indent(2, -1).unwrap();
     assert_eq!(totals(&ed), before);
+}
+
+#[test]
+fn fixed_cost_moves_between_summaries_without_changing_own_or_project_totals() {
+    let priced = |mut t: Task, level, fixed: &str, cost: &str, remaining: &str| {
+        t.outline_level = level;
+        t.fixed_cost = Rate::parse(fixed);
+        t.cost = Rate::parse(cost);
+        t.remaining_cost = Rate::parse(remaining);
+        t
+    };
+    let mut leaf = priced(task(2, 1), 2, "7000", "7000", "3500");
+    leaf.percent_complete = Some(50);
+    leaf.fixed_cost_accrual = Some(AccrueAt::Prorated);
+    let mut ed = Editor::new(Project {
+        tasks: vec![
+            priced(task(0, 0), 0, "0", "13000", "9500"),
+            priced(task(3, 0), 1, "1000", "3000", "3000"),
+            priced(task(1, 1), 2, "2000", "2000", "2000"),
+            priced(task(4, 0), 1, "3000", "10000", "6500"),
+            leaf,
+        ],
+        ..Project::default()
+    });
+    ed.edit_structure(|p| {
+        let leaf = p.tasks.remove(4);
+        p.tasks.insert(3, leaf);
+    })
+    .unwrap();
+    let cost = |uid| {
+        let t = ed.project().task(uid).unwrap();
+        (
+            text(&t.cost).map(str::to_owned),
+            text(&t.remaining_cost).map(str::to_owned),
+        )
+    };
+    assert_eq!(cost(3), (Some("10000".into()), Some("6500".into())));
+    assert_eq!(cost(4), (Some("3000".into()), Some("3000".into())));
+    assert_eq!(cost(2), (Some("7000".into()), Some("3500".into())));
+    assert_eq!(cost(0), (Some("13000".into()), Some("9500".into())));
+}
+
+#[test]
+fn deleting_a_summary_removes_its_own_fixed_cost_and_its_child_once() {
+    let priced = |mut t: Task, level, fixed: &str, cost: &str| {
+        t.outline_level = level;
+        t.fixed_cost = Rate::parse(fixed);
+        t.cost = Rate::parse(cost);
+        t.remaining_cost = Rate::parse(cost);
+        t
+    };
+    let mut ed = Editor::new(Project {
+        tasks: vec![
+            priced(task(0, 0), 0, "100", "1300"),
+            priced(task(3, 0), 1, "200", "1200"),
+            priced(task(1, 1), 2, "1000", "1000"),
+        ],
+        ..Project::default()
+    });
+    ed.delete_task(3).unwrap();
+    let root = ed.project().task(0).unwrap();
+    assert_eq!(text(&root.cost), Some("100"));
+    assert_eq!(text(&root.remaining_cost), Some("100"));
+    assert!(ed.undo());
+    ed.delete_task(1).unwrap();
+    let root = ed.project().task(0).unwrap();
+    let summary = ed.project().task(3).unwrap();
+    assert_eq!(text(&root.cost), Some("300"));
+    assert_eq!(text(&root.remaining_cost), Some("300"));
+    assert_eq!(text(&summary.cost), Some("200"));
+}
+
+#[test]
+fn fixed_cost_remaining_share_follows_accrual_and_percent_complete() {
+    for (accrual, percent, expected) in [
+        (Some(AccrueAt::Start), 0, "101"),
+        (Some(AccrueAt::Start), 1, "0"),
+        (Some(AccrueAt::End), 99, "101"),
+        (Some(AccrueAt::End), 100, "0"),
+        (Some(AccrueAt::Prorated), 50, "51"),
+        (None, 50, "51"),
+        (Some(AccrueAt::Invalid), 50, "51"),
+    ] {
+        let mut root = task(0, 0);
+        root.outline_level = 0;
+        root.cost = Rate::parse("101");
+        root.remaining_cost = Rate::parse(expected);
+        let mut summary = task(2, 0);
+        summary.cost = Rate::parse("0");
+        summary.remaining_cost = Rate::parse("0");
+        let mut leaf = task(1, 1);
+        leaf.fixed_cost = Rate::parse("101");
+        leaf.fixed_cost_accrual = accrual;
+        leaf.percent_complete = Some(percent);
+        leaf.cost = Rate::parse("101");
+        leaf.remaining_cost = Rate::parse(expected);
+        let mut ed = Editor::new(Project {
+            tasks: vec![root, summary, leaf],
+            ..Project::default()
+        });
+        ed.indent(1, 1).unwrap();
+        let summary = ed.project().task(2).unwrap();
+        assert_eq!(text(&summary.cost), Some("101"), "{accrual:?} {percent}");
+        assert_eq!(
+            text(&summary.remaining_cost),
+            Some(expected),
+            "{accrual:?} {percent}"
+        );
+    }
 }
 
 #[test]

@@ -15,8 +15,8 @@
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Assignment, Calendar, LagFormat, LagKind, Project, Rate, Resource, ResourceType, Task,
-    TimephasedValue, WorkCalendar,
+    AccrueAt, Assignment, Calendar, LagFormat, LagKind, Project, Rate, Resource, ResourceType,
+    Task, TimephasedValue, WorkCalendar,
 };
 use crate::schedule::{HORIZON_DAYS, Schedule, working_minutes_on};
 use std::collections::{HashMap, HashSet};
@@ -332,13 +332,30 @@ fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> Totals {
     })
 }
 
-/// The totals a task's stored fields count of its own assignments: the cost
-/// of all of them, the work of those whose work is time ([`is_work`]).
+/// The task's own contribution to stored totals: its assignments and fixed
+/// cost, with work counting only assignments whose work is time ([`is_work`]).
 fn task_totals(p: &Project, uid: i32) -> Totals {
     let mine = p.assignments.iter().filter(|a| a.task_uid == uid);
     let (_, cost, _, remaining_cost) = totals(mine.clone());
     let (work, _, remaining, _) = totals(mine.filter(|a| is_work(&p.resources, a)));
-    (work, cost, remaining, remaining_cost)
+    let fixed = p.task(uid).map_or(0.0, |t| value(t.fixed_cost.as_ref()));
+    let fixed_remaining = p.task(uid).map_or(0.0, |t| {
+        let amount = value(t.fixed_cost.as_ref());
+        let pct = t.percent_complete.unwrap_or(0).min(100);
+        let share = match t.fixed_cost_accrual {
+            Some(AccrueAt::Start) => f64::from(pct == 0),
+            Some(AccrueAt::End) => f64::from(pct < 100),
+            // Invalid and absent use the Prorated default from CST-082.
+            _ => f64::from(100 - pct) / 100.0,
+        };
+        value(money(amount * share).as_ref())
+    });
+    (
+        work,
+        cost + fixed,
+        remaining,
+        remaining_cost + fixed_remaining,
+    )
 }
 
 /// The UIDs of a task's outline ancestors, nearest first, up to and including
@@ -376,11 +393,10 @@ fn ancestors(p: &Project, uid: i32) -> Vec<i32> {
 ///   `RemainingCost` = cost − actual cost. Its planned-work spread (Type 1)
 ///   is dropped when its dates or work moved.
 /// - A task keeps its stored `Work`, `Cost`, `RemainingWork` and
-///   `RemainingCost` but moves each by how much its assignments' total moved
+///   `RemainingCost` but moves each by how much its own contribution changed
 ///   (work counting work resources only), and so do its outline summaries; a
-///   task moved in the outline takes its assignments' totals from its old
-///   summaries to its new ones. A fixed cost inside a stored task cost
-///   survives, and an absent total stays absent.
+///   task moved in the outline takes its assignments and its own fixed cost
+///   from its old summaries to its new ones. An absent total stays absent.
 /// - A resource whose assignments changed (added, removed or refreshed) gets
 ///   its work, cost and remaining totals and its `Start`/`Finish` from them.
 pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project, sched: &Schedule) {
@@ -438,18 +454,30 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         }
     }
 
-    // Tasks: move the stored totals by the change in their assignments', and
+    // Tasks: move the stored totals by the change in their contributions, and
     // every outline summary above them by the same. A task the edit moved in
-    // the outline (or deleted, or added) takes its assignments' whole totals
-    // out of its old summaries and adds them to its new ones. Only
-    // assignment totals move: anything else in a stored total (a fixed cost,
-    // not modelled) stays with the summaries that had it.
-    let changed: HashSet<i32> = prev
+    // the outline (or deleted, or added) takes its whole contribution out of
+    // its old summaries and adds it to its new ones.
+    let mut changed: HashSet<i32> = prev
         .assignments
         .iter()
         .chain(&proj.assignments)
         .map(|a| a.task_uid)
         .collect();
+    for uid in prev.tasks.iter().chain(&proj.tasks).map(|t| t.uid) {
+        let (before, after) = (prev.task(uid), proj.task(uid));
+        if before.is_none()
+            || after.is_none()
+            || ancestors(prev, uid) != ancestors(proj, uid)
+            || before.zip(after).is_some_and(|(a, b)| {
+                a.fixed_cost != b.fixed_cost
+                    || a.fixed_cost_accrual != b.fixed_cost_accrual
+                    || a.percent_complete != b.percent_complete
+            })
+        {
+            changed.insert(uid);
+        }
+    }
     let mut moved: HashMap<i32, Totals> = HashMap::new();
     let mut add = |uid: i32, (w, c, rw, rc): Totals, sign: i64| {
         let sum = moved.entry(uid).or_insert((0, 0.0, 0, 0.0));
