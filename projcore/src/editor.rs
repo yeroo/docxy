@@ -280,11 +280,11 @@ impl Editor {
     /// made that way gets its dates pinned, as [`Self::add_task`] does.
     fn edit_row(&mut self, i: usize, edit: impl FnOnce(&mut Project, bool)) -> Result<(), String> {
         let (was_blank, uid) = (self.proj.tasks[i].is_null, self.proj.tasks[i].uid);
-        let start = self.new_task_start();
-        let collapsed = self.collapsed.clone();
+        // The edit runs on a copy of this project, so the row becomes the same.
+        let made = was_blank.then(|| self.row_as_edited(i));
         self.edit_structure(|proj| {
-            if was_blank {
-                proj.tasks[i] = materialized(proj, i, start, &collapsed);
+            if let Some(made) = made {
+                proj.tasks[i] = made;
             }
             edit(proj, was_blank);
         })?;
