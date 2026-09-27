@@ -1410,3 +1410,15 @@ fn the_outline_glyph_commits_an_open_cell_edit_first() {
     assert!(!v(&t).ed.is_collapsed(1));
     assert_eq!(v(&t).ed.selected_uid(), Some(3));
 }
+
+#[test]
+fn a_reveal_scrolls_to_the_row_as_shown() {
+    let mut t = outline_tab();
+    apply_project_act(&mut t, ProjectAct::HideSubtasks);
+    take_reveal(&t);
+    // Z is task 3, but the second row shown: X and Y are hidden.
+    commit(&mut t, ProjectAct::Find, "z");
+    assert_eq!((v(&t).cursor_row(), v(&t).display_row()), (3, 1));
+    assert_eq!(take_reveal(&t), Some(1));
+    assert!(v(&t).ed.is_collapsed(1));
+}
