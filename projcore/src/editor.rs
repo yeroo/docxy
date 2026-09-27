@@ -424,8 +424,10 @@ impl Editor {
     /// are skipped (see [`level_at`]). Below a collapsed summary's hidden
     /// rows, a task appended or added after a row shown there becomes that
     /// summary's sibling; one added after a hidden row takes its level as if
-    /// the summary were expanded. The returned row is not automatically
-    /// selected.
+    /// the summary were expanded. The task takes the plan's stated task type
+    /// and effort-driven default, and with the plan's `Autolink` on, a task
+    /// inserted into a finish-to-start chain is linked into it (see
+    /// `autolink`). The returned row is not automatically selected.
     pub fn add_task(
         &mut self,
         after: Option<i32>,
@@ -459,11 +461,18 @@ impl Editor {
                     manual,
                     manual_start,
                     manual_duration_min: manual.then_some(duration_min),
-                    // Only a typed `?` marks it: an unset flag saves as absent.
+                    // Only a `?` (typed, or the plan's estimated default)
+                    // marks it: an unset flag saves as absent.
                     estimated: estimated.then_some(true),
+                    // The plan's defaults, only where the file states them.
+                    task_type: proj.default_task_type,
+                    effort_driven: proj.new_tasks_effort_driven,
                     ..Task::default()
                 },
-            )
+            );
+            if anchor.is_some() {
+                autolink(proj, at);
+            }
         })?;
         self.stamp_pinned_dates(uid);
         Ok(at)
@@ -1336,9 +1345,11 @@ fn level_at(
 
 /// Row `i` as it becomes when edited. Typing into a blank row turns it into a
 /// task, as in Project: it joins the outline where it sits when it has no
-/// level, without a duration it gets Project's new-task default, `1 day?`,
-/// instead of turning into a milestone, and in a plan whose new tasks are
-/// manual it becomes manual at `start`, as [`Editor::add_task`] makes one.
+/// level, without a duration it gets Project's new-task default, `1 day?`
+/// (`1 day` when the plan's new tasks are not estimated), instead of turning
+/// into a milestone, it takes the plan's stated task type and effort-driven
+/// default, and in a plan whose new tasks are manual it becomes manual at
+/// `start`, as [`Editor::add_task`] makes one.
 fn materialized(
     proj: &Project,
     i: usize,
@@ -1353,9 +1364,13 @@ fn materialized(
         }
         if t.duration_min == 0 {
             t.duration_min = proj.days_to_minutes(1.0);
-            t.estimated = Some(true);
+            // Estimated when the plan's new tasks are; otherwise unset, so
+            // the saved task has no `<Estimated>`.
+            t.estimated = proj.new_tasks_estimated().then_some(true);
             t.milestone = false;
         }
+        t.task_type = t.task_type.or(proj.default_task_type);
+        t.effort_driven = t.effort_driven.or(proj.new_tasks_effort_driven);
         if proj.new_tasks_are_manual && !t.manual {
             t.manual = true;
             t.manual_start = t.manual_start.or(Some(start));
@@ -1363,6 +1378,42 @@ fn materialized(
         }
     }
     t
+}
+
+/// Link the task just inserted at row `at` into the chain it split, as
+/// Project's Autolink does: when the task above it, A, has a finish-to-start
+/// link to the next task below it, B, and A, the new task N and B are leaves
+/// at one outline level, A->B becomes A->N (no lag) and N->B (with A->B's
+/// lag). Otherwise, or with the plan's `Autolink` off, nothing changes.
+fn autolink(proj: &mut Project, at: usize) {
+    if !proj.autolink() || at == 0 {
+        return;
+    }
+    let (a, n) = (at - 1, at);
+    let Some(b) = (at + 1..proj.tasks.len()).find(|&i| !proj.tasks[i].is_null) else {
+        return;
+    };
+    let leaf = |i: usize| {
+        let t = &proj.tasks[i];
+        !t.is_null && !t.summary && !proj.is_outline_summary(i)
+    };
+    let level = proj.tasks[n].outline_level;
+    if !(leaf(a) && leaf(n) && leaf(b))
+        || proj.tasks[a].outline_level != level
+        || proj.tasks[b].outline_level != level
+    {
+        return;
+    }
+    let (a_uid, n_uid) = (proj.tasks[a].uid, proj.tasks[n].uid);
+    let Some(link) = proj.tasks[b]
+        .predecessors
+        .iter_mut()
+        .find(|p| p.uid == a_uid && p.link == LinkType::FinishStart)
+    else {
+        return;
+    };
+    link.uid = n_uid;
+    proj.tasks[n].predecessors = vec![Predecessor::fs(a_uid)];
 }
 
 /// Give task `t` duration `min`. A manual task keeps its start; its finish
@@ -2862,6 +2913,158 @@ mod tests {
     // ---- blank rows and estimates (#80) ----
 
     /// Task 1, a blank row (UID 3) with no level or duration, then Task 2.
+    #[test]
+    fn a_new_task_takes_the_plans_stated_task_type_and_effort_driven() {
+        let mut proj = editor().project().clone();
+        proj.default_task_type = Some(TaskType::FixedWork);
+        proj.new_tasks_effort_driven = Some(true);
+        let mut ed = Editor::new(proj);
+        let at = ed.add_task(Some(1), "New", 480, false).unwrap();
+        let t = &ed.project().tasks[at];
+        assert_eq!(
+            (t.task_type, t.effort_driven),
+            (Some(TaskType::FixedWork), Some(true))
+        );
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        assert!(xml.contains("<Type>2</Type>"), "{xml}");
+        assert!(xml.contains("<EffortDriven>1</EffortDriven>"), "{xml}");
+        // Unstated, the task keeps both absent, as before.
+        let mut ed = editor();
+        let at = ed.add_task(Some(1), "New", 480, false).unwrap();
+        let t = &ed.project().tasks[at];
+        assert_eq!((t.task_type, t.effort_driven), (None, None));
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        assert!(
+            !xml.contains("<Type>") && !xml.contains("<EffortDriven>"),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn a_blank_row_follows_the_plans_new_task_defaults() {
+        let mut proj = blank_row_editor().project().clone();
+        proj.new_tasks_estimated = Some(false);
+        proj.default_task_type = Some(TaskType::FixedDuration);
+        proj.new_tasks_effort_driven = Some(false);
+        let mut ed = Editor::new(proj);
+        ed.rename(3, "Typed").unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!(
+            (t.duration_min, t.estimated, t.task_type, t.effort_driven),
+            (480, None, Some(TaskType::FixedDuration), Some(false))
+        );
+        assert_eq!(duration_suffix(ed.project(), 3), "");
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        assert!(!xml.contains("<Estimated>"), "{xml}");
+        // Stated on, it is `1 day?` as with the option absent.
+        let mut proj = blank_row_editor().project().clone();
+        proj.new_tasks_estimated = Some(true);
+        let mut ed = Editor::new(proj);
+        ed.rename(3, "Typed").unwrap();
+        assert_eq!(ed.project().tasks[1].estimated, Some(true));
+        assert_eq!(duration_suffix(ed.project(), 3), "?");
+    }
+
+    /// Tasks 1 (A) and 2 (B), B depending on A by `link`, with `autolink`.
+    fn chain(link: LinkType, lag: i64, autolink: Option<bool>) -> Editor {
+        let mut proj = editor().project().clone();
+        proj.tasks[1].predecessors = vec![Predecessor::working(1, link, lag)];
+        proj.autolink = autolink;
+        Editor::new(proj)
+    }
+
+    fn preds(ed: &Editor, uid: i32) -> Vec<(i32, LinkType, i64)> {
+        ed.project()
+            .task(uid)
+            .unwrap()
+            .predecessors
+            .iter()
+            .map(|p| (p.uid, p.link, p.lag))
+            .collect()
+    }
+
+    #[test]
+    fn a_task_inserted_into_a_linked_chain_is_linked_into_it() {
+        for autolink in [None, Some(true)] {
+            let mut ed = chain(LinkType::FinishStart, 960, autolink);
+            let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+            let n = ed.project().tasks[at].uid;
+            assert_eq!(preds(&ed, n), [(1, LinkType::FinishStart, 0)]);
+            // N->B keeps A->B's lag.
+            assert_eq!(preds(&ed, 2), [(n, LinkType::FinishStart, 960)]);
+            assert_schedule(&ed);
+            // One undo step restores A->B.
+            assert_eq!(ed.undo_depth(), 1);
+            assert!(ed.undo());
+            assert_eq!(preds(&ed, 2), [(1, LinkType::FinishStart, 960)]);
+            assert_eq!(ed.project().tasks.len(), 2);
+        }
+    }
+
+    #[test]
+    fn autolink_leaves_other_inserts_alone() {
+        // Autolink off.
+        let mut ed = chain(LinkType::FinishStart, 0, Some(false));
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        assert!(ed.project().tasks[at].predecessors.is_empty());
+        assert_eq!(preds(&ed, 2), [(1, LinkType::FinishStart, 0)]);
+        // A link other than finish-to-start.
+        let mut ed = chain(LinkType::StartStart, 0, None);
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        assert!(ed.project().tasks[at].predecessors.is_empty());
+        assert_eq!(preds(&ed, 2), [(1, LinkType::StartStart, 0)]);
+        // A is not linked to B.
+        let mut ed = editor();
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        assert!(ed.project().tasks[at].predecessors.is_empty());
+        assert!(preds(&ed, 2).is_empty());
+        // Appending below B, and inserting after B: nothing below to split.
+        for after in [None, Some(2)] {
+            let mut ed = chain(LinkType::FinishStart, 0, None);
+            let at = ed.add_task(after, "N", 480, false).unwrap();
+            assert!(ed.project().tasks[at].predecessors.is_empty());
+            assert_eq!(preds(&ed, 2), [(1, LinkType::FinishStart, 0)]);
+        }
+        // B at another level: A is the last subtask of a summary.
+        let mut ed = chain(LinkType::FinishStart, 0, None);
+        let mut proj = ed.project().clone();
+        proj.tasks.insert(
+            0,
+            Task {
+                uid: 3,
+                id: 3,
+                name: "Phase".into(),
+                outline_level: 1,
+                ..Task::default()
+            },
+        );
+        proj.tasks[1].outline_level = 2;
+        ed.replace_project(proj);
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        assert_eq!(ed.project().tasks[at].outline_level, 2);
+        assert!(ed.project().tasks[at].predecessors.is_empty());
+        assert_eq!(preds(&ed, 2), [(1, LinkType::FinishStart, 0)]);
+    }
+
+    #[test]
+    fn autolink_skips_blank_rows_to_find_the_task_below() {
+        let mut proj = chain(LinkType::FinishStart, 0, None).project().clone();
+        proj.tasks.insert(
+            1,
+            Task {
+                uid: 3,
+                id: 3,
+                is_null: true,
+                ..Task::default()
+            },
+        );
+        let mut ed = Editor::new(proj);
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        let n = ed.project().tasks[at].uid;
+        assert_eq!(preds(&ed, n), [(1, LinkType::FinishStart, 0)]);
+        assert_eq!(preds(&ed, 2), [(n, LinkType::FinishStart, 0)]);
+    }
+
     fn blank_row_editor() -> Editor {
         let mut proj = editor().project().clone();
         proj.tasks.insert(

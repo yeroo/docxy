@@ -381,3 +381,21 @@ fn a_recalculation_leaves_the_estimate_alone() {
     assert_eq!(duration(&ed), DAY);
     assert_eq!(ed.proj.tasks[0].estimated, Some(true));
 }
+
+// ---- the plan's new-task defaults (#187) ----
+
+#[test]
+fn a_task_added_under_a_fixed_work_default_keeps_its_work() {
+    for (default, work_after) in [(Some(TaskType::FixedWork), 2 * DAY), (None, 4 * DAY)] {
+        let mut ed = plan(None, None, DAY, Vec::new());
+        ed.proj.tasks.clear();
+        ed.proj.default_task_type = default;
+        ed.proj.new_tasks_effort_driven = default.map(|_| true);
+        ed.add_task(None, "Added", 2 * DAY, false).unwrap();
+        assert_eq!(ed.proj.tasks[0].uid, 1);
+        set(&mut ed, &["Bob"]);
+        assert_eq!(alloc(&ed, 1), (1.0, 2 * DAY));
+        ed.set_duration(1, "4d").unwrap();
+        assert_eq!(alloc(&ed, 1).1, work_after, "{default:?}");
+    }
+}
