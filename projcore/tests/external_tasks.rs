@@ -1,6 +1,6 @@
 use projcore::DateTime;
 use projcore::editor::{format_predecessors, parse_task_predecessors};
-use projcore::gantt::to_markdown;
+use projcore::gantt::{to_markdown, to_mermaid};
 use projcore::mspdi::{read_mspdi, write_mspdi};
 use projcore::schedule::{level, schedule};
 use projcore::yppx::{read_yppx, write_yppx};
@@ -188,4 +188,21 @@ fn external_leaf_is_not_local_work_or_a_project_bound() {
     assert_eq!(schedule(&dated).project_start, fallback);
     assert_eq!(schedule(&dated).project_finish, fallback);
     assert_eq!(level(&dated).project_finish, fallback);
+}
+
+#[test]
+fn external_gantt_bar_uses_stored_span() {
+    let xml = fixture(
+        r"C:\plans\other.mpp",
+        "<Start>2026-03-09T08:00:00</Start><Finish>2026-03-20T17:00:00</Finish>",
+    );
+    let proj = read_mspdi(&xml).unwrap();
+    let sched = schedule(&proj);
+    let chart = to_mermaid(&proj, &sched);
+    assert!(chart.contains("Deliver :2026-03-09, 10d"), "{chart}");
+    let table = to_markdown(&proj, &sched);
+    assert!(
+        table.contains("| Deliver | 2026-03-09 08:00:00 | 2026-03-20 17:00:00 |  | 10d |"),
+        "{table}"
+    );
 }

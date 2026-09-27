@@ -710,7 +710,9 @@ impl Editor {
 
     pub fn update_task(&mut self, uid: i32, patch: TaskPatch) -> Result<(), String> {
         let i = self.index(uid)?;
-        if patch.duration_min.is_some() && self.proj.tasks[i].is_external_leaf() {
+        if (patch.duration_min.is_some() || patch.manual.is_some())
+            && self.proj.tasks[i].is_external_leaf()
+        {
             return Err(EXTERNAL_TASK_DATES.into());
         }
         if patch.name.is_none()
@@ -1809,18 +1811,56 @@ mod tests {
             let back = crate::mspdi::read_mspdi(&saved).unwrap();
             assert_eq!(back.task(1).unwrap().stored_start, before.stored_start);
             assert_eq!(back.task(1).unwrap().stored_finish, before.stored_finish);
-            if !manual {
-                ed.set_manual(1, true).unwrap();
-                assert_eq!(
-                    ed.project().task(1).unwrap().stored_start,
-                    before.stored_start
-                );
-                assert_eq!(
-                    ed.project().task(1).unwrap().stored_finish,
-                    before.stored_finish
-                );
-            }
+            assert_eq!(ed.set_manual(1, !manual).unwrap_err(), EXTERNAL_TASK_DATES);
         }
+    }
+
+    #[test]
+    fn external_resource_edits_keep_dates_and_duration() {
+        for manual in [false, true] {
+            let mut proj = editor().project().clone();
+            let task = &mut proj.tasks[0];
+            task.external_task = Some(true);
+            task.manual = manual;
+            task.effort_driven = Some(true);
+            task.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+            task.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+            task.manual_start = task.stored_start;
+            task.manual_finish = task.stored_finish;
+            task.manual_duration_min = Some(480);
+            let mut ed = Editor::new(proj);
+            ed.set_resources(1, &["Bob".into()]).unwrap();
+            let before = ed.project().task(1).unwrap().clone();
+
+            ed.set_resources(1, &["Bob[50%]".into()]).unwrap();
+            assert_eq!(ed.project().task(1).unwrap(), &before);
+            ed.set_resources(1, &["Bob[50%]".into(), "Alice".into()])
+                .unwrap();
+            assert_eq!(ed.project().task(1).unwrap(), &before);
+            assert_eq!(
+                ed.project()
+                    .assignments
+                    .iter()
+                    .filter(|a| a.task_uid == 1)
+                    .count(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn external_stamp_guard_keeps_dates_even_with_a_different_manual_start() {
+        let mut proj = editor().project().clone();
+        let task = &mut proj.tasks[0];
+        task.external_task = Some(true);
+        task.manual = true;
+        task.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        task.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+        task.manual_start = Some(DateTime::from_ymd_hm(2026, 3, 16, 8, 0));
+        let mut ed = Editor::new(proj);
+        let before = ed.project().task(1).unwrap().clone();
+        ed.stamp_pinned_dates(1);
+        assert_eq!(ed.project().task(1).unwrap(), &before);
     }
 
     #[test]

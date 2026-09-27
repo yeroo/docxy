@@ -23,7 +23,8 @@ impl Editor {
     ) -> Result<(), String> {
         let task = self.row_as_edited(i);
         let summary = self.proj.is_outline_summary(i);
-        let duration = recalculate(&self.proj, &task, summary, &resources, &mut assignments);
+        let duration = recalculate(&self.proj, &task, summary, &resources, &mut assignments)
+            .filter(|_| !task.is_external_leaf());
         if duration.is_some() {
             self.validate_cell_horizon(task.uid, duration, None)?;
         }

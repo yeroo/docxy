@@ -2008,8 +2008,8 @@ pub(crate) fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: Da
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
-/// A task's scheduled duration in working minutes: a leaf's own
-/// `duration_min`, or for a summary the working time spanned by its scheduled
+/// A task's scheduled duration in working minutes: a local leaf's own
+/// `duration_min`, or for a summary or external leaf the working time spanned by its scheduled
 /// early start/finish (rolled up, or a manual summary's own span). The stored `duration_min` of a summary is never
 /// recomputed, so every surface that shows one must derive it here. `None` when
 /// the task has no schedule result.
@@ -2031,7 +2031,7 @@ pub(crate) fn summary_or_leaf_min(
     start: DateTime,
     finish: DateTime,
 ) -> i64 {
-    if task.summary {
+    if task.summary || task.is_external_leaf() {
         working_minutes_on(&summary_calendar(proj), start, finish)
     } else {
         task.duration_min
