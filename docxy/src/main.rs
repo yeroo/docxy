@@ -6495,7 +6495,10 @@ fn clip_has_formatting(clip: &Clip) -> bool {
     fn inline_has_formatting(inline: &Inline) -> bool {
         match inline {
             Inline::Run(run) => run.props != RunProps::default(),
-            Inline::Hyperlink(link) => link.runs.iter().any(|run| run.props != RunProps::default()),
+            Inline::Hyperlink(link) => {
+                link.runs.iter().any(|run| run.props != RunProps::default())
+                    || link.content.iter().any(inline_has_formatting)
+            }
             Inline::Tab(props) => *props != RunProps::default(),
             Inline::Revision { content, .. } => content.iter().any(inline_has_formatting),
             Inline::TextBox { blocks, .. } => blocks_have_formatting(blocks),
@@ -9781,6 +9784,32 @@ mod tests {
         app.run_act(ribbon::Act::PasteSpecial);
         let ps = app.paste_special.as_ref().expect("dialog opened");
         assert!(ps.opts.contains(&PasteOpt::Hyperlink));
+    }
+
+    #[test]
+    fn a_clip_with_a_formatted_complex_link_carries_formatting_212() {
+        let link = |bold: bool| {
+            Inline::Hyperlink(Hyperlink {
+                anchor: Some("top".to_string()),
+                content: vec![
+                    Inline::Raw("<w:proofErr w:type=\"spellStart\"/>".to_string()),
+                    Inline::Run(Run {
+                        text: "Contoso".to_string(),
+                        props: RunProps {
+                            bold,
+                            ..RunProps::default()
+                        },
+                    }),
+                ],
+                ..Hyperlink::default()
+            })
+        };
+        assert!(clip_has_formatting(&Clip {
+            paras: vec![vec![link(true)]],
+        }));
+        assert!(!clip_has_formatting(&Clip {
+            paras: vec![vec![link(false)]],
+        }));
     }
 
     fn vim_app(paras: &[&str]) -> App {
