@@ -18,7 +18,7 @@
 //! | `task.list` | — | `{count, tasks:[{uid, name, level, manual, duration, start, finish, critical, …}]}` |
 //! | `task.get` | `{uid}` | one task |
 //! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
-//! | `task.add` | `{after?, name?, duration?}` | the new task |
+//! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
 //! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` as the Predecessors cell spells it: `4h`, `2ed`, `50%`) |
 //! | `link.del` | `{uid, pred}` | the updated task |
@@ -262,7 +262,8 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
     let (duration_min, estimated) = match args.get_str("duration") {
         Some(d) => parse_task_duration(d, ed.project())
             .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w)"))?,
-        None => (480, false),
+        // The default duration is estimated when the plan's new tasks are.
+        None => (480, ed.project().new_tasks_estimated()),
     };
     let at = ed.add_task(
         after,
@@ -633,6 +634,66 @@ mod tests {
         assert_eq!(r.get_usize("level"), Some(3));
         assert_eq!(a.sel(), 0);
         assert_eq!(a.undo_depth(), 2);
+    }
+
+    #[test]
+    fn add_without_a_duration_follows_the_plans_new_tasks_estimated() {
+        for (stated, estimated) in [(None, true), (Some(true), true), (Some(false), false)] {
+            let mut p = new_project();
+            p.new_tasks_estimated = stated;
+            let mut ed = Editor::new(p);
+            let r = dispatch_editor(&mut ed, "task.add", &Json::Null)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                r.get("estimated"),
+                Some(&Json::Bool(estimated)),
+                "{stated:?}"
+            );
+            assert_eq!(r.get("duration_days").unwrap().as_f64(), Some(1.0));
+        }
+        // A typed duration keeps its own `?` rule.
+        let mut a = app();
+        let uid = add(&mut a, "Sure", "2d");
+        let r = task_get(&a, &Json::obj(vec![("uid", Json::Num(uid as f64))])).unwrap();
+        assert_eq!(r.get("estimated"), Some(&Json::Bool(false)));
+    }
+
+    #[test]
+    fn add_after_a_task_links_it_into_the_chain_it_splits() {
+        let mut a = app();
+        let b = add(&mut a, "B", "1d");
+        let link = |a: &mut Editor, uid: i64, pred: i64| {
+            link_add(
+                a,
+                &Json::obj(vec![
+                    ("uid", Json::Num(uid as f64)),
+                    ("pred", Json::Num(pred as f64)),
+                ]),
+            )
+        };
+        link(&mut a, b, 1).unwrap();
+        let args = Json::parse(r#"{"after":1,"name":"N"}"#).unwrap();
+        let r = dispatch_editor(&mut a, "task.add", &args).unwrap().unwrap();
+        let n = r.get("uid").unwrap().as_i64().unwrap();
+        let preds = |r: &Json| -> Vec<i64> {
+            r.get("predecessors")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p.get("uid").unwrap().as_i64().unwrap())
+                .collect()
+        };
+        assert_eq!(preds(&r), [1]);
+        let b_task = task_get(&a, &Json::obj(vec![("uid", Json::Num(b as f64))])).unwrap();
+        assert_eq!(preds(&b_task), [n]);
+        // An agent linking N to A itself gets an error, not a duplicate.
+        let depth = a.undo_depth();
+        let err = link(&mut a, n, 1).unwrap_err();
+        assert!(err.contains("Already depends on"), "{err}");
+        assert_eq!(a.undo_depth(), depth);
+        assert_eq!(a.project().task(n as i32).unwrap().predecessors.len(), 1);
     }
 
     #[test]

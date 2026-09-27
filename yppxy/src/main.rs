@@ -792,9 +792,11 @@ impl App {
     // ---- edits ----
 
     fn add_task(&mut self) {
+        // The default duration is estimated when the plan's new tasks are.
+        let estimated = self.ed.project().new_tasks_estimated();
         match self
             .ed
-            .add_task(self.ed.selected_uid(), "New task", 480, false)
+            .add_task(self.ed.selected_uid(), "New task", 480, estimated)
         {
             Ok(at) => self.ed.select(at),
             Err(message) => self.status = message,
@@ -2587,6 +2589,23 @@ mod tests {
         app.indent(1);
         assert!(app.ed.project().tasks[0].summary); // parent became a summary
         assert!(!app.ed.project().tasks[1].summary);
+    }
+
+    #[test]
+    fn insert_task_follows_the_plans_new_tasks_estimated() {
+        // Project's default for a plan that does not say: estimated.
+        let mut app = App::new(new_project(), None, false);
+        app.add_task();
+        let uid = app.ed.selected_uid().unwrap();
+        assert_eq!(app.ed.project().task(uid).unwrap().estimated, Some(true));
+        assert_eq!(duration_suffix(app.ed.project(), uid), "?");
+        let mut proj = new_project();
+        proj.new_tasks_estimated = Some(false);
+        let mut app = App::new(proj, None, false);
+        app.add_task();
+        let uid = app.ed.selected_uid().unwrap();
+        assert_eq!(app.ed.project().task(uid).unwrap().estimated, None);
+        assert_eq!(duration_suffix(app.ed.project(), uid), "");
     }
 
     fn app_with_history_and_preferences() -> App {
