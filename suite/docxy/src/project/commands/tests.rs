@@ -1422,3 +1422,35 @@ fn a_reveal_scrolls_to_the_row_as_shown() {
     assert_eq!(take_reveal(&t), Some(1));
     assert!(v(&t).ed.is_collapsed(1));
 }
+
+#[test]
+fn indenting_under_a_collapsed_summary_scrolls_to_the_task() {
+    use ProjectAct::*;
+    let mut t = outline_tab();
+    // Phase is collapsed; Z sits right below it, at its level.
+    apply_project_act(&mut t, HideSubtasks);
+    project_cell_click(&mut t, 3, None, false);
+    take_reveal(&t);
+    assert_eq!((v(&t).cursor_row(), v(&t).display_row()), (3, 1));
+    apply_project_act(&mut t, Indent);
+    // Z joined Phase, which shows its subtasks: Z is shown below X and Y.
+    assert!(!v(&t).ed.is_collapsed(1));
+    assert_eq!((v(&t).cursor_row(), v(&t).display_row()), (3, 3));
+    assert_eq!(take_reveal(&t), Some(3));
+    // The keyboard route dispatches the same act.
+    apply_project_act(&mut t, HideSubtasks);
+    take_reveal(&t);
+    assert_eq!(
+        project_input(
+            &mut t,
+            "right",
+            None,
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::default()
+            }
+        ),
+        Some(Indent)
+    );
+}

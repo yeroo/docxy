@@ -796,7 +796,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
         return;
     };
     v.cancel_prompt();
-    let before = v.cursor_row();
+    let before = (v.cursor_row(), v.display_row());
     let mut status = None;
     let result: Result<(), String> = (|| {
         match act {
@@ -942,8 +942,6 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
         }
         Ok(())
     })();
-    // Hide Subtasks moves a cursor inside the subtree to its summary.
-    let moved = v.cursor_row() != before;
     if let Err(e) = result {
         status = Some(e);
     }
@@ -953,10 +951,16 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     if matches!(act, Indent | Outdent) {
         indent_project(tab, if act == Indent { 1 } else { -1 });
     }
+    // The cursor's row as shown can move without a new selection: Hide
+    // Subtasks takes a cursor inside to the summary, and indenting a task
+    // under a collapsed summary shows the summary's subtasks above it.
+    let moved = match &tab.surface {
+        Surface::Project(v) => (v.cursor_row(), v.display_row()) != before,
+        _ => false,
+    };
     complete_project(
         tab,
-        matches!(act, AddTask | DeleteTask | FindNext | Undo | Redo)
-            || (act == HideSubtasks && moved),
+        matches!(act, AddTask | DeleteTask | FindNext | Undo | Redo) || moved,
     );
 }
 
