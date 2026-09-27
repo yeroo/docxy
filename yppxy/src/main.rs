@@ -334,7 +334,7 @@ struct Prompt {
 struct App {
     ed: Editor,
     path: Option<String>,
-    top: usize,   // first visible task row
+    top: usize,   // first shown row, in visible-row space (collapsed subtasks skipped)
     hscroll: i64, // gantt horizontal scroll in days from the earliest displayed start
     prompt: Option<Prompt>,
     status: String,
@@ -356,6 +356,7 @@ struct App {
     vim: bool,
     // geometry recorded during draw for mouse hit-testing
     list_y0: u16,     // absolute y of the first task row
+    list_x0: u16,     // absolute x of the task pane's inner area
     list_left_w: u16, // width of the task pane (left of the gantt)
     gantt_x0: u16,    // absolute x where the gantt inner area begins
     screen_w: u16,    // terminal width, for the tab-strip Theme button
@@ -416,6 +417,7 @@ impl App {
                 Color::Yellow,
             ),
             list_y0: 0,
+            list_x0: 0,
             list_left_w: 0,
             gantt_x0: 0,
             screen_w: 0,
@@ -719,7 +721,33 @@ impl App {
             Act::ScrollLeft => self.hscroll -= 1,
             Act::ScrollRight => self.hscroll += 1,
             Act::GoToStart => self.hscroll = 0,
+            Act::ShowSubtasks => self.show_subtasks(),
+            Act::HideSubtasks => self.hide_subtasks(),
         }
+    }
+
+    /// View › Data › Show Subtasks (`+`): expand the selected summary.
+    fn show_subtasks(&mut self) {
+        if let Some(uid) = self.ed.selected_uid() {
+            if let Err(message) = self.ed.set_collapsed(uid, false) {
+                self.status = message;
+            }
+        }
+    }
+
+    /// View › Data › Hide Subtasks (`-`): collapse the selected summary, or
+    /// the summary of the selected subtask, as Project does.
+    fn hide_subtasks(&mut self) {
+        if let Some(uid) = self.ed.selected_uid() {
+            if let Err(message) = self.ed.hide_subtasks(uid) {
+                self.status = message;
+            }
+        }
+    }
+
+    /// Move the selection `delta` rows, over collapsed subtasks.
+    fn step(&mut self, delta: isize) {
+        self.ed.select(self.ed.visible_step(self.ed.sel(), delta));
     }
 
     /// Open the Find prompt (Ctrl+F and Task › Editing › Find).
@@ -1264,15 +1292,15 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
         MouseEventKind::ScrollDown => {
             if x >= app.gantt_x0 {
                 app.hscroll += 2;
-            } else if app.ed.sel() + 1 < app.ed.project().tasks.len() {
-                app.ed.select(app.ed.sel() + 1);
+            } else {
+                app.step(1);
             }
         }
         MouseEventKind::ScrollUp => {
             if x >= app.gantt_x0 {
                 app.hscroll -= 2;
             } else {
-                app.ed.select(app.ed.sel().saturating_sub(1));
+                app.step(-1);
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1310,11 +1338,19 @@ fn on_mouse(app: &mut App, m: MouseEvent) {
                 app.toggle_new_tasks_manual();
                 return;
             }
-            // Click a task row to select it.
+            // Click a task row to select it, or a summary's bullet to show
+            // or hide its subtasks.
             if x < app.list_left_w && y >= app.list_y0 {
-                let idx = app.top + (y - app.list_y0) as usize;
-                if idx < app.ed.project().tasks.len() {
-                    app.ed.select(idx);
+                let shown = app.top + (y - app.list_y0) as usize;
+                if let Some(&idx) = app.ed.visible_rows().get(shown) {
+                    let t = &app.ed.project().tasks[idx];
+                    if t.summary && x == bullet_x(app.list_x0, t) {
+                        if let Err(message) = app.ed.toggle_collapsed(t.uid) {
+                            app.status = message;
+                        }
+                    } else {
+                        app.ed.select(idx);
+                    }
                 }
             }
         }
@@ -1408,16 +1444,12 @@ fn on_key(app: &mut App, k: KeyEvent) {
         // Any quit key opens the shared confirm (which warns about unsaved
         // changes) — consistent with Ctrl+Q and the other apps.
         KeyCode::Char('q') | KeyCode::Char('Q') => app.request_exit(),
-        KeyCode::Up | KeyCode::Char('k') => app.ed.select(app.ed.sel().saturating_sub(1)),
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.ed.sel() + 1 < app.ed.project().tasks.len() {
-                app.ed.select(app.ed.sel() + 1);
-            }
-        }
+        KeyCode::Up | KeyCode::Char('k') => app.step(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.step(1),
         KeyCode::Home | KeyCode::Char('g') => app.ed.select(0),
-        KeyCode::End | KeyCode::Char('G') => app
-            .ed
-            .select(app.ed.project().tasks.len().saturating_sub(1)),
+        KeyCode::End | KeyCode::Char('G') => app.ed.select_last_visible(),
+        KeyCode::Char('-') => app.hide_subtasks(),
+        KeyCode::Char('+') | KeyCode::Char('=') => app.show_subtasks(),
         KeyCode::Left | KeyCode::Char('h') => app.hscroll -= 1,
         KeyCode::Right | KeyCode::Char('l') => app.hscroll += 1,
         KeyCode::Char('n') | KeyCode::Insert => app.add_task(),
@@ -1713,17 +1745,22 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     // Record geometry so mouse clicks can map to task rows / the gantt.
     app.list_left_w = left.width;
     app.list_y0 = left.y + 2; // border + column-header row
+    app.list_x0 = left.x + 1; // border
     app.gantt_x0 = right.x + 1;
 
     // visible task rows (inner height minus borders and the column-header row)
     let inner_h = left.height.saturating_sub(3) as usize; // 2 border + 1 header
-    if app.ed.sel() < app.top {
-        app.top = app.ed.sel();
-    } else if inner_h > 0 && app.ed.sel() >= app.top + inner_h {
-        app.top = app.ed.sel() + 1 - inner_h;
+    // Rows collapsed summaries hide are skipped; `top` counts shown rows.
+    let rows = app.ed.visible_rows();
+    let sel = rows.iter().position(|&i| i == app.ed.sel()).unwrap_or(0);
+    app.top = app.top.min(rows.len().saturating_sub(1));
+    if sel < app.top {
+        app.top = sel;
+    } else if inner_h > 0 && sel >= app.top + inner_h {
+        app.top = sel + 1 - inner_h;
     }
     let visible = inner_h.max(1);
-    let end = (app.top + visible).min(app.ed.project().tasks.len());
+    let shown = &rows[app.top.min(rows.len())..(app.top + visible).min(rows.len())];
 
     // ---- left: task table ----
     let mut left_lines: Vec<Line> = Vec::new();
@@ -1731,7 +1768,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         format!(" {:<2}{:<24} {:>5} {:>6}", "", "Task", "Dur", "Slack"),
         Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
     )));
-    for i in app.top..end {
+    for &i in shown {
         let t = &app.ed.project().tasks[i];
         if t.is_null {
             // A blank row (#80) is not a task: an empty, still selectable line.
@@ -1744,7 +1781,9 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
         }
         let r = app.ed.schedule().get(t.uid);
         let indent = "  ".repeat((t.outline_level.saturating_sub(1)) as usize);
-        let bullet = if t.summary {
+        let bullet = if app.ed.is_collapsed(t.uid) {
+            "▸ "
+        } else if t.summary {
             "▾ "
         } else if t.is_milestone() {
             "◆ "
@@ -1808,7 +1847,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     let start = DateTime::from_minutes(origin * 1440).parts();
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(build_scale(gw, app.hscroll, origin));
-    for i in app.top..end {
+    for &i in shown {
         let t = &app.ed.project().tasks[i];
         let crit = app.ed.schedule().get(t.uid).is_some_and(|r| r.critical);
         let s_day = app
@@ -1970,6 +2009,12 @@ fn mode_name(manual: bool) -> &'static str {
 
 /// The Task Mode cell: a pin for a manually scheduled task, two columns
 /// either way (the pin is a wide character).
+/// The column of a task row's bullet (`▾`/`▸` on a summary): after the
+/// leading space, the two-column Task Mode cell and the outline indent.
+fn bullet_x(list_x0: u16, t: &Task) -> u16 {
+    list_x0 + 3 + 2 * t.outline_level.saturating_sub(1).min(20) as u16
+}
+
 fn mode_marker(t: &Task) -> &'static str {
     if t.manual { "📌" } else { "  " }
 }
@@ -1984,7 +2029,7 @@ fn new_tasks_label(app: &App) -> String {
 }
 
 fn draw_status(f: &mut Frame, area: Rect, app: &App) {
-    let help = "n add · d dur · p dep · m manual/auto · Tab indent · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · T theme · q quit";
+    let help = "n add · d dur · p dep · m manual/auto · Tab indent · -/+ hide/show subtasks · Enter rename · x del · Ctrl+F find · Ctrl+Z undo · Ctrl+S save · T theme · q quit";
     let text = if app.status.is_empty() {
         help.to_string()
     } else {
@@ -3201,5 +3246,145 @@ mod tests {
         frame_row(&mut app, w, h - 1);
         click(&mut app, w - 2, h - 1);
         assert!(!app.ed.project().new_tasks_are_manual);
+    }
+
+    /// Phase { A, B }, then C, all a day long.
+    fn outline_app() -> App {
+        let task = |uid: i32, name: &str, outline_level| Task {
+            uid,
+            id: uid,
+            name: name.into(),
+            outline_level,
+            duration_min: 480,
+            ..Task::default()
+        };
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
+            tasks: vec![
+                task(1, "Phase", 1),
+                task(2, "A", 2),
+                task(3, "B", 2),
+                task(4, "C", 1),
+            ],
+            ..Project::default()
+        };
+        App::new(proj, Some("plan.yppx".into()), false)
+    }
+
+    fn press_key(app: &mut App, code: KeyCode) {
+        on_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    /// The task table's shown rows (bullet and name) and each row's Gantt text.
+    fn shown_rows(app: &mut App) -> Vec<(String, String)> {
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), app)).unwrap();
+        let buf = term.backend().buffer();
+        let text = |y, xs: std::ops::Range<u16>| -> String {
+            xs.map(|x| buf.cell((x, y)).unwrap().symbol()).collect()
+        };
+        (app.list_y0..app.list_y0 + 6)
+            .map(|y| {
+                let name = text(y, 1..30)
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                (name, text(y, app.gantt_x0..99))
+            })
+            .filter(|(name, _)| !name.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn hiding_subtasks_removes_their_rows_and_bars() {
+        let mut app = outline_app();
+        press_key(&mut app, KeyCode::Char('-'));
+        let rows = shown_rows(&mut app);
+        let names: Vec<_> = rows.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["▸ Phase", "• C"]);
+        // C's bar is on the row after Phase: A's and B's rows are gone.
+        assert!(rows[1].1.contains('█'), "{}", rows[1].1);
+        assert!(!app.ed.dirty());
+
+        press_key(&mut app, KeyCode::Char('+'));
+        let names: Vec<_> = shown_rows(&mut app).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(names, ["▾ Phase", "• A", "• B", "• C"]);
+        press_key(&mut app, KeyCode::Char('-'));
+        press_key(&mut app, KeyCode::Char('='));
+        assert!(!app.ed.is_collapsed(1), "= shows too (the unshifted +)");
+    }
+
+    #[test]
+    fn keys_and_the_wheel_step_over_hidden_rows() {
+        let mut app = outline_app();
+        press_key(&mut app, KeyCode::Char('-'));
+        press_key(&mut app, KeyCode::Down);
+        assert_eq!(app.ed.sel(), 3);
+        press_key(&mut app, KeyCode::Char('k'));
+        assert_eq!(app.ed.sel(), 0);
+        press_key(&mut app, KeyCode::End);
+        assert_eq!(app.ed.sel(), 3);
+        press_key(&mut app, KeyCode::Char('g'));
+        press_key(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.ed.sel(), 3);
+        // The wheel over the task table (drawn, so its bounds are known).
+        shown_rows(&mut app);
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 2,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        on_mouse(&mut app, wheel(MouseEventKind::ScrollUp));
+        assert_eq!(app.ed.sel(), 0);
+        on_mouse(&mut app, wheel(MouseEventKind::ScrollDown));
+        assert_eq!(app.ed.sel(), 3);
+        assert!(app.ed.is_collapsed(1), "navigation never expands");
+    }
+
+    #[test]
+    fn clicks_map_shown_rows_and_the_bullet_toggles() {
+        let mut app = outline_app();
+        press_key(&mut app, KeyCode::Char('-'));
+        // Draw the whole screen, which records the geometry clicks use.
+        buffer_text(&mut app, 100, 22);
+        let (y0, bullet) = (
+            app.list_y0,
+            bullet_x(app.list_x0, &app.ed.project().tasks[0]),
+        );
+        let row = frame_row(&mut app, 100, y0);
+        assert_eq!(row.chars().nth(bullet as usize), Some('▸'), "{row}");
+        // The second shown row is C, not the hidden A.
+        click(&mut app, 12, y0 + 1);
+        assert_eq!(app.ed.sel(), 3);
+        // Phase's bullet shows its subtasks without selecting it.
+        click(&mut app, bullet, y0);
+        assert!(!app.ed.is_collapsed(1));
+        assert_eq!(app.ed.sel(), 3);
+        click(&mut app, bullet, y0);
+        assert!(app.ed.is_collapsed(1));
+        // Elsewhere on the summary's row selects it.
+        click(&mut app, bullet + 3, y0);
+        assert_eq!(app.ed.sel(), 0);
+        assert!(app.ed.is_collapsed(1));
+    }
+
+    #[test]
+    fn hide_subtasks_on_a_subtask_hides_its_siblings() {
+        let mut app = outline_app();
+        app.ed.select(2);
+        app.apply_act(Act::HideSubtasks);
+        assert_eq!((app.ed.sel(), app.ed.is_collapsed(1)), (0, true));
+        app.apply_act(Act::ShowSubtasks);
+        assert!(!app.ed.is_collapsed(1));
+        app.ed.select(3);
+        app.apply_act(Act::HideSubtasks);
+        assert_eq!(app.status, "The task has no subtasks to hide");
+        app.apply_act(Act::ShowSubtasks);
+        assert_eq!(
+            app.status,
+            "Only a summary task has subtasks to show or hide"
+        );
     }
 }
