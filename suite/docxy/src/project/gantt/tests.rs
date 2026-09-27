@@ -84,6 +84,7 @@ fn slot_one_alone_does_not_show_a_bar_or_extend_the_scale() {
             (normal.origin_day + 60) * 1440,
         )),
         duration_min: Some(2400),
+        ..projcore::Baseline::default()
     });
     let ed = ProjectEditor::new(p);
     assert_eq!(gantt_scale(&ed), normal);
