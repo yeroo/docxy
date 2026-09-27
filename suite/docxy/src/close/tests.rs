@@ -303,18 +303,19 @@ fn window_close_does_not_stop_at_an_invalid_project_buffer() {
     assert!(restored[2].dirty);
 }
 
-/// A saved .docx whose header was written by another tool (extra namespace,
-/// its own whitespace), loaded clean, with the header editor opened on it the
-/// way `enter_hf` opens it and nothing typed.
-fn untouched_existing_header(name: &str) -> (DocTab, String, Vec<u8>) {
+/// A saved .docx whose header (or footer) was written by another tool (extra
+/// namespace, its own whitespace), loaded clean, with the header/footer editor
+/// opened on it the way `enter_hf` opens it and nothing typed.
+fn untouched_existing_header(name: &str, is_header: bool) -> (DocTab, String, Vec<u8>) {
     let mut source = tab(Kind::Docx);
     let pkg = source.pkg.as_mut().unwrap();
-    let part_name = pkg.create_hf(true, "default").unwrap();
+    let part_name = pkg.create_hf(is_header, "default").unwrap();
     let word_xml = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\r\n\
         <w:hdr xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\" \
         xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" \
         xmlns:w14=\"http://schemas.microsoft.com/office/word/2010/wordml\">\r\n  \
-        <w:p><w:r><w:t>Existing header</w:t></w:r></w:p>\r\n</w:hdr>";
+        <w:p><w:r><w:t>Existing header</w:t></w:r></w:p>\r\n</w:hdr>"
+        .replace("w:hdr", if is_header { "w:hdr" } else { "w:ftr" });
     assert!(pkg.set_part(&part_name, word_xml.as_bytes().to_vec()));
     let Surface::Doc(ed) = &source.surface else {
         panic!()
@@ -333,14 +334,14 @@ fn untouched_existing_header(name: &str) -> (DocTab, String, Vec<u8>) {
     let _ = std::fs::remove_dir_all(&dir);
     assert!(!t.dirty, "{}", t.status);
     let pkg = t.pkg.as_ref().unwrap();
-    let part_name = hf_part_name_typed(pkg, true, "default").unwrap();
+    let part_name = hf_part_name_typed(pkg, is_header, "default").unwrap();
     let before = pkg.part(&part_name).unwrap().to_vec();
     assert_eq!(before, word_xml.as_bytes());
     let body = parse_hf_part(pkg, &part_name);
     t.hf_edit = Some(HfEdit {
         editor: Editor::new(docxcore::model::Document { body }),
         part_name: part_name.clone(),
-        is_header: true,
+        is_header,
         variant: "default",
     });
     (t, part_name, before)
@@ -348,8 +349,8 @@ fn untouched_existing_header(name: &str) -> (DocTab, String, Vec<u8>) {
 
 #[test]
 fn window_close_leaves_an_untouched_header_editor_clean_and_its_part_intact() {
-    let (first, part_name, before) = untouched_existing_header("untouched-0");
-    let (last, _, _) = untouched_existing_header("untouched-2");
+    let (first, part_name, before) = untouched_existing_header("untouched-0", true);
+    let (last, _, _) = untouched_existing_header("untouched-2", true);
     let mut tabs = vec![first, pending_sheet("Beside"), last];
     let restored = exit_and_restore(&mut tabs, "untouched");
     for i in [0, 2] {
@@ -417,6 +418,82 @@ fn window_close_leaves_an_untouched_cell_editor_open_and_the_cell_intact() {
         assert!(!restored[i].dirty, "{i}");
         a1_is_text_007(&restored[i]);
     }
+}
+
+#[test]
+fn single_close_of_an_untouched_header_editor_removes_without_asking_and_keeps_the_part() {
+    for is_header in [true, false] {
+        let (mut t, part_name, before) =
+            untouched_existing_header(&format!("single-{is_header}"), is_header);
+        assert_eq!(
+            close_step(&mut t, |_| panic!("an untouched editor must not ask")),
+            CloseStep::Remove
+        );
+        assert!(!t.dirty, "{is_header}");
+        assert!(t.hf_edit.is_none());
+        assert_eq!(
+            t.pkg.as_ref().unwrap().part(&part_name).unwrap(),
+            &before[..],
+            "{is_header}"
+        );
+    }
+}
+
+#[test]
+fn exiting_or_saving_an_untouched_header_editor_keeps_the_tab_clean_and_the_part_intact() {
+    for is_header in [true, false] {
+        let (mut t, part_name, before) =
+            untouched_existing_header(&format!("exit-{is_header}"), is_header);
+        // The pre-save flush (Save, switching regions) leaves the session open.
+        flush_hf_tab(&mut t);
+        assert!(!t.dirty, "{is_header}");
+        assert!(t.hf_edit.is_some());
+        assert_eq!(
+            t.pkg.as_ref().unwrap().part(&part_name).unwrap(),
+            &before[..]
+        );
+        // Esc / Close Header and Footer.
+        exit_hf_tab(&mut t);
+        assert!(!t.dirty, "{is_header}");
+        assert!(t.hf_edit.is_none());
+        assert_eq!(t.status.as_ref(), "Closed header/footer");
+        assert_eq!(
+            t.pkg.as_ref().unwrap().part(&part_name).unwrap(),
+            &before[..]
+        );
+    }
+}
+
+#[test]
+fn single_close_of_an_untouched_cell_editor_removes_without_asking_and_keeps_the_cell() {
+    let mut t = untouched_text_cell();
+    assert_eq!(
+        close_step(&mut t, |_| panic!("an untouched editor must not ask")),
+        CloseStep::Remove
+    );
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert!(v.undo.is_empty());
+    a1_is_text_007(&t);
+}
+
+#[test]
+fn a_cancelled_single_close_keeps_an_untouched_cell_editor_open_as_seeded() {
+    let mut t = untouched_text_cell();
+    // Dirty for another reason, so the close asks.
+    t.dirty = true;
+    assert_eq!(
+        close_step(&mut t, |_| Ok(CloseAnswer::Cancel)),
+        CloseStep::Keep
+    );
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    a1_is_text_007(&t);
 }
 
 #[test]
