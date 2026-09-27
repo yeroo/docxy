@@ -2865,6 +2865,23 @@ mod tests {
     }
 
     #[test]
+    fn status_line_shows_a_material_quantity_and_label() {
+        let mut proj = new_project();
+        proj.resources.push(projcore::model::Resource {
+            uid: 1,
+            id: 1,
+            name: "Cement".into(),
+            kind: projcore::model::ResourceType::Material,
+            material_label: Some("tons".into()),
+            ..Default::default()
+        });
+        let mut app = App::new(proj, Some("plan.yppx".into()), false);
+        app.assign_resource("Cement[5 tons]");
+        let s = buffer_text(&mut app, 110, 24);
+        assert!(s.contains("Cement[5 tons]"), "{s}");
+    }
+
+    #[test]
     fn level_toggle_delays_shared_resource() {
         let mut proj = new_project(); // task 1 (1d)
         proj.tasks.push(Task {
