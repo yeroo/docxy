@@ -144,6 +144,9 @@
       <LevelingCanSplit>0</LevelingCanSplit>
       <LevelingDelay>4800</LevelingDelay>
       <LevelingDelayFormat>7</LevelingDelayFormat>
+      <Hyperlink>Pour instructions</Hyperlink>
+      <HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>
+      <HyperlinkSubAddress>Gantt Chart!4</HyperlinkSubAddress>
       <IgnoreResourceCalendar>1</IgnoreResourceCalendar>
       <HideBar>1</HideBar>
       <EarnedValueMethod>1</EarnedValueMethod>

@@ -350,6 +350,9 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "LevelingCanSplit" => t.leveling_can_split = opt_bool_of(p),
                     "LevelingDelay" => t.leveling_delay = opt_int_of(p),
                     "LevelingDelayFormat" => t.leveling_delay_format = opt_i32_of(p),
+                    "Hyperlink" => t.hyperlink = Some(text_of(p)),
+                    "HyperlinkAddress" => t.hyperlink_address = Some(text_of(p)),
+                    "HyperlinkSubAddress" => t.hyperlink_sub_address = Some(text_of(p)),
                     "IgnoreResourceCalendar" => t.ignore_resource_calendar = opt_bool_of(p),
                     "EarnedValueMethod" => t.earned_value_method = opt_i32_of(p),
                     "Recurring" => t.recurring = opt_bool_of(p),
@@ -1767,6 +1770,9 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_flag(s, "LevelingCanSplit", t.leveling_can_split);
     opt_text(s, "LevelingDelay", t.leveling_delay);
     opt_text(s, "LevelingDelayFormat", t.leveling_delay_format);
+    opt_text(s, "Hyperlink", t.hyperlink.as_deref());
+    opt_text(s, "HyperlinkAddress", t.hyperlink_address.as_deref());
+    opt_text(s, "HyperlinkSubAddress", t.hyperlink_sub_address.as_deref());
     opt_flag(s, "IgnoreResourceCalendar", t.ignore_resource_calendar);
     opt_flag(s, "HideBar", t.hide_bar);
     opt_flag(s, "Rollup", t.rollup);
@@ -3721,7 +3727,11 @@ mod tests {
         <ExternalTask>1</ExternalTask><Cost>1250.50</Cost>\
         <Deadline>2026-03-20T17:00:00</Deadline><LevelAssignments>0</LevelAssignments>\
         <LevelingCanSplit>0</LevelingCanSplit><LevelingDelay>4800</LevelingDelay>\
-        <LevelingDelayFormat>7</LevelingDelayFormat><IgnoreResourceCalendar>1</IgnoreResourceCalendar>\
+        <LevelingDelayFormat>7</LevelingDelayFormat>\
+        <Hyperlink>Survey plan</Hyperlink>\
+        <HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>\
+        <HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>\
+        <IgnoreResourceCalendar>1</IgnoreResourceCalendar>\
         <HideBar>1</HideBar><Rollup>1</Rollup><EarnedValueMethod>1</EarnedValueMethod></Task>";
 
     #[test]
@@ -3748,6 +3758,9 @@ mod tests {
                 leveling_can_split: Some(false),
                 leveling_delay: Some(4800),
                 leveling_delay_format: Some(7),
+                hyperlink: Some("Survey plan".into()),
+                hyperlink_address: Some("https://example.com/a?x=1&y=2".into()),
+                hyperlink_sub_address: Some("Gantt Chart!1".into()),
                 ignore_resource_calendar: Some(true),
                 earned_value_method: Some(1),
                 recurring: Some(true),
@@ -3790,6 +3803,9 @@ mod tests {
             "<LevelingCanSplit>0</LevelingCanSplit>",
             "<LevelingDelay>4800</LevelingDelay>",
             "<LevelingDelayFormat>7</LevelingDelayFormat>",
+            "<Hyperlink>Survey plan</Hyperlink>",
+            "<HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>",
+            "<HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>",
             "<IgnoreResourceCalendar>1</IgnoreResourceCalendar>",
             "<HideBar>1</HideBar>",
             "<Rollup>1</Rollup>",
@@ -3803,6 +3819,56 @@ mod tests {
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
         assert_eq!(package.tasks, proj.tasks);
+    }
+
+    #[test]
+    fn empty_task_hyperlink_elements_are_kept() {
+        let proj = task_project(
+            "<Task><UID>1</UID><Hyperlink/><HyperlinkAddress></HyperlinkAddress><HyperlinkSubAddress/></Task>",
+        );
+        let task = &proj.tasks[0];
+        assert_eq!(task.hyperlink.as_deref(), Some(""));
+        assert_eq!(task.hyperlink_address.as_deref(), Some(""));
+        assert_eq!(task.hyperlink_sub_address.as_deref(), Some(""));
+
+        let xml = write_mspdi(&proj);
+        for name in ["Hyperlink", "HyperlinkAddress", "HyperlinkSubAddress"] {
+            assert!(xml.contains(&format!("<{name}></{name}>")));
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+    }
+
+    #[test]
+    fn task_hyperlink_survives_save() {
+        let source = include_str!("../../corpus/mspdi/01-single-task.xml");
+        let xml = source.replace(
+            "<Name>Dig foundation</Name>",
+            "<Name>Dig foundation</Name>\n      <Hyperlink>Site survey</Hyperlink>\n      <HyperlinkAddress>https://example.com/survey.pdf</HyperlinkAddress>\n      <HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>",
+        );
+        assert_ne!(xml, source);
+        let proj = read_mspdi(&xml).unwrap();
+        let task = &proj.tasks[0];
+        assert_eq!(task.hyperlink.as_deref(), Some("Site survey"));
+        assert_eq!(
+            task.hyperlink_address.as_deref(),
+            Some("https://example.com/survey.pdf")
+        );
+        assert_eq!(task.hyperlink_sub_address.as_deref(), Some("Gantt Chart!1"));
+
+        let saved = write_mspdi(&proj);
+        for element in [
+            "<Hyperlink>Site survey</Hyperlink>",
+            "<HyperlinkAddress>https://example.com/survey.pdf</HyperlinkAddress>",
+            "<HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>",
+        ] {
+            assert!(saved.contains(element), "missing {element}");
+        }
+        let back = read_mspdi(&saved).unwrap();
+        assert_eq!(back.tasks, proj.tasks);
+        let result = crate::schedule::schedule(&back);
+        let task = result.get(1).unwrap();
+        assert_eq!(task.early_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        assert_eq!(task.early_finish, DateTime::from_ymd_hm(2026, 3, 3, 17, 0));
     }
 
     #[test]
@@ -3826,7 +3892,7 @@ mod tests {
 
     /// Optional task elements #80 keeps. IsNull is not among them: every row
     /// states it.
-    const NEW_TASK_ELEMENTS: [&str; 26] = [
+    const NEW_TASK_ELEMENTS: [&str; 29] = [
         "GUID",
         "Active",
         "Type",
@@ -3849,6 +3915,9 @@ mod tests {
         "LevelingCanSplit",
         "LevelingDelay",
         "LevelingDelayFormat",
+        "Hyperlink",
+        "HyperlinkAddress",
+        "HyperlinkSubAddress",
         "IgnoreResourceCalendar",
         "HideBar",
         "Rollup",
@@ -4114,6 +4183,9 @@ mod tests {
                 "LevelingCanSplit",
                 "LevelingDelay",
                 "LevelingDelayFormat",
+                "Hyperlink",
+                "HyperlinkAddress",
+                "HyperlinkSubAddress",
                 "IgnoreResourceCalendar",
                 "HideBar",
                 "Rollup",
