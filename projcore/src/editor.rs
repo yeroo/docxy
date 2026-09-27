@@ -470,8 +470,17 @@ impl Editor {
                     ..Task::default()
                 },
             );
-            if anchor.is_some() {
-                autolink(proj, at);
+            // A manual task linked into a chain starts where that link puts
+            // it, as an auto one would, rather than at the project start
+            // before its new predecessor finishes.
+            if anchor.is_some() && autolink(proj, at) && manual {
+                let mut probe = proj.clone();
+                probe.tasks[at].manual = false;
+                probe.tasks[at].manual_start = None;
+                probe.tasks[at].manual_duration_min = None;
+                if let Some(r) = crate::schedule::schedule(&probe).get(uid) {
+                    proj.tasks[at].manual_start = Some(r.early_start);
+                }
             }
         })?;
         self.stamp_pinned_dates(uid);
@@ -1385,13 +1394,14 @@ fn materialized(
 /// link to the next task below it, B, and A, the new task N and B are leaves
 /// at one outline level, A->B becomes A->N (no lag) and N->B (with A->B's
 /// lag). Otherwise, or with the plan's `Autolink` off, nothing changes.
-fn autolink(proj: &mut Project, at: usize) {
+/// Returns whether it linked the task.
+fn autolink(proj: &mut Project, at: usize) -> bool {
     if !proj.autolink() || at == 0 {
-        return;
+        return false;
     }
     let (a, n) = (at - 1, at);
     let Some(b) = (at + 1..proj.tasks.len()).find(|&i| !proj.tasks[i].is_null) else {
-        return;
+        return false;
     };
     let leaf = |i: usize| {
         let t = &proj.tasks[i];
@@ -1402,7 +1412,7 @@ fn autolink(proj: &mut Project, at: usize) {
         || proj.tasks[a].outline_level != level
         || proj.tasks[b].outline_level != level
     {
-        return;
+        return false;
     }
     let (a_uid, n_uid) = (proj.tasks[a].uid, proj.tasks[n].uid);
     let Some(link) = proj.tasks[b]
@@ -1410,10 +1420,11 @@ fn autolink(proj: &mut Project, at: usize) {
         .iter_mut()
         .find(|p| p.uid == a_uid && p.link == LinkType::FinishStart)
     else {
-        return;
+        return false;
     };
     link.uid = n_uid;
     proj.tasks[n].predecessors = vec![Predecessor::fs(a_uid)];
+    true
 }
 
 /// Give task `t` duration `min`. A manual task keeps its start; its finish
@@ -3690,6 +3701,52 @@ mod tests {
         assert_eq!(ed.project().tasks[at].outline_level, 2);
         assert!(ed.project().tasks[at].predecessors.is_empty());
         assert_eq!(preds(&ed, 2), [(1, LinkType::FinishStart, 0)]);
+    }
+
+    #[test]
+    fn a_manual_task_linked_into_a_chain_starts_after_its_predecessor() {
+        // A (10d) -> B in a plan whose new tasks are manual.
+        let manual_chain = |autolink| {
+            let mut ed = chain(LinkType::FinishStart, 480, autolink);
+            let mut proj = ed.project().clone();
+            proj.tasks[0].duration_min = 10 * 480;
+            proj.new_tasks_are_manual = true;
+            ed.replace_project(proj);
+            ed
+        };
+        let mut ed = manual_chain(None);
+        let (a_finish, b_start) = {
+            let s = ed.schedule();
+            (
+                s.get(1).unwrap().early_finish,
+                s.get(2).unwrap().early_start,
+            )
+        };
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        let n = ed.project().tasks[at].clone();
+        assert!(n.manual);
+        assert_eq!(preds(&ed, n.uid), [(1, LinkType::FinishStart, 0)]);
+        assert_eq!(preds(&ed, 2), [(n.uid, LinkType::FinishStart, 480)]);
+        let s = ed.schedule();
+        let (nr, br) = (s.get(n.uid).unwrap(), s.get(2).unwrap());
+        // N starts where an auto task after A would; B moves past N by
+        // N's day, keeping its one-day lag.
+        assert!(nr.early_start > a_finish, "{nr:?}");
+        assert_eq!(n.manual_start, Some(nr.early_start));
+        assert!(br.early_start > nr.early_finish && br.early_start > b_start);
+        for t in &ed.project().tasks {
+            let r = s.get(t.uid).unwrap();
+            assert!(r.total_slack_min >= 0, "task {}: {r:?}", t.uid);
+        }
+        assert_schedule(&ed);
+        // With Autolink off, the manual task starts at the project start as
+        // before, unlinked, and B stays put.
+        let mut ed = manual_chain(Some(false));
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        let n = ed.project().tasks[at].clone();
+        assert_eq!(n.manual_start, ed.project().start_date);
+        assert!(n.predecessors.is_empty());
+        assert_eq!(ed.schedule().get(2).unwrap().early_start, b_start);
     }
 
     #[test]
