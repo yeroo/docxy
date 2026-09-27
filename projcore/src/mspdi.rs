@@ -3422,7 +3422,7 @@ mod tests {
     fn task_baseline_new_fields_keep_their_slots_and_yppx_values() {
         let proj = project_with_baselines(
             "<Baseline><Number>0</Number><DurationFormat>7</DurationFormat><Work>PT0H0M0S</Work><Cost>0</Cost></Baseline>\
-             <Baseline><Number>3</Number><DurationFormat>8</DurationFormat><Work>PT8H0M0S</Work><Cost>+001000.50</Cost></Baseline>",
+             <Baseline><Number>3</Number><Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish><Duration>PT8H0M0S</Duration><DurationFormat>8</DurationFormat><Work>PT8H0M0S</Work><Cost>+001000.50</Cost></Baseline>",
         );
         assert_eq!(proj.tasks[0].baseline(0).unwrap().duration_format, Some(7));
         assert_eq!(proj.tasks[0].baseline(0).unwrap().work_min, Some(0));
@@ -3447,7 +3447,17 @@ mod tests {
             Some("+001000.50")
         );
         let xml = write_mspdi(&proj);
-        assert!(xml.contains("<Number>3</Number>\n        <DurationFormat>8</DurationFormat>\n        <Work>PT8H0M0S</Work>\n        <Cost>+001000.50</Cost>"));
+        let slot_three = xml
+            .split("<Baseline>")
+            .nth(2)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            slot_three.trim(),
+            "<Number>3</Number>\n        <Start>2026-03-02T08:00:00</Start>\n        <Finish>2026-03-03T17:00:00</Finish>\n        <Duration>PT8H0M0S</Duration>\n        <DurationFormat>8</DurationFormat>\n        <Work>PT8H0M0S</Work>\n        <Cost>+001000.50</Cost>"
+        );
         assert_eq!(
             read_mspdi(&xml).unwrap().tasks[0].baselines,
             proj.tasks[0].baselines
