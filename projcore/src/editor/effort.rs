@@ -7,12 +7,14 @@
 //! material and cost work is not time. A task with a contoured assignment,
 //! a summary and a milestone keep the plain rule (work = duration x units).
 use super::*;
+use crate::assign::{contoured, is_work};
 
 impl Editor {
     /// Commit staged `resources` and `assignments` for row `i` as one undo
     /// step, first recalculating the task by its type (see [`recalculate`]).
     /// A new duration is checked against the scheduling horizon before
-    /// anything changes, and applied as a typed one is.
+    /// anything changes. A manual task keeps its start and its finish
+    /// follows; the estimate and the milestone flag are left alone.
     pub(super) fn commit_assignments(
         &mut self,
         i: usize,
@@ -30,13 +32,7 @@ impl Editor {
             proj.resources = resources;
             proj.assignments = assignments;
             if let Some(d) = duration {
-                let t = &mut proj.tasks[i];
-                t.duration_min = d;
-                // A manual task keeps its start; its finish follows.
-                if t.manual && changed {
-                    t.manual_duration_min = Some(d);
-                    t.manual_finish = None;
-                }
+                apply_duration(&mut proj.tasks[i], d, changed);
             }
         })?;
         if changed {
@@ -54,19 +50,6 @@ fn task_type(t: &Task) -> TaskType {
 /// A Fixed Work task is always effort-driven.
 fn effort_driven(t: &Task) -> bool {
     t.effort_driven == Some(true) || task_type(t) == TaskType::FixedWork
-}
-
-/// Whether `a` is a work assignment: its resource is a work resource, or
-/// unknown (then [`assigned_work`] treats it as one).
-fn is_work(resources: &[Resource], a: &Assignment) -> bool {
-    resources
-        .iter()
-        .find(|r| r.uid == a.resource_uid)
-        .is_none_or(|r| r.kind == ResourceType::Work)
-}
-
-fn contoured(a: &Assignment) -> bool {
-    a.work_contour.is_some_and(|c| c != 0)
 }
 
 /// Recalculate `task`'s staged work `assignments` after a resource edit, from

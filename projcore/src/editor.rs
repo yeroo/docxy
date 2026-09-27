@@ -712,7 +712,8 @@ impl Editor {
         let pin = self.pin_at(i);
         self.edit_row(i, |proj, was_blank| {
             // A blank row's `1 day?` is a default, not a duration the user
-            // typed: typing any duration into it commits it.
+            // typed: typing a duration replaces it, committing the estimate
+            // unless typed with `?`.
             let t = &mut proj.tasks[i];
             if let Some(name) = patch.name {
                 t.name = name;
@@ -738,20 +739,16 @@ impl Editor {
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
                 let changed = was_blank || min != t.duration_min;
                 rescale = changed.then_some((t.duration_min, min));
+                // A summary's `?` rolls up from its subtasks: its own flag
+                // stays as read.
                 match patch.estimated {
+                    _ if t.summary => {}
                     Some(e) => t.estimated = estimate_after(t.estimated, e),
                     None if changed => commit_estimate(t),
                     None => {}
                 }
-                t.duration_min = min;
                 t.milestone = min == 0;
-                // A manual task keeps its start; its finish follows a new
-                // duration instead of staying pinned. Repeating the current
-                // duration keeps a pinned finish.
-                if t.manual && changed {
-                    t.manual_duration_min = Some(min);
-                    t.manual_finish = None;
-                }
+                apply_duration(t, min, changed);
             }
             if let Some(lv) = patch.level {
                 t.outline_level = lv;
@@ -1344,6 +1341,17 @@ fn materialized(
         }
     }
     t
+}
+
+/// Give task `t` duration `min`. A manual task keeps its start; its finish
+/// follows a new duration instead of staying pinned, while repeating the
+/// current duration (`changed` false) keeps a pinned finish.
+fn apply_duration(t: &mut Task, min: i64, changed: bool) {
+    t.duration_min = min;
+    if t.manual && changed {
+        t.manual_duration_min = Some(min);
+        t.manual_finish = None;
+    }
 }
 
 /// Typing a duration without `?` commits an estimated one, as in Project.
@@ -3263,6 +3271,42 @@ mod tests {
         assert_eq!(ed.undo_depth(), 1);
         let at = ed.add_task(None, "Sure", 960, false).unwrap();
         assert_eq!(ed.project().tasks[at].estimated, None);
+    }
+
+    #[test]
+    fn an_auto_summary_keeps_its_stored_estimate_through_a_duration_patch() {
+        for (stored, typed) in [(None, true), (Some(true), false), (Some(false), true)] {
+            let mut proj = outline(&[(1, "S", 1), (2, "a", 2)]).project().clone();
+            proj.tasks[0].estimated = stored;
+            let mut ed = Editor::new(proj);
+            for patch in [
+                // Minutes that differ from its stale stored duration.
+                TaskPatch {
+                    duration_min: Some(1440),
+                    estimated: Some(typed),
+                    ..TaskPatch::default()
+                },
+                // A rename carrying the duration it has.
+                TaskPatch {
+                    name: Some("Renamed".into()),
+                    duration_min: Some(480),
+                    estimated: Some(typed),
+                    ..TaskPatch::default()
+                },
+                // The old rule without an estimate.
+                TaskPatch {
+                    duration_min: Some(960),
+                    ..TaskPatch::default()
+                },
+            ] {
+                ed.update_task(1, patch).unwrap();
+                assert_eq!(
+                    ed.project().tasks[0].estimated,
+                    stored,
+                    "{stored:?} {typed}"
+                );
+            }
+        }
     }
 
     #[test]
