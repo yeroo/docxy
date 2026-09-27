@@ -25,6 +25,8 @@ pub use cells::{
 use cells::parse_predecessors;
 use cells::{format_units, parse_resource_token};
 mod moving;
+mod outline;
+use outline::subtree_end;
 #[cfg(test)]
 mod refresh_tests;
 
@@ -73,6 +75,13 @@ pub enum FindOutcome {
 pub struct Editor {
     proj: Project,
     sel: usize,
+    /// The task at `sel` when it was last chosen. After an edit, a selection
+    /// still on that task is revealed; one left on another task by a clamp
+    /// or a shifted index moves out of collapsed summaries instead.
+    sel_uid: Option<i32>,
+    /// Collapsed summaries by UID: view state, outside the model, history and
+    /// saved files (see [`Self::set_collapsed`]).
+    collapsed: std::collections::BTreeSet<i32>,
     undo: Vec<Project>,
     redo: Vec<Project>,
     dirty: bool,
@@ -99,9 +108,12 @@ impl Editor {
     pub fn restored(mut proj: Project, dirty: bool) -> Self {
         recompute_summaries(&mut proj);
         let sched = schedule(&proj);
+        let sel_uid = proj.tasks.first().map(|t| t.uid);
         Self {
             proj,
             sel: 0,
+            sel_uid,
+            collapsed: Default::default(),
             undo: Vec::new(),
             redo: Vec::new(),
             dirty,
@@ -118,6 +130,8 @@ impl Editor {
     pub fn replace_project(&mut self, proj: Project) {
         self.proj = proj;
         self.sel = 0;
+        self.sel_uid = self.selected_uid();
+        self.collapsed.clear();
         self.undo.clear();
         self.redo.clear();
         self.dirty = false;
@@ -131,8 +145,11 @@ impl Editor {
     pub fn sel(&self) -> usize {
         self.sel
     }
+    /// Select a row, expanding any collapsed summary that hides it.
     pub fn select(&mut self, index: usize) {
         self.sel = index.min(self.proj.tasks.len().saturating_sub(1));
+        self.reveal(self.sel);
+        self.sel_uid = self.selected_uid();
     }
     pub fn selected_uid(&self) -> Option<i32> {
         self.proj.tasks.get(self.sel).map(|t| t.uid)
@@ -255,7 +272,7 @@ impl Editor {
 
     /// Row `i` as an edit would make it (see [`materialized`]).
     fn row_as_edited(&self, i: usize) -> Task {
-        materialized(&self.proj, i, self.new_task_start())
+        materialized(&self.proj, i, self.new_task_start(), &self.collapsed)
     }
 
     /// A structural edit of row `i`. A blank row first becomes a task (see
@@ -263,10 +280,11 @@ impl Editor {
     /// made that way gets its dates pinned, as [`Self::add_task`] does.
     fn edit_row(&mut self, i: usize, edit: impl FnOnce(&mut Project, bool)) -> Result<(), String> {
         let (was_blank, uid) = (self.proj.tasks[i].is_null, self.proj.tasks[i].uid);
-        let start = self.new_task_start();
+        // The edit runs on a copy of this project, so the row becomes the same.
+        let made = was_blank.then(|| self.row_as_edited(i));
         self.edit_structure(|proj| {
-            if was_blank {
-                proj.tasks[i] = materialized(proj, i, start);
+            if let Some(made) = made {
+                proj.tasks[i] = made;
             }
             edit(proj, was_blank);
         })?;
@@ -309,7 +327,16 @@ impl Editor {
 
     fn changed(&mut self) {
         self.dirty = true;
-        self.select(self.sel);
+        self.prune_collapsed();
+        self.sel = self.sel.min(self.proj.tasks.len().saturating_sub(1));
+        if self.selected_uid() == self.sel_uid {
+            // The edited task itself moved under a collapsed summary.
+            self.reveal(self.sel);
+        } else if let Some(owner) = self.hidden_owners().get(self.sel).copied().flatten() {
+            // A clamped or shifted index: keep the summaries collapsed.
+            self.sel = owner;
+        }
+        self.sel_uid = self.selected_uid();
         self.reschedule();
     }
 
@@ -351,6 +378,17 @@ impl Editor {
     /// Find the next matching row, wrapping after the selected row. An empty
     /// query repeats the previous search. Searching never changes history.
     pub fn find(&mut self, query: &str) -> FindOutcome {
+        self.find_from(query, self.sel + 1)
+    }
+
+    /// [`Self::find`], starting at the first task instead of after the
+    /// selected one (as from docxy's entry row).
+    pub fn find_from_top(&mut self, query: &str) -> FindOutcome {
+        self.find_from(query, 0)
+    }
+
+    /// A hidden match expands the summaries that hide it.
+    fn find_from(&mut self, query: &str, first: usize) -> FindOutcome {
         let query = query.trim().to_lowercase();
         if !query.is_empty() {
             self.last_find = query;
@@ -359,14 +397,14 @@ impl Editor {
         if self.last_find.is_empty() || n == 0 {
             return FindOutcome::Inactive;
         }
-        for step in 1..=n {
-            let i = (self.sel + step) % n;
+        for step in 0..n {
+            let i = (first + step) % n;
             if self.proj.tasks[i]
                 .name
                 .to_lowercase()
                 .contains(&self.last_find)
             {
-                self.sel = i;
+                self.select(i);
                 return FindOutcome::Found(i);
             }
         }
@@ -376,7 +414,10 @@ impl Editor {
     /// Insert after a UID, or append. As in Microsoft Project, the new task is
     /// the next sibling of the task above it, or that task's first child when
     /// it is a summary; the row it pushes down plays no part, and blank rows
-    /// are skipped (see [`level_at`]). The returned row is not automatically
+    /// are skipped (see [`level_at`]). Below a collapsed summary's hidden
+    /// rows, a task appended or added after a row shown there becomes that
+    /// summary's sibling; one added after a hidden row takes its level as if
+    /// the summary were expanded. The returned row is not automatically
     /// selected.
     pub fn add_task(
         &mut self,
@@ -389,7 +430,9 @@ impl Editor {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
         };
-        let outline_level = level_at(&self.proj, at);
+        // The row the task goes after; appending has none.
+        let anchor = after.map(|_| at - 1);
+        let outline_level = level_at(&self.proj, at, anchor, &self.collapsed);
         let uid = self
             .proj
             .tasks
@@ -488,21 +531,7 @@ impl Editor {
     /// goes with it; one after its last descendant stays.
     fn subtree(&self, uid: i32) -> Result<std::ops::Range<usize>, String> {
         let i = self.index(uid)?;
-        let task = &self.proj.tasks[i];
-        if task.is_null {
-            return Ok(i..i + 1);
-        }
-        let mut end = i + 1;
-        for (k, row) in self.proj.tasks.iter().enumerate().skip(i + 1) {
-            if row.is_null {
-                continue;
-            }
-            if row.outline_level <= task.outline_level {
-                break;
-            }
-            end = k + 1;
-        }
-        Ok(i..end)
+        Ok(i..subtree_end(&self.proj, i))
     }
 
     /// How many subtasks (all depths) deleting `uid` would also remove; hosts
@@ -1211,10 +1240,29 @@ fn new_assignment(
 /// sibling of the nearest task above, or that task's first child when it is
 /// a summary (so the summary keeps its children); the rows below play no
 /// part. Blank rows are outside the outline and skipped. At least 1.
-fn level_at(proj: &Project, at: usize) -> u32 {
+///
+/// When the nearest task above is hidden by a collapsed summary and the
+/// row the task is placed from (`anchor`: the row it goes after, or the
+/// blank row itself; none when appending) is shown, the summary is the row
+/// the user sees above, so the task becomes its sibling. From a hidden
+/// anchor, the level is the one it would be with the summary expanded.
+fn level_at(
+    proj: &Project,
+    at: usize,
+    anchor: Option<usize>,
+    collapsed: &std::collections::BTreeSet<i32>,
+) -> u32 {
     let Some(above) = proj.tasks[..at].iter().rposition(|t| !t.is_null) else {
         return 1;
     };
+    let owners = outline::hidden_owners(proj, collapsed);
+    // A hidden anchor leaves the rows around it as they are: existing tasks
+    // keep their parents (see `outline::hidden_owners`).
+    if let Some(owner) = owners[above]
+        && anchor.is_none_or(|a| owners[a].is_none())
+    {
+        return proj.tasks[owner].outline_level.max(1);
+    }
     let level = proj.tasks[above].outline_level;
     // A summary's first child is deeper still, so `+ 1` stays within 20.
     if proj.is_outline_summary(above) {
@@ -1229,12 +1277,17 @@ fn level_at(proj: &Project, at: usize) -> u32 {
 /// level, without a duration it gets Project's new-task default, `1 day?`,
 /// instead of turning into a milestone, and in a plan whose new tasks are
 /// manual it becomes manual at `start`, as [`Editor::add_task`] makes one.
-fn materialized(proj: &Project, i: usize, start: DateTime) -> Task {
+fn materialized(
+    proj: &Project,
+    i: usize,
+    start: DateTime,
+    collapsed: &std::collections::BTreeSet<i32>,
+) -> Task {
     let mut t = proj.tasks[i].clone();
     if t.is_null {
         t.is_null = false;
         if t.outline_level == 0 {
-            t.outline_level = level_at(proj, i);
+            t.outline_level = level_at(proj, i, Some(i), collapsed);
         }
         if t.duration_min == 0 {
             t.duration_min = proj.days_to_minutes(1.0);

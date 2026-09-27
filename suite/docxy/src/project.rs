@@ -160,6 +160,17 @@ impl ProjectView {
         }
     }
 
+    /// The cursor's row as shown, where collapsed summaries hide rows: its
+    /// position among the visible rows, or their count on the entry row.
+    pub fn display_row(&self) -> usize {
+        let rows = self.ed.visible_rows();
+        if self.on_entry_row() {
+            rows.len()
+        } else {
+            rows.iter().position(|&i| i == self.ed.sel()).unwrap_or(0)
+        }
+    }
+
     /// The task the cursor is on; none on the entry row, so commands that act
     /// on the selected task do nothing there.
     pub fn selected_uid(&self) -> Option<i32> {
@@ -170,12 +181,12 @@ impl ProjectView {
         }
     }
 
-    /// Put the cursor on the entry row. The selection moves to the last task,
-    /// so a search from here starts at the first task.
+    /// Put the cursor on the entry row. The selection moves to the last
+    /// visible task, leaving collapsed summaries collapsed.
     pub fn enter_entry_row(&mut self) {
         self.cancel_prompt();
         self.entry = true;
-        self.ed.select(usize::MAX);
+        self.ed.select_last_visible();
     }
 
     /// Navigation and horizontal scrolling only; command completion owns row reveal.
@@ -190,19 +201,20 @@ impl ProjectView {
             self.reveal_col();
             return true;
         }
-        let count = self.ed.project().tasks.len();
+        // Rows under collapsed summaries are skipped.
+        let last = self.ed.visible_rows().last().copied();
         let index = match key {
             // From the entry row, Up goes to the last task.
-            "up" if self.on_entry_row() => count.saturating_sub(1),
-            "up" => self.ed.sel().saturating_sub(1),
+            "up" if self.on_entry_row() => last.unwrap_or(0),
+            "up" => self.ed.visible_step(self.ed.sel(), -1),
             // Down from the last task goes to the entry row, as in Project.
-            "down" if self.on_entry_row() || self.ed.sel() + 1 >= count => {
+            "down" if self.on_entry_row() || last.is_none_or(|last| self.ed.sel() >= last) => {
                 self.enter_entry_row();
                 return true;
             }
-            "down" => self.ed.sel() + 1,
+            "down" => self.ed.visible_step(self.ed.sel(), 1),
             "home" => 0,
-            "end" => count.saturating_sub(1),
+            "end" => last.unwrap_or(0),
             _ => return false,
         };
         self.entry = false;
@@ -450,13 +462,14 @@ pub(super) fn project_state(
     use ctlcore::json::Json;
     let scale = gantt_scale(&v.ed);
     let count = v.ed.project().tasks.len();
+    let shown = v.ed.visible_rows().len();
     let scroll_y = -f32::from(v.scroll.0.borrow().base_handle.offset().y);
     let mut entries = vec![
         ("selected_task".into(), Json::Num(v.cursor_row() as f64)),
         ("tasks".into(), Json::Num(count as f64)),
         (
             "filler_rows".into(),
-            Json::Num(body_h.map_or(0, |h| filler_rows(h, scroll_y, count)) as f64),
+            Json::Num(body_h.map_or(0, |h| filler_rows(h, scroll_y, shown)) as f64),
         ),
         (
             "prompt".into(),
@@ -873,6 +886,30 @@ fn editable_row_cells(
                     .child(div().flex_none().w(px(1.5)).h(px(16.)).bg(hsla_u(BRAND)))
                     .child(edit.buf[edit.caret..].to_owned())
                     .into_any_element()
+            } else if let Some(uid) = uid.filter(|_| summary && col == COL_NAME) {
+                // A summary's outline glyph: a click shows or hides its
+                // subtasks without editing the cell or moving the cursor.
+                let glyph = if v.ed.is_collapsed(uid) { "▸" } else { "▾" };
+                h_flex()
+                    .child(
+                        div()
+                            .id(("project-toggle", row))
+                            .relative()
+                            .flex_none()
+                            .w(px(12.))
+                            .cursor_pointer()
+                            .child(probe(probes, format!("project-toggle:{probe_row}")))
+                            .child(glyph)
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                if let Some(tab) = this.tabs.get_mut(index) {
+                                    toggle_project_collapse(tab, uid);
+                                }
+                                this.refocus(window, cx);
+                            })),
+                    )
+                    .child(value)
+                    .into_any_element()
             } else {
                 div().child(value).into_any_element()
             };
@@ -937,6 +974,12 @@ fn chart_pane(width: f32, offset: f32, pal: Pal, content: impl IntoElement) -> i
         .child(pane(width, offset, content))
 }
 
+/// The task index list row `r` draws, given the visible rows: the `r`th
+/// visible task, or past them the entry row (index `task_count`).
+pub(crate) fn list_task(rows: &[usize], task_count: usize, r: usize) -> usize {
+    rows.get(r).copied().unwrap_or(task_count)
+}
+
 pub(super) fn project_el(
     view: &ProjectView,
     index: usize,
@@ -944,7 +987,8 @@ pub(super) fn project_el(
     probes: &std::rc::Rc<std::cell::RefCell<Probes>>,
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
-    let count = view.ed.project().tasks.len();
+    // Collapsed summaries hide their subtasks' rows.
+    let shown = view.ed.visible_rows().len();
     let (table_w, gantt_w, table_x, gantt_x, scale) = (
         view.table_w,
         view.gantt_w,
@@ -1048,8 +1092,8 @@ pub(super) fn project_el(
                         .child(
                             uniform_list(
                                 ("project-rows", index),
-                                // The tasks, then the entry row.
-                                count + 1,
+                                // The visible tasks, then the entry row.
+                                shown + 1,
                                 cx.processor(
                                     move |this, range: std::ops::Range<usize>, window, cx| {
                                         let Some(Surface::Project(v)) =
@@ -1059,10 +1103,14 @@ pub(super) fn project_el(
                                         };
                                         let cursor_row = v.cursor_row();
                                         let tasks = &v.ed.project().tasks;
-                                        // Past the last task, the one entry row (`None`).
+                                        let rows = v.ed.visible_rows();
+                                        // List rows are shown rows; `i` is the task index,
+                                        // and past the last shown task the one entry row
+                                        // (`None`, index `tasks.len()`).
                                         range
-                                            .filter(|&i| i <= tasks.len())
-                                            .map(|i| {
+                                            .filter(|&r| r <= rows.len())
+                                            .map(|r| {
+                                                let i = list_task(&rows, tasks.len(), r);
                                                 let task = tasks.get(i);
                                                 let is_task = task.is_some();
                                                 let indent = task

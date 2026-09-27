@@ -28,6 +28,9 @@ pub(crate) enum ProjectAct {
     ScrollLeft,
     ScrollRight,
     GoToStart,
+    /// View › Data › Outline: Show Subtasks / Hide Subtasks.
+    ShowSubtasks,
+    HideSubtasks,
     Find,
     ScrollToTask,
     Timeline,
@@ -72,6 +75,8 @@ impl ProjectAct {
         Self::ScrollLeft,
         Self::ScrollRight,
         Self::GoToStart,
+        Self::ShowSubtasks,
+        Self::HideSubtasks,
         Self::Find,
         Self::ScrollToTask,
         Self::Timeline,
@@ -345,6 +350,28 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
             "W",
             vec![
                 rs::group(
+                    "Data",
+                    90,
+                    vec![rs::column(vec![
+                        cmd(
+                            "pr-show-subtasks",
+                            "table-insert-row",
+                            "Show Subtasks",
+                            ShowSubtasks,
+                            "Alt+Shift+=",
+                            "S",
+                        ),
+                        cmd(
+                            "pr-hide-subtasks",
+                            "table-delete-row",
+                            "Hide Subtasks",
+                            HideSubtasks,
+                            "Alt+Shift+-",
+                            "H",
+                        ),
+                    ])],
+                ),
+                rs::group(
                     "Split View",
                     70,
                     vec![rs::column(vec![cmd(
@@ -540,12 +567,9 @@ impl ProjectView {
     /// Find the next match; an empty query repeats the last search. From the
     /// entry row the search starts at the first task, and a hit leaves it.
     pub fn find(&mut self, query: &str) -> Option<String> {
-        if self.on_entry_row() {
-            // Tasks added after the cursor went there (Redo, the control
-            // pipe) can leave the selection short of the last task.
-            self.ed.select(usize::MAX);
-        }
-        let status = find_status(&mut self.ed, query);
+        // From the entry row, the search starts at the first task.
+        let from_top = self.on_entry_row();
+        let status = find_status(&mut self.ed, query, from_top);
         if matches!(status, Some((FindOutcome::Found(_), _))) {
             self.entry = false;
         }
@@ -565,6 +589,10 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
         return match (key, m.shift) {
             ("right", true) => Some(Indent),
             ("left", true) => Some(Outdent),
+            // Project's Alt+Shift+Minus / Alt+Shift+Plus; the key may arrive
+            // shifted or not, depending on the platform and layout.
+            ("-", true) | ("_", _) => Some(HideSubtasks),
+            ("=", true) | ("+", _) => Some(ShowSubtasks),
             ("right", false) => Some(ScrollRight),
             ("left", false) => Some(ScrollLeft),
             _ => None,
@@ -651,8 +679,16 @@ pub(crate) fn project_input(
     None
 }
 
-fn find_status(ed: &mut ProjectEditor, query: &str) -> Option<(FindOutcome, String)> {
-    let outcome = ed.find(query);
+fn find_status(
+    ed: &mut ProjectEditor,
+    query: &str,
+    from_top: bool,
+) -> Option<(FindOutcome, String)> {
+    let outcome = if from_top {
+        ed.find_from_top(query)
+    } else {
+        ed.find(query)
+    };
     let status = match outcome {
         FindOutcome::Inactive => return None,
         FindOutcome::Found(_) => format!("Found '{}'  (F3 next)", ed.find_query()),
@@ -746,7 +782,7 @@ pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
         // The list always holds the entry row, so there is a row to reveal.
         if reveal {
             v.scroll
-                .scroll_to_item(v.cursor_row(), ScrollStrategy::Nearest);
+                .scroll_to_item(v.display_row(), ScrollStrategy::Nearest);
         }
     }
 }
@@ -760,6 +796,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
         return;
     };
     v.cancel_prompt();
+    let before = (v.cursor_row(), v.display_row());
     let mut status = None;
     let result: Result<(), String> = (|| {
         match act {
@@ -886,6 +923,17 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 v.pan_gantt(true);
             }
             GoToStart => v.gantt_x.set(0.),
+            ShowSubtasks => {
+                if let Some(uid) = v.selected_uid() {
+                    v.ed.set_collapsed(uid, false)?;
+                }
+            }
+            // On a subtask, its summary collapses and takes the cursor.
+            HideSubtasks => {
+                if let Some(uid) = v.selected_uid() {
+                    v.ed.hide_subtasks(uid)?;
+                }
+            }
             ScrollToTask => v.scroll_to_task(),
             Timeline => v.timeline = !v.timeline,
             CriticalTasks => v.show_critical = !v.show_critical,
@@ -903,10 +951,35 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     if matches!(act, Indent | Outdent) {
         indent_project(tab, if act == Indent { 1 } else { -1 });
     }
+    // The cursor's row as shown can move without a new selection: Hide
+    // Subtasks takes a cursor inside to the summary, and indenting a task
+    // under a collapsed summary shows the summary's subtasks above it.
+    let moved = match &tab.surface {
+        Surface::Project(v) => (v.cursor_row(), v.display_row()) != before,
+        _ => false,
+    };
     complete_project(
         tab,
-        matches!(act, AddTask | DeleteTask | FindNext | Undo | Redo),
+        matches!(act, AddTask | DeleteTask | FindNext | Undo | Redo) || moved,
     );
+}
+
+/// A click on a summary's outline glyph: show or hide its subtasks. An open
+/// cell edit commits first, as on any click away, and a failed commit keeps
+/// the outline as it is. The cursor stays unless the rows it was on hide.
+pub(crate) fn toggle_project_collapse(tab: &mut DocTab, uid: i32) {
+    if !commit_project_cell(tab) {
+        return;
+    }
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    let before = v.cursor_row();
+    if let Err(e) = v.ed.toggle_collapsed(uid) {
+        tab.status = e.into();
+    }
+    let moved = v.cursor_row() != before;
+    complete_project(tab, moved);
 }
 
 #[derive(Debug, PartialEq)]

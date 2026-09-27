@@ -268,6 +268,8 @@ fn project_instruction_paths_exist() {
         ("Project", "Schedule", "Calculate Project", Recalc),
         ("Project", "Schedule", "Set Baseline", Baseline),
         ("Project", "Schedule", "Clear Baseline", ClearBaseline),
+        ("View", "Data", "Show Subtasks", ShowSubtasks),
+        ("View", "Data", "Hide Subtasks", HideSubtasks),
         ("View", "Split View", "Timeline", Timeline),
         (
             "Gantt Chart Format",
@@ -952,6 +954,8 @@ fn task_commands_do_nothing_on_the_entry_row() {
         UnlinkTasks,
         MoveTask,
         ScrollToTask,
+        ShowSubtasks,
+        HideSubtasks,
     ] {
         vm(&mut t).gantt_x.set(44.);
         apply_project_act(&mut t, act);
@@ -1217,4 +1221,236 @@ fn scroll_to_task_puts_the_bar_a_day_in_from_the_left_edge() {
     vm(&mut t).ed.select(0);
     apply_project_act(&mut t, ProjectAct::ScrollToTask);
     assert_eq!(v(&t).gantt_x.get(), 0.);
+}
+
+// ---- View > Data > Outline: Show/Hide Subtasks (#155) ----
+
+/// Phase over X and Y, then Z; saved, with Phase selected.
+fn outline_tab() -> DocTab {
+    let mut t = new_project_tab();
+    for name in ["Phase", "X", "Y", "Z"] {
+        vm(&mut t).ed.add_task(None, name, 480).unwrap();
+    }
+    vm(&mut t).ed.indent(2, 1).unwrap();
+    vm(&mut t).ed.indent(3, 1).unwrap();
+    let p = v(&t).ed.project().clone();
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    vm(&mut t).ed.select(0);
+    t
+}
+
+fn alt_shift() -> Modifiers {
+    Modifiers {
+        alt: true,
+        shift: true,
+        ..Modifiers::default()
+    }
+}
+
+#[test]
+fn alt_shift_minus_and_plus_hide_and_show_subtasks() {
+    use ProjectAct::*;
+    for (key, act) in [
+        ("-", HideSubtasks),
+        ("_", HideSubtasks),
+        ("=", ShowSubtasks),
+        ("+", ShowSubtasks),
+    ] {
+        assert_eq!(key_act(key, alt_shift()), Some(act), "{key}");
+    }
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(key_act("-", alt), None);
+    assert_eq!(key_act("=", alt), None);
+    assert_eq!(key_act("-", Modifiers::default()), None);
+    let mut t = outline_tab();
+    assert_eq!(
+        project_input(&mut t, "-", Some("_"), alt_shift()),
+        Some(HideSubtasks),
+        "routed to the host, not typed into a cell"
+    );
+    assert!(v(&t).cell.is_none());
+}
+
+#[test]
+fn hide_and_show_subtasks_act_on_the_selected_summary_as_view_state() {
+    use ProjectAct::*;
+    let mut t = outline_tab();
+    let before = v(&t).ed.project().clone();
+    apply_project_act(&mut t, HideSubtasks);
+    assert!(v(&t).ed.is_collapsed(1));
+    assert_eq!(v(&t).ed.visible_rows(), [0, 3]);
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert!(!t.dirty);
+    apply_project_act(&mut t, ShowSubtasks);
+    assert!(!v(&t).ed.is_collapsed(1));
+    assert_eq!(v(&t).ed.visible_rows(), [0, 1, 2, 3]);
+
+    // On a subtask, Hide collapses its summary, which takes the cursor
+    // (and the list scrolls to it).
+    project_cell_click(&mut t, 2, None, false);
+    take_reveal(&t);
+    apply_project_act(&mut t, HideSubtasks);
+    assert!(v(&t).ed.is_collapsed(1));
+    assert_eq!((v(&t).cursor_row(), v(&t).display_row()), (0, 0));
+    assert_eq!(take_reveal(&t), Some(0));
+
+    // Nothing to show or hide on a top-level task.
+    project_cell_click(&mut t, 3, None, false);
+    apply_project_act(&mut t, HideSubtasks);
+    assert_eq!(t.status.as_ref(), "The task has no subtasks to hide");
+    apply_project_act(&mut t, ShowSubtasks);
+    assert_eq!(
+        t.status.as_ref(),
+        "Only a summary task has subtasks to show or hide"
+    );
+    assert!(v(&t).ed.is_collapsed(1));
+    assert_eq!(v(&t).cursor_row(), 3);
+}
+
+#[test]
+fn arrow_keys_home_and_end_move_over_visible_rows() {
+    let mut t = outline_tab();
+    apply_project_act(&mut t, ProjectAct::HideSubtasks);
+    let key = |t: &mut DocTab, k| {
+        project_input(t, k, None, Modifiers::default());
+        (v(t).cursor_row(), v(t).display_row())
+    };
+    // Row indexes stay task indexes; the display row counts shown rows.
+    assert_eq!(key(&mut t, "down"), (3, 1));
+    assert_eq!(key(&mut t, "down"), (4, 2), "then the entry row");
+    assert!(v(&t).on_entry_row());
+    assert_eq!(key(&mut t, "up"), (3, 1));
+    assert_eq!(key(&mut t, "up"), (0, 0));
+    assert_eq!(key(&mut t, "end"), (3, 1));
+    assert_eq!(key(&mut t, "home"), (0, 0));
+    assert!(v(&t).ed.is_collapsed(1), "moving never expands");
+}
+
+#[test]
+fn the_entry_row_below_a_collapsed_last_summary_keeps_it_collapsed() {
+    let mut t = outline_tab();
+    vm(&mut t).ed.delete_task(4).unwrap();
+    apply_project_act(&mut t, ProjectAct::HideSubtasks);
+    project_input(&mut t, "down", None, Modifiers::default());
+    assert!(v(&t).on_entry_row());
+    assert_eq!(v(&t).display_row(), 1);
+    assert!(v(&t).ed.is_collapsed(1));
+    // Find from there still starts at the first task.
+    commit(&mut t, ProjectAct::Find, "x");
+    assert_eq!(v(&t).cursor_row(), 1, "{}", t.status);
+    assert!(
+        !v(&t).ed.is_collapsed(1),
+        "a hidden hit shows its summary's subtasks"
+    );
+}
+
+#[test]
+fn list_rows_map_to_task_indexes_for_clicks() {
+    let mut t = outline_tab();
+    apply_project_act(&mut t, ProjectAct::HideSubtasks);
+    let rows = v(&t).ed.visible_rows();
+    let n = v(&t).ed.project().tasks.len();
+    assert_eq!(
+        (0..3).map(|r| list_task(&rows, n, r)).collect::<Vec<_>>(),
+        [0, 3, n],
+        "Phase, Z, then the entry row"
+    );
+    // A click on the second list row lands on Z, not the hidden X.
+    project_cell_click(&mut t, list_task(&rows, n, 1), None, false);
+    assert_eq!(v(&t).ed.selected_uid(), Some(4));
+    assert!(v(&t).ed.is_collapsed(1));
+}
+
+#[test]
+fn the_outline_glyph_toggles_without_moving_the_cursor() {
+    let mut t = outline_tab();
+    project_cell_click(&mut t, 3, None, false);
+    take_reveal(&t);
+    toggle_project_collapse(&mut t, 1);
+    assert!(v(&t).ed.is_collapsed(1));
+    assert_eq!(v(&t).ed.selected_uid(), Some(4));
+    assert!(v(&t).cell.is_none(), "no cell edit starts");
+    assert_eq!(take_reveal(&t), None, "the cursor did not move");
+    toggle_project_collapse(&mut t, 1);
+    assert!(!v(&t).ed.is_collapsed(1));
+    assert!(!t.dirty);
+    // On a task that is not a summary it only reports.
+    toggle_project_collapse(&mut t, 4);
+    assert_eq!(
+        t.status.as_ref(),
+        "Only a summary task has subtasks to show or hide"
+    );
+}
+
+#[test]
+fn the_outline_glyph_commits_an_open_cell_edit_first() {
+    let mut t = outline_tab();
+    project_cell_click(&mut t, 2, Some(COL_NAME), false);
+    vm(&mut t).open_cell(Some("Renamed")).unwrap();
+    toggle_project_collapse(&mut t, 1);
+    assert_eq!(v(&t).ed.project().tasks[2].name, "Renamed");
+    assert!(v(&t).cell.is_none());
+    assert!(v(&t).ed.is_collapsed(1));
+    assert_eq!(
+        v(&t).ed.selected_uid(),
+        Some(1),
+        "the hidden cursor moves up"
+    );
+
+    // A commit that fails keeps the edit and the outline.
+    toggle_project_collapse(&mut t, 1);
+    project_cell_click(&mut t, 2, Some(COL_DURATION), false);
+    vm(&mut t).open_cell(Some("soon")).unwrap();
+    toggle_project_collapse(&mut t, 1);
+    assert!(v(&t).cell.is_some());
+    assert!(!v(&t).ed.is_collapsed(1));
+    assert_eq!(v(&t).ed.selected_uid(), Some(3));
+}
+
+#[test]
+fn a_reveal_scrolls_to_the_row_as_shown() {
+    let mut t = outline_tab();
+    apply_project_act(&mut t, ProjectAct::HideSubtasks);
+    take_reveal(&t);
+    // Z is task 3, but the second row shown: X and Y are hidden.
+    commit(&mut t, ProjectAct::Find, "z");
+    assert_eq!((v(&t).cursor_row(), v(&t).display_row()), (3, 1));
+    assert_eq!(take_reveal(&t), Some(1));
+    assert!(v(&t).ed.is_collapsed(1));
+}
+
+#[test]
+fn indenting_under_a_collapsed_summary_scrolls_to_the_task() {
+    use ProjectAct::*;
+    let mut t = outline_tab();
+    // Phase is collapsed; Z sits right below it, at its level.
+    apply_project_act(&mut t, HideSubtasks);
+    project_cell_click(&mut t, 3, None, false);
+    take_reveal(&t);
+    assert_eq!((v(&t).cursor_row(), v(&t).display_row()), (3, 1));
+    apply_project_act(&mut t, Indent);
+    // Z joined Phase, which shows its subtasks: Z is shown below X and Y.
+    assert!(!v(&t).ed.is_collapsed(1));
+    assert_eq!((v(&t).cursor_row(), v(&t).display_row()), (3, 3));
+    assert_eq!(take_reveal(&t), Some(3));
+    // The keyboard route dispatches the same act.
+    apply_project_act(&mut t, HideSubtasks);
+    take_reveal(&t);
+    assert_eq!(
+        project_input(
+            &mut t,
+            "right",
+            None,
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::default()
+            }
+        ),
+        Some(Indent)
+    );
 }
