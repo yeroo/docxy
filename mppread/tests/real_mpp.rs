@@ -316,6 +316,16 @@ fn new_task_default_decodes_when_present() {
     }
 }
 
+#[test]
+fn untouched_new_task_default_imports_as_manual_when_present() {
+    let Some(bytes) = manual_case("m4-default-new-task-mode") else {
+        return;
+    };
+    assert_eq!(mppread::mpp::decode_new_tasks_are_manual(&bytes), Ok(true));
+    let project = mppread::project::project_from_mpp(&bytes).unwrap();
+    assert!(project.new_tasks_are_manual);
+}
+
 /// #181: a tracked plan's progress survives `.mpp` → MSPDI. Every task field
 /// the decoder reads equals Project's own export after a save and re-read;
 /// the variances, which the file does not store, stay absent.
