@@ -1589,6 +1589,16 @@ impl Project {
             .unwrap_or_else(Calendar::standard_week)
     }
 
+    /// Calendar used to display project-wide non-working days. A wholly
+    /// closed weekly pattern has no useful project-wide shading: its tasks
+    /// can still be scheduled on their own calendars.
+    pub fn project_shading_calendar(&self) -> Option<WorkCalendar> {
+        self.project_week()
+            .iter()
+            .any(DayWorking::working)
+            .then(|| self.project_calendar())
+    }
+
     /// A task's working week, resolved through its base chain: the task's
     /// calendar, or the project default when the task names none; if that UID
     /// is missing, the first calendar; with no calendars, Standard. This differs

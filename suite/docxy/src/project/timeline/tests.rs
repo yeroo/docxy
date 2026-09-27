@@ -24,9 +24,9 @@ fn timeline_shading_merges_off_days_and_respects_exceptions_and_density() {
     ));
     let mut p = untitled_project();
     p.calendars = vec![cal];
-    let runs = timeline_shading(span, &p.project_calendar(), 280.);
+    let runs = timeline_shading(span, p.project_shading_calendar().as_ref(), 280.);
     assert_eq!(runs, [(40., 20.), (120., 20.), (240., 40.)]);
-    assert!(timeline_shading(span, &p.project_calendar(), 20.).is_empty());
+    assert!(timeline_shading(span, p.project_shading_calendar().as_ref(), 20.).is_empty());
     assert!(
         runs.iter()
             .all(|(left, width)| *left >= 0. && *left + *width <= 280.)
@@ -60,6 +60,19 @@ fn timeline_state_exposes_current_holiday_shading() {
     assert!(
         matches!(&shaded.1, Json::Arr(runs) if runs.contains(&Json::Arr(vec![Json::Str("Wed 3/4/26".into()), Json::Str("Wed 3/4/26".into())])))
     );
+}
+
+#[test]
+fn closed_project_week_has_no_timeline_shading() {
+    use projcore::{Calendar, DayWorking};
+    let span = TimelineSpan::new(day(2026, 3, 2), day(2026, 3, 15));
+    let mut p = untitled_project();
+    p.calendars = vec![Calendar::base(
+        p.default_calendar_uid,
+        "Closed",
+        std::array::from_fn(|_| DayWorking::default()),
+    )];
+    assert!(timeline_shading(span, p.project_shading_calendar().as_ref(), 280.).is_empty());
 }
 
 fn corpus_editor(name: &str) -> ProjectEditor {

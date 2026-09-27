@@ -1069,7 +1069,7 @@ pub(super) fn project_el(
                             pal,
                             gantt_header(
                                 scale,
-                                view.ed.project().project_calendar(),
+                                view.ed.project().project_shading_calendar(),
                                 gantt_x,
                                 gantt_w,
                                 pal,

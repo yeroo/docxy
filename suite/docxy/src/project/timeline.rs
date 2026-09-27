@@ -184,7 +184,14 @@ impl TimelineSpan {
 
 /// Inclusive non-working runs in the plan span. Skip shading when individual
 /// days would be too narrow to distinguish in the fit-to-width overview.
-fn timeline_runs(span: TimelineSpan, cal: &projcore::WorkCalendar, width: f32) -> Vec<(i64, i64)> {
+fn timeline_runs(
+    span: TimelineSpan,
+    cal: Option<&projcore::WorkCalendar>,
+    width: f32,
+) -> Vec<(i64, i64)> {
+    let Some(cal) = cal else {
+        return Vec::new();
+    };
     if width / (span.days as f32) < 2. {
         return Vec::new();
     }
@@ -206,7 +213,7 @@ fn timeline_runs(span: TimelineSpan, cal: &projcore::WorkCalendar, width: f32) -
 /// Clipped `(left, width)` pixel runs for the Timeline's visible non-working days.
 pub(crate) fn timeline_shading(
     span: TimelineSpan,
-    cal: &projcore::WorkCalendar,
+    cal: Option<&projcore::WorkCalendar>,
     width: f32,
 ) -> Vec<(f32, f32)> {
     timeline_runs(span, cal, width)
@@ -336,7 +343,7 @@ pub(crate) fn timeline_state(v: &ProjectView) -> Vec<(String, ctlcore::json::Jso
     let date = |d: i64| Json::Str(project_date(DateTime::from_minutes(d * 1440)));
     let nonworking = timeline_runs(
         TimelineSpan::of(&v.ed),
-        &v.ed.project().project_calendar(),
+        v.ed.project().project_shading_calendar().as_ref(),
         ruler_width(v.width),
     )
     .into_iter()
@@ -380,6 +387,16 @@ fn release_timeline(
     })
 }
 
+fn tint_run((left, width): (f32, f32), fill: Hsla) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(left))
+        .top_0()
+        .h_full()
+        .w(px(width))
+        .bg(fill)
+}
+
 pub(crate) fn timeline_el(
     view: &ProjectView,
     index: usize,
@@ -391,7 +408,7 @@ pub(crate) fn timeline_el(
     let r = timeline_ruler(&view.ed, w);
     let shading = timeline_shading(
         TimelineSpan::of(&view.ed),
-        &view.ed.project().project_calendar(),
+        view.ed.project().project_shading_calendar().as_ref(),
         w,
     );
     let (f0, f1) = view.timeline_box();
@@ -411,15 +428,12 @@ pub(crate) fn timeline_el(
         .flex_none()
         .text_size(px(10.))
         .text_color(pal.dim)
-        .children(shading.iter().copied().map(|(left, width)| {
-            div()
-                .absolute()
-                .left(px(left))
-                .top_0()
-                .h_full()
-                .w(px(width))
-                .bg(Hsla { a: 0.12, ..pal.dim })
-        }))
+        .children(
+            shading
+                .iter()
+                .copied()
+                .map(|run| tint_run(run, nonworking_fill(pal))),
+        )
         .children(r.ticks.into_iter().map(|(at, label)| {
             div()
                 .absolute()
@@ -442,15 +456,12 @@ pub(crate) fn timeline_el(
         .items_center()
         .rounded(px(3.))
         .bg(pal.sel)
-        .children(shading.iter().copied().map(|(left, width)| {
-            div()
-                .absolute()
-                .left(px(left))
-                .top_0()
-                .h_full()
-                .w(px(width))
-                .bg(Hsla { a: 0.18, ..pal.dim })
-        }))
+        .children(
+            shading
+                .iter()
+                .copied()
+                .map(|run| tint_run(run, nonworking_fill(pal))),
+        )
         .child(caption("Start", r.start, false))
         .child(caption("Finish", r.finish, true));
     h_flex()

@@ -629,10 +629,16 @@ fn day_lines_follow_horizontal_scroll_and_stay_in_the_viewport() {
 fn shaded_days_are_the_visible_weekends() {
     let scale = monday_scale(30);
     let cal = untitled_project().project_calendar();
-    assert_eq!(shaded_days(scale, &cal, 0., 14. * DAY_W), [5, 6, 12, 13]);
-    assert_eq!(shaded_days(scale, &cal, 6. * DAY_W, 2. * DAY_W), [6]);
-    assert_eq!(shaded_days(scale, &cal, 5.5 * DAY_W, DAY_W), [5, 6]);
-    assert_eq!(shaded_days(scale, &cal, 26. * DAY_W, 10. * DAY_W), [26, 27]);
+    assert_eq!(
+        shaded_days(scale, Some(&cal), 0., 14. * DAY_W),
+        [5, 6, 12, 13]
+    );
+    assert_eq!(shaded_days(scale, Some(&cal), 6. * DAY_W, 2. * DAY_W), [6]);
+    assert_eq!(shaded_days(scale, Some(&cal), 5.5 * DAY_W, DAY_W), [5, 6]);
+    assert_eq!(
+        shaded_days(scale, Some(&cal), 26. * DAY_W, 10. * DAY_W),
+        [26, 27]
+    );
 }
 
 #[test]
@@ -655,7 +661,7 @@ fn shaded_days_follow_project_calendar_exceptions_and_week() {
     ));
     p.calendars = vec![cal];
     assert_eq!(
-        shaded_days(scale, &p.project_calendar(), 0., 7. * DAY_W),
+        shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DAY_W),
         [2, 6]
     );
 
@@ -663,13 +669,13 @@ fn shaded_days_follow_project_calendar_exceptions_and_week() {
     p.calendars[0].week[0] = p.calendars[0].week[1].clone();
     p.calendars[0].week[5] = Some(DayWorking::default());
     assert_eq!(
-        shaded_days(scale, &p.project_calendar(), 0., 7. * DAY_W),
+        shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DAY_W),
         [4, 5]
     );
 
     p.default_calendar_uid = 99;
     assert_eq!(
-        shaded_days(scale, &p.project_calendar(), 0., 7. * DAY_W),
+        shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DAY_W),
         [5, 6]
     );
 }
@@ -682,7 +688,15 @@ fn shaded_days_recompute_after_project_replacement() {
     let mut v = ProjectView::new(p.clone(), false);
     let scale = gantt_scale(&v.ed);
     let wed = DateTime::from_minutes((scale.origin_day + 2) * 1440);
-    assert!(!shaded_days(scale, &v.ed.project().project_calendar(), 0., 7. * DAY_W).contains(&2));
+    assert!(
+        !shaded_days(
+            scale,
+            v.ed.project().project_shading_calendar().as_ref(),
+            0.,
+            7. * DAY_W
+        )
+        .contains(&2)
+    );
     let mut cal = Calendar::standard(p.default_calendar_uid);
     cal.exceptions.push(CalendarException::date_range(
         wed,
@@ -691,7 +705,34 @@ fn shaded_days_recompute_after_project_replacement() {
     ));
     p.calendars = vec![cal];
     v.ed.replace_project(p);
-    assert!(shaded_days(scale, &v.ed.project().project_calendar(), 0., 7. * DAY_W).contains(&2));
+    assert!(
+        shaded_days(
+            scale,
+            v.ed.project().project_shading_calendar().as_ref(),
+            0.,
+            7. * DAY_W
+        )
+        .contains(&2)
+    );
+}
+
+#[test]
+fn closed_project_week_has_no_global_shading() {
+    use projcore::{Calendar, DayWorking};
+    let mut p = untitled_project();
+    p.calendars = vec![
+        Calendar::base(
+            p.default_calendar_uid,
+            "Closed",
+            std::array::from_fn(|_| DayWorking::default()),
+        ),
+        Calendar::standard(3),
+    ];
+    let mut leaf = task(1, 3, 1);
+    leaf.calendar_uid = Some(3);
+    p.tasks = vec![leaf];
+    let scale = gantt_scale(&ProjectEditor::new(p.clone()));
+    assert!(shaded_days(scale, p.project_shading_calendar().as_ref(), 0., 7. * DAY_W).is_empty());
 }
 
 #[test]
@@ -731,7 +772,12 @@ fn a_short_plan_on_a_wide_window_has_days_across_the_whole_chart() {
         "last day line {last} of {}",
         v.gantt_w
     );
-    let weekend = shaded_days(chart, &v.ed.project().project_calendar(), 0., v.gantt_w);
+    let weekend = shaded_days(
+        chart,
+        v.ed.project().project_shading_calendar().as_ref(),
+        0.,
+        v.gantt_w,
+    );
     assert!(*weekend.last().unwrap() as f32 * DAY_W >= v.gantt_w - 7. * DAY_W);
     // Bars keep their days, and the widened days are not a place to scroll to.
     assert_eq!(bar(&v.ed, 1), before);

@@ -170,8 +170,10 @@ fn fmt_days(days: f64) -> String {
 
 /// Write weekly exclusions and dated overrides for the emitted bars' span.
 fn calendar_directives(proj: &Project, sched: &Schedule, out: &mut String) {
+    let Some(cal) = proj.project_shading_calendar() else {
+        return;
+    };
     let week = proj.project_week();
-    let cal = proj.project_calendar();
     let weekends = !week[0].working() && !week[6].working();
     let mut excludes: Vec<String> = Vec::new();
     if weekends {
@@ -822,5 +824,22 @@ mod tests {
                 .find(|line| line.trim_start().starts_with("excludes ")),
             Some("    excludes weekends")
         );
+    }
+
+    #[test]
+    fn closed_project_week_does_not_exclude_every_mermaid_day() {
+        let closed = Calendar::base(1, "Closed", std::array::from_fn(|_| DayWorking::default()));
+        let mut leaf = task(1, "Leaf", 480);
+        leaf.calendar_uid = Some(3);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            calendars: vec![closed, Calendar::standard(3)],
+            tasks: vec![leaf],
+            ..Project::default()
+        };
+        assert!(proj.project_shading_calendar().is_none());
+        let m = to_mermaid(&proj, &schedule(&proj));
+        assert!(m.contains("Leaf :"), "{m}");
+        assert!(!m.contains("excludes ") && !m.contains("includes "), "{m}");
     }
 }
