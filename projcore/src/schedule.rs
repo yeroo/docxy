@@ -31,14 +31,26 @@
 //! Summary tasks roll up from their descendants, except that a manually
 //! scheduled summary keeps its own dates: they floor its unconstrained
 //! subtasks' starts and extend the project finish (see [`Schedule::rolled_up`]
-//! and [`manual_warning`]). Resource
+//! and [`manual_warning`]).
+//!
+//! A leaf with recorded progress ([`Task::tracked`]) is scheduled from its
+//! actuals, which links, constraints, the deadline and leveling never move. A
+//! complete task stays on its ActualStart..ActualFinish and is never critical.
+//! An in-progress task keeps its completed part and schedules its remaining
+//! duration (Duration less ActualDuration, so a Duration edit moves its
+//! finish) from its Resume, so a stopped and resumed task is split. A start
+//! link (FS/SS) that a complete task's start, or an in-progress task's
+//! resume, precedes, or a finish link (FF/SF) that its finish precedes, shows
+//! as negative total slack. Project's `Split
+//! in-progress tasks` option, which would let a late predecessor move the
+//! remaining work, is not modeled: the remaining work never moves. Resource
 //! leveling is separate from CPM. Free slack is computed precisely for
 //! finish-to-start successors and falls back to total slack otherwise.
 
 use crate::datetime::DateTime;
 use crate::model::{
-    Calendar, ConstraintType, LagKind, LinkType, Predecessor, Project, ResourceType, Task, Week,
-    WorkCalendar, WorkingTime,
+    Calendar, ConstraintType, LagKind, LinkType, Predecessor, Project, ResourceType, Task, Tracked,
+    Week, WorkCalendar, WorkingTime,
 };
 use std::collections::HashMap;
 
@@ -284,22 +296,23 @@ struct ConstraintDates {
 
 impl<'a> Scheduler<'a> {
     fn new(proj: &'a Project) -> Scheduler<'a> {
-        // Anchor: explicit project start, else the earliest stored or pinned
-        // start of a leaf `run()` schedules, else a fixed Monday, snapped to
-        // the default calendar's first working instant. Summaries and leaves
-        // without working time never place the anchor.
+        // Anchor: explicit project start, else the earliest stored, pinned or
+        // actual start of a leaf `run()` schedules, else a fixed Monday,
+        // snapped to the default calendar's first working instant. Summaries
+        // and leaves without working time never place the anchor.
         let default_cal = proj.default_calendar_uid;
         let calendars = CalendarResolver::new(proj);
         let schedulable = proj.tasks.iter().filter(|t| calendars.schedulable(t));
+        // A tracked task stays on its actual start as a pinned one does.
         let pinned_starts = schedulable
             .clone()
-            .filter_map(|t| t.pinned_dates().map(|(start, _)| start.minutes()));
+            .filter_map(|t| fixed_start(t).map(|start| start.minutes()));
         let raw_anchor = proj
             .start_date
             .or_else(|| {
                 schedulable
                     .clone()
-                    .flat_map(|t| [t.stored_start, t.pinned_dates().map(|(start, _)| start)])
+                    .flat_map(|t| [t.stored_start, fixed_start(t)])
                     .flatten()
                     .min()
             })
@@ -386,13 +399,27 @@ impl<'a> Scheduler<'a> {
         // counted from the anchor, not from a pinned start, so holidays in a
         // far task's span need reach of their own. A calendar without weekly
         // working time cannot schedule the task at all.
+        // A tracked task's remaining work lies past its latest recorded date.
         let pinned_reach = proj.tasks.iter().filter_map(|t| {
-            let (start, _) = t.pinned_dates()?;
+            let (from, work) = match t.tracked() {
+                Some(Tracked::Complete { finish, .. }) => (finish, 0),
+                Some(Tracked::InProgress {
+                    start,
+                    stop,
+                    resume,
+                    actual_min,
+                    remaining_min,
+                }) => {
+                    let from = [Some(start), stop, resume].into_iter().flatten().max()?;
+                    (from, actual_min.unwrap_or(0) + remaining_min)
+                }
+                None => (t.pinned_dates()?.0, t.duration_min.max(0)),
+            };
             let cal = weeks
                 .get(&t.calendar_uid.unwrap_or(default_cal))
                 .or_else(|| weeks.get(&default_cal))?;
             cal.has_working_time()
-                .then(|| reach_after(cal, start.minutes(), t.duration_min.max(0)))
+                .then(|| reach_after(cal, from.minutes(), work))
         });
         // A manual summary's span, and room after its start for the subtasks
         // it floors there.
@@ -500,7 +527,7 @@ impl<'a> Scheduler<'a> {
         let mut spans: HashMap<i32, (i64, i64, i64)> = HashMap::new();
         for &i in leaves {
             let t = &self.proj.tasks[i];
-            if linked.contains(&t.uid) || t.pinned_dates().is_some() || !is_backward(t.constraint) {
+            if linked.contains(&t.uid) || fixed(t) || !is_backward(t.constraint) {
                 continue;
             }
             let Some(dates) = self.constraint_dates(t, false).filter(|d| d.clamped) else {
@@ -604,11 +631,20 @@ impl<'a> Scheduler<'a> {
         let mut ef_abs: HashMap<i32, i64> = HashMap::new();
         let mut es_abs: HashMap<i32, i64> = HashMap::new();
         let mut driven_es: HashMap<i32, i64> = HashMap::new();
+        // Where each in-progress task's remaining work resumes, and the
+        // finish its FF/SF links drive for a tracked task (indices).
+        let mut resume_idx: HashMap<i32, i64> = HashMap::new();
+        let mut driven_ef: HashMap<i32, i64> = HashMap::new();
         let mut linked_tasks = std::collections::HashSet::new();
         for &i in &order {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
             let mut linked_start: Option<i64> = None;
+            // A tracked task's slack compares start links with its start (or
+            // resume) and finish links with its finish (index), not with a
+            // start derived from its duration.
+            let mut start_link: Option<i64> = None;
+            let mut finish_link: Option<i64> = None;
             let mut fs_milestone_start: Option<i64> = None;
             let mut finish_bounds = Vec::new();
             for p in &t.predecessors {
@@ -637,14 +673,19 @@ impl<'a> Scheduler<'a> {
                         if let Offset::Elapsed(_) = offset {
                             finish_bounds.push((tl.to_index(pf_abs), pf_abs));
                         }
+                        finish_link = finish_link.max(Some(tl.to_index(cf)));
                         tl.abs_start(tl.to_index(cf) - t.duration_min)
                     }
                     LinkType::StartFinish => {
                         let bound = sf_bound(tl, ps_abs, lag);
                         finish_bounds.push(bound);
+                        finish_link = finish_link.max(Some(bound.0));
                         tl.abs_start(bound.0 - t.duration_min)
                     }
                 };
+                if matches!(p.link, LinkType::FinishStart | LinkType::StartStart) {
+                    start_link = start_link.max(Some(cand));
+                }
                 linked_start = Some(linked_start.map_or(cand, |s| s.max(cand)));
             }
             // Only resolved leaf links may schedule a task before the anchor.
@@ -654,6 +695,25 @@ impl<'a> Scheduler<'a> {
             let mut held_milestone: Option<i64> = None;
             if linked_start.is_some() {
                 linked_tasks.insert(t.uid);
+            }
+            // A task with recorded progress stays on its actuals, and only its
+            // remaining work is scheduled, from its resume instant. As for a
+            // manual task, links and constraints never move it, and its slack
+            // shows a violated link (see the results below).
+            if let Some(tracked) = t.tracked() {
+                let (s_abs, resume, f_abs) = tracked_span(tl, tracked);
+                driven_es.insert(t.uid, tl.to_index(start_link.unwrap_or(s_abs)));
+                if let Some(finish) = finish_link {
+                    driven_ef.insert(t.uid, finish);
+                }
+                if let Some(resume) = resume {
+                    resume_idx.insert(t.uid, tl.to_index(resume));
+                }
+                es.insert(t.uid, tl.to_index(s_abs));
+                ef.insert(t.uid, tl.to_index(f_abs));
+                es_abs.insert(t.uid, s_abs);
+                ef_abs.insert(t.uid, f_abs);
+                continue;
             }
             // A manual task stays where the user put it: links and constraints
             // never move it. Its start is kept unsnapped, as Project keeps it.
@@ -802,9 +862,11 @@ impl<'a> Scheduler<'a> {
         for &i in order.iter().rev() {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
-            // A manual task's working span comes from its pinned dates, which
-            // need not match its duration, and its constraints are ignored.
-            let pinned = t.pinned_dates().is_some();
+            // A manual or tracked task's working span comes from its fixed
+            // dates, which need not match its duration (a tracked one's
+            // includes its Stop..Resume gap), and its constraints and deadline
+            // are ignored.
+            let pinned = fixed(t);
             let span = if pinned {
                 ef[&t.uid] - es[&t.uid]
             } else {
@@ -1032,11 +1094,25 @@ impl<'a> Scheduler<'a> {
             };
             // A manual task pinned before its link-driven start violates the
             // link: report at least that gap as negative slack, even off the
-            // critical path.
-            if t.pinned_dates().is_some() && driven > early {
+            // critical path. So does a tracked task, by the most that a start
+            // link overruns its start (an in-progress task's resume: only its
+            // remaining work can violate it) or a finish link its finish.
+            let tracked = t.tracked();
+            if tracked.is_some() {
+                let from = resume_idx.get(&t.uid).copied().unwrap_or(early);
+                let finish_overrun = driven_ef.get(&t.uid).map_or(0, |&f| f - tl.to_index(e_f));
+                let overrun = (driven - from).max(finish_overrun).max(0);
+                total = tl.to_index(l_s) - early - overrun;
+                if overrun > 0 {
+                    total = total.min(-overrun);
+                }
+            } else if t.pinned_dates().is_some() && driven > early {
                 total = total.min(early - driven);
             }
-            let free = self.free_slack(t, tl, &es_abs, &succs);
+            // A tracked task finishes where its actuals put it, not at its
+            // start plus its duration.
+            let finish = tracked.map(|_| tl.to_index(e_f));
+            let free = self.free_slack(t, tl, &es_abs, finish, &succs);
             results.insert(
                 t.uid,
                 TaskResult {
@@ -1049,7 +1125,8 @@ impl<'a> Scheduler<'a> {
                     free_slack_min: free.unwrap_or(total).max(0),
                     start_slack_min: total,
                     finish_slack_min: total + span_gap,
-                    critical: total <= 0,
+                    // A complete task is never critical (Project 2024).
+                    critical: total <= 0 && !matches!(tracked, Some(Tracked::Complete { .. })),
                 },
             );
         }
@@ -1190,15 +1267,17 @@ impl<'a> Scheduler<'a> {
 
     /// Free slack: for finish-to-start successors, how long this task can slip
     /// before the earliest successor must move. `None` ⇒ fall back to total.
+    /// `finish`, when given, replaces the finish index `start + duration`.
     fn free_slack(
         &self,
         t: &Task,
         tl: &Timeline,
         es_abs: &HashMap<i32, i64>,
+        finish: Option<i64>,
         succs: &HashMap<i32, Vec<(i32, LinkType, Offset)>>,
     ) -> Option<i64> {
         let list = succs.get(&t.uid)?;
-        let ef_idx = tl.to_index(es_abs[&t.uid]) + t.duration_min;
+        let ef_idx = finish.unwrap_or_else(|| tl.to_index(es_abs[&t.uid]) + t.duration_min);
         let mut min_gap: Option<i64> = None;
         for &(suid, link, offset) in list {
             if link != LinkType::FinishStart {
@@ -1253,6 +1332,64 @@ fn capped_milestone(tl: &Timeline, milestone: i64, bound_instant: i64) -> i64 {
         milestone.min(bound_instant)
     } else {
         milestone
+    }
+}
+
+/// A leaf that links and constraints never move: a pinned manual task, or a
+/// task with recorded progress.
+fn fixed(t: &Task) -> bool {
+    t.pinned_dates().is_some() || t.tracked().is_some()
+}
+
+/// Where a fixed task starts: its actual start, else its pinned start.
+fn fixed_start(t: &Task) -> Option<DateTime> {
+    match t.tracked() {
+        Some(Tracked::Complete { start, .. } | Tracked::InProgress { start, .. }) => Some(start),
+        None => t.pinned_dates().map(|(start, _)| start),
+    }
+}
+
+/// A tracked task's start and finish on `tl`, and for an in-progress task the
+/// instant its remaining work resumes. Actual dates are instants that
+/// happened, kept unsnapped; the resume is snapped as a start. The completed
+/// part ends at `Stop`, else `ActualDuration` after the start. The remaining
+/// work resumes at `Resume` unless that precedes the completed part's end, and
+/// then at that end. Dates outside the timeline are clamped into it and out of
+/// order ones are ordered, so the finish never precedes the start.
+fn tracked_span(tl: &Timeline, tracked: Tracked) -> (i64, Option<i64>, i64) {
+    match tracked {
+        Tracked::Complete { start, finish } => {
+            let s_abs = tl.clamp(start.minutes());
+            (s_abs, None, tl.clamp(finish.minutes()).max(s_abs))
+        }
+        Tracked::InProgress {
+            start,
+            stop,
+            resume,
+            actual_min,
+            remaining_min,
+        } => {
+            // Leave room for the remaining work after a start beyond the
+            // timeline, as for a pinned task.
+            let latest = tl.abs_start((tl.total - remaining_min).max(0));
+            let s_abs = tl.clamp(start.minutes()).min(latest);
+            let done = match (stop, actual_min) {
+                (Some(stop), _) => tl.clamp(stop.minutes()).max(s_abs),
+                (None, Some(actual)) => tl.abs_finish(tl.to_index(s_abs) + actual).max(s_abs),
+                (None, None) => s_abs,
+            };
+            let resume = resume
+                .map(|r| tl.clamp(r.minutes()))
+                .filter(|&r| r >= done)
+                .unwrap_or(done);
+            let resume = tl.snap(resume).max(s_abs);
+            let f_abs = if remaining_min == 0 {
+                done
+            } else {
+                tl.abs_finish(tl.to_index(resume) + remaining_min)
+            };
+            (s_abs, Some(resume), f_abs.max(s_abs))
+        }
     }
 }
 
@@ -2086,11 +2223,13 @@ impl Scheduler<'_> {
         let mut moved_start = std::collections::HashSet::new();
         let mut moved_finish = std::collections::HashSet::new();
 
-        // Manual tasks never move, so book them before placing anything else:
-        // auto tasks earlier in topological order must level around them.
+        // Manual and tracked tasks never move, so book them before placing
+        // anything else: auto tasks earlier in topological order must level
+        // around them. An in-progress task is booked through its Stop..Resume
+        // gap too.
         for &i in &order {
             let t = &self.proj.tasks[i];
-            if t.pinned_dates().is_none() {
+            if !fixed(t) {
                 continue;
             }
             let cpm = base.get(t.uid).expect("leaf scheduled");
@@ -2103,8 +2242,8 @@ impl Scheduler<'_> {
         for &i in &order {
             let t = &self.proj.tasks[i];
             let cpm = base.get(t.uid).expect("leaf scheduled");
-            // A manual task keeps its pinned dates and passes no delay on.
-            if t.pinned_dates().is_some() {
+            // A manual or tracked task keeps its dates and passes no delay on.
+            if fixed(t) {
                 delay.insert(t.uid, 0);
                 start.insert(t.uid, cpm.early_start);
                 finish.insert(t.uid, cpm.early_finish);
@@ -6503,5 +6642,436 @@ mod tests {
         assert_eq!(lv.rolled_up(1), Some((at(9, 8), at(12, 17))));
         assert_eq!(schedule(&proj).rolled_up(1), Some((at(9, 8), at(10, 17))));
         assert_eq!(lv.project_finish, at(12, 17));
+    }
+
+    // ---- tracked tasks (#179) ----
+
+    /// A complete task: started at `start`, finished at `finish`.
+    fn complete(uid: i32, name: &str, duration: i64, start: DateTime, finish: DateTime) -> Task {
+        Task {
+            actual_start: Some(start),
+            actual_finish: Some(finish),
+            ..task(uid, name, duration)
+        }
+    }
+
+    /// An in-progress task started at `start`.
+    fn in_progress(
+        uid: i32,
+        name: &str,
+        duration: i64,
+        start: DateTime,
+        stop_resume: (Option<DateTime>, Option<DateTime>),
+        actual: Option<i64>,
+    ) -> Task {
+        Task {
+            actual_start: Some(start),
+            stop: stop_resume.0,
+            resume: stop_resume.1,
+            actual_duration_min: actual,
+            ..task(uid, name, duration)
+        }
+    }
+
+    fn span(s: &Schedule, uid: i32) -> (DateTime, DateTime) {
+        let r = s.get(uid).unwrap();
+        (r.early_start, r.early_finish)
+    }
+
+    #[test]
+    fn complete_task_stays_on_its_actuals_whatever_links_and_constraints_say() {
+        // P runs Mon 2 to Wed 4; C started Tue 3, before P finished, with a
+        // duration and an MSO its actuals no longer match.
+        let mut c = complete(2, "C", 480, at(3, 8), at(4, 17));
+        c.predecessors.push(fs(1));
+        c.constraint = ConstraintType::MustStartOn;
+        c.constraint_date = Some(at(16, 8));
+        let s = schedule(&march2(vec![task(1, "P", 1440), c]));
+        assert_eq!(span(&s, 2), (at(3, 8), at(4, 17)));
+        // The link wanted Thu 5: two days of negative slack, never critical.
+        let c = s.get(2).unwrap();
+        assert_eq!(c.total_slack_min, -960);
+        assert!(!c.critical);
+        // Deliberate, not verified in Project: C's actual start bounds P's
+        // late finish, so P shows the violation too.
+        let p = s.get(1).unwrap();
+        assert_eq!(p.late_finish, at(2, 17));
+        assert_eq!(p.total_slack_min, -960);
+        assert!(p.critical);
+    }
+
+    /// Project 2024's `25-progress` plan and results (spec corpus/paired).
+    #[test]
+    fn tracked_plan_matches_project_2024() {
+        let done = complete(1, "Done", 960, at(2, 8), at(3, 17));
+        let mut half = in_progress(
+            2,
+            "Half",
+            1920,
+            at(4, 8),
+            (Some(at(5, 17)), Some(at(6, 8))),
+            Some(960),
+        );
+        half.remaining_duration_min = Some(960);
+        half.predecessors.push(fs(1));
+        let s = schedule(&march2(vec![done, half]));
+        assert_eq!(span(&s, 1), (at(2, 8), at(3, 17)));
+        assert_eq!(span(&s, 2), (at(4, 8), at(9, 17)));
+        for (uid, critical) in [(1, false), (2, true)] {
+            let r = s.get(uid).unwrap();
+            assert_eq!(
+                (r.total_slack_min, r.free_slack_min, r.critical),
+                (0, 0, critical),
+                "task {uid}"
+            );
+        }
+        assert_eq!(s.project_finish, at(9, 17));
+    }
+
+    #[test]
+    fn in_progress_task_schedules_its_remaining_work_from_its_resume() {
+        let cases = [
+            // Stop == Resume at the evening, as Project 2021 writes it.
+            (
+                "contiguous",
+                in_progress(
+                    1,
+                    "T",
+                    2400,
+                    at(2, 8),
+                    (Some(at(3, 17)), Some(at(3, 17))),
+                    Some(960),
+                ),
+                at(6, 17),
+            ),
+            // Stopped Tue 3, resumed Thu 5: 3 days left run Thu, Fri, Mon.
+            (
+                "split",
+                in_progress(
+                    1,
+                    "T",
+                    2400,
+                    at(2, 8),
+                    (Some(at(3, 17)), Some(at(5, 8))),
+                    Some(960),
+                ),
+                at(9, 17),
+            ),
+            (
+                "actual duration only",
+                in_progress(1, "T", 2400, at(2, 8), (None, None), Some(960)),
+                at(6, 17),
+            ),
+            (
+                "nothing left",
+                in_progress(
+                    1,
+                    "T",
+                    960,
+                    at(2, 8),
+                    (Some(at(3, 17)), Some(at(3, 17))),
+                    Some(960),
+                ),
+                at(3, 17),
+            ),
+            (
+                "resume, no actual duration",
+                in_progress(1, "T", 480, at(2, 8), (None, Some(at(4, 8))), None),
+                at(4, 17),
+            ),
+        ];
+        for (case, t, finish) in cases {
+            let s = schedule(&march2(vec![t]));
+            assert_eq!(span(&s, 1), (at(2, 8), finish), "{case}");
+        }
+        // Without an ActualDuration, the stored RemainingDuration is left.
+        let mut t = in_progress(1, "T", 2400, at(2, 8), (None, None), None);
+        t.remaining_duration_min = Some(960);
+        assert_eq!(span(&schedule(&march2(vec![t])), 1), (at(2, 8), at(3, 17)));
+        // Nothing left after a Stop in nonworking time: it finishes there.
+        let t = in_progress(1, "T", 960, at(6, 8), (Some(at(7, 10)), None), Some(960));
+        assert_eq!(span(&schedule(&march2(vec![t])), 1), (at(6, 8), at(7, 10)));
+        // More actual than planned duration leaves nothing, not negative work.
+        let t = in_progress(
+            1,
+            "T",
+            960,
+            at(2, 8),
+            (Some(at(3, 17)), Some(at(3, 17))),
+            Some(1200),
+        );
+        assert_eq!(span(&schedule(&march2(vec![t])), 1), (at(2, 8), at(3, 17)));
+        // Actual dates are instants that happened: weekend work stays put.
+        let t = complete(1, "T", 480, at(7, 10), at(7, 12));
+        let s = schedule(&march2(vec![t]));
+        assert_eq!(span(&s, 1), (at(7, 10), at(7, 12)));
+    }
+
+    #[test]
+    fn in_progress_task_violates_a_link_only_with_its_remaining_work() {
+        // T worked Wed 4, stopped, and resumes Mon 9.
+        let t = || {
+            let mut t = in_progress(
+                2,
+                "T",
+                960,
+                at(4, 8),
+                (Some(at(4, 17)), Some(at(9, 8))),
+                Some(480),
+            );
+            t.predecessors.push(fs(1));
+            t
+        };
+        // P finishes Thu 5, before T resumes: no violation on T.
+        let s = schedule(&march2(vec![task(1, "P", 1920), t()]));
+        assert_eq!(span(&s, 2), (at(4, 8), at(9, 17)));
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+        assert!(s.get(2).unwrap().critical);
+        // P's late finish is still bounded by T's actual start, as for a
+        // complete successor (and for Project's `25-progress`).
+        assert_eq!(s.get(1).unwrap().total_slack_min, -960);
+        // P finishes Tue 10, two days after T resumed: T shows the overrun.
+        let s = schedule(&march2(vec![task(1, "P", 3360), t()]));
+        assert_eq!(span(&s, 2), (at(4, 8), at(9, 17)));
+        assert_eq!(s.get(2).unwrap().total_slack_min, -960);
+        assert!(s.get(2).unwrap().critical);
+    }
+
+    /// A finish link bounds a tracked task's finish, where its actuals and
+    /// remaining work put it, not a start derived from its whole duration.
+    #[test]
+    fn tracked_task_violates_a_finish_link_by_its_own_finish() {
+        let link = |uid, link| Predecessor { link, ..fs(uid) };
+        // T (5 days) did 3 by Wed 4 and finishes Fri 6; A (planned 5 days)
+        // was done on Mon 2.
+        let t = in_progress(
+            2,
+            "T",
+            2400,
+            at(2, 8),
+            (Some(at(4, 17)), Some(at(4, 17))),
+            Some(1440),
+        );
+        let a = complete(2, "A", 2400, at(2, 8), at(2, 17));
+        // P runs Mon 2 to Tue 10 (FF); P runs Wed 11 after Q (SF).
+        let ff = || vec![task(1, "P", 3360)];
+        let sf = || {
+            let mut p = task(1, "P", 480);
+            p.predecessors.push(fs(3));
+            vec![p, task(3, "Q", 3360)]
+        };
+        let cases = [
+            (
+                "in progress, FF",
+                t.clone(),
+                LinkType::FinishFinish,
+                ff(),
+                -960,
+            ),
+            (
+                "in progress, SF",
+                t.clone(),
+                LinkType::StartFinish,
+                sf(),
+                -960,
+            ),
+            (
+                "complete, FF",
+                a.clone(),
+                LinkType::FinishFinish,
+                ff(),
+                -2880,
+            ),
+            ("complete, SF", a, LinkType::StartFinish, sf(), -2880),
+        ];
+        for (case, mut tracked, kind, mut tasks, slack) in cases {
+            tracked.predecessors.push(link(1, kind));
+            let complete = tracked.actual_finish.is_some();
+            let dates = (tracked.actual_start.unwrap(), tracked.actual_finish);
+            tasks.push(tracked);
+            let s = schedule(&march2(tasks));
+            let r = s.get(2).unwrap();
+            assert_eq!(r.early_start, dates.0, "{case}");
+            if let Some(finish) = dates.1 {
+                assert_eq!(r.early_finish, finish, "{case}");
+            }
+            assert_eq!(r.total_slack_min, slack, "{case}");
+            assert_eq!(r.critical, !complete, "{case}");
+        }
+        // A finish link it meets leaves its slack alone.
+        let mut ok = t;
+        ok.predecessors.push(link(1, LinkType::FinishFinish));
+        let s = schedule(&march2(vec![task(1, "P", 1440), ok]));
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+        // So does one met by an actual span longer than the duration: a
+        // finish link never derives a start from the duration.
+        let mut long = complete(2, "A", 480, at(2, 8), at(6, 17));
+        long.predecessors.push(link(1, LinkType::FinishFinish));
+        let s = schedule(&march2(vec![task(1, "P", 2400), long]));
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn successors_follow_a_tracked_finish() {
+        for (finish, successor_start) in [(at(4, 17), at(5, 8)), (at(2, 17), at(3, 8))] {
+            let mut succ = task(2, "S", 480);
+            succ.predecessors.push(fs(1));
+            let a = complete(1, "A", 960, at(2, 8), finish);
+            let s = schedule(&march2(vec![a, succ]));
+            assert_eq!(
+                span(&s, 2),
+                (successor_start, successor_start.add_minutes(540))
+            );
+        }
+    }
+
+    #[test]
+    fn tracked_late_window_keeps_its_span_and_ignores_constraints_and_deadlines() {
+        // T works Mon 2 to Tue 3; a deadline and an FNLT on Mon 2 noon no
+        // longer bind it. L sets the project finish on Fri 6.
+        let mut t = in_progress(1, "T", 960, at(2, 8), (None, None), Some(480));
+        t.deadline = Some(at(2, 12));
+        t.constraint = ConstraintType::FinishNoLaterThan;
+        t.constraint_date = Some(at(2, 12));
+        let s = schedule(&march2(vec![t, task(2, "L", 2400)]));
+        assert_eq!(span(&s, 1), (at(2, 8), at(3, 17)));
+        assert_eq!(s.get(1).unwrap().total_slack_min, 1440);
+        // A split task's late window spans its gap too: T (Wed 4, then Mon 9)
+        // must finish by Tue 10, so its late start is Thu 5.
+        let t = in_progress(
+            1,
+            "T",
+            960,
+            at(4, 8),
+            (Some(at(4, 17)), Some(at(9, 8))),
+            Some(480),
+        );
+        let s = schedule(&march2(vec![t, task(2, "L", 3360)]));
+        let r = s.get(1).unwrap();
+        assert_eq!((r.late_start, r.late_finish), (at(5, 8), at(10, 17)));
+        assert_eq!(r.total_slack_min, 480);
+    }
+
+    #[test]
+    fn tracked_free_slack_counts_from_its_actual_finish() {
+        // A was planned for 5 days but finished Mon 2; S waits for Q (Wed 4).
+        let a = complete(1, "A", 2400, at(2, 8), at(2, 17));
+        let mut s_task = task(3, "S", 480);
+        s_task.predecessors = vec![fs(1), fs(2)];
+        let s = schedule(&march2(vec![a, task(2, "Q", 1440), s_task]));
+        assert_eq!(s.get(1).unwrap().free_slack_min, 960);
+    }
+
+    #[test]
+    fn leveling_never_moves_a_tracked_task() {
+        // X comes first and would take Alice first; T has already started.
+        let t = in_progress(2, "T", 960, at(2, 8), (None, None), None);
+        let proj = Project {
+            resources: vec![worker(1, "Alice", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+            ..march2(vec![task(1, "X", 960), t])
+        };
+        let lv = level(&proj);
+        assert_eq!(
+            (lv.start(2), lv.finish(2)),
+            (Some(at(2, 8)), Some(at(3, 17)))
+        );
+        assert_eq!(lv.start(1), Some(at(4, 8)));
+    }
+
+    #[test]
+    fn tracked_dates_far_from_the_project_start_lie_on_the_timeline() {
+        let feb = |d, h| DateTime::from_ymd_hm(2026, 2, d, h, 0);
+        let resume = DateTime::from_ymd_hm(2027, 3, 1, 8, 0);
+        let tasks = || {
+            vec![
+                complete(1, "C", 960, feb(23, 8), feb(24, 17)),
+                in_progress(
+                    2,
+                    "I",
+                    960,
+                    feb(25, 8),
+                    (Some(feb(25, 17)), Some(resume)),
+                    Some(480),
+                ),
+            ]
+        };
+        // A week and more before the project start, and a year after it.
+        let s = schedule(&march2(tasks()));
+        assert_eq!(span(&s, 1), (feb(23, 8), feb(24, 17)));
+        assert_eq!(span(&s, 2), (feb(25, 8), resume.add_minutes(540)));
+        assert_eq!(s.project_finish, resume.add_minutes(540));
+        // Without a project start, the earliest actual start anchors it.
+        let s = schedule(&Project {
+            tasks: tasks(),
+            ..Project::default()
+        });
+        assert_eq!(s.project_start, feb(23, 8));
+        assert_eq!(span(&s, 1), (feb(23, 8), feb(24, 17)));
+    }
+
+    #[test]
+    fn summary_rolls_up_tracked_dates() {
+        let mut sum = task(1, "Phase", 0);
+        sum.summary = true;
+        let mut a = complete(2, "A", 480, at(3, 8), at(4, 17));
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        b.predecessors = vec![fs(2)];
+        let s = schedule(&march2(vec![sum, a, b]));
+        assert_eq!(span(&s, 1), (at(3, 8), at(5, 17)));
+    }
+
+    #[test]
+    fn odd_progress_never_panics_nor_finishes_before_it_starts() {
+        let manual_tracked = Task {
+            actual_start: Some(at(2, 8)),
+            actual_finish: Some(at(2, 17)),
+            ..manual(1, "M", 480, at(9, 8))
+        };
+        let cases = [
+            // An ActualFinish without an ActualStart is ignored.
+            (
+                "finish alone",
+                Task {
+                    actual_finish: Some(at(10, 17)),
+                    ..task(1, "T", 480)
+                },
+                (at(2, 8), at(2, 17)),
+            ),
+            (
+                "finish before start",
+                complete(1, "T", 480, at(4, 8), at(3, 17)),
+                (at(4, 8), at(4, 8)),
+            ),
+            // A Resume before the completed part's end resumes there.
+            (
+                "resume before start",
+                in_progress(1, "T", 960, at(4, 8), (None, Some(at(2, 8))), Some(480)),
+                (at(4, 8), at(5, 17)),
+            ),
+            (
+                "stop before start",
+                in_progress(1, "T", 480, at(4, 8), (Some(at(2, 17)), None), None),
+                (at(4, 8), at(4, 17)),
+            ),
+            (
+                "complete milestone",
+                complete(1, "T", 0, at(4, 12), at(4, 12)),
+                (at(4, 12), at(4, 12)),
+            ),
+            (
+                "in-progress milestone",
+                in_progress(1, "T", 0, at(4, 10), (None, None), None),
+                (at(4, 10), at(4, 10)),
+            ),
+            // Actuals beat a manual task's pinned dates.
+            ("manual", manual_tracked, (at(2, 8), at(2, 17))),
+        ];
+        for (case, t, expected) in cases {
+            let s = schedule(&march2(vec![t]));
+            assert_eq!(span(&s, 1), expected, "{case}");
+        }
     }
 }

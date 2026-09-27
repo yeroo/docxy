@@ -354,10 +354,11 @@ pub struct Task {
     pub cost: Option<Rate>,
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
-    // computes nor reconciles it: the scheduler ignores it and edits leave it
-    // as read, except that `remaining_work_min` and `remaining_cost` move with
-    // the task's assignments as `work_min` and `cost` do. Durations and work
-    // are whole minutes, rounded from the source.
+    // computes nor reconciles it: edits leave it as read, except that
+    // `remaining_work_min` and `remaining_cost` move with the task's
+    // assignments as `work_min` and `cost` do. The scheduler reads a leaf's
+    // actual dates, `Stop`/`Resume` and durations through [`Task::tracked`].
+    // Durations and work are whole minutes, rounded from the source.
     /// Percents, 0..=100.
     pub percent_complete: Option<u8>,
     pub percent_work_complete: Option<u8>,
@@ -422,6 +423,37 @@ impl Task {
         Some((start, self.manual_finish))
     }
 
+    /// The recorded progress a leaf is scheduled from: `None` for summaries,
+    /// blank rows and a task without an `ActualStart` (an `ActualFinish` alone
+    /// is ignored). With an `ActualFinish` the task is complete. Otherwise it
+    /// is in progress, and its remaining duration is `duration_min` less its
+    /// `ActualDuration` when that is known, so an edit to the duration moves
+    /// the finish; else the stored `RemainingDuration`, else the whole
+    /// duration. The dates are as read: the scheduler orders and clamps them.
+    pub fn tracked(&self) -> Option<Tracked> {
+        if self.summary || self.is_null {
+            return None;
+        }
+        let start = self.actual_start?;
+        Some(match self.actual_finish {
+            Some(finish) => Tracked::Complete { start, finish },
+            None => {
+                let actual_min = self.actual_duration_min.map(|d| d.max(0));
+                let remaining_min = match actual_min {
+                    Some(actual) => self.duration_min - actual,
+                    None => self.remaining_duration_min.unwrap_or(self.duration_min),
+                };
+                Tracked::InProgress {
+                    start,
+                    stop: self.stop,
+                    resume: self.resume,
+                    actual_min,
+                    remaining_min: remaining_min.max(0),
+                }
+            }
+        })
+    }
+
     pub fn is_active(&self) -> bool {
         self.active.unwrap_or(true)
     }
@@ -439,6 +471,23 @@ impl Task {
     pub fn misses_deadline(&self, finish: DateTime) -> bool {
         !self.is_null && self.deadline.is_some_and(|deadline| finish > deadline)
     }
+}
+
+/// A leaf's recorded progress, see [`Task::tracked`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tracked {
+    /// Started and finished: it stays on its actual dates.
+    Complete { start: DateTime, finish: DateTime },
+    /// Started, not finished: the completed part ends at `stop` (else
+    /// `actual_min` working minutes after `start`) and `remaining_min`
+    /// working minutes are left from `resume`.
+    InProgress {
+        start: DateTime,
+        stop: Option<DateTime>,
+        resume: Option<DateTime>,
+        actual_min: Option<i64>,
+        remaining_min: i64,
+    },
 }
 
 /// Resource kind. MSPDI encodes Cost using Type 0 plus IsCostResource.

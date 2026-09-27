@@ -14,8 +14,8 @@
 //! Blank rows carry no oracle. File 21's oracle (issue #100) was entered by
 //! hand from the issue's Project 2024 capture; the file was not run through
 //! `verify_mspdi_project.py`. File 22
-//! (issue #81) carries progress values of our own and is not verified in
-//! Project either, nor is file 23's derived calendar (issue #83), nor are
+//! (issue #81) carries progress values of our own, which the scheduler reads
+//! (issue #179), and is not verified in Project either, nor is file 23's derived calendar (issue #83), nor are
 //! file 13's resource and assignment fields of issue #84, chosen to leave its
 //! schedule unchanged. Files 24 and 25 (calendar exceptions, issue #126) were
 //! checked against Project 2024 by `verify_mspdi_project.py`, both as
@@ -661,6 +661,43 @@ fn progress_fixture_keeps_actuals_through_a_save() {
             "{element}"
         );
     }
+}
+
+/// Work already done stays where it happened (#179): moving the project
+/// start a week later moves neither the complete Excavate nor the in-progress
+/// Pour, and Cure still follows Pour's remaining work. A longer Pour moves
+/// only its remaining work, and Cure with it.
+#[test]
+fn progress_fixture_schedules_from_its_actuals() {
+    use projcore::DateTime;
+    let xml = std::fs::read_to_string(corpus_dir().join("22-progress.xml")).unwrap();
+    let mut proj = read_mspdi(&xml).unwrap();
+    proj.start_date = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+    let dates = |proj: &projcore::model::Project| {
+        let sched = schedule(proj);
+        [1, 2, 3].map(|uid| {
+            let r = sched.get(uid).unwrap();
+            (r.early_start.to_mspdi(), r.early_finish.to_mspdi())
+        })
+    };
+    let d = |s: &str, f: &str| (s.to_string(), f.to_string());
+    assert_eq!(
+        dates(&proj),
+        [
+            d("2026-03-02T08:00:00", "2026-03-03T17:00:00"),
+            d("2026-03-04T08:00:00", "2026-03-09T17:00:00"),
+            d("2026-03-10T08:00:00", "2026-03-10T17:00:00"),
+        ]
+    );
+    proj.tasks[1].duration_min += 480;
+    assert_eq!(
+        dates(&proj),
+        [
+            d("2026-03-02T08:00:00", "2026-03-03T17:00:00"),
+            d("2026-03-04T08:00:00", "2026-03-10T17:00:00"),
+            d("2026-03-11T08:00:00", "2026-03-11T17:00:00"),
+        ]
+    );
 }
 
 #[test]

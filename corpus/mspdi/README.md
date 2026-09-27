@@ -93,8 +93,11 @@ File 22 keeps recorded progress
 ([issue #81](https://github.com/yeroo/docxy/issues/81)): percent complete,
 actuals, `Stop`/`Resume`, remaining values and variances on tasks and
 assignments, and assignment baselines. Its shapes follow a Project 2024
-tracked plan, and its actual dates equal the scheduled ones, so the oracle
-holds while the scheduler ignores progress. It is **not** verified against
+tracked plan. The scheduler schedules its tracked tasks from their actuals
+(issue [#179](https://github.com/yeroo/docxy/issues/179)), and those equal
+the dates its links give, so the oracle is the untracked schedule except that
+the complete task is not critical, as in the paired Project 2024
+`25-progress` file. It is **not** verified against
 Project 2024, and no Project file with an assignment `<Baseline>` was
 available: that shape follows Microsoft's schema.
 File 23 keeps a derived calendar derived
@@ -173,7 +176,7 @@ Project's warning have no MSPDI field; projcore's unit tests check them.
 | `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
 | `20-task-fields` | stored task fields, custom fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`, as do task custom field values and the custom field definitions (a lookup table and a formula, #268); the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
 | `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
-| `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx` |
+| `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx`; the scheduler keeps the tracked tasks on their actuals, and the complete one is not critical |
 | `23-derived-calendar` | derived calendar | `BaseCalendarUID`, `IsBaselineCalendar` and only the calendar's own weekday survive MSPDI and `.yppx`; a task on it inherits Standard's week, skips its own Friday off and finishes Mon 9 |
 | `24-calendar-holiday` | calendar exceptions | a holiday inside a task pushes its finish out a day; a working Saturday with changed hours carries the next task; both exceptions survive MSPDI and `.yppx` in both forms |
 | `25-derived-calendar-holiday` | exceptions on a derived calendar | the base's holiday beats a weekday the derived calendar states; the derived calendar's own exception beats the base's holiday |

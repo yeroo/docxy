@@ -682,8 +682,10 @@ def build():
     # task, each with an assignment carrying its actuals; the in-progress
     # assignment also has two baseline slots. Shapes follow a Project 2024
     # tracked plan (Stop == Resume == finish once complete, Resume at the next
-    # working moment after Stop). The actual dates equal the scheduled ones, so
-    # the oracle holds while the scheduler ignores progress. Hand-derived like
+    # working moment after Stop). The scheduler schedules the tracked tasks
+    # from their actuals (#179), and those equal the dates the links give, so
+    # the oracle is the untracked one except that the complete task is not
+    # critical, as in Project 2024's paired 25-progress. Hand-derived like
     # files 19 and 20, not verified in Project; no Project file with an
     # assignment <Baseline> was available, so that shape follows the schema.
     progress_res = ("    <Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>"
@@ -730,7 +732,8 @@ def build():
         "Percent complete, actuals, stop/resume, remaining values, variances and "
         "assignment baselines survive saves.",
         project("progress", "\n".join([
-            task(1, "Excavate", 2 * D, dt(2), dt(3, "17:00:00"), **CRIT, fields=[
+            task(1, "Excavate", 2 * D, dt(2), dt(3, "17:00:00"), slack=0, critical=False,
+                 fields=[
                 ("Stop", dt(3, "17:00:00")), ("Resume", dt(3, "17:00:00")),
                 ("StartVariance", 0), ("FinishVariance", 0), ("WorkVariance", "0.0"),
                 ("PercentComplete", 100), ("PercentWorkComplete", 100),
