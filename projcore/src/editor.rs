@@ -937,6 +937,41 @@ impl Editor {
         Ok(links)
     }
 
+    /// Set a task and, for a summary, its descendants active or inactive as
+    /// one undoable edit. Blank rows inside the outline are left untouched.
+    pub fn set_active(&mut self, uid: i32, active: bool) -> Result<usize, String> {
+        let i = self.index(uid)?;
+        let task = &self.proj.tasks[i];
+        if task.is_null {
+            return Err("A blank row cannot be inactivated".into());
+        }
+        if active {
+            let mut level = task.outline_level;
+            for ancestor in self.proj.tasks[..i].iter().rev().filter(|t| !t.is_null) {
+                if ancestor.outline_level < level {
+                    if !ancestor.is_active() {
+                        return Err("Its summary task is inactive".into());
+                    }
+                    level = ancestor.outline_level;
+                }
+            }
+        }
+        let end = subtree_end(&self.proj, i);
+        let changed: Vec<usize> = (i..end)
+            .filter(|&j| !self.proj.tasks[j].is_null && self.proj.tasks[j].is_active() != active)
+            .collect();
+        if changed.is_empty() {
+            return Ok(0);
+        }
+        let count = changed.len();
+        self.edit_structure(|proj| {
+            for j in changed {
+                proj.tasks[j].active = Some(active);
+            }
+        })?;
+        Ok(count)
+    }
+
     pub fn set_constraint(&mut self, uid: i32, text: &str) -> Result<(), String> {
         let (constraint, constraint_date) = parse_constraint(text)?;
         self.set_constraint_typed(uid, constraint, constraint_date)
@@ -2509,6 +2544,92 @@ mod tests {
                 .collect(),
             ..Project::default()
         })
+    }
+
+    #[test]
+    fn inactivate_summary_skips_blank_rows_and_undo_restores_exact_flags() {
+        let base = outline(&[(1, "Summary", 1), (2, "A", 2), (3, "B", 2)]);
+        let mut proj = base.project().clone();
+        let mut blank = Task {
+            uid: 4,
+            id: 4,
+            is_null: true,
+            ..Task::default()
+        };
+        blank.outline_level = 0;
+        proj.tasks.insert(2, blank);
+        let mut ed = Editor::new(proj.clone());
+        assert_eq!(ed.set_active(1, false).unwrap(), 3);
+        assert_eq!(ed.undo_depth(), 1);
+        assert_eq!(ed.project().tasks[2].active, None);
+        assert!(ed.dirty());
+        assert_eq!(ed.set_active(1, false).unwrap(), 0);
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.undo());
+        assert_eq!(ed.project(), &proj);
+        assert!(ed.redo());
+        assert_eq!(ed.project().tasks[0].active, Some(false));
+        assert_eq!(ed.set_active(1, true).unwrap(), 3);
+        assert_eq!(ed.project().tasks[2].active, None);
+    }
+
+    #[test]
+    fn activating_an_unset_flag_is_a_clean_noop() {
+        let mut ed = outline(&[(1, "Task", 1)]);
+        assert_eq!(ed.project().tasks[0].active, None);
+        assert_eq!(ed.set_active(1, true).unwrap(), 0);
+        assert_eq!(ed.project().tasks[0].active, None);
+        assert_eq!(ed.undo_depth(), 0);
+        assert!(!ed.dirty());
+    }
+
+    #[test]
+    fn inactivate_refuses_blank_and_activation_beneath_inactive_summary() {
+        let mut proj = outline(&[(1, "Summary", 1), (2, "Child", 2)])
+            .project()
+            .clone();
+        proj.tasks[0].active = Some(false);
+        let mut ed = Editor::new(proj.clone());
+        assert!(ed.set_active(2, true).is_err());
+        assert_eq!(ed.undo_depth(), 0);
+        assert!(!ed.dirty());
+        let blank = Task {
+            uid: 3,
+            id: 3,
+            is_null: true,
+            ..Task::default()
+        };
+        proj.tasks.push(blank);
+        let mut ed = Editor::new(proj);
+        assert!(ed.set_active(3, false).is_err());
+        assert_eq!(ed.undo_depth(), 0);
+    }
+
+    #[test]
+    fn edited_active_flag_round_trips_through_mspdi_and_yppx() {
+        let mut ed = outline(&[(1, "Task", 1)]);
+        assert_eq!(ed.set_active(1, false).unwrap(), 1);
+        let xml = crate::mspdi::write_mspdi(ed.project());
+        assert!(xml.contains("<Active>0</Active>"));
+        assert_eq!(
+            crate::mspdi::read_mspdi(&xml)
+                .unwrap()
+                .task(1)
+                .unwrap()
+                .active,
+            Some(false)
+        );
+        let package = crate::yppx::write_yppx(ed.project());
+        assert_eq!(
+            crate::yppx::read_yppx(&package)
+                .unwrap()
+                .task(1)
+                .unwrap()
+                .active,
+            Some(false)
+        );
+        ed.set_active(1, true).unwrap();
+        assert!(crate::mspdi::write_mspdi(ed.project()).contains("<Active>1</Active>"));
     }
 
     fn names(ed: &Editor) -> Vec<(&str, u32)> {

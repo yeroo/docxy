@@ -2,6 +2,35 @@ use super::*;
 use core::prelude::v1::test;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn inactive_row_decision_inherits_summary_state_and_skips_blanks() {
+    let mut proj = projcore::Project::default();
+    let mut summary = Task {
+        uid: 1,
+        outline_level: 1,
+        active: Some(false),
+        ..Task::default()
+    };
+    summary.summary = true;
+    proj.tasks = vec![
+        summary,
+        Task {
+            uid: 2,
+            is_null: true,
+            ..Task::default()
+        },
+        Task {
+            uid: 3,
+            outline_level: 2,
+            ..Task::default()
+        },
+    ];
+    assert!(inactive_row(&proj, 0));
+    assert!(!inactive_row(&proj, 1));
+    assert!(inactive_row(&proj, 2));
+    assert!(!inactive_row(&proj, 3));
+}
+
 // No runtime environment reads: the suite's config-override test mutates env.
 struct Scratch(PathBuf);
 impl Scratch {

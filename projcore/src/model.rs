@@ -320,8 +320,7 @@ pub struct Task {
     pub create_date: Option<DateTime>,
     pub wbs: Option<String>,
     pub task_type: Option<TaskType>,
-    /// `None` reads as active; see [`Task::is_active`]. The scheduler does not
-    /// yet drop inactive tasks.
+    /// `None` reads as active; see [`Task::is_active`].
     pub active: Option<bool>,
     pub effort_driven: Option<bool>,
     /// Duration shown with `?` in Project.
@@ -1488,6 +1487,27 @@ pub(crate) fn is_outline_summary_in(tasks: &[Task], index: usize) -> bool {
 }
 
 impl Project {
+    /// Whether a non-blank task and all of its outline ancestors are active.
+    /// Blank rows do not participate in the outline.
+    pub fn effectively_active(&self, index: usize) -> bool {
+        let Some(task) = self.tasks.get(index) else {
+            return false;
+        };
+        if task.is_null || !task.is_active() {
+            return false;
+        }
+        let mut level = task.outline_level;
+        for ancestor in self.tasks[..index].iter().rev().filter(|t| !t.is_null) {
+            if ancestor.outline_level < level {
+                if !ancestor.is_active() {
+                    return false;
+                }
+                level = ancestor.outline_level;
+            }
+        }
+        true
+    }
+
     /// The stored text of an unmodeled project option (see [`Project::options`]).
     pub fn option(&self, name: &str) -> Option<&str> {
         self.options

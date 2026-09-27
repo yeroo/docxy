@@ -1817,7 +1817,74 @@ fn manual_summary_floors(proj: &Project, spans: &HashMap<i32, (i64, i64)>) -> Ha
 /// Task UIDs must be unique: results, links and assignments are keyed by UID.
 /// Readers reject duplicates; a code-built project must not contain them.
 pub fn schedule(proj: &Project) -> Schedule {
-    Scheduler::new(&without_blank_rows(proj)).run()
+    let clean = without_blank_rows(proj);
+    let dormant = dormant_uids(&clean);
+    if dormant.is_empty() {
+        return Scheduler::new(&clean).run();
+    }
+    let active = without_tasks(&clean, &dormant);
+    let mut main = Scheduler::new(&active).run();
+    let all_dormant = active.tasks.is_empty();
+    let dormant_view = dormant_view(&clean, &dormant);
+    let other = Scheduler::new(&dormant_view).run();
+    if all_dormant {
+        main.project_start = other.project_start;
+        main.project_finish = other.project_finish;
+    }
+    for uid in &dormant {
+        if let Some(mut result) = other.results.get(uid).cloned() {
+            result.critical = false;
+            main.results.insert(*uid, result);
+        }
+        if let Some(span) = other.rollups.get(uid) {
+            main.rollups.insert(*uid, *span);
+        }
+    }
+    main
+}
+
+/// Inactive tasks and summaries with no active descendants have no effect on
+/// the active schedule. The latter still retain their own dates in pass B.
+fn dormant_uids(proj: &Project) -> std::collections::HashSet<i32> {
+    let mut dormant = std::collections::HashSet::new();
+    for (i, task) in proj.tasks.iter().enumerate() {
+        if !proj.effectively_active(i) {
+            dormant.insert(task.uid);
+        }
+    }
+    for (i, task) in proj.tasks.iter().enumerate().rev() {
+        if !task.summary || dormant.contains(&task.uid) {
+            continue;
+        }
+        let descendants: Vec<&Task> = proj.tasks[i + 1..]
+            .iter()
+            .take_while(|t| t.outline_level > task.outline_level)
+            .collect();
+        if !descendants.is_empty() && descendants.iter().all(|t| dormant.contains(&t.uid)) {
+            dormant.insert(task.uid);
+        }
+    }
+    dormant
+}
+
+fn without_tasks(proj: &Project, removed: &std::collections::HashSet<i32>) -> Project {
+    let mut kept = proj.clone();
+    kept.tasks.retain(|t| !removed.contains(&t.uid));
+    for task in &mut kept.tasks {
+        task.predecessors.retain(|p| !removed.contains(&p.uid));
+    }
+    kept.assignments.retain(|a| !removed.contains(&a.task_uid));
+    kept
+}
+
+fn dormant_view(proj: &Project, dormant: &std::collections::HashSet<i32>) -> Project {
+    let mut view = proj.clone();
+    for task in &mut view.tasks {
+        if !dormant.contains(&task.uid) {
+            task.predecessors.retain(|p| !dormant.contains(&p.uid));
+        }
+    }
+    view
 }
 
 /// The project the scheduler sees: blank rows (`is_null`) removed, with the
@@ -1958,7 +2025,27 @@ impl Leveled {
 /// other. Multi-calendar leveling and task splitting are out of scope.
 /// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
-    Scheduler::new(&without_blank_rows(proj)).level()
+    let clean = without_blank_rows(proj);
+    let dormant = dormant_uids(&clean);
+    if dormant.is_empty() {
+        return Scheduler::new(&clean).level();
+    }
+    let active = without_tasks(&clean, &dormant);
+    let mut main = Scheduler::new(&active).level();
+    let other = Scheduler::new(&dormant_view(&clean, &dormant)).run();
+    if active.tasks.is_empty() {
+        main.project_finish = other.project_finish;
+    }
+    for uid in &dormant {
+        if let Some(result) = other.get(*uid) {
+            main.start.insert(*uid, result.early_start);
+            main.finish.insert(*uid, result.early_finish);
+        }
+        if let Some(span) = other.rolled_up(*uid) {
+            main.rollups.insert(*uid, span);
+        }
+    }
+    main
 }
 
 /// One booking of a resource: `[start, end)` in the default timeline's
@@ -2438,6 +2525,124 @@ impl Scheduler<'_> {
 mod tests {
     use super::*;
     use crate::model::*;
+
+    #[test]
+    fn inactive_links_keep_their_dates_but_do_not_drive_active_successors() {
+        let a = task(1, "A", 480);
+        let mut b = task(2, "B", 960);
+        b.active = Some(false);
+        b.predecessors.push(fs(1));
+        let mut c = task(3, "C", 480);
+        c.predecessors.push(fs(2));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![a, b, c],
+            ..Project::default()
+        };
+        let result = schedule(&proj);
+        assert!(result.get(2).unwrap().early_start > result.get(1).unwrap().early_finish);
+        assert_eq!(
+            result.get(3).unwrap().early_start,
+            result.get(1).unwrap().early_start
+        );
+        assert!(!result.get(2).unwrap().critical);
+        assert_eq!(result.project_finish, result.get(3).unwrap().early_finish);
+        assert!(result.get(3).unwrap().critical);
+    }
+
+    #[test]
+    fn inactive_descendants_leave_active_summary_and_finish_alone() {
+        let mut summary = task(1, "Phase", 0);
+        summary.summary = true;
+        let mut short = task(2, "Short", 480);
+        short.outline_level = 2;
+        let mut long = task(3, "Long", 4800);
+        long.outline_level = 2;
+        long.active = Some(false);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![summary, short, long],
+            ..Project::default()
+        };
+        let result = schedule(&proj);
+        assert_eq!(
+            result.get(1).unwrap().early_finish,
+            result.get(2).unwrap().early_finish
+        );
+        assert_eq!(result.project_finish, result.get(2).unwrap().early_finish);
+        assert!(result.get(3).unwrap().early_finish > result.project_finish);
+    }
+
+    #[test]
+    fn all_dormant_keeps_dates_and_leveling_does_not_book_resources() {
+        let mut inactive = task(1, "Inactive", 2400);
+        inactive.active = Some(false);
+        let all = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![inactive.clone()],
+            ..Project::default()
+        };
+        let sched = schedule(&all);
+        assert_eq!(sched.project_finish, sched.get(1).unwrap().early_finish);
+        assert_eq!(level(&all).finish(1), Some(sched.project_finish));
+
+        let active = task(2, "Active", 480);
+        let mixed = Project {
+            tasks: vec![inactive, active],
+            resources: vec![worker(1, "Crew", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+            ..all
+        };
+        let sched = schedule(&mixed);
+        let leveled = level(&mixed);
+        assert_eq!(sched.project_finish, sched.get(2).unwrap().early_finish);
+        assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
+        assert_eq!(leveled.start(1), Some(sched.get(1).unwrap().early_start));
+    }
+
+    #[test]
+    fn an_inactive_summary_silences_an_active_flagged_child() {
+        let mut summary = task(1, "Phase", 0);
+        summary.summary = true;
+        summary.active = Some(false);
+        let mut child = task(2, "Child", 2400);
+        child.outline_level = 2;
+        let other = task(3, "Other", 480);
+        let proj = Project {
+            tasks: vec![summary, child, other],
+            ..Project::default()
+        };
+        assert!(!proj.effectively_active(1));
+        let sched = schedule(&proj);
+        assert!(!sched.get(2).unwrap().critical);
+        assert_eq!(sched.project_finish, sched.get(3).unwrap().early_finish);
+    }
+
+    #[test]
+    fn active_summary_with_only_dormant_children_retains_its_rollup() {
+        let mut summary = task(1, "Phase", 0);
+        summary.summary = true;
+        let mut child = task(2, "Dormant", 1440);
+        child.outline_level = 2;
+        child.active = Some(false);
+        let active = task(3, "Active", 480);
+        let proj = Project {
+            tasks: vec![summary, child, active],
+            ..Project::default()
+        };
+        assert!(proj.effectively_active(0));
+        let sched = schedule(&proj);
+        assert_eq!(
+            sched.get(1).unwrap().early_finish,
+            sched.get(2).unwrap().early_finish
+        );
+        assert_eq!(
+            sched.rolled_up(1).unwrap().1,
+            sched.get(2).unwrap().early_finish
+        );
+        assert_eq!(sched.project_finish, sched.get(3).unwrap().early_finish);
+        assert!(!sched.get(1).unwrap().critical);
+    }
 
     fn task(uid: i32, name: &str, days_min: i64) -> Task {
         Task {

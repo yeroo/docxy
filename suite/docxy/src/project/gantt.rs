@@ -14,6 +14,7 @@ pub(crate) enum BarKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GanttBar {
     pub kind: BarKind,
+    pub inactive: bool,
     pub start: i64,
     pub end: i64,
     pub baseline: Option<(i64, i64)>,
@@ -39,6 +40,9 @@ impl GanttBar {
         }
         if self.warning {
             state += " warning";
+        }
+        if self.inactive {
+            state += " inactive";
         }
         state
     }
@@ -122,12 +126,19 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
     let start = ed.disp_start(task.uid)?;
     let finish = ed.disp_finish(task.uid)?;
     let day = |dt: projcore::DateTime| dt.day_number() - scale.origin_day;
+    let inactive = ed
+        .project()
+        .tasks
+        .iter()
+        .position(|t| t.uid == task.uid)
+        .is_some_and(|i| !ed.project().effectively_active(i));
     Some(GanttBar {
+        inactive,
         kind: if task.summary {
             BarKind::Summary
         } else if task.is_milestone() {
             BarKind::Milestone
-        } else if result.critical {
+        } else if result.critical && !inactive {
             BarKind::Critical
         } else {
             BarKind::OnTrack
@@ -430,6 +441,66 @@ pub(crate) fn gantt_strip(
     if let Some((s, e)) = bar.baseline {
         strip = strip.child(span(s, e, 22., 4., pal.dim));
     }
+    if bar.inactive {
+        let color = bar_kind_color(bar.kind);
+        if let Some((s, e)) = bar.rollup {
+            strip = strip.child(
+                div()
+                    .absolute()
+                    .left(px(s as f32 * DAY_W))
+                    .top(px(3.))
+                    .w(px((e - s + 1).max(1) as f32 * DAY_W))
+                    .h(px(4.))
+                    .border_1()
+                    .border_color(hsla_u(color)),
+            );
+        }
+        let marker = probe(probes, format!("bar:{id}"));
+        let outline = if bar.kind == BarKind::Milestone {
+            div()
+                .absolute()
+                .left(px(bar.start as f32 * DAY_W + 4.))
+                .top(px(5.))
+                .size(px(14.))
+                .child(
+                    canvas(
+                        |_, _, _| (),
+                        move |b, _, window, _| {
+                            let mut path = PathBuilder::stroke(px(1.));
+                            let x = b.origin.x;
+                            let y = b.origin.y;
+                            path.move_to(point(x + px(7.), y));
+                            path.line_to(point(x + px(14.), y + px(7.)));
+                            path.line_to(point(x + px(7.), y + px(14.)));
+                            path.line_to(point(x, y + px(7.)));
+                            path.close();
+                            if let Ok(path) = path.build() {
+                                window.paint_path(path, rgb(color));
+                            }
+                        },
+                    )
+                    .size_full(),
+                )
+                .child(marker)
+                .into_any_element()
+        } else {
+            div()
+                .absolute()
+                .left(px(bar.start as f32 * DAY_W))
+                .top(px(if bar.kind == BarKind::Summary { 9. } else { 5. }))
+                .w(px((bar.end - bar.start + 1).max(1) as f32 * DAY_W))
+                .h(px(if bar.kind == BarKind::Summary {
+                    10.
+                } else {
+                    14.
+                }))
+                .border_1()
+                .border_color(hsla_u(color))
+                .child(marker)
+                .into_any_element()
+        };
+        return strip.child(outline);
+    }
     // A manual summary's rollup: a thin bar above its own. Its warning marks
     // the part past its finish, else its own finish day (an overrun within
     // that day, or a finish past its manual parent), in the warning colour.
@@ -523,6 +594,15 @@ pub(crate) fn gantt_strip(
             .into_any_element(),
     };
     strip.child(element)
+}
+
+fn bar_kind_color(kind: BarKind) -> u32 {
+    match kind {
+        BarKind::Critical => GANTT_CRIT,
+        BarKind::OnTrack => BRAND,
+        BarKind::Summary => GANTT_SUMMARY,
+        BarKind::Milestone => GANTT_MILESTONE,
+    }
 }
 
 #[cfg(test)]

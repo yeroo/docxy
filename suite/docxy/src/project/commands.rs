@@ -15,6 +15,7 @@ pub(crate) enum ProjectAct {
     Duration,
     AddLink,
     UnlinkTasks,
+    Inactivate,
     ManuallySchedule,
     AutoSchedule,
     MoveTask,
@@ -65,6 +66,7 @@ impl ProjectAct {
         Self::Duration,
         Self::AddLink,
         Self::UnlinkTasks,
+        Self::Inactivate,
         Self::ManuallySchedule,
         Self::AutoSchedule,
         Self::MoveTask,
@@ -105,7 +107,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
             vec![
                 rs::group(
                     "Schedule",
-                    90,
+                    125,
                     vec![
                         rs::column(vec![
                             cmd(
@@ -141,6 +143,14 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "Alt, T, P",
                             "P",
                         )),
+                        rs::column(vec![cmd(
+                            "pr-inactivate",
+                            "strikethrough",
+                            "Inactivate",
+                            Inactivate,
+                            "Alt, T, E",
+                            "E",
+                        )]),
                     ],
                 ),
                 rs::group(
@@ -475,6 +485,12 @@ pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
         ProjectAct::Timeline => v.timeline,
         ProjectAct::CriticalTasks => v.show_critical,
         ProjectAct::BaselineBars => v.show_baseline,
+        ProjectAct::Inactivate => v
+            .selected_uid()
+            .and_then(|uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
+            .is_some_and(|i| {
+                !v.ed.project().tasks[i].is_null && !v.ed.project().effectively_active(i)
+            }),
         // The selected task's mode, as Project highlights it; none on the
         // entry row or a blank row.
         ProjectAct::ManuallySchedule | ProjectAct::AutoSchedule => v
@@ -885,6 +901,31 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                         0 => "No links to remove".into(),
                         1 => "Removed 1 link".into(),
                         n => format!("Removed {n} links"),
+                    });
+                }
+            }
+            Inactivate => {
+                if let Some(uid) = v.selected_uid() {
+                    let task = v.ed.project().task(uid).ok_or("No task selected")?;
+                    let index =
+                        v.ed.project()
+                            .tasks
+                            .iter()
+                            .position(|t| t.uid == uid)
+                            .unwrap();
+                    if task.is_active()
+                        && !v.ed.project().effectively_active(index)
+                        && !task.is_null
+                    {
+                        return Err("Its summary task is inactive".into());
+                    }
+                    let activate = !task.is_active();
+                    let count = v.ed.set_active(uid, activate)?;
+                    status = Some(match (activate, count) {
+                        (true, 1) => "Task activated".into(),
+                        (false, 1) => "Task inactivated".into(),
+                        (true, n) => format!("Activated {n} tasks"),
+                        (false, n) => format!("Inactivated {n} tasks"),
                     });
                 }
             }

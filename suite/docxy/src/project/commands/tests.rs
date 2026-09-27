@@ -259,6 +259,7 @@ fn project_instruction_paths_exist() {
         ("Task", "Schedule", "Outdent Task", Outdent),
         ("Task", "Schedule", "Link the Selected Tasks", AddLink),
         ("Task", "Schedule", "Unlink Tasks", UnlinkTasks),
+        ("Task", "Schedule", "Inactivate", Inactivate),
         ("Task", "Tasks", "Manually Schedule", ManuallySchedule),
         ("Task", "Tasks", "Auto Schedule", AutoSchedule),
         ("Task", "Tasks", "Move", MoveTask),
@@ -308,6 +309,56 @@ fn project_instruction_paths_exist() {
             "{gone:?} is not on Project's ribbon"
         );
     }
+}
+
+#[test]
+fn inactivate_ribbon_toggles_a_summary_and_reports_the_count() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(2, 1).unwrap();
+    vm(&mut t).ed.select(0);
+    apply_project_act(&mut t, ProjectAct::Inactivate);
+    assert_eq!(t.status.as_ref(), "Inactivated 2 tasks");
+    assert!(project_act_active(v(&t), ProjectAct::Inactivate));
+    assert!(
+        v(&t)
+            .ed
+            .project()
+            .tasks
+            .iter()
+            .all(|task| !task.is_active())
+    );
+    apply_project_act(&mut t, ProjectAct::Inactivate);
+    assert_eq!(t.status.as_ref(), "Activated 2 tasks");
+    assert!(!project_act_active(v(&t), ProjectAct::Inactivate));
+}
+
+#[test]
+fn inactivate_refuses_blank_and_inherited_inactivity() {
+    let mut t = tab();
+    vm(&mut t).ed.indent(2, 1).unwrap();
+    vm(&mut t).ed.select(0);
+    apply_project_act(&mut t, ProjectAct::Inactivate);
+    let depth = v(&t).ed.undo_depth();
+    vm(&mut t).ed.select(1);
+    // This project has an inactive child because the summary was toggled.
+    // Restore only the child's own flag through a file-style project.
+    let mut proj = v(&t).ed.project().clone();
+    proj.tasks[1].active = None;
+    t.surface = Surface::Project(ProjectView::new(proj, false));
+    vm(&mut t).ed.select(1);
+    apply_project_act(&mut t, ProjectAct::Inactivate);
+    assert_eq!(t.status.as_ref(), "Its summary task is inactive");
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert!(project_act_active(v(&t), ProjectAct::Inactivate));
+    assert!(depth > 0);
+
+    let blank = v(&t).ed.project().tasks.len();
+    vm(&mut t).ed.insert_blank_row(None).unwrap();
+    vm(&mut t).ed.select(blank);
+    let before = v(&t).ed.undo_depth();
+    apply_project_act(&mut t, ProjectAct::Inactivate);
+    assert!(t.status.contains("blank row"));
+    assert_eq!(v(&t).ed.undo_depth(), before);
 }
 
 #[test]
