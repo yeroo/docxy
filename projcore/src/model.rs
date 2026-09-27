@@ -264,7 +264,7 @@ impl Predecessor {
 }
 
 /// A recorded plan in one MSPDI baseline slot.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Baseline {
     /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
     pub number: u8,
@@ -272,6 +272,10 @@ pub struct Baseline {
     pub finish: Option<DateTime>,
     /// Recorded working minutes; None when Duration was omitted, empty, or invalid.
     pub duration_min: Option<i64>,
+    pub duration_format: Option<u8>,
+    /// Recorded work in whole minutes; None when omitted or invalid.
+    pub work_min: Option<i64>,
+    pub cost: Option<Rate>,
 }
 
 /// A schedulable task (or a summary/milestone).

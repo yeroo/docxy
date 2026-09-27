@@ -1136,19 +1136,22 @@ fn baseline_fixture_records_different_plans_and_missing_duration() {
                 number: 0,
                 start: Some(DateTime::from_ymd_hm(2026, 3, 4, 8, 0)),
                 finish: Some(DateTime::from_ymd_hm(2026, 3, 6, 17, 0)),
-                duration_min: Some(1440)
+                duration_min: Some(1440),
+                ..Baseline::default()
             },
             Baseline {
                 number: 1,
                 start: Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
                 finish: Some(DateTime::from_ymd_hm(2026, 3, 13, 17, 0)),
-                duration_min: Some(2400)
+                duration_min: Some(2400),
+                ..Baseline::default()
             },
             Baseline {
                 number: 2,
                 start: Some(DateTime::from_ymd_hm(2026, 3, 16, 8, 0)),
                 finish: Some(DateTime::from_ymd_hm(2026, 3, 17, 17, 0)),
-                duration_min: None
+                duration_min: None,
+                ..Baseline::default()
             },
         ]
     );
