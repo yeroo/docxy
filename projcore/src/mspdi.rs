@@ -58,8 +58,10 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "HonorConstraints" => proj.honor_constraints = bool_of(&mut p),
                     "NewTasksAreManual" => proj.new_tasks_are_manual = bool_of(&mut p),
                     // Modeled options: a value that parses fills the field; one
-                    // that does not is kept verbatim. Either way the later of a
-                    // repeated element wins, as `set_option` has it.
+                    // that does not is kept verbatim. Of repeated leaves, the
+                    // later wins, as `set_option` has it; a block or an
+                    // attributed or prefixed repeat is skipped (see
+                    // `read_option`).
                     "NewTasksEffortDriven" => {
                         read_option(&mut p, &mut proj, name, parse_bool, |proj| {
                             &mut proj.new_tasks_effort_driven
@@ -190,8 +192,9 @@ fn element_text(p: &mut XmlParser) -> (String, bool) {
 
 /// Read a modeled project option into its field. Text that parses sets the
 /// field and drops any stored text of an earlier repeat; text that does not
-/// (or a block, prefixed element or one with attributes, as for an unmodeled
-/// option) clears the field and is stored verbatim, or skipped.
+/// clears the field and is stored verbatim. A block, a prefixed element or one
+/// with attributes is skipped, as an unmodeled option's is, and leaves an
+/// earlier repeat's value in place.
 fn read_option<T>(
     p: &mut XmlParser,
     proj: &mut Project,
@@ -4387,22 +4390,24 @@ mod tests {
 
     #[test]
     fn an_unparseable_modeled_option_is_kept_verbatim() {
-        let header: String = [
+        let names = [
             "NewTasksEffortDriven",
             "NewTasksEstimated",
             "DefaultTaskType",
             "Autolink",
             "CriticalSlackLimit",
             "MultipleCriticalPaths",
-        ]
-        .iter()
-        .map(|n| format!("<{n}>{n}-value</{n}>"))
-        .collect();
+        ];
+        let header: String = names
+            .iter()
+            .map(|n| format!("<{n}>{n}-value</{n}>"))
+            .collect();
         let proj = read_mspdi(&format!("<Project>{header}<Tasks/></Project>")).unwrap();
         assert_eq!(modeled_options(&proj), (None, None, None, None, None, None));
         let xml = write_mspdi(&proj);
-        assert!(xml.contains("<DefaultTaskType>DefaultTaskType-value</DefaultTaskType>"));
-        assert!(xml.contains("<Autolink>Autolink-value</Autolink>"));
+        for n in names {
+            assert!(xml.contains(&format!("<{n}>{n}-value</{n}>")), "{n}: {xml}");
+        }
         // Out of range is unparseable too.
         let proj = read_mspdi("<Project><DefaultTaskType>7</DefaultTaskType></Project>").unwrap();
         assert_eq!(proj.default_task_type, None);
