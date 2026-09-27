@@ -1580,8 +1580,11 @@ fn autolink(proj: &mut Project, at: usize) -> bool {
     else {
         return false;
     };
+    let mut new_link = Predecessor::fs(a_uid);
+    new_link.cross_project = link.cross_project.take();
+    new_link.cross_project_name = link.cross_project_name.take();
     link.uid = n_uid;
-    proj.tasks[n].predecessors = vec![Predecessor::fs(a_uid)];
+    proj.tasks[n].predecessors = vec![new_link];
     true
 }
 
@@ -3900,6 +3903,31 @@ mod tests {
             assert_eq!(preds(&ed, 2), [(1, LinkType::FinishStart, 960)]);
             assert_eq!(ed.project().tasks.len(), 2);
         }
+    }
+
+    #[test]
+    fn autolink_moves_cross_project_fields_with_the_external_endpoint() {
+        let mut proj = chain(LinkType::FinishStart, 0, Some(true))
+            .project()
+            .clone();
+        proj.tasks[0].external_task = Some(true);
+        let link = &mut proj.tasks[1].predecessors[0];
+        link.cross_project = Some(true);
+        link.cross_project_name = Some(r"C:\plans\other.mpp\7".into());
+        let mut ed = Editor::new(proj);
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        let new_uid = ed.project().tasks[at].uid;
+        let to_external = &ed.project().task(new_uid).unwrap().predecessors[0];
+        assert_eq!(to_external.uid, 1);
+        assert_eq!(to_external.cross_project, Some(true));
+        assert_eq!(
+            to_external.cross_project_name.as_deref(),
+            Some(r"C:\plans\other.mpp\7")
+        );
+        let to_new = &ed.project().task(2).unwrap().predecessors[0];
+        assert_eq!(to_new.uid, new_uid);
+        assert_eq!(to_new.cross_project, None);
+        assert_eq!(to_new.cross_project_name, None);
     }
 
     #[test]

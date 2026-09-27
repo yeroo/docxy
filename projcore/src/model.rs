@@ -395,6 +395,11 @@ pub struct Task {
 }
 
 impl Task {
+    /// A placeholder for a leaf task in another project, not local work.
+    pub fn is_external_leaf(&self) -> bool {
+        self.external_task == Some(true) && !self.summary && !self.is_null
+    }
+
     /// Whether this is the non-blank project summary row reserved at UID 0.
     pub fn is_project_summary(&self) -> bool {
         self.uid == 0 && self.summary && !self.is_null

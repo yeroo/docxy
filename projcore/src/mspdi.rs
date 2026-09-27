@@ -1668,7 +1668,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     let task = !t.is_null;
     // Display dates for an external placeholder are not local calculations.
     // Keep its stored Start/Finish; do not synthesize Critical or slack.
-    let result = if t.external_task == Some(true) && !t.summary {
+    let result = if t.is_external_leaf() {
         None
     } else {
         computed.result
@@ -3227,6 +3227,21 @@ mod tests {
     }
 
     #[test]
+    fn external_leaf_on_an_empty_calendar_can_be_read() {
+        let mut proj = empty_calendar_project();
+        proj.tasks[0].external_task = Some(true);
+        proj.tasks[0].calendar_uid = Some(3);
+        let back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        assert_eq!(back.tasks[0].external_task, Some(true));
+        assert!(
+            !crate::schedule::schedule(&back)
+                .get(back.tasks[0].uid)
+                .unwrap()
+                .critical
+        );
+    }
+
+    #[test]
     fn empty_calendars_unused_by_leaves_are_accepted() {
         fn assert_editor_reopens(proj: &Project) {
             let loaded = read_mspdi(&write_mspdi(proj)).unwrap();
@@ -4007,7 +4022,7 @@ mod tests {
         let mut proj = task_project(TASK_FIELDS);
         let t = &mut proj.tasks[0];
         t.manual = true;
-        t.external_task_project = Some(r"C:\plans\other.mpp".into());
+        t.external_task = Some(false);
         t.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
         t.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 2, 17, 0));
         t.manual_start = t.stored_start;
@@ -4102,13 +4117,21 @@ mod tests {
                 "Estimated",
                 "Milestone",
                 "Summary",
+                "Critical",
                 "IsSubproject",
                 "IsSubprojectReadOnly",
                 "ExternalTask",
-                "ExternalTaskProject",
+                "EarlyStart",
+                "EarlyFinish",
+                "LateStart",
+                "LateFinish",
                 "StartVariance",
                 "FinishVariance",
                 "WorkVariance",
+                "FreeSlack",
+                "TotalSlack",
+                "StartSlack",
+                "FinishSlack",
                 "FixedCost",
                 "FixedCostAccrual",
                 "PercentComplete",
@@ -4152,6 +4175,21 @@ mod tests {
                 "Duration",
             ]
         );
+        proj.tasks[1].external_task = Some(true);
+        proj.tasks[1].external_task_project = Some(r"C:\plans\other.mpp".into());
+        let mut external_xml = String::new();
+        write_task(
+            &mut external_xml,
+            &proj.tasks[1],
+            &Computed {
+                outline_number: Some("2"),
+                result: sched.get(1),
+            },
+        );
+        let external_flag = external_xml.find("<ExternalTask>1</ExternalTask>").unwrap();
+        let external_path = external_xml.find("<ExternalTaskProject>").unwrap();
+        let early = external_xml.find("<StartVariance>").unwrap();
+        assert!(external_flag < external_path && external_path < early);
         // IsNull sits between Type and CreateDate on a blank row.
         let blank = Task {
             uid: 3,

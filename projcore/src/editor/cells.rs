@@ -862,13 +862,14 @@ fn parse_predecessors_keeping(
             }
             parse_lag(rest, proj).ok_or("Invalid predecessor lag")?
         };
+        let original = existing.iter().find(|p| p.uid == uid);
         let parsed = Predecessor {
             uid,
             link,
             lag,
             lag_format,
-            cross_project: None,
-            cross_project_name: None,
+            cross_project: original.and_then(|p| p.cross_project),
+            cross_project_name: original.and_then(|p| p.cross_project_name.clone()),
         };
         // The shown text parses to the same task, link and lag; only a
         // fallback display can differ in format.

@@ -44,6 +44,14 @@ fn cross_project_fields_survive_xml_yppx_and_cell_edit() {
     let shown = format_predecessors(proj.task(2).unwrap(), &proj);
     let parsed = parse_task_predecessors(&shown, proj.task(2).unwrap(), &proj).unwrap();
     assert_eq!(parsed[1], *link);
+    for typed in ["1, 3FS", "1, 3FS+1d", "1, 3SS"] {
+        let edited = parse_task_predecessors(typed, proj.task(2).unwrap(), &proj).unwrap();
+        assert_eq!(edited[1].cross_project, Some(true), "{typed}");
+        assert_eq!(
+            edited[1].cross_project_name, link.cross_project_name,
+            "{typed}"
+        );
+    }
     let with_new = parse_task_predecessors(&format!("{shown}, 3SS"), proj.task(2).unwrap(), &proj);
     assert!(with_new.is_err()); // Duplicate UID is still rejected.
 

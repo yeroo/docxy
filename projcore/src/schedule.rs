@@ -1602,12 +1602,13 @@ impl<'a> CalendarResolver<'a> {
     }
 }
 
-/// Reject tasks that have no working time and are leaves either in the stored
-/// schedule or in the outline the editor uses to recompute summary flags.
+/// Reject local tasks that have no working time and are leaves either in the
+/// stored schedule or in the outline the editor uses to recompute summary flags.
+/// External leaves need no working calendar because they are not scheduled.
 pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
     let calendars = CalendarResolver::new(proj);
     for (i, task) in proj.tasks.iter().enumerate() {
-        if task.is_null || (task.summary && proj.is_outline_summary(i)) {
+        if task.is_null || task.is_external_leaf() || (task.summary && proj.is_outline_summary(i)) {
             continue;
         }
         let Some(cal) = calendars.resolve(task.calendar_uid) else {
@@ -1829,11 +1830,15 @@ fn manual_summary_floors(proj: &Project, spans: &HashMap<i32, (i64, i64)>) -> Ha
 /// bounds and critical path. When no active leaf can be scheduled, dormant
 /// dates bound the project; a summary with only dormant subtasks keeps its
 /// own rollup.
+/// External leaves, their links, and their assignments are excluded from CPM.
+/// A dated external leaf reports its stored Start/Finish with zero slack and
+/// is never critical. An undated one has no result. Neither drives successors,
+/// rollups, project bounds, or the critical path.
 pub fn schedule(proj: &Project) -> Schedule {
     let clean = without_unscheduled_rows(proj);
     let mut main = schedule_local(&clean);
     for task in &proj.tasks {
-        if task.external_task == Some(true) && !task.summary && !task.is_null {
+        if task.is_external_leaf() {
             if let Some(start) = task.stored_start {
                 let finish = task.stored_finish.unwrap_or(start);
                 main.results.insert(
@@ -1858,15 +1863,14 @@ pub fn schedule(proj: &Project) -> Schedule {
 }
 
 fn schedule_local(proj: &Project) -> Schedule {
-    let clean = without_blank_rows(proj);
-    let dormant = dormant_uids(&clean);
+    let dormant = dormant_uids(proj);
     if dormant.is_empty() {
-        return Scheduler::new(&clean).run();
+        return Scheduler::new(proj).run();
     }
-    let active = without_tasks(&clean, &dormant);
+    let active = without_tasks(proj, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let mut main = active_scheduler.run();
-    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler);
+    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler);
     if dormant_bounds {
         main.project_start = other.project_start;
         main.project_finish = other.project_finish;
@@ -1965,29 +1969,13 @@ fn dormant_view(proj: &Project, dormant: &std::collections::HashSet<i32>) -> Pro
     view
 }
 
-/// The project the scheduler sees: blank rows (`is_null`) removed, with the
-/// links and assignments that name them. A blank row therefore gets no
-/// result, never bounds a summary, and cannot drive another task.
-fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
-    if !proj.tasks.iter().any(|t| t.is_null) {
-        return std::borrow::Cow::Borrowed(proj);
-    }
-    let blank: std::collections::HashSet<i32> = proj
-        .tasks
-        .iter()
-        .filter(|t| t.is_null)
-        .map(|t| t.uid)
-        .collect();
-    std::borrow::Cow::Owned(without_tasks(proj, &blank))
-}
-
-/// External leaves are placeholders for work in another project. Their links
-/// and assignments cannot enter the local CPM or resource-leveling passes.
+/// The scheduler sees neither blank rows nor external leaves. Their links and
+/// assignments cannot enter the local CPM or resource-leveling passes.
 fn without_unscheduled_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
     let removed: std::collections::HashSet<i32> = proj
         .tasks
         .iter()
-        .filter(|t| t.is_null || (t.external_task == Some(true) && !t.summary))
+        .filter(|t| t.is_null || t.is_external_leaf())
         .map(|t| t.uid)
         .collect();
     if removed.is_empty() {
@@ -2065,7 +2053,7 @@ fn summary_calendar(proj: &Project) -> WorkCalendar {
     WorkCalendar::union(
         proj.tasks
             .iter()
-            .filter(|t| calendars.schedulable(t))
+            .filter(|t| !t.is_external_leaf() && calendars.schedulable(t))
             .filter_map(|t| calendars.resolve(t.calendar_uid))
             .filter(|cal| seen.insert(cal.uid))
             .map(|cal| calendars.calendar(cal))
@@ -2100,9 +2088,12 @@ impl Leveled {
 /// Resource-level a project: run CPM, then delay tasks so that no work resource
 /// is booked beyond its capacity, never scheduling a task before its CPM early
 /// start and never breaking a dependency (a predecessor's leveling delay is
-/// propagated to its successors, preserving every link's gap).
+/// propagated to its successors, preserving every local link's gap).
 /// Inactive tasks book no resource capacity and report their CPM dates; an
 /// active predecessor's leveling delay does not propagate to an inactive one.
+/// External leaves, their links, and their assignments are excluded. A dated
+/// external leaf reports its stored Start/Finish; an undated one has no result.
+/// Neither affects local successors, rollups, or project finish.
 ///
 /// v1 scope: a single-pass, topological-order serial leveler operating in the
 /// default calendar's working-minute space; resource occupation is the task's
@@ -2118,7 +2109,7 @@ pub fn level(proj: &Project) -> Leveled {
     let clean = without_unscheduled_rows(proj);
     let mut main = level_local(&clean);
     for task in &proj.tasks {
-        if task.external_task == Some(true) && !task.summary && !task.is_null {
+        if task.is_external_leaf() {
             if let Some(start) = task.stored_start {
                 main.start.insert(task.uid, start);
                 main.finish
@@ -2130,15 +2121,14 @@ pub fn level(proj: &Project) -> Leveled {
 }
 
 fn level_local(proj: &Project) -> Leveled {
-    let clean = without_blank_rows(proj);
-    let dormant = dormant_uids(&clean);
+    let dormant = dormant_uids(proj);
     if dormant.is_empty() {
-        return Scheduler::new(&clean).level();
+        return Scheduler::new(proj).level();
     }
-    let active = without_tasks(&clean, &dormant);
+    let active = without_tasks(proj, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let mut main = active_scheduler.level();
-    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler);
+    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler);
     if dormant_bounds {
         main.project_finish = other.project_finish;
     }
