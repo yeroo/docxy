@@ -13839,6 +13839,31 @@ fn table_tab() -> rs::Tab<Act> {
     )
 }
 
+/// One icon button's share of a ribbon row, in px (see `group_est`).
+const ROW_BTN_PITCH: f32 = 35.0;
+
+/// Which of a ribbon tab's groups fit `width`: whether labels are dropped, and
+/// the groups still shown after the lowest priorities collapse.
+fn ribbon_fit(groups: &[rs::Group<Act>], width: f32) -> (bool, Vec<usize>) {
+    let avail = (width - 28.0).max(120.0);
+    // 1) drop control labels if the full layout overflows.
+    let icon_only = groups.iter().map(|g| group_est(g, false)).sum::<f32>() > avail;
+    // 2) collapse lowest-priority groups until what remains fits.
+    let mut shown: Vec<usize> = (0..groups.len()).collect();
+    loop {
+        let total: f32 = shown
+            .iter()
+            .map(|&i| group_est(&groups[i], icon_only))
+            .sum();
+        if total <= avail || shown.len() <= 1 {
+            break;
+        }
+        let victim = *shown.iter().min_by_key(|&&i| groups[i].priority).unwrap();
+        shown.retain(|&i| i != victim);
+    }
+    (icon_only, shown)
+}
+
 /// Rough natural width (px) of a group, for responsive collapse decisions.
 fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
     let mut w: f32 = 22.0;
@@ -13866,7 +13891,12 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
                                     48.0
                                 }
                             }
-                            rs::Cell::Btn(_) => 25.0,
+                            // `icon_btn` without its label: 1px border and
+                            // `px_2` each side around a 16px icon (34px), plus
+                            // the row's 1px gap. At 25 the Font and Paragraph
+                            // rows underran by ~70px, and at the default
+                            // 1180px window the Home tab clipped Editing.
+                            rs::Cell::Btn(_) => ROW_BTN_PITCH,
                         })
                         .sum::<f32>()
                 })
@@ -15400,26 +15430,7 @@ impl Docxy {
     /// overflow indicator (Office-style scaling driven by ribbonspec::priority).
     fn ribbon_body(&self, width: f32, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let tab = &self.active_ribbon_tab_def();
-        let avail = (width - 28.0).max(120.0);
-
-        // 1) drop control labels if the full layout overflows.
-        let icon_only = tab.groups.iter().map(|g| group_est(g, false)).sum::<f32>() > avail;
-        // 2) collapse lowest-priority groups until what remains fits.
-        let mut shown: Vec<usize> = (0..tab.groups.len()).collect();
-        loop {
-            let total: f32 = shown
-                .iter()
-                .map(|&i| group_est(&tab.groups[i], icon_only))
-                .sum();
-            if total <= avail || shown.len() <= 1 {
-                break;
-            }
-            let victim = *shown
-                .iter()
-                .min_by_key(|&&i| tab.groups[i].priority)
-                .unwrap();
-            shown.retain(|&i| i != victim);
-        }
+        let (icon_only, shown) = ribbon_fit(&tab.groups, width);
         let hidden = tab.groups.len() - shown.len();
 
         let mut groups: Vec<AnyElement> = shown
@@ -26964,5 +26975,52 @@ mod config_root_tests {
         assert_eq!(hot_dir(), real.join("docxy").join("hot"));
         assert!(!session_path().starts_with(over));
         assert!(!hot_dir().starts_with(over));
+    }
+}
+
+#[cfg(test)]
+mod ribbon_fit_tests {
+    // Not `super::*`: that brings gpui's `test` attribute in over the std one.
+    use super::{ROW_BTN_PITCH, docxy_ribbon, group_est, ribbon_fit};
+
+    fn home_titles(width: f32) -> (bool, Vec<&'static str>) {
+        let ribbon = docxy_ribbon();
+        let home = ribbon.tabs.iter().find(|t| t.name == "Home").unwrap();
+        let (icon_only, shown) = ribbon_fit(&home.groups, width);
+        (
+            icon_only,
+            shown.iter().map(|&i| home.groups[i].title).collect(),
+        )
+    }
+
+    // At the suite's default 1180px window the Home tab drops its labels
+    // and collapses Clipboard, the lowest priority. Editing stays, and the
+    // window shot shows it whole: the estimates are the rendered widths, so
+    // what fits here fits on screen. (Issue 215, review r1: at 25px a row
+    // button the estimate said Clipboard fit too, and Editing was clipped.)
+    #[test]
+    fn home_at_the_default_window_collapses_clipboard_and_keeps_editing() {
+        let (icon_only, shown) = home_titles(1180.);
+        assert!(icon_only);
+        assert_eq!(shown, ["Font", "Paragraph", "Styles", "Editing"]);
+    }
+
+    #[test]
+    fn a_wide_window_shows_every_home_group() {
+        let (_, shown) = home_titles(1600.);
+        assert_eq!(
+            shown,
+            ["Clipboard", "Font", "Paragraph", "Styles", "Editing"]
+        );
+    }
+
+    /// The Paragraph group's two rows are all icon buttons; the wider row
+    /// (7) sets the width, each at `icon_btn`'s rendered pitch.
+    #[test]
+    fn a_row_of_icon_buttons_is_estimated_at_their_rendered_pitch() {
+        let ribbon = docxy_ribbon();
+        let home = ribbon.tabs.iter().find(|t| t.name == "Home").unwrap();
+        let para = home.groups.iter().find(|g| g.title == "Paragraph").unwrap();
+        assert_eq!(group_est(para, true), 22. + 7. * ROW_BTN_PITCH);
     }
 }
