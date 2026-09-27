@@ -204,14 +204,20 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 fn load(path: &str) -> Result<Project, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let lower = path.to_ascii_lowercase();
-    if lower.ends_with(".yppx") {
+    let mut project = if lower.ends_with(".yppx") {
         yppx::read_yppx(&bytes)
     } else if lower.ends_with(".mpp") {
         project_from_mpp(&bytes)
     } else {
         let xml = String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
         mspdi::read_mspdi(&xml)
-    }
+    }?;
+    let stem = Path::new(path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    project.fill_unnamed_summary(stem);
+    Ok(project)
 }
 
 fn write_gantt_md(
@@ -2187,6 +2193,77 @@ fn truncate(s: &str, width: usize) -> String {
 mod tests {
     use super::*;
     use projcore::editor::parse_duration;
+
+    fn unnamed_summary_fixture(title: &str) -> Project {
+        Project {
+            title: title.into(),
+            start_date: Some(projcore::datetime::DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![
+                Task {
+                    uid: 0,
+                    summary: true,
+                    outline_level: 0,
+                    ..Task::default()
+                },
+                Task {
+                    uid: 1,
+                    id: 1,
+                    name: "Work".into(),
+                    outline_level: 1,
+                    duration_min: 480,
+                    ..Task::default()
+                },
+            ],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn load_names_summary_from_title_or_file_stem_and_saves_it() {
+        let dir = std::env::temp_dir().join(format!("yppxy-summary-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("site-plan.xml");
+        for (title, expected) in [
+            ("", "site-plan"),
+            ("Warehouse fit-out", "Warehouse fit-out"),
+        ] {
+            std::fs::write(&path, mspdi::write_mspdi(&unnamed_summary_fixture(title))).unwrap();
+            let loaded = load(path.to_str().unwrap()).unwrap();
+            assert_eq!(loaded.task(0).unwrap().name, expected);
+            assert_eq!(loaded.name, expected);
+            let markdown = gantt::to_markdown(&loaded, &schedule(&loaded));
+            assert!(
+                markdown.contains(&format!("| **{expected}** |")),
+                "{markdown}"
+            );
+            assert!(!markdown.contains("Task 0"), "{markdown}");
+            let saved = mspdi::write_mspdi(&loaded);
+            assert_eq!(
+                saved.matches(&format!("<Name>{expected}</Name>")).count(),
+                2
+            );
+            let reread = mspdi::read_mspdi(&saved).unwrap();
+            assert_eq!(reread.name, expected);
+            assert_eq!(reread.task(0).unwrap().name, expected);
+        }
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn opening_unnamed_summary_fills_name_without_editor_history() {
+        let dir = std::env::temp_dir().join(format!("yppxy-summary-open-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("site-plan.xml");
+        std::fs::write(&path, mspdi::write_mspdi(&unnamed_summary_fixture(""))).unwrap();
+        let mut app = App::new(new_project(), None, false);
+        app.open_file(path.to_str().unwrap());
+        assert_eq!(app.ed.project().task(0).unwrap().name, "site-plan");
+        assert!(!app.ed.dirty());
+        assert_eq!(app.ed.undo_depth(), 0);
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn save_as_prompt_retains_binding_on_failure_and_adds_native_extension() {
