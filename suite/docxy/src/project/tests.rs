@@ -567,14 +567,19 @@ fn summary_duration_follows_child_edits_and_matches_the_gantt_export() {
     let row = project_row(&ed, ed.project().task(phase).unwrap());
     assert_eq!(row[COL_DURATION], "4d");
     let md = projcore::gantt::to_markdown(ed.project(), ed.schedule());
-    let exported = md
-        .lines()
-        .find(|l| l.starts_with("| **Phase** |"))
-        .unwrap()
-        .split('|')
-        .map(str::trim)
-        .nth(4)
+    let cells = |prefix: &str| -> Vec<&str> {
+        md.lines()
+            .find(|l| l.starts_with(prefix))
+            .unwrap()
+            .split('|')
+            .map(str::trim)
+            .collect()
+    };
+    let duration = cells("| Task |")
+        .iter()
+        .position(|&c| c == "Duration")
         .unwrap();
+    let exported = cells("| **Phase** |")[duration];
     assert_eq!(row[COL_DURATION], exported);
 }
 
