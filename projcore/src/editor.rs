@@ -2121,6 +2121,39 @@ mod tests {
     }
 
     #[test]
+    fn a_blank_row_next_to_a_collapsed_summary_is_shown_and_keeps_it_collapsed() {
+        // Collapse Phase, put the selection on `sel`, insert as the hosts do
+        // (then select the row), and type into it.
+        let insert = |mut ed: Editor, sel: usize, before: bool| {
+            ed.set_collapsed(2, true).unwrap();
+            ed.select(sel);
+            let at = ed
+                .insert_blank_row(before.then(|| ed.selected_uid().unwrap()))
+                .unwrap();
+            ed.select(at);
+            let shown = (at, ed.visible_rows(), ed.is_collapsed(2));
+            let uid = ed.project().tasks[at].uid;
+            ed.rename(uid, "Typed").unwrap();
+            assert!(ed.is_collapsed(2), "typing keeps Phase collapsed");
+            (shown, ed.project().tasks[at].outline_level)
+        };
+        // On B, after Phase's hidden subtasks: the row is outside Phase's
+        // subtree, so it shows, and typed it is Phase's sibling.
+        assert_eq!(
+            insert(phase_plan(), 4, true),
+            ((4, vec![0, 1, 4, 5], true), 1)
+        );
+        // On the collapsed Phase itself: above it.
+        assert_eq!(
+            insert(phase_plan(), 1, true),
+            ((1, vec![0, 1, 2, 5], true), 1)
+        );
+        // Appended (the suite's entry row) after a collapsed last summary.
+        let last = outline(&[(1, "A", 1), (2, "Phase", 1), (3, "P1", 2)]);
+        assert_eq!(insert(last, 1, false), ((3, vec![0, 1, 3], true), 1));
+    }
+
+    #[test]
     fn typing_into_an_inserted_blank_row_makes_a_task_where_it_sits() {
         // Above Phase's first subtask: the typed row is Phase's first child.
         let mut ed = phase_plan();
