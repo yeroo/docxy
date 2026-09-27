@@ -1818,8 +1818,9 @@ fn manual_summary_floors(proj: &Project, spans: &HashMap<i32, (i64, i64)>) -> Ha
 /// Readers reject duplicates; a code-built project must not contain them.
 /// Inactive tasks keep their dates from a second pass, but never drive an
 /// active successor, an active summary's rollup, or the active project's
-/// bounds and critical path. When every task is dormant, their dates bound
-/// the project; a summary with only dormant subtasks keeps its own rollup.
+/// bounds and critical path. When no active leaf can be scheduled, dormant
+/// dates bound the project; a summary with only dormant subtasks keeps its
+/// own rollup.
 pub fn schedule(proj: &Project) -> Schedule {
     let clean = without_blank_rows(proj);
     let dormant = dormant_uids(&clean);
@@ -1828,13 +1829,13 @@ pub fn schedule(proj: &Project) -> Schedule {
     }
     let active = without_tasks(&clean, &dormant);
     let mut main = Scheduler::new(&active).run();
-    let all_dormant = active.tasks.is_empty();
+    let active_schedulable = has_schedulable_task(&active);
     let mut dormant_view = dormant_view(&clean, &dormant);
-    if !all_dormant {
+    if active_schedulable {
         dormant_view.start_date.get_or_insert(main.project_start);
     }
     let other = Scheduler::new(&dormant_view).run();
-    if all_dormant {
+    if !active_schedulable {
         main.project_start = other.project_start;
         main.project_finish = other.project_finish;
     }
@@ -1848,6 +1849,11 @@ pub fn schedule(proj: &Project) -> Schedule {
         }
     }
     main
+}
+
+fn has_schedulable_task(proj: &Project) -> bool {
+    let calendars = CalendarResolver::new(proj);
+    proj.tasks.iter().any(|task| calendars.schedulable(task))
 }
 
 /// Inactive tasks and summaries with no active descendants have no effect on
@@ -2045,15 +2051,16 @@ pub fn level(proj: &Project) -> Leveled {
         return Scheduler::new(&clean).level();
     }
     let active = without_tasks(&clean, &dormant);
+    let active_schedulable = has_schedulable_task(&active);
     let active_scheduler = Scheduler::new(&active);
     let active_start = DateTime::from_minutes(active_scheduler.anchor);
     let mut main = active_scheduler.level();
     let mut dormant_view = dormant_view(&clean, &dormant);
-    if !active.tasks.is_empty() {
+    if active_schedulable {
         dormant_view.start_date.get_or_insert(active_start);
     }
     let other = Scheduler::new(&dormant_view).run();
-    if active.tasks.is_empty() {
+    if !active_schedulable {
         main.project_finish = other.project_finish;
     }
     for uid in &dormant {
@@ -2699,6 +2706,29 @@ mod tests {
         let dormant = dormant_uids(&proj);
         assert!(!dormant.contains(&1));
         assert!(!dormant.contains(&2));
+    }
+
+    #[test]
+    fn childless_active_summary_does_not_anchor_a_stored_inactive_leaf() {
+        let mut summary = task(1, "Empty active summary", 0);
+        summary.summary = true;
+        let mut dormant = task(2, "Dormant", 480);
+        dormant.active = Some(false);
+        dormant.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        let proj = Project {
+            tasks: vec![summary, dormant],
+            ..Project::default()
+        };
+        assert!(!has_schedulable_task(&without_tasks(
+            &proj,
+            &dormant_uids(&proj)
+        )));
+        let sched = schedule(&proj);
+        assert_eq!(sched.project_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        assert_eq!(sched.project_finish, sched.get(2).unwrap().early_finish);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
+        assert_eq!(leveled.project_finish, sched.project_finish);
     }
 
     #[test]

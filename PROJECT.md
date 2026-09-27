@@ -100,8 +100,9 @@ clears history while retaining the find query and leveling preference.
   task, cascading to its subtasks in one undo step. Inactive tasks keep their
   own dates and can follow active or inactive predecessors, but they do not
   drive active successors, active summary rollups, the active project's bounds,
-  or its critical path. When every task is inactive, their dates bound the
-  project. A summary whose subtasks are all inactive keeps their rollup.
+  or its critical path. When no active leaf can be scheduled, dormant dates
+  bound the project. A summary whose subtasks are all inactive keeps their
+  rollup.
 - **Constraints** pin dates: ASAP/ALAP and the six hard ones
   (SNET/SNLT/FNET/FNLT/MSO/MFO).
 - **Calendars** define working time per weekday (e.g. Mon–Fri 08:00–12:00,
