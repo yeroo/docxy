@@ -458,3 +458,41 @@ fn protected_docx() -> Vec<u8> {
         ("word/styles.xml".into(), b"<w:styles/>".to_vec()),
     ])
 }
+
+/// #212: a link holding markup besides its text (spell-check marks, a tracked
+/// change) shows its text as linked, editable run segments at the editor's
+/// offsets, not as one uneditable width-0 atom.
+#[test]
+fn a_complex_links_text_is_linked_editable_segments_212() {
+    let s = open(&docx_from_body(
+        "<w:p><w:r><w:t>ab</w:t></w:r><w:hyperlink w:anchor=\"top\">\
+         <w:proofErr w:type=\"spellStart\"/><w:r><w:t>Contoso</w:t></w:r>\
+         <w:proofErr w:type=\"spellEnd\"/>\
+         <w:ins w:id=\"1\" w:author=\"A\"><w:r><w:t>X</w:t></w:r></w:ins>\
+         </w:hyperlink><w:r><w:t>cd</w:t></w:r></w:p>",
+    ));
+    let paras = all_paragraphs(&s);
+    let p = &paras[0];
+    assert_eq!(p.get_usize("len"), Some(11));
+    let segs = arr(p.get("segs").unwrap());
+    let mut at = 0;
+    for seg in segs {
+        assert_eq!(seg.get_usize("o"), Some(at), "segments tile: {p:?}");
+        at += seg.get_usize("w").unwrap();
+    }
+    assert_eq!(at, 11);
+    assert!(segs.iter().all(|seg| seg.get_str("k") != Some("link")));
+    let linked = segs
+        .iter()
+        .find(|seg| seg.get_str("x") == Some("Contoso"))
+        .expect("the link's text is a run segment");
+    assert_eq!(linked.get_str("k"), Some("t"));
+    assert_eq!(linked.get_usize("o"), Some(2));
+    assert_eq!(linked.get_str("href"), Some("#top"));
+    let rev = segs
+        .iter()
+        .find(|seg| seg.get_str("k") == Some("rev"))
+        .expect("the tracked change inside the link");
+    assert_eq!((rev.get_usize("o"), rev.get_usize("w")), (Some(9), Some(0)));
+    assert_eq!(para_text(p), "abContosocd");
+}

@@ -200,14 +200,12 @@ Notes:
   those aren't surfaced by these verbs — only `app.headers.default`/
   `app.footers.default`.
 - **`doc.find` and `doc.replace-all` see only the text the editor can edit.**
-  A paragraph's editable text is its runs, simple links, tabs and breaks. Text
-  it only shows is not searched or replaced: tracked changes (`w:ins`/`w:del`),
-  field results, footnote/endnote references, equations, SmartArt, chart
-  titles, inline text boxes, and complex links. A link is complex when it
-  holds anything but plain text runs, for example a tracked change, a field, a
-  bookmark or a proofing mark (`w:proofErr`); an external link is also
-  complex when it holds a tab or a break (an anchor link may hold those and
-  stay simple). A match's
+  A paragraph's editable text is its runs, tabs and breaks, including those
+  inside hyperlinks. Text it only shows is not searched or replaced: tracked
+  changes (`w:ins`/`w:del`), field results, footnote/endnote references,
+  equations, SmartArt, chart titles and inline text boxes, including any of
+  these inside a hyperlink. A link's bookmarks and proofing marks
+  (`w:proofErr`) don't hide its text, and an edit keeps them in place. A match's
   `start`/`end` count only editable text, while `text` is the paragraph's full
   plain text (the form `doc.replace-range` round-trips), which includes the
   rest. So `text[start..end]` is the match only when the paragraph holds

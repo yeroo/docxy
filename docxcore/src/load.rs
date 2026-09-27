@@ -1662,10 +1662,10 @@ fn parse_hyperlink_into(p: &mut XmlParser, rels: &Relationships, out: &mut Vec<I
         rel_id,
         runs,
         content,
-        // Complex links use the complete raw wrapper until a descendant review
-        // action changes them. Simple links rebuild editable runs immediately,
-        // but retain the raw opener so non-modeled hyperlink attributes survive
-        // repeated save/reload cycles.
+        // Complex links use the complete raw wrapper until an edit or a review
+        // action changes a descendant. Simple links rebuild editable runs
+        // immediately, but retain the raw opener so non-modeled hyperlink
+        // attributes survive repeated save/reload cycles.
         raw: (!simple || preserve_opener).then_some(raw),
         content_changed: simple && preserve_opener,
     }));
