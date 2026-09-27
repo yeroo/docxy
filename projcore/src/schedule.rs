@@ -627,27 +627,65 @@ impl<'a> Scheduler<'a> {
             })
             .filter_map(|t| initial.get(t.uid).map(|r| (t.uid, r.late_start.minutes())))
             .collect();
-        // A fixed successor cannot follow an ALAP predecessor. Its late
-        // window can extend beyond its pinned or actual dates, so use those
-        // dates to cap the predecessor's placement instead.
-        for successor in self.proj.tasks.iter().filter(|t| fixed(t)) {
-            let Some(result) = initial.get(successor.uid) else {
-                continue;
-            };
-            for link in &successor.predecessors {
-                let Some(floor) = alap.get_mut(&link.uid) else {
-                    continue;
-                };
-                let Some(predecessor) = self.proj.task(link.uid) else {
-                    continue;
-                };
-                *floor =
-                    (*floor).min(self.fixed_successor_cap(predecessor, successor, link, result));
-            }
-        }
         if alap.is_empty() {
             initial
         } else {
+            // A fixed leaf cannot follow an ALAP predecessor. Propagate its
+            // actual dates backward through every intervening auto task;
+            // ordinary late dates can float past a fixed task's own dates.
+            let leaves: Vec<usize> = (0..self.proj.tasks.len())
+                .filter(|&i| {
+                    let t = &self.proj.tasks[i];
+                    !t.summary && self.tl(t).total > 0
+                })
+                .collect();
+            let leaf_uids: std::collections::HashSet<i32> =
+                leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
+            let idx_of: HashMap<i32, usize> = leaves
+                .iter()
+                .map(|&i| (self.proj.tasks[i].uid, i))
+                .collect();
+            let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
+            let mut successors: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
+            for &i in &leaves {
+                for (link_idx, link) in self.proj.tasks[i].predecessors.iter().enumerate() {
+                    if leaf_uids.contains(&link.uid) {
+                        successors.entry(link.uid).or_default().push((i, link_idx));
+                    }
+                }
+            }
+            let mut caps: HashMap<i32, (i64, i64)> = HashMap::new();
+            for &i in order.iter().rev() {
+                let task = &self.proj.tasks[i];
+                if fixed(task) {
+                    let result = initial.get(task.uid).expect("leaf scheduled");
+                    caps.insert(
+                        task.uid,
+                        (result.early_start.minutes(), result.early_finish.minutes()),
+                    );
+                    continue;
+                }
+                let cap = successors.get(&task.uid).into_iter().flatten().filter_map(
+                    |&(successor_idx, link_idx)| {
+                        let successor = &self.proj.tasks[successor_idx];
+                        let &(start, finish) = caps.get(&successor.uid)?;
+                        let link = &successor.predecessors[link_idx];
+                        Some(self.fixed_successor_cap(task, successor, link, start, finish))
+                    },
+                );
+                if let Some(start) = cap.min() {
+                    let tl = self.tl(task);
+                    let finish = if task.duration_min == 0 {
+                        start
+                    } else {
+                        tl.abs_finish(tl.to_index(start) + task.duration_min)
+                    };
+                    caps.insert(task.uid, (start, finish));
+                    if let Some(floor) = alap.get_mut(&task.uid) {
+                        *floor = (*floor).min(start);
+                    }
+                }
+            }
             self.pass(&alap)
         }
     }
@@ -657,14 +695,14 @@ impl<'a> Scheduler<'a> {
         predecessor: &Task,
         successor: &Task,
         link: &Predecessor,
-        result: &TaskResult,
+        start: i64,
+        finish: i64,
     ) -> i64 {
         let pred_tl = self.tl(predecessor);
         let succ_tl = self.tl(successor);
-        let start = result.early_start.minutes();
         let endpoint = match link.link {
             LinkType::FinishStart | LinkType::StartStart => start,
-            LinkType::FinishFinish | LinkType::StartFinish => result.early_finish.minutes(),
+            LinkType::FinishFinish | LinkType::StartFinish => finish,
         };
         let offset = self.offset(link);
         let (endpoint, lag) = offset.backward(endpoint);
@@ -3042,6 +3080,30 @@ mod tests {
             b.predecessors.push(Predecessor::working(1, link_type, 0));
             let sched = schedule(&march2(vec![a, b, task(3, "Long", 4800)]));
             assert!(sched.get(2).unwrap().total_slack_min >= 0, "{link_type:?}");
+        }
+    }
+
+    #[test]
+    fn fixed_successor_cap_propagates_through_an_intermediate_task() {
+        for middle_alap in [false, true] {
+            let mut a = task(1, "A", 960);
+            a.constraint = ConstraintType::AsLateAsPossible;
+            let mut c = task(3, "C", 480);
+            c.predecessors.push(fs(1));
+            if middle_alap {
+                c.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = manual(2, "B", 960, at(6, 8));
+            b.predecessors.push(fs(3));
+            let sched = schedule(&march2(vec![a, c, b, task(4, "Long", 4800)]));
+            let a = sched.get(1).unwrap();
+            let c = sched.get(3).unwrap();
+            let b = sched.get(2).unwrap();
+            assert_eq!((a.early_start, a.early_finish), (at(3, 8), at(4, 17)));
+            assert_eq!((c.early_start, c.early_finish), (at(5, 8), at(5, 17)));
+            assert_eq!((b.early_start, b.early_finish), (at(6, 8), at(9, 17)));
+            assert!(b.total_slack_min >= 0, "middle_alap={middle_alap}");
+            assert_eq!(sched.project_finish, at(13, 17));
         }
     }
 
