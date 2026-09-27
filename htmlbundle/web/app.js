@@ -752,7 +752,6 @@
       case 'field': return atom(s, 'field', esc(s.x || ''));
       case 'eq': return atom(s, 'eq', '<i>' + esc(s.x || '') + '</i>');
       case 'note': return atom(s, 'note', esc(s.x || ''));
-      case 'link': return atom(s, 'link', esc(s.x || ''));
       case 'comment': return atom(s, 'comment-mark', '', ' title="Comment"');
       case 'art':
       case 'chart':

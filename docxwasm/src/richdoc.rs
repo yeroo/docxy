@@ -274,9 +274,15 @@ impl SegWriter<'_, '_> {
     }
 
     fn inline(&mut self, inline: &Inline) {
+        self.inline_in(inline, None);
+    }
+
+    /// One inline's segments; `href` is the enclosing hyperlink's target, which
+    /// its text runs carry.
+    fn inline_in(&mut self, inline: &Inline, href: Option<&str>) {
         let width = inline_len(inline);
         match inline {
-            Inline::Run(r) => self.run(&r.text, &r.props, None),
+            Inline::Run(r) => self.run(&r.text, &r.props, href),
             Inline::Hyperlink(h) => {
                 let href = h
                     .target
@@ -285,11 +291,11 @@ impl SegWriter<'_, '_> {
                 for r in &h.runs {
                     self.run(&r.text, &r.props, href.as_deref());
                 }
-                // Links carrying revisions or other markup keep that content
-                // outside the editor's offsets: show it, uneditable.
-                if !h.content.is_empty() {
-                    let text: String = h.content.iter().map(Inline::text).collect();
-                    self.atom("link", 0, &text, "");
+                // A link holding revisions or other markup: its plain runs are
+                // editable linked text, and every other child shows as it
+                // would outside the link, at the same offsets as the editor's.
+                for child in &h.content {
+                    self.inline_in(child, href.as_deref());
                 }
             }
             Inline::Tab(_) => self.atom("tab", width, "", ""),
