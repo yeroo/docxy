@@ -212,13 +212,13 @@ scheduled ones. The project's `NewTasksAreManual` is the 2-byte `Props` entry
 `0x024013C8`: `0000` when set to auto, `ff00` when explicitly set to manual,
 and `0100` when Project's manual default is left untouched. Legacy MPP9 files
 have no manual tasks. MPP9 link records in the local samples all have zero lag
-and LagFormat 7, so nonzero
-legacy lag has no oracle yet. Newest Project links have positive and negative
-lag examples checked against MSPDI. Their lag i32 at +14 and LagFormat u16 at
-+18 encode exactly as MSPDI's `LinkLag` and `LagFormat`: tenths of a minute of
-working or elapsed time, or the percentage itself for format 19. The importer
-reads the formats projcore schedules (3-12, 19 and their estimated variants
-35-44 and 51) and refuses the others, elapsed percent (20, 52) included.
+and LagFormat 7, so nonzero legacy lag has no oracle yet. Newest Project links
+have positive and negative lag examples checked against MSPDI. Their lag i32
+at +14 and LagFormat u16 at +18 encode exactly as MSPDI's `LinkLag` and
+`LagFormat`: tenths of a minute of working or elapsed time, or the percentage
+itself for format 19. The importer reads the formats projcore schedules (3-12,
+19 and their estimated variants 35-44 and 51) and refuses the others, elapsed
+percent (20, 52) included.
 
 Task progress, work and cost are decoded for the newest layout
 ([#181](https://github.com/yeroo/docxy/issues/181)) and imported as read; the
