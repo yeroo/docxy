@@ -414,7 +414,10 @@ impl Editor {
     /// Insert after a UID, or append. As in Microsoft Project, the new task is
     /// the next sibling of the task above it, or that task's first child when
     /// it is a summary; the row it pushes down plays no part, and blank rows
-    /// are skipped (see [`level_at`]). The returned row is not automatically
+    /// are skipped (see [`level_at`]). Below a collapsed summary's hidden
+    /// rows, a task appended or added after a row shown there becomes that
+    /// summary's sibling; one added after a hidden row takes its level as if
+    /// the summary were expanded. The returned row is not automatically
     /// selected.
     pub fn add_task(
         &mut self,
@@ -427,7 +430,9 @@ impl Editor {
             Some(uid) => self.index(uid)? + 1,
             None => self.proj.tasks.len(),
         };
-        let outline_level = level_at(&self.proj, at, &self.collapsed);
+        // The row the task goes after; appending has none.
+        let anchor = after.map(|_| at - 1);
+        let outline_level = level_at(&self.proj, at, anchor, &self.collapsed);
         let uid = self
             .proj
             .tasks
@@ -1235,16 +1240,26 @@ fn new_assignment(
 /// sibling of the nearest task above, or that task's first child when it is
 /// a summary (so the summary keeps its children); the rows below play no
 /// part. Blank rows are outside the outline and skipped. At least 1.
-fn level_at(proj: &Project, at: usize, collapsed: &std::collections::BTreeSet<i32>) -> u32 {
+///
+/// When the nearest task above is hidden by a collapsed summary and the
+/// row the task is placed from (`anchor`: the row it goes after, or the
+/// blank row itself; none when appending) is shown, the summary is the row
+/// the user sees above, so the task becomes its sibling. From a hidden
+/// anchor, the level is the one it would be with the summary expanded.
+fn level_at(
+    proj: &Project,
+    at: usize,
+    anchor: Option<usize>,
+    collapsed: &std::collections::BTreeSet<i32>,
+) -> u32 {
     let Some(above) = proj.tasks[..at].iter().rposition(|t| !t.is_null) else {
         return 1;
     };
-    // Past a collapsed summary's hidden rows, the row shown above is the
-    // summary, so the new task is its sibling (see `outline::hidden_owners`).
-    // Inside them the outline decides as if expanded: view state never
-    // changes the plan's structure.
-    if let Some(owner) = outline::hidden_owners(proj, collapsed)[above]
-        && at >= subtree_end(proj, owner)
+    let owners = outline::hidden_owners(proj, collapsed);
+    // A hidden anchor leaves the rows around it as they are: existing tasks
+    // keep their parents (see `outline::hidden_owners`).
+    if let Some(owner) = owners[above]
+        && anchor.is_none_or(|a| owners[a].is_none())
     {
         return proj.tasks[owner].outline_level.max(1);
     }
@@ -1272,7 +1287,7 @@ fn materialized(
     if t.is_null {
         t.is_null = false;
         if t.outline_level == 0 {
-            t.outline_level = level_at(proj, i, collapsed);
+            t.outline_level = level_at(proj, i, Some(i), collapsed);
         }
         if t.duration_min == 0 {
             t.duration_min = proj.days_to_minutes(1.0);

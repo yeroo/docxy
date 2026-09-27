@@ -277,3 +277,43 @@ fn a_hidden_blank_row_becomes_a_task_at_its_expanded_level() {
     assert_eq!(ed.project().tasks[2].outline_level, 2);
     assert_eq!(ed.project(), expanded.project());
 }
+
+#[test]
+fn inserting_after_the_last_hidden_subtask_keeps_the_outline() {
+    let rows = [(1, "S", 1), (2, "S1", 2), (3, "S2", 2), (4, "B", 1)];
+    let mut expanded = outline(&rows);
+    expanded.add_task(Some(3), "N", 480).unwrap();
+    let mut ed = outline(&rows);
+    ed.set_collapsed(1, true).unwrap();
+    let at = ed.add_task(Some(3), "N", 480).unwrap();
+    assert_eq!((at, ed.project().tasks[at].outline_level), (3, 2));
+    assert_eq!(ed.subtree_len(1), Ok(3), "S takes N");
+    assert_eq!(ed.project().tasks, expanded.project().tasks);
+    assert!(ed.is_collapsed(1));
+}
+
+#[test]
+fn inserting_after_a_nested_hidden_subtask_keeps_the_outline() {
+    // Only T is collapsed; T1 is its last and only child.
+    let mut ed = outline(&[(1, "S", 1), (2, "S1", 2), (3, "T", 2), (4, "T1", 3)]);
+    ed.set_collapsed(3, true).unwrap();
+    let at = ed.add_task(Some(4), "N", 480).unwrap();
+    assert_eq!(ed.project().tasks[at].outline_level, 3);
+    assert!(ed.is_collapsed(3));
+}
+
+#[test]
+fn adding_after_a_shown_blank_row_below_a_collapsed_summary_makes_its_sibling() {
+    // The blank row after S's last subtask is outside S, so it shows.
+    let mut ed = outline(&[(1, "S", 1), (2, "S1", 2), (3, "", 0)]);
+    ed.set_collapsed(1, true).unwrap();
+    assert_eq!(ed.visible_rows(), [0, 2]);
+    let at = ed.add_task(Some(3), "N", 480).unwrap();
+    assert_eq!(ed.project().tasks[at].outline_level, 1);
+    // Filling it in makes a sibling too.
+    let mut ed = outline(&[(1, "S", 1), (2, "S1", 2), (3, "", 0)]);
+    ed.set_collapsed(1, true).unwrap();
+    ed.rename(3, "Filled").unwrap();
+    assert_eq!(ed.project().tasks[2].outline_level, 1);
+    assert!(ed.is_collapsed(1));
+}
