@@ -237,6 +237,14 @@ the subtasks' rolled-up span as a thin bar above its own, the part past its
 finish in a warning colour (yppxy marks those days `╍`), else its own finish
 day (an overrun within that day, or a finish past its manual parent).
 
+Durations show Project's `?` for an estimated task (`1d?`, `2.5d?`), in the
+suite, yppxy and projctl's task JSON (`estimated`). Typing a duration with a
+trailing `?` marks it estimated; typing it without `?` commits the estimate,
+even at the same duration (`1d` over `1d?`), as one undo step. A task never
+marked estimated stays unmarked. A summary shows `?` when any task below it is
+estimated; that rollup is shown, not saved, and a summary takes no `?` of its
+own.
+
 As in Project, the blank row below the last task is the entry row: clicking any
 empty row below the tasks, or Down from the last task, puts the cell cursor
 there, and typing into it then committing appends a task (`1 day?` unless a
@@ -272,8 +280,7 @@ day's last working time (17:00 on a non-working day) and its duration to the
 working time in between; neither adds a constraint. Predecessors use
 displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated,
 and unknown names create resources. A new work assignment starts at the
-resource's Max. Units capped at 100%, with work = duration x units; `Name[NN%]`
-sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
+resource's Max. Units capped at 100%; `Name[NN%]` sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
 allowed). The cell shows `Name[NN%]` for a work assignment that is not at 100%,
 and deleting the bracket resets it to 100%. In the Resource Names cell, a token
 that names, or equals the shown `Name[NN%]` text of, one of the task's
@@ -282,6 +289,23 @@ ones (a token that fits two resources equally well is ambiguous and rejected);
 otherwise an existing resource whose name matches the whole token wins;
 otherwise a name ending in `[...]` must hold valid `NN%` units. Retained
 assignments whose text is unchanged keep their units/work.
+
+Duration, work and units follow the task's Type, as in Project (a task
+without one is Fixed Units, and not effort-driven):
+- A duration edit gives each work assignment work = duration x units on a
+  Fixed Units or Fixed Duration task; a Fixed Work task keeps its work and its
+  units change (from an assignment's delay to the task finish).
+- A units edit on a Fixed Units or Fixed Work task keeps the assignment's work
+  and the task takes the duration its longest assignment needs (the others
+  keep their work); on a Fixed Duration task the work follows the units.
+- A new assignment gets work = duration x units. On an effort-driven task (a
+  Fixed Work task always is) that had work, adding or removing work resources
+  keeps the total work and splits it by units: the duration changes, or on a
+  Fixed Duration task the units do. Adding resources and changing units in
+  one edit splits by the new units.
+- Material and cost assignments take no part. Summaries, milestones, tasks
+  with a contoured assignment and, for effort-driven, a delayed one keep work
+  = duration x units. A manual task keeps its start and its finish follows.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
 be entered individually through the resource-list syntax.
@@ -301,6 +325,7 @@ Next, roughly in order:
    corpus workflow is documented in `corpus/mpp/README.md`.
 2. **Richer leveling** — priority-ordered (not just topological), multi-calendar,
    optional task splitting, and a "resource-critical" flag.
-3. **Assignment editing depth** — units/work per assignment, effort-driven
-   durations, over-allocation highlighting in the UI.
+3. **Assignment editing depth** — editing work (a Work column) and a task's
+   Type and Effort Driven, over-allocation highlighting in the UI. Units per
+   assignment, task types and effort-driven durations are done.
 4. **Views** — filtering, grouping, and a resource-usage view.
