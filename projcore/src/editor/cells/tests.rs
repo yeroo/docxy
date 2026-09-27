@@ -1168,6 +1168,8 @@ fn resource_names_show_work_units_that_are_not_100_percent() {
 #[test]
 fn bracketed_units_round_trip_through_the_resource_names_text() {
     let mut ed = with_bob(ResourceType::Work, 0.5);
+    // Fixed Duration: a units edit rescales the work from the duration (#159).
+    ed.proj.tasks[0].task_type = Some(TaskType::FixedDuration);
     // Explicit units on new assignments, including over-allocation.
     ed.set_resources(10, &["Bob[150%]".into(), " Carol [25 %] ".into()])
         .unwrap();
@@ -1270,6 +1272,8 @@ fn malformed_units_are_rejected_atomically_unless_a_resource_has_that_name() {
 #[test]
 fn assign_prompt_takes_units_and_changes_only_different_ones() {
     let mut ed = with_bob(ResourceType::Work, 0.5);
+    // Fixed Duration: a units edit rescales the work from the duration (#159).
+    ed.proj.tasks[0].task_type = Some(TaskType::FixedDuration);
     assert_eq!(
         ed.assign_resource(10, "Bob[25%]").unwrap(),
         AssignOutcome::Assigned
@@ -1421,6 +1425,8 @@ fn names_and_shown_text_share_one_exactness_ladder() {
         ("ALICE[75%]", 0.75),
     ] {
         let mut ed = on_task_10(&[(1, "Alice"), (2, "ALICE")], &[(1, 1.0), (2, 0.5)]);
+        // Fixed Duration: a units edit rescales the work (#159).
+        ed.proj.tasks[0].task_type = Some(TaskType::FixedDuration);
         assert_eq!(format_resource_names(&ed.proj, 10), "Alice, ALICE[50%]");
         ed.set_resources(10, &["Alice".into(), token.into()])
             .unwrap();
@@ -1939,7 +1945,8 @@ fn fixed_work_material_and_cost_work_survive_a_duration_change() {
         imported(5, 20, 1, 1.0, 480),
     ];
     // A fixed-work task's work is not rewritten, so its overtime stays; what
-    // derives from its schedule and rates is refreshed (#269).
+    // derives from its schedule and rates is refreshed (#269). Its units
+    // follow the new duration instead (#159).
     with_work_derived(&mut ed.proj.assignments[4]);
     let fixed = ed.proj.assignments[4].clone();
     ed = Editor::new(ed.proj);
@@ -1968,10 +1975,12 @@ fn fixed_work_material_and_cost_work_survive_a_duration_change() {
             remaining_work_min: fixed.remaining_work_min,
             remaining_cost: fixed.remaining_cost.clone(),
             timephased_data: fixed.timephased_data.clone(),
+            units: fixed.units,
             ..after.clone()
         },
         fixed
     );
+    assert_eq!(after.units, 0.5);
     assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
     let works: Vec<_> = (1..=5).map(|uid| work(&ed, uid)).collect();
     assert_eq!(

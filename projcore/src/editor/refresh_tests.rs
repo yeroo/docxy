@@ -109,7 +109,10 @@ fn a_duration_edit_refreshes_its_assignments_and_only_those() {
 
 #[test]
 fn a_units_edit_reprices_and_redates_the_assignment() {
-    let mut ed = staffed();
+    let mut proj = staffed().project().clone();
+    // Fixed Duration: the work follows the units (#159).
+    proj.tasks[0].task_type = Some(crate::model::TaskType::FixedDuration);
+    let mut ed = Editor::new(proj);
     ed.assign_resource(1, "Alice[50%]").unwrap();
     let a = assignment(&ed, 1);
     assert_eq!((a.units, a.work_min), (0.5, 240));

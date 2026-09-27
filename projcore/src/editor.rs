@@ -15,6 +15,7 @@ use crate::schedule::{Leveled, Schedule, level, schedule};
 const UNDO_CAP: usize = 100;
 
 mod cells;
+mod effort;
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
     parse_lag, parse_task_predecessors,
@@ -931,9 +932,9 @@ impl Editor {
             };
             let u = checked_units(u, name)?;
             let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
-            self.edit_row(i, |proj, _| {
-                proj.assignments[k].set_units(u, assigned_work(kind, duration, u));
-            })?;
+            let mut assignments = self.proj.assignments.clone();
+            assignments[k].set_units(u, assigned_work(kind, duration, u));
+            self.commit_assignments(i, resources, assignments)?;
             return Ok(AssignOutcome::Assigned);
         }
         let units = match units {
@@ -948,11 +949,16 @@ impl Editor {
             .max()
             .unwrap_or(0);
         let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
-        let assignment = new_assignment(&mut next_aid, uid, rid, kind, units, duration)?;
-        self.edit_row(i, |proj, _| {
-            proj.resources = resources;
-            proj.assignments.push(assignment);
-        })?;
+        let mut assignments = self.proj.assignments.clone();
+        assignments.push(new_assignment(
+            &mut next_aid,
+            uid,
+            rid,
+            kind,
+            units,
+            duration,
+        )?);
+        self.commit_assignments(i, resources, assignments)?;
         Ok(AssignOutcome::Assigned)
     }
 
@@ -1199,7 +1205,8 @@ fn assigned_work(kind: Option<ResourceType>, duration_min: i64, units: f64) -> i
 
 /// A duration change on row `i` rescales its assignments' work to duration x
 /// units, as Project does for a fixed-units or fixed-duration task. A
-/// fixed-work task keeps its work, a summary's stored duration is not the one
+/// fixed-work task keeps its work and its units follow instead (see
+/// [`effort::fixed_work_units`]); a summary's stored duration is not the one
 /// it shows, and material and cost work is not time, so those are left as
 /// read. A contoured assignment's units are its peak, so its contour stretches
 /// and its work scales with the duration instead. Without a basis to scale
@@ -1210,7 +1217,11 @@ fn assigned_work(kind: Option<ResourceType>, duration_min: i64, units: f64) -> i
 /// its `Delay` on, so it still finishes with the task.
 fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
     let t = &proj.tasks[i];
-    if t.task_type == Some(TaskType::FixedWork) || proj.is_outline_summary(i) {
+    if proj.is_outline_summary(i) {
+        return;
+    }
+    if t.task_type == Some(TaskType::FixedWork) {
+        effort::fixed_work_units(proj, i, new_min);
         return;
     }
     let uid = t.uid;
