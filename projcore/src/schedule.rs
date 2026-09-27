@@ -299,6 +299,14 @@ struct Scheduler<'a> {
     floors: HashMap<i32, i64>,
 }
 
+struct LeafGraph {
+    leaves: Vec<usize>,
+    idx_of: HashMap<i32, usize>,
+    order: Vec<usize>,
+    succs: HashMap<i32, Vec<(i32, LinkType, Offset)>>,
+    successor_links: HashMap<i32, Vec<(usize, usize)>>,
+}
+
 struct ConstraintDates {
     start: i64,
     finish: i64,
@@ -625,7 +633,12 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&self) -> Schedule {
-        let initial = self.pass(&HashMap::new());
+        self.run_with_alap_override(&HashMap::new())
+    }
+
+    fn run_with_alap_override(&self, forced: &HashMap<i32, i64>) -> Schedule {
+        let graph = self.leaf_graph();
+        let initial = self.pass(&graph, &HashMap::new());
         let mut alap: HashMap<i32, i64> = self
             .proj
             .tasks
@@ -638,66 +651,101 @@ impl<'a> Scheduler<'a> {
             })
             .filter_map(|t| initial.get(t.uid).map(|r| (t.uid, r.late_start.minutes())))
             .collect();
+        alap.extend(forced);
         if alap.is_empty() {
             initial
         } else {
-            // A fixed leaf cannot follow an ALAP predecessor. Propagate its
-            // actual dates backward through every intervening auto task;
-            // ordinary late dates can float past a fixed task's own dates.
-            let leaves: Vec<usize> = (0..self.proj.tasks.len())
-                .filter(|&i| {
-                    let t = &self.proj.tasks[i];
-                    !t.summary && self.tl(t).total > 0
-                })
-                .collect();
-            let leaf_uids: std::collections::HashSet<i32> =
-                leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-            let idx_of: HashMap<i32, usize> = leaves
-                .iter()
-                .map(|&i| (self.proj.tasks[i].uid, i))
-                .collect();
-            let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
-            let mut successors: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
-            for &i in &leaves {
-                for (link_idx, link) in self.proj.tasks[i].predecessors.iter().enumerate() {
-                    if leaf_uids.contains(&link.uid) {
-                        successors.entry(link.uid).or_default().push((i, link_idx));
-                    }
-                }
-            }
-            let mut caps: HashMap<i32, (i64, i64)> = HashMap::new();
-            for &i in order.iter().rev() {
-                let task = &self.proj.tasks[i];
-                if fixed(task) {
-                    let result = initial.get(task.uid).expect("leaf scheduled");
-                    caps.insert(
+            self.cap_alap_for_fixed(&graph, &initial, &mut alap, forced);
+            self.pass(&graph, &alap)
+        }
+    }
+
+    fn leaf_graph(&self) -> LeafGraph {
+        // Exclude unschedulable leaves before either pass so they cannot
+        // affect dependencies, project finish, or summary dates.
+        let leaves: Vec<usize> = (0..self.proj.tasks.len())
+            .filter(|&i| !self.proj.tasks[i].summary && self.tl(&self.proj.tasks[i]).total > 0)
+            .collect();
+        let leaf_uids: std::collections::HashSet<i32> =
+            leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
+        let idx_of: HashMap<i32, usize> = leaves
+            .iter()
+            .map(|&i| (self.proj.tasks[i].uid, i))
+            .collect();
+        let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
+        let mut succs: HashMap<i32, Vec<(i32, LinkType, Offset)>> = HashMap::new();
+        let mut successor_links: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
+        for &i in &leaves {
+            let task = &self.proj.tasks[i];
+            for (link_idx, link) in task.predecessors.iter().enumerate() {
+                if leaf_uids.contains(&link.uid) {
+                    succs.entry(link.uid).or_default().push((
                         task.uid,
-                        (result.early_start.minutes(), result.early_finish.minutes()),
-                    );
-                    continue;
-                }
-                let cap = successors.get(&task.uid).into_iter().flatten().filter_map(
-                    |&(successor_idx, link_idx)| {
-                        let successor = &self.proj.tasks[successor_idx];
-                        let &(start, finish) = caps.get(&successor.uid)?;
-                        let link = &successor.predecessors[link_idx];
-                        Some(self.fixed_successor_cap(task, successor, link, start, finish))
-                    },
-                );
-                if let Some(start) = cap.min() {
-                    let tl = self.tl(task);
-                    let finish = if task.duration_min == 0 {
-                        start
-                    } else {
-                        tl.abs_finish(tl.to_index(start) + task.duration_min)
-                    };
-                    caps.insert(task.uid, (start, finish));
-                    if let Some(floor) = alap.get_mut(&task.uid) {
-                        *floor = (*floor).min(start);
-                    }
+                        link.link,
+                        self.offset(link),
+                    ));
+                    successor_links
+                        .entry(link.uid)
+                        .or_default()
+                        .push((i, link_idx));
                 }
             }
-            self.pass(&alap)
+        }
+        LeafGraph {
+            leaves,
+            idx_of,
+            order,
+            succs,
+            successor_links,
+        }
+    }
+
+    fn cap_alap_for_fixed(
+        &self,
+        graph: &LeafGraph,
+        initial: &Schedule,
+        alap: &mut HashMap<i32, i64>,
+        forced: &HashMap<i32, i64>,
+    ) {
+        // A fixed leaf cannot follow an ALAP predecessor. Propagate its
+        // actual dates backward through every intervening auto task;
+        // ordinary late dates can float past a fixed task's own dates.
+        let mut caps: HashMap<i32, (i64, i64)> = HashMap::new();
+        for &i in graph.order.iter().rev() {
+            let task = &self.proj.tasks[i];
+            if fixed(task) {
+                let result = initial.get(task.uid).expect("leaf scheduled");
+                caps.insert(
+                    task.uid,
+                    (result.early_start.minutes(), result.early_finish.minutes()),
+                );
+                continue;
+            }
+            let cap = graph
+                .successor_links
+                .get(&task.uid)
+                .into_iter()
+                .flatten()
+                .filter_map(|&(successor_idx, link_idx)| {
+                    let successor = &self.proj.tasks[successor_idx];
+                    let &(start, finish) = caps.get(&successor.uid)?;
+                    let link = &successor.predecessors[link_idx];
+                    Some(self.fixed_successor_cap(task, successor, link, start, finish))
+                });
+            if let Some(start) = cap.min() {
+                let tl = self.tl(task);
+                let finish = if task.duration_min == 0 {
+                    start
+                } else {
+                    tl.abs_finish(tl.to_index(start) + task.duration_min)
+                };
+                caps.insert(task.uid, (start, finish));
+                if let Some(floor) = alap.get_mut(&task.uid)
+                    && !forced.contains_key(&task.uid)
+                {
+                    *floor = (*floor).min(start);
+                }
+            }
         }
     }
 
@@ -723,34 +771,11 @@ impl<'a> Scheduler<'a> {
         .0
     }
 
-    fn pass(&self, alap: &HashMap<i32, i64>) -> Schedule {
-        // Exclude unschedulable leaves before either pass so they cannot affect
-        // dependencies, project finish, or summary dates with empty timelines.
-        let leaves: Vec<usize> = (0..self.proj.tasks.len())
-            .filter(|&i| !self.proj.tasks[i].summary && self.tl(&self.proj.tasks[i]).total > 0)
-            .collect();
-        let leaf_uids: std::collections::HashSet<i32> =
-            leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> = leaves
-            .iter()
-            .map(|&i| (self.proj.tasks[i].uid, i))
-            .collect();
-
-        let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
-
-        // Successors of each leaf (for backward pass + free slack).
-        let mut succs: HashMap<i32, Vec<(i32, LinkType, Offset)>> = HashMap::new();
-        for &i in &leaves {
-            let t = &self.proj.tasks[i];
-            for p in &t.predecessors {
-                if leaf_uids.contains(&p.uid) {
-                    succs
-                        .entry(p.uid)
-                        .or_default()
-                        .push((t.uid, p.link, self.offset(p)));
-                }
-            }
-        }
+    fn pass(&self, graph: &LeafGraph, alap: &HashMap<i32, i64>) -> Schedule {
+        let leaves = &graph.leaves;
+        let idx_of = &graph.idx_of;
+        let order = &graph.order;
+        let succs = &graph.succs;
 
         // ---- forward pass: early start / early finish ----
         let mut es: HashMap<i32, i64> = HashMap::new(); // index space (own calendar)
@@ -763,7 +788,7 @@ impl<'a> Scheduler<'a> {
         let mut resume_idx: HashMap<i32, i64> = HashMap::new();
         let mut driven_ef: HashMap<i32, i64> = HashMap::new();
         let mut linked_tasks = std::collections::HashSet::new();
-        for &i in &order {
+        for &i in order {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
             let mut linked_start: Option<i64> = None;
@@ -958,10 +983,10 @@ impl<'a> Scheduler<'a> {
                     held_milestone = Some(late_start);
                 }
             }
-            // A binding FS milestone occupies the finish instant, even in a
-            // nonworking gap, as does a binding MFO/FNLT milestone or one with
-            // an SNET at a period's end. Later start-type links/constraints
-            // still snap.
+            // A binding FS or ALAP milestone occupies its exact finish or
+            // late-start instant, even in a nonworking gap. So do binding
+            // MFO/FNLT and period-end SNET milestones. Later start-type
+            // links/constraints still snap.
             let s_abs =
                 if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
                     start_abs
@@ -987,7 +1012,7 @@ impl<'a> Scheduler<'a> {
             .chain(self.manual_spans.values().map(|&(_, finish)| finish))
             .max()
             .unwrap_or(self.anchor);
-        let pre_start = self.pre_start_timelines(&leaves, &linked_tasks);
+        let pre_start = self.pre_start_timelines(leaves, &linked_tasks);
         // A task is critical at or below this much total slack
         // (`CriticalSlackLimit`), and with `MultipleCriticalPaths` each task
         // without successors ends a critical path of its own.
@@ -1171,17 +1196,17 @@ impl<'a> Scheduler<'a> {
                 // reuse the early instants unless a hard date set that bound.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                // A binding MFO/FNLT/deadline milestone sits on its own
-                // instant (an FNLT or deadline capped by the successor bound),
-                // which can be the morning side of that date's index.
+                // A binding MFO/FNLT/deadline milestone keeps its own instant;
+                // an elapsed successor can bound it earlier in the same index.
                 if let Some(m) = milestone_late {
                     debug_assert_eq!(tl.to_index(m), finish_index);
                 }
-                let successor_milestone = (span == 0 && tl.to_index(bound_instant) == finish_index)
+                let evening = tl.abs_finish(finish_index);
+                let successor_milestone = (span == 0
+                    && bound_instant < evening
+                    && tl.to_index(bound_instant) == finish_index)
                     .then_some(bound_instant);
-                let f_abs = milestone_late
-                    .or(successor_milestone)
-                    .unwrap_or_else(|| tl.abs_finish(finish_index));
+                let f_abs = milestone_late.or(successor_milestone).unwrap_or(evening);
                 let s_abs = if span == 0 {
                     f_abs
                 } else {
@@ -1195,7 +1220,7 @@ impl<'a> Scheduler<'a> {
 
         // ---- assemble leaf results ----
         let mut results: HashMap<i32, TaskResult> = HashMap::new();
-        for &i in &leaves {
+        for &i in leaves {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
             let e_s = es_abs[&t.uid];
@@ -1240,7 +1265,7 @@ impl<'a> Scheduler<'a> {
             // A tracked task finishes where its actuals put it, not at its
             // start plus its duration.
             let finish = tracked.map(|_| tl.to_index(e_f));
-            let free = self.free_slack(t, tl, &es_abs, finish, &succs);
+            let free = self.free_slack(t, tl, &es_abs, finish, succs);
             results.insert(
                 t.uid,
                 TaskResult {
@@ -1271,7 +1296,7 @@ impl<'a> Scheduler<'a> {
         let mut rollups = HashMap::new();
         for i in summaries_deepest_first(self.proj) {
             let t = &self.proj.tasks[i];
-            let nodes: Vec<Node> = rollup_nodes(self.proj, i, &leaves)
+            let nodes: Vec<Node> = rollup_nodes(self.proj, i, leaves)
                 .filter_map(|k| {
                     let r = results.get(&self.proj.tasks[k].uid)?;
                     Some(if self.proj.tasks[k].summary {
@@ -1413,8 +1438,19 @@ impl<'a> Scheduler<'a> {
             if link != LinkType::FinishStart {
                 continue;
             }
-            let (succ_es, lag) = offset.backward(*es_abs.get(&suid)?);
-            let gap = tl.to_index(succ_es) - lag - ef_idx;
+            let succ = self.proj.task(suid)?;
+            let succ_tl = self.tl(succ);
+            let succ_es = *es_abs.get(&suid)?;
+            let (_, allowed_finish, _) = inverse_link_start(
+                tl,
+                succ_tl,
+                LinkType::FinishStart,
+                offset,
+                succ_es,
+                succ_es,
+                0,
+            );
+            let gap = tl.to_index(allowed_finish) - ef_idx;
             min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
         }
         min_gap
@@ -1554,15 +1590,6 @@ impl Offset {
             Offset::Elapsed(lag) => (abs.saturating_add(lag), 0),
         }
     }
-
-    /// [`Self::forward`] mirrored for a successor's late instant: the lag is
-    /// still to be subtracted in index space.
-    fn backward(self, abs: i64) -> (i64, i64) {
-        match self {
-            Offset::Working(lag) => (abs, lag),
-            Offset::Elapsed(lag) => (abs.saturating_sub(lag), 0),
-        }
-    }
 }
 
 /// Invert the forward link on the successor's calendar, then choose the
@@ -1588,8 +1615,16 @@ fn inverse_link_start(
     // The successor's next working start shares an index with the previous
     // evening. Forward scheduling accepts a predecessor endpoint throughout
     // that gap, so the inverse keeps the morning side of the index.
-    let morning = succ_tl.abs_start(succ_tl.to_index(endpoint) - working_lag);
-    let bound = morning.saturating_sub(elapsed_lag);
+    let bound = if matches!(offset, Offset::Elapsed(_))
+        && matches!(link, LinkType::FinishFinish | LinkType::StartFinish)
+    {
+        // An elapsed FF/SF forward link keeps the successor's exact finish,
+        // including an instant outside working time.
+        endpoint.saturating_sub(elapsed_lag)
+    } else {
+        let morning = succ_tl.abs_start(succ_tl.to_index(endpoint) - working_lag);
+        morning.saturating_sub(elapsed_lag)
+    };
     match link {
         LinkType::FinishStart | LinkType::FinishFinish => {
             let finish = pred_tl.abs_finish(pred_tl.to_index(bound));
@@ -1989,7 +2024,7 @@ pub fn schedule(proj: &Project) -> Schedule {
     let active = without_tasks(&clean, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let mut main = active_scheduler.run();
-    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler);
+    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler, &main);
     if dormant_bounds {
         main.project_start = other.project_start;
         main.project_finish = other.project_finish;
@@ -2012,6 +2047,7 @@ fn dormant_pass(
     clean: &Project,
     dormant: &std::collections::HashSet<i32>,
     active: &Scheduler<'_>,
+    active_result: &Schedule,
 ) -> (Schedule, bool) {
     let dormant_bounds = !active.has_leaf();
     let mut view = dormant_view(clean, dormant);
@@ -2030,7 +2066,20 @@ fn dormant_pass(
         view.start_date
             .get_or_insert(DateTime::from_minutes(active.anchor));
     }
-    (Scheduler::new(&view).run(), dormant_bounds)
+    let forced: HashMap<i32, i64> = view
+        .tasks
+        .iter()
+        .filter(|t| !dormant.contains(&t.uid) && t.constraint == ConstraintType::AsLateAsPossible)
+        .filter_map(|t| {
+            active_result
+                .get(t.uid)
+                .map(|r| (t.uid, r.early_start.minutes()))
+        })
+        .collect();
+    (
+        Scheduler::new(&view).run_with_alap_override(&forced),
+        dormant_bounds,
+    )
 }
 
 /// Inactive tasks and summaries with no active descendants have no effect on
@@ -2230,7 +2279,8 @@ pub fn level(proj: &Project) -> Leveled {
     let active = without_tasks(&clean, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let mut main = active_scheduler.level();
-    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler);
+    let active_result = active_scheduler.run();
+    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler, &active_result);
     if dormant_bounds {
         main.project_finish = other.project_finish;
     }
@@ -3066,8 +3116,102 @@ mod tests {
         assert_eq!(sched.get(2).unwrap().early_start, at(16, 8));
         assert_eq!(sched.get(2).unwrap().early_finish, at(16, 17));
         assert_eq!(sched.get(1).unwrap().total_slack_min, 0);
+        assert_eq!(sched.get(1).unwrap().free_slack_min, 0);
         assert_eq!(sched.get(2).unwrap().total_slack_min, 0);
         assert_eq!(sched.get(3).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn linked_alap_milestone_uses_evening_late_instant() {
+        for alap in [false, true] {
+            let mut milestone = task(1, "M", 0);
+            if alap {
+                milestone.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 960);
+            b.predecessors.push(fs(1));
+            let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 4800)]));
+            let m = sched.get(1).unwrap();
+            assert_eq!((m.late_start, m.late_finish), (at(11, 17), at(11, 17)));
+            if alap {
+                assert_eq!((m.early_start, m.early_finish), (at(11, 17), at(11, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(12, 8));
+                assert_eq!(sched.project_finish, at(13, 17));
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_free_elapsed_fs_milestone_keeps_evening_convention() {
+        for alap in [false, true] {
+            let mut milestone = task(1, "M", 0);
+            if alap {
+                milestone.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 900,
+                lag_format: LagFormat::from_code(4).unwrap(),
+            });
+            let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 6 * 480)]));
+            let m = sched.get(1).unwrap();
+            assert_eq!((m.late_start, m.late_finish), (at(6, 17), at(6, 17)));
+            if alap {
+                assert_eq!((m.early_start, m.early_finish), (at(6, 17), at(6, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(9, 8));
+                assert_eq!(sched.project_finish, at(9, 17));
+            }
+        }
+    }
+
+    #[test]
+    fn elapsed_ff_alap_preserves_successors_exact_finish() {
+        let mut a = task(1, "A", 4 * 480);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(Predecessor {
+            uid: 1,
+            link: LinkType::FinishFinish,
+            lag: 2880,
+            lag_format: LagFormat::from_code(8).unwrap(),
+        });
+        let sched = schedule(&march2(vec![a, b]));
+        assert_eq!(
+            (
+                sched.get(1).unwrap().early_start,
+                sched.get(1).unwrap().early_finish
+            ),
+            (at(2, 8), at(5, 17))
+        );
+        assert_eq!(sched.get(2).unwrap().early_finish, at(7, 17));
+        assert_eq!(sched.project_finish, at(7, 17));
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn dormant_successor_follows_active_alap_placement() {
+        let mut a = task(1, "A", 960);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut d = task(2, "D", 960);
+        d.active = Some(false);
+        d.predecessors.push(fs(1));
+        let proj = march2(vec![a, d, task(3, "Long", 4800)]);
+        let sched = schedule(&proj);
+        assert_eq!(
+            (
+                sched.get(1).unwrap().early_start,
+                sched.get(1).unwrap().early_finish
+            ),
+            (at(12, 8), at(13, 17))
+        );
+        assert_eq!(sched.get(2).unwrap().early_start, at(16, 8));
+        assert_eq!(sched.project_finish, at(13, 17));
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(1), Some(at(12, 8)));
+        assert_eq!(leveled.finish(1), Some(at(13, 17)));
+        assert_eq!(leveled.start(2), Some(at(16, 8)));
     }
 
     #[test]
