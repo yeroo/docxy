@@ -14497,6 +14497,31 @@ fn list_markers(body: &[Block]) -> Vec<Option<String>> {
     out
 }
 
+/// A paragraph's inlines with every hyperlink opened up into its runs and then
+/// its `content` (recursively), each flagged when it sits inside a link. The
+/// pieces that take caret offsets (runs, tabs, breaks) then add up to
+/// `docxcore::editor::inline_len`: a complex link's plain text is editable.
+fn flat_inlines(content: &[Inline]) -> Vec<(Cow<'_, Inline>, bool)> {
+    fn push<'a>(inline: &'a Inline, in_link: bool, out: &mut Vec<(Cow<'a, Inline>, bool)>) {
+        match inline {
+            Inline::Hyperlink(h) => {
+                for r in &h.runs {
+                    out.push((Cow::Owned(Inline::Run(r.clone())), true));
+                }
+                for child in &h.content {
+                    push(child, true, out);
+                }
+            }
+            other => out.push((Cow::Borrowed(other), in_link)),
+        }
+    }
+    let mut out = Vec::new();
+    for inline in content {
+        push(inline, false, &mut out);
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paragraph_el(
     p: &Paragraph,
@@ -14550,8 +14575,11 @@ fn paragraph_el(
         .map(|(c, _)| *c)
         .fold(f32::NEG_INFINITY, f32::max);
     let mut x = 0.0_f32;
+    // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
+    // link take caret offsets exactly as the editor counts them.
+    let items = flat_inlines(&p.content);
     // Only paragraphs that actually contain a tab need per-run width measurement.
-    let has_tab = p.content.iter().any(|i| matches!(i, Inline::Tab(_)));
+    let has_tab = items.iter().any(|(i, _)| matches!(**i, Inline::Tab(_)));
     let m = meas.filter(|_| has_tab);
     // Width of a run's text at its effective size (matching emit_words' sizing).
     let run_w = |r: &docxcore::model::Run| -> f32 {
@@ -14572,7 +14600,6 @@ fn paragraph_el(
     let inline_w = |it: &Inline| -> f32 {
         match it {
             Inline::Run(r) => run_w(r),
-            Inline::Hyperlink(h) => h.runs.iter().map(run_w).sum(),
             Inline::Field { text, .. } => m
                 .map(|m| {
                     m.width(
@@ -14592,8 +14619,9 @@ fn paragraph_el(
     // Total width of content from index `from` up to the next tab / break / end —
     // the segment a centre/right tab must position.
     let seg_width = |from: usize| -> f32 {
-        p.content[from..]
+        items[from..]
             .iter()
+            .map(|(it, _)| &**it)
             .take_while(|it| !matches!(it, Inline::Tab(_) | Inline::Break(_)))
             .map(&inline_w)
             .sum()
@@ -14640,25 +14668,18 @@ fn paragraph_el(
             x += ms.width(m, base, false, false);
         }
     }
-    for i in 0..p.content.len() {
-        let inline = &p.content[i];
+    for i in 0..items.len() {
+        let (inline, in_link) = (&*items[i].0, items[i].1);
         match inline {
             Inline::Run(r) => {
                 emit_run(
-                    &mut spans, &r.text, &r.props, base, false, &mut idx, &mut caret, sel, click,
+                    &mut spans, &r.text, &r.props, base, in_link, &mut idx, &mut caret, sel, click,
                     pal,
                 );
                 x += run_w(r);
             }
-            Inline::Hyperlink(h) => {
-                for r in &h.runs {
-                    emit_run(
-                        &mut spans, &r.text, &r.props, base, true, &mut idx, &mut caret, sel,
-                        click, pal,
-                    );
-                    x += run_w(r);
-                }
-            }
+            // Opened up by `flat_inlines`.
+            Inline::Hyperlink(_) => {}
             Inline::Tab(_) => {
                 // Advance to the next stop; centre/right stops position the segment
                 // that follows (up to the next tab) so it centres on / ends at it.
@@ -26916,5 +26937,68 @@ mod config_root_tests {
         assert_eq!(hot_dir(), real.join("docxy").join("hot"));
         assert!(!session_path().starts_with(over));
         assert!(!hot_dir().starts_with(over));
+    }
+}
+
+#[cfg(test)]
+mod flat_inlines_tests {
+    use super::{Inline, flat_inlines};
+    use docxcore::model::{BreakKind, Hyperlink, Run, RunProps};
+
+    fn run(text: &str) -> Inline {
+        Inline::Run(Run {
+            text: text.into(),
+            props: RunProps::default(),
+        })
+    }
+
+    /// The caret offsets `paragraph_el` hands out for these pieces: what
+    /// `emit_run`, `emit_tab` and `emit_break` advance `idx` by.
+    fn offsets(items: &[(std::borrow::Cow<'_, Inline>, bool)]) -> usize {
+        items
+            .iter()
+            .map(|(i, _)| match &**i {
+                Inline::Run(r) => r.text.chars().count(),
+                Inline::Tab(_) | Inline::Break(_) => 1,
+                _ => 0,
+            })
+            .sum()
+    }
+
+    /// #212: text after a complex link (one holding proofing marks, a tracked
+    /// change, a tab) sits at the engine's offsets, so clicks, the caret and
+    /// selections after it are not shifted.
+    #[test]
+    fn a_complex_links_pieces_take_the_engines_offsets_212() {
+        let link = Inline::Hyperlink(Hyperlink {
+            anchor: Some("top".into()),
+            content: vec![
+                Inline::Raw("<w:proofErr w:type=\"spellStart\"/>".into()),
+                run("Con"),
+                Inline::Tab(RunProps::default()),
+                Inline::Field {
+                    raw: String::new(),
+                    text: "F".into(),
+                },
+                Inline::Hyperlink(Hyperlink {
+                    content: vec![Inline::Break(BreakKind::Line), run("toso")],
+                    ..Hyperlink::default()
+                }),
+            ],
+            ..Hyperlink::default()
+        });
+        let content = vec![run("ab"), link, run("cd")];
+        let items = flat_inlines(&content);
+        assert_eq!(
+            offsets(&items),
+            content
+                .iter()
+                .map(docxcore::editor::inline_len)
+                .sum::<usize>()
+        );
+        let linked: Vec<bool> = items.iter().map(|(_, l)| *l).collect();
+        assert_eq!(linked, [false, true, true, true, true, true, true, false]);
+        let before_cd = offsets(&items[..items.len() - 1]);
+        assert_eq!(before_cd, 11, "`cd` starts at the engine's offset 11");
     }
 }
