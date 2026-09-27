@@ -298,10 +298,13 @@ otherwise a name ending in `[...]` must hold valid units for its resource's
 kind. Retained assignments whose text shows the same units keep their units/work.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
-be entered individually through the resource-list syntax. A comma inside a
-matched `[...]` pair does not split, so a material label such as
-`Cement[5 bags, 50 lb]` stays in its token; brackets pair like parentheses, and
-a stray `[` or `]` protects nothing. Brackets that pair across names (a
+be entered individually through the resource-list syntax, and a token whose new
+name would contain a comma is rejected rather than created. A comma inside a
+`[...]` pair that ends a token (only whitespace, then a comma or the end of the
+text, follows its `]`) does not split, so a material label such as
+`Cement[5 bags, 50 lb]` stays in its token. Brackets pair like parentheses; a
+stray `[` or `]`, or a pair closed mid-name (`Crew [A, Bob] Jr`), protects
+nothing. Brackets that pair across names into a token ending in `]` (a
 resource named `Crew [A` followed by `Bob]`) make one token, which is rejected
 unless it names a resource.
 

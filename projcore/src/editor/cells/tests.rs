@@ -1576,7 +1576,14 @@ fn resource_names_split_at_commas_outside_brackets() {
             &["Cement[5 bags, 50 lb]", " Bob[50%"],
         ),
         ("X[a[b], c], Bob", &["X[a[b], c]", " Bob"]),
-        // Brackets that pair across a comma hold it: one token.
+        (
+            "Cement[5 bags, 50 lb] , Bob",
+            &["Cement[5 bags, 50 lb] ", " Bob"],
+        ),
+        // A pair closed mid-name protects nothing.
+        ("Crew [A, Bob] Jr", &["Crew [A", " Bob] Jr"]),
+        ("Crew [A, Rig][50%]", &["Crew [A", " Rig][50%]"]),
+        // A pair that ends a token holds its comma, even across names: one token.
         ("Crew [A, Bob]", &["Crew [A, Bob]"]),
     ] {
         assert_eq!(split_resource_names(text), tokens, "{text}");
@@ -1627,8 +1634,8 @@ fn a_material_label_with_a_comma_survives_the_cell() {
         commit_shown_text(&mut ed).unwrap();
         unchanged(&ed, &before, (1, 0, false));
     }
-    // Brackets pairing across a comma make one token, which is rejected
-    // whole rather than read as other names.
+    // Brackets pairing across names into a token that ends in `]` make one
+    // token, which is rejected whole rather than read as other names.
     let mut ed = with_cement(Some("bags, 50 lb"));
     ed.proj.resources.push(Resource {
         uid: 3,
@@ -1644,6 +1651,70 @@ fn a_material_label_with_a_comma_survives_the_cell() {
         Err("Invalid units in 'Crew [A, Bob]'".into())
     );
     unchanged(&ed, &before, (0, 0, false));
+}
+
+#[test]
+fn a_bracket_pair_closed_mid_name_does_not_join_names() {
+    let mut ed = with_bob(ResourceType::Work, 1.0);
+    for (uid, name, max_units) in [(2, "Crew [A", 1.0), (3, "Bob] Jr", 1.0), (4, "Rig]", 0.5)] {
+        ed.proj.resources.push(Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            max_units,
+            ..Resource::default()
+        });
+    }
+    let base = ed.proj.clone();
+    for (other, name, units, shown) in [
+        (3, "Bob] Jr", 1.0, "Crew [A, Bob] Jr"),
+        (4, "Rig]", 0.5, "Crew [A, Rig][50%]"),
+    ] {
+        let mut ed = Editor::new(base.clone());
+        ed.set_resources(10, &["Crew [A".into(), name.into()])
+            .unwrap();
+        let text = format_resource_names(&ed.proj, 10);
+        assert_eq!(text, shown);
+        let count = ed.proj.resources.len();
+        ed.set_resources(10, &split_resource_names(&format!("{text}, Alice")))
+            .unwrap();
+        assert_eq!(allocation(&ed, 10, 2), (1.0, 960), "{shown}");
+        assert_eq!(
+            allocation(&ed, 10, other),
+            (units, work_for(960, units)),
+            "{shown}"
+        );
+        assert_eq!(ed.proj.resources.len(), count + 1, "{shown}");
+        assert_eq!(
+            format_resource_names(&ed.proj, 10),
+            format!("{shown}, Alice")
+        );
+    }
+    // A joined token that would still create a resource is refused whole.
+    let mut ed = Editor::new(base.clone());
+    for token in ["Crew [A, Nobody", "Crew [A, Nobody[50%]"] {
+        let name = token.strip_suffix("[50%]").unwrap_or(token);
+        assert_eq!(
+            ed.set_resources(10, &["Bob".into(), token.into()]),
+            Err(format!("Resource name '{name}' cannot contain a comma"))
+        );
+        unchanged(&ed, &base, (0, 0, false));
+    }
+    // An existing resource whose name has a comma is still found, bare or
+    // with units.
+    let mut p = base.clone();
+    p.resources.push(Resource {
+        uid: 5,
+        id: 5,
+        name: "Smith, J".into(),
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    ed = Editor::new(p);
+    ed.set_resources(10, &["smith, j".into()]).unwrap();
+    assert_eq!(allocation(&ed, 10, 5), (1.0, 960));
+    ed.set_resources(10, &["smith, j[50%]".into()]).unwrap();
+    assert_eq!(allocation(&ed, 10, 5), (0.5, 480));
 }
 
 #[test]

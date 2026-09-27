@@ -287,6 +287,15 @@ impl Editor {
                     let rid = match matched {
                         Some(rid) => rid,
                         None if name.trim().is_empty() => continue,
+                        // No resource has this name (`match_resource` looked), so
+                        // it would be created. Cell text splits at commas, so a
+                        // comma in it means tokens were joined: refuse it.
+                        None if name.contains(',') => {
+                            return Err(format!(
+                                "Resource name '{}' cannot contain a comma",
+                                name.trim()
+                            ));
+                        }
                         None => find_or_stage_resource(&mut resources, name.trim())?,
                     };
                     let r = resources.iter().find(|r| r.uid == rid).expect("staged");
@@ -552,19 +561,27 @@ pub fn format_resource_names(proj: &Project, task_uid: i32) -> String {
 }
 
 /// Split Resource Names cell text into its tokens, untrimmed, at every comma
-/// that is not inside a matched `[...]` pair, so a material label with a comma
-/// (`Cement[5 bags, 50 lb]`) stays in its token. Brackets pair like parentheses
-/// (each `]` closes the nearest open `[`); a `]` with no `[` and a `[` never
-/// closed protect nothing, so a stray bracket in one name leaves the others
-/// split as usual. Text that pairs across a comma, such as a resource named
-/// `Crew [A` followed by `Bob]`, stays one token.
+/// that is not inside a protecting `[...]` pair, so a material label with a
+/// comma (`Cement[5 bags, 50 lb]`) stays in its token. Brackets pair like
+/// parentheses (each `]` closes the nearest open `[`), and a pair protects its
+/// commas only when its `]` ends a token: what follows it, past whitespace, is
+/// a comma or the end of the text. A stray `[` or `]`, or a pair closed
+/// mid-name (`Crew [A, Bob] Jr`, `Crew [A, Rig][50%]`), protects nothing. A
+/// pair that closes a token after another name's `[` (`Crew [A`, `Bob]` shown
+/// as `Crew [A, Bob]`) still makes one token.
 pub fn split_resource_names(text: &str) -> Vec<String> {
     let mut open = Vec::new();
     let mut pairs = Vec::new();
     for (i, c) in text.char_indices() {
         match c {
             '[' => open.push(i),
-            ']' => pairs.extend(open.pop().map(|start| start..i)),
+            ']' => {
+                let ends_token =
+                    matches!(text[i + 1..].trim_start().chars().next(), None | Some(','));
+                if let Some(start) = open.pop().filter(|_| ends_token) {
+                    pairs.push(start..i);
+                }
+            }
             _ => {}
         }
     }
