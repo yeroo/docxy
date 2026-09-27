@@ -184,7 +184,7 @@ fn gallery_tile(items: usize) -> Value {
 }
 
 /// One gallery item's sample in one theme: px size, CSS weight, and its ink
-/// (`fg`, `dim` or `#rrggbb`).
+/// (`fg` or `#rrggbb`).
 fn sample_look(preview: &str, dark: bool) -> Value {
     let l = crate::style_gallery::sample_look(preview, dark);
     json!({ "size": l.size, "weight": l.weight, "ink": l.ink.css() })
