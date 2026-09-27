@@ -455,6 +455,18 @@ pub(crate) fn gantt_strip(
                     .border_color(hsla_u(color)),
             );
         }
+        if let Some((s, e)) = bar.warning_days() {
+            strip = strip.child(
+                div()
+                    .absolute()
+                    .left(px(s as f32 * DAY_W))
+                    .top(px(3.))
+                    .w(px((e - s + 1).max(1) as f32 * DAY_W))
+                    .h(px(4.))
+                    .border_1()
+                    .border_color(hsla_u(GANTT_WARNING)),
+            );
+        }
         let marker = probe(probes, format!("bar:{id}"));
         let outline = if bar.kind == BarKind::Milestone {
             div()

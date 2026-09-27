@@ -945,16 +945,8 @@ impl Editor {
         if task.is_null {
             return Err("A blank row cannot be inactivated".into());
         }
-        if active {
-            let mut level = task.outline_level;
-            for ancestor in self.proj.tasks[..i].iter().rev().filter(|t| !t.is_null) {
-                if ancestor.outline_level < level {
-                    if !ancestor.is_active() {
-                        return Err("Its summary task is inactive".into());
-                    }
-                    level = ancestor.outline_level;
-                }
-            }
+        if active && !self.proj.ancestors_active(i) {
+            return Err("Its summary task is inactive".into());
         }
         let end = subtree_end(&self.proj, i);
         let changed: Vec<usize> = (i..end)

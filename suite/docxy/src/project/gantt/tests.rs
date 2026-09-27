@@ -877,6 +877,9 @@ fn inactive_manual_summary_retains_its_secondary_rollup_outline() {
     assert_eq!(b.kind, BarKind::Summary);
     assert!(b.rollup.is_some());
     assert!(b.state().contains("rollup"));
+    assert!(b.warning);
+    assert!(b.state().contains("warning"));
+    assert!(b.warning_days().is_some());
 }
 
 #[test]

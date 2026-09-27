@@ -485,12 +485,7 @@ pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
         ProjectAct::Timeline => v.timeline,
         ProjectAct::CriticalTasks => v.show_critical,
         ProjectAct::BaselineBars => v.show_baseline,
-        ProjectAct::Inactivate => v
-            .selected_uid()
-            .and_then(|uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
-            .is_some_and(|i| {
-                !v.ed.project().tasks[i].is_null && !v.ed.project().effectively_active(i)
-            }),
+        ProjectAct::Inactivate => selected_task_inactive(v),
         // The selected task's mode, as Project highlights it; none on the
         // entry row or a blank row.
         ProjectAct::ManuallySchedule | ProjectAct::AutoSchedule => v
@@ -499,6 +494,12 @@ pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
             .is_some_and(|t| !t.is_null && t.manual == (act == ProjectAct::ManuallySchedule)),
         _ => false,
     }
+}
+
+fn selected_task_inactive(v: &ProjectView) -> bool {
+    v.selected_uid()
+        .and_then(|uid| v.ed.project().tasks.iter().position(|t| t.uid == uid))
+        .is_some_and(|i| inactive_row(v.ed.project(), i))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -906,20 +907,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             }
             Inactivate => {
                 if let Some(uid) = v.selected_uid() {
-                    let task = v.ed.project().task(uid).ok_or("No task selected")?;
-                    let index =
-                        v.ed.project()
-                            .tasks
-                            .iter()
-                            .position(|t| t.uid == uid)
-                            .unwrap();
-                    if task.is_active()
-                        && !v.ed.project().effectively_active(index)
-                        && !task.is_null
-                    {
-                        return Err("Its summary task is inactive".into());
-                    }
-                    let activate = !task.is_active();
+                    let activate = selected_task_inactive(v);
                     let count = v.ed.set_active(uid, activate)?;
                     status = Some(match (activate, count) {
                         (true, 1) => "Task activated".into(),

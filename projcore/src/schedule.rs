@@ -1816,6 +1816,8 @@ fn manual_summary_floors(proj: &Project, spans: &HashMap<i32, (i64, i64)>) -> Ha
 ///
 /// Task UIDs must be unique: results, links and assignments are keyed by UID.
 /// Readers reject duplicates; a code-built project must not contain them.
+/// Inactive tasks keep their dates from a second pass, but never drive an
+/// active successor, summary rollup, project bound, or critical path.
 pub fn schedule(proj: &Project) -> Schedule {
     let clean = without_blank_rows(proj);
     let dormant = dormant_uids(&clean);
@@ -1846,21 +1848,32 @@ pub fn schedule(proj: &Project) -> Schedule {
 /// Inactive tasks and summaries with no active descendants have no effect on
 /// the active schedule. The latter still retain their own dates in pass B.
 fn dormant_uids(proj: &Project) -> std::collections::HashSet<i32> {
+    let activity = proj.effective_activity();
     let mut dormant = std::collections::HashSet::new();
-    for (i, task) in proj.tasks.iter().enumerate() {
-        if !proj.effectively_active(i) {
+    let mut active_leaves = Vec::with_capacity(proj.tasks.len() + 1);
+    active_leaves.push(0usize);
+    for (task, active) in proj.tasks.iter().zip(activity) {
+        if !active {
             dormant.insert(task.uid);
         }
+        active_leaves
+            .push(active_leaves.last().copied().unwrap() + usize::from(active && !task.summary));
     }
+    // The next row at the same or a shallower level ends this subtree.
+    let mut ends = vec![proj.tasks.len(); proj.tasks.len()];
+    let mut stack: Vec<usize> = Vec::new();
     for (i, task) in proj.tasks.iter().enumerate().rev() {
-        if !task.summary || dormant.contains(&task.uid) {
-            continue;
+        while stack
+            .last()
+            .is_some_and(|&j| proj.tasks[j].outline_level > task.outline_level)
+        {
+            stack.pop();
         }
-        let descendants: Vec<&Task> = proj.tasks[i + 1..]
-            .iter()
-            .take_while(|t| t.outline_level > task.outline_level)
-            .collect();
-        if !descendants.is_empty() && descendants.iter().all(|t| dormant.contains(&t.uid)) {
+        ends[i] = stack.last().copied().unwrap_or(proj.tasks.len());
+        stack.push(i);
+    }
+    for (i, task) in proj.tasks.iter().enumerate() {
+        if task.summary && ends[i] > i + 1 && active_leaves[ends[i]] == active_leaves[i + 1] {
             dormant.insert(task.uid);
         }
     }
@@ -1900,13 +1913,7 @@ fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
         .filter(|t| t.is_null)
         .map(|t| t.uid)
         .collect();
-    let mut kept = proj.clone();
-    kept.tasks.retain(|t| !t.is_null);
-    for t in &mut kept.tasks {
-        t.predecessors.retain(|p| !blank.contains(&p.uid));
-    }
-    kept.assignments.retain(|a| !blank.contains(&a.task_uid));
-    std::borrow::Cow::Owned(kept)
+    std::borrow::Cow::Owned(without_tasks(proj, &blank))
 }
 
 /// Working minutes between two wall-clock instants under the project's default
@@ -2013,6 +2020,8 @@ impl Leveled {
 /// is booked beyond its capacity, never scheduling a task before its CPM early
 /// start and never breaking a dependency (a predecessor's leveling delay is
 /// propagated to its successors, preserving every link's gap).
+/// Inactive tasks book no resource capacity and report their CPM dates; an
+/// active predecessor's leveling delay does not propagate to an inactive one.
 ///
 /// v1 scope: a single-pass, topological-order serial leveler operating in the
 /// default calendar's working-minute space; resource occupation is the task's
@@ -2585,6 +2594,7 @@ mod tests {
         let sched = schedule(&all);
         assert_eq!(sched.project_finish, sched.get(1).unwrap().early_finish);
         assert_eq!(level(&all).finish(1), Some(sched.project_finish));
+        assert_eq!(level(&all).project_finish, sched.project_finish);
 
         let active = task(2, "Active", 480);
         let mixed = Project {
@@ -2598,6 +2608,32 @@ mod tests {
         assert_eq!(sched.project_finish, sched.get(2).unwrap().early_finish);
         assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
         assert_eq!(leveled.start(1), Some(sched.get(1).unwrap().early_start));
+    }
+
+    #[test]
+    fn inactive_predecessor_does_not_delay_an_active_summary_or_child() {
+        let mut dormant = task(1, "Dormant", 4800);
+        dormant.active = Some(false);
+        let mut summary = task(2, "Phase", 0);
+        summary.summary = true;
+        summary.predecessors.push(fs(1));
+        let mut child = task(3, "Child", 480);
+        child.outline_level = 2;
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![dormant, summary, child],
+            ..Project::default()
+        };
+        let active = without_tasks(&proj, &dormant_uids(&proj));
+        assert!(active.task(2).unwrap().predecessors.is_empty());
+        let sched = schedule(&proj);
+        assert_eq!(sched.get(3).unwrap().early_start, sched.project_start);
+        assert_eq!(sched.get(2).unwrap().early_start, sched.project_start);
+        assert_eq!(
+            sched.get(2).unwrap().early_finish,
+            sched.get(3).unwrap().early_finish
+        );
+        assert!(sched.get(1).unwrap().early_finish > sched.project_finish);
     }
 
     #[test]
