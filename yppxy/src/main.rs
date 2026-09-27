@@ -2266,6 +2266,25 @@ mod tests {
     }
 
     #[test]
+    fn loading_non_summary_uid_zero_keeps_its_task_name_empty() {
+        let dir = std::env::temp_dir().join(format!("yppxy-uid-zero-leaf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("site-plan.xml");
+        let mut project = unnamed_summary_fixture("");
+        project.tasks[0].summary = false;
+        std::fs::write(&path, mspdi::write_mspdi(&project)).unwrap();
+        let loaded = load(path.to_str().unwrap()).unwrap();
+        assert_eq!(loaded.name, "site-plan");
+        assert!(loaded.task(0).unwrap().name.is_empty());
+        let markdown = gantt::to_markdown(&loaded, &schedule(&loaded));
+        assert!(markdown.contains("| Task 0 |"), "{markdown}");
+        let saved = mspdi::read_mspdi(&mspdi::write_mspdi(&loaded)).unwrap();
+        assert!(saved.task(0).unwrap().name.is_empty());
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn save_as_prompt_retains_binding_on_failure_and_adds_native_extension() {
         let dir = std::env::temp_dir().join(format!("yppxy-save-prompt-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

@@ -57,9 +57,7 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
             emitted = Some(sec);
         }
 
-        let name = sanitize(&task.name)
-            .or_else(|| summary_fallback(proj, task))
-            .unwrap_or_else(|| format!("Task {}", task.uid));
+        let name = sanitize(&task.name).unwrap_or_else(|| format!("Task {}", task.uid));
         let p = r.early_start.parts();
         let date = format!("{:04}-{:02}-{:02}", p.year, p.month, p.day);
         let mut tags: Vec<&str> = Vec::new();
@@ -255,7 +253,7 @@ fn sanitize(s: &str) -> Option<String> {
 
 /// A pathless project can still name its UID 0 row from project metadata.
 fn summary_fallback(proj: &Project, task: &Task) -> Option<String> {
-    (task.uid == 0 && task.summary && task.name.trim().is_empty())
+    (task.is_project_summary() && task.name.trim().is_empty())
         .then(|| sanitize(&proj.title).or_else(|| sanitize(&proj.name)))
         .flatten()
 }
