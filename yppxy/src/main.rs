@@ -1862,7 +1862,15 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             // The Task Mode cell, its own span: `format!` pads by chars,
             // and the pin is two columns wide.
             Span::styled(mode_marker(t), Style::default().fg(Color::Yellow)),
-            Span::styled(format!("{namecol:<24}"), style),
+            // Padded by display width, not chars, so a wide name keeps the
+            // cells after it (and the indicator at the row end) in place.
+            Span::styled(
+                format!(
+                    "{namecol}{}",
+                    " ".repeat(24usize.saturating_sub(namecol.width()))
+                ),
+                style,
+            ),
             Span::styled(format!(" {dur:>5}"), Style::default().fg(Color::Gray)),
             Span::styled(format!(" {slack:>6}"), Style::default().fg(Color::DarkGray)),
             // The Indicators cell, at the row end so the name and bullet
@@ -2420,6 +2428,26 @@ mod tests {
         };
         assert_eq!(cell(0).0, " ");
         assert_eq!(cell(1), ("⚠".to_string(), CRIT));
+    }
+
+    #[test]
+    fn task_grid_keeps_the_indicator_in_place_after_a_wide_name() {
+        use ratatui::backend::TestBackend;
+        let mut proj =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/21-deadline-missed.xml"))
+                .unwrap();
+        // Double-width names: a short one and one truncated at the edge.
+        proj.tasks[0].name = "基礎".into();
+        proj.tasks[0].deadline = Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0));
+        proj.tasks[1].name = "基礎工事と配筋検査と打設".into();
+        let mut app = App::new(proj, None, false);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        for row in [0, 1] {
+            let cell = buf.cell((app.list_x0 + 41, app.list_y0 + row)).unwrap();
+            assert_eq!(cell.symbol(), "⚠", "row {row}");
+        }
     }
 
     #[test]
