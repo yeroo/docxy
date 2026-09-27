@@ -858,6 +858,7 @@ fn row_cells(values: [String; COLUMN_COUNT], indent: f32) -> impl IntoElement {
 /// A row's cells: a task's, or the empty entry row's when `task` is `None`.
 fn editable_row_cells(
     v: &ProjectView,
+    pal: Pal,
     task: Option<&Task>,
     row: usize,
     index: usize,
@@ -866,6 +867,7 @@ fn editable_row_cells(
     window: &Window,
     cx: &mut Context<Docxy>,
 ) -> impl IntoElement {
+    let inactive = inactive_row(v.ed.project(), row);
     let values = task.map(|t| project_row(&v.ed, t)).unwrap_or_default();
     let (uid, summary) = (task.map(|t| t.uid), task.is_some_and(|t| t.summary));
     let probe_row = task.map_or_else(|| "entry".to_string(), |t| t.id.to_string());
@@ -873,6 +875,7 @@ fn editable_row_cells(
     h_flex()
         .h(px(ROW_H))
         .items_center()
+        .when(inactive, |d| d.text_color(pal.dim).line_through())
         .children(values.into_iter().enumerate().map(|(col, value)| {
             let edit = v.cell.as_ref().filter(|c| c.uid == uid && c.col == col);
             let content = if let Some(edit) = edit {
@@ -948,6 +951,12 @@ fn editable_row_cells(
                     this.refocus(window, cx);
                 }))
         }))
+}
+
+fn inactive_row(proj: &projcore::Project, index: usize) -> bool {
+    proj.tasks
+        .get(index)
+        .is_some_and(|t| !t.is_null && !proj.effectively_active(index))
 }
 
 fn pane(width: f32, offset: f32, content: impl IntoElement) -> impl IntoElement {
@@ -1141,6 +1150,7 @@ pub(super) fn project_el(
                                                         table_x,
                                                         editable_row_cells(
                                                             v,
+                                                            pal,
                                                             task,
                                                             i,
                                                             index,

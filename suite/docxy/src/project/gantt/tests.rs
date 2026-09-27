@@ -23,6 +23,27 @@ fn bar(ed: &ProjectEditor, uid: i32) -> GanttBar {
 }
 
 #[test]
+fn inactive_bars_keep_their_kind_but_never_critical() {
+    let mut summary = task(1, 0, 1);
+    summary.active = Some(false);
+    let mut leaf = task(2, 4, 2);
+    leaf.active = Some(true);
+    let mut milestone = task(3, 0, 2);
+    milestone.active = Some(false);
+    let ed = editor(vec![summary, leaf, milestone]);
+    for uid in [1, 2, 3] {
+        let b = bar(&ed, uid);
+        assert!(b.inactive);
+        assert_ne!(b.kind, BarKind::Critical);
+        assert!(b.state().ends_with(" inactive"));
+    }
+    assert_eq!(bar(&ed, 1).kind, BarKind::Summary);
+    assert_eq!(bar(&ed, 3).kind, BarKind::Milestone);
+    assert_eq!(bar_kind_color(BarKind::Summary), GANTT_SUMMARY);
+    assert_eq!(bar_kind_color(BarKind::Milestone), GANTT_MILESTONE);
+}
+
+#[test]
 fn critical_parallel_summary_milestone_and_missing_results() {
     let mut ed = editor(vec![
         task(1, 0, 1),
@@ -810,6 +831,7 @@ fn a_manual_summary_bar_carries_its_rollup_and_warning() {
     // A finish later on the summary's own last day warns on that day.
     let same_day = GanttBar {
         kind: BarKind::Summary,
+        inactive: false,
         start: 0,
         end: 3,
         baseline: None,
@@ -843,6 +865,21 @@ fn manual_summary(uid: i32, level: u32, start: u32, finish: u32) -> Task {
         manual_finish: Some(projcore::DateTime::from_ymd_hm(2026, 1, finish, 17, 0)),
         ..task(uid, 0, level)
     }
+}
+
+#[test]
+fn inactive_manual_summary_retains_its_secondary_rollup_outline() {
+    let mut summary = manual_summary(1, 1, 5, 6);
+    summary.active = Some(false);
+    let ed = editor(vec![summary, task(2, 4, 2)]);
+    let b = bar(&ed, 1);
+    assert!(b.inactive);
+    assert_eq!(b.kind, BarKind::Summary);
+    assert!(b.rollup.is_some());
+    assert!(b.state().contains("rollup"));
+    assert!(b.warning);
+    assert!(b.state().contains("warning"));
+    assert!(b.warning_days().is_some());
 }
 
 #[test]
@@ -887,6 +924,7 @@ fn a_summary_past_its_manual_parent_warns_on_its_own_finish_day() {
 #[test]
 fn bar_styles_hide_critical_colour_and_baseline_only() {
     let base = GanttBar {
+        inactive: false,
         kind: BarKind::Critical,
         start: 2,
         end: 5,

@@ -14,6 +14,7 @@ pub(crate) enum BarKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct GanttBar {
     pub kind: BarKind,
+    pub inactive: bool,
     pub start: i64,
     pub end: i64,
     pub baseline: Option<(i64, i64)>,
@@ -39,6 +40,9 @@ impl GanttBar {
         }
         if self.warning {
             state += " warning";
+        }
+        if self.inactive {
+            state += " inactive";
         }
         state
     }
@@ -122,12 +126,19 @@ pub(crate) fn gantt_bar(ed: &ProjectEditor, task: &Task, scale: GanttScale) -> O
     let start = ed.disp_start(task.uid)?;
     let finish = ed.disp_finish(task.uid)?;
     let day = |dt: projcore::DateTime| dt.day_number() - scale.origin_day;
+    let inactive = ed
+        .project()
+        .tasks
+        .iter()
+        .position(|t| t.uid == task.uid)
+        .is_some_and(|i| inactive_row(ed.project(), i));
     Some(GanttBar {
+        inactive,
         kind: if task.summary {
             BarKind::Summary
         } else if task.is_milestone() {
             BarKind::Milestone
-        } else if result.critical {
+        } else if result.critical && !inactive {
             BarKind::Critical
         } else {
             BarKind::OnTrack
@@ -406,14 +417,15 @@ pub(crate) fn gantt_strip(
     let Some(bar) = bar else {
         return strip;
     };
-    let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla| {
+    let span = |s: i64, e: i64, y: f32, h: f32, color: Hsla, hollow: bool| {
         div()
             .absolute()
             .left(px(s as f32 * DAY_W))
             .top(px(y))
             .w(px((e - s + 1).max(1) as f32 * DAY_W))
             .h(px(h))
-            .bg(color)
+            .when(hollow, |d| d.border_1().border_color(color))
+            .when(!hollow, |d| d.bg(color))
     };
     let mut strip = strip;
     if let Some((s, e)) = bar.delay {
@@ -428,7 +440,43 @@ pub(crate) fn gantt_strip(
         );
     }
     if let Some((s, e)) = bar.baseline {
-        strip = strip.child(span(s, e, 22., 4., pal.dim));
+        strip = strip.child(span(s, e, 22., 4., pal.dim, false));
+    }
+    if bar.inactive {
+        let color = bar_kind_color(bar.kind);
+        if let Some((s, e)) = bar.rollup {
+            strip = strip.child(span(s, e, 3., 4., hsla_u(color), true));
+        }
+        if let Some((s, e)) = bar.warning_days() {
+            strip = strip.child(span(s, e, 3., 4., hsla_u(GANTT_WARNING), true));
+        }
+        let marker = probe(probes, format!("bar:{id}"));
+        let outline = if bar.kind == BarKind::Milestone {
+            div()
+                .absolute()
+                .left(px(bar.start as f32 * DAY_W + 4.))
+                .top(px(5.))
+                .size(px(14.))
+                .child(milestone_diamond(color, true))
+                .child(marker)
+                .into_any_element()
+        } else {
+            span(
+                bar.start,
+                bar.end,
+                if bar.kind == BarKind::Summary { 9. } else { 5. },
+                if bar.kind == BarKind::Summary {
+                    10.
+                } else {
+                    14.
+                },
+                hsla_u(color),
+                true,
+            )
+            .child(marker)
+            .into_any_element()
+        };
+        return strip.child(outline);
     }
     // A manual summary's rollup: a thin bar above its own. Its warning marks
     // the part past its finish, else its own finish day (an overrun within
@@ -443,10 +491,11 @@ pub(crate) fn gantt_strip(
                 a: 0.6,
                 ..hsla_u(GANTT_SUMMARY)
             },
+            false,
         ));
     }
     if let Some((s, e)) = bar.warning_days() {
-        strip = strip.child(span(s, e, 3., 3., hsla_u(GANTT_WARNING)));
+        strip = strip.child(span(s, e, 3., 3., hsla_u(GANTT_WARNING), false));
     }
     let marker = probe(probes, format!("bar:{id}"));
     let element = match bar.kind {
@@ -455,11 +504,8 @@ pub(crate) fn gantt_strip(
             bar.end,
             5.,
             14.,
-            hsla_u(if bar.kind == BarKind::Critical {
-                GANTT_CRIT
-            } else {
-                BRAND
-            }),
+            hsla_u(bar_kind_color(bar.kind)),
+            false,
         )
         .child(marker)
         .into_any_element(),
@@ -475,7 +521,7 @@ pub(crate) fn gantt_strip(
                     .top_0()
                     .w_full()
                     .h(px(6.))
-                    .bg(hsla_u(GANTT_SUMMARY)),
+                    .bg(hsla_u(bar_kind_color(bar.kind))),
             )
             .child(
                 div()
@@ -483,7 +529,7 @@ pub(crate) fn gantt_strip(
                     .left_0()
                     .w(px(3.))
                     .h_full()
-                    .bg(hsla_u(GANTT_SUMMARY)),
+                    .bg(hsla_u(bar_kind_color(bar.kind))),
             )
             .child(
                 div()
@@ -491,7 +537,7 @@ pub(crate) fn gantt_strip(
                     .right_0()
                     .w(px(3.))
                     .h_full()
-                    .bg(hsla_u(GANTT_SUMMARY)),
+                    .bg(hsla_u(bar_kind_color(bar.kind))),
             )
             .child(marker)
             .into_any_element(),
@@ -500,29 +546,44 @@ pub(crate) fn gantt_strip(
             .left(px(bar.start as f32 * DAY_W + 4.))
             .top(px(5.))
             .size(px(14.))
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    |b, _, window, _| {
-                        let mut path = PathBuilder::fill();
-                        let x = b.origin.x;
-                        let y = b.origin.y;
-                        path.move_to(point(x + px(7.), y));
-                        path.line_to(point(x + px(14.), y + px(7.)));
-                        path.line_to(point(x + px(7.), y + px(14.)));
-                        path.line_to(point(x, y + px(7.)));
-                        path.close();
-                        if let Ok(path) = path.build() {
-                            window.paint_path(path, rgb(GANTT_MILESTONE));
-                        }
-                    },
-                )
-                .size_full(),
-            )
+            .child(milestone_diamond(bar_kind_color(bar.kind), false))
             .child(marker)
             .into_any_element(),
     };
     strip.child(element)
+}
+
+fn milestone_diamond(color: u32, hollow: bool) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |b, _, window, _| {
+            let mut path = if hollow {
+                PathBuilder::stroke(px(1.))
+            } else {
+                PathBuilder::fill()
+            };
+            let x = b.origin.x;
+            let y = b.origin.y;
+            path.move_to(point(x + px(7.), y));
+            path.line_to(point(x + px(14.), y + px(7.)));
+            path.line_to(point(x + px(7.), y + px(14.)));
+            path.line_to(point(x, y + px(7.)));
+            path.close();
+            if let Ok(path) = path.build() {
+                window.paint_path(path, rgb(color));
+            }
+        },
+    )
+    .size_full()
+}
+
+fn bar_kind_color(kind: BarKind) -> u32 {
+    match kind {
+        BarKind::Critical => GANTT_CRIT,
+        BarKind::OnTrack => BRAND,
+        BarKind::Summary => GANTT_SUMMARY,
+        BarKind::Milestone => GANTT_MILESTONE,
+    }
 }
 
 #[cfg(test)]

@@ -320,8 +320,7 @@ pub struct Task {
     pub create_date: Option<DateTime>,
     pub wbs: Option<String>,
     pub task_type: Option<TaskType>,
-    /// `None` reads as active; see [`Task::is_active`]. The scheduler does not
-    /// yet drop inactive tasks.
+    /// `None` reads as active; see [`Task::is_active`].
     pub active: Option<bool>,
     pub effort_driven: Option<bool>,
     /// Duration shown with `?` in Project.
@@ -1488,6 +1487,56 @@ pub(crate) fn is_outline_summary_in(tasks: &[Task], index: usize) -> bool {
 }
 
 impl Project {
+    /// Whether a non-blank task and all of its outline ancestors are active.
+    /// Blank rows do not participate in the outline.
+    pub fn effectively_active(&self, index: usize) -> bool {
+        let Some(task) = self.tasks.get(index) else {
+            return false;
+        };
+        !task.is_null && task.is_active() && self.ancestors_active(index)
+    }
+
+    /// Whether the outline ancestors of a task are active. A task's own flag
+    /// is excluded so this also validates activation of an inactive task.
+    pub(crate) fn ancestors_active(&self, index: usize) -> bool {
+        let Some(task) = self.tasks.get(index) else {
+            return false;
+        };
+        let mut level = task.outline_level;
+        for ancestor in self.tasks[..index].iter().rev().filter(|t| !t.is_null) {
+            if ancestor.outline_level < level {
+                if !ancestor.is_active() {
+                    return false;
+                }
+                level = ancestor.outline_level;
+            }
+        }
+        true
+    }
+
+    /// Effective activity of every row in one outline walk. The scheduler
+    /// uses this rather than repeating the ancestor search for every task.
+    pub(crate) fn effective_activity(&self) -> Vec<bool> {
+        let mut states = Vec::with_capacity(self.tasks.len());
+        let mut ancestors: Vec<(u32, bool)> = Vec::new();
+        for task in &self.tasks {
+            if task.is_null {
+                states.push(false);
+                continue;
+            }
+            while ancestors
+                .last()
+                .is_some_and(|(level, _)| *level >= task.outline_level)
+            {
+                ancestors.pop();
+            }
+            let active = task.is_active() && ancestors.last().is_none_or(|(_, active)| *active);
+            states.push(active);
+            ancestors.push((task.outline_level, active));
+        }
+        states
+    }
+
     /// The stored text of an unmodeled project option (see [`Project::options`]).
     pub fn option(&self, name: &str) -> Option<&str> {
         self.options
@@ -1697,6 +1746,37 @@ mod tests {
         };
         let summaries: Vec<bool> = (0..5).map(|i| proj.is_outline_summary(i)).collect();
         assert_eq!(summaries, [true, false, false, false, false]);
+    }
+
+    #[test]
+    fn batch_activity_matches_single_task_rule_across_nested_and_blank_rows() {
+        let row = |outline_level, active, is_null| Task {
+            outline_level,
+            active,
+            is_null,
+            ..Task::default()
+        };
+        let proj = Project {
+            tasks: vec![
+                row(1, Some(false), false),
+                row(0, None, true),
+                row(2, Some(true), false),
+                row(1, None, false),
+                row(2, Some(false), false),
+                row(3, Some(true), false),
+                row(2, Some(true), false),
+                row(1, Some(true), false),
+            ],
+            ..Project::default()
+        };
+        let batch = proj.effective_activity();
+        assert_eq!(batch, [false, false, false, true, false, false, true, true]);
+        assert_eq!(
+            batch,
+            (0..proj.tasks.len())
+                .map(|i| proj.effectively_active(i))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
