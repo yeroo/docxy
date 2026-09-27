@@ -2877,6 +2877,9 @@ mod tests {
         });
         let mut app = App::new(proj, Some("plan.yppx".into()), false);
         app.assign_resource("Cement[5 tons]");
+        assert_eq!(app.status, "Assigned Cement[5 tons]");
+        // The status message echoes the typed text; only the task's resources remain.
+        app.status.clear();
         let s = buffer_text(&mut app, 110, 24);
         assert!(s.contains("Cement[5 tons]"), "{s}");
     }
