@@ -6,8 +6,9 @@
 //! UTF-16 code units, so an astral character takes one offset here and two in
 //! Word. External comparisons must convert before comparing such text.
 //! Cached text inside fields, revisions and other zero-length wrappers is
-//! omitted: the editor cannot place a caret inside it. Hyperlink run text is
-//! included because those runs do have editor offsets.
+//! omitted: the editor cannot place a caret inside it. Hyperlink text is
+//! included because it does have editor offsets: a link's runs, and the plain
+//! runs, tabs and breaks among its other children.
 
 use super::{Caret, inline_len};
 use crate::model::{Block, BreakKind, Document, Inline};
@@ -153,7 +154,13 @@ impl FlatDocument {
 fn inline_chars(inline: &Inline) -> String {
     match inline {
         Inline::Run(r) => r.text.clone(),
-        Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.as_str()).collect(),
+        Inline::Hyperlink(h) => {
+            let mut out: String = h.runs.iter().map(|r| r.text.as_str()).collect();
+            h.content
+                .iter()
+                .for_each(|i| out.push_str(&inline_chars(i)));
+            out
+        }
         Inline::Tab(_) => "\t".into(),
         Inline::Break(BreakKind::Line) => "\u{000b}".into(),
         Inline::Break(BreakKind::Page) => "\u{000c}".into(),
@@ -186,6 +193,34 @@ mod tests {
             blocks,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn flat_text_includes_the_plain_text_of_a_complex_link_212() {
+        let link = Inline::Hyperlink(crate::model::Hyperlink {
+            anchor: Some("top".into()),
+            content: vec![
+                Inline::Raw("<w:proofErr w:type=\"spellStart\"/>".into()),
+                run("Con"),
+                Inline::Tab(RunProps::default()),
+                Inline::Field {
+                    raw: String::new(),
+                    text: "hidden".into(),
+                },
+                run("toso"),
+            ],
+            ..Default::default()
+        });
+        let doc = Document {
+            body: vec![para(vec![run("ab"), link, run("cd")])],
+        };
+        let flat = FlatDocument::new(&doc);
+        assert_eq!(flat.main().text, "abCon\ttosocd\n");
+        assert_eq!(
+            flat.main().caret(6),
+            Some(Caret::at(vec![0], 6)),
+            "offsets inside the link are the editor's"
+        );
     }
 
     #[test]

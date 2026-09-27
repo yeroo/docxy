@@ -1266,20 +1266,85 @@ struct Seg {
     block: Option<usize>,
 }
 
-/// Visible width (chars) of the inline content following index `from`, up to the
-/// next tab or break — used to right/center-align text at a tab stop.
-fn following_inline_width(content: &[Inline], from: usize) -> usize {
-    let mut w = 0;
-    for it in &content[(from + 1).min(content.len())..] {
-        match it {
-            Inline::Run(r) => w += str_width(&r.text),
-            Inline::Hyperlink(h) => {
-                w += h
-                    .visible_runs()
-                    .iter()
-                    .map(|r| str_width(&r.text))
-                    .sum::<usize>()
+/// One piece of a paragraph as `flatten_para` lays it out. Hyperlinks are
+/// opened up: their runs and children follow in order, carrying the link's
+/// target, so text inside a link takes caret offsets exactly as the editor
+/// counts them (`editor::inline_len`).
+struct FlatInline<'a> {
+    /// The top-level `para.content` index this piece belongs to.
+    idx: usize,
+    item: FlatItem<'a>,
+    /// The enclosing hyperlink's target; `Some` for anything inside a link.
+    link: Option<Rc<str>>,
+}
+
+enum FlatItem<'a> {
+    Run(&'a Run),
+    /// Any inline but a run or a hyperlink.
+    Inline(&'a Inline),
+}
+
+fn flat_inlines(content: &[Inline]) -> Vec<FlatInline<'_>> {
+    let mut out = Vec::new();
+    for (idx, inline) in content.iter().enumerate() {
+        push_flat_inline(inline, idx, None, &mut out);
+    }
+    out
+}
+
+fn push_flat_inline<'a>(
+    inline: &'a Inline,
+    idx: usize,
+    link: Option<Rc<str>>,
+    out: &mut Vec<FlatInline<'a>>,
+) {
+    match inline {
+        Inline::Run(r) => out.push(FlatInline {
+            idx,
+            item: FlatItem::Run(r),
+            link,
+        }),
+        Inline::Hyperlink(h) => {
+            let target = h
+                .target
+                .clone()
+                .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
+                .unwrap_or_default();
+            let rc: Rc<str> = Rc::from(target.as_str());
+            for run in &h.runs {
+                out.push(FlatInline {
+                    idx,
+                    item: FlatItem::Run(run),
+                    link: Some(rc.clone()),
+                });
             }
+            for child in &h.content {
+                push_flat_inline(child, idx, Some(rc.clone()), out);
+            }
+        }
+        other => out.push(FlatInline {
+            idx,
+            item: FlatItem::Inline(other),
+            link,
+        }),
+    }
+}
+
+/// Visible width (chars) of the pieces following `from`, up to the next tab or
+/// break (inside a link or not) — used to right/center-align text at a tab stop.
+fn following_inline_width(items: &[FlatInline<'_>], from: usize) -> usize {
+    let mut w = 0;
+    for fi in &items[(from + 1).min(items.len())..] {
+        let it = match fi.item {
+            FlatItem::Run(r) => {
+                w += str_width(&r.text);
+                continue;
+            }
+            FlatItem::Inline(it) => it,
+        };
+        match it {
+            // Both are laid out as `FlatItem::Run`s by `flat_inlines`.
+            Inline::Run(_) | Inline::Hyperlink(_) => {}
             Inline::Tab(_) | Inline::Break(_) => break,
             Inline::Equation { text, .. } if !text.contains('\n') => w += str_width(text),
             Inline::Field { text, .. } => w += str_width(text),
@@ -1389,14 +1454,24 @@ fn flatten_para(
         g
     };
 
-    for (idx, item) in para.content.iter().enumerate() {
+    let items = flat_inlines(&para.content);
+    for (k, fi) in items.iter().enumerate() {
+        let idx = fi.idx;
+        // Block-level content nested in a link has no top-level index of its
+        // own to render from, so it stays undrawn, as before links were opened.
+        let nested = fi.link.is_some();
         // Inline content that lands right after a block marker starts a fresh text
         // seg, so it renders below the block (not appended to the block's marker).
-        let produces_inline = match item {
-            Inline::Run(_) | Inline::Hyperlink(_) | Inline::Tab(_) | Inline::Field { .. } => true,
-            Inline::Equation { text, .. } => !text.contains('\n'),
-            Inline::Raw(raw) => inline_image(raw).is_some(),
-            _ => false,
+        let produces_inline = match fi.item {
+            FlatItem::Run(_) => true,
+            FlatItem::Inline(item) => match item {
+                Inline::Run(_) | Inline::Hyperlink(_) | Inline::Tab(_) | Inline::Field { .. } => {
+                    true
+                }
+                Inline::Equation { text, .. } => !text.contains('\n'),
+                Inline::Raw(raw) => inline_image(raw).is_some(),
+                _ => false,
+            },
         };
         if produces_inline && segs.last().is_some_and(|s| s.block.is_some()) {
             segs.push(Seg {
@@ -1405,14 +1480,18 @@ fn flatten_para(
                 block: None,
             });
         }
-        match item {
-            Inline::Run(r) => {
+        let item = match fi.item {
+            FlatItem::Run(r) => {
                 let eff = opts.styles.effective_run(
                     para.props.style_id.as_deref(),
                     r.props.style_id.as_deref(),
                     &r.props,
                 );
                 let mut st = style_from_run(&eff);
+                if fi.link.is_some() {
+                    st.underline = true;
+                    st.color = Some(Color::Cyan);
+                }
                 if heading {
                     st.bold = true;
                 }
@@ -1421,42 +1500,16 @@ fn flatten_para(
                     segs.last_mut()
                         .unwrap()
                         .glyphs
-                        .push(make(ch, &st, None, mc, dir));
+                        .push(make(ch, &st, fi.link.clone(), mc, dir));
                     mc += 1;
                 }
+                continue;
             }
-            Inline::Hyperlink(h) => {
-                let target = h
-                    .target
-                    .clone()
-                    .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
-                    .unwrap_or_default();
-                let rc: Rc<str> = Rc::from(target.as_str());
-                for run in h.visible_runs() {
-                    let eff = opts.styles.effective_run(
-                        para.props.style_id.as_deref(),
-                        run.props.style_id.as_deref(),
-                        &run.props,
-                    );
-                    let mut st = style_from_run(&eff);
-                    st.underline = true;
-                    st.color = Some(Color::Cyan);
-                    if heading {
-                        st.bold = true;
-                    }
-                    let dir = run_direction(&eff);
-                    for ch in run.text.chars() {
-                        segs.last_mut().unwrap().glyphs.push(make(
-                            ch,
-                            &st,
-                            Some(rc.clone()),
-                            mc,
-                            dir,
-                        ));
-                        mc += 1;
-                    }
-                }
-            }
+            FlatItem::Inline(item) => item,
+        };
+        match item {
+            // Both are laid out as `FlatItem::Run`s by `flat_inlines`.
+            Inline::Run(_) | Inline::Hyperlink(_) => {}
             Inline::Tab(rp) => {
                 let hl = sel_at(mc);
                 // The run style behind the tab — so an underlined tab draws its
@@ -1477,7 +1530,7 @@ fn flatten_para(
                     .min_by_key(|(col, _, _)| *col)
                     .unwrap_or(((cur / 8 + 1) * 8, TabAlign::Left, TabLeader::None));
                 let (target, align, leader) = stop;
-                let fw = following_inline_width(&para.content, idx);
+                let fw = following_inline_width(&items, k);
                 // Right/center tabs right-align the following text to the stop.
                 let fill_to = match align {
                     TabAlign::Right => target.saturating_sub(fw),
@@ -1565,7 +1618,7 @@ fn flatten_para(
                             img: (i == 0).then(|| rc.clone()),
                         });
                     }
-                } else if raw_image_extent(raw).is_some() {
+                } else if !nested && raw_image_extent(raw).is_some() {
                     // A larger (block) image renders as a sized box in source order.
                     segs.push(Seg {
                         glyphs: Vec::new(),
@@ -1615,14 +1668,18 @@ fn flatten_para(
                             r.props.style_id.as_deref(),
                             &r.props,
                         );
-                        let st = style_from_run(&eff);
+                        let mut st = style_from_run(&eff);
+                        if fi.link.is_some() {
+                            st.underline = true;
+                            st.color = Some(Color::Cyan);
+                        }
                         let dir = run_direction(&eff);
                         for ch in r.text.chars() {
                             segs.last_mut().unwrap().glyphs.push(Glyph {
                                 ch,
                                 disp: None,
                                 style: st.clone(),
-                                link: None,
+                                link: fi.link.clone(),
                                 src: None,
                                 dir,
                                 img: None,
@@ -1652,11 +1709,13 @@ fn flatten_para(
             | Inline::Chart { .. }
             | Inline::TextBox { .. }
             | Inline::Equation { .. } => {
-                segs.push(Seg {
-                    glyphs: Vec::new(),
-                    sep: None,
-                    block: Some(idx),
-                });
+                if !nested {
+                    segs.push(Seg {
+                        glyphs: Vec::new(),
+                        sep: None,
+                        block: Some(idx),
+                    });
+                }
             }
             Inline::UnsupportedRevision { .. } => {}
         }
@@ -4472,6 +4531,62 @@ mod tests {
         assert_eq!(s.link.as_deref(), Some("https://x.test/"));
         assert!(s.style.underline);
         assert_eq!(s.style.color, Some(Color::Cyan));
+    }
+
+    /// #212: text inside a complex link (one holding markers and a tracked
+    /// change) takes caret offsets exactly as the editor counts them, and the
+    /// tracked change inside it takes none.
+    #[test]
+    fn complex_link_glyph_offsets_match_the_editor_212() {
+        let ins = Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: "<w:ins/>".into(),
+            content: vec![run("X", RunProps::default())],
+            content_changed: false,
+        };
+        let proof = || Inline::Raw(r#"<w:proofErr w:type="spellStart"/>"#.into());
+        let link = Inline::Hyperlink(Hyperlink {
+            target: Some("https://x.test/".into()),
+            content: vec![proof(), run("Contoso", RunProps::default()), ins, proof()],
+            raw: Some("<w:hyperlink/>".into()),
+            ..Hyperlink::default()
+        });
+        let para = Paragraph {
+            props: ParProps::default(),
+            content: vec![
+                run("ab", RunProps::default()),
+                link,
+                run("cd", RunProps::default()),
+            ],
+        };
+        let editor_text: Vec<char> = "abContosocd".chars().collect();
+        assert_eq!(
+            para.content
+                .iter()
+                .map(crate::editor::inline_len)
+                .sum::<usize>(),
+            editor_text.len()
+        );
+        let segs = flatten_para(&para, &opts(80), false, &[], 80);
+        let glyphs: Vec<&Glyph> = segs.iter().flat_map(|s| &s.glyphs).collect();
+        let shown: String = glyphs.iter().map(|g| g.ch).collect();
+        assert_eq!(shown, "abContosoXcd");
+        for g in &glyphs {
+            if let Some(o) = g.src {
+                assert_eq!(editor_text[o], g.ch, "glyph {:?} at offset {o}", g.ch);
+            }
+        }
+        let x = glyphs.iter().find(|g| g.ch == 'X').unwrap();
+        assert_eq!(x.src, None, "the tracked change is not editable");
+        assert_eq!(x.link.as_deref(), Some("https://x.test/"));
+        let c = glyphs.iter().find(|g| g.ch == 'C').unwrap();
+        assert_eq!(
+            (c.src, c.link.as_deref()),
+            (Some(2), Some("https://x.test/"))
+        );
+        assert!(c.style.underline);
+        assert_eq!(glyphs.last().unwrap().src, Some(10));
     }
 
     #[test]

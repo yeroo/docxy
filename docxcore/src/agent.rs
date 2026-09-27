@@ -677,7 +677,8 @@ fn checkpoint_for_block_range(ed: &mut Editor, start: usize) {
 }
 
 /// Apply `patch`'s SET-to-value fields to every run in `content` — bare
-/// [`Inline::Run`]s, the runs inside an [`Inline::Hyperlink`], and tabs (a tab
+/// [`Inline::Run`]s, the runs inside an [`Inline::Hyperlink`] (its `runs`, and
+/// the runs and tabs among its `content`), and tabs (a tab
 /// is a run in OOXML, and text typed after it takes its props), matching
 /// `Editor`'s own char-range formatting helpers (`editor.rs`'s
 /// `edit_run_range`). Every other inline kind (breaks, footnote refs, …) is
@@ -690,6 +691,12 @@ fn apply_run_patch(content: &mut [Inline], patch: &RunPatch) {
             Inline::Hyperlink(h) => {
                 for r in h.runs.iter_mut() {
                     apply_run_patch_props(&mut r.props, patch);
+                }
+                // The plain runs among a complex link's other children too;
+                // the link then saves from its content, not its stale raw.
+                if h.content.iter().any(|i| crate::editor::inline_len(i) > 0) {
+                    apply_run_patch(&mut h.content, patch);
+                    h.content_changed = true;
                 }
             }
             _ => {}
@@ -1440,6 +1447,53 @@ mod tests {
             matches!(&p.content[1], Inline::Tab(props) if props.bold),
             "the tab is bold, so typing after it is too: {:?}",
             p.content
+        );
+    }
+
+    #[test]
+    fn format_range_formats_the_plain_runs_inside_a_complex_link_212() {
+        let ins = Inline::Revision {
+            kind: crate::model::RevisionKind::Insert,
+            metadata: Default::default(),
+            raw: "<w:ins/>".into(),
+            content: vec![Inline::Run(Run {
+                text: "X".into(),
+                props: RunProps::default(),
+            })],
+            content_changed: false,
+        };
+        let mut doc = doc_with(&["placeholder"]);
+        doc.body[0] = Block::Paragraph(Paragraph {
+            props: ParProps::default(),
+            content: vec![Inline::Hyperlink(crate::model::Hyperlink {
+                anchor: Some("top".into()),
+                content: vec![
+                    Inline::Raw("<w:proofErr w:type=\"spellStart\"/>".into()),
+                    Inline::Run(Run {
+                        text: "Contoso".into(),
+                        props: RunProps::default(),
+                    }),
+                    ins,
+                ],
+                raw: Some("<w:hyperlink w:anchor=\"top\"/>".into()),
+                ..Default::default()
+            })],
+        });
+        let mut ed = Editor::new(doc);
+
+        format_range(&mut ed, 0, 0, &run_patch(&[("bold", "true")])).unwrap();
+        let Block::Paragraph(p) = &ed.doc.body[0] else {
+            panic!("expected a paragraph")
+        };
+        let Inline::Hyperlink(h) = &p.content[0] else {
+            panic!("expected the link: {:?}", p.content)
+        };
+        assert!(h.content_changed, "the link saves from its content");
+        assert!(matches!(&h.content[1], Inline::Run(r) if r.props.bold));
+        assert!(
+            matches!(&h.content[2], Inline::Revision { content, .. }
+                if matches!(&content[0], Inline::Run(r) if !r.props.bold)),
+            "a tracked change's own runs are left alone"
         );
     }
 

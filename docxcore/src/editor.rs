@@ -1479,8 +1479,9 @@ impl Editor {
 /// It searches the text the editor can address ([`editor_text`]), so match
 /// offsets are editor offsets that selection and editing can use directly.
 /// Text the editor gives zero width (tracked changes, field results, footnote
-/// refs, complex hyperlinks' `content`, …) is drawn but not searched: a match
-/// there could be neither selected nor replaced.
+/// refs, …, including those inside a hyperlink) is drawn but not searched: a
+/// match there could be neither selected nor replaced. A hyperlink's plain
+/// runs are searched, whatever else the link holds.
 pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool) -> Vec<Match> {
     if query.is_empty() {
         return Vec::new();
@@ -1816,7 +1817,20 @@ fn collect_inline_revision_positions(
     forced: Option<Caret>,
     positions: &mut Vec<RevisionPosition>,
 ) {
-    let mut offset = 0;
+    collect_inline_revision_positions_at(content, path, forced, positions, 0, false);
+}
+
+/// [`collect_inline_revision_positions`] over `content` starting at editor
+/// offset `offset`. `in_link` marks a hyperlink's `content`: its inline
+/// indices are not the paragraph's, so a text box there anchors at its point.
+fn collect_inline_revision_positions_at(
+    content: &[Inline],
+    path: &mut Vec<usize>,
+    forced: Option<Caret>,
+    positions: &mut Vec<RevisionPosition>,
+    mut offset: usize,
+    in_link: bool,
+) {
     for (inline_index, inline) in content.iter().enumerate() {
         let point = forced
             .clone()
@@ -1848,11 +1862,13 @@ fn collect_inline_revision_positions(
                     property_position(&run.props.property_change, Some((start, end)), positions);
                     run_offset += run.text.chars().count();
                 }
-                collect_inline_revision_positions(
+                collect_inline_revision_positions_at(
                     &link.content,
                     path,
-                    Some(point.clone()),
+                    forced.clone(),
                     positions,
+                    run_offset,
+                    true,
                 );
             }
             Inline::Tab(props) => {
@@ -1868,7 +1884,7 @@ fn collect_inline_revision_positions(
                 );
             }
             Inline::TextBox { blocks, .. } => {
-                if forced.is_some() {
+                if forced.is_some() || in_link {
                     collect_block_revision_positions(blocks, path, Some(point.clone()), positions);
                 } else {
                     path.push(inline_index);
@@ -2043,15 +2059,18 @@ fn collect_paths(body: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usiz
 
 // ---- content editing (operate on a paragraph's inline vector) ----
 
-/// How many caret offsets an inline occupies: its characters for a run or a
-/// simple hyperlink, one for a tab or break, and zero for everything the editor
-/// treats as an opaque, uneditable anchor (fields, revisions, drawings, …).
+/// How many caret offsets an inline occupies: its characters for a run, one
+/// for a tab or break, and zero for everything the editor treats as an opaque,
+/// uneditable anchor (fields, revisions, drawings, …). A hyperlink occupies its
+/// `runs` plus its `content` counted by these same rules, so the plain text of
+/// a link that also holds revisions, bookmarks or proofing marks is editable
+/// while those children stay zero-width.
 /// Hosts that map their own positions to editor offsets (the browser editor's
 /// `docx_doc` model) use this so the two never disagree.
 pub fn inline_len(i: &Inline) -> usize {
     match i {
         Inline::Run(r) => r.text.chars().count(),
-        Inline::Hyperlink(h) => h.runs.iter().map(|r| r.text.chars().count()).sum(),
+        Inline::Hyperlink(h) => link_runs_len(h) + h.content.iter().map(inline_len).sum::<usize>(),
         Inline::Tab(_) | Inline::Break(_) => 1,
         // Zero-length, invisible in the editor (preserved for save only).
         Inline::SmartArt { .. }
@@ -2068,15 +2087,24 @@ pub fn inline_len(i: &Inline) -> usize {
 
 /// A paragraph's text in editor offset space: one char per offset, matching
 /// [`inline_len`] inline by inline (zero-width inlines contribute nothing, a
-/// hyperlink contributes its `runs`, a tab is `'\t'`, a break is `'\n'`).
+/// hyperlink contributes its `runs` and then its `content` by these same rules,
+/// a tab is `'\t'`, a break is `'\n'`).
 /// Unlike [`Paragraph::plain_text`], every char here is one the caret can
 /// reach, so offsets into it can be selected and edited.
 fn editor_text(content: &[Inline]) -> String {
     let mut out = String::new();
+    push_editor_text(content, &mut out);
+    out
+}
+
+fn push_editor_text(content: &[Inline], out: &mut String) {
     for inline in content {
         match inline {
             Inline::Run(r) => out.push_str(&r.text),
-            Inline::Hyperlink(h) => h.runs.iter().for_each(|r| out.push_str(&r.text)),
+            Inline::Hyperlink(h) => {
+                h.runs.iter().for_each(|r| out.push_str(&r.text));
+                push_editor_text(&h.content, out);
+            }
             Inline::Tab(_) => out.push('\t'),
             Inline::Break(_) => out.push('\n'),
             Inline::SmartArt { .. }
@@ -2090,7 +2118,6 @@ fn editor_text(content: &[Inline]) -> String {
             | Inline::Raw(_) => {}
         }
     }
-    out
 }
 
 /// Replace editor offsets `[start, end)` with `with`, in place.
@@ -2161,13 +2188,32 @@ fn extract_range(content: &[Inline], start: usize, end: usize) -> Vec<Inline> {
                     }
                     p = rb;
                 }
-                if !runs.is_empty() {
+                // The link's `content` holds the rest of its offsets; its
+                // zero-width children fall outside any non-empty range, so a
+                // copy never duplicates a bookmark or a tracked change.
+                let inner = if h.content.is_empty() || oe <= p {
+                    Vec::new()
+                } else {
+                    extract_range(&h.content, os.max(p) - p, oe - p)
+                };
+                let (runs, content) = if inner.iter().all(|i| matches!(i, Inline::Run(_))) {
+                    runs.extend(inner.into_iter().filter_map(|i| match i {
+                        Inline::Run(r) => Some(r),
+                        _ => None,
+                    }));
+                    (runs, Vec::new())
+                } else {
+                    let mut all: Vec<Inline> = runs.into_iter().map(Inline::Run).collect();
+                    all.extend(inner);
+                    (Vec::new(), all)
+                };
+                if !runs.is_empty() || !content.is_empty() {
                     out.push(Inline::Hyperlink(Hyperlink {
                         target: h.target.clone(),
                         anchor: h.anchor.clone(),
                         rel_id: h.rel_id.clone(),
                         runs,
-                        content: Vec::new(),
+                        content,
                         raw: None,
                         content_changed: false,
                     }));
@@ -2285,6 +2331,59 @@ fn runs_delete(runs: &mut Vec<Run>, idx: usize) {
     }
 }
 
+fn link_runs_len(h: &Hyperlink) -> usize {
+    h.runs.iter().map(|r| r.text.chars().count()).sum()
+}
+
+/// Where caret offset `local` inside a hyperlink lives: in its `runs`, or in
+/// its `content` (at the returned offset within it).
+enum LinkPart {
+    Runs(usize),
+    Content(usize),
+}
+
+/// A simple link edits its `runs`; a complex one (children in `content`)
+/// edits `content`, except inside any `runs` it also has. The first check
+/// keeps an empty-runs complex link from growing a stray default-props run.
+fn link_part(h: &Hyperlink, local: usize) -> LinkPart {
+    if h.content.is_empty() {
+        return LinkPart::Runs(local);
+    }
+    let runs_len = link_runs_len(h);
+    if !h.runs.is_empty() && local <= runs_len {
+        LinkPart::Runs(local)
+    } else {
+        LinkPart::Content(local - runs_len)
+    }
+}
+
+/// A zero-width child that shows nothing: a bookmark, proofing or permission
+/// mark, or a comment range. These may leave a link whose text is all deleted.
+fn is_marker(inline: &Inline) -> bool {
+    const MARKERS: &[&str] = &[
+        "w:proofErr",
+        "w:bookmarkStart",
+        "w:bookmarkEnd",
+        "w:commentRangeStart",
+        "w:commentRangeEnd",
+        "w:permStart",
+        "w:permEnd",
+    ];
+    match inline {
+        Inline::Raw(raw) => {
+            let name = raw
+                .trim_start()
+                .strip_prefix('<')
+                .unwrap_or_default()
+                .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+                .next()
+                .unwrap_or_default();
+            MARKERS.contains(&name)
+        }
+        _ => false,
+    }
+}
+
 fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
     let Some((i, local)) = locate(content, o) else {
         if let Some(Inline::Run(r)) = content.last_mut() {
@@ -2301,7 +2400,13 @@ fn content_insert(content: &mut Vec<Inline>, o: usize, ch: char) {
     };
     match &mut content[i] {
         Inline::Run(r) => run_insert(r, local, ch),
-        Inline::Hyperlink(h) => runs_insert(&mut h.runs, local, ch),
+        Inline::Hyperlink(h) => match link_part(h, local) {
+            LinkPart::Runs(local) => runs_insert(&mut h.runs, local, ch),
+            LinkPart::Content(local) => {
+                content_insert(&mut h.content, local, ch);
+                h.content_changed = true;
+            }
+        },
         Inline::Tab(_)
         | Inline::Break(_)
         | Inline::SmartArt { .. }
@@ -2424,9 +2529,20 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                     }
                 }
                 Inline::Hyperlink(h) => {
-                    runs_delete(&mut h.runs, local);
-                    if h.runs.is_empty() {
-                        content.remove(i);
+                    let runs_len = link_runs_len(h);
+                    if local < runs_len {
+                        runs_delete(&mut h.runs, local);
+                    } else {
+                        content_delete(&mut h.content, local - runs_len);
+                        h.content_changed = true;
+                    }
+                    // A link with no editable text left goes, as in Word. Its
+                    // bookmarks and proofing marks stay where it was; anything
+                    // still showing inside it (a tracked change, a field, a
+                    // picture) keeps the link, zero-width.
+                    if h.runs.is_empty() && h.content.iter().all(is_marker) {
+                        let kept = std::mem::take(&mut h.content);
+                        content.splice(i..=i, kept);
                     }
                 }
                 Inline::Tab(_)
@@ -2480,14 +2596,26 @@ fn range_all_have(
     end: usize,
     get: fn(&RunProps) -> bool,
 ) -> bool {
-    let mut pos = 0;
-    let mut saw = false;
-    let mut check = |props: &RunProps, len: usize, pos: &mut usize| -> bool {
+    let (mut pos, mut saw) = (0, false);
+    range_all_have_at(content, start, end, get, &mut pos, &mut saw) && saw
+}
+
+/// [`range_all_have`] over `content` starting at offset `*pos`, advancing it;
+/// false as soon as a character in range lacks the property.
+fn range_all_have_at(
+    content: &[Inline],
+    start: usize,
+    end: usize,
+    get: fn(&RunProps) -> bool,
+    pos: &mut usize,
+    saw: &mut bool,
+) -> bool {
+    let check = |props: &RunProps, len: usize, pos: &mut usize, saw: &mut bool| -> bool {
         let (a, b) = (*pos, *pos + len);
         let (os, oe) = (start.clamp(a, b), end.clamp(a, b));
         *pos = b;
         if oe > os {
-            saw = true;
+            *saw = true;
             if !get(props) {
                 return false;
             }
@@ -2497,24 +2625,27 @@ fn range_all_have(
     for inline in content {
         match inline {
             Inline::Run(r) => {
-                if !check(&r.props, r.text.chars().count(), &mut pos) {
+                if !check(&r.props, r.text.chars().count(), pos, saw) {
                     return false;
                 }
             }
             Inline::Hyperlink(h) => {
                 for run in &h.runs {
-                    if !check(&run.props, run.text.chars().count(), &mut pos) {
+                    if !check(&run.props, run.text.chars().count(), pos, saw) {
                         return false;
                     }
+                }
+                if !range_all_have_at(&h.content, start, end, get, pos, saw) {
+                    return false;
                 }
             }
             // A tab is a formatted character (see `edit_run_range`).
             Inline::Tab(props) => {
-                if !check(props, 1, &mut pos) {
+                if !check(props, 1, pos, saw) {
                     return false;
                 }
             }
-            Inline::Break(_) => pos += 1,
+            Inline::Break(_) => *pos += 1,
             Inline::SmartArt { .. }
             | Inline::Chart { .. }
             | Inline::Equation { .. }
@@ -2526,7 +2657,7 @@ fn range_all_have(
             | Inline::Raw(_) => {} // zero-length
         }
     }
-    saw
+    true
 }
 
 /// Split a run at `[start, end)` (absolute char positions, run starting at `pos`)
@@ -2573,46 +2704,63 @@ fn edit_run_range(
     end: usize,
     mid_fn: &dyn Fn(&str, &RunProps) -> Run,
 ) {
+    edit_run_range_at(content, start, end, mid_fn, &mut 0);
+}
+
+/// [`edit_run_range`] over `content` starting at offset `*pos`, advancing it.
+fn edit_run_range_at(
+    content: &mut Vec<Inline>,
+    start: usize,
+    end: usize,
+    mid_fn: &dyn Fn(&str, &RunProps) -> Run,
+    pos: &mut usize,
+) {
     let mut out = Vec::new();
-    let mut pos = 0;
     for inline in content.drain(..) {
         match inline {
             Inline::Run(r) => {
                 let len = r.text.chars().count();
-                for nr in split_run_with(r, pos, start, end, mid_fn) {
+                for nr in split_run_with(r, *pos, start, end, mid_fn) {
                     out.push(Inline::Run(nr));
                 }
-                pos += len;
+                *pos += len;
             }
             Inline::Hyperlink(mut h) => {
                 let mut new_runs = Vec::new();
-                let mut p = pos;
                 for run in h.runs.drain(..) {
                     let len = run.text.chars().count();
-                    for nr in split_run_with(run, p, start, end, mid_fn) {
+                    for nr in split_run_with(run, *pos, start, end, mid_fn) {
                         new_runs.push(nr);
                     }
-                    p += len;
+                    *pos += len;
                 }
                 h.runs = new_runs;
-                pos = p;
+                // Only a range over the link's content rebuilds it on save; an
+                // untouched complex link keeps writing its original XML.
+                let len: usize = h.content.iter().map(inline_len).sum();
+                if len > 0 && start < *pos + len && *pos < end {
+                    edit_run_range_at(&mut h.content, start, end, mid_fn, pos);
+                    h.content_changed = true;
+                } else {
+                    *pos += len;
+                }
                 out.push(Inline::Hyperlink(h));
             }
             // A tab is a run in OOXML: formatting applies to it like to any
             // character, and typing after it takes its props. Only the props
             // of `mid_fn`'s result are kept; its text stays a tab.
             Inline::Tab(rp) => {
-                let rp = if (start..end).contains(&pos) {
+                let rp = if (start..end).contains(pos) {
                     mid_fn("\t", &rp).props
                 } else {
                     rp
                 };
                 out.push(Inline::Tab(rp));
-                pos += 1;
+                *pos += 1;
             }
             Inline::Break(k) => {
                 out.push(Inline::Break(k));
-                pos += 1;
+                *pos += 1;
             }
             // zero-length, unchanged
             other => out.push(other),
@@ -2688,19 +2836,22 @@ fn run_props_at(content: &[Inline], offset: usize) -> RunProps {
     };
     match &content[i] {
         Inline::Run(r) => r.props.clone(),
-        Inline::Hyperlink(h) => {
-            let mut run_acc = 0;
-            h.runs
-                .iter()
-                .find(|r| {
-                    let found = local <= run_acc + r.text.chars().count();
-                    run_acc += r.text.chars().count();
-                    found
-                })
-                .or_else(|| h.runs.last())
-                .map(|r| r.props.clone())
-                .unwrap_or_default()
-        }
+        Inline::Hyperlink(h) => match link_part(h, local) {
+            LinkPart::Runs(local) => {
+                let mut run_acc = 0;
+                h.runs
+                    .iter()
+                    .find(|r| {
+                        let found = local <= run_acc + r.text.chars().count();
+                        run_acc += r.text.chars().count();
+                        found
+                    })
+                    .or_else(|| h.runs.last())
+                    .map(|r| r.props.clone())
+                    .unwrap_or_default()
+            }
+            LinkPart::Content(local) => run_props_at(&h.content, local),
+        },
         _ => typing_props(content, i, local),
     }
 }
@@ -3828,7 +3979,8 @@ mod tests {
             (REPRO_197, "removed"),
             (FIELD_197, "Figure9"),
             (FOOTNOTE_197, "7"),
-            (COMPLEX_LINK_197, "here"),
+            // The tracked change inside a complex link stays zero-width; the
+            // link's plain `here` is editable text since #212 (see below).
             (COMPLEX_LINK_197, "more"),
         ] {
             let mut ed = Editor::new(xml_doc(xml));
@@ -3843,6 +3995,333 @@ mod tests {
             assert_eq!(ed.doc, before);
             assert!(!ed.undo(), "no-op Replace All must not checkpoint");
         }
+    }
+
+    // ---- #212: plain text inside complex hyperlinks ----
+
+    fn proof_err() -> Inline {
+        Inline::Raw(r#"<w:proofErr w:type="spellStart"/>"#.into())
+    }
+
+    fn bookmark(start: bool) -> Inline {
+        Inline::Raw(if start {
+            r#"<w:bookmarkStart w:id="1" w:name="b"/>"#.into()
+        } else {
+            r#"<w:bookmarkEnd w:id="1"/>"#.into()
+        })
+    }
+
+    fn ins(text: &str) -> Inline {
+        Inline::Revision {
+            kind: RevisionKind::Insert,
+            metadata: RevisionMetadata::default(),
+            raw: format!("<w:ins><w:r><w:t>{text}</w:t></w:r></w:ins>"),
+            content: vec![run(text, RunProps::default())],
+            content_changed: false,
+        }
+    }
+
+    fn complex_link(content: Vec<Inline>) -> Inline {
+        Inline::Hyperlink(Hyperlink {
+            anchor: Some("top".into()),
+            content,
+            raw: Some("<w:hyperlink w:anchor=\"top\">…</w:hyperlink>".into()),
+            ..Default::default()
+        })
+    }
+
+    fn link_at(content: &[Inline], i: usize) -> &Hyperlink {
+        match &content[i] {
+            Inline::Hyperlink(h) => h,
+            other => panic!("expected a hyperlink at {i}, got {other:?}"),
+        }
+    }
+
+    /// `[ab, link(proofErr, Contoso, ins X, proofErr), cd]`
+    fn contoso() -> Vec<Inline> {
+        vec![
+            run("ab", RunProps::default()),
+            complex_link(vec![
+                proof_err(),
+                run("Contoso", RunProps::default()),
+                ins("X"),
+                proof_err(),
+            ]),
+            run("cd", RunProps::default()),
+        ]
+    }
+
+    #[test]
+    fn plain_text_inside_a_complex_hyperlink_is_found_and_replaced_212() {
+        let mut ed = Editor::new(xml_doc(COMPLEX_LINK_197));
+        assert_eq!(etext(&ed), "See here end.");
+        let ms = ed.find_all("here", false);
+        assert_eq!(
+            ms,
+            vec![Match {
+                path: vec![0],
+                start: 4,
+                end: 8
+            }]
+        );
+        ed.select_match(&ms[0]);
+        assert_eq!(ed.selection_text(), "here");
+        assert_eq!(
+            crate::agent::replace_all(&mut ed, "here", "there", false),
+            (1, 1)
+        );
+        assert_eq!(etext(&ed), "See there end.");
+        let link = first_para(&ed)
+            .content
+            .iter()
+            .find_map(|i| match i {
+                Inline::Hyperlink(h) => Some(h),
+                _ => None,
+            })
+            .expect("the link survives");
+        assert!(link.content_changed);
+        assert!(
+            matches!(&link.content[..], [Inline::Run(r), Inline::Revision { .. }] if r.text == "there"),
+            "{:?}",
+            link.content
+        );
+    }
+
+    #[test]
+    fn a_complex_link_counts_its_plain_runs_212() {
+        let content = contoso();
+        assert_eq!(inline_len(&content[1]), 7);
+        assert_eq!(editor_text(&content), "abContosocd");
+    }
+
+    #[test]
+    fn typing_inside_a_complex_link_edits_its_run_212() {
+        let mut content = contoso();
+        content_insert(&mut content, 3, 'z'); // C|ontoso
+        content_insert(&mut content, 10, 'y'); // Contoso| (the link claims its end)
+        assert_eq!(editor_text(&content), "abCzontosoycd");
+        let h = link_at(&content, 1);
+        assert!(h.content_changed && h.runs.is_empty());
+        assert!(matches!(&h.content[1], Inline::Run(r) if r.text == "Czontosoy"));
+        assert!(matches!(h.content[2], Inline::Revision { .. }));
+        assert_eq!(content.len(), 3);
+    }
+
+    #[test]
+    fn typing_at_the_start_of_a_leading_complex_link_stays_in_it_212() {
+        let mut content = vec![complex_link(vec![
+            proof_err(),
+            run("Contoso", bold()),
+            proof_err(),
+        ])];
+        let expected = run_props_at(&content, 0);
+        content_insert(&mut content, 0, 'z');
+        assert_eq!(editor_text(&content), "zContoso");
+        let h = link_at(&content, 0);
+        assert!(h.runs.is_empty(), "no stray default-props run in `runs`");
+        match &h.content[0] {
+            Inline::Run(r) => {
+                assert_eq!(r.text, "z");
+                assert_eq!(r.props, expected);
+                assert!(r.props.bold);
+            }
+            other => panic!("typed char not in the link: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn deleting_inside_a_complex_link_keeps_its_other_children_212() {
+        let mut content = contoso();
+        content_delete(&mut content, 2); // C
+        content_delete(&mut content, 7); // o (last)
+        assert_eq!(editor_text(&content), "abontoscd");
+        let h = link_at(&content, 1);
+        assert!(h.content_changed);
+        assert_eq!(h.content.len(), 4);
+        assert_eq!(h.content[0], proof_err());
+        assert!(matches!(&h.content[1], Inline::Run(r) if r.text == "ontos"));
+    }
+
+    #[test]
+    fn emptying_a_complex_link_of_markers_drops_it_in_place_212() {
+        let mut content = vec![
+            run("x", RunProps::default()),
+            complex_link(vec![
+                proof_err(),
+                bookmark(true),
+                run("ab", RunProps::default()),
+                bookmark(false),
+                proof_err(),
+            ]),
+            run("y", RunProps::default()),
+        ];
+        content_delete(&mut content, 1);
+        content_delete(&mut content, 1);
+        assert_eq!(
+            content,
+            vec![
+                run("x", RunProps::default()),
+                proof_err(),
+                bookmark(true),
+                bookmark(false),
+                proof_err(),
+                run("y", RunProps::default()),
+            ]
+        );
+    }
+
+    #[test]
+    fn emptying_a_complex_link_that_still_shows_something_keeps_it_212() {
+        let mut content = vec![
+            run("x", RunProps::default()),
+            complex_link(vec![
+                run("ab", RunProps::default()),
+                ins("more"),
+                proof_err(),
+            ]),
+            run("y", RunProps::default()),
+        ];
+        content_delete(&mut content, 1);
+        content_delete(&mut content, 1);
+        assert_eq!(editor_text(&content), "xy");
+        assert_eq!(content.len(), 3);
+        let h = link_at(&content, 1);
+        assert!(h.content_changed);
+        assert_eq!(h.content, vec![ins("more"), proof_err()]);
+    }
+
+    #[test]
+    fn run_props_at_predicts_typing_inside_a_complex_link_212() {
+        fn typed(content: &[Inline]) -> Option<&Run> {
+            content.iter().find_map(|i| match i {
+                Inline::Run(r) if r.text.contains('z') => Some(r),
+                Inline::Hyperlink(h) => h
+                    .runs
+                    .iter()
+                    .find(|r| r.text.contains('z'))
+                    .or_else(|| typed(&h.content)),
+                _ => None,
+            })
+        }
+        let cases: Vec<(&str, Vec<Inline>, usize, bool)> = vec![
+            (
+                "leading link, before its proofErr",
+                vec![complex_link(vec![proof_err(), run("Co", bold())])],
+                0,
+                true,
+            ),
+            (
+                "inside the link's run",
+                vec![
+                    run("a", RunProps::default()),
+                    complex_link(vec![proof_err(), run("Co", bold()), ins("X")]),
+                ],
+                2,
+                true,
+            ),
+            (
+                "at the link's end, before its revision",
+                vec![
+                    run("a", RunProps::default()),
+                    complex_link(vec![run("Co", bold()), ins("X")]),
+                    run("b", RunProps::default()),
+                ],
+                3,
+                true,
+            ),
+            (
+                "after a tab inside the link",
+                vec![complex_link(vec![
+                    run("a", bold()),
+                    Inline::Tab(RunProps::default()),
+                    run("b", bold()),
+                ])],
+                2,
+                false,
+            ),
+        ];
+        for (name, mut content, offset, want_bold) in cases {
+            let expected = run_props_at(&content, offset);
+            content_insert(&mut content, offset, 'z');
+            assert_eq!(
+                editor_text(&content).chars().nth(offset),
+                Some('z'),
+                "{name}"
+            );
+            let inserted = typed(&content).unwrap_or_else(|| panic!("{name}: no run holds z"));
+            assert_eq!(
+                inserted.props, expected,
+                "{name}: run_props_at mispredicted"
+            );
+            assert_eq!(inserted.props.bold, want_bold, "{name}");
+        }
+    }
+
+    #[test]
+    fn formatting_reaches_a_complex_links_runs_only_when_in_range_212() {
+        let mut content = contoso();
+        // "ab" only: next to the link, not over it.
+        set_prop_range(&mut content, 0, 2, |p, v| p.bold = v, true);
+        assert!(!link_at(&content, 1).content_changed);
+        assert!(!range_all_have(&content, 0, 4, |p| p.bold));
+        // "bCon": into the link.
+        set_prop_range(&mut content, 1, 5, |p, v| p.bold = v, true);
+        assert!(range_all_have(&content, 0, 5, |p| p.bold));
+        assert!(!range_all_have(&content, 0, 6, |p| p.bold));
+        let h = link_at(&content, 2); // after "a", "b"
+        assert!(h.content_changed);
+        assert!(matches!(&h.content[1], Inline::Run(r) if r.text == "Con" && r.props.bold));
+        assert!(matches!(&h.content[2], Inline::Run(r) if r.text == "toso" && !r.props.bold));
+        assert_eq!(h.content[3], ins("X"), "the revision is untouched");
+        assert_eq!(editor_text(&content), "abContosocd");
+    }
+
+    #[test]
+    fn copying_from_a_complex_link_takes_only_its_text_212() {
+        let content = contoso();
+        let out = extract_range(&content, 1, 5);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], run("b", RunProps::default()));
+        let h = link_at(&out, 1);
+        assert_eq!(h.anchor.as_deref(), Some("top"));
+        assert_eq!(
+            h.runs,
+            vec![Run {
+                text: "Con".into(),
+                props: RunProps::default()
+            }]
+        );
+        assert!(h.content.is_empty() && h.raw.is_none() && !h.content_changed);
+        // A range holding a tab inside the link keeps it in `content`.
+        let tabbed = vec![complex_link(vec![
+            proof_err(),
+            run("a", RunProps::default()),
+            Inline::Tab(RunProps::default()),
+            run("b", RunProps::default()),
+        ])];
+        let out = extract_range(&tabbed, 0, 3);
+        let h = link_at(&out, 0);
+        assert!(h.runs.is_empty());
+        assert_eq!(
+            h.content,
+            vec![
+                run("a", RunProps::default()),
+                Inline::Tab(RunProps::default()),
+                run("b", RunProps::default()),
+            ]
+        );
+    }
+
+    #[test]
+    fn editing_a_nested_link_marks_every_level_changed_212() {
+        let inner = complex_link(vec![proof_err(), run("in", RunProps::default())]);
+        let mut content = vec![complex_link(vec![bookmark(true), inner, bookmark(false)])];
+        assert_eq!(editor_text(&content), "in");
+        content_insert(&mut content, 1, 'z');
+        assert_eq!(editor_text(&content), "izn");
+        let outer = link_at(&content, 0);
+        assert!(outer.content_changed);
+        assert!(link_at(&outer.content, 1).content_changed);
     }
 
     fn bold() -> RunProps {
@@ -4204,6 +4683,32 @@ mod tests {
                 content: vec![run("complex", RunProps::default())],
                 ..Default::default()
             }),
+            // #212: a link's plain runs, tabs and nested links count; its
+            // markers, revisions and fields don't.
+            Inline::Hyperlink(Hyperlink {
+                content: vec![
+                    Inline::Raw(r#"<w:proofErr w:type="spellStart"/>"#.into()),
+                    Inline::Raw(r#"<w:bookmarkStart w:id="1" w:name="b"/>"#.into()),
+                    run("mixed", RunProps::default()),
+                    Inline::Tab(RunProps::default()),
+                    field("F"),
+                    Inline::Revision {
+                        kind: RevisionKind::Insert,
+                        metadata: RevisionMetadata::default(),
+                        raw: String::new(),
+                        content: vec![run("rev", RunProps::default())],
+                        content_changed: false,
+                    },
+                    Inline::Hyperlink(Hyperlink {
+                        content: vec![
+                            Inline::Break(BreakKind::Line),
+                            run("nested", RunProps::default()),
+                        ],
+                        ..Default::default()
+                    }),
+                ],
+                ..Default::default()
+            }),
             Inline::Break(BreakKind::Line),
             Inline::Tab(RunProps::default()),
             Inline::SmartArt {
@@ -4267,6 +4772,7 @@ mod tests {
             editor_text(&all).chars().count(),
             all.iter().map(inline_len).sum::<usize>()
         );
+        assert_eq!(editor_text(&all[3..4]), "mixed\t\nnested");
     }
 
     #[test]

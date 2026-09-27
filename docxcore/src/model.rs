@@ -94,11 +94,15 @@ pub struct Hyperlink {
     pub rel_id: Option<String>,
     pub runs: Vec<Run>,
     /// Full child sequence for hyperlinks that contain revisions or other
-    /// non-run markup. Simple editable links continue to use `runs`.
+    /// non-run markup (`runs` is then empty). Its plain runs, tabs and breaks
+    /// are editable like those of a simple link's `runs`; its other children
+    /// stay zero-width anchors.
     pub content: Vec<Inline>,
     /// Original complete hyperlink XML for byte-faithful untouched saves.
     pub raw: Option<String>,
-    /// Set when a review action changes a descendant of `content`.
+    /// Set when an edit or a review action changes a descendant of `content`;
+    /// save then rebuilds the link from `raw`'s opener plus its children
+    /// instead of writing `raw`.
     #[doc(hidden)]
     pub content_changed: bool,
 }
