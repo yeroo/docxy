@@ -20,14 +20,16 @@
 //! ## Scope (v1)
 //!
 //! Leaf tasks schedule via FS/SS/FF/SF links with lag, ASAP by default, honoring
-//! date constraints. By default MSO/MFO/FNLT/SNLT override conflicting links;
+//! date constraints. ALAP tasks occupy their late dates. By default
+//! MSO/MFO/FNLT/SNLT override conflicting links;
 //! disabling HonorConstraints lets the links delay those tasks instead. Both
 //! modes report link conflicts as negative total slack within the timeline's
 //! bounded horizon. Constraints before the project start do not pull unlinked
 //! tasks before it, but a deadline there still reports its miss as negative
 //! slack. A task's deadline bounds only its late finish, like an FNLT would,
-//! whatever HonorConstraints says: it never moves scheduled dates, and a
-//! missed one shows as negative total slack on the task and its drivers.
+//! whatever HonorConstraints says. It pulls an ALAP task earlier, but does not
+//! move other tasks' scheduled dates. A missed deadline shows as negative
+//! total slack on the task and its drivers.
 //! Summary tasks roll up from their descendants, except that a manually
 //! scheduled summary keeps its own dates: they floor its unconstrained
 //! subtasks' starts and extend the project finish (see [`Schedule::rolled_up`]
@@ -611,6 +613,27 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&self) -> Schedule {
+        let initial = self.pass(&HashMap::new());
+        let alap: HashMap<i32, i64> = self
+            .proj
+            .tasks
+            .iter()
+            .filter(|t| {
+                !t.summary
+                    && t.constraint == ConstraintType::AsLateAsPossible
+                    && !fixed(t)
+                    && self.tl(t).total > 0
+            })
+            .filter_map(|t| initial.get(t.uid).map(|r| (t.uid, r.late_start.minutes())))
+            .collect();
+        if alap.is_empty() {
+            initial
+        } else {
+            self.pass(&alap)
+        }
+    }
+
+    fn pass(&self, alap: &HashMap<i32, i64>) -> Schedule {
         // Exclude unschedulable leaves before either pass so they cannot affect
         // dependencies, project finish, or summary dates with empty timelines.
         let leaves: Vec<usize> = (0..self.proj.tasks.len())
@@ -835,6 +858,14 @@ impl<'a> Scheduler<'a> {
                     ConstraintType::StartNoEarlierThan | ConstraintType::FinishNoEarlierThan
                 ) {
                     driven_start = start_abs;
+                }
+            }
+            if let Some(&late_start) = alap.get(&t.uid)
+                && late_start > start_abs
+            {
+                start_abs = late_start;
+                if t.duration_min == 0 {
+                    held_milestone = Some(late_start);
                 }
             }
             // A binding FS milestone occupies the finish instant, even in a
@@ -2833,6 +2864,133 @@ mod tests {
     }
     fn fs(uid: i32) -> Predecessor {
         Predecessor::fs(uid)
+    }
+
+    #[test]
+    fn alap_leaf_uses_project_finish_or_earlier_deadline() {
+        for (deadline, start, finish) in [
+            (None, at(12, 8), at(13, 17)),
+            (Some(at(6, 17)), at(5, 8), at(6, 17)),
+        ] {
+            let mut side = task(2, "Side", 960);
+            side.constraint = ConstraintType::AsLateAsPossible;
+            side.deadline = deadline;
+            let sched = schedule(&march2(vec![task(1, "Long", 4800), side]));
+            let long = sched.get(1).unwrap();
+            let side = sched.get(2).unwrap();
+            assert_eq!(
+                (long.early_start, long.early_finish),
+                (at(2, 8), at(13, 17))
+            );
+            assert_eq!((side.early_start, side.early_finish), (start, finish));
+            assert_eq!((side.late_start, side.late_finish), (start, finish));
+            assert_eq!(side.total_slack_min, 0);
+            assert!(side.critical);
+            assert_eq!(sched.project_finish, at(13, 17));
+        }
+    }
+
+    #[test]
+    fn alap_predecessor_moves_asap_successor_to_its_late_dates() {
+        let mut a = task(1, "A", 960);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 960);
+        b.predecessors.push(fs(1));
+        let sched = schedule(&march2(vec![a, b, task(3, "Long", 4800)]));
+        for (uid, start, finish) in [(1, at(10, 8), at(11, 17)), (2, at(12, 8), at(13, 17))] {
+            let result = sched.get(uid).unwrap();
+            assert_eq!((result.early_start, result.early_finish), (start, finish));
+            assert_eq!(result.total_slack_min, 0);
+            assert!(result.critical);
+        }
+        assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn two_linked_alap_tasks_use_one_backward_window() {
+        let mut a = task(1, "A", 960);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 960);
+        b.constraint = ConstraintType::AsLateAsPossible;
+        b.predecessors.push(fs(1));
+        let sched = schedule(&march2(vec![a, b, task(3, "Long", 4800)]));
+        for (uid, start, finish) in [(1, at(10, 8), at(11, 17)), (2, at(12, 8), at(13, 17))] {
+            let result = sched.get(uid).unwrap();
+            assert_eq!((result.early_start, result.early_finish), (start, finish));
+            assert_eq!(result.total_slack_min, 0);
+            assert!(result.critical);
+        }
+        assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn alap_milestone_keeps_project_finish_instant() {
+        let mut milestone = task(2, "Side milestone", 0);
+        milestone.constraint = ConstraintType::AsLateAsPossible;
+        let sched = schedule(&march2(vec![task(1, "Long", 4800), milestone]));
+        let result = sched.get(2).unwrap();
+        assert_eq!(
+            (result.early_start, result.early_finish),
+            (at(13, 17), at(13, 17))
+        );
+        assert_eq!(result.total_slack_min, 0);
+        assert!(result.critical);
+        assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn impossible_alap_deadline_keeps_link_driven_dates_and_negative_slack() {
+        let mut side = task(2, "Side", 960);
+        side.predecessors.push(fs(1));
+        side.deadline = Some(at(6, 17));
+        let asap = schedule(&march2(vec![task(1, "Long", 4800), side.clone()]));
+        side.constraint = ConstraintType::AsLateAsPossible;
+        let alap = schedule(&march2(vec![task(1, "Long", 4800), side]));
+        let expected = asap.get(2).unwrap();
+        let actual = alap.get(2).unwrap();
+        assert_eq!(
+            (actual.early_start, actual.early_finish),
+            (at(16, 8), at(17, 17))
+        );
+        assert_eq!(
+            (actual.early_start, actual.early_finish),
+            (expected.early_start, expected.early_finish)
+        );
+        assert_eq!(actual.total_slack_min, expected.total_slack_min);
+        assert!(actual.total_slack_min < 0);
+        assert!(actual.critical);
+    }
+
+    #[test]
+    fn fixed_alap_tasks_keep_their_pinned_and_actual_dates() {
+        let mut pinned = manual(2, "Pinned", 960, at(2, 8));
+        pinned.constraint = ConstraintType::AsLateAsPossible;
+        let mut tracked = in_progress(3, "Tracked", 960, at(2, 8), (None, None), Some(480));
+        tracked.constraint = ConstraintType::AsLateAsPossible;
+        let sched = schedule(&march2(vec![task(1, "Long", 4800), pinned, tracked]));
+        for uid in [2, 3] {
+            let result = sched.get(uid).unwrap();
+            assert_eq!(
+                (result.early_start, result.early_finish),
+                (at(2, 8), at(3, 17))
+            );
+        }
+    }
+
+    #[test]
+    fn leveling_starts_from_alap_cpm_dates() {
+        let mut side = task(2, "Side", 960);
+        side.constraint = ConstraintType::AsLateAsPossible;
+        let proj = Project {
+            resources: vec![worker(1, "Crew", 1.0)],
+            assignments: vec![assign(1, 2, 1, 1.0)],
+            ..march2(vec![task(1, "Long", 4800), side])
+        };
+        let sched = schedule(&proj);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
+        assert_eq!(leveled.finish(2), Some(sched.get(2).unwrap().early_finish));
+        assert_eq!(leveled.project_finish, sched.project_finish);
     }
 
     /// Phase (summary) over A and B, B after A, then C after B. With
