@@ -390,15 +390,7 @@ impl Editor {
             None => self.proj.tasks.len(),
         };
         let outline_level = level_at(&self.proj, at);
-        let uid = self
-            .proj
-            .tasks
-            .iter()
-            .map(|t| t.uid)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("No task IDs available")?;
+        let uid = self.next_uid()?;
         // Follow the plan's own default mode; a manual task starts at the
         // project start (or the anchor the schedule actually uses).
         let manual = self.proj.new_tasks_are_manual;
@@ -424,6 +416,43 @@ impl Editor {
         Ok(at)
     }
 
+    /// Insert a blank row above a UID, or append, as ONE undo step: Project's
+    /// Insert Task › Blank Row. The row stores nothing but its UID and ID, so
+    /// it is outside the outline and the schedule until typed into; then it
+    /// takes the level of the task above where it sits then (see
+    /// [`materialized`]). The returned row is not automatically selected.
+    pub fn insert_blank_row(&mut self, before: Option<i32>) -> Result<usize, String> {
+        let at = match before {
+            Some(uid) => self.index(uid)?,
+            None => self.proj.tasks.len(),
+        };
+        let uid = self.next_uid()?;
+        self.edit_structure(|proj| {
+            proj.tasks.insert(
+                at,
+                Task {
+                    uid,
+                    id: uid,
+                    is_null: true,
+                    ..Task::default()
+                },
+            )
+        })?;
+        Ok(at)
+    }
+
+    /// The UID a new row takes: one past the largest in use.
+    fn next_uid(&self) -> Result<i32, String> {
+        self.proj
+            .tasks
+            .iter()
+            .map(|t| t.uid)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| "No task IDs available".into())
+    }
+
     /// Append a blank row and apply `edit` to it as ONE undo step, as typing
     /// into Project's entry row below the last task does. The row becomes a
     /// task through the ordinary setters (see [`materialized`]). Returns the
@@ -433,15 +462,7 @@ impl Editor {
         &mut self,
         edit: impl FnOnce(&mut Editor, i32) -> Result<T, String>,
     ) -> Result<Option<(usize, T)>, String> {
-        let uid = self
-            .proj
-            .tasks
-            .iter()
-            .map(|t| t.uid)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("No task IDs available")?;
+        let uid = self.next_uid()?;
         let i = self.proj.tasks.len();
         // Outside history: the scheduler drops blank rows, so the schedule
         // stays valid, and every setter validates before its one snapshot.
@@ -1967,6 +1988,117 @@ mod tests {
         assert_eq!(ed.add_task(None, "First", 0).unwrap(), 0);
         assert_eq!(ed.project().tasks[0].outline_level, 1);
         assert!(ed.project().tasks[0].milestone);
+    }
+
+    // ---- Insert Task › Blank Row (#158) ----
+
+    #[test]
+    fn insert_blank_row_goes_above_as_one_undo_step_and_schedules_nothing() {
+        let mut ed = editor();
+        ed.toggle_level();
+        ed.select(1);
+        let sched = results(ed.schedule());
+        let finish = ed.level.as_ref().unwrap().project_finish;
+        let mut at = None;
+        assert_edit(&mut ed, |e| at = Some(e.insert_blank_row(Some(2)).unwrap()));
+        assert_eq!(at, Some(1), "above the row it is inserted before");
+        assert_eq!(
+            ed.project().tasks[1],
+            Task {
+                uid: 3,
+                id: 3,
+                is_null: true,
+                ..Task::default()
+            }
+        );
+        assert_eq!(ed.sel(), 1, "the host selects the new row");
+        // Every task keeps its schedule: the scheduler skips blank rows.
+        assert_eq!(results(ed.schedule()), sched);
+        assert!(ed.schedule().get(3).is_none());
+        assert_eq!(ed.level.as_ref().unwrap().project_finish, finish);
+        // `None` appends; the first row of an empty plan is blank too.
+        assert_eq!(ed.insert_blank_row(None), Ok(3));
+        assert!(ed.project().tasks[3].is_null);
+        assert_eq!(ed.project().tasks[3].uid, 4);
+        assert_reopens(&ed);
+        ed.replace_project(Project::default());
+        assert_eq!(ed.insert_blank_row(None), Ok(0));
+        assert_eq!(ed.project().tasks[0].uid, 1);
+        // An unknown UID changes nothing.
+        let mut ed = editor();
+        ed.rename(1, "Dirty").unwrap();
+        assert_unchanged(&mut ed, |e| {
+            assert_eq!(
+                e.insert_blank_row(Some(99)),
+                Err("no task with uid 99".into())
+            );
+        });
+    }
+
+    #[test]
+    fn a_blank_row_inserted_in_a_subtree_stays_outside_the_outline() {
+        let mut ed = phase_plan();
+        // Between Phase's subtasks, and after its last one (above B).
+        ed.insert_blank_row(Some(4)).unwrap();
+        ed.insert_blank_row(Some(5)).unwrap();
+        let blank = |ed: &Editor, i: usize| ed.project().tasks[i].is_null;
+        assert!(blank(&ed, 3) && blank(&ed, 5));
+        let tasks: Vec<_> = rows(&ed)
+            .into_iter()
+            .enumerate()
+            .filter(|&(i, _)| !blank(&ed, i))
+            .map(|(_, row)| row)
+            .collect();
+        assert_eq!(
+            tasks,
+            rows(&phase_plan()),
+            "no level or summary flag changes"
+        );
+        assert_reopens(&ed);
+        // Phase still has two subtasks; deleting it takes the blank row
+        // between them, not the one after its last subtask.
+        assert_eq!(ed.subtree_len(2), Ok(2));
+        assert_eq!(ed.delete_task(2).unwrap(), vec![2, 3, 6, 4]);
+        assert_eq!(
+            ed.project().tasks.iter().map(|t| t.uid).collect::<Vec<_>>(),
+            [1, 7, 5]
+        );
+    }
+
+    #[test]
+    fn typing_into_an_inserted_blank_row_makes_a_task_where_it_sits() {
+        // Above Phase's first subtask: the typed row is Phase's first child.
+        let mut ed = phase_plan();
+        let at = ed.insert_blank_row(Some(3)).unwrap();
+        assert_eq!(at, 2);
+        let depth = ed.undo_depth();
+        ed.rename(6, "Typed").unwrap();
+        let t = &ed.project().tasks[at];
+        assert_eq!(
+            (
+                &*t.name,
+                t.outline_level,
+                t.duration_min,
+                t.estimated,
+                t.is_null
+            ),
+            ("Typed", 2, 480, Some(true), false)
+        );
+        assert!(ed.project().tasks[1].summary);
+        assert!(ed.schedule().get(6).is_some());
+        assert_eq!(ed.undo_depth(), depth + 1);
+        assert!(ed.undo());
+        assert!(ed.project().tasks[at].is_null, "undo keeps the blank row");
+        // In a manual-default plan the typed row is a pinned manual task.
+        let mut proj = phase_plan().project().clone();
+        proj.new_tasks_are_manual = true;
+        let start = proj.start_date;
+        let mut ed = Editor::new(proj);
+        ed.insert_blank_row(Some(1)).unwrap();
+        ed.rename(6, "Typed").unwrap();
+        let t = &ed.project().tasks[0];
+        assert!(t.manual && !t.is_null);
+        assert_eq!((t.outline_level, t.manual_start), (1, start));
     }
 
     #[test]
