@@ -36,6 +36,8 @@ pub enum Act {
     CalculateProject,
     Baseline,
     // View
+    ShowSubtasks,
+    HideSubtasks,
     ScrollLeft,
     ScrollRight,
     GoToStart,
@@ -266,26 +268,44 @@ fn project_groups() -> Vec<Group> {
 
 fn view_groups() -> Vec<Group> {
     use Act::*;
-    vec![Group {
-        title: "Zoom",
-        width: 29,
-        rows: [
-            vec![
-                btn("◀ Scroll Left", ScrollLeft, "Scroll the timeline left (h)"),
-                Seg::Gap("  "),
-                btn(
-                    "▶ Scroll Right",
-                    ScrollRight,
-                    "Scroll the timeline right (l)",
-                ),
+    vec![
+        Group {
+            title: "Data",
+            width: 16,
+            rows: [
+                vec![btn(
+                    "▾ Show Subtasks",
+                    ShowSubtasks,
+                    "Show the selected summary's subtasks (+)",
+                )],
+                vec![btn(
+                    "▸ Hide Subtasks",
+                    HideSubtasks,
+                    "Hide the selected summary's subtasks (-)",
+                )],
             ],
-            vec![btn(
-                "⇤ Go to Start",
-                GoToStart,
-                "Scroll to the earliest task or project start",
-            )],
-        ],
-    }]
+        },
+        Group {
+            title: "Zoom",
+            width: 29,
+            rows: [
+                vec![
+                    btn("◀ Scroll Left", ScrollLeft, "Scroll the timeline left (h)"),
+                    Seg::Gap("  "),
+                    btn(
+                        "▶ Scroll Right",
+                        ScrollRight,
+                        "Scroll the timeline right (l)",
+                    ),
+                ],
+                vec![btn(
+                    "⇤ Go to Start",
+                    GoToStart,
+                    "Scroll to the earliest task or project start",
+                )],
+            ],
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -346,6 +366,8 @@ mod tests {
             ("Report", "Export", "Export Gantt", ExportGantt),
             ("Project", "Schedule", "Calculate Project", CalculateProject),
             ("Project", "Schedule", "Set Baseline", Baseline),
+            ("View", "Data", "Show Subtasks", ShowSubtasks),
+            ("View", "Data", "Hide Subtasks", HideSubtasks),
             ("View", "Zoom", "Scroll Left", ScrollLeft),
             ("View", "Zoom", "Scroll Right", ScrollRight),
             ("View", "Zoom", "Go to Start", GoToStart),

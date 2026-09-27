@@ -259,6 +259,18 @@ Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find
 undo/redo, save, and export. The former bare-letter commands are available on
 the ribbon; letters now start cell edits. Ribbon Rename still opens its Name prompt.
 
+A summary's subtasks can be hidden and shown again, as in Project: View › Data
+› Show Subtasks / Hide Subtasks (Alt+Shift+Plus / Alt+Shift+Minus; yppxy `+` or
+`=` and `-`), or a click on the `▾`/`▸` beside the summary's name. Hide Subtasks
+on a subtask collapses its summary. Hidden rows leave the grid and the Gantt,
+and the arrow keys, Home/End and clicks move over the rows shown. Collapsing is
+view state kept by `projcore::Editor`: it is not an edit, not undone, not saved
+(MSPDI has no element for it) and not restored with the session. The selected
+row is never hidden: selecting or finding a hidden task, or moving it under a
+collapsed summary, shows it, while a cursor left inside a collapsed subtree by
+a delete or an undo moves up to the summary. A task typed below a collapsed
+last summary becomes its sibling.
+
 Dates use `YYYY-MM-DD`. On an auto task, Start sets SNET and Finish sets FNET at
 the chosen working day's calendar finish (non-working Finish dates are rejected).
 On a manual task, Start moves the task to that day's first working time (08:00
