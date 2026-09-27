@@ -1737,6 +1737,22 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(color),
             ));
         }
+        // Project gives this in the missed-deadline indicator's tooltip.
+        if let (Some(deadline), Some(finish)) = (t.deadline, app.disp_finish(t.uid))
+            && t.misses_deadline(finish)
+        {
+            let d = deadline.parts();
+            spans.push(Span::styled(
+                format!(
+                    "· ⚠ {}: finishes after its deadline {:04}-{:02}-{:02} ",
+                    truncate(&t.name, 16),
+                    d.year,
+                    d.month,
+                    d.day
+                ),
+                Style::default().fg(CRIT),
+            ));
+        }
         // Resources assigned to the selected task.
         let res = format_resource_names(app.ed.project(), t.uid);
         if !res.is_empty() {
@@ -1849,6 +1865,17 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             Span::styled(format!("{namecol:<24}"), style),
             Span::styled(format!(" {dur:>5}"), Style::default().fg(Color::Gray)),
             Span::styled(format!(" {slack:>6}"), Style::default().fg(Color::DarkGray)),
+            // The Indicators cell, at the row end so the name and bullet
+            // columns keep their place (and a terminal that draws the sign
+            // two columns wide still fits it before the border).
+            Span::styled(
+                if app.disp_finish(t.uid).is_some_and(|f| t.misses_deadline(f)) {
+                    " ⚠"
+                } else {
+                    "  "
+                },
+                Style::default().fg(CRIT),
+            ),
         ]);
         if i == app.ed.sel() {
             line.style = Style::default().bg(app.sel_bg());
@@ -2374,6 +2401,56 @@ mod tests {
             row.split_whitespace().collect::<Vec<_>>(),
             ["•", "Late", "2d", "-1d"]
         );
+    }
+
+    #[test]
+    fn task_grid_marks_a_missed_deadline_at_the_row_end() {
+        use ratatui::backend::TestBackend;
+        let proj =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/21-deadline-missed.xml"))
+                .unwrap();
+        let mut app = App::new(proj, None, false);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        // Row A (no deadline), then row B (finishes after its deadline).
+        let cell = |row: u16| {
+            let c = buf.cell((app.list_x0 + 41, app.list_y0 + row)).unwrap();
+            (c.symbol().to_string(), c.fg)
+        };
+        assert_eq!(cell(0).0, " ");
+        assert_eq!(cell(1), ("⚠".to_string(), CRIT));
+    }
+
+    #[test]
+    fn header_names_the_selected_task_s_missed_deadline() {
+        use ratatui::backend::TestBackend;
+        let proj =
+            projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/21-deadline-missed.xml"))
+                .unwrap();
+        let mut app = App::new(proj, None, false);
+        for (index, missed) in [(0, false), (1, true)] {
+            app.ed.select(index);
+            let mut term = Terminal::new(TestBackend::new(160, 1)).unwrap();
+            term.draw(|f| draw_header(f, f.area(), &app)).unwrap();
+            let text: String = term
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert_eq!(
+                text.contains("⚠ B: finishes after its deadline 2026-03-06"),
+                missed,
+                "{text}"
+            );
+            assert_eq!(
+                text.contains("finishes after its deadline"),
+                missed,
+                "{text}"
+            );
+        }
     }
 
     #[test]
