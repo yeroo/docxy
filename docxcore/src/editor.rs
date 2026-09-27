@@ -1479,8 +1479,9 @@ impl Editor {
 /// It searches the text the editor can address ([`editor_text`]), so match
 /// offsets are editor offsets that selection and editing can use directly.
 /// Text the editor gives zero width (tracked changes, field results, footnote
-/// refs, complex hyperlinks' `content`, …) is drawn but not searched: a match
-/// there could be neither selected nor replaced.
+/// refs, …, including those inside a hyperlink) is drawn but not searched: a
+/// match there could be neither selected nor replaced. A hyperlink's plain
+/// runs are searched, whatever else the link holds.
 pub(crate) fn find_all_in_body(body: &[Block], query: &str, case_sensitive: bool) -> Vec<Match> {
     if query.is_empty() {
         return Vec::new();

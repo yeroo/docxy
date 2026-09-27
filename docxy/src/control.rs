@@ -263,11 +263,11 @@ fn find(app: &App, args: &Json) -> Result<Json, String> {
         ];
         // Top-level paragraph matches carry a direct block index + full text,
         // which a client can feed straight back to `doc.replace-range`.
-        // `start`/`end` count only editor-editable text (runs, simple links,
-        // tabs, breaks), while `text` is `plain_text()`, which also holds the
-        // text of zero-width inlines (tracked changes, fields, footnote refs,
-        // equations, SmartArt, chart titles, text boxes, complex links such as
-        // one holding a bookmark or proofing mark): when the paragraph
+        // `start`/`end` count only editor-editable text (runs, tabs and breaks,
+        // including those inside hyperlinks), while `text` is `plain_text()`,
+        // which also holds the text of zero-width inlines (tracked changes,
+        // fields, footnote refs, equations, SmartArt, chart titles, text boxes,
+        // and tracked changes or fields inside a hyperlink): when the paragraph
         // has any, `text[start..end]` need not be the match.
         if m.path.len() == 1 {
             f.push(("block", Json::Num(m.path[0] as f64)));
