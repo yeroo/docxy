@@ -872,18 +872,20 @@ impl Editor {
     pub fn add_link(&mut self, uid: i32, link: Predecessor) -> Result<(), String> {
         let pred = link.uid;
         let i = self.index(uid)?;
+        let pred_id = self.proj.task(pred).map_or(pred, |task| task.id);
         if uid == pred || self.index(pred).is_err() || self.is_blank(pred) {
-            return Err(format!("No other task with ID {pred}"));
+            return Err(format!("No other task with ID {pred_id}"));
         }
         if self.proj.tasks[i]
             .predecessors
             .iter()
             .any(|p| p.uid == pred)
         {
-            return Err(format!("Already depends on {pred}"));
+            return Err(format!("Already depends on {pred_id}"));
         }
         let mut predecessors = self.proj.tasks[i].predecessors.clone();
         predecessors.push(link);
+        LinkGraph::new(self, i, &predecessors).check_link(pred)?;
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;
         self.edit_row(i, |proj, _| {
             proj.tasks[i].predecessors = predecessors;
@@ -1396,6 +1398,125 @@ fn materialized(
         }
     }
     t
+}
+
+/// The prospective outline and dependency graph for one predecessor edit.
+/// Only tasks are copied; `row_as_edited` supplies the row a blank successor
+/// would become when the edit commits.
+struct LinkGraph {
+    tasks: Vec<Task>,
+    succ_i: usize,
+    successors: std::collections::HashMap<i32, Vec<i32>>,
+    ancestors: std::collections::HashMap<i32, Vec<i32>>,
+    indexes: std::collections::HashMap<i32, usize>,
+}
+
+impl LinkGraph {
+    fn new(ed: &Editor, succ_i: usize, proposed: &[Predecessor]) -> Self {
+        use std::collections::HashMap;
+
+        let mut tasks = ed.proj.tasks.clone();
+        if tasks[succ_i].is_null {
+            tasks[succ_i] = ed.row_as_edited(succ_i);
+        }
+        tasks[succ_i].predecessors = proposed.to_vec();
+        let mut successors: HashMap<i32, Vec<i32>> = HashMap::new();
+        let mut ancestors = HashMap::new();
+        let mut indexes = HashMap::new();
+        let mut stack: Vec<(u32, i32)> = Vec::new();
+        for (i, task) in tasks.iter().enumerate() {
+            if task.is_null {
+                continue;
+            }
+            while stack
+                .last()
+                .is_some_and(|(level, _)| *level >= task.outline_level)
+            {
+                stack.pop();
+            }
+            let mut lineage: Vec<i32> = stack.iter().map(|(_, uid)| *uid).collect();
+            lineage.push(task.uid);
+            ancestors.insert(task.uid, lineage);
+            indexes.insert(task.uid, i);
+            stack.push((task.outline_level, task.uid));
+            for predecessor in &task.predecessors {
+                successors
+                    .entry(predecessor.uid)
+                    .or_default()
+                    .push(task.uid);
+            }
+        }
+        Self {
+            tasks,
+            succ_i,
+            successors,
+            ancestors,
+            indexes,
+        }
+    }
+
+    fn check_link(&self, pred_uid: i32) -> Result<(), String> {
+        use std::collections::{HashSet, VecDeque};
+
+        let pred_i = self.indexes[&pred_uid]; // caller checked a non-blank predecessor
+        let succ_id = self.tasks[self.succ_i].id;
+        let pred_id = self.tasks[pred_i].id;
+        if (self.succ_i < pred_i && pred_i < outline::subtree_end_in(&self.tasks, self.succ_i))
+            || (pred_i < self.succ_i && self.succ_i < outline::subtree_end_in(&self.tasks, pred_i))
+        {
+            return Err(format!(
+                "Tasks {succ_id} and {pred_id} are a summary and its subtask; they cannot be linked"
+            ));
+        }
+
+        // Summary links connect their leaves. Expand each reachable task once
+        // so a link between large summaries does not enqueue a cross product.
+        let targets: HashSet<i32> = link_leaves(&self.tasks, pred_i).into_iter().collect();
+        let mut visited: HashSet<i32> = HashSet::new();
+        let mut queue = VecDeque::new();
+        for leaf in link_leaves(&self.tasks, self.succ_i) {
+            if visited.insert(leaf) {
+                queue.push_back(leaf);
+            }
+        }
+        let mut expanded_ancestors = HashSet::new();
+        let mut expanded_successors = HashSet::new();
+        while let Some(leaf) = queue.pop_front() {
+            if targets.contains(&leaf) {
+                return Err(format!(
+                    "Linking task {succ_id} to task {pred_id} would create a circular relationship"
+                ));
+            }
+            for ancestor in &self.ancestors[&leaf] {
+                if !expanded_ancestors.insert(*ancestor) {
+                    continue;
+                }
+                if let Some(next_tasks) = self.successors.get(ancestor) {
+                    for next_uid in next_tasks {
+                        if !expanded_successors.insert(*next_uid) {
+                            continue;
+                        }
+                        for next_leaf in link_leaves(&self.tasks, self.indexes[next_uid]) {
+                            if visited.insert(next_leaf) {
+                                queue.push_back(next_leaf);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Non-blank outline leaves below a row, including the row itself when it
+/// has no children.
+fn link_leaves(tasks: &[Task], i: usize) -> Vec<i32> {
+    let end = outline::subtree_end_in(tasks, i);
+    (i..end)
+        .filter(|&j| !tasks[j].is_null && !crate::model::is_outline_summary_in(tasks, j))
+        .map(|j| tasks[j].uid)
+        .collect()
 }
 
 /// Link the task just inserted at row `at` into the chain it split, as
@@ -3073,7 +3194,7 @@ mod tests {
         assert_eq!(
             ed.add_predecessor(2, 3, LinkType::FinishStart, 0)
                 .unwrap_err(),
-            "No other task with ID 3"
+            "No other task with ID 2"
         );
         let blank = Predecessor::fs(3);
         assert_eq!(
@@ -4271,6 +4392,197 @@ mod tests {
             .iter()
             .map(|t| (t.uid, t.predecessors.iter().map(|p| p.uid).collect()))
             .collect()
+    }
+
+    fn rejected_link(ed: &mut Editor, succ: i32, pred: i32, message: &str) {
+        let before = state(ed);
+        let err = ed.add_link(succ, Predecessor::fs(pred)).unwrap_err();
+        assert!(err.contains(message), "{err}");
+        assert_eq!(state(ed), before);
+    }
+
+    #[test]
+    fn summary_and_descendant_links_are_refused_in_both_directions() {
+        let proj =
+            crate::mspdi::read_mspdi(include_str!("../../corpus/mspdi/10-summary.xml")).unwrap();
+        let mut ed = Editor::new(proj);
+        rejected_link(&mut ed, 2, 1, "summary and its subtask");
+        rejected_link(&mut ed, 1, 3, "summary and its subtask");
+
+        let mut ed = outline(&[(1, "S", 1), (2, "Nested", 2), (3, "A", 3), (4, "X", 1)]);
+        rejected_link(&mut ed, 1, 3, "summary and its subtask");
+        rejected_link(&mut ed, 3, 1, "summary and its subtask");
+    }
+
+    #[test]
+    fn direct_and_transitive_cycles_are_refused_for_all_link_types() {
+        let types = [
+            LinkType::FinishStart,
+            LinkType::StartStart,
+            LinkType::FinishFinish,
+            LinkType::StartFinish,
+        ];
+        for link_type in types {
+            let mut ed = outline(&[(1, "A", 1), (2, "B", 1), (3, "C", 1)]);
+            ed.add_link(2, Predecessor::working(1, link_type, 0))
+                .unwrap();
+            let before = state(&ed);
+            assert!(
+                ed.add_link(1, Predecessor::working(2, link_type, 0))
+                    .unwrap_err()
+                    .contains("circular relationship")
+            );
+            assert_eq!(state(&ed), before);
+            ed.add_link(3, Predecessor::working(2, link_type, 0))
+                .unwrap();
+            let before = state(&ed);
+            assert!(
+                ed.add_link(1, Predecessor::working(3, link_type, 0))
+                    .unwrap_err()
+                    .contains("circular relationship")
+            );
+            assert_eq!(state(&ed), before);
+        }
+    }
+
+    #[test]
+    fn cycles_through_summary_leaves_are_refused() {
+        let rows = [(1, "S", 1), (2, "A", 2), (3, "B", 2), (4, "X", 1)];
+        let mut ed = outline(&rows);
+        ed.add_link(4, Predecessor::fs(2)).unwrap(); // A -> X
+        rejected_link(&mut ed, 1, 4, "circular relationship"); // X -> S -> A
+
+        let mut ed = outline(&rows);
+        ed.add_link(1, Predecessor::fs(4)).unwrap(); // X -> S -> A
+        rejected_link(&mut ed, 4, 2, "circular relationship"); // A -> X
+    }
+
+    #[test]
+    fn links_between_separate_outline_branches_are_allowed() {
+        let rows = [
+            (1, "S1", 1),
+            (2, "A", 2),
+            (3, "B", 2),
+            (4, "S2", 1),
+            (5, "C", 2),
+            (6, "D", 2),
+            (7, "X", 1),
+        ];
+        let mut ed = outline(&rows);
+        ed.add_link(3, Predecessor::fs(2)).unwrap(); // siblings
+        ed.add_link(4, Predecessor::fs(1)).unwrap(); // separate summaries
+        ed.add_link(7, Predecessor::fs(1)).unwrap(); // summary -> outside
+
+        let mut ed = outline(&rows);
+        ed.add_link(1, Predecessor::fs(7)).unwrap(); // outside -> summary
+        assert_eq!(
+            ed.project().task(1).unwrap().predecessors,
+            [Predecessor::fs(7)]
+        );
+    }
+
+    #[test]
+    fn a_blank_successor_is_checked_in_its_materialized_outline_position() {
+        for blank_after_last_child in [false, true] {
+            let mut proj = outline(&[(1, "S", 1), (2, "A", 2), (3, "X", 1)])
+                .project()
+                .clone();
+            let at = if blank_after_last_child { 2 } else { 1 };
+            proj.tasks.insert(
+                at,
+                Task {
+                    uid: 4,
+                    id: 4,
+                    is_null: true,
+                    ..Task::default()
+                },
+            );
+            let mut ed = Editor::new(proj);
+            rejected_link(&mut ed, 4, 1, "summary and its subtask");
+            let before = state(&ed);
+            assert!(
+                ed.set_predecessors(4, vec![Predecessor::fs(1)])
+                    .unwrap_err()
+                    .contains("summary and its subtask")
+            );
+            assert_eq!(state(&ed), before);
+        }
+    }
+
+    #[test]
+    fn new_link_errors_name_visible_task_ids() {
+        let mut proj = outline(&[(10, "S", 1), (20, "A", 2)]).project().clone();
+        proj.tasks[0].id = 1;
+        proj.tasks[1].id = 2;
+        let mut ed = Editor::new(proj);
+        let err = ed.add_link(20, Predecessor::fs(10)).unwrap_err();
+        assert!(err.contains("2") && err.contains("1"), "{err}");
+        assert!(!err.contains("10") && !err.contains("20"), "{err}");
+        assert_eq!(
+            ed.add_link(20, Predecessor::fs(20)).unwrap_err(),
+            "No other task with ID 2"
+        );
+
+        let mut proj = outline(&[(10, "A", 1), (20, "B", 1)]).project().clone();
+        proj.tasks[0].id = 1;
+        proj.tasks[1].id = 2;
+        let mut ed = Editor::new(proj);
+        ed.add_link(20, Predecessor::fs(10)).unwrap();
+        assert_eq!(
+            ed.add_link(20, Predecessor::fs(10)).unwrap_err(),
+            "Already depends on 1"
+        );
+    }
+
+    #[test]
+    fn cycles_through_large_linked_summaries_are_refused() {
+        let mut rows = vec![(1, "P", 1)];
+        for uid in 2..=251 {
+            rows.push((uid, "P leaf", 2));
+        }
+        rows.push((252, "S", 1));
+        for uid in 253..=502 {
+            rows.push((uid, "S leaf", 2));
+        }
+        rows.push((503, "X", 1));
+        let mut ed = outline(&rows);
+        ed.add_link(252, Predecessor::fs(1)).unwrap();
+        rejected_link(&mut ed, 1, 252, "circular relationship");
+        ed.add_link(503, Predecessor::fs(252)).unwrap();
+        rejected_link(&mut ed, 1, 503, "circular relationship");
+    }
+
+    #[test]
+    fn set_predecessors_checks_new_links_and_keeps_loaded_bad_links() {
+        let mut proj = outline(&[(1, "S", 1), (2, "A", 2), (3, "X", 1)])
+            .project()
+            .clone();
+        proj.tasks[1].predecessors = vec![Predecessor::fs(1)]; // loaded bad link
+        let mut ed = Editor::new(proj);
+        let mut retained = Predecessor::fs(1);
+        retained.lag = 60;
+        ed.set_predecessors(2, vec![retained]).unwrap();
+        assert_eq!(ed.project().task(2).unwrap().predecessors, [retained]);
+        let before = state(&ed);
+        assert!(
+            ed.set_predecessors(1, vec![Predecessor::fs(2)])
+                .unwrap_err()
+                .contains("summary and its subtask")
+        );
+        assert_eq!(state(&ed), before);
+
+        let mut ed = outline(&[(1, "A", 1), (2, "B", 1), (3, "C", 1)]);
+        ed.add_link(2, Predecessor::fs(1)).unwrap();
+        ed.add_link(3, Predecessor::fs(2)).unwrap();
+        let before = state(&ed);
+        assert!(
+            ed.set_predecessors(1, vec![Predecessor::fs(3)])
+                .unwrap_err()
+                .contains("circular relationship")
+        );
+        assert_eq!(state(&ed), before);
+        // A replacement that preserves an acyclic graph still works.
+        ed.set_predecessors(3, vec![Predecessor::fs(1)]).unwrap();
     }
 
     #[test]
