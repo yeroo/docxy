@@ -88,10 +88,15 @@ impl Export {
                 "kind": "gallery",
                 "id": g.id,
                 "tip": { "title": g.tip.title, "body": g.tip.body, "shortcut": g.tip.shortcut },
+                "tile": gallery_tile(g.items.len()),
                 "items": g.items.iter().map(|i| json!({
                     "label": i.label,
                     "preview": i.preview,
                     "act": act_name(i.act),
+                    "look": {
+                        "light": sample_look(i.preview, false),
+                        "dark": sample_look(i.preview, true),
+                    },
                 })).collect::<Vec<_>>(),
             }),
             Control::Rows(rows) => {
@@ -150,6 +155,39 @@ fn hex(c: Hsla) -> String {
     } else {
         format!("#{:02x}{:02x}{:02x}{:02x}", b(c.r), b(c.g), b(c.b), b(c.a))
     }
+}
+
+/// The Styles gallery's geometry and state mixes (`style_gallery::TILE`), so
+/// the page's tiles are the suite's.
+fn gallery_tile(items: usize) -> Value {
+    use crate::style_gallery as sg;
+    let t = sg::TILE;
+    json!({
+        "w": t.w,
+        "h": t.h,
+        "pad": t.pad,
+        "radius": t.radius,
+        "border": t.border,
+        "gap": t.gap,
+        "wellPad": t.well_pad,
+        "wellRadius": t.well_radius,
+        "wellBorder": t.well_border,
+        "wellWidth": sg::well_width(items),
+        "wellHeight": sg::well_height(),
+        "nameSize": t.name_size,
+        "sample": t.sample,
+        "sampleFamily": sg::SAMPLE_FAMILY,
+        "surfaceMix": { "light": sg::surface_mix(false), "dark": sg::surface_mix(true) },
+        "hoverMix": sg::HOVER_MIX,
+        "checkedMix": sg::CHECKED_MIX,
+    })
+}
+
+/// One gallery item's sample in one theme: px size, CSS weight, and its ink
+/// (`fg`, `dim` or `#rrggbb`).
+fn sample_look(preview: &str, dark: bool) -> Value {
+    let l = crate::style_gallery::sample_look(preview, dark);
+    json!({ "size": l.size, "weight": l.weight, "ink": l.ink.css() })
 }
 
 /// The gpui-component theme colours the suite's chrome reads, per mode.
@@ -307,6 +345,22 @@ mod tests {
         assert_eq!(v["contextual"][0]["context"], "table");
         assert_eq!(v["tabs"][0]["kind"], "backstage");
         assert!(v["icons"]["bold"].as_str().unwrap().starts_with("<svg"));
+        let gallery = &v["tabs"][1]["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["title"] == "Styles")
+            .unwrap()["items"][0];
+        assert_eq!(gallery["tile"]["w"], 64.0);
+        assert_eq!(gallery["tile"]["wellWidth"], 466.0);
+        let h1 = gallery["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["preview"] == "h1")
+            .unwrap();
+        assert_eq!(h1["look"]["light"]["ink"], "#2f5496");
+        assert_eq!(h1["look"]["light"]["weight"], 300);
         assert!(
             v["theme"]["light"]["background"]
                 .as_str()

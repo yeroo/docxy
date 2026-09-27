@@ -186,7 +186,10 @@ function Test-PageNumber($doc) {
 function Test-NoSpacing($doc) {
     $p = Launch
     Click $p 200 343                              # caret in the paragraph
-    Click $p 706 107                              # the "No Spacing" style in the gallery (Home is active)
+    # Styles gallery tiles (style_gallery::TILE): the well starts where the old
+    # 76px boxes did (x=588); tile i's centre is 588 + well border 1 + well pad 2
+    # + i*(w 64 + gap 2) + 32, so Normal 623, No Spacing 689, Heading 1 755.
+    Click $p 689 107                              # the "No Spacing" style in the gallery (Home is active)
     SaveClose $p
     $xml = Part $doc "word/document.xml"
     if ($xml -match 'w:line="240"') { "PASS: No Spacing sets single spacing (w:line=240)" } else { "FAIL: No Spacing not applied" }
@@ -194,7 +197,7 @@ function Test-NoSpacing($doc) {
 function Test-Heading($doc) {
     $p = Launch
     Click $p 200 343
-    Click $p 782 107                              # "Heading 1" in the Styles gallery
+    Click $p 755 107                              # "Heading 1" in the Styles gallery (see Test-NoSpacing)
     SaveClose $p
     $xml = Part $doc "word/document.xml"
     if ($xml -match 'w:val="Heading1"') { "PASS: Heading 1 applies pStyle Heading1" } else { "FAIL: no Heading1 style" }

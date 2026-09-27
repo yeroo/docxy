@@ -1,0 +1,19 @@
+# #215: the Home ribbon's Styles gallery tiles, dark and light. The shots are
+# the review evidence: each tile an "AaBbCc" in its style's size, weight and
+# colour, the name under it, Title selected (the caret's paragraph).
+
+test style gallery tiles in dark and light
+  open copy:../fixtures/basic.docx
+  call ribbon-click {"tab":"Home","command":"styles:Title"}
+  call ribbon-read {}
+  assert reply.tabs.1.groups.3.commands.5.checked is true
+  call theme-set {"theme":"dark"}
+  assert reply.theme is dark
+  assert reply.resolved is dark
+  shot gallery
+  call theme-set {"theme":"light"}
+  assert reply.resolved is light
+  shot gallery
+  call theme-set {"theme":"auto"}
+  assert reply.theme is auto
+  call-error theme-set {"theme":"dim"} => unknown theme 'dim'
