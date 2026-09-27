@@ -96,6 +96,12 @@ clears history while retaining the find query and leveling preference.
   `LinkLag`: *tenths of a minute* of working or elapsed time, or the percentage
   itself for formats 19/51 — one of several unit traps the reader normalizes.
   The format is kept and written back; unsupported formats fail the read.
+- **Inactive tasks** use MSPDI `Active`. Task ▸ Schedule ▸ Inactivate toggles a
+  task, cascading to its subtasks in one undo step. Inactive tasks keep their
+  own dates and can follow active or inactive predecessors, but they do not
+  drive active successors, active summary rollups, the active project's bounds,
+  or its critical path. When every task is inactive, their dates bound the
+  project. A summary whose subtasks are all inactive keeps their rollup.
 - **Constraints** pin dates: ASAP/ALAP and the six hard ones
   (SNET/SNLT/FNET/FNLT/MSO/MFO).
 - **Calendars** define working time per weekday (e.g. Mon–Fri 08:00–12:00,
@@ -207,8 +213,10 @@ finish; a stored `LevelingDelay`, Project's last leveling, is not added. A
 resource that is free and available somewhere takes a task above its capacity
 there, and one with no capacity anywhere later is left overallocated: the task
 goes where every other resource fits, or keeps its earliest start when it has
-no other. A predecessor's leveling delay propagates to its
-successors, preserving every link's gap. v1 is single-calendar and delay-only,
+no other. An active predecessor's leveling delay propagates to active
+successors, preserving their link gaps. Inactive tasks book no capacity and
+keep their CPM dates, even when an active predecessor is delayed by leveling.
+v1 is single-calendar and delay-only,
 and treats a task's occupation as its wall-clock span; multi-calendar leveling
 and task splitting are future work. Leveling never moves a manual
 task: its bookings are placed first, and auto tasks level around them.

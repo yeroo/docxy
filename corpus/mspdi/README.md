@@ -53,8 +53,7 @@ File 20 keeps the task fields Project writes that change scheduling
 ([issue #80](https://github.com/yeroo/docxy/issues/80)): task type,
 effort-driven, estimated, active, priority, deadline, levelling options,
 display flags, WBS, `GUID`/`CreateDate` and the stored `Work`/`Cost`. Like
-file 19 it is **not** verified against Project 2024, for two reasons: docxy
-still schedules its inactive task (Project would drop it), and its blank row
+file 19 it is **not** verified against Project 2024: its blank row
 (`<IsNull>1</IsNull>`, between two linked tasks under a summary) has a shape
 of our own, because no Project file with a blank row was available. It also
 carries task custom field values and the custom field definitions

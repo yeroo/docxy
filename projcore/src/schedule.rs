@@ -1817,7 +1817,9 @@ fn manual_summary_floors(proj: &Project, spans: &HashMap<i32, (i64, i64)>) -> Ha
 /// Task UIDs must be unique: results, links and assignments are keyed by UID.
 /// Readers reject duplicates; a code-built project must not contain them.
 /// Inactive tasks keep their dates from a second pass, but never drive an
-/// active successor, summary rollup, project bound, or critical path.
+/// active successor, an active summary's rollup, or the active project's
+/// bounds and critical path. When every task is dormant, their dates bound
+/// the project; a summary with only dormant subtasks keeps its own rollup.
 pub fn schedule(proj: &Project) -> Schedule {
     let clean = without_blank_rows(proj);
     let dormant = dormant_uids(&clean);
@@ -1827,7 +1829,10 @@ pub fn schedule(proj: &Project) -> Schedule {
     let active = without_tasks(&clean, &dormant);
     let mut main = Scheduler::new(&active).run();
     let all_dormant = active.tasks.is_empty();
-    let dormant_view = dormant_view(&clean, &dormant);
+    let mut dormant_view = dormant_view(&clean, &dormant);
+    if !all_dormant {
+        dormant_view.start_date.get_or_insert(main.project_start);
+    }
     let other = Scheduler::new(&dormant_view).run();
     if all_dormant {
         main.project_start = other.project_start;
@@ -1850,14 +1855,10 @@ pub fn schedule(proj: &Project) -> Schedule {
 fn dormant_uids(proj: &Project) -> std::collections::HashSet<i32> {
     let activity = proj.effective_activity();
     let mut dormant = std::collections::HashSet::new();
-    let mut active_leaves = Vec::with_capacity(proj.tasks.len() + 1);
-    active_leaves.push(0usize);
     for (task, active) in proj.tasks.iter().zip(activity) {
         if !active {
             dormant.insert(task.uid);
         }
-        active_leaves
-            .push(active_leaves.last().copied().unwrap() + usize::from(active && !task.summary));
     }
     // The next row at the same or a shallower level ends this subtree.
     let mut ends = vec![proj.tasks.len(); proj.tasks.len()];
@@ -1872,10 +1873,14 @@ fn dormant_uids(proj: &Project) -> std::collections::HashSet<i32> {
         ends[i] = stack.last().copied().unwrap_or(proj.tasks.len());
         stack.push(i);
     }
-    for (i, task) in proj.tasks.iter().enumerate() {
-        if task.summary && ends[i] > i + 1 && active_leaves[ends[i]] == active_leaves[i + 1] {
+    // Process children first. Suffix counts include the final dormant state
+    // of nested summaries, including a stored summary with no children.
+    let mut active_suffix = vec![0usize; proj.tasks.len() + 1];
+    for (i, task) in proj.tasks.iter().enumerate().rev() {
+        if task.summary && ends[i] > i + 1 && active_suffix[i + 1] == active_suffix[ends[i]] {
             dormant.insert(task.uid);
         }
+        active_suffix[i] = active_suffix[i + 1] + usize::from(!dormant.contains(&task.uid));
     }
     dormant
 }
@@ -2040,8 +2045,14 @@ pub fn level(proj: &Project) -> Leveled {
         return Scheduler::new(&clean).level();
     }
     let active = without_tasks(&clean, &dormant);
-    let mut main = Scheduler::new(&active).level();
-    let other = Scheduler::new(&dormant_view(&clean, &dormant)).run();
+    let active_scheduler = Scheduler::new(&active);
+    let active_start = DateTime::from_minutes(active_scheduler.anchor);
+    let mut main = active_scheduler.level();
+    let mut dormant_view = dormant_view(&clean, &dormant);
+    if !active.tasks.is_empty() {
+        dormant_view.start_date.get_or_insert(active_start);
+    }
+    let other = Scheduler::new(&dormant_view).run();
     if active.tasks.is_empty() {
         main.project_finish = other.project_finish;
     }
@@ -2634,6 +2645,60 @@ mod tests {
             sched.get(3).unwrap().early_finish
         );
         assert!(sched.get(1).unwrap().early_finish > sched.project_finish);
+    }
+
+    #[test]
+    fn dormant_successor_uses_the_active_anchor_without_a_project_start() {
+        let mut early = task(1, "Early dormant", 480);
+        early.active = Some(false);
+        early.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        let mut active = task(2, "Active", 480);
+        active.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        let mut successor = task(3, "Dormant successor", 480);
+        successor.active = Some(false);
+        successor.predecessors.push(fs(2));
+        let proj = Project {
+            tasks: vec![early, active, successor],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        assert_eq!(sched.project_start, DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        assert!(sched.get(3).unwrap().early_start > sched.get(2).unwrap().early_finish);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(3), Some(sched.get(3).unwrap().early_start));
+    }
+
+    #[test]
+    fn inactive_tasks_keep_links_between_each_other_without_extending_project_finish() {
+        let active = task(1, "Active", 480);
+        let mut first = task(2, "Dormant first", 960);
+        first.active = Some(false);
+        let mut second = task(3, "Dormant second", 480);
+        second.active = Some(false);
+        second.predecessors.push(fs(2));
+        let proj = Project {
+            tasks: vec![active, first, second],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        assert!(sched.get(3).unwrap().early_start >= sched.get(2).unwrap().early_finish);
+        assert_eq!(sched.project_finish, sched.get(1).unwrap().early_finish);
+    }
+
+    #[test]
+    fn a_stored_summary_without_children_keeps_its_parent_out_of_the_dormant_set() {
+        let mut parent = task(1, "Parent", 0);
+        parent.summary = true;
+        let mut empty_summary = task(2, "Empty summary", 480);
+        empty_summary.summary = true;
+        empty_summary.outline_level = 2;
+        let proj = Project {
+            tasks: vec![parent, empty_summary],
+            ..Project::default()
+        };
+        let dormant = dormant_uids(&proj);
+        assert!(!dormant.contains(&1));
+        assert!(!dormant.contains(&2));
     }
 
     #[test]
