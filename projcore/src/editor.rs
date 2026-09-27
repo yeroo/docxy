@@ -448,6 +448,7 @@ impl Editor {
         // project start (or the anchor the schedule actually uses).
         let manual = self.proj.new_tasks_are_manual;
         let manual_start = manual.then(|| self.new_task_start());
+        let leveled = self.leveled;
         self.edit_structure(|proj| {
             proj.tasks.insert(
                 at,
@@ -471,15 +472,23 @@ impl Editor {
                 },
             );
             // A manual task linked into a chain starts where that link puts
-            // it, as an auto one would, rather than at the project start
-            // before its new predecessor finishes.
+            // it, as an auto one would be shown, rather than at the project
+            // start before its new predecessor finishes. Under leveling that
+            // is its leveled start, as `set_manual` pins at the shown dates.
             if anchor.is_some() && autolink(proj, at) && manual {
                 let mut probe = proj.clone();
                 probe.tasks[at].manual = false;
                 probe.tasks[at].manual_start = None;
                 probe.tasks[at].manual_duration_min = None;
-                if let Some(r) = crate::schedule::schedule(&probe).get(uid) {
-                    proj.tasks[at].manual_start = Some(r.early_start);
+                let start = if leveled {
+                    crate::schedule::level(&probe).start(uid)
+                } else {
+                    crate::schedule::schedule(&probe)
+                        .get(uid)
+                        .map(|r| r.early_start)
+                };
+                if let Some(start) = start {
+                    proj.tasks[at].manual_start = Some(start);
                 }
             }
         })?;
@@ -3747,6 +3756,47 @@ mod tests {
         assert_eq!(n.manual_start, ed.project().start_date);
         assert!(n.predecessors.is_empty());
         assert_eq!(ed.schedule().get(2).unwrap().early_start, b_start);
+    }
+
+    #[test]
+    fn under_leveling_an_autolinked_manual_task_starts_after_the_leveled_predecessor() {
+        // X and A share Alice, so leveling delays A; B follows A.
+        let mut proj = chain(LinkType::FinishStart, 0, None).project().clone();
+        proj.tasks.insert(
+            0,
+            Task {
+                uid: 3,
+                id: 3,
+                ..proj.tasks[0].clone()
+            },
+        );
+        proj.tasks[0].name = "X".into();
+        proj.new_tasks_are_manual = true;
+        let mut ed = Editor::new(proj);
+        ed.assign_resource(3, "Alice").unwrap();
+        ed.assign_resource(1, "Alice").unwrap();
+        ed.toggle_level();
+        let a_finish = ed.disp_finish(1).unwrap();
+        assert!(
+            a_finish > ed.schedule().get(1).unwrap().early_finish,
+            "A leveled later"
+        );
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        let n = ed.project().tasks[at].clone();
+        assert!(n.manual);
+        assert_eq!(preds(&ed, 2), [(n.uid, LinkType::FinishStart, 0)]);
+        let (n_start, n_finish) = (
+            ed.disp_start(n.uid).unwrap(),
+            ed.disp_finish(n.uid).unwrap(),
+        );
+        assert_eq!(n.manual_start, Some(n_start));
+        assert!(
+            n_start > a_finish,
+            "N {n_start:?} before A's leveled finish {a_finish:?}"
+        );
+        assert!(ed.disp_start(2).unwrap() > n_finish);
+        // The saved start is the leveled one.
+        assert_eq!(n.stored_start, Some(n_start));
     }
 
     #[test]
