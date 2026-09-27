@@ -298,7 +298,8 @@ otherwise a name ending in `[...]` must hold valid units for its resource's
 kind. Retained assignments whose text shows the same units keep their units/work.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
-be entered individually through the resource-list syntax.
+be entered individually through the resource-list syntax; commas inside a
+balanced `[...]`, such as a material label `Cement[5 bags, 50 lb]`, do not split.
 
 ## Roadmap
 

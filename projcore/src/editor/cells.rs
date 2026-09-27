@@ -491,7 +491,7 @@ fn format_quantity(n: f64) -> String {
 }
 
 /// Assignment units as percent text: two decimals, trailing zeros trimmed (`50%`, `33.33%`).
-pub(super) fn format_units(units: f64) -> String {
+fn format_units(units: f64) -> String {
     format!("{}%", format_quantity(units * 100.))
 }
 
@@ -549,6 +549,32 @@ pub fn format_resource_names(proj: &Project, task_uid: i32) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// Split Resource Names cell text into its tokens, untrimmed, at the commas
+/// outside brackets, so a material label with a comma (`Cement[5 bags, 50 lb]`)
+/// stays in its token. Text whose brackets do not balance splits at every
+/// comma, as a stray `[` must not join the names after it.
+pub fn split_resource_names(text: &str) -> Vec<String> {
+    let mut tokens = vec![String::new()];
+    let mut depth = 0usize;
+    for c in text.chars() {
+        match c {
+            '[' => depth += 1,
+            ']' if depth == 0 => return text.split(',').map(str::to_owned).collect(),
+            ']' => depth -= 1,
+            ',' if depth == 0 => {
+                tokens.push(String::new());
+                continue;
+            }
+            _ => {}
+        }
+        tokens.last_mut().expect("one token").push(c);
+    }
+    if depth > 0 {
+        return text.split(',').map(str::to_owned).collect();
+    }
+    tokens
 }
 
 /// One assignment's Resource Names text: a work resource's units, a

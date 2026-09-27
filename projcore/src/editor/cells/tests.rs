@@ -1551,6 +1551,48 @@ fn assign_prompt_takes_material_quantities() {
 }
 
 #[test]
+fn resource_names_split_at_commas_outside_brackets() {
+    for (text, tokens) in [
+        ("Bob[50%], Alice", &["Bob[50%]", " Alice"][..]),
+        (
+            "Cement[5 bags, 50 lb], Alice",
+            &["Cement[5 bags, 50 lb]", " Alice"],
+        ),
+        ("a,,b", &["a", "", "b"]),
+        ("", &[""]),
+        // Unbalanced brackets split at every comma.
+        ("Crew [A, Bob", &["Crew [A", " Bob"]),
+        ("Rig], Bob[50%]", &["Rig]", " Bob[50%]"]),
+    ] {
+        assert_eq!(split_resource_names(text), tokens, "{text}");
+    }
+}
+
+#[test]
+fn a_material_label_with_a_comma_survives_the_cell() {
+    let mut ed = with_cement(Some("bags, 50 lb"));
+    ed.set_resources(10, &["Cement[5 bags, 50 lb]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (5.0, 300));
+    let text = format_resource_names(&ed.proj, 10);
+    assert_eq!(text, "Cement[5 bags, 50 lb]");
+    ed.mark_saved();
+    let before = ed.project().clone();
+    commit_shown_text(&mut ed).unwrap();
+    unchanged(&ed, &before, (1, 0, false));
+    let count = ed.proj.resources.len();
+    ed.set_resources(10, &split_resource_names(&format!("{text}, Bob")))
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (5.0, 300));
+    assert_eq!(allocation(&ed, 10, 1), (1.0, 960));
+    assert_eq!(ed.proj.resources.len(), count);
+    ed.set_resources(10, &split_resource_names("Cement[7 bags, 50 LB], Bob"))
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (7.0, 420));
+    assert_eq!(ed.proj.resources.len(), count);
+}
+
+#[test]
 fn material_quantities_survive_mspdi() {
     let mut ed = with_cement(Some("tons"));
     ed.set_resources(10, &["Cement[5 tons]".into()]).unwrap();
@@ -1661,9 +1703,8 @@ fn on_task_10(resources: &[(i32, &str)], assigned: &[(i32, f64)]) -> Editor {
 
 fn commit_shown_text(ed: &mut Editor) -> Result<(), String> {
     let text = format_resource_names(&ed.proj, 10);
-    // The suite splits on commas without trimming, as here.
-    let tokens: Vec<String> = text.split(',').map(str::to_owned).collect();
-    ed.set_resources(10, &tokens)
+    // The suite splits the cell as here, without trimming.
+    ed.set_resources(10, &split_resource_names(&text))
 }
 
 #[test]

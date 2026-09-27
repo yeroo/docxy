@@ -544,6 +544,54 @@ fn resource_names_cell_shows_and_keeps_partial_units() {
     assert_eq!(row(&t), "Bob[50%], Alice, Carol");
 }
 
+#[test]
+fn resource_names_cell_keeps_a_material_label_with_a_comma() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.resources.push(projcore::model::Resource {
+        uid: 1,
+        id: 1,
+        name: "Cement".into(),
+        kind: projcore::model::ResourceType::Material,
+        material_label: Some("bags, 50 lb".into()),
+        ..Default::default()
+    });
+    vm(&mut t).ed.replace_project(p);
+    vm(&mut t)
+        .ed
+        .set_resources(10, &["Cement[5 bags, 50 lb]".into()])
+        .unwrap();
+    let row = |t: &DocTab| {
+        project_row(&v(t).ed, v(t).ed.project().task(10).unwrap())[COL_RESOURCES].clone()
+    };
+    assert_eq!(row(&t), "Cement[5 bags, 50 lb]");
+    let depth = v(&t).ed.undo_depth();
+    vm(&mut t).col = COL_RESOURCES;
+    // Committing the shown text is a no-op.
+    key(&mut t, "f2");
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    // Appending a name keeps the material and stages no split-off names.
+    // (Enter moved the selection down a row.)
+    vm(&mut t).ed.select(0);
+    key(&mut t, "f2");
+    project_input(&mut t, "text", Some(", Alice"), Modifiers::default());
+    key(&mut t, "enter");
+    assert!(v(&t).cell.is_none(), "{}", t.status);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    let project = v(&t).ed.project();
+    let units: Vec<_> = project
+        .assignments
+        .iter()
+        .filter(|a| a.task_uid == 10)
+        .map(|a| (a.resource_uid, a.units))
+        .collect();
+    assert_eq!(units, [(1, 5.0), (2, 1.0)]);
+    assert_eq!(project.resources.len(), 2);
+    assert_eq!(row(&t), "Cement[5 bags, 50 lb], Alice");
+}
+
 // ---- the entry row below the last task (#145) ----
 
 fn state(t: &DocTab, name: &str) -> ctlcore::json::Json {
