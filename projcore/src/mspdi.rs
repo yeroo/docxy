@@ -356,6 +356,7 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "HideBar" => t.hide_bar = opt_bool_of(p),
                     "Rollup" => t.rollup = opt_bool_of(p),
                     "ExternalTask" => t.external_task = opt_bool_of(p),
+                    "ExternalTaskProject" => t.external_task_project = Some(text_of(p)),
                     "IsSubproject" => t.is_subproject = opt_bool_of(p),
                     "IsSubprojectReadOnly" => t.is_subproject_read_only = opt_bool_of(p),
                     "Work" => t.work_min = try_iso8601_to_minutes(&text_of(p)),
@@ -437,6 +438,8 @@ fn parse_predecessor(p: &mut XmlParser) -> Result<Option<Predecessor>, i64> {
     let mut uid: Option<i32> = None;
     let mut link = LinkType::FinishStart;
     let mut link_lag: i64 = 0;
+    let mut cross_project = None;
+    let mut cross_project_name = None;
     // An absent LagFormat is days, as docxy has always read it.
     let mut format_code = LagFormat::DAYS.code();
     loop {
@@ -449,6 +452,8 @@ fn parse_predecessor(p: &mut XmlParser) -> Result<Option<Predecessor>, i64> {
                         link = LinkType::from_code(int_of(p)).unwrap_or(LinkType::FinishStart)
                     }
                     "LinkLag" => link_lag = int_of(p),
+                    "CrossProject" => cross_project = opt_bool_of(p),
+                    "CrossProjectName" => cross_project_name = Some(text_of(p)),
                     "LagFormat" => format_code = int_of(p),
                     _ => p.skip_element(),
                 }
@@ -464,6 +469,8 @@ fn parse_predecessor(p: &mut XmlParser) -> Result<Option<Predecessor>, i64> {
         link,
         lag,
         lag_format,
+        cross_project,
+        cross_project_name,
     }))
 }
 
@@ -1659,6 +1666,13 @@ fn opt_work(s: &mut String, name: &str, value: Option<i64>) {
 /// fields and none of the elements every task otherwise states.
 fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     let task = !t.is_null;
+    // Display dates for an external placeholder are not local calculations.
+    // Keep its stored Start/Finish; do not synthesize Critical or slack.
+    let result = if t.external_task == Some(true) && !t.summary {
+        None
+    } else {
+        computed.result
+    };
     s.push_str("    <Task>\n");
     tag(s, 3, "UID", &t.uid.to_string());
     opt_text(s, "GUID", t.guid.as_ref());
@@ -1704,11 +1718,12 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     if task {
         tag(s, 3, "Summary", flag(t.summary));
     }
-    opt_flag(s, "Critical", computed.result.map(|r| r.critical));
+    opt_flag(s, "Critical", result.map(|r| r.critical));
     opt_flag(s, "IsSubproject", t.is_subproject);
     opt_flag(s, "IsSubprojectReadOnly", t.is_subproject_read_only);
     opt_flag(s, "ExternalTask", t.external_task);
-    if let Some(r) = computed.result {
+    opt_text(s, "ExternalTaskProject", t.external_task_project.as_ref());
+    if let Some(r) = result {
         tag(s, 3, "EarlyStart", &r.early_start.to_mspdi());
         tag(s, 3, "EarlyFinish", &r.early_finish.to_mspdi());
         tag(s, 3, "LateStart", &r.late_start.to_mspdi());
@@ -1721,7 +1736,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         "WorkVariance",
         t.work_variance.as_ref().map(Rate::as_str),
     );
-    if let Some(r) = computed.result {
+    if let Some(r) = result {
         // Slack is working minutes in the model, tenths of a minute in MSPDI.
         for (name, min) in [
             ("FreeSlack", r.free_slack_min),
@@ -1776,6 +1791,12 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         s.push_str("      <PredecessorLink>\n");
         tag(s, 4, "PredecessorUID", &p.uid.to_string());
         tag(s, 4, "Type", &p.link.code().to_string());
+        if let Some(value) = p.cross_project {
+            tag(s, 4, "CrossProject", flag(value));
+        }
+        if let Some(name) = &p.cross_project_name {
+            tag(s, 4, "CrossProjectName", name);
+        }
         tag(s, 4, "LinkLag", &link_lag_of(p).to_string());
         tag(s, 4, "LagFormat", &p.lag_format.code().to_string());
         s.push_str("      </PredecessorLink>\n");
@@ -2951,7 +2972,7 @@ mod tests {
 
         let b = &proj.tasks[1];
         assert_eq!(b.predecessors.len(), 1);
-        let pred = b.predecessors[0];
+        let pred = &b.predecessors[0];
         assert_eq!(pred.uid, 1);
         assert_eq!(pred.link, LinkType::FinishStart);
         assert_eq!(pred.lag, 480); // 4800 tenths-of-min = 2 days = 8h/day
@@ -3986,6 +4007,7 @@ mod tests {
         let mut proj = task_project(TASK_FIELDS);
         let t = &mut proj.tasks[0];
         t.manual = true;
+        t.external_task_project = Some(r"C:\plans\other.mpp".into());
         t.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
         t.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 2, 17, 0));
         t.manual_start = t.stored_start;
@@ -4035,6 +4057,8 @@ mod tests {
             },
         );
         proj.tasks[1].predecessors.push(Predecessor::fs(2));
+        proj.tasks[1].predecessors[0].cross_project = Some(true);
+        proj.tasks[1].predecessors[0].cross_project_name = Some(r"C:\plans\other.mpp\7".into());
         let mut xml = String::new();
         let sched = crate::schedule::schedule(&proj);
         write_task(
@@ -4078,21 +4102,13 @@ mod tests {
                 "Estimated",
                 "Milestone",
                 "Summary",
-                "Critical",
                 "IsSubproject",
                 "IsSubprojectReadOnly",
                 "ExternalTask",
-                "EarlyStart",
-                "EarlyFinish",
-                "LateStart",
-                "LateFinish",
+                "ExternalTaskProject",
                 "StartVariance",
                 "FinishVariance",
                 "WorkVariance",
-                "FreeSlack",
-                "TotalSlack",
-                "StartSlack",
-                "FinishSlack",
                 "FixedCost",
                 "FixedCostAccrual",
                 "PercentComplete",
@@ -4122,6 +4138,8 @@ mod tests {
                 "PredecessorLink",
                 "PredecessorUID",
                 "Type",
+                "CrossProject",
+                "CrossProjectName",
                 "LinkLag",
                 "LagFormat",
                 "ExtendedAttribute",
@@ -6390,7 +6408,7 @@ mod tests {
             (4800, None, 480),
         ] {
             let proj = read_mspdi(&lag_xml(link_lag, format)).unwrap();
-            let pred = proj.tasks[1].predecessors[0];
+            let pred = &proj.tasks[1].predecessors[0];
             assert_eq!(pred.lag, lag, "{link_lag} {format:?}");
             assert_eq!(pred.lag_format.code(), format.unwrap_or(7));
         }
@@ -6401,7 +6419,7 @@ mod tests {
         for format in supported_lag_formats() {
             for link_lag in [0, 10, -10, 50, -25, 28800, -28800, 1234560] {
                 let proj = read_mspdi(&lag_xml(link_lag, Some(format.code()))).unwrap();
-                let pred = proj.tasks[1].predecessors[0];
+                let pred = &proj.tasks[1].predecessors[0];
                 assert_eq!(pred.lag_format, format);
                 let saved = write_mspdi(&proj);
                 assert!(

@@ -934,6 +934,7 @@ fn retyping_a_predecessors_cell_keeps_a_link_shown_in_a_fallback_unit() {
         link: projcore::LinkType::FinishStart,
         lag,
         lag_format: projcore::LagFormat::from_code(code).unwrap(),
+        ..projcore::Predecessor::fs(uid)
     };
     let mut t = tab();
     let month = lag(20, 20 * 480, 11);

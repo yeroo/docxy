@@ -220,7 +220,7 @@ impl LagFormat {
 }
 
 /// One predecessor link on a task.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Predecessor {
     /// UID of the predecessor task.
     pub uid: i32,
@@ -230,6 +230,8 @@ pub struct Predecessor {
     /// duration (Percent). Negative means lead (overlap).
     pub lag: i64,
     pub lag_format: LagFormat,
+    pub cross_project: Option<bool>,
+    pub cross_project_name: Option<String>,
 }
 
 impl Predecessor {
@@ -245,6 +247,8 @@ impl Predecessor {
             link,
             lag: lag_min,
             lag_format: LagFormat::DAYS,
+            cross_project: None,
+            cross_project_name: None,
         }
     }
 
@@ -345,6 +349,7 @@ pub struct Task {
     pub hide_bar: Option<bool>,
     pub rollup: Option<bool>,
     pub external_task: Option<bool>,
+    pub external_task_project: Option<String>,
     pub is_subproject: Option<bool>,
     pub is_subproject_read_only: Option<bool>,
     /// Work (minutes), Cost and OverAllocated as Project last calculated
@@ -2179,6 +2184,7 @@ mod tests {
             link: LinkType::FinishStart,
             lag,
             lag_format: LagFormat::from_code(19).unwrap(),
+            ..Predecessor::fs(1)
         };
         assert_eq!(pct(50).lag_minutes(1920), Some(960));
         assert_eq!(pct(-25).lag_minutes(1920), Some(-480));

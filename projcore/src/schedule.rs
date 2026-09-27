@@ -1830,6 +1830,34 @@ fn manual_summary_floors(proj: &Project, spans: &HashMap<i32, (i64, i64)>) -> Ha
 /// dates bound the project; a summary with only dormant subtasks keeps its
 /// own rollup.
 pub fn schedule(proj: &Project) -> Schedule {
+    let clean = without_unscheduled_rows(proj);
+    let mut main = schedule_local(&clean);
+    for task in &proj.tasks {
+        if task.external_task == Some(true) && !task.summary && !task.is_null {
+            if let Some(start) = task.stored_start {
+                let finish = task.stored_finish.unwrap_or(start);
+                main.results.insert(
+                    task.uid,
+                    TaskResult {
+                        uid: task.uid,
+                        early_start: start,
+                        early_finish: finish,
+                        late_start: start,
+                        late_finish: finish,
+                        total_slack_min: 0,
+                        free_slack_min: 0,
+                        start_slack_min: 0,
+                        finish_slack_min: 0,
+                        critical: false,
+                    },
+                );
+            }
+        }
+    }
+    main
+}
+
+fn schedule_local(proj: &Project) -> Schedule {
     let clean = without_blank_rows(proj);
     let dormant = dormant_uids(&clean);
     if dormant.is_empty() {
@@ -1953,6 +1981,22 @@ fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
     std::borrow::Cow::Owned(without_tasks(proj, &blank))
 }
 
+/// External leaves are placeholders for work in another project. Their links
+/// and assignments cannot enter the local CPM or resource-leveling passes.
+fn without_unscheduled_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
+    let removed: std::collections::HashSet<i32> = proj
+        .tasks
+        .iter()
+        .filter(|t| t.is_null || (t.external_task == Some(true) && !t.summary))
+        .map(|t| t.uid)
+        .collect();
+    if removed.is_empty() {
+        std::borrow::Cow::Borrowed(proj)
+    } else {
+        std::borrow::Cow::Owned(without_tasks(proj, &removed))
+    }
+}
+
 /// Working minutes between two wall-clock instants under the project's default
 /// calendar. Used when importing a file that stores computed wall-clock
 /// start/finish (a `.mpp`) but not an explicit working-minute duration: the
@@ -2071,6 +2115,21 @@ impl Leveled {
 /// other. Multi-calendar leveling and task splitting are out of scope.
 /// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
+    let clean = without_unscheduled_rows(proj);
+    let mut main = level_local(&clean);
+    for task in &proj.tasks {
+        if task.external_task == Some(true) && !task.summary && !task.is_null {
+            if let Some(start) = task.stored_start {
+                main.start.insert(task.uid, start);
+                main.finish
+                    .insert(task.uid, task.stored_finish.unwrap_or(start));
+            }
+        }
+    }
+    main
+}
+
+fn level_local(proj: &Project) -> Leveled {
     let clean = without_blank_rows(proj);
     let dormant = dormant_uids(&clean);
     if dormant.is_empty() {
@@ -6242,6 +6301,7 @@ mod tests {
             link,
             lag,
             lag_format: LagFormat::from_code(code).unwrap(),
+            ..Predecessor::fs(uid)
         }
     }
 
@@ -6398,7 +6458,7 @@ mod tests {
         q.constraint = ConstraintType::StartNoEarlierThan;
         q.constraint_date = Some(at(6, 8));
         let eh19 = lag_link(16, LinkType::FinishStart, 19 * 60, 6);
-        let z_preds = vec![Predecessor::fs(5), eh19];
+        let z_preds = vec![Predecessor::fs(5), eh19.clone()];
         let mut z = task(17, "Z", 0);
         z.predecessors = z_preds.clone();
         let z2 = milestone(18, "Z2", z_preds, fnlt, at(13, 17));

@@ -867,11 +867,13 @@ fn parse_predecessors_keeping(
             link,
             lag,
             lag_format,
+            cross_project: None,
+            cross_project_name: None,
         };
         // The shown text parses to the same task, link and lag; only a
         // fallback display can differ in format.
         out.push(match shown {
-            Some(p) if (p.uid, p.link, p.lag) == (uid, link, lag) => *p,
+            Some(p) if (p.uid, p.link, p.lag) == (uid, link, lag) => p.clone(),
             _ => parsed,
         });
     }

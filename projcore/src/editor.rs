@@ -3243,7 +3243,7 @@ mod tests {
             ),
             (
                 "set_predecessors",
-                Box::new(move |ed| ed.set_predecessors(3, vec![fs1])),
+                Box::new(move |ed| ed.set_predecessors(3, vec![fs1.clone()])),
             ),
             (
                 "assign_resource",
@@ -3341,7 +3341,7 @@ mod tests {
         assert_eq!(back.tasks, ed.project().tasks);
         // A new link to the blank row is still refused.
         let mut added = ed.project().task(2).unwrap().predecessors.clone();
-        added.push(links[1]);
+        added.push(links[1].clone());
         assert_eq!(
             ed.set_predecessors(2, added).unwrap_err(),
             "No task with ID 3"
@@ -4675,7 +4675,7 @@ mod tests {
         let mut ed = Editor::new(proj);
         let mut retained = Predecessor::fs(1);
         retained.lag = 60;
-        ed.set_predecessors(2, vec![retained]).unwrap();
+        ed.set_predecessors(2, vec![retained.clone()]).unwrap();
         assert_eq!(ed.project().task(2).unwrap().predecessors, [retained]);
         let before = state(&ed);
         assert!(
