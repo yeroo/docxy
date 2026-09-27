@@ -1570,6 +1570,25 @@ impl Project {
         cal.resolve(|uid| self.calendar(uid))
     }
 
+    fn default_calendar(&self) -> Option<&Calendar> {
+        self.calendar(self.default_calendar_uid)
+    }
+
+    /// The project calendar, including exceptions through its base chain.
+    /// A missing default calendar uses Standard, as scheduling does.
+    pub fn project_calendar(&self) -> WorkCalendar {
+        self.default_calendar()
+            .map(|cal| self.resolved_calendar(cal))
+            .unwrap_or_else(|| WorkCalendar::weekly(Calendar::standard_week()))
+    }
+
+    /// The project calendar's weekly pattern without dated exceptions.
+    pub fn project_week(&self) -> Week {
+        self.default_calendar()
+            .map(|cal| self.resolved_week(cal))
+            .unwrap_or_else(Calendar::standard_week)
+    }
+
     /// A task's working week, resolved through its base chain: the task's
     /// calendar, or the project default when the task names none; if that UID
     /// is missing, the first calendar; with no calendars, Standard. This differs

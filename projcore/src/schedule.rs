@@ -1849,10 +1849,7 @@ fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
 /// is measured by [`task_duration_min`] instead, which falls back to the leaves'
 /// calendars when this one has no working time.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
-    let cal = match proj.calendar(proj.default_calendar_uid) {
-        Some(cal) => proj.resolved_calendar(cal),
-        None => WorkCalendar::weekly(Calendar::standard_week()),
-    };
+    let cal = proj.project_calendar();
     working_minutes_on(&cal, start, finish)
 }
 
