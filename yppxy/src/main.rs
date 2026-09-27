@@ -1900,6 +1900,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
     // ---- right: gantt ----
     let gw = right.width.saturating_sub(2) as usize; // inner width
     let origin = gantt_origin_day(app);
+    let cal = app.ed.project().project_shading_calendar();
     let start = DateTime::from_minutes(origin * 1440).parts();
     let mut right_lines: Vec<Line> = Vec::new();
     right_lines.push(build_scale(gw, app.hscroll, origin));
@@ -1922,6 +1923,7 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             .filter(|_| t.manual_summary_dates().is_some())
             .map(|(s, f)| (s.day_number() - origin, f.day_number() - origin));
         let mut line = build_gantt_row(
+            cal.as_ref(),
             gw,
             app.hscroll,
             origin,
@@ -1992,6 +1994,7 @@ fn build_scale(width: usize, hscroll: i64, base_day: i64) -> Line<'static> {
 /// finish day's cell in the warning colour instead.
 #[allow(clippy::too_many_arguments)]
 fn build_gantt_row(
+    cal: Option<&projcore::WorkCalendar>,
     width: usize,
     hscroll: i64,
     base_day: i64,
@@ -2009,8 +2012,7 @@ fn build_gantt_row(
     let bar_color = if crit { CRIT } else { ONTRACK };
     for col in 0..width {
         let day = hscroll + col as i64;
-        let dt = DateTime::from_minutes((base_day + day) * 1440);
-        let weekend = matches!(dt.weekday(), 0 | 6);
+        let nonworking = cal.is_some_and(|cal| cal.day(base_day + day).is_empty());
         let in_span = day >= s_day && day <= e_day;
         if milestone && day == s_day {
             spans.push(Span::styled(
@@ -2042,7 +2044,7 @@ fn build_gantt_row(
             spans.push(Span::styled("╍", style));
         } else if !milestone && in_span {
             spans.push(Span::styled("█", Style::default().fg(bar_color)));
-        } else if weekend {
+        } else if nonworking {
             spans.push(Span::styled(
                 "·",
                 Style::default().fg(WEEKEND).add_modifier(Modifier::DIM),
@@ -2496,6 +2498,7 @@ mod tests {
             DateTime::from_ymd_hm(2026, 2, 26, 8, 0).day_number()
         );
         let row = build_gantt_row(
+            app.ed.project().project_shading_calendar().as_ref(),
             10,
             0,
             origin,
@@ -2520,7 +2523,20 @@ mod tests {
         // Monday 2026-01-05 origin; the summary spans days 2..=3, its
         // subtasks days 1..=6.
         let origin = DateTime::from_ymd_hm(2026, 1, 5, 8, 0).day_number();
-        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((1, 6)), true);
+        let cal = new_project().project_shading_calendar().unwrap();
+        let row = build_gantt_row(
+            Some(&cal),
+            9,
+            0,
+            origin,
+            2,
+            3,
+            false,
+            true,
+            false,
+            Some((1, 6)),
+            true,
+        );
         let cells: Vec<&str> = row.spans.iter().map(|s| &*s.content).collect();
         assert_eq!(cells, [" ", "╍", "▟", "▟", "╍", "╍", "╍", " ", " "]);
         let fg = |col: usize| row.spans[col].style.fg;
@@ -2531,18 +2547,118 @@ mod tests {
         // Weekend days inside the late rollup are marked too.
         assert_ne!(cells[5], "·");
         // An auto summary (or one within its own span) draws no rollup.
-        let row = build_gantt_row(9, 0, origin, 1, 6, false, true, false, None, false);
+        let row = build_gantt_row(
+            Some(&cal),
+            9,
+            0,
+            origin,
+            1,
+            6,
+            false,
+            true,
+            false,
+            None,
+            false,
+        );
         assert!(row.spans.iter().all(|s| s.style.fg != Some(WARNING)));
         // An overrun within the finish day warns on that day's cell.
-        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((2, 3)), true);
+        let row = build_gantt_row(
+            Some(&cal),
+            9,
+            0,
+            origin,
+            2,
+            3,
+            false,
+            true,
+            false,
+            Some((2, 3)),
+            true,
+        );
         let warned: Vec<usize> = (0..9)
             .filter(|&col| row.spans[col].style.fg == Some(WARNING))
             .collect();
         assert_eq!(warned, [3]);
         assert_eq!(row.spans[3].content, "▟");
         // Unwarned, the same row is clean.
-        let row = build_gantt_row(9, 0, origin, 2, 3, false, true, false, Some((2, 3)), false);
+        let row = build_gantt_row(
+            Some(&cal),
+            9,
+            0,
+            origin,
+            2,
+            3,
+            false,
+            true,
+            false,
+            Some((2, 3)),
+            false,
+        );
         assert!(row.spans.iter().all(|s| s.style.fg != Some(WARNING)));
+    }
+
+    #[test]
+    fn gantt_row_marks_holiday_but_not_working_saturday() {
+        use projcore::{Calendar, CalendarException, DayWorking};
+        let origin = DateTime::from_ymd_hm(2026, 3, 2, 0, 0).day_number();
+        let mut proj = new_project();
+        let mut cal = Calendar::standard(proj.default_calendar_uid);
+        let wed = DateTime::from_minutes((origin + 2) * 1440);
+        let sat = DateTime::from_minutes((origin + 5) * 1440);
+        cal.exceptions.push(CalendarException::date_range(
+            wed,
+            wed,
+            DayWorking::default(),
+        ));
+        cal.exceptions.push(CalendarException::date_range(
+            sat,
+            sat,
+            cal.week[1].clone().unwrap(),
+        ));
+        proj.calendars = vec![cal];
+        let row = build_gantt_row(
+            proj.project_shading_calendar().as_ref(),
+            7,
+            0,
+            origin,
+            99,
+            99,
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
+        let cells: Vec<&str> = row.spans.iter().map(|s| &*s.content).collect();
+        assert_eq!(cells[2], "·");
+        assert_eq!(cells[5], " ");
+        assert_eq!(cells[6], "·");
+    }
+
+    #[test]
+    fn closed_project_week_does_not_mark_every_gantt_column() {
+        use projcore::{Calendar, DayWorking};
+        let origin = DateTime::from_ymd_hm(2026, 3, 2, 0, 0).day_number();
+        let mut proj = new_project();
+        proj.calendars = vec![Calendar::base(
+            proj.default_calendar_uid,
+            "Closed",
+            std::array::from_fn(|_| DayWorking::default()),
+        )];
+        let row = build_gantt_row(
+            proj.project_shading_calendar().as_ref(),
+            7,
+            0,
+            origin,
+            99,
+            99,
+            false,
+            false,
+            false,
+            None,
+            false,
+        );
+        assert!(row.spans.iter().all(|span| span.content == " "));
     }
 
     #[test]

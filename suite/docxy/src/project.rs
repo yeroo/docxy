@@ -1067,7 +1067,13 @@ pub(super) fn project_el(
                             gantt_w,
                             gantt_x,
                             pal,
-                            gantt_header(scale, gantt_x, gantt_w, pal),
+                            gantt_header(
+                                scale,
+                                view.ed.project().project_shading_calendar(),
+                                gantt_x,
+                                gantt_w,
+                                pal,
+                            ),
                         ))
                         // Above the vertical scrollbar.
                         .child(div().w(px(SCROLLBAR_W)).h_full().flex_none()),

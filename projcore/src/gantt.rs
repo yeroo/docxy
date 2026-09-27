@@ -5,9 +5,9 @@
 //! README, a PR description, or any Mermaid-aware viewer. Bars are driven by the
 //! computed [`Schedule`]: each task's early start and duration, with critical
 //! tasks flagged `crit`, milestones flagged `milestone`, and top-level summary
-//! tasks becoming chart sections. For a standard Mon–Fri calendar the block
-//! carries `excludes weekends` so the bars skip non-working days the way the
-//! schedule does.
+//! tasks becoming chart sections. The block excludes the project calendar's
+//! non-working weekdays and holiday dates, and includes working exception
+//! dates on otherwise excluded weekdays.
 //! The accompanying table includes bold summary rows with rolled-up dates (a
 //! manually scheduled summary's own dates) and working durations, each task's
 //! Deadline (marked `⚠` when the row's Finish is after it), signed total slack,
@@ -29,9 +29,7 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
     }
     out.push_str("    dateFormat YYYY-MM-DD\n");
     out.push_str("    axisFormat %m/%d\n");
-    if excludes_weekends(proj) {
-        out.push_str("    excludes weekends\n");
-    }
+    calendar_directives(proj, sched, &mut out);
 
     let mut section: Option<String> = None; // current section name (from summary)
     let mut emitted: Option<String> = None; // last section header written
@@ -170,14 +168,66 @@ fn fmt_days(days: f64) -> String {
     }
 }
 
-/// True when the project's default calendar takes both weekend days off, so the
-/// Mermaid `excludes weekends` directive matches the schedule. A missing default
-/// is the scheduler's synthesized Standard, which does.
-fn excludes_weekends(proj: &Project) -> bool {
-    proj.calendar(proj.default_calendar_uid)
-        .map(|c| proj.resolved_week(c))
-        .map(|week| !week[0].working() && !week[6].working())
-        .unwrap_or(true)
+/// Write weekly exclusions and dated overrides for the emitted bars' span.
+fn calendar_directives(proj: &Project, sched: &Schedule, out: &mut String) {
+    let Some(cal) = proj.project_shading_calendar() else {
+        return;
+    };
+    let week = cal.week();
+    let works = |weekday: usize| week[weekday].times.iter().any(|t| t.from < t.to);
+    let weekends = !works(0) && !works(6);
+    let mut excludes: Vec<String> = Vec::new();
+    if weekends {
+        excludes.push("weekends".into());
+    }
+    const DAYS: [&str; 7] = [
+        "sunday",
+        "monday",
+        "tuesday",
+        "wednesday",
+        "thursday",
+        "friday",
+        "saturday",
+    ];
+    for (weekday, name) in DAYS.into_iter().enumerate() {
+        if !(works(weekday) || weekends && matches!(weekday, 0 | 6)) {
+            excludes.push(name.into());
+        }
+    }
+    let span = proj
+        .tasks
+        .iter()
+        .filter(|t| !t.is_null && !t.summary)
+        .filter_map(|t| sched.get(t.uid))
+        .fold(None, |bounds: Option<(i64, i64)>, r| {
+            let first = r.early_start.day_number();
+            let last = r.early_finish.day_number();
+            Some(bounds.map_or((first, last), |(a, b)| (a.min(first), b.max(last))))
+        });
+    let mut includes = Vec::new();
+    if let Some((first, last)) = span {
+        for day in first..=last {
+            let dt = DateTime::from_minutes(day * 1440);
+            let weekly_off = !works(dt.weekday() as usize);
+            let actual_off = cal.day(day).is_empty();
+            if weekly_off == actual_off {
+                continue;
+            }
+            let p = dt.parts();
+            let date = format!("{:04}-{:02}-{:02}", p.year, p.month, p.day);
+            if actual_off {
+                excludes.push(date);
+            } else {
+                includes.push(date);
+            }
+        }
+    }
+    if !excludes.is_empty() {
+        out.push_str(&format!("    excludes {}\n", excludes.join(", ")));
+    }
+    if !includes.is_empty() {
+        out.push_str(&format!("    includes {}\n", includes.join(", ")));
+    }
 }
 
 /// Strip characters that would break a Mermaid task line (`:,;#` and newlines),
@@ -660,9 +710,9 @@ mod tests {
             calendars: vec![six_day, derived(None)],
             ..Project::default()
         };
-        assert!(!excludes_weekends(&proj));
+        assert!(proj.project_calendar().week()[6].working());
         proj.calendars[1] = derived(Some(crate::model::DayWorking::default()));
-        assert!(excludes_weekends(&proj));
+        assert!(to_mermaid(&proj, &schedule(&proj)).contains("excludes weekends"));
     }
 
     #[test]
@@ -679,7 +729,172 @@ mod tests {
             calendars: vec![every_day],
             ..Project::default()
         };
-        assert!(excludes_weekends(&proj));
+        assert!(!proj.project_calendar().week()[6].working());
         assert!(to_mermaid(&proj, &schedule(&proj)).contains("excludes weekends"));
+    }
+
+    #[test]
+    fn mermaid_exports_holidays_and_working_weekends_inside_task_span() {
+        let mut cal = Calendar::standard(1);
+        let holiday = DateTime::from_ymd_hm(2026, 3, 4, 0, 0);
+        let saturday = DateTime::from_ymd_hm(2026, 3, 7, 0, 0);
+        let later_holiday = DateTime::from_ymd_hm(2026, 3, 11, 0, 0);
+        cal.exceptions.push(CalendarException::date_range(
+            holiday,
+            holiday,
+            DayWorking::default(),
+        ));
+        cal.exceptions.push(CalendarException::date_range(
+            saturday,
+            saturday,
+            cal.week[1].clone().unwrap(),
+        ));
+        cal.exceptions.push(CalendarException::date_range(
+            later_holiday,
+            later_holiday,
+            DayWorking::default(),
+        ));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "Work", 6 * 480)],
+            calendars: vec![cal],
+            ..Project::default()
+        };
+        let m = to_mermaid(&proj, &schedule(&proj));
+        assert!(m.contains("excludes weekends, 2026-03-04"), "{m}");
+        assert!(m.contains("includes 2026-03-07"), "{m}");
+        assert!(!m.contains("2026-03-11"), "outside the bar span: {m}");
+    }
+
+    #[test]
+    fn mermaid_exception_span_extends_through_later_linked_bar() {
+        let holiday = DateTime::from_ymd_hm(2026, 3, 6, 0, 0);
+        let mut cal = Calendar::standard(1);
+        cal.exceptions.push(CalendarException::date_range(
+            holiday,
+            holiday,
+            DayWorking::default(),
+        ));
+        let mut second = task(2, "Second", 4 * 480);
+        second.predecessors.push(Predecessor::fs(1));
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "First", 2 * 480), second],
+            calendars: vec![cal],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        assert!(sched.get(1).unwrap().early_finish < holiday);
+        assert!(sched.get(2).unwrap().early_start < holiday);
+        assert!(sched.get(2).unwrap().early_finish > holiday);
+        let m = to_mermaid(&proj, &sched);
+        assert!(m.contains("excludes weekends, 2026-03-06"), "{m}");
+    }
+
+    #[test]
+    fn mermaid_names_nonstandard_weekdays_and_omits_empty_directives() {
+        let mut cal = Calendar::standard(1);
+        cal.week[0] = cal.week[1].clone();
+        cal.week[5] = Some(DayWorking::default());
+        let mut proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "Work", 480)],
+            calendars: vec![cal],
+            ..Project::default()
+        };
+        let m = to_mermaid(&proj, &schedule(&proj));
+        assert!(m.contains("excludes friday, saturday"), "{m}");
+        proj.calendars[0].week[5] = proj.calendars[0].week[1].clone();
+        proj.calendars[0].week[6] = proj.calendars[0].week[1].clone();
+        let m = to_mermaid(&proj, &schedule(&proj));
+        assert!(!m.contains("excludes ") && !m.contains("includes "), "{m}");
+    }
+
+    #[test]
+    fn mermaid_resolves_base_holiday_and_ignores_unscheduled_recurrence() {
+        let holiday = DateTime::from_ymd_hm(2026, 3, 4, 0, 0);
+        let mut base = Calendar::standard(3);
+        base.exceptions.push(CalendarException::date_range(
+            holiday,
+            holiday,
+            DayWorking::default(),
+        ));
+        let recurring = CalendarException {
+            kind: Some(2),
+            from: Some(DateTime::from_ymd_hm(2026, 3, 5, 0, 0)),
+            to: Some(DateTime::from_ymd_hm(2026, 3, 5, 0, 0)),
+            day: DayWorking::default(),
+            ..CalendarException::default()
+        };
+        base.exceptions.push(recurring);
+        let derived = Calendar {
+            base_calendar_uid: Some(3),
+            week: std::array::from_fn(|_| None),
+            ..Calendar::standard(1)
+        };
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(1, "Work", 5 * 480)],
+            calendars: vec![base, derived],
+            ..Project::default()
+        };
+        let m = to_mermaid(&proj, &schedule(&proj));
+        let excludes = m
+            .lines()
+            .find(|line| line.trim_start().starts_with("excludes "))
+            .unwrap();
+        assert!(excludes.contains("2026-03-04"), "{m}");
+        assert!(!excludes.contains("2026-03-05"), "{m}");
+
+        let empty = Project {
+            tasks: Vec::new(),
+            ..proj
+        };
+        let m = to_mermaid(&empty, &schedule(&empty));
+        assert_eq!(
+            m.lines()
+                .find(|line| line.trim_start().starts_with("excludes ")),
+            Some("    excludes weekends")
+        );
+    }
+
+    #[test]
+    fn closed_project_week_does_not_exclude_every_mermaid_day() {
+        let closed = Calendar::base(1, "Closed", std::array::from_fn(|_| DayWorking::default()));
+        let mut leaf = task(1, "Leaf", 480);
+        leaf.calendar_uid = Some(3);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            calendars: vec![closed, Calendar::standard(3)],
+            tasks: vec![leaf],
+            ..Project::default()
+        };
+        assert!(proj.project_shading_calendar().is_none());
+        let m = to_mermaid(&proj, &schedule(&proj));
+        assert!(m.contains("Leaf :"), "{m}");
+        assert!(!m.contains("excludes ") && !m.contains("includes "), "{m}");
+    }
+
+    #[test]
+    fn zero_length_weekly_slots_do_not_create_project_exclusions() {
+        let zero = DayWorking {
+            times: vec![WorkingTime {
+                from: 8 * 60,
+                to: 8 * 60,
+            }],
+        };
+        let closed = Calendar::base(1, "Zero", std::array::from_fn(|_| zero.clone()));
+        let mut leaf = task(1, "Leaf", 480);
+        leaf.calendar_uid = Some(3);
+        let proj = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            calendars: vec![closed, Calendar::standard(3)],
+            tasks: vec![leaf],
+            ..Project::default()
+        };
+        assert!(proj.project_shading_calendar().is_none());
+        let m = to_mermaid(&proj, &schedule(&proj));
+        assert!(m.contains("Leaf :"), "{m}");
+        assert!(!m.contains("excludes ") && !m.contains("includes "), "{m}");
     }
 }

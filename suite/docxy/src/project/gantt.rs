@@ -78,10 +78,6 @@ impl GanttScale {
         projcore::DateTime::from_minutes((self.origin_day + day) * 1440)
     }
 
-    pub fn is_weekend(self, day: i64) -> bool {
-        matches!(self.date(day).weekday(), 0 | 6)
-    }
-
     pub fn ticks(self, visible: std::ops::Range<i64>) -> Vec<(i64, String)> {
         visible
             .filter_map(|day| {
@@ -209,11 +205,19 @@ pub(crate) fn gantt_viewport(
     )
 }
 
-/// Weekend days in the visible range; the header and the body backdrop shade these.
-pub(crate) fn shaded_days(scale: GanttScale, offset: f32, width: f32) -> Vec<i64> {
+/// Non-working project-calendar days in the visible range.
+pub(crate) fn shaded_days(
+    scale: GanttScale,
+    cal: Option<&projcore::WorkCalendar>,
+    offset: f32,
+    width: f32,
+) -> Vec<i64> {
+    let Some(cal) = cal else {
+        return Vec::new();
+    };
     scale
         .visible(offset, width)
-        .filter(|d| scale.is_weekend(*d))
+        .filter(|d| cal.day(scale.origin_day + *d).is_empty())
         .collect()
 }
 
@@ -243,21 +247,27 @@ pub(crate) fn filler_rows(body_h: f32, scroll_y: f32, count: usize) -> usize {
     ((body_h - used).max(0.) / ROW_H).ceil() as usize
 }
 
-fn weekend_fill(pal: Pal) -> Hsla {
+pub(crate) fn nonworking_fill(pal: Pal) -> Hsla {
     Hsla { a: 0.12, ..pal.dim }
 }
 
-fn backdrop(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> impl IntoElement {
+fn backdrop(
+    scale: GanttScale,
+    cal: Option<projcore::WorkCalendar>,
+    offset: f32,
+    width: f32,
+    pal: Pal,
+) -> impl IntoElement {
     canvas(
         |_, _, _| (),
         move |bounds, _, window, _| {
-            for day in shaded_days(scale, offset, width) {
+            for day in shaded_days(scale, cal.as_ref(), offset, width) {
                 window.paint_quad(fill(
                     Bounds {
                         origin: point(bounds.origin.x + px(day as f32 * DAY_W), bounds.origin.y),
                         size: size(px(DAY_W), bounds.size.height),
                     },
-                    weekend_fill(pal),
+                    nonworking_fill(pal),
                 ));
             }
         },
@@ -269,6 +279,7 @@ fn backdrop(scale: GanttScale, offset: f32, width: f32, pal: Pal) -> impl IntoEl
 /// The grid behind every row of the body, task or empty: table rules and column dividers,
 /// chart shading, day lines and rules. Painted once at full height so it fills the pane.
 pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
+    let cal = view.ed.project().project_shading_calendar();
     // The handle the list tracks, so the rules cannot drift from the rows.
     let scroll = view.scroll.clone();
     // The same widths and offsets the rows are drawn at this render.
@@ -333,7 +344,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
             };
             let width = f32::from(chart.size.width);
             window.with_content_mask(Some(ContentMask { bounds: chart }), |window| {
-                for day in shaded_days(scale, gantt_x, width) {
+                for day in shaded_days(scale, cal.as_ref(), gantt_x, width) {
                     window.paint_quad(fill(
                         Bounds {
                             origin: point(
@@ -342,7 +353,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
                             ),
                             size: size(px(DAY_W), chart.size.height),
                         },
-                        weekend_fill(pal),
+                        nonworking_fill(pal),
                     ));
                 }
                 for x in day_lines(scale, gantt_x, width) {
@@ -360,6 +371,7 @@ pub(crate) fn body_grid(view: &ProjectView, pal: Pal) -> impl IntoElement {
 
 pub(crate) fn gantt_header(
     scale: GanttScale,
+    cal: Option<projcore::WorkCalendar>,
     offset: f32,
     width: f32,
     pal: Pal,
@@ -368,7 +380,7 @@ pub(crate) fn gantt_header(
         .relative()
         .w(px(scale.width()))
         .h(px(ROW_H))
-        .child(backdrop(scale, offset, width, pal))
+        .child(backdrop(scale, cal, offset, width, pal))
         .children(
             scale
                 .ticks(scale.visible((offset - DAY_W * 2.).max(0.), width + DAY_W * 2.))

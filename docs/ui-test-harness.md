@@ -259,6 +259,7 @@ State keys, as the app reports them after every driving verb:
 | `table_w`, `gantt_w` | Project: entry-table pane and Gantt chart widths in px. Split-bar drags move them; `table_w + 6 + gantt_w + 16` is the window width |
 | `timeline`, `timeline_start`, `timeline_finish` | Project: `shown`/`hidden`, and the Timeline's Start/Finish labels (`Mon 3/2/26`; the displayed span, leveled while leveling is on) |
 | `timeline_view_start`, `timeline_view_finish` | Project: the first and last day the Gantt chart shows, which the Timeline's view box highlights, clamped to the Timeline's span (`Mon 3/2/26`) |
+| `nonworking` | Project: Timeline's inclusive, merged shaded day runs as `[[first, last], ...]` in Project date form (`Wed 3/4/26`). Empty when each day is narrower than 2 px or the project calendar has no weekly working time. Reported even while the Timeline is hidden |
 | `filler_rows` | Project: ruled empty rows visible below the last task, from the last drawn frame's `project-body` height (0 before the first layout). Unlike the other keys it trails a driving verb by a frame, so settle with a `shot` before asserting it |
 | `ribbon_tab` | current kind-aware ribbon tab name (`Task`, `Resource`, `View`, `Home`, etc.) |
 
