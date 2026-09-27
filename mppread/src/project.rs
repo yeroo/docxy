@@ -74,6 +74,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                         lag_format: LagFormat::from_code(i64::from(p.lag_format)).ok_or_else(
                             || format!("unsupported LagFormat {} for UID {}", p.lag_format, t.uid),
                         )?,
+                        ..Predecessor::fs(p.pred_uid as i32)
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;

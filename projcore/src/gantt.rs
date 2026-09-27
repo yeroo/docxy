@@ -72,7 +72,9 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
         } else {
             format!("{}, ", tags.join(", "))
         };
-        let dur = duration_str(proj, task.duration_min);
+        let duration_min =
+            crate::schedule::summary_or_leaf_min(proj, task, r.early_start, r.early_finish);
+        let dur = duration_str(proj, duration_min);
         out.push_str(&format!("    {name} :{tagstr}{date}, {dur}\n"));
     }
     out
