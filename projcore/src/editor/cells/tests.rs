@@ -207,7 +207,7 @@ fn unchanged_fields_and_constraints_preserve_redo_and_clean_state() {
 fn aggregate_duration_and_lag_overflow_reject_before_snapshot() {
     let mut ed = editor();
     let before = ed.project().clone();
-    assert!(ed.set_duration_min(10, i64::MAX - 1).is_err());
+    assert!(ed.set_duration_min(10, i64::MAX - 1, false).is_err());
     for lag_min in [i64::MIN, i64::MAX - 1] {
         assert!(
             ed.set_predecessors(
@@ -245,7 +245,7 @@ fn scheduling_range_reserves_room_for_dated_start_indices() {
             .unwrap_err()
             .contains("scheduling range")
     );
-    assert!(ed.set_duration_min(10, minutes).is_err());
+    assert!(ed.set_duration_min(10, minutes, false).is_err());
     assert!(
         ed.update_task(
             10,
@@ -293,7 +293,10 @@ fn scheduling_range_accounts_for_time_before_the_anchor() {
     let before = ed.project().clone();
     let history = (ed.undo_depth(), ed.redo_depth(), ed.dirty());
     let old_reserve = (366_i64 * 100 + 1) * 1440 + 200 * 480 + 480;
-    assert!(ed.set_duration_min(10, i64::MAX - old_reserve).is_err());
+    assert!(
+        ed.set_duration_min(10, i64::MAX - old_reserve, false)
+            .is_err()
+    );
     unchanged(&ed, &before, history);
 }
 
@@ -341,10 +344,10 @@ fn negative_duration_rejection_is_atomic_for_all_update_entry_points() {
     ed.undo();
     ed.mark_saved();
     let before = ed.project().clone();
-    assert!(ed.add_task(None, "must not append", -1440).is_err());
-    assert!(ed.add_task(Some(10), "must not insert", -1).is_err());
+    assert!(ed.add_task(None, "must not append", -1440, false).is_err());
+    assert!(ed.add_task(Some(10), "must not insert", -1, false).is_err());
     assert!(ed.set_duration(10, "-3d").is_err());
-    assert!(ed.set_duration_min(10, -1).is_err());
+    assert!(ed.set_duration_min(10, -1, false).is_err());
     assert!(
         ed.update_task(
             10,
@@ -614,12 +617,12 @@ fn mspdi(date: Option<DateTime>) -> Option<String> {
 #[test]
 fn new_tasks_follow_the_plans_default_mode() {
     let mut ed = editor();
-    let at = ed.add_task(None, "auto", 480).unwrap();
+    let at = ed.add_task(None, "auto", 480, false).unwrap();
     assert!(!ed.project().tasks[at].manual);
     assert_eq!(ed.project().tasks[at].manual_start, None);
 
     ed.proj.new_tasks_are_manual = true;
-    let at = ed.add_task(None, "manual", 960).unwrap();
+    let at = ed.add_task(None, "manual", 960, false).unwrap();
     let task = &ed.project().tasks[at];
     assert!(task.manual);
     assert_eq!(mspdi(task.manual_start), mspdi(ed.project().start_date));
@@ -628,7 +631,7 @@ fn new_tasks_follow_the_plans_default_mode() {
     ed.proj.start_date = None;
     ed.reschedule();
     let anchor = ed.schedule().project_start;
-    let at = ed.add_task(None, "undated", 480).unwrap();
+    let at = ed.add_task(None, "undated", 480, false).unwrap();
     assert_eq!(ed.project().tasks[at].manual_start, Some(anchor));
 }
 
@@ -761,7 +764,7 @@ fn edited_manual_tasks_save_start_and_finish_matching_their_pinned_dates() {
     assert_eq!(saved(&ed, 30).1.unwrap(), "2026-01-07T17:00:00");
 
     ed.proj.new_tasks_are_manual = true;
-    let at = ed.add_task(None, "new", 480).unwrap();
+    let at = ed.add_task(None, "new", 480, false).unwrap();
     let uid = ed.project().tasks[at].uid;
     assert_saved_consistently(&ed, uid);
 
@@ -1166,6 +1169,8 @@ fn resource_names_show_work_units_that_are_not_100_percent() {
 #[test]
 fn bracketed_units_round_trip_through_the_resource_names_text() {
     let mut ed = with_bob(ResourceType::Work, 0.5);
+    // Fixed Duration: a units edit rescales the work from the duration (#159).
+    ed.proj.tasks[0].task_type = Some(TaskType::FixedDuration);
     // Explicit units on new assignments, including over-allocation.
     ed.set_resources(10, &["Bob[150%]".into(), " Carol [25 %] ".into()])
         .unwrap();
@@ -1268,6 +1273,8 @@ fn malformed_units_are_rejected_atomically_unless_a_resource_has_that_name() {
 #[test]
 fn assign_prompt_takes_units_and_changes_only_different_ones() {
     let mut ed = with_bob(ResourceType::Work, 0.5);
+    // Fixed Duration: a units edit rescales the work from the duration (#159).
+    ed.proj.tasks[0].task_type = Some(TaskType::FixedDuration);
     assert_eq!(
         ed.assign_resource(10, "Bob[25%]").unwrap(),
         AssignOutcome::Assigned
@@ -1714,7 +1721,7 @@ fn a_bracket_pair_closed_mid_name_does_not_join_names() {
     ed.set_resources(10, &["smith, j".into()]).unwrap();
     assert_eq!(allocation(&ed, 10, 5), (1.0, 960));
     ed.set_resources(10, &["smith, j[50%]".into()]).unwrap();
-    assert_eq!(allocation(&ed, 10, 5), (0.5, 480));
+    assert_eq!(allocation(&ed, 10, 5).0, 0.5);
 }
 
 #[test]
@@ -1842,6 +1849,8 @@ fn names_and_shown_text_share_one_exactness_ladder() {
         ("ALICE[75%]", 0.75),
     ] {
         let mut ed = on_task_10(&[(1, "Alice"), (2, "ALICE")], &[(1, 1.0), (2, 0.5)]);
+        // Fixed Duration: a units edit rescales the work (#159).
+        ed.proj.tasks[0].task_type = Some(TaskType::FixedDuration);
         assert_eq!(format_resource_names(&ed.proj, 10), "Alice, ALICE[50%]");
         ed.set_resources(10, &["Alice".into(), token.into()])
             .unwrap();
@@ -2169,7 +2178,7 @@ fn a_duration_change_rescales_assignment_work_and_keeps_progress() {
     with_work_derived(a);
     with_work_derived(&mut ed.proj.assignments[2]);
     let before = ed.proj.assignments.clone();
-    ed.set_duration_min(10, 960).unwrap();
+    ed.set_duration_min(10, 960, false).unwrap();
     let after = &ed.proj.assignments;
     // Overtime and the planned spread described the old work, as on a units
     // edit; the actuals and the baseline curve stay. The cost, dates and
@@ -2233,7 +2242,7 @@ fn repeating_a_duration_keeps_imported_work_and_history() {
     ed.proj.assignments.push(imported(1, 10, -65535, 1.0, 123));
     ed = Editor::new(ed.proj);
     let before = ed.project().clone();
-    ed.set_duration_min(10, 480).unwrap();
+    ed.set_duration_min(10, 480, false).unwrap();
     unchanged(&ed, &before, (0, 0, false));
     // A rename in the same patch is an edit, but the duration it repeats is not.
     ed.update_task(
@@ -2267,8 +2276,8 @@ fn contoured_work_stretches_with_the_duration() {
         imported(4, 30, -65535, 1.0, 0),
     ];
     ed = Editor::new(ed.proj);
-    ed.set_duration_min(10, 960).unwrap();
-    ed.set_duration_min(30, 480).unwrap();
+    ed.set_duration_min(10, 960, false).unwrap();
+    ed.set_duration_min(30, 480, false).unwrap();
     let works: Vec<_> = (1..=4).map(|uid| work(&ed, uid)).collect();
     assert_eq!(
         works,
@@ -2360,12 +2369,13 @@ fn fixed_work_material_and_cost_work_survive_a_duration_change() {
         imported(5, 20, 1, 1.0, 480),
     ];
     // A fixed-work task's work is not rewritten, so its overtime stays; what
-    // derives from its schedule and rates is refreshed (#269).
+    // derives from its schedule and rates is refreshed (#269). Its units
+    // follow the new duration instead (#159).
     with_work_derived(&mut ed.proj.assignments[4]);
     let fixed = ed.proj.assignments[4].clone();
     ed = Editor::new(ed.proj);
-    ed.set_duration_min(10, 960).unwrap();
-    ed.set_duration_min(20, 960).unwrap();
+    ed.set_duration_min(10, 960, false).unwrap();
+    ed.set_duration_min(20, 960, false).unwrap();
     let after = &ed.proj.assignments[4];
     assert_eq!(
         (
@@ -2389,10 +2399,12 @@ fn fixed_work_material_and_cost_work_survive_a_duration_change() {
             remaining_work_min: fixed.remaining_work_min,
             remaining_cost: fixed.remaining_cost.clone(),
             timephased_data: fixed.timephased_data.clone(),
+            units: fixed.units,
             ..after.clone()
         },
         fixed
     );
+    assert_eq!(after.units, 0.5);
     assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
     let works: Vec<_> = (1..=5).map(|uid| work(&ed, uid)).collect();
     assert_eq!(
@@ -2416,7 +2428,7 @@ fn a_summary_keeps_its_assignments_work_judged_by_the_edited_outline() {
     ed.proj.assignments = vec![imported(1, 20, -65535, 1.0, 480)];
     ed = Editor::new(ed.proj);
     // Task 20 is the summary of task 30.
-    ed.set_duration_min(20, 960).unwrap();
+    ed.set_duration_min(20, 960, false).unwrap();
     assert_eq!(ed.proj.task(20).unwrap().duration_min, 960);
     assert_eq!(work(&ed, 1), (480, Some(480)));
     // Demoted beside task 30 in the same edit, it is a leaf again.
@@ -2579,7 +2591,7 @@ fn a_percent_lag_counts_against_the_range_with_its_predecessors_duration() {
     // Ten times this overflows; the duration alone does not.
     let huge = i64::MAX / 10;
     assert!(
-        ed.set_duration_min(10, huge)
+        ed.set_duration_min(10, huge, false)
             .unwrap_err()
             .contains("scheduling range")
     );

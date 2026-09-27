@@ -15,6 +15,7 @@ use crate::schedule::{Leveled, Schedule, level, schedule};
 const UNDO_CAP: usize = 100;
 
 mod cells;
+mod effort;
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
     parse_lag, parse_task_predecessors, split_resource_names,
@@ -53,6 +54,12 @@ pub struct TaskPatch {
     /// Manually (`true`) or automatically (`false`) scheduled; see
     /// [`Editor::set_manual`].
     pub manual: Option<bool>,
+    /// Whether the duration was typed with Project's `?` (see
+    /// [`parse_task_duration`]); only with `duration_min`. `Some(true)` marks
+    /// the task estimated, `Some(false)` commits an estimated one (an unset
+    /// flag stays unset), even when the minutes are unchanged. `None` keeps
+    /// the old rule: a changed duration commits an estimate.
+    pub estimated: Option<bool>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -424,6 +431,7 @@ impl Editor {
         after: Option<i32>,
         name: &str,
         duration_min: i64,
+        estimated: bool,
     ) -> Result<usize, String> {
         validate_duration(duration_min)?;
         let at = match after {
@@ -451,6 +459,8 @@ impl Editor {
                     manual,
                     manual_start,
                     manual_duration_min: manual.then_some(duration_min),
+                    // Only a typed `?` marks it: an unset flag saves as absent.
+                    estimated: estimated.then_some(true),
                     ..Task::default()
                 },
             )
@@ -604,17 +614,22 @@ impl Editor {
         )
     }
 
+    /// Set a typed duration; a trailing `?` marks it estimated (see
+    /// [`parse_task_duration`]).
     pub fn set_duration(&mut self, uid: i32, text: &str) -> Result<(), String> {
-        let min = parse_duration(text, &self.proj)
+        let (min, estimated) = parse_task_duration(text, &self.proj)
             .ok_or_else(|| format!("Couldn't read duration '{text}' (try 3d, 4h, 2w)"))?;
-        self.set_duration_min(uid, min)
+        self.set_duration_min(uid, min, estimated)
     }
 
-    pub fn set_duration_min(&mut self, uid: i32, min: i64) -> Result<(), String> {
+    /// Set a duration as typed, estimated (`1d?`) or not. As in Project,
+    /// typing it without `?` commits an estimated duration, even the same one.
+    pub fn set_duration_min(&mut self, uid: i32, min: i64, estimated: bool) -> Result<(), String> {
         self.update_task(
             uid,
             TaskPatch {
                 duration_min: Some(min),
+                estimated: Some(estimated),
                 ..TaskPatch::default()
             },
         )
@@ -679,6 +694,9 @@ impl Editor {
         if patch.level.is_some_and(|lv| !(1..=20).contains(&lv)) {
             return Err("'level' must be 1..=20".into());
         }
+        if patch.estimated.is_some() && patch.duration_min.is_none() {
+            return Err("'estimated' needs a 'duration'".into());
+        }
         if let Some(min) = patch.duration_min {
             validate_duration(min)?;
         }
@@ -696,12 +714,18 @@ impl Editor {
         let duration_changed = patch.duration_min.is_some_and(|min| min != current);
         // A blank row always becomes a task: a mode is an edit of it too.
         let mode_changed = patch.manual.is_some_and(|m| m != t.manual || t.is_null);
+        // A summary's `?` rolls up from its subtasks; it takes no estimate.
+        let estimate_changed = !t.summary
+            && patch
+                .estimated
+                .is_some_and(|e| estimate_after(t.estimated, e) != t.estimated);
         if patch.name.as_ref().is_none_or(|name| *name == t.name)
             && patch
                 .duration_min
                 .is_none_or(|min| min == current && milestone.is_none_or(|m| (min == 0) == m))
             && patch.level.is_none_or(|lv| lv == t.outline_level)
             && !mode_changed
+            && !estimate_changed
         {
             return Ok(());
         }
@@ -709,7 +733,8 @@ impl Editor {
         let pin = self.pin_at(i);
         self.edit_row(i, |proj, was_blank| {
             // A blank row's `1 day?` is a default, not a duration the user
-            // typed: typing any duration into it commits it.
+            // typed: typing a duration replaces it, committing the estimate
+            // unless typed with `?`.
             let t = &mut proj.tasks[i];
             if let Some(name) = patch.name {
                 t.name = name;
@@ -735,18 +760,16 @@ impl Editor {
                 // `1 day?` (and a manual plan's ManualDuration) is replaced.
                 let changed = was_blank || min != t.duration_min;
                 rescale = changed.then_some((t.duration_min, min));
-                if changed {
-                    commit_estimate(t);
+                // A summary's `?` rolls up from its subtasks: its own flag
+                // stays as read.
+                match patch.estimated {
+                    _ if t.summary => {}
+                    Some(e) => t.estimated = estimate_after(t.estimated, e),
+                    None if changed => commit_estimate(t),
+                    None => {}
                 }
-                t.duration_min = min;
                 t.milestone = min == 0;
-                // A manual task keeps its start; its finish follows a new
-                // duration instead of staying pinned. Repeating the current
-                // duration keeps a pinned finish.
-                if t.manual && changed {
-                    t.manual_duration_min = Some(min);
-                    t.manual_finish = None;
-                }
+                apply_duration(t, min, changed);
             }
             if let Some(lv) = patch.level {
                 t.outline_level = lv;
@@ -928,9 +951,9 @@ impl Editor {
                 return Ok(AssignOutcome::AlreadyAssigned);
             };
             let u = checked_units(u, name)?;
-            self.edit_row(i, |proj, _| {
-                proj.assignments[k].set_units(u, assigned_work(kind, duration, u));
-            })?;
+            let mut assignments = self.proj.assignments.clone();
+            assignments[k].set_units(u, assigned_work(kind, duration, u));
+            self.commit_assignments(i, resources, assignments)?;
             return Ok(AssignOutcome::Assigned);
         }
         let units = match units {
@@ -945,11 +968,16 @@ impl Editor {
             .max()
             .unwrap_or(0);
         let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
-        let assignment = new_assignment(&mut next_aid, uid, rid, kind, units, duration)?;
-        self.edit_row(i, |proj, _| {
-            proj.resources = resources;
-            proj.assignments.push(assignment);
-        })?;
+        let mut assignments = self.proj.assignments.clone();
+        assignments.push(new_assignment(
+            &mut next_aid,
+            uid,
+            rid,
+            kind,
+            units,
+            duration,
+        )?);
+        self.commit_assignments(i, resources, assignments)?;
         Ok(AssignOutcome::Assigned)
     }
 
@@ -1118,7 +1146,14 @@ impl Editor {
         } else {
             0
         };
-        self.set_duration_min(uid, min)
+        // Not a typed duration: the estimate follows the old rule.
+        self.update_task(
+            uid,
+            TaskPatch {
+                duration_min: Some(min),
+                ..TaskPatch::default()
+            },
+        )
     }
 }
 
@@ -1189,7 +1224,8 @@ fn assigned_work(kind: Option<ResourceType>, duration_min: i64, units: f64) -> i
 
 /// A duration change on row `i` rescales its assignments' work to duration x
 /// units, as Project does for a fixed-units or fixed-duration task. A
-/// fixed-work task keeps its work, a summary's stored duration is not the one
+/// fixed-work task keeps its work and its units follow instead (see
+/// [`effort::fixed_work_units`]); a summary's stored duration is not the one
 /// it shows, and material and cost work is not time, so those are left as
 /// read. A contoured assignment's units are its peak, so its contour stretches
 /// and its work scales with the duration instead. Without a basis to scale
@@ -1200,7 +1236,11 @@ fn assigned_work(kind: Option<ResourceType>, duration_min: i64, units: f64) -> i
 /// its `Delay` on, so it still finishes with the task.
 fn rescale_work(proj: &mut Project, i: usize, old_min: i64, new_min: i64) {
     let t = &proj.tasks[i];
-    if t.task_type == Some(TaskType::FixedWork) || proj.is_outline_summary(i) {
+    if proj.is_outline_summary(i) {
+        return;
+    }
+    if t.task_type == Some(TaskType::FixedWork) {
+        effort::fixed_work_units(proj, i, new_min);
         return;
     }
     let uid = t.uid;
@@ -1325,10 +1365,62 @@ fn materialized(
     t
 }
 
+/// Give task `t` duration `min`. A manual task keeps its start; its finish
+/// follows a new duration instead of staying pinned, while repeating the
+/// current duration (`changed` false) keeps a pinned finish.
+fn apply_duration(t: &mut Task, min: i64, changed: bool) {
+    t.duration_min = min;
+    if t.manual && changed {
+        t.manual_duration_min = Some(min);
+        t.manual_finish = None;
+    }
+}
+
 /// Typing a duration without `?` commits an estimated one, as in Project.
 fn commit_estimate(t: &mut Task) {
-    if t.estimated == Some(true) {
-        t.estimated = Some(false);
+    t.estimated = estimate_after(t.estimated, false);
+}
+
+/// A task's `Estimated` after a duration typed with (`true`) or without `?`:
+/// `?` marks it estimated; without, an estimate is committed and an unset
+/// flag stays unset, so an untouched import saves as it was read.
+fn estimate_after(current: Option<bool>, typed: bool) -> Option<bool> {
+    match (typed, current) {
+        (true, _) => Some(true),
+        (false, Some(true)) => Some(false),
+        (false, other) => other,
+    }
+}
+
+/// `"?"` after the duration of task `uid` when it is estimated, as Project
+/// shows `1 day?`, else `""`. A summary shows it when any task below it is
+/// estimated (the rollup is shown, not saved: see #159). Milestones and
+/// blank rows show none.
+pub fn duration_suffix(proj: &Project, uid: i32) -> &'static str {
+    let Some(i) = proj.tasks.iter().position(|t| t.uid == uid) else {
+        return "";
+    };
+    let leaf = |t: &Task| !t.is_null && !t.is_milestone() && t.estimated == Some(true);
+    let estimated = if proj.is_outline_summary(i) {
+        // A nested summary's own flag is stale too: only leaves count.
+        (i + 1..subtree_end(proj, i)).any(|k| leaf(&proj.tasks[k]) && !proj.is_outline_summary(k))
+    } else {
+        leaf(&proj.tasks[i])
+    };
+    if estimated { "?" } else { "" }
+}
+
+/// A task duration as typed: [`parse_duration`] with Project's optional
+/// trailing `?` for an estimate (`3d?`, `4h?`, `2?`). Returns the minutes and
+/// whether it was estimated.
+pub fn parse_task_duration(text: &str, proj: &Project) -> Option<(i64, bool)> {
+    let text = text.trim();
+    match text.strip_suffix('?') {
+        Some(rest) if !rest.trim_end().ends_with('?') => {
+            parse_duration(rest, proj).map(|min| (min, true))
+        }
+        Some(_) => None,
+        None => parse_duration(text, proj).map(|min| (min, false)),
     }
 }
 
@@ -1506,7 +1598,7 @@ mod tests {
         assert_eq!(ed.project(), &before);
         assert!(ed.redo());
         assert_eq!(ed.project(), &after);
-        ed.set_duration_min(2, 1440).unwrap();
+        ed.set_duration_min(2, 1440, false).unwrap();
         assert_eq!(
             ed.project().tasks[1].baseline(0).unwrap().duration_min,
             Some(960)
@@ -1798,12 +1890,12 @@ mod tests {
                         // Inserting keeps the parent a summary, so only a
                         // closed default calendar rejects the new task.
                         assert!(
-                            ed.add_task(Some(1), "Inserted", 480)
+                            ed.add_task(Some(1), "Inserted", 480, false)
                                 .unwrap_err()
                                 .contains("Closed")
                         );
                         assert!(
-                            ed.add_task(None, "Appended", 480)
+                            ed.add_task(None, "Appended", 480, false)
                                 .unwrap_err()
                                 .contains("Closed")
                         );
@@ -1822,7 +1914,7 @@ mod tests {
             if !empty_default {
                 // A first child keeps the empty-calendar summary a summary.
                 let mut ed = Editor::new(project_with_unused_empty_calendar(false));
-                let at = ed.add_task(Some(1), "Inserted", 480).unwrap();
+                let at = ed.add_task(Some(1), "Inserted", 480, false).unwrap();
                 let tasks = &ed.project().tasks;
                 assert_eq!(tasks[at].outline_level, tasks[0].outline_level + 1);
                 assert!(tasks[0].summary);
@@ -1830,7 +1922,7 @@ mod tests {
             }
             ed.rename(2, "Renamed").unwrap();
             assert_reopens(&ed);
-            ed.set_duration_min(2, 960).unwrap();
+            ed.set_duration_min(2, 960, false).unwrap();
             assert_reopens(&ed);
             ed.indent(2, 1).unwrap();
             assert_reopens(&ed);
@@ -1846,7 +1938,7 @@ mod tests {
             assert!(ed.project().tasks.is_empty());
             assert_reopens(&ed);
             if !empty_default {
-                ed.add_task(None, "New task", 480).unwrap();
+                ed.add_task(None, "New task", 480, false).unwrap();
                 assert_reopens(&ed);
             }
         }
@@ -1875,7 +1967,7 @@ mod tests {
         let mut ed = editor();
         ed.toggle_level();
         assert_edit(&mut ed, |e| {
-            e.add_task(Some(1), "Inserted", 960).unwrap();
+            e.add_task(Some(1), "Inserted", 960, false).unwrap();
         });
         assert_eq!(ed.project().tasks[1].name, "Inserted");
         assert_edit(&mut ed, |e| {
@@ -1906,7 +1998,7 @@ mod tests {
         assert_edit(&mut ed, |e| e.set_baseline());
         let baseline = ed.project().tasks[1].baseline(0).unwrap().finish.unwrap();
         assert_edit(&mut ed, |e| {
-            e.set_duration_min(3, 4800).unwrap();
+            e.set_duration_min(3, 4800, false).unwrap();
         });
         assert!(ed.schedule().get(3).unwrap().early_finish > baseline);
         assert_edit(&mut ed, |e| {
@@ -1931,6 +2023,7 @@ mod tests {
                     duration_min: Some(0),
                     level: Some(2),
                     manual: None,
+                    estimated: None,
                 },
             )
             .unwrap();
@@ -1955,13 +2048,13 @@ mod tests {
     fn rejected_edits_preserve_everything_clean_and_dirty() {
         type Edit = fn(&mut Editor) -> Result<(), String>;
         let bad: &[Edit] = &[
-            |e| e.add_task(Some(999), "bad", 480).map(|_| ()),
+            |e| e.add_task(Some(999), "bad", 480, false).map(|_| ()),
             |e| e.delete_task(999).map(|_| ()),
             |e| e.indent(999, 1),
             |e| e.rename(999, "bad"),
             |e| e.set_duration(999, "1d"),
             |e| e.set_duration(1, "banana"),
-            |e| e.set_duration_min(999, 480),
+            |e| e.set_duration_min(999, 480, false),
             |e| e.add_predecessor(999, 1, LinkType::FinishStart, 0),
             |e| e.add_predecessor(1, 999, LinkType::FinishStart, 0),
             |e| e.add_predecessor(1, 1, LinkType::FinishStart, 0),
@@ -2030,16 +2123,16 @@ mod tests {
         ed.indent(1, 1).unwrap();
         ed.indent(2, 2).unwrap();
         ed.select(1);
-        let at = ed.add_task(None, "Append", 480).unwrap();
+        let at = ed.add_task(None, "Append", 480, false).unwrap();
         assert_eq!(at, 2);
         assert_eq!(ed.project().tasks[at].outline_level, 3);
         // Task 1 is a summary over Task 2, so the insert is its first child.
-        let at = ed.add_task(Some(1), "Insert", 480).unwrap();
+        let at = ed.add_task(Some(1), "Insert", 480, false).unwrap();
         assert_eq!(at, 1);
         assert_eq!(ed.project().tasks[at].outline_level, 3);
         assert_eq!(ed.sel(), 1);
         ed.replace_project(Project::default());
-        assert_eq!(ed.add_task(None, "First", 0).unwrap(), 0);
+        assert_eq!(ed.add_task(None, "First", 0, false).unwrap(), 0);
         assert_eq!(ed.project().tasks[0].outline_level, 1);
         assert!(ed.project().tasks[0].milestone);
     }
@@ -2256,12 +2349,12 @@ mod tests {
     fn a_task_inserted_under_a_summary_is_its_first_child() {
         // The issue's repro, on an untitled project.
         let mut ed = Editor::new(Project::default());
-        ed.add_task(None, "S", 480).unwrap();
-        ed.add_task(None, "c1", 480).unwrap();
+        ed.add_task(None, "S", 480, false).unwrap();
+        ed.add_task(None, "c1", 480, false).unwrap();
         ed.indent(uid_of(&ed, "c1"), 1).unwrap();
         let before = ed.project().clone();
         let s = uid_of(&ed, "S");
-        assert_eq!(ed.add_task(Some(s), "New", 480).unwrap(), 1);
+        assert_eq!(ed.add_task(Some(s), "New", 480, false).unwrap(), 1);
         assert_eq!(
             rows(&ed),
             [("S", 1, true), ("New", 2, false), ("c1", 2, false)]
@@ -2275,7 +2368,7 @@ mod tests {
     fn a_task_inserted_after_a_leaf_is_its_sibling() {
         // S{c1, c2}, Y: inserting above Y (below c2) stays inside S.
         let mut ed = outline(&[(1, "S", 1), (2, "c1", 2), (3, "c2", 2), (4, "Y", 1)]);
-        assert_eq!(ed.add_task(Some(3), "New", 480).unwrap(), 3);
+        assert_eq!(ed.add_task(Some(3), "New", 480, false).unwrap(), 3);
         assert_eq!(
             rows(&ed),
             [
@@ -2288,11 +2381,11 @@ mod tests {
         );
         // After a plain task, the new one is a sibling at its level.
         let mut ed = outline(&[(1, "S", 1), (2, "Y", 1)]);
-        ed.add_task(Some(1), "New", 480).unwrap();
+        ed.add_task(Some(1), "New", 480, false).unwrap();
         assert_eq!(names(&ed), [("S", 1), ("New", 1), ("Y", 1)]);
         // Appending copies the last row, which is never a summary.
         let mut ed = outline(&[(1, "S", 1), (2, "c1", 2)]);
-        ed.add_task(None, "New", 480).unwrap();
+        ed.add_task(None, "New", 480, false).unwrap();
         assert_eq!(
             rows(&ed),
             [("S", 1, true), ("c1", 2, false), ("New", 2, false)]
@@ -2302,7 +2395,7 @@ mod tests {
     #[test]
     fn a_task_inserted_under_a_nested_summary_goes_one_level_deeper() {
         let mut ed = outline(&[(1, "A", 1), (2, "S", 2), (3, "c", 3), (4, "B", 1)]);
-        ed.add_task(Some(2), "New", 480).unwrap();
+        ed.add_task(Some(2), "New", 480, false).unwrap();
         assert_eq!(
             rows(&ed),
             [
@@ -2316,7 +2409,7 @@ mod tests {
         // An outline that skips a level: the new task is S's child, and the
         // deeper row it pushes down stays inside S.
         let mut ed = outline(&[(1, "S", 1), (2, "c", 3), (3, "Y", 1)]);
-        ed.add_task(Some(1), "New", 480).unwrap();
+        ed.add_task(Some(1), "New", 480, false).unwrap();
         assert_eq!(
             rows(&ed),
             [
@@ -2414,7 +2507,7 @@ mod tests {
         assert_eq!(ed.delete_task(3).unwrap(), vec![3, 2]);
         assert!(ed.project().assignments.is_empty());
 
-        let at = ed.add_task(None, "Replacement", 480).unwrap();
+        let at = ed.add_task(None, "Replacement", 480, false).unwrap();
         let uid = ed.project().tasks[at].uid;
         assert_eq!(uid, 2, "the removed subtask's UID is reused");
         assert!(ed.project().assignments.iter().all(|a| a.task_uid != uid));
@@ -2453,7 +2546,7 @@ mod tests {
         assert_eq!(before.resources[0].work_min, Some(960));
         assert_schedule(&ed);
 
-        let at = ed.add_task(None, "Replacement", 480).unwrap();
+        let at = ed.add_task(None, "Replacement", 480, false).unwrap();
         let uid = ed.project().tasks[at].uid;
         assert_eq!(uid, 2, "the highest deleted UID is reused");
         assert!(ed.project().assignments.iter().all(|a| a.task_uid != uid));
@@ -2612,17 +2705,17 @@ mod tests {
     #[test]
     fn structural_edits_keep_the_history_cap_and_clear_redo() {
         let mut ed = editor();
-        ed.add_task(None, "Undone", 480).unwrap();
+        ed.add_task(None, "Undone", 480, false).unwrap();
         assert!(ed.undo());
         assert_eq!(ed.redo_depth(), 1);
         let before = ed.project().clone();
-        ed.add_task(None, "Structural", 480).unwrap();
+        ed.add_task(None, "Structural", 480, false).unwrap();
         assert_eq!((ed.undo_depth(), ed.redo_depth()), (1, 0));
         assert!(ed.undo());
         assert_eq!(ed.project(), &before);
         let mut states = vec![before];
         for i in 0..UNDO_CAP + 5 {
-            ed.add_task(None, &format!("T{i}"), 480).unwrap();
+            ed.add_task(None, &format!("T{i}"), 480, false).unwrap();
             states.push(ed.project().clone());
         }
         assert_eq!(ed.undo_depth(), UNDO_CAP);
@@ -2668,7 +2761,7 @@ mod tests {
         let mut ed = editor();
         assert!(!ed.undo());
         assert!(!ed.redo());
-        let at = ed.add_task(None, "Third", 480).unwrap();
+        let at = ed.add_task(None, "Third", 480, false).unwrap();
         ed.select(at);
         assert!(ed.undo());
         assert_eq!(ed.sel(), 1);
@@ -2827,7 +2920,10 @@ mod tests {
         let day = DateTime::from_ymd_hm(2026, 1, 7, 0, 0);
         let edits: Vec<(&str, Box<Edit>)> = vec![
             ("indent", Box::new(|ed| ed.indent(3, 1))),
-            ("set_duration", Box::new(|ed| ed.set_duration_min(3, 960))),
+            (
+                "set_duration",
+                Box::new(|ed| ed.set_duration_min(3, 960, false)),
+            ),
             ("toggle_milestone", Box::new(|ed| ed.toggle_milestone(3))),
             (
                 "set_constraint",
@@ -2867,7 +2963,7 @@ mod tests {
         }
         // A typed duration commits the new task's estimate; a milestone has none.
         let mut ed = blank_row_editor();
-        ed.set_duration_min(3, 960).unwrap();
+        ed.set_duration_min(3, 960, false).unwrap();
         let t = &ed.project().tasks[1];
         assert_eq!(
             (t.duration_min, t.estimated, t.milestone),
@@ -2875,7 +2971,7 @@ mod tests {
         );
         // Typing exactly the default one day commits it too.
         let mut ed = blank_row_editor();
-        ed.set_duration_min(3, 480).unwrap();
+        ed.set_duration_min(3, 480, false).unwrap();
         let t = &ed.project().tasks[1];
         assert_eq!(
             (t.duration_min, t.estimated, t.is_null),
@@ -2979,7 +3075,7 @@ mod tests {
         let summaries: Vec<_> = ed.project().tasks.iter().map(|t| t.summary).collect();
         assert_eq!(summaries, [true, false, false, false]);
         // Phase rolls up the typed row: a 2-day subtask sets its finish.
-        ed.set_duration_min(3, 960).unwrap();
+        ed.set_duration_min(3, 960, false).unwrap();
         assert!(ed.project().tasks[0].summary);
         assert_eq!(
             ed.schedule().get(1).unwrap().early_finish,
@@ -3048,7 +3144,7 @@ mod tests {
         // A zero duration or milestone toggle replaces the default ManualDuration.
         for edit in [
             |ed: &mut Editor| ed.toggle_milestone(3),
-            |ed: &mut Editor| ed.set_duration_min(3, 0),
+            |ed: &mut Editor| ed.set_duration_min(3, 0, false),
         ] {
             let mut ed = manual_plan();
             edit(&mut ed).unwrap();
@@ -3115,7 +3211,7 @@ mod tests {
     #[test]
     fn a_task_inserted_after_a_blank_row_under_a_summary_is_its_first_child() {
         let mut ed = summary_blank_child_editor();
-        let at = ed.add_task(Some(3), "Inserted", 480).unwrap();
+        let at = ed.add_task(Some(3), "Inserted", 480, false).unwrap();
         assert_eq!(at, 2);
         let levels: Vec<_> = ed.project().tasks.iter().map(|t| t.outline_level).collect();
         assert_eq!(levels, [1, 0, 2, 2, 1]);
@@ -3204,13 +3300,13 @@ mod tests {
     fn a_task_added_below_a_blank_row_takes_the_level_of_the_task_above() {
         let mut ed = blank_row_editor();
         ed.indent(1, 1).unwrap(); // Task 1 at level 2
-        let at = ed.add_task(Some(3), "After blank", 480).unwrap();
+        let at = ed.add_task(Some(3), "After blank", 480, false).unwrap();
         assert_eq!(at, 2);
         assert_eq!(ed.project().tasks[at].outline_level, 2);
         // With no task above, the level is 1.
         let mut ed = blank_row_editor();
         ed.delete_task(1).unwrap();
-        let at = ed.add_task(Some(3), "First", 480).unwrap();
+        let at = ed.add_task(Some(3), "First", 480, false).unwrap();
         assert_eq!(ed.project().tasks[at].outline_level, 1);
         assert!(!ed.project().tasks[at - 1].summary);
     }
@@ -3218,7 +3314,7 @@ mod tests {
     #[test]
     fn new_tasks_carry_no_imported_task_fields() {
         let mut ed = editor();
-        let at = ed.add_task(None, "New", 480).unwrap();
+        let at = ed.add_task(None, "New", 480, false).unwrap();
         assert_eq!(
             ed.project().tasks[at],
             Task {
@@ -3237,13 +3333,15 @@ mod tests {
         let mut proj = editor().project().clone();
         proj.tasks[0].estimated = Some(true);
         let mut ed = Editor::new(proj);
-        // Retyping the same duration is a no-op (see the follow-up on #80).
-        ed.set_duration_min(1, 480).unwrap();
-        assert_eq!(ed.project().tasks[0].estimated, Some(true));
-        ed.set_duration_min(1, 960).unwrap();
+        // Retyping the same duration commits the estimate, as in Project (#159).
+        ed.set_duration_min(1, 480, false).unwrap();
+        assert_eq!(ed.project().tasks[0].estimated, Some(false));
+        assert_eq!(ed.undo_depth(), 1);
+        assert!(ed.dirty());
+        ed.set_duration_min(1, 960, false).unwrap();
         assert_eq!(ed.project().tasks[0].estimated, Some(false));
         // An unset flag stays unset.
-        ed.set_duration_min(2, 960).unwrap();
+        ed.set_duration_min(2, 960, false).unwrap();
         assert_eq!(ed.project().tasks[1].estimated, None);
         // A manual task's typed finish changes its duration and commits it.
         let mut proj = editor().project().clone();
@@ -3255,6 +3353,157 @@ mod tests {
             .unwrap();
         let t = &ed.project().tasks[0];
         assert_eq!((t.duration_min, t.estimated), (960, Some(false)));
+    }
+
+    #[test]
+    fn a_duration_typed_with_a_question_mark_is_estimated() {
+        let mut ed = editor();
+        ed.set_duration(1, "2d?").unwrap();
+        let t = &ed.project().tasks[0];
+        assert_eq!((t.duration_min, t.estimated), (960, Some(true)));
+        assert_eq!(duration_suffix(ed.project(), 1), "?");
+        assert_eq!(ed.undo_depth(), 1);
+        // The same estimate again changes nothing.
+        ed.mark_saved();
+        ed.set_duration(1, " 2d? ").unwrap();
+        assert_eq!((ed.undo_depth(), ed.dirty()), (1, false));
+        // `?` on the minutes a task already has marks it in one step.
+        ed.set_duration(2, "1d?").unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!((t.duration_min, t.estimated), (480, Some(true)));
+        assert_eq!((ed.undo_depth(), ed.dirty()), (2, true));
+        assert!(ed.undo());
+        assert_eq!(ed.project().tasks[1].estimated, None);
+        // Retyping it without `?` commits it; an unset flag is not set.
+        ed.set_duration(1, "2d").unwrap();
+        assert_eq!(ed.project().tasks[0].estimated, Some(false));
+        assert_eq!(duration_suffix(ed.project(), 1), "");
+        ed.mark_saved();
+        let depth = ed.undo_depth();
+        ed.set_duration(2, "1d").unwrap();
+        assert_eq!(ed.project().tasks[1].estimated, None);
+        assert_eq!((ed.undo_depth(), ed.dirty()), (depth, false));
+        // An estimate needs a duration.
+        assert!(
+            ed.update_task(
+                1,
+                TaskPatch {
+                    estimated: Some(true),
+                    name: Some("x".into()),
+                    ..TaskPatch::default()
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn task_durations_parse_an_optional_question_mark() {
+        let proj = Project::default();
+        for (text, parsed) in [
+            ("3d?", Some((1440, true))),
+            ("4h?", Some((240, true))),
+            ("2?", Some((960, true))),
+            (" 2d ? ", Some((960, true))),
+            ("2d", Some((960, false))),
+            ("2d??", None),
+            ("?", None),
+            ("nope?", None),
+        ] {
+            assert_eq!(parse_task_duration(text, &proj), parsed, "{text}");
+        }
+        // Lags and other callers keep the plain parser.
+        assert_eq!(parse_duration("3d?", &proj), None);
+    }
+
+    #[test]
+    fn a_blank_row_typed_with_an_estimate_becomes_an_estimated_task() {
+        let mut ed = blank_row_editor();
+        ed.set_duration(3, "2d?").unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!(
+            (t.is_null, t.duration_min, t.estimated),
+            (false, 960, Some(true))
+        );
+        let mut ed = blank_row_editor();
+        ed.set_duration(3, "1d").unwrap();
+        let t = &ed.project().tasks[1];
+        assert_eq!((t.duration_min, t.estimated), (480, Some(false)));
+    }
+
+    #[test]
+    fn added_tasks_carry_a_typed_estimate() {
+        let mut ed = editor();
+        let at = ed.add_task(None, "Maybe", 960, true).unwrap();
+        assert_eq!(ed.project().tasks[at].estimated, Some(true));
+        assert_eq!(ed.undo_depth(), 1);
+        let at = ed.add_task(None, "Sure", 960, false).unwrap();
+        assert_eq!(ed.project().tasks[at].estimated, None);
+    }
+
+    #[test]
+    fn an_auto_summary_keeps_its_stored_estimate_through_a_duration_patch() {
+        for (stored, typed) in [(None, true), (Some(true), false), (Some(false), true)] {
+            let mut proj = outline(&[(1, "S", 1), (2, "a", 2)]).project().clone();
+            proj.tasks[0].estimated = stored;
+            let mut ed = Editor::new(proj);
+            for patch in [
+                // Minutes that differ from its stale stored duration.
+                TaskPatch {
+                    duration_min: Some(1440),
+                    estimated: Some(typed),
+                    ..TaskPatch::default()
+                },
+                // A rename carrying the duration it has.
+                TaskPatch {
+                    name: Some("Renamed".into()),
+                    duration_min: Some(480),
+                    estimated: Some(typed),
+                    ..TaskPatch::default()
+                },
+                // The old rule without an estimate.
+                TaskPatch {
+                    duration_min: Some(960),
+                    ..TaskPatch::default()
+                },
+            ] {
+                ed.update_task(1, patch).unwrap();
+                assert_eq!(
+                    ed.project().tasks[0].estimated,
+                    stored,
+                    "{stored:?} {typed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_summary_shows_the_estimate_of_the_tasks_below_it() {
+        let mut ed = outline(&[(1, "S", 1), (2, "a", 2), (3, "b", 2), (4, "T", 1)]);
+        assert_eq!(duration_suffix(ed.project(), 1), "");
+        ed.set_duration(3, "2d?").unwrap();
+        assert_eq!(duration_suffix(ed.project(), 1), "?");
+        assert_eq!(duration_suffix(ed.project(), 3), "?");
+        assert_eq!(duration_suffix(ed.project(), 4), "");
+        // Not written into the summary's own flag.
+        assert_eq!(ed.project().tasks[0].estimated, None);
+        // Committing the last estimated subtask clears it; a stale stored
+        // flag on the summary does not show.
+        ed.set_duration(3, "2d").unwrap();
+        assert_eq!(duration_suffix(ed.project(), 1), "");
+        let mut proj = ed.project().clone();
+        proj.tasks[0].estimated = Some(true);
+        assert_eq!(duration_suffix(&proj, 1), "");
+        // A summary takes no estimate of its own.
+        let mut proj = ed.project().clone();
+        proj.tasks[0].manual = true;
+        proj.tasks[0].manual_start = Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0));
+        let mut ed = Editor::new(proj);
+        ed.set_duration(1, "5d?").unwrap();
+        assert_eq!(ed.project().tasks[0].estimated, None);
+        // A milestone shows none.
+        ed.set_duration(4, "0?").unwrap();
+        assert_eq!(duration_suffix(ed.project(), 4), "");
     }
 
     // ---- the entry row below the last task (#145) ----
@@ -3304,9 +3553,12 @@ mod tests {
         let edits: Vec<(&str, Box<RowEdit>)> = vec![
             (
                 "duration",
-                Box::new(|ed, uid| ed.set_duration_min(uid, 960)),
+                Box::new(|ed, uid| ed.set_duration_min(uid, 960, false)),
             ),
-            ("milestone", Box::new(|ed, uid| ed.set_duration_min(uid, 0))),
+            (
+                "milestone",
+                Box::new(|ed, uid| ed.set_duration_min(uid, 0, false)),
+            ),
             ("start", Box::new(move |ed, uid| ed.set_start(uid, day))),
             ("finish", Box::new(move |ed, uid| ed.set_finish(uid, day))),
             (
@@ -3354,7 +3606,7 @@ mod tests {
                 ed.mark_saved();
             }
             assert_unchanged(&mut ed, |ed| {
-                let e = ed.append_row(|ed, uid| ed.set_duration_min(uid, -1));
+                let e = ed.append_row(|ed, uid| ed.set_duration_min(uid, -1, false));
                 assert!(e.unwrap_err().contains("negative"));
                 let e = ed.append_row(|ed, uid| {
                     let preds = parse_predecessors("99", ed.project())?;
@@ -3382,7 +3634,7 @@ mod tests {
         let oldest = ed.undo[0].clone();
         assert_unchanged(&mut ed, |ed| {
             assert!(
-                ed.append_row(|ed, uid| ed.set_duration_min(uid, -1))
+                ed.append_row(|ed, uid| ed.set_duration_min(uid, -1, false))
                     .is_err()
             );
         });
@@ -3618,10 +3870,10 @@ mod tests {
         assert_unchanged(&mut ed, |e| e.set_new_tasks_manual(false));
         assert_edit(&mut ed, |e| e.set_new_tasks_manual(true));
         assert!(ed.project().new_tasks_are_manual);
-        let at = ed.add_task(None, "Pinned", 480).unwrap();
+        let at = ed.add_task(None, "Pinned", 480, false).unwrap();
         assert!(ed.project().tasks[at].manual);
         ed.set_new_tasks_manual(false);
-        let at = ed.add_task(None, "Auto", 480).unwrap();
+        let at = ed.add_task(None, "Auto", 480, false).unwrap();
         assert!(!ed.project().tasks[at].manual);
         // A blank row follows the plan's mode as it is when it is typed into.
         let mut ed = blank_row_editor();
@@ -3713,7 +3965,8 @@ mod tests {
     fn unlink_removes_predecessors_and_successors_in_one_step() {
         let mut ed = editor();
         for uid in 3..=4 {
-            ed.add_task(None, &format!("Task {uid}"), 480).unwrap();
+            ed.add_task(None, &format!("Task {uid}"), 480, false)
+                .unwrap();
         }
         // 1 -> 2 -> 3, and 2 -> 4 with 1 -> 4: unlinking 2 leaves only 1 -> 4.
         ed.add_predecessor(2, 1, LinkType::FinishStart, 0).unwrap();

@@ -229,8 +229,8 @@ fn a_chart_outside_the_span_moves_towards_it_and_never_snaps() {
 // window whose chart shows only part of it.
 fn long_tab() -> DocTab {
     let mut ed = ProjectEditor::new(untitled_project());
-    ed.add_task(None, "Build", 40 * 480).unwrap();
-    ed.add_task(None, "Late", 20 * 480).unwrap();
+    ed.add_task(None, "Build", 40 * 480, false).unwrap();
+    ed.add_task(None, "Late", 20 * 480, false).unwrap();
     ed.add_predecessor(2, 1, projcore::LinkType::FinishStart, 0)
         .unwrap();
     let mut t = new_project_tab();

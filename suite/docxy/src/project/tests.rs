@@ -588,7 +588,7 @@ fn summary_duration_follows_child_edits_and_matches_the_gantt_export() {
         project_row(&ed, ed.project().task(phase).unwrap())[COL_DURATION],
         "2d"
     );
-    ed.set_duration_min(b, 1440).unwrap();
+    ed.set_duration_min(b, 1440, false).unwrap();
     let row = project_row(&ed, ed.project().task(phase).unwrap());
     assert_eq!(row[COL_DURATION], "4d");
     let md = projcore::gantt::to_markdown(ed.project(), ed.schedule());
@@ -624,7 +624,7 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
     for i in 0..100 {
         view_mut(&mut t)
             .ed
-            .add_task(None, &format!("Task {i}"), 480)
+            .add_task(None, &format!("Task {i}"), 480, false)
             .unwrap();
     }
     // Down from the last task goes to the entry row (100), as in Project;

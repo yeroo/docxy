@@ -69,16 +69,18 @@ fn advance(cal: &WorkCalendar, from: DateTime, minutes: i64, finish: bool) -> Op
 /// its start plus work ÷ units: a work resource (or none, like Project's
 /// unassigned -65535), no contour, positive units.
 fn is_flat_work(proj: &Project, a: &Assignment) -> bool {
-    is_work(&proj.resources, a)
-        && matches!(a.work_contour, None | Some(0))
-        && a.units.is_finite()
-        && a.units > 0.0
+    is_work(&proj.resources, a) && !contoured(a) && a.units.is_finite() && a.units > 0.0
+}
+
+/// Whether the assignment's work follows a contour, so its units are its peak.
+pub(crate) fn contoured(a: &Assignment) -> bool {
+    !matches!(a.work_contour, None | Some(0))
 }
 
 /// Whether an assignment's work is working time: a work resource's, or one
 /// without a resource (Project's unassigned -65535). A material's work is a
 /// quantity and a cost resource has none, so a task's Work leaves them out.
-fn is_work(resources: &[Resource], a: &Assignment) -> bool {
+pub(crate) fn is_work(resources: &[Resource], a: &Assignment) -> bool {
     resources
         .iter()
         .find(|r| r.uid == a.resource_uid)

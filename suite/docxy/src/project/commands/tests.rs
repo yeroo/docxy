@@ -16,7 +16,7 @@ fn vm(t: &mut DocTab) -> &mut ProjectView {
 fn tab() -> DocTab {
     let mut t = new_project_tab();
     for (name, duration) in [("First", 480), ("Second", 960)] {
-        vm(&mut t).ed.add_task(None, name, duration).unwrap();
+        vm(&mut t).ed.add_task(None, name, duration, false).unwrap();
     }
     // A view over the finished plan, as opening it builds one.
     let p = v(&t).ed.project().clone();
@@ -1211,7 +1211,7 @@ fn move_prompts_for_an_amount_and_reports_the_new_start() {
     // The status names the date the task is scheduled on: a milestone at
     // its predecessor's 17:00 finish moves to the next day, not two.
     let mut t = tab();
-    vm(&mut t).ed.set_duration_min(2, 0).unwrap();
+    vm(&mut t).ed.set_duration_min(2, 0, false).unwrap();
     vm(&mut t)
         .ed
         .add_predecessor(2, 1, LinkType::FinishStart, 0)
@@ -1268,7 +1268,7 @@ fn scroll_to_task_puts_the_bar_a_day_in_from_the_left_edge() {
 fn outline_tab() -> DocTab {
     let mut t = new_project_tab();
     for name in ["Phase", "X", "Y", "Z"] {
-        vm(&mut t).ed.add_task(None, name, 480).unwrap();
+        vm(&mut t).ed.add_task(None, name, 480, false).unwrap();
     }
     vm(&mut t).ed.indent(2, 1).unwrap();
     vm(&mut t).ed.indent(3, 1).unwrap();

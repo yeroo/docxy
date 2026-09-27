@@ -1,7 +1,8 @@
 //! Entry-table edit state and transitions, shared by keyboard, mouse and host actions.
 use super::*;
 use projcore::editor::{
-    format_duration_exact, parse_cell_date, parse_duration, parse_task_predecessors,
+    duration_suffix, format_duration_exact, parse_cell_date, parse_task_duration,
+    parse_task_predecessors,
 };
 
 pub(crate) const COL_ID: usize = 0;
@@ -135,8 +136,13 @@ impl ProjectView {
                 };
                 if min == 0 {
                     "0".into()
-                } else {
+                } else if task.summary {
+                    // A summary's `?` is its subtasks'; it takes no estimate.
                     format_duration_exact(min, self.ed.project())
+                } else {
+                    // An estimated duration reopens as it shows, `1d?`.
+                    format_duration_exact(min, self.ed.project())
+                        + duration_suffix(self.ed.project(), task.uid)
                 }
             } else {
                 project_row(&self.ed, task)[self.col].clone()
@@ -218,9 +224,9 @@ fn apply_cell(
         COL_MODE => ed.set_manual(uid, parse_task_mode(buf)?)?,
         COL_NAME => ed.rename(uid, buf)?,
         COL_DURATION => {
-            let min =
-                parse_duration(buf, ed.project()).ok_or("Invalid duration (try 3d, 4h, 2w)")?;
-            ed.set_duration_min(uid, min)?;
+            let (min, estimated) = parse_task_duration(buf, ed.project())
+                .ok_or("Invalid duration (try 3d, 4h, 2w)")?;
+            ed.set_duration_min(uid, min, estimated)?;
         }
         COL_START | COL_FINISH => {
             let day = parse_cell_date(buf)?;

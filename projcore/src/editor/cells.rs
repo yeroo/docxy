@@ -364,11 +364,7 @@ impl Editor {
         if !changed {
             return Ok(());
         }
-        self.edit_row(i, |proj, _| {
-            proj.resources = resources;
-            proj.assignments = assignments;
-        })?;
-        Ok(())
+        self.commit_assignments(i, resources, assignments)
     }
 
     /// Resolve a whole token to an existing resource. The task's assignments

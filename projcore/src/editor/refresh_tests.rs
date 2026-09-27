@@ -85,7 +85,7 @@ fn assignment(ed: &Editor, uid: i32) -> &Assignment {
 fn a_duration_edit_refreshes_its_assignments_and_only_those() {
     let mut ed = staffed();
     let untouched = assignment(&ed, 2).clone();
-    ed.set_duration_min(1, 960).unwrap();
+    ed.set_duration_min(1, 960, false).unwrap();
     let a = assignment(&ed, 1);
     assert_eq!(
         (a.work_min, a.start, a.finish),
@@ -109,7 +109,10 @@ fn a_duration_edit_refreshes_its_assignments_and_only_those() {
 
 #[test]
 fn a_units_edit_reprices_and_redates_the_assignment() {
-    let mut ed = staffed();
+    let mut proj = staffed().project().clone();
+    // Fixed Duration: the work follows the units (#159).
+    proj.tasks[0].task_type = Some(crate::model::TaskType::FixedDuration);
+    let mut ed = Editor::new(proj);
     ed.assign_resource(1, "Alice[50%]").unwrap();
     let a = assignment(&ed, 1);
     assert_eq!((a.units, a.work_min), (0.5, 240));
@@ -123,7 +126,7 @@ fn a_successor_moved_by_its_predecessor_is_refreshed() {
     let mut ed = staffed();
     ed.add_predecessor(2, 1, LinkType::FinishStart, 0).unwrap();
     assert_eq!(assignment(&ed, 2).start, Some(at(6, 8)));
-    ed.set_duration_min(1, 1440).unwrap();
+    ed.set_duration_min(1, 1440, false).unwrap();
     let a = assignment(&ed, 2);
     assert_eq!((a.start, a.finish), (Some(at(8, 8)), Some(at(8, 17))));
     assert_eq!(text(&a.cost), Some("50000"));
@@ -187,7 +190,7 @@ fn resource_and_task_totals_follow_their_assignments() {
     ed.proj.resources[0].cost = Rate::parse("7");
     let untouched = ed.proj.tasks[1].clone();
     ed = Editor::new(ed.proj);
-    ed.set_duration_min(1, 960).unwrap();
+    ed.set_duration_min(1, 960, false).unwrap();
     let t = &ed.project().tasks[0];
     // Each total moves by its assignment's: work 480 → 960, remaining work
     // from the stale 1 to 960, cost from the stale 1 to 90000.
@@ -215,8 +218,8 @@ fn resource_and_task_totals_follow_their_assignments() {
 #[test]
 fn removing_assignments_lowers_the_resource_totals() {
     let mut ed = staffed();
-    ed.set_duration_min(1, 960).unwrap();
-    ed.set_duration_min(2, 1440).unwrap();
+    ed.set_duration_min(1, 960, false).unwrap();
+    ed.set_duration_min(2, 1440, false).unwrap();
     let r = &ed.project().resources[0];
     assert_eq!((r.work_min, text(&r.cost)), (Some(2400), Some("220000")));
 
@@ -240,7 +243,7 @@ fn a_delayed_assignment_still_finishes_with_its_task_after_a_duration_edit() {
     let mut ed = staffed();
     ed.proj.assignments[0].delay = Some(480 * 10);
     ed = Editor::new(ed.proj);
-    ed.set_duration_min(1, 3 * 480).unwrap();
+    ed.set_duration_min(1, 3 * 480, false).unwrap();
     let a = assignment(&ed, 1);
     // A day's delay leaves two days of work in a three-day task.
     assert_eq!(a.work_min, 960);
@@ -276,7 +279,7 @@ fn nothing_is_refreshed_without_an_edit_that_changes_it() {
 
     // Undo and redo restore the models exactly, refreshing nothing.
     let before = ed.project().clone();
-    ed.set_duration_min(1, 960).unwrap();
+    ed.set_duration_min(1, 960, false).unwrap();
     let after = ed.project().clone();
     assert_ne!(after.assignments, before.assignments);
     assert!(ed.undo());
@@ -367,7 +370,7 @@ fn summaries_move_with_their_subtasks() {
             .collect()
     };
     let row = |uid: i32, work: i64, cost: &str| (uid, Some(work), Some(cost.to_string()));
-    ed.set_duration_min(1, 960).unwrap();
+    ed.set_duration_min(1, 960, false).unwrap();
     // Task 1's assignment: work 480 → 960, cost 1 → 90000.
     let edited = vec![
         row(0, 1440, "93001"),

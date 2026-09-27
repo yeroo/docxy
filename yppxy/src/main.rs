@@ -35,7 +35,8 @@ use ribbon::{Act, Ribbon};
 use mppread::project::project_from_mpp;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    AssignOutcome, Editor, FindOutcome, constraint_hint, format_resource_names, parse_duration,
+    AssignOutcome, Editor, FindOutcome, constraint_hint, duration_suffix, format_resource_names,
+    parse_task_duration,
 };
 #[cfg(test)]
 use projcore::model::Predecessor;
@@ -791,7 +792,10 @@ impl App {
     // ---- edits ----
 
     fn add_task(&mut self) {
-        match self.ed.add_task(self.ed.selected_uid(), "New task", 480) {
+        match self
+            .ed
+            .add_task(self.ed.selected_uid(), "New task", 480, false)
+        {
             Ok(at) => self.ed.select(at),
             Err(message) => self.status = message,
         }
@@ -870,7 +874,7 @@ impl App {
             if let Err(message) = self.ed.set_duration(uid, text) {
                 self.status = message;
             }
-        } else if parse_duration(text, self.ed.project()).is_none() {
+        } else if parse_task_duration(text, self.ed.project()).is_none() {
             self.status = format!("Couldn't read duration '{text}' (try 3d, 4h, 2w)");
         }
     }
@@ -1815,12 +1819,16 @@ fn draw_body(f: &mut Frame, area: Rect, app: &mut App) {
             // The stored summary duration is stale; derive it from the shown dates.
             app.ed.disp_duration_min(t.uid).map_or_else(
                 || "?".into(),
-                |min| fmt_days(app.ed.project().minutes_to_days(min)),
+                |min| {
+                    fmt_days(app.ed.project().minutes_to_days(min))
+                        + duration_suffix(app.ed.project(), t.uid)
+                },
             )
         } else if t.is_milestone() {
             "—".to_string()
         } else {
             fmt_days(app.ed.project().minutes_to_days(t.duration_min))
+                + duration_suffix(app.ed.project(), t.uid)
         };
         let slack = r
             .map(|r| fmt_days(app.ed.project().minutes_to_days(r.total_slack_min)))
@@ -2139,6 +2147,7 @@ fn truncate(s: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use projcore::editor::parse_duration;
 
     #[test]
     fn save_as_prompt_retains_binding_on_failure_and_adds_native_extension() {
@@ -2269,7 +2278,7 @@ mod tests {
             projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/10-summary.xml")).unwrap();
         let mut app = App::new(proj, None, false);
         let b = app.ed.project().tasks[2].uid;
-        app.ed.set_duration_min(b, 1440).unwrap();
+        app.ed.set_duration_min(b, 1440, false).unwrap();
         let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
         term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
         let buf = term.backend().buffer();
@@ -2299,12 +2308,32 @@ mod tests {
         let (above, blank) = (app.list_y0 + 1, app.list_y0 + 2);
         assert_eq!(
             row(above, 1..45).split_whitespace().collect::<Vec<_>>(),
-            ["•", "Excavate", "2d", "0d"]
+            // Excavate is saved `Estimated` (#159).
+            ["•", "Excavate", "2d?", "0d"]
         );
         assert_eq!(row(blank, 1..45).trim(), "");
         // No bar or milestone in the Gantt; weekend shading only.
         let gantt = row(blank, app.gantt_x0..99);
         assert!(gantt.chars().all(|c| c == ' ' || c == '·'), "{gantt}");
+    }
+
+    #[test]
+    fn the_task_grid_shows_an_estimated_duration_with_a_question_mark() {
+        use ratatui::backend::TestBackend;
+        let mut app = App::new(new_project(), None, false);
+        let uid = app.ed.selected_uid().unwrap();
+        app.set_duration("2d?");
+        assert_eq!(app.ed.project().task(uid).unwrap().estimated, Some(true));
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| draw_body(f, f.area(), &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let row: String = (1..45)
+            .map(|x| buf.cell((x, app.list_y0)).unwrap().symbol())
+            .collect();
+        assert!(row.split_whitespace().any(|w| w == "2d?"), "{row}");
+        // Retyped without `?`, the estimate is committed.
+        app.set_duration("2d");
+        assert_eq!(app.ed.project().task(uid).unwrap().estimated, Some(false));
     }
 
     #[test]
@@ -2559,6 +2588,11 @@ mod tests {
             app.status,
             "Couldn't read duration 'banana' (try 3d, 4h, 2w)"
         );
+        // An estimate reads without a selected row too.
+        let mut empty = App::new(Project::default(), None, false);
+        empty.status = "unchanged".into();
+        empty.set_duration("2d?");
+        assert_eq!(empty.status, "unchanged");
         app.add_predecessor("abc");
         assert_eq!(app.status, "Predecessor must be a task ID (number)");
         app.add_predecessor("1");
