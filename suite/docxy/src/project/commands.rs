@@ -851,16 +851,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                             reveal_clear = true;
                         }
                         COL_NAME | COL_PREDECESSORS | COL_RESOURCES => {
-                            let task = v.ed.project().task(uid).ok_or("No task selected")?;
-                            let has_value = match v.col {
-                                COL_NAME => !task.name.is_empty(),
-                                COL_PREDECESSORS => !task.predecessors.is_empty(),
-                                COL_RESOURCES => {
-                                    v.ed.project().assignments.iter().any(|a| a.task_uid == uid)
-                                }
-                                _ => unreachable!(),
-                            };
-                            if !task.is_null && has_value {
+                            if !v.ed.project().task(uid).ok_or("No task selected")?.is_null {
                                 apply_cell(&mut v.ed, uid, v.col, "")?;
                             }
                         }
