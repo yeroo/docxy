@@ -429,6 +429,16 @@ impl Task {
     pub fn is_milestone(&self) -> bool {
         self.milestone || self.duration_min == 0
     }
+
+    /// Whether `finish` falls after the task's Deadline, as Project's missed
+    /// deadline indicator shows it: `Finish > Deadline` on the raw instants, so
+    /// finishing exactly at the deadline is not a miss. The deadline is not
+    /// snapped to the calendar, so for an off-hours deadline (say midnight)
+    /// this can differ from the scheduler's late-finish bound, which is. A
+    /// blank row never misses one.
+    pub fn misses_deadline(&self, finish: DateTime) -> bool {
+        !self.is_null && self.deadline.is_some_and(|deadline| finish > deadline)
+    }
 }
 
 /// Resource kind. MSPDI encodes Cost using Type 0 plus IsCostResource.
@@ -1879,5 +1889,24 @@ mod tests {
             Predecessor::fs(4),
             Predecessor::working(4, LinkType::FinishStart, 0)
         );
+    }
+
+    #[test]
+    fn misses_deadline_compares_the_finish_with_the_raw_deadline() {
+        let at = |day, hour| DateTime::from_ymd_hm(2026, 3, day, hour, 0);
+        let mut task = Task::default();
+        assert!(!task.misses_deadline(at(6, 17)), "no deadline");
+        task.deadline = Some(at(6, 17));
+        assert!(!task.misses_deadline(at(6, 17)), "finishes on the deadline");
+        assert!(!task.misses_deadline(at(5, 17)), "finishes before it");
+        assert!(task.misses_deadline(at(9, 8)), "finishes after it");
+        task.is_null = true;
+        assert!(!task.misses_deadline(at(9, 8)), "a blank row");
+        // A midnight deadline is that instant, not the evening of its day.
+        let task = Task {
+            deadline: Some(at(6, 0)),
+            ..Task::default()
+        };
+        assert!(task.misses_deadline(at(6, 17)));
     }
 }
