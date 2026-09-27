@@ -118,12 +118,17 @@ impl Editor {
 /// every following row deeper than it. Blank rows are outside the outline:
 /// one between two descendants goes with it; one after the last stays.
 pub(super) fn subtree_end(proj: &Project, i: usize) -> usize {
-    let task = &proj.tasks[i];
+    subtree_end_in(&proj.tasks, i)
+}
+
+/// The same positional outline rule on a proposed task list.
+pub(super) fn subtree_end_in(tasks: &[Task], i: usize) -> usize {
+    let task = &tasks[i];
     if task.is_null {
         return i + 1;
     }
     let mut end = i + 1;
-    for (k, row) in proj.tasks.iter().enumerate().skip(i + 1) {
+    for (k, row) in tasks.iter().enumerate().skip(i + 1) {
         if row.is_null {
             continue;
         }

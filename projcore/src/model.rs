@@ -1470,6 +1470,18 @@ impl Default for Project {
     }
 }
 
+/// Whether a row has outline children in a task list. Blank rows are outside
+/// the outline, so only the next non-blank row can make it a summary.
+pub(crate) fn is_outline_summary_in(tasks: &[Task], index: usize) -> bool {
+    tasks.get(index).is_some_and(|task| {
+        !task.is_null
+            && tasks[index + 1..]
+                .iter()
+                .find(|next| !next.is_null)
+                .is_some_and(|next| next.outline_level > task.outline_level)
+    })
+}
+
 impl Project {
     /// The stored text of an unmodeled project option (see [`Project::options`]).
     pub fn option(&self, name: &str) -> Option<&str> {
@@ -1517,13 +1529,7 @@ impl Project {
     /// Blank rows are outside the outline: one is never a summary, and the
     /// next non-blank row decides whether the row above it is.
     pub(crate) fn is_outline_summary(&self, index: usize) -> bool {
-        self.tasks.get(index).is_some_and(|task| {
-            !task.is_null
-                && self.tasks[index + 1..]
-                    .iter()
-                    .find(|next| !next.is_null)
-                    .is_some_and(|next| next.outline_level > task.outline_level)
-        })
+        is_outline_summary_in(&self.tasks, index)
     }
 
     /// Working minutes → days, using the project's `hours_per_day` (how MS

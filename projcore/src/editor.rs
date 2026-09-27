@@ -1456,13 +1456,13 @@ impl LinkGraph {
     }
 
     fn check_link(&self, pred_uid: i32) -> Result<(), String> {
-        use std::collections::{HashMap, HashSet, VecDeque};
+        use std::collections::{HashSet, VecDeque};
 
         let pred_i = self.indexes[&pred_uid]; // caller checked a non-blank predecessor
         let succ_id = self.tasks[self.succ_i].id;
         let pred_id = self.tasks[pred_i].id;
-        if (self.succ_i < pred_i && pred_i < link_subtree_end(&self.tasks, self.succ_i))
-            || (pred_i < self.succ_i && self.succ_i < link_subtree_end(&self.tasks, pred_i))
+        if (self.succ_i < pred_i && pred_i < outline::subtree_end_in(&self.tasks, self.succ_i))
+            || (pred_i < self.succ_i && self.succ_i < outline::subtree_end_in(&self.tasks, pred_i))
         {
             return Err(format!(
                 "Tasks {succ_id} and {pred_id} are a summary and its subtask; they cannot be linked"
@@ -1481,7 +1481,6 @@ impl LinkGraph {
         }
         let mut expanded_ancestors = HashSet::new();
         let mut expanded_successors = HashSet::new();
-        let mut leaves_cache: HashMap<i32, Vec<i32>> = HashMap::new();
         while let Some(leaf) = queue.pop_front() {
             if targets.contains(&leaf) {
                 return Err(format!(
@@ -1497,12 +1496,9 @@ impl LinkGraph {
                         if !expanded_successors.insert(*next_uid) {
                             continue;
                         }
-                        let next_leaves = leaves_cache
-                            .entry(*next_uid)
-                            .or_insert_with(|| link_leaves(&self.tasks, self.indexes[next_uid]));
-                        for next_leaf in next_leaves {
-                            if visited.insert(*next_leaf) {
-                                queue.push_back(*next_leaf);
+                        for next_leaf in link_leaves(&self.tasks, self.indexes[next_uid]) {
+                            if visited.insert(next_leaf) {
+                                queue.push_back(next_leaf);
                             }
                         }
                     }
@@ -1513,37 +1509,12 @@ impl LinkGraph {
     }
 }
 
-/// Mirror the outline's positional subtree rule on a proposed task list.
-fn link_subtree_end(tasks: &[Task], i: usize) -> usize {
-    let task = &tasks[i];
-    if task.is_null {
-        return i + 1;
-    }
-    let mut end = i + 1;
-    for (k, row) in tasks.iter().enumerate().skip(i + 1) {
-        if row.is_null {
-            continue;
-        }
-        if row.outline_level <= task.outline_level {
-            break;
-        }
-        end = k + 1;
-    }
-    end
-}
-
 /// Non-blank outline leaves below a row, including the row itself when it
 /// has no children.
 fn link_leaves(tasks: &[Task], i: usize) -> Vec<i32> {
-    let end = link_subtree_end(tasks, i);
+    let end = outline::subtree_end_in(tasks, i);
     (i..end)
-        .filter(|&j| {
-            !tasks[j].is_null
-                && tasks[j + 1..]
-                    .iter()
-                    .find(|next| !next.is_null)
-                    .is_none_or(|next| next.outline_level <= tasks[j].outline_level)
-        })
+        .filter(|&j| !tasks[j].is_null && !crate::model::is_outline_summary_in(tasks, j))
         .map(|j| tasks[j].uid)
         .collect()
 }
@@ -4564,7 +4535,7 @@ mod tests {
     }
 
     #[test]
-    fn large_summary_link_expands_each_reachable_branch_once() {
+    fn cycles_through_large_linked_summaries_are_refused() {
         let mut rows = vec![(1, "P", 1)];
         for uid in 2..=251 {
             rows.push((uid, "P leaf", 2));
