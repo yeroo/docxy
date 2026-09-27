@@ -249,9 +249,15 @@ impl Editor {
         if self.proj.tasks[i].predecessors == predecessors {
             return Ok(());
         }
-        for p in &predecessors {
-            if !current.iter().any(|c| c.uid == p.uid) {
-                self.check_link(i, p.uid, &predecessors)?;
+        let new_uids: Vec<i32> = predecessors
+            .iter()
+            .filter(|p| !current.iter().any(|c| c.uid == p.uid))
+            .map(|p| p.uid)
+            .collect();
+        if !new_uids.is_empty() {
+            let graph = LinkGraph::new(self, i, &predecessors);
+            for pred_uid in new_uids {
+                graph.check_link(pred_uid)?;
             }
         }
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;

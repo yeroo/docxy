@@ -872,119 +872,24 @@ impl Editor {
     pub fn add_link(&mut self, uid: i32, link: Predecessor) -> Result<(), String> {
         let pred = link.uid;
         let i = self.index(uid)?;
+        let pred_id = self.proj.task(pred).map_or(pred, |task| task.id);
         if uid == pred || self.index(pred).is_err() || self.is_blank(pred) {
-            return Err(format!("No other task with ID {pred}"));
+            return Err(format!("No other task with ID {pred_id}"));
         }
         if self.proj.tasks[i]
             .predecessors
             .iter()
             .any(|p| p.uid == pred)
         {
-            return Err(format!("Already depends on {pred}"));
+            return Err(format!("Already depends on {pred_id}"));
         }
         let mut predecessors = self.proj.tasks[i].predecessors.clone();
         predecessors.push(link);
-        self.check_link(i, pred, &predecessors)?;
+        LinkGraph::new(self, i, &predecessors).check_link(pred)?;
         self.validate_cell_horizon(uid, None, Some(&predecessors))?;
         self.edit_row(i, |proj, _| {
             proj.tasks[i].predecessors = predecessors;
         })
-    }
-
-    /// Validate a new edge against the outline and predecessor list that this
-    /// edit would leave behind. A blank successor joins the outline on edit.
-    fn check_link(
-        &self,
-        succ_i: usize,
-        pred_uid: i32,
-        proposed: &[Predecessor],
-    ) -> Result<(), String> {
-        use std::collections::{HashMap, HashSet, VecDeque};
-
-        let mut proj = self.proj.clone();
-        if proj.tasks[succ_i].is_null {
-            proj.tasks[succ_i] = self.row_as_edited(succ_i);
-        }
-        proj.tasks[succ_i].predecessors = proposed.to_vec();
-        let pred_i = proj
-            .tasks
-            .iter()
-            .position(|t| t.uid == pred_uid)
-            .expect("caller checked predecessor UID");
-        let succ_id = proj.tasks[succ_i].id;
-        let pred_id = proj.tasks[pred_i].id;
-
-        if (succ_i < pred_i && pred_i < subtree_end(&proj, succ_i))
-            || (pred_i < succ_i && succ_i < subtree_end(&proj, pred_i))
-        {
-            return Err(format!(
-                "Tasks {succ_id} and {pred_id} are a summary and its subtask; they cannot be linked"
-            ));
-        }
-
-        // A link on a summary represents an edge between every leaf of its
-        // outline subtree and every leaf of the other endpoint's subtree.
-        // Keep those edges implicit to avoid a large cross product.
-        let mut successors: HashMap<i32, Vec<i32>> = HashMap::new();
-        let mut ancestors: HashMap<i32, Vec<i32>> = HashMap::new();
-        let mut indexes: HashMap<i32, usize> = HashMap::new();
-        let mut stack: Vec<(u32, i32)> = Vec::new();
-        let active_uids: HashSet<i32> = proj
-            .tasks
-            .iter()
-            .filter(|task| !task.is_null)
-            .map(|task| task.uid)
-            .collect();
-        for (i, task) in proj.tasks.iter().enumerate() {
-            if task.is_null {
-                continue;
-            }
-            while stack
-                .last()
-                .is_some_and(|(level, _)| *level >= task.outline_level)
-            {
-                stack.pop();
-            }
-            let mut lineage: Vec<i32> = stack.iter().map(|(_, uid)| *uid).collect();
-            lineage.push(task.uid);
-            ancestors.insert(task.uid, lineage);
-            indexes.insert(task.uid, i);
-            stack.push((task.outline_level, task.uid));
-            for predecessor in &task.predecessors {
-                if active_uids.contains(&predecessor.uid) {
-                    successors
-                        .entry(predecessor.uid)
-                        .or_default()
-                        .push(task.uid);
-                }
-            }
-        }
-
-        let targets: HashSet<i32> = outline_leaves(&proj, pred_i).into_iter().collect();
-        let mut queue: VecDeque<i32> = outline_leaves(&proj, succ_i).into();
-        let mut visited = HashSet::new();
-        let mut leaves_cache: HashMap<i32, Vec<i32>> = HashMap::new();
-        while let Some(leaf) = queue.pop_front() {
-            if !visited.insert(leaf) {
-                continue;
-            }
-            if targets.contains(&leaf) {
-                return Err(format!(
-                    "Linking task {succ_id} to task {pred_id} would create a circular relationship"
-                ));
-            }
-            for ancestor in &ancestors[&leaf] {
-                if let Some(next_tasks) = successors.get(ancestor) {
-                    for next_uid in next_tasks {
-                        let next_leaves = leaves_cache
-                            .entry(*next_uid)
-                            .or_insert_with(|| outline_leaves(&proj, indexes[next_uid]));
-                        queue.extend(next_leaves.iter().copied());
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     pub fn remove_predecessor(&mut self, uid: i32, pred: i32) -> Result<(), String> {
@@ -1495,15 +1400,151 @@ fn materialized(
     t
 }
 
+/// The prospective outline and dependency graph for one predecessor edit.
+/// Only tasks are copied; `row_as_edited` supplies the row a blank successor
+/// would become when the edit commits.
+struct LinkGraph {
+    tasks: Vec<Task>,
+    succ_i: usize,
+    successors: std::collections::HashMap<i32, Vec<i32>>,
+    ancestors: std::collections::HashMap<i32, Vec<i32>>,
+    indexes: std::collections::HashMap<i32, usize>,
+}
+
+impl LinkGraph {
+    fn new(ed: &Editor, succ_i: usize, proposed: &[Predecessor]) -> Self {
+        use std::collections::HashMap;
+
+        let mut tasks = ed.proj.tasks.clone();
+        if tasks[succ_i].is_null {
+            tasks[succ_i] = ed.row_as_edited(succ_i);
+        }
+        tasks[succ_i].predecessors = proposed.to_vec();
+        let mut successors: HashMap<i32, Vec<i32>> = HashMap::new();
+        let mut ancestors = HashMap::new();
+        let mut indexes = HashMap::new();
+        let mut stack: Vec<(u32, i32)> = Vec::new();
+        for (i, task) in tasks.iter().enumerate() {
+            if task.is_null {
+                continue;
+            }
+            while stack
+                .last()
+                .is_some_and(|(level, _)| *level >= task.outline_level)
+            {
+                stack.pop();
+            }
+            let mut lineage: Vec<i32> = stack.iter().map(|(_, uid)| *uid).collect();
+            lineage.push(task.uid);
+            ancestors.insert(task.uid, lineage);
+            indexes.insert(task.uid, i);
+            stack.push((task.outline_level, task.uid));
+            for predecessor in &task.predecessors {
+                successors
+                    .entry(predecessor.uid)
+                    .or_default()
+                    .push(task.uid);
+            }
+        }
+        Self {
+            tasks,
+            succ_i,
+            successors,
+            ancestors,
+            indexes,
+        }
+    }
+
+    fn check_link(&self, pred_uid: i32) -> Result<(), String> {
+        use std::collections::{HashMap, HashSet, VecDeque};
+
+        let pred_i = self.indexes[&pred_uid]; // caller checked a non-blank predecessor
+        let succ_id = self.tasks[self.succ_i].id;
+        let pred_id = self.tasks[pred_i].id;
+        if (self.succ_i < pred_i && pred_i < link_subtree_end(&self.tasks, self.succ_i))
+            || (pred_i < self.succ_i && self.succ_i < link_subtree_end(&self.tasks, pred_i))
+        {
+            return Err(format!(
+                "Tasks {succ_id} and {pred_id} are a summary and its subtask; they cannot be linked"
+            ));
+        }
+
+        // Summary links connect their leaves. Expand each reachable task once
+        // so a link between large summaries does not enqueue a cross product.
+        let targets: HashSet<i32> = link_leaves(&self.tasks, pred_i).into_iter().collect();
+        let mut visited: HashSet<i32> = HashSet::new();
+        let mut queue = VecDeque::new();
+        for leaf in link_leaves(&self.tasks, self.succ_i) {
+            if visited.insert(leaf) {
+                queue.push_back(leaf);
+            }
+        }
+        let mut expanded_ancestors = HashSet::new();
+        let mut expanded_successors = HashSet::new();
+        let mut leaves_cache: HashMap<i32, Vec<i32>> = HashMap::new();
+        while let Some(leaf) = queue.pop_front() {
+            if targets.contains(&leaf) {
+                return Err(format!(
+                    "Linking task {succ_id} to task {pred_id} would create a circular relationship"
+                ));
+            }
+            for ancestor in &self.ancestors[&leaf] {
+                if !expanded_ancestors.insert(*ancestor) {
+                    continue;
+                }
+                if let Some(next_tasks) = self.successors.get(ancestor) {
+                    for next_uid in next_tasks {
+                        if !expanded_successors.insert(*next_uid) {
+                            continue;
+                        }
+                        let next_leaves = leaves_cache
+                            .entry(*next_uid)
+                            .or_insert_with(|| link_leaves(&self.tasks, self.indexes[next_uid]));
+                        for next_leaf in next_leaves {
+                            if visited.insert(*next_leaf) {
+                                queue.push_back(*next_leaf);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Mirror the outline's positional subtree rule on a proposed task list.
+fn link_subtree_end(tasks: &[Task], i: usize) -> usize {
+    let task = &tasks[i];
+    if task.is_null {
+        return i + 1;
+    }
+    let mut end = i + 1;
+    for (k, row) in tasks.iter().enumerate().skip(i + 1) {
+        if row.is_null {
+            continue;
+        }
+        if row.outline_level <= task.outline_level {
+            break;
+        }
+        end = k + 1;
+    }
+    end
+}
+
 /// Non-blank outline leaves below a row, including the row itself when it
 /// has no children.
-fn outline_leaves(proj: &Project, i: usize) -> Vec<i32> {
-    proj.tasks[i..subtree_end(proj, i)]
-        .iter()
-        .enumerate()
-        .filter_map(|(offset, task)| {
-            (!task.is_null && !proj.is_outline_summary(i + offset)).then_some(task.uid)
+fn link_leaves(tasks: &[Task], i: usize) -> Vec<i32> {
+    let end = link_subtree_end(tasks, i);
+    (i..end)
+        .filter(|&j| {
+            !tasks[j].is_null
+                && tasks[j + 1..]
+                    .iter()
+                    .find(|next| !next.is_null)
+                    .is_none_or(|next| next.outline_level <= tasks[j].outline_level)
         })
+        .map(|j| tasks[j].uid)
         .collect()
 }
 
@@ -3182,7 +3223,7 @@ mod tests {
         assert_eq!(
             ed.add_predecessor(2, 3, LinkType::FinishStart, 0)
                 .unwrap_err(),
-            "No other task with ID 3"
+            "No other task with ID 2"
         );
         let blank = Predecessor::fs(3);
         assert_eq!(
@@ -4506,6 +4547,38 @@ mod tests {
         let err = ed.add_link(20, Predecessor::fs(10)).unwrap_err();
         assert!(err.contains("2") && err.contains("1"), "{err}");
         assert!(!err.contains("10") && !err.contains("20"), "{err}");
+        assert_eq!(
+            ed.add_link(20, Predecessor::fs(20)).unwrap_err(),
+            "No other task with ID 2"
+        );
+
+        let mut proj = outline(&[(10, "A", 1), (20, "B", 1)]).project().clone();
+        proj.tasks[0].id = 1;
+        proj.tasks[1].id = 2;
+        let mut ed = Editor::new(proj);
+        ed.add_link(20, Predecessor::fs(10)).unwrap();
+        assert_eq!(
+            ed.add_link(20, Predecessor::fs(10)).unwrap_err(),
+            "Already depends on 1"
+        );
+    }
+
+    #[test]
+    fn large_summary_link_expands_each_reachable_branch_once() {
+        let mut rows = vec![(1, "P", 1)];
+        for uid in 2..=251 {
+            rows.push((uid, "P leaf", 2));
+        }
+        rows.push((252, "S", 1));
+        for uid in 253..=502 {
+            rows.push((uid, "S leaf", 2));
+        }
+        rows.push((503, "X", 1));
+        let mut ed = outline(&rows);
+        ed.add_link(252, Predecessor::fs(1)).unwrap();
+        rejected_link(&mut ed, 1, 252, "circular relationship");
+        ed.add_link(503, Predecessor::fs(252)).unwrap();
+        rejected_link(&mut ed, 1, 503, "circular relationship");
     }
 
     #[test]
