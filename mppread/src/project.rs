@@ -90,26 +90,17 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             task.stored_start = Some(s);
             task.stored_finish = Some(f);
             task.manual = t.manual;
-            let manual_date = |d: &Option<String>, what: &str| {
+            let date = |d: &Option<String>, what: &str| {
                 d.as_deref()
                     .map(|d| {
-                        parse_mpp_dt(d)
-                            .ok_or_else(|| format!("invalid manual {what} for UID {}", t.uid))
+                        parse_mpp_dt(d).ok_or_else(|| format!("invalid {what} for UID {}", t.uid))
                     })
                     .transpose()
             };
-            task.manual_start = manual_date(&t.manual_start, "start")?;
-            task.manual_finish = manual_date(&t.manual_finish, "finish")?;
+            task.manual_start = date(&t.manual_start, "manual start")?;
+            task.manual_finish = date(&t.manual_finish, "manual finish")?;
             task.manual_duration_min = t.manual_duration_min;
             if let Some(p) = &t.progress {
-                let date = |d: &Option<String>, what: &str| {
-                    d.as_deref()
-                        .map(|d| {
-                            parse_mpp_dt(d)
-                                .ok_or_else(|| format!("invalid {what} for UID {}", t.uid))
-                        })
-                        .transpose()
-                };
                 task.percent_complete = Some(p.percent_complete);
                 task.percent_work_complete = Some(p.percent_work_complete);
                 task.physical_percent_complete = Some(p.physical_percent_complete);
