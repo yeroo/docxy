@@ -476,8 +476,8 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
     let mut p = untitled_project();
     p.tasks = vec![
         Task {
-            uid: 7,
-            id: 3,
+            uid: 6,
+            id: 2,
             name: "Parent".into(),
             outline_level: 1,
             duration_min: 480,
@@ -488,6 +488,14 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
             id: 4,
             name: "Child".into(),
             outline_level: 2,
+            duration_min: 480,
+            ..Task::default()
+        },
+        Task {
+            uid: 7,
+            id: 3,
+            name: "Predecessor".into(),
+            outline_level: 1,
             duration_min: 480,
             ..Task::default()
         },
