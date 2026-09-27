@@ -525,7 +525,7 @@ impl ResourceType {
     }
 }
 
-/// When resource costs accrue, including the schema's explicit Invalid value.
+/// When a resource's costs or a task's fixed cost accrue, including the schema's explicit Invalid value.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AccrueAt {
     Start,
