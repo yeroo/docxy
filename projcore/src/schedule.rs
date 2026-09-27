@@ -266,19 +266,14 @@ impl Timeline {
         self.abs_start(self.to_index(abs))
     }
 
-    /// A working start no later than `abs`. When `abs` is in a nonworking gap,
-    /// use the start of the previous period so a task can occupy that period.
+    /// Latest working start no later than `abs`, including the last minute of
+    /// the previous period when `abs` lies in a nonworking gap.
     fn start_at_or_before(&self, abs: i64) -> i64 {
         let snapped = self.snap(abs);
         if snapped <= abs {
             snapped
         } else {
-            self.segs
-                .iter()
-                .rev()
-                .find(|seg| seg.start <= abs)
-                .map(|seg| seg.start)
-                .unwrap_or(snapped)
+            self.abs_start(self.to_index(abs).saturating_sub(1))
         }
     }
 }
@@ -1036,17 +1031,9 @@ impl<'a> Scheduler<'a> {
                 for &(suid, link, offset) in list {
                     let succ_tl = self.tl(&self.proj.tasks[idx_of[&suid]]);
                     if let (Some(&sls), Some(&slf)) = (ls_abs.get(&suid), lf_abs.get(&suid)) {
-                        let (_, c) = inverse_link_start(tl, succ_tl, link, offset, sls, slf, span);
+                        let (_, c, allowed) =
+                            inverse_link_start(tl, succ_tl, link, offset, sls, slf, span);
                         finish_abs = finish_abs.min(c);
-                        let endpoint = match link {
-                            LinkType::FinishStart | LinkType::StartStart => sls,
-                            LinkType::FinishFinish | LinkType::StartFinish => slf,
-                        };
-                        let allowed = if span == 0 && offset.index_lag() == 0 {
-                            endpoint
-                        } else {
-                            c
-                        };
                         bound_instant = bound_instant.min(allowed);
                     }
                 }
@@ -1190,7 +1177,11 @@ impl<'a> Scheduler<'a> {
                 if let Some(m) = milestone_late {
                     debug_assert_eq!(tl.to_index(m), finish_index);
                 }
-                let f_abs = milestone_late.unwrap_or_else(|| tl.abs_finish(finish_index));
+                let successor_milestone = (span == 0 && tl.to_index(bound_instant) == finish_index)
+                    .then_some(bound_instant);
+                let f_abs = milestone_late
+                    .or(successor_milestone)
+                    .unwrap_or_else(|| tl.abs_finish(finish_index));
                 let s_abs = if span == 0 {
                     f_abs
                 } else {
@@ -1564,14 +1555,6 @@ impl Offset {
         }
     }
 
-    /// The lag left to apply in index space once the instant is shifted.
-    fn index_lag(self) -> i64 {
-        match self {
-            Offset::Working(lag) => lag,
-            Offset::Elapsed(_) => 0,
-        }
-    }
-
     /// [`Self::forward`] mirrored for a successor's late instant: the lag is
     /// still to be subtracted in index space.
     fn backward(self, abs: i64) -> (i64, i64) {
@@ -1593,16 +1576,20 @@ fn inverse_link_start(
     succ_start: i64,
     succ_finish: i64,
     span: i64,
-) -> (i64, i64) {
+) -> (i64, i64, i64) {
     let endpoint = match link {
         LinkType::FinishStart | LinkType::StartStart => succ_start,
         LinkType::FinishFinish | LinkType::StartFinish => succ_finish,
     };
-    let (endpoint, lag) = offset.backward(endpoint);
+    let (working_lag, elapsed_lag) = match offset {
+        Offset::Working(lag) => (lag, 0),
+        Offset::Elapsed(lag) => (0, lag),
+    };
     // The successor's next working start shares an index with the previous
     // evening. Forward scheduling accepts a predecessor endpoint throughout
     // that gap, so the inverse keeps the morning side of the index.
-    let bound = succ_tl.abs_start(succ_tl.to_index(endpoint) - lag);
+    let morning = succ_tl.abs_start(succ_tl.to_index(endpoint) - working_lag);
+    let bound = morning.saturating_sub(elapsed_lag);
     match link {
         LinkType::FinishStart | LinkType::FinishFinish => {
             let finish = pred_tl.abs_finish(pred_tl.to_index(bound));
@@ -1611,7 +1598,12 @@ fn inverse_link_start(
             } else {
                 pred_tl.abs_start(pred_tl.to_index(finish) - span)
             };
-            (start, finish)
+            let allowed = match offset {
+                Offset::Working(0) if span == 0 => endpoint,
+                Offset::Elapsed(_) if span == 0 => bound,
+                _ => finish,
+            };
+            (start, finish, allowed)
         }
         LinkType::StartStart | LinkType::StartFinish => {
             let start = pred_tl.start_at_or_before(bound);
@@ -1620,7 +1612,12 @@ fn inverse_link_start(
             } else {
                 pred_tl.abs_finish(pred_tl.to_index(start) + span)
             };
-            (start, finish)
+            let allowed = match offset {
+                Offset::Working(0) if span == 0 => endpoint,
+                Offset::Elapsed(_) if span == 0 => bound,
+                _ => finish,
+            };
+            (start, finish, allowed)
         }
     }
 }
@@ -3127,6 +3124,43 @@ mod tests {
     }
 
     #[test]
+    fn elapsed_fs_lag_is_subtracted_after_successor_calendar_snap() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        for alap in [false, true] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            if alap {
+                a.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 1440,
+                lag_format: LagFormat::from_code(8).unwrap(),
+            });
+            let proj = Project {
+                calendars: vec![Calendar::standard(1), every_day.clone()],
+                ..march2(vec![a, b, task(3, "Long", 6 * 480)])
+            };
+            let sched = schedule(&proj);
+            let a = sched.get(1).unwrap();
+            assert_eq!((a.late_start, a.late_finish), (at(7, 8), at(7, 17)));
+            if alap {
+                assert_eq!((a.early_start, a.early_finish), (at(7, 8), at(7, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(9, 8));
+                assert_eq!(sched.project_finish, at(9, 17));
+            } else {
+                assert_eq!(a.total_slack_min, 2400);
+            }
+        }
+    }
+
+    #[test]
     fn cross_calendar_ss_alap_starts_before_successor_bound() {
         let mut evenings = Calendar::standard(2);
         for day in &mut evenings.week {
@@ -3153,7 +3187,7 @@ mod tests {
                 sched.get(1).unwrap().early_start,
                 sched.get(1).unwrap().early_finish
             ),
-            (at(11, 18), at(11, 22))
+            (at(11, 21).add_minutes(59), at(12, 21).add_minutes(59))
         );
         assert_eq!(
             (
@@ -3165,6 +3199,71 @@ mod tests {
         assert_eq!(sched.get(1).unwrap().total_slack_min, 0);
         assert_eq!(sched.get(2).unwrap().total_slack_min, 0);
         assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn ss_inverse_uses_last_working_minute_before_gap() {
+        let mut later = Calendar::standard(2);
+        for weekday in 1..=5 {
+            later.week[weekday] = Some(DayWorking {
+                times: vec![
+                    WorkingTime {
+                        from: 9 * 60,
+                        to: 12 * 60,
+                    },
+                    WorkingTime {
+                        from: 13 * 60,
+                        to: 18 * 60,
+                    },
+                ],
+            });
+        }
+        let mut p = task(1, "P", 60);
+        p.calendar_uid = Some(2);
+        p.constraint = ConstraintType::StartNoEarlierThan;
+        p.constraint_date = Some(at(6, 15));
+        let mut s = task(2, "S", 480);
+        s.predecessors
+            .push(Predecessor::working(1, LinkType::StartStart, 0));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), later],
+            ..march2(vec![p, s, task(3, "Long", 6 * 480)])
+        };
+        let sched = schedule(&proj);
+        assert_eq!(
+            sched.get(1).unwrap().late_start,
+            at(6, 17).add_minutes(59),
+            "{}",
+            sched.get(1).unwrap().late_start.to_mspdi()
+        );
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 179);
+        assert_eq!(sched.project_finish, at(9, 17));
+    }
+
+    #[test]
+    fn elapsed_fs_milestone_keeps_shifted_instant() {
+        for alap in [false, true] {
+            let mut milestone = task(1, "M", 0);
+            milestone.deadline = Some(at(9, 8));
+            if alap {
+                milestone.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 900,
+                lag_format: LagFormat::from_code(4).unwrap(),
+            });
+            let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 6 * 480)]));
+            let m = sched.get(1).unwrap();
+            assert_eq!((m.late_start, m.late_finish), (at(8, 17), at(8, 17)));
+            if alap {
+                assert_eq!((m.early_start, m.early_finish), (at(8, 17), at(8, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(9, 8));
+                assert_eq!(sched.project_finish, at(9, 17));
+            }
+        }
     }
 
     #[test]
