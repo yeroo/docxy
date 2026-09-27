@@ -271,7 +271,7 @@ folder browser and live preview), a start screen, a light/dark theme toggle
 | d | set duration (`3d` / `4h` / `2w`) |
 | p | add a predecessor by task ID |
 | c | set a date constraint (`SNET 2026-03-05`, `MSO …`, `none`) |
-| a | assign a resource to the task (created on first use; `Name[25%]` sets units; empty clears) |
+| a | assign a resource to the task (created on first use; `Name[25%]` sets units, `Cement[5 tons]` a material quantity; empty clears) |
 | b | set the baseline (planned-vs-current variance in the header) |
 | L | toggle resource leveling (delay bars to fit resource capacity) |
 | m | switch the task between Manually Scheduled (📌, pinned at its current dates) and Auto Scheduled |

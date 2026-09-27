@@ -18,13 +18,13 @@ mod cells;
 mod effort;
 pub use cells::{
     day_finish, format_duration_exact, format_predecessors, format_resource_names, parse_cell_date,
-    parse_lag, parse_task_predecessors,
+    parse_lag, parse_task_predecessors, split_resource_names,
 };
 // Re-entering a task's cell goes through `parse_task_predecessors`, which
 // keeps links shown in a fallback unit; the plain parser stays internal.
 #[cfg(test)]
 use cells::parse_predecessors;
-use cells::{format_units, parse_resource_token};
+use cells::{bracket_units, parse_resource_token, same_shown_units};
 mod moving;
 mod outline;
 use outline::subtree_end;
@@ -930,8 +930,10 @@ impl Editor {
         let (rid, units) = match resources.iter().find(|r| r.name.eq_ignore_ascii_case(name)) {
             Some(r) => (r.uid, None),
             None => {
-                let (base, units) = parse_resource_token(name)?;
-                (find_or_stage_resource(&mut resources, base.trim())?, units)
+                let (base, inner) = parse_resource_token(name)?;
+                let rid = find_or_stage_resource(&mut resources, base.trim())?;
+                let r = resources.iter().find(|r| r.uid == rid).expect("staged");
+                (rid, bracket_units(inner, r, name)?)
             }
         };
         // A blank row is assigned as the task the edit makes it.
@@ -943,13 +945,12 @@ impl Editor {
             .position(|a| a.task_uid == uid && a.resource_uid == rid)
         {
             // Only different explicit units change an existing assignment.
-            let Some(u) =
-                units.filter(|&u| format_units(u) != format_units(self.proj.assignments[k].units))
-            else {
+            let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
+            let current = self.proj.assignments[k].units;
+            let Some(u) = units.filter(|&u| !same_shown_units(kind, u, current)) else {
                 return Ok(AssignOutcome::AlreadyAssigned);
             };
             let u = checked_units(u, name)?;
-            let kind = resources.iter().find(|r| r.uid == rid).map(|r| r.kind);
             let mut assignments = self.proj.assignments.clone();
             assignments[k].set_units(u, assigned_work(kind, duration, u));
             self.commit_assignments(i, resources, assignments)?;

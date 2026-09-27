@@ -301,14 +301,14 @@ fn material_and_cost_resources_take_no_part_in_effort() {
         vec![assignment(1, 1, 1.0, 2 * DAY)],
     );
     // Only non-work resources added: the work resources are the same.
-    set(&mut ed, &["Bob", "Cement[400%]", "Fee"]);
+    set(&mut ed, &["Bob", "Cement[4]", "Fee"]);
     assert_eq!(duration(&ed), 2 * DAY);
     assert_eq!(
         (alloc(&ed, 1), alloc(&ed, 3), alloc(&ed, 4)),
         ((1.0, 2 * DAY), (4.0, 240), (1.0, 0))
     );
     // Adding Carol shares Bob's work only; Cement and Fee keep theirs.
-    set(&mut ed, &["Bob", "Carol", "Cement[400%]", "Fee"]);
+    set(&mut ed, &["Bob", "Carol", "Cement[4]", "Fee"]);
     assert_eq!((alloc(&ed, 1), alloc(&ed, 2)), ((1.0, DAY), (1.0, DAY)));
     assert_eq!((alloc(&ed, 3), alloc(&ed, 4)), ((4.0, 240), (1.0, 0)));
     assert_eq!(duration(&ed), DAY);

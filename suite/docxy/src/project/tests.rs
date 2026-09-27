@@ -528,6 +528,31 @@ fn rows_resolve_ids_format_links_milestones_and_resources() {
 }
 
 #[test]
+fn a_material_row_shows_its_quantity_and_label() {
+    let mut p = untitled_project();
+    p.tasks = vec![Task {
+        uid: 1,
+        id: 1,
+        name: "Pour".into(),
+        duration_min: 480,
+        ..Task::default()
+    }];
+    p.resources.push(projcore::model::Resource {
+        uid: 1,
+        id: 1,
+        name: "Cement".into(),
+        kind: projcore::model::ResourceType::Material,
+        material_label: Some("tons".into()),
+        ..Default::default()
+    });
+    let mut ed = ProjectEditor::new(p);
+    ed.set_resources(1, &["Cement[5 tons]".into(), "Alice[50%]".into()])
+        .unwrap();
+    let row = project_row(&ed, ed.project().task(1).unwrap());
+    assert_eq!(row[COL_RESOURCES], "Cement[5 tons], Alice[50%]");
+}
+
+#[test]
 fn a_blank_row_shows_only_its_id() {
     let xml = std::fs::read_to_string(corpus("20-task-fields.xml")).unwrap();
     let ed = ProjectEditor::new(mspdi::read_mspdi(&xml).unwrap());

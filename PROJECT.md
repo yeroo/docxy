@@ -289,13 +289,20 @@ displayed task IDs, e.g. `2, 3SS+2h, 4FF-7m`. Resource names are comma-separated
 and unknown names create resources. A new work assignment starts at the
 resource's Max. Units capped at 100%; `Name[NN%]` sets explicit units instead (NN > 0; over-allocation such as `Bob[150%]` is
 allowed). The cell shows `Name[NN%]` for a work assignment that is not at 100%,
-and deleting the bracket resets it to 100%. In the Resource Names cell, a token
-that names, or equals the shown `Name[NN%]` text of, one of the task's
+and deleting the bracket resets it to 100%. A material assignment always shows
+its quantity and the resource's material label, as Project does:
+`Cement[5 tons]` (`Cement[5]` without a label). `Name[<qty>]` or
+`Name[<qty> <label>]` sets the quantity (qty > 0; the label, if typed, must be
+the resource's own, case-insensitively), its work is the quantity in hours, and
+deleting the bracket resets the quantity to 1. A material takes no `NN%`, and a
+work or cost resource no quantity; rate-based material (`5 tons/day`) is not
+supported. In the Resource Names cell, a token
+that names, or equals the shown `Name[...]` text of, one of the task's
 assignments keeps that assignment, with exact spellings before case-insensitive
 ones (a token that fits two resources equally well is ambiguous and rejected);
 otherwise an existing resource whose name matches the whole token wins;
-otherwise a name ending in `[...]` must hold valid `NN%` units. Retained
-assignments whose text is unchanged keep their units/work.
+otherwise a name ending in `[...]` must hold valid units for its resource's
+kind. Retained assignments whose text shows the same units keep their units/work.
 
 Duration, work and units follow the task's Type, as in Project (a task
 without one is Fixed Units, and not effort-driven):
@@ -315,7 +322,15 @@ without one is Fixed Units, and not effort-driven):
   = duration x units. A manual task keeps its start and its finish follows.
 An unchanged edit preserves history and existing constraints. Cycles retain the
 engine's existing best-effort scheduling behavior. Names containing commas cannot
-be entered individually through the resource-list syntax.
+be entered individually through the resource-list syntax, and a token whose new
+name would contain a comma is rejected rather than created. A comma inside a
+`[...]` pair that ends a token (only whitespace, then a comma or the end of the
+text, follows its `]`) does not split, so a material label such as
+`Cement[5 bags, 50 lb]` stays in its token. Brackets pair like parentheses; a
+stray `[` or `]`, or a pair closed mid-name (`Crew [A, Bob] Jr`), protects
+nothing. Brackets that pair across names into a token ending in `]` (a
+resource named `Crew [A` followed by `Bob]`) make one token, which is rejected
+unless it names a resource.
 
 ## Roadmap
 

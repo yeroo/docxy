@@ -1148,19 +1148,20 @@ fn resource_names_show_work_units_that_are_not_100_percent() {
         max_units: 3.0,
         ..Resource::default()
     });
-    ed.set_resources(10, &["Bob".into(), "Cement[50%]".into(), "Pool".into()])
+    ed.set_resources(10, &["Bob".into(), "Cement[0.5]".into(), "Pool".into()])
         .unwrap();
-    // Explicit units apply to any kind; only work resources show them. A
-    // material's work is its quantity: half a unit is 30 minutes (#269).
+    // A material shows its quantity, even at 1 (#168). Its work is the
+    // quantity: half a unit is 30 minutes (#269).
     assert_eq!(allocation(&ed, 10, 2), (0.5, 30));
     assert_eq!(
         format_resource_names(&ed.proj, 10),
-        "Bob[50%], Cement, Pool"
+        "Bob[50%], Cement[0.5], Pool"
     );
+    ed.proj.assignments[1].units = 1.0 + 1e-12;
     ed.proj.assignments[2].units = 1.0 + 1e-12;
     assert_eq!(
         format_resource_names(&ed.proj, 10),
-        "Bob[50%], Cement, Pool"
+        "Bob[50%], Cement[1], Pool"
     );
     assert_eq!(format_resource_names(&ed.proj, 20), "");
 }
@@ -1196,7 +1197,7 @@ fn bracketed_units_round_trip_through_the_resource_names_text() {
     ed.undo();
     assert_eq!(ed.project(), &before);
     ed.redo();
-    // Deleting a work bracket means 100%; a non-work bare name keeps its units.
+    // Deleting a bracket means 100% for work and a quantity of 1 for a material.
     ed.proj.resources.push(Resource {
         uid: 9,
         id: 9,
@@ -1205,12 +1206,12 @@ fn bracketed_units_round_trip_through_the_resource_names_text() {
         max_units: 1.0,
         ..Resource::default()
     });
-    ed.set_resources(10, &["Bob[50%]".into(), "Cement[40%]".into()])
+    ed.set_resources(10, &["Bob[50%]".into(), "Cement[0.4]".into()])
         .unwrap();
     ed.set_resources(10, &["Bob".into(), "Cement".into()])
         .unwrap();
     assert_eq!(allocation(&ed, 10, 1), (1.0, 960));
-    assert_eq!(allocation(&ed, 10, 9), (0.4, 24));
+    assert_eq!(allocation(&ed, 10, 9), (1.0, 60));
     // An imported 0% assignment shows `[0%]` and survives an unchanged commit.
     ed.proj.assignments[0].units = 0.0;
     let before = ed.project().clone();
@@ -1309,6 +1310,430 @@ fn partial_units_survive_mspdi() {
     let a = back.assignments.iter().find(|a| a.task_uid == 10).unwrap();
     assert_eq!((a.units, a.work_min), (0.5, 480));
     assert_eq!(format_resource_names(&back, 10), "Bob[50%]");
+}
+
+/// Bob (work, 100%) plus Cement, a material resource with `label`.
+fn with_cement(label: Option<&str>) -> Editor {
+    let mut ed = with_bob(ResourceType::Work, 1.0);
+    ed.proj.resources.push(Resource {
+        uid: 2,
+        id: 2,
+        name: "Cement".into(),
+        kind: ResourceType::Material,
+        max_units: 1.0,
+        material_label: label.map(Into::into),
+        ..Resource::default()
+    });
+    Editor::new(ed.proj)
+}
+
+#[test]
+fn material_assignments_show_their_quantity_and_label() {
+    for (label, units, text) in [
+        (Some("tons"), 5.0, "Cement[5 tons]"),
+        (Some("tons"), 2.5, "Cement[2.5 tons]"),
+        (Some("tons"), 1. / 3., "Cement[0.33 tons]"),
+        // A quantity of 1 is a count, not a default allocation: still shown.
+        (Some("tons"), 1.0, "Cement[1 tons]"),
+        (Some("tons"), 0.0, "Cement[0 tons]"),
+        (Some(" cubic yards "), 5.0, "Cement[5 cubic yards]"),
+        (Some("   "), 5.0, "Cement[5]"),
+        (Some(""), 5.0, "Cement[5]"),
+        (None, 5.0, "Cement[5]"),
+        (Some("tons"), f64::NAN, "Cement"),
+    ] {
+        let mut ed = with_cement(label);
+        ed.proj.assignments.push(imported(1, 10, 2, units, 0));
+        assert_eq!(
+            format_resource_names(&ed.proj, 10),
+            text,
+            "{label:?} {units}"
+        );
+    }
+    // A cost resource shows its bare name.
+    let mut ed = with_bob(ResourceType::Cost, 1.0);
+    ed.proj.assignments.push(imported(1, 10, 1, 5.0, 0));
+    assert_eq!(format_resource_names(&ed.proj, 10), "Bob");
+}
+
+#[test]
+fn material_quantities_round_trip_through_the_resource_names_text() {
+    let mut ed = with_cement(Some("tons"));
+    ed.set_resources(10, &["Cement[5 tons]".into(), "Bob[50%]".into()])
+        .unwrap();
+    assert_eq!(ed.undo_depth(), 1);
+    // A material's work is its quantity in hours (#269).
+    assert_eq!(allocation(&ed, 10, 2), (5.0, 300));
+    assert_eq!(allocation(&ed, 10, 1), (0.5, 480));
+    assert_eq!(
+        format_resource_names(&ed.proj, 10),
+        "Cement[5 tons], Bob[50%]"
+    );
+    // Committing the shown text is a no-op.
+    ed.mark_saved();
+    let before = ed.project().clone();
+    commit_shown_text(&mut ed).unwrap();
+    unchanged(&ed, &before, (1, 0, false));
+    // A different quantity, with or without the label: one undo step.
+    ed.set_resources(10, &["Cement[2.5]".into(), "Bob[50%]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (2.5, 150));
+    assert_eq!(ed.undo_depth(), 2);
+    ed.undo();
+    assert_eq!(ed.project(), &before);
+    ed.redo();
+    assert_eq!(allocation(&ed, 10, 2), (2.5, 150));
+    // The label matches case-insensitively, around any spacing.
+    ed.set_resources(10, &[" cement [ 4   TONS ] ".into(), "Bob[50%]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (4.0, 240));
+    // A quantity the cell rounds survives spellings that read the same,
+    // not only the shown text itself.
+    let k = ed
+        .proj
+        .assignments
+        .iter()
+        .position(|a| a.resource_uid == 2)
+        .unwrap();
+    ed.proj.assignments[k].units = 1. / 3.;
+    ed.proj.assignments[k].work_min = 20;
+    ed.mark_saved();
+    let before = ed.project().clone();
+    let depth = ed.undo_depth();
+    assert_eq!(
+        format_resource_names(&ed.proj, 10),
+        "Cement[0.33 tons], Bob[50%]"
+    );
+    for token in ["Cement[0.33 tons]", "Cement[0.33]", "cement[0.330 TONS]"] {
+        ed.set_resources(10, &[token.into(), "Bob[50%]".into()])
+            .unwrap();
+        unchanged(&ed, &before, (depth, 0, false));
+    }
+    // Deleting the bracket means a quantity of 1...
+    ed.set_resources(10, &["Cement".into(), "Bob[50%]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (1.0, 60));
+    assert_eq!(ed.undo_depth(), depth + 1);
+    // ...which a bare name then leaves alone, even off by float noise.
+    ed.proj.assignments[k].units = 1.0 + 1e-12;
+    ed.mark_saved();
+    let before = ed.project().clone();
+    ed.set_resources(10, &["Cement".into(), "Bob[50%]".into()])
+        .unwrap();
+    unchanged(&ed, &before, (depth + 1, 0, false));
+    // A new material assignment takes its quantity from the bracket.
+    ed.set_resources(20, &["Cement[7]".into()]).unwrap();
+    assert_eq!(allocation(&ed, 20, 2), (7.0, 420));
+    // Without a label, only the bare quantity reads.
+    let mut ed = with_cement(None);
+    ed.set_resources(10, &["Cement[3]".into()]).unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (3.0, 180));
+    assert_eq!(format_resource_names(&ed.proj, 10), "Cement[3]");
+    assert_eq!(
+        ed.set_resources(10, &["Cement[3 tons]".into()]),
+        Err("Invalid units in 'Cement[3 tons]'".into())
+    );
+}
+
+#[test]
+fn malformed_material_quantities_are_rejected_atomically() {
+    let mut ed = with_cement(Some("tons"));
+    ed.set_resources(10, &["Cement[5 tons]".into()]).unwrap();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    for token in [
+        "Cement[0]",
+        "Cement[-1]",
+        "Cement[abc]",
+        "Cement[5 kg]",
+        "Cement[5 ton]",
+        "Cement[5tons]",
+        "Cement[NaN]",
+        "Cement[inf]",
+        "Cement[]",
+        "Cement[50%]",
+        "Cement[5 tons/day]",
+    ] {
+        let err = format!("Invalid units in '{token}'");
+        assert_eq!(
+            ed.set_resources(10, &["Bob".into(), token.into()]),
+            Err(err.clone())
+        );
+        assert_eq!(ed.set_resources(20, &[token.into()]), Err(err.clone()));
+        assert_eq!(ed.assign_resource(10, token), Err(err.clone()));
+        assert_eq!(ed.assign_resource(20, token), Err(err));
+        unchanged(&ed, &before, (1, 0, false));
+    }
+    // An unknown name would be a new work resource, which takes no quantity,
+    // and nothing is created.
+    let err = "Invalid units in 'Gravel[5 tons]'".to_string();
+    assert_eq!(
+        ed.set_resources(20, &["Gravel[5 tons]".into()]),
+        Err(err.clone())
+    );
+    assert_eq!(ed.assign_resource(20, "Gravel[5 tons]"), Err(err));
+    unchanged(&ed, &before, (1, 0, false));
+    assert!(ed.proj.resources.iter().all(|r| r.name != "Gravel"));
+    // Work and cost resources keep the percent grammar.
+    ed.proj.resources.push(Resource {
+        uid: 3,
+        id: 3,
+        name: "Airfare".into(),
+        kind: ResourceType::Cost,
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    for token in ["Bob[5 tons]", "Bob[5]", "Airfare[5]", "Airfare[5 tons]"] {
+        let err = format!("Invalid units in '{token}'");
+        assert_eq!(ed.set_resources(20, &[token.into()]), Err(err.clone()));
+        assert_eq!(ed.assign_resource(20, token), Err(err));
+    }
+    ed.set_resources(20, &["Bob[50%]".into(), "Airfare[50%]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 20, 1), (0.5, 240));
+    assert_eq!(allocation(&ed, 20, 3), (0.5, 0));
+}
+
+#[test]
+fn a_literal_bracketed_resource_wins_over_a_material_quantity() {
+    let mut ed = with_cement(Some("tons"));
+    ed.proj.resources.push(Resource {
+        uid: 3,
+        id: 3,
+        name: "Cement[5 tons]".into(),
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    let mut ed = Editor::new(ed.proj);
+    ed.set_resources(20, &["cement[5 TONS]".into()]).unwrap();
+    assert_eq!(allocation(&ed, 20, 3), (1.0, 480));
+    // On a task whose Cement shows that text, the assignment keeps it.
+    ed.set_resources(10, &["Cement[5]".into()]).unwrap();
+    ed.mark_saved();
+    let before = ed.project().clone();
+    ed.set_resources(10, &["Cement[5 tons]".into()]).unwrap();
+    unchanged(&ed, &before, (2, 0, false));
+    assert_eq!(
+        ed.proj
+            .assignments
+            .iter()
+            .filter(|a| a.task_uid == 10)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn assign_prompt_takes_material_quantities() {
+    let mut ed = with_cement(Some("tons"));
+    assert_eq!(
+        ed.assign_resource(10, "Cement[5 tons]").unwrap(),
+        AssignOutcome::Assigned
+    );
+    assert_eq!(allocation(&ed, 10, 2), (5.0, 300));
+    ed.mark_saved();
+    let before = ed.project().clone();
+    // The same quantity as the cell shows it, or a bare name, changes nothing.
+    for same in [
+        "cement[5]",
+        " CEMENT [5 TONS] ",
+        "Cement",
+        "Cement[5.001 tons]",
+    ] {
+        assert_eq!(
+            ed.assign_resource(10, same).unwrap(),
+            AssignOutcome::AlreadyAssigned,
+            "{same}"
+        );
+        unchanged(&ed, &before, (1, 0, false));
+    }
+    assert_eq!(
+        ed.assign_resource(10, "Cement[6]").unwrap(),
+        AssignOutcome::Assigned
+    );
+    assert_eq!(allocation(&ed, 10, 2), (6.0, 360));
+    assert_eq!(ed.undo_depth(), 2);
+    ed.undo();
+    assert_eq!(ed.project(), &before);
+}
+
+#[test]
+fn resource_names_split_at_commas_outside_brackets() {
+    for (text, tokens) in [
+        ("Bob[50%], Alice", &["Bob[50%]", " Alice"][..]),
+        (
+            "Cement[5 bags, 50 lb], Alice",
+            &["Cement[5 bags, 50 lb]", " Alice"],
+        ),
+        ("a,,b", &["a", "", "b"]),
+        ("", &[""]),
+        // A stray bracket protects nothing, and leaves other names' pairs whole.
+        ("Crew [A, Bob", &["Crew [A", " Bob"]),
+        ("Rig], Bob[50%]", &["Rig]", " Bob[50%]"]),
+        (
+            "Rig], Cement[5 bags, 50 lb]",
+            &["Rig]", " Cement[5 bags, 50 lb]"],
+        ),
+        (
+            "Crew [A, Cement[5 bags, 50 lb]",
+            &["Crew [A", " Cement[5 bags, 50 lb]"],
+        ),
+        (
+            "Cement[5 bags, 50 lb], Bob[50%",
+            &["Cement[5 bags, 50 lb]", " Bob[50%"],
+        ),
+        ("X[a[b], c], Bob", &["X[a[b], c]", " Bob"]),
+        (
+            "Cement[5 bags, 50 lb] , Bob",
+            &["Cement[5 bags, 50 lb] ", " Bob"],
+        ),
+        // A pair closed mid-name protects nothing.
+        ("Crew [A, Bob] Jr", &["Crew [A", " Bob] Jr"]),
+        ("Crew [A, Rig][50%]", &["Crew [A", " Rig][50%]"]),
+        // A pair that ends a token holds its comma, even across names: one token.
+        ("Crew [A, Bob]", &["Crew [A, Bob]"]),
+    ] {
+        assert_eq!(split_resource_names(text), tokens, "{text}");
+    }
+}
+
+#[test]
+fn a_material_label_with_a_comma_survives_the_cell() {
+    let mut ed = with_cement(Some("bags, 50 lb"));
+    ed.set_resources(10, &["Cement[5 bags, 50 lb]".into()])
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (5.0, 300));
+    let text = format_resource_names(&ed.proj, 10);
+    assert_eq!(text, "Cement[5 bags, 50 lb]");
+    ed.mark_saved();
+    let before = ed.project().clone();
+    commit_shown_text(&mut ed).unwrap();
+    unchanged(&ed, &before, (1, 0, false));
+    let count = ed.proj.resources.len();
+    ed.set_resources(10, &split_resource_names(&format!("{text}, Bob")))
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (5.0, 300));
+    assert_eq!(allocation(&ed, 10, 1), (1.0, 960));
+    assert_eq!(ed.proj.resources.len(), count);
+    ed.set_resources(10, &split_resource_names("Cement[7 bags, 50 LB], Bob"))
+        .unwrap();
+    assert_eq!(allocation(&ed, 10, 2), (7.0, 420));
+    assert_eq!(ed.proj.resources.len(), count);
+    // A stray bracket in another name does not split the label.
+    for stray in ["Rig]", "Crew [A"] {
+        let mut ed = with_cement(Some("bags, 50 lb"));
+        ed.proj.resources.push(Resource {
+            uid: 3,
+            id: 3,
+            name: stray.into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        let mut ed = Editor::new(ed.proj);
+        ed.set_resources(10, &[stray.into(), "Cement[5 bags, 50 lb]".into()])
+            .unwrap();
+        assert_eq!(
+            format_resource_names(&ed.proj, 10),
+            format!("{stray}, Cement[5 bags, 50 lb]")
+        );
+        ed.mark_saved();
+        let before = ed.project().clone();
+        commit_shown_text(&mut ed).unwrap();
+        unchanged(&ed, &before, (1, 0, false));
+    }
+    // Brackets pairing across names into a token that ends in `]` make one
+    // token, which is rejected whole rather than read as other names.
+    let mut ed = with_cement(Some("bags, 50 lb"));
+    ed.proj.resources.push(Resource {
+        uid: 3,
+        id: 3,
+        name: "Crew [A".into(),
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    let mut ed = Editor::new(ed.proj);
+    let before = ed.project().clone();
+    assert_eq!(
+        ed.set_resources(10, &split_resource_names("Crew [A, Bob]")),
+        Err("Invalid units in 'Crew [A, Bob]'".into())
+    );
+    unchanged(&ed, &before, (0, 0, false));
+}
+
+#[test]
+fn a_bracket_pair_closed_mid_name_does_not_join_names() {
+    let mut ed = with_bob(ResourceType::Work, 1.0);
+    for (uid, name, max_units) in [(2, "Crew [A", 1.0), (3, "Bob] Jr", 1.0), (4, "Rig]", 0.5)] {
+        ed.proj.resources.push(Resource {
+            uid,
+            id: uid,
+            name: name.into(),
+            max_units,
+            ..Resource::default()
+        });
+    }
+    let base = ed.proj.clone();
+    for (other, name, units, shown) in [
+        (3, "Bob] Jr", 1.0, "Crew [A, Bob] Jr"),
+        (4, "Rig]", 0.5, "Crew [A, Rig][50%]"),
+    ] {
+        let mut ed = Editor::new(base.clone());
+        ed.set_resources(10, &["Crew [A".into(), name.into()])
+            .unwrap();
+        let text = format_resource_names(&ed.proj, 10);
+        assert_eq!(text, shown);
+        let count = ed.proj.resources.len();
+        ed.set_resources(10, &split_resource_names(&format!("{text}, Alice")))
+            .unwrap();
+        assert_eq!(allocation(&ed, 10, 2), (1.0, 960), "{shown}");
+        assert_eq!(
+            allocation(&ed, 10, other),
+            (units, work_for(960, units)),
+            "{shown}"
+        );
+        assert_eq!(ed.proj.resources.len(), count + 1, "{shown}");
+        assert_eq!(
+            format_resource_names(&ed.proj, 10),
+            format!("{shown}, Alice")
+        );
+    }
+    // A joined token that would still create a resource is refused whole.
+    let mut ed = Editor::new(base.clone());
+    for token in ["Crew [A, Nobody", "Crew [A, Nobody[50%]"] {
+        let name = token.strip_suffix("[50%]").unwrap_or(token);
+        assert_eq!(
+            ed.set_resources(10, &["Bob".into(), token.into()]),
+            Err(format!("Resource name '{name}' cannot contain a comma"))
+        );
+        unchanged(&ed, &base, (0, 0, false));
+    }
+    // An existing resource whose name has a comma is still found, bare or
+    // with units.
+    let mut p = base.clone();
+    p.resources.push(Resource {
+        uid: 5,
+        id: 5,
+        name: "Smith, J".into(),
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    ed = Editor::new(p);
+    ed.set_resources(10, &["smith, j".into()]).unwrap();
+    assert_eq!(allocation(&ed, 10, 5), (1.0, 960));
+    ed.set_resources(10, &["smith, j[50%]".into()]).unwrap();
+    assert_eq!(allocation(&ed, 10, 5).0, 0.5);
+}
+
+#[test]
+fn material_quantities_survive_mspdi() {
+    let mut ed = with_cement(Some("tons"));
+    ed.set_resources(10, &["Cement[5 tons]".into()]).unwrap();
+    let xml = crate::mspdi::write_mspdi(ed.project());
+    assert!(xml.contains("<Units>5</Units>"), "{xml}");
+    let back = crate::mspdi::read_mspdi(&xml).unwrap();
+    let a = back.assignments.iter().find(|a| a.task_uid == 10).unwrap();
+    assert_eq!((a.units, a.work_min), (5.0, 300));
+    assert_eq!(format_resource_names(&back, 10), "Cement[5 tons]");
 }
 
 #[test]
@@ -1410,9 +1835,8 @@ fn on_task_10(resources: &[(i32, &str)], assigned: &[(i32, f64)]) -> Editor {
 
 fn commit_shown_text(ed: &mut Editor) -> Result<(), String> {
     let text = format_resource_names(&ed.proj, 10);
-    // The suite splits on commas without trimming, as here.
-    let tokens: Vec<String> = text.split(',').map(str::to_owned).collect();
-    ed.set_resources(10, &tokens)
+    // The suite splits the cell as here, without trimming.
+    ed.set_resources(10, &split_resource_names(&text))
 }
 
 #[test]

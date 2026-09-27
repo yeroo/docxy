@@ -262,9 +262,7 @@ fn apply_cell(
             let predecessors = parse_task_predecessors(buf, task, ed.project())?;
             ed.set_predecessors(uid, predecessors)?;
         }
-        COL_RESOURCES => {
-            ed.set_resources(uid, &buf.split(',').map(str::to_owned).collect::<Vec<_>>())?
-        }
+        COL_RESOURCES => ed.set_resources(uid, &projcore::editor::split_resource_names(buf))?,
         _ => return Err("ID is read-only".into()),
     }
     Ok(None)
