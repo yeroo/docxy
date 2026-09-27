@@ -38,9 +38,10 @@
 //! complete task stays on its ActualStart..ActualFinish and is never critical.
 //! An in-progress task keeps its completed part and schedules its remaining
 //! duration (Duration less ActualDuration, so a Duration edit moves its
-//! finish) from its Resume, so a stopped and resumed task is split. A link
-//! that a complete task's start, or an in-progress task's resume, precedes
-//! shows as negative total slack, as for a manual task. Project's `Split
+//! finish) from its Resume, so a stopped and resumed task is split. A start
+//! link (FS/SS) that a complete task's start, or an in-progress task's
+//! resume, precedes, or a finish link (FF/SF) that its finish precedes, shows
+//! as negative total slack. Project's `Split
 //! in-progress tasks` option, which would let a late predecessor move the
 //! remaining work, is not modeled: the remaining work never moves. Resource
 //! leveling is separate from CPM. Free slack is computed precisely for
@@ -6901,6 +6902,12 @@ mod tests {
         let mut ok = t;
         ok.predecessors.push(link(1, LinkType::FinishFinish));
         let s = schedule(&march2(vec![task(1, "P", 1440), ok]));
+        assert_eq!(s.get(2).unwrap().total_slack_min, 0);
+        // So does one met by an actual span longer than the duration: a
+        // finish link never derives a start from the duration.
+        let mut long = complete(2, "A", 480, at(2, 8), at(6, 17));
+        long.predecessors.push(link(1, LinkType::FinishFinish));
+        let s = schedule(&march2(vec![task(1, "P", 2400), long]));
         assert_eq!(s.get(2).unwrap().total_slack_min, 0);
     }
 
