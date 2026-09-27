@@ -5,6 +5,63 @@ fn day(y: i64, m: u32, d: u32) -> DateTime {
     DateTime::from_ymd_hm(y, m, d, 8, 0)
 }
 
+#[test]
+fn timeline_shading_merges_off_days_and_respects_exceptions_and_density() {
+    use projcore::{Calendar, CalendarException, DayWorking};
+    let span = TimelineSpan::new(day(2026, 3, 2), day(2026, 3, 15));
+    let mut cal = Calendar::standard(1);
+    let wed = day(2026, 3, 4);
+    let sat = day(2026, 3, 7);
+    cal.exceptions.push(CalendarException::date_range(
+        wed,
+        wed,
+        DayWorking::default(),
+    ));
+    cal.exceptions.push(CalendarException::date_range(
+        sat,
+        sat,
+        cal.week[1].clone().unwrap(),
+    ));
+    let mut p = untitled_project();
+    p.calendars = vec![cal];
+    let runs = timeline_shading(span, &p.project_calendar(), 280.);
+    assert_eq!(runs, [(40., 20.), (120., 20.), (240., 40.)]);
+    assert!(timeline_shading(span, &p.project_calendar(), 20.).is_empty());
+    assert!(
+        runs.iter()
+            .all(|(left, width)| *left >= 0. && *left + *width <= 280.)
+    );
+}
+
+#[test]
+fn timeline_state_exposes_current_holiday_shading() {
+    use ctlcore::json::Json;
+    use projcore::{Calendar, CalendarException, DayWorking};
+    let mut p = untitled_project();
+    p.start_date = Some(day(2026, 3, 2));
+    p.tasks = vec![Task {
+        uid: 1,
+        id: 1,
+        duration_min: 5 * 480,
+        ..Task::default()
+    }];
+    let wed = day(2026, 3, 4);
+    let mut cal = Calendar::standard(p.default_calendar_uid);
+    cal.exceptions.push(CalendarException::date_range(
+        wed,
+        wed,
+        DayWorking::default(),
+    ));
+    p.calendars = vec![cal];
+    let mut v = ProjectView::new(p, false);
+    v.width = 800.;
+    let state = timeline_state(&v);
+    let shaded = state.iter().find(|(key, _)| key == "nonworking").unwrap();
+    assert!(
+        matches!(&shaded.1, Json::Arr(runs) if runs.contains(&Json::Arr(vec![Json::Str("Wed 3/4/26".into()), Json::Str("Wed 3/4/26".into())])))
+    );
+}
+
 fn corpus_editor(name: &str) -> ProjectEditor {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../corpus/mspdi")
