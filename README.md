@@ -264,6 +264,7 @@ folder browser and live preview), a start screen, a light/dark theme toggle
 | ↑ ↓ · j / k · g / G | move the selection (top / bottom) |
 | ← → · h / l | scroll the Gantt timeline |
 | n · Insert | add a task below |
+| N | insert a blank row above (typing into it makes a task) |
 | x · Delete | delete the task (a summary asks first, then takes its subtasks) |
 | Tab · Shift-Tab | indent / outdent (auto-forms summary tasks) |
 | Enter · F2 | rename the task |
