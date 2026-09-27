@@ -1560,9 +1560,24 @@ fn resource_names_split_at_commas_outside_brackets() {
         ),
         ("a,,b", &["a", "", "b"]),
         ("", &[""]),
-        // Unbalanced brackets split at every comma.
+        // A stray bracket protects nothing, and leaves other names' pairs whole.
         ("Crew [A, Bob", &["Crew [A", " Bob"]),
         ("Rig], Bob[50%]", &["Rig]", " Bob[50%]"]),
+        (
+            "Rig], Cement[5 bags, 50 lb]",
+            &["Rig]", " Cement[5 bags, 50 lb]"],
+        ),
+        (
+            "Crew [A, Cement[5 bags, 50 lb]",
+            &["Crew [A", " Cement[5 bags, 50 lb]"],
+        ),
+        (
+            "Cement[5 bags, 50 lb], Bob[50%",
+            &["Cement[5 bags, 50 lb]", " Bob[50%"],
+        ),
+        ("X[a[b], c], Bob", &["X[a[b], c]", " Bob"]),
+        // Brackets that pair across a comma hold it: one token.
+        ("Crew [A, Bob]", &["Crew [A, Bob]"]),
     ] {
         assert_eq!(split_resource_names(text), tokens, "{text}");
     }
@@ -1590,6 +1605,45 @@ fn a_material_label_with_a_comma_survives_the_cell() {
         .unwrap();
     assert_eq!(allocation(&ed, 10, 2), (7.0, 420));
     assert_eq!(ed.proj.resources.len(), count);
+    // A stray bracket in another name does not split the label.
+    for stray in ["Rig]", "Crew [A"] {
+        let mut ed = with_cement(Some("bags, 50 lb"));
+        ed.proj.resources.push(Resource {
+            uid: 3,
+            id: 3,
+            name: stray.into(),
+            max_units: 1.0,
+            ..Resource::default()
+        });
+        let mut ed = Editor::new(ed.proj);
+        ed.set_resources(10, &[stray.into(), "Cement[5 bags, 50 lb]".into()])
+            .unwrap();
+        assert_eq!(
+            format_resource_names(&ed.proj, 10),
+            format!("{stray}, Cement[5 bags, 50 lb]")
+        );
+        ed.mark_saved();
+        let before = ed.project().clone();
+        commit_shown_text(&mut ed).unwrap();
+        unchanged(&ed, &before, (1, 0, false));
+    }
+    // Brackets pairing across a comma make one token, which is rejected
+    // whole rather than read as other names.
+    let mut ed = with_cement(Some("bags, 50 lb"));
+    ed.proj.resources.push(Resource {
+        uid: 3,
+        id: 3,
+        name: "Crew [A".into(),
+        max_units: 1.0,
+        ..Resource::default()
+    });
+    let mut ed = Editor::new(ed.proj);
+    let before = ed.project().clone();
+    assert_eq!(
+        ed.set_resources(10, &split_resource_names("Crew [A, Bob]")),
+        Err("Invalid units in 'Crew [A, Bob]'".into())
+    );
+    unchanged(&ed, &before, (0, 0, false));
 }
 
 #[test]

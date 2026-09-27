@@ -551,29 +551,32 @@ pub fn format_resource_names(proj: &Project, task_uid: i32) -> String {
         .join(", ")
 }
 
-/// Split Resource Names cell text into its tokens, untrimmed, at the commas
-/// outside brackets, so a material label with a comma (`Cement[5 bags, 50 lb]`)
-/// stays in its token. Text whose brackets do not balance splits at every
-/// comma, as a stray `[` must not join the names after it.
+/// Split Resource Names cell text into its tokens, untrimmed, at every comma
+/// that is not inside a matched `[...]` pair, so a material label with a comma
+/// (`Cement[5 bags, 50 lb]`) stays in its token. Brackets pair like parentheses
+/// (each `]` closes the nearest open `[`); a `]` with no `[` and a `[` never
+/// closed protect nothing, so a stray bracket in one name leaves the others
+/// split as usual. Text that pairs across a comma, such as a resource named
+/// `Crew [A` followed by `Bob]`, stays one token.
 pub fn split_resource_names(text: &str) -> Vec<String> {
-    let mut tokens = vec![String::new()];
-    let mut depth = 0usize;
-    for c in text.chars() {
+    let mut open = Vec::new();
+    let mut pairs = Vec::new();
+    for (i, c) in text.char_indices() {
         match c {
-            '[' => depth += 1,
-            ']' if depth == 0 => return text.split(',').map(str::to_owned).collect(),
-            ']' => depth -= 1,
-            ',' if depth == 0 => {
-                tokens.push(String::new());
-                continue;
-            }
+            '[' => open.push(i),
+            ']' => pairs.extend(open.pop().map(|start| start..i)),
             _ => {}
         }
-        tokens.last_mut().expect("one token").push(c);
     }
-    if depth > 0 {
-        return text.split(',').map(str::to_owned).collect();
+    let mut tokens = Vec::new();
+    let mut from = 0;
+    for (i, _) in text.match_indices(',') {
+        if !pairs.iter().any(|pair| pair.contains(&i)) {
+            tokens.push(text[from..i].to_owned());
+            from = i + 1;
+        }
     }
+    tokens.push(text[from..].to_owned());
     tokens
 }
 
