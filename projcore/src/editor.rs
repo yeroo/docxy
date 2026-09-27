@@ -744,21 +744,21 @@ impl Editor {
         let duration_changed = patch.duration_min.is_some_and(|min| min != current);
         // A blank row always becomes a task: a mode is an edit of it too.
         let mode_changed = patch.manual.is_some_and(|m| m != t.manual || t.is_null);
-        if t.is_external_leaf() && (duration_changed || mode_changed) {
-            return Err(EXTERNAL_TASK_DATES.into());
-        }
-        if t.is_external_leaf() {
-            // Re-entering unchanged schedule cells is a no-op even if their
-            // imported milestone or estimated flags are inconsistent.
-            patch.duration_min = None;
-            patch.estimated = None;
-            patch.manual = None;
-        }
         // A summary's `?` rolls up from its subtasks; it takes no estimate.
         let estimate_changed = !t.summary
             && patch
                 .estimated
                 .is_some_and(|e| estimate_after(t.estimated, e) != t.estimated);
+        if t.is_external_leaf() && (duration_changed || mode_changed || estimate_changed) {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
+        if t.is_external_leaf() {
+            // Re-entering unchanged schedule cells is a no-op even if an
+            // imported milestone flag is inconsistent.
+            patch.duration_min = None;
+            patch.estimated = None;
+            patch.manual = None;
+        }
         if patch.name.as_ref().is_none_or(|name| *name == t.name)
             && patch
                 .duration_min
@@ -1895,35 +1895,42 @@ mod tests {
     #[test]
     fn unchanged_external_mode_and_duration_are_noops() {
         for manual in [false, true] {
-            let mut proj = editor().project().clone();
-            proj.tasks[0].external_task = Some(true);
-            proj.tasks[0].manual = manual;
-            proj.tasks[0].milestone = true;
-            proj.tasks[0].estimated = Some(true);
-            let mut ed = Editor::new(proj);
-            let before = ed.project().task(1).unwrap().clone();
-            let depth = ed.undo_depth();
-            ed.set_manual(1, manual).unwrap();
-            ed.set_duration_min(1, 480, false).unwrap();
-            ed.set_duration(1, "1d").unwrap();
-            assert_eq!(ed.undo_depth(), depth);
-            assert_eq!(ed.project().task(1).unwrap(), &before);
-            ed.update_task(
-                1,
-                TaskPatch {
-                    name: Some("Renamed".into()),
-                    manual: Some(manual),
-                    ..TaskPatch::default()
-                },
-            )
-            .unwrap();
-            assert_eq!(ed.project().task(1).unwrap().name, "Renamed");
-            assert_eq!(ed.project().task(1).unwrap().duration_min, 480);
-            assert_eq!(ed.set_manual(1, !manual).unwrap_err(), EXTERNAL_TASK_DATES);
-            assert_eq!(
-                ed.set_duration_min(1, 960, false).unwrap_err(),
-                EXTERNAL_TASK_DATES
-            );
+            for estimated in [false, true] {
+                let mut proj = editor().project().clone();
+                proj.tasks[0].external_task = Some(true);
+                proj.tasks[0].manual = manual;
+                proj.tasks[0].milestone = true;
+                proj.tasks[0].estimated = Some(estimated);
+                let mut ed = Editor::new(proj);
+                let before = ed.project().task(1).unwrap().clone();
+                let depth = ed.undo_depth();
+                ed.set_manual(1, manual).unwrap();
+                ed.set_duration_min(1, 480, estimated).unwrap();
+                ed.set_duration(1, if estimated { "1d?" } else { "1d" })
+                    .unwrap();
+                assert_eq!(ed.undo_depth(), depth);
+                assert_eq!(ed.project().task(1).unwrap(), &before);
+                ed.update_task(
+                    1,
+                    TaskPatch {
+                        name: Some("Renamed".into()),
+                        manual: Some(manual),
+                        ..TaskPatch::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(ed.project().task(1).unwrap().name, "Renamed");
+                assert_eq!(ed.project().task(1).unwrap().duration_min, 480);
+                assert_eq!(ed.set_manual(1, !manual).unwrap_err(), EXTERNAL_TASK_DATES);
+                assert_eq!(
+                    ed.set_duration_min(1, 480, !estimated).unwrap_err(),
+                    EXTERNAL_TASK_DATES
+                );
+                assert_eq!(
+                    ed.set_duration_min(1, 960, false).unwrap_err(),
+                    EXTERNAL_TASK_DATES
+                );
+            }
         }
     }
 
