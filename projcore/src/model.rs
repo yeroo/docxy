@@ -390,6 +390,11 @@ pub struct Task {
 }
 
 impl Task {
+    /// Whether this is the non-blank project summary row reserved at UID 0.
+    pub fn is_project_summary(&self) -> bool {
+        self.uid == 0 && self.summary && !self.is_null
+    }
+
     pub fn baseline(&self, number: u8) -> Option<&Baseline> {
         self.baselines.iter().find(|b| b.number == number)
     }
@@ -1491,6 +1496,29 @@ pub(crate) fn is_outline_summary_in(tasks: &[Task], index: usize) -> bool {
 }
 
 impl Project {
+    /// Give an unnamed project summary its title or the source file's stem,
+    /// and fill an empty project name even when there is no summary task.
+    /// Hosts call this after reading a file and before creating an editor session.
+    pub fn fill_unnamed_summary(&mut self, file_stem: &str) {
+        let derived = if self.title.trim().is_empty() {
+            file_stem.trim()
+        } else {
+            self.title.trim()
+        };
+        if derived.is_empty() {
+            return;
+        }
+        let derived = derived.to_owned();
+        if let Some(summary) = self.tasks.iter_mut().find(|task| task.is_project_summary()) {
+            if summary.name.trim().is_empty() {
+                summary.name = derived.clone();
+            }
+        }
+        if self.name.trim().is_empty() {
+            self.name = derived;
+        }
+    }
+
     /// Whether a non-blank task and all of its outline ancestors are active.
     /// Blank rows do not participate in the outline.
     pub fn effectively_active(&self, index: usize) -> bool {
@@ -1660,6 +1688,67 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unnamed_summary_uses_title_then_file_stem() {
+        let mut project = Project {
+            title: "  Warehouse fit-out  ".into(),
+            tasks: vec![Task {
+                uid: 0,
+                summary: true,
+                ..Task::default()
+            }],
+            ..Project::default()
+        };
+        project.fill_unnamed_summary("site-plan");
+        assert_eq!(project.tasks[0].name, "Warehouse fit-out");
+        assert_eq!(project.name, "Warehouse fit-out");
+
+        project.title.clear();
+        project.name.clear();
+        project.tasks[0].name.clear();
+        project.fill_unnamed_summary("site-plan");
+        assert_eq!(project.tasks[0].name, "site-plan");
+        assert_eq!(project.name, "site-plan");
+    }
+
+    #[test]
+    fn fill_unnamed_summary_preserves_existing_names() {
+        let mut project = Project {
+            name: "Existing project".into(),
+            title: "Warehouse fit-out".into(),
+            tasks: vec![Task {
+                uid: 0,
+                summary: true,
+                name: "Existing summary".into(),
+                ..Task::default()
+            }],
+            ..Project::default()
+        };
+        project.fill_unnamed_summary("site-plan");
+        assert_eq!(project.name, "Existing project");
+        assert_eq!(project.tasks[0].name, "Existing summary");
+    }
+
+    #[test]
+    fn fill_unnamed_summary_handles_no_summary_or_usable_name() {
+        let mut project = Project::default();
+        project.fill_unnamed_summary("site-plan");
+        assert_eq!(project.name, "site-plan");
+        assert!(project.tasks.is_empty());
+
+        let mut project = Project {
+            tasks: vec![Task {
+                uid: 0,
+                summary: true,
+                ..Task::default()
+            }],
+            ..Project::default()
+        };
+        project.fill_unnamed_summary("  ");
+        assert!(project.name.is_empty());
+        assert!(project.tasks[0].name.is_empty());
+    }
 
     #[test]
     fn rate_keeps_decimal_text_and_normalizes_finite_float_syntax() {
