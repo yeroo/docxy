@@ -9763,19 +9763,24 @@ impl Docxy {
 }
 
 /// Serialize a tab's open header/footer editor, leaving the edit session open.
+/// An editor that still matches its part neither dirties the tab nor replaces
+/// the part with a re-serialization: every caller (Esc, switching regions,
+/// Save, closing a tab or the window) would otherwise rewrite untouched bytes.
 fn flush_hf_tab(tab: &mut DocTab) {
-    let Some(hf) = tab.hf_edit.as_ref() else {
+    let (Some(hf), Some(pkg)) = (tab.hf_edit.as_ref(), tab.pkg.as_mut()) else {
         return;
     };
     let inner = docxcore::serialize::blocks_to_xml(&hf.editor.doc.body);
+    // Both sides go through the same serializer, so byte layout does not matter.
+    if inner == docxcore::serialize::blocks_to_xml(&parse_hf_part(pkg, &hf.part_name)) {
+        return;
+    }
     let tag = if hf.is_header { "w:hdr" } else { "w:ftr" };
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n\
          <{tag} xmlns:w=\"{W_NS}\" xmlns:r=\"{R_NS}\" xmlns:m=\"{M_NS}\">{inner}</{tag}>"
     );
-    if let Some(pkg) = tab.pkg.as_mut() {
-        pkg.set_part(&hf.part_name, xml.into_bytes());
-    }
+    pkg.set_part(&hf.part_name, xml.into_bytes());
     tab.dirty = true;
 }
 
