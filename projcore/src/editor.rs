@@ -252,9 +252,11 @@ impl Editor {
     }
 
     /// The duration shown alongside [`Self::disp_start`]/[`Self::disp_finish`]:
-    /// a leaf's own duration, or a summary's working time between its displayed
-    /// (leveled when leveling is on) dates. `None` for an unknown or
-    /// unscheduled task.
+    /// a local leaf's own duration, or the working time between displayed dates
+    /// for a summary (on its summary calendar) or an external leaf (on its own
+    /// calendar, falling back to its stored duration if that calendar has no
+    /// working time). Dates are leveled when leveling is on. `None` for an
+    /// unknown or unscheduled task.
     pub fn disp_duration_min(&self, uid: i32) -> Option<i64> {
         let task = self.proj.task(uid)?;
         let start = self.disp_start(uid)?;
@@ -708,13 +710,8 @@ impl Editor {
         (start, finish, self.disp_duration_min(t.uid))
     }
 
-    pub fn update_task(&mut self, uid: i32, patch: TaskPatch) -> Result<(), String> {
+    pub fn update_task(&mut self, uid: i32, mut patch: TaskPatch) -> Result<(), String> {
         let i = self.index(uid)?;
-        if (patch.duration_min.is_some() || patch.manual.is_some())
-            && self.proj.tasks[i].is_external_leaf()
-        {
-            return Err(EXTERNAL_TASK_DATES.into());
-        }
         if patch.name.is_none()
             && patch.duration_min.is_none()
             && patch.level.is_none()
@@ -747,6 +744,16 @@ impl Editor {
         let duration_changed = patch.duration_min.is_some_and(|min| min != current);
         // A blank row always becomes a task: a mode is an edit of it too.
         let mode_changed = patch.manual.is_some_and(|m| m != t.manual || t.is_null);
+        if t.is_external_leaf() && (duration_changed || mode_changed) {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
+        if t.is_external_leaf() {
+            // Re-entering unchanged schedule cells is a no-op even if their
+            // imported milestone or estimated flags are inconsistent.
+            patch.duration_min = None;
+            patch.estimated = None;
+            patch.manual = None;
+        }
         // A summary's `?` rolls up from its subtasks; it takes no estimate.
         let estimate_changed = !t.summary
             && patch
@@ -1834,17 +1841,39 @@ mod tests {
 
             ed.set_resources(1, &["Bob[50%]".into()]).unwrap();
             assert_eq!(ed.project().task(1).unwrap(), &before);
+            let bob = ed
+                .project()
+                .assignments
+                .iter()
+                .find(|a| a.task_uid == 1)
+                .unwrap();
+            assert_eq!(bob.work_min, 240);
+            assert!(
+                crate::assign::assignment_span(ed.project(), ed.schedule(), bob)
+                    .unwrap()
+                    .1
+                    <= before.stored_finish.unwrap()
+            );
             ed.set_resources(1, &["Bob[50%]".into(), "Alice".into()])
                 .unwrap();
             assert_eq!(ed.project().task(1).unwrap(), &before);
-            assert_eq!(
-                ed.project()
-                    .assignments
-                    .iter()
-                    .filter(|a| a.task_uid == 1)
-                    .count(),
-                2
-            );
+            let mut work: Vec<_> = ed
+                .project()
+                .assignments
+                .iter()
+                .filter(|a| a.task_uid == 1)
+                .map(|a| {
+                    assert!(
+                        crate::assign::assignment_span(ed.project(), ed.schedule(), a)
+                            .unwrap()
+                            .1
+                            <= before.stored_finish.unwrap()
+                    );
+                    a.work_min
+                })
+                .collect();
+            work.sort();
+            assert_eq!(work, [240, 480]);
         }
     }
 
@@ -1861,6 +1890,41 @@ mod tests {
         let before = ed.project().task(1).unwrap().clone();
         ed.stamp_pinned_dates(1);
         assert_eq!(ed.project().task(1).unwrap(), &before);
+    }
+
+    #[test]
+    fn unchanged_external_mode_and_duration_are_noops() {
+        for manual in [false, true] {
+            let mut proj = editor().project().clone();
+            proj.tasks[0].external_task = Some(true);
+            proj.tasks[0].manual = manual;
+            proj.tasks[0].milestone = true;
+            proj.tasks[0].estimated = Some(true);
+            let mut ed = Editor::new(proj);
+            let before = ed.project().task(1).unwrap().clone();
+            let depth = ed.undo_depth();
+            ed.set_manual(1, manual).unwrap();
+            ed.set_duration_min(1, 480, false).unwrap();
+            ed.set_duration(1, "1d").unwrap();
+            assert_eq!(ed.undo_depth(), depth);
+            assert_eq!(ed.project().task(1).unwrap(), &before);
+            ed.update_task(
+                1,
+                TaskPatch {
+                    name: Some("Renamed".into()),
+                    manual: Some(manual),
+                    ..TaskPatch::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(ed.project().task(1).unwrap().name, "Renamed");
+            assert_eq!(ed.project().task(1).unwrap().duration_min, 480);
+            assert_eq!(ed.set_manual(1, !manual).unwrap_err(), EXTERNAL_TASK_DATES);
+            assert_eq!(
+                ed.set_duration_min(1, 960, false).unwrap_err(),
+                EXTERNAL_TASK_DATES
+            );
+        }
     }
 
     #[test]

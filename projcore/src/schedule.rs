@@ -2009,10 +2009,9 @@ pub(crate) fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: Da
 }
 
 /// A task's scheduled duration in working minutes: a local leaf's own
-/// `duration_min`, or for a summary or external leaf the working time spanned by its scheduled
-/// early start/finish (rolled up, or a manual summary's own span). The stored `duration_min` of a summary is never
-/// recomputed, so every surface that shows one must derive it here. `None` when
-/// the task has no schedule result.
+/// `duration_min`, or the working time between scheduled dates for a summary
+/// or external leaf. A summary's stored duration is never recomputed, so
+/// surfaces derive it here. `None` when the task has no schedule result.
 pub fn task_duration_min(proj: &Project, sched: &Schedule, task: &Task) -> Option<i64> {
     let r = sched.get(task.uid)?;
     Some(summary_or_leaf_min(
@@ -2031,8 +2030,22 @@ pub(crate) fn summary_or_leaf_min(
     start: DateTime,
     finish: DateTime,
 ) -> i64 {
-    if task.summary || task.is_external_leaf() {
+    if task.summary {
         working_minutes_on(&summary_calendar(proj), start, finish)
+    } else if task.is_external_leaf() {
+        let calendars = CalendarResolver::new(proj);
+        if let Some(cal) = calendars.resolve(task.calendar_uid) {
+            if !has_working_time(&calendars.week(cal)) {
+                return task.duration_min;
+            }
+            working_minutes_on(&calendars.calendar(cal), start, finish)
+        } else {
+            working_minutes_on(
+                &WorkCalendar::weekly(Calendar::standard_week()),
+                start,
+                finish,
+            )
+        }
     } else {
         task.duration_min
     }
@@ -5589,6 +5602,20 @@ mod tests {
             task_duration_min(&proj, &with_external, &proj.tasks[0]),
             expected
         );
+    }
+
+    #[test]
+    fn external_only_span_uses_its_own_calendar_or_stored_duration() {
+        let mut external = child(1, "External", 480, 3);
+        external.external_task = Some(true);
+        external.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        external.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 20, 17, 0));
+        let mut proj = closed_default(vec![external], vec![Calendar::standard(3)]);
+        let sched = schedule(&proj);
+        assert_eq!(task_duration_min(&proj, &sched, &proj.tasks[0]), Some(4800));
+        proj.tasks[0].calendar_uid = Some(1);
+        let sched = schedule(&proj);
+        assert_eq!(task_duration_min(&proj, &sched, &proj.tasks[0]), Some(480));
     }
 
     #[test]

@@ -11,10 +11,12 @@ use crate::assign::{contoured, is_work};
 
 impl Editor {
     /// Commit staged `resources` and `assignments` for row `i` as one undo
-    /// step, first recalculating the task by its type (see [`recalculate`]).
+    /// step, first recalculating a local task by its type (see [`recalculate`]).
     /// A new duration is checked against the scheduling horizon before
     /// anything changes. A manual task keeps its start and its finish
-    /// follows; the estimate and the milestone flag are left alone.
+    /// follows; the estimate and the milestone flag are left alone. An
+    /// external leaf keeps the assignment work staged against its stored
+    /// duration; it never enters the local effort recalculation.
     pub(super) fn commit_assignments(
         &mut self,
         i: usize,
@@ -23,8 +25,11 @@ impl Editor {
     ) -> Result<(), String> {
         let task = self.row_as_edited(i);
         let summary = self.proj.is_outline_summary(i);
-        let duration = recalculate(&self.proj, &task, summary, &resources, &mut assignments)
-            .filter(|_| !task.is_external_leaf());
+        let duration = if task.is_external_leaf() {
+            None
+        } else {
+            recalculate(&self.proj, &task, summary, &resources, &mut assignments)
+        };
         if duration.is_some() {
             self.validate_cell_horizon(task.uid, duration, None)?;
         }
