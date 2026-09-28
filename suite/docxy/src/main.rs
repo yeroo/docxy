@@ -1617,6 +1617,26 @@ fn dragged_left_marker(start: EffIndent, delta: i32) -> i32 {
     snap_twips(start.left.saturating_add(delta)).max(start.list_step)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ParagraphIndentLayout {
+    continuation_x: f32,
+    first_x: f32,
+    spacer_width: f32,
+    spacer_margin: f32,
+}
+
+fn paragraph_indent_layout(indent: EffIndent, zoom: f32) -> ParagraphIndentLayout {
+    let continuation_x = tw_px(indent.left, zoom);
+    let first_x = tw_px(indent.left + indent.first, zoom);
+    let offset = first_x - continuation_x;
+    ParagraphIndentLayout {
+        continuation_x,
+        first_x,
+        spacer_width: offset.max(0.0),
+        spacer_margin: offset.min(0.0),
+    }
+}
+
 fn ruler_box(window: &mut Window, x0: f32, y0: f32, x1: f32, y1: f32, color: Hsla) {
     if x1 > x0 && y1 > y0 {
         window.paint_quad(fill(
@@ -1669,18 +1689,11 @@ fn hruler_geom(
     page: docxcore::model::PageGeom,
     indent: EffIndent,
     tabs: &[docxcore::model::TabStop],
-    draft: bool,
+    draft_column: Option<ScreenRect>,
 ) -> HRulerGeom {
-    let content_x = if draft {
-        page_x
-    } else {
-        page_x + tw_px(page.ml, zoom)
-    };
-    let content_right = if draft {
-        viewport.x + viewport.w - 48.0
-    } else {
-        page_x + tw_px(page.w - page.mr, zoom)
-    };
+    let draft = draft_column.is_some();
+    let content_x = draft_column.map_or(page_x + tw_px(page.ml, zoom), |r| r.x);
+    let content_right = draft_column.map_or(page_x + tw_px(page.w - page.mr, zoom), |r| r.x + r.w);
     HRulerGeom {
         viewport,
         strip_y: 0.0,
@@ -1704,12 +1717,6 @@ fn hruler_hit(g: &HRulerGeom, x: f32, y: f32) -> Option<RulerHandle> {
         return None;
     }
     let y = y - g.strip_y;
-    if !g.draft && x >= g.content_x - 8.0 && x < g.content_x - 1.0 {
-        return Some(RulerHandle::MarginLeft);
-    }
-    if !g.draft && x > g.content_right + 1.0 && x <= g.content_right + 8.0 {
-        return Some(RulerHandle::MarginRight);
-    }
     if y < 11.0 && (x - g.first_x).abs() <= 7.0 {
         return Some(RulerHandle::FirstLine);
     }
@@ -1718,6 +1725,12 @@ fn hruler_hit(g: &HRulerGeom, x: f32, y: f32) -> Option<RulerHandle> {
     }
     if y >= 11.0 && (x - g.right_x).abs() <= 7.0 {
         return Some(RulerHandle::Right);
+    }
+    if !g.draft && x >= g.content_x - 8.0 && x < g.content_x - 1.0 {
+        return Some(RulerHandle::MarginLeft);
+    }
+    if !g.draft && x > g.content_right + 1.0 && x <= g.content_right + 8.0 {
+        return Some(RulerHandle::MarginRight);
     }
     None
 }
@@ -1738,6 +1751,7 @@ fn vruler_geom(page_top: f32, zoom: f32, page: docxcore::model::PageGeom) -> VRu
 #[derive(Default)]
 struct RulerProbe {
     viewport: Option<ScreenRect>,
+    draft_column: Option<ScreenRect>,
     pages: Vec<Option<ScreenRect>>,
     ranges: Vec<Vec<(usize, usize)>>,
     caret_block: Option<usize>,
@@ -1787,8 +1801,9 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
-        EffIndent, RulerHandle, RulerProbe, ScreenRect, dragged_left_marker, eff_indent,
-        hruler_geom, hruler_hit, px_tw, snap_twips, tracked_page, tw_px, vruler_geom,
+        EffIndent, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect,
+        dragged_left_marker, eff_indent, hruler_geom, hruler_hit, paragraph_indent_layout, px_tw,
+        ruler_drag_result, tracked_page, tw_px, vruler_geom,
     };
     use docxcore::model::{PageGeom, ParProps, TabAlign, TabLeader, TabStop};
 
@@ -1821,15 +1836,7 @@ mod ruler_geom_tests {
             leader: TabLeader::None,
         }];
         for zoom in [0.5, 1.0, 1.5, 2.0] {
-            let g = hruler_geom(
-                320.0,
-                viewport,
-                zoom,
-                page,
-                eff_indent(&props),
-                &tabs,
-                false,
-            );
+            let g = hruler_geom(320.0, viewport, zoom, page, eff_indent(&props), &tabs, None);
             near(g.content_x, 320.0 + tw_px(page.ml, zoom));
             near(g.content_right, 320.0 + tw_px(page.w - page.mr, zoom));
             near(g.left_x, g.content_x + tw_px(1440, zoom));
@@ -1840,8 +1847,42 @@ mod ruler_geom_tests {
     }
 
     #[test]
+    fn draft_geometry_uses_the_measured_text_column() {
+        let viewport = ScreenRect {
+            x: 100.0,
+            y: 0.0,
+            w: 700.0,
+            h: 500.0,
+        };
+        let column = ScreenRect {
+            x: 151.0,
+            y: 28.0,
+            w: 596.0,
+            h: 20.0,
+        };
+        let p = ParProps {
+            indent: 720,
+            ..ParProps::default()
+        };
+        let g = hruler_geom(
+            column.x,
+            viewport,
+            2.0,
+            PageGeom::default(),
+            eff_indent(&p),
+            &[],
+            Some(column),
+        );
+        near(g.content_x, 151.0);
+        near(g.content_right, 747.0);
+        near(g.left_x, 151.0 + tw_px(720, 2.0));
+        assert!(g.draft);
+        assert_eq!(hruler_hit(&g, column.x - 3.0, 18.0), None);
+    }
+
+    #[test]
     fn indent_offsets_share_the_renderer_math() {
-        for (left, first, ilvl) in [(1440, 720, 0), (0, -360, 2), (720, -360, 0)] {
+        for (left, first, ilvl) in [(1440, 720, 0), (0, -360, 2), (720, -360, 0), (360, -720, 0)] {
             let p = ParProps {
                 indent: left,
                 first_line: first,
@@ -1849,6 +1890,7 @@ mod ruler_geom_tests {
                 ..ParProps::default()
             };
             let eff = eff_indent(&p);
+            let layout = paragraph_indent_layout(eff, 1.5);
             let g = hruler_geom(
                 100.0,
                 ScreenRect {
@@ -1861,26 +1903,24 @@ mod ruler_geom_tests {
                 PageGeom::default(),
                 eff,
                 &[],
-                false,
+                None,
             );
-            near(g.left_x - g.content_x, tw_px(eff.left, 1.5));
-            near(g.first_x - g.content_x, tw_px(eff.left + eff.first, 1.5));
+            near(g.left_x - g.content_x, layout.continuation_x);
+            near(g.first_x - g.content_x, layout.first_x);
+            near(
+                layout.first_x,
+                layout.continuation_x + layout.spacer_width + layout.spacer_margin,
+            );
             assert!(eff.left + eff.first >= 0);
             assert_eq!(eff.list_step, ilvl * 300);
+            if left == 360 && first == -720 {
+                assert_eq!(eff.first, -360);
+            }
         }
     }
 
     #[test]
-    fn drag_delta_and_hit_follow_visible_geometry() {
-        for zoom in [0.5, 1.0, 2.0] {
-            let delta = px_tw(37.0, zoom);
-            assert_eq!(delta, (37.0 * 15.0 / zoom).round() as i32);
-            let marker = snap_twips(1440 + delta);
-            near(
-                300.0 + tw_px(marker, zoom),
-                300.0 + marker as f32 * zoom / 15.0,
-            );
-        }
+    fn hits_follow_visible_geometry_and_indent_markers_win() {
         let mut g = hruler_geom(
             50.0,
             ScreenRect {
@@ -1893,7 +1933,7 @@ mod ruler_geom_tests {
             PageGeom::default(),
             EffIndent::default(),
             &[],
-            false,
+            None,
         );
         g.strip_y = 10.0;
         assert!(hruler_hit(&g, g.first_x, 12.0).is_none());
@@ -1904,10 +1944,22 @@ mod ruler_geom_tests {
             PageGeom::default(),
             EffIndent::default(),
             &[],
-            false,
+            None,
         );
         g.strip_y = 10.0;
         assert_eq!(hruler_hit(&g, g.left_x, 28.0), Some(RulerHandle::Left));
+        assert_eq!(
+            hruler_hit(&g, g.content_x - 3.0, 12.0),
+            Some(RulerHandle::FirstLine)
+        );
+        assert_eq!(
+            hruler_hit(&g, g.content_x - 3.0, 28.0),
+            Some(RulerHandle::Left)
+        );
+        assert_eq!(
+            hruler_hit(&g, g.content_right + 3.0, 28.0),
+            Some(RulerHandle::Right)
+        );
     }
 
     #[test]
@@ -1923,6 +1975,72 @@ mod ruler_geom_tests {
             assert_eq!(marker, 600);
             assert_eq!(marker - start.list_step, 0);
             near(200.0 + tw_px(marker, zoom), 200.0 + 600.0 * zoom / 15.0);
+        }
+    }
+
+    #[test]
+    fn every_drag_handle_returns_the_stored_value_and_matching_guide() {
+        for zoom in [1.0, 2.0] {
+            let mut d = RulerDrag {
+                handle: RulerHandle::FirstLine,
+                start_x: 200.0,
+                zoom,
+                indent: EffIndent {
+                    left: 720,
+                    first: 360,
+                    right: 360,
+                    list_step: 0,
+                },
+                page: PageGeom::default(),
+                content_x: 300.0,
+                content_right: 900.0,
+                page_x: 100.0,
+            };
+            let pointer = 200.0 + 24.0 * zoom;
+            let first = ruler_drag_result(d, pointer);
+            assert_eq!(first.change, RulerChange::First(720));
+            near(first.guide, 300.0 + tw_px(1440, zoom));
+            let clamped = ruler_drag_result(d, 200.0 - 200.0 * zoom);
+            assert_eq!(clamped.change, RulerChange::First(-720));
+            near(clamped.guide, 300.0);
+
+            d.handle = RulerHandle::Left;
+            let left = ruler_drag_result(d, pointer);
+            assert_eq!(
+                left.change,
+                RulerChange::Left {
+                    indent: 1080,
+                    first: 360
+                }
+            );
+            near(left.guide, 300.0 + tw_px(1080, zoom));
+
+            d.handle = RulerHandle::Right;
+            let right = ruler_drag_result(d, pointer);
+            assert_eq!(right.change, RulerChange::Right(0));
+            near(right.guide, 900.0);
+
+            d.handle = RulerHandle::MarginLeft;
+            let ml = ruler_drag_result(d, pointer);
+            assert_eq!(
+                ml.change,
+                RulerChange::Margins {
+                    left: 1800,
+                    right: 1440
+                }
+            );
+            near(ml.guide, 100.0 + tw_px(1800, zoom));
+
+            d.handle = RulerHandle::MarginRight;
+            let mr = ruler_drag_result(d, pointer);
+            assert_eq!(
+                mr.change,
+                RulerChange::Margins {
+                    left: 1440,
+                    right: 1080
+                }
+            );
+            near(mr.guide, 100.0 + tw_px(d.page.w - 1080, zoom));
         }
     }
 
@@ -1991,6 +2109,69 @@ struct RulerDrag {
     content_x: f32,
     content_right: f32,
     page_x: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RulerChange {
+    First(i32),
+    Left { indent: i32, first: i32 },
+    Right(i32),
+    Margins { left: i32, right: i32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RulerDragResult {
+    change: RulerChange,
+    guide: f32,
+}
+
+fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
+    let delta = px_tw(x - d.start_x, d.zoom);
+    let tw = |t: i32| tw_px(t, d.zoom);
+    let (change, guide) = match d.handle {
+        RulerHandle::FirstLine => {
+            let marker = snap_twips(d.indent.left + d.indent.first + delta).max(0);
+            (
+                RulerChange::First(marker - d.indent.left),
+                d.content_x + tw(marker),
+            )
+        }
+        RulerHandle::Left => {
+            let marker = dragged_left_marker(d.indent, delta);
+            (
+                RulerChange::Left {
+                    indent: marker - d.indent.list_step,
+                    first: d.indent.first,
+                },
+                d.content_x + tw(marker),
+            )
+        }
+        RulerHandle::Right => {
+            let right = snap_twips((d.indent.right - delta).max(0));
+            (RulerChange::Right(right), d.content_right - tw(right))
+        }
+        RulerHandle::MarginLeft => {
+            let left = snap_twips((d.page.ml + delta).max(0));
+            (
+                RulerChange::Margins {
+                    left,
+                    right: d.page.mr,
+                },
+                d.page_x + tw(left),
+            )
+        }
+        RulerHandle::MarginRight => {
+            let right = snap_twips((d.page.mr - delta).max(0));
+            (
+                RulerChange::Margins {
+                    left: d.page.ml,
+                    right,
+                },
+                d.page_x + tw(d.page.w - right),
+            )
+        }
+    };
+    RulerDragResult { change, guide }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -11792,48 +11973,25 @@ impl Docxy {
     /// (Word's sticky ruler), and a vertical guide line is tracked down the page.
     fn ruler_drag_move(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.ruler_drag else { return };
-        let delta = px_tw(x - d.start_x, d.zoom);
-        let geom = d.page;
-        let tw = |t: i32| tw_px(t, d.zoom);
-        let guide = match d.handle {
-            RulerHandle::FirstLine => {
-                // Snap the marker (indent + first) to the grid, keep indent fixed.
-                let marker = snap_twips(d.indent.left + d.indent.first + delta).max(0);
-                let first = marker - d.indent.left;
-                self.with_editor(window, cx, |e| e.set_first_line(first));
-                d.content_x + tw(marker)
+        let result = ruler_drag_result(d, x);
+        match result.change {
+            RulerChange::First(first) => self.with_editor(window, cx, |e| e.set_first_line(first)),
+            RulerChange::Left { indent, first } => {
+                self.with_editor(window, cx, |e| e.set_indent(indent, first))
             }
-            RulerHandle::Left => {
-                let marker = dragged_left_marker(d.indent, delta);
-                self.with_editor(window, cx, |e| {
-                    e.set_indent(marker - d.indent.list_step, d.indent.first)
-                });
-                d.content_x + tw(marker)
+            RulerChange::Right(right) => {
+                self.with_editor(window, cx, |e| e.set_right_indent(right))
             }
-            // Dragging the right marker left (negative delta) increases the indent.
-            RulerHandle::Right => {
-                let ri = snap_twips((d.indent.right - delta).max(0));
-                self.with_editor(window, cx, |e| e.set_right_indent(ri));
-                d.content_right - tw(ri)
-            }
-            RulerHandle::MarginLeft | RulerHandle::MarginRight => {
-                let (ml, mr) = match d.handle {
-                    RulerHandle::MarginLeft => (snap_twips((geom.ml + delta).max(0)), geom.mr),
-                    _ => (geom.ml, snap_twips((geom.mr - delta).max(0))),
-                };
+            RulerChange::Margins { left, right } => {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     if let Some(pkg) = t.pkg.as_mut() {
-                        pkg.set_page_margins(geom.mt, mr, geom.mb, ml);
+                        pkg.set_page_margins(d.page.mt, right, d.page.mb, left);
                         t.dirty = true;
                     }
                 }
-                match d.handle {
-                    RulerHandle::MarginLeft => d.page_x + tw(ml),
-                    _ => d.page_x + tw(geom.w - mr),
-                }
             }
-        };
-        self.ruler_guide = Some(guide);
+        }
+        self.ruler_guide = Some(result.guide);
         cx.notify();
     }
 
@@ -11900,7 +12058,11 @@ impl Docxy {
                     return;
                 };
                 let page_x = if state.draft {
-                    viewport.x + 48.0
+                    let Some(r) = state.draft_column else {
+                        state.painted = None;
+                        return;
+                    };
+                    r.x
                 } else {
                     let Some(i) = tracked_page(&state) else {
                         state.painted = None;
@@ -11910,9 +12072,17 @@ impl Docxy {
                         state.painted = None;
                         return;
                     };
-                    r.x
+                    r.x + 1.0 // the page's 1px border precedes its margin padding
                 };
-                let mut g = hruler_geom(page_x, viewport, zoom, page, indent, &tabs, state.draft);
+                let mut g = hruler_geom(
+                    page_x,
+                    viewport,
+                    zoom,
+                    page,
+                    indent,
+                    &tabs,
+                    state.draft_column.filter(|_| state.draft),
+                );
                 g.strip_y = b.origin.y.into();
                 state.painted = Some(g.clone());
                 drop(state);
@@ -12056,6 +12226,7 @@ impl Docxy {
                     .text_color(pal.fg)
                     .cursor_pointer()
                     .child(glyph)
+                    .tooltip(|w, cx| Tooltip::new("Tab stop type — click to cycle").build(w, cx))
                     .on_click(cx.listener(|this, _, window, cx| this.cycle_ruler_tab(window, cx))),
             )
             .on_mouse_down(
@@ -12106,7 +12277,7 @@ impl Docxy {
                 };
                 let Some(rect) = state.pages[i] else { return };
                 let x: f32 = b.origin.x.into();
-                let vertical = vruler_geom(rect.y, zoom, page);
+                let vertical = vruler_geom(rect.y + 1.0, zoom, page);
                 let content_top = vertical.content_top;
                 let content_bottom = vertical.content_bottom;
                 let clip_top = viewport.y.max(f32::from(b.origin.y));
@@ -15154,7 +15325,8 @@ fn paragraph_el(
     // edge; a tab advances it to the next stop measured from the text margin. The
     // row's left edge sits `pad_l` px in from the margin (the paragraph indent).
     let indent = eff_indent(&p.props);
-    let pad_l = tw_px(indent.left, zoom);
+    let indent_layout = paragraph_indent_layout(indent, zoom);
+    let pad_l = indent_layout.continuation_x;
     let interval = zoom * 720.0 / 15.0; // Word's default tab stop: every 1/2"
     let mut customs: Vec<(f32, TabAlign)> = p
         .props
@@ -15176,7 +15348,7 @@ fn paragraph_el(
         .iter()
         .map(|(c, _)| *c)
         .fold(f32::NEG_INFINITY, f32::max);
-    let mut x = tw_px(indent.first, zoom);
+    let mut x = indent_layout.first_x - indent_layout.continuation_x;
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
@@ -15259,13 +15431,14 @@ fn paragraph_el(
     // The first flex item shifts just the first line. Subsequent wrapped lines
     // start at the paragraph's left padding, including hanging indents.
     if indent.first != 0 {
-        let offset = tw_px(indent.first, zoom);
         spans.push(
             div()
-                .w(px(offset.max(0.0)))
+                .w(px(indent_layout.spacer_width))
                 .h(px(1.))
                 .flex_none()
-                .when(offset < 0.0, |d| d.ml(px(offset)))
+                .when(indent_layout.spacer_margin < 0.0, |d| {
+                    d.ml(px(indent_layout.spacer_margin))
+                })
                 .into_any_element(),
         );
     }
@@ -15481,7 +15654,7 @@ fn paragraph_el(
     };
     // Leading indent: explicit paragraph indent (twips → px at ~96dpi) plus a step
     // per list nesting level.
-    let pad = tw_px(indent.left, zoom);
+    let pad = indent_layout.continuation_x;
     let pad_r = tw_px(indent.right, zoom);
     // The whole paragraph area is a click fallback (empty space past the text, the
     // indent gutter) that drops the caret at the paragraph end. Word clicks fire
@@ -19044,8 +19217,13 @@ impl Render for Docxy {
                                     },
                                     move |_b, _s, _w, _a| {},
                                 );
-                                page.relative()
-                                    .child(page_probe.absolute().size_full())
+                                div()
+                                    .relative()
+                                    .w(tw(geom.w))
+                                    .child(page)
+                                    .child(
+                                        page_probe.absolute().left_0().top_0().right_0().bottom_0(),
+                                    )
                                     .into_any_element()
                             })
                             .collect();
@@ -19058,7 +19236,6 @@ impl Render for Docxy {
                         );
                         let scroll = v_flex()
                             .id("doc-scroll")
-                            .relative()
                             .track_scroll(&self.doc_scroll)
                             .flex_1()
                             .h_full()
@@ -19068,18 +19245,32 @@ impl Render for Docxy {
                             .items_center()
                             .gap(px(18.))
                             .py(px(24.))
-                            .child(viewport_probe.absolute().size_full())
                             .children(sheets)
+                            .into_any_element();
+                        let scroll_view = v_flex()
+                            .relative()
+                            .flex_1()
+                            .h_full()
+                            .min_h(px(0.))
+                            .child(scroll)
+                            .child(
+                                viewport_probe
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0(),
+                            )
                             .into_any_element();
                         if self.show_ruler {
                             h_flex()
                                 .flex_1()
                                 .min_h(px(0.))
                                 .child(self.vruler(pal))
-                                .child(scroll)
+                                .child(scroll_view)
                                 .into_any_element()
                         } else {
-                            scroll.into_any_element()
+                            scroll_view
                         }
                     } else {
                         {
@@ -19088,6 +19279,7 @@ impl Render for Docxy {
                             probe.ranges.clear();
                             probe.caret_block = editor.caret.path.first().copied();
                             probe.draft = true;
+                            probe.draft_column = None;
                             probe.painted = None;
                         }
                         let probe = self.ruler_probe.clone();
@@ -19100,11 +19292,37 @@ impl Render for Docxy {
                         let blocks: Vec<AnyElement> = body
                             .iter()
                             .enumerate()
-                            .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
+                            .map(|(i, b)| {
+                                let block = block_el(b, vec![i], markers[i].as_deref(), ctx);
+                                if i == 0 {
+                                    let probe = self.ruler_probe.clone();
+                                    let column_probe = gpui::canvas(
+                                        move |bounds, _w, _a| {
+                                            probe.borrow_mut().draft_column =
+                                                Some(ScreenRect::from_bounds(bounds));
+                                        },
+                                        move |_b, _s, _w, _a| {},
+                                    );
+                                    div()
+                                        .relative()
+                                        .w_full()
+                                        .child(block)
+                                        .child(
+                                            column_probe
+                                                .absolute()
+                                                .left_0()
+                                                .top_0()
+                                                .right_0()
+                                                .bottom_0(),
+                                        )
+                                        .into_any_element()
+                                } else {
+                                    block
+                                }
+                            })
                             .collect();
-                        v_flex()
+                        let scroll = v_flex()
                             .id("doc-scroll")
-                            .relative()
                             .track_scroll(&self.doc_scroll)
                             .flex_1()
                             .h_full()
@@ -19115,8 +19333,22 @@ impl Render for Docxy {
                             .px(px(48.))
                             .py(px(28.))
                             .gap_1()
-                            .child(viewport_probe.absolute().size_full())
                             .children(blocks)
+                            .into_any_element();
+                        v_flex()
+                            .relative()
+                            .flex_1()
+                            .h_full()
+                            .min_h(px(0.))
+                            .child(scroll)
+                            .child(
+                                viewport_probe
+                                    .absolute()
+                                    .left_0()
+                                    .top_0()
+                                    .right_0()
+                                    .bottom_0(),
+                            )
                             .into_any_element()
                     }
                 }
