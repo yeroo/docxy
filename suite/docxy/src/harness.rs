@@ -1508,7 +1508,16 @@ pub fn dispatch(
             let strip = read("title-tabs")?;
             let drag = read("title-drag")?;
             let theme = read("title-theme")?;
-            let caption_left = crate::title_bar_geometry(window).caption_left;
+            // The root probe measures the actual inner box after Root's CSD
+            // shadow and border. This oracle is independent of the renderer's
+            // title-width arithmetic.
+            let root = read("suite-root")?;
+            let caption_w = if cfg!(any(target_os = "macos", target_family = "wasm")) {
+                0.0
+            } else {
+                3.0 * f32::from(gpui_component::TITLE_BAR_HEIGHT)
+            };
+            let caption_left = f32::from(root.origin.x + root.size.width) - caption_w;
             let content_right = f32::from(content.origin.x + content.size.width);
             let strip_right = f32::from(strip.origin.x + strip.size.width);
             let content_left = f32::from(content.origin.x);

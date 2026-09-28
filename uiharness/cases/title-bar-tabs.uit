@@ -63,6 +63,8 @@ test title bar keeps caption controls visible with twenty tabs
   call title-tab {"action":"more"}
   type Blocked
   assert dirty is false
+  key tab
+  assert dirty is false
   key escape
   call-error title-tab {"action":"pick","index":0} => the more-tabs list is closed
   call title-tab {"action":"more"}
@@ -72,6 +74,16 @@ test title bar keeps caption controls visible with twenty tabs
   call title-bar {}
   assert reply.first is 0
   assert reply.active_visible is true
+  key ctrl+m
+  call doc {}
+  assert reply.para.ind.left is 720
+  assert dirty is true
+  shot title-tabs
+  call title-tab {"action":"more"}
+  key shift+tab
+  call doc {}
+  assert reply.para.ind.left is 720
+  key escape
   call theme-set {"theme":"dark"}
   shot title-tabs
   call title-bar {}

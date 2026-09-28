@@ -206,7 +206,9 @@ pass while the handler under test was broken — the one way this harness could 
 worse than nothing.
 `selection-set` is a setup exception: it places the caret through the editor API
 because the UI cannot place it by document offset, so it does not test clicking
-or dragging a selection.
+or dragging a selection. `window-size` and `window-zoom` are setup exceptions
+that call GPUI window APIs. `title-tab` calls the same handler methods as the
+title-bar arrows and dropdown items.
 
 ⚠️ **"The same entry point" means the handler, not the hitbox.** A verb calls
 the method a handler calls; it does not synthesize a pointer at a coordinate and
@@ -300,7 +302,7 @@ footer editor; `selection-set` refuses while it is open.
 | `status-read {}` | read the tab's status line as an ordered `items` array |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
-| `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `controls_clear`, `active_visible`, `theme_visible`, `drag_ok`, and logical-pixel right edges. `caption_left` uses the pinned title-bar control width (102 px on Windows/Linux, zero on macOS) because the dependency's controls cannot be probed from the app child |
+| `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `controls_clear`, `active_visible`, `theme_visible`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |

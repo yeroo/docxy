@@ -4421,6 +4421,42 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
 /// The pinned gpui-component Root wraps TitleBar in window_border: client
 /// shadows are its padding and each untiled edge adds a 1px inner border.
 /// The pinned TitleBar separately adds left padding and a fullscreen inset.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FrameBorders {
+    top: f32,
+    right: f32,
+    bottom: f32,
+    left: f32,
+}
+
+fn frame_borders(tiling: Option<(bool, bool, bool, bool)>, scale: f32) -> FrameBorders {
+    let one = scale.ceil() / scale; // gpui rounds 1 logical px to a whole device pixel
+    let Some((top, right, bottom, left)) = tiling else {
+        return FrameBorders {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        };
+    };
+    FrameBorders {
+        top: if top { 0.0 } else { one },
+        right: if right { 0.0 } else { one },
+        bottom: if bottom { 0.0 } else { one },
+        left: if left { 0.0 } else { one },
+    }
+}
+
+fn window_frame_borders(window: &Window) -> FrameBorders {
+    let tiling = match window.window_decorations() {
+        Decorations::Server => None,
+        Decorations::Client { tiling } => {
+            Some((tiling.top, tiling.right, tiling.bottom, tiling.left))
+        }
+    };
+    frame_borders(tiling, window.scale_factor())
+}
+
 fn title_bar_geometry(window: &Window) -> tabstrip::TitleGeometry {
     #[cfg(target_os = "macos")]
     const TITLE_LEFT_PAD: f32 = 80.0;
@@ -4432,23 +4468,40 @@ fn title_bar_geometry(window: &Window) -> tabstrip::TitleGeometry {
         3.0 * f32::from(gpui_component::TITLE_BAR_HEIGHT)
     };
     let padding = gpui_component::window_paddings(window);
-    let (border_left, border_right) = match window.window_decorations() {
-        Decorations::Server => (0.0, 0.0),
-        Decorations::Client { tiling } => (
-            if tiling.left { 0.0 } else { 1.0 },
-            if tiling.right { 0.0 } else { 1.0 },
-        ),
-    };
+    let borders = window_frame_borders(window);
     tabstrip::title_geometry(
         f32::from(window.viewport_size().width),
         f32::from(padding.left),
         f32::from(padding.right),
-        border_left,
-        border_right,
+        borders.left,
+        borders.right,
         TITLE_LEFT_PAD,
         caption_w,
         if window.is_fullscreen() { 12.0 } else { 0.0 },
     )
+}
+
+#[cfg(test)]
+mod frame_border_tests {
+    use super::{FrameBorders, frame_borders};
+
+    #[test]
+    fn client_tiling_and_fractional_scale_reserve_snapped_borders() {
+        assert_eq!(
+            frame_borders(None, 1.75),
+            FrameBorders {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: 0.0
+            }
+        );
+        let b = frame_borders(Some((false, true, false, false)), 1.75);
+        assert!((b.left - 2.0 / 1.75).abs() < 0.0001);
+        assert_eq!(b.right, 0.0);
+        assert_eq!(b.top, b.left);
+        assert_eq!(b.bottom, b.left);
+    }
 }
 
 impl Docxy {
@@ -18242,6 +18295,15 @@ impl Docxy {
     fn tab_more_popup(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let anchor = self.probes.borrow().current("tab-more");
         let viewport = f32::from(window.viewport_size().width);
+        let padding = gpui_component::window_paddings(window);
+        let borders = window_frame_borders(window);
+        let max_menu_h = (f32::from(window.viewport_size().height)
+            - f32::from(padding.top + padding.bottom)
+            - borders.top
+            - borders.bottom
+            - f32::from(gpui_component::TITLE_BAR_HEIGHT)
+            - 8.0)
+            .clamp(0.0, 400.0);
         let left = anchor
             .map(|b| f32::from(b.origin.x))
             .unwrap_or(0.0)
@@ -18297,7 +18359,7 @@ impl Docxy {
                     .left(px(left))
                     .top(gpui_component::TITLE_BAR_HEIGHT)
                     .w(px(220.))
-                    .max_h(px(400.))
+                    .max_h(px(max_menu_h))
                     .overflow_y_scroll()
                     .py_1()
                     .rounded_md()
@@ -18408,7 +18470,12 @@ impl Render for Docxy {
             .take(strip.end - strip.first)
             .map(|(i, tb)| {
                 let active = i == self.active && !self.backstage;
-                let mark = if tb.dirty { " \u{2022}" } else { "" };
+                let full_tip = SharedString::from(format!(
+                    "{}{}{}",
+                    tb.title,
+                    if is_imported(tb) { " · imported" } else { "" },
+                    if tb.dirty { " · unsaved changes" } else { "" },
+                ));
                 h_flex()
                     .id(("chip", i))
                     .relative()
@@ -18420,6 +18487,7 @@ impl Render for Docxy {
                     .flex_none()
                     .rounded_sm()
                     .cursor_pointer()
+                    .tooltip(move |window, cx| Tooltip::new(full_tip.clone()).build(window, cx))
                     .text_size(px(12.))
                     .when(active, |d| d.bg(tab_active).text_color(fg))
                     .when(!active, |d| d.text_color(dim))
@@ -18433,13 +18501,18 @@ impl Render for Docxy {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .child(SharedString::from(format!(
-                                "{} {}{}{}",
+                                "{} {}",
                                 tb.kind.glyph(),
-                                tb.title,
-                                if is_imported(tb) { " · imported" } else { "" },
-                                mark
+                                tb.title
                             ))),
                     )
+                    // Keep status visible when the title is clipped. The full
+                    // imported text appears on roomy chips; narrow ones still
+                    // expose the source in the tooltip.
+                    .when(is_imported(tb) && strip.tab_w >= 160.0, |d| {
+                        d.child(div().flex_none().child(" · imported"))
+                    })
+                    .when(tb.dirty, |d| d.child(div().flex_none().child("•")))
                     .child(
                         div()
                             .id(("chipx", i))
@@ -18612,6 +18685,7 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
+                .child(probe(&self.probes, "suite-root"))
                 .child(title_bar)
                 .child(backstage)
                 .when_some(tab_popup, |d, popup| d.child(popup))
@@ -19249,6 +19323,7 @@ impl Render for Docxy {
                 }
             }))
             .bg(bg)
+            .child(probe(&self.probes, "suite-root"))
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
