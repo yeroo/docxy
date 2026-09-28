@@ -358,7 +358,8 @@ Project ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W
 after Alt or F10.
 
 An open cell editor owns input before prompts and KeyTips. Enter commits and
-moves down, Tab/Shift+Tab commit and move right/left, and Escape cancels.
+moves down, Up/Down commit and move one row up or down (keeping the column),
+Tab/Shift+Tab commit and move right/left, and Escape cancels.
 Left/Right/Home/End move the caret; Backspace/Delete remove characters.
 Invalid input retains the buffer and selection. ID and summary Duration/Start/Finish
 cells are read-only. Ctrl+S commits before saving; other Control, Alt, and
