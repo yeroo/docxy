@@ -18,3 +18,7 @@ workspace = true
 [dependencies]
 # Intentionally std-only — the one dependency is our own shared OPC/XML layer.
 opccore = { version = "0.1.0", path = "../opccore" }
+
+[[example]]
+name = "convert"
+test = true

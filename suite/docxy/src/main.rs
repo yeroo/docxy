@@ -9,6 +9,19 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+// ⚠️ `harness-capture` must never apply off macOS, and must never do so
+// silently. It turns on gpui's test-support, which also makes gpui draw every
+// dirty window on each effect flush WITHOUT presenting it. On Windows that
+// would let the harness's frame wait be satisfied by a frame that never reached
+// the screen, so `PrintWindow` would photograph the one before it: a capture
+// that quietly reads stale pixels. Windows captures through `PrintWindow` and
+// needs none of this.
+#[cfg(all(feature = "harness-capture", not(target_os = "macos")))]
+compile_error!(
+    "the `harness-capture` feature is macOS-only: it enables gpui test-support, \
+     whose draw-without-present would make Windows captures read stale pixels"
+);
+
 mod close;
 mod control;
 mod harness;
@@ -159,6 +172,10 @@ struct PersistTab {
     /// Restored in preference to `path` so edits survive a restart.
     #[serde(default)]
     hot: Option<String>,
+    /// Names omitted from a project hot-exit sidecar because their ZIP entries
+    /// could not be read. Restore them before allowing a later Save.
+    #[serde(default)]
+    unreadable: Vec<String>,
     #[serde(default)]
     markdown: bool,
     /// The tab's file could not be loaded, so `hot` holds a placeholder and
@@ -4373,8 +4390,11 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         }
         Surface::Project(v) => {
             let p = hd.join(format!("tab-{i}.yppx"));
-            opccore::fsio::write_atomic(&p, &projcore::yppx::write_yppx(v.ed.project()))
+            let mut snapshot = v.ed.project().clone();
+            snapshot.package.unreadable.clear();
+            projcore::yppx::write_yppx(&snapshot)
                 .ok()
+                .and_then(|bytes| opccore::fsio::write_atomic(&p, &bytes).ok())
                 .map(|_| p.display().to_string())
         }
         Surface::Placeholder => None,
@@ -4385,6 +4405,10 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         path: t.path.as_ref().map(|p| p.display().to_string()),
         dirty: t.dirty,
         hot,
+        unreadable: match &t.surface {
+            Surface::Project(v) => v.ed.project().package.unreadable.clone(),
+            _ => Vec::new(),
+        },
         markdown: t.markdown,
         load_failed: Some(t.load_failed),
     }
@@ -22107,6 +22131,46 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
         .child(div().text_color(dim).child(blurb))
 }
 
+/// The window the app opens, as a pure function of its bounds and whether this
+/// is a harness instance.
+///
+/// Pulled out of the gpui closure so the one thing a test can meaningfully
+/// assert about it — that a harness instance does not take the user's focus —
+/// is a unit test rather than something you discover by watching a window
+/// steal the keyboard while you are typing in another app.
+fn window_options(bounds: Bounds<Pixels>, harness: bool) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitleBar::title_bar_options()),
+        window_min_size: Some(size(px(460.), px(420.))),
+        kind: WindowKind::Normal,
+        // A harness instance must never take the keyboard from whoever is
+        // using the machine.
+        //
+        // ⚠️ This only achieves that on **macOS**, where gpui maps the flag to
+        // `orderFront` instead of `makeKeyAndOrderFront`. At the gpui revision
+        // suite/Cargo.lock pins, the Windows and Linux window layers do not
+        // read `focus` at all — only `show` — so a Windows harness window still
+        // activates, and keeping it off the user's desktop there remains the
+        // launcher's problem. (Upstream gpui has since grown a
+        // `SW_SHOWNOACTIVATE` path; do not assume it is in the pinned build,
+        // and check the vendored source rather than GitHub before relying on
+        // it.) The flag is set unconditionally anyway: it is free, it is the
+        // honest statement of intent, and it starts working on the other
+        // platforms the moment the pin moves.
+        focus: !harness,
+        // ⚠️ macOS only, and deliberately not Windows. Not showing the window
+        // is what keeps a macOS test run entirely off the user's screen, and it
+        // costs nothing because the harness drives the render pass itself. On
+        // Windows the same flag would be actively harmful: `show` is the one
+        // window option that layer does read, and it treats an unshown window
+        // as Hidden — precisely the state that stops frames there. So a
+        // Windows harness window stays shown.
+        show: !(harness && cfg!(target_os = "macos")),
+        ..Default::default()
+    }
+}
+
 fn main() {
     // The command line: files to open (e.g. double-clicking a document in
     // Explorer, opened on top of the restored hot-exit session), plus the
@@ -22160,13 +22224,7 @@ fn main() {
             KeyBinding::new("shift-tab", OutdentAction, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitleBar::title_bar_options()),
-            window_min_size: Some(size(px(460.), px(420.))),
-            kind: WindowKind::Normal,
-            ..Default::default()
-        };
+        let options = window_options(bounds, want_harness);
         let startup_files = cli_files.clone();
         cx.open_window(options, move |window, cx| {
             let view = cx.new(Docxy::new);
@@ -22218,6 +22276,82 @@ fn main() {
         })
         .expect("failed to open docxy window");
     });
+}
+
+#[cfg(test)]
+mod window_option_tests {
+    use super::window_options;
+    use gpui::{Bounds, Pixels, point, px, size};
+
+    /// The bounds are not what these tests are about; any window will do.
+    fn any_bounds() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(1180.), px(800.)),
+        }
+    }
+
+    /// A harness instance asks to come up **without taking the user's focus**.
+    ///
+    /// ⚠️ The option is set on every platform, but at the pinned gpui revision
+    /// only the macOS layer reads it (as `orderFront` rather than
+    /// `makeKeyAndOrderFront`); Windows and Linux ignore it. So this test pins
+    /// down what the app *asks for*, which is all a pure function can promise
+    /// — that the machine actually stays usable is measured per platform.
+    #[test]
+    fn a_harness_window_does_not_take_focus() {
+        assert!(
+            !window_options(any_bounds(), true).focus,
+            "a harness instance must not take focus from whatever the user is doing"
+        );
+    }
+
+    /// The flag is strictly opt-in: an ordinary launch is a foreground app and
+    /// must still come up focused, or double-clicking a document would open a
+    /// window behind everything else.
+    #[test]
+    fn a_normal_window_still_takes_focus() {
+        assert!(
+            window_options(any_bounds(), false).focus,
+            "a normal launch must keep focusing its window"
+        );
+    }
+
+    /// On macOS a harness window is never shown at all, so a test run cannot
+    /// cover what the user is looking at. It still lays out and draws — the
+    /// harness drives the render pass itself — so geometry verbs work against
+    /// a window that was never put on screen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_harness_window_is_never_shown_on_macos() {
+        assert!(
+            !window_options(any_bounds(), true).show,
+            "a harness instance must not put a window on the user's screen"
+        );
+    }
+
+    /// ⚠️ Everywhere else a harness window IS shown, and on Windows that is
+    /// load-bearing rather than incidental: its window layer reports a window
+    /// that is not shown as Hidden, and a hidden window is exactly the state
+    /// that stops frames. Leaving it shown is what keeps the working Windows
+    /// harness working.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_harness_window_is_still_shown_off_macos() {
+        assert!(
+            window_options(any_bounds(), true).show,
+            "only macOS withholds the window; elsewhere an unshown window stops drawing"
+        );
+    }
+
+    /// A normal launch always shows its window, on every platform.
+    #[test]
+    fn a_normal_window_is_always_shown() {
+        assert!(
+            window_options(any_bounds(), false).show,
+            "a normal launch must show its window"
+        );
+    }
 }
 
 #[cfg(test)]

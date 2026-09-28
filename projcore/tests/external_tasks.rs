@@ -69,7 +69,7 @@ fn cross_project_fields_survive_xml_yppx_and_cell_edit() {
     assert!(l < n && n < lag);
     for back in [
         read_mspdi(&saved).unwrap(),
-        read_yppx(&write_yppx(&proj)).unwrap(),
+        read_yppx(&write_yppx(&proj).unwrap()).unwrap(),
     ] {
         assert_eq!(
             back.task(3).unwrap().external_task_project,

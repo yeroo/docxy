@@ -546,7 +546,11 @@ cannot:
 | `to_image_data` | renders SVG |
 | `Window::render_to_image` | behind `cfg(any(test, feature = "test-support"))`, and re-renders the scene to an offscreen texture rather than reading what the compositor put on screen |
 
-So the app reports geometry and the harness takes the picture, with Win32
+The last one is the route macOS now takes, deliberately and only in a build
+made for it — see [Capture on macOS](#capture-on-macos). A shipping build
+still cannot do it.
+
+On **Windows** the app reports geometry and the harness takes the picture, with Win32
 `PrintWindow` (`PW_RENDERFULLCONTENT`) against the test window's HWND, found
 from its process id. `PrintWindow` asks the window to draw itself into a device
 context, which gets that window alone even when another is in front of it — a
@@ -567,6 +571,61 @@ from this repo, `windows` for the Win32 capture, and `gridcore` as a
 dev-dependency solely to generate and check the fixture workbook — the binary
 itself has no spreadsheet engine in it and wants none, since it reads pixels and
 JSON.
+
+### Capture on macOS
+
+Nothing outside the app can photograph a macOS harness window: it is never on
+screen, and reading another process's pixels needs Screen Recording
+permission, which a test must not ask for. So on macOS **the app takes the
+picture itself**. The `capture` verb renders the last drawn frame to an
+offscreen texture with `Window::render_to_image`, writes the raw RGBA to
+`<sandbox>/suite/capture/last.rgba`, and replies:
+
+```json
+{"path": "...", "width": 1180, "height": 800, "scale": 1, "frame": 8,
+ "content_origin": {"x": 370, "y": 140}}
+```
+
+`uiharness` reads that file and from then on it is an ordinary capture:
+`content_origin` is in the same physical desktop pixels `rect` answers in,
+computed by the same function, so the existing crop (a region's rect minus the
+capture's origin) lands on the right pixels unchanged, and every border probe
+runs as it does on Windows. The pixels travel beside the control channel, not
+through it — a full window is megabytes, no size for a JSON reply. The CLI
+reports these captures as `via offscreen render`.
+
+It needs a build made for it:
+
+```bash
+cargo build --release --manifest-path suite/Cargo.toml \
+  --features harness-capture --target-dir suite/target/capture
+cargo run --release -p uiharness -- run uiharness/cases/sheet-selection.uit \
+  --suite suite/target/capture/release/suite
+```
+
+The separate `--target-dir` is not decoration: the feature changes how gpui
+itself is compiled, so sharing a target directory with the normal build would
+rebuild gpui every time you switched between them. A default build answers
+`capture` with an error naming the feature, rather than a blank picture.
+
+⚠️ **Three things to know before trusting a macOS pixel case:**
+
+- **It tests a different build from the one users run.** `harness-capture`
+  turns on gpui's test-support, which also makes gpui draw every dirty window as
+  it flushes effects, and turns on leak detection. The scene is the same, but
+  the scheduling of draws is not. Never ship this feature.
+- **It is the scene gpui drew, not what a compositor showed.** Anything the
+  system draws outside gpui is absent — the native window buttons, most
+  visibly. `window` is therefore content only, where Windows' `PrintWindow`
+  includes the frame.
+- **It is refused off macOS.** The feature is a compile error on any other
+  target, because gpui's draw-without-present would let a Windows run
+  photograph a frame that never reached the screen.
+
+Enabling it has a cost. Measured on an M1 against the pinned gpui: the binary
+grows from 21,702,768 to 22,137,088 bytes (+2%), the dependency graph gains
+twelve crates (`proptest` and its helpers), and a clean build into the separate
+target directory took 252 s with the git dependencies already fetched.
 
 ### Why not golden images
 
@@ -591,8 +650,72 @@ name, deciding whether a sampled row of pixels is dashed or solid, comparing an
 expectation to an observation — and those are what the unit tests cover. The
 harness end to end is exercised by running it.
 
+## Where a harness window goes, and why it draws at all
+
+A harness instance is opened with gpui's `focus` flag off and, on macOS, its
+`show` flag off too. What that buys differs by platform, and the difference is
+not cosmetic:
+
+| | Takes focus? | On the user's screen? |
+|---|---|---|
+| **macOS** | no | **no** — the window is never shown |
+| **Windows** | ⚠️ **yes, still** | yes |
+
+⚠️ **`focus` is a macOS-only lever at the gpui revision `suite/Cargo.lock`
+pins.** Only that platform's window layer reads it, as `orderFront` instead of
+`makeKeyAndOrderFront`; the Windows and Linux layers read `show` and ignore
+`focus` entirely. A Windows harness window therefore still activates, and
+keeping a run off the user's desktop there is still the launcher's problem.
+The flag is set on every platform anyway — it costs nothing and starts working
+the moment the pin moves — but do not read it as a promise off macOS.
+
+(Upstream gpui has since grown a `SW_SHOWNOACTIVATE` path and an
+`inactive_frame_interval` option. Neither is in the pinned build. **Check the
+vendored source under `~/.cargo/git/checkouts/`, not GitHub**, before relying
+on any gpui behaviour — this document has been wrong that way twice.)
+
+On Windows the window stays **shown**, and that is load-bearing rather than an
+oversight: that layer reports an unshown window as `Hidden`, and hidden is
+exactly the state that stops frames there. Withholding it would break the one
+harness that already works.
+
+### The frame the app draws for itself
+
+⚠️ **gpui only draws a dirty window when its platform frame source ticks**, and
+on macOS that source is a display link which starts only while the window's
+occlusion state says it is visible. A harness window is unfocused and unshown,
+so the link never runs: `cx.notify()` leaves the view dirty forever, the app
+answers every verb correctly, and the frame counter never moves. The symptom is
+that `rect` times out — `the app drew no new frame within 5s (still frame 2,
+waiting for 4); is it hung?` — against an app that is not hung at all.
+
+(gpui does have a path that draws every dirty window as it flushes effects, but
+it is compiled in only under its own test cfg, so a shipping build never takes
+it.)
+
+So on macOS the `frame` verb **draws the frame itself** rather than waiting for
+a source that is never going to tick: it marks the view dirty and then drives
+the render pass directly before replying. `Done::ok_drawn` carries that request
+out to the pump and is the only reply that does; an ordinary verb still just
+marks the view dirty. Since a driver polls `frame` while it waits for the view
+to settle, the frames a case needs arrive exactly when it asks for them.
+
+Nothing is **presented**. A draw is all the probes and the frame counter need,
+and presentation is the part that would require the window to be on screen —
+which is the thing this is avoiding.
+
+⚠️ **That forced draw is gated to macOS, and the gate is not tidiness.**
+Elsewhere frames already flow for a shown window, so it would buy nothing while
+costing something real: a draw advances the frame counter *without presenting*,
+so `settle` could be satisfied by a frame that was never put on screen and
+`PrintWindow` would photograph the one before it. A capture that quietly reads
+stale pixels is exactly the failure a pixel assertion cannot notice by itself.
+
 ## Not covered
 
+- **Capture on Linux.** `shot`, `window` and every pixel assertion work on
+  Windows through `PrintWindow` and on macOS through the app's own offscreen
+  render, which needs the `harness-capture` build. Linux has neither yet.
 - **CI.** It needs a desktop session for `PrintWindow`.
 - **Mail editing and advanced document UI.** Document text, selection, ribbon,
   status and File rail are covered. Menus, dialogs, pane contents and pointer

@@ -950,6 +950,7 @@ fn a_restore_without_a_sidecar_takes_the_fresh_load_s_mark() {
         path: Some(path.display().to_string()),
         dirty: false,
         hot: None,
+        unreadable: Vec::new(),
         markdown: false,
         load_failed: Some(true),
     };

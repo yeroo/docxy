@@ -51,6 +51,17 @@ htmlbundle = { path = "../../htmlbundle" }
 # Embed the docxwasm engine so Save As "Editable HTML (*.docx.html)" can make
 # new bundles. Needs the wasm32-unknown-unknown target, or DOCXY_HTML_ENGINE.
 html-export = []
+# Offscreen window capture for the UI test harness, macOS only.
+#
+# Turns on gpui's test-support through `gpui_platform`, which is the only way
+# to reach the Metal renderer's render-to-texture: the macOS implementation is
+# gated on `gpui_macos`'s own test-support feature, so enabling `gpui`'s alone
+# builds cleanly and then answers every capture with "not implemented for this
+# platform". ⚠️ Not a neutral switch: test-support also makes gpui draw every
+# dirty window on each effect flush and turns on leak detection, so pixel cases
+# run against a build that schedules its draws differently from the shipped
+# app. Never enable it in a shipped build. Refused off macOS; see main.rs.
+harness-capture = ["gpui_platform/test-support"]
 
 # Embeds the Windows app icon (assets/docxy.ico) into suite.exe via docxy.rc.
 [target.'cfg(windows)'.build-dependencies]

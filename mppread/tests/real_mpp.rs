@@ -379,7 +379,7 @@ fn resource_calendars_survive_mpp_saves_when_present() {
         |c: &projcore::Calendar| (c.uid, c.name.clone(), c.base_calendar_uid, c.week.clone());
     for saved in [
         projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap(),
-        projcore::yppx::read_yppx(&projcore::yppx::write_yppx(&imported)).unwrap(),
+        projcore::yppx::read_yppx(&projcore::yppx::write_yppx(&imported).unwrap()).unwrap(),
     ] {
         assert_eq!(
             imported.calendars.iter().map(fields).collect::<Vec<_>>(),

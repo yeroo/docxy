@@ -1766,7 +1766,7 @@ mod tests {
         let mut ed = Editor::new(read_yppx(&write_zip(&entries)).unwrap());
         ed.set_duration_min(1, 960, false).unwrap();
         for stage in 0..3 {
-            let output = write_yppx(ed.project());
+            let output = write_yppx(ed.project()).unwrap();
             let zip = ZipArchive::open(&output).unwrap();
             assert_eq!(zip.read("views.xml").unwrap(), views, "stage {stage}");
             let types = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
@@ -2284,7 +2284,7 @@ mod tests {
             ed.project().tasks
         );
         assert_eq!(
-            crate::yppx::read_yppx(&crate::yppx::write_yppx(ed.project()))
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(ed.project()).unwrap())
                 .unwrap()
                 .tasks,
             ed.project().tasks
@@ -2829,7 +2829,7 @@ mod tests {
                 .active,
             Some(false)
         );
-        let package = crate::yppx::write_yppx(ed.project());
+        let package = crate::yppx::write_yppx(ed.project()).unwrap();
         assert_eq!(
             crate::yppx::read_yppx(&package)
                 .unwrap()

@@ -1,4 +1,4 @@
-//! Convert validated MPP metadata and tasks to a schedulable project.
+//! Convert validated MPP metadata, tasks, resources and assignments to a project.
 
 use projcore::editor::default_anchor;
 use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Project, Task};
@@ -9,8 +9,12 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// inserted subproject, is pinned with a Must-Start-On constraint at its start
 /// and given Project's stored working duration when available. Other durations
 /// use the working minutes between start and finish on the task's calendar.
-/// Splits and delayed assignments are not decoded, so those tasks can schedule
-/// an earlier finish than their retained stored finish. A resource calendar
+/// Current Project resource identity/type and assignment identity, planned
+/// work and dates are imported, together with saved baseline slots 0..10
+/// (Start, Finish, Work, Cost). Project's MPP/XML has no assignment-baseline
+/// BCWS/BCWP; those remain absent. Assignment progress, rate tables, contours
+/// and delays are not decoded. Splits and delayed assignments can therefore
+/// schedule an earlier finish than their retained stored finish. A resource calendar
 /// can move a resourced task's finish earlier or later because projcore does
 /// not schedule on resource calendars; MSPDI import behaves the same way. A **manual**
 /// leaf keeps its mode and its manual start, finish and duration instead,
@@ -28,6 +32,8 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// tasks use their stored working Duration when available; manual tasks keep
 /// their manual duration and use the calendar span only when it is absent.
 /// An unrecognised calendar record refuses the import.
+/// A malformed current assignment/resource table refuses import. Files with
+/// no such table, or a present unvalidated layout, retain task-only import.
 /// A calendar whose default week is wholly closed is refused even if one of
 /// its alternate weeks opens a day, as in MSPDI import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
@@ -66,6 +72,26 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         cal_ref.default_calendar_uid = default_calendar_uid;
     }
     let tasks = import_tasks(decoded, &cal_ref, has_calendar_table)?;
+    let resources_present = crate::tabledecode::present(bytes, "TBkndRsc")?;
+    let assignments_present = crate::tabledecode::present(bytes, "TBkndAssn")?;
+    if !legacy && assignments_present && !resources_present {
+        return Err("cannot read the assignments of this .mpp (missing resource table)".into());
+    }
+    let decoded_resources = crate::rscdecode::decode(bytes, legacy)
+        .map_err(|e| format!("cannot read the resources of this .mpp ({e})"))?;
+    let task_uids = assignment_task_uids(&tasks);
+    let (resources, assignments) = if let Some(resources) = decoded_resources {
+        let decoded_assignments = crate::assndecode::decode(bytes, legacy, &task_uids, &resources)
+            .map_err(|e| format!("cannot read the assignments of this .mpp ({e})"))?;
+        if assignments_present && decoded_assignments.is_none() {
+            (Vec::new(), Vec::new()) // Unsupported assignment layout: keep task-only import.
+        } else {
+            (resources, decoded_assignments.unwrap_or_default())
+        }
+    } else {
+        // No resource table, or one whose layout has not been validated.
+        (Vec::new(), Vec::new())
+    };
     let start = tasks
         .iter()
         .filter_map(|t| t.stored_start)
@@ -76,6 +102,8 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         title: info.title,
         start_date: Some(start),
         tasks,
+        resources,
+        assignments,
         new_tasks_are_manual,
         ..cal_ref
     };
@@ -83,6 +111,13 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         return Err(format!("cannot read the calendars of this .mpp ({error})"));
     }
     Ok(project)
+}
+
+fn assignment_task_uids(tasks: &[Task]) -> std::collections::HashSet<i32> {
+    let mut uids: std::collections::HashSet<i32> =
+        tasks.iter().filter(|t| !t.is_null).map(|t| t.uid).collect();
+    uids.insert(0); // Project summary assignments can reference UID 0.
+    uids
 }
 
 fn import_tasks(
@@ -237,7 +272,7 @@ fn import_tasks(
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
-fn parse_mpp_dt(s: &str) -> Option<DateTime> {
+pub(crate) fn parse_mpp_dt(s: &str) -> Option<DateTime> {
     let (date, time) = s.split_once(' ')?;
     let mut d = date.split('-');
     let (y, mo, da) = (
@@ -258,6 +293,46 @@ fn parse_mpp_dt(s: &str) -> Option<DateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfb::{Node, write_cfb_tree};
+
+    #[test]
+    fn unsupported_resource_layout_keeps_task_only_import() {
+        let mut rsc_meta = vec![0u8; 16 + 38];
+        rsc_meta[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        rsc_meta[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let mut assn_meta = vec![0u8; 16 + 34];
+        assn_meta[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        assn_meta[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let mut assn_data = vec![0u8; 110];
+        assn_data[..4].copy_from_slice(&2u32.to_le_bytes());
+        assn_data[8..12].copy_from_slice(&1i32.to_le_bytes());
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        let table = |name, data, meta| {
+            Node::Storage(
+                name,
+                vec![
+                    Node::Stream("FixedMeta", meta),
+                    Node::Stream("FixedData", data),
+                    Node::Stream("VarMeta", vm.clone()),
+                    Node::Stream("Var2Data", Vec::new()),
+                ],
+            )
+        };
+        let mpp = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                table("TBkndRsc", vec![0u8; 110], rsc_meta),
+                table("TBkndAssn", assn_data, assn_meta),
+            ],
+        )]);
+        let project = project_from_mpp(&mpp).unwrap();
+        assert!(
+            project.tasks.is_empty()
+                && project.resources.is_empty()
+                && project.assignments.is_empty()
+        );
+    }
 
     fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> {
         super::import_tasks(decoded, &Project::default(), false)
@@ -282,6 +357,44 @@ mod tests {
             is_null: true,
             ..crate::mpp::MppTask::default()
         }
+    }
+
+    #[test]
+    fn assignment_on_null_task_is_refused() {
+        let tasks = import_tasks(vec![task(0, 0, "Project", 0), blank(1, 4)]).unwrap();
+        let uids = assignment_task_uids(&tasks);
+        assert_eq!(uids, [0].into_iter().collect());
+
+        let mut fm = vec![0u8; 16 + 34];
+        fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        fm[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let mut row = vec![0u8; 110];
+        row[..4].copy_from_slice(&7u32.to_le_bytes());
+        row[4..8].copy_from_slice(&4i32.to_le_bytes());
+        row[8..12].copy_from_slice(&1i32.to_le_bytes());
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        let bytes = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![Node::Storage(
+                "TBkndAssn",
+                vec![
+                    Node::Stream("FixedMeta", fm),
+                    Node::Stream("FixedData", row),
+                    Node::Stream("VarMeta", vm),
+                    Node::Stream("Var2Data", Vec::new()),
+                ],
+            )],
+        )]);
+        let resources = [projcore::Resource {
+            uid: 1,
+            ..projcore::Resource::default()
+        }];
+        assert!(
+            crate::assndecode::decode(&bytes, false, &uids, &resources)
+                .unwrap_err()
+                .contains("unknown task UID 4")
+        );
     }
 
     #[test]
