@@ -1053,7 +1053,7 @@ mod win {
     // Application
     // -----------------------------------------------------------------------
 
-    #[implement(IWordApp)]
+    #[implement(IWordApp, Agile = false)]
     struct Application;
 
     impl Application {
@@ -1143,7 +1143,7 @@ mod win {
     // Documents
     // -----------------------------------------------------------------------
 
-    #[implement(IDocuments)]
+    #[implement(IDocuments, Agile = false)]
     struct Documents;
 
     // Word's REAL Documents dispids.
@@ -1220,7 +1220,7 @@ mod win {
     // Document
     // -----------------------------------------------------------------------
 
-    #[implement(IWordDoc)]
+    #[implement(IWordDoc, Agile = false)]
     struct DocumentObj {
         doc: usize,
     }
@@ -1325,7 +1325,7 @@ mod win {
     // Selection (bound to a document; a cursor at the end of the body)
     // -----------------------------------------------------------------------
 
-    #[implement(ISelection)]
+    #[implement(ISelection, Agile = false)]
     struct Selection {
         doc: usize,
     }
@@ -1491,7 +1491,7 @@ mod win {
     // Range (whole document, for the create path)
     // -----------------------------------------------------------------------
 
-    #[implement(IWordRange)]
+    #[implement(IWordRange, Agile = false)]
     struct Range {
         doc: usize,
     }
@@ -1616,12 +1616,12 @@ mod win {
     // _ParagraphFormat {00020953}), so an early-bound client casts to them — we
     // implement the duals (keeping IDispatch for late-bound), same as the other
     // objects. The create-path members forward to vt_font_*/vt_para_* below.
-    #[implement(IFont)]
+    #[implement(IFont, Agile = false)]
     struct WordFont {
         doc: usize,
         all: bool,
     }
-    #[implement(IParaFmt)]
+    #[implement(IParaFmt, Agile = false)]
     struct ParaFmt {
         doc: usize,
         all: bool,
@@ -1844,23 +1844,23 @@ mod win {
     // Late-bound (IDispatch); collections/leaves a report generator walks.
     // -----------------------------------------------------------------------
 
-    #[implement(IDispatch)]
+    #[implement(IDispatch, Agile = false)]
     struct Tables {
         doc: usize,
     }
-    #[implement(IDispatch)]
+    #[implement(IDispatch, Agile = false)]
     struct WordTable {
         doc: usize,
         tno: usize,
     }
-    #[implement(IDispatch)]
+    #[implement(IDispatch, Agile = false)]
     struct WordCell {
         doc: usize,
         tno: usize,
         row: usize,
         col: usize,
     }
-    #[implement(IDispatch)]
+    #[implement(IDispatch, Agile = false)]
     struct CellRange {
         doc: usize,
         tno: usize,
@@ -1869,7 +1869,7 @@ mod win {
     }
     into_disp_idispatch!(Tables, WordTable, WordCell, CellRange, ListFormat);
 
-    #[implement(IDispatch)]
+    #[implement(IDispatch, Agile = false)]
     struct ListFormat {
         doc: usize,
     }
