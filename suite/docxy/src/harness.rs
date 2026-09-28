@@ -992,12 +992,16 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
 
 /// Ruler coordinates come from the last painted frame, in logical pixels.
 fn ruler_state(app: &crate::Docxy) -> Json {
+    if !app.show_ruler {
+        return Json::Null;
+    }
     let probe = app.ruler_probe.borrow();
     let Some(g) = probe.painted.as_ref() else {
         return Json::Null;
     };
     let tenth = |n: f32| Json::Num(((n * 10.0).round() / 10.0) as f64);
     let mut fields = vec![
+        ("frame", Json::Num(app.frame as f64)),
         ("first_offset", tenth(g.first_x - g.content_x)),
         ("left_offset", tenth(g.left_x - g.content_x)),
         ("right_offset", tenth(g.content_right - g.right_x)),
@@ -1006,25 +1010,18 @@ fn ruler_state(app: &crate::Docxy) -> Json {
         fields.push(("column_inset", tenth(g.content_x - g.viewport.x)));
         fields.push(("text_inset", Json::Null));
         fields.push(("vtop_inset", Json::Null));
+        fields.push(("vbottom_inset", Json::Null));
         fields.push(("tracked_page", Json::Null));
     } else {
-        let page = crate::tracked_page(&probe);
-        let vtop = page
-            .and_then(|i| {
-                probe
-                    .pages
-                    .get(i)
-                    .and_then(|p| *p)
-                    .zip(probe.contents.get(i).and_then(|c| *c))
-            })
-            .map(|(p, c)| tenth(c.y - p.y))
-            .unwrap_or(Json::Null);
         fields.push(("column_inset", Json::Null));
         fields.push(("text_inset", tenth(g.content_x - g.page_x)));
-        fields.push(("vtop_inset", vtop));
+        fields.push(("vtop_inset", tenth(g.content_y - g.page_y)));
+        fields.push(("vbottom_inset", tenth(g.page_bottom - g.content_bottom)));
         fields.push((
             "tracked_page",
-            page.map(|i| Json::Num(i as f64)).unwrap_or(Json::Null),
+            g.tracked_page
+                .map(|i| Json::Num(i as f64))
+                .unwrap_or(Json::Null),
         ));
     }
     Json::obj(fields)
