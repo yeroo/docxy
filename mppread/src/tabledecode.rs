@@ -16,6 +16,14 @@ pub(crate) fn f64_at(b: &[u8], at: usize) -> f64 {
     f64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
+fn record_ok(i: usize, kind: u16, len: usize, stubs: usize, row_len: usize) -> bool {
+    if i < stubs {
+        kind == 4 && len == 16
+    } else {
+        (matches!(kind, 0 | 2) && len == row_len) || (kind == 4 && len == 16)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Table {
     pub rows: Vec<Vec<u8>>,
@@ -89,7 +97,7 @@ pub(crate) fn read(
         // If the bytes form complete entries in the validated layout, the
         // header count is wrong. In particular, a lowered count can otherwise
         // masquerade as a larger unsupported stride.
-        if payload.is_multiple_of(meta_stride) && payload / meta_stride != count {
+        if payload.is_multiple_of(meta_stride) {
             let actual = payload / meta_stride;
             let offsets: Vec<_> = (0..actual)
                 .map(|i| u32_at(&fm, 16 + i * meta_stride + 4) as usize)
@@ -100,8 +108,7 @@ pub(crate) fn read(
                     let end = offsets.get(i + 1).copied().unwrap_or(fd.len());
                     let len = end.saturating_sub(off);
                     let kind = u16_at(&fm, 16 + i * meta_stride);
-                    end <= fd.len()
-                        && ((matches!(kind, 0 | 2) && len == row_len) || (kind == 4 && len == 16))
+                    end <= fd.len() && record_ok(i, kind, len, stubs, row_len)
                 });
             if valid {
                 return Err(format!("{name}: FixedMeta count or length mismatch"));
@@ -137,11 +144,7 @@ pub(crate) fn read(
             .checked_sub(off)
             .ok_or_else(|| format!("{name}: FixedMeta offset order at record {i}"))?;
         let kind = u16_at(m, 0);
-        let kind_ok = if i < stubs {
-            kind == 4 && len == 16
-        } else {
-            (matches!(kind, 0 | 2) && len == row_len) || (kind == 4 && len == 16)
-        };
+        let kind_ok = record_ok(i, kind, len, stubs, row_len);
         if off != previous_end || end > fd.len() {
             return Err(format!(
                 "{name}: FixedMeta offset or length mismatch at record {i}"
@@ -245,6 +248,38 @@ mod tests {
         )])
     }
 
+    fn resource_fixture(first_kind: u16, declared: u32) -> Vec<u8> {
+        let mut fm = vec![0u8; 16 + 4 * 37];
+        fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        fm[8..12].copy_from_slice(&declared.to_le_bytes());
+        for (i, off) in [0u32, 16, 32, 48].iter().enumerate() {
+            let at = 16 + i * 37;
+            let kind = if i == 0 {
+                first_kind
+            } else if i < 3 {
+                4
+            } else {
+                0
+            };
+            fm[at..at + 2].copy_from_slice(&kind.to_le_bytes());
+            fm[at + 4..at + 8].copy_from_slice(&off.to_le_bytes());
+        }
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![Node::Storage(
+                "TBkndRsc",
+                vec![
+                    Node::Stream("FixedMeta", fm),
+                    Node::Stream("FixedData", vec![0u8; 48 + 172]),
+                    Node::Stream("VarMeta", vm),
+                    Node::Stream("Var2Data", Vec::new()),
+                ],
+            )],
+        )])
+    }
+
     #[test]
     fn unsupported_layout_falls_back_but_corruption_errors() {
         assert!(present(&fixture(34, 0, 0), "TBkndAssn").unwrap());
@@ -302,6 +337,25 @@ mod tests {
             )
             .unwrap_err()
             .contains("VarMeta count or Var2Data length mismatch")
+        );
+    }
+
+    #[test]
+    fn lowered_resource_count_respects_schema_stubs() {
+        assert!(
+            read(&resource_fixture(4, 2), "TBkndRsc", 37, 172, 0x0c40)
+                .unwrap_err()
+                .contains("FixedMeta count or length mismatch")
+        );
+        assert!(
+            read(&resource_fixture(0, 2), "TBkndRsc", 37, 172, 0x0c40)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read(&resource_fixture(0, 4), "TBkndRsc", 37, 172, 0x0c40)
+                .unwrap()
+                .is_none()
         );
     }
 
