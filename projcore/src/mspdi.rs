@@ -460,6 +460,7 @@ fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
+                    "TimephasedData" => baseline.timephased_data.extend(parse_timephased_data(p)),
                     "Number" => {
                         number = text_of(p).trim().parse::<u8>().ok().filter(|n| *n <= 10);
                     }
@@ -796,6 +797,7 @@ fn parse_assignment_baseline(p: &mut XmlParser, a: &mut Assignment) {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
+                    "TimephasedData" => baseline.timephased_data.extend(parse_timephased_data(p)),
                     "Number" => {
                         number = text_of(p).trim().parse::<u8>().ok().filter(|n| *n <= 10);
                     }
@@ -829,6 +831,7 @@ fn parse_resource_baseline(p: &mut XmlParser, r: &mut Resource) {
             Event::Start => {
                 let name = p.name().to_string();
                 match name.as_str() {
+                    "TimephasedData" => baseline.timephased_data.extend(parse_timephased_data(p)),
                     "Number" => {
                         number = text_of(p).trim().parse::<u8>().ok().filter(|n| *n <= 10);
                     }
@@ -1960,6 +1963,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     baselines.sort_by_key(|b| b.number);
     for baseline in baselines {
         s.push_str("      <Baseline>\n");
+        write_timephased_data(s, &baseline.timephased_data, 4);
         tag(s, 4, "Number", &baseline.number.to_string());
         if let Some(start) = baseline.start {
             tag(s, 4, "Start", &start.to_mspdi());
@@ -1987,7 +1991,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_date(s, "CommitmentStart", t.commitment_start);
     opt_date(s, "CommitmentFinish", t.commitment_finish);
     opt_text(s, "CommitmentType", t.commitment_type);
-    write_timephased_data(s, &t.timephased_data);
+    write_timephased_data(s, &t.timephased_data, 3);
     s.push_str("    </Task>\n");
 }
 
@@ -2086,6 +2090,7 @@ fn write_resource(s: &mut String, r: &Resource) {
     write_extended_attributes(s, &r.extended_attributes);
     for baseline in &r.baselines {
         s.push_str("      <Baseline>\n");
+        write_timephased_data(s, &baseline.timephased_data, 4);
         tag(s, 4, "Number", &baseline.number.to_string());
         if let Some(work) = baseline.work_min {
             tag(s, 4, "Work", &min_to_iso(work));
@@ -2155,7 +2160,7 @@ fn write_resource(s: &mut String, r: &Resource) {
         }
         s.push_str("      </Rates>\n");
     }
-    write_timephased_data(s, &r.timephased_data);
+    write_timephased_data(s, &r.timephased_data, 3);
     s.push_str("    </Resource>\n");
 }
 
@@ -2269,6 +2274,7 @@ fn write_assignment(s: &mut String, a: &Assignment) {
     write_extended_attributes(s, &a.extended_attributes);
     for baseline in &a.baselines {
         s.push_str("      <Baseline>\n");
+        write_timephased_data(s, &baseline.timephased_data, 4);
         tag(s, 4, "Number", &baseline.number.to_string());
         if let Some(start) = baseline.start {
             tag(s, 4, "Start", &start.to_mspdi());
@@ -2290,31 +2296,33 @@ fn write_assignment(s: &mut String, a: &Assignment) {
         }
         s.push_str("      </Baseline>\n");
     }
-    write_timephased_data(s, &a.timephased_data);
+    write_timephased_data(s, &a.timephased_data, 3);
     s.push_str("    </Assignment>\n");
 }
 
 /// Timephased records, in the schema's child order.
-fn write_timephased_data(s: &mut String, records: &[TimephasedValue]) {
+fn write_timephased_data(s: &mut String, records: &[TimephasedValue], depth: usize) {
     for record in records {
-        s.push_str("      <TimephasedData>\n");
-        tag(s, 4, "Type", &record.kind.to_string());
+        s.push_str(&"  ".repeat(depth));
+        s.push_str("<TimephasedData>\n");
+        tag(s, depth + 1, "Type", &record.kind.to_string());
         if let Some(uid) = record.uid {
-            tag(s, 4, "UID", &uid.to_string());
+            tag(s, depth + 1, "UID", &uid.to_string());
         }
         if let Some(start) = record.start {
-            tag(s, 4, "Start", &start.to_mspdi());
+            tag(s, depth + 1, "Start", &start.to_mspdi());
         }
         if let Some(finish) = record.finish {
-            tag(s, 4, "Finish", &finish.to_mspdi());
+            tag(s, depth + 1, "Finish", &finish.to_mspdi());
         }
         if let Some(unit) = record.unit {
-            tag(s, 4, "Unit", &unit.to_string());
+            tag(s, depth + 1, "Unit", &unit.to_string());
         }
         if let Some(value) = &record.value {
-            tag(s, 4, "Value", value);
+            tag(s, depth + 1, "Value", value);
         }
-        s.push_str("      </TimephasedData>\n");
+        s.push_str(&"  ".repeat(depth));
+        s.push_str("</TimephasedData>\n");
     }
 }
 
@@ -2562,6 +2570,77 @@ mod tests {
 
     fn uid_xml(tasks: &str) -> String {
         format!("<Project><Tasks>{tasks}</Tasks></Project>")
+    }
+
+    #[test]
+    fn nested_baseline_timephased_records_round_trip_for_all_owners() {
+        let record = "<TimephasedData><Type>4</Type><UID>7</UID><Start>2026-03-02T08:00:00</Start><Finish>2026-03-02T17:00:00</Finish><Unit>2</Unit><Value>PT8H0M0S</Value></TimephasedData>";
+        let xml = format!(
+            "<Project><Tasks><Task><UID>1</UID><ID>1</ID><Name>T</Name><Baseline>{record}<Number>1</Number></Baseline></Task></Tasks><Resources><Resource><UID>2</UID><ID>1</ID><Name>R</Name><Baseline>{record}<Number>1</Number></Baseline></Resource></Resources><Assignments><Assignment><UID>3</UID><TaskUID>1</TaskUID><ResourceUID>2</ResourceUID><Baseline>{record}<Number>1</Number></Baseline><TimephasedData><Type>1</Type><Value>PT1H0M0S</Value></TimephasedData></Assignment></Assignments></Project>"
+        );
+        let project = read_mspdi(&xml).unwrap();
+        let task = project.tasks[0].baseline(1).unwrap();
+        let resource = project.resources[0].baseline(1).unwrap();
+        let assignment = project.assignments[0].baseline(1).unwrap();
+        assert_eq!(task.timephased_data, resource.timephased_data);
+        assert_eq!(task.timephased_data, assignment.timephased_data);
+        assert_eq!(assignment.timephased_data.len(), 1);
+        assert_eq!(
+            assignment.timephased_data[0],
+            TimephasedValue {
+                kind: 4,
+                uid: Some(7),
+                start: DateTime::parse_mspdi("2026-03-02T08:00:00"),
+                finish: DateTime::parse_mspdi("2026-03-02T17:00:00"),
+                unit: Some(2),
+                value: Some("PT8H0M0S".into()),
+            }
+        );
+        assert_eq!(project.assignments[0].timephased_data.len(), 1);
+        assert_eq!(project.assignments[0].timephased_data[0].kind, 1);
+
+        let written = write_mspdi(&project);
+        let baseline_blocks: Vec<_> = written.split("<Baseline>").skip(1).collect();
+        assert_eq!(baseline_blocks.len(), 3);
+        for block in baseline_blocks {
+            let block = block.split("</Baseline>").next().unwrap();
+            assert!(block.contains("        <TimephasedData>\n"));
+            assert!(block.find("<TimephasedData>").unwrap() < block.find("<Number>").unwrap());
+        }
+        assert_eq!(read_mspdi(&written).unwrap(), project);
+        assert_eq!(
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(&project)).unwrap(),
+            project
+        );
+    }
+
+    #[test]
+    fn nested_baseline_records_follow_slot_and_type_validation() {
+        let typed = "<TimephasedData><Type>4</Type><Value>PT1H0M0S</Value></TimephasedData>";
+        let untyped = "<TimephasedData><Value>PT2H0M0S</Value></TimephasedData>";
+        let a = assignment_project(&format!(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID><Baseline>{typed}<Number>1</Number>{untyped}</Baseline><Baseline>{typed}<Number>11</Number></Baseline></Assignment>"
+        ));
+        assert_eq!(a.assignments[0].baselines.len(), 1);
+        assert_eq!(
+            a.assignments[0].baseline(1).unwrap().timephased_data.len(),
+            1
+        );
+        assert_eq!(
+            a.assignments[0].baseline(1).unwrap().timephased_data[0].kind,
+            4
+        );
+        assert_eq!(read_mspdi(&write_mspdi(&a)).unwrap(), a);
+
+        let later = "<TimephasedData><Type>5</Type><Value>2.5</Value></TimephasedData>";
+        let duplicate = assignment_project(&format!(
+            "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID><Baseline>{typed}<Number>1</Number></Baseline><Baseline>{later}<Number>1</Number><Work>PT2H0M0S</Work></Baseline></Assignment>"
+        ));
+        let slot = duplicate.assignments[0].baseline(1).unwrap();
+        assert_eq!(slot.timephased_data.len(), 1);
+        assert_eq!(slot.timephased_data[0].kind, 5);
+        assert_eq!(slot.timephased_data[0].value.as_deref(), Some("2.5"));
+        assert_eq!(slot.work_min, Some(120));
     }
 
     #[test]
@@ -3029,6 +3108,7 @@ mod tests {
             }],
             baselines: vec![ResourceBaseline {
                 number: 0,
+                timephased_data: vec![],
                 work_min: Some(480),
                 cost: Rate::parse("400"),
                 bcws: Rate::parse("1"),
@@ -5965,6 +6045,7 @@ mod tests {
                 baselines: vec![
                     AssignmentBaseline {
                         number: 0,
+                        timephased_data: vec![],
                         start: d(2, 8),
                         finish: d(5, 17),
                         work_min: Some(1920),
@@ -6722,6 +6803,7 @@ mod tests {
                 baselines: vec![
                     ResourceBaseline {
                         number: 0,
+                        timephased_data: vec![],
                         work_min: Some(2400),
                         cost: Rate::parse("2000"),
                         bcws: Rate::parse("1000"),
