@@ -1626,17 +1626,16 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
 /// Decode Markdown without replacing characters that Save would write back.
 /// A BOM identifies UTF-16; without one, Markdown must be UTF-8 text.
 fn decode_markdown(bytes: &[u8]) -> Result<(String, Option<&'static str>), String> {
-    if let Some(text) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        return String::from_utf8(text.to_vec())
-            .map(|text| (text, None))
-            .map_err(|e| format!("not UTF-8 text: {e}"));
-    }
-    let utf16 = if let Some(text) = bytes.strip_prefix(&[0xFF, 0xFE]) {
-        Some((text, true))
-    } else {
-        bytes.strip_prefix(&[0xFE, 0xFF]).map(|text| (text, false))
-    };
-    if let Some((text, little_endian)) = utf16 {
+    let utf16 = bytes
+        .strip_prefix(&[0xFF, 0xFE])
+        .map(|text| (text, true))
+        .or_else(|| bytes.strip_prefix(&[0xFE, 0xFF]).map(|text| (text, false)));
+    let decoded = if let Some(text) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        (
+            String::from_utf8(text.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
+            None,
+        )
+    } else if let Some((text, little_endian)) = utf16 {
         if text.len() % 2 != 0 {
             return Err("invalid UTF-16 text: odd byte count".into());
         }
@@ -1650,15 +1649,22 @@ fn decode_markdown(bytes: &[u8]) -> Result<(String, Option<&'static str>), Strin
         let decoded = char::decode_utf16(units)
             .collect::<Result<String, _>>()
             .map_err(|e| format!("invalid UTF-16 text: {e}"))?;
-        return Ok((decoded, Some("UTF-16")));
+        (decoded, Some("UTF-16"))
+    } else {
+        // ASCII UTF-16 without a BOM is valid UTF-8 bytewise, but includes NULs.
+        if bytes.contains(&0) {
+            return Err("unsupported text encoding (contains NUL bytes)".into());
+        }
+        (
+            String::from_utf8(bytes.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
+            None,
+        )
+    };
+    // UTF-32LE shares the UTF-16LE BOM and decodes to NUL-interleaved text.
+    if decoded.0.contains('\0') {
+        return Err("unsupported text encoding (contains NUL characters)".into());
     }
-    // ASCII UTF-16 without a BOM is valid UTF-8 bytewise, but includes NULs.
-    if bytes.contains(&0) {
-        return Err("unsupported text encoding (contains NUL bytes)".into());
-    }
-    String::from_utf8(bytes.to_vec())
-        .map(|text| (text, None))
-        .map_err(|e| format!("not UTF-8 text: {e}"))
+    Ok(decoded)
 }
 
 fn doc_from_path(path: &PathBuf) -> Loaded {
@@ -4160,7 +4166,14 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 // is asked directly (a missing one has nothing to lose, and
                 // the sidecar holds real content).
                 l.load_failed = match t.load_failed {
-                    Some(failed) => failed,
+                    // An older build could save a lossy Markdown sidecar with
+                    // `Some(false)`. Recheck its source before allowing Save.
+                    Some(failed) => {
+                        failed
+                            || path.as_ref().is_some_and(|p| {
+                                is_markdown_path(p) && p.exists() && doc_from_path(p).load_failed
+                            })
+                    }
                     None => path
                         .as_ref()
                         .is_some_and(|p| p.exists() && doc_from_path(p).load_failed),
@@ -12834,6 +12847,27 @@ mod load_failed_save_tests {
             assert_eq!(
                 loaded.status.as_ref(),
                 "load error: unsupported text encoding (contains NUL bytes)"
+            );
+            refused_in_place(&path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf32le_markdown_refuses_save_in_place() {
+        let dir = temp("utf32le-md");
+        for (name, text) in [("short.md", "a"), ("heading.md", "# Title\n")] {
+            let path = dir.join(name);
+            let mut bytes = vec![0xFF, 0xFE, 0x00, 0x00];
+            for c in text.chars() {
+                bytes.extend_from_slice(&(c as u32).to_le_bytes());
+            }
+            std::fs::write(&path, bytes).unwrap();
+            let loaded = doc_from_path(&path);
+            assert!(loaded.load_failed);
+            assert_eq!(
+                loaded.status.as_ref(),
+                "load error: unsupported text encoding (contains NUL characters)"
             );
             refused_in_place(&path);
         }

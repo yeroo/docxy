@@ -589,6 +589,35 @@ fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn a_session_from_before_strict_markdown_decoding_cannot_overwrite_its_source() {
+    let dir = close_test_dir("legacy-markdown-session");
+    let path = dir.join("legacy.md");
+    // The old decoder saved its replacement characters in the sidecar and
+    // marked the tab as loaded. Recreate that persisted state.
+    std::fs::write(&path, "caf\u{fffd}\n").unwrap();
+    let mut tab = tab_from_path(&path);
+    assert!(!tab.load_failed);
+    tab.dirty = true;
+    let persisted = persist_tab(&dir, 0, &tab);
+    assert!(persisted.hot.is_some());
+    assert_eq!(persisted.load_failed, Some(false));
+
+    let original = b"caf\xE9\n";
+    std::fs::write(&path, original).unwrap();
+    let mut restored = restore_tab(&persisted);
+    assert!(restored.load_failed, "{}", restored.status);
+    assert!(
+        restored.status.starts_with("load error"),
+        "{}",
+        restored.status
+    );
+    assert!(!save_doc_tab(&mut restored, None));
+    assert_eq!(restored.status.as_ref(), DOC_LOAD_FAILED_SAVE);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 fn close_test_dir(tag: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../target/close-tests")
