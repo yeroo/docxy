@@ -258,6 +258,33 @@ fn check_task_fields(
     );
     let dt =
         |d: Option<projcore::DateTime>| d.map(|d| d.to_mspdi().replace('T', " ")[..16].to_string());
+    if require_fields {
+        assert_eq!(
+            f.constraint_type,
+            Some(e.constraint),
+            "{}",
+            at("decoded constraint type")
+        );
+        assert_eq!(
+            f.constraint_date,
+            dt(e.constraint_date),
+            "{}",
+            at("decoded constraint date")
+        );
+        if (imported.constraint, imported.constraint_date) != (e.constraint, e.constraint_date) {
+            assert!(
+                !imported.manual && !imported.summary,
+                "{}",
+                at("unexpected pin row")
+            );
+            assert_eq!(
+                (imported.constraint, imported.constraint_date),
+                (projcore::ConstraintType::MustStartOn, imported.stored_start),
+                "{}",
+                at("imported pin")
+            );
+        }
+    }
     assert_eq!(f.create_date, dt(e.create_date), "{}", at("create date"));
     assert_eq!(f.deadline, dt(e.deadline), "{}", at("deadline"));
     assert_eq!(
@@ -491,61 +518,6 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             "{}: project StartDate",
             mpp.display()
         );
-        for expected_task in oracle.tasks.iter().filter(|t| t.uid != 0 && !t.is_null) {
-            let raw = decoded
-                .iter()
-                .find(|t| t.uid as i32 == expected_task.uid)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{}: decoded UID {} missing",
-                        mpp.display(),
-                        expected_task.uid
-                    )
-                });
-            let fields = raw.fields.as_ref().expect("current task fields");
-            let decoded_date = fields.constraint_date.as_deref().map(|date| {
-                projcore::DateTime::parse_mspdi(&format!("{}:00", date.replace(' ', "T")))
-                    .expect("decoded MPP constraint date")
-            });
-            let decoded_constraint = (
-                fields.constraint_type.expect("decoded constraint type"),
-                decoded_date,
-            );
-            assert_eq!(
-                decoded_constraint,
-                (expected_task.constraint, expected_task.constraint_date),
-                "{}: UID {} decoded constraint type/date",
-                mpp.display(),
-                expected_task.uid
-            );
-            let got = imported
-                .tasks
-                .iter()
-                .find(|t| t.uid == expected_task.uid)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{}: imported UID {} missing",
-                        mpp.display(),
-                        expected_task.uid
-                    )
-                });
-            let imported_constraint = (got.constraint, got.constraint_date);
-            if imported_constraint != decoded_constraint {
-                assert!(
-                    !got.manual && !got.summary,
-                    "{}: UID {} unexpected pin row",
-                    mpp.display(),
-                    got.uid
-                );
-                assert_eq!(
-                    imported_constraint,
-                    (projcore::ConstraintType::MustStartOn, got.stored_start),
-                    "{}: UID {} imported pin",
-                    mpp.display(),
-                    got.uid
-                );
-            }
-        }
     }
     if xml_text.contains("<Calendars>") {
         let fields = |c: &projcore::Calendar| {
@@ -1356,9 +1328,14 @@ fn project_2024_oracles() {
     let constraints = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/constraints");
     let cases = pairs(&constraints, "");
     if !cases.is_empty() {
-        assert_eq!(cases.len(), 2, "generated constraint pairs");
         let mut seen = [false; 8];
         for (mpp, xml) in &cases {
+            assert!(
+                mpp.file_stem()
+                    .is_some_and(|stem| stem == "k1-all-types" || stem == "k2-rows"),
+                "unknown generated constraint pair {}",
+                mpp.display()
+            );
             check_pair(mpp, xml, false, Oracle::Project);
             let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
             let imported =
@@ -1377,10 +1354,12 @@ fn project_2024_oracles() {
                 assert_eq!(child.constraint_date, child.stored_start);
             }
         }
-        assert!(
-            seen.iter().all(|&value| value),
-            "generated pairs omit a constraint code: {seen:?}"
-        );
+        if cases.len() == 2 {
+            assert!(
+                seen.iter().all(|&value| value),
+                "generated pairs omit a constraint code: {seen:?}"
+            );
+        }
     }
     let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     if snapshots.join("01-empty.mpp").exists() {
@@ -1404,7 +1383,8 @@ fn project_2024_oracles() {
         }
         let mut recurring_count = 0;
         let mut constraint_counts = [0usize; 8];
-        let mut summary_fallback_pins = 0usize;
+        let mut start_divergence_pins = 0usize;
+        let mut first_pins = std::collections::HashMap::new();
         for (mpp, xml) in &newest {
             // The two standalone XML exports were saved after a legacy-MPP
             // conversion: their GUIDs differ from the current .mpp, and
@@ -1415,18 +1395,20 @@ fn project_2024_oracles() {
                 mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
             let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
             for task in imported.tasks.iter().filter(|t| !t.is_null) {
-                constraint_counts[task.constraint.code() as usize] += 1;
-                if decoded
+                let original = decoded
                     .iter()
                     .find(|raw| raw.uid as i32 == task.uid)
                     .and_then(|raw| raw.fields.as_ref())
                     .and_then(|fields| fields.constraint_type)
-                    .is_some_and(|original| {
-                        original != task.constraint
-                            && task.constraint == projcore::ConstraintType::MustStartOn
-                    })
+                    .unwrap();
+                constraint_counts[original.code() as usize] += 1;
+                if original != task.constraint
+                    && task.constraint == projcore::ConstraintType::MustStartOn
                 {
-                    summary_fallback_pins += 1;
+                    start_divergence_pins += 1;
+                    first_pins
+                        .entry(task.uid)
+                        .or_insert_with(|| mpp.file_stem().unwrap().to_string_lossy().to_string());
                 }
             }
             if mpp.file_stem().is_some_and(|s| s == "x-recurring") {
@@ -1550,8 +1532,8 @@ fn project_2024_oracles() {
         assert_eq!(constraint_counts[4], 34, "SNET count in newest snapshots");
         assert_eq!(constraint_counts[7], 28, "FNLT count in newest snapshots");
         assert_eq!(
-            summary_fallback_pins, 0,
-            "summary fallback pins in newest snapshots"
+            start_divergence_pins, 0,
+            "unexpected effective pins in newest snapshots: {first_pins:?}"
         );
         assert_eq!(
             recurring_count, 5,

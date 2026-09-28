@@ -8,16 +8,11 @@ fn date(bytes: &[u8], uid: u32, what: &str) -> Result<Option<DateTime>, String> 
     if bytes.len() != 4 {
         return Err(format!("invalid {what} length for assignment UID {uid}"));
     }
-    let t = u16::from_le_bytes(bytes[..2].try_into().unwrap());
-    let day = u16::from_le_bytes(bytes[2..].try_into().unwrap());
-    if day == 0xffff {
+    let Some(s) = crate::mpp::decode_checked_timestamp(bytes, 0)
+        .map_err(|_| format!("invalid {what} time for assignment UID {uid}"))?
+    else {
         return Ok(None);
-    }
-    if t >= 14400 && t != 0xffff {
-        return Err(format!("invalid {what} time for assignment UID {uid}"));
-    }
-    let s = crate::mpp::decode_timestamp(bytes, 0)
-        .ok_or_else(|| format!("invalid {what} for assignment UID {uid}"))?;
+    };
     crate::project::parse_mpp_dt(&s)
         .map(Some)
         .ok_or_else(|| format!("invalid {what} for assignment UID {uid}"))

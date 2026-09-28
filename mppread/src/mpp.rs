@@ -562,6 +562,20 @@ pub fn decode_timestamp(data: &[u8], off: usize) -> Option<String> {
     ))
 }
 
+/// A task/property timestamp with NA allowed but an out-of-day time refused.
+/// Callers validate that four bytes are available and add field-specific errors.
+pub(crate) fn decode_checked_timestamp(data: &[u8], off: usize) -> Result<Option<String>, ()> {
+    let days = u16le(data, off + 2);
+    if days == 0xffff {
+        return Ok(None);
+    }
+    let time = u16le(data, off);
+    if time != 0xffff && time >= 14400 {
+        return Err(());
+    }
+    Ok(decode_timestamp(data, off))
+}
+
 /// Decode an MPP duration (a 4-byte value in tenths of a minute) at `off` into
 /// **working minutes**. Per MPXJ, the raw int / 600 is hours; ÷10 is minutes.
 pub fn decode_duration_minutes(data: &[u8], off: usize) -> i64 {

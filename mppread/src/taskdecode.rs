@@ -299,15 +299,11 @@ fn current_fields(
         .ok_or_else(|| format!("invalid constraint type {code} for UID {uid}"))?;
     let constraint_date = match constraint_type {
         ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible => None,
-        _ => {
-            let date = decode_timestamp(rec, CONSTRAINT_DATE)
-                .ok_or_else(|| format!("missing constraint date for UID {uid}"))?;
-            let time = u16_at(rec, CONSTRAINT_DATE);
-            if time != 0xffff && time >= 14400 {
-                return Err(format!("invalid constraint date for UID {uid}"));
-            }
-            Some(date)
-        }
+        _ => Some(
+            crate::mpp::decode_checked_timestamp(rec, CONSTRAINT_DATE)
+                .map_err(|_| format!("invalid constraint date for UID {uid}"))?
+                .ok_or_else(|| format!("missing constraint date for UID {uid}"))?,
+        ),
     };
     let priority = i32::from(u16_at(rec, 78));
     if priority > 1000 {

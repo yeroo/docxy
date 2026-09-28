@@ -9,10 +9,6 @@ of git, and the fetch scripts below.
 
 ## The generated corpus (preferred)
 
-`python corpus/tools/gen_mpp_constraint_cases.py` generates two optional
-`constraints/` MPP/XML pairs covering all eight task constraint codes, manual
-tasks, summaries, and a project start distinct from task dates.
-
 The primary `.mpp` corpus is **generated**, not hand-collected: a headless
 Runner (`mpp-corpus-gen`, a separate private repo; the documents land in the
 `mpp-corpus` repo) drives a real, licensed copy of
@@ -389,6 +385,14 @@ MPP9 progress has no oracle in the legacy samples and is not read.
 The older `mppread::mpp::tasks` and `task_names` functions remain exploratory
 heuristic probes. They are not used by the importer. Their output may be
 partial or wrong for a file that `decode_tasks` correctly refuses.
+
+## Constraint cases
+
+On Windows with Microsoft Project and pywin32 installed, run
+`python corpus/tools/gen_mpp_constraint_cases.py` to generate two optional
+`constraints/` MPP/XML pairs. They cover all eight task constraint codes,
+manual tasks, summaries, and a project start distinct from task dates. The
+script can also generate one case by name (`all_types` or `rows`).
 
 ## What already works on a real .mpp
 
