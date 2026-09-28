@@ -783,8 +783,9 @@ fn arm_fill(
     fill: &mut Option<FillDrag>,
     src: Option<(u32, u32, u32, u32)>,
     gesture_in_flight: bool,
+    tab_more_open: bool,
 ) -> bool {
-    if !may_arm_fill(fill.is_some(), gesture_in_flight) {
+    if tab_more_open || !may_arm_fill(fill.is_some(), gesture_in_flight) {
         return false;
     }
     let Some(src) = src else { return false };
@@ -1284,6 +1285,7 @@ struct Docxy {
     tab_first: usize,
     tab_layout: tabstrip::StripLayout,
     tab_more_open: bool,
+    title_chrome_budget: Option<(f32, f32)>,
     focus: FocusHandle,
     focused: bool,
     ribbon_tab: RibbonTab,
@@ -4418,46 +4420,33 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     }
 }
 
-/// The pinned gpui-component Root wraps TitleBar in window_border: client
-/// shadows are its padding and each untiled edge adds a 1px inner border.
-/// The pinned TitleBar separately adds left padding and a fullscreen inset.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct FrameBorders {
-    top: f32,
-    right: f32,
-    bottom: f32,
-    left: f32,
-}
-
-fn frame_borders(tiling: Option<(bool, bool, bool, bool)>, scale: f32) -> FrameBorders {
-    let one = scale.ceil() / scale; // gpui rounds 1 logical px to a whole device pixel
-    let Some((top, right, bottom, left)) = tiling else {
-        return FrameBorders {
-            top: 0.0,
-            right: 0.0,
-            bottom: 0.0,
-            left: 0.0,
-        };
+fn frame_borders(tiling: Option<Tiling>, scale: f32) -> Edges<f32> {
+    // Match gpui's round_stroke_to_device_pixel: round half toward zero,
+    // with at least one device pixel for a nonzero stroke.
+    let one = (scale - 0.5).ceil().max(1.0) / scale;
+    let Some(tiling) = tiling else {
+        return Edges::default();
     };
-    FrameBorders {
-        top: if top { 0.0 } else { one },
-        right: if right { 0.0 } else { one },
-        bottom: if bottom { 0.0 } else { one },
-        left: if left { 0.0 } else { one },
+    Edges {
+        top: if tiling.top { 0.0 } else { one },
+        right: if tiling.right { 0.0 } else { one },
+        bottom: if tiling.bottom { 0.0 } else { one },
+        left: if tiling.left { 0.0 } else { one },
     }
 }
 
-fn window_frame_borders(window: &Window) -> FrameBorders {
+fn window_frame_borders(window: &Window) -> Edges<f32> {
     let tiling = match window.window_decorations() {
         Decorations::Server => None,
-        Decorations::Client { tiling } => {
-            Some((tiling.top, tiling.right, tiling.bottom, tiling.left))
-        }
+        Decorations::Client { tiling } => Some(tiling),
     };
     frame_borders(tiling, window.scale_factor())
 }
 
-fn title_bar_geometry(window: &Window) -> tabstrip::TitleGeometry {
+/// The pinned gpui-component Root wraps TitleBar in window_border: client
+/// shadows are its padding and each untiled edge adds a snapped inner border.
+/// The pinned TitleBar separately adds left padding and a fullscreen inset.
+fn title_bar_geometry(window: &Window) -> f32 {
     #[cfg(target_os = "macos")]
     const TITLE_LEFT_PAD: f32 = 80.0;
     #[cfg(not(target_os = "macos"))]
@@ -4469,12 +4458,12 @@ fn title_bar_geometry(window: &Window) -> tabstrip::TitleGeometry {
     };
     let padding = gpui_component::window_paddings(window);
     let borders = window_frame_borders(window);
-    tabstrip::title_geometry(
+    tabstrip::title_content_w(
         f32::from(window.viewport_size().width),
-        f32::from(padding.left),
-        f32::from(padding.right),
-        borders.left,
-        borders.right,
+        tabstrip::TitleInsets {
+            left: f32::from(padding.left) + borders.left,
+            right: f32::from(padding.right) + borders.right,
+        },
         TITLE_LEFT_PAD,
         caption_w,
         if window.is_fullscreen() { 12.0 } else { 0.0 },
@@ -4483,24 +4472,27 @@ fn title_bar_geometry(window: &Window) -> tabstrip::TitleGeometry {
 
 #[cfg(test)]
 mod frame_border_tests {
-    use super::{FrameBorders, frame_borders};
+    use super::frame_borders;
+    use gpui::{Edges, Tiling};
 
     #[test]
     fn client_tiling_and_fractional_scale_reserve_snapped_borders() {
-        assert_eq!(
-            frame_borders(None, 1.75),
-            FrameBorders {
-                top: 0.0,
-                right: 0.0,
-                bottom: 0.0,
-                left: 0.0
-            }
+        assert_eq!(frame_borders(None, 1.75), Edges::default());
+        let b = frame_borders(
+            Some(Tiling {
+                right: true,
+                ..Default::default()
+            }),
+            1.75,
         );
-        let b = frame_borders(Some((false, true, false, false)), 1.75);
         assert!((b.left - 2.0 / 1.75).abs() < 0.0001);
         assert_eq!(b.right, 0.0);
         assert_eq!(b.top, b.left);
         assert_eq!(b.bottom, b.left);
+        for (scale, device_px) in [(1.0, 1.0), (1.25, 1.0), (1.5, 1.0), (1.75, 2.0), (2.0, 2.0)] {
+            let b = frame_borders(Some(Tiling::default()), scale);
+            assert!((b.left * scale - device_px).abs() < 0.0001, "scale {scale}");
+        }
     }
 }
 
@@ -4540,6 +4532,7 @@ impl Docxy {
             tab_first: 0,
             tab_layout: tabstrip::layout(0.0, 0, 0, 0),
             tab_more_open: false,
+            title_chrome_budget: None,
             focus: cx.focus_handle(),
             focused: false,
             ribbon_tab: RibbonTab::Home,
@@ -4851,7 +4844,12 @@ impl Docxy {
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         let gesture_in_flight = self.grid_gesture_in_flight();
         let src = self.active_sheet().map(|v| v.range());
-        if arm_fill(&mut self.sheet_fill, src, gesture_in_flight) {
+        if arm_fill(
+            &mut self.sheet_fill,
+            src,
+            gesture_in_flight,
+            self.tab_more_open,
+        ) {
             cx.notify();
         }
     }
@@ -12580,8 +12578,7 @@ impl Docxy {
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if self.tab_more_open {
             if ev.keystroke.key == "escape" {
-                self.tab_more_open = false;
-                cx.notify();
+                self.tab_more_close(cx);
             }
             return; // the modal list owns keys; do not edit the surface below
         }
@@ -15378,6 +15375,15 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
 // ---- chrome: ribbon + backstage --------------------------------------------
 
 impl Docxy {
+    fn tab_more_close(&mut self, cx: &mut Context<Self>) {
+        // A deferred sheet handle can sit above the modal backdrop. Never carry
+        // a fill armed by a press there into the next grid gesture.
+        self.sheet_fill = None;
+        self.grid_release(cx);
+        self.tab_more_open = false;
+        cx.notify();
+    }
+
     fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
         let names = ribbon_tab_set(self.ribbon_kind());
         let mut strip = h_flex()
@@ -18281,8 +18287,14 @@ impl Docxy {
 
     fn tab_more_toggle(&mut self, cx: &mut Context<Self>) {
         if self.tab_layout.more {
-            self.tab_more_open = !self.tab_more_open;
-            cx.notify();
+            if self.tab_more_open {
+                self.tab_more_close(cx);
+            } else {
+                self.sheet_fill = None;
+                self.grid_release(cx);
+                self.tab_more_open = true;
+                cx.notify();
+            }
         }
     }
 
@@ -18293,8 +18305,13 @@ impl Docxy {
     }
 
     fn tab_more_popup(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let anchor = self.probes.borrow().current("tab-more");
-        let viewport = f32::from(window.viewport_size().width);
+        let probes = self.probes.borrow();
+        let anchor = probes.get("tab-more");
+        let root = probes.get("suite-root");
+        let root_x = root.map(|b| f32::from(b.origin.x)).unwrap_or(0.0);
+        let root_w = root
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or_else(|| f32::from(window.viewport_size().width));
         let padding = gpui_component::window_paddings(window);
         let borders = window_frame_borders(window);
         let max_menu_h = (f32::from(window.viewport_size().height)
@@ -18305,9 +18322,9 @@ impl Docxy {
             - 8.0)
             .clamp(0.0, 400.0);
         let left = anchor
-            .map(|b| f32::from(b.origin.x))
+            .map(|b| f32::from(b.origin.x) - root_x)
             .unwrap_or(0.0)
-            .min((viewport - 224.0).max(0.0));
+            .clamp(0.0, (root_w - 224.0).max(0.0));
         let items = self
             .tabs
             .iter()
@@ -18348,8 +18365,7 @@ impl Docxy {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
-                    this.tab_more_open = false;
-                    cx.notify();
+                    this.tab_more_close(cx);
                 }),
             )
             .child(
@@ -18442,7 +18458,7 @@ impl Render for Docxy {
         // The pinned TitleBar gives #bar flex-shrink:0. A definite width,
         // accounting for Root's client decoration insets, keeps the caption
         // controls inside the viewport.
-        let title_w = title_bar_geometry(window).content_w;
+        let title_w = title_bar_geometry(window);
         let chrome = self.probes.borrow();
         let left_w = chrome
             .get("title-left")
@@ -18453,6 +18469,11 @@ impl Render for Docxy {
             .map(|b| f32::from(b.size.width))
             .unwrap_or(80.0);
         drop(chrome);
+        let measured = (left_w, theme_w);
+        if self.title_chrome_budget != Some(measured) {
+            self.title_chrome_budget = Some(measured);
+            cx.notify();
+        }
         // In very narrow windows the left chrome yields space to the drag
         // region before the caption controls can be affected.
         let left_cap = (title_w - 8.0 - 24.0 - tabstrip::DRAG_MIN_W).max(0.0);
@@ -18512,7 +18533,17 @@ impl Render for Docxy {
                     .when(is_imported(tb) && strip.tab_w >= 160.0, |d| {
                         d.child(div().flex_none().child(" · imported"))
                     })
-                    .when(tb.dirty, |d| d.child(div().flex_none().child("•")))
+                    .when(tb.dirty, |d| {
+                        d.child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .child("•")
+                                .when(i == self.active, |d| {
+                                    d.child(probe(&self.probes, "title-active-dirty"))
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .id(("chipx", i))
@@ -18641,7 +18672,7 @@ impl Render for Docxy {
                     h_flex()
                         .relative()
                         .w(px(strip.width))
-                        .flex_none()
+                        .flex_shrink(1.0)
                         .min_w_0()
                         .overflow_hidden()
                         .items_center()
@@ -22790,7 +22821,7 @@ mod grid_geom_tests {
         assert!(!gesture_in_flight(false, false, false, false));
         assert!(may_arm_fill(false, false));
         let mut fill = None;
-        assert!(arm_fill(&mut fill, Some(src), false));
+        assert!(arm_fill(&mut fill, Some(src), false, false));
         let armed = fill.expect("the source range becomes a fill drag");
         assert_eq!(armed.src, src);
         assert_eq!(armed.to, (src.2, src.3));
@@ -22815,7 +22846,8 @@ mod grid_geom_tests {
             assert!(!arm_fill(
                 &mut fill,
                 Some(src),
-                gesture_in_flight(drag, dragging, range, formula)
+                gesture_in_flight(drag, dragging, range, formula),
+                false
             ));
             assert!(fill.is_none(), "a grid gesture must leave the fill unarmed");
         }
@@ -22824,8 +22856,14 @@ mod grid_geom_tests {
         assert!(!may_arm_fill(true, false));
         assert!(!may_arm_fill(true, true));
         let mut fill = Some(armed);
-        assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false));
+        assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false, false));
         assert_eq!(fill.expect("the first fill stays armed").src, src);
+
+        // The deferred handle can receive a press above the more-tabs backdrop.
+        // That press must leave the fill unarmed even without a grid gesture.
+        let mut fill = None;
+        assert!(!arm_fill(&mut fill, Some(src), false, true));
+        assert!(fill.is_none());
     }
 
     fn names(list: &[&str]) -> Vec<String> {

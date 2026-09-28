@@ -79,6 +79,9 @@ test title bar keeps caption controls visible with twenty tabs
   assert reply.para.ind.left is 720
   assert dirty is true
   shot title-tabs
+  call title-bar {}
+  assert reply.overflow is true
+  assert reply.active_dirty_visible is true
   call title-tab {"action":"more"}
   key shift+tab
   call doc {}

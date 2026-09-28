@@ -697,7 +697,9 @@ fn shown(s: &str) -> String {
     }
 }
 
-/// Preserve the basename for titles and exports; never replace an existing copy.
+/// Copy `source` into `<sandbox>/<case-slug>/`, named `target_name` if given
+/// (a plain filename; the caller validates it) or else the source basename;
+/// never replace an existing copy.
 pub fn copy_fixture(
     source: &Path,
     sandbox: &Path,

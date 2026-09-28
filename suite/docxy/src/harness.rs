@@ -1537,6 +1537,16 @@ pub fn dispatch(
                         && right <= strip_right + 0.5
                         && right <= content_right + 0.5
                 });
+            let active_dirty_visible = app.tabs.get(app.active).is_some_and(|tab| tab.dirty)
+                && probes.get("title-active-chip").is_some_and(|chip| {
+                    probes.get("title-active-dirty").is_some_and(|mark| {
+                        let chip_left = f32::from(chip.origin.x);
+                        let chip_right = f32::from(chip.origin.x + chip.size.width);
+                        let mark_left = f32::from(mark.origin.x);
+                        let mark_right = f32::from(mark.origin.x + mark.size.width);
+                        mark_left >= chip_left - 0.5 && mark_right <= chip_right + 0.5
+                    })
+                });
             Done::ok(Json::obj(vec![
                 ("tabs", Json::Num(app.tabs.len() as f64)),
                 ("active", Json::Num(app.active as f64)),
@@ -1545,6 +1555,7 @@ pub fn dispatch(
                 ("mode", Json::Str(layout.mode.name().into())),
                 ("overflow", Json::Bool(layout.more)),
                 ("active_visible", Json::Bool(active_visible)),
+                ("active_dirty_visible", Json::Bool(active_dirty_visible)),
                 ("theme_visible", Json::Bool(theme_visible)),
                 ("strip_right", Json::Num(strip_right as f64)),
                 ("content_right", Json::Num(content_right as f64)),
