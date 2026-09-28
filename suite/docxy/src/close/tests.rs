@@ -497,6 +497,82 @@ fn a_cancelled_single_close_keeps_an_untouched_cell_editor_open_as_seeded() {
 }
 
 #[test]
+fn close_dialog_save_preserves_an_untouched_text_cell_on_disk() {
+    let dir = close_test_dir("untouched-cell-close-save");
+    let path = dir.join("saved.xlsx");
+    let mut t = untouched_text_cell();
+    t.dirty = true; // Another change caused the close dialog to ask.
+    assert_eq!(
+        close_step(&mut t, |_| Ok(CloseAnswer::Save)),
+        CloseStep::Save
+    );
+    prepare_sheet_save(&mut t);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    finish_sheet_save(&mut t, Some(&path));
+    assert!(!t.dirty, "{}", t.status);
+    assert!(path.is_file(), "{}", t.status);
+    a1_is_text_007(&tab_from_path(&path));
+}
+
+#[test]
+fn save_preserves_an_untouched_cell_editor_and_clean_tab() {
+    let dir = close_test_dir("untouched-cell-save");
+    let path = dir.join("saved.xlsx");
+    let mut t = untouched_text_cell();
+    prepare_sheet_save(&mut t);
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    a1_is_text_007(&t);
+    finish_sheet_save(&mut t, Some(&path));
+    assert!(!t.dirty, "{}", t.status);
+    assert!(path.is_file(), "{}", t.status);
+    a1_is_text_007(&tab_from_path(&path));
+}
+
+#[test]
+fn save_commits_a_changed_cell_editor_before_writing() {
+    let dir = close_test_dir("changed-cell-save");
+    for (buffer, expected) in [
+        ("abc", gridcore::sheet::CellValue::Text("abc".into())),
+        ("008", gridcore::sheet::CellValue::Number(8.0)),
+    ] {
+        let path = dir.join(format!("{buffer}.xlsx"));
+        let mut t = untouched_text_cell();
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.editing = Some(buffer.into());
+        prepare_sheet_save(&mut t);
+        assert!(t.dirty, "{buffer}");
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        assert!(v.editing.is_none(), "{buffer}");
+        assert_eq!(v.undo.len(), 1, "{buffer}");
+        finish_sheet_save(&mut t, Some(&path));
+        assert!(!t.dirty, "{}", t.status);
+        assert!(path.is_file(), "{}", t.status);
+        let reloaded = tab_from_path(&path);
+        let Surface::Sheet(v) = &reloaded.surface else {
+            panic!("{}", reloaded.status)
+        };
+        assert_eq!(
+            v.sheet().cell(0, 0).map(|c| &c.value),
+            Some(&expected),
+            "{buffer}"
+        );
+    }
+}
+
+#[test]
 fn a_tab_that_failed_to_load_stays_unsaveable_after_a_restart() {
     let dir = close_test_dir("load-failed-source");
     let path = dir.join("broken.docx");

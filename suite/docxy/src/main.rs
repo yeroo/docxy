@@ -10162,9 +10162,9 @@ impl Docxy {
     /// re-writes into the loaded package), preserving styles and formulas.
     /// `explicit_save_as` always asks where to go, even for a saved workbook.
     fn save_sheet(&mut self, explicit_save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // Commit any open cell edit first, so the decision and the write see it.
-        if self.active_sheet().is_some_and(|v| v.editing.is_some()) {
-            self.sheet_commit(0, 0, cx);
+        // Commit a changed cell edit first, so the decision and write see it.
+        if let Some(tab) = self.tabs.get_mut(self.active) {
+            close::prepare_sheet_save(tab);
         }
         let Some(tab) = self.tabs.get(self.active) else {
             return;
