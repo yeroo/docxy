@@ -8,6 +8,19 @@
 //! serve as an oracle for our scheduler.
 
 use crate::datetime::DateTime;
+use std::sync::Arc;
+
+/// Opaque parts and content types retained from a `.yppx` package.
+/// MSPDI output ignores these; a `.yppx` save writes them back.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct PackageParts {
+    /// ZIP name and uncompressed bytes, in package order.
+    pub parts: Vec<(String, Arc<[u8]>)>,
+    /// Extension and content type for non-XML Defaults.
+    pub defaults: Vec<(String, String)>,
+    /// Part name and content type for retained Overrides.
+    pub overrides: Vec<(String, String)>,
+}
 
 /// Dependency kind between two tasks. The `code` is MSPDI's integer encoding,
 /// which is *not* in the intuitive order — memorized here once so nowhere else
@@ -220,7 +233,7 @@ impl LagFormat {
 }
 
 /// One predecessor link on a task.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Predecessor {
     /// UID of the predecessor task.
     pub uid: i32,
@@ -230,6 +243,8 @@ pub struct Predecessor {
     /// duration (Percent). Negative means lead (overlap).
     pub lag: i64,
     pub lag_format: LagFormat,
+    pub cross_project: Option<bool>,
+    pub cross_project_name: Option<String>,
 }
 
 impl Predecessor {
@@ -245,6 +260,8 @@ impl Predecessor {
             link,
             lag: lag_min,
             lag_format: LagFormat::DAYS,
+            cross_project: None,
+            cross_project_name: None,
         }
     }
 
@@ -268,6 +285,8 @@ impl Predecessor {
 pub struct Baseline {
     /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
     pub number: u8,
+    /// Timephased records nested in this baseline, kept as written.
+    pub timephased_data: Vec<TimephasedValue>,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
     /// Recorded working minutes; None when Duration was omitted, empty, or invalid.
@@ -307,6 +326,8 @@ pub struct Task {
     pub baselines: Vec<Baseline>,
     /// Custom field values (MSPDI `ExtendedAttribute`), in file order.
     pub extended_attributes: Vec<ExtendedAttributeValue>,
+    /// Outline code values (MSPDI `OutlineCode`), in file order.
+    pub outline_codes: Vec<OutlineCodeValue>,
     /// Manually scheduled (MSPDI `Manual`): the task stays at the dates the
     /// user gave it instead of moving with its links and constraints.
     pub manual: bool,
@@ -322,7 +343,9 @@ pub struct Task {
     // the source had no (valid) value and the save writes none.
     pub guid: Option<String>,
     pub create_date: Option<DateTime>,
+    pub contact: Option<String>,
     pub wbs: Option<String>,
+    pub wbs_level: Option<String>,
     pub task_type: Option<TaskType>,
     /// `None` reads as active; see [`Task::is_active`].
     pub active: Option<bool>,
@@ -331,26 +354,39 @@ pub struct Task {
     pub estimated: Option<bool>,
     /// Levelling priority, 0..=1000.
     pub priority: Option<i32>,
-    /// Bounds the late finish only, so a missed deadline shows as negative
-    /// total slack. It never moves scheduled dates.
+    /// Bounds the late finish, so a missed deadline shows as negative total
+    /// slack. It can pull an ALAP task and its successors earlier.
     pub deadline: Option<DateTime>,
     pub level_assignments: Option<bool>,
     pub leveling_can_split: Option<bool>,
     /// MSPDI `LevelingDelay`, raw (tenths of a minute), with its display format.
     pub leveling_delay: Option<i64>,
     pub leveling_delay_format: Option<i32>,
+    pub pre_leveled_start: Option<DateTime>,
+    pub pre_leveled_finish: Option<DateTime>,
     /// MSPDI task hyperlink display text, address, and in-file location.
     pub hyperlink: Option<String>,
     pub hyperlink_address: Option<String>,
     pub hyperlink_sub_address: Option<String>,
     pub ignore_resource_calendar: Option<bool>,
+    pub notes: Option<String>,
     pub earned_value_method: Option<i32>,
     pub recurring: Option<bool>,
     pub hide_bar: Option<bool>,
     pub rollup: Option<bool>,
     pub external_task: Option<bool>,
+    pub external_task_project: Option<String>,
     pub is_subproject: Option<bool>,
     pub is_subproject_read_only: Option<bool>,
+    pub subproject_name: Option<String>,
+    pub display_as_summary: Option<bool>,
+    /// Publication and commitment metadata, kept as read for MSPDI saves.
+    pub is_published: Option<bool>,
+    pub status_manager: Option<String>,
+    pub commitment_start: Option<DateTime>,
+    pub commitment_finish: Option<DateTime>,
+    /// Project commitment type, 0..=2.
+    pub commitment_type: Option<i32>,
     /// Work (minutes), Cost and OverAllocated as Project last calculated
     /// them. docxy never computes them whole: they stay as read until an edit
     /// changes the task's assignments (or a subtask's), or moves a subtask
@@ -367,9 +403,10 @@ pub struct Task {
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
     // computes nor reconciles it: edits leave it as read, except that
-    // `remaining_work_min` and `remaining_cost` move with the task's
-    // assignments and fixed cost as `work_min` and `cost` do. The scheduler reads a leaf's
-    // actual dates, `Stop`/`Resume` and durations through [`Task::tracked`].
+    // `remaining_work_min`, `remaining_cost`, regular work and overtime totals
+    // move with assignment deltas as `work_min` and `cost` do. The scheduler
+    // reads a leaf's actual dates, `Stop`/`Resume` and durations through
+    // [`Task::tracked`].
     // Durations and work are whole minutes, rounded from the source.
     /// Percents, 0..=100.
     pub percent_complete: Option<u8>,
@@ -380,12 +417,32 @@ pub struct Task {
     /// Where completed work ends and remaining work picks up.
     pub stop: Option<DateTime>,
     pub resume: Option<DateTime>,
+    pub resume_valid: Option<bool>,
     pub actual_duration_min: Option<i64>,
     pub remaining_duration_min: Option<i64>,
     pub actual_work_min: Option<i64>,
     pub remaining_work_min: Option<i64>,
     pub actual_cost: Option<Rate>,
     pub remaining_cost: Option<Rate>,
+    /// Overtime and regular work move by assignment deltas on edits, including
+    /// outline rollups; absent values stay absent. Recorded actuals, earned
+    /// value and timephased records remain as read.
+    pub overtime_cost: Option<Rate>,
+    pub overtime_work_min: Option<i64>,
+    pub actual_overtime_cost: Option<Rate>,
+    pub actual_overtime_work_min: Option<i64>,
+    pub regular_work_min: Option<i64>,
+    pub remaining_overtime_cost: Option<Rate>,
+    pub remaining_overtime_work_min: Option<i64>,
+    pub acwp: Option<Rate>,
+    pub cv: Option<Rate>,
+    pub bcws: Option<Rate>,
+    pub bcwp: Option<Rate>,
+    pub actual_work_protected_min: Option<i64>,
+    pub actual_overtime_work_protected_min: Option<i64>,
+    /// Task records in file order. Their Type codes are not yet classified for
+    /// edits, so baseline and date edits leave them as read.
+    pub timephased_data: Vec<TimephasedValue>,
     /// Variances as MSPDI stores them, not interpreted: `StartVariance` and
     /// `FinishVariance` are integers, `WorkVariance` a float kept as decimal text.
     pub start_variance: Option<i64>,
@@ -394,6 +451,11 @@ pub struct Task {
 }
 
 impl Task {
+    /// A placeholder for a leaf task in another project, not local work.
+    pub fn is_external_leaf(&self) -> bool {
+        self.external_task == Some(true) && !self.summary && !self.is_null
+    }
+
     /// Whether this is the non-blank project summary row reserved at UID 0.
     pub fn is_project_summary(&self) -> bool {
         self.uid == 0 && self.summary && !self.is_null
@@ -750,6 +812,8 @@ impl Resource {
 pub struct ResourceBaseline {
     /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
     pub number: u8,
+    /// Timephased records nested in this baseline, kept as written.
+    pub timephased_data: Vec<TimephasedValue>,
     /// Recorded work in whole minutes; None when omitted or invalid.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
@@ -793,8 +857,8 @@ pub struct ExtendedAttributeValue {
     pub duration_format: Option<u8>,
 }
 
-/// An outline code's value on a resource (MSPDI `OutlineCode`). The code's
-/// definition is not modeled.
+/// An outline code's value on a task or resource (MSPDI `OutlineCode`).
+/// Definitions are kept in `Project::outline_code_definitions`.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct OutlineCodeValue {
     /// The field's ID, kept as written.
@@ -803,16 +867,16 @@ pub struct OutlineCodeValue {
     pub value_guid: Option<String>,
 }
 
-/// One record of a resource's or assignment's work or cost spread over time
+/// One record of a task's, resource's or assignment's work or cost spread over time
 /// (MSPDI `TimephasedData`), kept as written. `value` is a duration for the
 /// work types and a decimal for the cost types; it is not interpreted.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct TimephasedValue {
     /// The MSPDI `Type` code. Assignments carry 1-6 and their baseline codes
     /// (e.g. 1 remaining work, 2 actual work); resources carry their baseline
-    /// codes (7/8, 20/21, ...). The two owners' codes never overlap.
+    /// codes (7/8, 20/21, ...). Task Type codes are kept without interpretation.
     pub kind: u8,
-    /// The owning resource's or assignment's UID, as written.
+    /// The owning task's, resource's or assignment's UID, as written.
     pub uid: Option<i32>,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
@@ -1021,11 +1085,15 @@ fn tenths_to_min(tenths: Option<i64>) -> i64 {
 pub struct AssignmentBaseline {
     /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
     pub number: u8,
+    /// Timephased records nested in this baseline, kept as written.
+    pub timephased_data: Vec<TimephasedValue>,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
     /// Recorded work in whole minutes; None when omitted or invalid.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
+    pub bcws: Option<Rate>,
+    pub bcwp: Option<Rate>,
 }
 
 /// A working-time slot within a day, in minutes-of-day (`from` inclusive,
@@ -1079,6 +1147,27 @@ pub struct Calendar {
     /// changed hours. Only [`CalendarException::scheduled`] ones change working
     /// time; the rest are kept so a save writes them back.
     pub exceptions: Vec<CalendarException>,
+    /// Named date-ranged alternate weeks in MSPDI file order. An unstated
+    /// weekday falls back to this calendar's default week or its base chain.
+    pub work_weeks: Vec<WorkWeek>,
+}
+
+/// One MSPDI `Calendar/WorkWeeks/WorkWeek`. Optional fields stay absent through
+/// a save. `week` contains only weekdays explicitly stated in the work week.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct WorkWeek {
+    pub name: Option<String>,
+    pub from: Option<DateTime>,
+    pub to: Option<DateTime>,
+    pub week: [Option<DayWorking>; 7],
+}
+
+impl WorkWeek {
+    /// Inclusive day-number range, when both endpoints were provided.
+    pub fn scheduled(&self) -> Option<(i64, i64)> {
+        let first = self.from?.day_number();
+        Some((first, self.to?.day_number().max(first)))
+    }
 }
 
 /// One MSPDI calendar exception. Every `Option` field is kept as read (`None`
@@ -1176,6 +1265,7 @@ impl Calendar {
             is_baseline_calendar: false,
             week: week.map(Some),
             exceptions: Vec::new(),
+            work_weeks: Vec::new(),
         }
     }
 
@@ -1200,7 +1290,7 @@ impl Calendar {
         week.map(|day| day.cloned().unwrap_or_default())
     }
 
-    /// This calendar's working time by date, exceptions included, through the
+    /// This calendar's working time by date, exceptions and work weeks included, through the
     /// base chain [`Calendar::resolve_week`] walks.
     pub fn resolve<'a>(&'a self, lookup: impl Fn(i32) -> Option<&'a Calendar>) -> WorkCalendar {
         let mut levels = Vec::new();
@@ -1223,7 +1313,8 @@ impl Calendar {
 ///
 /// A day resolves to the first scheduled exception covering that date, looking
 /// down the base chain from the calendar itself; failing that, to the first
-/// calendar in the chain that states that weekday. A day nothing states is
+/// calendar in the chain whose covering work week or default week states that
+/// weekday. A day nothing states is
 /// non-working. So a derived calendar keeps its base's holidays even on a
 /// weekday it states itself, and only its own exception overrides one. This
 /// is Microsoft Project 2024's rule (checked on a resource calendar, #126);
@@ -1244,6 +1335,9 @@ struct Level {
     /// ranges sorted by day. Where exceptions overlap, the first in file order
     /// wins.
     exceptions: Vec<(i64, i64, DayWorking)>,
+    /// Date-ranged alternate weeks in file order; the first covering week
+    /// wins when a hand-edited file contains overlaps.
+    work_weeks: Vec<(i64, i64, [Option<DayWorking>; 7])>,
     week: [Option<DayWorking>; 7],
 }
 
@@ -1280,6 +1374,14 @@ impl Level {
         ranges.sort_by_key(|&(first, _, _)| first);
         Level {
             exceptions: ranges,
+            work_weeks: cal
+                .work_weeks
+                .iter()
+                .filter_map(|work_week| {
+                    let (first, last) = work_week.scheduled()?;
+                    Some((first, last, work_week.week.clone()))
+                })
+                .collect(),
             week: cal.week.clone(),
         }
     }
@@ -1295,7 +1397,12 @@ impl Level {
 
     /// The weekday of day number `day`, if this calendar states it.
     fn weekday(&self, day: i64) -> Option<&DayWorking> {
-        self.week[(day + 4).rem_euclid(7) as usize].as_ref()
+        let weekday = (day + 4).rem_euclid(7) as usize;
+        self.work_weeks
+            .iter()
+            .find(|(first, last, _)| *first <= day && day <= *last)
+            .and_then(|(_, _, week)| week[weekday].as_ref())
+            .or_else(|| self.week[weekday].as_ref())
     }
 }
 
@@ -1304,6 +1411,7 @@ impl WorkCalendar {
     pub fn weekly(week: Week) -> WorkCalendar {
         WorkCalendar(Kind::Chain(vec![Level {
             exceptions: Vec::new(),
+            work_weeks: Vec::new(),
             week: week.map(Some),
         }]))
     }
@@ -1346,7 +1454,7 @@ impl WorkCalendar {
         }
     }
 
-    /// The weekly pattern alone, exceptions ignored. Whether a calendar can
+    /// The default weekly pattern alone, exceptions and work weeks ignored. Whether a calendar can
     /// schedule at all is decided on this, so an exception never makes an
     /// otherwise empty calendar schedulable.
     pub fn week(&self) -> Week {
@@ -1408,6 +1516,8 @@ pub struct XmlElement {
 /// A whole project: tasks, staffing, and the calendars they schedule against.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Project {
+    /// Parts of the source `.yppx` that this build does not understand.
+    pub package: PackageParts,
     pub name: String,
     pub title: String,
     pub start_date: Option<DateTime>,
@@ -1448,6 +1558,12 @@ pub struct Project {
     /// lands here only when its text does not parse; one that parses is kept
     /// in its field and saved in canonical form (`true` saves as `1`).
     pub options: Vec<(String, String)>,
+    /// Outline code definitions (each an MSPDI `<OutlineCode>` from the
+    /// project's `<OutlineCodes>` block), in read order.
+    pub outline_code_definitions: Vec<XmlElement>,
+    /// The project's WBS code mask block, including its flags, prefix, and
+    /// ordered mask levels. The last non-empty block read wins.
+    pub wbs_masks: Option<XmlElement>,
     /// The custom field definitions (each an MSPDI `<ExtendedAttribute>` of
     /// the project's `<ExtendedAttributes>` block: alias, lookup table,
     /// formula, ...), in read order. Not modeled; a save writes them back.
@@ -1463,6 +1579,7 @@ pub struct Project {
 impl Default for Project {
     fn default() -> Project {
         Project {
+            package: PackageParts::default(),
             name: String::new(),
             title: String::new(),
             start_date: None,
@@ -1478,6 +1595,8 @@ impl Default for Project {
             hours_per_week: 40.0,
             default_calendar_uid: 1,
             options: Vec::new(),
+            outline_code_definitions: Vec::new(),
+            wbs_masks: None,
             extended_attribute_definitions: Vec::new(),
             tasks: Vec::new(),
             resources: Vec::new(),
@@ -1893,6 +2012,7 @@ mod tests {
             is_baseline_calendar: false,
             week,
             exceptions: Vec::new(),
+            work_weeks: Vec::new(),
         }
     }
 
@@ -1986,6 +2106,122 @@ mod tests {
             DateTime::from_ymd_hm(2026, 3, last, 23, 59),
             day,
         )
+    }
+
+    fn probe_week(first: u32, last: u32, week: [Option<DayWorking>; 7]) -> WorkWeek {
+        WorkWeek {
+            name: Some("Probe".into()),
+            from: Some(DateTime::from_ymd_hm(2026, 3, first, 0, 0)),
+            to: Some(DateTime::from_ymd_hm(2026, 3, last, 23, 59)),
+            week,
+        }
+    }
+
+    fn work_week_probe() -> Project {
+        // Project 2024 probe for #218: Standard has a Summer week and a
+        // holiday; three derived calendars each override different weekdays.
+        let mut standard = Calendar::standard(1);
+        standard.week[2] = Some(hours(9, 12));
+        standard
+            .exceptions
+            .push(exception(11, 11, DayWorking::default()));
+        let mut summer: [Option<DayWorking>; 7] = Default::default();
+        summer[1] = Some(DayWorking {
+            times: vec![hours(7, 12).times[0], hours(13, 18).times[0]],
+        });
+        summer[5] = Some(DayWorking::default());
+        summer[6] = Some(hours(8, 12));
+        standard.work_weeks.push(probe_week(9, 20, summer));
+
+        let mut alice_week: [Option<DayWorking>; 7] = Default::default();
+        alice_week[1] = Some(hours(10, 12));
+        let alice = derived(2, 1, alice_week);
+
+        let mut bob_week: [Option<DayWorking>; 7] = Default::default();
+        bob_week[2] = Some(hours(14, 16));
+        let mut bob = derived(3, 1, bob_week);
+        let mut crew: [Option<DayWorking>; 7] = Default::default();
+        crew[3] = Some(hours(8, 9));
+        crew[4] = Some(hours(12, 13));
+        bob.work_weeks.push(probe_week(9, 13, crew));
+
+        let mut carol_week: [Option<DayWorking>; 7] = Default::default();
+        carol_week[1] = Some(hours(15, 16));
+        let mut carol = derived(4, 1, carol_week);
+        let mut late: [Option<DayWorking>; 7] = Default::default();
+        late[1] = Some(hours(10, 11));
+        carol.work_weeks.push(probe_week(16, 20, late));
+        Project {
+            calendars: vec![standard, alice, bob, carol],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn work_week_stated_days_and_default_week_fallback_match_project_2024() {
+        let project = work_week_probe();
+        let standard = project.resolved_calendar(project.calendar(1).unwrap());
+        assert_eq!(standard.day(march(2)), Calendar::standard_week()[1].times);
+        assert_eq!(
+            standard.day(march(9)),
+            vec![hours(7, 12).times[0], hours(13, 18).times[0]]
+        );
+        assert_eq!(standard.day(march(10)), hours(9, 12).times);
+        assert_eq!(standard.day(march(12)), Calendar::standard_week()[4].times);
+        assert!(standard.day(march(13)).is_empty());
+        assert_eq!(standard.day(march(14)), hours(8, 12).times);
+        assert!(standard.day(march(20)).is_empty()); // inclusive ToDate
+        assert!(standard.day(march(21)).is_empty()); // work week ended
+        assert_eq!(standard.week()[1], Calendar::standard_week()[1]);
+    }
+
+    #[test]
+    fn work_week_and_default_week_resolve_level_by_level_match_project_2024() {
+        let project = work_week_probe();
+        let alice = project.resolved_calendar(project.calendar(2).unwrap());
+        assert_eq!(alice.day(march(2)), hours(10, 12).times);
+        assert_eq!(alice.day(march(9)), hours(10, 12).times); // own default beats base WW
+        assert_eq!(alice.day(march(10)), hours(9, 12).times);
+        assert!(alice.day(march(13)).is_empty()); // base WW Friday off
+        assert_eq!(alice.day(march(14)), hours(8, 12).times); // base WW Saturday
+        let bob = project.resolved_calendar(project.calendar(3).unwrap());
+        assert_eq!(
+            bob.day(march(9)),
+            vec![hours(7, 12).times[0], hours(13, 18).times[0]]
+        );
+        assert_eq!(bob.day(march(10)), hours(14, 16).times);
+        assert_eq!(bob.day(march(12)), hours(12, 13).times);
+        assert_eq!(
+            bob.day(march(16)),
+            vec![hours(7, 12).times[0], hours(13, 18).times[0]]
+        );
+        let carol = project.resolved_calendar(project.calendar(4).unwrap());
+        assert_eq!(carol.day(march(9)), hours(15, 16).times);
+        assert_eq!(carol.day(march(16)), hours(10, 11).times);
+    }
+
+    #[test]
+    fn exception_down_base_chain_beats_derived_work_week_match_project_2024() {
+        let project = work_week_probe();
+        for uid in [1, 2, 3, 4] {
+            assert!(
+                project
+                    .resolved_calendar(project.calendar(uid).unwrap())
+                    .day(march(11))
+                    .is_empty(),
+                "calendar {uid}"
+            );
+        }
+        let mut bob = project.calendar(3).unwrap().clone();
+        bob.exceptions.push(exception(11, 11, hours(10, 11)));
+        let mut project = project;
+        project.calendars[2] = bob;
+        assert_eq!(
+            project
+                .resolved_calendar(project.calendar(3).unwrap())
+                .day(march(11)),
+            hours(10, 11).times
+        );
     }
 
     #[test]
@@ -2183,6 +2419,7 @@ mod tests {
             link: LinkType::FinishStart,
             lag,
             lag_format: LagFormat::from_code(19).unwrap(),
+            ..Predecessor::fs(1)
         };
         assert_eq!(pct(50).lag_minutes(1920), Some(960));
         assert_eq!(pct(-25).lag_minutes(1920), Some(-480));

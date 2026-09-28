@@ -46,6 +46,45 @@ fn yppxy_save(input: Option<&Path>, target: &Path) -> std::process::Output {
     cmd.arg("--save").arg(target).output().unwrap()
 }
 
+#[test]
+fn headless_save_keeps_unknown_package_part_and_type() {
+    use opccore::zip::ZipArchive;
+    use opccore::zipwrite::write_zip;
+
+    let dir = std::env::temp_dir().join(format!("yppxy-cli-save-issue411-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let input = dir.join("views.yppx");
+    let target = dir.join("out.yppx");
+    let project = projcore::editor::untitled_project();
+    let views = b"<views xmlns=\"urn:yppx:views\"><table name=\"Entry\"/></views>";
+    let map = b"<Types><Override PartName=\"/views.xml\" ContentType=\"application/vnd.yppx.views+xml\"/></Types>";
+    let entries = vec![
+        ("[Content_Types].xml".to_string(), map.to_vec()),
+        (
+            "project.xml".to_string(),
+            projcore::mspdi::write_mspdi(&project).into_bytes(),
+        ),
+        ("views.xml".to_string(), views.to_vec()),
+    ];
+    std::fs::write(&input, write_zip(&entries)).unwrap();
+    let result = yppxy_save(Some(&input), &target);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = std::fs::read(&target).unwrap();
+    let zip = ZipArchive::open(&output).unwrap();
+    assert_eq!(zip.read("views.xml").unwrap(), views);
+    let types = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
+    assert!(types.contains(
+        "<Override PartName=\"/views.xml\" ContentType=\"application/vnd.yppx.views+xml\"/>"
+    ));
+    std::fs::remove_file(input).unwrap();
+    std::fs::remove_file(target).unwrap();
+    std::fs::remove_dir(dir).unwrap();
+}
+
 /// Issue #78: `--save` once wrote MSPDI XML under any extension and exited 0.
 /// Every row of the issue's table must either write the named format or refuse
 /// without creating the file.

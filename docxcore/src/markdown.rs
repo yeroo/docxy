@@ -31,6 +31,52 @@ use crate::model::{
     Table,
 };
 
+/// Decode Markdown without replacing characters that Save would write back.
+/// A BOM identifies UTF-16; without one, Markdown must be UTF-8 text.
+pub fn decode_markdown(bytes: &[u8]) -> Result<(String, Option<&'static str>), String> {
+    let utf16 = bytes
+        .strip_prefix(&[0xFF, 0xFE])
+        .map(|text| (text, true))
+        .or_else(|| bytes.strip_prefix(&[0xFE, 0xFF]).map(|text| (text, false)));
+    let decoded = if let Some(text) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        (
+            String::from_utf8(text.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
+            None,
+        )
+    } else if let Some((text, little_endian)) = utf16 {
+        if text.len() % 2 != 0 {
+            return Err("invalid UTF-16 text: odd byte count".into());
+        }
+        let (pairs, rest) = text.as_chunks::<2>();
+        debug_assert!(rest.is_empty());
+        let units = pairs.iter().map(|&pair| {
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        });
+        let decoded = char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map_err(|e| format!("invalid UTF-16 text: {e}"))?;
+        (decoded, Some("UTF-16"))
+    } else {
+        // ASCII UTF-16 without a BOM is valid UTF-8 bytewise, but includes NULs.
+        if bytes.contains(&0) {
+            return Err("unsupported text encoding (contains NUL bytes)".into());
+        }
+        (
+            String::from_utf8(bytes.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
+            None,
+        )
+    };
+    // UTF-32LE shares the UTF-16LE BOM and decodes to NUL-interleaved text.
+    if decoded.0.contains('\0') {
+        return Err("unsupported text encoding (contains NUL characters)".into());
+    }
+    Ok(decoded)
+}
+
 // ===========================================================================
 // Document -> Markdown
 // ===========================================================================
@@ -990,6 +1036,41 @@ impl From<Paragraph> for Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_markdown_accepts_utf8_and_bom_marked_utf16() {
+        let text = "# Title\n\ncafé\n";
+        assert_eq!(decode_markdown(text.as_bytes()), Ok((text.into(), None)));
+        let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+        utf8_bom.extend_from_slice(text.as_bytes());
+        assert_eq!(decode_markdown(&utf8_bom), Ok((text.into(), None)));
+        for (bom, little_endian) in [([0xFF, 0xFE], true), ([0xFE, 0xFF], false)] {
+            let mut bytes = bom.to_vec();
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&if little_endian {
+                    unit.to_le_bytes()
+                } else {
+                    unit.to_be_bytes()
+                });
+            }
+            assert_eq!(decode_markdown(&bytes), Ok((text.into(), Some("UTF-16"))));
+        }
+    }
+
+    #[test]
+    fn decode_markdown_rejects_invalid_or_ambiguous_text() {
+        for (bytes, message) in [
+            (b"caf\xE9\n".as_slice(), "not UTF-8 text"),
+            (b"#\0 X\0".as_slice(), "contains NUL bytes"),
+            (b"\0#\0 X".as_slice(), "contains NUL bytes"),
+            (b"\xFF\xFE\0\0".as_slice(), "contains NUL characters"),
+            (b"\xFF\xFEA".as_slice(), "invalid UTF-16 text"),
+            (b"\xFE\xFF\xD8\x00".as_slice(), "invalid UTF-16 text"),
+        ] {
+            let error = decode_markdown(bytes).unwrap_err();
+            assert!(error.contains(message), "{bytes:?}: {error}");
+        }
+    }
 
     fn run(text: &str, bold: bool, italic: bool) -> Inline {
         Inline::Run(Run {

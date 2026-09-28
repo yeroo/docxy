@@ -70,6 +70,12 @@ pub struct MppTask {
     pub manual_start: Option<String>,
     pub manual_finish: Option<String>,
     pub manual_duration_min: Option<i64>,
+    /// Project's stored Duration in whole minutes and MSPDI DurationFormat.
+    /// Both are absent for the legacy MPP9 layout.
+    pub duration_min: Option<i64>,
+    pub duration_format: Option<u16>,
+    /// Task CalendarUID as stored (-1 means no own calendar); absent for MPP9.
+    pub calendar_uid: Option<i32>,
     /// Recorded progress as Project stored it. `None` for MPP9 and blank rows.
     pub progress: Option<MppProgress>,
     /// Task fields validated for the current MPP layout. `None` for MPP9 and
@@ -151,6 +157,12 @@ pub struct MppPred {
 
 /// A malformed or unrecognized task table is refused by the importer.
 pub type MppError = String;
+
+/// Auto task DurationFormat codes measured in working time.
+/// The estimated bit does not change the calendar units.
+pub fn working_duration_format(code: u16) -> bool {
+    matches!(code & !32, 3 | 5 | 7 | 9 | 11)
+}
 
 /// Decode task rows only when the binary table has a recognized structure.
 pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {
@@ -516,7 +528,7 @@ pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
 /// Project corpus stores day 0x3a86 for 2025-01-06 in its XML export; using
 /// 1984-01-01 here would produce 2025-01-07. Legacy samples likewise shift
 /// from Tuesday starts to Monday starts with this epoch.
-const MPP_EPOCH_DAYS: i64 = 5112;
+pub(crate) const MPP_EPOCH_DAYS: i64 = 5112;
 
 fn u16le(b: &[u8], o: usize) -> u16 {
     if o + 2 <= b.len() {

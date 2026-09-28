@@ -11,9 +11,10 @@
 //!   task tables only after their counted indexes and fields validate.
 //!
 //! - [`project`] — convert decoded metadata, task dates, outline levels,
-//!   predecessor links and task modes into a `projcore` project for the
+//!   predecessor links, task modes and calendars into a `projcore` project for the
 //!   terminal and suite hosts.
 
+mod caldecode;
 pub mod cfb;
 mod fixedmeta;
 pub mod mpp;

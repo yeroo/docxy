@@ -6,6 +6,21 @@
   <CalendarUID>1</CalendarUID>
   <StartDate>2026-03-02T08:00:00</StartDate>
   <ProjectExternallyEdited>0</ProjectExternallyEdited>
+  <OutlineCodes>
+    <OutlineCode>
+      <FieldID>188744105</FieldID><FieldName>Task Outline Code1</FieldName>
+      <Alias>Zone &amp; trade</Alias>
+      <Masks><Mask><Level>1</Level><Type>0</Type><Length>2</Length><Separator>.</Separator></Mask></Masks>
+      <Values><Value><ValueID>1</ValueID><Description>Civil</Description></Value><Value><ValueID>2</ValueID><Description>M&amp;E</Description></Value></Values>
+    </OutlineCode>
+  </OutlineCodes>
+  <WBSMasks>
+    <VerifyUniqueCodes>1</VerifyUniqueCodes>
+    <GenerateCodes>1</GenerateCodes>
+    <Prefix>PRJ-</Prefix>
+    <WBSMask><Level>1</Level><Type>0</Type><Length>2</Length><Separator>.</Separator></WBSMask>
+    <WBSMask><Level>2</Level><Type>1</Type><Length>0</Length><Separator>-</Separator></WBSMask>
+  </WBSMasks>
   <ExtendedAttributes>
     <ExtendedAttribute>
       <FieldID>188743731</FieldID>
@@ -114,6 +129,15 @@
         <Value>PT32H0M0S</Value>
         <DurationFormat>7</DurationFormat>
       </ExtendedAttribute>
+      <OutlineCode>
+        <FieldID>188744105</FieldID>
+        <ValueID>1</ValueID>
+      </OutlineCode>
+      <OutlineCode>
+        <FieldID>188744105</FieldID>
+        <ValueID>2</ValueID>
+        <ValueGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102</ValueGUID>
+      </OutlineCode>
     </Task>
     <Task>
       <UID>3</UID><ID>3</ID>
@@ -134,9 +158,12 @@
       <CreateDate>2026-02-27T09:30:00</CreateDate>
       <Active>1</Active>
       <Type>2</Type>
+      <Contact>Site lead</Contact>
       <WBS>1.2</WBS>
+      <WBSLevel>Level 2</WBSLevel>
       <Priority>500</Priority>
       <Estimated>1</Estimated>
+      <DisplayAsSummary>0</DisplayAsSummary>
       <EffortDriven>0</EffortDriven>
       <Work>PT0H0M0S</Work>
       <Deadline>2026-03-20T17:00:00</Deadline>
@@ -144,13 +171,22 @@
       <LevelingCanSplit>0</LevelingCanSplit>
       <LevelingDelay>4800</LevelingDelay>
       <LevelingDelayFormat>7</LevelingDelayFormat>
+      <SubprojectName>Concrete phase</SubprojectName>
+      <PreLeveledStart>2026-03-04T08:00:00</PreLeveledStart>
+      <PreLeveledFinish>2026-03-04T17:00:00</PreLeveledFinish>
       <Hyperlink>Pour instructions</Hyperlink>
       <HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>
       <HyperlinkSubAddress>Gantt Chart!4</HyperlinkSubAddress>
       <IgnoreResourceCalendar>1</IgnoreResourceCalendar>
+      <Notes>Check forms &amp; rebar</Notes>
       <HideBar>1</HideBar>
       <EarnedValueMethod>1</EarnedValueMethod>
       <Rollup>0</Rollup>
+      <IsPublished>0</IsPublished>
+      <StatusManager>Alice</StatusManager>
+      <CommitmentStart>2026-03-05T08:00:00</CommitmentStart>
+      <CommitmentFinish>2026-03-05T17:00:00</CommitmentFinish>
+      <CommitmentType>2</CommitmentType>
       <PredecessorLink>
         <PredecessorUID>2</PredecessorUID>
         <Type>1</Type>

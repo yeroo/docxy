@@ -6,23 +6,35 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
 /// a task. Each decoded automatic task without local children, including an
-/// inserted subproject, is pinned
-/// with a Must-Start-On constraint at its start and given a duration equal to
-/// the working minutes between its start and finish, so the scheduler reproduces
-/// the real dates. A **manual** leaf keeps its mode and its manual start,
-/// finish and duration instead, which hold it where Project put it without a
-/// constraint; the project's new-task mode comes through too.
+/// inserted subproject, is pinned with a Must-Start-On constraint at its start
+/// and given Project's stored working duration when available. Other durations
+/// use the working minutes between start and finish on the task's calendar.
+/// Splits and delayed assignments are not decoded, so those tasks can schedule
+/// an earlier finish than their retained stored finish. A resource calendar
+/// can move a resourced task's finish earlier or later because projcore does
+/// not schedule on resource calendars; MSPDI import behaves the same way. A **manual**
+/// leaf keeps its mode and its manual start, finish and duration instead,
+/// which hold it where Project put it without a constraint; the project's
+/// new-task mode comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
 /// rollup come through, and the **predecessor links** decode from the `TBkndCons`
 /// table. Each task's recorded **progress**, work and cost come through as
 /// read (the scheduler ignores them, as it does for MSPDI); Project's
 /// variances are not stored in the file and stay absent. Validated task fields
-/// and blank grid rows come through too. Save As converts it
-/// to `.yppx`/MSPDI.
+/// and blank grid rows come through too. Save As converts it to `.yppx`/MSPDI.
+/// Current Project calendar tables keep base and derived calendars, their
+/// weekdays and exceptions, and the project's default calendar.
+/// Task calendar assignments and alternate work weeks are decoded. Auto
+/// tasks use their stored working Duration when available; manual tasks keep
+/// their manual duration and use the calendar span only when it is absent.
+/// An unrecognised calendar record refuses the import.
+/// A calendar whose default week is wholly closed is refused even if one of
+/// its alternate weeks opens a day, as in MSPDI import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)
         .map_err(|e| format!("cannot read the task table of this .mpp ({e})"))?;
+    let legacy = table.legacy;
     let new_tasks_are_manual = table
         .new_tasks_are_manual
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
@@ -41,24 +53,18 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .map(|t| t.name.clone())
             .unwrap_or_else(|| "Imported project".into())
     });
-    let tasks = import_tasks(decoded)?;
-    let start = tasks
-        .iter()
-        .filter_map(|t| t.stored_start)
-        .min()
-        .unwrap_or_else(default_anchor);
-    Ok(Project {
-        name,
-        title: info.title,
-        start_date: Some(start),
-        tasks,
-        new_tasks_are_manual,
-        ..Project::default()
-    })
-}
-
-fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> {
-    let cal_ref = Project::default();
+    let mut cal_ref = Project::default();
+    let decoded_calendars = crate::caldecode::decode(bytes, legacy)
+        .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?;
+    let has_calendar_table = decoded_calendars.is_some();
+    if let Some(crate::caldecode::DecodedCalendars {
+        calendars,
+        default_calendar_uid,
+    }) = decoded_calendars
+    {
+        cal_ref.calendars = calendars;
+        cal_ref.default_calendar_uid = default_calendar_uid;
+    }
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // Only a local deeper row can form a schedulable outline summary. Project
     // labels childless inserted subprojects as summaries in XML, but they must
@@ -103,6 +109,7 @@ fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> 
                         lag_format: LagFormat::from_code(i64::from(p.lag_format)).ok_or_else(
                             || format!("unsupported LagFormat {} for UID {}", p.lag_format, t.uid),
                         )?,
+                        ..Predecessor::fs(p.pred_uid as i32)
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
@@ -118,6 +125,15 @@ fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> 
                 .ok_or_else(|| format!("invalid finish date for UID {}", t.uid))?;
             task.stored_start = Some(s);
             task.stored_finish = Some(f);
+            let own_calendar_uid = t
+                .calendar_uid
+                .filter(|&uid| uid != -1 && has_calendar_table);
+            if let Some(uid) = own_calendar_uid {
+                if cal_ref.calendar(uid).is_none() {
+                    return Err(format!("unknown calendar UID {uid} for task UID {}", t.uid));
+                }
+            }
+            task.calendar_uid = own_calendar_uid;
             task.manual = t.manual;
             let date = |d: &Option<String>, what: &str| {
                 d.as_deref()
@@ -172,23 +188,43 @@ fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> 
                 task.remaining_cost = Some(p.remaining_cost.clone());
             }
             // Pin auto leaves and childless inserted subprojects. Outline
-            // summaries roll up from children, so a constraint would fight
-            // the rollup. Manual leaves use their stored dates instead.
+            // summaries roll up from children; manual leaves use stored dates.
+            let span = || {
+                projcore::schedule::working_minutes_between_on(&cal_ref, task.calendar_uid, s, f)
+            };
             if outline_summary {
                 task.duration_min = 0;
             } else if t.manual {
-                task.duration_min = t
-                    .manual_duration_min
-                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
+                task.duration_min = t.manual_duration_min.unwrap_or_else(span);
             } else {
-                task.duration_min = projcore::schedule::working_minutes_between(&cal_ref, s, f);
+                task.duration_min = t
+                    .duration_format
+                    .filter(|&fmt| crate::mpp::working_duration_format(fmt))
+                    .and(t.duration_min)
+                    .unwrap_or_else(span);
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }
             Ok(task)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(tasks)
+    let start = tasks
+        .iter()
+        .filter_map(|t| t.stored_start)
+        .min()
+        .unwrap_or_else(default_anchor);
+    let project = Project {
+        name,
+        title: info.title,
+        start_date: Some(start),
+        tasks,
+        new_tasks_are_manual,
+        ..cal_ref
+    };
+    if let Some(error) = projcore::schedule::calendar_error(&project) {
+        return Err(format!("cannot read the calendars of this .mpp ({error})"));
+    }
+    Ok(project)
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
@@ -214,39 +250,11 @@ fn parse_mpp_dt(s: &str) -> Option<DateTime> {
 mod tests {
     use super::*;
 
-    fn task(id: u32, uid: u32, name: &str, level: u32) -> crate::mpp::MppTask {
-        crate::mpp::MppTask {
-            id,
-            uid,
-            name: name.into(),
-            start: Some("2026-03-02 08:00".into()),
-            finish: Some("2026-03-03 08:00".into()),
-            outline_level: Some(level),
-            ..crate::mpp::MppTask::default()
-        }
-    }
-
-    fn blank(id: u32, uid: u32) -> crate::mpp::MppTask {
-        crate::mpp::MppTask {
-            id,
-            uid,
-            is_null: true,
-            ..crate::mpp::MppTask::default()
-        }
-    }
-
     #[test]
     fn blank_rows_between_before_child_and_trailing_preserve_outline() {
-        let rows = import_tasks(vec![
-            task(0, 0, "Project", 0),
-            task(1, 1, "Summary", 1),
-            blank(2, 4), // immediately before the child
-            task(3, 2, "Child", 2),
-            blank(4, 5), // between real tasks
-            task(5, 3, "After", 1),
-            blank(6, 7), // trailing blank cannot make After a summary
-        ])
-        .unwrap();
+        let rows = project_from_mpp(include_bytes!("../../corpus/mpp/task-fields/f3-blanks.mpp"))
+            .unwrap()
+            .tasks;
         assert_eq!(
             rows.iter()
                 .map(|t| (t.id, t.uid, t.is_null))
@@ -257,7 +265,7 @@ mod tests {
                 (3, 2, false),
                 (4, 5, true),
                 (5, 3, false),
-                (6, 7, true)
+                (6, 6, true)
             ]
         );
         assert!(rows[0].summary);
@@ -279,33 +287,29 @@ mod tests {
                 .filter(|t| t.is_null)
                 .map(|t| t.uid)
                 .collect::<Vec<_>>(),
-            [4, 5, 7]
+            [4, 5, 6]
         );
     }
 
     #[test]
     fn childless_subproject_keeps_its_duration_and_start_pin() {
-        let mut sub = task(1, 1, "Inserted plan", 1);
-        sub.fields = Some(crate::mpp::MppTaskFields {
-            is_subproject: Some(true),
-            ..crate::mpp::MppTaskFields::default()
-        });
-        let rows = import_tasks(vec![task(0, 0, "Project", 0), sub]).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(!rows[0].summary);
-        assert_eq!(rows[0].is_subproject, Some(true));
-        assert!(rows[0].duration_min > 0);
-        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
-        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
-        let project = Project {
-            start_date: rows[0].stored_start,
-            tasks: rows,
-            ..Project::default()
-        };
+        let project = project_from_mpp(include_bytes!(
+            "../../corpus/mpp/task-fields/f6-subprojects.mpp"
+        ))
+        .unwrap();
+        let sub = project
+            .tasks
+            .iter()
+            .find(|t| t.is_subproject == Some(true))
+            .unwrap();
+        assert!(!sub.summary);
+        assert!(sub.duration_min > 0);
+        assert_eq!(sub.constraint, ConstraintType::MustStartOn);
+        assert_eq!(sub.constraint_date, sub.stored_start);
         let scheduled = projcore::schedule::schedule(&project);
         assert_eq!(
-            scheduled.get(1).map(|r| r.early_start),
-            project.tasks[0].stored_start
+            scheduled.get(sub.uid).map(|r| r.early_start),
+            sub.stored_start
         );
     }
 

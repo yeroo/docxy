@@ -27,6 +27,7 @@ Close Project gracefully if a run is interrupted; never force-kill WINPROJ.EXE
 """
 
 import glob
+import datetime
 import os
 import re
 import sys
@@ -116,6 +117,78 @@ def read_exceptions(path):
     return out
 
 
+def shift_time(value):
+    """COM shift clock or MSPDI clock -> 24-hour HH:MM."""
+    if hasattr(value, "strftime"):
+        return value.strftime("%H:%M")
+    value = str(value).strip()
+    for fmt in ("%I:%M %p", "%I:%M:%S %p", "%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.datetime.strptime(value, fmt).strftime("%H:%M")
+        except ValueError:
+            pass
+    raise ValueError(f"unknown Project shift time {value!r}")
+
+
+def read_work_weeks(path):
+    """All named alternate weeks and their explicitly stated weekday pattern."""
+    root = ET.parse(path).getroot()
+    out = {}
+    for cal in root.findall("p:Calendars/p:Calendar", NS):
+        rows = []
+        for week in cal.findall("p:WorkWeeks/p:WorkWeek", NS):
+            period = week.find("p:TimePeriod", NS)
+            first = text(period, "FromDate") if period is not None else None
+            last = text(period, "ToDate") if period is not None else None
+            stated = {}
+            for day in week.findall("p:WeekDays/p:WeekDay", NS):
+                day_type = int(text(day, "DayType"))
+                if day_type not in range(1, 8):
+                    continue
+                working = text(day, "DayWorking") == "1"
+                shifts = tuple((shift_time(text(slot, "FromTime")),
+                                shift_time(text(slot, "ToTime")))
+                               for slot in day.findall("p:WorkingTimes/p:WorkingTime", NS))
+                stated[day_type] = (working, shifts if working else ())
+            rows.append((text(week, "Name", ""),
+                         first[:10] if first else None,
+                         last[:10] if last else None,
+                         stated))
+        out[text(cal, "Name")] = rows
+    return out
+
+
+def project_work_weeks(project, names):
+    """Project's imported alternate weeks, including each day's shift times."""
+    calendars = {cal.Name: cal for cal in project.BaseCalendars}
+    for r in project.Resources:
+        if r is not None and r.Calendar is not None:
+            calendars.setdefault(r.Calendar.Name, r.Calendar)
+    out = {}
+    for name in names:
+        cal = calendars.get(name)
+        if cal is None:
+            out[name] = None
+            continue
+        rows = []
+        for week in cal.WorkWeeks:
+            days = {}
+            for day_type in range(1, 8):
+                day = week.WeekDays(day_type)
+                shifts = []
+                for n in range(1, 6):
+                    slot = getattr(day, f"Shift{n}")
+                    # Project returns the string "0" for an unused shift.
+                    if slot.Start not in (None, "", "0", 0):
+                        shifts.append((shift_time(slot.Start), shift_time(slot.Finish)))
+                days[day_type] = (bool(day.Working), tuple(shifts))
+            first, last = when(week.Start), when(week.Finish)
+            rows.append((week.Name or "", first[:10] if first else None,
+                         last[:10] if last else None, days))
+        out[name] = rows
+    return out
+
+
 def project_exceptions(project, names):
     """The same view of Project's calendars with these names: base calendars
     and resource calendars. A calendar Project does not have maps to None."""
@@ -197,6 +270,28 @@ def check(app, path, tmpdir):
             if got != want:
                 fidelity.append(f"  FIDELITY calendar {cal_name}: exceptions file={want}"
                                 f" project={got}")
+        want_weeks = read_work_weeks(path)
+        got_weeks = project_work_weeks(project, want_weeks)
+        for cal_name, want in want_weeks.items():
+            if not want:
+                continue
+            got = got_weeks[cal_name]
+            if got is None or len(got) != len(want):
+                fidelity.append(f"  FIDELITY calendar {cal_name}: work weeks "
+                                f"file={len(want)} project={None if got is None else len(got)}")
+                continue
+            for index, ((name, first, last, stated), imported) in enumerate(zip(want, got), 1):
+                got_name, got_first, got_last, days = imported
+                if (name, first, last) != (got_name, got_first, got_last):
+                    fidelity.append(f"  FIDELITY calendar {cal_name} work week {index}: "
+                                    f"file={(name, first, last)} "
+                                    f"project={(got_name, got_first, got_last)}")
+                for day_type in range(1, 8):
+                    expected_day = stated.get(day_type, (False, ()))
+                    actual_day = days[day_type]
+                    if actual_day != expected_day:
+                        fidelity.append(f"  FIDELITY calendar {cal_name} work week {index} "
+                                        f"day {day_type}: file={expected_day} project={actual_day}")
         if sorted(t.UniqueID for t in tasks) != sorted(expected):
             fidelity.append(f"  FIDELITY task UIDs {sorted(t.UniqueID for t in tasks)}"
                             f" != file {sorted(expected)}")

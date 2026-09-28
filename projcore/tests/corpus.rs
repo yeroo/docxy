@@ -22,7 +22,8 @@
 //! generated and as `write_mspdi` writes them back, as was file 26 (percentage
 //! and elapsed lags, issue #104), whose plan and values Project itself
 //! produced (`corpus/tools/gen_mpp_lag_cases.py`), and file 27 (manual
-//! summaries, issue #124). Slack invariants below also check
+//! summaries, issue #124), and file 28 (alternate work weeks, issue #218).
+//! Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};
@@ -547,6 +548,30 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
         Some("https://example.com/a?x=1&y=2")
     );
     assert_eq!(pour.hyperlink_sub_address.as_deref(), Some("Gantt Chart!4"));
+    assert_eq!(pour.contact.as_deref(), Some("Site lead"));
+    assert_eq!(pour.wbs_level.as_deref(), Some("Level 2"));
+    assert_eq!(pour.display_as_summary, Some(false));
+    assert_eq!(pour.subproject_name.as_deref(), Some("Concrete phase"));
+    assert_eq!(
+        pour.pre_leveled_start,
+        Some(DateTime::from_ymd_hm(2026, 3, 4, 8, 0))
+    );
+    assert_eq!(
+        pour.pre_leveled_finish,
+        Some(DateTime::from_ymd_hm(2026, 3, 4, 17, 0))
+    );
+    assert_eq!(pour.notes.as_deref(), Some("Check forms & rebar"));
+    assert_eq!(pour.is_published, Some(false));
+    assert_eq!(pour.status_manager.as_deref(), Some("Alice"));
+    assert_eq!(
+        pour.commitment_start,
+        Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0))
+    );
+    assert_eq!(
+        pour.commitment_finish,
+        Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0))
+    );
+    assert_eq!(pour.commitment_type, Some(2));
     assert_eq!(proj.task(2).unwrap().work_min, Some(960));
     let blank = proj.task(3).unwrap();
     assert!(blank.is_null);
@@ -618,6 +643,34 @@ fn task_fields_fixture_keeps_custom_fields() {
 }
 
 #[test]
+fn task_fields_fixture_keeps_outline_codes_and_wbs_mask() {
+    let xml = std::fs::read_to_string(corpus_dir().join("20-task-fields.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    assert_eq!(proj.outline_code_definitions.len(), 1);
+    assert_eq!(
+        find_leaf(&proj.outline_code_definitions[0], "Alias"),
+        Some("Zone & trade")
+    );
+    let mask = proj.wbs_masks.as_ref().unwrap();
+    assert_eq!(find_leaf(mask, "Prefix"), Some("PRJ-"));
+    assert_eq!(
+        mask.children.iter().filter(|c| c.name == "WBSMask").count(),
+        2
+    );
+    let codes = &proj.task(2).unwrap().outline_codes;
+    assert_eq!(codes.len(), 2);
+    assert_eq!(codes[0].value_id.as_deref(), Some("1"));
+    assert_eq!(codes[1].value_id.as_deref(), Some("2"));
+    let saved = read_mspdi(&write_mspdi(&proj)).unwrap();
+    let package = read_yppx(&write_yppx(&proj)).unwrap();
+    for back in [saved, package] {
+        assert_eq!(back.outline_code_definitions, proj.outline_code_definitions);
+        assert_eq!(back.wbs_masks, proj.wbs_masks);
+        assert_eq!(back.task(2).unwrap().outline_codes, *codes);
+    }
+}
+
+#[test]
 fn progress_fixture_keeps_actuals_through_a_save() {
     use projcore::DateTime;
     let xml = std::fs::read_to_string(corpus_dir().join("22-progress.xml")).unwrap();
@@ -660,12 +713,58 @@ fn progress_fixture_keeps_actuals_through_a_save() {
         "<WorkVariance>",
         "<CostVariance>",
         "<Baseline>",
+        "<ResumeValid>",
+        "<OvertimeCost>",
+        "<OvertimeWork>",
+        "<ActualOvertimeCost>",
+        "<ActualOvertimeWork>",
+        "<RegularWork>",
+        "<RemainingOvertimeCost>",
+        "<RemainingOvertimeWork>",
+        "<ACWP>",
+        "<CV>",
+        "<BCWS>",
+        "<BCWP>",
+        "<ActualWorkProtected>",
+        "<ActualOvertimeWorkProtected>",
+        "<TimephasedData>",
     ] {
         assert_eq!(
             saved.matches(element).count(),
             xml.matches(element).count(),
             "{element}"
         );
+    }
+    let back = read_mspdi(&saved).unwrap();
+    assert_eq!(proj.tasks.len(), 3);
+    assert_eq!(proj.task(2).unwrap().timephased_data.len(), 2);
+    for (before, after) in proj.tasks.iter().zip(&back.tasks) {
+        macro_rules! kept {
+            ($field:ident) => {
+                assert_eq!(
+                    after.$field,
+                    before.$field,
+                    "{}: {}",
+                    before.name,
+                    stringify!($field)
+                );
+            };
+        }
+        kept!(resume_valid);
+        kept!(overtime_cost);
+        kept!(overtime_work_min);
+        kept!(actual_overtime_cost);
+        kept!(actual_overtime_work_min);
+        kept!(regular_work_min);
+        kept!(remaining_overtime_cost);
+        kept!(remaining_overtime_work_min);
+        kept!(acwp);
+        kept!(cv);
+        kept!(bcws);
+        kept!(bcwp);
+        kept!(actual_work_protected_min);
+        kept!(actual_overtime_work_protected_min);
+        kept!(timephased_data);
     }
 }
 
@@ -791,6 +890,8 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     );
     assert_eq!(alice.extended_attributes[0].field_id, "205520904");
     assert_eq!(alice.baseline(0).unwrap().cost, Rate::parse("970"));
+    assert_eq!(a.baseline(0).unwrap().bcws, Rate::parse("230"));
+    assert_eq!(a.baseline(0).unwrap().bcwp, Rate::parse("205.5"));
     // #199: the assignment's cost, table, delays, notes and timephased work.
     assert_eq!(
         (&a.cost, a.cost_rate_table, a.overtime_work_min),
@@ -817,6 +918,23 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     );
     // What the issue saw dropped comes back from a save, element for element.
     let saved = write_mspdi(&proj);
+    fn assignment_baseline(xml: &str) -> &str {
+        let assignment = xml.split("<Assignment>").nth(1).unwrap();
+        assignment
+            .split("<Baseline>")
+            .nth(1)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap()
+    }
+    for source in [&xml, &saved] {
+        let baseline = assignment_baseline(source);
+        let cost = baseline.find("<Cost>970</Cost>").unwrap();
+        let bcws = baseline.find("<BCWS>230</BCWS>").unwrap();
+        let bcwp = baseline.find("<BCWP>205.5</BCWP>").unwrap();
+        assert!(cost < bcws && bcws < bcwp);
+    }
     let section = |xml: &str, name: &str| {
         let open = xml.find(&format!("<{name}>")).unwrap();
         xml[open..xml.find(&format!("</{name}>")).unwrap()].to_string()

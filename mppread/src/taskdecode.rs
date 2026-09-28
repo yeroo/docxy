@@ -57,7 +57,10 @@ struct ProgressLayout {
     actual_cost: usize,
     remaining_cost: usize,
     actual_duration: usize,
+    duration: usize,
     remaining_duration: usize,
+    duration_format: usize,
+    calendar_uid: usize,
     percent_complete: usize,
     percent_work_complete: usize,
     actual_start: usize,
@@ -73,7 +76,10 @@ const NEWEST_PROGRESS: ProgressLayout = ProgressLayout {
     actual_cost: 40,
     remaining_cost: 56,
     actual_duration: 80,
+    duration: 84,
     remaining_duration: 88,
+    duration_format: 164,
+    calendar_uid: 178,
     percent_complete: 92,
     percent_work_complete: 94,
     actual_start: 120,
@@ -405,8 +411,11 @@ fn manual_fields(rec: &[u8], uid: u32) -> Result<ManualFields, String> {
     }
     // DurationFormat without its estimated (`?`) bit.
     let duration = match u16_at(rec, MANUAL_DURATION_FORMAT) & !32 {
-        // Minutes, hours, days, weeks, months, or blank: working time.
-        3 | 5 | 7 | 9 | 11 | 21 => Some(raw as i64 / 10),
+        // Manual blank (21) carries a usable duration. An auto blank format
+        // falls back to its date span because its stored Duration is unverified.
+        format if crate::mpp::working_duration_format(format) || format == 21 => {
+            Some(raw as i64 / 10)
+        }
         // Elapsed units have no oracle yet: keep the duration unknown.
         4 | 6 | 8 | 10 | 12 => None,
         format => {
@@ -423,6 +432,13 @@ fn tenths_to_minutes(tenths: i32) -> i64 {
     (f64::from(tenths) / 10.0).round() as i64
 }
 
+fn duration_at(rec: &[u8], off: usize, what: &str, uid: u32) -> Result<i64, String> {
+    let tenths = i32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
+    (tenths >= 0)
+        .then(|| tenths_to_minutes(tenths))
+        .ok_or_else(|| format!("negative {what} for UID {uid}"))
+}
+
 fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProgress, String> {
     let at = NEWEST_PROGRESS;
     let percent = |off: usize, what: &str| {
@@ -432,12 +448,6 @@ fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProg
             .ok_or_else(|| format!("invalid {what} {value} for UID {uid}"))
     };
     let f64_at = |off: usize| f64::from_le_bytes(rec[off..off + 8].try_into().unwrap());
-    let duration = |off: usize, what: &str| {
-        let tenths = i32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
-        (tenths >= 0)
-            .then(|| tenths_to_minutes(tenths))
-            .ok_or_else(|| format!("negative {what} for UID {uid}"))
-    };
     let work = |off: usize, what: &str| {
         let value = f64_at(off);
         (value.is_finite() && value >= 0.0)
@@ -466,8 +476,8 @@ fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProg
         actual_finish,
         stop: decode_timestamp(rec, at.stop),
         resume: decode_timestamp(rec, at.resume),
-        actual_duration_min: duration(at.actual_duration, "actual duration")?,
-        remaining_duration_min: duration(at.remaining_duration, "remaining duration")?,
+        actual_duration_min: duration_at(rec, at.actual_duration, "actual duration", uid)?,
+        remaining_duration_min: duration_at(rec, at.remaining_duration, "remaining duration", uid)?,
         work_min: work(at.work, "work")?,
         actual_work_min: work(at.actual_work, "actual work")?,
         remaining_work_min: work(at.remaining_work, "remaining work")?,
@@ -494,6 +504,7 @@ fn cost_rate(value: f64) -> Option<Rate> {
 pub(crate) struct Table {
     pub tasks: Vec<MppTask>,
     pub new_tasks_are_manual: Result<bool, String>,
+    pub legacy: bool,
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
@@ -516,6 +527,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
         return Ok(Table {
             tasks: Vec::new(),
             new_tasks_are_manual: Ok(false),
+            legacy: false,
         });
     }
     let Some(meta_path) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) else {
@@ -571,6 +583,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             Ok(Table {
                 tasks,
                 new_tasks_are_manual,
+                legacy: false,
             })
         }
         fixedmeta::TaskIndex::Legacy(indexed) => {
@@ -578,6 +591,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             Ok(Table {
                 tasks: decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)?,
                 new_tasks_are_manual: Ok(false),
+                legacy: true,
             })
         }
     }
@@ -637,6 +651,7 @@ fn decode_current(
             (None, None, None)
         };
         let physical_percent = var.physical_percent.get(&row.uid).copied().unwrap_or(0);
+        let duration_min = duration_at(rec, NEWEST_PROGRESS.duration, "duration", row.uid)?;
         let progress = progress_fields(rec, physical_percent, row.uid)?;
         if level > 0 {
             wbs_parts[level as usize] += 1;
@@ -663,6 +678,13 @@ fn decode_current(
             manual_start,
             manual_finish,
             manual_duration_min,
+            duration_min: Some(duration_min),
+            duration_format: Some(u16_at(rec, NEWEST_PROGRESS.duration_format)),
+            calendar_uid: Some(i32::from_le_bytes(
+                rec[NEWEST_PROGRESS.calendar_uid..NEWEST_PROGRESS.calendar_uid + 4]
+                    .try_into()
+                    .unwrap(),
+            )),
             progress: Some(progress),
             fields: Some(current_fields(
                 rec,
@@ -905,6 +927,73 @@ mod tests {
                 Node::Stream("Props", s.props.clone()),
                 Node::Storage("TBkndTask", task),
                 Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+            ],
+        )])
+    }
+    fn file_with_calendar(s: &Streams, closed: bool, work_week_uids: &[i32]) -> Vec<u8> {
+        let (cal_fm, cal_fd, mut cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
+        let original_v2 = cal_v2;
+        cal_v2 = Vec::new();
+        for index in 0..4 {
+            let entry = 24 + index * 12;
+            let uid = i32::from_le_bytes(cal_vm[entry..entry + 4].try_into().unwrap());
+            let key = u16::from_le_bytes(cal_vm[entry + 8..entry + 10].try_into().unwrap());
+            let old_off =
+                u32::from_le_bytes(cal_vm[entry + 4..entry + 8].try_into().unwrap()) as usize;
+            let len =
+                u32::from_le_bytes(original_v2[old_off..old_off + 4].try_into().unwrap()) as usize;
+            let mut value = original_v2[old_off + 4..old_off + 4 + len].to_vec();
+            if key == 8 && work_week_uids.contains(&uid) {
+                value[424..428].copy_from_slice(&1u32.to_le_bytes());
+                value.extend_from_slice(&crate::caldecode::tests::work_week_record());
+            }
+            cal_vm[entry + 4..entry + 8].copy_from_slice(&(cal_v2.len() as u32).to_le_bytes());
+            cal_v2.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            cal_v2.extend_from_slice(&value);
+        }
+        cal_vm[20..24].copy_from_slice(&(cal_v2.len() as u32).to_le_bytes());
+        if closed {
+            // The fourth VarMeta entry is UID 5's weekday block. Override
+            // every inherited day with a day having zero working periods.
+            let off = u32::from_le_bytes(cal_vm[64..68].try_into().unwrap()) as usize + 4;
+            for day in 0..7 {
+                cal_v2[off + day * 60..off + (day + 1) * 60].fill(0);
+            }
+        }
+        let default: Vec<_> = "Standard"
+            .encode_utf16()
+            .chain([0, 0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let props = crate::props::stream(&[
+            (crate::props::NEW_TASKS_ARE_MANUAL, &[0, 0]),
+            (0x0240_000e, default.as_slice()),
+        ]);
+        write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                Node::Stream("Props", props),
+                Node::Storage(
+                    "TBkndTask",
+                    vec![
+                        Node::Stream("FixedMeta", s.fm.clone()),
+                        Node::Stream("FixedData", s.fd.clone()),
+                        Node::Stream("VarMeta", s.vm.clone()),
+                        Node::Stream("Var2Data", s.v2.clone()),
+                        Node::Stream("Fixed2Meta", s.f2m.clone()),
+                        Node::Stream("Fixed2Data", s.f2d.clone()),
+                    ],
+                ),
+                Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+                Node::Storage(
+                    "TBkndCal",
+                    vec![
+                        Node::Stream("FixedMeta", cal_fm),
+                        Node::Stream("FixedData", cal_fd),
+                        Node::Stream("VarMeta", cal_vm),
+                        Node::Stream("Var2Data", cal_v2),
+                    ],
+                ),
             ],
         )])
     }
@@ -1575,6 +1664,126 @@ mod tests {
         put(s, 132, &[0xc0, 0x12, 0x2b, 0x3c]);
         put(s, 136, &[0xd8, 0x27, 0x2a, 0x3c]);
         add_var(s, 1, PHYSICAL_PERCENT_KEY, &40u16.to_le_bytes());
+    }
+    #[test]
+    fn stored_duration_and_format_control_auto_import() {
+        let mut s = fixture();
+        // Two working days, with one day's work stored by Project.
+        put(&mut s, 0x68, &[0xc0, 0x12, 0x2a, 0x3c]); // Mon 08:00
+        put(&mut s, 0x6c, &[0xd8, 0x27, 0x2b, 0x3c]); // Tue 17:00
+        put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &3i32.to_le_bytes());
+        let decoded = decode(&file(&s, true)).unwrap();
+        assert_eq!(decoded[1].duration_min, Some(480));
+        assert_eq!(decoded[1].duration_format, Some(7));
+        assert_eq!(decoded[1].calendar_uid, Some(3));
+        let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let task = &imported.tasks[0];
+        // Without TBkndCal, the import keeps synthesized Standard.
+        assert_eq!(task.calendar_uid, None);
+        assert_eq!(task.duration_min, 480);
+        assert_eq!(task.stored_start.unwrap().to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(
+            task.stored_finish.unwrap().to_mspdi(),
+            "2026-03-03T17:00:00"
+        );
+
+        // An elapsed format keeps the span: projcore cannot schedule elapsed duration.
+        put(&mut s, NEWEST_PROGRESS.duration_format, &8u16.to_le_bytes());
+        let elapsed = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(elapsed.tasks[0].duration_min, 960);
+
+        // An unknown format likewise keeps the span.
+        put(
+            &mut s,
+            NEWEST_PROGRESS.duration_format,
+            &21u16.to_le_bytes(),
+        );
+        let unknown = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(unknown.tasks[0].duration_min, 960);
+    }
+    #[test]
+    fn task_calendar_assignment_is_validated_and_imported() {
+        let mut s = fixture();
+        put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+        let project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[])).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, Some(5));
+        assert_eq!(project.tasks[0].duration_min, 480);
+
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &9i32.to_le_bytes());
+        assert_eq!(
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[])).unwrap_err(),
+            "unknown calendar UID 9 for task UID 1"
+        );
+
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &(-1i32).to_le_bytes());
+        let project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[])).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, None);
+
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+        let error =
+            crate::project::project_from_mpp(&file_with_calendar(&s, true, &[])).unwrap_err();
+        assert!(
+            error.contains("calendar \"Alice\" (UID 5) has no working time"),
+            "{error}"
+        );
+        assert!(
+            error.contains("task \"B\" (UID 1) cannot be scheduled"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn calendars_with_work_weeks_keep_task_calendar_and_stored_duration() {
+        let mut s = fixture();
+        put(&mut s, 0x68, &[0xc0, 0x12, 0x2a, 0x3c]); // Mon 08:00
+        put(&mut s, 0x6c, &[0xd8, 0x27, 0x2b, 0x3c]); // Tue 17:00
+        put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+
+        for weeks in [&[5][..], &[1][..]] {
+            let project =
+                crate::project::project_from_mpp(&file_with_calendar(&s, false, weeks)).unwrap();
+            assert_eq!(project.tasks[0].calendar_uid, Some(5));
+            assert_eq!(project.tasks[0].duration_min, 480);
+            assert_eq!(project.calendar(weeks[0]).unwrap().work_weeks.len(), 1);
+        }
+
+        let mut project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[5])).unwrap();
+        // The generic task fixture encodes an ActualStart at the MPP epoch;
+        // clear that unrelated progress marker to exercise auto scheduling.
+        project.tasks[0].actual_start = None;
+        let result = projcore::schedule::schedule(&project);
+        let task = result.get(1).unwrap();
+        assert_eq!(task.early_start, project.tasks[0].stored_start.unwrap());
+        assert_eq!(task.early_finish.to_mspdi(), "2026-03-03T08:00:00");
+    }
+
+    #[test]
+    fn closed_default_week_is_refused_even_with_an_open_work_week() {
+        let mut s = fixture();
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+        let error =
+            crate::project::project_from_mpp(&file_with_calendar(&s, true, &[5])).unwrap_err();
+        assert!(
+            error.contains("calendar \"Alice\" (UID 5) has no working time"),
+            "{error}"
+        );
+    }
+    #[test]
+    fn negative_stored_duration_names_uid() {
+        let mut s = fixture();
+        put(&mut s, NEWEST_PROGRESS.duration, &(-1i32).to_le_bytes());
+        assert_eq!(
+            decode(&file(&s, true)).unwrap_err(),
+            "negative duration for UID 1"
+        );
     }
     #[test]
     fn progress_decodes_in_mspdi_units_and_imports_as_read() {

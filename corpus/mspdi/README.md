@@ -166,21 +166,36 @@ Project's warning have no MSPDI field; projcore's unit tests check them.
 | `10-summary` | outline rollup | summary derives from children |
 | `11-resource-assignment` | resource + assignment | units × work parsing |
 | `12-calendar-6day` | custom calendar | Saturday working changes the finish |
-| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006); rate display units (a standard rate shown per day, an overtime rate shown per week), booking type, generic/budget/inactive/levelling flags, work group and stored work, and an assignment's contour, fixed-material and fixed-rate-units flags, own dates and regular work (#84); availability dates and periods, cost rate tables A and B, e-mail, notes, cost, overtime work, a custom field and a baseline on the resource, and the assignment's cost, rate table, zero delays, notes, overtime, custom field and timephased work (#199); every other Resource and Assignment child, with synthetic values (#267) |
+| `13-resource-fields` | resource round trip | Work identity/rates, Cost kind, Material label in MSPDI and `.yppx` (RES-CASE-005/006); rate display units (a standard rate shown per day, an overtime rate shown per week), booking type, generic/budget/inactive/levelling flags, work group and stored work, and an assignment's contour, fixed-material and fixed-rate-units flags, own dates and regular work (#84); availability dates and periods, cost rate tables A and B, e-mail, notes, cost, overtime work, a custom field and a baseline on the resource, and the assignment's cost, rate table, zero delays, notes, overtime, custom field and timephased work (#199); every other Resource and Assignment child, with synthetic values (#267); assignment baseline BCWS and BCWP (#289) |
 | `14-link-sf-before-start` | start-to-finish before anchor | linked task starts before project start; its predecessor is critical |
 | `15-baseline-slots` | baseline round trip | slots 0/1/2 retain distinct dates and recorded durations, including missing Duration, in MSPDI and `.yppx` |
 | `16-24-hour-calendar` | full-day calendar | midnight-to-midnight shifts schedule continuously and survive MSPDI and `.yppx` round trips |
 | `17-constraint-fnlt-conflict` | FNLT versus FS link | default constraint precedence and -5 days total slack on both tasks |
 | `18-milestone-after-fs` | FS milestones | predecessor finish instants retained, including a chain with two milestones |
 | `19-manual-tasks` | manually scheduled tasks | pinned before and after an FS link, an auto successor and a summary follow the pinned dates; task mode, manual fields and `NewTasksAreManual` survive MSPDI and `.yppx` |
-| `20-task-fields` | stored task fields, custom fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, hyperlink display text/address/subaddress, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`, as do task custom field values and the custom field definitions (a lookup table and a formula, #268); the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
+| `20-task-fields` | stored task fields, custom fields and a blank row | Type, EffortDriven, Estimated, Active, Priority, Deadline, levelling, hyperlink display text/address/subaddress, display flags, WBS, GUID and CreateDate survive MSPDI and `.yppx`, as do Contact, WBSLevel, DisplayAsSummary, SubprojectName, PreLeveledStart/Finish, Notes, IsPublished, StatusManager and commitment dates/type (#417), plus task custom field values and definitions (a lookup table and a formula, #268); the blank row keeps its UID and ID, gets no schedule, and its link is ignored |
 | `21-deadline-missed` | missed Deadline | a deadline bounds late finish only: -5 days total slack on the task and its FS driver, dates unchanged |
-| `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, remaining values and variances; their assignments keep the same plus two baseline slots, in MSPDI and `.yppx`; the scheduler keeps the tracked tasks on their actuals, and the complete one is not critical |
+| `22-progress` | recorded progress | a complete, an in-progress (stopped and resumed) and a not-started task keep percent complete, actuals, `Stop`/`Resume`, overtime, earned value, protected actuals, task timephased records, remaining values and variances; their assignments keep progress plus two baseline slots, in MSPDI and `.yppx`; the scheduler keeps the tracked tasks on their actuals, and the complete one is not critical |
 | `23-derived-calendar` | derived calendar | `BaseCalendarUID`, `IsBaselineCalendar` and only the calendar's own weekday survive MSPDI and `.yppx`; a task on it inherits Standard's week, skips its own Friday off and finishes Mon 9 |
 | `24-calendar-holiday` | calendar exceptions | a holiday inside a task pushes its finish out a day; a working Saturday with changed hours carries the next task; both exceptions survive MSPDI and `.yppx` in both forms |
 | `25-derived-calendar-holiday` | exceptions on a derived calendar | the base's holiday beats a weekday the derived calendar states; the derived calendar's own exception beats the base's holiday |
 | `26-lag-percent-elapsed` | percentage and elapsed lags | ±% of the predecessor's duration, ±elapsed days across a weekend on FS/SS/FF/SF links, an estimated elapsed week, a working lag in hours; the lag and its `LagFormat` survive MSPDI and `.yppx` |
 | `27-manual-summary` | manually scheduled summaries | a manual summary keeps its own Start/Finish: a short one under an auto summary (whose slack its fixed span bounds), one whose finish is the project finish, its start flooring an ASAP subtask, a link pushing one past it and an MSO subtask ignoring it |
+| `28-work-weeks` | alternate work weeks | date-ranged weekday changes, non-working Friday, extra Saturday inherited by Alice, fallback to the calendar's default week and base chain, and exception precedence (#218) |
+
+File 28 records a Project 2024 precedence probe. Standard has a default Tuesday
+09:00–12:00, a March 11 holiday, and a March 9–20 “Summer” work week stating
+Monday 07:00–12:00 and 13:00–18:00, Friday off, and Saturday 08:00–12:00.
+Alice derives from Standard and states Monday 10:00–12:00. Bob states Tuesday
+14:00–16:00 and has a March 9–13 “Crew” work week stating Wednesday 08:00–09:00
+and Thursday 12:00–13:00. Carol states Monday 15:00–16:00 and has a March 16–20
+“Late” work week stating Monday 10:00–11:00. Project resolves an exception
+anywhere down the base chain first. Otherwise, it walks each calendar level:
+a covering work week's stated weekday wins, then that level's default weekday,
+then the base. A work week's end date is inclusive; an unstated weekday falls
+back to that calendar's own default, including Standard's Tuesday 09:00–12:00.
+The fixture was verified with `verify_mspdi_project.py` as generated and after
+`write_mspdi` saved it.
 
 See `manifest.json` for machine-readable tags.
 
