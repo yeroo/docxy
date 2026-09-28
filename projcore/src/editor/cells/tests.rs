@@ -976,7 +976,7 @@ fn typed_dates_set_a_manual_summary_s_own_span() {
 }
 
 #[test]
-fn typed_dates_on_an_auto_summary_are_unchanged() {
+fn typed_start_on_an_auto_summary_floors_its_children() {
     let mut ed = editor();
     for (task, level) in ed.proj.tasks.iter_mut().zip([1, 2, 2]) {
         task.outline_level = level;
@@ -988,7 +988,7 @@ fn typed_dates_on_an_auto_summary_are_unchanged() {
         (t.constraint, t.manual_start, t.manual_duration_min),
         (ConstraintType::StartNoEarlierThan, None, None)
     );
-    assert_eq!(ed.disp_start(10), Some(jan(5, 8)));
+    assert_eq!(ed.disp_start(10), Some(jan(12, 8)));
 }
 
 #[test]
