@@ -30,6 +30,7 @@ mod project;
 #[cfg(test)]
 mod ribbon_export;
 mod style_gallery;
+mod tabstrip;
 use project::*;
 
 use std::path::PathBuf;
@@ -782,8 +783,9 @@ fn arm_fill(
     fill: &mut Option<FillDrag>,
     src: Option<(u32, u32, u32, u32)>,
     gesture_in_flight: bool,
+    tab_more_open: bool,
 ) -> bool {
-    if !may_arm_fill(fill.is_some(), gesture_in_flight) {
+    if tab_more_open || !may_arm_fill(fill.is_some(), gesture_in_flight) {
         return false;
     }
     let Some(src) = src else { return false };
@@ -1280,6 +1282,9 @@ struct HfEdit {
 struct Docxy {
     tabs: Vec<DocTab>,
     active: usize,
+    tab_first: usize,
+    tab_layout: tabstrip::StripLayout,
+    tab_more_open: bool,
     focus: FocusHandle,
     focused: bool,
     ribbon_tab: RibbonTab,
@@ -1495,10 +1500,23 @@ mod probes_tests {
 /// recomputed it would be asserting against a second copy of the layout instead
 /// of the one on screen.
 fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>) -> AnyElement {
+    probe_with_reflow(cell, name, |_| false)
+}
+
+/// Record fresh bounds during prepaint and request one more frame if the
+/// previous frame's geometry used for this render has gone stale.
+fn probe_with_reflow(
+    cell: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    name: impl Into<String>,
+    needs_frame: impl Fn(Bounds<Pixels>) -> bool + 'static,
+) -> AnyElement {
     let (cell, name) = (cell.clone(), name.into());
     canvas(
-        move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| {
+        move |b: Bounds<Pixels>, w: &mut Window, _a: &mut App| {
             cell.borrow_mut().next.push((name, b));
+            if needs_frame(b) {
+                w.request_animation_frame();
+            }
         },
         |_b, _s, _w, _a| {},
     )
@@ -1508,6 +1526,21 @@ fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>
     .right_0()
     .bottom_0()
     .into_any_element()
+}
+
+/// Track a probe's previous bounds while the more-tabs list is open, so a
+/// resize or layout change can re-anchor it on the following frame.
+fn probe_tracked(
+    cell: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    name: &'static str,
+    track: bool,
+) -> AnyElement {
+    if track {
+        let expected = cell.borrow().get(name);
+        probe_with_reflow(cell, name, move |b| expected != Some(b))
+    } else {
+        probe(cell, name)
+    }
 }
 
 /// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
@@ -4414,6 +4447,82 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     }
 }
 
+fn frame_borders(tiling: Option<Tiling>, scale: f32) -> Edges<f32> {
+    // Match gpui's round_stroke_to_device_pixel: round half toward zero,
+    // with at least one device pixel for a nonzero stroke.
+    let one = (scale - 0.5).ceil().max(1.0) / scale;
+    let Some(tiling) = tiling else {
+        return Edges::default();
+    };
+    Edges {
+        top: if tiling.top { 0.0 } else { one },
+        right: if tiling.right { 0.0 } else { one },
+        bottom: if tiling.bottom { 0.0 } else { one },
+        left: if tiling.left { 0.0 } else { one },
+    }
+}
+
+fn window_frame_borders(window: &Window) -> Edges<f32> {
+    let tiling = match window.window_decorations() {
+        Decorations::Server => None,
+        Decorations::Client { tiling } => Some(tiling),
+    };
+    frame_borders(tiling, window.scale_factor())
+}
+
+/// The pinned gpui-component Root wraps TitleBar in window_border: client
+/// shadows are its padding and each untiled edge adds a snapped inner border.
+/// The pinned TitleBar separately adds left padding and a fullscreen inset.
+fn title_bar_geometry(window: &Window) -> f32 {
+    #[cfg(target_os = "macos")]
+    const TITLE_LEFT_PAD: f32 = 80.0;
+    #[cfg(not(target_os = "macos"))]
+    const TITLE_LEFT_PAD: f32 = 12.0;
+    let caption_w = if cfg!(any(target_os = "macos", target_family = "wasm")) {
+        0.0
+    } else {
+        3.0 * f32::from(gpui_component::TITLE_BAR_HEIGHT)
+    };
+    let padding = gpui_component::window_paddings(window);
+    let borders = window_frame_borders(window);
+    tabstrip::title_content_w(
+        f32::from(window.viewport_size().width),
+        tabstrip::TitleInsets {
+            left: f32::from(padding.left) + borders.left,
+            right: f32::from(padding.right) + borders.right,
+        },
+        TITLE_LEFT_PAD,
+        caption_w,
+        if window.is_fullscreen() { 12.0 } else { 0.0 },
+    )
+}
+
+#[cfg(test)]
+mod frame_border_tests {
+    use super::frame_borders;
+    use gpui::{Edges, Tiling};
+
+    #[test]
+    fn client_tiling_and_fractional_scale_reserve_snapped_borders() {
+        assert_eq!(frame_borders(None, 1.75), Edges::default());
+        let b = frame_borders(
+            Some(Tiling {
+                right: true,
+                ..Default::default()
+            }),
+            1.75,
+        );
+        assert!((b.left - 2.0 / 1.75).abs() < 0.0001);
+        assert_eq!(b.right, 0.0);
+        assert_eq!(b.top, b.left);
+        assert_eq!(b.bottom, b.left);
+        for (scale, device_px) in [(1.0, 1.0), (1.25, 1.0), (1.5, 1.0), (1.75, 2.0), (2.0, 2.0)] {
+            let b = frame_borders(Some(Tiling::default()), scale);
+            assert!((b.left * scale - device_px).abs() < 0.0001, "scale {scale}");
+        }
+    }
+}
+
 impl Docxy {
     fn new(cx: &mut Context<Self>) -> Self {
         let session: Session = std::fs::read(session_path())
@@ -4447,6 +4556,9 @@ impl Docxy {
         Self {
             tabs,
             active,
+            tab_first: 0,
+            tab_layout: tabstrip::layout(0.0, 0, 0, 0),
+            tab_more_open: false,
             focus: cx.focus_handle(),
             focused: false,
             ribbon_tab: RibbonTab::Home,
@@ -4758,7 +4870,12 @@ impl Docxy {
     fn sheet_fill_start(&mut self, cx: &mut Context<Self>) {
         let gesture_in_flight = self.grid_gesture_in_flight();
         let src = self.active_sheet().map(|v| v.range());
-        if arm_fill(&mut self.sheet_fill, src, gesture_in_flight) {
+        if arm_fill(
+            &mut self.sheet_fill,
+            src,
+            gesture_in_flight,
+            self.tab_more_open,
+        ) {
             cx.notify();
         }
     }
@@ -5963,6 +6080,10 @@ impl Docxy {
                 origin: point(px(0.), px(0.)),
                 size: window.viewport_size(),
             }),
+            Region::TitleTabs | Region::TabPrev | Region::TabNext | Region::TabMore
+            | Region::TabMoreItem(_) => self.probes.borrow()
+                .get(&harness::region_name(region))
+                .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
             Region::Gantt
             | Region::Bar(_)
             | Region::ProjectHbarTable
@@ -9787,6 +9908,7 @@ impl Docxy {
         self.project_prompt_cancel();
         if i < self.tabs.len() {
             self.active = i;
+            self.tab_more_open = false;
             // Same reason as `select_sheet`: these all index the document we
             // were just on.
             self.drop_grid_state();
@@ -12384,6 +12506,9 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            return;
+        }
         if self.project_prompt_open() {
             return;
         }
@@ -12441,6 +12566,9 @@ impl Docxy {
 
     /// Shift+Tab decreases the paragraph indent (Word's outdent).
     fn shift_tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            return;
+        }
         if self.project_prompt_open() {
             return;
         }
@@ -12474,6 +12602,12 @@ impl Docxy {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            if ev.keystroke.key == "escape" {
+                self.tab_more_close(cx);
+            }
+            return; // the modal list owns keys; do not edit the surface below
+        }
         if self.project_edit_open() && !self.backstage {
             return self.project_key(ev, window, cx);
         }
@@ -15267,6 +15401,16 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
 // ---- chrome: ribbon + backstage --------------------------------------------
 
 impl Docxy {
+    fn tab_more_close(&mut self, cx: &mut Context<Self>) {
+        // The priority-1 backdrop sits above the deferred sheet handle, so a
+        // press cannot reach it while the list is open. Clear any earlier fill
+        // anyway, so it cannot leak into the next grid gesture.
+        self.sheet_fill = None;
+        self.grid_release(cx);
+        self.tab_more_open = false;
+        cx.notify();
+    }
+
     fn ribbon_tabs(&self, fg: Hsla, dim: Hsla, panel: Hsla, cx: &mut Context<Self>) -> AnyElement {
         let names = ribbon_tab_set(self.ribbon_kind());
         let mut strip = h_flex()
@@ -18155,6 +18299,129 @@ impl Docxy {
     }
 }
 
+impl Docxy {
+    fn tab_prev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active > 0 {
+            self.select_tab(self.active - 1, window, cx);
+        }
+    }
+
+    fn tab_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active + 1 < self.tabs.len() {
+            self.select_tab(self.active + 1, window, cx);
+        }
+    }
+
+    fn tab_more_toggle(&mut self, cx: &mut Context<Self>) {
+        if self.tab_layout.more {
+            if self.tab_more_open {
+                self.tab_more_close(cx);
+            } else {
+                self.sheet_fill = None;
+                self.grid_release(cx);
+                self.context_menu = None;
+                self.mini_bar = None;
+                self.tab_more_open = true;
+                cx.notify();
+            }
+        }
+    }
+
+    fn tab_more_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            self.select_tab(i, window, cx);
+        }
+    }
+
+    fn tab_more_popup(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let probes = self.probes.borrow();
+        let anchor = probes.get("tab-more");
+        let root = probes.get("suite-root");
+        let root_x = root.map(|b| f32::from(b.origin.x)).unwrap_or(0.0);
+        let root_w = root
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or_else(|| f32::from(window.viewport_size().width));
+        let padding = gpui_component::window_paddings(window);
+        let borders = window_frame_borders(window);
+        let max_menu_h = (f32::from(window.viewport_size().height)
+            - f32::from(padding.top + padding.bottom)
+            - borders.top
+            - borders.bottom
+            - f32::from(gpui_component::TITLE_BAR_HEIGHT)
+            - 8.0)
+            .clamp(0.0, 400.0);
+        let left = anchor
+            .map(|b| f32::from(b.origin.x) - root_x)
+            .unwrap_or(0.0)
+            .clamp(0.0, (root_w - 224.0).max(0.0));
+        let items = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                h_flex()
+                    .id(("tab-more-item", i))
+                    .relative()
+                    .w_full()
+                    .h(px(28.))
+                    .px_2()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(pal.fg)
+                    .hover(|d| d.bg(pal.hover))
+                    .child(probe(&self.probes, format!("tab-more-item:{i}")))
+                    .child(if i == self.active { "✓" } else { " " })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(tab.title.to_string())),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.tab_more_pick(i, window, cx)),
+                    )
+            })
+            .collect::<Vec<_>>();
+        deferred(
+            div()
+                .id("tab-more-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.tab_more_close(cx);
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("tab-more-menu")
+                        .absolute()
+                        .left(px(left))
+                        .top(gpui_component::TITLE_BAR_HEIGHT)
+                        .w(px(220.))
+                        .max_h(px(max_menu_h))
+                        .overflow_y_scroll()
+                        .py_1()
+                        .rounded_md()
+                        .bg(pal.panel)
+                        .border_1()
+                        .border_color(pal.border)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .children(items),
+                ),
+        )
+        .with_priority(1)
+        .into_any_element()
+    }
+}
+
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A new frame: what the probes recorded during the last one is now the
@@ -18220,34 +18487,94 @@ impl Render for Docxy {
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
+        // The pinned TitleBar gives #bar flex-shrink:0. A definite width,
+        // accounting for Root's client decoration insets, keeps the caption
+        // controls inside the viewport.
+        let title_w = title_bar_geometry(window);
+        let chrome = self.probes.borrow();
+        let left_w = chrome
+            .get("title-left")
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(170.0);
+        let theme_w = chrome
+            .get("title-theme")
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(80.0);
+        drop(chrome);
+        // In very narrow windows the left chrome yields space to the drag
+        // region before the caption controls can be affected.
+        let left_cap = (title_w - 8.0 - 24.0 - tabstrip::DRAG_MIN_W).max(0.0);
+        // Four children, three 8px gaps, plus our 8px left padding.
+        let avail =
+            (title_w - 8.0 - 24.0 - left_w.min(left_cap) - theme_w - tabstrip::DRAG_MIN_W).max(0.0);
+        let strip = tabstrip::layout(avail, self.tabs.len(), self.active, self.tab_first);
+        self.tab_first = strip.first;
+        self.tab_layout = strip;
         let chips: Vec<AnyElement> = self
             .tabs
             .iter()
             .enumerate()
+            .skip(strip.first)
+            .take(strip.end - strip.first)
             .map(|(i, tb)| {
                 let active = i == self.active && !self.backstage;
-                let mark = if tb.dirty { " \u{2022}" } else { "" };
+                let full_tip = SharedString::from(format!(
+                    "{}{}{}",
+                    tb.title,
+                    if is_imported(tb) { " · imported" } else { "" },
+                    if tb.dirty { " · unsaved changes" } else { "" },
+                ));
                 h_flex()
                     .id(("chip", i))
+                    .relative()
                     .items_center()
                     .gap_1()
                     .px_2()
                     .h(px(24.))
+                    .w(px(strip.tab_w))
+                    .flex_none()
                     .rounded_sm()
                     .cursor_pointer()
+                    .tooltip(move |window, cx| Tooltip::new(full_tip.clone()).build(window, cx))
                     .text_size(px(12.))
                     .when(active, |d| d.bg(tab_active).text_color(fg))
                     .when(!active, |d| d.text_color(dim))
-                    .child(SharedString::from(format!(
-                        "{} {}{}{}",
-                        tb.kind.glyph(),
-                        tb.title,
-                        if is_imported(tb) { " · imported" } else { "" },
-                        mark
-                    )))
+                    .when(i == self.active, |d| {
+                        d.child(probe(&self.probes, "title-active-chip"))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(format!(
+                                "{} {}",
+                                tb.kind.glyph(),
+                                tb.title
+                            ))),
+                    )
+                    // Keep status visible when the title is clipped. The full
+                    // imported text appears on roomy chips; narrow ones still
+                    // expose the source in the tooltip.
+                    .when(is_imported(tb) && strip.tab_w >= 160.0, |d| {
+                        d.child(div().flex_none().child(" · imported"))
+                    })
+                    .when(tb.dirty, |d| {
+                        d.child(
+                            div()
+                                .relative()
+                                .flex_none()
+                                .child("•")
+                                .when(i == self.active, |d| {
+                                    d.child(probe(&self.probes, "title-active-dirty"))
+                                }),
+                        )
+                    })
                     .child(
                         div()
                             .id(("chipx", i))
+                            .flex_none()
                             .px_1()
                             .rounded_sm()
                             .hover(|d| d.bg(border))
@@ -18264,6 +18591,60 @@ impl Render for Docxy {
             })
             .collect();
 
+        let mut tab_controls = h_flex().items_center().gap(px(tabstrip::TAB_GAP));
+        if strip.arrows {
+            tab_controls = tab_controls.child(
+                div()
+                    .id("tab-prev")
+                    .relative()
+                    .w(px(tabstrip::ARROW_W))
+                    .h(px(24.))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_color(if self.active == 0 { dim } else { fg })
+                    .child("‹")
+                    .child(probe(&self.probes, "tab-prev"))
+                    .on_click(cx.listener(|this, _, window, cx| this.tab_prev(window, cx))),
+            );
+        }
+        tab_controls = tab_controls.children(chips);
+        if strip.arrows {
+            tab_controls = tab_controls.child(
+                div()
+                    .id("tab-next")
+                    .relative()
+                    .w(px(tabstrip::ARROW_W))
+                    .h(px(24.))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_color(if self.active + 1 >= self.tabs.len() {
+                        dim
+                    } else {
+                        fg
+                    })
+                    .child("›")
+                    .child(probe(&self.probes, "tab-next"))
+                    .on_click(cx.listener(|this, _, window, cx| this.tab_next(window, cx))),
+            );
+        }
+        if strip.more {
+            tab_controls = tab_controls.child(
+                div()
+                    .id("tab-more")
+                    .relative()
+                    .w(px(tabstrip::MORE_W))
+                    .h(px(24.))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_color(fg)
+                    .child("▾")
+                    .child(probe_tracked(&self.probes, "tab-more", self.tab_more_open))
+                    .on_click(cx.listener(|this, _, _, cx| this.tab_more_toggle(cx))),
+            );
+        } else {
+            self.tab_more_open = false;
+        }
+
         // NOTE: the "docxy" brand label and the flex_1 spacer are plain,
         // non-interactive divs, so TitleBar's own drag region shows through them
         // — that idle space is natively draggable and double-click maximizes.
@@ -18271,46 +18652,78 @@ impl Render for Docxy {
         // mouse-down so a drag on them doesn't start a window move.
         let title_bar = TitleBar::new().child(
             h_flex()
-                .w_full()
+                .relative()
+                .w(px(title_w))
+                .h_full()
+                .flex_none()
+                .overflow_hidden()
                 .items_center()
                 .gap_2()
                 .pl_2()
-                .child(
-                    div()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(BRAND))
-                        .child("docxy"),
-                )
-                // Quick Access Toolbar: Undo / Redo (Word keeps these here, not on
-                // the ribbon).
+                .child(probe(&self.probes, "title-content"))
                 .child(
                     h_flex()
+                        .relative()
+                        .flex_none()
+                        .max_w(px(left_cap))
+                        .overflow_hidden()
                         .items_center()
-                        .gap_0p5()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .children(QAT_ITEMS.iter().map(|item| {
-                            let action = item.action;
-                            qat_btn(
-                                item.id,
-                                item.icon,
-                                item.tip,
-                                pal,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.qat_action(action, window, cx)
-                                }),
-                            )
-                        })),
+                        .gap_2()
+                        .child(probe_with_reflow(&self.probes, "title-left", move |b| {
+                            (f32::from(b.size.width) - left_w).abs() > 0.5
+                        }))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(BRAND))
+                                .child("docxy"),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_0p5()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .children(QAT_ITEMS.iter().map(|item| {
+                                    let action = item.action;
+                                    qat_btn(
+                                        item.id,
+                                        item.icon,
+                                        item.tip,
+                                        pal,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.qat_action(action, window, cx)
+                                        }),
+                                    )
+                                })),
+                        ),
                 )
                 .child(
                     h_flex()
+                        .relative()
+                        .w(px(strip.width))
+                        .flex_shrink(1.0)
+                        .min_w_0()
+                        .overflow_hidden()
                         .items_center()
-                        .gap_1()
+                        .child(probe(&self.probes, "title-tabs"))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .children(chips),
+                        .child(tab_controls),
                 )
-                .child(div().flex_1())
                 .child(
                     div()
+                        .relative()
+                        .flex_1()
+                        .h_full()
+                        .min_w(px(tabstrip::DRAG_MIN_W))
+                        .child(probe(&self.probes, "title-drag")),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(probe_with_reflow(&self.probes, "title-theme", move |b| {
+                            (f32::from(b.size.width) - theme_w).abs() > 0.5
+                        }))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             Button::new("theme")
@@ -18323,15 +18736,25 @@ impl Render for Docxy {
                         ),
                 ),
         );
+        let tab_popup = self
+            .tab_more_open
+            .then(|| self.tab_more_popup(window, pal, cx));
 
         if self.backstage {
             let backstage = self.backstage_view(bg, fg, dim, sidebar, cx);
             return v_flex()
                 .size_full()
+                .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
+                .child(probe_tracked(
+                    &self.probes,
+                    "suite-root",
+                    self.tab_more_open,
+                ))
                 .child(title_bar)
                 .child(backstage)
+                .when_some(tab_popup, |d, popup| d.child(popup))
                 .into_any_element();
         }
 
@@ -18926,6 +19349,7 @@ impl Render for Docxy {
             .when_some(chart_panel, |d, p| d.child(p));
         let context_menu = self
             .context_menu
+            .filter(|_| !self.tab_more_open)
             .map(|at| self.context_menu_el(at, pal, cx));
         let mini_bar = (is_doc && self.context_menu.is_none())
             .then_some(self.mini_bar)
@@ -18966,6 +19390,7 @@ impl Render for Docxy {
                 }
             }))
             .bg(bg)
+            .child(probe_tracked(&self.probes, "suite-root", self.tab_more_open))
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
@@ -18990,6 +19415,7 @@ impl Render for Docxy {
             .when_some(mini_bar, |d, m| d.child(m))
             .when_some(context_menu, |d, m| d.child(m))
             .when_some(sheet_fmt_panel, |d, p| d.child(p))
+            .when_some(tab_popup, |d, popup| d.child(popup))
             // A vertical guide line down the page while a ruler marker is dragged.
             .when_some(self.ruler_guide, |d, gx| {
                 d.child(div().absolute().top_0().bottom_0().left(px(gx)).w(px(1.)).bg(Hsla { a: 0.6, ..hsla_u(BRAND) }))
@@ -22431,7 +22857,7 @@ mod grid_geom_tests {
         assert!(!gesture_in_flight(false, false, false, false));
         assert!(may_arm_fill(false, false));
         let mut fill = None;
-        assert!(arm_fill(&mut fill, Some(src), false));
+        assert!(arm_fill(&mut fill, Some(src), false, false));
         let armed = fill.expect("the source range becomes a fill drag");
         assert_eq!(armed.src, src);
         assert_eq!(armed.to, (src.2, src.3));
@@ -22456,7 +22882,8 @@ mod grid_geom_tests {
             assert!(!arm_fill(
                 &mut fill,
                 Some(src),
-                gesture_in_flight(drag, dragging, range, formula)
+                gesture_in_flight(drag, dragging, range, formula),
+                false
             ));
             assert!(fill.is_none(), "a grid gesture must leave the fill unarmed");
         }
@@ -22465,8 +22892,14 @@ mod grid_geom_tests {
         assert!(!may_arm_fill(true, false));
         assert!(!may_arm_fill(true, true));
         let mut fill = Some(armed);
-        assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false));
+        assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false, false));
         assert_eq!(fill.expect("the first fill stays armed").src, src);
+
+        // The priority-1 more-tabs backdrop prevents presses on the deferred
+        // handle. Keep the guard as defence in depth if that order changes.
+        let mut fill = None;
+        assert!(!arm_fill(&mut fill, Some(src), false, true));
+        assert!(fill.is_none());
     }
 
     fn names(list: &[&str]) -> Vec<String> {
