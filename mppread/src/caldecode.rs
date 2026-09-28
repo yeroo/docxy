@@ -59,7 +59,13 @@ fn exception_name(value: &[u8]) -> Result<String, &'static str> {
     if units.last() != Some(&0) {
         return Err("unterminated UTF-16");
     }
-    String::from_utf16(&units[..units.len() - 1]).map_err(|_| "invalid UTF-16")
+    let s = String::from_utf16(&units[..units.len() - 1]).map_err(|_| "invalid UTF-16")?;
+    if s.chars().any(|c| {
+        !matches!(c, '\t' | '\n' | '\r') && !(' '..='\u{FFFD}').contains(&c) && c < '\u{10000}'
+    }) {
+        return Err("invalid XML character");
+    }
+    Ok(s)
 }
 
 fn working_time(
@@ -197,9 +203,9 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
             ..CalendarException::default()
         };
         match kind {
-            // Type 1's pattern word varies by creation path (0x0230 in
-            // COM-built snapshots, zero in MSPDI-resaved probes). It does not
-            // appear in Project's XML for one-off exceptions.
+            // Type 1's pattern word is not stable: 0x0230 in the generated
+            // snapshots, zero in MSPDI-resaved and COM Exceptions.Add probes.
+            // It does not appear in Project's XML for one-off exceptions.
             1 => {}
             2 => {
                 exception.month = Some(i32::from(b[0]));
@@ -544,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn exception_names_allow_empty_and_control_chars_but_refuse_bad_utf16() {
+    fn exception_names_allow_empty_and_xml_whitespace_but_refuse_bad_chars() {
         let renamed = |raw: &[u8]| {
             let mut b = exception_block();
             b.truncate(516);
@@ -573,6 +579,16 @@ mod tests {
         );
         let error = exceptions(&renamed(&[0, 0xd8, 0, 0])).unwrap_err();
         assert!(error.contains("exception 0 name"), "{error}");
+        let invalid_xml: Vec<_> = "A\u{0001}"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let error = exceptions(&renamed(&invalid_xml)).unwrap_err();
+        assert!(
+            error.contains("exception 0 name: invalid XML character"),
+            "{error}"
+        );
     }
 
     #[test]

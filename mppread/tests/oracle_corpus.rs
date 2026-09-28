@@ -426,6 +426,33 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             );
         }
         let stem = mpp.file_stem().unwrap().to_string_lossy();
+        let recurrence = oracle
+            .calendar(oracle.default_calendar_uid)
+            .and_then(|cal| cal.exceptions.first());
+        match stem.as_ref() {
+            "e6-monthly-position" | "k5-monthly-position" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month_position),
+                    (Some(5), Some(7), Some(1))
+                );
+            }
+            "e7-yearly-date" | "k6-yearly-date" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month),
+                    (Some(2), Some(5), Some(2))
+                );
+            }
+            "e8-yearly-position" | "k7-yearly-position" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month, e.month_position),
+                    (Some(3), Some(5), Some(2), Some(1))
+                );
+            }
+            _ => {}
+        }
         if stem == "33-calendar-holiday" {
             let task = imported.tasks.iter().find(|t| t.uid == 5).unwrap();
             assert_eq!(
