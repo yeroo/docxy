@@ -36,6 +36,10 @@ const MANUAL_START: usize = 50;
 const MANUAL_FINISH: usize = 54;
 const MANUAL_DURATION: usize = 58;
 const MANUAL_DURATION_FORMAT: usize = 62;
+/// Auto task Duration and DurationFormat in newest-layout FixedData. Both
+/// offsets match every task in the Project-written MSPDI snapshot pairs.
+const DURATION: usize = 84;
+const DURATION_FORMAT: usize = 164;
 /// Recorded progress in the newest layout's 202-byte FixedData record, found
 /// by diffing Project's progress cases (corpus/tools/gen_mpp_progress_cases.py)
 /// and checked against its MSPDI export of every snapshot, paired plan and
@@ -336,6 +340,25 @@ fn tenths_to_minutes(tenths: i32) -> i64 {
     (f64::from(tenths) / 10.0).round() as i64
 }
 
+fn stored_duration(rec: &[u8], uid: u32) -> Result<Option<i64>, String> {
+    let raw = u32_at(rec, DURATION);
+    let format = u16_at(rec, DURATION_FORMAT);
+    // An absent value or format has no validated working duration.
+    if raw == u32::MAX || format == 0 {
+        return Ok(None);
+    }
+    if raw > i32::MAX as u32 {
+        return Err(format!("invalid task duration for UID {uid}"));
+    }
+    match format & !32 {
+        3 | 5 | 7 | 9 | 11 | 21 => Ok(Some(tenths_to_minutes(raw as i32))),
+        4 | 6 | 8 | 10 | 12 => Ok(None),
+        _ => Err(format!(
+            "unrecognized DurationFormat {format} for UID {uid}"
+        )),
+    }
+}
+
 fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProgress, String> {
     let at = NEWEST_PROGRESS;
     let percent = |off: usize, what: &str| {
@@ -533,6 +556,7 @@ fn decode_current(
             manual_start,
             manual_finish,
             manual_duration_min,
+            duration_min: stored_duration(rec, row.uid)?,
             progress: Some(progress),
         });
     }
@@ -770,6 +794,49 @@ mod tests {
         assert_eq!(project.tasks[0].name, "B");
         let err = crate::project::project_from_mpp(&file(&s, false)).unwrap_err();
         assert!(err.starts_with("cannot read the task table of this .mpp ("));
+    }
+    #[test]
+    fn conversion_uses_stored_duration_and_falls_back_without_one() {
+        let mut s = fixture();
+        let rec = 250; // leaf B, UID 1
+        let span = crate::project::project_from_mpp(&file(&s, true))
+            .unwrap()
+            .tasks[0]
+            .duration_min;
+        assert_eq!(span, 0); // fixture start and finish are the same instant
+
+        s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&9600u32.to_le_bytes());
+        s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
+            .copy_from_slice(&39u16.to_le_bytes()); // estimated working days
+        assert_eq!(decode(&file(&s, true)).unwrap()[1].duration_min, Some(960));
+        assert_eq!(
+            crate::project::project_from_mpp(&file(&s, true))
+                .unwrap()
+                .tasks[0]
+                .duration_min,
+            960
+        );
+
+        s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2].copy_from_slice(&8u16.to_le_bytes()); // elapsed days: no validated working duration
+        assert_eq!(decode(&file(&s, true)).unwrap()[1].duration_min, None);
+        assert_eq!(
+            crate::project::project_from_mpp(&file(&s, true))
+                .unwrap()
+                .tasks[0]
+                .duration_min,
+            span
+        );
+        s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
+            .copy_from_slice(&39u16.to_le_bytes());
+        s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(decode(&file(&s, true)).unwrap()[1].duration_min, None);
+        assert_eq!(
+            crate::project::project_from_mpp(&file(&s, true))
+                .unwrap()
+                .tasks[0]
+                .duration_min,
+            span
+        );
     }
     #[test]
     fn refuses_structural_corruption() {

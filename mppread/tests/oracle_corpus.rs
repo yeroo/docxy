@@ -351,23 +351,29 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             if task.summary || task.manual || expected_task.milestone {
                 continue;
             }
-            // Splits are not decoded from .mpp; this known task has a work
-            // interruption that makes its duration shorter than its span.
-            if task.uid == 23 && expected_task.name == "S13 split task" {
-                dropped[0] += 1;
-                continue;
-            }
-            if task.uid == 55 && expected_task.name == "S43 delayed start" {
-                // Project's delayed assignment makes this task's Duration
-                // shorter than the working span; assignments are not imported.
-                dropped[1] += 1;
-                continue;
-            }
             if formats
                 .get(&task.uid)
                 .is_some_and(|format| matches!(format & !32, 4 | 6 | 8 | 10 | 12))
             {
                 dropped[2] += 1;
+                continue;
+            }
+            assert_eq!(
+                task.duration_min,
+                expected_task.duration_min,
+                "{}: stored duration UID {}",
+                mpp.display(),
+                task.uid
+            );
+            // projcore's CPM does not model splits or delayed assignments.
+            // Split decoding and assignment import (#342) are follow-ups;
+            // delayed-assignment finish calculation needs a CPM follow-up.
+            if task.uid == 23 && expected_task.name == "S13 split task" {
+                dropped[0] += 1;
+                continue;
+            }
+            if task.uid == 55 && expected_task.name == "S43 delayed start" {
+                dropped[1] += 1;
                 continue;
             }
             if expected_task
@@ -391,14 +397,6 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 dropped[4] += 1;
                 continue;
             }
-            selected += 1;
-            assert_eq!(
-                task.duration_min,
-                expected_task.duration_min,
-                "{}: calendar duration UID {}",
-                mpp.display(),
-                task.uid
-            );
             let working_start = project_cal
                 .day(start.day_number())
                 .iter()
@@ -409,6 +407,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 dropped[5] += 1;
                 continue;
             }
+            selected += 1;
             let result = scheduled.get(task.uid).unwrap();
             assert_eq!(
                 (result.early_start, result.early_finish),
@@ -466,6 +465,10 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 "{}: holiday UID 5 was not compared",
                 mpp.display()
             );
+        }
+        if stem == "43-assignment-delay" {
+            let task = imported.tasks.iter().find(|t| t.uid == 55).unwrap();
+            assert_eq!(task.duration_min, 960, "delayed assignment UID 55 duration");
         }
         if [
             "e1-range",

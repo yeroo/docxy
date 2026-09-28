@@ -267,6 +267,17 @@ itself for format 19. The importer reads the formats projcore schedules (3-12,
 19 and their estimated variants 35-44 and 51) and refuses the others, elapsed
 percent (20, 52) included.
 
+The newest layout's task `FixedData` stores Duration as i32 tenths of a minute
+at +84 and DurationFormat as u16 at +164. Both fields match every task in the
+46 generated Project-written MSPDI snapshot pairs. The importer uses the
+rounded stored duration for auto tasks with a working-time format; an absent
+duration, an elapsed format, or MPP9 falls back to the working span between
+stored dates.
+The stored value also covers a split or a delayed assignment, whose duration
+can be shorter than that span. The scheduler does not yet account for splits
+or a delayed assignment when calculating the task's finish; assignments
+themselves are not yet imported from `.mpp` (#342).
+
 Task progress, work and cost are decoded for the newest layout
 ([#181](https://github.com/yeroo/docxy/issues/181)) and imported as read; the
 scheduler ignores them, as it does for MSPDI. They sit in the task's 202-byte

@@ -66,6 +66,9 @@ pub struct MppTask {
     pub manual_start: Option<String>,
     pub manual_finish: Option<String>,
     pub manual_duration_min: Option<i64>,
+    /// Project's stored working duration for a current-layout task. Absent
+    /// for MPP9, missing values, and elapsed DurationFormats.
+    pub duration_min: Option<i64>,
     /// Recorded progress as Project stored it. `None` for a layout whose
     /// progress fields are not validated (MPP9).
     pub progress: Option<MppProgress>,
