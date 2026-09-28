@@ -190,6 +190,7 @@ fn check_progress(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_task_fields(
     a: &mppread::mpp::MppTask,
     imported: &projcore::Task,
