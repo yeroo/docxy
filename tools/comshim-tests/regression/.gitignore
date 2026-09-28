@@ -1,0 +1,3 @@
+# Outputs of the regression kit: staged binaries and run results.
+bin-*/
+run-*/
