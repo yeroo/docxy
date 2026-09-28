@@ -210,6 +210,7 @@ fn check_task_fields(
     same!(ignore_resource_calendar);
     same!(earned_value_method);
     same!(recurring);
+    same!(over_allocated);
     same!(hide_bar);
     same!(rollup);
     same!(external_task);
@@ -608,7 +609,7 @@ fn project_2024_oracles() {
     let task_fields = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/task-fields");
     if task_fields.exists() {
         let cases = pairs(&task_fields, "");
-        assert_eq!(cases.len(), 10);
+        assert_eq!(cases.len(), 11);
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);
             if mpp.file_stem().is_some_and(|s| s == "f3-blanks") {

@@ -545,7 +545,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 // reports the Props error via NewTasksAreManual below.
                 .and_then(|p| crate::props::has_default_wbs_mask(p).ok())
                 .unwrap_or(false);
-            let tasks = decode_current(
+            let mut tasks = decode_current(
                 &cfb,
                 prefix,
                 CurrentStreams {
@@ -558,6 +558,13 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 &fixed2,
                 default_wbs_mask,
             )?;
+            if let Ok(overallocated) = crate::overalloc::decode(&cfb, &tasks) {
+                for task in &mut tasks {
+                    if let Some(fields) = &mut task.fields {
+                        fields.over_allocated = overallocated.get(&task.uid).copied();
+                    }
+                }
+            }
             let new_tasks_are_manual = props_data
                 .ok_or_else(|| "missing project Props stream".to_string())
                 .and_then(|props| crate::props::new_tasks_are_manual(&props));
@@ -903,6 +910,13 @@ mod tests {
     }
     fn reject(s: &Streams) {
         assert!(decode(&file(s, true)).is_err());
+    }
+
+    #[test]
+    fn missing_optional_assignment_table_keeps_task_import() {
+        let bytes = file(&fixture(), true);
+        let project = crate::project::project_from_mpp(&bytes).unwrap();
+        assert!(project.tasks.iter().all(|t| t.over_allocated.is_none()));
     }
 
     #[test]

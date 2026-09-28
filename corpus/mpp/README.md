@@ -129,10 +129,13 @@ minutes. Generate them the same way:
 python corpus/tools/gen_mpp_lag_cases.py
 ```
 
-Ten paired task-field files in `task-fields/` cover the current-layout task
+Eleven paired task-field files in `task-fields/` cover the current-layout task
 flags, GUID, creation date, WBS, type, deadline, leveling fields, subprojects,
 over-allocation and blank rows. The custom-mask case proves generated WBS codes
 have no explicit per-task binary value, so the decoder leaves them absent.
+The `f9-overalloc-edges` case pins assignment units against capacity, a
+resource availability change, a material resource, and direct assignments on
+summary tasks. Project rejects assigning the same resource twice to one task.
 The cross-project predecessor case also has an external task in the binary
 table; Project omits that ghost row from its XML export. Generate the pairs on
 Windows with Project and pywin32:
@@ -141,11 +144,19 @@ Windows with Project and pywin32:
 python corpus/tools/gen_mpp_task_field_cases.py
 ```
 
-Project computes `OverAllocated` from resource assignments when it exports;
-the task-table decoder leaves it absent until resource and assignment decoding
-can reproduce that result. The private snapshots include a UI-authored
-`x-recurring` pair, which locates the recurring flag on its summary and four
-occurrences. The `x-overallocated` sample shows that an overallocated resource
+For the current layout, the decoder derives a task's `OverAllocated` from its
+direct assignments: a work assignment is overallocated if its own units exceed
+the resource's capacity during any overlap between its saved start and finish.
+It reads availability periods when present; material and cost assignments do
+not overallocate. A valid empty assignment table yields false for each task,
+while a missing or unrecognized table leaves the field absent without failing
+the task import. The corpus does not decide whether overlap only during a
+nonworking calendar interval or a contoured assignment should count; the
+decoder currently treats any overlap in the saved span as a working moment.
+Resource calendars and exceptions are not decoded for this field. The private
+snapshots include a UI-authored `x-recurring` pair, which locates the recurring
+flag on its summary and four occurrences. The `x-overallocated` sample shows
+that an overallocated resource
 can have tasks whose `OverAllocated` values are all false.
 
 The generated `.mpp` and `.xml` files stay git-ignored. The generator sources

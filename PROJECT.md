@@ -241,9 +241,10 @@ task: its bookings are placed first, and auto tasks level around them.
   GUID, type, flags, priority, deadline and leveling options survive an
   import and MSPDI save. Explicit WBS codes and generated codes under the
   default numeric mask also survive; generated codes under a custom mask
-  remain absent. Project-derived over-allocation remains absent until
-  resource and assignment records are decoded. Recurring tasks are validated
-  against a UI-authored Project sample.
+  remain absent. Current-layout over-allocation is derived from each task's
+  direct assignments and their resources' availability; if either table is
+  unrecognized, the field remains absent. The value is kept after edits.
+  Recurring tasks are validated against a UI-authored Project sample.
   Stored task IDs determine display order; stable UIDs connect predecessor
   links from `TBkndCons`. An unrecognized layout or malformed row causes an
   import error. Imported automatic leaves and childless inserted subprojects
