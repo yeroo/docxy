@@ -1639,11 +1639,13 @@ fn decode_markdown(bytes: &[u8]) -> Result<(String, Option<&'static str>), Strin
         if text.len() % 2 != 0 {
             return Err("invalid UTF-16 text: odd byte count".into());
         }
-        let units = text.chunks_exact(2).map(|pair| {
+        let (pairs, rest) = text.as_chunks::<2>();
+        debug_assert!(rest.is_empty());
+        let units = pairs.iter().map(|&pair| {
             if little_endian {
-                u16::from_le_bytes([pair[0], pair[1]])
+                u16::from_le_bytes(pair)
             } else {
-                u16::from_be_bytes([pair[0], pair[1]])
+                u16::from_be_bytes(pair)
             }
         });
         let decoded = char::decode_utf16(units)
