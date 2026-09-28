@@ -216,7 +216,7 @@
         "link",
         "link-fs"
       ],
-      "desc": "Percent complete, actuals, stop/resume, remaining values, variances and assignment baselines survive saves."
+      "desc": "Percent complete, actuals, stop/resume, overtime, earned value, task timephased data, remaining values, variances and assignment baselines survive saves."
     },
     {
       "file": "23-derived-calendar.xml",

@@ -321,6 +321,45 @@ fn remaining_cost(a: &Assignment) -> f64 {
 /// Work, cost, remaining work and remaining cost of a group of assignments.
 type Totals = (i64, f64, i64, f64);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TaskTotals {
+    work: i64,
+    cost: f64,
+    remaining_work: i64,
+    remaining_cost: f64,
+    overtime_work: i64,
+    remaining_overtime_work: i64,
+    overtime_cost: f64,
+    remaining_overtime_cost: f64,
+}
+
+impl TaskTotals {
+    fn difference(self, before: Self) -> Self {
+        Self {
+            work: self.work - before.work,
+            cost: self.cost - before.cost,
+            remaining_work: self.remaining_work - before.remaining_work,
+            remaining_cost: self.remaining_cost - before.remaining_cost,
+            overtime_work: self.overtime_work - before.overtime_work,
+            remaining_overtime_work: self.remaining_overtime_work - before.remaining_overtime_work,
+            overtime_cost: self.overtime_cost - before.overtime_cost,
+            remaining_overtime_cost: self.remaining_overtime_cost - before.remaining_overtime_cost,
+        }
+    }
+
+    fn add_scaled(&mut self, other: Self, sign: i64) {
+        let f = sign as f64;
+        self.work += sign * other.work;
+        self.cost += f * other.cost;
+        self.remaining_work += sign * other.remaining_work;
+        self.remaining_cost += f * other.remaining_cost;
+        self.overtime_work += sign * other.overtime_work;
+        self.remaining_overtime_work += sign * other.remaining_overtime_work;
+        self.overtime_cost += f * other.overtime_cost;
+        self.remaining_overtime_cost += f * other.remaining_overtime_cost;
+    }
+}
+
 fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> Totals {
     assignments.fold((0, 0.0, 0, 0.0), |(w, c, rw, rc), a| {
         (
@@ -334,10 +373,24 @@ fn totals<'a>(assignments: impl Iterator<Item = &'a Assignment>) -> Totals {
 
 /// The task's own contribution to stored totals: its assignments and fixed
 /// cost, with work counting only assignments whose work is time ([`is_work`]).
-fn task_totals(p: &Project, uid: i32) -> Totals {
+fn task_totals(p: &Project, uid: i32) -> TaskTotals {
     let mine = p.assignments.iter().filter(|a| a.task_uid == uid);
     let (_, cost, _, remaining_cost) = totals(mine.clone());
-    let (work, _, remaining, _) = totals(mine.filter(|a| is_work(&p.resources, a)));
+    let overtime_cost: f64 = mine.clone().map(|a| value(a.overtime_cost.as_ref())).sum();
+    let remaining_overtime_cost: f64 = mine
+        .clone()
+        .map(|a| value(a.remaining_overtime_cost.as_ref()))
+        .sum();
+    let work_assignments: Vec<_> = mine.filter(|a| is_work(&p.resources, a)).collect();
+    let (work, _, remaining, _) = totals(work_assignments.iter().copied());
+    let overtime_work = work_assignments
+        .iter()
+        .map(|a| a.overtime_work_min.unwrap_or(0))
+        .sum();
+    let remaining_overtime_work = work_assignments
+        .iter()
+        .map(|a| a.remaining_overtime_work_min.unwrap_or(0))
+        .sum();
     let (fixed, fixed_remaining) = p.task(uid).map_or((0.0, 0.0), |t| {
         let amount = value(t.fixed_cost.as_ref());
         let pct = t.percent_complete.unwrap_or(0).min(100);
@@ -350,12 +403,16 @@ fn task_totals(p: &Project, uid: i32) -> Totals {
         // Stored costs are whole hundredths. Avoid writing negative zero.
         (amount, (amount * share).round() + 0.0)
     });
-    (
+    TaskTotals {
         work,
-        cost + fixed,
-        remaining,
-        remaining_cost + fixed_remaining,
-    )
+        cost: cost + fixed,
+        remaining_work: remaining,
+        remaining_cost: remaining_cost + fixed_remaining,
+        overtime_work,
+        remaining_overtime_work,
+        overtime_cost,
+        remaining_overtime_cost,
+    }
 }
 
 /// Task positions and outline ancestors, nearest first. A blank row has no
@@ -514,24 +571,17 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
             changed.insert(uid);
         }
     }
-    let mut moved: HashMap<i32, Totals> = HashMap::new();
-    let mut add = |uid: i32, (w, c, rw, rc): Totals, sign: i64| {
-        let sum = moved.entry(uid).or_insert((0, 0.0, 0, 0.0));
-        let f = sign as f64;
-        *sum = (
-            sum.0 + sign * w,
-            sum.1 + f * c,
-            sum.2 + sign * rw,
-            sum.3 + f * rc,
-        );
+    let mut moved: HashMap<i32, TaskTotals> = HashMap::new();
+    let mut add = |uid: i32, totals: TaskTotals, sign: i64| {
+        moved.entry(uid).or_default().add_scaled(totals, sign);
     };
     for uid in changed {
-        let (w0, c0, rw0, rc0) = task_totals(prev, uid);
-        let (w1, c1, rw1, rc1) = task_totals(proj, uid);
-        let delta = (w1 - w0, c1 - c0, rw1 - rw0, rc1 - rc0);
+        let before = task_totals(prev, uid);
+        let after = task_totals(proj, uid);
+        let delta = after.difference(before);
         let (was_under, now_under) = (prev_index.ancestors(uid), now_index.ancestors(uid));
         if was_under == now_under {
-            if delta == (0, 0.0, 0, 0.0) {
+            if delta == TaskTotals::default() {
                 continue;
             }
             for target in std::iter::once(uid).chain(now_under.iter().copied()) {
@@ -540,33 +590,58 @@ pub(crate) fn refresh(prev: &Project, prev_sched: &Schedule, proj: &mut Project,
         } else {
             add(uid, delta, 1);
             for &target in was_under {
-                add(target, (w0, c0, rw0, rc0), -1);
+                add(target, before, -1);
             }
             for &target in now_under {
-                add(target, (w1, c1, rw1, rc1), 1);
+                add(target, after, 1);
             }
         }
     }
     for t in &mut proj.tasks {
-        let (Some(&(dw, dc, drw, drc)), Some(was)) =
-            (moved.get(&t.uid), prev_index.task(prev, t.uid))
-        else {
+        let (Some(&delta), Some(was)) = (moved.get(&t.uid), prev_index.task(prev, t.uid)) else {
             continue;
         };
-        if dw != 0 {
-            t.work_min = was.work_min.map(|w| w + dw);
+        if delta.work != 0 {
+            t.work_min = was.work_min.map(|w| w + delta.work);
         }
-        if drw != 0 {
-            t.remaining_work_min = was.remaining_work_min.map(|w| w + drw);
+        if delta.remaining_work != 0 {
+            t.remaining_work_min = was.remaining_work_min.map(|w| w + delta.remaining_work);
         }
-        if dc != 0.0 {
-            t.cost = was.cost.as_ref().and_then(|c| money(value(Some(c)) + dc));
+        if delta.cost != 0.0 {
+            t.cost = was
+                .cost
+                .as_ref()
+                .and_then(|c| money(value(Some(c)) + delta.cost));
         }
-        if drc != 0.0 {
+        if delta.remaining_cost != 0.0 {
             t.remaining_cost = was
                 .remaining_cost
                 .as_ref()
-                .and_then(|c| money(value(Some(c)) + drc));
+                .and_then(|c| money(value(Some(c)) + delta.remaining_cost));
+        }
+        if delta.overtime_work != 0 {
+            t.overtime_work_min = was.overtime_work_min.map(|w| w + delta.overtime_work);
+        }
+        if delta.remaining_overtime_work != 0 {
+            t.remaining_overtime_work_min = was
+                .remaining_overtime_work_min
+                .map(|w| w + delta.remaining_overtime_work);
+        }
+        if delta.overtime_cost != 0.0 {
+            t.overtime_cost = was
+                .overtime_cost
+                .as_ref()
+                .and_then(|c| money(value(Some(c)) + delta.overtime_cost));
+        }
+        if delta.remaining_overtime_cost != 0.0 {
+            t.remaining_overtime_cost = was
+                .remaining_overtime_cost
+                .as_ref()
+                .and_then(|c| money(value(Some(c)) + delta.remaining_overtime_cost));
+        }
+        let regular_delta = delta.work - delta.overtime_work;
+        if regular_delta != 0 {
+            t.regular_work_min = was.regular_work_min.map(|w| w + regular_delta);
         }
     }
 
@@ -668,6 +743,118 @@ mod tests {
 
     fn cost(proj: &Project, a: &Assignment) -> Option<String> {
         assignment_cost(proj, a, span(proj, a)).map(|r| r.as_str().to_string())
+    }
+
+    #[test]
+    fn refresh_rolls_task_overtime_deltas_to_ancestors_without_filling_absent_fields() {
+        let mut prev = plan(at(2, 8), 1);
+        let tracked = |uid,
+                       outline,
+                       summary,
+                       regular,
+                       overtime,
+                       remaining_overtime,
+                       overtime_cost,
+                       remaining_overtime_cost| Task {
+            uid,
+            id: uid,
+            outline_level: outline,
+            summary,
+            name: format!("T{uid}"),
+            duration_min: 480,
+            regular_work_min: Some(regular),
+            overtime_work_min: Some(overtime),
+            remaining_overtime_work_min: Some(remaining_overtime),
+            overtime_cost: Rate::parse(overtime_cost),
+            remaining_overtime_cost: Rate::parse(remaining_overtime_cost),
+            actual_overtime_work_min: Some(20),
+            acwp: Rate::parse("9.125"),
+            resume_valid: Some(false),
+            actual_work_protected_min: Some(30),
+            timephased_data: vec![TimephasedValue {
+                kind: 2,
+                value: Some("PT1H0M0S".into()),
+                ..TimephasedValue::default()
+            }],
+            ..Task::default()
+        };
+        prev.tasks = vec![
+            tracked(1, 1, true, 600, 90, 60, "200", "100"),
+            tracked(2, 2, false, 500, 70, 40, "150", "85"),
+            Task {
+                uid: 3,
+                id: 3,
+                outline_level: 1,
+                summary: true,
+                ..Task::default()
+            },
+            Task {
+                uid: 4,
+                id: 4,
+                outline_level: 2,
+                ..Task::default()
+            },
+        ];
+        prev.resources = vec![resource(1, ResourceType::Work, "0", "0")];
+        prev.assignments = vec![
+            Assignment {
+                task_uid: 2,
+                overtime_work_min: Some(60),
+                remaining_overtime_work_min: Some(30),
+                overtime_cost: Rate::parse("120"),
+                remaining_overtime_cost: Rate::parse("75"),
+                ..assignment(1, 1, 1.0, 8)
+            },
+            Assignment {
+                task_uid: 4,
+                overtime_work_min: Some(60),
+                remaining_overtime_work_min: Some(30),
+                overtime_cost: Rate::parse("120"),
+                remaining_overtime_cost: Rate::parse("75"),
+                ..assignment(2, 1, 1.0, 8)
+            },
+        ];
+        let mut next = prev.clone();
+        for a in &mut next.assignments {
+            a.set_work(600);
+        }
+        refresh(&prev, &schedule(&prev), &mut next, &schedule(&prev));
+        for (uid, regular, overtime, remaining_overtime, overtime_cost, remaining_cost) in
+            [(1, 780, 30, 30, "80", "25"), (2, 680, 10, 10, "30", "10")]
+        {
+            let before = prev.task(uid).unwrap();
+            let after = next.task(uid).unwrap();
+            assert_eq!(after.regular_work_min, Some(regular));
+            assert_eq!(after.overtime_work_min, Some(overtime));
+            assert_eq!(after.remaining_overtime_work_min, Some(remaining_overtime));
+            assert_eq!(
+                after.overtime_cost.as_ref().map(Rate::as_str),
+                Some(overtime_cost)
+            );
+            assert_eq!(
+                after.remaining_overtime_cost.as_ref().map(Rate::as_str),
+                Some(remaining_cost)
+            );
+            assert_eq!(
+                after.actual_overtime_work_min,
+                before.actual_overtime_work_min
+            );
+            assert_eq!(after.acwp, before.acwp);
+            assert_eq!(after.resume_valid, before.resume_valid);
+            assert_eq!(
+                after.actual_work_protected_min,
+                before.actual_work_protected_min
+            );
+            assert_eq!(after.timephased_data, before.timephased_data);
+        }
+        for uid in [3, 4] {
+            let t = next.task(uid).unwrap();
+            assert_eq!(t.regular_work_min, None);
+            assert_eq!(t.overtime_work_min, None);
+            assert_eq!(t.remaining_overtime_work_min, None);
+            assert_eq!(t.overtime_cost, None);
+            assert_eq!(t.remaining_overtime_cost, None);
+        }
     }
 
     #[test]

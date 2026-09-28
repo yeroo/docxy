@@ -372,9 +372,10 @@ pub struct Task {
     pub over_allocated: Option<bool>,
     // Recorded progress, kept as read so a save writes it back. docxy neither
     // computes nor reconciles it: edits leave it as read, except that
-    // `remaining_work_min` and `remaining_cost` move with the task's
-    // assignments and fixed cost as `work_min` and `cost` do. The scheduler reads a leaf's
-    // actual dates, `Stop`/`Resume` and durations through [`Task::tracked`].
+    // `remaining_work_min`, `remaining_cost`, regular work and overtime totals
+    // move with assignment deltas as `work_min` and `cost` do. The scheduler
+    // reads a leaf's actual dates, `Stop`/`Resume` and durations through
+    // [`Task::tracked`].
     // Durations and work are whole minutes, rounded from the source.
     /// Percents, 0..=100.
     pub percent_complete: Option<u8>,
@@ -385,12 +386,32 @@ pub struct Task {
     /// Where completed work ends and remaining work picks up.
     pub stop: Option<DateTime>,
     pub resume: Option<DateTime>,
+    pub resume_valid: Option<bool>,
     pub actual_duration_min: Option<i64>,
     pub remaining_duration_min: Option<i64>,
     pub actual_work_min: Option<i64>,
     pub remaining_work_min: Option<i64>,
     pub actual_cost: Option<Rate>,
     pub remaining_cost: Option<Rate>,
+    /// Overtime and regular work move by assignment deltas on edits, including
+    /// outline rollups; absent values stay absent. Recorded actuals, earned
+    /// value and timephased records remain as read.
+    pub overtime_cost: Option<Rate>,
+    pub overtime_work_min: Option<i64>,
+    pub actual_overtime_cost: Option<Rate>,
+    pub actual_overtime_work_min: Option<i64>,
+    pub regular_work_min: Option<i64>,
+    pub remaining_overtime_cost: Option<Rate>,
+    pub remaining_overtime_work_min: Option<i64>,
+    pub acwp: Option<Rate>,
+    pub cv: Option<Rate>,
+    pub bcws: Option<Rate>,
+    pub bcwp: Option<Rate>,
+    pub actual_work_protected_min: Option<i64>,
+    pub actual_overtime_work_protected_min: Option<i64>,
+    /// Task records in file order. Their Type codes are not yet classified for
+    /// edits, so baseline and date edits leave them as read.
+    pub timephased_data: Vec<TimephasedValue>,
     /// Variances as MSPDI stores them, not interpreted: `StartVariance` and
     /// `FinishVariance` are integers, `WorkVariance` a float kept as decimal text.
     pub start_variance: Option<i64>,
@@ -813,16 +834,16 @@ pub struct OutlineCodeValue {
     pub value_guid: Option<String>,
 }
 
-/// One record of a resource's or assignment's work or cost spread over time
+/// One record of a task's, resource's or assignment's work or cost spread over time
 /// (MSPDI `TimephasedData`), kept as written. `value` is a duration for the
 /// work types and a decimal for the cost types; it is not interpreted.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct TimephasedValue {
     /// The MSPDI `Type` code. Assignments carry 1-6 and their baseline codes
     /// (e.g. 1 remaining work, 2 actual work); resources carry their baseline
-    /// codes (7/8, 20/21, ...). The two owners' codes never overlap.
+    /// codes (7/8, 20/21, ...). Task Type codes are kept without interpretation.
     pub kind: u8,
-    /// The owning resource's or assignment's UID, as written.
+    /// The owning task's, resource's or assignment's UID, as written.
     pub uid: Option<i32>,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,

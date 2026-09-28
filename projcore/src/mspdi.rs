@@ -376,6 +376,7 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "ActualFinish" => t.actual_finish = DateTime::parse_mspdi(&text_of(p)),
                     "Stop" => t.stop = DateTime::parse_mspdi(&text_of(p)),
                     "Resume" => t.resume = DateTime::parse_mspdi(&text_of(p)),
+                    "ResumeValid" => t.resume_valid = opt_bool_of(p),
                     "ActualDuration" => t.actual_duration_min = try_iso8601_to_minutes(&text_of(p)),
                     "RemainingDuration" => {
                         t.remaining_duration_min = try_iso8601_to_minutes(&text_of(p));
@@ -384,6 +385,28 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "RemainingWork" => t.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
                     "ActualCost" => t.actual_cost = rate_of(p),
                     "RemainingCost" => t.remaining_cost = rate_of(p),
+                    "OvertimeCost" => t.overtime_cost = rate_of(p),
+                    "OvertimeWork" => t.overtime_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "ActualOvertimeCost" => t.actual_overtime_cost = rate_of(p),
+                    "ActualOvertimeWork" => {
+                        t.actual_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "RegularWork" => t.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingOvertimeCost" => t.remaining_overtime_cost = rate_of(p),
+                    "RemainingOvertimeWork" => {
+                        t.remaining_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ACWP" => t.acwp = rate_of(p),
+                    "CV" => t.cv = rate_of(p),
+                    "BCWS" => t.bcws = rate_of(p),
+                    "BCWP" => t.bcwp = rate_of(p),
+                    "ActualWorkProtected" => {
+                        t.actual_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ActualOvertimeWorkProtected" => {
+                        t.actual_overtime_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "TimephasedData" => t.timephased_data.extend(parse_timephased_data(p)),
                     "StartVariance" => t.start_variance = opt_int_of(p),
                     "FinishVariance" => t.finish_variance = opt_int_of(p),
                     "WorkVariance" => t.work_variance = rate_of(p),
@@ -1711,6 +1734,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_text(s, "Work", t.work_min.map(min_to_iso));
     opt_date(s, "Stop", t.stop);
     opt_date(s, "Resume", t.resume);
+    opt_flag(s, "ResumeValid", t.resume_valid);
     opt_flag(s, "EffortDriven", t.effort_driven);
     opt_flag(s, "Recurring", t.recurring);
     opt_flag(s, "OverAllocated", t.over_allocated);
@@ -1759,11 +1783,28 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_text(s, "PercentComplete", t.percent_complete);
     opt_text(s, "PercentWorkComplete", t.percent_work_complete);
     opt_text(s, "Cost", t.cost.as_ref().map(Rate::as_str));
+    opt_text(
+        s,
+        "OvertimeCost",
+        t.overtime_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "OvertimeWork", t.overtime_work_min.map(min_to_iso));
     opt_date(s, "ActualStart", t.actual_start);
     opt_date(s, "ActualFinish", t.actual_finish);
     opt_text(s, "ActualDuration", t.actual_duration_min.map(min_to_iso));
     opt_text(s, "ActualCost", t.actual_cost.as_ref().map(Rate::as_str));
+    opt_text(
+        s,
+        "ActualOvertimeCost",
+        t.actual_overtime_cost.as_ref().map(Rate::as_str),
+    );
     opt_text(s, "ActualWork", t.actual_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "ActualOvertimeWork",
+        t.actual_overtime_work_min.map(min_to_iso),
+    );
+    opt_text(s, "RegularWork", t.regular_work_min.map(min_to_iso));
     opt_text(
         s,
         "RemainingDuration",
@@ -1775,6 +1816,18 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         t.remaining_cost.as_ref().map(Rate::as_str),
     );
     opt_text(s, "RemainingWork", t.remaining_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "RemainingOvertimeCost",
+        t.remaining_overtime_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(
+        s,
+        "RemainingOvertimeWork",
+        t.remaining_overtime_work_min.map(min_to_iso),
+    );
+    opt_text(s, "ACWP", t.acwp.as_ref().map(Rate::as_str));
+    opt_text(s, "CV", t.cv.as_ref().map(Rate::as_str));
     if task || t.constraint != ConstraintType::AsSoonAsPossible {
         tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
     }
@@ -1791,6 +1844,8 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_flag(s, "IgnoreResourceCalendar", t.ignore_resource_calendar);
     opt_flag(s, "HideBar", t.hide_bar);
     opt_flag(s, "Rollup", t.rollup);
+    opt_text(s, "BCWS", t.bcws.as_ref().map(Rate::as_str));
+    opt_text(s, "BCWP", t.bcwp.as_ref().map(Rate::as_str));
     opt_text(s, "PhysicalPercentComplete", t.physical_percent_complete);
     opt_text(s, "EarnedValueMethod", t.earned_value_method);
     for p in &t.predecessors {
@@ -1807,6 +1862,16 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         tag(s, 4, "LagFormat", &p.lag_format.code().to_string());
         s.push_str("      </PredecessorLink>\n");
     }
+    opt_text(
+        s,
+        "ActualWorkProtected",
+        t.actual_work_protected_min.map(min_to_iso),
+    );
+    opt_text(
+        s,
+        "ActualOvertimeWorkProtected",
+        t.actual_overtime_work_protected_min.map(min_to_iso),
+    );
     write_extended_attributes(s, &t.extended_attributes);
     let mut baselines: Vec<_> = t.baselines.iter().collect();
     baselines.sort_by_key(|b| b.number);
@@ -1833,6 +1898,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         }
         s.push_str("      </Baseline>\n");
     }
+    write_timephased_data(s, &t.timephased_data);
     s.push_str("    </Task>\n");
 }
 
@@ -4134,6 +4200,26 @@ mod tests {
         t.start_variance = progress.start_variance;
         t.finish_variance = progress.finish_variance;
         t.work_variance = progress.work_variance.clone();
+        t.resume_valid = Some(false);
+        t.overtime_cost = Rate::parse("12.25");
+        t.overtime_work_min = Some(0);
+        t.actual_overtime_cost = Rate::parse("2.5");
+        t.actual_overtime_work_min = Some(30);
+        t.regular_work_min = Some(450);
+        t.remaining_overtime_cost = Rate::parse("9.75");
+        t.remaining_overtime_work_min = Some(15);
+        t.acwp = Rate::parse("101.25");
+        t.cv = Rate::parse("-3.5");
+        t.bcws = Rate::parse("105");
+        t.bcwp = Rate::parse("97.75");
+        t.actual_work_protected_min = Some(60);
+        t.actual_overtime_work_protected_min = Some(0);
+        t.timephased_data.push(TimephasedValue {
+            kind: 2,
+            uid: Some(1),
+            value: Some("PT1H0M0S".into()),
+            ..TimephasedValue::default()
+        });
         proj.tasks.insert(
             0,
             Task {
@@ -4183,6 +4269,7 @@ mod tests {
                 "Work",
                 "Stop",
                 "Resume",
+                "ResumeValid",
                 "EffortDriven",
                 "Recurring",
                 "OverAllocated",
@@ -4209,14 +4296,23 @@ mod tests {
                 "PercentComplete",
                 "PercentWorkComplete",
                 "Cost",
+                "OvertimeCost",
+                "OvertimeWork",
                 "ActualStart",
                 "ActualFinish",
                 "ActualDuration",
                 "ActualCost",
+                "ActualOvertimeCost",
                 "ActualWork",
+                "ActualOvertimeWork",
+                "RegularWork",
                 "RemainingDuration",
                 "RemainingCost",
                 "RemainingWork",
+                "RemainingOvertimeCost",
+                "RemainingOvertimeWork",
+                "ACWP",
+                "CV",
                 "ConstraintType",
                 "CalendarUID",
                 "ConstraintDate",
@@ -4231,6 +4327,8 @@ mod tests {
                 "IgnoreResourceCalendar",
                 "HideBar",
                 "Rollup",
+                "BCWS",
+                "BCWP",
                 "PhysicalPercentComplete",
                 "EarnedValueMethod",
                 "PredecessorLink",
@@ -4240,6 +4338,8 @@ mod tests {
                 "CrossProjectName",
                 "LinkLag",
                 "LagFormat",
+                "ActualWorkProtected",
+                "ActualOvertimeWorkProtected",
                 "ExtendedAttribute",
                 "FieldID",
                 "Value",
@@ -4248,6 +4348,10 @@ mod tests {
                 "Baseline",
                 "Number",
                 "Duration",
+                "TimephasedData",
+                "Type",
+                "UID",
+                "Value",
             ]
         );
         proj.tasks[1].external_task = Some(true);
@@ -4293,6 +4397,123 @@ mod tests {
                 "CreateDate",
                 "OutlineLevel"
             ]
+        );
+    }
+
+    #[test]
+    fn task_tracking_fields_keep_values_and_timephased_order() {
+        let source = "<Task><UID>1</UID><ID>1</ID><Name>Tracked</Name>\
+            <ResumeValid>0</ResumeValid><OvertimeCost>001.250</OvertimeCost>\
+            <OvertimeWork>PT0H0M0S</OvertimeWork>\
+            <ActualOvertimeCost>-2.50</ActualOvertimeCost>\
+            <ActualOvertimeWork>PT1H0M0S</ActualOvertimeWork>\
+            <RegularWork>PT7H0M0S</RegularWork>\
+            <RemainingOvertimeCost>0</RemainingOvertimeCost>\
+            <RemainingOvertimeWork>PT0H30M0S</RemainingOvertimeWork>\
+            <ACWP>3.125</ACWP><CV>-0.5</CV><BCWS>007</BCWS><BCWP>8.</BCWP>\
+            <ActualWorkProtected>PT1H0M0S</ActualWorkProtected>\
+            <ActualOvertimeWorkProtected>PT0H0M0S</ActualOvertimeWorkProtected>\
+            <TimephasedData><Type>2</Type><UID>1</UID><Value>PT1H0M0S</Value></TimephasedData>\
+            <TimephasedData><Type>99</Type><UID>1</UID><Value>4.25</Value></TimephasedData>\
+            </Task>";
+        let proj = task_project(source);
+        let task = &proj.tasks[0];
+        assert_eq!(task.resume_valid, Some(false));
+        assert_eq!(task.overtime_work_min, Some(0));
+        assert_eq!(task.actual_overtime_work_min, Some(60));
+        assert_eq!(task.regular_work_min, Some(420));
+        assert_eq!(task.remaining_overtime_work_min, Some(30));
+        assert_eq!(task.actual_work_protected_min, Some(60));
+        assert_eq!(task.actual_overtime_work_protected_min, Some(0));
+        for (value, expected) in [
+            (&task.overtime_cost, "001.250"),
+            (&task.actual_overtime_cost, "-2.50"),
+            (&task.remaining_overtime_cost, "0"),
+            (&task.acwp, "3.125"),
+            (&task.cv, "-0.5"),
+            (&task.bcws, "007"),
+            (&task.bcwp, "8."),
+        ] {
+            assert_eq!(value.as_ref().map(Rate::as_str), Some(expected));
+        }
+        assert_eq!(
+            task.timephased_data
+                .iter()
+                .map(|v| v.kind)
+                .collect::<Vec<_>>(),
+            [2, 99]
+        );
+        let saved = write_mspdi(&proj);
+        assert_eq!(read_mspdi(&saved).unwrap().tasks[0], *task);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks[0], *task);
+
+        let absent = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Name>Invalid</Name>\
+             <ResumeValid>maybe</ResumeValid><OvertimeWork>8h</OvertimeWork>\
+             <ActualOvertimeCost>free</ActualOvertimeCost></Task>",
+        );
+        let saved = write_mspdi(&absent);
+        for name in [
+            "ResumeValid",
+            "OvertimeWork",
+            "ActualOvertimeCost",
+            "BCWS",
+            "TimephasedData",
+        ] {
+            assert!(!task_xml(&saved).contains(&format!("<{name}>")), "{name}");
+        }
+    }
+
+    #[test]
+    fn task_overtime_work_rounds_to_whole_minutes() {
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Name>A</Name>\
+             <ActualOvertimeWork>PT1M30S</ActualOvertimeWork></Task>",
+        );
+        assert_eq!(proj.tasks[0].actual_overtime_work_min, Some(2));
+        assert!(
+            task_xml(&write_mspdi(&proj))
+                .contains("<ActualOvertimeWork>PT0H2M0S</ActualOvertimeWork>")
+        );
+    }
+
+    #[test]
+    fn resource_and_assignment_tracking_fields_still_survive_save() {
+        let xml = "<Project><Tasks><Task><UID>1</UID><ID>1</ID><Name>T</Name>\
+            <Duration>PT8H0M0S</Duration></Task></Tasks><Resources>\
+            <Resource><UID>1</UID><ID>1</ID><Name>R</Name><Type>1</Type>\
+            <ActualOvertimeWork>PT1H0M0S</ActualOvertimeWork>\
+            <ActualOvertimeCost>2.25</ActualOvertimeCost>\
+            <RemainingOvertimeWork>PT2H0M0S</RemainingOvertimeWork>\
+            <RemainingOvertimeCost>3.25</RemainingOvertimeCost>\
+            <ACWP>4.25</ACWP><BCWS>5.25</BCWS><BCWP>6.25</BCWP><CV>7.25</CV>\
+            <TimephasedData><Type>2</Type><UID>1</UID><Value>PT1H0M0S</Value></TimephasedData>\
+            </Resource></Resources><Assignments>\
+            <Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+            <ActualOvertimeWork>PT3H0M0S</ActualOvertimeWork>\
+            <ActualOvertimeCost>12.25</ActualOvertimeCost>\
+            <RemainingOvertimeWork>PT4H0M0S</RemainingOvertimeWork>\
+            <RemainingOvertimeCost>13.25</RemainingOvertimeCost>\
+            <ACWP>14.25</ACWP><BCWS>15.25</BCWS><BCWP>16.25</BCWP><CV>17.25</CV>\
+            <TimephasedData><Type>2</Type><UID>1</UID><Value>PT3H0M0S</Value></TimephasedData>\
+            </Assignment></Assignments></Project>";
+        let project = read_mspdi(xml).unwrap();
+        let saved = read_mspdi(&write_mspdi(&project)).unwrap();
+        assert_eq!(saved.resources, project.resources);
+        assert_eq!(saved.assignments, project.assignments);
+        assert_eq!(saved.resources[0].timephased_data[0].kind, 2);
+        assert_eq!(saved.assignments[0].timephased_data[0].kind, 2);
+        assert_eq!(
+            saved.resources[0]
+                .actual_overtime_cost
+                .as_ref()
+                .map(Rate::as_str),
+            Some("2.25")
+        );
+        assert_eq!(
+            saved.assignments[0].bcwp.as_ref().map(Rate::as_str),
+            Some("16.25")
         );
     }
 
