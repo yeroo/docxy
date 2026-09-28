@@ -5,7 +5,7 @@
 //! Current FixedData offsets, checked against Project's XML corpus:
 //! assignment records (110 bytes) have UID +0, TaskUID +4, ResourceUID +8,
 //! Units × 10000 at +12, Start +52, Finish +56. Resource records (172 bytes)
-//! have UID +0, MaxUnits × 10000 at +8, and work/nonwork type at +170; a
+//! have row ID +0, UID +4, MaxUnits × 10000 at +8, and work/nonwork type at +170; a
 //! Fixed2Meta +8 bit 0x10 marks a cost resource among the nonwork ones.
 //! Resource VarMeta key 0x0114 holds availability boundaries and capacities.
 use crate::{cfb::Cfb, mpp::MppTask};
@@ -135,8 +135,22 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
     {
         return Err("resource variable table mismatch".into());
     }
+    for i in 0..3 {
+        if u16_at(&fm, 16 + i * 37) != 4 || u32_at(&fm, 16 + i * 37 + 4) as usize != i * 16 {
+            return Err("unrecognized resource schema row".into());
+        }
+    }
+    let schema_end = if n > 3 {
+        u32_at(&fm, 16 + 3 * 37 + 4) as usize
+    } else {
+        fd.len()
+    };
+    if schema_end != 48 {
+        return Err("resource schema length mismatch".into());
+    }
     let mut out = HashMap::new();
     for i in 3..n {
+        let meta_kind = u16_at(&fm, 16 + i * 37);
         let at = u32_at(&fm, 16 + i * 37 + 4) as usize;
         let end = if i + 1 < n {
             u32_at(&fm, 16 + (i + 1) * 37 + 4) as usize
@@ -146,11 +160,20 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
         if end < at || end > fd.len() {
             return Err("resource offset out of range".into());
         }
-        if end - at != 172 {
+        if meta_kind == 4 && end - at == 16 {
+            continue; // Blank resource row.
+        }
+        if !matches!(meta_kind, 0 | 2) || end - at != 172 {
             return Err("unrecognized resource record length".into());
         }
+        if meta_kind == 2 {
+            continue; // Deleted row may reuse a live UID or ID.
+        }
         let row = &fd[at..end];
-        let uid = u32_at(row, 0);
+        let uid = u32_at(row, 4);
+        if uid == 0 {
+            continue; // Implicit unassigned resource.
+        }
         let max_units = f64_at(row, 8) / 10_000.0;
         let raw_kind = u16_at(row, 170);
         let f2 = &f2m[16 + i * 51..16 + (i + 1) * 51];
@@ -195,9 +218,9 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
             .and_then(|n| n.checked_add(len))
             .filter(|&n| n <= v2.len())
             .ok_or("availability data out of range")?;
-        let r = out
-            .get_mut(&uid)
-            .ok_or("availability for unknown resource")?;
+        let Some(r) = out.get_mut(&uid) else {
+            continue; // A deleted or implicit resource can retain variable fields.
+        };
         if !r.periods.is_empty() {
             return Err("duplicate availability".into());
         }
@@ -210,27 +233,38 @@ pub(crate) fn assignments(cfb: &Cfb) -> Result<Vec<Assignment>, String> {
     let fm = stream(cfb, "TBkndAssn", "FixedMeta")?;
     let fd = stream(cfb, "TBkndAssn", "FixedData")?;
     let n = count(&fm, 34, fd.len(), 0)?;
-    if fd.len() != n * 110 {
-        return Err("assignment record length mismatch".into());
-    }
     let mut out = Vec::new();
     let mut seen = HashSet::new();
+    let mut previous_end = 0;
     for i in 0..n {
         let meta = &fm[16 + i * 34..16 + (i + 1) * 34];
-        if u32_at(meta, 4) as usize != i * 110 {
+        let at = u32_at(meta, 4) as usize;
+        let end = if i + 1 < n {
+            u32_at(&fm, 16 + (i + 1) * 34 + 4) as usize
+        } else {
+            fd.len()
+        };
+        if at != previous_end || end < at || end > fd.len() {
             return Err("assignment offset mismatch".into());
         }
+        previous_end = end;
         let kind = u16_at(meta, 0);
-        if kind == 2 {
-            continue;
-        } // deleted or unassigned grid row
-        if kind != 0 {
-            return Err("unrecognized assignment kind".into());
+        if kind == 4 && end - at == 16 {
+            continue; // Blank assignment row.
         }
-        let row = &fd[i * 110..(i + 1) * 110];
+        if !matches!(kind, 0 | 2) || end - at != 110 {
+            return Err("assignment record length mismatch".into());
+        }
+        if kind == 2 {
+            continue; // Deleted assignment row.
+        }
+        let row = &fd[at..end];
         let uid = u32_at(row, 0);
         let task_uid = u32_at(row, 4);
         let resource_uid = u32_at(row, 8) as i32;
+        if task_uid == 0 && resource_uid == 0 {
+            continue; // Internal placeholder omitted by the assignment importer.
+        }
         let units = f64_at(row, 12) / 10_000.0;
         let start = row_time(row, 52).ok_or("invalid assignment start")?;
         let finish = row_time(row, 56).ok_or("invalid assignment finish")?;
@@ -541,9 +575,13 @@ mod tests {
         for i in 0..4 {
             resource_meta[16 + i * 37 + 4..16 + i * 37 + 8]
                 .copy_from_slice(&((i * 16) as u32).to_le_bytes());
+            if i < 3 {
+                resource_meta[16 + i * 37..16 + i * 37 + 2].copy_from_slice(&4u16.to_le_bytes());
+            }
         }
         let mut resource_data = vec![0; 220];
-        resource_data[48..52].copy_from_slice(&2u32.to_le_bytes());
+        resource_data[48..52].copy_from_slice(&10u32.to_le_bytes());
+        resource_data[52..56].copy_from_slice(&2u32.to_le_bytes());
         resource_data[56..64].copy_from_slice(&5000f64.to_le_bytes());
         let mut resource_fixed2 = fixed_header(4, 160, 51);
         for i in 0..4 {

@@ -449,10 +449,7 @@ fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProg
     };
     let f64_at = |off: usize| f64::from_le_bytes(rec[off..off + 8].try_into().unwrap());
     let work = |off: usize, what: &str| {
-        let value = f64_at(off);
-        (value.is_finite() && value >= 0.0)
-            .then(|| (value / 1000.0).round() as i64)
-            .ok_or_else(|| format!("invalid {what} for UID {uid}"))
+        work_minutes(f64_at(off)).ok_or_else(|| format!("invalid {what} for UID {uid}"))
     };
     let cost = |off: usize, what: &str| {
         cost_rate(f64_at(off)).ok_or_else(|| format!("invalid {what} for UID {uid}"))
@@ -487,9 +484,15 @@ fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProg
     })
 }
 
+/// Work as Project stores it: thousandths of a minute, rounded for MSPDI.
+pub(crate) fn work_minutes(value: f64) -> Option<i64> {
+    (value.is_finite() && value >= 0.0 && value / 1000.0 <= i64::MAX as f64)
+        .then(|| (value / 1000.0).round() as i64)
+}
+
 /// A stored cost as Project's MSPDI export writes it: rounded to two
 /// decimals, without trailing zeros (`9319.5`, `3406`).
-fn cost_rate(value: f64) -> Option<Rate> {
+pub(crate) fn cost_rate(value: f64) -> Option<Rate> {
     if !value.is_finite() {
         return None;
     }
