@@ -112,6 +112,47 @@ jobs:
       - name: Test
         run: cargo test --manifest-path suite/Cargo.toml --locked
 
+  suite-linux:
+    name: desktop suite (linux)
+    # The suite ships on Windows and macOS and should build on Linux too (#504): gpui's
+    # x11/wayland backends are enabled. Tests run under Xvfb. The Windows job above is
+    # the one that gates the harness isolation tests on the platform the suite ships on.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: suite
+      - name: System packages gpui needs on Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             pkg-config clang cmake             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev             libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev             libwayland-dev libvulkan-dev mesa-vulkan-drivers             libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev libzstd-dev             xvfb
+      - name: Clippy
+        run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test
+        run: xvfb-run -a cargo test --manifest-path suite/Cargo.toml --locked
+
+  suite-macos:
+    name: desktop suite (macos)
+    # Releases already build the suite on macOS; this catches a macOS break in the PR
+    # that causes it instead of at release time (#505).
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: suite
+      - name: Clippy
+        run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --manifest-path suite/Cargo.toml --locked
+
   webapp:
     name: editable HTML (${{ matrix.os }})
     # The browser half of editable HTML (htmlbundle/web): node unit tests, then
