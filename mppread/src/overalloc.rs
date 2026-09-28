@@ -81,7 +81,7 @@ fn availability(block: &[u8]) -> Result<Vec<(u32, f64, bool)>, String> {
         return Err("availability block length mismatch".into());
     }
     let mut periods = Vec::new();
-    for row in block[16..].chunks_exact(20) {
+    for row in block[16..].as_chunks::<20>().0 {
         let capacity = f64_at(row, 0) / 10_000.0;
         let marker = u32_at(row, 8);
         let end = u32_at(row, 16);
@@ -180,7 +180,7 @@ pub(crate) fn resources(cfb: &Cfb) -> Result<HashMap<u32, Resource>, String> {
             return Err("invalid resource record".into());
         }
     }
-    for e in vm[24..].chunks_exact(12) {
+    for e in vm[24..].as_chunks::<12>().0 {
         if u16_at(e, 8) != 0x0114 {
             continue;
         }
