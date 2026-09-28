@@ -730,16 +730,8 @@ mod tests {
             ],
         )])
     }
-    fn file_with_calendar(
-        s: &Streams,
-        closed: bool,
-        work_week_uids: &[i32],
-        independent: bool,
-    ) -> Vec<u8> {
-        let (cal_fm, mut cal_fd, mut cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
-        if independent {
-            cal_fd[76..80].copy_from_slice(&(-1i32).to_le_bytes());
-        }
+    fn file_with_calendar(s: &Streams, closed: bool, work_week_uids: &[i32]) -> Vec<u8> {
+        let (cal_fm, cal_fd, mut cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
         let original_v2 = cal_v2;
         cal_v2 = Vec::new();
         for index in 0..4 {
@@ -1161,25 +1153,24 @@ mod tests {
         put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
         let project =
-            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[], false)).unwrap();
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[])).unwrap();
         assert_eq!(project.tasks[0].calendar_uid, Some(5));
         assert_eq!(project.tasks[0].duration_min, 480);
 
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &9i32.to_le_bytes());
         assert_eq!(
-            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[], false))
-                .unwrap_err(),
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[])).unwrap_err(),
             "unknown calendar UID 9 for task UID 1"
         );
 
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &(-1i32).to_le_bytes());
         let project =
-            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[], false)).unwrap();
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[])).unwrap();
         assert_eq!(project.tasks[0].calendar_uid, None);
 
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
-        let error = crate::project::project_from_mpp(&file_with_calendar(&s, true, &[], false))
-            .unwrap_err();
+        let error =
+            crate::project::project_from_mpp(&file_with_calendar(&s, true, &[])).unwrap_err();
         assert!(
             error.contains("calendar \"Alice\" (UID 5) has no working time"),
             "{error}"
@@ -1200,15 +1191,14 @@ mod tests {
 
         for weeks in [&[5][..], &[1][..]] {
             let project =
-                crate::project::project_from_mpp(&file_with_calendar(&s, false, weeks, false))
-                    .unwrap();
+                crate::project::project_from_mpp(&file_with_calendar(&s, false, weeks)).unwrap();
             assert_eq!(project.tasks[0].calendar_uid, Some(5));
             assert_eq!(project.tasks[0].duration_min, 480);
             assert_eq!(project.calendar(weeks[0]).unwrap().work_weeks.len(), 1);
         }
 
         let mut project =
-            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[5], false)).unwrap();
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[5])).unwrap();
         // The generic task fixture encodes an ActualStart at the MPP epoch;
         // clear that unrelated progress marker to exercise auto scheduling.
         project.tasks[0].actual_start = None;
@@ -1222,8 +1212,8 @@ mod tests {
     fn closed_default_week_is_refused_even_with_an_open_work_week() {
         let mut s = fixture();
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
-        let error = crate::project::project_from_mpp(&file_with_calendar(&s, true, &[5], false))
-            .unwrap_err();
+        let error =
+            crate::project::project_from_mpp(&file_with_calendar(&s, true, &[5])).unwrap_err();
         assert!(
             error.contains("calendar \"Alice\" (UID 5) has no working time"),
             "{error}"

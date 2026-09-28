@@ -559,8 +559,8 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             if [
                 "w8-inherited",
                 "w12-task-calendar",
-                "c1-com-summer",
-                "c2-com-out-of-order",
+                "m1-com-summer",
+                "m2-com-out-of-order",
             ]
             .contains(&stem.as_ref())
             {
@@ -742,8 +742,8 @@ fn project_2024_oracles() {
             ("w10-unnamed", 1, &[""]),
             ("w11-exception", 1, &["With holiday"]),
             ("w12-task-calendar", 5, &["Task summer"]),
-            ("c1-com-summer", 1, &["COM Summer"]),
-            ("c2-com-out-of-order", 1, &["Earlier", "Later"]),
+            ("m1-com-summer", 1, &["COM Summer"]),
+            ("m2-com-out-of-order", 1, &["Earlier", "Later"]),
         ];
         for (mpp, xml) in &cases {
             let stem = mpp.file_stem().unwrap().to_str().unwrap();
@@ -760,9 +760,9 @@ fn project_2024_oracles() {
             );
             for (index, week) in weeks.iter().enumerate() {
                 let (first, last) =
-                    if (stem == "w6-two" || stem == "c2-com-out-of-order") && index == 0 {
+                    if (stem == "w6-two" || stem == "m2-com-out-of-order") && index == 0 {
                         (9, 13)
-                    } else if (stem == "w6-two" || stem == "c2-com-out-of-order") && index == 1 {
+                    } else if (stem == "w6-two" || stem == "m2-com-out-of-order") && index == 1 {
                         (16, 20)
                     } else {
                         (9, 20)

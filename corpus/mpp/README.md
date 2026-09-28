@@ -159,8 +159,8 @@ in MSPDI. Types 2/3 are yearly by date/position, 4/5 monthly by date/position,
 6 weekly, and 7 every N days. Type 8 has no binary probe and is not decoded.
 The decoder refuses Type 8, unknown types and malformed records.
 
-The work-week decoder has twelve MSPDI-seeded and two COM-created Project-written
-probes in `workweeks/`. They cover changed and inherited weekdays, a closed
+The work-week decoder has twelve `w*` MSPDI-seeded and two `m*` COM-created
+Project-written probes in `workweeks/`. They cover changed and inherited weekdays, a closed
 weekday, a working Saturday, five shifts, a 24-hour day, two sorted periods,
 resource calendars, Unicode and blank names, exceptions in the same block,
 and tasks crossing an alternate-week boundary on both the project calendar
@@ -175,7 +175,9 @@ python corpus/tools/gen_mpp_workweek_cases.py
 After the four-byte work-week count, each record has seven 60-byte weekday
 records in Sunday-first order. A flag of one with otherwise zero bytes means
 the weekday is unstated; flag zero supplies a period count and working times
-as in the default week. At +420/+422 are inclusive `u16` from/to day numbers
+as in the default week. In each stated 60-byte day, +4 is the `u32` total
+duration and +40 holds five `i32` cumulative durations, all in tenths of a
+minute. At +420/+422 are inclusive `u16` from/to day numbers
 since 1983-12-31. At +424 is a Project-assigned `u32` identifier, at +428 a
 zero reserved `u32`, and at +432 a `u32` byte length for the four-byte-aligned
 UTF-16 name that follows the 436-byte fixed part. A zero-length name exports

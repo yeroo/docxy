@@ -184,9 +184,9 @@ def main():
                     app.FileCloseEx(0)
             finally:
                 os.remove(source)
-        com_case(app, "c1-com-summer", [("COM Summer", 9, 20,
+        com_case(app, "m1-com-summer", [("COM Summer", 9, 20,
                  {day: SUMMER for day in range(2, 7)})])
-        com_case(app, "c2-com-out-of-order", [
+        com_case(app, "m2-com-out-of-order", [
             ("Later", 16, 20, {2: FIVE}),
             ("Earlier", 9, 13, {2: SUMMER, 6: [], 7: SUMMER}),
         ])

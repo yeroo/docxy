@@ -112,11 +112,7 @@ fn working_time(
     Ok(WorkingTime { from, to })
 }
 
-fn weekday_record(
-    rec: &[u8],
-    day: usize,
-    strict_inherit: bool,
-) -> Result<Option<DayWorking>, String> {
+fn weekday_record(rec: &[u8], day: usize, work_week: bool) -> Result<Option<DayWorking>, String> {
     let flag = u16_at(rec, 0);
     let count = u16_at(rec, 2) as usize;
     if flag > 1 || count > 5 {
@@ -125,7 +121,7 @@ fn weekday_record(
         ));
     }
     if flag == 1 {
-        if strict_inherit && rec[2..].iter().any(|&b| b != 0) {
+        if work_week && rec[2..].iter().any(|&b| b != 0) {
             return Err(format!(
                 "invalid calendar work-week weekday {day} inherited fields"
             ));
@@ -133,12 +129,26 @@ fn weekday_record(
         return Ok(None);
     }
     let mut times = Vec::with_capacity(count);
+    let mut cumulative = 0u32;
     for period in 0..count {
         let from_tenths = u32::from(u16_at(rec, 8 + period * 2));
         let duration = i32_at(rec, 20 + period * 4);
         let time = working_time(from_tenths, duration, times.last())
             .map_err(|e| format!("calendar weekday {day} period {period}: {e}"))?;
+        if work_week {
+            cumulative = cumulative
+                .checked_add(duration as u32)
+                .ok_or_else(|| format!("calendar work-week weekday {day} period total overflow"))?;
+            if i32_at(rec, 40 + period * 4) != cumulative as i32 {
+                return Err(format!(
+                    "invalid calendar work-week weekday {day} cumulative period {period}"
+                ));
+            }
+        }
         times.push(time);
+    }
+    if work_week && u32_at(rec, 4) != cumulative {
+        return Err(format!("invalid calendar work-week weekday {day} total"));
     }
     Ok(Some(DayWorking { times }))
 }
@@ -594,8 +604,10 @@ pub(crate) mod tests {
         // Monday 08:00-15:00, one seven-hour summer shift.
         rec[60..62].copy_from_slice(&0u16.to_le_bytes());
         rec[62..64].copy_from_slice(&1u16.to_le_bytes());
+        rec[64..68].copy_from_slice(&4200u32.to_le_bytes());
         rec[68..70].copy_from_slice(&4800u16.to_le_bytes());
         rec[80..84].copy_from_slice(&4200i32.to_le_bytes());
+        rec[100..104].copy_from_slice(&4200i32.to_le_bytes());
         let first = (DateTime::from_ymd_hm(2026, 3, 2, 0, 0).day_number()
             - crate::mpp::MPP_EPOCH_DAYS) as u16;
         let last = (DateTime::from_ymd_hm(2026, 3, 20, 0, 0).day_number()
@@ -691,6 +703,12 @@ pub(crate) mod tests {
         let mut bad = block.clone();
         bad[508..512].copy_from_slice(&(-1i32).to_le_bytes());
         assert!(exceptions(&bad).unwrap_err().contains("invalid period"));
+        let mut bad = block.clone();
+        bad[492..496].copy_from_slice(&1u32.to_le_bytes());
+        assert!(exceptions(&bad).unwrap_err().contains("weekday 1 total"));
+        let mut bad = block.clone();
+        bad[528..532].copy_from_slice(&1i32.to_le_bytes());
+        assert!(exceptions(&bad).unwrap_err().contains("cumulative period"));
         let mut bad = block.clone();
         bad[490..492].copy_from_slice(&2u16.to_le_bytes());
         bad[498..500].copy_from_slice(&6000u16.to_le_bytes());
