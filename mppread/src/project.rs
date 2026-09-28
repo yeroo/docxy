@@ -6,9 +6,14 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
 /// a task. Each decoded auto leaf is pinned
-/// with a Must-Start-On constraint at its start and given a duration equal to
-/// the working minutes between its start and finish, so the scheduler reproduces
-/// the real dates. A **manual** leaf keeps its mode and its manual start,
+/// with a Must-Start-On constraint at its start and given Project's stored
+/// working duration when available. Other durations use the working minutes
+/// between start and finish on the task's calendar. Splits and delayed
+/// assignments are not decoded, so those tasks can schedule an earlier finish
+/// than their retained stored finish. A resource calendar can move a resourced
+/// task's finish earlier or later because projcore does not schedule on resource
+/// calendars; MSPDI import of the same plan behaves the same way. A **manual**
+/// leaf keeps its mode and its manual start,
 /// finish and duration instead, which hold it where Project put it without a
 /// constraint; the project's new-task mode comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
@@ -18,7 +23,10 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// variances are not stored in the file and stay absent. Save As converts it
 /// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
 /// calendars, their weekdays and exceptions, and the project's default calendar.
-/// Work weeks and each task's own calendar assignment are not yet decoded. An
+/// Task calendar assignments are decoded. Work weeks are not yet decoded;
+/// tasks using one keep no task calendar. Auto tasks use the project-calendar
+/// span, as before stored Duration was read; manual tasks keep their manual
+/// duration and use that span only when it is absent. An
 /// unrecognised exception record refuses the import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
@@ -44,11 +52,19 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .unwrap_or_else(|| "Imported project".into())
     });
     let mut cal_ref = Project::default();
-    if let Some((calendars, default_calendar_uid)) = crate::caldecode::decode(bytes, legacy)
-        .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?
+    let mut work_week_uids = std::collections::HashSet::new();
+    let decoded_calendars = crate::caldecode::decode(bytes, legacy)
+        .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?;
+    let has_calendar_table = decoded_calendars.is_some();
+    if let Some(crate::caldecode::DecodedCalendars {
+        calendars,
+        default_calendar_uid,
+        work_week_uids: weeks,
+    }) = decoded_calendars
     {
         cal_ref.calendars = calendars;
         cal_ref.default_calendar_uid = default_calendar_uid;
+        work_week_uids = weeks;
     }
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // A task is a summary when the next task sits one WBS level deeper.
@@ -100,6 +116,23 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 .ok_or_else(|| format!("invalid finish date for UID {}", t.uid))?;
             task.stored_start = Some(s);
             task.stored_finish = Some(f);
+            let own_calendar_uid = t
+                .calendar_uid
+                .filter(|&uid| uid != -1 && has_calendar_table);
+            if let Some(uid) = own_calendar_uid {
+                if cal_ref.calendar(uid).is_none() {
+                    return Err(format!("unknown calendar UID {uid} for task UID {}", t.uid));
+                }
+            }
+            let mut current = Some(own_calendar_uid.unwrap_or(cal_ref.default_calendar_uid));
+            let mut work_week_affected = false;
+            while let Some(uid) = current {
+                work_week_affected |= work_week_uids.contains(&uid);
+                current = cal_ref.calendar(uid).and_then(|cal| cal.base_calendar_uid);
+            }
+            if !work_week_affected {
+                task.calendar_uid = own_calendar_uid;
+            }
             task.manual = t.manual;
             let date = |d: &Option<String>, what: &str| {
                 d.as_deref()
@@ -131,14 +164,20 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             // Pin only leaf tasks; a summary's dates roll up from its
             // children, so a constraint on it would fight the rollup. A
             // manual leaf is held by its pinned dates, not a constraint.
+            // A work-week-affected task has no assigned task calendar here.
+            let span = || {
+                projcore::schedule::working_minutes_between_on(&cal_ref, task.calendar_uid, s, f)
+            };
             if is_summary {
                 task.duration_min = 0;
             } else if t.manual {
-                task.duration_min = t
-                    .manual_duration_min
-                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
+                task.duration_min = t.manual_duration_min.unwrap_or_else(span);
             } else {
-                task.duration_min = projcore::schedule::working_minutes_between(&cal_ref, s, f);
+                task.duration_min = t
+                    .duration_format
+                    .filter(|&fmt| !work_week_affected && crate::mpp::working_duration_format(fmt))
+                    .and(t.duration_min)
+                    .unwrap_or_else(span);
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }
@@ -150,14 +189,18 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         .filter_map(|t| t.stored_start)
         .min()
         .unwrap_or_else(default_anchor);
-    Ok(Project {
+    let project = Project {
         name,
         title: info.title,
         start_date: Some(start),
         tasks,
         new_tasks_are_manual,
         ..cal_ref
-    })
+    };
+    if let Some(error) = projcore::schedule::calendar_error(&project) {
+        return Err(format!("cannot read the calendars of this .mpp ({error})"));
+    }
+    Ok(project)
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
