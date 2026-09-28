@@ -96,8 +96,8 @@ pub struct MppTaskFields {
     pub leveling_delay_format: Option<i32>,
     pub ignore_resource_calendar: Option<bool>,
     pub earned_value_method: Option<i32>,
-    /// Project's recurrence needs a recurring task oracle; no offset is
-    /// validated for this field yet.
+    /// Project's recurring-task flag, validated against the UI-authored
+    /// `snapshots/x-recurring` summary and four occurrences.
     pub recurring: Option<bool>,
     pub hide_bar: Option<bool>,
     pub rollup: Option<bool>,

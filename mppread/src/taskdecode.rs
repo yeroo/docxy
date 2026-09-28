@@ -318,6 +318,9 @@ fn current_fields(
         earned_value_method: Some(i32::from(
             uid != 0 && meta[26] & 0x80 == 0 && fixed2.meta[76] & 0x80 != 0,
         )),
+        // x-recurring: this bit is set on the recurrence summary and all four
+        // occurrences, but on none of 1,723 nonrecurring Project task rows.
+        recurring: Some(meta[13] & 0x02 != 0),
         hide_bar: Some(meta[12] & 0x80 != 0),
         rollup: Some(meta[12] & 0x04 != 0),
         is_subproject: Some(meta[15] & 0x02 != 0),
@@ -1168,6 +1171,33 @@ mod tests {
                 "block {block} offset {offset} bit {bit:#x}"
             );
         }
+    }
+
+    #[test]
+    fn recurring_bit_is_fixedmeta_13_bit_02() {
+        let mut s = fixture();
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .recurring,
+            Some(false)
+        );
+        s.fm[16 + 4 * 47 + 13] |= 0x02;
+        let bytes = file(&s, true);
+        assert_eq!(
+            decode(&bytes).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .recurring,
+            Some(true)
+        );
+        let imported = crate::project::project_from_mpp(&bytes).unwrap();
+        assert_eq!(imported.tasks[0].recurring, Some(true));
+        let reread = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();
+        assert_eq!(reread.tasks[0].recurring, Some(true));
     }
 
     #[test]

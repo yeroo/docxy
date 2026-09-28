@@ -172,6 +172,7 @@ fn check_task_fields(
     same!(leveling_delay_format);
     same!(ignore_resource_calendar);
     same!(earned_value_method);
+    same!(recurring);
     same!(hide_bar);
     same!(rollup);
     same!(external_task);
@@ -672,11 +673,99 @@ fn project_2024_oracles() {
             .filter(|(p, _)| !p.file_stem().unwrap().to_string_lossy().ends_with("-mpp12"))
             .collect::<Vec<_>>();
         let older = pairs(&snapshots, "-mpp12");
-        assert_eq!(newest.len(), 46);
-        assert_eq!(older.len(), 46);
-        for (mpp, xml) in &newest {
-            check_pair(mpp, xml, false, Oracle::Project);
+        assert_eq!(newest.len(), 48);
+        assert_eq!(older.len(), 48);
+        for stem in ["x-recurring", "x-overallocated"] {
+            assert!(
+                newest
+                    .iter()
+                    .any(|(p, _)| p.file_stem().is_some_and(|s| s == stem))
+            );
+            assert!(older.iter().any(|(p, _)| {
+                p.file_stem()
+                    .is_some_and(|s| s.to_string_lossy() == format!("{stem}-mpp12"))
+            }));
         }
+        let mut recurring_count = 0;
+        for (mpp, xml) in &newest {
+            // The two standalone XML exports were saved after a legacy-MPP
+            // conversion: their GUIDs differ from the current .mpp, and
+            // x-recurring's occurrence Manual values changed too. Compare
+            // the stable field under study, not those mismatched properties.
+            if mpp.file_stem().is_some_and(|s| s == "x-recurring") {
+                let oracle =
+                    projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+                let bytes = std::fs::read(mpp).unwrap();
+                let decoded = mppread::mpp::decode_tasks(&bytes).unwrap();
+                let imported = mppread::project::project_from_mpp(&bytes).unwrap();
+                assert_eq!(decoded.len(), oracle.tasks.len());
+                for expected in &oracle.tasks {
+                    let raw = decoded
+                        .iter()
+                        .find(|t| t.uid as i32 == expected.uid)
+                        .unwrap();
+                    assert_eq!(raw.name, expected.name);
+                    assert_eq!(
+                        raw.fields.as_ref().and_then(|f| f.recurring),
+                        expected.recurring
+                    );
+                    if expected.uid != 0 {
+                        let task = imported
+                            .tasks
+                            .iter()
+                            .find(|t| t.uid == expected.uid)
+                            .unwrap();
+                        assert_eq!(task.recurring, expected.recurring);
+                    }
+                }
+                recurring_count = oracle
+                    .tasks
+                    .iter()
+                    .filter(|t| t.recurring == Some(true))
+                    .count();
+            } else if mpp.file_stem().is_some_and(|s| s == "x-overallocated") {
+                let oracle =
+                    projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+                let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
+                assert_eq!(oracle.tasks.len(), 5);
+                assert!(oracle.tasks.iter().all(|t| t.over_allocated == Some(false)));
+                assert_eq!(decoded.len(), oracle.tasks.len());
+                for expected in &oracle.tasks {
+                    if expected.uid == 0 {
+                        continue;
+                    } // XML was renamed by the legacy save.
+                    assert_eq!(
+                        decoded
+                            .iter()
+                            .find(|t| t.uid as i32 == expected.uid)
+                            .map(|t| t.name.as_str()),
+                        Some(expected.name.as_str())
+                    );
+                }
+                assert_eq!(
+                    oracle
+                        .resources
+                        .iter()
+                        .find(|r| r.name == "Alice")
+                        .and_then(|r| r.over_allocated),
+                    Some(true)
+                );
+                assert_eq!(
+                    oracle
+                        .resources
+                        .iter()
+                        .find(|r| r.name == "Bob")
+                        .and_then(|r| r.over_allocated),
+                    Some(false)
+                );
+            } else {
+                check_pair(mpp, xml, false, Oracle::Project);
+            }
+        }
+        assert_eq!(
+            recurring_count, 5,
+            "recurring summary plus four occurrences"
+        );
         let matched = older
             .iter()
             .filter(|(mpp, xml)| check_pair(mpp, xml, true, Oracle::Project))

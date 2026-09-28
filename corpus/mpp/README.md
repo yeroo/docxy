@@ -143,9 +143,10 @@ python corpus/tools/gen_mpp_task_field_cases.py
 
 Project computes `OverAllocated` from resource assignments when it exports;
 the task-table decoder leaves it absent until resource and assignment decoding
-can reproduce that result. A Project-authored recurring task pair is still
-needed to locate its binary flag; importing a bare `<Recurring>1</Recurring>`
-does not make Project retain the recurrence.
+can reproduce that result. The private snapshots include a UI-authored
+`x-recurring` pair, which locates the recurring flag on its summary and four
+occurrences. The `x-overallocated` sample shows that an overallocated resource
+can have tasks whose `OverAllocated` values are all false.
 
 The generated `.mpp` and `.xml` files stay git-ignored. The generator sources
 are kept with the fetch scripts in `corpus/tools/`.
