@@ -57,8 +57,10 @@ fn name(bytes: &[u8], uid: u32) -> Result<String, String> {
         return Err(format!("invalid resource name for UID {uid}"));
     }
     let units: Vec<_> = bytes[..bytes.len() - 2]
-        .chunks_exact(2)
-        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|x| u16::from_le_bytes(*x))
         .collect();
     let value =
         String::from_utf16(&units).map_err(|_| format!("invalid resource name for UID {uid}"))?;
