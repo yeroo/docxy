@@ -87,6 +87,8 @@ pub struct MppTask {
 pub struct MppTaskFields {
     pub guid: Option<String>,
     pub create_date: Option<String>,
+    /// Plain text from current-layout VarMeta key 0x000F (Project's RTF task notes).
+    pub notes: Option<String>,
     /// Explicit WBS code, or a generated code when the Project mask is the
     /// ordinary numeric outline mask. Custom masks remain unknown.
     pub wbs: Option<String>,
