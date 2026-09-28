@@ -1605,7 +1605,7 @@ impl<'a> CalendarResolver<'a> {
 /// Reject local tasks that have no working time and are leaves either in the
 /// stored schedule or in the outline the editor uses to recompute summary flags.
 /// External leaves need no working calendar because they are not scheduled.
-pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
+pub fn calendar_error(proj: &Project) -> Option<String> {
     let calendars = CalendarResolver::new(proj);
     for (i, task) in proj.tasks.iter().enumerate() {
         if task.is_null
@@ -1989,18 +1989,14 @@ fn without_unscheduled_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
 }
 
 /// Working minutes between two wall-clock instants under the project's default
-/// calendar. Used when importing a file that stores computed wall-clock
-/// start/finish (a `.mpp`) but not an explicit working-minute duration: the
-/// duration is `working_minutes_between(start, finish)`. A summary's duration
-/// is measured by [`task_duration_min`] instead, which falls back to the leaves'
-/// calendars when this one has no working time.
+/// calendar. Summaries use [`task_duration_min`] to account for leaf calendars.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
-    let cal = proj.project_calendar();
-    working_minutes_on(&cal, start, finish)
+    working_minutes_between_on(proj, None, start, finish)
 }
 
-/// Working minutes on a task calendar, with the scheduler's default-calendar
-/// fallback when the requested calendar is unavailable.
+/// Working minutes on a task calendar, including exceptions, with the
+/// scheduler's default-calendar fallback when the requested one is unavailable.
+/// The MPP importer uses this for Start–Finish span fallbacks.
 pub fn working_minutes_between_on(
     proj: &Project,
     calendar_uid: Option<i32>,

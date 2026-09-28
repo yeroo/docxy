@@ -296,6 +296,9 @@ use the working Start–Finish span on that calendar because the project model
 does not retain DurationFormat. Split segments and delayed assignments are
 not decoded: those tasks retain Project's stored Start and Finish but can
 schedule an earlier Finish when their stored Duration omits the gap.
+Resource calendars are not used by projcore's scheduler: a resourced task's
+Duration may move its scheduled Finish earlier or later than Project's stored
+Finish. MSPDI import of the same plan has the same limitation.
 StartVariance, FinishVariance and WorkVariance are **not stored**: Project
 derives them at export from the baseline (Var2Data keeps the baseline
 duration, start and finish under keys `0x001b`, `0x002b` and `0x002c`), and

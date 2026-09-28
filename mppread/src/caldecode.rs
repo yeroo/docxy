@@ -490,7 +490,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::cfb::{Node, write_cfb_tree};
 
@@ -619,7 +619,7 @@ mod tests {
         assert!(exceptions(&b).is_err(), "unknown recurrence type");
     }
 
-    fn fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+    pub(crate) fn fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut fd = vec![0u8; 64];
         for i in 0..4 {
             fd[i * 16..i * 16 + 2].copy_from_slice(&(i as u16).to_le_bytes());

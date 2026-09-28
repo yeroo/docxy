@@ -10,7 +10,9 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// working duration when available. Other durations use the working minutes
 /// between start and finish on the task's calendar. Splits and delayed
 /// assignments are not decoded, so those tasks can schedule an earlier finish
-/// than their retained stored finish. A **manual**
+/// than their retained stored finish. A resource calendar can move a resourced
+/// task's finish earlier or later because projcore does not schedule on resource
+/// calendars; MSPDI import of the same plan behaves the same way. A **manual**
 /// leaf keeps its mode and its manual start,
 /// finish and duration instead, which hold it where Project put it without a
 /// constraint; the project's new-task mode comes through too.
@@ -179,14 +181,18 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         .filter_map(|t| t.stored_start)
         .min()
         .unwrap_or_else(default_anchor);
-    Ok(Project {
+    let project = Project {
         name,
         title: info.title,
         start_date: Some(start),
         tasks,
         new_tasks_are_manual,
         ..cal_ref
-    })
+    };
+    if let Some(error) = projcore::schedule::calendar_error(&project) {
+        return Err(format!("cannot read the calendars of this .mpp ({error})"));
+    }
+    Ok(project)
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.

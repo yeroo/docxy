@@ -730,6 +730,53 @@ mod tests {
             ],
         )])
     }
+    fn file_with_calendar(s: &Streams, closed: bool) -> Vec<u8> {
+        let (cal_fm, cal_fd, cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
+        if closed {
+            // The fourth VarMeta entry is UID 5's weekday block. Override
+            // every inherited day with a day having zero working periods.
+            let off = u32::from_le_bytes(cal_vm[64..68].try_into().unwrap()) as usize + 4;
+            for day in 0..7 {
+                cal_v2[off + day * 60..off + (day + 1) * 60].fill(0);
+            }
+        }
+        let default: Vec<_> = "Standard"
+            .encode_utf16()
+            .chain([0, 0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let props = crate::props::stream(&[
+            (crate::props::NEW_TASKS_ARE_MANUAL, &[0, 0]),
+            (0x0240_000e, default.as_slice()),
+        ]);
+        write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                Node::Stream("Props", props),
+                Node::Storage(
+                    "TBkndTask",
+                    vec![
+                        Node::Stream("FixedMeta", s.fm.clone()),
+                        Node::Stream("FixedData", s.fd.clone()),
+                        Node::Stream("VarMeta", s.vm.clone()),
+                        Node::Stream("Var2Data", s.v2.clone()),
+                        Node::Stream("Fixed2Meta", s.f2m.clone()),
+                        Node::Stream("Fixed2Data", s.f2d.clone()),
+                    ],
+                ),
+                Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+                Node::Storage(
+                    "TBkndCal",
+                    vec![
+                        Node::Stream("FixedMeta", cal_fm),
+                        Node::Stream("FixedData", cal_fd),
+                        Node::Stream("VarMeta", cal_vm),
+                        Node::Stream("Var2Data", cal_v2),
+                    ],
+                ),
+            ],
+        )])
+    }
     fn reject(s: &Streams) {
         assert!(decode(&file(s, true)).is_err());
     }
@@ -1078,6 +1125,37 @@ mod tests {
         );
         let unknown = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         assert_eq!(unknown.tasks[0].duration_min, 960);
+    }
+    #[test]
+    fn task_calendar_assignment_is_validated_and_imported() {
+        let mut s = fixture();
+        put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+        let project = crate::project::project_from_mpp(&file_with_calendar(&s, false)).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, Some(5));
+        assert_eq!(project.tasks[0].duration_min, 480);
+
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &9i32.to_le_bytes());
+        assert_eq!(
+            crate::project::project_from_mpp(&file_with_calendar(&s, false)).unwrap_err(),
+            "unknown calendar UID 9 for task UID 1"
+        );
+
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &(-1i32).to_le_bytes());
+        let project = crate::project::project_from_mpp(&file_with_calendar(&s, false)).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, None);
+
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+        let error = crate::project::project_from_mpp(&file_with_calendar(&s, true)).unwrap_err();
+        assert!(
+            error.contains("calendar \"Alice\" (UID 5) has no working time"),
+            "{error}"
+        );
+        assert!(
+            error.contains("task \"B\" (UID 1) cannot be scheduled"),
+            "{error}"
+        );
     }
     #[test]
     fn negative_stored_duration_names_uid() {
