@@ -1002,18 +1002,80 @@ impl SheetView {
                 (false, c, -1)
             }
         };
-        // UI-authored charts live outside the workbook until save, so update
-        // their references alongside the workbook's structural edit.
+        // Charts the UI authored live outside the workbook until they're
+        // saved, so the workbook's structural edit never sees them. Their refs
+        // are written to the file all the same, and Excel re-reads them.
         let name = self.pkg.workbook.sheets[s].name.clone();
         let shift = gridcore::formula::EditShift {
             rows: shift.0,
             at: shift.1,
             delta: shift.2,
         };
+        // Every authored chart, not just the ones ON the edited sheet: a
+        // chart elsewhere can name these cells outright (`Data!$B$2:$B$10`)
+        // and has to follow them. `home` is what keeps the UNqualified refs
+        // — which mean the chart's own sheet — out of it.
         for ch in self.charts.iter_mut() {
             edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
         }
         self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+    }
+
+    /// The contiguous region around the selection to sort, as `(start, bottom)`
+    /// data-row bounds (header excluded). A header is inferred when the top row
+    /// carries a text label over numeric data in *any* column. `None` when
+    /// there's nothing to sort.
+    fn sort_bounds(&self) -> Option<(u32, u32)> {
+        use gridcore::sheet::CellValue;
+        let s = self.active;
+        let (max_r, max_c) = self.extent();
+        let sh = &self.pkg.workbook.sheets[s];
+        let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+        let sr = self.sel.0;
+        if !row_used(sr) {
+            return None;
+        }
+        let mut top = sr;
+        while top > 0 && row_used(top - 1) {
+            top -= 1;
+        }
+        let mut bottom = sr;
+        while bottom < max_r && row_used(bottom + 1) {
+            bottom += 1;
+        }
+        let header = (0..=max_c).any(|c| {
+            matches!(
+                sh.cell(top, c).map(|cl| &cl.value),
+                Some(CellValue::Text(_))
+            ) && (top + 1..=bottom).any(|r| {
+                matches!(
+                    sh.cell(r, c).map(|cl| &cl.value),
+                    Some(CellValue::Number(_))
+                )
+            })
+        });
+        let start = if header { top + 1 } else { top };
+        (bottom > start).then_some((start, bottom))
+    }
+
+    /// Commit the editor before computing bounds or sorting its row.
+    /// `keys` is absent for a sort by the selected column.
+    fn sort_with_pending_edit(
+        &mut self,
+        field: Option<(u32, u32, u32, u32)>,
+        keys: Option<&[(u32, bool)]>,
+        ascending: bool,
+    ) -> (bool, bool) {
+        let committed = self.commit_edit();
+        let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
+            return (committed, false);
+        };
+        let selected_key = [(self.sel.1, ascending)];
+        let keys = keys.unwrap_or(&selected_key);
+        self.push_undo();
+        gridcore::edit::sort_rows(&mut self.pkg.workbook, self.active, start, bottom, keys);
+        self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+        (committed, true)
     }
 
     fn sheet(&self) -> &gridcore::sheet::Sheet {
@@ -7895,60 +7957,22 @@ impl Docxy {
         cx.notify();
     }
 
-    /// The contiguous region around the selection to sort, as `(start, bottom)`
-    /// data-row bounds (header excluded). A header is inferred when the top row
-    /// carries a text label over numeric data in *any* column. `None` when
-    /// there's nothing to sort.
     fn sheet_sort_bounds(&self) -> Option<(u32, u32)> {
-        use gridcore::sheet::CellValue;
-        let v = self.active_sheet()?;
-        let s = v.active;
-        let (max_r, max_c) = v.extent();
-        let sh = &v.pkg.workbook.sheets[s];
-        let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        let sr = v.sel.0;
-        if !row_used(sr) {
-            return None;
-        }
-        let mut top = sr;
-        while top > 0 && row_used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = sr;
-        while bottom < max_r && row_used(bottom + 1) {
-            bottom += 1;
-        }
-        let header = (0..=max_c).any(|c| {
-            matches!(
-                sh.cell(top, c).map(|cl| &cl.value),
-                Some(CellValue::Text(_))
-            ) && (top + 1..=bottom).any(|r| {
-                matches!(
-                    sh.cell(r, c).map(|cl| &cl.value),
-                    Some(CellValue::Number(_))
-                )
-            })
-        });
-        let start = if header { top + 1 } else { top };
-        (bottom > start).then_some((start, bottom))
+        self.active_sheet()?.sort_bounds()
     }
 
     /// Sort the current region by the selected column (header-aware). Rows move
     /// as whole units (all columns + styles); blanks sort last. Formula refs are
     /// not re-based, so this targets value tables (the common case).
     fn sheet_sort(&mut self, ascending: bool, cx: &mut Context<Self>) {
-        let Some((start, bottom)) = self.sheet_sort_bounds() else {
+        let Some(v) = self.active_sheet_mut() else {
             return;
         };
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            let sc = v.sel.1;
-            gridcore::edit::sort_rows(&mut v.pkg.workbook, s, start, bottom, &[(sc, ascending)]);
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        let (committed, sorted) = v.sort_with_pending_edit(None, None, ascending);
+        if committed || sorted {
+            self.mark_sheet_dirty();
+            cx.notify();
         }
-        self.mark_sheet_dirty();
-        cx.notify();
     }
 
     /// Multi-level sort of the current region from a typed spec like
@@ -7964,17 +7988,14 @@ impl Docxy {
             .as_deref()
             .and_then(parse_ref_text)
             .map(|r| r.range);
-        let Some((start, bottom)) = sort_rows_from(field, self.sheet_sort_bounds()) else {
+        let Some(v) = self.active_sheet_mut() else {
             return;
         };
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            gridcore::edit::sort_rows(&mut v.pkg.workbook, s, start, bottom, &keys);
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        let (committed, sorted) = v.sort_with_pending_edit(field, Some(&keys), true);
+        if committed || sorted {
+            self.mark_sheet_dirty();
+            cx.notify();
         }
-        self.mark_sheet_dirty();
-        cx.notify();
     }
 
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then

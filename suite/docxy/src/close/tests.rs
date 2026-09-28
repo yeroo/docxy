@@ -607,6 +607,44 @@ fn structural_edit_commits_the_open_editor_before_shifting_cells() {
 }
 
 #[test]
+fn sort_commits_an_open_editor_before_moving_its_row() {
+    use gridcore::sheet::CellValue;
+
+    for multi_key in [false, true] {
+        let mut t = tab(Kind::Xlsx);
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (2, 0); // A3 is South; B3 is 20.
+        v.begin_cell_edit(None);
+        v.editing = Some("Zzz".into());
+        let keys = [(0, true)];
+        let explicit = multi_key.then_some(keys.as_slice());
+
+        assert_eq!(v.sort_with_pending_edit(None, explicit, true), (true, true));
+        assert!(v.editing.is_none());
+        assert_eq!(v.undo.len(), 2);
+        for (row, name, number) in [
+            (1, "East", 30.0),
+            (2, "North", 10.0),
+            (3, "West", 40.0),
+            (4, "Zzz", 20.0),
+        ] {
+            assert_eq!(
+                v.sheet().cell(row, 0).map(|c| &c.value),
+                Some(&CellValue::Text(name.into())),
+                "multi_key={multi_key}, row={row}"
+            );
+            assert_eq!(
+                v.sheet().cell(row, 1).map(|c| &c.value),
+                Some(&CellValue::Number(number)),
+                "multi_key={multi_key}, row={row}"
+            );
+        }
+    }
+}
+
+#[test]
 fn window_close_leaves_an_untouched_cell_editor_open_and_the_cell_intact() {
     let mut tabs = vec![
         untouched_text_cell(),
