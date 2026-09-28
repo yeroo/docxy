@@ -79,7 +79,7 @@ pub fn is_blank(img: &Image) -> bool {
 #[cfg(windows)]
 mod win {
     use super::{Capture, How, Image, is_blank};
-    use windows::Win32::Foundation::{BOOL, HANDLE, HWND, LPARAM, RECT, TRUE};
+    use windows::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
         DeleteDC, DeleteObject, GdiFlush, GetDC, HBITMAP, HDC, ReleaseDC, SRCCOPY, SelectObject,
@@ -92,17 +92,12 @@ mod win {
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GW_OWNER, GetWindow, GetWindowRect, GetWindowThreadProcessId, IsWindowVisible,
     };
+    use windows::core::BOOL;
 
     /// `PW_RENDERFULLCONTENT` — include content the window draws itself rather
     /// than only what it hands to GDI. The crate has `PW_CLIENTONLY` but not
     /// this one.
     const PW_RENDERFULLCONTENT: PRINT_WINDOW_FLAGS = PRINT_WINDOW_FLAGS(2);
-
-    /// The null window handle, which is how the Win32 calls here spell "the
-    /// desktop".
-    fn no_window() -> HWND {
-        HWND(std::ptr::null_mut())
-    }
 
     /// Tell Windows this process reads real pixels. Without it `GetWindowRect`
     /// hands back coordinates scaled for a 96-DPI fiction, and every crop on a
@@ -184,7 +179,7 @@ mod win {
     impl Drop for Bmp {
         fn drop(&mut self) {
             unsafe {
-                let _ = DeleteObject(self.0);
+                let _ = DeleteObject(self.0.into());
             }
         }
     }
@@ -193,7 +188,8 @@ mod win {
     impl Drop for ScreenDc {
         fn drop(&mut self) {
             unsafe {
-                ReleaseDC(no_window(), self.0);
+                // No window: this is the desktop's DC.
+                ReleaseDC(None, self.0);
             }
         }
     }
@@ -213,11 +209,12 @@ mod win {
         }
 
         unsafe {
-            let screen = ScreenDc(GetDC(no_window()));
+            // No window: the whole desktop.
+            let screen = ScreenDc(GetDC(None));
             if screen.0.is_invalid() {
                 return Err("GetDC failed: no desktop device context".to_string());
             }
-            let mem = Dc(CreateCompatibleDC(screen.0));
+            let mem = Dc(CreateCompatibleDC(Some(screen.0)));
             if mem.0.is_invalid() {
                 return Err("CreateCompatibleDC failed".to_string());
             }
@@ -231,19 +228,14 @@ mod win {
             info.bmiHeader.biBitCount = 32;
             info.bmiHeader.biCompression = BI_RGB.0;
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let bmp = Bmp(CreateDIBSection(
-                mem.0,
-                &info,
-                DIB_RGB_COLORS,
-                &mut bits,
-                HANDLE(std::ptr::null_mut()),
-                0,
-            )
-            .map_err(|e| format!("CreateDIBSection: {e}"))?);
+            let bmp = Bmp(
+                CreateDIBSection(Some(mem.0), &info, DIB_RGB_COLORS, &mut bits, None, 0)
+                    .map_err(|e| format!("CreateDIBSection: {e}"))?,
+            );
             if bits.is_null() {
                 return Err("CreateDIBSection returned no pixels".to_string());
             }
-            let old = SelectObject(mem.0, bmp.0);
+            let old = SelectObject(mem.0, bmp.0.into());
 
             let printed = PrintWindow(hwnd, mem.0, PW_RENDERFULLCONTENT).as_bool();
             let mut how = How::PrintWindow;
@@ -259,7 +251,17 @@ mod win {
                 // The GPU-rendered fallback: copy the same rectangle off the
                 // screen. StretchBlt with matching sizes is a plain copy.
                 let ok = StretchBlt(
-                    mem.0, 0, 0, w, h, screen.0, rect.left, rect.top, w, h, SRCCOPY,
+                    mem.0,
+                    0,
+                    0,
+                    w,
+                    h,
+                    Some(screen.0),
+                    rect.left,
+                    rect.top,
+                    w,
+                    h,
+                    SRCCOPY,
                 )
                 .as_bool();
                 if ok {

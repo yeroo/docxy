@@ -4,6 +4,25 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # `windows` and `windows-core` are one API split across two crates: the
+    # shims' `#[implement]` types and `IDispatch`/`IClassFactory` must come from
+    # the same generation of both, and bumping one alone is what broke #46.
+    # So their patch updates travel together in one PR,
+    groups:
+      windows-rs:
+        patterns:
+          - "windows"
+          - "windows-core"
+    # and anything past 0.62 is a deliberate manual upgrade, not a Dependabot
+    # PR. ⚠️ `windows-core` has already moved to 0.100 (MSRV 1.95, above our
+    # 1.88) with no `windows` release to pair it with; a PR for either crate
+    # alone would reproduce #46's mismatch. Lift both ignores together when a
+    # `windows` release pairs with a newer `windows-core`.
+    ignore:
+      - dependency-name: "windows"
+        versions: [">= 0.63"]
+      - dependency-name: "windows-core"
+        versions: [">= 0.63"]
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

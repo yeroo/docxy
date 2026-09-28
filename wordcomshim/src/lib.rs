@@ -60,10 +60,9 @@ mod win {
     use windows::Win32::System::Com::{
         DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch, IDispatch_Impl, IDispatch_Vtbl,
     };
+    use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
-    use windows::core::{
-        BSTR, GUID, HRESULT, Interface, PCWSTR, Result, VARIANT, implement, interface,
-    };
+    use windows::core::{BSTR, GUID, HRESULT, Interface, PCWSTR, Result, implement, interface};
 
     /// OUR authored type library's LIBID (mkwordtypelib's `docxy_libid`). We
     /// source per-object typeinfo from our own registered docxy-word.tlb so it

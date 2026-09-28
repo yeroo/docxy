@@ -210,7 +210,7 @@ fn load_office(spec: &Spec) -> Result<ITypeLib> {
             return Ok(tl);
         }
     }
-    Err(Error::from_win32())
+    Err(Error::from_thread())
 }
 
 /// The vtable (TKIND_INTERFACE) typeinfo for an IID — a dual is stored as a

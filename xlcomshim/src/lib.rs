@@ -54,10 +54,9 @@ mod win {
     use windows::Win32::System::Com::{
         DISPATCH_FLAGS, DISPPARAMS, EXCEPINFO, IDispatch, IDispatch_Impl, IDispatch_Vtbl,
     };
+    use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::UI::WindowsAndMessaging::PostQuitMessage;
-    use windows::core::{
-        BSTR, GUID, HRESULT, Interface, PCWSTR, Result, VARIANT, implement, interface,
-    };
+    use windows::core::{BSTR, GUID, HRESULT, Interface, PCWSTR, Result, implement, interface};
 
     /// OUR authored type library's LIBID (see the mktypelib bin's `docxy_libid`).
     /// We source per-object typeinfo from HERE — our own registered docxy-excel.tlb
@@ -415,7 +414,7 @@ mod win {
 
     fn cellvalue_to_variant(v: &CellValue) -> VARIANT {
         match v {
-            CellValue::Empty => VARIANT::new(),
+            CellValue::Empty => VARIANT::default(),
             CellValue::Number(n) => VARIANT::from(*n),
             CellValue::Text(s) => VARIANT::from(BSTR::from(s.as_str())),
             CellValue::Bool(b) => VARIANT::from(*b),

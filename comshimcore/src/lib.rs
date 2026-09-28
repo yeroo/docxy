@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{
-    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, DISP_E_MEMBERNOTFOUND,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, DISP_E_MEMBERNOTFOUND,
     E_POINTER, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
@@ -25,10 +25,13 @@ use windows::Win32::System::Com::{
     DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
     IClassFactory_Impl, IDispatch, IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage,
 };
-use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, VARIANT, implement};
+use windows::core::{
+    BOOL, BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Ref, Result, implement,
+};
 
 pub mod typelib;
 
@@ -407,7 +410,7 @@ struct ShimFactory {
 impl IClassFactory_Impl for ShimFactory_Impl {
     fn CreateInstance(
         &self,
-        punkouter: Option<&IUnknown>,
+        punkouter: Ref<'_, IUnknown>,
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> Result<()> {
