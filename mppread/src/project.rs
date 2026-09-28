@@ -231,46 +231,21 @@ fn pin_unreproduced_starts(project: &mut Project) {
     // This costs one full schedule per accepted pin, in addition to at most
     // candidate-count accept/reject passes. The 48 newest snapshot files
     // currently need zero pins, so they incur no minimisation schedules.
+    if pinned.is_empty() {
+        return;
+    }
     let uid_to_index: std::collections::HashMap<_, _> = candidates
         .iter()
         .map(|&i| (project.tasks[i].uid, i))
         .collect();
-    let mut successors = vec![Vec::new(); project.tasks.len()];
-    let mut indegree = vec![0usize; project.tasks.len()];
-    for &i in &candidates {
-        for predecessor in &project.tasks[i].predecessors {
-            if let Some(&before) = uid_to_index.get(&predecessor.uid) {
-                successors[before].push(i);
-                indegree[i] += 1;
-            }
-        }
-    }
-    // Descending row order here makes the reversed order use ascending rows
-    // for unrelated tasks.
-    let mut ready: std::collections::BTreeSet<_> = candidates
-        .iter()
-        .copied()
-        .filter(|&i| indegree[i] == 0)
-        .map(std::cmp::Reverse)
+    let mut order: Vec<usize> = projcore::schedule::effective_leaf_order(project)
+        .into_iter()
+        .filter_map(|uid| uid_to_index.get(&uid).copied())
         .collect();
-    let mut order = Vec::with_capacity(candidates.len());
-    while let Some(&std::cmp::Reverse(i)) = ready.first() {
-        ready.pop_first();
-        order.push(i);
-        for &next in &successors[i] {
-            indegree[next] -= 1;
-            if indegree[next] == 0 {
-                ready.insert(std::cmp::Reverse(next));
-            }
-        }
-    }
-    // A malformed cycle has no topological order. The scheduler has already
-    // handled it; use row order for any nodes left over.
-    for &i in &candidates {
-        if indegree[i] > 0 {
-            order.push(i);
-        }
-    }
+    // An unschedulable candidate has no result and cannot be pinned, but keep
+    // it in the order so cleanup remains exhaustive.
+    let seen: std::collections::HashSet<_> = order.iter().copied().collect();
+    order.extend(candidates.iter().copied().filter(|i| !seen.contains(i)));
     for i in order.into_iter().rev() {
         if !pinned.contains(&i) {
             continue;
@@ -594,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn alap_predecessor_of_a_summary_requires_a_downstream_pin() {
+    fn alap_predecessor_of_a_summary_is_pinned_but_asap_is_not() {
         let mut late = current(1, 1, "ALAP predecessor", 1);
         late.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
         let early = current(2, 2, "ASAP predecessor", 1);
@@ -618,15 +593,15 @@ mod tests {
             tail,
         ])
         .unwrap();
-        assert_eq!(rows[0].constraint, ConstraintType::AsLateAsPossible);
-        assert_eq!(rows[3].constraint, ConstraintType::MustStartOn);
-        assert_eq!(rows[3].constraint_date, rows[3].stored_start);
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[1].constraint_date, None);
     }
 
     #[test]
-    fn alap_child_of_a_summary_predecessor_requires_a_successor_pin() {
+    fn alap_child_of_a_summary_predecessor_is_pinned_but_asap_sibling_is_not() {
         let mut late = current(2, 2, "ALAP child", 2);
         late.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
         let mut successor = later(
@@ -649,15 +624,15 @@ mod tests {
             tail,
         ])
         .unwrap();
-        assert_eq!(rows[1].constraint, ConstraintType::AsLateAsPossible);
-        assert_eq!(rows[3].constraint, ConstraintType::MustStartOn);
-        assert_eq!(rows[3].constraint_date, rows[3].stored_start);
+        assert_eq!(rows[1].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[1].constraint_date, rows[1].stored_start);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[2].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[2].constraint_date, None);
     }
 
     #[test]
-    fn alap_to_asap_to_summary_chain_pins_its_downstream_child() {
+    fn alap_to_asap_to_summary_chain_needs_only_upstream_pin() {
         let mut a = current(1, 1, "ALAP A", 1);
         a.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
         let mut b = later(
@@ -686,10 +661,10 @@ mod tests {
             tail,
         ])
         .unwrap();
-        assert_eq!(rows[0].constraint, ConstraintType::AsLateAsPossible);
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
         assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
-        assert_eq!(rows[3].constraint, ConstraintType::MustStartOn);
-        assert_eq!(rows[3].constraint_date, rows[3].stored_start);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
         assert_eq!(rows[1].constraint_date, None);
     }
 

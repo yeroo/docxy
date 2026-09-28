@@ -173,8 +173,14 @@ Wednesday 08:00" both come out right.
   manual or auto, rolls up through its own span and sees it as fixed: the
   nested summary's late window is its own span, and an auto summary over one
   measures its slack from its late window. A manual summary with no start
-  (TBD) rolls up as an auto summary. Links on summaries themselves are not
-  scheduled yet, for auto and manual summaries alike.
+  (TBD) rolls up as an auto summary. FS/SS links into an auto summary drive
+  leaves below auto summary levels; a nested manual summary stops inheritance.
+  Links out of an auto summary use its rolled start or finish, while links out
+  of a manual summary use its own dates. A link into a manual summary changes
+  predecessor slack but does not move that summary or its children. Auto
+  summary start floors and backward date bounds apply to inherited leaves.
+  Summary FF/SF predecessors and some summary constraint types remain unsupported;
+  the provisional late-bound rules await verification in Microsoft Project.
 
 Leaf tasks are ordered by a Kahn topological sort of the dependency graph;
 cycles fall back to input order.
