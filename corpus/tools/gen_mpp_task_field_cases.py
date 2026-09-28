@@ -57,6 +57,7 @@ def save(app, slug, expected, null_min=0):
             raise AssertionError(f"{slug}: {name}.{field} absent")
     app.FileCloseEx(0)
     print("wrote", slug)
+    return tasks
 
 
 def flags(app):
@@ -103,9 +104,14 @@ def values(app):
     t = add(p, "Level delay")
     t.LevelingDelay = "2d"
     checks.append(("Level delay", "LevelingDelay", None))
+    checks.append(("Level delay", "LevelingDelayFormat", "8"))
     t = add(p, "Elapsed delay")
     t.LevelingDelay = "2ed"
-    checks.append(("Elapsed delay", "LevelingDelayFormat", None))
+    checks.append(("Elapsed delay", "LevelingDelayFormat", "8"))
+    for name, delay, code in (("Hour delay", "3eh", "6"), ("Week delay", "1ew", "10"), ("Minute delay", "45m", "4")):
+        t = add(p, name)
+        t.LevelingDelay = delay
+        checks.append((name, "LevelingDelayFormat", code))
     t = add(p, "Physical EV")
     t.EarnedValueMethod = 1
     checks.append(("Physical EV", "EarnedValueMethod", "1"))
@@ -125,11 +131,17 @@ def blanks(app):
     app.RowInsert()
     app.SelectRow(Row=4, RowRelative=False)
     app.RowInsert()
-    former = add(p, "Former task")
-    former.Delete()
     app.SelectRow(Row=6, RowRelative=False)
     app.RowInsert()
     save(app, "f3-blanks", [], null_min=3)
+    root = ET.parse(os.path.join(OUT, "f3-blanks.xml")).getroot()
+    rows = [
+        (t.findtext(f"{NS}Name"), t.findtext(f"{NS}IsNull"))
+        for t in root.findall(f"{NS}Tasks/{NS}Task") if t.findtext(f"{NS}UID") != "0"
+    ]
+    if rows != [("Summary", "0"), (None, "1"), ("Child", "0"),
+                (None, "1"), ("After", "0"), (None, "1")]:
+        raise AssertionError(f"f3-blanks: unexpected row layout {rows!r}")
 
 
 def overflow(app):
@@ -178,9 +190,20 @@ def external(app):
     save(app, "f7-external", [])
 
 
+def wbs_mask(app):
+    p = new_plan(app)
+    app.WBSCodeMaskEdit(CodePrefix="PX-", Level=1, Sequence=1, Length=1, Separator="-", CodeGenerate=True)
+    add(p, "Mask root")
+    child = add(p, "Mask child")
+    child.OutlineIndent()
+    tasks = save(app, "f8-wbs-mask", [("Mask root", "WBS", None), ("Mask child", "WBS", None)])
+    if not tasks["Mask root"]["WBS"].startswith("PX-"):
+        raise AssertionError(f"WBS mask did not apply: {tasks['Mask root']['WBS']}")
+
+
 def main():
     os.makedirs(OUT, exist_ok=True)
-    cases = (flags, values, blanks, overflow, subprojects, external)
+    cases = (flags, values, blanks, overflow, subprojects, external, wbs_mask)
     selected = sys.argv[1:]
     app = win32.Dispatch("MSProject.Application")
     try:

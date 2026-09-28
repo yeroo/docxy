@@ -47,7 +47,9 @@ pub struct MppInfo {
 
 /// A task decoded from a recognized `.mpp` table. `id` is the visible row
 /// number; `uid` is the stable reference used by predecessor links. UID 0 is
-/// Project's summary row. Dates use `YYYY-MM-DD HH:MM`.
+/// Project's summary row. Dates use `YYYY-MM-DD HH:MM`. A blank row has only
+/// its ID and UID: name is empty and dates, outline, progress and fields are
+/// absent.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MppTask {
     pub id: u32,
@@ -68,10 +70,10 @@ pub struct MppTask {
     pub manual_start: Option<String>,
     pub manual_finish: Option<String>,
     pub manual_duration_min: Option<i64>,
-    /// Recorded progress as Project stored it. `None` for a layout whose
-    /// progress fields are not validated (MPP9).
+    /// Recorded progress as Project stored it. `None` for MPP9 and blank rows.
     pub progress: Option<MppProgress>,
-    /// Task fields validated for the current MPP layout. Legacy MPP9 has none.
+    /// Task fields validated for the current MPP layout. `None` for MPP9 and
+    /// blank rows.
     pub fields: Option<MppTaskFields>,
 }
 
@@ -79,6 +81,8 @@ pub struct MppTask {
 pub struct MppTaskFields {
     pub guid: Option<String>,
     pub create_date: Option<String>,
+    /// Explicit WBS code, or a generated code when the Project mask is the
+    /// ordinary numeric outline mask. Custom masks remain unknown.
     pub wbs: Option<String>,
     pub task_type: Option<projcore::TaskType>,
     pub active: Option<bool>,

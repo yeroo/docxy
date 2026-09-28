@@ -45,6 +45,15 @@ pub(crate) fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
 
 /// `NewTasksAreManual`: a 2-byte value, `0`, `1`, or `0x00ff`.
 pub(crate) const NEW_TASKS_ARE_MANUAL: u32 = 0x0240_13c8;
+/// WBS code mask. Project omits this entry for its ordinary numeric outline mask.
+const WBS_CODE_MASK: u32 = 0x0240_138b;
+
+pub(crate) fn has_default_wbs_mask(b: &[u8]) -> Result<bool, String> {
+    Ok(matches!(
+        entries(b)?.get(&WBS_CODE_MASK),
+        None | Some(&[0, 0, 0, 0])
+    ))
+}
 
 pub(crate) fn new_tasks_are_manual(b: &[u8]) -> Result<bool, String> {
     match entries(b)?.get(&NEW_TASKS_ARE_MANUAL) {
@@ -113,5 +122,18 @@ mod tests {
             (NEW_TASKS_ARE_MANUAL, &[0, 0]),
         ]);
         assert!(new_tasks_are_manual(&dup).is_err());
+    }
+
+    #[test]
+    fn recognizes_default_and_custom_wbs_masks() {
+        assert_eq!(has_default_wbs_mask(&stream(&[])), Ok(true));
+        assert_eq!(
+            has_default_wbs_mask(&stream(&[(WBS_CODE_MASK, &[0, 0, 0, 0])])),
+            Ok(true)
+        );
+        assert_eq!(
+            has_default_wbs_mask(&stream(&[(WBS_CODE_MASK, &[1, 0, 0, 0])])),
+            Ok(false)
+        );
     }
 }

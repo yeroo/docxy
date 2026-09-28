@@ -40,9 +40,27 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .map(|t| t.name.clone())
             .unwrap_or_else(|| "Imported project".into())
     });
+    let tasks = import_tasks(decoded)?;
+    let start = tasks
+        .iter()
+        .filter_map(|t| t.stored_start)
+        .min()
+        .unwrap_or_else(default_anchor);
+    Ok(Project {
+        name,
+        title: info.title,
+        start_date: Some(start),
+        tasks,
+        new_tasks_are_manual,
+        ..Project::default()
+    })
+}
+
+fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> {
     let cal_ref = Project::default();
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
-    // A task is a summary when the next task sits one WBS level deeper.
+    // Outline summaries own the next deeper row; Project also labels an
+    // inserted subproject as a summary even when its children live elsewhere.
     let tasks: Vec<Task> = decoded
         .iter()
         .enumerate()
@@ -56,19 +74,20 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 });
             }
             let level = t.outline_level.expect("validated task outline");
-            let is_summary = decoded[i + 1..]
+            let outline_summary = decoded[i + 1..]
                 .iter()
                 .find(|next| !next.is_null)
-                .is_some_and(|next| next.outline_level.is_some_and(|nxt| nxt > level))
-                || t.fields
-                    .as_ref()
-                    .is_some_and(|f| f.is_subproject == Some(true));
+                .is_some_and(|next| next.outline_level.is_some_and(|nxt| nxt > level));
+            let project_summary = t
+                .fields
+                .as_ref()
+                .is_some_and(|f| f.is_subproject == Some(true));
             let mut task = Task {
                 uid: t.uid as i32,
                 id: t.id as i32,
                 name: t.name.clone(),
                 outline_level: level,
-                summary: is_summary,
+                summary: outline_summary || project_summary,
                 duration_min: 480,
                 ..Task::default()
             };
@@ -157,7 +176,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             // Pin only leaf tasks; a summary's dates roll up from its
             // children, so a constraint on it would fight the rollup. A
             // manual leaf is held by its pinned dates, not a constraint.
-            if is_summary {
+            if outline_summary {
                 task.duration_min = 0;
             } else if t.manual {
                 task.duration_min = t
@@ -171,19 +190,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             Ok(task)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let start = tasks
-        .iter()
-        .filter_map(|t| t.stored_start)
-        .min()
-        .unwrap_or_else(default_anchor);
-    Ok(Project {
-        name,
-        title: info.title,
-        start_date: Some(start),
-        tasks,
-        new_tasks_are_manual,
-        ..Project::default()
-    })
+    Ok(tasks)
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
@@ -208,6 +215,76 @@ fn parse_mpp_dt(s: &str) -> Option<DateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn task(id: u32, uid: u32, name: &str, level: u32) -> crate::mpp::MppTask {
+        crate::mpp::MppTask {
+            id,
+            uid,
+            name: name.into(),
+            start: Some("2026-03-02 08:00".into()),
+            finish: Some("2026-03-03 08:00".into()),
+            outline_level: Some(level),
+            ..crate::mpp::MppTask::default()
+        }
+    }
+
+    fn blank(id: u32, uid: u32) -> crate::mpp::MppTask {
+        crate::mpp::MppTask {
+            id,
+            uid,
+            is_null: true,
+            ..crate::mpp::MppTask::default()
+        }
+    }
+
+    #[test]
+    fn blank_rows_between_before_child_and_trailing_preserve_outline() {
+        let rows = import_tasks(vec![
+            task(0, 0, "Project", 0),
+            task(1, 1, "Summary", 1),
+            blank(2, 4), // immediately before the child
+            task(3, 2, "Child", 2),
+            blank(4, 5), // between real tasks
+            task(5, 3, "After", 1),
+            blank(6, 7), // trailing blank cannot make After a summary
+        ])
+        .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|t| (t.id, t.uid, t.is_null))
+                .collect::<Vec<_>>(),
+            [
+                (1, 1, false),
+                (2, 4, true),
+                (3, 2, false),
+                (4, 5, true),
+                (5, 3, false),
+                (6, 7, true)
+            ]
+        );
+        assert!(rows[0].summary);
+        assert_eq!(rows[0].duration_min, 0);
+        assert!(!rows[2].summary);
+        assert!(!rows[4].summary);
+        assert!(rows[4].duration_min > 0);
+        assert_eq!(rows[4].constraint, ConstraintType::MustStartOn);
+        let p = Project {
+            tasks: rows,
+            ..Project::default()
+        };
+        let xml = projcore::mspdi::write_mspdi(&p);
+        let round = projcore::mspdi::read_mspdi(&xml).unwrap();
+        assert_eq!(
+            round
+                .tasks
+                .iter()
+                .filter(|t| t.is_null)
+                .map(|t| t.uid)
+                .collect::<Vec<_>>(),
+            [4, 5, 7]
+        );
+    }
+
     #[test]
     fn opens_mpp_metadata_as_partial_project() {
         // Build a minimal .mpp: a SummaryInformation property set with a title,

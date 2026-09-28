@@ -150,17 +150,23 @@ fn links(cfb: &Cfb, prefix: &str, out: &mut [MppTask], layout: LinkLayout) -> Re
     Ok(())
 }
 
-fn decode_name(v2: &[u8], off: usize, uid: u32) -> Result<String, String> {
+fn decode_text(
+    v2: &[u8],
+    off: usize,
+    uid: u32,
+    what: &str,
+    allow_empty: bool,
+) -> Result<String, String> {
     let Some(header_end) = off.checked_add(4).filter(|&n| n <= v2.len()) else {
-        return Err(format!("Var2Data offset out of range for UID {uid}"));
+        return Err(format!("{what} Var2Data offset out of range for UID {uid}"));
     };
     let len = u32_at(v2, off) as usize;
     let Some(end) = header_end.checked_add(len).filter(|&n| n <= v2.len()) else {
-        return Err(format!("Var2Data block out of range for UID {uid}"));
+        return Err(format!("{what} Var2Data block out of range for UID {uid}"));
     };
     let value = &v2[header_end..end];
-    if value.len() < 4 || !value.len().is_multiple_of(2) {
-        return Err(format!("invalid task name block for UID {uid}"));
+    if value.len() < 2 || !value.len().is_multiple_of(2) {
+        return Err(format!("invalid {what} block for UID {uid}"));
     }
     let units: Vec<u16> = value
         .as_chunks::<2>()
@@ -169,14 +175,18 @@ fn decode_name(v2: &[u8], off: usize, uid: u32) -> Result<String, String> {
         .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     if *units.last().unwrap() != 0 {
-        return Err(format!("unterminated task name for UID {uid}"));
+        return Err(format!("unterminated {what} for UID {uid}"));
     }
     let name = String::from_utf16(&units[..units.len() - 1])
-        .map_err(|_| format!("invalid UTF-16 task name for UID {uid}"))?;
-    if name.is_empty() || name.chars().any(char::is_control) {
-        return Err(format!("invalid task name for UID {uid}"));
+        .map_err(|_| format!("invalid UTF-16 {what} for UID {uid}"))?;
+    if (!allow_empty && name.is_empty()) || name.chars().any(char::is_control) {
+        return Err(format!("invalid {what} for UID {uid}"));
     }
     Ok(name)
+}
+
+fn decode_name(v2: &[u8], off: usize, uid: u32) -> Result<String, String> {
+    decode_text(v2, off, uid, "task name", false)
 }
 
 fn validate_legacy_level(index: usize, uid: u32, level: u32, previous: u32) -> Result<(), String> {
@@ -236,7 +246,7 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
             names.insert(uid, decode_name(v2, off, uid)?);
         } else if key == 0x0010 {
             // Explicit WBS override; default WBS is generated from the outline.
-            wbs.insert(uid, decode_name(v2, off, uid)?);
+            wbs.insert(uid, decode_text(v2, off, uid, "WBS", true)?);
         } else if key == PHYSICAL_PERCENT_KEY {
             let value = &v2[header_end..end];
             let percent = (value.len() == 2)
@@ -272,7 +282,7 @@ fn current_fields(
     meta: &[u8],
     fixed2: fixedmeta::Fixed2<'_>,
     uid: u32,
-    wbs: String,
+    wbs: Option<String>,
 ) -> Result<MppTaskFields, String> {
     let task_type = projcore::TaskType::from_code(i64::from(u16_at(rec, 140)))
         .ok_or_else(|| format!("invalid task type for UID {uid}"))?;
@@ -280,10 +290,16 @@ fn current_fields(
     if priority > 1000 {
         return Err(format!("invalid priority {priority} for UID {uid}"));
     }
+    let leveling_delay_format = u16_at(rec, 162);
+    if !matches!(leveling_delay_format, 3..=12 | 21) {
+        return Err(format!(
+            "invalid LevelingDelayFormat {leveling_delay_format} for UID {uid}"
+        ));
+    }
     Ok(MppTaskFields {
         guid: Some(guid_text(&fixed2.data[..16])),
         create_date: decode_timestamp(rec, 128),
-        wbs: Some(wbs),
+        wbs,
         task_type: Some(task_type),
         active: Some(fixed2.meta[8] & 0x40 != 0),
         effort_driven: Some(meta[13] & 0x08 != 0),
@@ -293,9 +309,8 @@ fn current_fields(
         level_assignments: Some(meta[16] & 0x04 != 0),
         leveling_can_split: Some(meta[16] & 0x02 != 0),
         leveling_delay: Some(i64::from(u32_at(rec, 70))),
-        // Project exports elapsed-day code 8 for every current-layout case,
-        // including delays entered as working days and elapsed days.
-        leveling_delay_format: Some(8),
+        // f2-values: 3eh/1ew/45m export codes 6/10/4 at +162.
+        leveling_delay_format: Some(i32::from(leveling_delay_format)),
         ignore_resource_calendar: Some(fixed2.meta[77] & 0x08 != 0),
         earned_value_method: Some(i32::from(
             meta[26] & 0x80 == 0 && fixed2.meta[76] & 0x80 != 0,
@@ -514,6 +529,14 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             let fixed_count = u32_at(&fm, 8) as usize;
             let (f2m, f2d) = (read("Fixed2Meta")?, read("Fixed2Data")?);
             let fixed2 = fixedmeta::current_fixed2(&f2m, &f2d, fixed_count, &indexed)?;
+            let props = prefix.trim_end_matches("TBkndTask/").to_string() + "Props";
+            let props_data = cfb.read_path(&props);
+            // A custom Project WBS mask changes generated codes. Preserve explicit
+            // per-task codes, but leave other codes unknown until that mask is decoded.
+            let default_wbs_mask = props_data
+                .as_ref()
+                .and_then(|p| crate::props::has_default_wbs_mask(p).ok())
+                .unwrap_or(false);
             let tasks = decode_current(
                 &cfb,
                 prefix,
@@ -525,10 +548,9 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 },
                 indexed,
                 &fixed2,
+                default_wbs_mask,
             )?;
-            let props = prefix.trim_end_matches("TBkndTask/").to_string() + "Props";
-            let new_tasks_are_manual = cfb
-                .read_path(&props)
+            let new_tasks_are_manual = props_data
                 .ok_or_else(|| "missing project Props stream".to_string())
                 .and_then(|props| crate::props::new_tasks_are_manual(&props));
             Ok(Table {
@@ -552,6 +574,7 @@ fn decode_current(
     streams: CurrentStreams<'_>,
     indexed: Vec<fixedmeta::CurrentRecord>,
     fixed2: &[fixedmeta::Fixed2],
+    default_wbs_mask: bool,
 ) -> Result<Vec<MppTask>, String> {
     let CurrentStreams { fm, fd, vm, v2 } = streams;
     let uids: HashSet<_> = indexed
@@ -631,7 +654,10 @@ fn decode_current(
                 meta,
                 *fixed2,
                 row.uid,
-                var.wbs.get(&row.uid).cloned().unwrap_or(default_wbs),
+                var.wbs
+                    .get(&row.uid)
+                    .cloned()
+                    .or_else(|| default_wbs_mask.then_some(default_wbs)),
             )?),
             ..MppTask::default()
         });
@@ -729,6 +755,7 @@ mod tests {
             fd[o..o + 4].copy_from_slice(&uid.to_le_bytes());
             fd[o + 4..o + 8].copy_from_slice(&uid.to_le_bytes());
             fd[o + 172] = i as u8;
+            fd[o + 162..o + 164].copy_from_slice(&8u16.to_le_bytes());
             for d in [0x68, 0x6c] {
                 fd[o + d..o + d + 4].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
             }
@@ -1012,6 +1039,120 @@ mod tests {
                 b.over_allocated,
                 b.milestone
             )
+        );
+    }
+
+    #[test]
+    fn task_field_flags_use_independent_bits() {
+        type Read = fn(&MppTaskFields) -> Option<bool>;
+        let cases: &[(usize, usize, u8, Read)] = &[
+            (0, 10, 0x02, |f| f.milestone),
+            (0, 12, 0x80, |f| f.hide_bar),
+            (0, 12, 0x04, |f| f.rollup),
+            (0, 13, 0x08, |f| f.effort_driven),
+            (0, 15, 0x02, |f| f.is_subproject),
+            (0, 15, 0x80, |f| f.is_subproject_read_only),
+            (0, 15, 0x40, |f| f.external_task),
+            (0, 16, 0x04, |f| f.level_assignments),
+            (0, 16, 0x02, |f| f.leveling_can_split),
+            (1, 8, 0x40, |f| f.active),
+            (1, 77, 0x08, |f| f.ignore_resource_calendar),
+        ];
+        for &(block, offset, bit, read) in cases {
+            let mut s = fixture();
+            let before = decode(&file(&s, true)).unwrap().remove(1).fields.unwrap();
+            let pos = if block == 0 {
+                16 + 4 * 47 + offset
+            } else {
+                16 + 4 * 96 + offset
+            };
+            let meta = if block == 0 { &mut s.fm } else { &mut s.f2m };
+            meta[pos] ^= bit;
+            let after = decode(&file(&s, true)).unwrap().remove(1).fields.unwrap();
+            assert_eq!(
+                read(&before),
+                Some(false),
+                "block {block} offset {offset} bit {bit:#x}"
+            );
+            assert_eq!(
+                read(&after),
+                Some(true),
+                "block {block} offset {offset} bit {bit:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn task_field_offsets_decode_defaults_and_changes() {
+        let mut s = fixture();
+        let base = decode(&file(&s, true)).unwrap().remove(1).fields.unwrap();
+        assert_eq!(base.task_type, Some(projcore::TaskType::FixedUnits));
+        assert_eq!(base.priority, Some(0));
+        assert_eq!(base.leveling_delay, Some(0));
+        assert_eq!(base.leveling_delay_format, Some(8));
+        assert_eq!(base.estimated, Some(false));
+        assert_eq!(base.deadline.as_deref(), Some("1983-12-31 00:00"));
+        assert_eq!(
+            base.guid.as_deref(),
+            Some("00000004-0000-0000-0000-000000000000")
+        );
+        assert!(base.create_date.is_some());
+        let d = 250;
+        s.fd[d + 70..d + 74].copy_from_slice(&600u32.to_le_bytes());
+        s.fd[d + 78..d + 80].copy_from_slice(&123u16.to_le_bytes());
+        s.fd[d + 140..d + 142].copy_from_slice(&2u16.to_le_bytes());
+        s.fd[d + 162..d + 164].copy_from_slice(&6u16.to_le_bytes());
+        s.fd[d + 164..d + 166].copy_from_slice(&32u16.to_le_bytes());
+        s.fd[d + 128..d + 132].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
+        s.f2d[4 * 64] = 42;
+        let created = s.fd[d + 128..d + 132].to_vec();
+        s.fd[d + 182..d + 186].copy_from_slice(&created);
+        let changed = decode(&file(&s, true)).unwrap().remove(1).fields.unwrap();
+        assert_eq!(changed.task_type, Some(projcore::TaskType::FixedWork));
+        assert_eq!(changed.priority, Some(123));
+        assert_eq!(changed.leveling_delay, Some(600));
+        assert_eq!(changed.leveling_delay_format, Some(6));
+        assert_eq!(changed.estimated, Some(true));
+        assert_eq!(
+            changed.guid.as_deref(),
+            Some("0000002A-0000-0000-0000-000000000000")
+        );
+        assert_ne!(changed.create_date, base.create_date);
+        assert_eq!(changed.deadline, changed.create_date);
+        s.fd[d + 162..d + 164].copy_from_slice(&99u16.to_le_bytes());
+        reject(&s);
+    }
+
+    #[test]
+    fn earned_value_method_needs_fixed2_bit_without_fixedmeta_override() {
+        let mut s = fixture();
+        let f = 16 + 4 * 96;
+        let m = 16 + 4 * 47;
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .earned_value_method,
+            Some(0)
+        );
+        s.f2m[f + 76] |= 0x80;
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .earned_value_method,
+            Some(1)
+        );
+        s.fm[m + 26] |= 0x80;
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .earned_value_method,
+            Some(0)
         );
     }
     #[test]

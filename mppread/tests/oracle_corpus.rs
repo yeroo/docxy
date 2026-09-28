@@ -151,7 +151,13 @@ fn check_task_fields(
         };
     }
     same!(guid);
-    same!(wbs);
+    if f.wbs.is_some() {
+        same!(wbs);
+    } else {
+        // A custom WBS mask has no per-task code in the MPP table. The
+        // importer leaves the value unknown instead of inventing "1.2".
+        assert_eq!(imported.wbs, None, "{}", at("imported wbs"));
+    }
     same!(task_type);
     same!(active);
     same!(effort_driven);
@@ -375,6 +381,35 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             mpp.display(),
             e.uid
         );
+        if t.is_subproject == Some(true) {
+            assert_eq!(
+                t.duration_min,
+                e.duration_min,
+                "{}: uid {} subproject duration",
+                mpp.display(),
+                e.uid
+            );
+            let editor = projcore::editor::Editor::new(imported.clone());
+            let after = editor
+                .project()
+                .tasks
+                .iter()
+                .find(|row| row.uid == e.uid)
+                .unwrap();
+            assert_eq!(
+                after.duration_min,
+                e.duration_min,
+                "{}: uid {} edited subproject duration",
+                mpp.display(),
+                e.uid
+            );
+            assert!(
+                !after.is_milestone(),
+                "{}: uid {} became a milestone",
+                mpp.display(),
+                e.uid
+            );
+        }
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
         check_task_fields(a, t, e, &at);
@@ -442,13 +477,34 @@ fn project_2024_oracles() {
     if task_fields.exists() {
         let cases = pairs(&task_fields, "");
         let expected_count = if task_fields.join("f6-recurring.mpp").exists() {
-            10
+            11
         } else {
-            9
+            10
         };
         assert_eq!(cases.len(), expected_count);
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);
+            if mpp.file_stem().is_some_and(|s| s == "f3-blanks") {
+                let oracle =
+                    projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+                let layout: Vec<_> = oracle
+                    .tasks
+                    .iter()
+                    .filter(|t| t.uid != 0)
+                    .map(|t| (t.name.as_str(), t.is_null))
+                    .collect();
+                assert_eq!(
+                    layout,
+                    [
+                        ("Summary", false),
+                        ("", true),
+                        ("Child", false),
+                        ("", true),
+                        ("After", false),
+                        ("", true)
+                    ]
+                );
+            }
         }
         let mut seen = std::collections::HashSet::new();
         for (mpp, xml) in &cases {
@@ -501,7 +557,7 @@ fn project_2024_oracles() {
                 if t.leveling_delay.is_some_and(|d| d != 0) {
                     seen.insert("leveling_delay");
                 }
-                if t.leveling_delay_format.is_some() {
+                if t.leveling_delay_format.is_some_and(|format| format != 8) {
                     seen.insert("leveling_delay_format");
                 }
                 if t.ignore_resource_calendar == Some(true) {

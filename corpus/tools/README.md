@@ -10,6 +10,6 @@ python corpus/tools/gen_mpp_task_field_cases.py
 ```
 
 The task-field generator accepts individual case function names (`flags`,
-`values`, `blanks`, `overflow`, `subprojects`, `external`) as arguments. It
+`values`, `blanks`, `overflow`, `subprojects`, `external`, `wbs_mask`) as arguments. It
 checks the exported XML for the requested field values before accepting a
 case. Close Project gracefully if a run is interrupted.
