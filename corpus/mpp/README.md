@@ -129,11 +129,13 @@ minutes. Generate them the same way:
 python corpus/tools/gen_mpp_lag_cases.py
 ```
 
-Nine paired task-field files in `task-fields/` cover the current-layout task
+Ten paired task-field files in `task-fields/` cover the current-layout task
 flags, GUID, creation date, WBS, type, deadline, leveling fields, subprojects,
-over-allocation and blank rows. The cross-project predecessor case also has an
-external task in the binary table; Project omits that ghost row from its XML
-export. Generate the pairs on Windows with Project and pywin32:
+over-allocation and blank rows. The custom-mask case proves generated WBS codes
+have no explicit per-task binary value, so the decoder leaves them absent.
+The cross-project predecessor case also has an external task in the binary
+table; Project omits that ghost row from its XML export. Generate the pairs on
+Windows with Project and pywin32:
 
 ```powershell
 python corpus/tools/gen_mpp_task_field_cases.py

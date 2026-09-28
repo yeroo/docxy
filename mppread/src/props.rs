@@ -45,7 +45,8 @@ pub(crate) fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
 
 /// `NewTasksAreManual`: a 2-byte value, `0`, `1`, or `0x00ff`.
 pub(crate) const NEW_TASKS_ARE_MANUAL: u32 = 0x0240_13c8;
-/// WBS code mask. Project omits this entry for its ordinary numeric outline mask.
+/// WBS code mask. Project writes four zero bytes for its ordinary numeric
+/// outline mask in the paired corpus; absent also means no custom mask.
 const WBS_CODE_MASK: u32 = 0x0240_138b;
 
 pub(crate) fn has_default_wbs_mask(b: &[u8]) -> Result<bool, String> {
@@ -126,11 +127,11 @@ mod tests {
 
     #[test]
     fn recognizes_default_and_custom_wbs_masks() {
-        assert_eq!(has_default_wbs_mask(&stream(&[])), Ok(true));
         assert_eq!(
             has_default_wbs_mask(&stream(&[(WBS_CODE_MASK, &[0, 0, 0, 0])])),
             Ok(true)
         );
+        assert_eq!(has_default_wbs_mask(&stream(&[])), Ok(true));
         assert_eq!(
             has_default_wbs_mask(&stream(&[(WBS_CODE_MASK, &[1, 0, 0, 0])])),
             Ok(false)

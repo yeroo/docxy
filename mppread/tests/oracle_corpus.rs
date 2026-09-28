@@ -135,6 +135,7 @@ fn check_task_fields(
     imported: &projcore::Task,
     e: &projcore::Task,
     at: &dyn Fn(&str) -> String,
+    custom_wbs_mask: bool,
 ) {
     let Some(f) = &a.fields else {
         return;
@@ -151,12 +152,12 @@ fn check_task_fields(
         };
     }
     same!(guid);
-    if f.wbs.is_some() {
-        same!(wbs);
-    } else {
-        // A custom WBS mask has no per-task code in the MPP table. The
-        // importer leaves the value unknown instead of inventing "1.2".
+    if custom_wbs_mask {
+        // f8 has no per-task code: preserve the unknown value.
+        assert_eq!(f.wbs, None, "{}", at("decoded wbs"));
         assert_eq!(imported.wbs, None, "{}", at("imported wbs"));
+    } else {
+        same!(wbs);
     }
     same!(task_type);
     same!(active);
@@ -195,6 +196,7 @@ fn check_task_fields(
 }
 
 fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool {
+    let custom_wbs_mask = mpp.file_stem().is_some_and(|s| s == "f8-wbs-mask");
     let bytes = std::fs::read(mpp).unwrap();
     let xml_text = std::fs::read_to_string(xml).unwrap();
     let oracle = projcore::mspdi::read_mspdi(&xml_text).unwrap();
@@ -211,6 +213,22 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         Err(error) => panic!("{}: {error}", mpp.display()),
     };
+    if source == Oracle::Project {
+        if let (Some(root), Some(binary_root)) = (
+            oracle.tasks.iter().find(|t| t.uid == 0),
+            decoded.iter().find(|t| t.uid == 0),
+        ) {
+            assert_eq!(
+                binary_root
+                    .fields
+                    .as_ref()
+                    .and_then(|f| f.earned_value_method),
+                root.earned_value_method,
+                "{}: UID 0 EarnedValueMethod",
+                mpp.display()
+            );
+        }
+    }
     let expected: Vec<_> = oracle.tasks.iter().filter(|t| t.uid != 0).collect();
     let expected_uids: std::collections::HashSet<_> = expected.iter().map(|t| t.uid).collect();
     // Project's export omits a cross-project ghost predecessor even though
@@ -412,7 +430,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at);
+        check_task_fields(a, t, e, &at, custom_wbs_mask);
         assert_eq!(
             t.manual,
             e.manual,
@@ -439,7 +457,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let t = round.tasks.iter().find(|t| t.uid == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} round trip {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at);
+        check_task_fields(a, t, e, &at, custom_wbs_mask);
     }
     for ghost in decoded
         .iter()
@@ -528,6 +546,13 @@ fn project_2024_oracles() {
                 if t.wbs.as_deref().is_some_and(|w| w.contains("ABC")) {
                     seen.insert("wbs");
                 }
+                // f3's Child has no explicit WBS override in its generator.
+                if mpp.file_stem().is_some_and(|s| s == "f3-blanks")
+                    && t.name == "Child"
+                    && t.wbs.as_deref().is_some_and(|w| w.contains('.'))
+                {
+                    seen.insert("derived_wbs");
+                }
                 if t.task_type
                     .is_some_and(|kind| kind != projcore::TaskType::FixedUnits)
                 {
@@ -597,6 +622,7 @@ fn project_2024_oracles() {
             "guid",
             "create_date",
             "wbs",
+            "derived_wbs",
             "task_type",
             "active",
             "effort_driven",

@@ -108,6 +108,9 @@ def values(app):
     t = add(p, "Elapsed delay")
     t.LevelingDelay = "2ed"
     checks.append(("Elapsed delay", "LevelingDelayFormat", "8"))
+    t = add(p, "Estimated elapsed delay")
+    t.LevelingDelay = "2ed?"
+    checks.append(("Estimated elapsed delay", "LevelingDelayFormat", "40"))
     for name, delay, code in (("Hour delay", "3eh", "6"), ("Week delay", "1ew", "10"), ("Minute delay", "45m", "4")):
         t = add(p, name)
         t.LevelingDelay = delay

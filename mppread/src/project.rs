@@ -5,7 +5,8 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
-/// a task. Each decoded auto leaf is pinned
+/// a task. Each decoded automatic task without local children, including an
+/// inserted subproject, is pinned
 /// with a Must-Start-On constraint at its start and given a duration equal to
 /// the working minutes between its start and finish, so the scheduler reproduces
 /// the real dates. A **manual** leaf keeps its mode and its manual start,
@@ -173,9 +174,9 @@ fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> 
                 task.actual_cost = Some(p.actual_cost.clone());
                 task.remaining_cost = Some(p.remaining_cost.clone());
             }
-            // Pin only leaf tasks; a summary's dates roll up from its
-            // children, so a constraint on it would fight the rollup. A
-            // manual leaf is held by its pinned dates, not a constraint.
+            // Pin auto leaves and childless inserted subprojects. Outline
+            // summaries roll up from children, so a constraint would fight
+            // the rollup. Manual leaves use their stored dates instead.
             if outline_summary {
                 task.duration_min = 0;
             } else if t.manual {
@@ -283,6 +284,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             [4, 5, 7]
         );
+    }
+
+    #[test]
+    fn childless_subproject_keeps_its_duration_and_start_pin() {
+        let mut sub = task(1, 1, "Inserted plan", 1);
+        sub.fields = Some(crate::mpp::MppTaskFields {
+            is_subproject: Some(true),
+            ..crate::mpp::MppTaskFields::default()
+        });
+        let rows = import_tasks(vec![task(0, 0, "Project", 0), sub]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].summary);
+        assert_eq!(rows[0].is_subproject, Some(true));
+        assert!(rows[0].duration_min > 0);
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
     }
 
     #[test]

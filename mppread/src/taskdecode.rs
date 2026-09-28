@@ -291,7 +291,7 @@ fn current_fields(
         return Err(format!("invalid priority {priority} for UID {uid}"));
     }
     let leveling_delay_format = u16_at(rec, 162);
-    if !matches!(leveling_delay_format, 3..=12 | 21) {
+    if !matches!(leveling_delay_format & !32, 3..=12 | 21) {
         return Err(format!(
             "invalid LevelingDelayFormat {leveling_delay_format} for UID {uid}"
         ));
@@ -309,11 +309,14 @@ fn current_fields(
         level_assignments: Some(meta[16] & 0x04 != 0),
         leveling_can_split: Some(meta[16] & 0x02 != 0),
         leveling_delay: Some(i64::from(u32_at(rec, 70))),
-        // f2-values: 3eh/1ew/45m export codes 6/10/4 at +162.
+        // f2-values: 3eh/1ew/45m export 6/10/4, and 2ed? exports 40.
         leveling_delay_format: Some(i32::from(leveling_delay_format)),
         ignore_resource_calendar: Some(fixed2.meta[77] & 0x08 != 0),
+        // Fixed2 +76 bit 0x40 also appears on a real physical-EV task
+        // (progress/p2-work), so it cannot suppress 0x80. Project's UID 0
+        // summary alone exports EarnedValueMethod=0 despite both bits set.
         earned_value_method: Some(i32::from(
-            meta[26] & 0x80 == 0 && fixed2.meta[76] & 0x80 != 0,
+            uid != 0 && meta[26] & 0x80 == 0 && fixed2.meta[76] & 0x80 != 0,
         )),
         hide_bar: Some(meta[12] & 0x80 != 0),
         rollup: Some(meta[12] & 0x04 != 0),
@@ -535,6 +538,8 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             // per-task codes, but leave other codes unknown until that mask is decoded.
             let default_wbs_mask = props_data
                 .as_ref()
+                // Malformed Props makes WBS unknown here; the project import
+                // reports the Props error via NewTasksAreManual below.
                 .and_then(|p| crate::props::has_default_wbs_mask(p).ok())
                 .unwrap_or(false);
             let tasks = decode_current(
@@ -717,6 +722,7 @@ fn decode_legacy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::cfb::{Node, write_cfb_tree};
 
     #[test]
@@ -819,6 +825,59 @@ mod tests {
     fn props(new_tasks_are_manual: &[u8]) -> Vec<u8> {
         crate::props::stream(&[(crate::props::NEW_TASKS_ARE_MANUAL, new_tasks_are_manual)])
     }
+
+    fn outline_fixture() -> Streams {
+        let mut s = fixture();
+        s.fd.truncate(48);
+        s.fm.truncate(16 + 3 * 47);
+        s.vm.truncate(24);
+        s.v2.clear();
+        let rows: [(u32, u32, u8, Option<&str>); 6] = [
+            (0, 0, 0, Some("Project")),
+            (1, 1, 1, Some("One")),
+            (2, 2, 2, Some("Child A")),
+            (5, 3, 0, None),
+            (3, 4, 2, Some("Child B")),
+            (4, 5, 1, Some("Two")),
+        ];
+        for (entry, (uid, id, level, name)) in rows.into_iter().enumerate() {
+            let offset = s.fd.len() as u32;
+            let mut meta = [0u8; 47];
+            meta[4..8].copy_from_slice(&offset.to_le_bytes());
+            if let Some(name) = name {
+                let mut rec = [0u8; 202];
+                rec[..4].copy_from_slice(&id.to_le_bytes());
+                rec[4..8].copy_from_slice(&uid.to_le_bytes());
+                rec[172] = level;
+                rec[162..164].copy_from_slice(&8u16.to_le_bytes());
+                for d in [0x68, 0x6c] {
+                    rec[d..d + 4].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
+                }
+                s.fd.extend_from_slice(&rec);
+                let off = s.v2.len() as u32;
+                let mut value: Vec<_> = name.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                value.extend_from_slice(&0u16.to_le_bytes());
+                s.v2.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                s.v2.extend_from_slice(&value);
+                s.vm.extend_from_slice(&uid.to_le_bytes());
+                s.vm.extend_from_slice(&off.to_le_bytes());
+                s.vm.extend_from_slice(&0x000eu16.to_le_bytes());
+                s.vm.extend_from_slice(&0x0b40u16.to_le_bytes());
+            } else {
+                meta[..2].copy_from_slice(&4u16.to_le_bytes());
+                s.fd.extend_from_slice(&uid.to_le_bytes());
+                s.fd.extend_from_slice(&id.to_le_bytes());
+                s.fd.extend_from_slice(&[0; 8]);
+            }
+            assert_eq!(s.fm.len(), 16 + (3 + entry) * 47);
+            s.fm.extend_from_slice(&meta);
+        }
+        s.fm[8..12].copy_from_slice(&9u32.to_le_bytes());
+        s.vm[8..12].copy_from_slice(&5u32.to_le_bytes());
+        s.vm[20..24].copy_from_slice(&(s.v2.len() as u32).to_le_bytes());
+        (s.f2m, s.f2d) = fixed2_for(&s.fm);
+        s
+    }
     fn file(s: &Streams, include_fd: bool) -> Vec<u8> {
         let mut task = vec![
             Node::Stream("FixedMeta", s.fm.clone()),
@@ -856,6 +915,35 @@ mod tests {
         assert!(decode(&file(&s, true)).is_ok());
         s.vm[8..12].copy_from_slice(&4u32.to_le_bytes());
         reject(&s);
+    }
+    #[test]
+    fn derives_wbs_across_depth_pop_and_blank_only_for_default_mask() {
+        let mut s = outline_fixture();
+        let default = decode(&file(&s, true)).unwrap();
+        assert_eq!(
+            default
+                .iter()
+                .map(|t| t.fields.as_ref().and_then(|f| f.wbs.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                Some("0"),
+                Some("1"),
+                Some("1.1"),
+                None,
+                Some("1.2"),
+                Some("2")
+            ]
+        );
+        s.props = crate::props::stream(&[
+            (crate::props::NEW_TASKS_ARE_MANUAL, &[0, 0]),
+            (0x0240_138b, &[1, 0, 0, 0]),
+        ]);
+        let custom = decode(&file(&s, true)).unwrap();
+        assert!(
+            custom
+                .iter()
+                .all(|t| t.fields.as_ref().is_none_or(|f| f.wbs.is_none()))
+        );
     }
     #[test]
     fn null_rows_are_identified_by_fixedmeta_kind_and_count_for_id_gaps() {
@@ -1119,6 +1207,15 @@ mod tests {
         );
         assert_ne!(changed.create_date, base.create_date);
         assert_eq!(changed.deadline, changed.create_date);
+        s.fd[d + 162..d + 164].copy_from_slice(&40u16.to_le_bytes());
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .leveling_delay_format,
+            Some(40)
+        );
         s.fd[d + 162..d + 164].copy_from_slice(&99u16.to_le_bytes());
         reject(&s);
     }
@@ -1145,6 +1242,25 @@ mod tests {
                 .earned_value_method,
             Some(1)
         );
+        s.f2m[f + 76] |= 0x40; // also occurs on a real physical-EV task
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .earned_value_method,
+            Some(1)
+        );
+        s.f2m[16 + 3 * 96 + 76] = 0xc0; // UID 0 project summary
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[0]
+                .fields
+                .as_ref()
+                .unwrap()
+                .earned_value_method,
+            Some(0)
+        );
+        s.f2m[f + 76] &= !0x40;
         s.fm[m + 26] |= 0x80;
         assert_eq!(
             decode(&file(&s, true)).unwrap()[1]

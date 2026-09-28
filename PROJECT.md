@@ -238,15 +238,17 @@ task: its bookings are placed first, and auto tasks level around them.
   task layouts, `mppread` uses counted `FixedMeta` and `VarMeta` records to
   locate rows and names, then reads dates, outline levels and validated task
   fields at known offsets. Current Project blank rows keep their ID and UID;
-  GUID, WBS, type, flags, priority, deadline and leveling options survive an
-  import and MSPDI save. Project-derived over-allocation remains absent until
+  GUID, type, flags, priority, deadline and leveling options survive an
+  import and MSPDI save. Explicit WBS codes and generated codes under the
+  default numeric mask also survive; generated codes under a custom mask
+  remain absent. Project-derived over-allocation remains absent until
   resource and assignment records are decoded; recurring tasks still need a
   Project-authored binary oracle.
   Stored task IDs determine display order; stable UIDs connect predecessor
   links from `TBkndCons`. An unrecognized layout or malformed row causes an
-  import error. Imported leaves are pinned to decoded starts and durations;
-  summaries roll up from their children. Nonzero link lag still lacks a
-  real-file oracle.
+  import error. Imported automatic leaves and childless inserted subprojects
+  are pinned to decoded starts and durations; outline summaries roll up from
+  their children. Nonzero link lag still lacks a real-file oracle.
 
 ## Desktop suite entry table
 
