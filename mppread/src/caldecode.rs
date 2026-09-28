@@ -451,6 +451,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
         return Err("calendar FixedMeta count or FixedData length mismatch".into());
     }
     let mut rows = Vec::new();
+    let mut indexed_uids = HashSet::new();
     for i in 0..count {
         let e = &fm[16 + i * 10..26 + i * 10];
         let off = u32_at(e, 4) as usize;
@@ -471,7 +472,8 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
             // Some files append a 14-byte terminal row. Others end with an
             // ordinary 12-byte calendar row.
         } else {
-            if len != 12 || u16_at(e, 0) != 0 {
+            let kind = u16_at(e, 0);
+            if len != 12 || !matches!(kind, 0 | 2) {
                 return Err(format!("unrecognized calendar record {i}"));
             }
             let rec = &fd[off..end];
@@ -479,6 +481,10 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
             let base = i32_at(rec, 0);
             if uid <= 0 || base < -1 {
                 return Err(format!("invalid calendar UID {uid} or base UID {base}"));
+            }
+            indexed_uids.insert(uid);
+            if kind == 2 {
+                continue;
             }
             rows.push((
                 uid,
@@ -509,7 +515,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
         let e = &vm[24 + i * 12..36 + i * 12];
         let uid = i32_at(e, 0);
         let key = u16_at(e, 8);
-        if !uids.contains(&uid) || u16_at(e, 10) != 0x0d40 {
+        if !indexed_uids.contains(&uid) || u16_at(e, 10) != 0x0d40 {
             return Err(format!(
                 "invalid calendar VarMeta entry {i}: UID {uid}, key {key}, tag {:#x}",
                 u16_at(e, 10)
@@ -520,8 +526,10 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
             return Err(format!("duplicate calendar VarMeta key ({uid},{key})"));
         }
     }
+    fields.retain(|&(uid, _), _| uids.contains(&uid));
     let mut calendars = Vec::with_capacity(rows.len());
     let mut resources = None;
+    let mut live_resource_names: Option<HashMap<i32, String>> = None;
     for (uid, base_uid, resource_uid) in rows {
         // FixedData also contains unnamed internal/unused calendar rows.
         // Project omits these from MSPDI, and they have no VarMeta entries.
@@ -535,9 +543,29 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
                 Some(names) => names,
                 None => resources.insert(resource_names(&cfb, prefix)?),
             };
-            names.get(&resource_uid).cloned().ok_or_else(|| {
-                format!("calendar UID {uid} has no name or resource UID {resource_uid} name")
-            })?
+            match names.get(&resource_uid) {
+                Some(name) => name.clone(),
+                None => {
+                    if live_resource_names.is_none() {
+                        live_resource_names = Some(
+                            crate::rscdecode::decode(bytes, false)?
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|r| (r.uid, r.name))
+                                .collect(),
+                        );
+                    }
+                    live_resource_names
+                        .as_ref()
+                        .and_then(|names| names.get(&resource_uid))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "calendar UID {uid} has no name or resource UID {resource_uid} name"
+                            )
+                        })?
+                }
+            }
         } else {
             return Err(format!("missing calendar name for UID {uid}"));
         };
@@ -963,6 +991,172 @@ pub(crate) mod tests {
 
     fn file(fm: Vec<u8>, fd: Vec<u8>, vm: Vec<u8>, v2: Vec<u8>) -> Vec<u8> {
         file_with_default(fm, fd, vm, v2, "Standard")
+    }
+
+    fn with_calendar_row(
+        mut fm: Vec<u8>,
+        mut fd: Vec<u8>,
+        kind: u16,
+        row: &[u8],
+    ) -> (Vec<u8>, Vec<u8>) {
+        fd.splice(76..76, row.iter().copied());
+        let mut entry = [0u8; 10];
+        entry[..2].copy_from_slice(&kind.to_le_bytes());
+        entry[4..8].copy_from_slice(&76u32.to_le_bytes());
+        fm.splice(66..66, entry);
+        fm[8..12].copy_from_slice(&7u32.to_le_bytes());
+        fm[12..16].copy_from_slice(&(fd.len() as u32).to_le_bytes());
+        fm[16 + 6 * 10 + 4..16 + 6 * 10 + 8]
+            .copy_from_slice(&(76 + row.len() as u32).to_le_bytes());
+        (fm, fd)
+    }
+
+    fn resource_file(fm: Vec<u8>, fd: Vec<u8>, vm: Vec<u8>, v2: Vec<u8>, uid: i32) -> Vec<u8> {
+        let mut resource_fm = vec![0u8; 16 + 5 * 37];
+        resource_fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        resource_fm[8..12].copy_from_slice(&5u32.to_le_bytes());
+        let mut resource_fd = vec![0u8; 3 * 16 + 2 * 172];
+        for i in 0..5 {
+            let meta = 16 + i * 37;
+            let offset = if i < 3 { i * 16 } else { 48 + (i - 3) * 172 };
+            resource_fm[meta..meta + 2].copy_from_slice(
+                &(if i < 3 {
+                    4u16
+                } else if i == 4 {
+                    2
+                } else {
+                    0
+                })
+                .to_le_bytes(),
+            );
+            resource_fm[meta + 4..meta + 8].copy_from_slice(&(offset as u32).to_le_bytes());
+        }
+        for (i, row_uid) in [3u32, 4].into_iter().enumerate() {
+            let row = 48 + i * 172;
+            resource_fd[row..row + 4].copy_from_slice(&(i as u32).to_le_bytes());
+            resource_fd[row + 4..row + 8].copy_from_slice(&row_uid.to_le_bytes());
+            resource_fd[row + 8..row + 16].copy_from_slice(&10000f64.to_le_bytes());
+            resource_fd[row + 166..row + 168].copy_from_slice(&2u16.to_le_bytes());
+        }
+        let mut resource_vm = vec![0u8; 24];
+        resource_vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        let default: Vec<_> = "Standard"
+            .encode_utf16()
+            .chain([0, 0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        let mut fd = fd;
+        fd[80..84].copy_from_slice(&uid.to_le_bytes());
+        write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                Node::Stream("Props", props::stream(&[(0x0240_000e, &default)])),
+                Node::Storage(
+                    "TBkndCal",
+                    vec![
+                        Node::Stream("FixedMeta", fm),
+                        Node::Stream("FixedData", fd),
+                        Node::Stream("VarMeta", vm),
+                        Node::Stream("Var2Data", v2),
+                    ],
+                ),
+                Node::Storage(
+                    "TBkndRsc",
+                    vec![
+                        Node::Stream("FixedMeta", resource_fm),
+                        Node::Stream("FixedData", resource_fd),
+                        Node::Stream("VarMeta", resource_vm),
+                        Node::Stream("Var2Data", Vec::new()),
+                    ],
+                ),
+            ],
+        )])
+    }
+
+    #[test]
+    fn skips_deleted_calendar_before_live_same_uid() {
+        let (fm, fd, vm, v2) = fixture();
+        let mut deleted = [0u8; 12];
+        deleted[8..12].copy_from_slice(&5i32.to_le_bytes());
+        let (fm, fd) = with_calendar_row(fm, fd, 2, &deleted);
+        let decoded = decode(&file(fm.clone(), fd.clone(), vm.clone(), v2.clone()), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            decoded.calendars.iter().map(|c| c.uid).collect::<Vec<_>>(),
+            [1, 5]
+        );
+
+        let mut wrong_kind = fm.clone();
+        wrong_kind[66..68].copy_from_slice(&3u16.to_le_bytes());
+        assert!(decode(&file(wrong_kind, fd.clone(), vm.clone(), v2.clone()), false).is_err());
+        let (short_fm, short_fd) = with_calendar_row(fixture().0, fixture().1, 2, &deleted[..11]);
+        assert!(decode(&file(short_fm, short_fd, vm, v2), false).is_err());
+    }
+
+    #[test]
+    fn validates_deleted_calendar_varmeta_before_ignoring_it() {
+        let (fm, fd, mut vm, mut v2) = fixture();
+        let mut deleted = [0u8; 12];
+        deleted[8..12].copy_from_slice(&9i32.to_le_bytes());
+        let (fm, fd) = with_calendar_row(fm, fd, 2, &deleted);
+        let entry = vm.len();
+        vm.extend_from_slice(&9i32.to_le_bytes());
+        vm.extend_from_slice(&(v2.len() as u32).to_le_bytes());
+        vm.extend_from_slice(&1u16.to_le_bytes());
+        vm.extend_from_slice(&0x0d40u16.to_le_bytes());
+        vm[8..12].copy_from_slice(&5u32.to_le_bytes());
+        v2.extend_from_slice(&2u32.to_le_bytes());
+        v2.extend_from_slice(&[0, 0]);
+        vm[20..24].copy_from_slice(&(v2.len() as u32).to_le_bytes());
+        assert_eq!(
+            decode(&file(fm.clone(), fd.clone(), vm.clone(), v2.clone()), false)
+                .unwrap()
+                .unwrap()
+                .calendars
+                .len(),
+            2
+        );
+        let mut duplicate = vm.clone();
+        duplicate.extend_from_slice(&vm[entry..entry + 12]);
+        duplicate[8..12].copy_from_slice(&6u32.to_le_bytes());
+        let error =
+            decode(&file(fm.clone(), fd.clone(), duplicate, v2.clone()), false).unwrap_err();
+        assert!(
+            error.contains("duplicate calendar VarMeta key (9,1)"),
+            "{error}"
+        );
+        let mut bad = vm.clone();
+        bad[entry..entry + 4].copy_from_slice(&99i32.to_le_bytes());
+        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone()), false).is_err());
+        let mut bad = vm.clone();
+        bad[entry + 10..entry + 12].copy_from_slice(&0u16.to_le_bytes());
+        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone()), false).is_err());
+        let mut bad = vm;
+        bad[entry + 4..entry + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(decode(&file(fm, fd, bad, v2), false).is_err());
+    }
+
+    #[test]
+    fn unnamed_live_resource_calendar_gets_empty_name() {
+        let (fm, fd, mut vm, v2) = fixture();
+        vm.drain(48..60); // Remove calendar UID 5's key-1 name.
+        vm[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let decoded = decode(
+            &resource_file(fm.clone(), fd.clone(), vm.clone(), v2.clone(), 3),
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(decoded.calendars[1].name, "");
+        for uid in [4, 99] {
+            let error = decode(
+                &resource_file(fm.clone(), fd.clone(), vm.clone(), v2.clone(), uid),
+                false,
+            )
+            .unwrap_err();
+            assert!(error.contains("has no name or resource UID"), "{error}");
+        }
     }
 
     #[test]
