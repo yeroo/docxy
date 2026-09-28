@@ -65,6 +65,31 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         cal_ref.calendars = calendars;
         cal_ref.default_calendar_uid = default_calendar_uid;
     }
+    let tasks = import_tasks(decoded, &cal_ref, has_calendar_table)?;
+    let start = tasks
+        .iter()
+        .filter_map(|t| t.stored_start)
+        .min()
+        .unwrap_or_else(default_anchor);
+    let project = Project {
+        name,
+        title: info.title,
+        start_date: Some(start),
+        tasks,
+        new_tasks_are_manual,
+        ..cal_ref
+    };
+    if let Some(error) = projcore::schedule::calendar_error(&project) {
+        return Err(format!("cannot read the calendars of this .mpp ({error})"));
+    }
+    Ok(project)
+}
+
+fn import_tasks(
+    decoded: Vec<crate::mpp::MppTask>,
+    cal_ref: &Project,
+    has_calendar_table: bool,
+) -> Result<Vec<Task>, String> {
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // Only a local deeper row can form a schedulable outline summary. Project
     // labels childless inserted subprojects as summaries in XML, but they must
@@ -189,9 +214,8 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             }
             // Pin auto leaves and childless inserted subprojects. Outline
             // summaries roll up from children; manual leaves use stored dates.
-            let span = || {
-                projcore::schedule::working_minutes_between_on(&cal_ref, task.calendar_uid, s, f)
-            };
+            let span =
+                || projcore::schedule::working_minutes_between_on(cal_ref, task.calendar_uid, s, f);
             if outline_summary {
                 task.duration_min = 0;
             } else if t.manual {
@@ -208,23 +232,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             Ok(task)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let start = tasks
-        .iter()
-        .filter_map(|t| t.stored_start)
-        .min()
-        .unwrap_or_else(default_anchor);
-    let project = Project {
-        name,
-        title: info.title,
-        start_date: Some(start),
-        tasks,
-        new_tasks_are_manual,
-        ..cal_ref
-    };
-    if let Some(error) = projcore::schedule::calendar_error(&project) {
-        return Err(format!("cannot read the calendars of this .mpp ({error})"));
-    }
-    Ok(project)
+    Ok(tasks)
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
@@ -250,11 +258,43 @@ fn parse_mpp_dt(s: &str) -> Option<DateTime> {
 mod tests {
     use super::*;
 
+    fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> {
+        super::import_tasks(decoded, &Project::default(), false)
+    }
+
+    fn task(id: u32, uid: u32, name: &str, level: u32) -> crate::mpp::MppTask {
+        crate::mpp::MppTask {
+            id,
+            uid,
+            name: name.into(),
+            start: Some("2026-03-02 08:00".into()),
+            finish: Some("2026-03-03 08:00".into()),
+            outline_level: Some(level),
+            ..crate::mpp::MppTask::default()
+        }
+    }
+
+    fn blank(id: u32, uid: u32) -> crate::mpp::MppTask {
+        crate::mpp::MppTask {
+            id,
+            uid,
+            is_null: true,
+            ..crate::mpp::MppTask::default()
+        }
+    }
+
     #[test]
     fn blank_rows_between_before_child_and_trailing_preserve_outline() {
-        let rows = project_from_mpp(include_bytes!("../../corpus/mpp/task-fields/f3-blanks.mpp"))
-            .unwrap()
-            .tasks;
+        let rows = import_tasks(vec![
+            task(0, 0, "Project", 0),
+            task(1, 1, "Summary", 1),
+            blank(2, 4), // immediately before the child
+            task(3, 2, "Child", 2),
+            blank(4, 5), // between real tasks
+            task(5, 3, "After", 1),
+            blank(6, 7), // trailing blank cannot make After a summary
+        ])
+        .unwrap();
         assert_eq!(
             rows.iter()
                 .map(|t| (t.id, t.uid, t.is_null))
@@ -265,7 +305,7 @@ mod tests {
                 (3, 2, false),
                 (4, 5, true),
                 (5, 3, false),
-                (6, 6, true)
+                (6, 7, true)
             ]
         );
         assert!(rows[0].summary);
@@ -287,29 +327,33 @@ mod tests {
                 .filter(|t| t.is_null)
                 .map(|t| t.uid)
                 .collect::<Vec<_>>(),
-            [4, 5, 6]
+            [4, 5, 7]
         );
     }
 
     #[test]
     fn childless_subproject_keeps_its_duration_and_start_pin() {
-        let project = project_from_mpp(include_bytes!(
-            "../../corpus/mpp/task-fields/f6-subprojects.mpp"
-        ))
-        .unwrap();
-        let sub = project
-            .tasks
-            .iter()
-            .find(|t| t.is_subproject == Some(true))
-            .unwrap();
-        assert!(!sub.summary);
-        assert!(sub.duration_min > 0);
-        assert_eq!(sub.constraint, ConstraintType::MustStartOn);
-        assert_eq!(sub.constraint_date, sub.stored_start);
+        let mut sub = task(1, 1, "Inserted plan", 1);
+        sub.fields = Some(crate::mpp::MppTaskFields {
+            is_subproject: Some(true),
+            ..crate::mpp::MppTaskFields::default()
+        });
+        let rows = import_tasks(vec![task(0, 0, "Project", 0), sub]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].summary);
+        assert_eq!(rows[0].is_subproject, Some(true));
+        assert!(rows[0].duration_min > 0);
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        let project = Project {
+            start_date: rows[0].stored_start,
+            tasks: rows,
+            ..Project::default()
+        };
         let scheduled = projcore::schedule::schedule(&project);
         assert_eq!(
-            scheduled.get(sub.uid).map(|r| r.early_start),
-            sub.stored_start
+            scheduled.get(1).map(|r| r.early_start),
+            project.tasks[0].stored_start
         );
     }
 
