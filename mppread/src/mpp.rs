@@ -47,11 +47,15 @@ pub struct MppInfo {
 
 /// A task decoded from a recognized `.mpp` table. `id` is the visible row
 /// number; `uid` is the stable reference used by predecessor links. UID 0 is
-/// Project's summary row. Dates use `YYYY-MM-DD HH:MM`.
+/// Project's summary row. Dates use `YYYY-MM-DD HH:MM`. A blank row has only
+/// its ID and UID: name is empty and dates, outline, progress and fields are
+/// absent.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MppTask {
     pub id: u32,
     pub uid: u32,
+    /// A blank task row retained by Project's grid.
+    pub is_null: bool,
     pub name: String,
     pub start: Option<String>,
     pub finish: Option<String>,
@@ -72,9 +76,46 @@ pub struct MppTask {
     pub duration_format: Option<u16>,
     /// Task CalendarUID as stored (-1 means no own calendar); absent for MPP9.
     pub calendar_uid: Option<i32>,
-    /// Recorded progress as Project stored it. `None` for a layout whose
-    /// progress fields are not validated (MPP9).
+    /// Recorded progress as Project stored it. `None` for MPP9 and blank rows.
     pub progress: Option<MppProgress>,
+    /// Task fields validated for the current MPP layout. `None` for MPP9 and
+    /// blank rows.
+    pub fields: Option<MppTaskFields>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MppTaskFields {
+    pub guid: Option<String>,
+    pub create_date: Option<String>,
+    /// Explicit WBS code, or a generated code when the Project mask is the
+    /// ordinary numeric outline mask. Custom masks remain unknown.
+    pub wbs: Option<String>,
+    pub task_type: Option<projcore::TaskType>,
+    pub active: Option<bool>,
+    pub effort_driven: Option<bool>,
+    pub estimated: Option<bool>,
+    pub priority: Option<i32>,
+    pub deadline: Option<String>,
+    pub level_assignments: Option<bool>,
+    pub leveling_can_split: Option<bool>,
+    pub leveling_delay: Option<i64>,
+    pub leveling_delay_format: Option<i32>,
+    pub ignore_resource_calendar: Option<bool>,
+    pub earned_value_method: Option<i32>,
+    /// Project's recurring-task flag, validated against the UI-authored
+    /// `snapshots/x-recurring` summary and four occurrences.
+    pub recurring: Option<bool>,
+    pub hide_bar: Option<bool>,
+    pub rollup: Option<bool>,
+    pub external_task: Option<bool>,
+    pub is_subproject: Option<bool>,
+    pub is_subproject_read_only: Option<bool>,
+    /// Derived for the current layout from each direct assignment's units and
+    /// its resource availability. A valid empty assignment table gives false;
+    /// missing or unrecognized assignments, or needed resources, leave it
+    /// absent. Project does not store a task-local bit for this field.
+    pub over_allocated: Option<bool>,
+    pub milestone: Option<bool>,
 }
 
 /// A task's recorded progress, work and cost, in MSPDI's units: whole minutes

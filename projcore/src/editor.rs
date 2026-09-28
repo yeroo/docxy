@@ -1114,6 +1114,7 @@ impl Editor {
                     k,
                     AssignmentBaseline {
                         number: 0,
+                        timephased_data: Vec::new(),
                         start: Some(span.0),
                         finish: Some(span.1),
                         work_min: Some(a.work_min),
@@ -1154,6 +1155,7 @@ impl Editor {
                     j,
                     ResourceBaseline {
                         number: 0,
+                        timephased_data: Vec::new(),
                         work_min: Some(r.work_min.unwrap_or(work)),
                         cost,
                         bcws: None,
@@ -5178,5 +5180,88 @@ mod tests {
         let xml = crate::mspdi::write_mspdi(ed.project());
         assert_eq!(kinds(&crate::mspdi::read_mspdi(&xml).unwrap()), [20]);
         assert_eq!(ed.clear_baseline(), Ok(false));
+    }
+
+    #[test]
+    fn set_and_clear_baseline_replace_nested_records_in_slot_zero_only() {
+        let mut proj = baselined();
+        let record = |kind| TimephasedValue {
+            kind,
+            value: Some("PT8H0M0S".into()),
+            ..TimephasedValue::default()
+        };
+        for baseline in &mut proj.tasks[0].baselines {
+            baseline.timephased_data.push(record(10 + baseline.number));
+        }
+        for baseline in &mut proj.resources[0].baselines {
+            baseline.timephased_data.push(record(20 + baseline.number));
+        }
+        for baseline in &mut proj.assignments[0].baselines {
+            baseline.timephased_data.push(record(30 + baseline.number));
+        }
+        proj.resources[0].timephased_data = vec![record(7), record(20)];
+        let mut ed = Editor::new(proj);
+        ed.set_baseline();
+        let project = ed.project();
+        assert!(
+            project.tasks[0]
+                .baseline(0)
+                .unwrap()
+                .timephased_data
+                .is_empty()
+        );
+        assert!(
+            project.resources[0]
+                .baseline(0)
+                .unwrap()
+                .timephased_data
+                .is_empty()
+        );
+        assert!(
+            project.assignments[0]
+                .baseline(0)
+                .unwrap()
+                .timephased_data
+                .is_empty()
+        );
+        assert_eq!(
+            project.tasks[0].baseline(1).unwrap().timephased_data,
+            [record(11)]
+        );
+        assert_eq!(
+            project.resources[0].baseline(1).unwrap().timephased_data,
+            [record(21)]
+        );
+        assert_eq!(
+            project.assignments[0].baseline(3).unwrap().timephased_data,
+            [record(33)]
+        );
+        assert_eq!(project.resources[0].timephased_data, [record(20)]);
+        assert_eq!(
+            project.assignments[0]
+                .timephased_data
+                .iter()
+                .map(|t| t.kind)
+                .collect::<Vec<_>>(),
+            [1, 16]
+        );
+
+        assert_eq!(ed.clear_baseline(), Ok(true));
+        let project = ed.project();
+        assert!(project.tasks[0].baseline(0).is_none());
+        assert!(project.resources[0].baseline(0).is_none());
+        assert!(project.assignments[0].baseline(0).is_none());
+        assert_eq!(
+            project.tasks[0].baseline(1).unwrap().timephased_data,
+            [record(11)]
+        );
+        assert_eq!(
+            project.resources[0].baseline(1).unwrap().timephased_data,
+            [record(21)]
+        );
+        assert_eq!(
+            project.assignments[0].baseline(3).unwrap().timephased_data,
+            [record(33)]
+        );
     }
 }

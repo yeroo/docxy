@@ -145,6 +145,7 @@ pub(crate) fn decode(
                 cost,
                 bcws: None,
                 bcwp: None,
+                timephased_data: Vec::new(),
             });
         }
         out.push(Assignment {
