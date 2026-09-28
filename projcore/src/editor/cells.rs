@@ -713,6 +713,8 @@ pub fn parse_lag(text: &str, proj: &Project) -> Option<(i64, LagFormat)> {
     let value = if unit == LagUnit::Percent {
         num.parse::<i64>().ok()?
     } else if !elapsed {
+        // Only the lag's own numeric part may precede its single-letter unit.
+        num.parse::<f64>().ok()?;
         parse_duration(&format!("{num}{}", unit_suffix(unit)), proj)?
     } else if let Ok(exact) = num.parse::<i64>() {
         exact.checked_mul(elapsed_unit_min(unit)? as i64)?

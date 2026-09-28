@@ -14,6 +14,7 @@ use crate::schedule::{Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
 const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
+pub const DURATION_HINT: &str = "try 3d, 4h, 2w, 1mo";
 
 mod cells;
 mod effort;
@@ -648,7 +649,7 @@ impl Editor {
     /// [`parse_task_duration`]).
     pub fn set_duration(&mut self, uid: i32, text: &str) -> Result<(), String> {
         let (min, estimated) = parse_task_duration(text, &self.proj)
-            .ok_or_else(|| format!("Couldn't read duration '{text}' (try 3d, 4h, 2w, 1mo)"))?;
+            .ok_or_else(|| format!("Couldn't read duration '{text}' ({DURATION_HINT})"))?;
         self.set_duration_min(uid, min, estimated)
     }
 
@@ -1714,12 +1715,12 @@ pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
         ("d", Unit::Day),
         ("w", Unit::Week),
     ];
-    let (num, unit) = if t.parse::<f64>().is_ok() {
-        (t.as_str(), Unit::Day)
+    let (num, v, unit) = if let Ok(v) = t.parse::<f64>() {
+        (t.as_str(), v, Unit::Day)
     } else {
         spellings.iter().find_map(|(suffix, unit)| {
             let num = t.strip_suffix(suffix)?.trim();
-            num.parse::<f64>().ok().map(|_| (num, *unit))
+            num.parse::<f64>().ok().map(|v| (num, v, *unit))
         })?
     };
     // Exact minute literals must not lose integer precision through f64.
@@ -1728,7 +1729,6 @@ pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
             return Some(minutes);
         }
     }
-    let v: f64 = num.parse().ok()?;
     let minutes = match unit {
         Unit::Hour => v * 60.0,
         Unit::Week => v * proj.hours_per_week * 60.0,

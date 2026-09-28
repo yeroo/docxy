@@ -29,7 +29,9 @@
 
 use ctlcore::json::Json;
 use projcore::datetime::DateTime;
-use projcore::editor::{Editor, TaskPatch, parse_duration, parse_lag, parse_task_duration};
+use projcore::editor::{
+    DURATION_HINT, Editor, TaskPatch, parse_duration, parse_lag, parse_task_duration,
+};
 use projcore::model::{LagFormat, LinkType, Predecessor, Task};
 
 /// Successful calls to these verbs signal agent editing activity.
@@ -226,7 +228,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get_str("duration")
         .map(|d| {
             parse_task_duration(d, ed.project())
-                .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w, 1mo)"))
+                .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))
         })
         .transpose()?;
     let level = args
@@ -261,7 +263,7 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .transpose()?;
     let (duration_min, estimated) = match args.get_str("duration") {
         Some(d) => parse_task_duration(d, ed.project())
-            .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w, 1mo)"))?,
+            .ok_or_else(|| format!("Couldn't read duration '{d}' ({DURATION_HINT})"))?,
         // The default duration is estimated when the plan's new tasks are.
         None => (480, ed.project().new_tasks_estimated()),
     };
@@ -545,6 +547,7 @@ mod tests {
             ("4h", 240, 5),
             ("2", 960, 7),
             ("1mo", 9600, 7),
+            ("1 month", 9600, 7),
             ("2 weeks", 4800, 7),
         ] {
             let mut a = app();

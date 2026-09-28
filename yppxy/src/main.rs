@@ -35,8 +35,8 @@ use ribbon::{Act, Ribbon};
 use mppread::project::project_from_mpp;
 use projcore::datetime::DateTime;
 use projcore::editor::{
-    AssignOutcome, Editor, FindOutcome, constraint_hint, duration_suffix, format_resource_names,
-    parse_task_duration,
+    AssignOutcome, DURATION_HINT, Editor, FindOutcome, constraint_hint, duration_suffix,
+    format_resource_names, parse_task_duration,
 };
 #[cfg(test)]
 use projcore::model::Predecessor;
@@ -883,7 +883,7 @@ impl App {
                 self.status = message;
             }
         } else if parse_task_duration(text, self.ed.project()).is_none() {
-            self.status = format!("Couldn't read duration '{text}' (try 3d, 4h, 2w, 1mo)");
+            self.status = format!("Couldn't read duration '{text}' ({DURATION_HINT})");
         }
     }
 

@@ -1705,7 +1705,7 @@ impl Project {
     /// Working days per month, using Project's default when the option is invalid.
     pub fn days_per_month(&self) -> f64 {
         self.option("DaysPerMonth")
-            .and_then(|text| text.parse::<f64>().ok())
+            .and_then(|text| text.trim().parse::<f64>().ok())
             .filter(|days| days.is_finite() && *days > 0.0)
             .unwrap_or(20.0)
     }
@@ -1828,6 +1828,7 @@ mod tests {
         assert_eq!(project.days_per_month(), 20.0);
         for (text, expected) in [
             ("22", 22.0),
+            (" 22 ", 22.0),
             ("0", 20.0),
             ("-3", 20.0),
             ("inf", 20.0),
