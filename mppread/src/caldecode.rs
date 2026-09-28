@@ -147,8 +147,9 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
         if last < first {
             return Err(format!("calendar exception {index} ends before it starts"));
         }
-        // These reserved bytes are zero in both the COM-built snapshots and
-        // the Project-resaved MSPDI probes, unlike the Type 1 pattern word.
+        // These reserved bytes are zero in the generated snapshots, the
+        // MSPDI-resaved probes and the COM Exceptions.Add probes, unlike the
+        // Type 1 pattern word.
         if u16_at(rec, 6) != 0
             || rec[9..14].iter().any(|&b| b != 0)
             || rec[73..76].iter().any(|&b| b != 0)
