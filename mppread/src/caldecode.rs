@@ -132,18 +132,12 @@ fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, Strin
     Ok(names)
 }
 
-pub(crate) fn decode(bytes: &[u8]) -> Result<Option<(Vec<Calendar>, i32)>, String> {
+pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>, i32)>, String> {
+    if legacy {
+        return Ok(None);
+    }
     let cfb = Cfb::open(bytes)?;
     let paths = cfb.paths();
-    // MPP9 uses a different task and calendar layout. Its task FixedMeta has
-    // 8-byte schema stubs, versus 16-byte stubs in the current layout.
-    if let Some(task_meta) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) {
-        if let Some(meta) = cfb.read_path(task_meta) {
-            if meta.len() >= 24 && u32_at(&meta, 20) == 8 {
-                return Ok(None);
-            }
-        }
-    }
     let cal_paths: Vec<_> = paths.iter().filter(|p| p.contains("TBkndCal/")).collect();
     if cal_paths.is_empty() {
         return Ok(None);
@@ -266,12 +260,9 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Option<(Vec<Calendar>, i32)>, Strin
         let week = match fields.get(&(uid, 8)) {
             Some(value) => hours(value, base_uid.is_none())?,
             None if base_uid.is_some() => std::array::from_fn(|_| None),
-            None if calendar_name == "Standard"
-                || calendar_name == "Used for Microsoft Project 98 Baseline Calendar" =>
-            {
-                Calendar::standard_week().map(Some)
-            }
-            None => return Err(format!("missing calendar hours for UID {uid}")),
+            // A base without a key-8 block uses Project's built-in week,
+            // regardless of its name. MPXJ applies the same default.
+            None => Calendar::standard_week().map(Some),
         };
         calendars.push(Calendar {
             uid,
@@ -406,8 +397,14 @@ mod tests {
         (fm, fd, vm, v2)
     }
 
-    fn file(fm: Vec<u8>, fd: Vec<u8>, vm: Vec<u8>, v2: Vec<u8>) -> Vec<u8> {
-        let default: Vec<_> = "Standard"
+    fn file_with_default(
+        fm: Vec<u8>,
+        fd: Vec<u8>,
+        vm: Vec<u8>,
+        v2: Vec<u8>,
+        default_name: &str,
+    ) -> Vec<u8> {
+        let default: Vec<_> = default_name
             .encode_utf16()
             .chain([0, 0])
             .flat_map(u16::to_le_bytes)
@@ -429,10 +426,31 @@ mod tests {
         )])
     }
 
+    fn file(fm: Vec<u8>, fd: Vec<u8>, vm: Vec<u8>, v2: Vec<u8>) -> Vec<u8> {
+        file_with_default(fm, fd, vm, v2, "Standard")
+    }
+
+    #[test]
+    fn hours_less_base_uses_builtin_week_regardless_of_name() {
+        let (fm, fd, mut vm, mut v2) = fixture();
+        // "Workdays" and "Standard" have equal UTF-16 block sizes.
+        for (i, unit) in "Workdays".encode_utf16().enumerate() {
+            v2[4 + i * 2..6 + i * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        vm.drain(36..48); // remove the base calendar's key-8 entry
+        vm[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let (calendars, uid) = decode(&file_with_default(fm, fd, vm, v2, "Workdays"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(uid, 1);
+        assert_eq!(calendars[0].name, "Workdays");
+        assert_eq!(calendars[0].week, Calendar::standard_week().map(Some));
+    }
+
     #[test]
     fn decodes_base_and_derived_weekdays() {
         let (fm, fd, vm, v2) = fixture();
-        let (cals, default) = decode(&file(fm, fd, vm, v2)).unwrap().unwrap();
+        let (cals, default) = decode(&file(fm, fd, vm, v2), false).unwrap().unwrap();
         assert_eq!(default, 1);
         assert_eq!(
             cals.iter()
@@ -452,23 +470,23 @@ mod tests {
         let (fm, fd, vm, v2) = fixture();
         let mut bad = fm.clone();
         bad[0] = 0;
-        assert!(decode(&file(bad, fd.clone(), vm.clone(), v2.clone())).is_err());
+        assert!(decode(&file(bad, fd.clone(), vm.clone(), v2.clone()), false).is_err());
         let mut bad = fm.clone();
         bad[8..12].copy_from_slice(&7u32.to_le_bytes());
-        assert!(decode(&file(bad, fd.clone(), vm.clone(), v2.clone())).is_err());
+        assert!(decode(&file(bad, fd.clone(), vm.clone(), v2.clone()), false).is_err());
         let mut bad = vm.clone();
         bad[8..12].copy_from_slice(&5u32.to_le_bytes());
-        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone())).is_err());
+        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone()), false).is_err());
         let mut bad = vm.clone();
         bad[24 + 3 * 12 + 4..24 + 3 * 12 + 8].copy_from_slice(&u32::MAX.to_le_bytes());
-        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone())).is_err());
+        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone()), false).is_err());
         let mut bad = v2.clone();
         let off = u32_at(&vm, 24 + 3 * 12 + 4) as usize;
         bad[off + 4 + 2 * 60 + 2..off + 4 + 2 * 60 + 4].copy_from_slice(&6u16.to_le_bytes());
-        assert!(decode(&file(fm.clone(), fd.clone(), vm.clone(), bad)).is_err());
+        assert!(decode(&file(fm.clone(), fd.clone(), vm.clone(), bad), false).is_err());
         let mut bad = fd.clone();
         bad[76..80].copy_from_slice(&99i32.to_le_bytes());
-        assert!(decode(&file(fm, bad, vm, v2)).is_err());
+        assert!(decode(&file(fm, bad, vm, v2), false).is_err());
     }
 
     #[test]
@@ -476,13 +494,13 @@ mod tests {
         let (fm, fd, vm, v2) = fixture();
         let mut bad = vm.clone();
         bad[24..28].copy_from_slice(&99u32.to_le_bytes());
-        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone())).is_err());
+        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone()), false).is_err());
         let mut bad = vm.clone();
         bad[24 + 12 + 8..24 + 12 + 10].copy_from_slice(&1u16.to_le_bytes());
-        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone())).is_err());
+        assert!(decode(&file(fm.clone(), fd.clone(), bad, v2.clone()), false).is_err());
         let mut bad = v2.clone();
         bad[4..6].copy_from_slice(&0xd800u16.to_le_bytes());
-        assert!(decode(&file(fm, fd, vm, bad)).is_err());
+        assert!(decode(&file(fm, fd, vm, bad), false).is_err());
     }
 
     #[test]
@@ -507,6 +525,47 @@ mod tests {
     #[test]
     fn no_calendar_storage_keeps_synthesized_standard() {
         let bytes = write_cfb_tree(&[Node::Stream("Props", vec![0u8; 4])]);
-        assert_eq!(decode(&bytes), Ok(None));
+        assert_eq!(decode(&bytes, false), Ok(None));
+    }
+
+    #[test]
+    fn legacy_task_layout_ignores_its_unrecognized_calendar_storage() {
+        let mut fm = vec![0u8; 16 + 4 * 47];
+        fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        fm[8..12].copy_from_slice(&4u32.to_le_bytes());
+        for (i, offset) in [0u32, 8, 16, 24].into_iter().enumerate() {
+            let p = 16 + i * 47 + 4;
+            fm[p..p + 4].copy_from_slice(&offset.to_le_bytes());
+        }
+        let mut fd = vec![0u8; 24 + 264];
+        for offset in [24 + 88, 24 + 92] {
+            fd[offset..offset + 4].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
+        }
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        vm[8..12].copy_from_slice(&1u32.to_le_bytes());
+        vm[20..24].copy_from_slice(&8u32.to_le_bytes());
+        vm.extend_from_slice(&0u16.to_le_bytes());
+        vm.extend_from_slice(&0x0b00u16.to_le_bytes());
+        vm.extend_from_slice(&0u32.to_le_bytes());
+        let v2 = vec![4, 0, 0, 0, b'P', 0, 0, 0];
+        let bytes = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                Node::Storage(
+                    "TBkndTask",
+                    vec![
+                        Node::Stream("FixedMeta", fm),
+                        Node::Stream("FixedData", fd),
+                        Node::Stream("VarMeta", vm),
+                        Node::Stream("Var2Data", v2),
+                    ],
+                ),
+                Node::Storage("TBkndCal", vec![Node::Stream("VarMeta", vec![1, 2])]),
+            ],
+        )]);
+        assert!(crate::taskdecode::decode_table(&bytes).unwrap().legacy);
+        let project = crate::project::project_from_mpp(&bytes).unwrap();
+        assert_eq!(project.calendars, vec![Calendar::standard(1)]);
     }
 }

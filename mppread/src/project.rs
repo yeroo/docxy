@@ -23,6 +23,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)
         .map_err(|e| format!("cannot read the task table of this .mpp ({e})"))?;
+    let legacy = table.legacy;
     let new_tasks_are_manual = table
         .new_tasks_are_manual
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
@@ -42,7 +43,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .unwrap_or_else(|| "Imported project".into())
     });
     let mut cal_ref = Project::default();
-    if let Some((calendars, default_calendar_uid)) = crate::caldecode::decode(bytes)
+    if let Some((calendars, default_calendar_uid)) = crate::caldecode::decode(bytes, legacy)
         .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?
     {
         cal_ref.calendars = calendars;

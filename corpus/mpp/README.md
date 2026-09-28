@@ -206,9 +206,12 @@ field map before it can be imported.
 Current Project blank rows are identified by their short FixedMeta record and
 omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
-row ID order. Resources, assignments, calendars, baselines, constraints, and
-custom fields are not imported. Task progress is (see below); assignment
-progress needs assignments first.
+row ID order. Resources, assignments, baselines, constraints, and custom fields
+are not imported. Newest-layout base and derived calendars, their weekdays,
+and the default calendar are imported; exceptions and task calendar assignment
+are not. An invalid newest calendar table refuses import. Files without
+`TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
+imported (see below); assignment progress needs assignments first.
 
 Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
 byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and
