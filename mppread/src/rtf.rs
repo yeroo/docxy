@@ -277,7 +277,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                             skip_fallback(bytes, &mut pos, state.uc)?;
                         }
                         b"par" | b"line" if !state.hidden => {
-                            out.extend([b'\r' as u16, b'\n' as u16]);
+                            out.push(u16::from(b'\n'));
                             final_par = word == b"par";
                         }
                         b"tab" | b"emdash" | b"endash" | b"bullet" | b"lquote" | b"rquote"
@@ -320,7 +320,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                                 pos += 1;
                             }
                             if !state.hidden {
-                                out.extend([b'\r' as u16, b'\n' as u16]);
+                                out.push(u16::from(b'\n'));
                                 final_par = true;
                             }
                         }
@@ -363,7 +363,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
     // RichEdit ends every note with a paragraph marker, which Project's XML
     // export does not include as part of Notes.
     if final_par {
-        out.truncate(out.len() - 2);
+        out.pop();
     }
     String::from_utf16(&out).map_err(|_| ())
 }
@@ -376,7 +376,9 @@ pub(crate) fn plain_text(bytes: &[u8], uid: u32) -> Result<String, String> {
     {
         return Err(format!("invalid notes for UID {uid}"));
     }
-    Ok(note)
+    // Paragraph and line marks already give `\n`; a CR spelled `\u13?` or
+    // `\'0d` must too, so the model has one newline convention (#531).
+    Ok(projcore::normalize_newlines(&note))
 }
 
 #[cfg(test)]
@@ -388,7 +390,7 @@ mod tests {
         let rtf = b"{\\rtf1\\ansi\\ansicpg1252{\\fonttbl{\\f0 Arial;}}\r\n{\\*\\generator RichEdit}\\uc1 First line.\\par\r\nSecond \\emdash  \\u10003? and \\u171?quotes\\u187?.\\par\r\n}\r\n\0";
         assert_eq!(
             plain_text(rtf, 8).unwrap(),
-            "First line.\r\nSecond — ✓ and «quotes»."
+            "First line.\nSecond — ✓ and «quotes»."
         );
     }
 
@@ -403,8 +405,16 @@ mod tests {
 
     #[test]
     fn line_break_is_kept_when_it_is_the_note_content() {
-        assert_eq!(plain_text(br"{\rtf1 A\line}", 1).unwrap(), "A\r\n");
-        assert_eq!(plain_text(br"{\rtf1 A\line\par}", 1).unwrap(), "A\r\n");
+        assert_eq!(plain_text(br"{\rtf1 A\line}", 1).unwrap(), "A\n");
+        assert_eq!(plain_text(br"{\rtf1 A\line\par}", 1).unwrap(), "A\n");
+    }
+
+    /// Issue #531: a note never holds a CR, however the RTF spells the break.
+    #[test]
+    fn carriage_returns_in_note_text_read_as_lf() {
+        assert_eq!(plain_text(br"{\rtf1 A\u13?\u10?B}", 1).unwrap(), "A\nB");
+        assert_eq!(plain_text(br"{\rtf1 A\'0d B}", 1).unwrap(), "A\n B");
+        assert_eq!(plain_text(br"{\rtf1 A\'0d\'0aB\par}", 1).unwrap(), "A\nB");
     }
 
     #[test]
@@ -534,7 +544,7 @@ mod tests {
     #[test]
     fn rich_edit_bullets_are_not_note_text() {
         let note = br"{\rtf1{\fonttbl{\f1\fnil\fcharset2 Symbol;}}\pard{\pntext\f1\'b7\tab}{\*\pn\pnlvlblt\pnf1{\pntxtb\'b7}}\fi-360\li720 item 1\par item 2\par}";
-        assert_eq!(plain_text(note, 1).unwrap(), "item 1\r\nitem 2");
+        assert_eq!(plain_text(note, 1).unwrap(), "item 1\nitem 2");
     }
 
     #[test]
@@ -553,10 +563,7 @@ mod tests {
             plain_text(br"{\rtf1\uc2\u233?}X", 1),
             Err("invalid notes for UID 1".into())
         );
-        assert_eq!(
-            plain_text(b"{\\rtf1 A\\\r\nB\\\nC}", 1).unwrap(),
-            "A\r\nB\r\nC"
-        );
+        assert_eq!(plain_text(b"{\\rtf1 A\\\r\nB\\\nC}", 1).unwrap(), "A\nB\nC");
     }
 
     #[test]
