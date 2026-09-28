@@ -328,6 +328,16 @@ Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find
 undo/redo, save, and export. The former bare-letter commands are available on
 the ribbon; letters now start cell edits. Ribbon Rename still opens its Name prompt.
 
+Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste cells through the system clipboard
+as tab-separated text (#369). Copy takes the cursor cell's edit text (a
+duration as `2d`, so it pastes back exactly); Cut clears it as Delete does on
+Name, Predecessors and Resource Names, and elsewhere only copies (it never
+deletes a task). Paste overwrites from the cursor cell as Project does with
+cells selected: line i goes to the i-th shown row below, field j to the j-th
+column right, ID fields are ignored, and lines past the last task append
+tasks; no row is inserted. The whole paste is one undo step, and a field that
+cannot apply cancels it, naming the cell.
+
 A summary's subtasks can be hidden and shown again, as in Project: View › Data
 › Show Subtasks / Hide Subtasks (Alt+Shift+Plus / Alt+Shift+Minus; yppxy `+` or
 `=` and `-`), or a click on the `▾`/`▸` beside the summary's name. Hide Subtasks
