@@ -1994,3 +1994,151 @@ fn ribbon_insert_shortcut_is_on_blank_row_not_task() {
     assert_eq!(shortcut("pr-blank-row"), "Insert");
     assert_eq!(shortcut("pr-add"), "Alt, T, N");
 }
+
+fn ctrl_shift() -> Modifiers {
+    Modifiers {
+        shift: true,
+        ..ctrl()
+    }
+}
+
+/// A chord through the real key route, run the way the host runs its act.
+fn chord(t: &mut DocTab, key: &str, m: Modifiers) {
+    if let Some(act) = project_input(t, key, None, m) {
+        apply_project_act(t, act);
+    }
+}
+
+fn predecessors(t: &DocTab, uid: i32) -> usize {
+    v(t).ed.project().task(uid).unwrap().predecessors.len()
+}
+
+#[test]
+fn ctrl_f2_links_and_ctrl_shift_f2_unlinks() {
+    use ProjectAct::*;
+    assert_eq!(key_act("f2", ctrl()), Some(AddLink));
+    assert_eq!(key_act("f2", ctrl_shift()), Some(UnlinkTasks));
+    for m in [ctrl(), ctrl_shift()] {
+        for gated in [
+            Modifiers { alt: true, ..m },
+            Modifiers {
+                platform: true,
+                ..m
+            },
+        ] {
+            assert_eq!(key_act("f2", gated), None, "{gated:?}");
+        }
+    }
+}
+
+#[test]
+fn ctrl_shift_f2_removes_the_selected_tasks_links_as_one_undo_step() {
+    let mut t = tab();
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let depth = v(&t).ed.undo_depth();
+    // The cursor is on the second task, the link's successor.
+    chord(&mut t, "f2", ctrl_shift());
+    assert_eq!(t.status.as_ref(), "Removed 1 link");
+    assert_eq!(predecessors(&t, 2), 0);
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+    assert!(t.dirty);
+    chord(&mut t, "z", ctrl());
+    assert_eq!(predecessors(&t, 2), 1);
+}
+
+#[test]
+fn ctrl_shift_f2_on_an_unlinked_task_changes_nothing() {
+    let mut t = tab();
+    vm(&mut t).ed.mark_saved();
+    t.dirty = false;
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "f2", ctrl_shift());
+    assert_eq!(t.status.as_ref(), "No links to remove");
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    assert!(!t.dirty && !v(&t).ed.dirty());
+}
+
+#[test]
+fn ctrl_f2_asks_for_the_predecessor_and_links_in_one_undo_step() {
+    let mut t = tab();
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "f2", ctrl());
+    assert_eq!(
+        v(&t).prompt.as_ref().map(|p| p.kind),
+        Some(PromptKind::Predecessor)
+    );
+    project_input(&mut t, "1", Some("1"), Modifiers::default());
+    press(&mut t, "enter");
+    assert!(v(&t).prompt.is_none());
+    let preds = &v(&t).ed.project().task(2).unwrap().predecessors;
+    assert_eq!(preds.len(), 1);
+    assert_eq!((preds[0].uid, preds[0].link), (1, LinkType::FinishStart));
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+}
+
+#[test]
+fn link_chords_leave_an_open_cell_editor_and_prompt_alone() {
+    let mut t = tab();
+    vm(&mut t)
+        .ed
+        .add_predecessor(2, 1, LinkType::FinishStart, 0)
+        .unwrap();
+    let depth = v(&t).ed.undo_depth();
+    press(&mut t, "f2");
+    for m in [ctrl(), ctrl_shift()] {
+        chord(&mut t, "f2", m);
+        assert!(v(&t).cell.is_some(), "{m:?}");
+        assert!(v(&t).prompt.is_none(), "{m:?}");
+    }
+    press(&mut t, "escape");
+    apply_project_act(&mut t, ProjectAct::Find);
+    for m in [ctrl(), ctrl_shift()] {
+        chord(&mut t, "f2", m);
+        assert_eq!(
+            v(&t).prompt.as_ref().map(|p| p.kind),
+            Some(PromptKind::Find),
+            "{m:?}"
+        );
+    }
+    assert_eq!(predecessors(&t, 2), 1);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+}
+
+#[test]
+fn ribbon_link_hints_name_the_chords_the_keys_run() {
+    use ProjectAct::*;
+    let ribbon = project_ribbon();
+    let command = |id: &str| {
+        ribbon
+            .tabs
+            .iter()
+            .flat_map(|t| &t.groups)
+            .flat_map(|g| &g.items)
+            .flat_map(|item| match item {
+                Control::Large(c) | Control::Toggle(c) => vec![c],
+                Control::Column(commands) => commands.iter().collect(),
+                _ => vec![],
+            })
+            .find(|c| c.id == id)
+            .unwrap()
+    };
+    for (id, act, hint, m) in [
+        ("pr-link", AddLink, "Alt, T, P  (Ctrl+F2)", ctrl()),
+        (
+            "pr-unlink",
+            UnlinkTasks,
+            "Alt, T, U  (Ctrl+Shift+F2)",
+            ctrl_shift(),
+        ),
+    ] {
+        let c = command(id);
+        assert!(matches!(c.act, Act::Project(a) if a == act), "{id}");
+        assert_eq!(c.tip.shortcut, hint);
+        assert_eq!(key_act("f2", m), Some(act), "{id}");
+    }
+}

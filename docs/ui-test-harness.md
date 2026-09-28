@@ -366,7 +366,9 @@ it reports `<column> can't be cleared`. On the ID column Delete deletes the task
 (a summary asks first: Enter deletes it with its subtasks, Esc cancels, and
 typed text is ignored while that prompt is open; the state's `prompt` reads
 `delete:`). Alt+Shift+Right/Left indent/outdent, Alt+Right/Left pan the Gantt,
-and Ctrl+Shift+L toggles leveling. Former bare-letter commands
+and Ctrl+Shift+L toggles leveling. Ctrl+F2 opens the Predecessor prompt
+(Link the Selected Tasks) and Ctrl+Shift+F2 removes the selected task's links
+(Unlink Tasks) as one undo step. Former bare-letter commands
 (`n x d p c a b L`) now type into cells. Duration, predecessor, constraint,
 resource, baseline, and Rename commands remain on the ribbon; ribbon Rename
 still opens a Name prompt. Predecessors in cells use **displayed IDs**. Ctrl+F

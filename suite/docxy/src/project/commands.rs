@@ -131,7 +131,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "cut",
                                 "Unlink Tasks",
                                 UnlinkTasks,
-                                "Alt, T, U",
+                                "Alt, T, U  (Ctrl+Shift+F2)",
                                 "U",
                             ),
                         ]),
@@ -140,7 +140,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "copy",
                             "Link the Selected Tasks",
                             AddLink,
-                            "Alt, T, P",
+                            "Alt, T, P  (Ctrl+F2)",
                             "P",
                         )),
                         rs::column(vec![cmd(
@@ -633,6 +633,9 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
     if m.control {
         return match key {
             "l" if m.shift => Some(Level),
+            // Project's Link / Unlink the selected tasks.
+            "f2" if m.shift => Some(UnlinkTasks),
+            "f2" => Some(AddLink),
             "f" => Some(Find),
             "z" => Some(Undo),
             "y" => Some(Redo),

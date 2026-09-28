@@ -324,7 +324,10 @@ day, estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
 `Autolink` on (the default) it is linked into the finish-to-start chain it
 splits: A→B becomes A→N→B, N→B keeping the lag. Alt+Shift+Right/Left
 indent/outdent; Alt+Right/Left pan the Gantt;
-Ctrl+Shift+L toggles leveling. Ctrl+F, F3, Ctrl+Z/Y/S/E retain find, repeat find,
+Ctrl+Shift+L toggles leveling. Ctrl+F2 links the selected task (it opens
+the Predecessor prompt, as Task › Schedule › Link the Selected Tasks does) and
+Ctrl+Shift+F2 removes its links, as Project does. Ctrl+F, F3, Ctrl+Z/Y/S/E
+retain find, repeat find,
 undo/redo, save, and export. The former bare-letter commands are available on
 the ribbon; letters now start cell edits. Ribbon Rename still opens its Name prompt.
 
