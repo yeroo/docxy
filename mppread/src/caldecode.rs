@@ -522,12 +522,14 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
             ));
         }
         let value = block(&v2, u32_at(e, 4) as usize)?;
-        if uids.contains(&uid) && fields.insert((uid, key), value).is_some() {
+        if fields.insert((uid, key), value).is_some() {
             return Err(format!("duplicate calendar VarMeta key ({uid},{key})"));
         }
     }
+    fields.retain(|&(uid, _), _| uids.contains(&uid));
     let mut calendars = Vec::with_capacity(rows.len());
     let mut resources = None;
+    let mut live_resource_names: Option<HashMap<i32, String>> = None;
     for (uid, base_uid, resource_uid) in rows {
         // FixedData also contains unnamed internal/unused calendar rows.
         // Project omits these from MSPDI, and they have no VarMeta entries.
@@ -543,14 +545,26 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
             };
             match names.get(&resource_uid) {
                 Some(name) => name.clone(),
-                None => crate::rscdecode::decode(bytes, false)?
-                    .and_then(|resources| resources.into_iter().find(|r| r.uid == resource_uid))
-                    .map(|r| r.name)
-                    .ok_or_else(|| {
-                        format!(
-                            "calendar UID {uid} has no name or resource UID {resource_uid} name"
-                        )
-                    })?,
+                None => {
+                    if live_resource_names.is_none() {
+                        live_resource_names = Some(
+                            crate::rscdecode::decode(bytes, false)?
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|r| (r.uid, r.name))
+                                .collect(),
+                        );
+                    }
+                    live_resource_names
+                        .as_ref()
+                        .and_then(|names| names.get(&resource_uid))
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "calendar UID {uid} has no name or resource UID {resource_uid} name"
+                            )
+                        })?
+                }
             }
         } else {
             return Err(format!("missing calendar name for UID {uid}"));
@@ -1102,6 +1116,15 @@ pub(crate) mod tests {
                 .calendars
                 .len(),
             2
+        );
+        let mut duplicate = vm.clone();
+        duplicate.extend_from_slice(&vm[entry..entry + 12]);
+        duplicate[8..12].copy_from_slice(&6u32.to_le_bytes());
+        let error =
+            decode(&file(fm.clone(), fd.clone(), duplicate, v2.clone()), false).unwrap_err();
+        assert!(
+            error.contains("duplicate calendar VarMeta key (9,1)"),
+            "{error}"
         );
         let mut bad = vm.clone();
         bad[entry..entry + 4].copy_from_slice(&99i32.to_le_bytes());
