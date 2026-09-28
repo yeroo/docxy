@@ -195,7 +195,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "table-insert-row",
                             "Task",
                             AddTask,
-                            "Insert",
+                            "Alt, T, N",
                             "N",
                         )),
                         rs::column(vec![
@@ -212,7 +212,7 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "table-insert-row",
                                 "Blank Row",
                                 InsertBlankRow,
-                                "Alt, T, B",
+                                "Insert",
                                 "B",
                             ),
                         ]),
@@ -642,7 +642,7 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
         };
     }
     match key {
-        "insert" => Some(AddTask),
+        "insert" => Some(InsertBlankRow),
         "delete" => Some(ClearCell),
         "f3" => Some(FindNext),
         _ => None,

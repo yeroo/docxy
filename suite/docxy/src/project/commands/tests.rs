@@ -521,7 +521,11 @@ fn level_all_and_clear_leveling_are_idempotent() {
 #[test]
 fn keys_and_whole_route_enforce_modifiers() {
     use ProjectAct::*;
-    for (key, act) in [("insert", AddTask), ("delete", ClearCell), ("f3", FindNext)] {
+    for (key, act) in [
+        ("insert", InsertBlankRow),
+        ("delete", ClearCell),
+        ("f3", FindNext),
+    ] {
         assert_eq!(key_act(key, Modifiers::default()), Some(act));
     }
     for (key, act) in [
@@ -1028,7 +1032,7 @@ fn task_commands_do_nothing_on_the_entry_row() {
 }
 
 #[test]
-fn insert_on_the_entry_row_appends_and_selects_a_new_task() {
+fn add_task_on_the_entry_row_appends_and_selects_a_new_task() {
     let mut t = tab();
     project_entry_click(&mut t, None, false);
     apply_project_act(&mut t, ProjectAct::AddTask);
@@ -1091,6 +1095,62 @@ fn blank_row_goes_above_the_selected_row_or_the_entry_row_and_is_selected() {
     apply_project_act(&mut t, ProjectAct::Undo);
     apply_project_act(&mut t, ProjectAct::Undo);
     assert_eq!(rows(&t), [row("First", false), row("Second", false)]);
+}
+
+#[test]
+fn insert_key_puts_blank_rows_above_the_cursor_in_the_same_column() {
+    // As the host's key route does: project_input maps, then the act applies.
+    fn press_insert(t: &mut DocTab) {
+        let act = project_input(t, "insert", None, Modifiers::default());
+        assert_eq!(act, Some(ProjectAct::InsertBlankRow));
+        apply_project_act(t, act.unwrap());
+    }
+    let rows = |t: &DocTab| -> Vec<(String, bool)> {
+        v(t).ed
+            .project()
+            .tasks
+            .iter()
+            .map(|t| (t.name.clone(), t.is_null))
+            .collect()
+    };
+    let row = |name: &str, blank| (name.to_string(), blank);
+    let mut t = tab();
+    project_cell_click(&mut t, 1, Some(COL_NAME), false);
+    press_insert(&mut t);
+    assert_eq!(
+        rows(&t),
+        [row("First", false), row("", true), row("Second", false)]
+    );
+    assert_eq!(v(&t).cursor_row(), 1);
+    assert_eq!(v(&t).col, COL_NAME, "the cursor keeps its column");
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    // Again: a second blank row, above the first, still above "Second".
+    press_insert(&mut t);
+    assert_eq!(
+        rows(&t),
+        [
+            row("First", false),
+            row("", true),
+            row("", true),
+            row("Second", false)
+        ]
+    );
+    assert_eq!(v(&t).cursor_row(), 1);
+    assert_eq!(v(&t).col, COL_NAME);
+    assert_eq!(v(&t).ed.undo_depth(), 2);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert_eq!(rows(&t), [row("First", false), row("Second", false)]);
+    // On the entry row: a blank row just above it, not a named task.
+    project_entry_click(&mut t, Some(COL_DURATION), false);
+    press_insert(&mut t);
+    assert_eq!(
+        rows(&t),
+        [row("First", false), row("Second", false), row("", true)]
+    );
+    assert!(!v(&t).on_entry_row());
+    assert_eq!(v(&t).cursor_row(), 2);
+    assert_eq!(v(&t).col, COL_DURATION);
 }
 
 #[test]
@@ -1773,4 +1833,27 @@ fn ribbon_delete_task_shortcut_names_the_id_column() {
         .unwrap();
     assert!(matches!(command.act, Act::Project(ProjectAct::DeleteTask)));
     assert_eq!(command.tip.shortcut, "Delete on the ID column");
+}
+
+#[test]
+fn ribbon_insert_shortcut_is_on_blank_row_not_task() {
+    let ribbon = project_ribbon();
+    let shortcut = |id: &str| {
+        ribbon
+            .tabs
+            .iter()
+            .flat_map(|t| &t.groups)
+            .flat_map(|g| &g.items)
+            .flat_map(|item| match item {
+                Control::Large(c) | Control::Toggle(c) => vec![c],
+                Control::Column(commands) => commands.iter().collect(),
+                _ => vec![],
+            })
+            .find(|c| c.id == id)
+            .unwrap()
+            .tip
+            .shortcut
+    };
+    assert_eq!(shortcut("pr-blank-row"), "Insert");
+    assert_eq!(shortcut("pr-add"), "Alt, T, N");
 }
