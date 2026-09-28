@@ -709,8 +709,22 @@ fn summary_with_zero_stored_duration_is_not_shown_as_a_milestone() {
 #[test]
 fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
     let mut t = new_project_tab();
-    for key in ["up", "down", "home", "end"] {
-        assert!(view_mut(&mut t).key(key, false));
+    // `ctrl-` keys are Project's row jumps, the rest are plain keys.
+    let press = |t: &mut DocTab, key: &str| match key.strip_prefix("ctrl-") {
+        Some(key) => view_mut(t).ctrl_key(key),
+        None => view_mut(t).key(key, false),
+    };
+    for key in [
+        "up",
+        "down",
+        "home",
+        "end",
+        "ctrl-up",
+        "ctrl-down",
+        "ctrl-home",
+        "ctrl-end",
+    ] {
+        assert!(press(&mut t, key));
         assert_eq!(view(&t).ed.sel(), 0);
         // An empty plan has only the entry row.
         assert!(view(&t).on_entry_row());
@@ -725,19 +739,19 @@ fn navigation_clamps_and_preserves_dirty_state_even_on_an_empty_project() {
     // Down from the last task goes to the entry row (100), as in Project;
     // Up from there goes back to the last task.
     for (key, cursor, selected) in [
-        ("end", 99, 99),
+        ("ctrl-down", 99, 99),
         ("down", 100, 99),
         ("down", 100, 99),
         ("up", 99, 99),
         ("up", 98, 98),
         ("down", 99, 99),
         ("down", 100, 99),
-        ("end", 99, 99),
+        ("ctrl-down", 99, 99),
         ("down", 100, 99),
-        ("home", 0, 0),
+        ("ctrl-up", 0, 0),
         ("up", 0, 0),
     ] {
-        assert!(view_mut(&mut t).key(key, false));
+        assert!(press(&mut t, key));
         assert_eq!(
             (view(&t).cursor_row(), view(&t).ed.sel()),
             (cursor, selected),

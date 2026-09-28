@@ -201,6 +201,12 @@ impl ProjectView {
             self.reveal_col();
             return true;
         }
+        // Home and End stay on the row and go to its first and last field, as in Project.
+        if matches!(key, "home" | "end") {
+            self.col = if key == "home" { 0 } else { COLUMN_COUNT - 1 };
+            self.reveal_col();
+            return true;
+        }
         // Rows under collapsed summaries are skipped.
         let last = self.ed.visible_rows().last().copied();
         let index = match key {
@@ -213,12 +219,36 @@ impl ProjectView {
                 return true;
             }
             "down" => self.ed.visible_step(self.ed.sel(), 1),
-            "home" => 0,
-            "end" => last.unwrap_or(0),
             _ => return false,
         };
         self.entry = false;
         self.ed.select(index);
+        true
+    }
+
+    /// Project's Ctrl navigation: Ctrl+Left/Right are Home/End, Ctrl+Up/Down go
+    /// to the first/last visible task, and Ctrl+Home/End do both. An empty plan
+    /// has only the entry row, so only the column moves.
+    pub fn ctrl_key(&mut self, key: &str) -> bool {
+        let (col, first) = match key {
+            "left" => return self.key("home", false),
+            "right" => return self.key("end", false),
+            "up" => (None, true),
+            "down" => (None, false),
+            "home" => (Some(0), true),
+            "end" => (Some(COLUMN_COUNT - 1), false),
+            _ => return false,
+        };
+        let rows = self.ed.visible_rows();
+        let row = if first { rows.first() } else { rows.last() };
+        if let Some(&row) = row {
+            self.entry = false;
+            self.ed.select(row);
+        }
+        if let Some(col) = col {
+            self.col = col;
+            self.reveal_col();
+        }
         true
     }
 

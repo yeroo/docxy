@@ -311,8 +311,11 @@ row is outside the outline and the schedule until something is typed into it;
 then it becomes a task at the level of the task above where it sits (a summary's
 first child). yppxy has the same command on its ribbon and on `N`.
 
-Arrow keys move the cell cursor. Insert inserts a blank row above the current
-row, keeping the column. Delete clears the active Name, Predecessors, or
+Arrow keys move the cell cursor. Home and End (or Ctrl+Left/Right) go to the
+first and last field of the row, as in Project; Ctrl+Up/Down go to the first
+and last task, keeping the column, and Ctrl+Home/End to the first task's first
+field and the last task's last field. Insert inserts a blank row above the
+current row, keeping the column. Delete clears the active Name, Predecessors, or
 Resource Names cell; on the ID column, it deletes the task (a summary asks
 first: Enter deletes it with its subtasks, Esc cancels). Task › Editing › Delete
 Task deletes the selected task from any column. A task added with Task › Insert
@@ -329,7 +332,8 @@ A summary's subtasks can be hidden and shown again, as in Project: View › Data
 › Show Subtasks / Hide Subtasks (Alt+Shift+Plus / Alt+Shift+Minus; yppxy `+` or
 `=` and `-`), or a click on the `▾`/`▸` beside the summary's name. Hide Subtasks
 on a subtask collapses its summary. Hidden rows leave the grid and the Gantt,
-and the arrow keys, Home/End and clicks move over the rows shown. Collapsing is
+and the arrow keys, Ctrl+Up/Down and Ctrl+Home/End (Home/End in yppxy) and
+clicks move over the rows shown. Collapsing is
 view state kept by `projcore::Editor`: it is not an edit, not undone, not saved
 (MSPDI has no element for it) and not restored with the session. The selected
 row is never hidden: selecting or finding a hidden task, or moving it under a

@@ -352,10 +352,13 @@ the harness has no pointer-drag verb for it, so cases move the chart with keys
 (Scroll to Task, Go to Start) instead.
 
 Project cells use Enter/F2 or a double-click to edit the current value; typing
-any printable character replaces it. Left/Right move between columns;
-Up/Down/Home/End move between rows; Down from the last task, or a click below
-it, goes to the entry row, where typing appends a task (`click C<tasks+1>`
-addresses it). Tab/Shift+Tab move between columns.
+any printable character replaces it. Left/Right move between columns, and
+Home/End (or Ctrl+Left/Right) go to the row's first and last column. Up/Down
+move between rows; Ctrl+Up/Down go to the first and last task, and
+Ctrl+Home/End to the first task's first column and the last task's last column.
+Down from the last task, or a click below it, goes to the entry row, where
+typing appends a task (`click C<tasks+1>` addresses it). Tab/Shift+Tab move
+between columns.
 Insert inserts a blank row above the current row (above the entry row when the
 cursor is on it) and keeps the column. Delete clears the active Name,
 Predecessors, or Resource Names cell; on Task Mode, Duration, Start, or Finish

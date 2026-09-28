@@ -41,6 +41,14 @@ fn key(t: &mut DocTab, key: &str) {
         apply_project_act(t, act);
     }
 }
+/// Project's Ctrl+Up/Down row jumps.
+fn ctrl_key(t: &mut DocTab, key: &str) {
+    let m = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(project_input(t, key, None, m), None);
+}
 fn edit(t: &mut DocTab, col: usize, text: &str) {
     vm(t).col = col;
     project_input(t, "text", Some(text), Modifiers::default());
@@ -61,9 +69,9 @@ fn navigation_scrolls_and_all_printable_shortcuts_start_an_edit() {
         key(&mut t, "escape");
         assert!(!t.dirty);
     }
-    key(&mut t, "end");
+    ctrl_key(&mut t, "down");
     assert_eq!(v(&t).ed.sel(), 2);
-    key(&mut t, "home");
+    ctrl_key(&mut t, "up");
     assert_eq!(v(&t).ed.sel(), 0);
     for _ in 0..10 {
         key(&mut t, "right");
@@ -765,7 +773,7 @@ fn a_new_plan_takes_its_first_task_from_the_entry_row() {
 #[test]
 fn enter_after_editing_the_last_task_goes_to_the_entry_row() {
     let mut t = tab();
-    key(&mut t, "end");
+    ctrl_key(&mut t, "down");
     edit(&mut t, COL_NAME, "Last");
     key(&mut t, "enter");
     assert_eq!(v(&t).ed.project().tasks[2].name, "Last");
@@ -1133,7 +1141,7 @@ fn up_or_down_from_an_unchanged_editor_closes_it_and_moves() {
     assert_eq!((v(&t).cursor_row(), v(&t).ed.undo_depth()), (1, 0));
     assert!(!t.dirty);
     // The last task's editor: Down goes to the entry row.
-    key(&mut t, "end");
+    ctrl_key(&mut t, "down");
     key(&mut t, "f2");
     key(&mut t, "down");
     assert!(v(&t).cell.is_none());

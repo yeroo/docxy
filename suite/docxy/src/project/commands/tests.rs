@@ -85,11 +85,14 @@ fn completion_reveals_selection_changes_without_disturbing_other_inputs() {
                 ..Modifiers::default()
             },
         ),
+        // Home and End stay on the row.
+        ("home", Modifiers::default()),
+        ("end", Modifiers::default()),
     ] {
         project_input(&mut t, key, None, modifiers);
         assert_eq!(take_reveal(&t), None, "{key}");
     }
-    project_input(&mut t, "home", None, Modifiers::default());
+    project_input(&mut t, "home", None, ctrl());
     assert_eq!(take_reveal(&t), Some(0));
     let old_uid = v(&t).ed.selected_uid();
     apply_project_act(&mut t, DeleteTask);
@@ -1479,22 +1482,156 @@ fn hide_and_show_subtasks_act_on_the_selected_summary_as_view_state() {
 }
 
 #[test]
-fn arrow_keys_home_and_end_move_over_visible_rows() {
+fn arrow_keys_and_ctrl_up_and_down_move_over_visible_rows() {
     let mut t = outline_tab();
     apply_project_act(&mut t, ProjectAct::HideSubtasks);
-    let key = |t: &mut DocTab, k| {
-        project_input(t, k, None, Modifiers::default());
+    let key = |t: &mut DocTab, k, m| {
+        project_input(t, k, None, m);
         (v(t).cursor_row(), v(t).display_row())
     };
+    let plain = Modifiers::default();
     // Row indexes stay task indexes; the display row counts shown rows.
-    assert_eq!(key(&mut t, "down"), (3, 1));
-    assert_eq!(key(&mut t, "down"), (4, 2), "then the entry row");
+    assert_eq!(key(&mut t, "down", plain), (3, 1));
+    assert_eq!(key(&mut t, "down", plain), (4, 2), "then the entry row");
     assert!(v(&t).on_entry_row());
-    assert_eq!(key(&mut t, "up"), (3, 1));
-    assert_eq!(key(&mut t, "up"), (0, 0));
-    assert_eq!(key(&mut t, "end"), (3, 1));
-    assert_eq!(key(&mut t, "home"), (0, 0));
+    assert_eq!(key(&mut t, "up", plain), (3, 1));
+    assert_eq!(key(&mut t, "up", plain), (0, 0));
+    assert_eq!(key(&mut t, "down", ctrl()), (3, 1));
+    assert_eq!(key(&mut t, "up", ctrl()), (0, 0));
     assert!(v(&t).ed.is_collapsed(1), "moving never expands");
+}
+
+fn ctrl() -> Modifiers {
+    Modifiers {
+        control: true,
+        ..Modifiers::default()
+    }
+}
+
+/// (cursor row, column, on the entry row, a cell editor open, dirty)
+fn cursor(t: &DocTab) -> (usize, usize, bool, bool, bool) {
+    let v = v(t);
+    (
+        v.cursor_row(),
+        v.col,
+        v.on_entry_row(),
+        v.cell.is_some(),
+        t.dirty || v.ed.dirty(),
+    )
+}
+
+#[test]
+fn home_and_end_move_to_the_rows_first_and_last_field() {
+    let mut t = tab();
+    vm(&mut t).col = COL_NAME;
+    // Ctrl+Left/Right are Project's aliases for Home/End.
+    for (key, m, col) in [
+        ("end", Modifiers::default(), COLUMN_COUNT - 1),
+        ("home", Modifiers::default(), 0),
+        ("right", ctrl(), COLUMN_COUNT - 1),
+        ("left", ctrl(), 0),
+    ] {
+        assert_eq!(project_input(&mut t, key, None, m), None, "{key}");
+        assert_eq!(cursor(&t), (1, col, false, false, false), "{key}");
+        assert_eq!(v(&t).ed.sel(), 1, "{key}");
+        assert_eq!(take_reveal(&t), None, "{key}");
+    }
+    // End reveals the Resource Names column, Home scrolls back to ID.
+    vm(&mut t).table_w = 200.;
+    press(&mut t, "end");
+    assert!(v(&t).table_x.get() > 0.);
+    press(&mut t, "home");
+    assert_eq!(v(&t).table_x.get(), 0.);
+    // On the entry row they move the column and stay there.
+    vm(&mut t).enter_entry_row();
+    press(&mut t, "end");
+    assert_eq!(cursor(&t), (2, COLUMN_COUNT - 1, true, false, false));
+    press(&mut t, "home");
+    assert_eq!(cursor(&t), (2, 0, true, false, false));
+}
+
+#[test]
+fn ctrl_home_and_end_go_to_the_first_and_last_task_and_field() {
+    let mut t = outline_tab();
+    apply_project_act(&mut t, ProjectAct::HideSubtasks);
+    vm(&mut t).enter_entry_row();
+    take_reveal(&t);
+    vm(&mut t).col = COL_NAME;
+    // Ctrl+Up/Down keep the column; Shift is ignored.
+    let shift = Modifiers {
+        shift: true,
+        ..ctrl()
+    };
+    for (key, m, row, col) in [
+        ("up", ctrl(), 0, COL_NAME),
+        ("down", shift, 3, COL_NAME),
+        ("up", shift, 0, COL_NAME),
+        ("end", ctrl(), 3, COLUMN_COUNT - 1),
+        ("home", ctrl(), 0, 0),
+    ] {
+        assert_eq!(project_input(&mut t, key, None, m), None, "{key}");
+        assert_eq!(cursor(&t), (row, col, false, false, false), "{key}");
+        assert_eq!(take_reveal(&t), Some(v(&t).display_row()), "{key}");
+    }
+    // Already there: nothing to reveal.
+    project_input(&mut t, "up", None, ctrl());
+    assert_eq!(take_reveal(&t), None);
+    assert!(v(&t).ed.is_collapsed(1), "moving never expands");
+}
+
+#[test]
+fn ctrl_row_jumps_on_an_empty_plan_move_only_the_column() {
+    let mut t = new_project_tab();
+    vm(&mut t).col = COL_NAME;
+    for (key, col) in [
+        ("up", COL_NAME),
+        ("down", COL_NAME),
+        ("end", COLUMN_COUNT - 1),
+        ("home", 0),
+    ] {
+        project_input(&mut t, key, None, ctrl());
+        assert_eq!(cursor(&t), (0, col, true, false, false), "{key}");
+    }
+}
+
+#[test]
+fn ctrl_navigation_leaves_ctrl_shortcuts_the_cell_editor_and_prompts_alone() {
+    use ProjectAct::*;
+    let mut t = tab();
+    let shift = Modifiers {
+        shift: true,
+        ..ctrl()
+    };
+    assert_eq!(project_input(&mut t, "l", None, shift), Some(Level));
+    assert_eq!(project_input(&mut t, "f", None, ctrl()), Some(Find));
+    assert_eq!(project_input(&mut t, "home", None, ctrl_alt()), None);
+    assert_eq!(
+        cursor(&t),
+        (1, COL_NAME, false, false, false),
+        "Ctrl+Alt+Home"
+    );
+    // An open cell editor keeps its row, and Home/End move its caret.
+    press(&mut t, "f2");
+    project_input(&mut t, "home", None, ctrl());
+    assert_eq!(cursor(&t), (1, COL_NAME, false, true, false));
+    press(&mut t, "home");
+    assert_eq!(v(&t).cell.as_ref().unwrap().caret, 0);
+    press(&mut t, "end");
+    let cell = v(&t).cell.as_ref().unwrap();
+    assert_eq!((cell.caret, cell.buf.as_str()), ("Second".len(), "Second"));
+    press(&mut t, "escape");
+    // So does an open prompt.
+    apply_project_act(&mut t, Find);
+    project_input(&mut t, "up", None, ctrl());
+    assert!(v(&t).prompt.is_some());
+    assert_eq!(v(&t).cursor_row(), 1);
+}
+
+fn ctrl_alt() -> Modifiers {
+    Modifiers {
+        alt: true,
+        ..ctrl()
+    }
 }
 
 #[test]
