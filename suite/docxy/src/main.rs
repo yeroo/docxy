@@ -1059,19 +1059,15 @@ impl SheetView {
     }
 
     /// Commit the editor before computing bounds or sorting its row.
-    /// `keys` is absent for a sort by the selected column.
     fn sort_with_pending_edit(
         &mut self,
         field: Option<(u32, u32, u32, u32)>,
-        keys: Option<&[(u32, bool)]>,
-        ascending: bool,
+        keys: &[(u32, bool)],
     ) -> (bool, bool) {
         let committed = self.commit_edit();
         let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
             return (committed, false);
         };
-        let selected_key = [(self.sel.1, ascending)];
-        let keys = keys.unwrap_or(&selected_key);
         self.push_undo();
         gridcore::edit::sort_rows(&mut self.pkg.workbook, self.active, start, bottom, keys);
         self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
@@ -7968,11 +7964,12 @@ impl Docxy {
         let Some(v) = self.active_sheet_mut() else {
             return;
         };
-        let (committed, sorted) = v.sort_with_pending_edit(None, None, ascending);
+        let keys = [(v.sel.1, ascending)];
+        let (committed, sorted) = v.sort_with_pending_edit(None, &keys);
         if committed || sorted {
             self.mark_sheet_dirty();
-            cx.notify();
         }
+        cx.notify();
     }
 
     /// Multi-level sort of the current region from a typed spec like
@@ -7991,11 +7988,11 @@ impl Docxy {
         let Some(v) = self.active_sheet_mut() else {
             return;
         };
-        let (committed, sorted) = v.sort_with_pending_edit(field, Some(&keys), true);
+        let (committed, sorted) = v.sort_with_pending_edit(field, &keys);
         if committed || sorted {
             self.mark_sheet_dirty();
-            cx.notify();
         }
+        cx.notify();
     }
 
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then

@@ -12,7 +12,7 @@ test f2 enter on an untouched cell changes nothing
   assert sel is A2
   assert cells unchanged
 
-# Escape must clear the old seed before type-to-replace opens a fresh editor.
+# After escaping F2, typing the cell's existing text as a fresh entry must commit.
 test f2 escape then typing the same text still commits
   open copy:../fixtures/basic.xlsx
   click A1

@@ -610,7 +610,7 @@ fn structural_edit_commits_the_open_editor_before_shifting_cells() {
 fn sort_commits_an_open_editor_before_moving_its_row() {
     use gridcore::sheet::CellValue;
 
-    for multi_key in [false, true] {
+    for field in [None, Some((1, 0, 4, 1))] {
         let mut t = tab(Kind::Xlsx);
         let Surface::Sheet(v) = &mut t.surface else {
             panic!()
@@ -619,9 +619,8 @@ fn sort_commits_an_open_editor_before_moving_its_row() {
         v.begin_cell_edit(None);
         v.editing = Some("Zzz".into());
         let keys = [(0, true)];
-        let explicit = multi_key.then_some(keys.as_slice());
 
-        assert_eq!(v.sort_with_pending_edit(None, explicit, true), (true, true));
+        assert_eq!(v.sort_with_pending_edit(field, &keys), (true, true));
         assert!(v.editing.is_none());
         assert_eq!(v.undo.len(), 2);
         for (row, name, number) in [
@@ -633,15 +632,32 @@ fn sort_commits_an_open_editor_before_moving_its_row() {
             assert_eq!(
                 v.sheet().cell(row, 0).map(|c| &c.value),
                 Some(&CellValue::Text(name.into())),
-                "multi_key={multi_key}, row={row}"
+                "field={field:?}, row={row}"
             );
             assert_eq!(
                 v.sheet().cell(row, 1).map(|c| &c.value),
                 Some(&CellValue::Number(number)),
-                "multi_key={multi_key}, row={row}"
+                "field={field:?}, row={row}"
             );
         }
     }
+}
+
+#[test]
+fn unsortable_region_still_closes_an_untouched_editor() {
+    let mut t = tab(Kind::Xlsx);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (98, 25); // Z99 is empty, outside the used region.
+    v.begin_cell_edit(None);
+
+    assert_eq!(
+        v.sort_with_pending_edit(None, &[(25, true)]),
+        (false, false)
+    );
+    assert!(v.editing.is_none());
+    assert!(v.undo.is_empty());
 }
 
 #[test]
