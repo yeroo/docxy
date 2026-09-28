@@ -285,6 +285,8 @@ impl Predecessor {
 pub struct Baseline {
     /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
     pub number: u8,
+    /// Timephased records nested in this baseline, kept as written.
+    pub timephased_data: Vec<TimephasedValue>,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
     /// Recorded working minutes; None when Duration was omitted, empty, or invalid.
@@ -810,6 +812,8 @@ impl Resource {
 pub struct ResourceBaseline {
     /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
     pub number: u8,
+    /// Timephased records nested in this baseline, kept as written.
+    pub timephased_data: Vec<TimephasedValue>,
     /// Recorded work in whole minutes; None when omitted or invalid.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
@@ -1081,6 +1085,8 @@ fn tenths_to_min(tenths: Option<i64>) -> i64 {
 pub struct AssignmentBaseline {
     /// 0 = Baseline; 1..=10 = Baseline1..Baseline10.
     pub number: u8,
+    /// Timephased records nested in this baseline, kept as written.
+    pub timephased_data: Vec<TimephasedValue>,
     pub start: Option<DateTime>,
     pub finish: Option<DateTime>,
     /// Recorded work in whole minutes; None when omitted or invalid.
