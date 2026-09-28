@@ -22,7 +22,8 @@
 //! generated and as `write_mspdi` writes them back, as was file 26 (percentage
 //! and elapsed lags, issue #104), whose plan and values Project itself
 //! produced (`corpus/tools/gen_mpp_lag_cases.py`), and file 27 (manual
-//! summaries, issue #124). Slack invariants below also check
+//! summaries, issue #124), and file 28 (alternate work weeks, issue #218).
+//! Slack invariants below also check
 //! properties that do not depend on the embedded expectations.
 
 use projcore::mspdi::{read_mspdi, write_mspdi};

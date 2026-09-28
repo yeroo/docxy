@@ -1112,6 +1112,27 @@ pub struct Calendar {
     /// changed hours. Only [`CalendarException::scheduled`] ones change working
     /// time; the rest are kept so a save writes them back.
     pub exceptions: Vec<CalendarException>,
+    /// Named date-ranged alternate weeks in MSPDI file order. An unstated
+    /// weekday falls back to this calendar's default week or its base chain.
+    pub work_weeks: Vec<WorkWeek>,
+}
+
+/// One MSPDI `Calendar/WorkWeeks/WorkWeek`. Optional fields stay absent through
+/// a save. `week` contains only weekdays explicitly stated in the work week.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct WorkWeek {
+    pub name: Option<String>,
+    pub from: Option<DateTime>,
+    pub to: Option<DateTime>,
+    pub week: [Option<DayWorking>; 7],
+}
+
+impl WorkWeek {
+    /// Inclusive day-number range, when both endpoints were provided.
+    pub fn scheduled(&self) -> Option<(i64, i64)> {
+        let first = self.from?.day_number();
+        Some((first, self.to?.day_number().max(first)))
+    }
 }
 
 /// One MSPDI calendar exception. Every `Option` field is kept as read (`None`
@@ -1209,6 +1230,7 @@ impl Calendar {
             is_baseline_calendar: false,
             week: week.map(Some),
             exceptions: Vec::new(),
+            work_weeks: Vec::new(),
         }
     }
 
@@ -1233,7 +1255,7 @@ impl Calendar {
         week.map(|day| day.cloned().unwrap_or_default())
     }
 
-    /// This calendar's working time by date, exceptions included, through the
+    /// This calendar's working time by date, exceptions and work weeks included, through the
     /// base chain [`Calendar::resolve_week`] walks.
     pub fn resolve<'a>(&'a self, lookup: impl Fn(i32) -> Option<&'a Calendar>) -> WorkCalendar {
         let mut levels = Vec::new();
@@ -1256,7 +1278,8 @@ impl Calendar {
 ///
 /// A day resolves to the first scheduled exception covering that date, looking
 /// down the base chain from the calendar itself; failing that, to the first
-/// calendar in the chain that states that weekday. A day nothing states is
+/// calendar in the chain whose covering work week or default week states that
+/// weekday. A day nothing states is
 /// non-working. So a derived calendar keeps its base's holidays even on a
 /// weekday it states itself, and only its own exception overrides one. This
 /// is Microsoft Project 2024's rule (checked on a resource calendar, #126);
@@ -1277,6 +1300,9 @@ struct Level {
     /// ranges sorted by day. Where exceptions overlap, the first in file order
     /// wins.
     exceptions: Vec<(i64, i64, DayWorking)>,
+    /// Date-ranged alternate weeks in file order; the first covering week
+    /// wins when a hand-edited file contains overlaps.
+    work_weeks: Vec<(i64, i64, [Option<DayWorking>; 7])>,
     week: [Option<DayWorking>; 7],
 }
 
@@ -1313,6 +1339,14 @@ impl Level {
         ranges.sort_by_key(|&(first, _, _)| first);
         Level {
             exceptions: ranges,
+            work_weeks: cal
+                .work_weeks
+                .iter()
+                .filter_map(|work_week| {
+                    let (first, last) = work_week.scheduled()?;
+                    Some((first, last, work_week.week.clone()))
+                })
+                .collect(),
             week: cal.week.clone(),
         }
     }
@@ -1328,7 +1362,12 @@ impl Level {
 
     /// The weekday of day number `day`, if this calendar states it.
     fn weekday(&self, day: i64) -> Option<&DayWorking> {
-        self.week[(day + 4).rem_euclid(7) as usize].as_ref()
+        let weekday = (day + 4).rem_euclid(7) as usize;
+        self.work_weeks
+            .iter()
+            .find(|(first, last, _)| *first <= day && day <= *last)
+            .and_then(|(_, _, week)| week[weekday].as_ref())
+            .or_else(|| self.week[weekday].as_ref())
     }
 }
 
@@ -1337,6 +1376,7 @@ impl WorkCalendar {
     pub fn weekly(week: Week) -> WorkCalendar {
         WorkCalendar(Kind::Chain(vec![Level {
             exceptions: Vec::new(),
+            work_weeks: Vec::new(),
             week: week.map(Some),
         }]))
     }
@@ -1379,7 +1419,7 @@ impl WorkCalendar {
         }
     }
 
-    /// The weekly pattern alone, exceptions ignored. Whether a calendar can
+    /// The default weekly pattern alone, exceptions and work weeks ignored. Whether a calendar can
     /// schedule at all is decided on this, so an exception never makes an
     /// otherwise empty calendar schedulable.
     pub fn week(&self) -> Week {
@@ -1934,6 +1974,7 @@ mod tests {
             is_baseline_calendar: false,
             week,
             exceptions: Vec::new(),
+            work_weeks: Vec::new(),
         }
     }
 
@@ -2027,6 +2068,122 @@ mod tests {
             DateTime::from_ymd_hm(2026, 3, last, 23, 59),
             day,
         )
+    }
+
+    fn probe_week(first: u32, last: u32, week: [Option<DayWorking>; 7]) -> WorkWeek {
+        WorkWeek {
+            name: Some("Probe".into()),
+            from: Some(DateTime::from_ymd_hm(2026, 3, first, 0, 0)),
+            to: Some(DateTime::from_ymd_hm(2026, 3, last, 23, 59)),
+            week,
+        }
+    }
+
+    fn work_week_probe() -> Project {
+        // Project 2024 probe for #218: Standard has a Summer week and a
+        // holiday; three derived calendars each override different weekdays.
+        let mut standard = Calendar::standard(1);
+        standard.week[2] = Some(hours(9, 12));
+        standard
+            .exceptions
+            .push(exception(11, 11, DayWorking::default()));
+        let mut summer: [Option<DayWorking>; 7] = Default::default();
+        summer[1] = Some(DayWorking {
+            times: vec![hours(7, 12).times[0], hours(13, 18).times[0]],
+        });
+        summer[5] = Some(DayWorking::default());
+        summer[6] = Some(hours(8, 12));
+        standard.work_weeks.push(probe_week(9, 20, summer));
+
+        let mut alice_week: [Option<DayWorking>; 7] = Default::default();
+        alice_week[1] = Some(hours(10, 12));
+        let alice = derived(2, 1, alice_week);
+
+        let mut bob_week: [Option<DayWorking>; 7] = Default::default();
+        bob_week[2] = Some(hours(14, 16));
+        let mut bob = derived(3, 1, bob_week);
+        let mut crew: [Option<DayWorking>; 7] = Default::default();
+        crew[3] = Some(hours(8, 9));
+        crew[4] = Some(hours(12, 13));
+        bob.work_weeks.push(probe_week(9, 13, crew));
+
+        let mut carol_week: [Option<DayWorking>; 7] = Default::default();
+        carol_week[1] = Some(hours(15, 16));
+        let mut carol = derived(4, 1, carol_week);
+        let mut late: [Option<DayWorking>; 7] = Default::default();
+        late[1] = Some(hours(10, 11));
+        carol.work_weeks.push(probe_week(16, 20, late));
+        Project {
+            calendars: vec![standard, alice, bob, carol],
+            ..Project::default()
+        }
+    }
+
+    #[test]
+    fn work_week_stated_days_and_default_week_fallback_match_project_2024() {
+        let project = work_week_probe();
+        let standard = project.resolved_calendar(project.calendar(1).unwrap());
+        assert_eq!(standard.day(march(2)), Calendar::standard_week()[1].times);
+        assert_eq!(
+            standard.day(march(9)),
+            vec![hours(7, 12).times[0], hours(13, 18).times[0]]
+        );
+        assert_eq!(standard.day(march(10)), hours(9, 12).times);
+        assert_eq!(standard.day(march(12)), Calendar::standard_week()[4].times);
+        assert!(standard.day(march(13)).is_empty());
+        assert_eq!(standard.day(march(14)), hours(8, 12).times);
+        assert!(standard.day(march(20)).is_empty()); // inclusive ToDate
+        assert!(standard.day(march(21)).is_empty()); // work week ended
+        assert_eq!(standard.week()[1], Calendar::standard_week()[1]);
+    }
+
+    #[test]
+    fn work_week_and_default_week_resolve_level_by_level_match_project_2024() {
+        let project = work_week_probe();
+        let alice = project.resolved_calendar(project.calendar(2).unwrap());
+        assert_eq!(alice.day(march(2)), hours(10, 12).times);
+        assert_eq!(alice.day(march(9)), hours(10, 12).times); // own default beats base WW
+        assert_eq!(alice.day(march(10)), hours(9, 12).times);
+        assert!(alice.day(march(13)).is_empty()); // base WW Friday off
+        assert_eq!(alice.day(march(14)), hours(8, 12).times); // base WW Saturday
+        let bob = project.resolved_calendar(project.calendar(3).unwrap());
+        assert_eq!(
+            bob.day(march(9)),
+            vec![hours(7, 12).times[0], hours(13, 18).times[0]]
+        );
+        assert_eq!(bob.day(march(10)), hours(14, 16).times);
+        assert_eq!(bob.day(march(12)), hours(12, 13).times);
+        assert_eq!(
+            bob.day(march(16)),
+            vec![hours(7, 12).times[0], hours(13, 18).times[0]]
+        );
+        let carol = project.resolved_calendar(project.calendar(4).unwrap());
+        assert_eq!(carol.day(march(9)), hours(15, 16).times);
+        assert_eq!(carol.day(march(16)), hours(10, 11).times);
+    }
+
+    #[test]
+    fn exception_down_base_chain_beats_derived_work_week_match_project_2024() {
+        let project = work_week_probe();
+        for uid in [1, 2, 3, 4] {
+            assert!(
+                project
+                    .resolved_calendar(project.calendar(uid).unwrap())
+                    .day(march(11))
+                    .is_empty(),
+                "calendar {uid}"
+            );
+        }
+        let mut bob = project.calendar(3).unwrap().clone();
+        bob.exceptions.push(exception(11, 11, hours(10, 11)));
+        let mut project = project;
+        project.calendars[2] = bob;
+        assert_eq!(
+            project
+                .resolved_calendar(project.calendar(3).unwrap())
+                .day(march(11)),
+            hours(10, 11).times
+        );
     }
 
     #[test]

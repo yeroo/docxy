@@ -276,6 +276,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
             is_baseline_calendar: false,
             week,
             exceptions: Vec::new(),
+            work_weeks: Vec::new(),
         });
     }
     calendars.sort_by_key(|c| c.uid); // Project's MSPDI export uses UID order.

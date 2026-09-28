@@ -181,6 +181,21 @@ Project's warning have no MSPDI field; projcore's unit tests check them.
 | `25-derived-calendar-holiday` | exceptions on a derived calendar | the base's holiday beats a weekday the derived calendar states; the derived calendar's own exception beats the base's holiday |
 | `26-lag-percent-elapsed` | percentage and elapsed lags | ±% of the predecessor's duration, ±elapsed days across a weekend on FS/SS/FF/SF links, an estimated elapsed week, a working lag in hours; the lag and its `LagFormat` survive MSPDI and `.yppx` |
 | `27-manual-summary` | manually scheduled summaries | a manual summary keeps its own Start/Finish: a short one under an auto summary (whose slack its fixed span bounds), one whose finish is the project finish, its start flooring an ASAP subtask, a link pushing one past it and an MSO subtask ignoring it |
+| `28-work-weeks` | alternate work weeks | date-ranged weekday changes, non-working Friday, extra Saturday inherited by Alice, fallback to the calendar's default week and base chain, and exception precedence (#218) |
+
+File 28 records a Project 2024 precedence probe. Standard has a default Tuesday
+09:00–12:00, a March 11 holiday, and a March 9–20 “Summer” work week stating
+Monday 07:00–12:00 and 13:00–18:00, Friday off, and Saturday 08:00–12:00.
+Alice derives from Standard and states Monday 10:00–12:00. Bob states Tuesday
+14:00–16:00 and has a March 9–13 “Crew” work week stating Wednesday 08:00–09:00
+and Thursday 12:00–13:00. Carol states Monday 15:00–16:00 and has a March 16–20
+“Late” work week stating Monday 10:00–11:00. Project resolves an exception
+anywhere down the base chain first. Otherwise, it walks each calendar level:
+a covering work week's stated weekday wins, then that level's default weekday,
+then the base. A work week's end date is inclusive; an unstated weekday falls
+back to that calendar's own default, including Standard's Tuesday 09:00–12:00.
+The fixture was verified with `verify_mspdi_project.py` as generated and after
+`write_mspdi` saved it.
 
 See `manifest.json` for machine-readable tags.
 
