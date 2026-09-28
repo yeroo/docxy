@@ -328,7 +328,9 @@ pub struct Task {
     // the source had no (valid) value and the save writes none.
     pub guid: Option<String>,
     pub create_date: Option<DateTime>,
+    pub contact: Option<String>,
     pub wbs: Option<String>,
+    pub wbs_level: Option<String>,
     pub task_type: Option<TaskType>,
     /// `None` reads as active; see [`Task::is_active`].
     pub active: Option<bool>,
@@ -345,11 +347,14 @@ pub struct Task {
     /// MSPDI `LevelingDelay`, raw (tenths of a minute), with its display format.
     pub leveling_delay: Option<i64>,
     pub leveling_delay_format: Option<i32>,
+    pub pre_leveled_start: Option<DateTime>,
+    pub pre_leveled_finish: Option<DateTime>,
     /// MSPDI task hyperlink display text, address, and in-file location.
     pub hyperlink: Option<String>,
     pub hyperlink_address: Option<String>,
     pub hyperlink_sub_address: Option<String>,
     pub ignore_resource_calendar: Option<bool>,
+    pub notes: Option<String>,
     pub earned_value_method: Option<i32>,
     pub recurring: Option<bool>,
     pub hide_bar: Option<bool>,
@@ -358,6 +363,15 @@ pub struct Task {
     pub external_task_project: Option<String>,
     pub is_subproject: Option<bool>,
     pub is_subproject_read_only: Option<bool>,
+    pub subproject_name: Option<String>,
+    pub display_as_summary: Option<bool>,
+    /// Publication and commitment metadata, kept as read for MSPDI saves.
+    pub is_published: Option<bool>,
+    pub status_manager: Option<String>,
+    pub commitment_start: Option<DateTime>,
+    pub commitment_finish: Option<DateTime>,
+    /// Project commitment type, 0..=2.
+    pub commitment_type: Option<i32>,
     /// Work (minutes), Cost and OverAllocated as Project last calculated
     /// them. docxy never computes them whole: they stay as read until an edit
     /// changes the task's assignments (or a subtask's), or moves a subtask

@@ -548,6 +548,30 @@ fn task_fields_fixture_keeps_fields_and_a_blank_row() {
         Some("https://example.com/a?x=1&y=2")
     );
     assert_eq!(pour.hyperlink_sub_address.as_deref(), Some("Gantt Chart!4"));
+    assert_eq!(pour.contact.as_deref(), Some("Site lead"));
+    assert_eq!(pour.wbs_level.as_deref(), Some("Level 2"));
+    assert_eq!(pour.display_as_summary, Some(false));
+    assert_eq!(pour.subproject_name.as_deref(), Some("Concrete phase"));
+    assert_eq!(
+        pour.pre_leveled_start,
+        Some(DateTime::from_ymd_hm(2026, 3, 4, 8, 0))
+    );
+    assert_eq!(
+        pour.pre_leveled_finish,
+        Some(DateTime::from_ymd_hm(2026, 3, 4, 17, 0))
+    );
+    assert_eq!(pour.notes.as_deref(), Some("Check forms & rebar"));
+    assert_eq!(pour.is_published, Some(false));
+    assert_eq!(pour.status_manager.as_deref(), Some("Alice"));
+    assert_eq!(
+        pour.commitment_start,
+        Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0))
+    );
+    assert_eq!(
+        pour.commitment_finish,
+        Some(DateTime::from_ymd_hm(2026, 3, 5, 17, 0))
+    );
+    assert_eq!(pour.commitment_type, Some(2));
     assert_eq!(proj.task(2).unwrap().work_min, Some(960));
     let blank = proj.task(3).unwrap();
     assert!(blank.is_null);

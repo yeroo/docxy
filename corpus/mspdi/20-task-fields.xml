@@ -158,9 +158,12 @@
       <CreateDate>2026-02-27T09:30:00</CreateDate>
       <Active>1</Active>
       <Type>2</Type>
+      <Contact>Site lead</Contact>
       <WBS>1.2</WBS>
+      <WBSLevel>Level 2</WBSLevel>
       <Priority>500</Priority>
       <Estimated>1</Estimated>
+      <DisplayAsSummary>0</DisplayAsSummary>
       <EffortDriven>0</EffortDriven>
       <Work>PT0H0M0S</Work>
       <Deadline>2026-03-20T17:00:00</Deadline>
@@ -168,13 +171,22 @@
       <LevelingCanSplit>0</LevelingCanSplit>
       <LevelingDelay>4800</LevelingDelay>
       <LevelingDelayFormat>7</LevelingDelayFormat>
+      <SubprojectName>Concrete phase</SubprojectName>
+      <PreLeveledStart>2026-03-04T08:00:00</PreLeveledStart>
+      <PreLeveledFinish>2026-03-04T17:00:00</PreLeveledFinish>
       <Hyperlink>Pour instructions</Hyperlink>
       <HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>
       <HyperlinkSubAddress>Gantt Chart!4</HyperlinkSubAddress>
       <IgnoreResourceCalendar>1</IgnoreResourceCalendar>
+      <Notes>Check forms &amp; rebar</Notes>
       <HideBar>1</HideBar>
       <EarnedValueMethod>1</EarnedValueMethod>
       <Rollup>0</Rollup>
+      <IsPublished>0</IsPublished>
+      <StatusManager>Alice</StatusManager>
+      <CommitmentStart>2026-03-05T08:00:00</CommitmentStart>
+      <CommitmentFinish>2026-03-05T17:00:00</CommitmentFinish>
+      <CommitmentType>2</CommitmentType>
       <PredecessorLink>
         <PredecessorUID>2</PredecessorUID>
         <Type>1</Type>
