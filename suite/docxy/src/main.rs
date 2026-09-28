@@ -19430,9 +19430,17 @@ impl Render for Docxy {
                             .py(px(28.))
                             .gap_1()
                             .children(blocks)
-                            .child(ruler_probe_el(&self.ruler_probe, |state, rect| {
-                                state.draft_column = Some(rect)
-                            }))
+                            // An in-flow child sits inside the scroll area's 48px padding.
+                            // Keep it last so scroll_to_item(b) still indexes block b.
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .h(px(0.))
+                                    .child(ruler_probe_el(&self.ruler_probe, |state, rect| {
+                                        state.draft_column = Some(rect)
+                                    })),
+                            )
                             .into_any_element();
                         ruler_scroll_view(scroll, &self.ruler_probe)
                     }
