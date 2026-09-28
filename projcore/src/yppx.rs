@@ -121,32 +121,22 @@ fn local_name(name: &str) -> &str {
 
 fn decode_content_types(bytes: &[u8]) -> Option<String> {
     if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
-        let chunks = bytes.chunks_exact(2);
-        if !chunks.remainder().is_empty() {
-            return None;
-        }
-        String::from_utf16(
-            &chunks
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect::<Vec<_>>(),
-        )
-        .ok()
+        decode_utf16(bytes, u16::from_le_bytes)
     } else if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
-        let chunks = bytes.chunks_exact(2);
-        if !chunks.remainder().is_empty() {
-            return None;
-        }
-        String::from_utf16(
-            &chunks
-                .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                .collect::<Vec<_>>(),
-        )
-        .ok()
+        decode_utf16(bytes, u16::from_be_bytes)
     } else {
         std::str::from_utf8(bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes))
             .ok()
             .map(str::to_owned)
     }
+}
+
+fn decode_utf16(bytes: &[u8], unit: fn([u8; 2]) -> u16) -> Option<String> {
+    let (pairs, remainder) = bytes.as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    String::from_utf16(&pairs.iter().copied().map(unit).collect::<Vec<_>>()).ok()
 }
 
 /// Parse a complete content-type map. A damaged map cannot safely supply a
