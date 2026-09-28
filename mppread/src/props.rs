@@ -58,8 +58,10 @@ pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> 
         return Err("invalid default calendar name in Props".into());
     }
     let units: Vec<_> = raw
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
         .collect();
     let end = units
         .iter()

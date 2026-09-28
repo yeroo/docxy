@@ -29,7 +29,12 @@ fn name(value: &[u8]) -> Result<String, String> {
     if value.len() < 4 || !value.len().is_multiple_of(2) {
         return Err("invalid calendar name block".into());
     }
-    let units: Vec<_> = value.chunks_exact(2).map(|c| u16_at(c, 0)).collect();
+    let units: Vec<_> = value
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
     if units.last() != Some(&0) {
         return Err("unterminated calendar name".into());
     }
