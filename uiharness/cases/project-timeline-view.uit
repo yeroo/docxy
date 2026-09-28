@@ -6,7 +6,7 @@ test project timeline highlights the chart's visible range and follows its scrol
   assert timeline_view_start is Mon 1/5/26
   assert timeline_view_finish is Fri 1/30/26
   shot project-timeline
-  key end alt t s
+  key ctrl+down alt t s
   assert selected_name is Late
   assert timeline_view_start is Sun 3/1/26
   assert timeline_view_finish is Thu 3/26/26

@@ -12,7 +12,7 @@ test project editing keys and prompts
   assert cell is ID
   key delete
   assert tasks is 3
-  key home down alt t r
+  key ctrl+up down alt t r
   assert prompt is rename:Task 2
   type renamed
   key enter
