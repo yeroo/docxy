@@ -8,6 +8,19 @@
 //! serve as an oracle for our scheduler.
 
 use crate::datetime::DateTime;
+use std::sync::Arc;
+
+/// Opaque parts and content types retained from a `.yppx` package.
+/// MSPDI output ignores these; a `.yppx` save writes them back.
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct PackageParts {
+    /// ZIP name and uncompressed bytes, in package order.
+    pub parts: Vec<(String, Arc<[u8]>)>,
+    /// Extension and content type for non-XML Defaults.
+    pub defaults: Vec<(String, String)>,
+    /// Part name and content type for retained Overrides.
+    pub overrides: Vec<(String, String)>,
+}
 
 /// Dependency kind between two tasks. The `code` is MSPDI's integer encoding,
 /// which is *not* in the intuitive order — memorized here once so nowhere else
@@ -1483,6 +1496,8 @@ pub struct XmlElement {
 /// A whole project: tasks, staffing, and the calendars they schedule against.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Project {
+    /// Parts of the source `.yppx` that this build does not understand.
+    pub package: PackageParts,
     pub name: String,
     pub title: String,
     pub start_date: Option<DateTime>,
@@ -1544,6 +1559,7 @@ pub struct Project {
 impl Default for Project {
     fn default() -> Project {
         Project {
+            package: PackageParts::default(),
             name: String::new(),
             title: String::new(),
             start_date: None,
