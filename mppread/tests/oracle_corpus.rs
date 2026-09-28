@@ -1140,16 +1140,33 @@ fn assignment_oracles() {
         let cases = pairs(&generated, "");
         assert_eq!(cases.len(), 4);
         for (mpp, xml) in &cases {
-            // Deleting a resource also leaves a calendar record the existing
-            // calendar decoder refuses; the resource/assignment table probes
-            // are tested directly in their decoder unit tests.
-            if mpp
-                .file_stem()
-                .is_some_and(|stem| stem == "a3-deleted-rows")
-            {
-                continue;
-            }
             compare_assignment_oracle(mpp, xml);
+            let imported =
+                mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
+            let expected =
+                projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+            let fields = |c: &projcore::Calendar| {
+                (
+                    c.uid,
+                    c.name.clone(),
+                    c.base_calendar_uid,
+                    c.week.clone(),
+                    c.exceptions.clone(),
+                    c.work_weeks.clone(),
+                )
+            };
+            assert_eq!(
+                imported.calendars.iter().map(fields).collect::<Vec<_>>(),
+                expected.calendars.iter().map(fields).collect::<Vec<_>>(),
+                "{}: calendars",
+                mpp.display()
+            );
+            assert_eq!(
+                imported.default_calendar_uid,
+                expected.default_calendar_uid,
+                "{}: default calendar UID",
+                mpp.display()
+            );
         }
     }
     if let Ok(paired) = std::env::var("MPP_PAIRED_CORPUS") {
