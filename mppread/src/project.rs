@@ -11,7 +11,7 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// can make its scheduled finish earlier than its stored finish, as on MSPDI
 /// import; a recurring calendar exception the scheduler cannot expand can
 /// also make those dates differ. Invalid stored durations, unrecognized
-/// duration formats and missing task calendar references refuse the file.
+/// duration formats and invalid or missing task calendar references refuse the file.
 /// A **manual** leaf keeps its mode and
 /// its manual start,
 /// finish and duration instead, which hold it where Project put it without a
@@ -114,6 +114,12 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 }
             }
             task.calendar_uid = t.calendar_uid;
+            let task_cal = t
+                .calendar_uid
+                .and_then(|uid| cal_ref.calendar(uid))
+                .map(|cal| cal_ref.resolved_calendar(cal))
+                .unwrap_or_else(|| cal_ref.project_calendar());
+            let working_span = || projcore::schedule::working_minutes_on(&task_cal, s, f);
             task.manual = t.manual;
             let date = |d: &Option<String>, what: &str| {
                 d.as_deref()
@@ -148,13 +154,9 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             if is_summary {
                 task.duration_min = 0;
             } else if t.manual {
-                task.duration_min = t
-                    .manual_duration_min
-                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
+                task.duration_min = t.manual_duration_min.unwrap_or_else(working_span);
             } else {
-                task.duration_min = t
-                    .duration_min
-                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
+                task.duration_min = t.duration_min.unwrap_or_else(working_span);
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }

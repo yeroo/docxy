@@ -277,7 +277,8 @@ Percent DurationFormats also use the span fallback. Unknown DurationFormats and
 negative durations other than the absent marker refuse the file. Task
 CalendarUID is a signed i32 at +178: -1 means the project calendar. A task
 reference to a calendar absent from the decoded calendar table refuses the
-file.
+file; any other negative CalendarUID also refuses it. Fallback spans are
+measured on the task's calendar when it has one.
 The stored value also covers a split or a delayed assignment, whose duration
 can be shorter than that span. The scheduler does not yet account for splits
 or a delayed assignment when calculating the task's finish; a recurring

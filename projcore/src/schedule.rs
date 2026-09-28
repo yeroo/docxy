@@ -1989,11 +1989,10 @@ fn without_unscheduled_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
 }
 
 /// Working minutes between two wall-clock instants under the project's default
-/// calendar. Used when importing a file that stores computed wall-clock
-/// start/finish (a `.mpp`) but not an explicit working-minute duration: the
-/// duration is `working_minutes_between(start, finish)`. A summary's duration
-/// is measured by [`task_duration_min`] instead, which falls back to the leaves'
-/// calendars when this one has no working time.
+/// calendar. For a task with its own calendar, resolve that calendar and use
+/// [`working_minutes_on`] instead. A summary's duration is measured by
+/// [`task_duration_min`], which falls back to the leaves' calendars when the
+/// project calendar has no working time.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
     let cal = proj.project_calendar();
     working_minutes_on(&cal, start, finish)
@@ -2001,7 +2000,7 @@ pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime
 
 /// Working minutes between two wall-clock instants on one calendar, counted
 /// through the same timeline the scheduler uses.
-pub(crate) fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: DateTime) -> i64 {
+pub fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: DateTime) -> i64 {
     let a = start.minutes().min(finish.minutes());
     let b = start.minutes().max(finish.minutes());
     let tl = Timeline::build(cal, a, a, (b - a) + 480, b + 1440);

@@ -67,7 +67,8 @@ pub struct MppTask {
     pub manual_finish: Option<String>,
     pub manual_duration_min: Option<i64>,
     /// Project's stored working duration for a current-layout task. Absent
-    /// for MPP9, missing values, and elapsed DurationFormats.
+    /// for MPP9, a missing value or format, and elapsed or percent
+    /// DurationFormats.
     pub duration_min: Option<i64>,
     /// Assigned task calendar UID in the newest layout, or `None` when it
     /// uses the project calendar (and for MPP9).

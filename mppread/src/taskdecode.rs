@@ -749,6 +749,83 @@ mod tests {
             ],
         )])
     }
+    /// A task fixture with Standard (UID 1) and a 24-hour task calendar
+    /// (UID 3), so identical stored dates have different working spans.
+    fn file_with_task_calendar(s: &Streams) -> Vec<u8> {
+        let mut cal_fd = vec![0u8; 64];
+        for i in 0..4 {
+            cal_fd[i * 16..i * 16 + 2].copy_from_slice(&(i as u16).to_le_bytes());
+        }
+        for uid in [1i32, 3] {
+            cal_fd.extend_from_slice(&(-1i32).to_le_bytes()); // base
+            cal_fd.extend_from_slice(&(-1i32).to_le_bytes()); // resource
+            cal_fd.extend_from_slice(&uid.to_le_bytes());
+        }
+        let mut cal_fm = vec![0u8; 16 + 6 * 10];
+        cal_fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        cal_fm[8..12].copy_from_slice(&6u32.to_le_bytes());
+        cal_fm[12..16].copy_from_slice(&(cal_fd.len() as u32).to_le_bytes());
+        for (i, off) in [0, 16, 32, 48, 64, 76].into_iter().enumerate() {
+            let p = 16 + i * 10;
+            cal_fm[p..p + 2].copy_from_slice(&(if i < 4 { 4u16 } else { 0 }).to_le_bytes());
+            cal_fm[p + 4..p + 8].copy_from_slice(&(off as u32).to_le_bytes());
+        }
+        let mut cal_v2 = Vec::new();
+        let mut cal_vm = vec![0u8; 24];
+        cal_vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        let mut put = |uid: u32, key: u16, value: &[u8]| {
+            cal_vm.extend_from_slice(&uid.to_le_bytes());
+            cal_vm.extend_from_slice(&(cal_v2.len() as u32).to_le_bytes());
+            cal_vm.extend_from_slice(&key.to_le_bytes());
+            cal_vm.extend_from_slice(&0x0d40u16.to_le_bytes());
+            cal_v2.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            cal_v2.extend_from_slice(value);
+        };
+        let name = |s: &str| {
+            s.encode_utf16()
+                .chain([0])
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        put(1, 1, &name("Standard"));
+        put(3, 1, &name("24 Hours"));
+        let mut hours = vec![0u8; 428];
+        for day in 0..7 {
+            let p = day * 60;
+            hours[p + 2..p + 4].copy_from_slice(&1u16.to_le_bytes());
+            hours[p + 20..p + 24].copy_from_slice(&14400i32.to_le_bytes());
+        }
+        put(3, 8, &hours);
+        cal_vm[8..12].copy_from_slice(&3u32.to_le_bytes());
+        cal_vm[20..24].copy_from_slice(&(cal_v2.len() as u32).to_le_bytes());
+        write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                Node::Stream("Props", s.props.clone()),
+                Node::Storage(
+                    "TBkndTask",
+                    vec![
+                        Node::Stream("FixedMeta", s.fm.clone()),
+                        Node::Stream("FixedData", s.fd.clone()),
+                        Node::Stream("VarMeta", s.vm.clone()),
+                        Node::Stream("Var2Data", s.v2.clone()),
+                        Node::Stream("Fixed2Meta", s.f2m.clone()),
+                        Node::Stream("Fixed2Data", s.f2d.clone()),
+                    ],
+                ),
+                Node::Storage("TBkndCons", vec![Node::Stream("FixedData", s.cons.clone())]),
+                Node::Storage(
+                    "TBkndCal",
+                    vec![
+                        Node::Stream("FixedMeta", cal_fm),
+                        Node::Stream("FixedData", cal_fd),
+                        Node::Stream("VarMeta", cal_vm),
+                        Node::Stream("Var2Data", cal_v2),
+                    ],
+                ),
+            ],
+        )])
+    }
     fn reject(s: &Streams) {
         assert!(decode(&file(s, true)).is_err());
     }
@@ -875,6 +952,39 @@ mod tests {
                 .duration_min,
             span
         );
+    }
+    #[test]
+    fn fallback_duration_uses_the_tasks_own_calendar() {
+        let mut s = fixture();
+        let rec = 250; // leaf B, UID 1
+        s.fd[rec + NEWEST.finish..rec + NEWEST.finish + 4]
+            .copy_from_slice(&[0x80, 0x25, 0x86, 0x3a]); // same day, 16:00
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&3i32.to_le_bytes());
+        s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&4800u32.to_le_bytes());
+        s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2].copy_from_slice(&8u16.to_le_bytes()); // elapsed format: use span
+        let bytes = file_with_task_calendar(&s);
+        let project = crate::project::project_from_mpp(&bytes).unwrap();
+        let task = &project.tasks[0];
+        let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
+        assert_eq!(task.calendar_uid, Some(3));
+        assert_eq!(
+            projcore::schedule::working_minutes_between(&project, start, finish),
+            420
+        );
+        assert_eq!(task.duration_min, 480); // 24-hour task calendar
+        let task_cal = project.resolved_calendar(project.calendar(3).unwrap());
+        assert_eq!(
+            projcore::schedule::working_minutes_on(&task_cal, start, finish),
+            480
+        );
+
+        make_manual(&mut s);
+        s.f2d[4 * 64 + MANUAL_DURATION..4 * 64 + MANUAL_DURATION + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let manual = crate::project::project_from_mpp(&file_with_task_calendar(&s)).unwrap();
+        assert!(manual.tasks[0].manual);
+        assert_eq!(manual.tasks[0].manual_duration_min, None);
+        assert_eq!(manual.tasks[0].duration_min, 480);
     }
     #[test]
     fn refuses_structural_corruption() {
