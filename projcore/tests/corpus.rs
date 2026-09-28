@@ -618,6 +618,34 @@ fn task_fields_fixture_keeps_custom_fields() {
 }
 
 #[test]
+fn task_fields_fixture_keeps_outline_codes_and_wbs_mask() {
+    let xml = std::fs::read_to_string(corpus_dir().join("20-task-fields.xml")).unwrap();
+    let proj = read_mspdi(&xml).unwrap();
+    assert_eq!(proj.outline_code_definitions.len(), 1);
+    assert_eq!(
+        find_leaf(&proj.outline_code_definitions[0], "Alias"),
+        Some("Zone & trade")
+    );
+    let mask = proj.wbs_masks.as_ref().unwrap();
+    assert_eq!(find_leaf(mask, "Prefix"), Some("PRJ-"));
+    assert_eq!(
+        mask.children.iter().filter(|c| c.name == "WBSMask").count(),
+        2
+    );
+    let codes = &proj.task(2).unwrap().outline_codes;
+    assert_eq!(codes.len(), 2);
+    assert_eq!(codes[0].value_id.as_deref(), Some("1"));
+    assert_eq!(codes[1].value_id.as_deref(), Some("2"));
+    let saved = read_mspdi(&write_mspdi(&proj)).unwrap();
+    let package = read_yppx(&write_yppx(&proj)).unwrap();
+    for back in [saved, package] {
+        assert_eq!(back.outline_code_definitions, proj.outline_code_definitions);
+        assert_eq!(back.wbs_masks, proj.wbs_masks);
+        assert_eq!(back.task(2).unwrap().outline_codes, *codes);
+    }
+}
+
+#[test]
 fn progress_fixture_keeps_actuals_through_a_save() {
     use projcore::DateTime;
     let xml = std::fs::read_to_string(corpus_dir().join("22-progress.xml")).unwrap();

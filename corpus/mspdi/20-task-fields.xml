@@ -6,6 +6,21 @@
   <CalendarUID>1</CalendarUID>
   <StartDate>2026-03-02T08:00:00</StartDate>
   <ProjectExternallyEdited>0</ProjectExternallyEdited>
+  <OutlineCodes>
+    <OutlineCode>
+      <FieldID>188744105</FieldID><FieldName>Task Outline Code1</FieldName>
+      <Alias>Zone &amp; trade</Alias>
+      <Masks><Mask><Level>1</Level><Type>0</Type><Length>2</Length><Separator>.</Separator></Mask></Masks>
+      <Values><Value><ValueID>1</ValueID><Description>Civil</Description></Value><Value><ValueID>2</ValueID><Description>M&amp;E</Description></Value></Values>
+    </OutlineCode>
+  </OutlineCodes>
+  <WBSMasks>
+    <VerifyUniqueCodes>1</VerifyUniqueCodes>
+    <GenerateCodes>1</GenerateCodes>
+    <Prefix>PRJ-</Prefix>
+    <WBSMask><Level>1</Level><Mask>0</Mask><Length>2</Length><Separator>.</Separator></WBSMask>
+    <WBSMask><Level>2</Level><Mask>1</Mask><Length>0</Length><Separator>-</Separator></WBSMask>
+  </WBSMasks>
   <ExtendedAttributes>
     <ExtendedAttribute>
       <FieldID>188743731</FieldID>
@@ -114,6 +129,15 @@
         <Value>PT32H0M0S</Value>
         <DurationFormat>7</DurationFormat>
       </ExtendedAttribute>
+      <OutlineCode>
+        <FieldID>188744105</FieldID>
+        <ValueID>1</ValueID>
+      </OutlineCode>
+      <OutlineCode>
+        <FieldID>188744105</FieldID>
+        <ValueID>2</ValueID>
+        <ValueGUID>7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102</ValueGUID>
+      </OutlineCode>
     </Task>
     <Task>
       <UID>3</UID><ID>3</ID>

@@ -311,6 +311,8 @@ pub struct Task {
     pub baselines: Vec<Baseline>,
     /// Custom field values (MSPDI `ExtendedAttribute`), in file order.
     pub extended_attributes: Vec<ExtendedAttributeValue>,
+    /// Outline code values (MSPDI `OutlineCode`), in file order.
+    pub outline_codes: Vec<OutlineCodeValue>,
     /// Manually scheduled (MSPDI `Manual`): the task stays at the dates the
     /// user gave it instead of moving with its links and constraints.
     pub manual: bool,
@@ -824,8 +826,8 @@ pub struct ExtendedAttributeValue {
     pub duration_format: Option<u8>,
 }
 
-/// An outline code's value on a resource (MSPDI `OutlineCode`). The code's
-/// definition is not modeled.
+/// An outline code's value on a task or resource (MSPDI `OutlineCode`).
+/// Definitions are kept in `Project::outline_code_definitions`.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct OutlineCodeValue {
     /// The field's ID, kept as written.
@@ -1479,6 +1481,12 @@ pub struct Project {
     /// lands here only when its text does not parse; one that parses is kept
     /// in its field and saved in canonical form (`true` saves as `1`).
     pub options: Vec<(String, String)>,
+    /// Outline code definitions (each an MSPDI `<OutlineCode>` from the
+    /// project's `<OutlineCodes>` block), in read order.
+    pub outline_code_definitions: Vec<XmlElement>,
+    /// The project's WBS code mask block, including its flags, prefix, and
+    /// ordered mask levels. The last non-empty block read wins.
+    pub wbs_masks: Option<XmlElement>,
     /// The custom field definitions (each an MSPDI `<ExtendedAttribute>` of
     /// the project's `<ExtendedAttributes>` block: alias, lookup table,
     /// formula, ...), in read order. Not modeled; a save writes them back.
@@ -1509,6 +1517,8 @@ impl Default for Project {
             hours_per_week: 40.0,
             default_calendar_uid: 1,
             options: Vec::new(),
+            outline_code_definitions: Vec::new(),
+            wbs_masks: None,
             extended_attribute_definitions: Vec::new(),
             tasks: Vec::new(),
             resources: Vec::new(),
