@@ -2045,11 +2045,19 @@ mod tests {
             start: Some(DateTime::from_ymd_hm(2026, 1, 1, 8, 0)),
             finish: Some(DateTime::from_ymd_hm(2026, 1, 1, 9, 0)),
             cost,
-            baselines: vec![AssignmentBaseline {
-                number: 1,
-                work_min: Some(1),
-                ..AssignmentBaseline::default()
-            }],
+            baselines: vec![
+                AssignmentBaseline {
+                    number: 0,
+                    bcws: rate("5"),
+                    bcwp: rate("5"),
+                    ..AssignmentBaseline::default()
+                },
+                AssignmentBaseline {
+                    number: 1,
+                    work_min: Some(1),
+                    ..AssignmentBaseline::default()
+                },
+            ],
             timephased_data: vec![record(1), record(4), record(5), record(16)],
             ..Assignment::default()
         };
@@ -2071,6 +2079,7 @@ mod tests {
             assert_eq!(b.finish, Some(monday.add_minutes(9 * 60)), "{}", a.uid);
             assert_eq!(b.work_min, Some(480));
             assert_eq!(b.cost.as_ref().map(Rate::as_str), Some(cost), "{}", a.uid);
+            assert_eq!((b.bcws.clone(), b.bcwp.clone()), (None, None), "{}", a.uid);
             assert_eq!(a.baseline(1).unwrap().work_min, Some(1));
             let kinds: Vec<u8> = a.timephased_data.iter().map(|t| t.kind).collect();
             assert_eq!(kinds, [1, 16]);
