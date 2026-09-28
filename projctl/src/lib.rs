@@ -20,7 +20,7 @@
 //! | `task.set` | `{uid, name?, duration?, level?, manual?}` | the updated task (`manual`: `true` Manually / `false` Auto Scheduled) |
 //! | `task.add` | `{after?, name?, duration?}` | the new task (without `duration`, 1 day, estimated when the plan's `NewTasksEstimated` is; inserted `after` a task that a finish-to-start link joins to the next, it is linked into that chain when the plan's `Autolink` is on, as it is by default) |
 //! | `task.del` | `{uid}` | `{deleted, removed:[uid…]}` (a summary takes its subtree) |
-//! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` as the Predecessors cell spells it: `4h`, `2ed`, `50%`) |
+//! | `link.add` | `{uid, pred, type?, lag?}` | the updated task (`lag` uses Predecessors cell spellings such as `4h`, `2ed`, `50%`; other duration spellings such as `1 month` are read as working-days lags) |
 //! | `link.del` | `{uid, pred}` | the updated task |
 //! | `find` | `{query}` | `{count, tasks:[…]}` |
 //!
@@ -295,7 +295,8 @@ fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         Some(t) => parse_link_name(t).ok_or("'type' must be FS, SS, FF, or SF")?,
         None => LinkType::FinishStart,
     };
-    // The Predecessors cell's lag grammar; a bare number stays working days.
+    // The Predecessors cell's lag grammar; anything else parse_duration reads
+    // (a bare number, unit words, months) is a working-days lag.
     let (lag, lag_format) = match args.get_str("lag") {
         Some(l) => parse_lag(l, ed.project())
             .or_else(|| parse_duration(l, ed.project()).map(|min| (min, LagFormat::DAYS)))
