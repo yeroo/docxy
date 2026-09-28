@@ -199,6 +199,8 @@ living under the harness's own directory.
 (`offxy-vscode/mcp/templates/blank.docx`) for the cross-kind ribbon smoke case.
 `doc-table.docx` has a paragraph before and after a two-cell table; the
 `doc-state.uit` case uses it to check Table's contextual visibility.
+`rulers.docx` has contrasting page margins, first-line and hanging indents,
+and four pages of text. `doc-rulers.uit` checks the painted ruler at two zooms.
 
 Every verb goes in through **the same entry point the pointer or keyboard
 would**. A verb that reached past a handler into the state it maintains could
@@ -273,12 +275,23 @@ replaces the saved reply, and `open` clears it.
 ### Document tabs
 
 `state()` and `call doc {}` report `text`, `textboxes`, `sel`, `anchor`,
-`caret`, `cross_story`, `para`, `run`, `view`, and `hf_edit` from the active body
+`caret`, `cross_story`, `para`, `run`, `view`, `hf_edit`, and `ruler` from the active body
 editor. `doc` returns only those document fields. `text` is the main story;
 each paragraph contributes a final `\n`, including a table cell paragraph.
 Tab is `\t`, and line/page/column breaks are `\u000B`/`\u000C`/`\u000E`.
 Cached field and revision text has no editor caret and contributes no offset.
 Text boxes appear in `textboxes` as separate stories.
+
+`ruler` reports the last painted ruler geometry in logical pixels rounded to
+0.1: `first_offset`, `left_offset`, and `right_offset` are marker distances from
+the text column edges; `column_inset` is the Draft column's inset from the
+viewport; `text_inset`, `vtop_inset`, and `vbottom_inset` are the Print text box's
+distances from the page edges. `tracked_page` is the zero-based page index and
+`frame` is the frame counter. The object is `null` when the ruler is hidden or
+has not painted. Draft reports `text_inset`, both vertical insets, and
+`tracked_page` as `null`; Print reports `column_inset` as `null`. Geometry
+trails a driving verb by a frame, so settle with `shot window` before asserting
+it, as with `filler_rows`.
 
 Offsets count Unicode scalar values, as the editor does. Word counts UTF-16
 code units, so offsets after an astral character need conversion for external

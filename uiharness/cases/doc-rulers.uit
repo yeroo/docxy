@@ -1,0 +1,48 @@
+test ruler positions follow the document geometry at 100 and 200 percent
+  open copy:../fixtures/rulers.docx
+  call doc {}
+  assert reply.ruler is null
+  call ribbon-click {"tab":"View","command":"ruler"}
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call doc {}
+  assert reply.view.layout is print
+  assert reply.ruler.text_inset is 145
+  assert reply.ruler.vtop_inset is 145
+  assert reply.ruler.vbottom_inset is 121
+  assert reply.ruler.first_offset is 144
+  assert reply.ruler.left_offset is 96
+  assert reply.ruler.right_offset is 0
+  assert reply.ruler.tracked_page is 0
+  assert reply.ruler.frame is not null
+  call selection-set {"start":13,"end":13}
+  shot window
+  call doc {}
+  assert reply.para.index is 1
+  assert reply.ruler.first_offset is 48
+  assert reply.ruler.left_offset is 96
+  assert reply.ruler.right_offset is 96
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call doc {}
+  assert reply.view.layout is web
+  assert reply.ruler.column_inset is 48
+  assert reply.ruler.first_offset is 48
+  key ctrl+= ctrl+= ctrl+= ctrl+= ctrl+= ctrl+= ctrl+= ctrl+= ctrl+= ctrl+=
+  shot window
+  call doc {}
+  assert reply.view.zoom is 2.000000238418579
+  assert reply.ruler.column_inset is 48
+  assert reply.ruler.first_offset is 96
+  assert reply.ruler.left_offset is 192
+  assert reply.ruler.right_offset is 192
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call doc {}
+  assert reply.view.layout is print
+  assert reply.ruler.text_inset is 289
+  assert reply.ruler.vtop_inset is 289
+  assert reply.ruler.vbottom_inset is 241
+  assert reply.ruler.first_offset is 96
+  assert reply.ruler.left_offset is 192
+  assert reply.ruler.right_offset is 192

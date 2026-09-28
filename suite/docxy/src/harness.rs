@@ -1014,6 +1014,51 @@ fn doc_state(editor: &Editor, flags: &ViewFlags) -> Json {
     ])
 }
 
+/// Ruler coordinates come from the last painted frame, in logical pixels.
+fn ruler_state(app: &crate::Docxy) -> Json {
+    if !app.show_ruler {
+        return Json::Null;
+    }
+    let probe = app.ruler_probe.borrow();
+    let Some(g) = probe.painted.as_ref() else {
+        return Json::Null;
+    };
+    let tenth = |n: f32| Json::Num(((n * 10.0).round() / 10.0) as f64);
+    let mut fields = vec![
+        ("frame", Json::Num(app.frame as f64)),
+        ("first_offset", tenth(g.first_x - g.content_x)),
+        ("left_offset", tenth(g.left_x - g.content_x)),
+        ("right_offset", tenth(g.content_right - g.right_x)),
+    ];
+    if g.draft {
+        fields.push(("column_inset", tenth(g.content_x - g.viewport.x)));
+        fields.push(("text_inset", Json::Null));
+        fields.push(("vtop_inset", Json::Null));
+        fields.push(("vbottom_inset", Json::Null));
+        fields.push(("tracked_page", Json::Null));
+    } else {
+        fields.push(("column_inset", Json::Null));
+        fields.push(("text_inset", tenth(g.content_x - g.page_x)));
+        fields.push(("vtop_inset", tenth(g.content_y - g.page_y)));
+        fields.push(("vbottom_inset", tenth(g.page_bottom - g.content_bottom)));
+        fields.push((
+            "tracked_page",
+            g.tracked_page
+                .map(|i| Json::Num(i as f64))
+                .unwrap_or(Json::Null),
+        ));
+    }
+    Json::obj(fields)
+}
+
+fn live_doc_state(app: &crate::Docxy, window: &Window) -> Result<Json, String> {
+    let mut doc = doc_state(active_doc(app)?, &ViewFlags::live(app, window));
+    if let Json::Obj(fields) = &mut doc {
+        fields.push(("ruler".into(), ruler_state(app)));
+    }
+    Ok(doc)
+}
+
 fn active_doc(app: &crate::Docxy) -> Result<&Editor, String> {
     match app.tabs.get(app.active).map(|t| &t.surface) {
         Some(crate::Surface::Doc(ed)) => Ok(ed),
@@ -1435,8 +1480,8 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
         ("sel_hidden", Json::Bool(ov.sel_hidden)),
     ]);
     let mut out: Vec<_> = out.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-    if let Ok(ed) = active_doc(app) {
-        if let Json::Obj(fields) = doc_state(ed, &ViewFlags::live(app, window)) {
+    if active_doc(app).is_ok() {
+        if let Ok(Json::Obj(fields)) = live_doc_state(app, window) {
             out.extend(fields);
         }
     }
@@ -1590,7 +1635,7 @@ pub fn dispatch(
             }
             Done::ok(state(app, window))
         }
-        "doc" => Done::ok(doc_state(active_doc(app)?, &ViewFlags::live(app, window))),
+        "doc" => Done::ok(live_doc_state(app, window)?),
         "selection-set" => {
             let (start, end) = (arg_usize(args, "start")?, arg_usize(args, "end")?);
             if app.hf_active() {

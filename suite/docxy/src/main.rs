@@ -1328,9 +1328,8 @@ struct Docxy {
     ruler_drag: Option<RulerDrag>,
     // The tab-stop type placed when clicking the ruler (cycled via the corner box).
     ruler_tab: docxcore::model::TabAlign,
-    // The ruler content area's left-margin screen x, written by the ruler canvas
-    // each paint and read by click handlers to map a click to a tab position.
-    ruler_x0: std::rc::Rc<std::cell::Cell<f32>>,
+    // Screen bounds measured during prepaint and shared with the ruler paint and hit path.
+    ruler_probe: std::rc::Rc<std::cell::RefCell<RulerProbe>>,
     // A text drag-selection is in progress (mouse down in the doc, not yet up).
     selecting: bool,
     // A spreadsheet drag-select is in progress (left button held over cells).
@@ -1584,7 +1583,7 @@ enum KeyTip {
     Commands,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum RulerHandle {
     FirstLine,
     Left,
@@ -1593,15 +1592,1098 @@ enum RulerHandle {
     MarginRight,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct ScreenRect {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+impl ScreenRect {
+    fn from_bounds(b: Bounds<Pixels>) -> Self {
+        Self {
+            x: b.origin.x.into(),
+            y: b.origin.y.into(),
+            w: b.size.width.into(),
+            h: b.size.height.into(),
+        }
+    }
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+    fn intersects(&self, other: &Self) -> bool {
+        self.x < other.x + other.w
+            && self.x + self.w > other.x
+            && self.y < other.y + other.h
+            && self.y + self.h > other.y
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct EffIndent {
+    left: i32,
+    first: i32,
+    right: i32,
+    list_step: i32,
+}
+
+fn eff_indent(p: &docxcore::model::ParProps) -> EffIndent {
+    let list_step = p.ilvl.max(0).saturating_mul(300);
+    let left = p.indent.max(0).saturating_add(list_step);
+    EffIndent {
+        left,
+        first: p.first_line.max(-left),
+        right: p.indent_right.max(0),
+        list_step,
+    }
+}
+
+fn tw_px(t: i32, zoom: f32) -> f32 {
+    t as f32 * zoom / 15.0
+}
+fn px_tw(p: f32, zoom: f32) -> i32 {
+    (p * 15.0 / zoom).round() as i32
+}
+
+fn dragged_left_marker(start: EffIndent, delta: i32) -> i32 {
+    snap_twips(start.left.saturating_add(delta)).max(start.list_step)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParagraphIndentLayout {
+    continuation_x: f32,
+    first_x: f32,
+    spacer_width: f32,
+    spacer_margin: f32,
+}
+
+impl ParagraphIndentLayout {
+    fn first_line_tab_origin(self) -> f32 {
+        self.first_x - self.continuation_x
+    }
+    fn first_line_spacer(self) -> Option<(f32, f32)> {
+        (self.first_x != self.continuation_x).then_some((self.spacer_width, self.spacer_margin))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LeadingItem {
+    Spacer { width: f32, margin: f32 },
+    ListMarker,
+    MarkerGap(f32),
+}
+
+fn next_tab_stop(
+    xm: f32,
+    pad_l: f32,
+    interval: f32,
+    customs: &[(f32, docxcore::model::TabAlign)],
+) -> (f32, docxcore::model::TabAlign) {
+    use docxcore::model::TabAlign;
+    let mut pos = f32::INFINITY;
+    let mut align = TabAlign::Left;
+    let max_custom = customs
+        .iter()
+        .map(|(c, _)| *c)
+        .fold(f32::NEG_INFINITY, f32::max);
+    for &(c, a) in customs {
+        if c > xm + 0.5 && c < pos {
+            pos = c;
+            align = a;
+        }
+    }
+    let lo = xm
+        .max(if max_custom.is_finite() {
+            max_custom
+        } else {
+            0.0
+        })
+        .max(if xm < pad_l { pad_l } else { 0.0 });
+    let mut d = ((lo / interval).floor() + 1.0) * interval;
+    while d <= xm + 0.5 {
+        d += interval;
+    }
+    if d < pos {
+        pos = d;
+        align = TabAlign::Left;
+    }
+    // A hanging paragraph's left indent is an implicit stop on its first line.
+    if pad_l > xm + 0.5 && pad_l < pos {
+        (pad_l, TabAlign::Left)
+    } else {
+        (pos, align)
+    }
+}
+
+fn leading_items(
+    layout: ParagraphIndentLayout,
+    marker_width: Option<f32>,
+    interval: f32,
+    customs: &[(f32, docxcore::model::TabAlign)],
+) -> Vec<LeadingItem> {
+    let mut items = Vec::with_capacity(3);
+    if let Some((width, margin)) = layout.first_line_spacer() {
+        items.push(LeadingItem::Spacer { width, margin });
+    }
+    if let Some(width) = marker_width {
+        items.push(LeadingItem::ListMarker);
+        if layout.first_x + 0.5 < layout.continuation_x {
+            let xm = layout.first_x + width;
+            let (stop, _) = next_tab_stop(xm, layout.continuation_x, interval, customs);
+            items.push(LeadingItem::MarkerGap((stop - xm).max(3.0)));
+        }
+    }
+    items
+}
+
+fn paragraph_indent_layout(indent: EffIndent, zoom: f32) -> ParagraphIndentLayout {
+    let continuation_x = tw_px(indent.left, zoom);
+    let first_x = tw_px(indent.left.saturating_add(indent.first), zoom);
+    let offset = first_x - continuation_x;
+    ParagraphIndentLayout {
+        continuation_x,
+        first_x,
+        spacer_width: offset.max(0.0),
+        spacer_margin: offset.min(0.0),
+    }
+}
+
+fn ruler_box(window: &mut Window, x0: f32, y0: f32, x1: f32, y1: f32, color: Hsla) {
+    if x1 > x0 && y1 > y0 {
+        window.paint_quad(fill(
+            Bounds::from_corners(point(px(x0), px(y0)), point(px(x1), px(y1))),
+            color,
+        ));
+    }
+}
+
+fn ruler_triangle(
+    window: &mut Window,
+    a: Point<Pixels>,
+    b: Point<Pixels>,
+    c: Point<Pixels>,
+    color: Hsla,
+) {
+    let mut path = Path::new(a);
+    path.line_to(b);
+    path.line_to(c);
+    path.line_to(a);
+    window.paint_path(path, color);
+}
+
+#[derive(Clone, Copy)]
+struct RulerColors {
+    ground: Hsla,
+    content: Hsla,
+    tick: Hsla,
+    marker: Hsla,
+}
+
+fn ruler_colors(pal: Pal, dark: bool) -> RulerColors {
+    RulerColors {
+        ground: Hsla {
+            l: if dark { 0.42 } else { 0.67 },
+            a: 1.0,
+            ..pal.border
+        },
+        content: Hsla {
+            l: if dark { 0.87 } else { 0.99 },
+            a: 1.0,
+            ..pal.panel
+        },
+        tick: Hsla {
+            l: if dark { 0.08 } else { 0.25 },
+            a: 1.0,
+            ..pal.fg
+        },
+        marker: Hsla {
+            l: if dark { 0.06 } else { 0.20 },
+            a: 1.0,
+            ..pal.fg
+        },
+    }
+}
+
+fn ruler_number(window: &mut Window, cx: &mut App, number: usize, x: f32, y: f32, color: Hsla) {
+    let text = number.to_string();
+    let run = TextRun {
+        len: text.len(),
+        font: window.text_style().font(),
+        color,
+        ..Default::default()
+    };
+    let line = window
+        .text_system()
+        .shape_line(SharedString::from(text), px(8.0), &[run], None);
+    let _ = line.paint(
+        point(px(x), px(y)),
+        px(10.0),
+        TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
+#[derive(Clone, Debug)]
+struct HRulerGeom {
+    viewport: ScreenRect,
+    strip_y: f32,
+    draft: bool,
+    page_x: f32,
+    page_right: f32,
+    page_y: f32,
+    page_bottom: f32,
+    content_x: f32,
+    content_right: f32,
+    content_y: f32,
+    content_bottom: f32,
+    tracked_page: Option<usize>,
+    first_x: f32,
+    left_x: f32,
+    right_x: f32,
+    tabs: Vec<f32>,
+    zoom: f32,
+}
+
+fn hruler_geom(
+    page_rect: ScreenRect,
+    text_rect: ScreenRect,
+    viewport: ScreenRect,
+    zoom: f32,
+    indent: EffIndent,
+    tabs: &[docxcore::model::TabStop],
+    draft: bool,
+) -> HRulerGeom {
+    let content_x = text_rect.x;
+    let content_right = text_rect.x + text_rect.w;
+    HRulerGeom {
+        viewport,
+        strip_y: 0.0,
+        draft,
+        page_x: page_rect.x,
+        page_right: page_rect.x + page_rect.w,
+        page_y: page_rect.y,
+        page_bottom: page_rect.y + page_rect.h,
+        content_x,
+        content_right,
+        content_y: text_rect.y,
+        content_bottom: text_rect.y + text_rect.h,
+        tracked_page: None,
+        first_x: content_x + tw_px(indent.left.saturating_add(indent.first), zoom),
+        left_x: content_x + tw_px(indent.left, zoom),
+        right_x: content_right - tw_px(indent.right, zoom),
+        tabs: tabs
+            .iter()
+            .map(|t| content_x + tw_px(t.pos, zoom))
+            .collect(),
+        zoom,
+    }
+}
+
+fn hruler_hit(g: &HRulerGeom, x: f32, y: f32) -> Option<RulerHandle> {
+    if x < g.viewport.x || x >= g.viewport.x + g.viewport.w {
+        return None;
+    }
+    let y = y - g.strip_y;
+    if y < 11.0 && marker_visible(g, g.first_x, 5.0) && (x - g.first_x).abs() <= 7.0 {
+        return Some(RulerHandle::FirstLine);
+    }
+    if y >= 11.0 && marker_visible(g, g.left_x, 5.0) && (x - g.left_x).abs() <= 7.0 {
+        return Some(RulerHandle::Left);
+    }
+    if y >= 11.0 && marker_visible(g, g.right_x, 5.0) && (x - g.right_x).abs() <= 7.0 {
+        return Some(RulerHandle::Right);
+    }
+    if !g.draft && x >= g.content_x - 8.0 && x < g.content_x - 1.0 {
+        return Some(RulerHandle::MarginLeft);
+    }
+    if !g.draft && x > g.content_right + 1.0 && x <= g.content_right + 8.0 {
+        return Some(RulerHandle::MarginRight);
+    }
+    None
+}
+
+fn marker_visible(g: &HRulerGeom, x: f32, half_width: f32) -> bool {
+    x >= g.viewport.x + half_width && x <= g.viewport.x + g.viewport.w - half_width
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VRulerGeom {
+    content_top: f32,
+    content_bottom: f32,
+}
+
+fn vruler_geom(text_rect: ScreenRect) -> VRulerGeom {
+    VRulerGeom {
+        content_top: text_rect.y,
+        content_bottom: text_rect.y + text_rect.h,
+    }
+}
+
+#[derive(Default)]
+struct RulerProbe {
+    viewport: Option<ScreenRect>,
+    draft_column: Option<ScreenRect>,
+    pages: Vec<Option<ScreenRect>>,
+    contents: Vec<Option<ScreenRect>>,
+    ranges: Vec<Vec<(usize, usize)>>,
+    caret_block: Option<usize>,
+    pointer: Option<(f32, f32)>,
+    draft: bool,
+    painted: Option<HRulerGeom>,
+}
+
+fn ruler_probe_el(
+    cell: &std::rc::Rc<std::cell::RefCell<RulerProbe>>,
+    record: impl Fn(&mut RulerProbe, ScreenRect) + 'static,
+) -> AnyElement {
+    let cell = cell.clone();
+    canvas(
+        move |b, _w, _a| {
+            record(&mut cell.borrow_mut(), ScreenRect::from_bounds(b));
+        },
+        move |_b, _s, _w, _a| {},
+    )
+    .absolute()
+    .left_0()
+    .top_0()
+    .right_0()
+    .bottom_0()
+    .into_any_element()
+}
+
+fn ruler_scroll_view(
+    scroll: AnyElement,
+    probe: &std::rc::Rc<std::cell::RefCell<RulerProbe>>,
+) -> AnyElement {
+    v_flex()
+        .relative()
+        .flex_1()
+        .h_full()
+        .min_h(px(0.))
+        .child(scroll)
+        .child(ruler_probe_el(probe, |state, rect| {
+            state.viewport = Some(rect)
+        }))
+        .into_any_element()
+}
+
+fn tracked_page(probe: &RulerProbe) -> Option<usize> {
+    let viewport = probe.viewport?;
+    let visible = |i: usize| {
+        probe
+            .pages
+            .get(i)
+            .and_then(|p| *p)
+            .is_some_and(|r| r.intersects(&viewport))
+    };
+    if let Some(block) = probe.caret_block {
+        if let Some(i) = probe
+            .ranges
+            .iter()
+            .position(|cols| cols.iter().any(|&(s, e)| s <= block && block < e))
+        {
+            if visible(i) {
+                return Some(i);
+            }
+        }
+    }
+    if let Some((x, y)) = probe.pointer.filter(|&(x, y)| viewport.contains(x, y)) {
+        if let Some(i) = probe
+            .pages
+            .iter()
+            .position(|p| p.is_some_and(|r| r.contains(x, y)))
+        {
+            return Some(i);
+        }
+    }
+    probe
+        .pages
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| p.filter(|r| r.intersects(&viewport)).map(|r| (i, r.y)))
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(i, _)| i)
+}
+
+#[cfg(test)]
+mod ruler_geom_tests {
+    use super::{
+        EffIndent, LeadingItem, Pal, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect,
+        dragged_left_marker, eff_indent, hruler_geom, hruler_hit, leading_items, next_tab_stop,
+        paragraph_indent_layout, px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px,
+        vruler_geom,
+    };
+    use docxcore::model::{PageGeom, ParProps, TabAlign, TabLeader, TabStop};
+
+    fn near(a: f32, b: f32) {
+        assert!((a - b).abs() < 0.02, "{a} != {b}");
+    }
+
+    #[test]
+    fn page_margins_and_paragraph_markers_follow_zoom() {
+        let page = PageGeom {
+            ml: 1080,
+            mr: 1800,
+            ..PageGeom::default()
+        };
+        let props = ParProps {
+            indent: 1440,
+            first_line: 720,
+            indent_right: 360,
+            ..ParProps::default()
+        };
+        let viewport = ScreenRect {
+            x: 250.0,
+            y: 50.0,
+            w: 1200.0,
+            h: 800.0,
+        };
+        let tabs = [TabStop {
+            pos: 720,
+            align: TabAlign::Left,
+            leader: TabLeader::None,
+        }];
+        for zoom in [0.5, 1.0, 1.5, 2.0] {
+            let outer = ScreenRect {
+                x: 320.0,
+                y: 40.0,
+                w: tw_px(page.w, zoom),
+                h: tw_px(page.h, zoom),
+            };
+            let text = ScreenRect {
+                x: outer.x + 1.0 + tw_px(page.ml, zoom),
+                y: outer.y + 1.0 + tw_px(page.mt, zoom),
+                w: outer.w - 2.0 - tw_px(page.ml + page.mr, zoom),
+                h: 400.0,
+            };
+            let g = hruler_geom(
+                outer,
+                text,
+                viewport,
+                zoom,
+                eff_indent(&props),
+                &tabs,
+                false,
+            );
+            near(g.content_x, outer.x + 1.0 + tw_px(page.ml, zoom));
+            near(
+                g.content_right,
+                outer.x + outer.w - 1.0 - tw_px(page.mr, zoom),
+            );
+            near(g.left_x, g.content_x + tw_px(1440, zoom));
+            near(g.first_x, g.content_x + tw_px(2160, zoom));
+            near(g.right_x, g.content_right - tw_px(360, zoom));
+            near(g.tabs[0], g.content_x + tw_px(720, zoom));
+        }
+    }
+
+    #[test]
+    fn draft_geometry_uses_the_measured_text_column() {
+        let viewport = ScreenRect {
+            x: 100.0,
+            y: 0.0,
+            w: 700.0,
+            h: 500.0,
+        };
+        let column = ScreenRect {
+            x: 151.0,
+            y: 28.0,
+            w: 596.0,
+            h: 20.0,
+        };
+        let p = ParProps {
+            indent: 720,
+            ..ParProps::default()
+        };
+        let g = hruler_geom(viewport, column, viewport, 2.0, eff_indent(&p), &[], true);
+        near(g.content_x, 151.0);
+        near(g.content_right, 747.0);
+        near(g.left_x, 151.0 + tw_px(720, 2.0));
+        assert!(g.draft);
+        assert_eq!(hruler_hit(&g, column.x - 3.0, 18.0), None);
+    }
+
+    #[test]
+    fn indent_offsets_share_the_renderer_math() {
+        for (left, first, ilvl) in [(1440, 720, 0), (0, -360, 2), (720, -360, 0), (360, -720, 0)] {
+            let p = ParProps {
+                indent: left,
+                first_line: first,
+                ilvl,
+                ..ParProps::default()
+            };
+            let eff = eff_indent(&p);
+            let layout = paragraph_indent_layout(eff, 1.5);
+            let viewport = ScreenRect {
+                x: 0.0,
+                y: 0.0,
+                w: 1000.0,
+                h: 800.0,
+            };
+            let outer = ScreenRect {
+                x: 100.0,
+                y: 0.0,
+                w: 816.0,
+                h: 1056.0,
+            };
+            let text = ScreenRect {
+                x: 196.0,
+                y: 96.0,
+                w: 622.0,
+                h: 400.0,
+            };
+            let g = hruler_geom(outer, text, viewport, 1.5, eff, &[], false);
+            near(g.left_x - g.content_x, layout.continuation_x);
+            near(g.first_x - g.content_x, layout.first_x);
+            near(
+                layout.first_x,
+                layout.continuation_x + layout.spacer_width + layout.spacer_margin,
+            );
+            near(
+                layout.first_line_tab_origin(),
+                layout.first_x - layout.continuation_x,
+            );
+            assert_eq!(
+                layout.first_line_spacer(),
+                (eff.first != 0).then_some((layout.spacer_width, layout.spacer_margin))
+            );
+            assert!(eff.left + eff.first >= 0);
+            assert_eq!(eff.list_step, ilvl * 300);
+            if left == 360 && first == -720 {
+                assert_eq!(eff.first, -360);
+            }
+        }
+    }
+
+    #[test]
+    fn zero_first_line_has_no_spacer_or_tab_shift() {
+        let layout = paragraph_indent_layout(eff_indent(&ParProps::default()), 1.0);
+        assert_eq!(layout.first_line_spacer(), None);
+        near(layout.first_line_tab_origin(), 0.0);
+    }
+
+    #[test]
+    fn first_line_items_put_the_spacer_before_list_marker() {
+        let positive = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                first_line: 720,
+                ..ParProps::default()
+            }),
+            1.5,
+        );
+        near(positive.first_line_tab_origin(), 72.0);
+        assert_eq!(
+            leading_items(positive, Some(10.0), 72.0, &[]),
+            vec![
+                LeadingItem::Spacer {
+                    width: 72.0,
+                    margin: 0.0
+                },
+                LeadingItem::ListMarker
+            ]
+        );
+
+        let hanging = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                indent: 720,
+                first_line: -360,
+                ..ParProps::default()
+            }),
+            1.5,
+        );
+        near(hanging.first_line_tab_origin(), -36.0);
+        assert_eq!(
+            leading_items(hanging, None, 72.0, &[]),
+            vec![LeadingItem::Spacer {
+                width: 0.0,
+                margin: -36.0
+            }]
+        );
+
+        let list = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                ilvl: 2,
+                first_line: -360,
+                ..ParProps::default()
+            }),
+            1.5,
+        );
+        assert_eq!(
+            leading_items(list, Some(8.0), 72.0, &[]),
+            vec![
+                LeadingItem::Spacer {
+                    width: 0.0,
+                    margin: -36.0
+                },
+                LeadingItem::ListMarker,
+                LeadingItem::MarkerGap(28.0)
+            ]
+        );
+        near(list.first_x, 24.0); // the marker follows the spacer at the first-line origin
+    }
+
+    #[test]
+    fn plain_list_levels_keep_text_after_the_marker() {
+        for ilvl in [0, 1] {
+            let layout = paragraph_indent_layout(
+                eff_indent(&ParProps {
+                    ilvl,
+                    ..ParProps::default()
+                }),
+                1.0,
+            );
+            assert_eq!(
+                leading_items(layout, Some(10.0), 48.0, &[]),
+                vec![LeadingItem::ListMarker]
+            );
+        }
+    }
+
+    #[test]
+    fn default_tab_grid_tolerance_advances_past_nearby_stop() {
+        for zoom in [0.9, 1.0] {
+            let interval = 48.0 * zoom;
+            for (xm, expected) in [
+                (interval - 1e-4, 2.0 * interval),
+                (7.0 * interval, 8.0 * interval),
+            ] {
+                let (stop, _) = next_tab_stop(xm, 0.0, interval, &[]);
+                near(stop, expected);
+                assert!(stop > xm + 0.5);
+            }
+        }
+    }
+
+    #[test]
+    fn hanging_first_line_tabs_and_list_suffix_reach_left_indent() {
+        use docxcore::model::TabAlign;
+        for zoom in [1.0, 1.5] {
+            let layout = paragraph_indent_layout(
+                EffIndent {
+                    left: 720,
+                    first: -360,
+                    ..EffIndent::default()
+                },
+                zoom,
+            );
+            near(layout.first_x, 24.0 * zoom); // the bullet starts at the hanging marker
+            let interval = 48.0 * zoom;
+            let marker_width = 9.0 * zoom;
+            let leading = leading_items(layout, Some(marker_width), interval, &[]);
+            let gap = match leading.last() {
+                Some(LeadingItem::MarkerGap(w)) => *w,
+                _ => panic!("missing marker suffix"),
+            };
+            near(layout.first_x + marker_width + gap, layout.continuation_x);
+            let (stop, align) = next_tab_stop(
+                layout.first_x + 12.0 * zoom,
+                layout.continuation_x,
+                interval,
+                &[],
+            );
+            near(stop, layout.continuation_x);
+            assert_eq!(align, TabAlign::Left);
+            let wider = leading_items(layout, Some(40.0 * zoom), interval, &[]);
+            let wide_gap = match wider.last() {
+                Some(LeadingItem::MarkerGap(w)) => *w,
+                _ => panic!("missing marker suffix"),
+            };
+            near(layout.first_x + 40.0 * zoom + wide_gap, 96.0 * zoom);
+            let (custom, _) = next_tab_stop(
+                layout.first_x,
+                layout.continuation_x,
+                interval,
+                &[(36.0 * zoom, TabAlign::Left)],
+            );
+            near(custom, 36.0 * zoom);
+            let term = paragraph_indent_layout(
+                EffIndent {
+                    left: 1440,
+                    first: -1440,
+                    ..EffIndent::default()
+                },
+                zoom,
+            );
+            let (definition, _) = next_tab_stop(
+                term.first_x + 20.0 * zoom,
+                term.continuation_x,
+                interval,
+                &[],
+            );
+            near(definition, 96.0 * zoom);
+        }
+    }
+
+    #[test]
+    fn margin_shading_contrasts_in_both_themes() {
+        for dark in [false, true] {
+            let theme = if dark {
+                gpui_component::ThemeColor::dark()
+            } else {
+                gpui_component::ThemeColor::light()
+            };
+            let pal = Pal {
+                fg: theme.foreground,
+                dim: theme.muted_foreground,
+                border: theme.border,
+                panel: theme.secondary,
+                hover: theme.foreground,
+                sel: theme.selection,
+            };
+            let colors = ruler_colors(pal, dark);
+            assert!(colors.content.l - colors.ground.l >= 0.30);
+            for ink in [colors.tick, colors.marker] {
+                assert!((ink.l - colors.ground.l).abs() >= 0.30);
+                assert!((ink.l - colors.content.l).abs() >= 0.30);
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_indent_values_do_not_overflow() {
+        let p = ParProps {
+            indent: i32::MAX,
+            first_line: i32::MAX,
+            ..ParProps::default()
+        };
+        let eff = eff_indent(&p);
+        let layout = paragraph_indent_layout(eff, 2.0);
+        assert!(layout.first_x.is_finite());
+        let r = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 1000.0,
+        };
+        let g = hruler_geom(r, r, r, 2.0, eff, &[], false);
+        assert!(g.first_x.is_finite());
+        assert_eq!(super::snap_twips(i32::MAX), i32::MAX);
+    }
+
+    #[test]
+    fn hits_follow_visible_geometry_and_indent_markers_win() {
+        let viewport = ScreenRect {
+            x: 200.0,
+            y: 0.0,
+            w: 800.0,
+            h: 500.0,
+        };
+        let outer = ScreenRect {
+            x: 50.0,
+            y: 0.0,
+            w: 816.0,
+            h: 1056.0,
+        };
+        let mut g = hruler_geom(
+            outer,
+            ScreenRect {
+                x: 146.0,
+                y: 96.0,
+                w: 620.0,
+                h: 400.0,
+            },
+            viewport,
+            1.0,
+            EffIndent::default(),
+            &[],
+            false,
+        );
+        g.strip_y = 10.0;
+        assert!(hruler_hit(&g, g.first_x, 12.0).is_none());
+        g = hruler_geom(
+            outer,
+            ScreenRect {
+                x: 246.0,
+                y: 96.0,
+                w: 620.0,
+                h: 400.0,
+            },
+            viewport,
+            1.0,
+            EffIndent::default(),
+            &[],
+            false,
+        );
+        g.strip_y = 10.0;
+        assert_eq!(hruler_hit(&g, g.left_x, 28.0), Some(RulerHandle::Left));
+        assert_eq!(
+            hruler_hit(&g, g.content_x - 3.0, 12.0),
+            Some(RulerHandle::FirstLine)
+        );
+        assert_eq!(
+            hruler_hit(&g, g.content_x - 3.0, 28.0),
+            Some(RulerHandle::Left)
+        );
+        assert_eq!(
+            hruler_hit(&g, g.content_right + 3.0, 28.0),
+            Some(RulerHandle::Right)
+        );
+        let clipped = hruler_geom(
+            outer,
+            ScreenRect {
+                x: viewport.x - 3.0,
+                y: 96.0,
+                w: 620.0,
+                h: 400.0,
+            },
+            viewport,
+            1.0,
+            EffIndent::default(),
+            &[],
+            false,
+        );
+        assert!(!super::marker_visible(&clipped, clipped.first_x, 5.0));
+        assert_eq!(hruler_hit(&clipped, viewport.x + 1.0, 2.0), None);
+    }
+
+    #[test]
+    fn list_left_drag_clamps_to_its_nesting_step() {
+        let p = ParProps {
+            indent: 1440,
+            ilvl: 2,
+            ..ParProps::default()
+        };
+        let start = eff_indent(&p);
+        for zoom in [1.0, 2.0] {
+            let marker = dragged_left_marker(start, px_tw(-400.0 * zoom, zoom));
+            assert_eq!(marker, 600);
+            assert_eq!(marker - start.list_step, 0);
+            near(200.0 + tw_px(marker, zoom), 200.0 + 600.0 * zoom / 15.0);
+        }
+    }
+
+    #[test]
+    fn every_drag_handle_returns_the_stored_value_and_matching_guide() {
+        for zoom in [1.0, 2.0] {
+            let mut d = RulerDrag {
+                handle: RulerHandle::FirstLine,
+                start_x: 200.0,
+                zoom,
+                indent: EffIndent {
+                    left: 720,
+                    first: 360,
+                    right: 360,
+                    list_step: 0,
+                },
+                page: PageGeom::default(),
+                content_x: 300.0,
+                content_right: 900.0,
+                page_x: 100.0,
+                page_right: 100.0 + tw_px(PageGeom::default().w, zoom),
+            };
+            let pointer = 200.0 + 24.0 * zoom;
+            let first = ruler_drag_result(d, pointer);
+            assert_eq!(first.change, RulerChange::First(720));
+            near(first.guide, 300.0 + tw_px(1440, zoom));
+            let clamped = ruler_drag_result(d, 200.0 - 200.0 * zoom);
+            assert_eq!(clamped.change, RulerChange::First(-720));
+            near(clamped.guide, 300.0);
+
+            d.handle = RulerHandle::Left;
+            let left = ruler_drag_result(d, pointer);
+            assert_eq!(
+                left.change,
+                RulerChange::Left {
+                    indent: 1080,
+                    first: 360
+                }
+            );
+            near(left.guide, 300.0 + tw_px(1080, zoom));
+            d.indent.first = -720;
+            let left_to_zero = ruler_drag_result(d, 200.0 - tw_px(720, zoom));
+            assert_eq!(
+                left_to_zero.change,
+                RulerChange::Left {
+                    indent: 0,
+                    first: 0
+                }
+            );
+            d.indent.first = 360;
+
+            d.handle = RulerHandle::Right;
+            let right = ruler_drag_result(d, pointer);
+            assert_eq!(right.change, RulerChange::Right(0));
+            near(right.guide, 900.0);
+
+            d.handle = RulerHandle::MarginLeft;
+            let ml = ruler_drag_result(d, pointer);
+            assert_eq!(
+                ml.change,
+                RulerChange::Margins {
+                    left: 1800,
+                    right: 1440
+                }
+            );
+            near(ml.guide, 101.0 + tw_px(1800, zoom));
+
+            d.handle = RulerHandle::MarginRight;
+            let mr = ruler_drag_result(d, pointer);
+            assert_eq!(
+                mr.change,
+                RulerChange::Margins {
+                    left: 1440,
+                    right: 1080
+                }
+            );
+            near(mr.guide, d.page_right - 1.0 - tw_px(1080, zoom));
+        }
+    }
+
+    #[test]
+    fn tracked_page_prefers_visible_caret_then_pointer_then_top() {
+        let mut p = RulerProbe {
+            viewport: Some(ScreenRect {
+                x: 0.0,
+                y: 0.0,
+                w: 500.0,
+                h: 500.0,
+            }),
+            pages: vec![
+                Some(ScreenRect {
+                    x: 20.0,
+                    y: -300.0,
+                    w: 400.0,
+                    h: 500.0,
+                }),
+                Some(ScreenRect {
+                    x: 20.0,
+                    y: 220.0,
+                    w: 400.0,
+                    h: 500.0,
+                }),
+                Some(ScreenRect {
+                    x: 20.0,
+                    y: 740.0,
+                    w: 400.0,
+                    h: 500.0,
+                }),
+            ],
+            ranges: vec![vec![(0, 2)], vec![(2, 4)], vec![(4, 6)]],
+            caret_block: Some(3),
+            pointer: None,
+            ..RulerProbe::default()
+        };
+        assert_eq!(tracked_page(&p), Some(1));
+        p.caret_block = Some(5);
+        p.pointer = Some((100.0, 300.0));
+        assert_eq!(tracked_page(&p), Some(1));
+        p.pointer = Some((100.0, 100.0));
+        assert_eq!(tracked_page(&p), Some(0));
+        p.pointer = Some((100.0, 700.0));
+        assert_eq!(tracked_page(&p), Some(0));
+    }
+
+    #[test]
+    fn vertical_scale_tracks_scrolled_page_at_each_zoom() {
+        let page = PageGeom::default();
+        for zoom in [0.5, 1.0, 1.5, 2.0] {
+            for top in [-250.0, 0.0, 400.0] {
+                let outer = ScreenRect {
+                    x: 100.0,
+                    y: top,
+                    w: tw_px(page.w, zoom),
+                    h: tw_px(page.h, zoom),
+                };
+                for (header_extra, footer_extra) in [(0.0, 0.0), (40.0, 60.0)] {
+                    let y = top + 1.0 + tw_px(page.mt, zoom) + header_extra;
+                    let bottom = outer.y + outer.h - 1.0 - tw_px(page.mb, zoom) - footer_extra;
+                    let text = ScreenRect {
+                        x: 100.0 + 1.0 + tw_px(page.ml, zoom),
+                        y,
+                        w: 500.0,
+                        h: bottom - y,
+                    };
+                    let g = vruler_geom(text);
+                    near(g.content_top, y);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RulerDrag {
     handle: RulerHandle,
     start_x: f32,
-    start_indent: i32,
-    start_first: i32,
-    start_right: i32,
-    start_ml: i32,
-    start_mr: i32,
+    zoom: f32,
+    indent: EffIndent,
+    page: docxcore::model::PageGeom,
+    content_x: f32,
+    content_right: f32,
+    page_x: f32,
+    page_right: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum RulerChange {
+    First(i32),
+    Left { indent: i32, first: i32 },
+    Right(i32),
+    Margins { left: i32, right: i32 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RulerDragResult {
+    change: RulerChange,
+    guide: f32,
+}
+
+fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
+    let delta = px_tw(x - d.start_x, d.zoom);
+    let tw = |t: i32| tw_px(t, d.zoom);
+    let (change, guide) = match d.handle {
+        RulerHandle::FirstLine => {
+            let marker = snap_twips(
+                d.indent
+                    .left
+                    .saturating_add(d.indent.first)
+                    .saturating_add(delta),
+            )
+            .max(0);
+            (
+                RulerChange::First(marker - d.indent.left),
+                d.content_x + tw(marker),
+            )
+        }
+        RulerHandle::Left => {
+            let marker = dragged_left_marker(d.indent, delta);
+            (
+                RulerChange::Left {
+                    indent: marker - d.indent.list_step,
+                    first: d.indent.first.max(-marker),
+                },
+                d.content_x + tw(marker),
+            )
+        }
+        RulerHandle::Right => {
+            let right = snap_twips(d.indent.right.saturating_sub(delta).max(0));
+            (RulerChange::Right(right), d.content_right - tw(right))
+        }
+        RulerHandle::MarginLeft => {
+            let left = snap_twips(d.page.ml.saturating_add(delta).max(0));
+            (
+                RulerChange::Margins {
+                    left,
+                    right: d.page.mr,
+                },
+                d.page_x + 1.0 + tw(left),
+            )
+        }
+        RulerHandle::MarginRight => {
+            let right = snap_twips(d.page.mr.saturating_sub(delta).max(0));
+            (
+                RulerChange::Margins {
+                    left: d.page.ml,
+                    right,
+                },
+                d.page_right - 1.0 - tw(right),
+            )
+        }
+    };
+    RulerDragResult { change, guide }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -4586,7 +5668,7 @@ impl Docxy {
             show_ruler: false,
             ruler_drag: None,
             ruler_tab: docxcore::model::TabAlign::Left,
-            ruler_x0: std::rc::Rc::new(std::cell::Cell::new(0.0)),
+            ruler_probe: std::rc::Rc::new(std::cell::RefCell::new(RulerProbe::default())),
             selecting: false,
             sheet_dragging: false,
             sheet_fill: None,
@@ -11460,12 +12542,12 @@ impl Docxy {
 
     /// Begin dragging a ruler marker.
     fn ruler_drag_start(&mut self, handle: RulerHandle, x: f32, cx: &mut Context<Self>) {
-        let (indent, first, right) = match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Doc(ed)) => {
-                let (i, f) = ed.caret_para_indent();
-                (i, f, ed.caret_para_right_indent())
-            }
-            _ => (0, 0, 0),
+        let Some(g) = self.ruler_probe.borrow().painted.clone() else {
+            return;
+        };
+        let indent = match self.tabs.get(self.active).map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => eff_indent(&ed.caret_para_props()),
+            _ => return,
         };
         let geom = self
             .tabs
@@ -11476,11 +12558,13 @@ impl Docxy {
         self.ruler_drag = Some(RulerDrag {
             handle,
             start_x: x,
-            start_indent: indent,
-            start_first: first,
-            start_right: right,
-            start_ml: geom.ml,
-            start_mr: geom.mr,
+            zoom: g.zoom,
+            indent,
+            page: geom,
+            content_x: g.content_x,
+            content_right: g.content_right,
+            page_x: g.page_x,
+            page_right: g.page_right,
         });
         self.ruler_guide = Some(x); // guide starts under the pointer
         cx.notify();
@@ -11491,62 +12575,35 @@ impl Docxy {
     /// (Word's sticky ruler), and a vertical guide line is tracked down the page.
     fn ruler_drag_move(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
         let Some(d) = self.ruler_drag else { return };
-        let delta = ((x - d.start_x) * 15.0).round() as i32; // px → twips
-        let x0 = self.ruler_x0.get(); // left-margin screen x
-        let geom = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pkg.as_ref())
-            .map(|p| p.page_geom())
-            .unwrap_or_default();
-        let content_w = (geom.w - geom.ml - geom.mr).max(0);
-        let origin = x0 - geom.ml as f32 / 15.0; // page's left-edge screen x
-        let tw = |t: i32| t as f32 / 15.0;
-        let guide = match d.handle {
-            RulerHandle::FirstLine => {
-                // Snap the marker (indent + first) to the grid, keep indent fixed.
-                let marker = snap_twips(d.start_indent + d.start_first + delta);
-                let first = marker - d.start_indent;
-                self.with_editor(window, cx, |e| e.set_first_line(first));
-                x0 + tw(d.start_indent + first)
+        let result = ruler_drag_result(d, x);
+        match result.change {
+            RulerChange::First(first) => self.with_editor(window, cx, |e| e.set_first_line(first)),
+            RulerChange::Left { indent, first } => {
+                self.with_editor(window, cx, |e| e.set_indent(indent, first))
             }
-            RulerHandle::Left => {
-                let ind = snap_twips((d.start_indent + delta).max(0));
-                let first = d.start_first;
-                self.with_editor(window, cx, |e| e.set_indent(ind, first));
-                x0 + tw(ind)
+            RulerChange::Right(right) => {
+                self.with_editor(window, cx, |e| e.set_right_indent(right))
             }
-            // Dragging the right marker left (negative delta) increases the indent.
-            RulerHandle::Right => {
-                let ri = snap_twips((d.start_right - delta).max(0));
-                self.with_editor(window, cx, |e| e.set_right_indent(ri));
-                x0 + tw(content_w - ri)
-            }
-            RulerHandle::MarginLeft | RulerHandle::MarginRight => {
-                let (ml, mr) = match d.handle {
-                    RulerHandle::MarginLeft => (snap_twips((d.start_ml + delta).max(0)), geom.mr),
-                    _ => (geom.ml, snap_twips((d.start_mr - delta).max(0))),
-                };
+            RulerChange::Margins { left, right } => {
                 if let Some(t) = self.tabs.get_mut(self.active) {
                     if let Some(pkg) = t.pkg.as_mut() {
-                        pkg.set_page_margins(geom.mt, mr, geom.mb, ml);
+                        pkg.set_page_margins(d.page.mt, right, d.page.mb, left);
                         t.dirty = true;
                     }
                 }
-                match d.handle {
-                    RulerHandle::MarginLeft => origin + tw(ml),
-                    _ => origin + tw(geom.w - mr),
-                }
             }
-        };
-        self.ruler_guide = Some(guide);
+        }
+        self.ruler_guide = Some(result.guide);
         cx.notify();
     }
 
     /// Add a tab stop at the clicked ruler position (mapped from the stored
     /// left-margin origin), or remove one if the click lands on an existing stop.
     fn ruler_click_tab(&mut self, x: f32, window: &mut Window, cx: &mut Context<Self>) {
-        let pos = ((x - self.ruler_x0.get()) * 15.0).round() as i32;
+        let Some(g) = self.ruler_probe.borrow().painted.clone() else {
+            return;
+        };
+        let pos = px_tw(x - g.content_x, g.zoom);
         if pos < 0 {
             return;
         }
@@ -11576,404 +12633,290 @@ impl Docxy {
         }
     }
 
-    /// A Word-style horizontal ruler: the page/margins, tick marks, tab stops and
-    /// the current paragraph's first-line / left (other-rows) indent markers.
+    /// The horizontal ruler paints in window coordinates measured from the page.
     fn ruler(&self, cx: &mut Context<Self>) -> AnyElement {
         use docxcore::model::{TabAlign, TabStop};
         let tab = self.tabs.get(self.active);
-        let geom = tab
-            .and_then(|t| t.pkg.as_ref())
-            .map(|p| p.page_geom())
-            .unwrap_or_default();
-        let (indent, first_line, indent_right, tabs): (i32, i32, i32, Vec<TabStop>) =
-            match tab.map(|t| &t.surface) {
-                Some(Surface::Doc(ed)) => {
-                    let (i, f) = ed.caret_para_indent();
-                    (
-                        i,
-                        f,
-                        ed.caret_para_right_indent(),
-                        ed.caret_para_props().tabs.clone(),
-                    )
-                }
-                _ => (0, 0, 0, vec![]),
-            };
-        let d = 15.0_f32; // twips → px at ~96dpi
-        let pw = geom.w as f32 / d;
-        let ml = geom.ml as f32 / d;
-        let mr = geom.mr as f32 / d;
-        let ind = indent as f32 / d;
-        let fl = first_line as f32 / d;
-        let rind = indent_right as f32 / d;
-        let content_r = pw - mr;
-        let right_marker = content_r - rind;
-        let h = 22.0_f32;
-        let x0_cell = self.ruler_x0.clone();
-
+        let (indent, tabs): (EffIndent, Vec<TabStop>) = match tab.map(|t| &t.surface) {
+            Some(Surface::Doc(ed)) => {
+                let p = ed.caret_para_props();
+                (eff_indent(&p), p.tabs)
+            }
+            _ => (EffIndent::default(), Vec::new()),
+        };
+        let zoom = self.zoom;
+        let pal = Pal::of(cx);
+        let colors = ruler_colors(pal, self.applied == Some(ThemeMode::Dark));
+        let probe = self.ruler_probe.clone();
         let paint = canvas(
             move |_b, _w, _a| {},
-            move |b: Bounds<Pixels>, _s, window: &mut Window, _a: &mut App| {
-                // Record the left-margin screen x so click handlers can map a click
-                // to a tab position (twips from the left margin).
-                x0_cell.set(f32::from(b.origin.x) + ml);
-                let x = |v: f32| b.origin.x + px(v);
-                let top = b.origin.y;
-                let base = hsla_u(0xb8b8b8);
-                let white = hsla_u(0xffffff);
-                let tick = hsla_u(0x707070);
-                let brand = hsla_u(BRAND);
-                let dim = hsla_u(0x555555);
-                window.paint_quad(fill(b, base));
-                window.paint_quad(fill(
-                    Bounds::from_corners(
-                        point(x(ml), top + px(3.)),
-                        point(x(content_r), top + px(h - 3.)),
-                    ),
-                    white,
-                ));
-                // Tick marks every 1/8", taller each inch, from the left margin.
-                let step = 96.0 / 8.0;
-                let mut i = 0;
-                let mut xx = ml;
-                while xx <= content_r + 0.5 {
-                    let major = i % 8 == 0;
-                    let th = if major {
-                        h * 0.34
-                    } else if i % 4 == 0 {
-                        h * 0.24
-                    } else {
-                        h * 0.15
+            move |b: Bounds<Pixels>, _s, window: &mut Window, cx: &mut App| {
+                let mut state = probe.borrow_mut();
+                let Some(viewport) = state.viewport else {
+                    state.painted = None;
+                    return;
+                };
+                let (page_rect, text_rect, tracked) = if state.draft {
+                    let Some(text) = state.draft_column else {
+                        state.painted = None;
+                        return;
                     };
-                    window.paint_quad(fill(
-                        Bounds::from_corners(
-                            point(x(xx), top + px((h - th) * 0.5)),
-                            point(x(xx + 1.0), top + px((h + th) * 0.5)),
-                        ),
-                        tick,
-                    ));
-                    xx += step;
+                    (viewport, text, None)
+                } else {
+                    let Some(i) = tracked_page(&state) else {
+                        state.painted = None;
+                        return;
+                    };
+                    let (Some(page), Some(text)) = (state.pages[i], state.contents[i]) else {
+                        state.painted = None;
+                        return;
+                    };
+                    (page, text, Some(i))
+                };
+                let mut g = hruler_geom(
+                    page_rect,
+                    text_rect,
+                    viewport,
+                    zoom,
+                    indent,
+                    &tabs,
+                    state.draft,
+                );
+                g.strip_y = b.origin.y.into();
+                g.tracked_page = tracked;
+                state.painted = Some(g.clone());
+                drop(state);
+                let y: f32 = b.origin.y.into();
+                let ground = colors.ground;
+                let content = colors.content;
+                let tick = colors.tick;
+                let marker = colors.marker;
+                window.paint_quad(fill(b, ground));
+                let clip_l = viewport.x.max(b.origin.x.into());
+                let clip_r = (viewport.x + viewport.w).min(f32::from(b.origin.x + b.size.width));
+                let l = g.content_x.max(clip_l);
+                let r = g.content_right.min(clip_r);
+                if r > l {
+                    ruler_box(window, l, y + 3.0, r, y + 19.0, content);
+                }
+                let mut i = 0;
+                let step = 12.0 * zoom;
+                let mut x = g.content_x;
+                while x <= g.content_right && i < 1000 {
+                    if x >= clip_l && x < clip_r {
+                        let h = if i % 8 == 0 {
+                            7.0
+                        } else if i % 4 == 0 {
+                            5.0
+                        } else {
+                            3.0
+                        };
+                        ruler_box(
+                            window,
+                            x,
+                            y + 11.0 - h / 2.0,
+                            x + 1.0,
+                            y + 11.0 + h / 2.0,
+                            tick,
+                        );
+                    }
+                    x += step;
                     i += 1;
                 }
-                // Default tab stops (every 0.5") as tiny ticks along the baseline.
-                let mut tx = ml + 48.0;
-                while tx <= content_r {
-                    window.paint_quad(fill(
-                        Bounds::from_corners(
-                            point(x(tx), top + px(h - 4.)),
-                            point(x(tx + 1.0), top + px(h - 2.)),
-                        ),
-                        hsla_u(0x999999),
-                    ));
-                    tx += 48.0;
+                let mut inch = 1;
+                while g.content_x + 96.0 * zoom * (inch as f32) < g.content_right && inch < 100 {
+                    let nx = g.content_x + 96.0 * zoom * inch as f32;
+                    if nx >= clip_l && nx < clip_r - 8.0 {
+                        ruler_number(window, cx, inch, nx - 3.0, y + 3.0, tick);
+                    }
+                    inch += 1;
                 }
-                // Custom tab stops (from the paragraph) as L / ⊥ / ⌐ markers.
-                for t in &tabs {
-                    let sx = x(ml + t.pos as f32 / d);
-                    let yb = top + px(h - 5.);
-                    // vertical stem
-                    window.paint_quad(fill(
-                        Bounds::from_corners(point(sx, top + px(h - 11.)), point(sx + px(1.5), yb)),
-                        dim,
-                    ));
-                    // foot direction encodes alignment
-                    let (fx0, fx1) = match t.align {
-                        TabAlign::Left => (0.0, 5.0),
-                        TabAlign::Right => (-5.0, 0.0),
-                        TabAlign::Center => (-3.0, 3.0),
-                    };
-                    window.paint_quad(fill(
-                        Bounds::from_corners(
-                            point(sx + px(fx0), yb - px(1.5)),
-                            point(sx + px(fx1), yb),
-                        ),
-                        dim,
-                    ));
+                let mut default_tab = g.content_x + 48.0 * zoom;
+                while default_tab < g.content_right {
+                    if default_tab >= clip_l && default_tab < clip_r {
+                        ruler_box(
+                            window,
+                            default_tab,
+                            y + 16.0,
+                            default_tab + 1.0,
+                            y + 18.0,
+                            tick,
+                        );
+                    }
+                    default_tab += 48.0 * zoom;
                 }
-                let z = point(0.0_f32, 0.0);
-                // First-line indent — downward triangle at the top.
-                let flx = ml + ind + fl;
-                let mut t1 = Path::new(point(x(flx - 5.0), top + px(1.)));
-                t1.push_triangle(
-                    (
-                        point(x(flx - 5.0), top + px(1.)),
-                        point(x(flx + 5.0), top + px(1.)),
-                        point(x(flx), top + px(8.)),
-                    ),
-                    (z, z, z),
-                );
-                window.paint_path(t1, brand);
-                // Left / other-rows indent — upward triangle + a square below it.
-                let lx = ml + ind;
-                let by = top + px(h - 1.);
-                let mut t2 = Path::new(point(x(lx - 5.0), by - px(4.)));
-                t2.push_triangle(
-                    (
-                        point(x(lx - 5.0), by - px(4.)),
-                        point(x(lx + 5.0), by - px(4.)),
-                        point(x(lx), by - px(11.)),
-                    ),
-                    (z, z, z),
-                );
-                window.paint_path(t2, brand);
-                window.paint_quad(fill(
-                    Bounds::from_corners(point(x(lx - 4.0), by - px(4.)), point(x(lx + 4.0), by)),
-                    brand,
-                ));
-                // Right indent — upward triangle, positioned in from the right
-                // margin by the paragraph's right indent.
-                let rx = right_marker;
-                let mut t3 = Path::new(point(x(rx - 5.0), by));
-                t3.push_triangle(
-                    (
-                        point(x(rx - 5.0), by),
-                        point(x(rx + 5.0), by),
-                        point(x(rx), top + px(h - 8.)),
-                    ),
-                    (z, z, z),
-                );
-                window.paint_path(t3, brand);
+                for (t, &x) in tabs.iter().zip(&g.tabs) {
+                    if x >= clip_l && x < clip_r {
+                        ruler_box(window, x, y + 12.0, x + 1.5, y + 18.0, marker);
+                        let (left, right) = match t.align {
+                            TabAlign::Left => (x, x + 5.0),
+                            TabAlign::Right => (x - 5.0, x),
+                            TabAlign::Center => (x - 3.0, x + 3.0),
+                        };
+                        ruler_box(
+                            window,
+                            left.max(clip_l),
+                            y + 16.5,
+                            right.min(clip_r),
+                            y + 18.0,
+                            marker,
+                        );
+                    }
+                }
+                if marker_visible(&g, g.first_x, 5.0) {
+                    ruler_triangle(
+                        window,
+                        point(px(g.first_x - 5.0), px(y + 1.0)),
+                        point(px(g.first_x + 5.0), px(y + 1.0)),
+                        point(px(g.first_x), px(y + 8.0)),
+                        marker,
+                    );
+                }
+                for x in [g.left_x, g.right_x] {
+                    if marker_visible(&g, x, 5.0) {
+                        ruler_triangle(
+                            window,
+                            point(px(x - 5.0), px(y + 21.0)),
+                            point(px(x + 5.0), px(y + 21.0)),
+                            point(px(x), px(y + 13.0)),
+                            marker,
+                        );
+                    }
+                }
+                if g.left_x >= clip_l + 4.0 && g.left_x <= clip_r - 4.0 {
+                    ruler_box(
+                        window,
+                        g.left_x - 4.0,
+                        y + 18.0,
+                        g.left_x + 4.0,
+                        y + 22.0,
+                        marker,
+                    );
+                }
             },
         );
-
-        // Measurement numbers (1, 2, 3 …) at each inch from the left margin.
-        let mut numbers = div().absolute().size_full();
-        let mut inch = 1;
-        loop {
-            let xx = ml + inch as f32 * 96.0;
-            if xx > content_r - 6.0 {
-                break;
-            }
-            numbers = numbers.child(
-                div()
-                    .absolute()
-                    .left(px(xx - 3.0))
-                    .top(px(4.0))
-                    .text_size(px(8.))
-                    .text_color(hsla_u(0x555555))
-                    .child(SharedString::from(inch.to_string())),
-            );
-            inch += 1;
-        }
-
-        // Draggable indent handles, split into a TOP band (first-line marker) and
-        // a BOTTOM band (left / right markers) so they never overlap where they
-        // share an x (e.g. a paragraph with no indent) and each stays grabbable.
-        let handle = |id: &'static str,
-                      cx_px: f32,
-                      top_px: f32,
-                      h_px: f32,
-                      which: RulerHandle,
-                      cxx: &mut Context<Self>| {
-            div()
-                .id(id)
-                .absolute()
-                .left(px(cx_px - 6.0))
-                .top(px(top_px))
-                .w(px(12.))
-                .h(px(h_px))
-                .cursor_pointer()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cxx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                        cx.stop_propagation();
-                        this.ruler_drag_start(which, f32::from(ev.position.x), cx);
-                    }),
-                )
+        let glyph = match self.ruler_tab {
+            docxcore::model::TabAlign::Left => "L",
+            docxcore::model::TabAlign::Center => "⊥",
+            docxcore::model::TabAlign::Right => "⌐",
         };
-
-        // Margin grab strips sit in the grey zone just OUTSIDE the white content
-        // area (Word's margin boundary), clear of the indent markers.
-        let margin_handle =
-            |id: &'static str, left_px: f32, which: RulerHandle, cxx: &mut Context<Self>| {
-                div()
-                    .id(id)
-                    .absolute()
-                    .left(px(left_px))
-                    .top(px(0.))
-                    .w(px(8.))
-                    .h(px(h))
-                    .cursor_col_resize()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cxx.listener(move |this, ev: &MouseDownEvent, _w, cx| {
-                            cx.stop_propagation();
-                            this.ruler_drag_start(which, f32::from(ev.position.x), cx);
-                        }),
-                    )
-            };
-
-        let container = div()
+        h_flex()
+            .w_full()
+            .h(px(26.))
             .relative()
-            .w(px(pw))
-            .h(px(h))
-            .child(paint.size_full())
-            .child(numbers)
-            // Click the content area to add/remove a tab stop of the current type.
+            .bg(colors.ground)
+            .child(paint.absolute().size_full())
+            .child(
+                div()
+                    .id("ruler-tabtype")
+                    .w(px(18.))
+                    .h(px(22.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(colors.content)
+                    .text_color(colors.marker)
+                    .cursor_pointer()
+                    .child(glyph)
+                    .tooltip(|w, cx| Tooltip::new("Tab stop type — click to cycle").build(w, cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.cycle_ruler_tab(window, cx))),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                    this.ruler_click_tab(f32::from(ev.position.x), window, cx);
+                    let x = f32::from(ev.position.x);
+                    let hit = this
+                        .ruler_probe
+                        .borrow()
+                        .painted
+                        .as_ref()
+                        .and_then(|g| hruler_hit(g, x, f32::from(ev.position.y)));
+                    if let Some(handle) = hit {
+                        this.ruler_drag_start(handle, x, cx);
+                    } else if this.ruler_probe.borrow().painted.as_ref().is_some_and(|g| {
+                        x >= g.content_x
+                            && x <= g.content_right
+                            && x >= g.viewport.x
+                            && x < g.viewport.x + g.viewport.w
+                    }) {
+                        this.ruler_click_tab(x, window, cx);
+                    }
                 }),
             )
-            .child(margin_handle(
-                "rh-mleft",
-                ml - 8.0,
-                RulerHandle::MarginLeft,
-                cx,
-            ))
-            .child(margin_handle(
-                "rh-mright",
-                content_r,
-                RulerHandle::MarginRight,
-                cx,
-            ))
-            .child(handle(
-                "rh-first",
-                ml + ind + fl,
-                0.0,
-                h * 0.5,
-                RulerHandle::FirstLine,
-                cx,
-            ))
-            .child(handle(
-                "rh-left",
-                ml + ind,
-                h * 0.5,
-                h * 0.5,
-                RulerHandle::Left,
-                cx,
-            ))
-            .child(handle(
-                "rh-right",
-                right_marker,
-                h * 0.5,
-                h * 0.5,
-                RulerHandle::Right,
-                cx,
-            ));
-
-        // The tab-type selector box at the far left (click to cycle L/Centre/Right).
-        let tab_glyph = match self.ruler_tab {
-            docxcore::model::TabAlign::Left => "L",
-            docxcore::model::TabAlign::Center => "\u{22A5}",
-            docxcore::model::TabAlign::Right => "\u{2510}",
-        };
-        // Same width + gap as the vertical ruler so the horizontal ruler content
-        // lines up with the page sheet (this box sits in the corner, Word-style).
-        let selector = div()
-            .id("ruler-tabtype")
-            .w(px(18.))
-            .h(px(18.))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(2.))
-            .bg(hsla_u(0xffffff))
-            .border_1()
-            .border_color(hsla_u(0xb0b0b0))
-            .text_size(px(11.))
-            .text_color(hsla_u(0x333333))
-            .cursor_pointer()
-            .child(tab_glyph)
-            .tooltip(|w, cx| Tooltip::new("Tab stop type — click to cycle").build(w, cx))
-            .on_click(cx.listener(|this, _, window, cx| this.cycle_ruler_tab(window, cx)));
-
-        // Drag move/end are handled at the window root (so a drag survives the
-        // pointer leaving this thin strip); the ruler itself only starts drags.
-        h_flex()
-            .w_full()
-            .items_center()
-            .justify_center()
-            .gap(px(3.))
-            .bg(hsla_u(0xdedede))
-            .py_0p5()
-            .child(selector)
-            .child(container)
             .into_any_element()
     }
 
-    /// The vertical ruler on the left of the page (Print Layout): top/bottom
-    /// margins shaded, content white, tick marks every inch from the top margin.
-    fn vruler(&self) -> AnyElement {
-        let geom = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pkg.as_ref())
-            .map(|p| p.page_geom())
-            .unwrap_or_default();
-        let d = 15.0_f32;
-        let mt = geom.mt as f32 / d;
-        let mb = geom.mb as f32 / d;
+    /// A fixed strip beside the scroll viewport, painted from the tracked page.
+    fn vruler(&self, pal: Pal) -> AnyElement {
+        let zoom = self.zoom;
+        let colors = ruler_colors(pal, self.applied == Some(ThemeMode::Dark));
+        let probe = self.ruler_probe.clone();
         let paint = canvas(
             move |_b, _w, _a| {},
-            move |b: Bounds<Pixels>, _s, window: &mut Window, _a: &mut App| {
-                let y = |v: f32| b.origin.y + px(v);
-                let left = b.origin.x;
-                let w = f32::from(b.size.width);
-                let hh = f32::from(b.size.height);
-                let base = hsla_u(0xb8b8b8);
-                let white = hsla_u(0xffffff);
-                let tick = hsla_u(0x707070);
-                // ground + white content strip between top and bottom margins.
-                window.paint_quad(fill(b, base));
-                window.paint_quad(fill(
-                    Bounds::from_corners(
-                        point(left + px(3.), y(mt)),
-                        point(left + px(w - 3.), y((hh - mb).max(mt))),
-                    ),
-                    white,
-                ));
-                // ticks every 1/8", taller each inch, measured from the top margin.
-                let step = 96.0 / 8.0;
+            move |b: Bounds<Pixels>, _s, window: &mut Window, cx: &mut App| {
+                window.paint_quad(fill(b, colors.ground));
+                let state = probe.borrow();
+                let Some(viewport) = state.viewport else {
+                    return;
+                };
+                let Some(i) = tracked_page(&state) else {
+                    return;
+                };
+                let Some(content) = state.contents[i] else {
+                    return;
+                };
+                let x: f32 = b.origin.x.into();
+                let vertical = vruler_geom(content);
+                let content_top = vertical.content_top;
+                let content_bottom = vertical.content_bottom;
+                let clip_top = viewport.y.max(f32::from(b.origin.y));
+                let clip_bottom =
+                    (viewport.y + viewport.h).min(f32::from(b.origin.y + b.size.height));
+                let l = content_top.max(clip_top);
+                let r = content_bottom.min(clip_bottom);
+                if r > l {
+                    ruler_box(window, x + 3.0, l, x + 15.0, r, colors.content);
+                }
+                let mut y = content_top;
                 let mut i = 0;
-                let mut yy = mt;
-                while yy <= hh - mb + 0.5 {
-                    let major = i % 8 == 0;
-                    let tw = if major {
-                        w * 0.42
-                    } else if i % 4 == 0 {
-                        w * 0.30
-                    } else {
-                        w * 0.18
-                    };
-                    let x1 = left + px((w - tw) * 0.5);
-                    let x2 = left + px((w + tw) * 0.5);
-                    window.paint_quad(fill(
-                        Bounds::from_corners(point(x1, y(yy)), point(x2, y(yy + 1.0))),
-                        tick,
-                    ));
-                    yy += step;
+                while y <= content_bottom && i < 1000 {
+                    if y >= clip_top && y < clip_bottom {
+                        let w = if i % 8 == 0 {
+                            8.0
+                        } else if i % 4 == 0 {
+                            5.0
+                        } else {
+                            3.0
+                        };
+                        ruler_box(
+                            window,
+                            x + 9.0 - w / 2.0,
+                            y,
+                            x + 9.0 + w / 2.0,
+                            y + 1.0,
+                            colors.tick,
+                        );
+                    }
+                    y += 12.0 * zoom;
                     i += 1;
+                }
+                let mut inch = 1;
+                while content_top + 96.0 * zoom * (inch as f32) < content_bottom && inch < 100 {
+                    let ny = content_top + 96.0 * zoom * inch as f32;
+                    if ny >= clip_top && ny < clip_bottom - 10.0 {
+                        ruler_number(window, cx, inch, x + 3.0, ny - 5.0, colors.tick);
+                    }
+                    inch += 1;
                 }
             },
         );
-        // Measurement numbers down the ruler at each inch from the top margin.
-        let mut numbers = div().absolute().size_full();
-        let mut inch = 1;
-        loop {
-            let yy = mt + inch as f32 * 96.0;
-            // stop numbering a little before the bottom margin using a generous page.
-            if yy > (geom.h as f32 / d) - mb - 6.0 {
-                break;
-            }
-            numbers = numbers.child(
-                div()
-                    .absolute()
-                    .top(px(yy - 5.0))
-                    .left(px(4.0))
-                    .text_size(px(8.))
-                    .text_color(hsla_u(0x555555))
-                    .child(SharedString::from(inch.to_string())),
-            );
-            inch += 1;
-        }
         div()
             .relative()
             .w(px(18.))
+            .h_full()
             .flex_none()
-            .child(paint.size_full())
-            .child(numbers)
+            .child(paint.absolute().size_full())
             .into_any_element()
     }
 
@@ -14402,8 +15345,14 @@ const FONT_SIZES: &[u32] = &[8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 7
 /// Snap a twips measurement to the nearest 1/8" ruler gridline (180 twips), so
 /// dragging a ruler marker sticks to the visible ticks like Word's ruler.
 fn snap_twips(v: i32) -> i32 {
-    const GRID: i32 = 180; // 1/8 inch
-    ((v as f32 / GRID as f32).round() as i32) * GRID
+    const GRID: i64 = 180; // 1/8 inch
+    let n = i64::from(v);
+    let rounded = if n >= 0 {
+        (n + GRID / 2) / GRID
+    } else {
+        (n - GRID / 2) / GRID
+    };
+    (rounded * GRID).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 fn caret_bar() -> AnyElement {
@@ -14983,7 +15932,9 @@ fn paragraph_el(
     // Tab-stop geometry. `x` tracks the running pixel width from the row's left
     // edge; a tab advances it to the next stop measured from the text margin. The
     // row's left edge sits `pad_l` px in from the margin (the paragraph indent).
-    let pad_l = zoom * ((p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0);
+    let indent = eff_indent(&p.props);
+    let indent_layout = paragraph_indent_layout(indent, zoom);
+    let pad_l = indent_layout.continuation_x;
     let interval = zoom * 720.0 / 15.0; // Word's default tab stop: every 1/2"
     let mut customs: Vec<(f32, TabAlign)> = p
         .props
@@ -15001,11 +15952,7 @@ fn paragraph_el(
             customs.push(((w - 4.0).max(0.0), TabAlign::Right));
         }
     }
-    let max_custom = customs
-        .iter()
-        .map(|(c, _)| *c)
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut x = 0.0_f32;
+    let mut x = indent_layout.first_line_tab_origin();
     // Hyperlinks opened up into their pieces, so text, tabs and breaks inside a
     // link take caret offsets exactly as the editor counts them.
     let items = flat_inlines(&p.content);
@@ -15057,46 +16004,35 @@ fn paragraph_el(
             .map(&inline_w)
             .sum()
     };
-    // The next tab stop strictly past `xm` (twips-px from the margin) and its
-    // alignment: the nearest custom stop, else the default 1/2" grid (defaults
-    // are suppressed up to the last custom stop, as Word does).
-    let next_stop = |xm: f32| -> (f32, TabAlign) {
-        let mut pos = f32::INFINITY;
-        let mut align = TabAlign::Left;
-        for &(c, a) in &customs {
-            if c > xm + 0.5 && c < pos {
-                pos = c;
-                align = a;
+    // The first flex item shifts just the first line. Subsequent wrapped lines
+    // start at the paragraph's left padding, including hanging indents.
+    let marker_width = marker.map(|s| meas.map(|m| m.width(s, base, false, false)).unwrap_or(0.0));
+    for item in leading_items(indent_layout, marker_width, interval, &customs) {
+        match item {
+            LeadingItem::Spacer { width, margin } => spans.push(
+                div()
+                    .w(px(width))
+                    .h(px(1.))
+                    .flex_none()
+                    .when(margin < 0.0, |d| d.ml(px(margin)))
+                    .into_any_element(),
+            ),
+            LeadingItem::ListMarker => {
+                let m = marker.expect("marker descriptor requires a marker");
+                // The marker isn't document content and must not map clicks to offsets.
+                spans.push(
+                    div()
+                        .text_size(px(base))
+                        .text_color(pal.dim)
+                        .child(SharedString::from(m.to_string()))
+                        .into_any_element(),
+                );
+                x += marker_width.unwrap_or(0.0);
             }
-        }
-        let lo = xm.max(if max_custom.is_finite() {
-            max_custom
-        } else {
-            0.0
-        });
-        let mut d = ((lo / interval).floor() + 1.0) * interval;
-        while d <= xm + 0.5 {
-            d += interval;
-        }
-        if d < pos {
-            pos = d;
-            align = TabAlign::Left;
-        }
-        (pos, align)
-    };
-
-    if let Some(m) = marker {
-        // The marker isn't document content — render it plain (non-clickable) so it
-        // never maps clicks to bogus offsets.
-        spans.push(
-            div()
-                .text_size(px(base))
-                .text_color(pal.dim)
-                .child(SharedString::from(m.to_string()))
-                .into_any_element(),
-        );
-        if let Some(ms) = meas.filter(|_| has_tab) {
-            x += ms.width(m, base, false, false);
+            LeadingItem::MarkerGap(width) => {
+                spans.push(div().w(px(width)).h(px(1.)).flex_none().into_any_element());
+                x += width;
+            }
         }
     }
     for i in 0..items.len() {
@@ -15115,7 +16051,7 @@ fn paragraph_el(
                 // Advance to the next stop; centre/right stops position the segment
                 // that follows (up to the next tab) so it centres on / ends at it.
                 let xm = pad_l + x;
-                let (stop, align) = next_stop(xm);
+                let (stop, align) = next_tab_stop(xm, pad_l, interval, &customs);
                 let w = match align {
                     TabAlign::Left => stop - xm,
                     TabAlign::Right => stop - seg_width(i + 1) - xm,
@@ -15297,8 +16233,8 @@ fn paragraph_el(
     };
     // Leading indent: explicit paragraph indent (twips → px at ~96dpi) plus a step
     // per list nesting level.
-    let pad = zoom * ((p.props.indent.max(0) as f32) / 15.0 + p.props.ilvl.max(0) as f32 * 20.0);
-    let pad_r = zoom * (p.props.indent_right.max(0) as f32) / 15.0;
+    let pad = indent_layout.continuation_x;
+    let pad_r = tw_px(indent.right, zoom);
     // The whole paragraph area is a click fallback (empty space past the text, the
     // indent gutter) that drops the caret at the paragraph end. Word clicks fire
     // first and stop propagation, so this only runs on a "past the text" click.
@@ -18900,7 +19836,15 @@ impl Render for Docxy {
                                 .map(|r| vec![r])
                                 .collect()
                         };
-                        let show_ruler = self.show_ruler;
+                        {
+                            let mut probe = self.ruler_probe.borrow_mut();
+                            probe.pages = vec![None; pages.len()];
+                            probe.contents = vec![None; pages.len()];
+                            probe.ranges = pages.clone();
+                            probe.caret_block = editor.caret.path.first().copied();
+                            probe.draft = false;
+                            probe.painted = None;
+                        }
                         // Per-page header/footer. A section can carry distinct
                         // first-page (w:titlePg) and even-page (evenAndOddHeaders)
                         // variants; every other page uses the "default" one.
@@ -19057,6 +20001,17 @@ impl Render for Docxy {
                             .iter()
                             .enumerate()
                             .map(|(pi, cols_ranges)| {
+                                let content = div()
+                                    .relative()
+                                    .w_full()
+                                    .flex_1()
+                                    .child(build_mid(cols_ranges))
+                                    .child(ruler_probe_el(&self.ruler_probe, move |state, rect| {
+                                        if let Some(slot) = state.contents.get_mut(pi) {
+                                            *slot = Some(rect);
+                                        }
+                                    }))
+                                    .into_any_element();
                                 let hdr_children = region_children(pi, true);
                                 let ftr_children = region_children(pi, false);
                                 let edit_hdr_here =
@@ -19093,7 +20048,7 @@ impl Render for Docxy {
                                         .flex_1()
                                         .pl(tw(geom.ml))
                                         .pr(tw(geom.mr))
-                                        .child(build_mid(cols_ranges));
+                                        .child(content);
                                     if hf.is_some() {
                                         let ent2 = ent.clone();
                                         mid = mid.cursor_pointer().on_mouse_down(
@@ -19130,17 +20085,21 @@ impl Render for Docxy {
                                         .pr(tw(geom.mr))
                                         .pb(tw(geom.mb))
                                         .pl(tw(geom.ml))
-                                        .child(build_mid(cols_ranges))
+                                        .child(content)
                                 };
-                                h_flex()
-                                    .items_stretch()
-                                    .gap(px(3.))
-                                    .when(show_ruler, |d| d.child(self.vruler()))
+                                div()
+                                    .relative()
+                                    .w(tw(geom.w))
                                     .child(page)
+                                    .child(ruler_probe_el(&self.ruler_probe, move |state, rect| {
+                                        if let Some(slot) = state.pages.get_mut(pi) {
+                                            *slot = Some(rect);
+                                        }
+                                    }))
                                     .into_any_element()
                             })
                             .collect();
-                        v_flex()
+                        let scroll = v_flex()
                             .id("doc-scroll")
                             .track_scroll(&self.doc_scroll)
                             .flex_1()
@@ -19152,15 +20111,39 @@ impl Render for Docxy {
                             .gap(px(18.))
                             .py(px(24.))
                             .children(sheets)
-                            .into_any_element()
+                            .into_any_element();
+                        let scroll_view = ruler_scroll_view(scroll, &self.ruler_probe);
+                        if self.show_ruler {
+                            h_flex()
+                                .flex_1()
+                                .h_full()
+                                .items_stretch()
+                                .min_h(px(0.))
+                                .child(self.vruler(pal))
+                                .child(scroll_view)
+                                .into_any_element()
+                        } else {
+                            scroll_view
+                        }
                     } else {
+                        {
+                            let mut probe = self.ruler_probe.borrow_mut();
+                            probe.pages.clear();
+                            probe.contents.clear();
+                            probe.ranges.clear();
+                            probe.caret_block = editor.caret.path.first().copied();
+                            probe.draft = true;
+                            probe.draft_column = None;
+                            probe.painted = None;
+                        }
                         let blocks: Vec<AnyElement> = body
                             .iter()
                             .enumerate()
                             .map(|(i, b)| block_el(b, vec![i], markers[i].as_deref(), ctx))
                             .collect();
-                        v_flex()
+                        let scroll = v_flex()
                             .id("doc-scroll")
+                            .relative()
                             .track_scroll(&self.doc_scroll)
                             .flex_1()
                             .h_full()
@@ -19172,7 +20155,19 @@ impl Render for Docxy {
                             .py(px(28.))
                             .gap_1()
                             .children(blocks)
-                            .into_any_element()
+                            // An in-flow child sits inside the scroll area's 48px padding.
+                            // Keep it last so scroll_to_item(b) still indexes block b.
+                            .child(
+                                div()
+                                    .relative()
+                                    .w_full()
+                                    .h(px(0.))
+                                    .child(ruler_probe_el(&self.ruler_probe, |state, rect| {
+                                        state.draft_column = Some(rect)
+                                    })),
+                            )
+                            .into_any_element();
+                        ruler_scroll_view(scroll, &self.ruler_probe)
                     }
                 }
                 Surface::Sheet(v) => sheet_el(
@@ -19370,6 +20365,16 @@ impl Render for Docxy {
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 if this.ruler_drag.is_some() {
                     this.ruler_drag_move(f32::from(ev.position.x), window, cx);
+                }
+                let point = (f32::from(ev.position.x), f32::from(ev.position.y));
+                let mut probe = this.ruler_probe.borrow_mut();
+                let pointer = probe.viewport.filter(|r| r.contains(point.0, point.1)).map(|_| point);
+                if probe.pointer != pointer {
+                    let old_page = tracked_page(&probe);
+                    probe.pointer = pointer;
+                    let new_page = tracked_page(&probe);
+                    drop(probe);
+                    if old_page != new_page { cx.notify(); }
                 }
             }))
             // End a text drag-selection or a ruler drag wherever the button is
