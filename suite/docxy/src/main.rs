@@ -30,6 +30,7 @@ mod project;
 #[cfg(test)]
 mod ribbon_export;
 mod style_gallery;
+mod tabstrip;
 use project::*;
 
 use std::path::PathBuf;
@@ -1280,6 +1281,9 @@ struct HfEdit {
 struct Docxy {
     tabs: Vec<DocTab>,
     active: usize,
+    tab_first: usize,
+    tab_layout: tabstrip::StripLayout,
+    tab_more_open: bool,
     focus: FocusHandle,
     focused: bool,
     ribbon_tab: RibbonTab,
@@ -4447,6 +4451,9 @@ impl Docxy {
         Self {
             tabs,
             active,
+            tab_first: 0,
+            tab_layout: tabstrip::layout(0.0, 0, 0, 0),
+            tab_more_open: false,
             focus: cx.focus_handle(),
             focused: false,
             ribbon_tab: RibbonTab::Home,
@@ -5963,6 +5970,10 @@ impl Docxy {
                 origin: point(px(0.), px(0.)),
                 size: window.viewport_size(),
             }),
+            Region::TitleTabs | Region::TabPrev | Region::TabNext | Region::TabMore
+            | Region::TabMoreItem(_) => self.probes.borrow()
+                .get(&harness::region_name(region))
+                .ok_or_else(|| format!("{} is not visible", harness::region_name(region))),
             Region::Gantt
             | Region::Bar(_)
             | Region::ProjectHbarTable
@@ -9787,6 +9798,7 @@ impl Docxy {
         self.project_prompt_cancel();
         if i < self.tabs.len() {
             self.active = i;
+            self.tab_more_open = false;
             // Same reason as `select_sheet`: these all index the document we
             // were just on.
             self.drop_grid_state();
@@ -18155,6 +18167,101 @@ impl Docxy {
     }
 }
 
+impl Docxy {
+    fn tab_prev(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active > 0 {
+            self.select_tab(self.active - 1, window, cx);
+        }
+    }
+
+    fn tab_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active + 1 < self.tabs.len() {
+            self.select_tab(self.active + 1, window, cx);
+        }
+    }
+
+    fn tab_more_toggle(&mut self, cx: &mut Context<Self>) {
+        self.tab_more_open = !self.tab_more_open;
+        cx.notify();
+    }
+
+    fn tab_more_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            self.select_tab(i, window, cx);
+        }
+    }
+
+    fn tab_more_popup(&self, window: &Window, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let anchor = self.probes.borrow().current("tab-more");
+        let viewport = f32::from(window.viewport_size().width);
+        let left = anchor
+            .map(|b| f32::from(b.origin.x))
+            .unwrap_or(0.0)
+            .min((viewport - 224.0).max(0.0));
+        let items = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                h_flex()
+                    .id(("tab-more-item", i))
+                    .relative()
+                    .w_full()
+                    .h(px(28.))
+                    .px_2()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_size(px(12.))
+                    .text_color(pal.fg)
+                    .hover(|d| d.bg(pal.hover))
+                    .child(probe(&self.probes, format!("tab-more-item:{i}")))
+                    .child(if i == self.active { "✓" } else { " " })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(tab.title.to_string())),
+                    )
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.tab_more_pick(i, window, cx)),
+                    )
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("tab-more-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.tab_more_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                v_flex()
+                    .id("tab-more-menu")
+                    .absolute()
+                    .left(px(left))
+                    .top(px(34.))
+                    .w(px(220.))
+                    .max_h(px(400.))
+                    .overflow_y_scroll()
+                    .py_1()
+                    .rounded_md()
+                    .bg(pal.panel)
+                    .border_1()
+                    .border_color(pal.border)
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .children(items),
+            )
+            .into_any_element()
+    }
+}
+
 impl Render for Docxy {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // A new frame: what the probes recorded during the last one is now the
@@ -18220,34 +18327,86 @@ impl Render for Docxy {
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
+        // The pinned gpui-component TitleBar gives #bar flex-shrink:0. Give
+        // our sole child a definite width so its min-content cannot move the
+        // caption controls outside the viewport. These are logical pixels.
+        #[cfg(target_os = "macos")]
+        const TITLE_LEFT_PAD: f32 = 80.0;
+        #[cfg(not(target_os = "macos"))]
+        const TITLE_LEFT_PAD: f32 = 12.0;
+        #[cfg(any(target_os = "macos", target_family = "wasm"))]
+        const CAPTION_W: f32 = 0.0;
+        #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
+        const CAPTION_W: f32 = 3.0 * 34.0; // pinned title_bar.rs TITLE_BAR_HEIGHT
+        let viewport_w = f32::from(window.viewport_size().width);
+        let title_w = (viewport_w
+            - TITLE_LEFT_PAD
+            - CAPTION_W
+            - if window.is_fullscreen() { 12.0 } else { 0.0 })
+        .max(0.0);
+        let chrome = self.probes.borrow();
+        let left_w = chrome
+            .get("title-left")
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(170.0);
+        let theme_w = chrome
+            .get("title-theme")
+            .map(|b| f32::from(b.size.width))
+            .unwrap_or(80.0);
+        drop(chrome);
+        // In very narrow windows the left chrome yields space to the drag
+        // region before the caption controls can be affected.
+        let left_cap = (title_w - 8.0 - 24.0 - tabstrip::DRAG_MIN_W).max(0.0);
+        // Four children, three 8px gaps, plus our 8px left padding.
+        let avail =
+            (title_w - 8.0 - 24.0 - left_w.min(left_cap) - theme_w - tabstrip::DRAG_MIN_W).max(0.0);
+        let strip = tabstrip::layout(avail, self.tabs.len(), self.active, self.tab_first);
+        self.tab_first = strip.first;
+        self.tab_layout = strip;
         let chips: Vec<AnyElement> = self
             .tabs
             .iter()
             .enumerate()
+            .skip(strip.first)
+            .take(strip.end - strip.first)
             .map(|(i, tb)| {
                 let active = i == self.active && !self.backstage;
                 let mark = if tb.dirty { " \u{2022}" } else { "" };
                 h_flex()
                     .id(("chip", i))
+                    .relative()
                     .items_center()
                     .gap_1()
                     .px_2()
                     .h(px(24.))
+                    .w(px(strip.tab_w))
+                    .flex_none()
                     .rounded_sm()
                     .cursor_pointer()
                     .text_size(px(12.))
                     .when(active, |d| d.bg(tab_active).text_color(fg))
                     .when(!active, |d| d.text_color(dim))
-                    .child(SharedString::from(format!(
-                        "{} {}{}{}",
-                        tb.kind.glyph(),
-                        tb.title,
-                        if is_imported(tb) { " · imported" } else { "" },
-                        mark
-                    )))
+                    .when(i == self.active, |d| {
+                        d.child(probe(&self.probes, "title-active-chip"))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .child(SharedString::from(format!(
+                                "{} {}{}{}",
+                                tb.kind.glyph(),
+                                tb.title,
+                                if is_imported(tb) { " · imported" } else { "" },
+                                mark
+                            ))),
+                    )
                     .child(
                         div()
                             .id(("chipx", i))
+                            .flex_none()
                             .px_1()
                             .rounded_sm()
                             .hover(|d| d.bg(border))
@@ -18264,6 +18423,60 @@ impl Render for Docxy {
             })
             .collect();
 
+        let mut tab_controls = h_flex().items_center().gap(px(tabstrip::TAB_GAP));
+        if strip.arrows {
+            tab_controls = tab_controls.child(
+                div()
+                    .id("tab-prev")
+                    .relative()
+                    .w(px(tabstrip::ARROW_W))
+                    .h(px(24.))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_color(if self.active == 0 { dim } else { fg })
+                    .child("‹")
+                    .child(probe(&self.probes, "tab-prev"))
+                    .on_click(cx.listener(|this, _, window, cx| this.tab_prev(window, cx))),
+            );
+        }
+        tab_controls = tab_controls.children(chips);
+        if strip.arrows {
+            tab_controls = tab_controls.child(
+                div()
+                    .id("tab-next")
+                    .relative()
+                    .w(px(tabstrip::ARROW_W))
+                    .h(px(24.))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_color(if self.active + 1 >= self.tabs.len() {
+                        dim
+                    } else {
+                        fg
+                    })
+                    .child("›")
+                    .child(probe(&self.probes, "tab-next"))
+                    .on_click(cx.listener(|this, _, window, cx| this.tab_next(window, cx))),
+            );
+        }
+        if strip.more {
+            tab_controls = tab_controls.child(
+                div()
+                    .id("tab-more")
+                    .relative()
+                    .w(px(tabstrip::MORE_W))
+                    .h(px(24.))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_color(fg)
+                    .child("▾")
+                    .child(probe(&self.probes, "tab-more"))
+                    .on_click(cx.listener(|this, _, _, cx| this.tab_more_toggle(cx))),
+            );
+        } else {
+            self.tab_more_open = false;
+        }
+
         // NOTE: the "docxy" brand label and the flex_1 spacer are plain,
         // non-interactive divs, so TitleBar's own drag region shows through them
         // — that idle space is natively draggable and double-click maximizes.
@@ -18271,46 +18484,74 @@ impl Render for Docxy {
         // mouse-down so a drag on them doesn't start a window move.
         let title_bar = TitleBar::new().child(
             h_flex()
-                .w_full()
+                .relative()
+                .w(px(title_w))
+                .h_full()
+                .flex_none()
+                .overflow_hidden()
                 .items_center()
                 .gap_2()
                 .pl_2()
-                .child(
-                    div()
-                        .font_weight(FontWeight::BOLD)
-                        .text_color(rgb(BRAND))
-                        .child("docxy"),
-                )
-                // Quick Access Toolbar: Undo / Redo (Word keeps these here, not on
-                // the ribbon).
+                .child(probe(&self.probes, "title-content"))
                 .child(
                     h_flex()
+                        .relative()
+                        .flex_none()
+                        .max_w(px(left_cap))
+                        .overflow_hidden()
                         .items_center()
-                        .gap_0p5()
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .children(QAT_ITEMS.iter().map(|item| {
-                            let action = item.action;
-                            qat_btn(
-                                item.id,
-                                item.icon,
-                                item.tip,
-                                pal,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.qat_action(action, window, cx)
-                                }),
-                            )
-                        })),
+                        .gap_2()
+                        .child(probe(&self.probes, "title-left"))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::BOLD)
+                                .text_color(rgb(BRAND))
+                                .child("docxy"),
+                        )
+                        .child(
+                            h_flex()
+                                .items_center()
+                                .gap_0p5()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .children(QAT_ITEMS.iter().map(|item| {
+                                    let action = item.action;
+                                    qat_btn(
+                                        item.id,
+                                        item.icon,
+                                        item.tip,
+                                        pal,
+                                        cx.listener(move |this, _, window, cx| {
+                                            this.qat_action(action, window, cx)
+                                        }),
+                                    )
+                                })),
+                        ),
                 )
                 .child(
                     h_flex()
+                        .relative()
+                        .w(px(strip.width))
+                        .flex_none()
+                        .min_w_0()
+                        .overflow_hidden()
                         .items_center()
-                        .gap_1()
+                        .child(probe(&self.probes, "title-tabs"))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .children(chips),
+                        .child(tab_controls),
                 )
-                .child(div().flex_1())
                 .child(
                     div()
+                        .relative()
+                        .flex_1()
+                        .h_full()
+                        .min_w(px(tabstrip::DRAG_MIN_W))
+                        .child(probe(&self.probes, "title-drag")),
+                )
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(probe(&self.probes, "title-theme"))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             Button::new("theme")
@@ -18323,15 +18564,20 @@ impl Render for Docxy {
                         ),
                 ),
         );
+        let tab_popup = self
+            .tab_more_open
+            .then(|| self.tab_more_popup(window, pal, cx));
 
         if self.backstage {
             let backstage = self.backstage_view(bg, fg, dim, sidebar, cx);
             return v_flex()
                 .size_full()
+                .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
                 .child(title_bar)
                 .child(backstage)
+                .when_some(tab_popup, |d, popup| d.child(popup))
                 .into_any_element();
         }
 
@@ -18990,6 +19236,7 @@ impl Render for Docxy {
             .when_some(mini_bar, |d, m| d.child(m))
             .when_some(context_menu, |d, m| d.child(m))
             .when_some(sheet_fmt_panel, |d, p| d.child(p))
+            .when_some(tab_popup, |d, popup| d.child(popup))
             // A vertical guide line down the page while a ruler marker is dragged.
             .when_some(self.ruler_guide, |d, gx| {
                 d.child(div().absolute().top_0().bottom_0().left(px(gx)).w(px(1.)).bg(Hsla { a: 0.6, ..hsla_u(BRAND) }))

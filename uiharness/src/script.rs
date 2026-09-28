@@ -104,6 +104,8 @@ pub enum Action {
     Open(String),
     /// Copy a fixture into the run sandbox before opening it.
     OpenCopy(String),
+    /// Copy a fixture under a unique plain filename before opening it.
+    OpenCopyAs { path: String, name: String },
     /// Raw control request with an object payload, parsed before launch.
     Call {
         verb: String,
@@ -361,7 +363,15 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
                 if path.is_empty() {
                     return Err(err(line, "'open copy:' needs a path"));
                 }
-                Ok(Action::OpenCopy(path.into()))
+                if let Some((source, name)) = path.rsplit_once(" as ") {
+                    if source.is_empty() || name.is_empty() || name == "." || name.contains("..")
+                        || name.contains('/') || name.contains('\\') || name.contains(':') {
+                        return Err(err(line, "'open copy:... as' needs a plain target filename"));
+                    }
+                    Ok(Action::OpenCopyAs { path: source.into(), name: name.into() })
+                } else {
+                    Ok(Action::OpenCopy(path.into()))
+                }
             } else {
                 Ok(Action::Open(path.into()))
             }
@@ -593,7 +603,7 @@ fn parse_is(rest: &str, line: usize, whole: &str) -> Result<(bool, String), Scri
 // ---------------------------------------------------------------------------
 
 /// The region names, for an error message. Mirrors `harness::parse_region`.
-pub const REGION_WORDS: &str = "window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery";
+pub const REGION_WORDS: &str = "window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery";
 
 /// A region name a script may use, normalized to the form the app's `rect`
 /// verb takes (`A1:C5` becomes `cell:A1:C5`).
@@ -609,7 +619,7 @@ pub fn validate_region(name: &str) -> Result<String, String> {
         None => (full.as_str(), None),
     };
     match head.to_ascii_lowercase().as_str() {
-        "window" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
+        "window" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
         | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split"
         | "gallery" => {
             if arg.is_some() {
@@ -646,6 +656,11 @@ pub fn validate_region(name: &str) -> Result<String, String> {
                 .ok_or_else(|| "'chart' needs an index, e.g. chart:0".to_string())?;
             a.parse::<usize>()
                 .map_err(|_| format!("'{a}' is not a chart index (they count from 0)"))?;
+            Ok(full.clone())
+        }
+        "tab-more-item" => {
+            let a = arg.filter(|a| !a.is_empty()).ok_or("'tab-more-item' needs an index")?;
+            a.parse::<usize>().map_err(|_| "'tab-more-item' needs a numeric index")?;
             Ok(full.clone())
         }
         other => Err(format!("unknown region '{other}' ({REGION_WORDS})")),
@@ -883,6 +898,17 @@ test a pointed range dashes
         // The line numbers are the script's own, so a failure can be found.
         assert_eq!(s.cases[0].line, 2);
         assert_eq!(s.cases[0].steps[0].line, 3);
+    }
+
+    #[test]
+    fn named_fixture_copies_need_plain_unique_filenames() {
+        let script = parse_script("test copies\n  open copy:../fixtures/basic.docx as tab-07.docx\n").unwrap();
+        assert_eq!(script.cases[0].steps[0].action, Action::OpenCopyAs {
+            path: "../fixtures/basic.docx".into(), name: "tab-07.docx".into()
+        });
+        for name in ["../escape.docx", "sub/file.docx", "sub\\file.docx", "..docx", "C:drive.docx"] {
+            assert!(parse_script(&format!("test bad\n  open copy:basic.docx as {name}\n")).is_err(), "{name}");
+        }
     }
 
     #[test]
@@ -1308,6 +1334,11 @@ test Smoke-Case
             ("window", "window"),
             ("grid", "grid"),
             ("chart-panel", "chart-panel"),
+            ("title-tabs", "title-tabs"),
+            ("tab-prev", "tab-prev"),
+            ("tab-next", "tab-next"),
+            ("tab-more", "tab-more"),
+            ("tab-more-item:19", "tab-more-item:19"),
             ("cell:B3", "cell:B3"),
             ("B3", "cell:B3"),
             ("A1:C5", "cell:A1:C5"),

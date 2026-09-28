@@ -31,7 +31,7 @@ use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
-use gpui::{App, Context, Entity, KeyDownEvent, Keystroke, Window};
+use gpui::{App, Context, Entity, KeyDownEvent, Keystroke, Window, px, size};
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -586,6 +586,12 @@ pub enum Region {
     /// The window's whole client area — everything a capture contains except
     /// the frame the OS draws.
     Window,
+    /// The bounded document tab strip and its overflow controls.
+    TitleTabs,
+    TabPrev,
+    TabNext,
+    TabMore,
+    TabMoreItem(usize),
     /// The scrolling cell area of the grid: below the column header, above the
     /// sheet-tab row.
     Grid,
@@ -628,6 +634,17 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
     };
     match head.to_ascii_lowercase().as_str() {
         "window" if arg.is_none() => Ok(Region::Window),
+        "title-tabs" if arg.is_none() => Ok(Region::TitleTabs),
+        "tab-prev" if arg.is_none() => Ok(Region::TabPrev),
+        "tab-next" if arg.is_none() => Ok(Region::TabNext),
+        "tab-more" if arg.is_none() => Ok(Region::TabMore),
+        "tab-more-item" => {
+            let i = arg
+                .ok_or("'tab-more-item' needs an index")?
+                .parse::<usize>()
+                .map_err(|_| "'tab-more-item' needs a numeric index".to_string())?;
+            Ok(Region::TabMoreItem(i))
+        }
         "grid" if arg.is_none() => Ok(Region::Grid),
         "chart-panel" if arg.is_none() => Ok(Region::ChartPanel),
         "gantt" if arg.is_none() => Ok(Region::Gantt),
@@ -637,9 +654,11 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
         "project-timeline" if arg.is_none() => Ok(Region::ProjectTimeline),
         "project-split" if arg.is_none() => Ok(Region::ProjectSplit),
         "gallery" if arg.is_none() => Ok(Region::Gallery),
-        "window" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
-        | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split"
-        | "gallery" => Err(format!("'{head}' does not take an argument; use '{head}'")),
+        "window" | "grid" | "chart-panel" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more"
+        | "gantt" | "project-hbar-table" | "project-hbar-chart" | "project-vbar"
+        | "project-timeline" | "project-split" | "gallery" => {
+            Err(format!("'{head}' does not take an argument; use '{head}'"))
+        }
         "cell" | "cells" => {
             let a = arg.filter(|a| !a.is_empty()).ok_or_else(|| {
                 format!("'{head}' needs a cell or a range, e.g. {head}:B3 or {head}:A1:C5")
@@ -669,7 +688,7 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
             Ok(Region::Chart(i))
         }
         other => Err(format!(
-            "unknown region '{other}' (window, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery)"
+            "unknown region '{other}' (window, title-tabs, tab-prev, tab-next, tab-more, tab-more-item:0, grid, chart-panel, cell:B3, cell:A1:C5, chart:0, gantt, bar:3, project-hbar-table, project-hbar-chart, project-vbar, project-timeline, project-split, gallery)"
         )),
     }
 }
@@ -679,6 +698,11 @@ pub fn parse_region(name: &str) -> Result<Region, String> {
 pub fn region_name(region: Region) -> String {
     match region {
         Region::Window => "window".into(),
+        Region::TitleTabs => "title-tabs".into(),
+        Region::TabPrev => "tab-prev".into(),
+        Region::TabNext => "tab-next".into(),
+        Region::TabMore => "tab-more".into(),
+        Region::TabMoreItem(i) => format!("tab-more-item:{i}"),
         Region::Grid => "grid".into(),
         Region::ChartPanel => "chart-panel".into(),
         Region::Cells(r0, c0, r1, c1) => format!("cell:{}", a1_range((r0, c0, r1, c1))),
@@ -1450,6 +1474,104 @@ pub fn dispatch(
     cx: &mut Context<crate::Docxy>,
 ) -> Result<Done, String> {
     match verb {
+        "window-zoom" => {
+            window.zoom_window();
+            cx.notify();
+            Done::ok(Json::obj(vec![(
+                "maximized",
+                Json::Bool(window.is_maximized()),
+            )]))
+        }
+        "window-size" => {
+            let w = arg_usize(args, "w")?;
+            let h = arg_usize(args, "h")?;
+            if !(300..=4096).contains(&w) || !(200..=4096).contains(&h) {
+                return Err("window size must be 300..4096 by 200..4096 logical pixels".into());
+            }
+            window.resize(size(px(w as f32), px(h as f32)));
+            cx.notify();
+            Done::ok(Json::obj(vec![
+                ("w", Json::Num(w as f64)),
+                ("h", Json::Num(h as f64)),
+            ]))
+        }
+        "title-bar" => {
+            let probes = app.probes.borrow();
+            let read = |name: &str| {
+                probes
+                    .get(name)
+                    .ok_or_else(|| format!("{name} has not been laid out yet"))
+            };
+            let content = read("title-content")?;
+            let strip = read("title-tabs")?;
+            let drag = read("title-drag")?;
+            let theme = read("title-theme")?;
+            #[cfg(any(target_os = "macos", target_family = "wasm"))]
+            let caption_w = 0.0;
+            #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
+            let caption_w = 102.0;
+            let caption_left = f32::from(window.viewport_size().width) - caption_w;
+            let content_right = f32::from(content.origin.x + content.size.width);
+            let strip_right = f32::from(strip.origin.x + strip.size.width);
+            let content_left = f32::from(content.origin.x);
+            let drag_left = f32::from(drag.origin.x);
+            let drag_right = f32::from(drag.origin.x + drag.size.width);
+            let drag_w = (drag_right.min(content_right) - drag_left.max(content_left)).max(0.0);
+            let theme_left = f32::from(theme.origin.x);
+            let theme_right = f32::from(theme.origin.x + theme.size.width);
+            let theme_visible =
+                theme_left >= content_left - 0.5 && theme_right <= content_right + 0.5;
+            let layout = app.tab_layout;
+            let active_visible = layout.active_visible(app.active)
+                && probes.get("title-active-chip").is_some_and(|chip| {
+                    let left = f32::from(chip.origin.x);
+                    let right = f32::from(chip.origin.x + chip.size.width);
+                    left >= f32::from(strip.origin.x) - 0.5
+                        && right <= strip_right + 0.5
+                        && right <= content_right + 0.5
+                });
+            Done::ok(Json::obj(vec![
+                ("tabs", Json::Num(app.tabs.len() as f64)),
+                ("active", Json::Num(app.active as f64)),
+                ("first", Json::Num(layout.first as f64)),
+                ("visible", Json::Num((layout.end - layout.first) as f64)),
+                ("mode", Json::Str(layout.mode.name().into())),
+                ("overflow", Json::Bool(layout.more)),
+                ("active_visible", Json::Bool(active_visible)),
+                ("theme_visible", Json::Bool(theme_visible)),
+                ("strip_right", Json::Num(strip_right as f64)),
+                ("content_right", Json::Num(content_right as f64)),
+                ("caption_left", Json::Num(caption_left as f64)),
+                (
+                    "controls_clear",
+                    Json::Bool(content_right <= caption_left + 0.5),
+                ),
+                ("drag_w", Json::Num(drag_w as f64)),
+                (
+                    "drag_ok",
+                    Json::Bool(drag_w + 0.5 >= crate::tabstrip::DRAG_MIN_W),
+                ),
+            ]))
+        }
+        "title-tab" => {
+            match arg_str(args, "action")? {
+                "prev" => app.tab_prev(window, cx),
+                "next" => app.tab_next(window, cx),
+                "more" => app.tab_more_toggle(cx),
+                "pick" => {
+                    let i = arg_usize(args, "index")?;
+                    if i >= app.tabs.len() {
+                        return Err(format!("no tab {i}"));
+                    }
+                    if !app.tab_more_open {
+                        return Err("the more-tabs list is closed".into());
+                    }
+                    app.tab_more_pick(i, window, cx);
+                }
+                _ => return Err("'action' must be prev, next, more or pick".into()),
+            }
+            Done::ok(state(app, window))
+        }
         "doc" => Done::ok(doc_state(active_doc(app)?, &ViewFlags::live(app, window))),
         "selection-set" => {
             let (start, end) = (arg_usize(args, "start")?, arg_usize(args, "end")?);
@@ -3168,6 +3290,11 @@ mod tests {
     fn region_names_round_trip() {
         for r in [
             Region::Window,
+            Region::TitleTabs,
+            Region::TabPrev,
+            Region::TabNext,
+            Region::TabMore,
+            Region::TabMoreItem(19),
             Region::Grid,
             Region::ChartPanel,
             Region::Cells(2, 1, 2, 1),

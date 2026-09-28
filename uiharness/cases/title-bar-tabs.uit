@@ -1,0 +1,107 @@
+# Distinct names make distinct canonical paths; the suite otherwise reuses a tab.
+test title bar keeps caption controls visible with twenty tabs
+  open copy:../fixtures/basic.docx as tab-01.docx
+  open copy:../fixtures/basic.docx as tab-02.docx
+  open copy:../fixtures/basic.docx as tab-03.docx
+  open copy:../fixtures/basic.docx as tab-04.docx
+  open copy:../fixtures/basic.docx as tab-05.docx
+  open copy:../fixtures/basic.docx as tab-06.docx
+  open copy:../fixtures/basic.docx as tab-07.docx
+  open copy:../fixtures/basic.docx as tab-08.docx
+  open copy:../fixtures/basic.docx as tab-09.docx
+  open copy:../fixtures/basic.docx as tab-10.docx
+  open copy:../fixtures/basic.docx as tab-11.docx
+  open copy:../fixtures/basic.docx as tab-12.docx
+  open copy:../fixtures/basic.docx as tab-13.docx
+  open copy:../fixtures/basic.docx as tab-14.docx
+  open copy:../fixtures/basic.docx as tab-15.docx
+  open copy:../fixtures/basic.docx as tab-16.docx
+  open copy:../fixtures/basic.docx as tab-17.docx
+  open copy:../fixtures/basic.docx as tab-18.docx
+  open copy:../fixtures/basic.docx as tab-19.docx
+  open copy:../fixtures/basic.docx as tab-20.docx
+  call close-tab {"index":0}
+  assert tabs is 20
+  shot title-tabs
+  shot window
+  call title-bar {}
+  assert reply.tabs is 20
+  assert reply.overflow is true
+  assert reply.active_visible is true
+  assert reply.controls_clear is true
+  assert reply.drag_ok is true
+  assert reply.theme_visible is true
+  call window-size {"w":600,"h":700}
+  shot title-tabs
+  shot window
+  call title-bar {}
+  assert reply.controls_clear is true
+  assert reply.active_visible is true
+  assert reply.drag_ok is true
+  assert reply.theme_visible is true
+  call window-size {"w":1000,"h":700}
+  shot title-tabs
+  call title-bar {}
+  assert reply.controls_clear is true
+  assert reply.active_visible is true
+  assert reply.theme_visible is true
+  call window-zoom {}
+  shot title-tabs
+  call title-bar {}
+  assert reply.controls_clear is true
+  assert reply.active_visible is true
+  call title-tab {"action":"prev"}
+  shot title-tabs
+  call title-bar {}
+  assert reply.active is 18
+  assert reply.active_visible is true
+  call title-tab {"action":"next"}
+  shot title-tabs
+  call title-bar {}
+  assert reply.active is 19
+  assert reply.active_visible is true
+  call title-tab {"action":"more"}
+  shot tab-more-item:0
+  call title-tab {"action":"pick","index":0}
+  shot title-tabs
+  call title-bar {}
+  assert reply.first is 0
+  assert reply.active_visible is true
+  call theme-set {"theme":"dark"}
+  shot title-tabs
+  call title-bar {}
+  assert reply.controls_clear is true
+  assert reply.theme_visible is true
+  call theme-set {"theme":"light"}
+  shot title-tabs
+  call title-bar {}
+  assert reply.controls_clear is true
+  assert reply.theme_visible is true
+  call theme-set {"theme":"auto"}
+  shot title-tabs
+  call title-bar {}
+  assert reply.controls_clear is true
+  assert reply.theme_visible is true
+  call close-tab {"index":19}
+  call close-tab {"index":18}
+  call close-tab {"index":17}
+  call close-tab {"index":16}
+  call close-tab {"index":15}
+  call close-tab {"index":14}
+  call close-tab {"index":13}
+  call close-tab {"index":12}
+  call close-tab {"index":11}
+  call close-tab {"index":10}
+  call close-tab {"index":9}
+  call close-tab {"index":8}
+  call close-tab {"index":7}
+  call close-tab {"index":6}
+  call close-tab {"index":5}
+  call close-tab {"index":4}
+  call close-tab {"index":3}
+  call close-tab {"index":2}
+  shot title-tabs
+  call title-bar {}
+  assert reply.tabs is 2
+  assert reply.overflow is false
+  assert reply.controls_clear is true
