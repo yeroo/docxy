@@ -299,10 +299,15 @@ fn current_fields(
         .ok_or_else(|| format!("invalid constraint type {code} for UID {uid}"))?;
     let constraint_date = match constraint_type {
         ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible => None,
-        _ => Some(
-            decode_timestamp(rec, CONSTRAINT_DATE)
-                .ok_or_else(|| format!("missing constraint date for UID {uid}"))?,
-        ),
+        _ => {
+            let date = decode_timestamp(rec, CONSTRAINT_DATE)
+                .ok_or_else(|| format!("missing constraint date for UID {uid}"))?;
+            let time = u16_at(rec, CONSTRAINT_DATE);
+            if time != 0xffff && time >= 14400 {
+                return Err(format!("invalid constraint date for UID {uid}"));
+            }
+            Some(date)
+        }
     };
     let priority = i32::from(u16_at(rec, 78));
     if priority > 1000 {
@@ -1678,6 +1683,13 @@ mod tests {
         let error = decode(&file(&s, true)).unwrap_err();
         assert!(
             error.contains("constraint date") && error.contains("UID 1"),
+            "{error}"
+        );
+        s.fd[row + CONSTRAINT_DATE..row + CONSTRAINT_DATE + 4]
+            .copy_from_slice(&[0x41, 0x38, 0x8d, 0x3a]); // 14401 tenths of a minute
+        let error = decode(&file(&s, true)).unwrap_err();
+        assert!(
+            error.contains("invalid constraint date for UID 1"),
             "{error}"
         );
     }

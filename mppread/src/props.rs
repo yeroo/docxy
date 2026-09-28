@@ -64,9 +64,7 @@ pub(crate) fn project_start(b: &[u8]) -> Result<Option<String>, String> {
     if time != 0xffff && time >= 14400 {
         return Err("invalid project StartDate in Props".into());
     }
-    crate::mpp::decode_timestamp(raw, 0)
-        .ok_or_else(|| "invalid project StartDate in Props".into())
-        .map(Some)
+    Ok(crate::mpp::decode_timestamp(raw, 0))
 }
 /// WBS code mask. Project writes four zero bytes for its ordinary numeric
 /// outline mask in the paired corpus; absent also means no custom mask.

@@ -286,6 +286,8 @@ struct Scheduler<'a> {
     weeks: HashMap<i32, WorkCalendar>,
     default_cal: i32,
     anchor: i64,
+    /// Project start before the default calendar snaps it to working time.
+    raw_anchor: i64,
     /// No timeline starts before this day, however far back a date lies.
     earliest_origin: i64,
     /// Each task's working duration, which a percent lag is a share of.
@@ -523,6 +525,7 @@ impl<'a> Scheduler<'a> {
             weeks,
             default_cal,
             anchor,
+            raw_anchor,
             earliest_origin,
             durations,
             floors: manual_summary_floors(proj, &manual_spans),
@@ -606,7 +609,7 @@ impl<'a> Scheduler<'a> {
         if linked {
             tl.abs_start(0)
         } else {
-            tl.snap(self.anchor)
+            tl.snap(self.raw_anchor)
         }
     }
 
@@ -841,7 +844,7 @@ impl<'a> Scheduler<'a> {
                 linked_start = Some(linked_start.map_or(cand, |s| s.max(cand)));
             }
             // Only resolved leaf links may schedule a task before the anchor.
-            let mut start_abs = linked_start.unwrap_or(self.anchor);
+            let mut start_abs = linked_start.unwrap_or_else(|| tl.snap(self.raw_anchor));
             let mut driven_start = start_abs;
             let mut finish_bound = None;
             let mut held_milestone: Option<i64> = None;
@@ -6459,6 +6462,26 @@ mod tests {
                 .push(WorkingTime { from, to });
         }
         cal
+    }
+
+    #[test]
+    fn unlinked_tasks_snap_project_start_on_their_own_calendars() {
+        let default = weekly(1, &[(1, 510, 1020)]); // Monday 08:30-17:00
+        let own = weekly(2, &[(1, 0, 1440)]); // Monday around the clock
+        let mut early = task(1, "Own calendar", 480);
+        early.calendar_uid = Some(2);
+        let project = Project {
+            start_date: Some(at(2, 8)),
+            calendars: vec![default, own],
+            tasks: vec![early, task(2, "Default calendar", 480)],
+            ..Project::default()
+        };
+        let result = schedule(&project);
+        assert_eq!(result.get(1).unwrap().early_start, at(2, 8));
+        assert_eq!(
+            result.get(2).unwrap().early_start,
+            DateTime::from_ymd_hm(2026, 3, 2, 8, 30)
+        );
     }
 
     /// Default calendar 1 has no working time; every leaf sets its own.
