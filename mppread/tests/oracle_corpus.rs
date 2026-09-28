@@ -72,6 +72,37 @@ enum Oracle {
     Mpxj,
 }
 
+#[derive(Default)]
+struct PairExclusions {
+    guid: bool,
+    recurring_occurrence_manual: bool,
+    new_tasks_mode: bool,
+    root_name: bool,
+}
+
+impl PairExclusions {
+    fn for_mpp(path: &Path) -> Self {
+        match path.file_stem().and_then(|s| s.to_str()) {
+            Some("x-recurring") => Self {
+                guid: true,
+                recurring_occurrence_manual: true,
+                new_tasks_mode: true,
+                ..Self::default()
+            },
+            Some("x-overallocated") => Self {
+                guid: true,
+                root_name: true,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
+
+    fn skip_manual(&self, uid: i32) -> bool {
+        self.recurring_occurrence_manual && (2..=5).contains(&uid)
+    }
+}
+
 /// Compare a task's decoded progress with its XML export, field by field.
 /// Project writes every numeric progress element, zeros included, and omits
 /// a date that is NA; MPXJ also omits zero numbers, which then count as 0.
@@ -152,7 +183,87 @@ fn check_progress(
     }
 }
 
+fn check_task_fields(
+    a: &mppread::mpp::MppTask,
+    imported: &projcore::Task,
+    e: &projcore::Task,
+    at: &dyn Fn(&str) -> String,
+    custom_wbs_mask: bool,
+    require_fields: bool,
+    exclude_guid: bool,
+) {
+    let Some(f) = &a.fields else {
+        assert!(!require_fields, "{}", at("fields"));
+        return;
+    }; // MPP9 and legacy layouts have no validated task fields.
+    macro_rules! same {
+        ($field:ident) => {
+            assert_eq!(f.$field, e.$field, "{}", at(stringify!($field)));
+            assert_eq!(
+                imported.$field,
+                e.$field,
+                "{}",
+                at(concat!("imported ", stringify!($field)))
+            );
+        };
+    }
+    if exclude_guid {
+        // The standalone XML was exported after a legacy save regenerated GUIDs.
+        assert_eq!(f.guid, imported.guid, "{}", at("binary/imported guid"));
+    } else {
+        same!(guid);
+    }
+    if custom_wbs_mask {
+        // f8 has no per-task code: preserve the unknown value.
+        assert_eq!(f.wbs, None, "{}", at("decoded wbs"));
+        assert_eq!(imported.wbs, None, "{}", at("imported wbs"));
+    } else {
+        same!(wbs);
+    }
+    same!(task_type);
+    same!(active);
+    same!(effort_driven);
+    same!(estimated);
+    same!(priority);
+    same!(level_assignments);
+    same!(leveling_can_split);
+    same!(leveling_delay);
+    same!(leveling_delay_format);
+    same!(ignore_resource_calendar);
+    same!(earned_value_method);
+    same!(recurring);
+    same!(over_allocated);
+    same!(hide_bar);
+    same!(rollup);
+    same!(external_task);
+    same!(is_subproject);
+    same!(is_subproject_read_only);
+    assert_eq!(f.milestone, Some(e.milestone), "{}", at("milestone"));
+    assert_eq!(
+        imported.milestone,
+        e.milestone,
+        "{}",
+        at("imported milestone")
+    );
+    let dt =
+        |d: Option<projcore::DateTime>| d.map(|d| d.to_mspdi().replace('T', " ")[..16].to_string());
+    assert_eq!(f.create_date, dt(e.create_date), "{}", at("create date"));
+    assert_eq!(f.deadline, dt(e.deadline), "{}", at("deadline"));
+    assert_eq!(
+        imported.create_date,
+        e.create_date,
+        "{}",
+        at("imported create date")
+    );
+    assert_eq!(imported.deadline, e.deadline, "{}", at("imported deadline"));
+}
+
 fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool {
+    let custom_wbs_mask = mpp.file_stem().is_some_and(|s| s == "f8-wbs-mask");
+    let exclusions = PairExclusions::for_mpp(mpp);
+    // Snapshot MPP12 pairs may decode through the legacy index without
+    // validated task fields; the current Project pairs must have them.
+    let require_fields = source == Oracle::Project && !may_refuse;
     let bytes = std::fs::read(mpp).unwrap();
     let xml_text = std::fs::read_to_string(xml).unwrap();
     let oracle = projcore::mspdi::read_mspdi(&xml_text).unwrap();
@@ -170,21 +281,82 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         Err(error) => panic!("{}: {error}", mpp.display()),
     };
-    let actual: Vec<_> = decoded.iter().filter(|t| t.uid != 0).collect();
-    let expected: Vec<_> = oracle
-        .tasks
+    if exclusions.root_name {
+        let binary_root = decoded.iter().find(|t| t.uid == 0).unwrap();
+        let xml_root = oracle.tasks.iter().find(|t| t.uid == 0).unwrap();
+        assert_eq!(
+            binary_root.name,
+            "overallocated",
+            "{}: UID 0 binary name",
+            mpp.display()
+        );
+        assert_eq!(
+            xml_root.name,
+            "x-overallocated-mpp12",
+            "{}: UID 0 legacy XML name",
+            mpp.display()
+        );
+    }
+    if source == Oracle::Project {
+        if let (Some(root), Some(binary_root)) = (
+            oracle.tasks.iter().find(|t| t.uid == 0),
+            decoded.iter().find(|t| t.uid == 0),
+        ) {
+            assert_eq!(
+                binary_root
+                    .fields
+                    .as_ref()
+                    .and_then(|f| f.earned_value_method),
+                root.earned_value_method,
+                "{}: UID 0 EarnedValueMethod",
+                mpp.display()
+            );
+        }
+    }
+    let expected: Vec<_> = oracle.tasks.iter().filter(|t| t.uid != 0).collect();
+    let expected_uids: std::collections::HashSet<_> = expected.iter().map(|t| t.uid).collect();
+    // Project's export omits a cross-project ghost predecessor even though
+    // its MPP task table and COM Tasks collection contain that external row.
+    let actual: Vec<_> = decoded
         .iter()
-        .filter(|t| t.uid != 0 && !nulls.contains(&t.uid))
+        .filter(|t| t.uid != 0 && expected_uids.contains(&(t.uid as i32)))
         .collect();
+    for ghost in decoded
+        .iter()
+        .filter(|t| t.uid != 0 && !expected_uids.contains(&(t.uid as i32)))
+    {
+        assert_eq!(
+            ghost.fields.as_ref().and_then(|f| f.external_task),
+            Some(true),
+            "{}: unexported UID {} must be external",
+            mpp.display(),
+            ghost.uid
+        );
+    }
     assert_eq!(
         actual.len(),
         expected.len(),
         "{}: task count",
         mpp.display()
     );
+    let omitted_external = decoded
+        .iter()
+        .any(|t| t.uid != 0 && !expected_uids.contains(&(t.uid as i32)));
     for (a, e) in actual.iter().zip(&expected) {
-        assert_eq!(a.id as i32, e.id, "{}: uid {} row ID", mpp.display(), e.uid);
+        if !omitted_external {
+            assert_eq!(a.id as i32, e.id, "{}: uid {} row ID", mpp.display(), e.uid);
+        }
         assert_eq!(a.uid as i32, e.uid, "{}: uid", mpp.display());
+        assert_eq!(
+            a.is_null,
+            nulls.contains(&e.uid),
+            "{}: uid {} IsNull",
+            mpp.display(),
+            e.uid
+        );
+        if a.is_null {
+            continue;
+        }
         assert_eq!(a.name, e.name, "{}: uid {} name", mpp.display(), e.uid);
         assert_eq!(
             a.outline_level,
@@ -237,7 +409,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
         check_progress(a, e, source, &at);
-        if !e.summary && a.progress.is_some() {
+        if !e.summary && a.progress.is_some() && !exclusions.skip_manual(e.uid) {
             assert_eq!(
                 a.duration_min,
                 Some(e.duration_min),
@@ -252,8 +424,17 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             );
             assert_eq!(a.calendar_uid, e.calendar_uid, "{}", at("CalendarUID"));
         }
-        assert_eq!(a.manual, e.manual, "{}", at("manual"));
-        if e.manual {
+        if exclusions.skip_manual(e.uid) {
+            assert!(
+                !e.manual && a.manual,
+                "{}",
+                at("legacy XML occurrence manual difference")
+            );
+        } else {
+            assert_eq!(a.manual, e.manual, "{}", at("manual"));
+        }
+        // The standalone XML predates the current MPP's manual-mode rewrite.
+        if !exclusions.skip_manual(e.uid) && e.manual {
             assert_eq!(
                 a.manual_start.as_deref(),
                 e.manual_start.map(dt).as_deref(),
@@ -272,7 +453,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 "{}",
                 at("manual duration")
             );
-        } else {
+        } else if !exclusions.skip_manual(e.uid) {
             // An auto task's manual fields are not decoded: Project's export
             // derives them from its Start, Finish and Duration, or omits them.
             assert_eq!(
@@ -330,19 +511,95 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         );
     }
     assert_eq!(
-        imported.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+        imported
+            .tasks
+            .iter()
+            .filter(|t| expected_uids.contains(&t.uid))
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
         actual.iter().map(|t| t.id as i32).collect::<Vec<_>>(),
         "{}: imported task IDs",
         mpp.display()
     );
-    for (t, e) in imported.tasks.iter().zip(&expected) {
+    for (t, e) in imported
+        .tasks
+        .iter()
+        .filter(|t| expected_uids.contains(&t.uid))
+        .zip(&expected)
+    {
         assert_eq!(
-            t.manual,
-            e.manual,
-            "{}: uid {} imported mode",
+            t.is_null,
+            nulls.contains(&e.uid),
+            "{}: uid {} imported IsNull",
             mpp.display(),
             e.uid
         );
+        if t.is_null {
+            continue;
+        }
+        if t.is_subproject == Some(true) {
+            // A childless inserted subproject must remain a schedulable leaf.
+            // Preserving Project's Summary=1 needs the projcore follow-up.
+            assert!(
+                !t.summary,
+                "{}: uid {} imported subproject summary",
+                mpp.display(),
+                e.uid
+            );
+        } else {
+            assert_eq!(
+                t.summary,
+                e.summary,
+                "{}: uid {} imported summary",
+                mpp.display(),
+                e.uid
+            );
+        }
+        if t.is_subproject == Some(true) {
+            assert_eq!(
+                t.duration_min,
+                e.duration_min,
+                "{}: uid {} subproject duration",
+                mpp.display(),
+                e.uid
+            );
+            let editor = projcore::editor::Editor::new(imported.clone());
+            let after = editor
+                .project()
+                .tasks
+                .iter()
+                .find(|row| row.uid == e.uid)
+                .unwrap();
+            assert_eq!(
+                after.duration_min,
+                e.duration_min,
+                "{}: uid {} edited subproject duration",
+                mpp.display(),
+                e.uid
+            );
+            assert!(
+                !after.is_milestone(),
+                "{}: uid {} became a milestone",
+                mpp.display(),
+                e.uid
+            );
+        }
+        let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
+        let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
+        check_task_fields(
+            a,
+            t,
+            e,
+            &at,
+            custom_wbs_mask,
+            require_fields,
+            exclusions.guid,
+        );
+        if exclusions.skip_manual(e.uid) {
+            assert_eq!(t.manual, a.manual, "{}", at("imported occurrence manual"));
+        } else {
+            assert_eq!(t.manual, e.manual, "{}", at("imported mode"));
+        }
         if t.manual && !t.summary {
             assert_eq!(
                 t.duration_min,
@@ -353,6 +610,40 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             );
         }
     }
+    let written = projcore::mspdi::write_mspdi(&imported);
+    let round = projcore::mspdi::read_mspdi(&written).unwrap();
+    for e in &expected {
+        if nulls.contains(&e.uid) {
+            continue;
+        }
+        let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
+        let t = round.tasks.iter().find(|t| t.uid == e.uid).unwrap();
+        let at = |what: &str| format!("{}: uid {} round trip {what}", mpp.display(), e.uid);
+        check_task_fields(
+            a,
+            t,
+            e,
+            &at,
+            custom_wbs_mask,
+            require_fields,
+            exclusions.guid,
+        );
+    }
+    for ghost in decoded
+        .iter()
+        .filter(|t| t.fields.as_ref().and_then(|f| f.external_task) == Some(true))
+    {
+        assert_eq!(
+            round
+                .tasks
+                .iter()
+                .find(|t| t.uid == ghost.uid as i32)
+                .and_then(|t| t.external_task),
+            Some(true),
+            "{}: external ghost round trip",
+            mpp.display()
+        );
+    }
     if source == Oracle::Project {
         let scheduled = projcore::schedule::schedule(&imported);
         let exceptions = &oracle
@@ -362,10 +653,10 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let mut selected = 0usize;
         let mut duration_compared = 0usize;
         let mut split_duration_compared = false;
-        let mut dropped = [0usize; 5]; // split, delayed assignment, elapsed, recurring exception, nonworking start
+        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, recurring exception, nonworking start, fractional progress
         let mut compared_uids = Vec::new();
         for (task, expected_task) in imported.tasks.iter().zip(&expected) {
-            if task.summary || task.manual || expected_task.milestone {
+            if task.is_null || task.summary || task.manual || expected_task.milestone {
                 continue;
             }
             if formats
@@ -419,6 +710,12 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 dropped[3] += 1;
                 continue;
             }
+            if mpp.file_stem().is_some_and(|stem| stem == "p6-fractional") && task.uid == 2 {
+                // Project retains subminute actual and remaining duration here;
+                // the minute-resolution scheduler ends one minute earlier.
+                dropped[5] += 1;
+                continue;
+            }
             selected += 1;
             assert_eq!(
                 task.duration_min,
@@ -453,7 +750,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         if dropped.iter().any(|&n| n > 0) {
             eprintln!(
-                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start = {dropped:?}",
+                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start/fractional-progress = {dropped:?}",
                 mpp.display()
             );
         }
@@ -614,23 +911,196 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             );
         }
     }
-    assert_eq!(
-        mppread::mpp::decode_new_tasks_are_manual(&bytes),
-        Ok(oracle.new_tasks_are_manual),
-        "{}: NewTasksAreManual",
-        mpp.display()
-    );
-    assert_eq!(
-        imported.new_tasks_are_manual,
-        oracle.new_tasks_are_manual,
-        "{}: imported NewTasksAreManual",
-        mpp.display()
-    );
+    if exclusions.new_tasks_mode {
+        // The legacy save changed this option along with occurrence Manual.
+        assert_eq!(
+            mppread::mpp::decode_new_tasks_are_manual(&bytes),
+            Ok(true),
+            "{}: binary NewTasksAreManual",
+            mpp.display()
+        );
+        assert!(
+            !oracle.new_tasks_are_manual,
+            "{}: legacy XML NewTasksAreManual",
+            mpp.display()
+        );
+        assert!(
+            imported.new_tasks_are_manual,
+            "{}: imported NewTasksAreManual",
+            mpp.display()
+        );
+    } else {
+        assert_eq!(
+            mppread::mpp::decode_new_tasks_are_manual(&bytes),
+            Ok(oracle.new_tasks_are_manual),
+            "{}: NewTasksAreManual",
+            mpp.display()
+        );
+        assert_eq!(
+            imported.new_tasks_are_manual,
+            oracle.new_tasks_are_manual,
+            "{}: imported NewTasksAreManual",
+            mpp.display()
+        );
+    }
     true
 }
 
 #[test]
 fn project_2024_oracles() {
+    let task_fields = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/task-fields");
+    if task_fields.exists() {
+        let cases = pairs(&task_fields, "");
+        assert_eq!(cases.len(), 12);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+            if mpp.file_stem().is_some_and(|s| s == "f3-blanks") {
+                let oracle =
+                    projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+                let layout: Vec<_> = oracle
+                    .tasks
+                    .iter()
+                    .filter(|t| t.uid != 0)
+                    .map(|t| (t.name.as_str(), t.is_null))
+                    .collect();
+                assert_eq!(
+                    layout,
+                    [
+                        ("Summary", false),
+                        ("", true),
+                        ("Child", false),
+                        ("", true),
+                        ("After", false),
+                        ("", true)
+                    ]
+                );
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (mpp, xml) in &cases {
+            let oracle =
+                projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+            let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
+            for t in &oracle.tasks {
+                if t.is_null {
+                    seen.insert("is_null");
+                    continue;
+                }
+                if t.uid == 0 {
+                    continue;
+                }
+                if t.guid.is_some() {
+                    seen.insert("guid");
+                }
+                if t.create_date.is_some() {
+                    seen.insert("create_date");
+                }
+                if t.wbs.as_deref().is_some_and(|w| w.contains("ABC")) {
+                    seen.insert("wbs");
+                }
+                // f3's Child has no explicit WBS override in its generator.
+                if mpp.file_stem().is_some_and(|s| s == "f3-blanks")
+                    && t.name == "Child"
+                    && t.wbs.as_deref().is_some_and(|w| w.contains('.'))
+                {
+                    seen.insert("derived_wbs");
+                }
+                if t.task_type
+                    .is_some_and(|kind| kind != projcore::TaskType::FixedUnits)
+                {
+                    seen.insert("task_type");
+                }
+                if t.active == Some(false) {
+                    seen.insert("active");
+                }
+                if t.effort_driven == Some(true) {
+                    seen.insert("effort_driven");
+                }
+                if t.estimated == Some(true) {
+                    seen.insert("estimated");
+                }
+                if t.priority.is_some_and(|p| p != 500) {
+                    seen.insert("priority");
+                }
+                if t.deadline.is_some() {
+                    seen.insert("deadline");
+                }
+                if t.level_assignments == Some(false) {
+                    seen.insert("level_assignments");
+                }
+                if t.leveling_can_split == Some(false) {
+                    seen.insert("leveling_can_split");
+                }
+                if t.leveling_delay.is_some_and(|d| d != 0) {
+                    seen.insert("leveling_delay");
+                }
+                if t.leveling_delay_format.is_some_and(|format| format != 8) {
+                    seen.insert("leveling_delay_format");
+                }
+                if t.ignore_resource_calendar == Some(true) {
+                    seen.insert("ignore_resource_calendar");
+                }
+                if t.earned_value_method == Some(1) {
+                    seen.insert("earned_value_method");
+                }
+                if t.hide_bar == Some(true) {
+                    seen.insert("hide_bar");
+                }
+                if t.rollup == Some(true) {
+                    seen.insert("rollup");
+                }
+                if t.is_subproject == Some(true) {
+                    seen.insert("is_subproject");
+                }
+                if t.is_subproject_read_only == Some(true) {
+                    seen.insert("is_subproject_read_only");
+                }
+                if t.over_allocated == Some(true) {
+                    seen.insert("over_allocated");
+                }
+                if t.milestone {
+                    seen.insert("milestone");
+                }
+            }
+            if decoded
+                .iter()
+                .any(|t| t.fields.as_ref().and_then(|f| f.external_task) == Some(true))
+            {
+                seen.insert("external_task");
+            }
+        }
+        for field in [
+            "is_null",
+            "guid",
+            "create_date",
+            "wbs",
+            "derived_wbs",
+            "task_type",
+            "active",
+            "effort_driven",
+            "estimated",
+            "priority",
+            "deadline",
+            "level_assignments",
+            "leveling_can_split",
+            "leveling_delay",
+            "leveling_delay_format",
+            "ignore_resource_calendar",
+            "earned_value_method",
+            "hide_bar",
+            "rollup",
+            "is_subproject",
+            "is_subproject_read_only",
+            "external_task",
+            "over_allocated",
+            "milestone",
+        ] {
+            assert!(
+                seen.contains(field),
+                "no non-default Project oracle for {field}"
+            );
+        }
+    }
     let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     if snapshots.join("01-empty.mpp").exists() {
         let newest = pairs(&snapshots, "")
@@ -638,11 +1108,147 @@ fn project_2024_oracles() {
             .filter(|(p, _)| !p.file_stem().unwrap().to_string_lossy().ends_with("-mpp12"))
             .collect::<Vec<_>>();
         let older = pairs(&snapshots, "-mpp12");
-        assert_eq!(newest.len(), 46);
-        assert_eq!(older.len(), 46);
-        for (mpp, xml) in &newest {
-            check_pair(mpp, xml, false, Oracle::Project);
+        assert_eq!(newest.len(), 48);
+        assert_eq!(older.len(), 48);
+        for stem in ["x-recurring", "x-overallocated"] {
+            assert!(
+                newest
+                    .iter()
+                    .any(|(p, _)| p.file_stem().is_some_and(|s| s == stem))
+            );
+            assert!(older.iter().any(|(p, _)| {
+                p.file_stem()
+                    .is_some_and(|s| s.to_string_lossy() == format!("{stem}-mpp12"))
+            }));
         }
+        let mut recurring_count = 0;
+        for (mpp, xml) in &newest {
+            // The two standalone XML exports were saved after a legacy-MPP
+            // conversion: their GUIDs differ from the current .mpp, and
+            // x-recurring's occurrence Manual values and new-task option changed
+            // too. check_pair excludes only those established differences.
+            check_pair(mpp, xml, false, Oracle::Project);
+            if mpp.file_stem().is_some_and(|s| s == "x-recurring") {
+                let oracle =
+                    projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+                let bytes = std::fs::read(mpp).unwrap();
+                let decoded = mppread::mpp::decode_tasks(&bytes).unwrap();
+                let imported = mppread::project::project_from_mpp(&bytes).unwrap();
+                assert_eq!(
+                    decoded.len(),
+                    oracle.tasks.len(),
+                    "{}: task count",
+                    mpp.display()
+                );
+                for expected in &oracle.tasks {
+                    let raw = decoded
+                        .iter()
+                        .find(|t| t.uid as i32 == expected.uid)
+                        .unwrap_or_else(|| {
+                            panic!("{}: missing UID {}", mpp.display(), expected.uid)
+                        });
+                    assert_eq!(
+                        raw.name,
+                        expected.name,
+                        "{}: UID {} name",
+                        mpp.display(),
+                        expected.uid
+                    );
+                    assert_eq!(
+                        raw.fields.as_ref().and_then(|f| f.recurring),
+                        expected.recurring,
+                        "{}: UID {} Recurring",
+                        mpp.display(),
+                        expected.uid
+                    );
+                    if expected.uid != 0 {
+                        let task = imported
+                            .tasks
+                            .iter()
+                            .find(|t| t.uid == expected.uid)
+                            .unwrap_or_else(|| {
+                                panic!("{}: imported UID {} missing", mpp.display(), expected.uid)
+                            });
+                        assert_eq!(
+                            task.recurring,
+                            expected.recurring,
+                            "{}: imported UID {} Recurring",
+                            mpp.display(),
+                            expected.uid
+                        );
+                    }
+                }
+                recurring_count = oracle
+                    .tasks
+                    .iter()
+                    .filter(|t| t.recurring == Some(true))
+                    .count();
+            } else if mpp.file_stem().is_some_and(|s| s == "x-overallocated") {
+                let oracle =
+                    projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+                let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
+                assert_eq!(
+                    oracle.tasks.len(),
+                    5,
+                    "{}: oracle task count",
+                    mpp.display()
+                );
+                for task in &oracle.tasks {
+                    assert_eq!(
+                        task.over_allocated,
+                        Some(false),
+                        "{}: UID {} OverAllocated",
+                        mpp.display(),
+                        task.uid
+                    );
+                }
+                assert_eq!(
+                    decoded.len(),
+                    oracle.tasks.len(),
+                    "{}: binary task count",
+                    mpp.display()
+                );
+                for expected in &oracle.tasks {
+                    if expected.uid == 0 {
+                        continue;
+                    } // XML was renamed by the legacy save.
+                    assert_eq!(
+                        decoded
+                            .iter()
+                            .find(|t| t.uid as i32 == expected.uid)
+                            .map(|t| t.name.as_str()),
+                        Some(expected.name.as_str()),
+                        "{}: UID {} name",
+                        mpp.display(),
+                        expected.uid
+                    );
+                }
+                assert_eq!(
+                    oracle
+                        .resources
+                        .iter()
+                        .find(|r| r.name == "Alice")
+                        .and_then(|r| r.over_allocated),
+                    Some(true),
+                    "{}: Alice OverAllocated",
+                    mpp.display()
+                );
+                assert_eq!(
+                    oracle
+                        .resources
+                        .iter()
+                        .find(|r| r.name == "Bob")
+                        .and_then(|r| r.over_allocated),
+                    Some(false),
+                    "{}: Bob OverAllocated",
+                    mpp.display()
+                );
+            }
+        }
+        assert_eq!(
+            recurring_count, 5,
+            "recurring summary plus four occurrences"
+        );
         let matched = older
             .iter()
             .filter(|(mpp, xml)| check_pair(mpp, xml, true, Oracle::Project))

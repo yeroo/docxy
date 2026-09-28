@@ -236,12 +236,21 @@ task: its bookings are placed first, and auto tasks level around them.
   addressable by path (`read_path("TBkndTask/FixedData")`). Its metadata streams
   are OLE **property sets** (MS-OLEPS). For recognized MPP9 and current Project
   task layouts, `mppread` uses counted `FixedMeta` and `VarMeta` records to
-  locate rows and names, then reads dates and outline levels at known offsets.
+  locate rows and names, then reads dates, outline levels and validated task
+  fields at known offsets. Current Project blank rows keep their ID and UID;
+  GUID, type, flags, priority, deadline and leveling options survive an
+  import and MSPDI save. Explicit WBS codes and generated codes under the
+  default numeric mask also survive; generated codes under a custom mask
+  remain absent. Current-layout over-allocation is derived from each task's
+  direct assignments and their resources' availability. A valid empty
+  assignment table gives false; a missing or unrecognized assignment table,
+  or a needed resource table, leaves the field absent. The value is kept after edits.
+  Recurring tasks are validated against a UI-authored Project sample.
   Stored task IDs determine display order; stable UIDs connect predecessor
   links from `TBkndCons`. An unrecognized layout or malformed row causes an
-  import error. Imported leaves are pinned to decoded starts and durations;
-  summaries roll up from their children. Nonzero link lag still lacks a
-  real-file oracle.
+  import error. Imported automatic leaves and childless inserted subprojects
+  are pinned to decoded starts and durations; outline summaries roll up from
+  their children. Nonzero link lag still lacks a real-file oracle.
 
 ## Desktop suite entry table
 
@@ -379,7 +388,8 @@ backstage, live Gantt, editing, undo/redo, find, vim mode, themes).
 Next, roughly in order:
 
 1. **Broader `.mpp` support** — recognized MPP9 and current Project task
-   layouts import validated names, dates, outline levels, and predecessor links.
+   layouts import validated names, dates, outline levels, predecessor links and
+   current-layout task fields.
    Other layouts and nonzero link lag need further oracle-backed work. The
    corpus workflow is documented in `corpus/mpp/README.md`.
 2. **Richer leveling** — priority-ordered (not just topological), multi-calendar,

@@ -38,9 +38,10 @@ fn main() {
         } else {
             format!("  [pred UID: {}]", preds.join(","))
         };
+        let name = if t.is_null { "[blank row]" } else { &t.name };
         println!(
             "  {:>4}  {:>4}  {:<19}  {:<19}  {indent}{}{dep}",
-            t.id, t.uid, start, finish, t.name
+            t.id, t.uid, start, finish, name
         );
     }
 }
