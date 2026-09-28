@@ -1285,7 +1285,6 @@ struct Docxy {
     tab_first: usize,
     tab_layout: tabstrip::StripLayout,
     tab_more_open: bool,
-    title_chrome_budget: Option<(f32, f32)>,
     focus: FocusHandle,
     focused: bool,
     ribbon_tab: RibbonTab,
@@ -1501,10 +1500,23 @@ mod probes_tests {
 /// recomputed it would be asserting against a second copy of the layout instead
 /// of the one on screen.
 fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>) -> AnyElement {
+    probe_with_reflow(cell, name, |_| false)
+}
+
+/// Record fresh bounds during prepaint and request one more frame if the
+/// previous frame's geometry used for this render has gone stale.
+fn probe_with_reflow(
+    cell: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    name: impl Into<String>,
+    needs_frame: impl Fn(Bounds<Pixels>) -> bool + 'static,
+) -> AnyElement {
     let (cell, name) = (cell.clone(), name.into());
     canvas(
-        move |b: Bounds<Pixels>, _w: &mut Window, _a: &mut App| {
+        move |b: Bounds<Pixels>, w: &mut Window, _a: &mut App| {
             cell.borrow_mut().next.push((name, b));
+            if needs_frame(b) {
+                w.request_animation_frame();
+            }
         },
         |_b, _s, _w, _a| {},
     )
@@ -4532,7 +4544,6 @@ impl Docxy {
             tab_first: 0,
             tab_layout: tabstrip::layout(0.0, 0, 0, 0),
             tab_more_open: false,
-            title_chrome_budget: None,
             focus: cx.focus_handle(),
             focused: false,
             ribbon_tab: RibbonTab::Home,
@@ -18292,6 +18303,8 @@ impl Docxy {
             } else {
                 self.sheet_fill = None;
                 self.grid_release(cx);
+                self.context_menu = None;
+                self.mini_bar = None;
                 self.tab_more_open = true;
                 cx.notify();
             }
@@ -18356,37 +18369,40 @@ impl Docxy {
                     )
             })
             .collect::<Vec<_>>();
-        div()
-            .id("tab-more-backdrop")
-            .absolute()
-            .inset_0()
-            .occlude()
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.tab_more_close(cx);
-                }),
-            )
-            .child(
-                v_flex()
-                    .id("tab-more-menu")
-                    .absolute()
-                    .left(px(left))
-                    .top(gpui_component::TITLE_BAR_HEIGHT)
-                    .w(px(220.))
-                    .max_h(px(max_menu_h))
-                    .overflow_y_scroll()
-                    .py_1()
-                    .rounded_md()
-                    .bg(pal.panel)
-                    .border_1()
-                    .border_color(pal.border)
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .children(items),
-            )
-            .into_any_element()
+        deferred(
+            div()
+                .id("tab-more-backdrop")
+                .absolute()
+                .inset_0()
+                .occlude()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.tab_more_close(cx);
+                    }),
+                )
+                .child(
+                    v_flex()
+                        .id("tab-more-menu")
+                        .absolute()
+                        .left(px(left))
+                        .top(gpui_component::TITLE_BAR_HEIGHT)
+                        .w(px(220.))
+                        .max_h(px(max_menu_h))
+                        .overflow_y_scroll()
+                        .py_1()
+                        .rounded_md()
+                        .bg(pal.panel)
+                        .border_1()
+                        .border_color(pal.border)
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .children(items),
+                ),
+        )
+        .with_priority(1)
+        .into_any_element()
     }
 }
 
@@ -18469,11 +18485,6 @@ impl Render for Docxy {
             .map(|b| f32::from(b.size.width))
             .unwrap_or(80.0);
         drop(chrome);
-        let measured = (left_w, theme_w);
-        if self.title_chrome_budget != Some(measured) {
-            self.title_chrome_budget = Some(measured);
-            cx.notify();
-        }
         // In very narrow windows the left chrome yields space to the drag
         // region before the caption controls can be affected.
         let left_cap = (title_w - 8.0 - 24.0 - tabstrip::DRAG_MIN_W).max(0.0);
@@ -18611,7 +18622,12 @@ impl Render for Docxy {
                     .cursor_pointer()
                     .text_color(fg)
                     .child("▾")
-                    .child(probe(&self.probes, "tab-more"))
+                    .child(if self.tab_more_open {
+                        let expected = self.probes.borrow().get("tab-more");
+                        probe_with_reflow(&self.probes, "tab-more", move |b| expected != Some(b))
+                    } else {
+                        probe(&self.probes, "tab-more")
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.tab_more_toggle(cx))),
             );
         } else {
@@ -18642,7 +18658,9 @@ impl Render for Docxy {
                         .overflow_hidden()
                         .items_center()
                         .gap_2()
-                        .child(probe(&self.probes, "title-left"))
+                        .child(probe_with_reflow(&self.probes, "title-left", move |b| {
+                            (f32::from(b.size.width) - left_w).abs() > 0.5
+                        }))
                         .child(
                             div()
                                 .font_weight(FontWeight::BOLD)
@@ -18692,7 +18710,9 @@ impl Render for Docxy {
                     div()
                         .relative()
                         .flex_none()
-                        .child(probe(&self.probes, "title-theme"))
+                        .child(probe_with_reflow(&self.probes, "title-theme", move |b| {
+                            (f32::from(b.size.width) - theme_w).abs() > 0.5
+                        }))
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
                             Button::new("theme")
@@ -18716,7 +18736,14 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
-                .child(probe(&self.probes, "suite-root"))
+                .child({
+                    let expected = self.probes.borrow().get("suite-root");
+                    if self.tab_more_open {
+                        probe_with_reflow(&self.probes, "suite-root", move |b| expected != Some(b))
+                    } else {
+                        probe(&self.probes, "suite-root")
+                    }
+                })
                 .child(title_bar)
                 .child(backstage)
                 .when_some(tab_popup, |d, popup| d.child(popup))
@@ -19314,6 +19341,7 @@ impl Render for Docxy {
             .when_some(chart_panel, |d, p| d.child(p));
         let context_menu = self
             .context_menu
+            .filter(|_| !self.tab_more_open)
             .map(|at| self.context_menu_el(at, pal, cx));
         let mini_bar = (is_doc && self.context_menu.is_none())
             .then_some(self.mini_bar)
@@ -19354,7 +19382,14 @@ impl Render for Docxy {
                 }
             }))
             .bg(bg)
-            .child(probe(&self.probes, "suite-root"))
+            .child({
+                let expected = self.probes.borrow().get("suite-root");
+                if self.tab_more_open {
+                    probe_with_reflow(&self.probes, "suite-root", move |b| expected != Some(b))
+                } else {
+                    probe(&self.probes, "suite-root")
+                }
+            })
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
