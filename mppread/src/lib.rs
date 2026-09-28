@@ -26,6 +26,8 @@ mod overalloc;
 pub mod project;
 mod props;
 mod rscdecode;
+mod rtf;
+mod rtf_codepage;
 mod tabledecode;
 mod taskdecode;
 pub mod vardata;

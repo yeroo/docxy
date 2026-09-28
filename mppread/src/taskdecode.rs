@@ -92,6 +92,9 @@ const NEWEST_PROGRESS: ProgressLayout = ProgressLayout {
 /// PhysicalPercentComplete is a keyed Var2Data block holding a u16. Project
 /// writes the block only for a task that has one; without it the value is 0.
 const PHYSICAL_PERCENT_KEY: u16 = 0x045f;
+/// Current-layout Var2Data RTF task notes, validated against Project's
+/// step-07 snapshot and its MSPDI export.
+const TASK_NOTES_KEY: u16 = 0x000f;
 const LEGACY: TaskLayout = TaskLayout {
     length: 264,
     start: 88,
@@ -212,6 +215,7 @@ fn validate_legacy_level(index: usize, uid: u32, level: u32, previous: u32) -> R
 /// Keyed Var2Data values of the newest layout's tasks.
 struct VarFields {
     names: HashMap<u32, String>,
+    notes: HashMap<u32, String>,
     physical_percent: HashMap<u32, u8>,
     wbs: HashMap<u32, String>,
 }
@@ -230,6 +234,7 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
     }
     let mut seen = HashSet::new();
     let mut names = HashMap::new();
+    let mut notes = HashMap::new();
     let mut physical_percent = HashMap::new();
     let mut wbs = HashMap::new();
     for i in 0..count {
@@ -252,6 +257,8 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
         };
         if key == 0x000e {
             names.insert(uid, decode_name(v2, off, uid)?);
+        } else if key == TASK_NOTES_KEY {
+            notes.insert(uid, crate::rtf::plain_text(&v2[header_end..end], uid)?);
         } else if key == 0x0010 {
             // Explicit WBS override; default WBS is generated from the outline.
             wbs.insert(uid, decode_text(v2, off, uid, "WBS", true)?);
@@ -269,6 +276,7 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
     }
     Ok(VarFields {
         names,
+        notes,
         physical_percent,
         wbs,
     })
@@ -291,6 +299,7 @@ fn current_fields(
     fixed2: fixedmeta::Fixed2<'_>,
     uid: u32,
     wbs: Option<String>,
+    notes: Option<String>,
 ) -> Result<MppTaskFields, String> {
     let task_type = projcore::TaskType::from_code(i64::from(u16_at(rec, 140)))
         .ok_or_else(|| format!("invalid task type for UID {uid}"))?;
@@ -319,6 +328,7 @@ fn current_fields(
         guid: Some(guid_text(&fixed2.data[..16])),
         create_date: decode_timestamp(rec, 128),
         wbs,
+        notes,
         task_type: Some(task_type),
         constraint_type: Some(constraint_type),
         constraint_date,
@@ -722,6 +732,7 @@ fn decode_current(
                     .get(&row.uid)
                     .cloned()
                     .or_else(|| default_wbs_mask.then_some(default_wbs)),
+                var.notes.get(&row.uid).cloned(),
             )?),
             ..MppTask::default()
         });
@@ -1260,6 +1271,46 @@ mod tests {
                 b.over_allocated,
                 b.milestone
             )
+        );
+    }
+
+    #[test]
+    fn task_notes_decode_and_survive_mspdi_round_trip() {
+        let mut s = fixture();
+        assert_eq!(
+            decode(&file(&s, true)).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .notes,
+            None
+        );
+        // This is the exact 314-byte RichEdit value in snapshot step 07, UID 8.
+        let note = b"{\\rtf1\\ansi\\ansicpg1252\\deff0\\nouicompat\\deflang1033{\\fonttbl{\\f0\\fnil\\fcharset0 Segoe UI;}{\\f1\\fnil Segoe UI;}{\\f2\\fnil\\fcharset1 Segoe UI Symbol;}}\r\n{\\*\\generator Riched20 16.0.20026}\\viewkind4\\uc1 \r\n\\pard\\f0\\fs20 First line.\\par\r\nSecond line \\f1\\emdash  unicode \\f2\\u10003?\\f0  and \\u171?quotes\\u187?.\\par\r\n}\r\n\0";
+        assert_eq!(note.len(), 314);
+        let off = s.v2.len() as u32;
+        add_var(&mut s, 1, TASK_NOTES_KEY, note);
+        let bytes = file(&s, true);
+        let expected = "First line.\r\nSecond line — unicode ✓ and «quotes».";
+        assert_eq!(
+            decode(&bytes).unwrap()[1]
+                .fields
+                .as_ref()
+                .unwrap()
+                .notes
+                .as_deref(),
+            Some(expected)
+        );
+        let imported = crate::project::project_from_mpp(&bytes).unwrap();
+        assert_eq!(imported.tasks[0].notes.as_deref(), Some(expected));
+        let reread = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();
+        assert_eq!(reread.tasks[0].notes.as_deref(), Some(expected));
+
+        s.v2[off as usize + 4] = b'!';
+        assert!(
+            decode(&file(&s, true))
+                .unwrap_err()
+                .contains("invalid notes for UID 1")
         );
     }
 

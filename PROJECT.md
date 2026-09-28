@@ -238,7 +238,7 @@ task: its bookings are placed first, and auto tasks level around them.
   task layouts, `mppread` uses counted `FixedMeta` and `VarMeta` records to
   locate rows and names, then reads dates, outline levels and validated task
   fields at known offsets. Current Project blank rows keep their ID and UID;
-  GUID, type, flags, priority, deadline and leveling options survive an
+  GUID, type, flags, priority, deadline, Notes and leveling options survive an
   import and MSPDI save. Explicit WBS codes and generated codes under the
   default numeric mask also survive; generated codes under a custom mask
   remain absent. Current-layout over-allocation is derived from each task's

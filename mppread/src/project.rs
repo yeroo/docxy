@@ -398,6 +398,7 @@ fn import_tasks(
             if let Some(fields) = &t.fields {
                 task.guid = fields.guid.clone();
                 task.create_date = date(&fields.create_date, "create date")?;
+                task.notes = fields.notes.clone();
                 task.wbs = fields.wbs.clone();
                 task.task_type = fields.task_type;
                 if let Some(constraint) = fields.constraint_type {
