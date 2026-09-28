@@ -304,7 +304,6 @@ struct LeafGraph {
     idx_of: HashMap<i32, usize>,
     order: Vec<usize>,
     succs: HashMap<i32, Vec<(i32, LinkType, Offset)>>,
-    successor_links: HashMap<i32, Vec<(usize, usize)>>,
 }
 
 struct ConstraintDates {
@@ -638,7 +637,15 @@ impl<'a> Scheduler<'a> {
 
     fn run_with_alap_override(&self, forced: &HashMap<i32, i64>) -> Schedule {
         let graph = self.leaf_graph();
-        let initial = self.pass(&graph, &HashMap::new());
+        let has_alap = graph.leaves.iter().any(|&i| {
+            let t = &self.proj.tasks[i];
+            t.constraint == ConstraintType::AsLateAsPossible && !fixed(t)
+        });
+        let legacy = !has_alap && forced.is_empty();
+        let initial = self.pass(&graph, &HashMap::new(), legacy);
+        if legacy {
+            return initial;
+        }
         let mut alap: HashMap<i32, i64> = self
             .proj
             .tasks
@@ -656,7 +663,7 @@ impl<'a> Scheduler<'a> {
             initial
         } else {
             self.cap_alap_for_fixed(&graph, &initial, &mut alap, forced);
-            self.pass(&graph, &alap)
+            self.pass(&graph, &alap, false)
         }
     }
 
@@ -674,20 +681,15 @@ impl<'a> Scheduler<'a> {
             .collect();
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
         let mut succs: HashMap<i32, Vec<(i32, LinkType, Offset)>> = HashMap::new();
-        let mut successor_links: HashMap<i32, Vec<(usize, usize)>> = HashMap::new();
         for &i in &leaves {
             let task = &self.proj.tasks[i];
-            for (link_idx, link) in task.predecessors.iter().enumerate() {
+            for link in &task.predecessors {
                 if leaf_uids.contains(&link.uid) {
                     succs.entry(link.uid).or_default().push((
                         task.uid,
                         link.link,
                         self.offset(link),
                     ));
-                    successor_links
-                        .entry(link.uid)
-                        .or_default()
-                        .push((i, link_idx));
                 }
             }
         }
@@ -696,7 +698,6 @@ impl<'a> Scheduler<'a> {
             idx_of,
             order,
             succs,
-            successor_links,
         }
     }
 
@@ -721,17 +722,13 @@ impl<'a> Scheduler<'a> {
                 );
                 continue;
             }
-            let cap = graph
-                .successor_links
-                .get(&task.uid)
-                .into_iter()
-                .flatten()
-                .filter_map(|&(successor_idx, link_idx)| {
-                    let successor = &self.proj.tasks[successor_idx];
+            let cap = graph.succs.get(&task.uid).into_iter().flatten().filter_map(
+                |&(successor_uid, link, offset)| {
+                    let successor = &self.proj.tasks[graph.idx_of[&successor_uid]];
                     let &(start, finish) = caps.get(&successor.uid)?;
-                    let link = &successor.predecessors[link_idx];
-                    Some(self.fixed_successor_cap(task, successor, link, start, finish))
-                });
+                    Some(self.fixed_successor_cap(task, successor, link, offset, start, finish))
+                },
+            );
             if let Some(start) = cap.min() {
                 let tl = self.tl(task);
                 let finish = if task.duration_min == 0 {
@@ -753,25 +750,29 @@ impl<'a> Scheduler<'a> {
         &self,
         predecessor: &Task,
         successor: &Task,
-        link: &Predecessor,
+        link: LinkType,
+        offset: Offset,
         start: i64,
         finish: i64,
     ) -> i64 {
         let pred_tl = self.tl(predecessor);
         let succ_tl = self.tl(successor);
-        inverse_link_start(
+        inverse_link(
             pred_tl,
             succ_tl,
-            link.link,
-            self.offset(link),
-            start,
-            finish,
+            link,
+            offset,
+            SuccessorBound {
+                start,
+                finish,
+                milestone: successor.duration_min == 0,
+            },
             predecessor.duration_min,
         )
-        .0
+        .start
     }
 
-    fn pass(&self, graph: &LeafGraph, alap: &HashMap<i32, i64>) -> Schedule {
+    fn pass(&self, graph: &LeafGraph, alap: &HashMap<i32, i64>, legacy: bool) -> Schedule {
         let leaves = &graph.leaves;
         let idx_of = &graph.idx_of;
         let order = &graph.order;
@@ -1054,12 +1055,27 @@ impl<'a> Scheduler<'a> {
             let mut bound_instant = end_abs;
             if let Some(list) = succs.get(&t.uid) {
                 for &(suid, link, offset) in list {
-                    let succ_tl = self.tl(&self.proj.tasks[idx_of[&suid]]);
+                    let successor = &self.proj.tasks[idx_of[&suid]];
+                    let succ_tl = self.tl(successor);
                     if let (Some(&sls), Some(&slf)) = (ls_abs.get(&suid), lf_abs.get(&suid)) {
-                        let (_, c, allowed) =
-                            inverse_link_start(tl, succ_tl, link, offset, sls, slf, span);
-                        finish_abs = finish_abs.min(c);
-                        bound_instant = bound_instant.min(allowed);
+                        let inverse = if legacy {
+                            legacy_inverse_link(tl, link, offset, sls, slf, span)
+                        } else {
+                            inverse_link(
+                                tl,
+                                succ_tl,
+                                link,
+                                offset,
+                                SuccessorBound {
+                                    start: sls,
+                                    finish: slf,
+                                    milestone: successor.duration_min == 0,
+                                },
+                                span,
+                            )
+                        };
+                        finish_abs = finish_abs.min(inverse.finish);
+                        bound_instant = bound_instant.min(inverse.allowed_milestone);
                     }
                 }
             }
@@ -1196,17 +1212,12 @@ impl<'a> Scheduler<'a> {
                 // reuse the early instants unless a hard date set that bound.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                // A binding MFO/FNLT/deadline milestone keeps its own instant;
-                // an elapsed successor can bound it earlier in the same index.
+                // A binding MFO/FNLT/deadline milestone keeps its own instant,
+                // capped by a successor on the same working index.
                 if let Some(m) = milestone_late {
                     debug_assert_eq!(tl.to_index(m), finish_index);
                 }
-                let evening = tl.abs_finish(finish_index);
-                let successor_milestone = (span == 0
-                    && bound_instant < evening
-                    && tl.to_index(bound_instant) == finish_index)
-                    .then_some(bound_instant);
-                let f_abs = milestone_late.or(successor_milestone).unwrap_or(evening);
+                let f_abs = milestone_late.unwrap_or_else(|| tl.abs_finish(finish_index));
                 let s_abs = if span == 0 {
                     f_abs
                 } else {
@@ -1265,7 +1276,7 @@ impl<'a> Scheduler<'a> {
             // A tracked task finishes where its actuals put it, not at its
             // start plus its duration.
             let finish = tracked.map(|_| tl.to_index(e_f));
-            let free = self.free_slack(t, tl, &es_abs, finish, succs);
+            let free = self.free_slack(t, tl, &es_abs, finish, graph, legacy);
             results.insert(
                 t.uid,
                 TaskResult {
@@ -1429,28 +1440,41 @@ impl<'a> Scheduler<'a> {
         tl: &Timeline,
         es_abs: &HashMap<i32, i64>,
         finish: Option<i64>,
-        succs: &HashMap<i32, Vec<(i32, LinkType, Offset)>>,
+        graph: &LeafGraph,
+        legacy: bool,
     ) -> Option<i64> {
-        let list = succs.get(&t.uid)?;
+        let list = graph.succs.get(&t.uid)?;
         let ef_idx = finish.unwrap_or_else(|| tl.to_index(es_abs[&t.uid]) + t.duration_min);
         let mut min_gap: Option<i64> = None;
         for &(suid, link, offset) in list {
             if link != LinkType::FinishStart {
                 continue;
             }
-            let succ = self.proj.task(suid)?;
+            let succ = &self.proj.tasks[graph.idx_of[&suid]];
             let succ_tl = self.tl(succ);
             let succ_es = *es_abs.get(&suid)?;
-            let (_, allowed_finish, _) = inverse_link_start(
+            if legacy {
+                let (shifted, lag) = match offset {
+                    Offset::Working(lag) => (succ_es, lag),
+                    Offset::Elapsed(lag) => (succ_es.saturating_sub(lag), 0),
+                };
+                let gap = tl.to_index(shifted) - lag - ef_idx;
+                min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
+                continue;
+            }
+            let inverse = inverse_link(
                 tl,
                 succ_tl,
                 LinkType::FinishStart,
                 offset,
-                succ_es,
-                succ_es,
+                SuccessorBound {
+                    start: succ_es,
+                    finish: succ_es,
+                    milestone: succ.duration_min == 0,
+                },
                 0,
             );
-            let gap = tl.to_index(allowed_finish) - ef_idx;
+            let gap = tl.to_index(inverse.finish) - ef_idx;
             min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
         }
         min_gap
@@ -1592,21 +1616,73 @@ impl Offset {
     }
 }
 
-/// Invert the forward link on the successor's calendar, then choose the
-/// predecessor's latest usable endpoint. CPM late dates and ALAP caps use
-/// the same conversion across calendars and working-time gaps.
-fn inverse_link_start(
-    pred_tl: &Timeline,
-    succ_tl: &Timeline,
+/// The predecessor window allowed by one successor link.
+struct InverseLink {
+    start: i64,
+    finish: i64,
+    /// Exact instant for zero-duration predecessors under a date bound.
+    allowed_milestone: i64,
+}
+
+struct SuccessorBound {
+    start: i64,
+    finish: i64,
+    milestone: bool,
+}
+
+/// Preserve the original CPM late-date arithmetic for plans without ALAP.
+/// Their output is part of the scheduler's existing compatibility contract.
+fn legacy_inverse_link(
+    tl: &Timeline,
     link: LinkType,
     offset: Offset,
     succ_start: i64,
     succ_finish: i64,
     span: i64,
-) -> (i64, i64, i64) {
+) -> InverseLink {
     let endpoint = match link {
         LinkType::FinishStart | LinkType::StartStart => succ_start,
         LinkType::FinishFinish | LinkType::StartFinish => succ_finish,
+    };
+    let (endpoint, lag) = match offset {
+        Offset::Working(lag) => (endpoint, lag),
+        Offset::Elapsed(lag) => (endpoint.saturating_sub(lag), 0),
+    };
+    let (start, finish) = match link {
+        LinkType::FinishStart | LinkType::FinishFinish => {
+            let finish = tl.abs_finish(tl.to_index(endpoint) - lag);
+            (tl.abs_start(tl.to_index(finish) - span), finish)
+        }
+        LinkType::StartStart | LinkType::StartFinish => {
+            let start = tl.abs_start(tl.to_index(endpoint) - lag);
+            (start, tl.abs_finish(tl.to_index(start) + span))
+        }
+    };
+    InverseLink {
+        start,
+        finish,
+        allowed_milestone: if span == 0 && lag == 0 {
+            endpoint
+        } else {
+            finish
+        },
+    }
+}
+
+/// Invert the forward link on the successor's calendar, then choose the
+/// predecessor's latest usable endpoint. CPM late dates and ALAP caps use
+/// the same conversion across calendars and working-time gaps.
+fn inverse_link(
+    pred_tl: &Timeline,
+    succ_tl: &Timeline,
+    link: LinkType,
+    offset: Offset,
+    successor: SuccessorBound,
+    span: i64,
+) -> InverseLink {
+    let endpoint = match link {
+        LinkType::FinishStart | LinkType::StartStart => successor.start,
+        LinkType::FinishFinish | LinkType::StartFinish => successor.finish,
     };
     let (working_lag, elapsed_lag) = match offset {
         Offset::Working(lag) => (lag, 0),
@@ -1615,7 +1691,14 @@ fn inverse_link_start(
     // The successor's next working start shares an index with the previous
     // evening. Forward scheduling accepts a predecessor endpoint throughout
     // that gap, so the inverse keeps the morning side of the index.
-    let bound = if matches!(offset, Offset::Elapsed(_))
+    let bound = if link == LinkType::FinishStart
+        && successor.milestone
+        && matches!(offset, Offset::Working(0) | Offset::Elapsed(_))
+    {
+        // A zero-lag or elapsed FS milestone keeps the predecessor's exact
+        // finish plus elapsed time, without snapping to a working morning.
+        endpoint.saturating_sub(elapsed_lag)
+    } else if matches!(offset, Offset::Elapsed(_))
         && matches!(link, LinkType::FinishFinish | LinkType::StartFinish)
     {
         // An elapsed FF/SF forward link keeps the successor's exact finish,
@@ -1638,7 +1721,11 @@ fn inverse_link_start(
                 Offset::Elapsed(_) if span == 0 => bound,
                 _ => finish,
             };
-            (start, finish, allowed)
+            InverseLink {
+                start,
+                finish,
+                allowed_milestone: allowed,
+            }
         }
         LinkType::StartStart | LinkType::StartFinish => {
             let start = pred_tl.start_at_or_before(bound);
@@ -1652,7 +1739,11 @@ fn inverse_link_start(
                 Offset::Elapsed(_) if span == 0 => bound,
                 _ => finish,
             };
-            (start, finish, allowed)
+            InverseLink {
+                start,
+                finish,
+                allowed_milestone: allowed,
+            }
         }
     }
 }
@@ -2278,8 +2369,8 @@ pub fn level(proj: &Project) -> Leveled {
     }
     let active = without_tasks(&clean, &dormant);
     let active_scheduler = Scheduler::new(&active);
-    let mut main = active_scheduler.level();
     let active_result = active_scheduler.run();
+    let mut main = active_scheduler.level_from_base(&active_result);
     let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler, &active_result);
     if dormant_bounds {
         main.project_finish = other.project_finish;
@@ -2520,6 +2611,10 @@ impl Scheduler<'_> {
 
     fn level(&self) -> Leveled {
         let base = self.run();
+        self.level_from_base(&base)
+    }
+
+    fn level_from_base(&self, base: &Schedule) -> Leveled {
         let tl = self
             .timelines
             .get(&self.default_cal)
@@ -3240,6 +3335,69 @@ mod tests {
     }
 
     #[test]
+    fn fs_milestone_successor_uses_its_exact_late_instant() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        for (alap, lag, finish, slack) in [
+            (false, 0, at(6, 17), 1920),
+            (true, 0, at(6, 17), 0),
+            (true, 480, at(5, 17), 0),
+        ] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            if alap {
+                a.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut milestone = task(2, "M", 0);
+            milestone.deadline = Some(at(6, 17));
+            milestone
+                .predecessors
+                .push(Predecessor::working(1, LinkType::FinishStart, lag));
+            let proj = Project {
+                calendars: vec![Calendar::standard(1), every_day.clone()],
+                ..march2(vec![a, milestone, task(3, "Long", 4800)])
+            };
+            let sched = schedule(&proj);
+            assert_eq!(sched.get(1).unwrap().late_finish, finish, "lag={lag}");
+            assert_eq!(sched.get(1).unwrap().total_slack_min, slack, "lag={lag}");
+            if alap {
+                assert_eq!(sched.get(1).unwrap().early_finish, finish, "lag={lag}");
+                assert_eq!(sched.get(2).unwrap().early_start, at(6, 17));
+            }
+        }
+    }
+
+    #[test]
+    fn elapsed_fs_milestone_successor_preserves_project_finish() {
+        for alap in [false, true] {
+            let mut a = task(1, "A", 480);
+            if alap {
+                a.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut milestone = task(2, "M", 0);
+            milestone.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 1440,
+                lag_format: LagFormat::from_code(8).unwrap(),
+            });
+            let sched = schedule(&march2(vec![a, milestone, task(3, "Long", 5 * 480)]));
+            let a = sched.get(1).unwrap();
+            assert_eq!((a.late_start, a.late_finish), (at(5, 8), at(5, 17)));
+            if alap {
+                assert_eq!((a.early_start, a.early_finish), (at(5, 8), at(5, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(6, 17));
+                assert_eq!(sched.project_finish, at(6, 17));
+            } else {
+                assert_eq!(a.total_slack_min, 1440);
+            }
+        }
+    }
+
+    #[test]
     fn cross_calendar_alap_fs_uses_sunday_before_monday_successor() {
         let mut every_day = Calendar::standard(2);
         let monday = every_day.week[1].clone();
@@ -3346,7 +3504,7 @@ mod tests {
     }
 
     #[test]
-    fn ss_inverse_uses_last_working_minute_before_gap() {
+    fn ss_inverse_in_alap_plan_uses_last_working_minute_before_gap() {
         let mut later = Calendar::standard(2);
         for weekday in 1..=5 {
             later.week[weekday] = Some(DayWorking {
@@ -3369,9 +3527,11 @@ mod tests {
         let mut s = task(2, "S", 480);
         s.predecessors
             .push(Predecessor::working(1, LinkType::StartStart, 0));
+        let mut side = task(4, "ALAP side", 0);
+        side.constraint = ConstraintType::AsLateAsPossible;
         let proj = Project {
             calendars: vec![Calendar::standard(1), later],
-            ..march2(vec![p, s, task(3, "Long", 6 * 480)])
+            ..march2(vec![p, s, task(3, "Long", 6 * 480), side])
         };
         let sched = schedule(&proj);
         assert_eq!(
@@ -8310,6 +8470,97 @@ mod tests {
         for (case, t, expected) in cases {
             let s = schedule(&march2(vec![t]));
             assert_eq!(span(&s, 1), expected, "{case}");
+        }
+    }
+    /// Late dates and slack measured on origin/main (28c2628) for plans with
+    /// no ALAP task. Keep the original CPM answers across link kinds.
+    #[test]
+    fn non_alap_late_dates_match_main() {
+        let mut cal = Calendar::standard(2);
+        let monday = cal.week[1].clone();
+        for day in &mut cal.week {
+            *day = monday.clone();
+        }
+        for (link, lag, a_day, a_slack, b_slack) in [
+            (LinkType::FinishStart, 480, 7, 2400, 1440),
+            (LinkType::FinishStart, 900, 8, 2880, 1920),
+            (LinkType::StartStart, 480, 8, 2880, 1920),
+            (LinkType::StartStart, 900, 9, 3360, 1920),
+            (LinkType::FinishFinish, 480, 8, 2880, 1920),
+            (LinkType::FinishFinish, 900, 8, 2880, 2400),
+            (LinkType::StartFinish, 480, 9, 3360, 2400),
+            (LinkType::StartFinish, 900, 9, 3360, 2400),
+        ] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link,
+                lag,
+                lag_format: if lag == 480 {
+                    LagFormat::DAYS
+                } else {
+                    LagFormat::from_code(4).unwrap()
+                },
+            });
+            let p = Project {
+                calendars: vec![Calendar::standard(1), cal.clone()],
+                ..march2(vec![a, b, task(3, "Long", 6 * 480)])
+            };
+            let s = schedule(&p);
+            let a = s.get(1).unwrap();
+            let b = s.get(2).unwrap();
+            assert_eq!(
+                (a.late_start, a.late_finish, a.total_slack_min),
+                (at(a_day, 8), at(a_day, 17), a_slack),
+                "{link:?} lag={lag}"
+            );
+            assert_eq!(
+                (b.late_start, b.late_finish, b.total_slack_min),
+                (at(9, 8), at(9, 17), b_slack),
+                "{link:?} lag={lag}"
+            );
+            assert_eq!(s.project_finish, at(9, 17));
+        }
+        for (deadline, lag, a_day, a_slack, m_day, m_slack) in [
+            (None, 0, 9, 3360, 9, 2400),
+            (Some(at(6, 17)), 0, 6, 1920, 6, 1920),
+            (None, 900, 8, 2880, 9, 2400),
+            (Some(at(6, 17)), 900, 5, 1440, 6, 1920),
+        ] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            let mut m = task(2, "M", 0);
+            m.deadline = deadline;
+            m.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag,
+                lag_format: if lag == 0 {
+                    LagFormat::DAYS
+                } else {
+                    LagFormat::from_code(4).unwrap()
+                },
+            });
+            let p = Project {
+                calendars: vec![Calendar::standard(1), cal.clone()],
+                ..march2(vec![a, m, task(3, "Long", 6 * 480)])
+            };
+            let s = schedule(&p);
+            let a = s.get(1).unwrap();
+            let m = s.get(2).unwrap();
+            assert_eq!(
+                (a.late_start, a.late_finish, a.total_slack_min),
+                (at(a_day, 8), at(a_day, 17), a_slack),
+                "deadline={deadline:?} lag={lag}"
+            );
+            assert_eq!(
+                (m.late_start, m.late_finish, m.total_slack_min),
+                (at(m_day, 17), at(m_day, 17), m_slack),
+                "deadline={deadline:?} lag={lag}"
+            );
+            assert_eq!(s.project_finish, at(9, 17));
         }
     }
 }
