@@ -49,7 +49,13 @@ pub fn save_target(path: &Path) -> Result<PathBuf, String> {
 }
 
 /// Serialize a [`Project`] into a `.yppx` package (bytes of a ZIP container).
-pub fn write_yppx(proj: &Project) -> Vec<u8> {
+pub fn write_yppx(proj: &Project) -> Result<Vec<u8>, String> {
+    if !proj.package.unreadable.is_empty() {
+        return Err(format!(
+            "cannot save as .yppx: part(s) {} could not be read and would be lost; save as .xml (MSPDI) instead",
+            proj.package.unreadable.join(", ")
+        ));
+    }
     let mut entries = vec![
         (
             CONTENT_TYPES_PART.to_string(),
@@ -66,7 +72,7 @@ pub fn write_yppx(proj: &Project) -> Vec<u8> {
             entries.push((name.clone(), bytes.to_vec()));
         }
     }
-    write_zip(&entries)
+    Ok(write_zip(&entries))
 }
 
 /// XML parts default to the project type, and the main part is `/project.xml`.
@@ -241,10 +247,11 @@ pub fn read_yppx(bytes: &[u8]) -> Result<Project, String> {
         {
             continue;
         }
-        let bytes = zip
-            .extract(entry)
-            .ok_or_else(|| format!("cannot read .yppx part {name}"))?;
-        project.package.parts.push((name.clone(), Arc::from(bytes)));
+        if let Some(bytes) = zip.extract(entry) {
+            project.package.parts.push((name.clone(), Arc::from(bytes)));
+        } else {
+            project.package.unreadable.push(name.clone());
+        }
     }
     if let Some(map) = zip
         .entries()
@@ -286,7 +293,7 @@ mod tests {
     /// #111: the package's MSPDI part tells Project to keep its durations.
     #[test]
     fn project_part_declares_durations_authoritative() {
-        let bytes = write_yppx(&Project::default());
+        let bytes = write_yppx(&Project::default()).unwrap();
         let part = ZipArchive::open(&bytes).unwrap().read(MAIN_PART).unwrap();
         let xml = String::from_utf8(part).unwrap();
         let tag = "<ProjectExternallyEdited>0</ProjectExternallyEdited>";
@@ -323,7 +330,7 @@ mod tests {
 
     #[test]
     fn package_is_a_zip() {
-        let bytes = write_yppx(&sample());
+        let bytes = write_yppx(&sample()).unwrap();
         assert_eq!(&bytes[..2], b"PK"); // ZIP local-file-header magic
         // and the container advertises the two expected parts
         let zip = ZipArchive::open(&bytes).unwrap();
@@ -349,6 +356,101 @@ mod tests {
         write_zip(&entries)
     }
 
+    /// Change one entry to Deflate64 in both ZIP headers, while leaving its
+    /// bytes intact. Our ZIP reader can enumerate it but cannot extract it.
+    fn unsupported_method(mut bytes: Vec<u8>, index: usize) -> Vec<u8> {
+        let eocd = bytes.windows(4).rposition(|s| s == b"PK\x05\x06").unwrap();
+        let mut central =
+            u32::from_le_bytes(bytes[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+        for _ in 0..index {
+            assert_eq!(&bytes[central..central + 4], b"PK\x01\x02");
+            let name =
+                u16::from_le_bytes(bytes[central + 28..central + 30].try_into().unwrap()) as usize;
+            let extra =
+                u16::from_le_bytes(bytes[central + 30..central + 32].try_into().unwrap()) as usize;
+            let comment =
+                u16::from_le_bytes(bytes[central + 32..central + 34].try_into().unwrap()) as usize;
+            central += 46 + name + extra + comment;
+        }
+        assert_eq!(&bytes[central..central + 4], b"PK\x01\x02");
+        let local =
+            u32::from_le_bytes(bytes[central + 42..central + 46].try_into().unwrap()) as usize;
+        assert_eq!(&bytes[local..local + 4], b"PK\x03\x04");
+        bytes[local + 8..local + 10].copy_from_slice(&9u16.to_le_bytes());
+        bytes[central + 10..central + 12].copy_from_slice(&9u16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn unreadable_extra_parts_open_and_block_yppx_save() {
+        let source = with_parts(
+            ORIGINAL_CONTENT_TYPES,
+            &[
+                ("views.xml", b"readable"),
+                ("media/one.bin", b"one"),
+                ("media/two.bin", b"two"),
+            ],
+        );
+        let source = unsupported_method(unsupported_method(source, 3), 4);
+        let project = read_yppx(&source).unwrap();
+        assert_eq!(project.tasks.len(), 2);
+        assert_eq!(project.package.parts.len(), 1);
+        assert_eq!(project.package.parts[0].0, "views.xml");
+        assert_eq!(&*project.package.parts[0].1, b"readable");
+        assert_eq!(
+            project.package.unreadable,
+            ["media/one.bin", "media/two.bin"]
+        );
+        let error = write_yppx(&project).unwrap_err();
+        for expected in ["media/one.bin", "media/two.bin", "save as .xml"] {
+            assert!(error.contains(expected), "{error}");
+        }
+        assert!(write_mspdi(&project).contains("Design &amp; build"));
+    }
+
+    #[test]
+    fn unreadable_main_part_still_fails() {
+        let source = unsupported_method(with_parts(ORIGINAL_CONTENT_TYPES, &[]), 1);
+        assert_eq!(
+            read_yppx(&source).unwrap_err(),
+            ".yppx package is missing its project.xml part"
+        );
+    }
+
+    #[test]
+    fn unreadable_content_types_is_not_listed() {
+        let map =
+            r#"<Types><Override PartName="/views.xml" ContentType="application/x-views"/></Types>"#;
+        let source = unsupported_method(with_parts(map, &[("views.xml", b"<views/>")]), 0);
+        let project = read_yppx(&source).unwrap();
+        assert!(project.package.unreadable.is_empty());
+        assert!(project.package.overrides.is_empty());
+        let output = write_yppx(&project).unwrap();
+        let zip = ZipArchive::open(&output).unwrap();
+        assert_eq!(
+            zip.read(CONTENT_TYPES_PART).unwrap(),
+            ORIGINAL_CONTENT_TYPES.as_bytes()
+        );
+        assert_eq!(zip.read("views.xml").unwrap(), b"<views/>");
+    }
+
+    #[test]
+    fn unreadable_case_duplicate_is_skipped() {
+        let source = write_zip(&[
+            (
+                CONTENT_TYPES_PART.into(),
+                ORIGINAL_CONTENT_TYPES.as_bytes().to_vec(),
+            ),
+            (MAIN_PART.into(), write_mspdi(&sample()).into_bytes()),
+            ("Views.xml".into(), b"first".to_vec()),
+            ("views.XML".into(), b"second".to_vec()),
+        ]);
+        let project = read_yppx(&unsupported_method(source, 3)).unwrap();
+        assert_eq!(project.package.parts.len(), 1);
+        assert_eq!(&*project.package.parts[0].1, b"first");
+        assert!(project.package.unreadable.is_empty());
+    }
+
     #[test]
     fn keeps_views_binary_nested_parts_and_their_types() {
         let map = r#"<Types><Default Extension="xml" ContentType="application/vnd.yppx.project+xml"/><Default Extension="png" ContentType="image/png"/><Override PartName="/views.xml" ContentType="application/vnd.yppx.views+xml"/></Types>"#;
@@ -364,7 +466,7 @@ mod tests {
             ],
         );
         let project = read_yppx(&source).unwrap();
-        let output = write_yppx(&project);
+        let output = write_yppx(&project).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         for (name, bytes) in [
             ("views.xml", views.as_slice()),
@@ -387,7 +489,7 @@ mod tests {
         let source = with_parts(map, &[("views.xml", b"<views/>")]);
         let mut project = read_yppx(&source).unwrap();
         project.name = "Changed".into();
-        let output = write_yppx(&project);
+        let output = write_yppx(&project).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         let types = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
         assert!(types.contains(
@@ -408,7 +510,7 @@ mod tests {
     fn content_type_attributes_are_decoded_then_escaped() {
         let map = r#"<Types><Override PartName="/a&amp;b.xml" ContentType="application/x-a&amp;b"/></Types>"#;
         let source = with_parts(map, &[("a&b.xml", b"<a/>")]);
-        let output = write_yppx(&read_yppx(&source).unwrap());
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         let types = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
         assert!(types.contains(
@@ -421,7 +523,7 @@ mod tests {
     fn malformed_content_types_keep_parts_without_partial_entries() {
         let map = r#"<Types><Override PartName="/views.xml" ContentType="application/x-views"/>"#;
         let source = with_parts(map, &[("views.xml", b"<views/>")]);
-        let output = write_yppx(&read_yppx(&source).unwrap());
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         assert_eq!(zip.read("views.xml").unwrap(), b"<views/>");
         assert_eq!(
@@ -434,7 +536,8 @@ mod tests {
     fn prefixed_content_type_names_keep_overrides() {
         let map = r#"<ct:Types xmlns:ct="http://schemas.openxmlformats.org/package/2006/content-types"><ct:Override PartName="/views.xml" ContentType="application/x-views"/></ct:Types>"#;
         let output =
-            write_yppx(&read_yppx(&with_parts(map, &[("views.xml", b"<views/>")])).unwrap());
+            write_yppx(&read_yppx(&with_parts(map, &[("views.xml", b"<views/>")])).unwrap())
+                .unwrap();
         let types = String::from_utf8(
             ZipArchive::open(&output)
                 .unwrap()
@@ -461,7 +564,7 @@ mod tests {
             (MAIN_PART.into(), write_mspdi(&sample()).into_bytes()),
             ("views.xml".into(), b"<views/>".to_vec()),
         ]);
-        let output = write_yppx(&read_yppx(&source).unwrap());
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
         let types = String::from_utf8(
             ZipArchive::open(&output)
                 .unwrap()
@@ -485,7 +588,7 @@ mod tests {
             (MAIN_PART.into(), write_mspdi(&sample()).into_bytes()),
             ("views.xml".into(), b"<views/>".to_vec()),
         ]);
-        let output = write_yppx(&read_yppx(&source).unwrap());
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
         let types = String::from_utf8(
             ZipArchive::open(&output)
                 .unwrap()
@@ -511,7 +614,7 @@ mod tests {
         ]);
         let project = read_yppx(&source).unwrap();
         assert_eq!(project.name, "Demo");
-        let output = write_yppx(&project);
+        let output = write_yppx(&project).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         assert_eq!(zip.entries().len(), 2);
         assert!(zip.read(MAIN_PART).is_some());
@@ -523,7 +626,7 @@ mod tests {
             "<a:Types><a:Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></b:Types>",
             &[("views.xml", b"<views/>")],
         );
-        let output = write_yppx(&read_yppx(&source).unwrap());
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         assert_eq!(
             zip.read(CONTENT_TYPES_PART).unwrap(),
@@ -539,7 +642,7 @@ mod tests {
             (MAIN_PART.into(), write_mspdi(&sample()).into_bytes()),
             ("views.xml".into(), b"<views/>".to_vec()),
         ]);
-        let output = write_yppx(&read_yppx(&source).unwrap());
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         assert_eq!(zip.entries().len(), 3);
         assert!(
@@ -555,7 +658,7 @@ mod tests {
             "<Types><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></Types>garbage",
             &[("views.xml", b"<views/>")],
         );
-        let output = write_yppx(&read_yppx(&source).unwrap());
+        let output = write_yppx(&read_yppx(&source).unwrap()).unwrap();
         let zip = ZipArchive::open(&output).unwrap();
         assert_eq!(
             zip.read(CONTENT_TYPES_PART).unwrap(),
@@ -578,7 +681,7 @@ mod tests {
                 .parts
                 .push((name.into(), Arc::from(b"opaque".as_slice())));
         }
-        let zip = write_yppx(&project);
+        let zip = write_yppx(&project).unwrap();
         let archive = ZipArchive::open(&zip).unwrap();
         let names: Vec<_> = archive
             .entries()
@@ -608,7 +711,7 @@ mod tests {
     #[test]
     fn round_trips_through_package() {
         let orig = sample();
-        let bytes = write_yppx(&orig);
+        let bytes = write_yppx(&orig).unwrap();
         let back = read_yppx(&bytes).unwrap();
         assert_eq!(back.name, orig.name);
         assert_eq!(back.tasks.len(), 2);
@@ -635,7 +738,7 @@ mod tests {
                     "<Project><Resources><Resource><{name}>{value}</{name}></Resource></Resources></Project>"
                 );
                 let project = read_mspdi(&xml).unwrap();
-                let result = read_yppx(&write_yppx(&project)).unwrap();
+                let result = read_yppx(&write_yppx(&project).unwrap()).unwrap();
                 let rate = match name {
                     "StandardRate" => result.resources[0].standard_rate.as_ref(),
                     "OvertimeRate" => result.resources[0].overtime_rate.as_ref(),
@@ -655,7 +758,7 @@ mod tests {
     fn rejects_task_on_empty_calendar() {
         let mut proj = sample();
         proj.calendars[0].week = Default::default();
-        let error = read_yppx(&write_yppx(&proj)).unwrap_err();
+        let error = read_yppx(&write_yppx(&proj).unwrap()).unwrap_err();
         assert!(error.contains("calendar \"Standard\" (UID 1) has no working time"));
         assert!(error.contains("task \"Design & build\" (UID 1) cannot be scheduled"));
     }

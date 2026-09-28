@@ -90,7 +90,7 @@ fn missed_deadline_matches_project_2024_negative_slack() {
     let baseline = schedule(&without);
     // The deadline survives MSPDI and .yppx saves, and so does its slack.
     let saved = read_mspdi(&write_mspdi(&proj)).unwrap();
-    let packaged = read_yppx(&write_yppx(&proj)).unwrap();
+    let packaged = read_yppx(&write_yppx(&proj).unwrap()).unwrap();
     for (label, proj) in [("read", &proj), ("mspdi", &saved), ("yppx", &packaged)] {
         assert_eq!(proj.tasks[1].deadline, deadline, "{label}");
         let sched = schedule(proj);
@@ -245,7 +245,7 @@ fn tasks_and_resources_round_trip_through_mspdi_and_yppx() {
             "{}: MSPDI custom field definitions changed",
             path.display()
         );
-        let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        let package_back = read_yppx(&write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(
             package_back.tasks,
             proj.tasks,
@@ -338,7 +338,7 @@ fn project_options_round_trip_through_mspdi_and_yppx() {
     for path in mspdi_files() {
         let xml = std::fs::read_to_string(&path).unwrap();
         let proj = read_mspdi(&xml).unwrap();
-        let package = read_yppx(&write_yppx(&proj)).unwrap();
+        let package = read_yppx(&write_yppx(&proj).unwrap()).unwrap();
         for saved in [write_mspdi(&proj), write_mspdi(&package)] {
             let leaves = header_leaves(&saved);
             let edited: Vec<_> = leaves
@@ -502,7 +502,7 @@ fn saved_files_carry_project_slack_and_critical() {
             oracle,
             "{name}: MSPDI"
         );
-        let package = read_yppx(&write_yppx(&proj)).unwrap();
+        let package = read_yppx(&write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(
             embedded_slack_oracle(&name, &write_mspdi(&package)),
             oracle,
@@ -662,7 +662,7 @@ fn task_fields_fixture_keeps_outline_codes_and_wbs_mask() {
     assert_eq!(codes[0].value_id.as_deref(), Some("1"));
     assert_eq!(codes[1].value_id.as_deref(), Some("2"));
     let saved = read_mspdi(&write_mspdi(&proj)).unwrap();
-    let package = read_yppx(&write_yppx(&proj)).unwrap();
+    let package = read_yppx(&write_yppx(&proj).unwrap()).unwrap();
     for back in [saved, package] {
         assert_eq!(back.outline_code_definitions, proj.outline_code_definitions);
         assert_eq!(back.wbs_masks, proj.wbs_masks);
@@ -1029,7 +1029,7 @@ fn derived_calendar_fixture_keeps_its_base_through_a_save() {
         assert_eq!(saved.matches(element).count(), 1, "{element}");
     }
     check(&read_mspdi(&saved).unwrap(), "MSPDI");
-    check(&read_yppx(&write_yppx(&proj)).unwrap(), ".yppx");
+    check(&read_yppx(&write_yppx(&proj).unwrap()).unwrap(), ".yppx");
 }
 
 #[test]
@@ -1072,7 +1072,7 @@ fn holiday_fixture_keeps_exceptions_and_skips_the_holiday() {
     assert_eq!(saved.matches("<DayType>0</DayType>").count(), 2);
     assert_eq!(saved.matches("<Exception>").count(), 2);
     check(&read_mspdi(&saved).unwrap(), "MSPDI");
-    check(&read_yppx(&write_yppx(&proj)).unwrap(), ".yppx");
+    check(&read_yppx(&write_yppx(&proj).unwrap()).unwrap(), ".yppx");
 }
 
 #[test]
@@ -1107,7 +1107,7 @@ fn yppx_package_round_trip_preserves_schedule() {
         let xml = std::fs::read_to_string(&path).unwrap();
         let proj = read_mspdi(&xml).unwrap();
 
-        let bytes = write_yppx(&proj);
+        let bytes = write_yppx(&proj).unwrap();
         assert_eq!(&bytes[..2], b"PK", "{name}: .yppx is not a ZIP");
         let back = read_yppx(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
 
@@ -1150,7 +1150,7 @@ fn baselines_round_trip_through_mspdi_and_yppx() {
     for path in files {
         let proj = read_mspdi(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
-        let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        let package_back = read_yppx(&write_yppx(&proj).unwrap()).unwrap();
         for (kind, back) in [("MSPDI", xml_back), (".yppx", package_back)] {
             assert_eq!(back.tasks.len(), proj.tasks.len());
             for (expected, actual) in proj.tasks.iter().zip(&back.tasks) {
@@ -1178,7 +1178,7 @@ fn manual_task_mode_and_dates_survive_mspdi_and_yppx() {
     for path in files {
         let proj = read_mspdi(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let xml_back = read_mspdi(&write_mspdi(&proj)).unwrap();
-        let package_back = read_yppx(&write_yppx(&proj)).unwrap();
+        let package_back = read_yppx(&write_yppx(&proj).unwrap()).unwrap();
         for (kind, back) in [("MSPDI", xml_back), (".yppx", package_back)] {
             assert_eq!(
                 back.new_tasks_are_manual,

@@ -159,6 +159,10 @@ struct PersistTab {
     /// Restored in preference to `path` so edits survive a restart.
     #[serde(default)]
     hot: Option<String>,
+    /// Names omitted from a project hot-exit sidecar because their ZIP entries
+    /// could not be read. Restore them before allowing a later Save.
+    #[serde(default)]
+    unreadable: Vec<String>,
     #[serde(default)]
     markdown: bool,
     /// The tab's file could not be loaded, so `hot` holds a placeholder and
@@ -4223,8 +4227,11 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         }
         Surface::Project(v) => {
             let p = hd.join(format!("tab-{i}.yppx"));
-            opccore::fsio::write_atomic(&p, &projcore::yppx::write_yppx(v.ed.project()))
+            let mut snapshot = v.ed.project().clone();
+            snapshot.package.unreadable.clear();
+            projcore::yppx::write_yppx(&snapshot)
                 .ok()
+                .and_then(|bytes| opccore::fsio::write_atomic(&p, &bytes).ok())
                 .map(|_| p.display().to_string())
         }
         Surface::Placeholder => None,
@@ -4235,6 +4242,10 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
         path: t.path.as_ref().map(|p| p.display().to_string()),
         dirty: t.dirty,
         hot,
+        unreadable: match &t.surface {
+            Surface::Project(v) => v.ed.project().package.unreadable.clone(),
+            _ => Vec::new(),
+        },
         markdown: t.markdown,
         load_failed: Some(t.load_failed),
     }

@@ -240,7 +240,7 @@ fn save_to(proj: &Project, path: &str) -> Result<std::path::PathBuf, String> {
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("yppx"))
     {
-        yppx::write_yppx(proj)
+        yppx::write_yppx(proj)?
     } else {
         mspdi::write_mspdi(proj).into_bytes()
     };
@@ -2372,6 +2372,26 @@ mod tests {
         std::fs::remove_file(original).unwrap();
         std::fs::remove_file(converted).unwrap();
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn unreadable_parts_refuse_yppx_but_allow_xml() {
+        let dir = std::env::temp_dir().join(format!(
+            "yppxy-unreadable-save-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut project = new_project();
+        project.package.unreadable.push("media/unknown.bin".into());
+        let native = dir.join("blocked.yppx");
+        let error = save_to(&project, native.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("media/unknown.bin") && error.contains("save as .xml"));
+        assert!(!native.exists());
+        let xml = dir.join("safe.xml");
+        save_to(&project, xml.to_str().unwrap()).unwrap();
+        assert!(xml.exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -29,17 +29,35 @@ fn main() {
 
     // Save in the format named by the output extension; refuse any other name.
     let target = yppx::save_target(Path::new(output)).unwrap_or_else(|e| fail(output, &e));
-    let bytes = if has_ext(&target, "yppx") {
-        yppx::write_yppx(&proj)
-    } else {
-        mspdi::write_mspdi(&proj).into_bytes()
-    };
+    let bytes = output_bytes(&proj, &target).unwrap_or_else(|e| fail(output, &e));
     opccore::fsio::write_atomic(&target, &bytes).unwrap_or_else(|e| fail(output, &e.to_string()));
     eprintln!(
         "{} task(s): {input} -> {}",
         proj.tasks.len(),
         target.display()
     );
+}
+
+fn output_bytes(proj: &projcore::Project, target: &Path) -> Result<Vec<u8>, String> {
+    if has_ext(target, "yppx") {
+        yppx::write_yppx(proj)
+    } else {
+        Ok(mspdi::write_mspdi(proj).into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converter_refuses_unreadable_yppx_parts_and_allows_xml() {
+        let mut project = projcore::Project::default();
+        project.package.unreadable.push("media/unknown.bin".into());
+        let error = output_bytes(&project, Path::new("copy.yppx")).unwrap_err();
+        assert!(error.contains("media/unknown.bin") && error.contains("save as .xml"));
+        assert!(output_bytes(&project, Path::new("copy.xml")).is_ok());
+    }
 }
 
 fn has_ext(path: &Path, ext: &str) -> bool {

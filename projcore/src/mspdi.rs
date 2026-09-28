@@ -2609,7 +2609,7 @@ mod tests {
         }
         assert_eq!(read_mspdi(&written).unwrap(), project);
         assert_eq!(
-            crate::yppx::read_yppx(&crate::yppx::write_yppx(&project)).unwrap(),
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(&project).unwrap()).unwrap(),
             project
         );
     }
@@ -2742,7 +2742,7 @@ mod tests {
                 read_mspdi(&xml).unwrap().honor_constraints,
                 honor_constraints
             );
-            let package = crate::yppx::write_yppx(&proj);
+            let package = crate::yppx::write_yppx(&proj).unwrap();
             assert_eq!(
                 crate::yppx::read_yppx(&package).unwrap().honor_constraints,
                 honor_constraints
@@ -2790,7 +2790,7 @@ mod tests {
         assert!(xml.contains("<ManualStart>2026-03-02T08:00:00</ManualStart>"));
         assert!(xml.contains("<ManualDuration>PT8H0M0S</ManualDuration>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, proj.tasks);
         assert!(package.new_tasks_are_manual);
     }
@@ -3373,7 +3373,7 @@ mod tests {
         ));
         let back = read_mspdi(&xml).unwrap();
         assert_eq!(back.calendars, proj.calendars);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.calendars, proj.calendars);
     }
 
@@ -3611,7 +3611,9 @@ mod tests {
             let loaded = read_mspdi(&write_mspdi(proj)).unwrap();
             let editor = crate::editor::Editor::new(loaded);
             assert!(read_mspdi(&write_mspdi(editor.project())).is_ok());
-            assert!(crate::yppx::read_yppx(&crate::yppx::write_yppx(editor.project())).is_ok());
+            assert!(
+                crate::yppx::read_yppx(&crate::yppx::write_yppx(editor.project()).unwrap()).is_ok()
+            );
         }
         let mut proj = empty_calendar_project();
         assert_editor_reopens(&proj);
@@ -3702,7 +3704,7 @@ mod tests {
         assert!(xml.contains("<ToTime>00:00:00</ToTime>"));
         assert_eq!(read_mspdi(&xml).unwrap().calendars, proj.calendars);
         assert_eq!(
-            crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj))
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap())
                 .unwrap()
                 .calendars,
             proj.calendars
@@ -3862,7 +3864,7 @@ mod tests {
             read_mspdi(&xml).unwrap().tasks[0].baselines,
             proj.tasks[0].baselines
         );
-        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(back.tasks[0].baselines, proj.tasks[0].baselines);
     }
 
@@ -3886,7 +3888,7 @@ mod tests {
         let xml = write_mspdi(&proj);
         assert!(xml.find("<Number>0").unwrap() < xml.find("<Number>1").unwrap());
         assert_eq!(read_mspdi(&xml).unwrap().tasks[0].baselines, expected);
-        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(back.tasks[0].baselines, expected);
     }
 
@@ -4243,7 +4245,7 @@ mod tests {
         assert!(xml.contains("<IsNull>0</IsNull>"));
         assert!(xml.contains("<OutlineNumber>1</OutlineNumber>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, proj.tasks);
     }
 
@@ -4308,7 +4310,7 @@ mod tests {
         let xml = write_mspdi(&proj);
         assert!(xml.contains("<Notes>Line 1&#13;\nLine 2 &amp; &lt;x&gt;</Notes>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, proj.tasks);
     }
 
@@ -4854,7 +4856,7 @@ mod tests {
         );
         let saved = write_mspdi(&proj);
         assert_eq!(read_mspdi(&saved).unwrap().tasks[0], *task);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks[0], *task);
 
         let absent = task_project(
@@ -5102,7 +5104,7 @@ mod tests {
             Some("2026-03-04T08:00:00")
         );
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, proj.tasks);
     }
 
@@ -5231,7 +5233,7 @@ mod tests {
         assert!(xml.contains("<ScheduleFromStart>0</ScheduleFromStart>"));
         // A save stores the options in schema order; the saved file reads back
         // to the same header.
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(header_of(&write_mspdi(&package)), expected);
     }
 
@@ -5274,7 +5276,7 @@ mod tests {
         assert!(proj.options.is_empty(), "{:?}", proj.options);
         let xml = write_mspdi(&proj);
         assert_eq!(modeled_options(&read_mspdi(&xml).unwrap()), expected);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(modeled_options(&package), expected);
         // The effective values follow the file.
         assert!(proj.new_tasks_effort_driven() && !proj.new_tasks_estimated());
@@ -5479,7 +5481,7 @@ mod tests {
             read_mspdi(&xml).unwrap().tasks[0].extended_attributes,
             expected
         );
-        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(back.tasks[0].extended_attributes, expected);
     }
 
@@ -5551,7 +5553,7 @@ mod tests {
         let back = read_mspdi(&xml).unwrap();
         assert_eq!(back.extended_attribute_definitions, expected);
         assert_eq!(back.options, proj.options);
-        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(back.extended_attribute_definitions, expected);
     }
 
@@ -5647,7 +5649,7 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         for back in [
             read_mspdi(&xml).unwrap(),
-            crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap(),
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap(),
         ] {
             assert_eq!(back.outline_code_definitions, proj.outline_code_definitions);
             assert_eq!(back.wbs_masks, proj.wbs_masks);
@@ -6128,7 +6130,7 @@ mod tests {
         let back = read_mspdi(&xml).unwrap();
         assert_eq!(back.tasks, proj.tasks);
         assert_eq!(back.assignments, proj.assignments);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, proj.tasks);
         assert_eq!(package.assignments, proj.assignments);
     }
@@ -6544,7 +6546,7 @@ mod tests {
             assert!(xml.contains(element), "missing {element}");
         }
         assert_eq!(read_mspdi(&xml).unwrap().resources, proj.resources);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.resources, proj.resources);
     }
 
@@ -6588,7 +6590,7 @@ mod tests {
             assert!(assignment_xml(&xml).contains(element), "missing {element}");
         }
         assert_eq!(read_mspdi(&xml).unwrap().assignments, proj.assignments);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.assignments, proj.assignments);
     }
 
@@ -6865,7 +6867,7 @@ mod tests {
         assert_eq!(read, proj.resources);
         assert_eq!(read[0].rates.len(), 2);
         assert_eq!(read[0].availability_periods.len(), 2);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.resources, proj.resources);
     }
 
@@ -6943,7 +6945,7 @@ mod tests {
         let read = read_mspdi(&xml).unwrap().assignments;
         assert_eq!(read, proj.assignments);
         assert_eq!(read[0].timephased_data.len(), 2);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.assignments, proj.assignments);
     }
 
@@ -7232,7 +7234,7 @@ mod tests {
 
         let written = write_mspdi(&proj);
         assert_eq!(read_mspdi(&written).unwrap().calendars, proj.calendars);
-        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.calendars, proj.calendars);
         // Each scheduled exception is also written in the legacy form, the
         // yearly one only in `Exceptions`.

@@ -615,7 +615,7 @@ fn save_target(path: &Path) -> Result<PathBuf, String> {
 fn write_project(ed: &ProjectEditor, path: &Path) -> Result<(PathBuf, usize), String> {
     let path = save_target(path)?;
     let bytes = if ext_is(&path, "yppx") {
-        yppx::write_yppx(ed.project())
+        yppx::write_yppx(ed.project())?
     } else {
         mspdi::write_mspdi(ed.project()).into_bytes()
     };
@@ -697,7 +697,17 @@ pub(super) fn restore_project_tab(t: &PersistTab) -> DocTab {
     let recovery = if let Some(hot) = &t.hot {
         let hp = Path::new(hot);
         match project_from_path(hp) {
-            Ok(p) => {
+            Ok(mut p) => {
+                for name in &t.unreadable {
+                    if !p
+                        .package
+                        .unreadable
+                        .iter()
+                        .any(|known| known.eq_ignore_ascii_case(name))
+                    {
+                        p.package.unreadable.push(name.clone());
+                    }
+                }
                 let status = imported_status(
                     if t.dirty {
                         "unsaved — restored"

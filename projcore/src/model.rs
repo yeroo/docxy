@@ -16,6 +16,8 @@ use std::sync::Arc;
 pub struct PackageParts {
     /// ZIP name and uncompressed bytes, in package order.
     pub parts: Vec<(String, Arc<[u8]>)>,
+    /// ZIP names of parts that could not be extracted, in package order.
+    pub unreadable: Vec<String>,
     /// Extension and content type for non-XML Defaults.
     pub defaults: Vec<(String, String)>,
     /// Part name and content type for retained Overrides.
