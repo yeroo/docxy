@@ -95,6 +95,7 @@ fn persisted(path: Option<&Path>, hot: Option<&Path>, dirty: bool) -> PersistTab
         title: "Schedule".into(),
         path: path.map(|p| p.to_string_lossy().into_owned()),
         hot: hot.map(|p| p.to_string_lossy().into_owned()),
+        unreadable: Vec::new(),
         dirty,
         markdown: false,
         load_failed: None,
@@ -368,6 +369,58 @@ fn hot_exit_round_trips_dirty_clean_untitled_and_imported_sessions() {
             assert!(restored_status.contains("imported from .mpp; Save As"));
         }
     }
+}
+
+#[test]
+fn unreadable_parts_refuse_yppx_but_allow_xml() {
+    let dir = Scratch::new();
+    let mut project =
+        mspdi::read_mspdi(&std::fs::read_to_string(corpus("11-resource-assignment.xml")).unwrap())
+            .unwrap();
+    project.package.unreadable = vec!["media/mystery.bin".into()];
+    let ed = ProjectEditor::new(project);
+    let native = dir.path("blocked.yppx");
+    let error = write_project(&ed, &native).unwrap_err();
+    assert!(error.contains("media/mystery.bin") && error.contains("save as .xml"));
+    assert!(!native.exists());
+    let xml = dir.path("safe.xml");
+    write_project(&ed, &xml).unwrap();
+    assert!(xml.exists());
+}
+
+#[test]
+fn hot_exit_preserves_unreadable_guard_without_original() {
+    let dir = Scratch::new();
+    let original = dir.path("original.yppx");
+    let mut project =
+        mspdi::read_mspdi(&std::fs::read_to_string(corpus("11-resource-assignment.xml")).unwrap())
+            .unwrap();
+    std::fs::write(&original, yppx::write_yppx(&project).unwrap()).unwrap();
+    project.package.unreadable = vec!["media/mystery.bin".into()];
+    let mut tab = project_tab(
+        "original.yppx".into(),
+        Some(original.clone()),
+        Surface::Project(ProjectView::new(project, false)),
+        false,
+        "loaded".into(),
+    );
+    view_mut(&mut tab).ed.rename(1, "Unsaved rename").unwrap();
+    tab.dirty = true;
+    let persisted = persist_tab(&dir.0, 0, &tab);
+    assert_eq!(persisted.unreadable, ["media/mystery.bin"]);
+    assert!(persisted.hot.is_some());
+    std::fs::remove_file(&original).unwrap();
+    let restored = restore_project_tab(&persisted);
+    assert!(restored.dirty);
+    assert_eq!(view(&restored).ed.project().tasks[0].name, "Unsaved rename");
+    assert_eq!(
+        view(&restored).ed.project().package.unreadable,
+        ["media/mystery.bin"]
+    );
+    let target = dir.path("blocked.yppx");
+    let error = write_project(&view(&restored).ed, &target).unwrap_err();
+    assert!(error.contains("media/mystery.bin"));
+    assert!(!target.exists());
 }
 
 #[test]
