@@ -50,6 +50,37 @@ enum Oracle {
     Mpxj,
 }
 
+#[derive(Default)]
+struct PairExclusions {
+    guid: bool,
+    recurring_occurrence_manual: bool,
+    new_tasks_mode: bool,
+    root_name: bool,
+}
+
+impl PairExclusions {
+    fn for_mpp(path: &Path) -> Self {
+        match path.file_stem().and_then(|s| s.to_str()) {
+            Some("x-recurring") => Self {
+                guid: true,
+                recurring_occurrence_manual: true,
+                new_tasks_mode: true,
+                ..Self::default()
+            },
+            Some("x-overallocated") => Self {
+                guid: true,
+                root_name: true,
+                ..Self::default()
+            },
+            _ => Self::default(),
+        }
+    }
+
+    fn skip_manual(&self, uid: i32) -> bool {
+        self.recurring_occurrence_manual && (2..=5).contains(&uid)
+    }
+}
+
 /// Compare a task's decoded progress with its XML export, field by field.
 /// Project writes every numeric progress element, zeros included, and omits
 /// a date that is NA; MPXJ also omits zero numbers, which then count as 0.
@@ -137,6 +168,7 @@ fn check_task_fields(
     at: &dyn Fn(&str) -> String,
     custom_wbs_mask: bool,
     require_fields: bool,
+    exclude_guid: bool,
 ) {
     let Some(f) = &a.fields else {
         assert!(!require_fields, "{}", at("fields"));
@@ -153,7 +185,12 @@ fn check_task_fields(
             );
         };
     }
-    same!(guid);
+    if exclude_guid {
+        // The standalone XML was exported after a legacy save regenerated GUIDs.
+        assert_eq!(f.guid, imported.guid, "{}", at("binary/imported guid"));
+    } else {
+        same!(guid);
+    }
     if custom_wbs_mask {
         // f8 has no per-task code: preserve the unknown value.
         assert_eq!(f.wbs, None, "{}", at("decoded wbs"));
@@ -200,6 +237,7 @@ fn check_task_fields(
 
 fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool {
     let custom_wbs_mask = mpp.file_stem().is_some_and(|s| s == "f8-wbs-mask");
+    let exclusions = PairExclusions::for_mpp(mpp);
     // Snapshot MPP12 pairs may decode through the legacy index without
     // validated task fields; the current Project pairs must have them.
     let require_fields = source == Oracle::Project && !may_refuse;
@@ -219,6 +257,22 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         Err(error) => panic!("{}: {error}", mpp.display()),
     };
+    if exclusions.root_name {
+        let binary_root = decoded.iter().find(|t| t.uid == 0).unwrap();
+        let xml_root = oracle.tasks.iter().find(|t| t.uid == 0).unwrap();
+        assert_eq!(
+            binary_root.name,
+            "overallocated",
+            "{}: UID 0 binary name",
+            mpp.display()
+        );
+        assert_eq!(
+            xml_root.name,
+            "x-overallocated-mpp12",
+            "{}: UID 0 legacy XML name",
+            mpp.display()
+        );
+    }
     if source == Oracle::Project {
         if let (Some(root), Some(binary_root)) = (
             oracle.tasks.iter().find(|t| t.uid == 0),
@@ -331,8 +385,17 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
         check_progress(a, e, source, &at);
-        assert_eq!(a.manual, e.manual, "{}", at("manual"));
-        if e.manual {
+        if exclusions.skip_manual(e.uid) {
+            assert!(
+                !e.manual && a.manual,
+                "{}",
+                at("legacy XML occurrence manual difference")
+            );
+        } else {
+            assert_eq!(a.manual, e.manual, "{}", at("manual"));
+        }
+        // The standalone XML predates the current MPP's manual-mode rewrite.
+        if !exclusions.skip_manual(e.uid) && e.manual {
             assert_eq!(
                 a.manual_start.as_deref(),
                 e.manual_start.map(dt).as_deref(),
@@ -351,7 +414,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 "{}",
                 at("manual duration")
             );
-        } else {
+        } else if !exclusions.skip_manual(e.uid) {
             // An auto task's manual fields are not decoded: Project's export
             // derives them from its Start, Finish and Duration, or omits them.
             assert_eq!(
@@ -447,14 +510,20 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at, custom_wbs_mask, require_fields);
-        assert_eq!(
-            t.manual,
-            e.manual,
-            "{}: uid {} imported mode",
-            mpp.display(),
-            e.uid
+        check_task_fields(
+            a,
+            t,
+            e,
+            &at,
+            custom_wbs_mask,
+            require_fields,
+            exclusions.guid,
         );
+        if exclusions.skip_manual(e.uid) {
+            assert_eq!(t.manual, a.manual, "{}", at("imported occurrence manual"));
+        } else {
+            assert_eq!(t.manual, e.manual, "{}", at("imported mode"));
+        }
         if t.manual && !t.summary {
             assert_eq!(
                 t.duration_min,
@@ -474,7 +543,15 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let t = round.tasks.iter().find(|t| t.uid == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} round trip {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at, custom_wbs_mask, require_fields);
+        check_task_fields(
+            a,
+            t,
+            e,
+            &at,
+            custom_wbs_mask,
+            require_fields,
+            exclusions.guid,
+        );
     }
     for ghost in decoded
         .iter()
@@ -491,18 +568,38 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             mpp.display()
         );
     }
-    assert_eq!(
-        mppread::mpp::decode_new_tasks_are_manual(&bytes),
-        Ok(oracle.new_tasks_are_manual),
-        "{}: NewTasksAreManual",
-        mpp.display()
-    );
-    assert_eq!(
-        imported.new_tasks_are_manual,
-        oracle.new_tasks_are_manual,
-        "{}: imported NewTasksAreManual",
-        mpp.display()
-    );
+    if exclusions.new_tasks_mode {
+        // The legacy save changed this option along with occurrence Manual.
+        assert_eq!(
+            mppread::mpp::decode_new_tasks_are_manual(&bytes),
+            Ok(true),
+            "{}: binary NewTasksAreManual",
+            mpp.display()
+        );
+        assert!(
+            !oracle.new_tasks_are_manual,
+            "{}: legacy XML NewTasksAreManual",
+            mpp.display()
+        );
+        assert!(
+            imported.new_tasks_are_manual,
+            "{}: imported NewTasksAreManual",
+            mpp.display()
+        );
+    } else {
+        assert_eq!(
+            mppread::mpp::decode_new_tasks_are_manual(&bytes),
+            Ok(oracle.new_tasks_are_manual),
+            "{}: NewTasksAreManual",
+            mpp.display()
+        );
+        assert_eq!(
+            imported.new_tasks_are_manual,
+            oracle.new_tasks_are_manual,
+            "{}: imported NewTasksAreManual",
+            mpp.display()
+        );
+    }
     true
 }
 
@@ -511,12 +608,7 @@ fn project_2024_oracles() {
     let task_fields = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/task-fields");
     if task_fields.exists() {
         let cases = pairs(&task_fields, "");
-        let expected_count = if task_fields.join("f6-recurring.mpp").exists() {
-            11
-        } else {
-            10
-        };
-        assert_eq!(cases.len(), expected_count);
+        assert_eq!(cases.len(), 10);
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);
             if mpp.file_stem().is_some_and(|s| s == "f3-blanks") {
@@ -690,32 +782,57 @@ fn project_2024_oracles() {
         for (mpp, xml) in &newest {
             // The two standalone XML exports were saved after a legacy-MPP
             // conversion: their GUIDs differ from the current .mpp, and
-            // x-recurring's occurrence Manual values changed too. Compare
-            // the stable field under study, not those mismatched properties.
+            // x-recurring's occurrence Manual values and new-task option changed
+            // too. check_pair excludes only those established differences.
+            check_pair(mpp, xml, false, Oracle::Project);
             if mpp.file_stem().is_some_and(|s| s == "x-recurring") {
                 let oracle =
                     projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
                 let bytes = std::fs::read(mpp).unwrap();
                 let decoded = mppread::mpp::decode_tasks(&bytes).unwrap();
                 let imported = mppread::project::project_from_mpp(&bytes).unwrap();
-                assert_eq!(decoded.len(), oracle.tasks.len());
+                assert_eq!(
+                    decoded.len(),
+                    oracle.tasks.len(),
+                    "{}: task count",
+                    mpp.display()
+                );
                 for expected in &oracle.tasks {
                     let raw = decoded
                         .iter()
                         .find(|t| t.uid as i32 == expected.uid)
-                        .unwrap();
-                    assert_eq!(raw.name, expected.name);
+                        .unwrap_or_else(|| {
+                            panic!("{}: missing UID {}", mpp.display(), expected.uid)
+                        });
+                    assert_eq!(
+                        raw.name,
+                        expected.name,
+                        "{}: UID {} name",
+                        mpp.display(),
+                        expected.uid
+                    );
                     assert_eq!(
                         raw.fields.as_ref().and_then(|f| f.recurring),
-                        expected.recurring
+                        expected.recurring,
+                        "{}: UID {} Recurring",
+                        mpp.display(),
+                        expected.uid
                     );
                     if expected.uid != 0 {
                         let task = imported
                             .tasks
                             .iter()
                             .find(|t| t.uid == expected.uid)
-                            .unwrap();
-                        assert_eq!(task.recurring, expected.recurring);
+                            .unwrap_or_else(|| {
+                                panic!("{}: imported UID {} missing", mpp.display(), expected.uid)
+                            });
+                        assert_eq!(
+                            task.recurring,
+                            expected.recurring,
+                            "{}: imported UID {} Recurring",
+                            mpp.display(),
+                            expected.uid
+                        );
                     }
                 }
                 recurring_count = oracle
@@ -727,9 +844,27 @@ fn project_2024_oracles() {
                 let oracle =
                     projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
                 let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
-                assert_eq!(oracle.tasks.len(), 5);
-                assert!(oracle.tasks.iter().all(|t| t.over_allocated == Some(false)));
-                assert_eq!(decoded.len(), oracle.tasks.len());
+                assert_eq!(
+                    oracle.tasks.len(),
+                    5,
+                    "{}: oracle task count",
+                    mpp.display()
+                );
+                for task in &oracle.tasks {
+                    assert_eq!(
+                        task.over_allocated,
+                        Some(false),
+                        "{}: UID {} OverAllocated",
+                        mpp.display(),
+                        task.uid
+                    );
+                }
+                assert_eq!(
+                    decoded.len(),
+                    oracle.tasks.len(),
+                    "{}: binary task count",
+                    mpp.display()
+                );
                 for expected in &oracle.tasks {
                     if expected.uid == 0 {
                         continue;
@@ -739,7 +874,10 @@ fn project_2024_oracles() {
                             .iter()
                             .find(|t| t.uid as i32 == expected.uid)
                             .map(|t| t.name.as_str()),
-                        Some(expected.name.as_str())
+                        Some(expected.name.as_str()),
+                        "{}: UID {} name",
+                        mpp.display(),
+                        expected.uid
                     );
                 }
                 assert_eq!(
@@ -748,7 +886,9 @@ fn project_2024_oracles() {
                         .iter()
                         .find(|r| r.name == "Alice")
                         .and_then(|r| r.over_allocated),
-                    Some(true)
+                    Some(true),
+                    "{}: Alice OverAllocated",
+                    mpp.display()
                 );
                 assert_eq!(
                     oracle
@@ -756,10 +896,10 @@ fn project_2024_oracles() {
                         .iter()
                         .find(|r| r.name == "Bob")
                         .and_then(|r| r.over_allocated),
-                    Some(false)
+                    Some(false),
+                    "{}: Bob OverAllocated",
+                    mpp.display()
                 );
-            } else {
-                check_pair(mpp, xml, false, Oracle::Project);
             }
         }
         assert_eq!(
