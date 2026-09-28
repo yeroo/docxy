@@ -294,9 +294,36 @@ fn cut_clears_what_delete_clears_and_never_deletes_a_task() {
 
 #[test]
 fn tsv_keeps_all_but_one_trailing_line_break() {
-    assert_eq!(parse_tsv(""), Vec::<Vec<String>>::new());
-    assert_eq!(parse_tsv("\n"), Vec::<Vec<String>>::new());
+    // An empty copied cell is one empty field, not nothing.
+    for empty in ["", "\n", "\r\n"] {
+        assert_eq!(parse_tsv(empty), [[""]], "{empty:?}");
+    }
     assert_eq!(parse_tsv("A\r\n"), [["A"]]);
     assert_eq!(parse_tsv("A\tB\r\nC"), [vec!["A", "B"], vec!["C"]]);
     assert_eq!(parse_tsv("A\n\n"), [["A"], [""]]);
+}
+
+#[test]
+fn an_empty_copied_cell_pastes_as_an_emptied_cell() {
+    for text in ["", "\r\n"] {
+        let mut t = tab();
+        apply_cell(&mut vm(&mut t).ed, 2, COL_PREDECESSORS, "1").unwrap();
+        let depth = v(&t).ed.undo_depth();
+        // Copied from A, which has no predecessors.
+        at(&mut t, 0, COL_PREDECESSORS);
+        assert_eq!(project_copy_text(v(&t)), "");
+        at(&mut t, 1, COL_PREDECESSORS);
+        t.status = "Earlier error".into();
+        paste_project_text(&mut t, text);
+        assert!(
+            v(&t).ed.project().tasks[1].predecessors.is_empty(),
+            "{text:?}"
+        );
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        assert_eq!(t.status.as_ref(), "Ready");
+        // On the entry row it makes no task and records nothing.
+        at(&mut t, 2, COL_NAME);
+        paste_project_text(&mut t, text);
+        assert_eq!((tasks(&t).len(), v(&t).ed.undo_depth()), (2, depth + 1));
+    }
 }

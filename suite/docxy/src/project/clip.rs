@@ -45,13 +45,11 @@ pub(crate) fn project_cut(tab: &mut DocTab) {
 
 /// Tab-separated text as lines of fields. One trailing line break, which
 /// spreadsheets end a copy with, closes the last line rather than adding an
-/// empty one.
+/// empty one. There is always a line: an empty copied cell (`""`, or Excel's
+/// `"\r\n"`) is one empty field, which pastes as an emptied cell.
 pub(crate) fn parse_tsv(text: &str) -> Vec<Vec<String>> {
     let text = text.replace("\r\n", "\n");
     let text = text.strip_suffix('\n').unwrap_or(&text);
-    if text.is_empty() {
-        return Vec::new();
-    }
     text.split('\n')
         .map(|line| line.split('\t').map(str::to_owned).collect())
         .collect()
@@ -68,9 +66,6 @@ pub(crate) fn paste_project_text(tab: &mut DocTab, text: &str) {
         return;
     };
     let lines = parse_tsv(text);
-    if lines.is_empty() {
-        return;
-    }
     let first_col = v.col;
     let entry = v.on_entry_row();
     // By UID, fixed before anything changes: typing into a blank row can
