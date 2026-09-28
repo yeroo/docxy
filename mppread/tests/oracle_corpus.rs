@@ -78,6 +78,7 @@ struct PairExclusions {
     recurring_occurrence_manual: bool,
     new_tasks_mode: bool,
     root_name: bool,
+    ignore_resource_calendar_uids: &'static [i32],
 }
 
 impl PairExclusions {
@@ -92,6 +93,12 @@ impl PairExclusions {
             Some("x-overallocated") => Self {
                 guid: true,
                 root_name: true,
+                ..Self::default()
+            },
+            Some("26-task-calendar") => Self {
+                // Binary UID 1 has this bit set; the paired MPXJ XML says 0.
+                // Main's paired oracle failed here before this exclusion.
+                ignore_resource_calendar_uids: &[1],
                 ..Self::default()
             },
             _ => Self::default(),
@@ -191,7 +198,7 @@ fn check_task_fields(
     custom_wbs_mask: bool,
     require_fields: bool,
     exclude_guid: bool,
-    source: Oracle,
+    exclude_ignore_resource_calendar: bool,
 ) {
     let Some(f) = &a.fields else {
         assert!(!require_fields, "{}", at("fields"));
@@ -230,16 +237,8 @@ fn check_task_fields(
     same!(leveling_can_split);
     same!(leveling_delay);
     same!(leveling_delay_format);
-    if source == Oracle::Project {
+    if !exclude_ignore_resource_calendar {
         same!(ignore_resource_calendar);
-    } else {
-        // MPXJ's paired XML reports false for 26-task-calendar's task UID 1
-        // even though the current-layout bit is set. Project-exported task
-        // field cases remain the authority for this bit.
-        assert_eq!(
-            f.ignore_resource_calendar,
-            imported.ignore_resource_calendar
-        );
     }
     same!(earned_value_method);
     same!(recurring);
@@ -605,7 +604,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             custom_wbs_mask,
             require_fields,
             exclusions.guid,
-            source,
+            exclusions.ignore_resource_calendar_uids.contains(&e.uid),
         );
         if exclusions.skip_manual(e.uid) {
             assert_eq!(t.manual, a.manual, "{}", at("imported occurrence manual"));
@@ -639,7 +638,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             custom_wbs_mask,
             require_fields,
             exclusions.guid,
-            source,
+            exclusions.ignore_resource_calendar_uids.contains(&e.uid),
         );
     }
     for ghost in decoded

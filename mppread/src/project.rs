@@ -79,8 +79,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     }
     let decoded_resources = crate::rscdecode::decode(bytes, legacy)
         .map_err(|e| format!("cannot read the resources of this .mpp ({e})"))?;
-    let mut task_uids: std::collections::HashSet<i32> = tasks.iter().map(|t| t.uid).collect();
-    task_uids.insert(0); // Project summary assignments can reference UID 0.
+    let task_uids = assignment_task_uids(&tasks);
     let (resources, assignments) = if let Some(resources) = decoded_resources {
         let decoded_assignments = crate::assndecode::decode(bytes, legacy, &task_uids, &resources)
             .map_err(|e| format!("cannot read the assignments of this .mpp ({e})"))?;
@@ -112,6 +111,13 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         return Err(format!("cannot read the calendars of this .mpp ({error})"));
     }
     Ok(project)
+}
+
+fn assignment_task_uids(tasks: &[Task]) -> std::collections::HashSet<i32> {
+    let mut uids: std::collections::HashSet<i32> =
+        tasks.iter().filter(|t| !t.is_null).map(|t| t.uid).collect();
+    uids.insert(0); // Project summary assignments can reference UID 0.
+    uids
 }
 
 fn import_tasks(
@@ -350,6 +356,44 @@ mod tests {
             is_null: true,
             ..crate::mpp::MppTask::default()
         }
+    }
+
+    #[test]
+    fn assignment_on_null_task_is_refused() {
+        let tasks = import_tasks(vec![task(0, 0, "Project", 0), blank(1, 4)]).unwrap();
+        let uids = assignment_task_uids(&tasks);
+        assert_eq!(uids, [0].into_iter().collect());
+
+        let mut fm = vec![0u8; 16 + 34];
+        fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        fm[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let mut row = vec![0u8; 110];
+        row[..4].copy_from_slice(&7u32.to_le_bytes());
+        row[4..8].copy_from_slice(&4i32.to_le_bytes());
+        row[8..12].copy_from_slice(&1i32.to_le_bytes());
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        let bytes = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![Node::Storage(
+                "TBkndAssn",
+                vec![
+                    Node::Stream("FixedMeta", fm),
+                    Node::Stream("FixedData", row),
+                    Node::Stream("VarMeta", vm),
+                    Node::Stream("Var2Data", Vec::new()),
+                ],
+            )],
+        )]);
+        let resources = [projcore::Resource {
+            uid: 1,
+            ..projcore::Resource::default()
+        }];
+        assert!(
+            crate::assndecode::decode(&bytes, false, &uids, &resources)
+                .unwrap_err()
+                .contains("unknown task UID 4")
+        );
     }
 
     #[test]
