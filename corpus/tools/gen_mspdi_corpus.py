@@ -50,7 +50,7 @@ def iso(minutes):
 def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
          outline=1, summary=False, milestone=False, preds=(), ctype=None,
          cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
-         manual_finish=None, manual_duration=None, fields=(), ext=(),
+         manual_finish=None, manual_duration=None, fields=(), ext=(), outline_codes=(),
          timephased=()):
     """One <Task>. `preds` is a list of (uid, type_code, link_lag) or
     (uid, type_code, link_lag, lag_format): LinkLag is tenths of a minute, or
@@ -110,6 +110,10 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
             if value is not None:
                 lines.append(f"        <{tag}>{value}</{tag}>")
         lines.append("      </Baseline>")
+    for code in outline_codes:
+        lines.append("      <OutlineCode>")
+        lines += [f"        <{tag}>{value}</{tag}>" for tag, value in code]
+        lines.append("      </OutlineCode>")
     for record in timephased:
         lines += ["      <TimephasedData>"]
         lines += [f"        <{tag}>{value}</{tag}>" for tag, value in record]
@@ -198,7 +202,8 @@ def standard_calendar(uid=1, name="Standard", saturday=False, exs=()):
 
 
 def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
-            calendars=None, new_tasks_are_manual=None, extended_attributes=""):
+            calendars=None, new_tasks_are_manual=None, extended_attributes="",
+            outline_codes="", wbs_masks=""):
     calendars = calendars or [standard_calendar()]
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -215,6 +220,10 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
     ]
     if new_tasks_are_manual is not None:
         parts.append(f"  <NewTasksAreManual>{new_tasks_are_manual}</NewTasksAreManual>")
+    if outline_codes:
+        parts += ["  <OutlineCodes>", outline_codes, "  </OutlineCodes>"]
+    if wbs_masks:
+        parts += ["  <WBSMasks>", wbs_masks, "  </WBSMasks>"]
     if extended_attributes:
         # Custom field definitions (#268): after the header, before the tasks.
         parts += ["  <ExtendedAttributes>", extended_attributes, "  </ExtendedAttributes>"]
@@ -624,6 +633,25 @@ def build():
         "      <Formula>[Duration]*2</Formula>",
         "    </ExtendedAttribute>",
     ])
+    outline_definitions = "\n".join([
+        "    <OutlineCode>",
+        "      <FieldID>188744105</FieldID><FieldName>Task Outline Code1</FieldName>",
+        "      <Alias>Zone &amp; trade</Alias>",
+        "      <Masks><Mask><Level>1</Level><Type>0</Type><Length>2</Length>"
+        "<Separator>.</Separator></Mask></Masks>",
+        "      <Values><Value><ValueID>1</ValueID><Description>Civil</Description></Value>"
+        "<Value><ValueID>2</ValueID><Description>M&amp;E</Description></Value></Values>",
+        "    </OutlineCode>",
+    ])
+    wbs_mask = "\n".join([
+        "    <VerifyUniqueCodes>1</VerifyUniqueCodes>",
+        "    <GenerateCodes>1</GenerateCodes>",
+        "    <Prefix>PRJ-</Prefix>",
+        "    <WBSMask><Level>1</Level><Type>0</Type><Length>2</Length>"
+        "<Separator>.</Separator></WBSMask>",
+        "    <WBSMask><Level>2</Level><Type>1</Type><Length>0</Length>"
+        "<Separator>-</Separator></WBSMask>",
+    ])
     common = [("LevelAssignments", 1), ("LevelingCanSplit", 1),
               ("LevelingDelay", 0), ("LevelingDelayFormat", 8),
               ("IgnoreResourceCalendar", 0), ("HideBar", 0), ("EarnedValueMethod", 0),
@@ -652,7 +680,10 @@ def build():
                  ext=[[("FieldID", 188743731), ("Value", "Civil"),
                        ("ValueGUID", "7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101")],
                       [("FieldID", 188743783), ("Value", iso(4 * D)),
-                       ("DurationFormat", 7)]]),
+                       ("DurationFormat", 7)]],
+                 outline_codes=[[("FieldID", 188744105), ("ValueID", 1)],
+                                [("FieldID", 188744105), ("ValueID", 2),
+                                 ("ValueGUID", "7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102")]]),
             blank_row(3, 3, ident(3)),
             # Its link from the blank row is ignored: Pour follows Excavate.
             task(4, "Pour", D, dt(4), dt(4, "17:00:00"), **CRIT, outline=2,
@@ -673,7 +704,8 @@ def build():
             task(5, "Inspect", D, dt(2), dt(2, "17:00:00"), slack=2 * D, critical=False,
                  fields=ident(5) + [("Active", 0), ("Type", 1), ("WBS", "2"),
                                     ("Priority", 500), ("Estimated", 1)] + common),
-        ]), extended_attributes=definitions))
+        ]), extended_attributes=definitions, outline_codes=outline_definitions,
+        wbs_masks=wbs_mask))
 
     # 21 — B misses its Deadline by 5 days. The deadline bounds late finish
     # only: dates stay put and A and B both get -5d total slack (#100).

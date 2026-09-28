@@ -115,19 +115,27 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
                     "Calendars" => parse_calendars(&mut p, &mut proj.calendars),
-                    "ExtendedAttributes" => parse_extended_attribute_definitions(
+                    "OutlineCodes" if kept_as_element(&p) => {
+                        parse_definitions(&mut p, "OutlineCode", &mut proj.outline_code_definitions)
+                    }
+                    "WBSMasks" if kept_as_element(&p) => {
+                        let block = parse_element(&mut p, 0);
+                        if !block.children.is_empty() {
+                            proj.wbs_masks = Some(block);
+                        }
+                    }
+                    "ExtendedAttributes" => parse_definitions(
                         &mut p,
+                        "ExtendedAttribute",
                         &mut proj.extended_attribute_definitions,
                     ),
-                    // Any other leaf is a project option docxy does not model:
-                    // keep its text so a save writes it back. A block with
-                    // child elements (OutlineCodes, WBSMasks, ...) is
-                    // consumed whole so its children can't be mistaken for
-                    // header fields. So is a prefixed element or one carrying
-                    // attributes: an option stores only a name and text, so
-                    // writing it back would lose its namespace binding (an
-                    // unbound `x:` prefix, or a foreign `xmlns` moved into
-                    // MSPDI's) or attributes such as `xsi:nil`.
+                    // A prefixed or attributed element (leaf or block) is
+                    // consumed here, including OutlineCodes/WBSMasks wrappers:
+                    // an option stores only name and text, so writing it back
+                    // would lose namespace bindings or attributes like xsi:nil.
+                    // The final arm keeps plain unknown leaves as options.
+                    // Plain unknown blocks such as Views reach that arm, but
+                    // leaf_text_of returns None and drops them whole.
                     _ if !kept_as_element(&p) => p.skip_element(),
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
@@ -332,6 +340,7 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "ExtendedAttribute" => {
                         t.extended_attributes.extend(parse_extended_attribute(p));
                     }
+                    "OutlineCode" => t.outline_codes.extend(parse_outline_code(p)),
                     "IsNull" => t.is_null = bool_of(p),
                     "GUID" => t.guid = guid_of(p),
                     "CreateDate" => t.create_date = DateTime::parse_mspdi(&text_of(p)),
@@ -921,7 +930,7 @@ fn parse_extended_attribute(p: &mut XmlParser) -> Option<ExtendedAttributeValue>
     Some(attribute)
 }
 
-/// Parse one resource outline code value; `None` without a `FieldID`, which
+/// Parse one task or resource outline code value; `None` without a `FieldID`, which
 /// names it.
 fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
     let mut field_id = None;
@@ -945,12 +954,12 @@ fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
     Some(code)
 }
 
-/// Collect the custom field definitions of an `<ExtendedAttributes>` block,
-/// each `<ExtendedAttribute>` kept whole; any other child is skipped.
-fn parse_extended_attribute_definitions(p: &mut XmlParser, out: &mut Vec<XmlElement>) {
+/// Keep matching definitions in an `<OutlineCodes>` or
+/// `<ExtendedAttributes>` block whole; skip other children.
+fn parse_definitions(p: &mut XmlParser, child_name: &str, out: &mut Vec<XmlElement>) {
     loop {
         match p.next() {
-            Event::Start if p.name() == "ExtendedAttribute" && kept_as_element(p) => {
+            Event::Start if p.name() == child_name && kept_as_element(p) => {
                 out.push(parse_element(p, 1));
             }
             Event::Start => p.skip_element(),
@@ -967,7 +976,7 @@ fn kept_as_element(p: &XmlParser) -> bool {
     !p.name().contains(':') && p.attrs().is_empty()
 }
 
-/// How deep a kept definition goes, counting its `<ExtendedAttribute>` as 1.
+/// How deep a kept definition goes, counting its root as 1.
 /// Project's deepest is 4 (`ExtendedAttribute/ValueList/Value/ID`); the bound
 /// keeps a crafted file from overflowing the stack of the recursive reader,
 /// writer, and the tree's derived `Clone`/`PartialEq`/`Drop`.
@@ -1417,11 +1426,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Emits the fields projcore models — enough for MS Project to open the file
 /// and for our own reader to round-trip — plus every project-level option the
 /// reader kept verbatim in [`Project::options`]: the schema's in
-/// [`PROJECT_HEADER`] order, then any others in read order. The custom field
-/// definitions in [`Project::extended_attribute_definitions`] follow, as one
-/// `<ExtendedAttributes>` block. Other elements outside the model (views,
-/// outline codes, WBS masks) are not preserved: this is a model-faithful
-/// writer, not a byte-faithful one. Each task's stored
+/// [`PROJECT_HEADER`] order, then any others in read order. Outline code
+/// definitions, WBS masks and extended attribute definitions follow in schema
+/// order. Other elements outside the model (views, etc.) are not preserved:
+/// this is a model-faithful writer, not a byte-faithful one. Each task's stored
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
 /// stamping them back), so a scheduled project exports with dates Project can
 /// display without recalculating.
@@ -1458,8 +1466,17 @@ pub fn write_mspdi(proj: &Project) -> String {
             tag(&mut s, 1, name, text);
         }
     }
-    // After the header leaves (and the schema's OutlineCodes and WBSMasks,
-    // which docxy does not keep), before Calendars and Tasks.
+    // Definition blocks follow header leaves and precede Calendars and Tasks.
+    if !proj.outline_code_definitions.is_empty() {
+        s.push_str("  <OutlineCodes>\n");
+        for definition in &proj.outline_code_definitions {
+            write_element(&mut s, 2, definition);
+        }
+        s.push_str("  </OutlineCodes>\n");
+    }
+    if let Some(block) = &proj.wbs_masks {
+        write_element(&mut s, 1, block);
+    }
     if !proj.extended_attribute_definitions.is_empty() {
         s.push_str("  <ExtendedAttributes>\n");
         for definition in &proj.extended_attribute_definitions {
@@ -1898,6 +1915,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         }
         s.push_str("      </Baseline>\n");
     }
+    write_outline_codes(s, &t.outline_codes);
     write_timephased_data(s, &t.timephased_data);
     s.push_str("    </Task>\n");
 }
@@ -2012,17 +2030,7 @@ fn write_resource(s: &mut String, r: &Resource) {
         }
         s.push_str("      </Baseline>\n");
     }
-    for code in &r.outline_codes {
-        s.push_str("      <OutlineCode>\n");
-        tag(s, 4, "FieldID", &code.field_id);
-        if let Some(value_id) = &code.value_id {
-            tag(s, 4, "ValueID", value_id);
-        }
-        if let Some(guid) = &code.value_guid {
-            tag(s, 4, "ValueGUID", guid);
-        }
-        s.push_str("      </OutlineCode>\n");
-    }
+    write_outline_codes(s, &r.outline_codes);
     if !r.availability_periods.is_empty() {
         s.push_str("      <AvailabilityPeriods>\n");
         for period in &r.availability_periods {
@@ -2078,6 +2086,20 @@ fn write_resource(s: &mut String, r: &Resource) {
     }
     write_timephased_data(s, &r.timephased_data);
     s.push_str("    </Resource>\n");
+}
+
+fn write_outline_codes(s: &mut String, codes: &[OutlineCodeValue]) {
+    for code in codes {
+        s.push_str("      <OutlineCode>\n");
+        tag(s, 4, "FieldID", &code.field_id);
+        if let Some(value_id) = &code.value_id {
+            tag(s, 4, "ValueID", value_id);
+        }
+        if let Some(guid) = &code.value_guid {
+            tag(s, 4, "ValueGUID", guid);
+        }
+        s.push_str("      </OutlineCode>\n");
+    }
 }
 
 /// Custom field values, in the schema's child order.
@@ -5156,6 +5178,188 @@ mod tests {
         assert!(empty.extended_attribute_definitions.is_empty());
         assert!(empty.options.is_empty());
         assert!(!write_mspdi(&empty).contains("ExtendedAttributes"));
+    }
+
+    #[test]
+    fn outline_definitions_wbs_masks_and_task_values_round_trip_in_schema_order() {
+        let proj = read_mspdi(
+            "<Project><Author>Me</Author><OutlineCodes>\
+             <OutlineCode><FieldID>1</FieldID><FieldName>Region</FieldName>\
+             <Masks><Mask><Level>1</Level><Separator>.</Separator></Mask></Masks>\
+             <Values><Value><ValueID>1</ValueID><Description>A&amp;B</Description>\
+             <Children><Value><ValueID>2</ValueID><Description>&lt;West&gt;</Description>\
+             </Value></Children></Value></Values></OutlineCode></OutlineCodes>\
+             <OutlineCodes><OutlineCode><FieldID>2</FieldID><Alias>Team</Alias>\
+             </OutlineCode></OutlineCodes>\
+             <WBSMasks><VerifyUniqueCodes>1</VerifyUniqueCodes><GenerateCodes>0</GenerateCodes>\
+             <Prefix>PRJ&amp;</Prefix><WBSMask><Level>1</Level><Type>0</Type>\
+             <Length>2</Length><Separator>.</Separator></WBSMask>\
+             <WBSMask><Level>2</Level><Type>1</Type><Length>0</Length>\
+             <Separator>-</Separator></WBSMask></WBSMasks>\
+             <ExtendedAttributes><ExtendedAttribute><FieldID>3</FieldID>\
+             </ExtendedAttribute></ExtendedAttributes>\
+             <Tasks><Task><UID>1</UID><Name>Work</Name><OutlineLevel>1</OutlineLevel>\
+             <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start></Baseline>\
+             <OutlineCode><FieldID>1</FieldID><ValueID>1</ValueID></OutlineCode>\
+             <OutlineCode><FieldID>2</FieldID><ValueGUID>abc</ValueGUID></OutlineCode>\
+             <TimephasedData><Type>1</Type><UID>1</UID><Start>2026-03-02T08:00:00</Start>\
+             <Finish>2026-03-02T17:00:00</Finish><Unit>0</Unit><Value>PT8H0M0S</Value>\
+             </TimephasedData></Task></Tasks></Project>",
+        )
+        .unwrap();
+        assert_eq!(proj.outline_code_definitions.len(), 2);
+        assert_eq!(
+            proj.outline_code_definitions[0].children[3].children[0].children[2].children[0]
+                .children[1]
+                .text,
+            "<West>"
+        );
+        assert_eq!(
+            proj.wbs_masks.as_ref().unwrap().children,
+            vec![
+                leaf("VerifyUniqueCodes", "1"),
+                leaf("GenerateCodes", "0"),
+                leaf("Prefix", "PRJ&"),
+                node(
+                    "WBSMask",
+                    vec![
+                        leaf("Level", "1"),
+                        leaf("Type", "0"),
+                        leaf("Length", "2"),
+                        leaf("Separator", "."),
+                    ],
+                ),
+                node(
+                    "WBSMask",
+                    vec![
+                        leaf("Level", "2"),
+                        leaf("Type", "1"),
+                        leaf("Length", "0"),
+                        leaf("Separator", "-"),
+                    ],
+                ),
+            ]
+        );
+        assert_eq!(proj.tasks[0].outline_codes.len(), 2);
+        let xml = write_mspdi(&proj);
+        assert_eq!(xml.matches("<OutlineCodes>").count(), 1);
+        assert_eq!(xml.matches("<WBSMasks>").count(), 1);
+        assert!(xml.contains("<Description>A&amp;B</Description>"));
+        let positions = [
+            "<Author>",
+            "<OutlineCodes>",
+            "<WBSMasks>",
+            "<ExtendedAttributes>",
+            "<Tasks>",
+        ]
+        .map(|tag| xml.find(tag).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let task = task_xml(&xml);
+        let positions =
+            ["<Baseline>", "<OutlineCode>", "<TimephasedData>"].map(|tag| task.find(tag).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        for back in [
+            read_mspdi(&xml).unwrap(),
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap(),
+        ] {
+            assert_eq!(back.outline_code_definitions, proj.outline_code_definitions);
+            assert_eq!(back.wbs_masks, proj.wbs_masks);
+            assert_eq!(back.tasks[0].outline_codes, proj.tasks[0].outline_codes);
+        }
+    }
+
+    #[test]
+    fn empty_and_repeated_header_blocks_follow_defined_rules() {
+        let plain = task_project("<Task><UID>1</UID></Task>");
+        let saved = write_mspdi(&plain);
+        assert!(!saved.contains("OutlineCodes"));
+        assert!(!saved.contains("WBSMasks"));
+        assert!(!saved.contains("<OutlineCode>"));
+        let proj = read_mspdi(
+            "<Project><OutlineCodes/><WBSMasks/>\
+             <WBSMasks><Prefix>A</Prefix></WBSMasks>\
+             <WBSMasks><Prefix>B</Prefix></WBSMasks><WBSMasks/>\
+             <WBSMasks>
+               </WBSMasks>\
+             <Tasks/></Project>",
+        )
+        .unwrap();
+        assert!(proj.outline_code_definitions.is_empty());
+        assert_eq!(
+            proj.wbs_masks,
+            Some(node("WBSMasks", vec![leaf("Prefix", "B")]))
+        );
+        let saved = write_mspdi(&proj);
+        assert!(!saved.contains("OutlineCodes"));
+        assert_eq!(saved.matches("<WBSMasks>").count(), 1);
+        let empty = read_mspdi("<Project><OutlineCodes/><WBSMasks/><Tasks/></Project>").unwrap();
+        assert!(empty.wbs_masks.is_none());
+        assert!(!write_mspdi(&empty).contains("WBSMasks"));
+        let text_only = read_mspdi("<Project><WBSMasks>junk</WBSMasks><Tasks/></Project>").unwrap();
+        assert!(text_only.wbs_masks.is_none());
+        assert!(!write_mspdi(&text_only).contains("WBSMasks"));
+    }
+
+    #[test]
+    fn unsafe_children_and_wrappers_in_header_blocks_are_skipped() {
+        let proj = read_mspdi(
+            r#"<Project xmlns:x="urn:x">
+               <OutlineCodes><OutlineCode><FieldID>1</FieldID>
+                 <x:Extra><Inner>bad</Inner></x:Extra>
+                 <Alias x:flag="yes"><Inner>bad</Inner></Alias>
+                 <Name xmlns:y="urn:y"><Inner>bad</Inner></Name>
+                 <Value>safe</Value>
+               </OutlineCode></OutlineCodes>
+               <OutlineCodes x:flag="yes"><OutlineCode><FieldID>bad</FieldID></OutlineCode></OutlineCodes>
+               <x:OutlineCodes><OutlineCode><FieldID>bad</FieldID></OutlineCode></x:OutlineCodes>
+               <WBSMasks><Prefix>safe</Prefix>
+                 <x:Other><Inner>bad</Inner></x:Other>
+                 <WBSMask x:flag="yes"><Inner>bad</Inner></WBSMask>
+                 <Wrapper xmlns:y="urn:y"><Inner>bad</Inner></Wrapper>
+               </WBSMasks>
+               <WBSMasks x:flag="yes"><Prefix>bad</Prefix></WBSMasks>
+               <x:WBSMasks><Prefix>bad</Prefix></x:WBSMasks>
+               <Tasks/></Project>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            proj.outline_code_definitions,
+            vec![node(
+                "OutlineCode",
+                vec![leaf("FieldID", "1"), leaf("Value", "safe")]
+            )]
+        );
+        assert_eq!(
+            proj.wbs_masks,
+            Some(node("WBSMasks", vec![leaf("Prefix", "safe")]))
+        );
+        let xml = write_mspdi(&proj);
+        assert!(!xml.contains("bad") && !xml.contains("x:") && !xml.contains("xmlns:y"));
+        assert_eq!(read_mspdi(&xml).unwrap().wbs_masks, proj.wbs_masks);
+    }
+
+    #[test]
+    fn wbs_mask_descendants_stop_at_definition_depth_limit() {
+        let deep = 10_000;
+        let xml = format!(
+            "<Project><WBSMasks><Prefix>P</Prefix><WBSMask>{}x{}</WBSMask>\
+             </WBSMasks><Tasks/></Project>",
+            "<a>".repeat(deep),
+            "</a>".repeat(deep)
+        );
+        let proj = read_mspdi(&xml).unwrap();
+        let mask = proj.wbs_masks.as_ref().unwrap();
+        let mut depth = 1;
+        let mut element = &mask.children[1];
+        while let Some(child) = element.children.first() {
+            element = child;
+            depth += 1;
+        }
+        assert_eq!((depth, element.text.as_str()), (MAX_DEFINITION_DEPTH, ""));
+        assert_eq!(
+            read_mspdi(&write_mspdi(&proj)).unwrap().wbs_masks,
+            proj.wbs_masks
+        );
     }
 
     #[test]
