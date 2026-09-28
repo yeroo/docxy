@@ -349,7 +349,7 @@ values):
 | DurationFormat | +164 | u16, MSPDI format code |
 | CalendarUID | +178 | i32; -1 means project calendar |
 | PhysicalPercentComplete | Var2Data key `0x045f` | u16 block, written only when nonzero |
-| Notes | Var2Data key `0x000f` | RichEdit RTF followed by CRLF and NUL; the final `\\par` is omitted from exported text. Malformed RTF and unsupported escaped-byte code pages are refused. |
+| Notes | Var2Data key `0x000f` | RichEdit RTF followed by CRLF and NUL; the final `\par` is omitted from exported text. Malformed RTF and unsupported escaped-byte code pages are refused. |
 
 Durations and work are rounded to whole minutes, as MSPDI import rounds
 seconds. Every numeric field is present on every task, zero included, since

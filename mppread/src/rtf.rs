@@ -8,11 +8,20 @@ struct State {
     uc: usize,
     codepage: i32,
     font: i32,
+    default_font: i32,
+}
+
+#[derive(Clone, Copy, Default)]
+struct FontInfo {
+    charset: Option<i32>,
+    codepage: Option<i32>,
 }
 
 fn charset_page(charset: i32, ansi_page: i32) -> Option<i32> {
     Some(match charset {
-        0 | 1 => ansi_page,
+        0 => 1252,
+        1 => ansi_page,
+        2 => 42, // Windows SYMBOL_CHARSET: U+F000 + byte.
         161 => 1253,
         162 => 1254,
         163 => 1258,
@@ -50,12 +59,71 @@ fn hidden_destination(word: &[u8]) -> bool {
             | b"listoverridetable"
             | b"rsidtbl"
             | b"mmathPr"
+            | b"pntext"
+            | b"listtext"
     ) || word.starts_with(b"header")
         || word.starts_with(b"footer")
 }
 
 fn push(out: &mut Vec<u16>, c: char) {
     out.extend(c.encode_utf16(&mut [0; 2]).iter().copied());
+}
+
+fn read_word<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<(&'a [u8], Option<i32>), ()> {
+    let start = *pos;
+    while bytes.get(*pos).is_some_and(u8::is_ascii_alphabetic) {
+        *pos += 1;
+    }
+    if *pos == start {
+        return Err(());
+    }
+    let word = &bytes[start..*pos];
+    let negative = bytes.get(*pos) == Some(&b'-');
+    if negative {
+        *pos += 1;
+    }
+    let num_start = *pos;
+    while bytes.get(*pos).is_some_and(u8::is_ascii_digit) {
+        *pos += 1;
+    }
+    let number = if *pos > num_start {
+        let value = std::str::from_utf8(&bytes[num_start..*pos])
+            .map_err(|_| ())?
+            .parse::<i32>()
+            .map_err(|_| ())?;
+        Some(if negative {
+            value.checked_neg().ok_or(())?
+        } else {
+            value
+        })
+    } else {
+        if negative {
+            return Err(());
+        }
+        None
+    };
+    if bytes.get(*pos) == Some(&b' ') {
+        *pos += 1;
+    }
+    Ok((word, number))
+}
+
+fn skip_bin(bytes: &[u8], pos: &mut usize, n: Option<i32>) -> Result<(), ()> {
+    let size = usize::try_from(n.ok_or(())?).map_err(|_| ())?;
+    *pos = pos
+        .checked_add(size)
+        .filter(|&end| end <= bytes.len())
+        .ok_or(())?;
+    Ok(())
+}
+
+fn read_hex(bytes: &[u8], pos: &mut usize) -> Result<u8, ()> {
+    let digits = bytes.get(*pos..*pos + 2).ok_or(())?;
+    if !digits.iter().all(u8::is_ascii_hexdigit) {
+        return Err(());
+    }
+    *pos += 2;
+    u8::from_str_radix(std::str::from_utf8(digits).map_err(|_| ())?, 16).map_err(|_| ())
 }
 
 fn skip_fallback(bytes: &[u8], pos: &mut usize, count: usize) -> Result<(), ()> {
@@ -77,43 +145,14 @@ fn skip_fallback(bytes: &[u8], pos: &mut usize, count: usize) -> Result<(), ()> 
                 return Err(());
             }
             if bytes[*pos] == b'\'' {
-                if *pos + 2 >= bytes.len()
-                    || !bytes[*pos + 1].is_ascii_hexdigit()
-                    || !bytes[*pos + 2].is_ascii_hexdigit()
-                {
-                    return Err(());
-                }
-                *pos += 3;
+                *pos += 1;
+                read_hex(bytes, pos)?;
             } else if bytes[*pos].is_ascii_alphabetic() {
-                let start = *pos;
-                while bytes.get(*pos).is_some_and(u8::is_ascii_alphabetic) {
-                    *pos += 1;
-                }
-                let word = &bytes[start..*pos];
-                let num_start = *pos;
-                if bytes.get(*pos) == Some(&b'-') {
-                    *pos += 1;
-                }
-                while bytes.get(*pos).is_some_and(u8::is_ascii_digit) {
-                    *pos += 1;
-                }
+                let (word, num) = read_word(bytes, pos)?;
                 if word == b"bin" {
-                    let n = std::str::from_utf8(&bytes[num_start..*pos])
-                        .map_err(|_| ())?
-                        .parse::<usize>()
-                        .map_err(|_| ())?;
-                    if bytes.get(*pos) == Some(&b' ') {
-                        *pos += 1;
-                    }
-                    *pos = pos
-                        .checked_add(n)
-                        .filter(|&end| end <= bytes.len())
-                        .ok_or(())?;
+                    skip_bin(bytes, pos, num)?;
                     skipped += 1;
                     continue;
-                }
-                if bytes.get(*pos) == Some(&b' ') {
-                    *pos += 1;
                 }
             } else {
                 *pos += 1;
@@ -127,7 +166,12 @@ fn skip_fallback(bytes: &[u8], pos: &mut usize, count: usize) -> Result<(), ()> 
 }
 
 fn parse(bytes: &[u8]) -> Result<String, ()> {
-    if !bytes.starts_with(b"{\\rtf") {
+    if !bytes.starts_with(b"{\\") {
+        return Err(());
+    }
+    let mut header_pos = 2;
+    let (header, version) = read_word(bytes, &mut header_pos)?;
+    if header != b"rtf" || version.is_none_or(|v| v <= 0) {
         return Err(());
     }
     let mut pos = 0;
@@ -138,8 +182,9 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
         uc: 1,
         codepage: 1252,
         font: 0,
+        default_font: 0,
     };
-    let mut fonts = HashMap::new();
+    let mut fonts: HashMap<i32, FontInfo> = HashMap::new();
     let mut out = Vec::new();
     let mut group_start = false;
     let mut closed = false;
@@ -170,38 +215,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                 pos += 1;
                 let &next = bytes.get(pos).ok_or(())?;
                 if next.is_ascii_alphabetic() {
-                    let start = pos;
-                    while bytes.get(pos).is_some_and(u8::is_ascii_alphabetic) {
-                        pos += 1;
-                    }
-                    let word = &bytes[start..pos];
-                    let mut sign = 1i32;
-                    if bytes.get(pos) == Some(&b'-') {
-                        sign = -1;
-                        pos += 1;
-                    }
-                    let num_start = pos;
-                    while bytes.get(pos).is_some_and(u8::is_ascii_digit) {
-                        pos += 1;
-                    }
-                    let num = if pos > num_start {
-                        Some(
-                            std::str::from_utf8(&bytes[num_start..pos])
-                                .map_err(|_| ())?
-                                .parse::<i32>()
-                                .map_err(|_| ())?
-                                .checked_mul(sign)
-                                .ok_or(())?,
-                        )
-                    } else {
-                        if sign == -1 {
-                            return Err(());
-                        }
-                        None
-                    };
-                    if bytes.get(pos) == Some(&b' ') {
-                        pos += 1;
-                    }
+                    let (word, num) = read_word(bytes, &mut pos)?;
                     if group_start && hidden_destination(word) {
                         state.hidden = true;
                         if word == b"fonttbl" {
@@ -211,18 +225,19 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                     group_start = false;
                     match word {
                         b"ansicpg" => state.codepage = num.ok_or(())?,
-                        b"deff" => state.font = num.ok_or(())?,
+                        b"deff" => {
+                            state.default_font = num.ok_or(())?;
+                            state.font = state.default_font;
+                        }
                         b"f" => state.font = num.ok_or(())?,
                         b"fcharset" if state.font_table => {
-                            fonts.insert(state.font, num.ok_or(())?);
+                            fonts.entry(state.font).or_default().charset = Some(num.ok_or(())?);
                         }
-                        b"bin" => {
-                            let n = usize::try_from(num.ok_or(())?).map_err(|_| ())?;
-                            pos = pos
-                                .checked_add(n)
-                                .filter(|&end| end <= bytes.len())
-                                .ok_or(())?;
+                        b"cpg" if state.font_table => {
+                            fonts.entry(state.font).or_default().codepage = Some(num.ok_or(())?);
                         }
+                        b"plain" => state.font = state.default_font,
+                        b"bin" => skip_bin(bytes, &mut pos, num)?,
                         b"uc" => state.uc = usize::try_from(num.ok_or(())?).map_err(|_| ())?,
                         b"u" => {
                             let value = num.ok_or(())?;
@@ -261,50 +276,54 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                 } else {
                     pos += 1;
                     match next {
-                        b'*' if group_start => state.hidden = true,
-                        b'\'' => {
-                            let digits = bytes.get(pos..pos + 2).ok_or(())?;
-                            let hex = std::str::from_utf8(digits).map_err(|_| ())?;
-                            let value = u8::from_str_radix(hex, 16).map_err(|_| ())?;
-                            pos += 2;
-                            if !state.hidden {
-                                let page = fonts
-                                    .get(&state.font)
-                                    .copied()
-                                    .map(|charset| charset_page(charset, state.codepage))
-                                    .unwrap_or(Some(state.codepage))
-                                    .ok_or(())?;
-                                push(
-                                    &mut out,
-                                    crate::rtf_codepage::decode(page, value).ok_or(())?,
-                                );
-                                final_par = false;
+                        b'*' => {
+                            if group_start {
+                                state.hidden = true;
                             }
                         }
-                        b'\r' | b'\n' if !state.hidden => {
-                            if next == b'\r' && bytes.get(pos) == Some(&b'\n') {
-                                pos += 1;
+                        b'\'' => {
+                            let value = read_hex(bytes, &mut pos)?;
+                            if !state.hidden {
+                                let font = fonts.get(&state.font).copied().unwrap_or_default();
+                                let page = font
+                                    .codepage
+                                    .or_else(|| {
+                                        font.charset
+                                            .map(|charset| charset_page(charset, state.codepage))
+                                            .unwrap_or(Some(state.codepage))
+                                    })
+                                    .ok_or(())?;
+                                let character = if page == 42 {
+                                    char::from_u32(0xf000 + u32::from(value)).ok_or(())?
+                                } else {
+                                    crate::rtf_codepage::decode(page, value).ok_or(())?
+                                };
+                                push(&mut out, character);
+                                final_par = false;
                             }
-                            out.extend([b'\r' as u16, b'\n' as u16]);
-                            final_par = true;
                         }
                         b'\r' | b'\n' => {
                             if next == b'\r' && bytes.get(pos) == Some(&b'\n') {
                                 pos += 1;
                             }
+                            if !state.hidden {
+                                out.extend([b'\r' as u16, b'\n' as u16]);
+                                final_par = true;
+                            }
                         }
-                        b'\\' | b'{' | b'}' | b'~' | b'_' | b'-' if !state.hidden => {
+                        b'\\' | b'{' | b'}' | b'~' | b'_' | b'-' | b' ' => {
                             let c = match next {
                                 b'~' => '\u{a0}',
                                 b'_' => '\u{2011}',
                                 b'-' => '\u{ad}',
                                 _ => next as char,
                             };
-                            push(&mut out, c);
-                            final_par = false;
+                            if !state.hidden {
+                                push(&mut out, c);
+                                final_par = false;
+                            }
                         }
-                        b'*' | b'\\' | b'{' | b'}' | b'~' | b'_' | b'-' => {}
-                        _ => return Err(()),
+                        _ => {} // Other RTF control symbols carry no note text.
                     }
                     group_start = false;
                 }
@@ -410,8 +429,47 @@ mod tests {
             "При"
         );
         assert_eq!(
-            plain_text(br"{\rtf1{\fonttbl{\f0\fcharset2 Symbol;}}\f0\'cf}", 1),
-            Err("invalid notes for UID 1".into())
+            plain_text(
+                br"{\rtf1\ansi\ansicpg1251{\fonttbl{\f0\fcharset0 Calibri;}}\f0 caf\'e9}",
+                1
+            )
+            .unwrap(),
+            "café"
+        );
+        assert_eq!(
+            plain_text(
+                br"{\rtf1{\fonttbl{\f0\fcharset0\cpg1251 Arial;}}\f0\'cf}",
+                1
+            )
+            .unwrap(),
+            "П"
+        );
+        assert_eq!(plain_text(br"{\rtf1\deff0{\fonttbl{\f0\fcharset204 Arial;}{\f1\fcharset0 Calibri;}}\f1\'e9\plain\'cf}", 1).unwrap(), "éП");
+        assert_eq!(
+            plain_text(br"{\rtf1{\fonttbl{\f0\fcharset2 Symbol;}}\f0\'cf}", 1).unwrap(),
+            "\u{f0cf}"
+        );
+        assert_eq!(
+            plain_text(br"{\rtf1\ansicpg1255\'ca}", 1).unwrap(),
+            "\u{05ba}"
+        );
+        assert_eq!(
+            plain_text(br"{\rtf1\ansicpg1252\'81}", 1).unwrap(),
+            "\u{0081}"
+        );
+    }
+
+    #[test]
+    fn rich_edit_bullets_are_not_note_text() {
+        let note = br"{\rtf1{\fonttbl{\f1\fnil\fcharset2 Symbol;}}\pard{\pntext\f1\'b7\tab}{\*\pn\pnlvlblt\pnf1{\pntxtb\'b7}}\fi-360\li720 item 1\par item 2\par}";
+        assert_eq!(plain_text(note, 1).unwrap(), "item 1\r\nitem 2");
+    }
+
+    #[test]
+    fn unknown_symbols_and_hidden_index_entries_do_not_refuse() {
+        assert_eq!(
+            plain_text(br"{\rtf1{\xe term\:sub}Body\|}", 1).unwrap(),
+            "Body"
         );
     }
 
@@ -435,6 +493,9 @@ mod tests {
             br"plain".as_slice(),
             br"{\rtf1 missing".as_slice(),
             br"{\rtf1\'zz}".as_slice(),
+            br"{\rtf1 A\'+9B}".as_slice(),
+            br"{\rtfgarbage x}".as_slice(),
+            br"{\rtf}".as_slice(),
             br"{\rtf1\ansicpg932\'82}".as_slice(),
             br"{\rtf1 ok}garbage".as_slice(),
         ] {
