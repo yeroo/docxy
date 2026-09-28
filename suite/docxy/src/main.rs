@@ -28827,6 +28827,18 @@ mod ribbon_fit_tests {
         assert_eq!(shown, ["Font", "Paragraph", "Styles", "Editing"]);
     }
 
+    /// Project's Report tab has no groups yet (#370); its body lays out empty,
+    /// with no overflow indicator.
+    #[test]
+    fn an_empty_tab_fits_with_nothing_shown() {
+        let ribbon = super::project_ribbon();
+        let report = ribbon.tabs.iter().find(|t| t.name == "Report").unwrap();
+        assert!(report.groups.is_empty());
+        for width in [0., 400., 1600.] {
+            assert_eq!(ribbon_fit(&report.groups, width), (false, Vec::new()));
+        }
+    }
+
     #[test]
     fn a_wide_window_shows_every_home_group() {
         let (_, shown) = home_titles(1600.);
