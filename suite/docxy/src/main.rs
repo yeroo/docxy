@@ -920,8 +920,12 @@ impl SheetView {
         let Some(buf) = self.editing.take() else {
             return false;
         };
-        self.push_undo();
         let (r, c) = self.sel;
+        // An untouched editor must not reparse a stored value such as text "007".
+        if buf == self.edit_string(r, c) {
+            return false;
+        }
+        self.push_undo();
         let style = self.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
         let cell = parse_cell_input(&buf, style);
         self.engine
@@ -935,7 +939,8 @@ impl SheetView {
             .min(self.pkg.workbook.sheets.len().saturating_sub(1))]
     }
     /// The text to seed the editor with when re-editing a cell: `=formula` for a
-    /// formula, the raw literal otherwise (unformatted, so it round-trips).
+    /// formula, the raw literal otherwise. `commit_edit` preserves the stored
+    /// cell when this seed is left untouched, even if reparsing would change it.
     fn edit_string(&self, row: u32, col: u32) -> String {
         use gridcore::sheet::CellValue;
         let sh = self.sheet();

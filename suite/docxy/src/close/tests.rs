@@ -401,6 +401,74 @@ fn a1_is_text_007(t: &DocTab) {
 }
 
 #[test]
+fn untouched_commit_keeps_every_cell_kind() {
+    use gridcore::sheet::{Cell, CellValue};
+
+    let cells = [
+        Cell::text("007"),
+        Cell::text("TRUE"),
+        Cell::text(" 5 "),
+        Cell::text("=x"),
+        Cell {
+            value: CellValue::Error("#DIV/0!".into()),
+            ..Cell::default()
+        },
+        Cell::formula("1+1"),
+        Cell::number(7.0),
+        Cell {
+            value: CellValue::Bool(true),
+            ..Cell::default()
+        },
+        Cell::default(),
+    ];
+    for cell in cells {
+        let mut t = tab(Kind::Xlsx);
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (0, 0);
+        v.engine
+            .set_cell(&mut v.pkg.workbook, (v.active, 0, 0), cell.clone());
+        let before = v.sheet().cell(0, 0).cloned();
+        v.editing = Some(v.edit_string(0, 0));
+        v.redo.push(v.snapshot());
+
+        assert!(!v.commit_edit(), "{cell:?}");
+        assert!(v.editing.is_none(), "{cell:?}");
+        assert!(v.undo.is_empty(), "{cell:?}");
+        assert_eq!(v.redo.len(), 1, "{cell:?}");
+        assert_eq!(v.sheet().cell(0, 0), before.as_ref(), "{cell:?}");
+    }
+}
+
+#[test]
+fn changed_commit_still_parses_and_records_undo() {
+    use gridcore::sheet::{Cell, CellValue};
+
+    for (buffer, expected) in [
+        ("0070", CellValue::Number(70.0)),
+        ("007 ", CellValue::Number(7.0)),
+    ] {
+        let mut t = untouched_text_cell();
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.redo.push(v.snapshot());
+        v.editing = Some(buffer.into());
+
+        assert!(v.commit_edit(), "{buffer:?}");
+        assert!(v.editing.is_none());
+        assert_eq!(v.undo.len(), 1);
+        assert!(v.redo.is_empty());
+        assert_eq!(v.sheet().cell(0, 0).map(|c| &c.value), Some(&expected));
+        assert_eq!(
+            v.undo[0].wb.sheets[v.active].cell(0, 0),
+            Some(&Cell::text("007"))
+        );
+    }
+}
+
+#[test]
 fn window_close_leaves_an_untouched_cell_editor_open_and_the_cell_intact() {
     let mut tabs = vec![
         untouched_text_cell(),

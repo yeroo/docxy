@@ -1,0 +1,13 @@
+# An untouched F2 editor must close without changing the workbook or dirty flag.
+test f2 enter on an untouched cell changes nothing
+  open copy:../fixtures/basic.xlsx
+  click A1
+  assert dirty is false
+  snapshot A1
+  key f2
+  assert editing is true
+  key enter
+  assert editing is false
+  assert dirty is false
+  assert sel is A2
+  assert cells unchanged
