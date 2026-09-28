@@ -1340,20 +1340,26 @@ fn resolve_ribbon_command(
     resolve_commands(&commands, tab_name, query)
 }
 
-/// Resolve by id first, then by label only when it is unique.
+/// Resolve by id first, then by label, then by screentip title, each tier
+/// tried only when the one before matched nothing and used only when unique.
+/// The screentip tier lets instructions that name an icon-only command by its
+/// screentip ("Indent Task") find it, as they would in Microsoft Project.
 fn resolve_commands(
     commands: &[RibbonCommand],
     tab_name: &str,
     query: &str,
 ) -> Result<crate::Act, String> {
-    let matches: Vec<_> = {
-        let ids: Vec<_> = commands.iter().filter(|c| c.id == query).collect();
-        if ids.is_empty() {
-            commands.iter().filter(|c| c.label == query).collect()
-        } else {
-            ids
-        }
-    };
+    let tiers: [fn(&RibbonCommand) -> &str; 3] = [|c| &c.id, |c| &c.label, |c| &c.tip_title];
+    let matches: Vec<_> = tiers
+        .iter()
+        .map(|field| {
+            commands
+                .iter()
+                .filter(|c| field(c) == query)
+                .collect::<Vec<_>>()
+        })
+        .find(|m| !m.is_empty())
+        .unwrap_or_default();
     match matches.as_slice() {
         [only] => Ok(only.act),
         [] => Err(format!("command '{query}' is not on tab '{tab_name}'")),
@@ -2533,6 +2539,74 @@ mod tests {
             &editor.caret_para_props(),
             crate::Act::Normal
         ));
+    }
+
+    #[test]
+    fn ribbon_resolver_falls_back_to_the_screentip_after_id_and_label() {
+        use crate::{Act, ProjectAct};
+        let task = crate::project_ribbon()
+            .tabs
+            .into_iter()
+            .find(|t| t.name == "Task")
+            .unwrap();
+        let commands = tab_commands(&task);
+        for query in ["pr-indent", "Indent", "Indent Task"] {
+            assert!(
+                matches!(
+                    resolve_commands(&commands, "Task", query),
+                    Ok(Act::Project(ProjectAct::Indent))
+                ),
+                "{query}"
+            );
+        }
+        assert!(matches!(
+            resolve_commands(&commands, "Task", "Link the Selected Tasks"),
+            Ok(Act::Project(ProjectAct::AddLink))
+        ));
+        // A label beats another command's screentip, and screentip matches
+        // are refused when ambiguous, as labels are.
+        let cmd = |id: &str, label: &str, tip: &str, act| RibbonCommand {
+            id: id.into(),
+            label: label.into(),
+            tip_title: tip.into(),
+            tip_body: String::new(),
+            key_tip: String::new(),
+            act,
+            gallery: false,
+        };
+        let commands = vec![
+            cmd("one", "Move", "Move Task", Act::Bold),
+            cmd("two", "Other", "Move", Act::Italic),
+            cmd("three", "Third", "Shared", Act::Underline),
+            cmd("four", "Fourth", "Shared", Act::Bold),
+        ];
+        assert!(matches!(
+            resolve_commands(&commands, "Task", "Move"),
+            Ok(Act::Bold)
+        ));
+        assert!(matches!(
+            resolve_commands(&commands, "Task", "Move Task"),
+            Ok(Act::Bold)
+        ));
+        let err = resolve_commands(&commands, "Task", "Shared").unwrap_err();
+        assert!(err.contains("three, four"), "{err}");
+    }
+
+    #[test]
+    fn project_report_tab_is_listed_with_no_groups() {
+        let json = ribbon_json_for(crate::Kind::Project, false, false, |_| false);
+        let report = json
+            .get("tabs")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get_str("name") == Some("Report"))
+            .unwrap();
+        assert_eq!(report.get_str("kind"), Some("ribbon"));
+        assert_eq!(report.get_str("key_tip"), Some("R"));
+        assert_eq!(report.get("groups"), Some(&Json::Arr(Vec::new())));
+        assert!(ribbon_tab_by_name(crate::Kind::Project, "Report").is_ok());
     }
 
     #[test]
