@@ -9,6 +9,10 @@ of git, and the fetch scripts below.
 
 ## The generated corpus (preferred)
 
+`python corpus/tools/gen_mpp_constraint_cases.py` generates two optional
+`constraints/` MPP/XML pairs covering all eight task constraint codes, manual
+tasks, summaries, and a project start distinct from task dates.
+
 The primary `.mpp` corpus is **generated**, not hand-collected: a headless
 Runner (`mpp-corpus-gen`, a separate private repo; the documents land in the
 `mpp-corpus` repo) drives a real, licensed copy of

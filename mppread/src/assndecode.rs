@@ -129,7 +129,9 @@ pub(crate) fn decode(
             let work_min = if resource.is_some_and(|r| r.kind == ResourceType::Cost) {
                 None
             } else {
-                w.filter(|&v| v != 0.0)
+                // Project writes -0.000001 for an assignment baseline with
+                // no work. It rounds to zero minutes in the XML export.
+                w.filter(|&v| v != 0.0 && v != -0.000001)
                     .map(|v| work(v, uid, "baseline work"))
                     .transpose()?
             };

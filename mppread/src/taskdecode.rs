@@ -5,7 +5,7 @@ use crate::{
     mpp::{MppPred, MppProgress, MppTask, MppTaskFields, decode_timestamp},
 };
 use projcore::mspdi::lag_from_link_lag;
-use projcore::{LagFormat, Rate};
+use projcore::{ConstraintType, LagFormat, Rate};
 use std::collections::{HashMap, HashSet};
 
 fn u32_at(b: &[u8], o: usize) -> u32 {
@@ -32,6 +32,8 @@ const NEWEST: TaskLayout = TaskLayout {
     finish: 0x6c,
     level: 172,
 };
+const CONSTRAINT_TYPE: usize = 64;
+const CONSTRAINT_DATE: usize = 66;
 /// Manual scheduling in the newest layout, found by saving one plan with one
 /// task auto and then manual (corpus/tools/gen_mpp_manual_cases.py). The mode
 /// is a Fixed2Meta flag; the manual start, finish and duration sit in the
@@ -292,6 +294,16 @@ fn current_fields(
 ) -> Result<MppTaskFields, String> {
     let task_type = projcore::TaskType::from_code(i64::from(u16_at(rec, 140)))
         .ok_or_else(|| format!("invalid task type for UID {uid}"))?;
+    let code = u16_at(rec, CONSTRAINT_TYPE);
+    let constraint_type = ConstraintType::from_code(i64::from(code))
+        .ok_or_else(|| format!("invalid constraint type {code} for UID {uid}"))?;
+    let constraint_date = match constraint_type {
+        ConstraintType::AsSoonAsPossible | ConstraintType::AsLateAsPossible => None,
+        _ => Some(
+            decode_timestamp(rec, CONSTRAINT_DATE)
+                .ok_or_else(|| format!("missing constraint date for UID {uid}"))?,
+        ),
+    };
     let priority = i32::from(u16_at(rec, 78));
     if priority > 1000 {
         return Err(format!("invalid priority {priority} for UID {uid}"));
@@ -307,6 +319,8 @@ fn current_fields(
         create_date: decode_timestamp(rec, 128),
         wbs,
         task_type: Some(task_type),
+        constraint_type: Some(constraint_type),
+        constraint_date,
         active: Some(fixed2.meta[8] & 0x40 != 0),
         effort_driven: Some(meta[13] & 0x08 != 0),
         estimated: Some(u16_at(rec, 164) & 32 != 0),
@@ -507,6 +521,7 @@ pub(crate) fn cost_rate(value: f64) -> Option<Rate> {
 pub(crate) struct Table {
     pub tasks: Vec<MppTask>,
     pub new_tasks_are_manual: Result<bool, String>,
+    pub project_start: Result<Option<String>, String>,
     pub legacy: bool,
 }
 
@@ -530,6 +545,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
         return Ok(Table {
             tasks: Vec::new(),
             new_tasks_are_manual: Ok(false),
+            project_start: Ok(None),
             legacy: false,
         });
     }
@@ -581,11 +597,17 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
                 }
             }
             let new_tasks_are_manual = props_data
+                .as_ref()
                 .ok_or_else(|| "missing project Props stream".to_string())
-                .and_then(|props| crate::props::new_tasks_are_manual(&props));
+                .and_then(|props| crate::props::new_tasks_are_manual(props));
+            let project_start = props_data
+                .as_ref()
+                .ok_or_else(|| "missing project Props stream".to_string())
+                .and_then(|props| crate::props::project_start(props));
             Ok(Table {
                 tasks,
                 new_tasks_are_manual,
+                project_start,
                 legacy: false,
             })
         }
@@ -594,6 +616,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             Ok(Table {
                 tasks: decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)?,
                 new_tasks_are_manual: Ok(false),
+                project_start: Ok(None),
                 legacy: true,
             })
         }
@@ -1583,13 +1606,13 @@ mod tests {
         assert!(new_tasks_are_manual(&file(&s, true)).is_err());
     }
     #[test]
-    fn manual_leaf_imports_pinned_by_its_dates_and_auto_leaf_by_a_constraint() {
+    fn manual_leaf_imports_pinned_by_its_dates_and_auto_leaf_without_a_constraint() {
         use projcore::ConstraintType;
         let mut s = fixture();
         let auto = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         let task = &auto.tasks[0];
         assert!(!task.manual);
-        assert_eq!(task.constraint, ConstraintType::MustStartOn);
+        assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(task.pinned_dates(), None);
         make_manual(&mut s);
         let manual = crate::project::project_from_mpp(&file(&s, true)).unwrap();
@@ -1602,6 +1625,119 @@ mod tests {
         let (start, finish) = task.pinned_dates().unwrap();
         assert_eq!(start.to_mspdi(), "2026-03-02T08:00:00");
         assert_eq!(finish.unwrap().to_mspdi(), "2026-03-03T17:00:00");
+    }
+
+    #[test]
+    fn current_constraint_codes_decode_import_and_round_trip() {
+        for code in 0u16..=7 {
+            let mut s = fixture();
+            let row = 48 + 202;
+            s.fd[row + CONSTRAINT_TYPE..row + CONSTRAINT_TYPE + 2]
+                .copy_from_slice(&code.to_le_bytes());
+            s.fd[row + CONSTRAINT_DATE..row + CONSTRAINT_DATE + 4]
+                .copy_from_slice(&[0xa8, 0x2f, 0x8d, 0x3a]); // distinct from stored Start
+            let bytes = file(&s, true);
+            let decoded = decode(&bytes).unwrap();
+            let field = decoded[1].fields.as_ref().unwrap();
+            let expected = ConstraintType::from_code(i64::from(code)).unwrap();
+            assert_eq!(field.constraint_type, Some(expected), "code {code}");
+            let imported = crate::project::project_from_mpp(&bytes).unwrap();
+            let task = &imported.tasks[0];
+            assert_eq!(task.constraint, expected, "code {code}");
+            assert_eq!(
+                task.constraint_date,
+                if code <= 1 {
+                    None
+                } else {
+                    Some(crate::project::parse_mpp_dt("2025-01-13 20:20").unwrap())
+                },
+                "code {code}"
+            );
+            let xml = projcore::mspdi::write_mspdi(&imported);
+            let round = projcore::mspdi::read_mspdi(&xml).unwrap();
+            assert_eq!(round.tasks[0].constraint, task.constraint, "code {code}");
+            assert_eq!(
+                round.tasks[0].constraint_date, task.constraint_date,
+                "code {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn constraint_decode_refuses_unknown_type_and_missing_dated_value() {
+        let row = 48 + 202;
+        let mut s = fixture();
+        s.fd[row + CONSTRAINT_TYPE..row + CONSTRAINT_TYPE + 2].copy_from_slice(&8u16.to_le_bytes());
+        let error = decode(&file(&s, true)).unwrap_err();
+        assert!(
+            error.contains("constraint type 8") && error.contains("UID 1"),
+            "{error}"
+        );
+        s.fd[row + CONSTRAINT_TYPE..row + CONSTRAINT_TYPE + 2].copy_from_slice(&4u16.to_le_bytes());
+        s.fd[row + CONSTRAINT_DATE..row + CONSTRAINT_DATE + 4].fill(0xff);
+        let error = decode(&file(&s, true)).unwrap_err();
+        assert!(
+            error.contains("constraint date") && error.contains("UID 1"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn current_summary_and_manual_child_keep_their_own_constraints() {
+        let mut s = outline_fixture();
+        let summary = 48 + 202;
+        let child = summary + 202;
+        for (row, code) in [(summary, 4u16), (child, 7u16)] {
+            s.fd[row + CONSTRAINT_TYPE..row + CONSTRAINT_TYPE + 2]
+                .copy_from_slice(&code.to_le_bytes());
+            s.fd[row + CONSTRAINT_DATE..row + CONSTRAINT_DATE + 4]
+                .copy_from_slice(&[0xc0, 0x12, 0x8d, 0x3a]);
+        }
+        s.f2m[16 + 5 * 96 + MANUAL_FLAG.0] |= MANUAL_FLAG.1;
+        let fixed = 5 * 64;
+        s.f2d[fixed + MANUAL_START..fixed + MANUAL_START + 4]
+            .copy_from_slice(&[0xc0, 0x12, 0x2a, 0x3c]);
+        s.f2d[fixed + MANUAL_FINISH..fixed + MANUAL_FINISH + 4]
+            .copy_from_slice(&[0xd8, 0x27, 0x2b, 0x3c]);
+        s.f2d[fixed + MANUAL_DURATION..fixed + MANUAL_DURATION + 4]
+            .copy_from_slice(&9600u32.to_le_bytes());
+        s.f2d[fixed + MANUAL_DURATION_FORMAT..fixed + MANUAL_DURATION_FORMAT + 2]
+            .copy_from_slice(&7u16.to_le_bytes());
+        let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let summary = imported.tasks.iter().find(|t| t.uid == 1).unwrap();
+        let child = imported.tasks.iter().find(|t| t.uid == 2).unwrap();
+        assert!(summary.summary);
+        assert_eq!(summary.constraint, ConstraintType::StartNoEarlierThan);
+        assert_eq!(
+            summary.constraint_date.unwrap().to_mspdi(),
+            "2025-01-13T08:00:00"
+        );
+        assert!(child.manual);
+        assert_eq!(child.constraint, ConstraintType::FinishNoLaterThan);
+        assert_eq!(child.constraint_date, summary.constraint_date);
+        assert_ne!(child.constraint_date, child.stored_start);
+    }
+
+    #[test]
+    fn project_start_comes_from_props_not_the_earliest_task() {
+        let mut s = fixture();
+        s.props = crate::props::stream(&[
+            (crate::props::NEW_TASKS_ARE_MANUAL, &[0, 0]),
+            (0x0240_0002, &[0xc0, 0x12, 0x8d, 0x3a]),
+        ]);
+        let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(
+            project.start_date.unwrap().to_mspdi(),
+            "2025-01-13T08:00:00"
+        );
+        assert!(project.tasks[0].stored_start.unwrap() < project.start_date.unwrap());
+        s.props = crate::props::stream(&[
+            (crate::props::NEW_TASKS_ARE_MANUAL, &[0, 0]),
+            (0x0240_0002, &[0]),
+        ]);
+        let error = crate::project::project_from_mpp(&file(&s, true)).unwrap_err();
+        assert!(error.contains("project StartDate in Props"), "{error}");
+        assert!(decode(&file(&s, true)).is_ok());
     }
     #[test]
     fn percent_elapsed_and_estimated_lags_decode_in_their_kind() {
@@ -1856,8 +1992,8 @@ mod tests {
         );
         assert_eq!((t.start_variance, t.finish_variance), (None, None));
         assert_eq!(t.work_variance, None);
-        // Progress is kept, not scheduled from: the leaf stays pinned.
-        assert_eq!(t.constraint, projcore::ConstraintType::MustStartOn);
+        // Progress is kept as read, while the task's ASAP constraint remains ASAP.
+        assert_eq!(t.constraint, projcore::ConstraintType::AsSoonAsPossible);
     }
     #[test]
     fn refuses_progress_outside_its_range() {

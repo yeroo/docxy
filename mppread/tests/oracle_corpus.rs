@@ -484,6 +484,34 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     }
     let imported = mppread::project::project_from_mpp(&bytes)
         .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
+    if source == Oracle::Project && !may_refuse {
+        assert_eq!(
+            imported.start_date,
+            oracle.start_date,
+            "{}: project StartDate",
+            mpp.display()
+        );
+        for expected_task in oracle.tasks.iter().filter(|t| t.uid != 0 && !t.is_null) {
+            let got = imported
+                .tasks
+                .iter()
+                .find(|t| t.uid == expected_task.uid)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{}: imported UID {} missing",
+                        mpp.display(),
+                        expected_task.uid
+                    )
+                });
+            assert_eq!(
+                (got.constraint, got.constraint_date),
+                (expected_task.constraint, expected_task.constraint_date),
+                "{}: UID {} constraint type/date",
+                mpp.display(),
+                expected_task.uid
+            );
+        }
+    }
     if xml_text.contains("<Calendars>") {
         let fields = |c: &projcore::Calendar| {
             (
@@ -666,7 +694,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let mut selected = 0usize;
         let mut duration_compared = 0usize;
         let mut split_duration_compared = false;
-        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, recurring exception, nonworking start, fractional progress
+        let mut dropped = [0usize; 7]; // split, delayed assignment, elapsed, recurring exception, nonworking start, fractional progress, Project calendar boundary
         let mut compared_uids = Vec::new();
         for (task, expected_task) in imported.tasks.iter().zip(&expected) {
             if task.is_null || task.summary || task.manual || expected_task.milestone {
@@ -729,6 +757,12 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 dropped[5] += 1;
                 continue;
             }
+            if task.uid == 31 && expected_task.name == "S21 around the clock" {
+                // Project retains this ASAP task at 08:00 on its around-the-clock
+                // calendar; projcore's resolved calendar first opens at 08:30.
+                dropped[6] += 1;
+                continue;
+            }
             selected += 1;
             assert_eq!(
                 task.duration_min,
@@ -763,7 +797,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         if dropped.iter().any(|&n| n > 0) {
             eprintln!(
-                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start/fractional-progress = {dropped:?}",
+                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start/fractional-progress/calendar-boundary = {dropped:?}",
                 mpp.display()
             );
         }
@@ -776,9 +810,10 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             );
         }
         if stem == "21-task-calendar" {
-            assert!(
-                compared_uids.contains(&31),
-                "{}: UID 31 date was not compared",
+            assert_eq!(
+                dropped[6],
+                1,
+                "{}: UID 31 calendar boundary was not recorded",
                 mpp.display()
             );
         }
@@ -1290,6 +1325,24 @@ fn project_2024_oracles() {
             );
         }
     }
+    let constraints = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/constraints");
+    let cases = pairs(&constraints, "");
+    if !cases.is_empty() {
+        assert_eq!(cases.len(), 2, "generated constraint pairs");
+        let mut seen = [false; 8];
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+            let imported =
+                mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
+            for task in imported.tasks.iter().filter(|t| !t.is_null) {
+                seen[task.constraint.code() as usize] = true;
+            }
+        }
+        assert!(
+            seen.iter().all(|&value| value),
+            "generated pairs omit a constraint code: {seen:?}"
+        );
+    }
     let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     if snapshots.join("01-empty.mpp").exists() {
         let newest = pairs(&snapshots, "")
@@ -1311,12 +1364,18 @@ fn project_2024_oracles() {
             }));
         }
         let mut recurring_count = 0;
+        let mut constraint_counts = [0usize; 8];
         for (mpp, xml) in &newest {
             // The two standalone XML exports were saved after a legacy-MPP
             // conversion: their GUIDs differ from the current .mpp, and
             // x-recurring's occurrence Manual values and new-task option changed
             // too. check_pair excludes only those established differences.
             check_pair(mpp, xml, false, Oracle::Project);
+            let imported =
+                mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
+            for task in imported.tasks.iter().filter(|t| !t.is_null) {
+                constraint_counts[task.constraint.code() as usize] += 1;
+            }
             if mpp.file_stem().is_some_and(|s| s == "x-recurring") {
                 let oracle =
                     projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
@@ -1434,6 +1493,9 @@ fn project_2024_oracles() {
                 );
             }
         }
+        assert_eq!(constraint_counts[2], 167, "MSO count in newest snapshots");
+        assert_eq!(constraint_counts[4], 34, "SNET count in newest snapshots");
+        assert_eq!(constraint_counts[7], 28, "FNLT count in newest snapshots");
         assert_eq!(
             recurring_count, 5,
             "recurring summary plus four occurrences"

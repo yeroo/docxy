@@ -45,6 +45,29 @@ pub(crate) fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
 
 /// `NewTasksAreManual`: a 2-byte value, `0`, `1`, or `0x00ff`.
 pub(crate) const NEW_TASKS_ARE_MANUAL: u32 = 0x0240_13c8;
+const PROJECT_START: u32 = 0x0240_0002;
+
+/// Project StartDate in the same four-byte format as task timestamps.
+pub(crate) fn project_start(b: &[u8]) -> Result<Option<String>, String> {
+    let entries = entries(b)?;
+    let Some(raw) = entries.get(&PROJECT_START) else {
+        return Ok(None);
+    };
+    if raw.len() != 4 {
+        return Err("invalid project StartDate in Props".into());
+    }
+    let time = u16::from_le_bytes([raw[0], raw[1]]);
+    let days = u16::from_le_bytes([raw[2], raw[3]]);
+    if days == 0xffff {
+        return Ok(None);
+    }
+    if time != 0xffff && time >= 14400 {
+        return Err("invalid project StartDate in Props".into());
+    }
+    crate::mpp::decode_timestamp(raw, 0)
+        .ok_or_else(|| "invalid project StartDate in Props".into())
+        .map(Some)
+}
 /// WBS code mask. Project writes four zero bytes for its ordinary numeric
 /// outline mask in the paired corpus; absent also means no custom mask.
 const WBS_CODE_MASK: u32 = 0x0240_138b;
@@ -120,6 +143,25 @@ pub(crate) fn stream(values: &[(u32, &[u8])]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_start_distinguishes_missing_na_valid_and_invalid_values() {
+        assert_eq!(project_start(&stream(&[])), Ok(None));
+        assert_eq!(
+            project_start(&stream(&[(PROJECT_START, &[0xff; 4])])),
+            Ok(None)
+        );
+        assert_eq!(
+            project_start(&stream(&[(PROJECT_START, &[0xc0, 0x12, 0x86, 0x3a])])),
+            Ok(Some("2025-01-06 08:00".into()))
+        );
+        for value in [&[0u8; 3][..], &[0x41, 0x38, 0x86, 0x3a][..]] {
+            assert_eq!(
+                project_start(&stream(&[(PROJECT_START, value)])),
+                Err("invalid project StartDate in Props".into())
+            );
+        }
+    }
 
     #[test]
     fn reads_the_new_task_default_and_refuses_what_it_does_not_know() {

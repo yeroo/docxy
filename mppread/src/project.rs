@@ -5,10 +5,12 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
-/// a task. Each decoded automatic task without local children, including an
-/// inserted subproject, is pinned with a Must-Start-On constraint at its start
-/// and given Project's stored working duration when available. Other durations
-/// use the working minutes between start and finish on the task's calendar.
+/// a task. Current-layout tasks keep their recorded constraints, including
+/// manual tasks and summaries. Legacy MPP9 automatic leaves, including a
+/// childless inserted subproject, remain pinned with Must-Start-On at their
+/// stored start. Automatic leaves use Project's stored working duration when
+/// available. Other durations use the working minutes between start and finish
+/// on the task's calendar.
 /// Current Project resource identity/type and assignment identity, planned
 /// work and dates are imported, together with saved baseline slots 0..10
 /// (Start, Finish, Work, Cost). Project's MPP/XML has no assignment-baseline
@@ -43,6 +45,12 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let legacy = table.legacy;
     let new_tasks_are_manual = table
         .new_tasks_are_manual
+        .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
+    let project_start = table
+        .project_start
+        .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?
+        .map(|d| parse_mpp_dt(&d).ok_or_else(|| "invalid project StartDate in Props".to_string()))
+        .transpose()
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
     let decoded = table.tasks;
     let name = [
@@ -92,11 +100,13 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         // No resource table, or one whose layout has not been validated.
         (Vec::new(), Vec::new())
     };
-    let start = tasks
-        .iter()
-        .filter_map(|t| t.stored_start)
-        .min()
-        .unwrap_or_else(default_anchor);
+    let start = project_start.unwrap_or_else(|| {
+        tasks
+            .iter()
+            .filter_map(|t| t.stored_start)
+            .min()
+            .unwrap_or_else(default_anchor)
+    });
     let project = Project {
         name,
         title: info.title,
@@ -207,6 +217,10 @@ fn import_tasks(
                 task.create_date = date(&fields.create_date, "create date")?;
                 task.wbs = fields.wbs.clone();
                 task.task_type = fields.task_type;
+                if let Some(constraint) = fields.constraint_type {
+                    task.constraint = constraint;
+                    task.constraint_date = date(&fields.constraint_date, "constraint date")?;
+                }
                 task.active = fields.active;
                 task.effort_driven = fields.effort_driven;
                 task.estimated = fields.estimated;
@@ -261,8 +275,10 @@ fn import_tasks(
                     .filter(|&fmt| crate::mpp::working_duration_format(fmt))
                     .and(t.duration_min)
                     .unwrap_or_else(span);
-                task.constraint = ConstraintType::MustStartOn;
-                task.constraint_date = Some(s);
+                if t.fields.as_ref().and_then(|f| f.constraint_type).is_none() {
+                    task.constraint = ConstraintType::MustStartOn;
+                    task.constraint_date = Some(s);
+                }
             }
             Ok(task)
         })

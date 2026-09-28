@@ -91,6 +91,11 @@ pub struct MppTaskFields {
     /// ordinary numeric outline mask. Custom masks remain unknown.
     pub wbs: Option<String>,
     pub task_type: Option<projcore::TaskType>,
+    /// Current 202-byte task record: constraint type at +64 and date at +66.
+    /// Checked against Project XML for the paired snapshot corpus (types 0/2/4/7).
+    /// Types 1/3/5/6 follow MSPDI's code mapping but lack paired samples.
+    pub constraint_type: Option<projcore::ConstraintType>,
+    pub constraint_date: Option<String>,
     pub active: Option<bool>,
     pub effort_driven: Option<bool>,
     pub estimated: Option<bool>,
