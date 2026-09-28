@@ -29,6 +29,28 @@
       <ActualCost>800</ActualCost>
       <ActualWork>PT16H0M0S</ActualWork>
       <PhysicalPercentComplete>0</PhysicalPercentComplete>
+      <ResumeValid>1</ResumeValid>
+      <OvertimeCost>80.25</OvertimeCost>
+      <OvertimeWork>PT1H0M0S</OvertimeWork>
+      <ActualOvertimeCost>80.25</ActualOvertimeCost>
+      <ActualOvertimeWork>PT1H0M0S</ActualOvertimeWork>
+      <RegularWork>PT15H0M0S</RegularWork>
+      <RemainingOvertimeCost>0</RemainingOvertimeCost>
+      <RemainingOvertimeWork>PT0H0M0S</RemainingOvertimeWork>
+      <ACWP>800.25</ACWP>
+      <CV>-12.5</CV>
+      <BCWS>805.5</BCWS>
+      <BCWP>787.75</BCWP>
+      <ActualWorkProtected>PT16H0M0S</ActualWorkProtected>
+      <ActualOvertimeWorkProtected>PT1H0M0S</ActualOvertimeWorkProtected>
+      <TimephasedData>
+        <Type>2</Type>
+        <UID>1</UID>
+        <Start>2026-03-02T08:00:00</Start>
+        <Finish>2026-03-03T17:00:00</Finish>
+        <Unit>2</Unit>
+        <Value>PT16H0M0S</Value>
+      </TimephasedData>
     </Task>
     <Task>
       <UID>2</UID><ID>2</ID>
@@ -54,11 +76,41 @@
       <RemainingCost>800</RemainingCost>
       <RemainingWork>PT16H0M0S</RemainingWork>
       <PhysicalPercentComplete>40</PhysicalPercentComplete>
+      <ResumeValid>1</ResumeValid>
+      <OvertimeCost>120.50</OvertimeCost>
+      <OvertimeWork>PT1H30M0S</OvertimeWork>
+      <ActualOvertimeCost>40.25</ActualOvertimeCost>
+      <ActualOvertimeWork>PT0H30M0S</ActualOvertimeWork>
+      <RegularWork>PT30H30M0S</RegularWork>
+      <RemainingOvertimeCost>80.25</RemainingOvertimeCost>
+      <RemainingOvertimeWork>PT1H0M0S</RemainingOvertimeWork>
+      <ACWP>801.125</ACWP>
+      <CV>-7.75</CV>
+      <BCWS>1600.25</BCWS>
+      <BCWP>799.75</BCWP>
+      <ActualWorkProtected>PT16H0M0S</ActualWorkProtected>
+      <ActualOvertimeWorkProtected>PT0H30M0S</ActualOvertimeWorkProtected>
       <PredecessorLink>
         <PredecessorUID>1</PredecessorUID>
         <Type>1</Type>
         <LinkLag>0</LinkLag><LagFormat>7</LagFormat>
       </PredecessorLink>
+      <TimephasedData>
+        <Type>2</Type>
+        <UID>2</UID>
+        <Start>2026-03-04T08:00:00</Start>
+        <Finish>2026-03-05T17:00:00</Finish>
+        <Unit>2</Unit>
+        <Value>PT16H0M0S</Value>
+      </TimephasedData>
+      <TimephasedData>
+        <Type>99</Type>
+        <UID>2</UID>
+        <Start>2026-03-06T08:00:00</Start>
+        <Finish>2026-03-06T17:00:00</Finish>
+        <Unit>2</Unit>
+        <Value>3.5</Value>
+      </TimephasedData>
     </Task>
     <Task>
       <UID>3</UID><ID>3</ID>
@@ -77,6 +129,20 @@
       <RemainingCost>400</RemainingCost>
       <RemainingWork>PT8H0M0S</RemainingWork>
       <PhysicalPercentComplete>0</PhysicalPercentComplete>
+      <ResumeValid>0</ResumeValid>
+      <OvertimeCost>0</OvertimeCost>
+      <OvertimeWork>PT0H0M0S</OvertimeWork>
+      <ActualOvertimeCost>0</ActualOvertimeCost>
+      <ActualOvertimeWork>PT0H0M0S</ActualOvertimeWork>
+      <RegularWork>PT8H0M0S</RegularWork>
+      <RemainingOvertimeCost>0</RemainingOvertimeCost>
+      <RemainingOvertimeWork>PT0H0M0S</RemainingOvertimeWork>
+      <ACWP>0</ACWP>
+      <CV>0</CV>
+      <BCWS>0</BCWS>
+      <BCWP>0</BCWP>
+      <ActualWorkProtected>PT0H0M0S</ActualWorkProtected>
+      <ActualOvertimeWorkProtected>PT0H0M0S</ActualOvertimeWorkProtected>
       <PredecessorLink>
         <PredecessorUID>2</PredecessorUID>
         <Type>1</Type>

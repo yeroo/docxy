@@ -50,7 +50,8 @@ def iso(minutes):
 def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
          outline=1, summary=False, milestone=False, preds=(), ctype=None,
          cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
-         manual_finish=None, manual_duration=None, fields=(), ext=()):
+         manual_finish=None, manual_duration=None, fields=(), ext=(),
+         timephased=()):
     """One <Task>. `preds` is a list of (uid, type_code, link_lag) or
     (uid, type_code, link_lag, lag_format): LinkLag is tenths of a minute, or
     the percentage itself for LagFormat 19; the format defaults to 7 (days).
@@ -109,6 +110,10 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
             if value is not None:
                 lines.append(f"        <{tag}>{value}</{tag}>")
         lines.append("      </Baseline>")
+    for record in timephased:
+        lines += ["      <TimephasedData>"]
+        lines += [f"        <{tag}>{value}</{tag}>" for tag, value in record]
+        lines.append("      </TimephasedData>")
     lines.append("    </Task>")
     return "\n".join(lines)
 
@@ -680,7 +685,7 @@ def build():
                  preds=[(1, FS, 0)], fields=[("Deadline", dt(6, "17:00:00"))]),
         ])))
 
-    # 22 — recorded progress survives saves (#81): a complete task, an
+    # 22 — recorded progress survives saves (#81, #182): a complete task, an
     # in-progress task stopped Thu 5 and resuming Fri 6, and a not-started
     # task, each with an assignment carrying its actuals; the in-progress
     # assignment also has two baseline slots. Shapes follow a Project 2024
@@ -732,8 +737,8 @@ def build():
             ("RemainingWork", iso(D))]),
     ])
     add("22-progress.xml", ["progress", "assignment", "round-trip", "link", "link-fs"],
-        "Percent complete, actuals, stop/resume, remaining values, variances and "
-        "assignment baselines survive saves.",
+        "Percent complete, actuals, stop/resume, overtime, earned value, task "
+        "timephased data, remaining values, variances and assignment baselines survive saves.",
         project("progress", "\n".join([
             task(1, "Excavate", 2 * D, dt(2), dt(3, "17:00:00"), slack=0, critical=False,
                  fields=[
@@ -742,7 +747,18 @@ def build():
                 ("PercentComplete", 100), ("PercentWorkComplete", 100),
                 ("ActualStart", dt(2)), ("ActualFinish", dt(3, "17:00:00")),
                 ("ActualDuration", iso(2 * D)), ("ActualCost", "800"),
-                ("ActualWork", iso(2 * D)), ("PhysicalPercentComplete", 0)]),
+                ("ActualWork", iso(2 * D)), ("PhysicalPercentComplete", 0),
+                ("ResumeValid", 1), ("OvertimeCost", "80.25"),
+                ("OvertimeWork", iso(60)), ("ActualOvertimeCost", "80.25"),
+                ("ActualOvertimeWork", iso(60)), ("RegularWork", iso(2 * D - 60)),
+                ("RemainingOvertimeCost", "0"), ("RemainingOvertimeWork", iso(0)),
+                ("ACWP", "800.25"), ("CV", "-12.5"),
+                ("BCWS", "805.5"), ("BCWP", "787.75"),
+                ("ActualWorkProtected", iso(2 * D)),
+                ("ActualOvertimeWorkProtected", iso(60))],
+                 timephased=[[("Type", 2), ("UID", 1), ("Start", dt(2)),
+                              ("Finish", dt(3, "17:00:00")), ("Unit", 2),
+                              ("Value", iso(2 * D))]]),
             task(2, "Pour", 4 * D, dt(4), dt(9, "17:00:00"), **CRIT, preds=[(1, FS, 0)],
                  fields=[
                 ("Stop", dt(5, "17:00:00")), ("Resume", dt(6)),
@@ -752,13 +768,35 @@ def build():
                 ("ActualDuration", iso(2 * D)), ("ActualCost", "800"),
                 ("ActualWork", iso(2 * D)), ("RemainingDuration", iso(2 * D)),
                 ("RemainingCost", "800"), ("RemainingWork", iso(2 * D)),
-                ("PhysicalPercentComplete", 40)]),
+                ("PhysicalPercentComplete", 40),
+                ("ResumeValid", 1), ("OvertimeCost", "120.50"),
+                ("OvertimeWork", iso(90)), ("ActualOvertimeCost", "40.25"),
+                ("ActualOvertimeWork", iso(30)), ("RegularWork", iso(4 * D - 90)),
+                ("RemainingOvertimeCost", "80.25"),
+                ("RemainingOvertimeWork", iso(60)),
+                ("ACWP", "801.125"), ("CV", "-7.75"),
+                ("BCWS", "1600.25"), ("BCWP", "799.75"),
+                ("ActualWorkProtected", iso(2 * D)),
+                ("ActualOvertimeWorkProtected", iso(30))],
+                 timephased=[[("Type", 2), ("UID", 2), ("Start", dt(4)),
+                              ("Finish", dt(5, "17:00:00")), ("Unit", 2),
+                              ("Value", iso(2 * D))],
+                             [("Type", 99), ("UID", 2), ("Start", dt(6)),
+                              ("Finish", dt(6, "17:00:00")), ("Unit", 2),
+                              ("Value", "3.5")]]),
             task(3, "Cure", D, dt(10), dt(10, "17:00:00"), **CRIT, preds=[(2, FS, 0)],
                  fields=[
                 ("StartVariance", 4800), ("FinishVariance", 4800),
                 ("PercentComplete", 0), ("PercentWorkComplete", 0),
                 ("RemainingDuration", iso(D)), ("RemainingCost", "400"),
-                ("RemainingWork", iso(D)), ("PhysicalPercentComplete", 0)]),
+                ("RemainingWork", iso(D)), ("PhysicalPercentComplete", 0),
+                ("ResumeValid", 0), ("OvertimeCost", "0"),
+                ("OvertimeWork", iso(0)), ("ActualOvertimeCost", "0"),
+                ("ActualOvertimeWork", iso(0)), ("RegularWork", iso(D)),
+                ("RemainingOvertimeCost", "0"), ("RemainingOvertimeWork", iso(0)),
+                ("ACWP", "0"), ("CV", "0"), ("BCWS", "0"), ("BCWP", "0"),
+                ("ActualWorkProtected", iso(0)),
+                ("ActualOvertimeWorkProtected", iso(0))]),
         ]), resources_xml=progress_res, assignments_xml=progress_asn))
 
     # 23 — a derived calendar keeps its base through a save (#83): "Crew"

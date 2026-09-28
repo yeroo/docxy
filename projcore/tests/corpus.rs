@@ -660,12 +660,58 @@ fn progress_fixture_keeps_actuals_through_a_save() {
         "<WorkVariance>",
         "<CostVariance>",
         "<Baseline>",
+        "<ResumeValid>",
+        "<OvertimeCost>",
+        "<OvertimeWork>",
+        "<ActualOvertimeCost>",
+        "<ActualOvertimeWork>",
+        "<RegularWork>",
+        "<RemainingOvertimeCost>",
+        "<RemainingOvertimeWork>",
+        "<ACWP>",
+        "<CV>",
+        "<BCWS>",
+        "<BCWP>",
+        "<ActualWorkProtected>",
+        "<ActualOvertimeWorkProtected>",
+        "<TimephasedData>",
     ] {
         assert_eq!(
             saved.matches(element).count(),
             xml.matches(element).count(),
             "{element}"
         );
+    }
+    let back = read_mspdi(&saved).unwrap();
+    assert_eq!(proj.tasks.len(), 3);
+    assert_eq!(proj.task(2).unwrap().timephased_data.len(), 2);
+    for (before, after) in proj.tasks.iter().zip(&back.tasks) {
+        macro_rules! kept {
+            ($field:ident) => {
+                assert_eq!(
+                    after.$field,
+                    before.$field,
+                    "{}: {}",
+                    before.name,
+                    stringify!($field)
+                );
+            };
+        }
+        kept!(resume_valid);
+        kept!(overtime_cost);
+        kept!(overtime_work_min);
+        kept!(actual_overtime_cost);
+        kept!(actual_overtime_work_min);
+        kept!(regular_work_min);
+        kept!(remaining_overtime_cost);
+        kept!(remaining_overtime_work_min);
+        kept!(acwp);
+        kept!(cv);
+        kept!(bcws);
+        kept!(bcwp);
+        kept!(actual_work_protected_min);
+        kept!(actual_overtime_work_protected_min);
+        kept!(timephased_data);
     }
 }
 
