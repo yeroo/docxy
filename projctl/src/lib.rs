@@ -226,7 +226,7 @@ fn task_set(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .get_str("duration")
         .map(|d| {
             parse_task_duration(d, ed.project())
-                .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w)"))
+                .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w, 1mo)"))
         })
         .transpose()?;
     let level = args
@@ -261,7 +261,7 @@ fn task_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
         .transpose()?;
     let (duration_min, estimated) = match args.get_str("duration") {
         Some(d) => parse_task_duration(d, ed.project())
-            .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w)"))?,
+            .ok_or_else(|| format!("Couldn't read duration '{d}' (try 3d, 4h, 2w, 1mo)"))?,
         // The default duration is estimated when the plan's new tasks are.
         None => (480, ed.project().new_tasks_estimated()),
     };
@@ -463,6 +463,40 @@ mod tests {
     }
 
     #[test]
+    fn task_verbs_accept_word_units_and_estimates() {
+        let mut a = app();
+        let uid = add(&mut a, "Two days", "2d");
+        let set = |a: &mut Editor, duration: &str| {
+            task_set(
+                a,
+                &Json::obj(vec![
+                    ("uid", Json::Num(uid as f64)),
+                    ("duration", Json::Str(duration.into())),
+                ]),
+            )
+            .unwrap()
+        };
+        let r = set(&mut a, "2 week");
+        assert_eq!(a.project().task(uid as i32).unwrap().duration_min, 4800);
+        assert_eq!(r.get("estimated"), Some(&Json::Bool(false)));
+        let r = set(&mut a, "2d?");
+        assert_eq!(a.project().task(uid as i32).unwrap().duration_min, 960);
+        assert_eq!(r.get("estimated"), Some(&Json::Bool(true)));
+        let r = set(&mut a, "1 mon?");
+        assert_eq!(a.project().task(uid as i32).unwrap().duration_min, 9600);
+        assert_eq!(r.get("estimated"), Some(&Json::Bool(true)));
+        let added = task_add(
+            &mut a,
+            &Json::obj(vec![
+                ("name", Json::Str("Hours".into())),
+                ("duration", Json::Str("4 hour".into())),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(added.get("duration_days").unwrap().as_f64(), Some(0.5));
+    }
+
+    #[test]
     fn links_reschedule_the_successor() {
         let mut a = app();
         let t1 = add(&mut a, "Build", "2d");
@@ -510,6 +544,8 @@ mod tests {
             ("1ew?", 10080, 42),
             ("4h", 240, 5),
             ("2", 960, 7),
+            ("1mo", 9600, 7),
+            ("2 weeks", 4800, 7),
         ] {
             let mut a = app();
             let t1 = add(&mut a, "Build", "4d");
@@ -535,7 +571,7 @@ mod tests {
         let mut a = app();
         let t1 = add(&mut a, "Build", "4d");
         let t2 = add(&mut a, "Test", "1d");
-        for bad in ["50e%", "1mo", "2x"] {
+        for bad in ["50e%", "2x"] {
             let err = link_add(
                 &mut a,
                 &Json::obj(vec![

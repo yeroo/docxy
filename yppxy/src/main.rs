@@ -883,7 +883,7 @@ impl App {
                 self.status = message;
             }
         } else if parse_task_duration(text, self.ed.project()).is_none() {
-            self.status = format!("Couldn't read duration '{text}' (try 3d, 4h, 2w)");
+            self.status = format!("Couldn't read duration '{text}' (try 3d, 4h, 2w, 1mo)");
         }
     }
 
@@ -2809,6 +2809,8 @@ mod tests {
         assert_eq!(parse_duration("3", &p), Some(1440));
         assert_eq!(parse_duration("4h", &p), Some(240));
         assert_eq!(parse_duration("1w", &p), Some(2400)); // 5 working days
+        assert_eq!(parse_duration("1 month", &p), Some(9600));
+        assert_eq!(parse_task_duration("2 days?", &p), Some((960, true)));
         assert_eq!(parse_duration("nope", &p), None);
     }
 
@@ -2942,7 +2944,7 @@ mod tests {
         app.set_duration("banana");
         assert_eq!(
             app.status,
-            "Couldn't read duration 'banana' (try 3d, 4h, 2w)"
+            "Couldn't read duration 'banana' (try 3d, 4h, 2w, 1mo)"
         );
         // An estimate reads without a selected row too.
         let mut empty = App::new(Project::default(), None, false);

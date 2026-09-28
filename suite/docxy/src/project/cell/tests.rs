@@ -993,7 +993,7 @@ fn an_estimated_duration_shows_and_reopens_with_a_question_mark() {
     assert_eq!(v(&t).ed.undo_depth(), 1);
     // And `?` marks one.
     vm(&mut t).ed.select(2);
-    edit(&mut t, COL_DURATION, "3d?");
+    edit(&mut t, COL_DURATION, "3 days?");
     key(&mut t, "enter");
     assert!(v(&t).cell.is_none(), "{}", t.status);
     assert_eq!(duration_text(&t, 30), "3d?");
@@ -1003,7 +1003,7 @@ fn an_estimated_duration_shows_and_reopens_with_a_question_mark() {
 fn the_entry_row_takes_an_estimated_duration() {
     let mut t = tab();
     project_entry_click(&mut t, Some(COL_DURATION), false);
-    edit(&mut t, COL_DURATION, "2d?");
+    edit(&mut t, COL_DURATION, "2 days?");
     key(&mut t, "enter");
     let ed = &v(&t).ed;
     let new = &ed.project().tasks[3];

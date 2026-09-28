@@ -648,7 +648,7 @@ impl Editor {
     /// [`parse_task_duration`]).
     pub fn set_duration(&mut self, uid: i32, text: &str) -> Result<(), String> {
         let (min, estimated) = parse_task_duration(text, &self.proj)
-            .ok_or_else(|| format!("Couldn't read duration '{text}' (try 3d, 4h, 2w)"))?;
+            .ok_or_else(|| format!("Couldn't read duration '{text}' (try 3d, 4h, 2w, 1mo)"))?;
         self.set_duration_min(uid, min, estimated)
     }
 
@@ -1673,25 +1673,68 @@ fn recompute_summaries(proj: &mut Project) {
     }
 }
 
-/// Parse the TUI's duration units using the project's working-day length.
+/// Parse Project's minute, hour, day, week and month spellings as working time.
 pub fn parse_duration(text: &str, proj: &Project) -> Option<i64> {
     let t = text.trim().to_lowercase();
-    let (num, unit) = t
-        .strip_suffix(['d', 'h', 'w', 'm'])
-        .map(|n| (n, t.chars().last().unwrap()))
-        .unwrap_or((t.as_str(), 'd'));
+    #[derive(Clone, Copy, PartialEq)]
+    enum Unit {
+        Minute,
+        Hour,
+        Day,
+        Week,
+        Month,
+    }
+    // Longest spellings first. The numeric remainder must parse in full, so
+    // an unknown suffix cannot be mistaken for one of these units.
+    let spellings = [
+        ("minutes", Unit::Minute),
+        ("minute", Unit::Minute),
+        ("months", Unit::Month),
+        ("month", Unit::Month),
+        ("hours", Unit::Hour),
+        ("weeks", Unit::Week),
+        ("mins", Unit::Minute),
+        ("mons", Unit::Month),
+        ("hour", Unit::Hour),
+        ("days", Unit::Day),
+        ("week", Unit::Week),
+        ("min", Unit::Minute),
+        ("mos", Unit::Month),
+        ("mon", Unit::Month),
+        ("hrs", Unit::Hour),
+        ("dys", Unit::Day),
+        ("day", Unit::Day),
+        ("wks", Unit::Week),
+        ("mo", Unit::Month),
+        ("hr", Unit::Hour),
+        ("dy", Unit::Day),
+        ("wk", Unit::Week),
+        ("m", Unit::Minute),
+        ("h", Unit::Hour),
+        ("d", Unit::Day),
+        ("w", Unit::Week),
+    ];
+    let (num, unit) = if t.parse::<f64>().is_ok() {
+        (t.as_str(), Unit::Day)
+    } else {
+        spellings.iter().find_map(|(suffix, unit)| {
+            let num = t.strip_suffix(suffix)?.trim();
+            num.parse::<f64>().ok().map(|_| (num, *unit))
+        })?
+    };
     // Exact minute literals must not lose integer precision through f64.
-    if unit == 'm' {
-        if let Ok(minutes) = num.trim().parse::<i64>() {
+    if unit == Unit::Minute {
+        if let Ok(minutes) = num.parse::<i64>() {
             return Some(minutes);
         }
     }
-    let v: f64 = num.trim().parse().ok()?;
+    let v: f64 = num.parse().ok()?;
     let minutes = match unit {
-        'h' => v * 60.0,
-        'w' => v * proj.hours_per_week * 60.0,
-        'm' => v,
-        _ => v * proj.hours_per_day * 60.0,
+        Unit::Hour => v * 60.0,
+        Unit::Week => v * proj.hours_per_week * 60.0,
+        Unit::Month => v * proj.days_per_month() * proj.hours_per_day * 60.0,
+        Unit::Minute => v,
+        Unit::Day => v * proj.hours_per_day * 60.0,
     }
     .round();
     (minutes.is_finite() && minutes > i64::MIN as f64 && minutes < i64::MAX as f64)
@@ -3350,10 +3393,49 @@ mod tests {
             ("30m", 30),
             (" 2D ", 960),
             ("-4h", -240),
+            ("90m", 90),
+            ("90 min", 90),
+            ("90 mins", 90),
+            ("90 minute", 90),
+            ("90minutes", 90),
+            ("4 hr", 240),
+            ("4hrs", 240),
+            ("4 hour", 240),
+            ("4 hours", 240),
+            ("3dy", 1440),
+            ("3 dys", 1440),
+            ("3 day", 1440),
+            ("3days", 1440),
+            ("2w", 4800),
+            ("2 wk", 4800),
+            ("2wks", 4800),
+            ("2 week", 4800),
+            ("2 weeks", 4800),
+            ("2 Weeks", 4800),
+            ("1mo", 9600),
+            ("1 mos", 9600),
+            ("1 mon", 9600),
+            ("1 mons", 9600),
+            ("1 month", 9600),
+            ("1 months", 9600),
+            ("1.5 wk", 3600),
+            ("-4 hours", -240),
+            ("+2d", 960),
+            ("1e2d", 48000),
+            ("1e2", 48000),
         ] {
-            assert_eq!(parse_duration(text, &proj), Some(min));
+            assert_eq!(parse_duration(text, &proj), Some(min), "{text}");
         }
-        assert_eq!(parse_duration("nope", &proj), None);
+        for text in [
+            "nope", "3 dayz", "3 d d", "month", "3 ed", "3ed", "2 ww", "",
+        ] {
+            assert_eq!(parse_duration(text, &proj), None, "{text}");
+        }
+        let mut with_month = proj.clone();
+        with_month
+            .options
+            .push(("DaysPerMonth".into(), "22".into()));
+        assert_eq!(parse_duration("1 month", &with_month), Some(10560));
         for code in ["SNET", "SNLT", "FNET", "FNLT", "MSO", "MFO", "ALAP"] {
             let text = if code == "ALAP" {
                 code.to_string()
@@ -3925,6 +4007,9 @@ mod tests {
         let proj = Project::default();
         for (text, parsed) in [
             ("3d?", Some((1440, true))),
+            ("2 days?", Some((960, true))),
+            ("1 mon?", Some((9600, true))),
+            ("2d?", Some((960, true))),
             ("4h?", Some((240, true))),
             ("2?", Some((960, true))),
             (" 2d ? ", Some((960, true))),

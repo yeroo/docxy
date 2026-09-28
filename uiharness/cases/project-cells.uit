@@ -69,7 +69,7 @@ test project cell invalid edits retain focus and read-only cells stay closed
   type banana
   key enter
   assert cell_edit is banana
-  assert status is Invalid duration (try 3d, 4h, 2w)
+  assert status is Invalid duration (try 3d, 4h, 2w, 1mo)
   click C3 double
   assert selected_task is 1
   assert cell is Duration
@@ -166,7 +166,7 @@ test corrected duration clears its validation error
   click D2
   type banana
   key enter
-  assert status is Invalid duration (try 3d, 4h, 2w)
+  assert status is Invalid duration (try 3d, 4h, 2w, 1mo)
   key home delete delete delete delete delete delete
   type 2d
   key enter

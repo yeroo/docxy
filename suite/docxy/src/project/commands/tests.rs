@@ -666,7 +666,7 @@ fn rejection_preserves_model_geometry_and_both_history_stacks() {
         (
             Duration,
             "banana",
-            "Couldn't read duration 'banana' (try 3d, 4h, 2w)",
+            "Couldn't read duration 'banana' (try 3d, 4h, 2w, 1mo)",
         ),
         (AddLink, "abc", "Predecessor must be a task ID (number)"),
         (AddLink, "999", "No other task with ID 999"),

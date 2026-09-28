@@ -225,7 +225,7 @@ pub(crate) fn apply_cell(
         COL_NAME => ed.rename(uid, buf)?,
         COL_DURATION => {
             let (min, estimated) = parse_task_duration(buf, ed.project())
-                .ok_or("Invalid duration (try 3d, 4h, 2w)")?;
+                .ok_or("Invalid duration (try 3d, 4h, 2w, 1mo)")?;
             ed.set_duration_min(uid, min, estimated)?;
         }
         COL_START | COL_FINISH => {
