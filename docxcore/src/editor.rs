@@ -1210,11 +1210,6 @@ impl Editor {
         (pr.indent, pr.first_line)
     }
 
-    /// The right indent (twips) at the caret.
-    pub fn caret_para_right_indent(&self) -> i32 {
-        self.caret_para_props().indent_right
-    }
-
     /// Set the line spacing (`w:line` + `w:lineRule`) of the selected paragraphs.
     /// Word's presets are all `auto`-rule: 240 = single, 276 = 1.15, 360 = 1.5,
     /// 480 = double. Space before/after is left untouched.

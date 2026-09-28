@@ -1629,17 +1629,31 @@ impl ParagraphIndentLayout {
     fn first_line_tab_origin(self) -> f32 {
         self.first_x - self.continuation_x
     }
-    fn continuation_tab_origin(self) -> f32 {
-        0.0
-    }
     fn first_line_spacer(self) -> Option<(f32, f32)> {
         (self.first_x != self.continuation_x).then_some((self.spacer_width, self.spacer_margin))
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LeadingItem {
+    Spacer { width: f32, margin: f32 },
+    ListMarker,
+}
+
+fn leading_items(layout: ParagraphIndentLayout, has_marker: bool) -> Vec<LeadingItem> {
+    let mut items = Vec::with_capacity(2);
+    if let Some((width, margin)) = layout.first_line_spacer() {
+        items.push(LeadingItem::Spacer { width, margin });
+    }
+    if has_marker {
+        items.push(LeadingItem::ListMarker);
+    }
+    items
+}
+
 fn paragraph_indent_layout(indent: EffIndent, zoom: f32) -> ParagraphIndentLayout {
     let continuation_x = tw_px(indent.left, zoom);
-    let first_x = tw_px(indent.left + indent.first, zoom);
+    let first_x = tw_px(indent.left.saturating_add(indent.first), zoom);
     let offset = first_x - continuation_x;
     ParagraphIndentLayout {
         continuation_x,
@@ -1655,6 +1669,53 @@ fn ruler_box(window: &mut Window, x0: f32, y0: f32, x1: f32, y1: f32, color: Hsl
             Bounds::from_corners(point(px(x0), px(y0)), point(px(x1), px(y1))),
             color,
         ));
+    }
+}
+
+fn ruler_triangle(
+    window: &mut Window,
+    a: Point<Pixels>,
+    b: Point<Pixels>,
+    c: Point<Pixels>,
+    color: Hsla,
+) {
+    let mut path = Path::new(a);
+    path.line_to(b);
+    path.line_to(c);
+    path.line_to(a);
+    window.paint_path(path, color);
+}
+
+#[derive(Clone, Copy)]
+struct RulerColors {
+    ground: Hsla,
+    content: Hsla,
+    tick: Hsla,
+    marker: Hsla,
+}
+
+fn ruler_colors(pal: Pal, dark: bool) -> RulerColors {
+    RulerColors {
+        ground: Hsla {
+            l: if dark { 0.27 } else { 0.67 },
+            a: 1.0,
+            ..pal.border
+        },
+        content: Hsla {
+            l: if dark { 0.87 } else { 0.99 },
+            a: 1.0,
+            ..pal.panel
+        },
+        tick: Hsla {
+            l: if dark { 0.22 } else { 0.35 },
+            a: 1.0,
+            ..pal.fg
+        },
+        marker: Hsla {
+            l: if dark { 0.12 } else { 0.20 },
+            a: 1.0,
+            ..pal.fg
+        },
     }
 }
 
@@ -1714,7 +1775,7 @@ fn hruler_geom(
         page_right: page_rect.x + page_rect.w,
         content_x,
         content_right,
-        first_x: content_x + tw_px(indent.left + indent.first, zoom),
+        first_x: content_x + tw_px(indent.left.saturating_add(indent.first), zoom),
         left_x: content_x + tw_px(indent.left, zoom),
         right_x: content_right - tw_px(indent.right, zoom),
         tabs: tabs
@@ -1758,15 +1819,10 @@ struct VRulerGeom {
     content_bottom: f32,
 }
 
-fn vruler_geom(
-    page_rect: ScreenRect,
-    text_rect: ScreenRect,
-    zoom: f32,
-    page: docxcore::model::PageGeom,
-) -> VRulerGeom {
+fn vruler_geom(text_rect: ScreenRect) -> VRulerGeom {
     VRulerGeom {
         content_top: text_rect.y,
-        content_bottom: page_rect.y + page_rect.h - 1.0 - tw_px(page.mb, zoom),
+        content_bottom: text_rect.y + text_rect.h,
     }
 }
 
@@ -1859,9 +1915,10 @@ fn tracked_page(probe: &RulerProbe) -> Option<usize> {
 #[cfg(test)]
 mod ruler_geom_tests {
     use super::{
-        EffIndent, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect,
-        dragged_left_marker, eff_indent, hruler_geom, hruler_hit, paragraph_indent_layout, px_tw,
-        ruler_drag_result, tracked_page, tw_px, vruler_geom,
+        EffIndent, LeadingItem, Pal, RulerChange, RulerDrag, RulerHandle, RulerProbe, ScreenRect,
+        dragged_left_marker, eff_indent, hruler_geom, hruler_hit, hsla_u, leading_items,
+        paragraph_indent_layout, px_tw, ruler_colors, ruler_drag_result, tracked_page, tw_px,
+        vruler_geom,
     };
     use docxcore::model::{PageGeom, ParProps, TabAlign, TabLeader, TabStop};
 
@@ -1993,7 +2050,6 @@ mod ruler_geom_tests {
                 layout.first_line_tab_origin(),
                 layout.first_x - layout.continuation_x,
             );
-            near(layout.continuation_tab_origin(), 0.0);
             assert_eq!(
                 layout.first_line_spacer(),
                 (eff.first != 0).then_some((layout.spacer_width, layout.spacer_margin))
@@ -2011,6 +2067,104 @@ mod ruler_geom_tests {
         let layout = paragraph_indent_layout(eff_indent(&ParProps::default()), 1.0);
         assert_eq!(layout.first_line_spacer(), None);
         near(layout.first_line_tab_origin(), 0.0);
+    }
+
+    #[test]
+    fn first_line_items_put_the_spacer_before_list_marker() {
+        let positive = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                first_line: 720,
+                ..ParProps::default()
+            }),
+            1.5,
+        );
+        near(positive.first_line_tab_origin(), 72.0);
+        assert_eq!(
+            leading_items(positive, true),
+            vec![
+                LeadingItem::Spacer {
+                    width: 72.0,
+                    margin: 0.0
+                },
+                LeadingItem::ListMarker
+            ]
+        );
+
+        let hanging = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                indent: 720,
+                first_line: -360,
+                ..ParProps::default()
+            }),
+            1.5,
+        );
+        near(hanging.first_line_tab_origin(), -36.0);
+        assert_eq!(
+            leading_items(hanging, false),
+            vec![LeadingItem::Spacer {
+                width: 0.0,
+                margin: -36.0
+            }]
+        );
+
+        let list = paragraph_indent_layout(
+            eff_indent(&ParProps {
+                ilvl: 2,
+                first_line: -360,
+                ..ParProps::default()
+            }),
+            1.5,
+        );
+        assert_eq!(
+            leading_items(list, true),
+            vec![
+                LeadingItem::Spacer {
+                    width: 0.0,
+                    margin: -36.0
+                },
+                LeadingItem::ListMarker
+            ]
+        );
+        near(list.first_x, 24.0); // the marker follows the spacer at the first-line origin
+    }
+
+    #[test]
+    fn margin_shading_contrasts_in_both_themes() {
+        let base = hsla_u(0x777777);
+        let pal = Pal {
+            fg: base,
+            dim: base,
+            border: base,
+            panel: base,
+            hover: base,
+            sel: base,
+        };
+        for dark in [false, true] {
+            let colors = ruler_colors(pal, dark);
+            assert!(colors.content.l - colors.ground.l >= 0.30);
+            assert!(colors.content.l - colors.marker.l >= 0.65);
+        }
+    }
+
+    #[test]
+    fn extreme_indent_values_do_not_overflow() {
+        let p = ParProps {
+            indent: i32::MAX,
+            first_line: i32::MAX,
+            ..ParProps::default()
+        };
+        let eff = eff_indent(&p);
+        let layout = paragraph_indent_layout(eff, 2.0);
+        assert!(layout.first_x.is_finite());
+        let r = ScreenRect {
+            x: 0.0,
+            y: 0.0,
+            w: 800.0,
+            h: 1000.0,
+        };
+        let g = hruler_geom(r, r, r, 2.0, eff, &[], false);
+        assert!(g.first_x.is_finite());
+        assert_eq!(super::snap_twips(i32::MAX), i32::MAX);
     }
 
     #[test]
@@ -2227,18 +2381,19 @@ mod ruler_geom_tests {
                     w: tw_px(page.w, zoom),
                     h: tw_px(page.h, zoom),
                 };
-                let text = ScreenRect {
-                    x: 100.0 + 1.0 + tw_px(page.ml, zoom),
-                    y: top + 1.0 + tw_px(page.mt, zoom) + 40.0,
-                    w: 500.0,
-                    h: 400.0,
-                };
-                let g = vruler_geom(outer, text, zoom, page);
-                near(g.content_top, text.y);
-                near(
-                    g.content_bottom,
-                    outer.y + outer.h - 1.0 - tw_px(page.mb, zoom),
-                );
+                for (header_extra, footer_extra) in [(0.0, 0.0), (40.0, 60.0)] {
+                    let y = top + 1.0 + tw_px(page.mt, zoom) + header_extra;
+                    let bottom = outer.y + outer.h - 1.0 - tw_px(page.mb, zoom) - footer_extra;
+                    let text = ScreenRect {
+                        x: 100.0 + 1.0 + tw_px(page.ml, zoom),
+                        y,
+                        w: 500.0,
+                        h: bottom - y,
+                    };
+                    let g = vruler_geom(text);
+                    near(g.content_top, y);
+                    near(g.content_bottom, bottom);
+                }
             }
         }
     }
@@ -2276,7 +2431,13 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
     let tw = |t: i32| tw_px(t, d.zoom);
     let (change, guide) = match d.handle {
         RulerHandle::FirstLine => {
-            let marker = snap_twips(d.indent.left + d.indent.first + delta).max(0);
+            let marker = snap_twips(
+                d.indent
+                    .left
+                    .saturating_add(d.indent.first)
+                    .saturating_add(delta),
+            )
+            .max(0);
             (
                 RulerChange::First(marker - d.indent.left),
                 d.content_x + tw(marker),
@@ -2293,11 +2454,11 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
             )
         }
         RulerHandle::Right => {
-            let right = snap_twips((d.indent.right - delta).max(0));
+            let right = snap_twips(d.indent.right.saturating_sub(delta).max(0));
             (RulerChange::Right(right), d.content_right - tw(right))
         }
         RulerHandle::MarginLeft => {
-            let left = snap_twips((d.page.ml + delta).max(0));
+            let left = snap_twips(d.page.ml.saturating_add(delta).max(0));
             (
                 RulerChange::Margins {
                     left,
@@ -2307,7 +2468,7 @@ fn ruler_drag_result(d: RulerDrag, x: f32) -> RulerDragResult {
             )
         }
         RulerHandle::MarginRight => {
-            let right = snap_twips((d.page.mr - delta).max(0));
+            let right = snap_twips(d.page.mr.saturating_sub(delta).max(0));
             (
                 RulerChange::Margins {
                     left: d.page.ml,
@@ -12191,6 +12352,7 @@ impl Docxy {
         };
         let zoom = self.zoom;
         let pal = Pal::of(cx);
+        let colors = ruler_colors(pal, self.applied == Some(ThemeMode::Dark));
         let probe = self.ruler_probe.clone();
         let paint = canvas(
             move |_b, _w, _a| {},
@@ -12230,10 +12392,10 @@ impl Docxy {
                 state.painted = Some(g.clone());
                 drop(state);
                 let y: f32 = b.origin.y.into();
-                let ground = pal.border;
-                let content = pal.panel;
-                let tick = pal.dim;
-                let marker = pal.fg;
+                let ground = colors.ground;
+                let content = colors.content;
+                let tick = colors.tick;
+                let marker = colors.marker;
                 window.paint_quad(fill(b, ground));
                 let clip_l = viewport.x.max(b.origin.x.into());
                 let clip_r = (viewport.x + viewport.w).min(f32::from(b.origin.x + b.size.width));
@@ -12306,31 +12468,24 @@ impl Docxy {
                         );
                     }
                 }
-                let z = point(0.0_f32, 0.0);
                 if marker_visible(&g, g.first_x, 5.0) {
-                    let mut t = Path::new(point(px(g.first_x - 5.0), px(y + 1.0)));
-                    t.push_triangle(
-                        (
-                            point(px(g.first_x - 5.0), px(y + 1.0)),
-                            point(px(g.first_x + 5.0), px(y + 1.0)),
-                            point(px(g.first_x), px(y + 8.0)),
-                        ),
-                        (z, z, z),
+                    ruler_triangle(
+                        window,
+                        point(px(g.first_x - 5.0), px(y + 1.0)),
+                        point(px(g.first_x + 5.0), px(y + 1.0)),
+                        point(px(g.first_x), px(y + 8.0)),
+                        marker,
                     );
-                    window.paint_path(t, marker);
                 }
                 for x in [g.left_x, g.right_x] {
                     if marker_visible(&g, x, 5.0) {
-                        let mut t = Path::new(point(px(x - 5.0), px(y + 21.0)));
-                        t.push_triangle(
-                            (
-                                point(px(x - 5.0), px(y + 21.0)),
-                                point(px(x + 5.0), px(y + 21.0)),
-                                point(px(x), px(y + 13.0)),
-                            ),
-                            (z, z, z),
+                        ruler_triangle(
+                            window,
+                            point(px(x - 5.0), px(y + 21.0)),
+                            point(px(x + 5.0), px(y + 21.0)),
+                            point(px(x), px(y + 13.0)),
+                            marker,
                         );
-                        window.paint_path(t, marker);
                     }
                 }
                 if g.left_x >= clip_l + 4.0 && g.left_x <= clip_r - 4.0 {
@@ -12354,7 +12509,7 @@ impl Docxy {
             .w_full()
             .h(px(26.))
             .relative()
-            .bg(pal.border)
+            .bg(colors.ground)
             .child(paint.absolute().size_full())
             .child(
                 div()
@@ -12365,8 +12520,8 @@ impl Docxy {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(pal.panel)
-                    .text_color(pal.fg)
+                    .bg(colors.content)
+                    .text_color(colors.marker)
                     .cursor_pointer()
                     .child(glyph)
                     .tooltip(|w, cx| Tooltip::new("Tab stop type — click to cycle").build(w, cx))
@@ -12399,18 +12554,13 @@ impl Docxy {
 
     /// A fixed strip beside the scroll viewport, painted from the tracked page.
     fn vruler(&self, pal: Pal) -> AnyElement {
-        let page = self
-            .tabs
-            .get(self.active)
-            .and_then(|t| t.pkg.as_ref())
-            .map(|p| p.page_geom())
-            .unwrap_or_default();
         let zoom = self.zoom;
+        let colors = ruler_colors(pal, self.applied == Some(ThemeMode::Dark));
         let probe = self.ruler_probe.clone();
         let paint = canvas(
             move |_b, _w, _a| {},
             move |b: Bounds<Pixels>, _s, window: &mut Window, cx: &mut App| {
-                window.paint_quad(fill(b, pal.border));
+                window.paint_quad(fill(b, colors.ground));
                 let state = probe.borrow();
                 let Some(viewport) = state.viewport else {
                     return;
@@ -12418,12 +12568,11 @@ impl Docxy {
                 let Some(i) = tracked_page(&state) else {
                     return;
                 };
-                let Some(rect) = state.pages[i] else { return };
                 let Some(content) = state.contents[i] else {
                     return;
                 };
                 let x: f32 = b.origin.x.into();
-                let vertical = vruler_geom(rect, content, zoom, page);
+                let vertical = vruler_geom(content);
                 let content_top = vertical.content_top;
                 let content_bottom = vertical.content_bottom;
                 let clip_top = viewport.y.max(f32::from(b.origin.y));
@@ -12432,7 +12581,7 @@ impl Docxy {
                 let l = content_top.max(clip_top);
                 let r = content_bottom.min(clip_bottom);
                 if r > l {
-                    ruler_box(window, x + 3.0, l, x + 15.0, r, pal.panel);
+                    ruler_box(window, x + 3.0, l, x + 15.0, r, colors.content);
                 }
                 let mut y = content_top;
                 let mut i = 0;
@@ -12451,7 +12600,7 @@ impl Docxy {
                             y,
                             x + 9.0 + w / 2.0,
                             y + 1.0,
-                            pal.dim,
+                            colors.tick,
                         );
                     }
                     y += 12.0 * zoom;
@@ -12461,7 +12610,7 @@ impl Docxy {
                 while content_top + 96.0 * zoom * (inch as f32) < content_bottom && inch < 100 {
                     let ny = content_top + 96.0 * zoom * inch as f32;
                     if ny >= clip_top && ny < clip_bottom - 10.0 {
-                        ruler_number(window, cx, inch, x + 3.0, ny - 5.0, pal.dim);
+                        ruler_number(window, cx, inch, x + 3.0, ny - 5.0, colors.tick);
                     }
                     inch += 1;
                 }
@@ -14889,8 +15038,14 @@ const FONT_SIZES: &[u32] = &[8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 36, 48, 7
 /// Snap a twips measurement to the nearest 1/8" ruler gridline (180 twips), so
 /// dragging a ruler marker sticks to the visible ticks like Word's ruler.
 fn snap_twips(v: i32) -> i32 {
-    const GRID: i32 = 180; // 1/8 inch
-    ((v as f32 / GRID as f32).round() as i32) * GRID
+    const GRID: i64 = 180; // 1/8 inch
+    let n = i64::from(v);
+    let rounded = if n >= 0 {
+        (n + GRID / 2) / GRID
+    } else {
+        (n - GRID / 2) / GRID
+    };
+    (rounded * GRID).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
 fn caret_bar() -> AnyElement {
@@ -15576,28 +15731,30 @@ fn paragraph_el(
 
     // The first flex item shifts just the first line. Subsequent wrapped lines
     // start at the paragraph's left padding, including hanging indents.
-    if let Some((width, margin)) = indent_layout.first_line_spacer() {
-        spans.push(
-            div()
-                .w(px(width))
-                .h(px(1.))
-                .flex_none()
-                .when(margin < 0.0, |d| d.ml(px(margin)))
-                .into_any_element(),
-        );
-    }
-    if let Some(m) = marker {
-        // The marker isn't document content — render it plain (non-clickable) so it
-        // never maps clicks to bogus offsets.
-        spans.push(
-            div()
-                .text_size(px(base))
-                .text_color(pal.dim)
-                .child(SharedString::from(m.to_string()))
-                .into_any_element(),
-        );
-        if let Some(ms) = meas.filter(|_| has_tab) {
-            x += ms.width(m, base, false, false);
+    for item in leading_items(indent_layout, marker.is_some()) {
+        match item {
+            LeadingItem::Spacer { width, margin } => spans.push(
+                div()
+                    .w(px(width))
+                    .h(px(1.))
+                    .flex_none()
+                    .when(margin < 0.0, |d| d.ml(px(margin)))
+                    .into_any_element(),
+            ),
+            LeadingItem::ListMarker => {
+                let m = marker.expect("marker descriptor requires a marker");
+                // The marker isn't document content and must not map clicks to offsets.
+                spans.push(
+                    div()
+                        .text_size(px(base))
+                        .text_color(pal.dim)
+                        .child(SharedString::from(m.to_string()))
+                        .into_any_element(),
+                );
+                if let Some(ms) = meas.filter(|_| has_tab) {
+                    x += ms.width(m, base, false, false);
+                }
+            }
         }
     }
     for i in 0..items.len() {
@@ -15630,7 +15787,7 @@ fn paragraph_el(
             }
             Inline::Break(_) => {
                 emit_break(&mut spans, &mut idx, &mut caret);
-                x = indent_layout.continuation_tab_origin(); // a hard break restarts the line
+                x = 0.0; // a hard break restarts the line
             }
             Inline::Raw(xml) => {
                 // Comment reference → a small badge; other raw XML (range markers,
@@ -19280,6 +19437,7 @@ impl Render for Docxy {
                                 let content = div()
                                     .relative()
                                     .w_full()
+                                    .flex_1()
                                     .child(build_mid(cols_ranges))
                                     .child(ruler_probe_el(&self.ruler_probe, move |state, rect| {
                                         if let Some(slot) = state.contents.get_mut(pi) {
