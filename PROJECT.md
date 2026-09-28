@@ -306,10 +306,10 @@ first task.
 
 Task › Insert › Blank Row (keytip Alt, T, B) and the Insert key insert an empty
 row above the selected row, or just above the entry row, as one undo step, and
-select it, keeping the column, as Project's Insert Task › Blank Row does. The row is outside the outline and the
-schedule until something is typed into it; then it becomes a task at the level
-of the task above where it sits (a summary's first child). yppxy has the same
-command on its ribbon and on `N`.
+select it, keeping the column, as Project's Insert Task › Blank Row does. The
+row is outside the outline and the schedule until something is typed into it;
+then it becomes a task at the level of the task above where it sits (a summary's
+first child). yppxy has the same command on its ribbon and on `N`.
 
 Arrow keys move the cell cursor. Insert inserts a blank row above the current
 row, keeping the column. Delete clears the active Name, Predecessors, or

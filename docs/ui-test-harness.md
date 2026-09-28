@@ -345,18 +345,19 @@ it, goes to the entry row, where typing appends a task (`click C<tasks+1>`
 addresses it). Tab/Shift+Tab move between columns.
 Insert inserts a blank row above the current row (above the entry row when the
 cursor is on it) and keeps the column. Delete clears the active Name,
-Predecessors, or Resource Names cell; on Task Mode, Duration, Start, or Finish it
-reports `<column> can't be cleared`. On the ID column Delete deletes the task (a summary asks first: Enter deletes it
-with its subtasks, Esc cancels, and typed text is ignored while that prompt is
-open; the state's `prompt` reads `delete:`). Alt+Shift+Right/Left indent/outdent,
-Alt+Right/Left pan the Gantt, and Ctrl+Shift+L toggles leveling. Former bare-letter
-commands (`n x d p c a b L`) now type into cells. Duration, predecessor, constraint,
+Predecessors, or Resource Names cell; on Task Mode, Duration, Start, or Finish
+it reports `<column> can't be cleared`. On the ID column Delete deletes the task
+(a summary asks first: Enter deletes it with its subtasks, Esc cancels, and
+typed text is ignored while that prompt is open; the state's `prompt` reads
+`delete:`). Alt+Shift+Right/Left indent/outdent, Alt+Right/Left pan the Gantt,
+and Ctrl+Shift+L toggles leveling. Former bare-letter commands
+(`n x d p c a b L`) now type into cells. Duration, predecessor, constraint,
 resource, baseline, and Rename commands remain on the ribbon; ribbon Rename
-still opens a Name prompt. Predecessors in cells use **displayed IDs**.
-Ctrl+F opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo,
-Ctrl+S saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export.
-Project ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W
-after Alt or F10.
+still opens a Name prompt. Predecessors in cells use **displayed IDs**. Ctrl+F
+opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
+saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export. Project
+ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W after
+Alt or F10.
 
 An open cell editor owns input before prompts and KeyTips. Enter commits and
 moves down, Tab/Shift+Tab commit and move right/left, and Escape cancels.
