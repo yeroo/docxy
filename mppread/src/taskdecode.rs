@@ -736,20 +736,30 @@ mod tests {
         work_week_uids: &[i32],
         independent: bool,
     ) -> Vec<u8> {
-        let (cal_fm, mut cal_fd, cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
+        let (cal_fm, mut cal_fd, mut cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
         if independent {
             cal_fd[76..80].copy_from_slice(&(-1i32).to_le_bytes());
         }
-        for &uid in work_week_uids {
-            let entry = match uid {
-                1 => 36,
-                5 => 60,
-                _ => panic!("fixture has no calendar UID {uid}"),
-            };
-            let off =
-                u32::from_le_bytes(cal_vm[entry + 4..entry + 8].try_into().unwrap()) as usize + 4;
-            cal_v2[off + 424..off + 428].copy_from_slice(&1u32.to_le_bytes());
+        let original_v2 = cal_v2;
+        cal_v2 = Vec::new();
+        for index in 0..4 {
+            let entry = 24 + index * 12;
+            let uid = i32::from_le_bytes(cal_vm[entry..entry + 4].try_into().unwrap());
+            let key = u16::from_le_bytes(cal_vm[entry + 8..entry + 10].try_into().unwrap());
+            let old_off =
+                u32::from_le_bytes(cal_vm[entry + 4..entry + 8].try_into().unwrap()) as usize;
+            let len =
+                u32::from_le_bytes(original_v2[old_off..old_off + 4].try_into().unwrap()) as usize;
+            let mut value = original_v2[old_off + 4..old_off + 4 + len].to_vec();
+            if key == 8 && work_week_uids.contains(&uid) {
+                value[424..428].copy_from_slice(&1u32.to_le_bytes());
+                value.push(0xa5); // one opaque record byte after the count
+            }
+            cal_vm[entry + 4..entry + 8].copy_from_slice(&(cal_v2.len() as u32).to_le_bytes());
+            cal_v2.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            cal_v2.extend_from_slice(&value);
         }
+        cal_vm[20..24].copy_from_slice(&(cal_v2.len() as u32).to_le_bytes());
         if closed {
             // The fourth VarMeta entry is UID 5's weekday block. Override
             // every inherited day with a day having zero working periods.

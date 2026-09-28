@@ -240,8 +240,9 @@ row ID order. Resources, assignments, baselines, constraints, and custom fields
 are not imported. Newest-layout base and derived calendars, their weekdays,
 exceptions, the default calendar and task calendar assignments are imported;
 work weeks are not decoded. Tasks using a calendar with work weeks keep the
-earlier import behaviour: their task calendar is not assigned and their
-Duration is measured as a span on the project calendar, so dates reproduce.
+earlier import behaviour: their task calendar is not assigned. Auto tasks use
+the Start–Finish span on the project calendar; manual tasks keep their stored
+manual duration and use that span only if it is absent.
 Type 8 exceptions and record shapes not covered by the
 Project-written probes refuse the file. An invalid newest calendar table refuses
 import. Files without

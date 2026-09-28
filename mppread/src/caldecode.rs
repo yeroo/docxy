@@ -261,7 +261,12 @@ fn exceptions(value: &[u8]) -> Result<(Vec<CalendarException>, bool), String> {
     if offset.checked_add(4).is_none_or(|n| n > value.len()) {
         return Err("truncated calendar work-week header".into());
     }
-    Ok((out, u32_at(value, offset) != 0))
+    let count = u32_at(value, offset);
+    // The record layout is unknown until Project-written probes are available.
+    if count != 0 && value.len() == offset + 4 {
+        return Err("truncated calendar work-week records".into());
+    }
+    Ok((out, count != 0))
 }
 
 fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, String> {
@@ -547,6 +552,12 @@ pub(crate) mod tests {
         assert_eq!(ex[0].occurrences, Some(1));
         assert!(!ex[0].entered_by_occurrences.unwrap());
         assert!(exceptions(&vec![0; 428]).unwrap().0.is_empty());
+        let mut missing_record = vec![0; 428];
+        missing_record[424..428].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(
+            exceptions(&missing_record).unwrap_err(),
+            "truncated calendar work-week records"
+        );
 
         let mut alternate = exception_block();
         alternate[500..504].copy_from_slice(&0x0100_0230u32.to_le_bytes());

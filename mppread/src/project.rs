@@ -24,8 +24,9 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
 /// calendars, their weekdays and exceptions, and the project's default calendar.
 /// Task calendar assignments are decoded. Work weeks are not yet decoded;
-/// tasks using one keep the project-calendar span and no task calendar, as
-/// before stored Duration was read, so their dates still schedule. An
+/// tasks using one keep no task calendar. Auto tasks use the project-calendar
+/// span, as before stored Duration was read; manual tasks keep their manual
+/// duration and use that span only when it is absent. An
 /// unrecognised exception record refuses the import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
@@ -163,33 +164,20 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             // Pin only leaf tasks; a summary's dates roll up from its
             // children, so a constraint on it would fight the rollup. A
             // manual leaf is held by its pinned dates, not a constraint.
+            // A work-week-affected task has no assigned task calendar here.
+            let span = || {
+                projcore::schedule::working_minutes_between_on(&cal_ref, task.calendar_uid, s, f)
+            };
             if is_summary {
                 task.duration_min = 0;
             } else if t.manual {
-                task.duration_min = t.manual_duration_min.unwrap_or_else(|| {
-                    projcore::schedule::working_minutes_between_on(
-                        &cal_ref,
-                        task.calendar_uid,
-                        s,
-                        f,
-                    )
-                });
+                task.duration_min = t.manual_duration_min.unwrap_or_else(span);
             } else {
-                task.duration_min = if work_week_affected {
-                    projcore::schedule::working_minutes_between_on(&cal_ref, None, s, f)
-                } else {
-                    t.duration_format
-                        .filter(|&fmt| crate::mpp::working_duration_format(fmt))
-                        .and(t.duration_min)
-                        .unwrap_or_else(|| {
-                            projcore::schedule::working_minutes_between_on(
-                                &cal_ref,
-                                task.calendar_uid,
-                                s,
-                                f,
-                            )
-                        })
-                };
+                task.duration_min = t
+                    .duration_format
+                    .filter(|&fmt| !work_week_affected && crate::mpp::working_duration_format(fmt))
+                    .and(t.duration_min)
+                    .unwrap_or_else(span);
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }
