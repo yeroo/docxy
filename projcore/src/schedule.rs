@@ -459,7 +459,19 @@ impl<'a> Scheduler<'a> {
         let durations = durations(proj);
         let summary_cal = summary_calendar(proj);
         let manual_spans = manual_summary_spans(proj, &summary_cal);
-        let horizon_durations = horizon_lag_durations(proj, &durations, &manual_spans);
+        // Every supported summary span lies within the two-sided
+        // HORIZON_DAYS window, so its working duration cannot exceed the
+        // window's wall minutes (MAX_LAG_MIN). Use that absolute bound for
+        // summary percent lags. It covers child constraints, outside links,
+        // nested percent links and manual dates without a circular estimate.
+        // Stored duration remains a floor; lag_minutes clamps at MAX_LAG_MIN.
+        let mut horizon_durations = durations.clone();
+        for task in proj.tasks.iter().filter(|task| task.summary) {
+            horizon_durations
+                .entry(task.uid)
+                .and_modify(|duration| *duration = (*duration).max(MAX_LAG_MIN))
+                .or_insert(MAX_LAG_MIN);
+        }
         // Elapsed lag is calendar minutes, which over-estimates the working
         // minutes it spans: safe for a working-minute budget.
         let lag: i64 = proj
@@ -2340,59 +2352,6 @@ fn durations(proj: &Project) -> HashMap<i32, i64> {
     out
 }
 
-/// An intentionally generous estimate for sizing timelines before summary
-/// rollups exist. Child link gaps and nested manual spans can widen an auto
-/// summary beyond the sum of its leaf durations.
-fn horizon_lag_durations(
-    proj: &Project,
-    stored: &HashMap<i32, i64>,
-    manual_spans: &HashMap<i32, (i64, i64)>,
-) -> HashMap<i32, i64> {
-    let tasks = &proj.tasks;
-    let mut leaf_prefix = vec![0i64; tasks.len() + 1];
-    let mut gap_prefix = vec![0i64; tasks.len() + 1];
-    let mut manual_prefix = vec![0i64; tasks.len() + 1];
-    for (i, task) in tasks.iter().enumerate() {
-        leaf_prefix[i + 1] = leaf_prefix[i].saturating_add(if task.summary {
-            0
-        } else {
-            task.duration_min.max(0)
-        });
-        gap_prefix[i + 1] = task.predecessors.iter().fold(gap_prefix[i], |sum, link| {
-            sum.saturating_add(lag_minutes(link, stored).saturating_abs())
-        });
-        manual_prefix[i + 1] = manual_prefix[i].saturating_add(
-            manual_spans
-                .get(&task.uid)
-                .map_or(0, |&(start, finish)| finish.saturating_sub(start)),
-        );
-    }
-    let mut ends = vec![tasks.len(); tasks.len()];
-    let mut stack = Vec::new();
-    for i in (0..tasks.len()).rev() {
-        while stack
-            .last()
-            .is_some_and(|&j: &usize| tasks[j].outline_level > tasks[i].outline_level)
-        {
-            stack.pop();
-        }
-        ends[i] = stack.last().copied().unwrap_or(tasks.len());
-        stack.push(i);
-    }
-    let mut result = stored.clone();
-    for (i, task) in tasks.iter().enumerate().filter(|(_, task)| task.summary) {
-        let descendants = leaf_prefix[ends[i]]
-            .saturating_sub(leaf_prefix[i + 1])
-            .saturating_add(gap_prefix[ends[i]].saturating_sub(gap_prefix[i + 1]))
-            .saturating_add(manual_prefix[ends[i]].saturating_sub(manual_prefix[i + 1]));
-        let own_manual = manual_spans
-            .get(&task.uid)
-            .map_or(0, |&(start, finish)| finish.saturating_sub(start));
-        result.insert(task.uid, stored[&task.uid].max(descendants).max(own_manual));
-    }
-    result
-}
-
 /// A link's lag in minutes of its kind (see [`Predecessor::lag_minutes`]); a
 /// percent of a missing predecessor is zero. No timeline spans more than
 /// [`MAX_LAG_MIN`], so a longer lag (an overflowing percent included) is
@@ -3563,13 +3522,13 @@ impl Scheduler<'_> {
                         Offset::Working(leveled_lag)
                             if pred_task.summary && p.lag_format.kind() == LagKind::Percent =>
                         {
-                            let cpm_offset = self.effective_offset(
-                                p,
-                                &graph,
+                            let cpm_offset = self.percent_offset(
+                                Offset::Working(0),
+                                Some(p),
                                 Some((pred.early_start.minutes(), pred.early_finish.minutes())),
                             );
                             let Offset::Working(cpm_lag) = cpm_offset else {
-                                return None;
+                                unreachable!("percent summary lag is working");
                             };
                             let succ_tl = self.tl(t);
                             let cpm_bound =
@@ -4591,6 +4550,136 @@ mod tests {
         );
         let expected = reference.abs_start(rolled_work * 3);
         assert_eq!(result.get(4).unwrap().early_start.minutes(), expected);
+    }
+
+    fn assert_summary_percent_fs_matches_full_timeline(
+        project: &Project,
+        summary_uid: i32,
+        successor_uid: i32,
+        percent: i64,
+    ) {
+        let result = schedule(project);
+        let span = result.get(summary_uid).unwrap();
+        let cal = summary_calendar(project);
+        let duration = working_minutes_on(&cal, span.early_start, span.early_finish);
+        let lag = duration * percent / 100;
+        let reference = Timeline::build(
+            &cal,
+            span.early_finish.minutes(),
+            span.early_finish.minutes(),
+            lag + 480,
+            span.early_finish.minutes(),
+        );
+        assert_eq!(
+            result.get(successor_uid).unwrap().early_start.minutes(),
+            reference.abs_start(lag)
+        );
+    }
+
+    #[test]
+    fn summary_percent_horizon_covers_far_child_constraint() {
+        let mut summary = summary_task(1, 1);
+        summary.duration_min = 960;
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        b.constraint = ConstraintType::StartNoEarlierThan;
+        b.constraint_date = Some(DateTime::from_ymd_hm(2027, 4, 6, 8, 0));
+        let mut c = task(4, "C", 480);
+        let mut percent = fs(1);
+        percent.lag = 100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        assert_summary_percent_fs_matches_full_timeline(&march2(vec![summary, a, b, c]), 1, 4, 100);
+    }
+
+    #[test]
+    fn summary_percent_horizon_covers_outside_predecessor_and_stored_floor() {
+        for stored in [0, 301 * 480] {
+            let predecessor = task(1, "Outside predecessor", 300 * 480);
+            let mut summary = summary_task(2, 1);
+            summary.duration_min = stored;
+            let mut a = task(3, "A", 480);
+            a.outline_level = 2;
+            let mut b = task(4, "B", 480);
+            b.outline_level = 2;
+            b.predecessors.push(fs(1));
+            let mut c = task(5, "C", 480);
+            let mut percent = fs(2);
+            percent.lag = 200;
+            percent.lag_format = LagFormat::from_code(19).unwrap();
+            c.predecessors.push(percent);
+            assert_summary_percent_fs_matches_full_timeline(
+                &march2(vec![predecessor, summary, a, b, c]),
+                2,
+                5,
+                200,
+            );
+        }
+    }
+
+    #[test]
+    fn summary_percent_horizon_covers_nested_percent_lags() {
+        let outer = summary_task(1, 1);
+        let mut nested = summary_task(2, 2);
+        nested.duration_min = 0;
+        let mut a = task(3, "A", 480);
+        a.outline_level = 3;
+        let mut b = task(4, "B", 480);
+        b.outline_level = 3;
+        b.predecessors
+            .push(Predecessor::working(3, LinkType::FinishStart, 100 * 480));
+        let mut c = task(5, "C", 480);
+        c.outline_level = 2;
+        let mut nested_percent = fs(2);
+        nested_percent.lag = 300;
+        nested_percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(nested_percent);
+        let mut successor = task(6, "Successor", 480);
+        let mut outer_percent = fs(1);
+        outer_percent.lag = 100;
+        outer_percent.lag_format = LagFormat::from_code(19).unwrap();
+        successor.predecessors.push(outer_percent);
+        assert_summary_percent_fs_matches_full_timeline(
+            &march2(vec![outer, nested, a, b, c, successor]),
+            1,
+            6,
+            100,
+        );
+    }
+
+    #[test]
+    fn negative_summary_percent_horizon_covers_far_child_constraint() {
+        let summary = summary_task(1, 1);
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        b.constraint = ConstraintType::StartNoEarlierThan;
+        b.constraint_date = Some(DateTime::from_ymd_hm(2027, 4, 6, 8, 0));
+        let mut c = task(4, "C", 480);
+        let mut percent = Predecessor::working(1, LinkType::StartStart, 0);
+        percent.lag = -100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        let project = march2(vec![summary, a, b, c]);
+        let result = schedule(&project);
+        let span = result.get(1).unwrap();
+        let cal = summary_calendar(&project);
+        let duration = working_minutes_on(&cal, span.early_start, span.early_finish);
+        let origin = Timeline::origin(&cal, span.early_start.minutes(), duration + 480);
+        let reference = Timeline::build(
+            &cal,
+            origin,
+            span.early_start.minutes(),
+            duration + 480,
+            span.early_start.minutes(),
+        );
+        let expected =
+            reference.abs_start(reference.to_index(span.early_start.minutes()) - duration);
+        assert_eq!(result.get(4).unwrap().early_start.minutes(), expected);
+        assert!(expected < at(2, 8).minutes());
     }
 
     #[test]
