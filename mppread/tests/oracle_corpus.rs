@@ -440,7 +440,14 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 mpp.display()
             );
         }
-        if ["e1-range", "e2-weekend-working", "e10-several-unicode"].contains(&stem.as_ref()) {
+        if [
+            "e1-range",
+            "e2-weekend-working",
+            "e10-several-unicode",
+            "k1-one-off",
+        ]
+        .contains(&stem.as_ref())
+        {
             assert!(
                 compared_uids.contains(&1),
                 "{}: one-off exception task was not compared",
@@ -530,7 +537,10 @@ fn project_2024_oracles() {
     let exceptions = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/exceptions");
     if exceptions.exists() {
         let cases = pairs(&exceptions, "");
-        assert_eq!(cases.len(), 10);
+        assert_eq!(
+            cases.len(),
+            17 + usize::from(exceptions.join("k8-period-300.mpp").exists())
+        );
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);
         }

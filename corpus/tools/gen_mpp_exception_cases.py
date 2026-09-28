@@ -119,6 +119,57 @@ def cases():
     ]
 
 
+def save_pair(app, slug):
+    for ext, fmt in ((".xml", PJ_XML), (".mpp", PJ_MPP)):
+        target = os.path.join(OUT, slug + ext)
+        if os.path.exists(target):
+            os.remove(target)
+        app.CalculateProject()
+        app.FileSaveAs(Name=target, FormatID=fmt)
+        if not os.path.isfile(target):
+            raise RuntimeError(f"Project did not write {target}")
+    print("wrote " + slug, flush=True)
+
+
+def com_cases():
+    # These are created through Project's object model, not by opening MSPDI.
+    # Type numbers and pattern fields match Project's PjExceptionType values.
+    return [
+        ("k1-one-off", 1, "3/4/2026", "3/4/2026", {}),
+        ("k2-daily-n", 7, "3/4/2026", None,
+         {"Period": 3, "Occurrences": 5}),
+        ("k3-weekly-days", 6, "3/4/2026", "4/30/2026",
+         {"Period": 1, "DaysOfWeek": 18}),
+        ("k4-monthly-day", 4, "3/4/2026", "9/4/2026",
+         {"Period": 1, "MonthDay": 4}),
+        ("k5-monthly-position", 5, "3/4/2026", "9/8/2026",
+         {"Period": 1, "MonthPosition": 2, "MonthItem": 5}),
+        ("k6-yearly-date", 2, "3/4/2026", "3/4/2030",
+         {"Month": 3, "MonthDay": 4}),
+        ("k7-yearly-position", 3, "3/4/2026", "3/10/2030",
+         {"Month": 3, "MonthPosition": 2, "MonthItem": 5}),
+        ("k8-period-300", 7, "3/4/2026", "8/20/2027", {"Period": 300}),
+    ]
+
+
+def com_case(app, slug, kind, start, finish, fields):
+    app.FileNew()
+    project = app.ActiveProject
+    try:
+        project.ProjectStart = "3/2/2026 8:00 AM"
+        project.NewTasksCreatedAsManual = False
+        task = project.Tasks.Add("Exception span")
+        task.Duration = "10d"
+        calendar = project.BaseCalendars("Standard")
+        kwargs = {"Type": kind, "Start": start, "Name": slug, **fields}
+        if finish is not None:
+            kwargs["Finish"] = finish
+        calendar.Exceptions.Add(**kwargs)
+        save_pair(app, slug)
+    finally:
+        app.FileCloseEx(0)
+
+
 def main():
     try:
         win32.GetActiveObject("MSProject.Application")
@@ -140,17 +191,20 @@ def main():
                 if not app.FileOpenEx(source, True) or app.Projects.Count != before + 1:
                     raise RuntimeError(f"Project did not open {slug} seed")
                 try:
-                    for ext, fmt in ((".xml", PJ_XML), (".mpp", PJ_MPP)):
-                        target = os.path.join(OUT, slug + ext)
-                        if os.path.exists(target):
-                            os.remove(target)
-                        app.CalculateProject()
-                        app.FileSaveAs(Name=target, FormatID=fmt)
-                        if not os.path.isfile(target):
-                            raise RuntimeError(f"Project did not write {target}")
+                    save_pair(app, slug)
                 finally:
                     app.FileCloseEx(0)
-                print("wrote " + slug, flush=True)
+        for slug, kind, start, finish, fields in com_cases():
+            try:
+                com_case(app, slug, kind, start, finish, fields)
+            except pywintypes.com_error as error:
+                if slug != "k8-period-300":
+                    raise
+                for ext in (".xml", ".mpp"):
+                    target = os.path.join(OUT, slug + ext)
+                    if os.path.exists(target):
+                        os.remove(target)
+                print(f"Project refused optional {slug}: {error}", flush=True)
     finally:
         for call in (lambda: app.FileCloseAll(0), lambda: app.Quit(0)):
             try:

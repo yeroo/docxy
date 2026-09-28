@@ -46,6 +46,24 @@ fn name(value: &[u8]) -> Result<String, String> {
     Ok(s)
 }
 
+fn working_time(
+    start_tenths: u32,
+    duration: i32,
+    previous: Option<&WorkingTime>,
+) -> Result<WorkingTime, &'static str> {
+    if !start_tenths.is_multiple_of(10) || duration <= 0 || duration % 10 != 0 {
+        return Err("invalid period");
+    }
+    let from = start_tenths / 10;
+    let to = from
+        .checked_add(duration as u32 / 10)
+        .ok_or("period overflow")?;
+    if to > 1440 || previous.is_some_and(|last| from < last.to) {
+        return Err("invalid period order");
+    }
+    Ok(WorkingTime { from, to })
+}
+
 fn hours(value: &[u8], base: bool) -> Result<[Option<DayWorking>; 7], String> {
     // Seven 60-byte Sunday-first records; exceptions start at byte 420. Start and
     // duration are tenths of a minute. An inherited base day uses Project's
@@ -77,21 +95,9 @@ fn hours(value: &[u8], base: bool) -> Result<[Option<DayWorking>; 7], String> {
         for period in 0..count {
             let from_tenths = u32::from(u16_at(rec, 8 + period * 2));
             let duration = i32_at(rec, 20 + period * 4);
-            if !from_tenths.is_multiple_of(10) || duration <= 0 || duration % 10 != 0 {
-                return Err(format!("invalid calendar weekday {day} period {period}"));
-            }
-            let from = from_tenths / 10;
-            let to = from
-                .checked_add(duration as u32 / 10)
-                .ok_or("calendar period overflow")?;
-            if to > 1440
-                || times
-                    .last()
-                    .is_some_and(|last: &WorkingTime| from < last.to)
-            {
-                return Err(format!("invalid calendar weekday {day} period order"));
-            }
-            times.push(WorkingTime { from, to });
+            let time = working_time(from_tenths, duration, times.last())
+                .map_err(|e| format!("calendar weekday {day} period {period}: {e}"))?;
+            times.push(time);
         }
         week[day] = Some(DayWorking { times });
     }
@@ -124,7 +130,6 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
         if u16_at(rec, 6) != 0
             || rec[9..14].iter().any(|&b| b != 0)
             || rec[73..76].iter().any(|&b| b != 0)
-            || rec[79] != 0
             || u32_at(rec, 84) != 0
         {
             return Err(format!("unrecognized calendar exception {index} fields"));
@@ -146,18 +151,10 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
         let mut times = Vec::with_capacity(period_count);
         let mut cumulative = 0u32;
         for p in 0..period_count {
-            let start = i32::from(u16_at(rec, 20 + 2 * p));
+            let start = u32::from(u16_at(rec, 20 + 2 * p));
             let duration = i32_at(rec, 32 + 4 * p);
-            if start < 0 || start % 10 != 0 || duration <= 0 || duration % 10 != 0 {
-                return Err(format!("invalid calendar exception {index} period {p}"));
-            }
-            let from = start as u32 / 10;
-            let to = from
-                .checked_add(duration as u32 / 10)
-                .ok_or("calendar exception period overflow")?;
-            if to > 1440 || times.last().is_some_and(|t: &WorkingTime| from < t.to) {
-                return Err(format!("invalid calendar exception {index} period order"));
-            }
+            let time = working_time(start, duration, times.last())
+                .map_err(|e| format!("calendar exception {index} period {p}: {e}"))?;
             cumulative = cumulative
                 .checked_add(duration as u32)
                 .ok_or("calendar exception cumulative period overflow")?;
@@ -166,7 +163,7 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
                     "invalid calendar exception {index} cumulative period"
                 ));
             }
-            times.push(WorkingTime { from, to });
+            times.push(time);
         }
         let kind = u32_at(rec, 72);
         let b = &rec[76..80];
@@ -188,7 +185,7 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
             // COM-built snapshots, zero in MSPDI-resaved probes). It does not
             // appear in Project's XML for one-off exceptions.
             1 => {}
-            2 if b[2] == 0 => {
+            2 => {
                 exception.month = Some(i32::from(b[0]));
                 exception.month_day = Some(i32::from(b[1]));
             }
@@ -197,21 +194,21 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
                 exception.month_position = Some(i32::from(b[1]));
                 exception.month_item = Some(i32::from(b[2]));
             }
-            4 if b[1] == 0 => {
+            4 => {
                 exception.month_day = Some(i32::from(b[0]));
-                exception.period = Some(i32::from(b[2]));
+                exception.period = Some(i32::from(u16_at(rec, 78)));
             }
             5 => {
                 exception.month_position = Some(i32::from(b[0]));
                 exception.month_item = Some(i32::from(b[1]));
-                exception.period = Some(i32::from(b[2]));
+                exception.period = Some(i32::from(u16_at(rec, 78)));
             }
-            6 if b[1] == 0 => {
+            6 => {
                 exception.days_of_week = Some(i32::from(b[0]));
-                exception.period = Some(i32::from(b[2]));
+                exception.period = Some(i32::from(u16_at(rec, 78)));
             }
-            7 if b[1] == 0 && b[2] == 0 => {
-                exception.period = Some(i32::from(b[0]));
+            7 => {
+                exception.period = Some(i32::from(u16_at(rec, 76)));
             }
             _ => {
                 return Err(format!(
@@ -507,8 +504,24 @@ mod tests {
         assert!(exceptions(&vec![0; 428]).unwrap().is_empty());
 
         let mut alternate = exception_block();
-        alternate[500..504].copy_from_slice(&0x1234u32.to_le_bytes());
+        alternate[500..504].copy_from_slice(&0x0100_0230u32.to_le_bytes());
         assert_eq!(exceptions(&alternate).unwrap(), ex);
+    }
+
+    #[test]
+    fn recurrence_periods_are_u16_and_unmapped_pattern_bytes_are_ignored() {
+        let mut monthly = exception_block();
+        monthly[496..500].copy_from_slice(&4u32.to_le_bytes());
+        monthly[500..504].copy_from_slice(&[4, 2, 44, 1]);
+        let decoded = exceptions(&monthly).unwrap();
+        assert_eq!(decoded[0].month_day, Some(4));
+        assert_eq!(decoded[0].period, Some(300));
+
+        let mut daily = exception_block();
+        daily[496..500].copy_from_slice(&7u32.to_le_bytes());
+        daily[500..504].copy_from_slice(&[44, 1, 5, 6]);
+        let decoded = exceptions(&daily).unwrap();
+        assert_eq!(decoded[0].period, Some(300));
     }
 
     #[test]

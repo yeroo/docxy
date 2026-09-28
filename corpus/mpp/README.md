@@ -130,7 +130,8 @@ python corpus/tools/gen_mpp_calendar_cases.py
 The binary and XML pairs stay git-ignored. The oracle test checks their exact
 calendar UIDs, names, base links, weekdays and default calendar UID when present.
 
-The exception decoder has ten Project-written probes in `exceptions/`: multi-day
+The exception decoder has ten MSPDI-seeded and seven COM-created Project-written
+probes in `exceptions/` (plus one optional Period 300 COM case): multi-day
 holidays, a working Saturday with two periods, daily/weekly/monthly/yearly
 recurrences, a derived calendar exception, several sorted exceptions, and a
 Unicode name. Generate them with:
@@ -150,7 +151,8 @@ exception. In each fixed record, +0/+2 are inclusive from/to days since
 1983-12-31, +4 is occurrences, +8 is EnteredByOccurrences, +14 is the working
 period count, +20 has five `u16` period starts and +32 five `i32` durations
 (tenths of a minute), +52 has cumulative durations, +72 is the MSPDI exception
-type, +76..+79 are type-specific recurrence bytes, and +88 is the name byte
+type, +76..+79 are type-specific recurrence bytes (including `u16` periods at
++78 for Types 4–6 and +76 for Type 7), and +88 is the name byte
 length. +80 holds a Project-assigned exception identifier that does not appear
 in MSPDI. Types 2/3 are yearly by date/position, 4/5 monthly by date/position,
 6 weekly, and 7 every N days. Type 8 has no binary probe and is not decoded.
