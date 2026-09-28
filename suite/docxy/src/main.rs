@@ -22037,6 +22037,37 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla) -> impl IntoElement {
         .child(div().text_color(dim).child(blurb))
 }
 
+/// The window the app opens, as a pure function of its bounds and whether this
+/// is a harness instance.
+///
+/// Pulled out of the gpui closure so the one thing a test can meaningfully
+/// assert about it — that a harness instance does not take the user's focus —
+/// is a unit test rather than something you discover by watching a window
+/// steal the keyboard while you are typing in another app.
+fn window_options(bounds: Bounds<Pixels>, harness: bool) -> WindowOptions {
+    WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitleBar::title_bar_options()),
+        window_min_size: Some(size(px(460.), px(420.))),
+        kind: WindowKind::Normal,
+        // ⚠️ A harness instance must never take the keyboard from whoever is
+        // using the machine. gpui turns this single flag into `orderFront`
+        // instead of `makeKeyAndOrderFront` on macOS, and `SW_SHOWNOACTIVATE`
+        // instead of an activating show on Windows, so one flag covers both
+        // platforms and neither needs a launcher trick to hold focus down.
+        focus: !harness,
+        // ⚠️ macOS only, and deliberately not Windows. Not showing the window
+        // is what keeps a test run entirely off the user's screen here, and it
+        // costs nothing because the harness drives the render pass itself. On
+        // Windows the same flag would be actively harmful: that window layer
+        // reports an unshown window as Hidden, which is precisely the state
+        // that stops frames — so there a harness window stays shown, just
+        // never focused.
+        show: !(harness && cfg!(target_os = "macos")),
+        ..Default::default()
+    }
+}
+
 fn main() {
     // The command line: files to open (e.g. double-clicking a document in
     // Explorer, opened on top of the restored hot-exit session), plus the
@@ -22090,13 +22121,7 @@ fn main() {
             KeyBinding::new("shift-tab", OutdentAction, None),
         ]);
         let bounds = Bounds::centered(None, size(px(1180.), px(800.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitleBar::title_bar_options()),
-            window_min_size: Some(size(px(460.), px(420.))),
-            kind: WindowKind::Normal,
-            ..Default::default()
-        };
+        let options = window_options(bounds, want_harness);
         let startup_files = cli_files.clone();
         cx.open_window(options, move |window, cx| {
             let view = cx.new(Docxy::new);
@@ -22148,6 +22173,80 @@ fn main() {
         })
         .expect("failed to open docxy window");
     });
+}
+
+#[cfg(test)]
+mod window_option_tests {
+    use super::window_options;
+    use gpui::{Bounds, Pixels, point, px, size};
+
+    /// The bounds are not what these tests are about; any window will do.
+    fn any_bounds() -> Bounds<Pixels> {
+        Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(1180.), px(800.)),
+        }
+    }
+
+    /// A harness instance must come up **without taking the user's focus**.
+    /// gpui turns this one flag into `orderFront` rather than
+    /// `makeKeyAndOrderFront` on macOS, and `SW_SHOWNOACTIVATE` rather than an
+    /// activating show on Windows — so the machine stays usable while a test
+    /// run is driving a window on it.
+    #[test]
+    fn a_harness_window_does_not_take_focus() {
+        assert!(
+            !window_options(any_bounds(), true).focus,
+            "a harness instance must not take focus from whatever the user is doing"
+        );
+    }
+
+    /// The flag is strictly opt-in: an ordinary launch is a foreground app and
+    /// must still come up focused, or double-clicking a document would open a
+    /// window behind everything else.
+    #[test]
+    fn a_normal_window_still_takes_focus() {
+        assert!(
+            window_options(any_bounds(), false).focus,
+            "a normal launch must keep focusing its window"
+        );
+    }
+
+    /// On macOS a harness window is never shown at all, so a test run cannot
+    /// cover what the user is looking at. It still lays out and draws — the
+    /// harness drives the render pass itself — so geometry verbs work against
+    /// a window that was never put on screen.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_harness_window_is_never_shown_on_macos() {
+        assert!(
+            !window_options(any_bounds(), true).show,
+            "a harness instance must not put a window on the user's screen"
+        );
+    }
+
+    /// ⚠️ Everywhere else a harness window IS shown, and on Windows that is
+    /// load-bearing rather than incidental: its window layer reports a window
+    /// that is not shown as Hidden, and a hidden window is exactly the state
+    /// that stops frames. Leaving it shown but unfocused is what keeps the
+    /// working Windows harness working.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_harness_window_is_still_shown_off_macos() {
+        assert!(
+            window_options(any_bounds(), true).show,
+            "only macOS withholds the window; elsewhere an unshown window stops drawing"
+        );
+    }
+
+    /// A normal launch always shows its window, on every platform.
+    #[test]
+    fn a_normal_window_is_always_shown() {
+        assert!(
+            window_options(any_bounds(), false).show,
+            "a normal launch must show its window"
+        );
+    }
 }
 
 #[cfg(test)]

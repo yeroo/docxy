@@ -1716,7 +1716,7 @@ pub fn dispatch(
         // before the change. See `Driver::settle`.
         "frame" => {
             cx.notify();
-            Done::ok(Json::obj(vec![("frame", Json::Num(app.frame as f64))]))
+            Done::ok_drawn(Json::obj(vec![("frame", Json::Num(app.frame as f64))]))
         }
 
         // Where a named region is, on the desktop, in physical pixels — so the
@@ -1767,6 +1767,7 @@ pub fn dispatch(
             Ok(Done {
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),
                 quit: true,
+                draw: false,
             })
         }
 

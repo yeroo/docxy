@@ -591,8 +591,57 @@ name, deciding whether a sampled row of pixels is dashed or solid, comparing an
 expectation to an observation — and those are what the unit tests cover. The
 harness end to end is exercised by running it.
 
+## Where a harness window goes, and why it draws at all
+
+A harness instance **never takes the keyboard**, on any platform. Its window is
+opened with gpui's `focus` flag off, which is one flag with two platform
+meanings: `orderFront` instead of `makeKeyAndOrderFront` on macOS, and
+`SW_SHOWNOACTIVATE` instead of an activating show on Windows. Nothing in the
+launcher has to fight for focus, because the window never asks for it.
+
+On **macOS** it also never takes the screen: the window is not shown at all
+(`show` off). On **Windows** it stays shown, and that difference is
+load-bearing rather than an oversight — that window layer reports an unshown
+window as `Hidden`, and hidden is exactly the state that stops frames there.
+Withholding the window on Windows would break the one harness that already
+works.
+
+### The frame the app draws for itself
+
+⚠️ **gpui only draws a dirty window when its platform frame source ticks**, and
+on macOS that source is a display link which starts only while the window's
+occlusion state says it is visible. A harness window is unfocused and unshown,
+so the link never runs: `cx.notify()` leaves the view dirty forever, the app
+answers every verb correctly, and the frame counter never moves. The symptom is
+that `rect` times out — `the app drew no new frame within 5s (still frame 2,
+waiting for 4); is it hung?` — against an app that is not hung at all.
+
+(gpui does have a path that draws every dirty window as it flushes effects, but
+it is compiled in only under its own test cfg, so a shipping build never takes
+it.)
+
+So the `frame` verb **draws the frame itself** rather than waiting for a source
+that is never going to tick: it marks the view dirty and then drives the render
+pass directly before replying. `Done::ok_drawn` is what carries that request out
+to the pump, and it is the only reply that does; an ordinary verb still just
+marks the view dirty. Since a driver polls `frame` while it waits for the view
+to settle, the frames a case needs arrive exactly when it asks for them.
+
+Nothing is **presented**. A draw is all the probes and the frame counter need,
+and presentation is the part that would require the window to be on screen —
+which is the thing this is avoiding.
+
 ## Not covered
 
+- **Capture off Windows.** `shot`, `window` and every pixel assertion are
+  Windows-only: `PrintWindow` is a Win32 call and there is no portable
+  replacement here yet. On macOS the verbs and `rect` work, so a case that only
+  drives and asserts state runs; anything that looks at pixels does not.
+  Screen-grabbing is not the answer for it either — it needs Screen Recording
+  permission and a window that is genuinely visible and unobstructed, which is
+  the opposite of what a harness window is. gpui's own offscreen
+  render-to-texture needs its test-support feature and is the route worth
+  measuring next.
 - **CI.** It needs a desktop session for `PrintWindow`.
 - **Mail editing and advanced document UI.** Document text, selection, ribbon,
   status and File rail are covered. Menus, dialogs, pane contents and pointer
