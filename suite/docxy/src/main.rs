@@ -1667,7 +1667,10 @@ fn next_tab_stop(
             0.0
         })
         .max(if xm < pad_l { pad_l } else { 0.0 });
-    let d = ((lo / interval).floor() + 1.0) * interval;
+    let mut d = ((lo / interval).floor() + 1.0) * interval;
+    while d <= xm + 0.5 {
+        d += interval;
+    }
     if d < pos {
         pos = d;
         align = TabAlign::Left;
@@ -1692,9 +1695,11 @@ fn leading_items(
     }
     if let Some(width) = marker_width {
         items.push(LeadingItem::ListMarker);
-        let xm = layout.first_x + width;
-        let (stop, _) = next_tab_stop(xm, layout.continuation_x, interval, customs);
-        items.push(LeadingItem::MarkerGap((stop - xm).max(3.0)));
+        if layout.first_x + 0.5 < layout.continuation_x {
+            let xm = layout.first_x + width;
+            let (stop, _) = next_tab_stop(xm, layout.continuation_x, interval, customs);
+            items.push(LeadingItem::MarkerGap((stop - xm).max(3.0)));
+        }
     }
     items
 }
@@ -2144,8 +2149,7 @@ mod ruler_geom_tests {
                     width: 72.0,
                     margin: 0.0
                 },
-                LeadingItem::ListMarker,
-                LeadingItem::MarkerGap(62.0)
+                LeadingItem::ListMarker
             ]
         );
 
@@ -2186,6 +2190,38 @@ mod ruler_geom_tests {
             ]
         );
         near(list.first_x, 24.0); // the marker follows the spacer at the first-line origin
+    }
+
+    #[test]
+    fn plain_list_levels_keep_text_after_the_marker() {
+        for ilvl in [0, 1] {
+            let layout = paragraph_indent_layout(
+                eff_indent(&ParProps {
+                    ilvl,
+                    ..ParProps::default()
+                }),
+                1.0,
+            );
+            assert_eq!(
+                leading_items(layout, Some(10.0), 48.0, &[]),
+                vec![LeadingItem::ListMarker]
+            );
+        }
+    }
+
+    #[test]
+    fn default_tab_grid_tolerance_advances_past_nearby_stop() {
+        for zoom in [0.9, 1.0] {
+            let interval = 48.0 * zoom;
+            for (xm, expected) in [
+                (interval - 1e-4, 2.0 * interval),
+                (7.0 * interval, 8.0 * interval),
+            ] {
+                let (stop, _) = next_tab_stop(xm, 0.0, interval, &[]);
+                near(stop, expected);
+                assert!(stop > xm + 0.5);
+            }
+        }
     }
 
     #[test]
