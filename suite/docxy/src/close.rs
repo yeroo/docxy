@@ -45,7 +45,7 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
 /// the cell would seed it with. An editor opened and left as seeded must not
 /// rewrite the cell: commit_edit reparses it (text "007" would become the
 /// number 7). Left open, a cancelled close or Save As keeps the editor as it was.
-fn commit_changed_cell(tab: &mut DocTab) -> bool {
+fn commit_changed_cell(tab: &mut DocTab) {
     if let Surface::Sheet(v) = &mut tab.surface
         && v.editing
             .as_deref()
@@ -53,19 +53,16 @@ fn commit_changed_cell(tab: &mut DocTab) -> bool {
     {
         let changed = v.commit_edit();
         tab.dirty |= changed;
-        return changed;
+        if changed {
+            v.anchor = v.sel;
+        }
     }
-    false
 }
 
 /// Apply the cell-editor part of Save before choosing a target and writing.
 /// Keep this path shared with close so Save cannot reparse an untouched editor.
 pub(crate) fn prepare_sheet_save(tab: &mut DocTab) {
-    if commit_changed_cell(tab)
-        && let Surface::Sheet(v) = &mut tab.surface
-    {
-        v.anchor = v.sel;
-    }
+    commit_changed_cell(tab);
 }
 
 fn close_step(

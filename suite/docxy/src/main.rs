@@ -10137,7 +10137,7 @@ impl Docxy {
             None => match doc_save_target(tab.path.as_deref(), self.harness.is_some()) {
                 DocSaveTarget::InPlace => None,
                 // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
-                // this thread and stops the control pump dead (see `save_sheet`).
+                // this thread and stops the control pump dead (see `save_sheet_tab`).
                 DocSaveTarget::RefuseHarness => {
                     self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
                     return self.refocus(window, cx);
@@ -12609,11 +12609,15 @@ fn save_sheet_tab(
     close::prepare_sheet_save(tab);
     match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
         SheetSaveDecision::InPlace(path) => finish_sheet_save(tab, Some(&path)),
+        // A never-saved workbook or Save As asks where to go, Excel-style.
         SheetSaveDecision::Dialog { suggested } => {
             let target = pick(suggested);
             finish_sheet_save(tab, target.as_deref());
         }
-        // A harness must never enter rfd's modal loop: it stops the control pump.
+        // Never in a harness instance: rfd runs its own modal loop on this
+        // thread and stops the control pump dead (see `open_args`). A harness
+        // `key ctrl+s` on an untitled workbook reaches here; refusing in words
+        // is the only answer a test can read.
         SheetSaveDecision::RefuseHarness(message) => {
             tab.status = message.into();
             return false;

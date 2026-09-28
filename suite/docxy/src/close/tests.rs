@@ -82,10 +82,11 @@ fn sheet_pending_edit_commits_before_asking_and_is_undoable() {
     };
     assert_eq!(v.undo.len(), 1);
     assert!(v.redo.is_empty());
-    assert_eq!(v.anchor, (2, 2));
+    assert_eq!(v.anchor, v.sel);
     let snap = v.undo.pop().unwrap();
     v.restore(snap);
     assert_eq!(v.edit_string(0, 0), before);
+    assert_eq!(v.anchor, (2, 2));
     assert!(!v.commit_edit());
     assert!(v.undo.is_empty());
 }
@@ -503,6 +504,10 @@ fn close_dialog_save_preserves_an_untouched_text_cell_on_disk() {
     let mut t = untouched_text_cell();
     t.path = Some(path.clone());
     t.dirty = true; // Another change caused the close dialog to ask.
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.anchor = (2, 2);
     assert_eq!(
         close_step(&mut t, |_| Ok(CloseAnswer::Save)),
         CloseStep::Save
@@ -515,9 +520,30 @@ fn close_dialog_save_preserves_an_untouched_text_cell_on_disk() {
     };
     assert_eq!(v.editing.as_deref(), Some("007"));
     assert!(v.undo.is_empty());
+    assert_eq!(v.anchor, (2, 2));
     assert!(!t.dirty, "{}", t.status);
     assert!(path.is_file(), "{}", t.status);
     a1_is_text_007(&tab_from_path(&path));
+}
+
+#[test]
+fn close_dialog_save_collapses_a_range_when_it_commits_a_changed_cell() {
+    let mut t = untouched_text_cell();
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.anchor = (2, 2);
+    v.editing = Some("abc".into());
+    assert_eq!(
+        close_step(&mut t, |_| Ok(CloseAnswer::Save)),
+        CloseStep::Save
+    );
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.anchor, v.sel);
+    assert!(v.editing.is_none());
+    assert_eq!(v.undo.len(), 1);
 }
 
 #[test]
