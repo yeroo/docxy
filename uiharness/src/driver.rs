@@ -233,8 +233,21 @@ impl Driver {
     }
 
     /// The whole window, as pixels.
+    ///
+    /// Windows photographs the window from outside with `PrintWindow`. macOS
+    /// cannot: a harness window is never on screen, and reading another
+    /// process's pixels needs Screen Recording permission. So there the app
+    /// renders its last drawn frame offscreen and hands the pixels back through
+    /// its sandbox — see [`crate::capture::offscreen_capture`]. The app has to
+    /// be built with the suite's `harness-capture` feature for that verb to
+    /// answer; a default build refuses it and says so.
     pub fn capture(&self) -> Result<Capture, String> {
-        capture_pid(self.pid())
+        if cfg!(target_os = "macos") {
+            let reply = self.call("capture", ctlcore::json::Json::Obj(Vec::new()))?;
+            crate::capture::offscreen_capture(&reply, |p: &std::path::Path| std::fs::read(p))
+        } else {
+            capture_pid(self.pid())
+        }
     }
 
     /// A capture cropped to `region`: settle first, then photograph, then cut.

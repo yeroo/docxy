@@ -546,7 +546,11 @@ cannot:
 | `to_image_data` | renders SVG |
 | `Window::render_to_image` | behind `cfg(any(test, feature = "test-support"))`, and re-renders the scene to an offscreen texture rather than reading what the compositor put on screen |
 
-So the app reports geometry and the harness takes the picture, with Win32
+The last one is the route macOS now takes, deliberately and only in a build
+made for it — see [Capture on macOS](#capture-on-macos). A shipping build
+still cannot do it.
+
+On **Windows** the app reports geometry and the harness takes the picture, with Win32
 `PrintWindow` (`PW_RENDERFULLCONTENT`) against the test window's HWND, found
 from its process id. `PrintWindow` asks the window to draw itself into a device
 context, which gets that window alone even when another is in front of it — a
@@ -567,6 +571,61 @@ from this repo, `windows` for the Win32 capture, and `gridcore` as a
 dev-dependency solely to generate and check the fixture workbook — the binary
 itself has no spreadsheet engine in it and wants none, since it reads pixels and
 JSON.
+
+### Capture on macOS
+
+Nothing outside the app can photograph a macOS harness window: it is never on
+screen, and reading another process's pixels needs Screen Recording
+permission, which a test must not ask for. So on macOS **the app takes the
+picture itself**. The `capture` verb renders the last drawn frame to an
+offscreen texture with `Window::render_to_image`, writes the raw RGBA to
+`<sandbox>/suite/capture/last.rgba`, and replies:
+
+```json
+{"path": "...", "width": 1180, "height": 800, "scale": 1, "frame": 8,
+ "content_origin": {"x": 370, "y": 140}}
+```
+
+`uiharness` reads that file and from then on it is an ordinary capture:
+`content_origin` is in the same physical desktop pixels `rect` answers in,
+computed by the same function, so the existing crop (a region's rect minus the
+capture's origin) lands on the right pixels unchanged, and every border probe
+runs as it does on Windows. The pixels travel beside the control channel, not
+through it — a full window is megabytes, no size for a JSON reply. The CLI
+reports these captures as `via offscreen render`.
+
+It needs a build made for it:
+
+```bash
+cargo build --release --manifest-path suite/Cargo.toml \
+  --features harness-capture --target-dir suite/target/capture
+cargo run --release -p uiharness -- run uiharness/cases/sheet-selection.uit \
+  --suite suite/target/capture/release/suite
+```
+
+The separate `--target-dir` is not decoration: the feature changes how gpui
+itself is compiled, so sharing a target directory with the normal build would
+rebuild gpui every time you switched between them. A default build answers
+`capture` with an error naming the feature, rather than a blank picture.
+
+⚠️ **Three things to know before trusting a macOS pixel case:**
+
+- **It tests a different build from the one users run.** `harness-capture`
+  turns on gpui's test-support, which also makes gpui draw every dirty window as
+  it flushes effects, and turns on leak detection. The scene is the same, but
+  the scheduling of draws is not. Never ship this feature.
+- **It is the scene gpui drew, not what a compositor showed.** Anything the
+  system draws outside gpui is absent — the native window buttons, most
+  visibly. `window` is therefore content only, where Windows' `PrintWindow`
+  includes the frame.
+- **It is refused off macOS.** The feature is a compile error on any other
+  target, because gpui's draw-without-present would let a Windows run
+  photograph a frame that never reached the screen.
+
+Enabling it has a cost. Measured on an M1 against the pinned gpui: the binary
+grows from 21,702,768 to 22,137,088 bytes (+2%), the dependency graph gains
+twelve crates (`proptest` and its helpers), and a clean build into the separate
+target directory took 252 s with the git dependencies already fetched.
 
 ### Why not golden images
 
@@ -654,15 +713,9 @@ stale pixels is exactly the failure a pixel assertion cannot notice by itself.
 
 ## Not covered
 
-- **Capture off Windows.** `shot`, `window` and every pixel assertion are
-  Windows-only: `PrintWindow` is a Win32 call and there is no portable
-  replacement here yet. On macOS the verbs and `rect` work, so a case that only
-  drives and asserts state runs; anything that looks at pixels does not.
-  Screen-grabbing is not the answer for it either — it needs Screen Recording
-  permission and a window that is genuinely visible and unobstructed, which is
-  the opposite of what a harness window is. gpui's own offscreen
-  render-to-texture needs its test-support feature and is the route worth
-  measuring next.
+- **Capture on Linux.** `shot`, `window` and every pixel assertion work on
+  Windows through `PrintWindow` and on macOS through the app's own offscreen
+  render, which needs the `harness-capture` build. Linux has neither yet.
 - **CI.** It needs a desktop session for `PrintWindow`.
 - **Mail editing and advanced document UI.** Document text, selection, ribbon,
   status and File rail are covered. Menus, dialogs, pane contents and pointer
