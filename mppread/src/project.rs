@@ -1,21 +1,25 @@
 //! Convert validated MPP metadata and tasks to a schedulable project.
 
 use projcore::editor::default_anchor;
-use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Project, Task};
+use projcore::{
+    ConstraintType, DateTime, DayWorking, LagFormat, LinkType, Predecessor, Project, Task,
+};
+use std::collections::HashSet;
 
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
 /// a task. Each decoded auto leaf is pinned with a Must-Start-On constraint at
-/// its start and given Project's stored duration where validated, or the
-/// working span between its dates otherwise. Delayed assignments and splits
-/// can make its scheduled finish earlier than its stored finish, as on MSPDI
-/// import; a recurring calendar exception the scheduler cannot expand can
-/// also make those dates differ. Invalid stored durations, unrecognized
-/// duration formats and invalid or missing task calendar references refuse the file.
-/// A **manual** leaf keeps its mode and
-/// its manual start,
-/// finish and duration instead, which hold it where Project put it without a
-/// constraint; the project's new-task mode comes through too.
+/// its start. When its effective calendar has weekly working time and no
+/// undecoded work weeks in its base chain, it uses Project's stored duration
+/// and its own calendar where one is assigned. Otherwise it keeps the working
+/// span on the project calendar and no task calendar. An unknown task calendar
+/// UID falls back to the project default; invalid negative UIDs, stored
+/// durations and duration formats refuse the file. Delayed assignments, splits,
+/// resource calendar exceptions and recurring exceptions the scheduler cannot
+/// expand can still make scheduled and stored finishes differ. A **manual**
+/// leaf keeps its mode and manual dates and duration instead, which hold it
+/// where Project put it without a constraint; the project's new-task mode
+/// comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
 /// rollup come through, and the **predecessor links** decode from the `TBkndCons`
 /// table. Each task's recorded **progress**, work and cost come through as
@@ -23,8 +27,8 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// variances are not stored in the file and stay absent. Save As converts it
 /// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
 /// calendars, their weekdays and exceptions, and the project's default calendar.
-/// Work weeks are not yet decoded. An
-/// unrecognised exception record refuses the import.
+/// Work weeks are not yet decoded; their presence suppresses stored-duration
+/// scheduling on that calendar. An unrecognised exception record refuses import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)
@@ -49,11 +53,13 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .unwrap_or_else(|| "Imported project".into())
     });
     let mut cal_ref = Project::default();
-    if let Some((calendars, default_calendar_uid)) = crate::caldecode::decode(bytes, legacy)
+    let mut work_week_uids = HashSet::new();
+    if let Some(decoded_calendars) = crate::caldecode::decode(bytes, legacy)
         .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?
     {
-        cal_ref.calendars = calendars;
-        cal_ref.default_calendar_uid = default_calendar_uid;
+        cal_ref.calendars = decoded_calendars.calendars;
+        cal_ref.default_calendar_uid = decoded_calendars.default_uid;
+        work_week_uids = decoded_calendars.work_week_uids;
     }
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // A task is a summary when the next task sits one WBS level deeper.
@@ -105,21 +111,28 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 .ok_or_else(|| format!("invalid finish date for UID {}", t.uid))?;
             task.stored_start = Some(s);
             task.stored_finish = Some(f);
-            if let Some(calendar_uid) = t.calendar_uid {
-                if cal_ref.calendar(calendar_uid).is_none() {
-                    return Err(format!(
-                        "task UID {} refers to missing calendar UID {calendar_uid}",
-                        t.uid
-                    ));
-                }
-            }
-            task.calendar_uid = t.calendar_uid;
-            let task_cal = t
+            let own_calendar = t
                 .calendar_uid
-                .and_then(|uid| cal_ref.calendar(uid))
-                .map(|cal| cal_ref.resolved_calendar(cal))
-                .unwrap_or_else(|| cal_ref.project_calendar());
-            let working_span = || projcore::schedule::working_minutes_on(&task_cal, s, f);
+                .filter(|&uid| cal_ref.calendar(uid).is_some());
+            let effective_uid = own_calendar.unwrap_or(cal_ref.default_calendar_uid);
+            let effective_cal = cal_ref
+                .calendar(effective_uid)
+                .expect("validated or synthesized project calendar");
+            let faithful = cal_ref
+                .resolved_week(effective_cal)
+                .iter()
+                .any(DayWorking::working)
+                && !calendar_chain_has_work_weeks(&cal_ref, effective_uid, &work_week_uids);
+            task.calendar_uid = if faithful { own_calendar } else { None };
+            let project_span = || projcore::schedule::working_minutes_between(&cal_ref, s, f);
+            let working_span = || {
+                if faithful {
+                    let cal = cal_ref.resolved_calendar(effective_cal);
+                    projcore::schedule::working_minutes_on(&cal, s, f)
+                } else {
+                    project_span()
+                }
+            };
             task.manual = t.manual;
             let date = |d: &Option<String>, what: &str| {
                 d.as_deref()
@@ -156,7 +169,11 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             } else if t.manual {
                 task.duration_min = t.manual_duration_min.unwrap_or_else(working_span);
             } else {
-                task.duration_min = t.duration_min.unwrap_or_else(working_span);
+                task.duration_min = if faithful {
+                    t.duration_min.unwrap_or_else(working_span)
+                } else {
+                    project_span()
+                };
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }
@@ -176,6 +193,21 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         new_tasks_are_manual,
         ..cal_ref
     })
+}
+
+fn calendar_chain_has_work_weeks(
+    project: &Project,
+    uid: i32,
+    work_week_uids: &HashSet<i32>,
+) -> bool {
+    let mut next = Some(uid);
+    while let Some(uid) = next {
+        if work_week_uids.contains(&uid) {
+            return true;
+        }
+        next = project.calendar(uid).and_then(|cal| cal.base_calendar_uid);
+    }
+    false
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
@@ -200,6 +232,18 @@ fn parse_mpp_dt(s: &str) -> Option<DateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn undecoded_base_work_week_marks_a_derived_calendar_unfaithful() {
+        let mut project = Project::default();
+        let mut derived = projcore::Calendar::standard(3);
+        derived.base_calendar_uid = Some(1);
+        project.calendars.push(derived);
+        let mut work_week_uids = HashSet::new();
+        work_week_uids.insert(1);
+        assert!(calendar_chain_has_work_weeks(&project, 3, &work_week_uids));
+        work_week_uids.clear();
+        assert!(!calendar_chain_has_work_weeks(&project, 3, &work_week_uids));
+    }
     #[test]
     fn opens_mpp_metadata_as_partial_project() {
         // Build a minimal .mpp: a SummaryInformation property set with a title,

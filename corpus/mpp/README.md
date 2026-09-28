@@ -270,20 +270,22 @@ percent (20, 52) included.
 The newest layout's task `FixedData` stores Duration as i32 tenths of a minute
 at +84 and DurationFormat as u16 at +164. Both fields match every task in the
 46 generated Project-written MSPDI snapshot pairs. The importer uses the
-rounded stored duration for auto tasks with a working-time format; an absent
-duration, an elapsed format, or MPP9 falls back to the working span between
-stored dates.
-Percent DurationFormats also use the span fallback. Unknown DurationFormats and
-negative durations other than the absent marker refuse the file. Task
-CalendarUID is a signed i32 at +178: -1 means the project calendar. A task
-reference to a calendar absent from the decoded calendar table refuses the
-file; any other negative CalendarUID also refuses it. Fallback spans are
-measured on the task's calendar when it has one.
+rounded stored duration for auto tasks with a working-time format when their
+effective calendar has weekly working time and no undecoded work weeks in its
+base chain. An absent duration, an elapsed or percent format, or MPP9 falls
+back to the working span on that calendar. If its calendar has undecoded work
+weeks or no weekly working time, the importer keeps the previous behavior:
+no task calendar and the span on the project calendar, even when a stored
+duration exists. Unknown DurationFormats and negative durations other than the
+absent marker refuse the file. Task CalendarUID is a signed i32 at +178:
+-1 means the project calendar. An unknown nonnegative UID falls back to the
+project default; any other negative UID refuses the file.
 The stored value also covers a split or a delayed assignment, whose duration
 can be shorter than that span. The scheduler does not yet account for splits
-or a delayed assignment when calculating the task's finish; a recurring
-exception it cannot expand can also make scheduled and stored finishes differ.
-Assignments themselves are not yet imported from `.mpp` (#342).
+or a delayed assignment when calculating the task's finish. Resource-calendar
+exceptions and recurring exceptions it cannot expand can also make scheduled
+and stored finishes differ. Assignments themselves are not yet imported from
+`.mpp` (#342).
 
 Task progress, work and cost are decoded for the newest layout
 ([#181](https://github.com/yeroo/docxy/issues/181)) and imported as read; the

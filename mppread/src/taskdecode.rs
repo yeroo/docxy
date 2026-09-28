@@ -751,7 +751,12 @@ mod tests {
     }
     /// A task fixture with Standard (UID 1) and a 24-hour task calendar
     /// (UID 3), so identical stored dates have different working spans.
-    fn file_with_task_calendar(s: &Streams) -> Vec<u8> {
+    fn file_with_task_calendar(
+        s: &Streams,
+        default_work_weeks: bool,
+        own_work_weeks: bool,
+        own_has_work: bool,
+    ) -> Vec<u8> {
         let mut cal_fd = vec![0u8; 64];
         for i in 0..4 {
             cal_fd[i * 16..i * 16 + 2].copy_from_slice(&(i as u16).to_le_bytes());
@@ -788,15 +793,29 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         put(1, 1, &name("Standard"));
+        if default_work_weeks {
+            let mut standard = vec![0u8; 428];
+            for day in 0..7 {
+                standard[day * 60..day * 60 + 2].copy_from_slice(&1u16.to_le_bytes());
+            }
+            standard[424..428].copy_from_slice(&1u32.to_le_bytes());
+            put(1, 8, &standard);
+        }
         put(3, 1, &name("24 Hours"));
         let mut hours = vec![0u8; 428];
-        for day in 0..7 {
-            let p = day * 60;
-            hours[p + 2..p + 4].copy_from_slice(&1u16.to_le_bytes());
-            hours[p + 20..p + 24].copy_from_slice(&14400i32.to_le_bytes());
+        if own_has_work {
+            for day in 0..7 {
+                let p = day * 60;
+                hours[p + 2..p + 4].copy_from_slice(&1u16.to_le_bytes());
+                hours[p + 20..p + 24].copy_from_slice(&14400i32.to_le_bytes());
+            }
+        }
+        if own_work_weeks {
+            hours[424..428].copy_from_slice(&1u32.to_le_bytes());
         }
         put(3, 8, &hours);
-        cal_vm[8..12].copy_from_slice(&3u32.to_le_bytes());
+        let cal_field_count = ((cal_vm.len() - 24) / 12) as u32;
+        cal_vm[8..12].copy_from_slice(&cal_field_count.to_le_bytes());
         cal_vm[20..24].copy_from_slice(&(cal_v2.len() as u32).to_le_bytes());
         write_cfb_tree(&[Node::Storage(
             "   114",
@@ -935,11 +954,8 @@ mod tests {
         let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         assert_eq!(project.tasks[0].calendar_uid, Some(1));
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&99i32.to_le_bytes());
-        assert!(
-            crate::project::project_from_mpp(&file(&s, true))
-                .unwrap_err()
-                .contains("missing calendar UID 99")
-        );
+        let dangling = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(dangling.tasks[0].calendar_uid, None);
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&(-1i32).to_le_bytes());
         s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
             .copy_from_slice(&39u16.to_le_bytes());
@@ -962,7 +978,7 @@ mod tests {
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&3i32.to_le_bytes());
         s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&4800u32.to_le_bytes());
         s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2].copy_from_slice(&8u16.to_le_bytes()); // elapsed format: use span
-        let bytes = file_with_task_calendar(&s);
+        let bytes = file_with_task_calendar(&s, false, false, true);
         let project = crate::project::project_from_mpp(&bytes).unwrap();
         let task = &project.tasks[0];
         let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
@@ -981,16 +997,73 @@ mod tests {
         make_manual(&mut s);
         s.f2d[4 * 64 + MANUAL_DURATION..4 * 64 + MANUAL_DURATION + 4]
             .copy_from_slice(&u32::MAX.to_le_bytes());
-        let manual = crate::project::project_from_mpp(&file_with_task_calendar(&s)).unwrap();
+        let manual =
+            crate::project::project_from_mpp(&file_with_task_calendar(&s, false, false, true))
+                .unwrap();
         assert!(manual.tasks[0].manual);
         assert_eq!(manual.tasks[0].manual_duration_min, None);
         assert_eq!(manual.tasks[0].duration_min, 480);
+    }
+    #[test]
+    fn unfaithful_calendars_keep_the_project_span() {
+        let mut s = fixture();
+        let rec = 250; // leaf B, UID 1
+        s.fd[rec + NEWEST.finish..rec + NEWEST.finish + 4]
+            .copy_from_slice(&[0x80, 0x25, 0x86, 0x3a]); // 08:00..16:00
+        s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&9600u32.to_le_bytes());
+        s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2].copy_from_slice(&7u16.to_le_bytes());
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&3i32.to_le_bytes());
+
+        let own_work_week =
+            crate::project::project_from_mpp(&file_with_task_calendar(&s, false, true, true))
+                .unwrap();
+        assert_eq!(own_work_week.tasks[0].calendar_uid, None);
+        assert_eq!(own_work_week.tasks[0].duration_min, 420);
+
+        let empty_week =
+            crate::project::project_from_mpp(&file_with_task_calendar(&s, false, false, false))
+                .unwrap();
+        assert_eq!(empty_week.tasks[0].calendar_uid, None);
+        assert_eq!(empty_week.tasks[0].duration_min, 420);
+
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&(-1i32).to_le_bytes());
+        let default_work_week =
+            crate::project::project_from_mpp(&file_with_task_calendar(&s, true, false, true))
+                .unwrap();
+        assert_eq!(default_work_week.tasks[0].calendar_uid, None);
+        assert_eq!(default_work_week.tasks[0].duration_min, 420);
+
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&99i32.to_le_bytes());
+        let dangling = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(dangling.tasks[0].calendar_uid, None);
+
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&3i32.to_le_bytes());
+        make_manual(&mut s);
+        s.f2d[4 * 64 + MANUAL_DURATION..4 * 64 + MANUAL_DURATION + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+        let manual =
+            crate::project::project_from_mpp(&file_with_task_calendar(&s, false, true, true))
+                .unwrap();
+        assert!(manual.tasks[0].manual);
+        assert_eq!(manual.tasks[0].duration_min, 420);
     }
     #[test]
     fn refuses_structural_corruption() {
         let mut s = fixture();
         s.v2[4] = 1;
         reject(&s); // binary/control name
+        let mut s = fixture();
+        s.fd[250 + DURATION..250 + DURATION + 4].copy_from_slice(&4800u32.to_le_bytes());
+        s.fd[250 + DURATION_FORMAT..250 + DURATION_FORMAT + 2]
+            .copy_from_slice(&99u16.to_le_bytes());
+        reject(&s); // unrecognized task DurationFormat
+        let mut s = fixture();
+        s.fd[250 + DURATION..250 + DURATION + 4].copy_from_slice(&0x8000_0000u32.to_le_bytes());
+        s.fd[250 + DURATION_FORMAT..250 + DURATION_FORMAT + 2].copy_from_slice(&7u16.to_le_bytes());
+        reject(&s); // negative task duration other than the absent marker
+        let mut s = fixture();
+        s.fd[250 + CALENDAR_UID..250 + CALENDAR_UID + 4].copy_from_slice(&(-2i32).to_le_bytes());
+        reject(&s); // invalid task calendar UID
         let mut s = fixture();
         s.fd[250 + 0x68 + 2..250 + 0x68 + 4].copy_from_slice(&0xffffu16.to_le_bytes());
         reject(&s); // a task with no start date cannot be imported
