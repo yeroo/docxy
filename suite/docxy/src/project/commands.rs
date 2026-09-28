@@ -51,6 +51,10 @@ pub(crate) enum ProjectAct {
     FindNext,
     /// Delete key: clear the active cell (the task itself on the ID column).
     ClearCell,
+    /// Ctrl+C / Ctrl+X / Ctrl+V on the cursor cell (see `clip.rs`).
+    Copy,
+    Cut,
+    Paste,
 }
 
 impl ProjectAct {
@@ -641,6 +645,9 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
             "y" => Some(Redo),
             "s" => Some(Save),
             "e" => Some(ExportGantt),
+            "c" if !m.shift => Some(Copy),
+            "x" if !m.shift => Some(Cut),
+            "v" if !m.shift => Some(Paste),
             _ => None,
         };
     }
@@ -1029,7 +1036,8 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Timeline => v.timeline = !v.timeline,
             CriticalTasks => v.show_critical = !v.show_critical,
             BaselineBars => v.show_baseline = !v.show_baseline,
-            Save | ExportGantt => {} // window-dependent host actions
+            // Window-dependent host actions: the file dialog, the clipboard.
+            Save | ExportGantt | Copy | Cut | Paste => {}
         }
         Ok(())
     })();
@@ -1231,6 +1239,9 @@ impl Docxy {
         self.project_prompt_cancel();
         match act {
             ProjectAct::Save => return self.save_project(false, window, cx),
+            ProjectAct::Copy | ProjectAct::Cut | ProjectAct::Paste => {
+                self.project_clipboard(act, cx)
+            }
             ProjectAct::ExportGantt => {
                 let Some(tab) = self.tabs.get(self.active) else {
                     return;
@@ -1253,6 +1264,27 @@ impl Docxy {
             }
         }
         self.refocus(window, cx);
+    }
+    /// Copy/Cut write the cursor cell to the system clipboard; Paste reads it.
+    fn project_clipboard(&mut self, act: ProjectAct, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        if act == ProjectAct::Paste {
+            if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                paste_project_text(tab, &text);
+            }
+            return;
+        }
+        let Surface::Project(v) = &tab.surface else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(project_copy_text(v)));
+        // A sheet pastes its own clipboard first; this copy is newer.
+        self.grid_clip = None;
+        if act == ProjectAct::Cut {
+            project_cut(&mut self.tabs[self.active]);
+        }
     }
     pub(crate) fn project_key(
         &mut self,
