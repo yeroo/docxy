@@ -302,7 +302,8 @@ struct Scheduler<'a> {
     raw_anchor: i64,
     /// No timeline starts before this day, however far back a date lies.
     earliest_origin: i64,
-    /// Each task's working duration, which a percent lag is a share of.
+    /// Each task's stored working duration. Leaf percent lags use it; summary
+    /// percent lags use their rolled or manual span (see `percent_offset`).
     durations: HashMap<i32, i64>,
     /// The calendar summaries measure their spans and slack on.
     summary_cal: WorkCalendar,
@@ -452,17 +453,18 @@ impl<'a> Scheduler<'a> {
             .unwrap_or_else(|| DateTime::from_ymd_hm(2020, 1, 6, 8, 0))
             .minutes();
 
-        // Horizon: enough working minutes for all work + lag, plus a wide
+        // Horizon: enough working minutes for all work and resolved lag, plus a wide
         // margin, and enough wall-clock reach to cover any far constraint date.
         let work: i64 = proj.tasks.iter().map(|t| t.duration_min.max(0)).sum();
         let durations = durations(proj);
+        let horizon_durations = horizon_lag_durations(proj, &durations);
         // Elapsed lag is calendar minutes, which over-estimates the working
         // minutes it spans: safe for a working-minute budget.
         let lag: i64 = proj
             .tasks
             .iter()
             .flat_map(|t| &t.predecessors)
-            .map(|p| lag_minutes(p, &durations).saturating_abs())
+            .map(|p| lag_minutes(p, &horizon_durations).saturating_abs())
             .fold(0, i64::saturating_add);
         let min_total = work.saturating_add(lag).saturating_add(HORIZON_PADDING_MIN);
 
@@ -506,7 +508,8 @@ impl<'a> Scheduler<'a> {
             || proj.tasks.iter().any(|t| {
                 t.predecessors.iter().any(|p| {
                     schedulable_source(p.uid)
-                        && (lag_minutes(p, &durations) < 0
+                        && (lag_minutes(p, &horizon_durations) < 0
+                            || (p.lag_format.kind() == LagKind::Percent && p.lag < 0)
                             || matches!(p.link, LinkType::StartFinish | LinkType::FinishFinish))
                 })
             });
@@ -994,7 +997,6 @@ impl<'a> Scheduler<'a> {
                     continue;
                 }
                 if task.summary
-                    && !self.manual_spans.contains_key(&task.uid)
                     && !matches!(link.link, LinkType::FinishStart | LinkType::StartStart)
                 {
                     continue;
@@ -1087,7 +1089,7 @@ impl<'a> Scheduler<'a> {
             &succs,
             &groups,
             &groups_by_source,
-            false,
+            ReadyOrder::Fifo,
         );
         LeafGraph {
             leaves,
@@ -2338,6 +2340,44 @@ fn durations(proj: &Project) -> HashMap<i32, i64> {
     out
 }
 
+/// A conservative base for sizing timelines before summary rollups exist.
+/// Every descendant leaf can contribute to a summary's working span; a
+/// manual summary can also extend beyond its children.
+fn horizon_lag_durations(proj: &Project, stored: &HashMap<i32, i64>) -> HashMap<i32, i64> {
+    let tasks = &proj.tasks;
+    let mut prefix = vec![0i64; tasks.len() + 1];
+    for (i, task) in tasks.iter().enumerate() {
+        prefix[i + 1] = prefix[i].saturating_add(if task.summary {
+            0
+        } else {
+            task.duration_min.max(0)
+        });
+    }
+    let mut ends = vec![tasks.len(); tasks.len()];
+    let mut stack = Vec::new();
+    for i in (0..tasks.len()).rev() {
+        while stack
+            .last()
+            .is_some_and(|&j: &usize| tasks[j].outline_level > tasks[i].outline_level)
+        {
+            stack.pop();
+        }
+        ends[i] = stack.last().copied().unwrap_or(tasks.len());
+        stack.push(i);
+    }
+    let mut result = stored.clone();
+    for (i, task) in tasks.iter().enumerate().filter(|(_, task)| task.summary) {
+        let descendants = prefix[ends[i]].saturating_sub(prefix[i + 1]);
+        let manual = task.manual_summary_dates().map_or(0, |(start, finish)| {
+            finish.map_or(0, |finish| {
+                finish.minutes().saturating_sub(start.minutes()).max(0)
+            })
+        });
+        result.insert(task.uid, descendants.max(manual));
+    }
+    result
+}
+
 /// A link's lag in minutes of its kind (see [`Predecessor::lag_minutes`]); a
 /// percent of a missing predecessor is zero. No timeline spans more than
 /// [`MAX_LAG_MIN`], so a longer lag (an overflowing percent included) is
@@ -2487,6 +2527,37 @@ pub fn calendar_error(proj: &Project) -> Option<String> {
 
 /// Kahn topological sort of leaf tasks by effective links; on a cycle, the
 /// remaining tasks are appended in input order (best effort).
+#[derive(Clone, Copy)]
+enum ReadyOrder {
+    Fifo,
+    HighestRowFirst,
+}
+
+enum ReadyQueue {
+    Fifo(std::collections::VecDeque<i32>),
+    HighestRowFirst(std::collections::BTreeSet<std::cmp::Reverse<usize>>),
+}
+
+impl ReadyQueue {
+    fn pop(&mut self, proj: &Project) -> Option<i32> {
+        match self {
+            Self::Fifo(queue) => queue.pop_front(),
+            Self::HighestRowFirst(rows) => rows
+                .pop_first()
+                .map(|std::cmp::Reverse(index)| proj.tasks[index].uid),
+        }
+    }
+
+    fn push(&mut self, uid: i32, idx_of: &HashMap<i32, usize>) {
+        match self {
+            Self::Fifo(queue) => queue.push_back(uid),
+            Self::HighestRowFirst(rows) => {
+                rows.insert(std::cmp::Reverse(idx_of[&uid]));
+            }
+        }
+    }
+}
+
 fn topo_order(
     proj: &Project,
     leaves: &[usize],
@@ -2494,7 +2565,7 @@ fn topo_order(
     succs: &HashMap<i32, Vec<EffectiveSuccessor>>,
     groups: &[SuccessorGroup],
     groups_by_source: &HashMap<i32, Vec<usize>>,
-    prefer_later_rows: bool,
+    ready_order: ReadyOrder,
 ) -> Vec<usize> {
     let mut indeg: HashMap<i32, usize> = leaves.iter().map(|&i| (proj.tasks[i].uid, 0)).collect();
     let mut adj: HashMap<i32, Vec<i32>> = HashMap::new();
@@ -2516,41 +2587,29 @@ fn topo_order(
             }
         }
     }
-    let mut queue: Vec<i32> = leaves
+    let initial: Vec<i32> = leaves
         .iter()
         .map(|&i| proj.tasks[i].uid)
         .filter(|u| indeg[u] == 0)
         .collect();
     let mut order = Vec::new();
-    let mut head = 0;
-    let mut ready: std::collections::BTreeSet<std::cmp::Reverse<usize>> = queue
-        .iter()
-        .map(|uid| std::cmp::Reverse(idx_of[uid]))
-        .collect();
-    loop {
-        let u = if prefer_later_rows {
-            ready
-                .pop_first()
-                .map(|std::cmp::Reverse(index)| proj.tasks[index].uid)
-        } else if head < queue.len() {
-            let uid = queue[head];
-            head += 1;
-            Some(uid)
-        } else {
-            None
-        };
-        let Some(u) = u else { break };
+    let mut ready = match ready_order {
+        ReadyOrder::Fifo => ReadyQueue::Fifo(initial.into()),
+        ReadyOrder::HighestRowFirst => ReadyQueue::HighestRowFirst(
+            initial
+                .into_iter()
+                .map(|uid| std::cmp::Reverse(idx_of[&uid]))
+                .collect(),
+        ),
+    };
+    while let Some(u) = ready.pop(proj) {
         order.push(idx_of[&u]);
         if let Some(next) = adj.get(&u) {
             for &v in next {
                 let d = indeg.get_mut(&v).unwrap();
                 *d -= 1;
                 if *d == 0 {
-                    if prefer_later_rows {
-                        ready.insert(std::cmp::Reverse(idx_of[&v]));
-                    } else {
-                        queue.push(v);
-                    }
+                    ready.push(v, idx_of);
                 }
             }
         }
@@ -2561,11 +2620,7 @@ fn topo_order(
                     if let Some(degree) = indeg.get_mut(&target) {
                         *degree -= 1;
                         if *degree == 0 {
-                            if prefer_later_rows {
-                                ready.insert(std::cmp::Reverse(idx_of[&target]));
-                            } else {
-                                queue.push(target);
-                            }
+                            ready.push(target, idx_of);
                         }
                     }
                 }
@@ -2815,7 +2870,7 @@ pub fn effective_leaf_pin_removal_order(proj: &Project) -> Vec<i32> {
         &graph.succs,
         &graph.groups,
         &graph.groups_by_source,
-        true,
+        ReadyOrder::HighestRowFirst,
     )
     .into_iter()
     .rev()
@@ -3481,18 +3536,41 @@ impl Scheduler<'_> {
                             (pred.early_start.minutes(), now_start)
                         }
                     };
-                    let Offset::Elapsed(lag) =
-                        self.effective_offset(p, &graph, Some((now_start, now_finish)))
-                    else {
-                        return if pred_task.summary {
-                            Some((tl.to_index(now) - tl.to_index(was)).max(0))
-                        } else {
-                            delay.get(&p.uid).copied()
-                        };
-                    };
-                    let bound = |at: i64| tl.to_index(at.saturating_add(lag));
-                    let gap = bound(now) - bound(was);
-                    Some(if pred_task.summary { gap.max(0) } else { gap })
+                    let leveled_offset =
+                        self.effective_offset(p, &graph, Some((now_start, now_finish)));
+                    match leveled_offset {
+                        Offset::Elapsed(lag) => {
+                            let bound = |at: i64| tl.to_index(at.saturating_add(lag));
+                            let gap = bound(now) - bound(was);
+                            Some(if pred_task.summary { gap.max(0) } else { gap })
+                        }
+                        Offset::Working(leveled_lag)
+                            if pred_task.summary && p.lag_format.kind() == LagKind::Percent =>
+                        {
+                            let base_span = base.get(p.uid)?;
+                            let Offset::Working(cpm_lag) = self.effective_offset(
+                                p,
+                                &graph,
+                                Some((
+                                    base_span.early_start.minutes(),
+                                    base_span.early_finish.minutes(),
+                                )),
+                            ) else {
+                                unreachable!()
+                            };
+                            Some(
+                                (tl.to_index(now) + leveled_lag - tl.to_index(was) - cpm_lag)
+                                    .max(0),
+                            )
+                        }
+                        Offset::Working(_) => {
+                            if pred_task.summary {
+                                Some((tl.to_index(now) - tl.to_index(was)).max(0))
+                            } else {
+                                delay.get(&p.uid).copied()
+                            }
+                        }
+                    }
                 })
                 .max()
                 .unwrap_or(0);
@@ -4401,6 +4479,99 @@ mod tests {
                 level(&project).start(3),
                 Some(expected.get(3).unwrap().early_start)
             );
+            if !manual {
+                let child = actual.get(2).unwrap();
+                let direct = expected.get(4).unwrap();
+                assert_eq!(
+                    (
+                        child.late_start,
+                        child.total_slack_min,
+                        child.free_slack_min
+                    ),
+                    (
+                        direct.late_start,
+                        direct.total_slack_min,
+                        direct.free_slack_min
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leveling_recomputes_percent_lag_from_stretched_summary() {
+        let summary = summary_task(1, 1);
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        let mut c = task(4, "C", 480);
+        let mut percent = fs(1);
+        percent.lag = 100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        let project = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![summary, a, b, c],
+            resources: vec![worker(1, "Team", 1.0)],
+            assignments: vec![assign(1, 2, 1, 1.0), assign(2, 3, 1, 1.0)],
+            ..Project::default()
+        };
+        assert_eq!(schedule(&project).get(4).unwrap().early_start, at(4, 8));
+        let leveled = level(&project);
+        assert_eq!(leveled.start(3), Some(at(3, 8)));
+        assert_eq!(leveled.start(4), Some(at(6, 8)));
+    }
+
+    #[test]
+    fn negative_summary_percent_lag_allocates_backward_horizon() {
+        let summary = summary_task(1, 1);
+        let mut child = task(2, "Child", 960);
+        child.outline_level = 2;
+        let mut successor = task(3, "Successor", 480);
+        let mut percent = Predecessor::working(1, LinkType::StartStart, 0);
+        percent.lag = -100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        successor.predecessors.push(percent);
+        let grouped = schedule(&march2(vec![summary, child, successor]));
+        let mut direct_successor = task(3, "Successor", 480);
+        let mut direct_percent = Predecessor::working(4, LinkType::StartStart, 0);
+        direct_percent.lag = -100;
+        direct_percent.lag_format = LagFormat::from_code(19).unwrap();
+        direct_successor.predecessors.push(direct_percent);
+        let direct = schedule(&march2(vec![task(4, "Direct", 960), direct_successor]));
+        assert_eq!(
+            grouped.get(3).unwrap().early_start,
+            direct.get(3).unwrap().early_start
+        );
+        assert!(grouped.get(3).unwrap().early_start < at(2, 8));
+    }
+
+    #[test]
+    fn finish_links_into_manual_summaries_do_not_bound_predecessors() {
+        for link in [LinkType::FinishFinish, LinkType::StartFinish] {
+            let predecessor = task(1, "Predecessor", 480);
+            let mut summary = summary_task(2, 1);
+            summary.manual = true;
+            summary.manual_start = Some(at(3, 8));
+            summary.manual_finish = Some(at(3, 17));
+            summary.predecessors.push(Predecessor::working(1, link, 0));
+            let mut child = task(3, "Child", 480);
+            child.outline_level = 2;
+            let linked = march2(vec![predecessor, summary, child]);
+            let mut unlinked = linked.clone();
+            unlinked.tasks[1].predecessors.clear();
+            let actual = schedule(&linked);
+            let expected = schedule(&unlinked);
+            for uid in [1, 2, 3] {
+                let a = actual.get(uid).unwrap();
+                let b = expected.get(uid).unwrap();
+                assert_eq!(
+                    (a.early_start, a.late_start, a.total_slack_min),
+                    (b.early_start, b.late_start, b.total_slack_min),
+                    "link {link:?}, UID {uid}"
+                );
+            }
         }
     }
 
