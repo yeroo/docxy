@@ -137,6 +137,12 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     Ok(project)
 }
 
+fn reproduces(schedule: &projcore::schedule::Schedule, task: &Task) -> bool {
+    schedule
+        .get(task.uid)
+        .is_some_and(|result| Some(result.early_start) == task.stored_start)
+}
+
 fn pin_unreproduced_starts(project: &mut Project) {
     let candidates: Vec<usize> = project
         .tasks
@@ -164,10 +170,8 @@ fn pin_unreproduced_starts(project: &mut Project) {
                 continue;
             }
             let task = &project.tasks[i];
-            if scheduled
-                .get(task.uid)
-                .is_some_and(|result| Some(result.early_start) != task.stored_start)
-            {
+            // A missing schedule row does not enter the divergent set.
+            if scheduled.get(task.uid).is_some() && !reproduces(&scheduled, task) {
                 divergent.push(i);
             }
         }
@@ -183,10 +187,7 @@ fn pin_unreproduced_starts(project: &mut Project) {
         let mut rejected_this_pass = false;
         for i in divergent {
             let task = &project.tasks[i];
-            if trial
-                .get(task.uid)
-                .is_some_and(|result| Some(result.early_start) == task.stored_start)
-            {
+            if reproduces(&trial, task) {
                 pinned.insert(i);
             } else {
                 let task = &mut project.tasks[i];
@@ -205,9 +206,7 @@ fn pin_unreproduced_starts(project: &mut Project) {
                     .copied()
                     .filter(|&i| {
                         let task = &project.tasks[i];
-                        scheduled
-                            .get(task.uid)
-                            .is_none_or(|result| Some(result.early_start) != task.stored_start)
+                        !reproduces(&scheduled, task)
                     })
                     .collect();
                 if unstable.is_empty() {
@@ -229,6 +228,9 @@ fn pin_unreproduced_starts(project: &mut Project) {
     // Batch pinning can pin a successor that an upstream pin already fixes.
     // Try removing accepted pins from successors toward predecessors. A pin
     // stays removed only if every start currently reproduced remains so.
+    // This costs one full schedule per accepted pin, in addition to at most
+    // candidate-count accept/reject passes. The 48 newest snapshot files
+    // currently need zero pins, so they incur no minimisation schedules.
     let uid_to_index: std::collections::HashMap<_, _> = candidates
         .iter()
         .map(|&i| (project.tasks[i].uid, i))
@@ -276,22 +278,15 @@ fn pin_unreproduced_starts(project: &mut Project) {
         let matching: Vec<_> = candidates
             .iter()
             .copied()
-            .filter(|&j| {
-                let task = &project.tasks[j];
-                scheduled
-                    .get(task.uid)
-                    .is_some_and(|result| Some(result.early_start) == task.stored_start)
-            })
+            .filter(|&j| reproduces(&scheduled, &project.tasks[j]))
             .collect();
         let task = &mut project.tasks[i];
         (task.constraint, task.constraint_date) = originals[i];
         let trial = projcore::schedule::schedule(project);
-        if matching.iter().all(|&j| {
-            let task = &project.tasks[j];
-            trial
-                .get(task.uid)
-                .is_some_and(|result| Some(result.early_start) == task.stored_start)
-        }) {
+        if matching
+            .iter()
+            .all(|&j| reproduces(&trial, &project.tasks[j]))
+        {
             pinned.remove(&i);
             scheduled = trial;
         } else {
