@@ -32,7 +32,7 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// their manual duration and use the calendar span only when it is absent.
 /// An unrecognised calendar record refuses the import.
 /// A malformed current assignment/resource table refuses import. Files with
-/// no such table and older MPP9 layouts retain their task-only import.
+/// no such table, or a present unvalidated layout, retain task-only import.
 /// A calendar whose default week is wholly closed is refused even if one of
 /// its alternate weeks opens a day, as in MSPDI import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
@@ -179,14 +179,27 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             Ok(task)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let resources = crate::rscdecode::decode(bytes, legacy)
-        .map_err(|e| format!("cannot read the resources of this .mpp ({e})"))?
-        .unwrap_or_default();
+    let resources_present = crate::tabledecode::present(bytes, "TBkndRsc")?;
+    let assignments_present = crate::tabledecode::present(bytes, "TBkndAssn")?;
+    if !legacy && assignments_present && !resources_present {
+        return Err("cannot read the assignments of this .mpp (missing resource table)".into());
+    }
+    let decoded_resources = crate::rscdecode::decode(bytes, legacy)
+        .map_err(|e| format!("cannot read the resources of this .mpp ({e})"))?;
     let mut task_uids: std::collections::HashSet<i32> = tasks.iter().map(|t| t.uid).collect();
     task_uids.insert(0); // Project summary assignments can reference UID 0.
-    let assignments = crate::assndecode::decode(bytes, legacy, &task_uids, &resources)
-        .map_err(|e| format!("cannot read the assignments of this .mpp ({e})"))?
-        .unwrap_or_default();
+    let (resources, assignments) = if let Some(resources) = decoded_resources {
+        let decoded_assignments = crate::assndecode::decode(bytes, legacy, &task_uids, &resources)
+            .map_err(|e| format!("cannot read the assignments of this .mpp ({e})"))?;
+        if assignments_present && decoded_assignments.is_none() {
+            (Vec::new(), Vec::new()) // Unsupported assignment layout: keep task-only import.
+        } else {
+            (resources, decoded_assignments.unwrap_or_default())
+        }
+    } else {
+        // No resource table, or one whose layout has not been validated.
+        (Vec::new(), Vec::new())
+    };
     let start = tasks
         .iter()
         .filter_map(|t| t.stored_start)
@@ -230,6 +243,46 @@ pub(crate) fn parse_mpp_dt(s: &str) -> Option<DateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cfb::{Node, write_cfb_tree};
+
+    #[test]
+    fn unsupported_resource_layout_keeps_task_only_import() {
+        let mut rsc_meta = vec![0u8; 16 + 38];
+        rsc_meta[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        rsc_meta[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let mut assn_meta = vec![0u8; 16 + 34];
+        assn_meta[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        assn_meta[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let mut assn_data = vec![0u8; 110];
+        assn_data[..4].copy_from_slice(&2u32.to_le_bytes());
+        assn_data[8..12].copy_from_slice(&1i32.to_le_bytes());
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        let table = |name, data, meta| {
+            Node::Storage(
+                name,
+                vec![
+                    Node::Stream("FixedMeta", meta),
+                    Node::Stream("FixedData", data),
+                    Node::Stream("VarMeta", vm.clone()),
+                    Node::Stream("Var2Data", Vec::new()),
+                ],
+            )
+        };
+        let mpp = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![
+                table("TBkndRsc", vec![0u8; 110], rsc_meta),
+                table("TBkndAssn", assn_data, assn_meta),
+            ],
+        )]);
+        let project = project_from_mpp(&mpp).unwrap();
+        assert!(
+            project.tasks.is_empty()
+                && project.resources.is_empty()
+                && project.assignments.is_empty()
+        );
+    }
     #[test]
     fn opens_mpp_metadata_as_partial_project() {
         // Build a minimal .mpp: a SummaryInformation property set with a title,

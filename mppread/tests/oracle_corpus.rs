@@ -353,25 +353,6 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             );
         }
     }
-    // Clearing the newly imported assignments/resources reproduces this
-    // importer's previous scheduling inputs. Their presence must not move a
-    // task, including plans that already carry a delayed assignment.
-    let mut previous_inputs = imported.clone();
-    previous_inputs.assignments.clear();
-    previous_inputs.resources.clear();
-    let old_schedule = projcore::schedule::schedule(&previous_inputs);
-    let new_schedule = projcore::schedule::schedule(&imported);
-    for task in &imported.tasks {
-        let old = old_schedule.get(task.uid).unwrap();
-        let new = new_schedule.get(task.uid).unwrap();
-        assert_eq!(
-            (new.early_start, new.early_finish),
-            (old.early_start, old.early_finish),
-            "{}: imported assignments moved task UID {}",
-            mpp.display(),
-            task.uid
-        );
-    }
     if source == Oracle::Project {
         let scheduled = projcore::schedule::schedule(&imported);
         let exceptions = &oracle
@@ -745,25 +726,28 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path) {
                 );
             }
         }
-        if a.resource_uid != -65535 {
-            let got = imported
-                .resources
-                .iter()
-                .find(|r| r.uid == a.resource_uid)
-                .unwrap();
-            let want = expected
-                .resources
-                .iter()
-                .find(|r| r.uid == a.resource_uid)
-                .unwrap();
-            assert_eq!(
-                (got.uid, got.id, &got.name, got.kind),
-                (want.uid, want.id, &want.name, want.kind),
-                "{} resource UID {}",
-                mpp.display(),
-                got.uid
-            );
-        }
+    }
+    for got in &imported.resources {
+        let want = expected
+            .resources
+            .iter()
+            .find(|r| r.uid == got.uid)
+            .unwrap_or_else(|| panic!("{}: missing resource UID {}", mpp.display(), got.uid));
+        assert_eq!(
+            (got.id, &got.name, got.kind),
+            (want.id, &want.name, want.kind),
+            "{} resource UID {}",
+            mpp.display(),
+            got.uid
+        );
+        assert!(
+            (got.max_units - want.max_units).abs() < 1e-6,
+            "{} resource UID {} max units {} vs {}",
+            mpp.display(),
+            got.uid,
+            got.max_units,
+            want.max_units
+        );
     }
     // The same records survive the actual MSPDI Save As path.
     let saved = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();

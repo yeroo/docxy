@@ -60,12 +60,14 @@ mod tests {
     fn file(ids: [u32; 3], markers: [(u16, u16); 3], bad_name: bool) -> Vec<u8> {
         let mut fm = vec![0u8; 16];
         fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
-        fm[8..12].copy_from_slice(&8u32.to_le_bytes());
+        fm[8..12].copy_from_slice(&9u32.to_le_bytes());
         let mut fd = Vec::new();
-        for i in 0..8 {
+        for i in 0..9 {
             let mut m = [0u8; 37];
             if i < 3 || i == 7 {
                 m[..2].copy_from_slice(&4u16.to_le_bytes());
+            } else if i == 8 {
+                m[..2].copy_from_slice(&2u16.to_le_bytes());
             }
             m[4..8].copy_from_slice(&(fd.len() as u32).to_le_bytes());
             fm.extend(m);
@@ -74,7 +76,10 @@ mod tests {
                 continue;
             }
             let mut row = [0u8; 172];
-            if i > 3 {
+            if i == 8 {
+                row[..4].copy_from_slice(&ids[1].to_le_bytes());
+                row[4..8].copy_from_slice(&2u32.to_le_bytes());
+            } else if i > 3 {
                 let j = i - 4;
                 row[..4].copy_from_slice(&ids[j].to_le_bytes());
                 row[4..8].copy_from_slice(&((j + 1) as u32).to_le_bytes());
@@ -121,7 +126,7 @@ mod tests {
     #[test]
     fn decodes_work_material_cost_and_refuses_bad_resources() {
         let markers = [(2, 0), (8, 1), (2, 1)];
-        let resources = decode(&file([1, 2, 3], markers, false), false)
+        let resources = decode(&file([10, 20, 30], markers, false), false)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -130,24 +135,24 @@ mod tests {
                 .map(|r| (r.uid, r.id, r.kind))
                 .collect::<Vec<_>>(),
             vec![
-                (1, 1, ResourceType::Work),
-                (2, 2, ResourceType::Material),
-                (3, 3, ResourceType::Cost)
+                (1, 10, ResourceType::Work),
+                (2, 20, ResourceType::Material),
+                (3, 30, ResourceType::Cost)
             ]
         );
         assert_eq!(resources[1].max_units, 2000.0);
         assert!(
-            decode(&file([1, 1, 3], markers, false), false)
+            decode(&file([10, 10, 30], markers, false), false)
                 .unwrap_err()
                 .contains("duplicate")
         );
         assert!(
-            decode(&file([1, 2, 3], [(2, 0), (9, 1), (2, 1)], false), false)
+            decode(&file([10, 20, 30], [(2, 0), (9, 1), (2, 1)], false), false)
                 .unwrap_err()
                 .contains("unknown resource type")
         );
         assert!(
-            decode(&file([1, 2, 3], markers, true), false)
+            decode(&file([10, 20, 30], markers, true), false)
                 .unwrap_err()
                 .contains("invalid resource name")
         );

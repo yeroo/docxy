@@ -266,7 +266,8 @@ Start/Finish/Work/Cost. Project's XML export omits assignment-baseline
 BCWS/BCWP even when assignment-level BCWS/BCWP are nonzero; the MPP importer
 leaves those baseline fields absent. Assignment progress, rates, contours,
 delays, resource details and other baselines remain unimported. Unsupported
-MPP9 assignment/resource layouts retain the previous task-only import;
+MPP9 and other unvalidated assignment/resource layouts retain the previous
+task-only import;
 malformed current tables refuse the import. Generate the local, ignored
 assignment oracle pairs with `python corpus/tools/gen_mpp_assignment_baseline_cases.py`.
 Newest-layout base and derived calendars, their weekdays,
@@ -280,7 +281,7 @@ Type 8 exceptions and record shapes not covered by the
 Project-written probes refuse the file. An invalid newest calendar table refuses
 import. Files without
 `TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
-imported (see below); assignment progress needs assignments first.
+imported (see below); assignment progress is not yet decoded.
 
 Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
 byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and

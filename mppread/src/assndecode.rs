@@ -84,10 +84,13 @@ pub(crate) fn decode(
         };
         let start = date(&row[52..56], uid, "start")?;
         let finish = date(&row[56..60], uid, "finish")?;
+        if start.zip(finish).is_some_and(|(s, f)| s > f) {
+            return Err(format!("assignment dates reversed for UID {uid}"));
+        }
         let mut baselines = Vec::new();
         for slot in 0..=10u8 {
-            // a1-slots-progress pins the slot-1 and slot-10 keys. Intervening
-            // slots advance by nine keys: Work/Cost and Start/Finish.
+            // a1-slots-progress pins every slot 0..10: subsequent slots
+            // advance by nine keys for Work/Cost and Start/Finish.
             let (wk, ck, sk, fk) = if slot == 0 {
                 (0x10, 0x20, 0x92, 0x93)
             } else {
@@ -171,7 +174,8 @@ mod tests {
     ) -> Vec<u8> {
         let mut fm = vec![0u8; 16];
         fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
-        fm[8..12].copy_from_slice(&declared.unwrap_or(rows.len() as u32).to_le_bytes());
+        fm[8..12].copy_from_slice(&declared.unwrap_or(rows.len() as u32 + 1).to_le_bytes());
+        let deleted = rows[0];
         let mut fd = Vec::new();
         for (i, row) in rows.drain(..).enumerate() {
             let mut meta = [0u8; 34];
@@ -179,6 +183,12 @@ mod tests {
             fm.extend(meta);
             fd.extend(row);
         }
+        // A superseded row may reuse a live UID; only the kind-0 row imports.
+        let mut meta = [0u8; 34];
+        meta[..2].copy_from_slice(&2u16.to_le_bytes());
+        meta[4..8].copy_from_slice(&(fd.len() as u32).to_le_bytes());
+        fm.extend(meta);
+        fd.extend(deleted);
         let mut vm = vec![0u8; 24];
         vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
         vm[8..12].copy_from_slice(&(vars.len() as u32).to_le_bytes());
@@ -334,9 +344,16 @@ mod tests {
         let mut midnight = vars();
         midnight[2].2 = vec![0xff, 0xff, 0x2a, 0x3c];
         assert!(decode(&file(rows(), midnight), false, &tasks(), &resources()).is_ok());
+        let mut reversed = rows();
+        reversed[0][52..56].copy_from_slice(&[0xd8, 0x27, 0x2c, 0x3c]);
+        assert!(
+            decode(&file(reversed, vars()), false, &tasks(), &resources())
+                .unwrap_err()
+                .contains("dates reversed")
+        );
         assert!(
             decode(
-                &file_with_count(rows(), vars(), Some(3)),
+                &file_with_count(rows(), vars(), Some(4)),
                 false,
                 &tasks(),
                 &resources()

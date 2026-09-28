@@ -16,6 +16,7 @@ pub(crate) fn f64_at(b: &[u8], at: usize) -> f64 {
     f64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
+#[derive(Debug)]
 pub(crate) struct Table {
     pub rows: Vec<Vec<u8>>,
     fields: HashMap<(u32, u16), Range<usize>>,
@@ -28,6 +29,11 @@ impl Table {
             .get(&(uid, key))
             .map(|range| &self.v2[range.clone()])
     }
+}
+
+pub(crate) fn present(bytes: &[u8], name: &str) -> Result<bool, String> {
+    let cfb = Cfb::open(bytes)?;
+    Ok(cfb.paths().iter().any(|p| p.contains(&format!("{name}/"))))
 }
 
 pub(crate) fn read(
@@ -64,16 +70,21 @@ pub(crate) fn read(
     }
     let count = u32_at(&fm, 8) as usize;
     let stubs = if name == "TBkndRsc" { 3 } else { 0 };
-    if 16usize.checked_add(
+    let expected_meta_len = 16usize.checked_add(
         count
             .checked_mul(meta_stride)
             .ok_or("FixedMeta count overflow")?,
-    ) != Some(fm.len())
-        || count < stubs
-    {
-        return Err(format!(
-            "{name}: FixedMeta count or FixedData length mismatch"
-        ));
+    );
+    if expected_meta_len != Some(fm.len()) {
+        // A different complete entry stride identifies an older/unvalidated
+        // layout. A torn index or impossible count is corruption.
+        if count > 0 && (fm.len() - 16) % count == 0 {
+            return Ok(None);
+        }
+        return Err(format!("{name}: FixedMeta count or length mismatch"));
+    }
+    if count < stubs {
+        return Err(format!("{name}: FixedMeta count or length mismatch"));
     }
     let mut rows = Vec::with_capacity(count.saturating_sub(stubs));
     let mut indexed_uids = HashSet::new();
@@ -96,8 +107,13 @@ pub(crate) fn read(
         } else {
             (matches!(kind, 0 | 2) && len == row_len) || (kind == 4 && len == 16)
         };
-        if off != previous_end || end > fd.len() || !kind_ok {
-            return Err(format!("{name}: unrecognized FixedMeta record {i}"));
+        if off != previous_end || end > fd.len() {
+            return Err(format!(
+                "{name}: FixedMeta offset or length mismatch at record {i}"
+            ));
+        }
+        if !kind_ok {
+            return Ok(None); // Present table in an unvalidated row layout.
         }
         previous_end = end;
         if i < stubs || kind == 4 {
@@ -170,6 +186,55 @@ pub(crate) fn name(bytes: &[u8], uid: u32) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::cfb::{Node, write_cfb_tree};
+
+    fn fixture(stride: usize, kind: u16, offset: u32) -> Vec<u8> {
+        let mut fm = vec![0u8; 16 + stride];
+        fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        fm[8..12].copy_from_slice(&1u32.to_le_bytes());
+        fm[16..18].copy_from_slice(&kind.to_le_bytes());
+        fm[20..24].copy_from_slice(&offset.to_le_bytes());
+        let mut fd = vec![0u8; 110];
+        fd[..4].copy_from_slice(&7u32.to_le_bytes());
+        let mut vm = vec![0u8; 24];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![Node::Storage(
+                "TBkndAssn",
+                vec![
+                    Node::Stream("FixedMeta", fm),
+                    Node::Stream("FixedData", fd),
+                    Node::Stream("VarMeta", vm),
+                    Node::Stream("Var2Data", Vec::new()),
+                ],
+            )],
+        )])
+    }
+
+    #[test]
+    fn unsupported_layout_falls_back_but_corruption_errors() {
+        assert!(present(&fixture(34, 0, 0), "TBkndAssn").unwrap());
+        assert!(
+            read(&fixture(35, 0, 0), "TBkndAssn", 34, 110, 0x0f40)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read(&fixture(34, 9, 0), "TBkndAssn", 34, 110, 0x0f40)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            read(&fixture(34, 0, 1), "TBkndAssn", 34, 110, 0x0f40)
+                .unwrap_err()
+                .contains("offset")
+        );
+        assert!(
+            read(&fixture(34, 0, 0), "TBkndAssn", 34, 110, 0x0f40)
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[test]
     fn shared_var_block_is_stored_once() {

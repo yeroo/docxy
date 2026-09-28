@@ -50,6 +50,9 @@ def save(app, slug):
     if slug == "a3-deleted-rows":
         assert len(exported) == 1
         assert exported[0].findtext("{*}ResourceUID") == "1"
+        unnamed = [r for r in root.findall(".//{*}Resource") if r.findtext("{*}UID") == "3"]
+        assert len(unnamed) == 1 and unnamed[0].findtext("{*}Name") is None
+        assert unnamed[0].findtext("{*}IsNull") == "0"
     for assn in root.findall(".//{*}Assignment"):
         uid = assn.findtext("{*}UID")
         fields = {name: assn.findtext("{*}" + name) for name in
@@ -159,7 +162,7 @@ def cases(app):
     old.Delete()
     task.Assignments.Add(ResourceID=keeper.ID)
     removed.Delete()
-    # A blank Resource Sheet row has no name but still occupies an ID.
+    # COM creates a live unnamed resource (IsNull=0), not a null sheet row.
     p.Resources.Add("")
     app.BaselineSave(All=True)
     save(app, "a3-deleted-rows")
