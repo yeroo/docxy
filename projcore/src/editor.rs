@@ -1746,6 +1746,40 @@ mod tests {
     use crate::schedule::TaskResult;
 
     #[test]
+    fn package_parts_survive_edit_undo_and_redo() {
+        use crate::yppx::{read_yppx, write_yppx};
+        use opccore::zip::ZipArchive;
+        use opccore::zipwrite::write_zip;
+
+        let map = b"<Types><Override PartName=\"/views.xml\" ContentType=\"application/vnd.yppx.views+xml\"/></Types>";
+        let views = b"<views><table name=\"Entry\"/></views>";
+        let entries = vec![
+            ("[Content_Types].xml".to_string(), map.to_vec()),
+            (
+                "project.xml".to_string(),
+                crate::mspdi::write_mspdi(editor().project()).into_bytes(),
+            ),
+            ("views.xml".to_string(), views.to_vec()),
+        ];
+        let mut ed = Editor::new(read_yppx(&write_zip(&entries)).unwrap());
+        ed.set_duration_min(1, 960, false).unwrap();
+        for stage in 0..3 {
+            let output = write_yppx(ed.project());
+            let zip = ZipArchive::open(&output).unwrap();
+            assert_eq!(zip.read("views.xml").unwrap(), views, "stage {stage}");
+            let types = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
+            assert!(types.contains(
+                "<Override PartName=\"/views.xml\" ContentType=\"application/vnd.yppx.views+xml\"/>"
+            ));
+            match stage {
+                0 => assert!(ed.undo()),
+                1 => assert!(ed.redo()),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn restored_dirty_state_survives_empty_history() {
         for dirty in [false, true] {
             let mut ed = Editor::restored(untitled_project(), dirty);
