@@ -1064,6 +1064,7 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
         is_baseline_calendar: false,
         week: Default::default(),
         exceptions: Vec::new(),
+        work_weeks: Vec::new(),
     };
     let mut is_base = false;
     let mut base_uid: Option<i32> = None;
@@ -1080,6 +1081,7 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
                     "BaseCalendarUID" => base_uid = opt_i32_of(p),
                     "WeekDays" => parse_weekdays(p, &mut cal.week, &mut legacy),
                     "Exceptions" => parse_exceptions(p, &mut cal.exceptions),
+                    "WorkWeeks" => parse_work_weeks(p, &mut cal.work_weeks),
                     _ => p.skip_element(),
                 }
             }
@@ -1188,6 +1190,45 @@ fn parse_time_period(p: &mut XmlParser) -> (Option<DateTime>, Option<DateTime>) 
         }
     }
     (from, to)
+}
+
+fn parse_work_weeks(p: &mut XmlParser, out: &mut Vec<WorkWeek>) {
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "WorkWeek" {
+                    out.push(parse_work_week(p));
+                } else {
+                    p.skip_element();
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+}
+
+fn parse_work_week(p: &mut XmlParser) -> WorkWeek {
+    let mut work_week = WorkWeek::default();
+    let mut legacy = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "TimePeriod" => {
+                        (work_week.from, work_week.to) = parse_time_period(p);
+                    }
+                    "Name" => work_week.name = Some(text_of(p)),
+                    "WeekDays" => parse_weekdays(p, &mut work_week.week, &mut legacy),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    work_week
 }
 
 fn parse_exceptions(p: &mut XmlParser, out: &mut Vec<CalendarException>) {
@@ -2301,7 +2342,56 @@ fn write_calendar(s: &mut String, c: &Calendar) {
         }
         s.push_str("      </Exceptions>\n");
     }
+    if !c.work_weeks.is_empty() {
+        write_work_weeks(s, &c.work_weeks);
+    }
     s.push_str("    </Calendar>\n");
+}
+
+fn write_work_weeks(s: &mut String, weeks: &[WorkWeek]) {
+    s.push_str("      <WorkWeeks>\n");
+    for work_week in weeks {
+        s.push_str("        <WorkWeek>\n");
+        if work_week.from.is_some() || work_week.to.is_some() {
+            s.push_str("          <TimePeriod>\n");
+            if let Some(from) = work_week.from {
+                tag(s, 6, "FromDate", &from.to_mspdi());
+            }
+            if let Some(to) = work_week.to {
+                tag(s, 6, "ToDate", &to.to_mspdi());
+            }
+            s.push_str("          </TimePeriod>\n");
+        }
+        if let Some(name) = &work_week.name {
+            tag(s, 5, "Name", name);
+        }
+        if work_week.week.iter().any(Option::is_some) {
+            s.push_str("          <WeekDays>\n");
+            for (idx, day) in work_week.week.iter().enumerate() {
+                let Some(day) = day else { continue };
+                s.push_str("            <WeekDay>\n");
+                tag(s, 7, "DayType", &(idx + 1).to_string());
+                tag(s, 7, "DayWorking", flag(day.working()));
+                if day.working() {
+                    s.push_str("              <WorkingTimes>\n");
+                    for slot in &day.times {
+                        s.push_str("                <WorkingTime>");
+                        s.push_str(&format!(
+                            "<FromTime>{}</FromTime><ToTime>{}</ToTime>",
+                            min_to_clock(slot.from),
+                            min_to_clock(slot.to)
+                        ));
+                        s.push_str("</WorkingTime>\n");
+                    }
+                    s.push_str("              </WorkingTimes>\n");
+                }
+                s.push_str("            </WeekDay>\n");
+            }
+            s.push_str("          </WeekDays>\n");
+        }
+        s.push_str("        </WorkWeek>\n");
+    }
+    s.push_str("      </WorkWeeks>\n");
 }
 
 /// One `Exception`, its elements in schema order. An optional field the
@@ -3210,6 +3300,74 @@ mod tests {
             back.calendar(5).unwrap().week,
             Calendar::base(5, "", Default::default()).week
         );
+    }
+
+    #[test]
+    fn work_weeks_read_write_in_project_order_and_keep_unstated_days() {
+        let xml = include_str!("../../corpus/mspdi/28-work-weeks.xml");
+        let mut project = read_mspdi(xml).unwrap();
+        assert_eq!(project.calendar(1).unwrap().work_weeks.len(), 1);
+        let summer = &project.calendar(1).unwrap().work_weeks[0];
+        assert_eq!(summer.name.as_deref(), Some("Summer"));
+        assert_eq!(summer.from.unwrap().to_mspdi(), "2026-03-09T00:00:00");
+        assert_eq!(summer.to.unwrap().to_mspdi(), "2026-03-20T23:59:00");
+        assert_eq!(
+            summer.week.iter().map(Option::is_some).collect::<Vec<_>>(),
+            [false, true, false, false, false, true, true]
+        );
+        assert_eq!(summer.week[1].as_ref().unwrap().minutes(), 600);
+        assert!(!summer.week[5].as_ref().unwrap().working());
+        assert_eq!(summer.week[6].as_ref().unwrap().minutes(), 240);
+        assert!(project.calendar(2).unwrap().work_weeks.is_empty());
+        assert_eq!(
+            project.calendar(3).unwrap().work_weeks[0]
+                .week
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            [false, false, false, true, true, false, false]
+        );
+
+        // An incomplete work week is kept exactly even though it cannot
+        // schedule until both dates exist.
+        project.calendars[0].work_weeks.push(WorkWeek {
+            from: Some(DateTime::from_ymd_hm(2026, 4, 1, 0, 0)),
+            week: std::array::from_fn(|_| None),
+            ..WorkWeek::default()
+        });
+        let written = write_mspdi(&project);
+        let standard = calendar_block(&written, 1);
+        assert!(standard.find("<Exceptions>").unwrap() < standard.find("<WorkWeeks>").unwrap());
+        let first = standard
+            .split("<WorkWeek>")
+            .nth(1)
+            .unwrap()
+            .split("</WorkWeek>")
+            .next()
+            .unwrap();
+        assert!(first.find("<TimePeriod>").unwrap() < first.find("<Name>").unwrap());
+        assert!(first.find("<Name>").unwrap() < first.find("<WeekDays>").unwrap());
+        let days: Vec<&str> = first
+            .split("<DayType>")
+            .skip(1)
+            .map(|part| part.split("</DayType>").next().unwrap())
+            .collect();
+        assert_eq!(days, ["2", "6", "7"]);
+        let second = standard
+            .split("<WorkWeek>")
+            .nth(2)
+            .unwrap()
+            .split("</WorkWeek>")
+            .next()
+            .unwrap();
+        assert!(second.contains("<FromDate>2026-04-01T00:00:00</FromDate>"));
+        assert!(
+            !second.contains("<ToDate>")
+                && !second.contains("<Name>")
+                && !second.contains("<WeekDays>")
+        );
+        assert!(!calendar_block(&written, 2).contains("<WorkWeeks>"));
+        assert_eq!(read_mspdi(&written).unwrap().calendars, project.calendars);
     }
 
     #[test]
