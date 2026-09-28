@@ -593,18 +593,32 @@ harness end to end is exercised by running it.
 
 ## Where a harness window goes, and why it draws at all
 
-A harness instance **never takes the keyboard**, on any platform. Its window is
-opened with gpui's `focus` flag off, which is one flag with two platform
-meanings: `orderFront` instead of `makeKeyAndOrderFront` on macOS, and
-`SW_SHOWNOACTIVATE` instead of an activating show on Windows. Nothing in the
-launcher has to fight for focus, because the window never asks for it.
+A harness instance is opened with gpui's `focus` flag off and, on macOS, its
+`show` flag off too. What that buys differs by platform, and the difference is
+not cosmetic:
 
-On **macOS** it also never takes the screen: the window is not shown at all
-(`show` off). On **Windows** it stays shown, and that difference is
-load-bearing rather than an oversight — that window layer reports an unshown
-window as `Hidden`, and hidden is exactly the state that stops frames there.
-Withholding the window on Windows would break the one harness that already
-works.
+| | Takes focus? | On the user's screen? |
+|---|---|---|
+| **macOS** | no | **no** — the window is never shown |
+| **Windows** | ⚠️ **yes, still** | yes |
+
+⚠️ **`focus` is a macOS-only lever at the gpui revision `suite/Cargo.lock`
+pins.** Only that platform's window layer reads it, as `orderFront` instead of
+`makeKeyAndOrderFront`; the Windows and Linux layers read `show` and ignore
+`focus` entirely. A Windows harness window therefore still activates, and
+keeping a run off the user's desktop there is still the launcher's problem.
+The flag is set on every platform anyway — it costs nothing and starts working
+the moment the pin moves — but do not read it as a promise off macOS.
+
+(Upstream gpui has since grown a `SW_SHOWNOACTIVATE` path and an
+`inactive_frame_interval` option. Neither is in the pinned build. **Check the
+vendored source under `~/.cargo/git/checkouts/`, not GitHub**, before relying
+on any gpui behaviour — this document has been wrong that way twice.)
+
+On Windows the window stays **shown**, and that is load-bearing rather than an
+oversight: that layer reports an unshown window as `Hidden`, and hidden is
+exactly the state that stops frames there. Withholding it would break the one
+harness that already works.
 
 ### The frame the app draws for itself
 
@@ -620,16 +634,23 @@ waiting for 4); is it hung?` — against an app that is not hung at all.
 it is compiled in only under its own test cfg, so a shipping build never takes
 it.)
 
-So the `frame` verb **draws the frame itself** rather than waiting for a source
-that is never going to tick: it marks the view dirty and then drives the render
-pass directly before replying. `Done::ok_drawn` is what carries that request out
-to the pump, and it is the only reply that does; an ordinary verb still just
+So on macOS the `frame` verb **draws the frame itself** rather than waiting for
+a source that is never going to tick: it marks the view dirty and then drives
+the render pass directly before replying. `Done::ok_drawn` carries that request
+out to the pump and is the only reply that does; an ordinary verb still just
 marks the view dirty. Since a driver polls `frame` while it waits for the view
 to settle, the frames a case needs arrive exactly when it asks for them.
 
 Nothing is **presented**. A draw is all the probes and the frame counter need,
 and presentation is the part that would require the window to be on screen —
 which is the thing this is avoiding.
+
+⚠️ **That forced draw is gated to macOS, and the gate is not tidiness.**
+Elsewhere frames already flow for a shown window, so it would buy nothing while
+costing something real: a draw advances the frame counter *without presenting*,
+so `settle` could be satisfied by a frame that was never put on screen and
+`PrintWindow` would photograph the one before it. A capture that quietly reads
+stale pixels is exactly the failure a pixel assertion cannot notice by itself.
 
 ## Not covered
 

@@ -244,19 +244,7 @@ pub(crate) struct ControlLink {
 pub(crate) struct Done {
     pub result: Json,
     pub quit: bool,
-    /// Draw one frame before replying.
-    ///
-    /// ⚠️ Harness-only, and the whole reason geometry verbs work off Windows.
-    /// gpui draws a dirty window from its platform frame source, which on macOS
-    /// is a display link that only starts while the window's occlusion state
-    /// says it is visible. A harness instance is deliberately unfocused and may
-    /// be covered or off-screen, so that link never runs and `cx.notify()`
-    /// leaves the view dirty forever — the app answers verbs perfectly while
-    /// its frame counter never moves, and every `rect` times out waiting.
-    /// Drawing here drives the render pass directly instead of waiting for a
-    /// frame source that is never going to tick. Nothing is presented: a draw
-    /// is all the probes and the frame counter need, and presentation is what
-    /// would require the window to be on screen.
+    /// Draw one frame before replying. **macOS only** — see [`Done::ok_drawn`].
     pub draw: bool,
 }
 
@@ -269,12 +257,35 @@ impl Done {
         })
     }
 
-    /// The reply to a verb that must leave a freshly drawn frame behind it.
+    /// The reply to a verb that must leave a freshly drawn frame behind it —
+    /// **on macOS, and only there**.
+    ///
+    /// ⚠️ This is what makes geometry verbs work on macOS. gpui draws a dirty
+    /// window when its platform frame source ticks, and there that source is a
+    /// display link which starts only while the window's occlusion state says
+    /// it is visible. A harness instance is unfocused and unshown, so the link
+    /// never runs: `cx.notify()` leaves the view dirty forever, the app answers
+    /// every verb correctly, and the frame counter never moves — so `rect`
+    /// times out against an app that is not hung at all. Drawing here drives
+    /// the render pass directly instead of waiting for a tick that is never
+    /// coming.
+    ///
+    /// ⚠️ And it is gated to macOS deliberately, not for tidiness. Elsewhere
+    /// frames already flow for a shown window, so this would buy nothing —
+    /// while costing something real: a draw advances the frame counter WITHOUT
+    /// presenting, so `Driver::settle` could be satisfied by a frame that was
+    /// never put on screen, and `PrintWindow` would then photograph the one
+    /// before it. A capture that quietly reads stale pixels is the exact
+    /// failure a pixel assertion cannot notice by itself.
+    ///
+    /// Nothing is presented here either. A draw is all the probes and the
+    /// frame counter need, and presentation is the part that would require the
+    /// window to be on screen — which is what this is avoiding.
     pub(crate) fn ok_drawn(result: Json) -> Result<Self, String> {
         Ok(Self {
             result,
             quit: false,
-            draw: true,
+            draw: cfg!(target_os = "macos"),
         })
     }
 }
@@ -405,11 +416,24 @@ mod done_tests {
         assert!(!Done::ok(Json::Null).unwrap().draw);
     }
 
-    /// The `frame` verb's reply is the one that must leave a drawn frame behind
-    /// it: it is what a driver polls while it waits for the view to settle, and
-    /// on macOS nothing else will draw a window that is unfocused or unshown.
+    /// On macOS the `frame` verb's reply must leave a drawn frame behind it:
+    /// it is what a driver polls while it waits for the view to settle, and
+    /// nothing else will draw a window that is unfocused or unshown.
+    #[cfg(target_os = "macos")]
     #[test]
-    fn the_drawing_reply_asks_for_a_frame() {
+    fn the_drawing_reply_asks_for_a_frame_on_macos() {
         assert!(Done::ok_drawn(Json::Null).unwrap().draw);
+    }
+
+    /// ⚠️ Nowhere else. On Windows frames already flow for a shown window, so
+    /// a forced draw would buy nothing and would actively cost something: it
+    /// advances the frame counter WITHOUT presenting, so `settle` could be
+    /// satisfied by a frame that was never put on screen and `PrintWindow`
+    /// would then photograph the one before it. A capture that reads stale
+    /// pixels is the one failure a pixel assertion cannot notice by itself.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn the_drawing_reply_does_not_force_a_frame_off_macos() {
+        assert!(!Done::ok_drawn(Json::Null).unwrap().draw);
     }
 }

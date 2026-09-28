@@ -22050,19 +22050,28 @@ fn window_options(bounds: Bounds<Pixels>, harness: bool) -> WindowOptions {
         titlebar: Some(TitleBar::title_bar_options()),
         window_min_size: Some(size(px(460.), px(420.))),
         kind: WindowKind::Normal,
-        // ⚠️ A harness instance must never take the keyboard from whoever is
-        // using the machine. gpui turns this single flag into `orderFront`
-        // instead of `makeKeyAndOrderFront` on macOS, and `SW_SHOWNOACTIVATE`
-        // instead of an activating show on Windows, so one flag covers both
-        // platforms and neither needs a launcher trick to hold focus down.
+        // A harness instance must never take the keyboard from whoever is
+        // using the machine.
+        //
+        // ⚠️ This only achieves that on **macOS**, where gpui maps the flag to
+        // `orderFront` instead of `makeKeyAndOrderFront`. At the gpui revision
+        // suite/Cargo.lock pins, the Windows and Linux window layers do not
+        // read `focus` at all — only `show` — so a Windows harness window still
+        // activates, and keeping it off the user's desktop there remains the
+        // launcher's problem. (Upstream gpui has since grown a
+        // `SW_SHOWNOACTIVATE` path; do not assume it is in the pinned build,
+        // and check the vendored source rather than GitHub before relying on
+        // it.) The flag is set unconditionally anyway: it is free, it is the
+        // honest statement of intent, and it starts working on the other
+        // platforms the moment the pin moves.
         focus: !harness,
         // ⚠️ macOS only, and deliberately not Windows. Not showing the window
-        // is what keeps a test run entirely off the user's screen here, and it
+        // is what keeps a macOS test run entirely off the user's screen, and it
         // costs nothing because the harness drives the render pass itself. On
-        // Windows the same flag would be actively harmful: that window layer
-        // reports an unshown window as Hidden, which is precisely the state
-        // that stops frames — so there a harness window stays shown, just
-        // never focused.
+        // Windows the same flag would be actively harmful: `show` is the one
+        // window option that layer does read, and it treats an unshown window
+        // as Hidden — precisely the state that stops frames there. So a
+        // Windows harness window stays shown.
         show: !(harness && cfg!(target_os = "macos")),
         ..Default::default()
     }
@@ -22188,11 +22197,13 @@ mod window_option_tests {
         }
     }
 
-    /// A harness instance must come up **without taking the user's focus**.
-    /// gpui turns this one flag into `orderFront` rather than
-    /// `makeKeyAndOrderFront` on macOS, and `SW_SHOWNOACTIVATE` rather than an
-    /// activating show on Windows — so the machine stays usable while a test
-    /// run is driving a window on it.
+    /// A harness instance asks to come up **without taking the user's focus**.
+    ///
+    /// ⚠️ The option is set on every platform, but at the pinned gpui revision
+    /// only the macOS layer reads it (as `orderFront` rather than
+    /// `makeKeyAndOrderFront`); Windows and Linux ignore it. So this test pins
+    /// down what the app *asks for*, which is all a pure function can promise
+    /// — that the machine actually stays usable is measured per platform.
     #[test]
     fn a_harness_window_does_not_take_focus() {
         assert!(
@@ -22228,8 +22239,8 @@ mod window_option_tests {
     /// ⚠️ Everywhere else a harness window IS shown, and on Windows that is
     /// load-bearing rather than incidental: its window layer reports a window
     /// that is not shown as Hidden, and a hidden window is exactly the state
-    /// that stops frames. Leaving it shown but unfocused is what keeps the
-    /// working Windows harness working.
+    /// that stops frames. Leaving it shown is what keeps the working Windows
+    /// harness working.
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_harness_window_is_still_shown_off_macos() {
