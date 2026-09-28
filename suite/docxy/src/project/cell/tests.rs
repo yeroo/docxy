@@ -1033,3 +1033,140 @@ fn a_summary_shows_the_estimate_of_its_subtasks() {
     );
     assert_eq!(duration_text(&t, 20), "1d");
 }
+
+fn shift_key(t: &mut DocTab, key: &str) {
+    let m = Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    };
+    project_input(t, key, None, m);
+}
+
+#[test]
+fn up_or_down_commits_a_new_plan_entry_row_edit_as_enter_does() {
+    for (arrow, row) in [("down", 1), ("up", 0)] {
+        let mut t = new_project_tab();
+        let col = v(&t).col;
+        project_input(&mut t, "a", Some("A"), Modifiers::default());
+        key(&mut t, arrow);
+        let tasks = &v(&t).ed.project().tasks;
+        assert_eq!(tasks.len(), 1, "{arrow}");
+        assert_eq!(
+            (
+                tasks[0].name.as_str(),
+                tasks[0].duration_min,
+                tasks[0].estimated
+            ),
+            ("A", 480, Some(true)),
+            "{arrow}: 1d? as with Enter"
+        );
+        assert!(v(&t).cell.is_none(), "{arrow}");
+        assert_eq!(v(&t).ed.undo_depth(), 1, "{arrow}");
+        assert_eq!((v(&t).cursor_row(), v(&t).col), (row, col), "{arrow}");
+        // Down lands on the entry row below; Up has no row above task A.
+        assert_eq!(v(&t).on_entry_row(), arrow == "down", "{arrow}");
+    }
+}
+
+#[test]
+fn up_after_appending_from_the_entry_row_goes_to_the_row_above_the_new_task() {
+    let mut t = tab();
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    edit(&mut t, COL_NAME, "Design");
+    key(&mut t, "up");
+    assert_eq!(v(&t).ed.project().tasks.len(), 4);
+    assert_eq!(v(&t).ed.project().tasks[3].name, "Design");
+    assert!(v(&t).cell.is_none());
+    assert!(!v(&t).on_entry_row());
+    assert_eq!((v(&t).cursor_row(), v(&t).col), (2, COL_NAME));
+}
+
+#[test]
+fn up_or_down_commits_a_task_edit_and_moves_one_row() {
+    for (arrow, row, shift) in [("down", 2, false), ("up", 0, false), ("down", 2, true)] {
+        let mut t = tab();
+        key(&mut t, "down");
+        edit(&mut t, COL_NAME, "Renamed");
+        if shift {
+            shift_key(&mut t, arrow);
+        } else {
+            key(&mut t, arrow);
+        }
+        assert!(v(&t).cell.is_none(), "{arrow}");
+        assert_eq!(v(&t).ed.project().tasks[1].name, "Renamed", "{arrow}");
+        assert_eq!(v(&t).ed.undo_depth(), 1, "{arrow}");
+        assert_eq!((v(&t).cursor_row(), v(&t).col), (row, COL_NAME), "{arrow}");
+        assert!(t.dirty);
+    }
+}
+
+#[test]
+fn a_rejected_value_keeps_the_editor_open_on_up_or_down() {
+    let mut enter = tab();
+    edit(&mut enter, COL_DURATION, "abc");
+    key(&mut enter, "enter");
+    assert!(
+        enter.status.contains("Invalid duration"),
+        "{}",
+        enter.status
+    );
+    for arrow in ["down", "up"] {
+        let mut t = tab();
+        key(&mut t, "down");
+        edit(&mut t, COL_DURATION, "abc");
+        key(&mut t, arrow);
+        assert_eq!(v(&t).cell.as_ref().map(|c| c.buf.as_str()), Some("abc"));
+        assert_eq!(t.status, enter.status, "{arrow}: the error Enter gives");
+        assert_eq!(v(&t).cursor_row(), 1, "{arrow}");
+        assert_eq!(v(&t).ed.undo_depth(), 0, "{arrow}");
+        assert!(!t.dirty);
+    }
+}
+
+#[test]
+fn up_or_down_from_an_unchanged_editor_closes_it_and_moves() {
+    // F2 on a task, then Down: no undo step, one row down.
+    let mut t = tab();
+    key(&mut t, "f2");
+    key(&mut t, "down");
+    assert!(v(&t).cell.is_none());
+    assert_eq!((v(&t).cursor_row(), v(&t).ed.undo_depth()), (1, 0));
+    assert!(!t.dirty);
+    // The last task's editor: Down goes to the entry row.
+    key(&mut t, "end");
+    key(&mut t, "f2");
+    key(&mut t, "down");
+    assert!(v(&t).cell.is_none());
+    assert!(v(&t).on_entry_row());
+    // The entry row's editor with nothing typed: Up goes to the last task.
+    key(&mut t, "f2");
+    assert!(v(&t).cell.is_some());
+    key(&mut t, "up");
+    assert!(v(&t).cell.is_none());
+    assert_eq!(v(&t).cursor_row(), 2);
+    assert_eq!(v(&t).ed.project().tasks.len(), 3);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    // An empty plan's entry row: Up has nowhere to go and appends nothing.
+    let mut t = new_project_tab();
+    key(&mut t, "f2");
+    key(&mut t, "up");
+    assert!(v(&t).cell.is_none());
+    assert!(v(&t).on_entry_row());
+    assert!(v(&t).ed.project().tasks.is_empty());
+}
+
+#[test]
+fn caret_keys_stay_in_the_editor() {
+    let mut t = tab();
+    edit(&mut t, COL_NAME, "ab");
+    key(&mut t, "left");
+    assert_eq!(v(&t).cell.as_ref().unwrap().caret, 1);
+    key(&mut t, "home");
+    assert_eq!(v(&t).cell.as_ref().unwrap().caret, 0);
+    key(&mut t, "end");
+    key(&mut t, "backspace");
+    let cell = v(&t).cell.as_ref().unwrap();
+    assert_eq!((cell.buf.as_str(), cell.caret), ("a", 1));
+    assert_eq!(v(&t).ed.undo_depth(), 0);
+    assert_eq!(v(&t).cursor_row(), 0);
+}
