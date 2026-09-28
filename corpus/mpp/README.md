@@ -130,7 +130,7 @@ python corpus/tools/gen_mpp_calendar_cases.py
 The binary and XML pairs stay git-ignored. The oracle test checks their exact
 calendar UIDs, names, base links, weekdays and default calendar UID when present.
 
-The exception decoder has ten MSPDI-seeded and seven COM-created Project-written
+The exception decoder has eleven MSPDI-seeded and eight COM-created Project-written
 probes in `exceptions/` (plus one optional Period 300 COM case): multi-day
 holidays, a working Saturday with two periods, daily/weekly/monthly/yearly
 recurrences, a derived calendar exception, several sorted exceptions, and a
@@ -140,7 +140,8 @@ Unicode name. Generate them with:
 python corpus/tools/gen_mpp_exception_cases.py
 ```
 
-The `.xml` output is Project's own rewrite of each temporary MSPDI seed. The
+The `.xml` output is Project's own export: a rewrite of the temporary MSPDI
+seed for `e*` cases, and an export of the COM-built project for `k*` cases. The
 oracle test compares every exception field in the decoded `.mpp` to that XML.
 
 In newest Project files, key 8 of `TBkndCal/Var2Data` starts with seven

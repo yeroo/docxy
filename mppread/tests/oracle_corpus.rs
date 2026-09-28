@@ -444,7 +444,9 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             "e1-range",
             "e2-weekend-working",
             "e10-several-unicode",
+            "e11-unnamed",
             "k1-one-off",
+            "k9-unnamed",
         ]
         .contains(&stem.as_ref())
         {
@@ -539,7 +541,7 @@ fn project_2024_oracles() {
         let cases = pairs(&exceptions, "");
         assert_eq!(
             cases.len(),
-            17 + usize::from(exceptions.join("k8-period-300.mpp").exists())
+            19 + usize::from(exceptions.join("k8-period-300.mpp").exists())
         );
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);

@@ -46,6 +46,22 @@ fn name(value: &[u8]) -> Result<String, String> {
     Ok(s)
 }
 
+fn exception_name(value: &[u8]) -> Result<String, &'static str> {
+    if value.len() < 2 || !value.len().is_multiple_of(2) {
+        return Err("invalid UTF-16 length");
+    }
+    let units: Vec<_> = value
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    if units.last() != Some(&0) {
+        return Err("unterminated UTF-16");
+    }
+    String::from_utf16(&units[..units.len() - 1]).map_err(|_| "invalid UTF-16")
+}
+
 fn working_time(
     start_tenths: u32,
     duration: i32,
@@ -225,10 +241,13 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
             .checked_add(padded)
             .filter(|&n| n <= value.len())
             .ok_or_else(|| format!("calendar exception {index} name past block"))?;
-        if name_len != 0 {
-            let raw = &value[end..end + name_len];
-            exception.name = Some(name(raw)?);
-        }
+        // Project writes an empty <Name> for zero-length binary names.
+        exception.name = Some(if name_len == 0 {
+            String::new()
+        } else {
+            exception_name(&value[end..end + name_len])
+                .map_err(|e| format!("calendar exception {index} name: {e}"))?
+        });
         out.push(exception);
         offset = next;
     }
@@ -522,6 +541,38 @@ mod tests {
         daily[500..504].copy_from_slice(&[44, 1, 5, 6]);
         let decoded = exceptions(&daily).unwrap();
         assert_eq!(decoded[0].period, Some(300));
+    }
+
+    #[test]
+    fn exception_names_allow_empty_and_control_chars_but_refuse_bad_utf16() {
+        let renamed = |raw: &[u8]| {
+            let mut b = exception_block();
+            b.truncate(516);
+            b[512..516].copy_from_slice(&(raw.len() as u32).to_le_bytes());
+            b.extend_from_slice(raw);
+            b.resize(b.len().next_multiple_of(4), 0);
+            b.extend_from_slice(&[0; 4]);
+            b
+        };
+        assert_eq!(
+            exceptions(&renamed(&[])).unwrap()[0].name.as_deref(),
+            Some("")
+        );
+        assert_eq!(
+            exceptions(&renamed(&[0, 0])).unwrap()[0].name.as_deref(),
+            Some("")
+        );
+        let control: Vec<_> = "A\nB"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert_eq!(
+            exceptions(&renamed(&control)).unwrap()[0].name.as_deref(),
+            Some("A\nB")
+        );
+        let error = exceptions(&renamed(&[0, 0xd8, 0, 0])).unwrap_err();
+        assert!(error.contains("exception 0 name"), "{error}");
     }
 
     #[test]

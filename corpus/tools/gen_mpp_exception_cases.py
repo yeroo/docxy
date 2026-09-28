@@ -9,6 +9,7 @@ is interrupted; never force-kill WINPROJ.EXE.
 import os
 import sys
 import tempfile
+from datetime import datetime, timezone
 from xml.etree import ElementTree as ET
 
 import pywintypes
@@ -19,6 +20,12 @@ OUT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "mpp", "exce
 NS = "http://schemas.microsoft.com/project"
 PJ_MPP, PJ_XML = "MSProject.MPP", "MSProject.XML"
 ET.register_namespace("", NS)
+
+
+def project_date(year, month, day, hour=0):
+    # pywin32 converts datetimes to VT_DATE through UTC. Tag the intended
+    # Project wall-clock components as UTC to keep them unchanged in COM.
+    return datetime(year, month, day, hour, tzinfo=timezone.utc)
 
 
 def child(parent, tag, value=None):
@@ -35,7 +42,8 @@ def exception(parent, spec):
     child(dates, "FromDate", spec["from"] + "T00:00:00")
     child(dates, "ToDate", spec["to"] + "T23:59:00")
     child(item, "Occurrences", spec.get("occurrences", 1))
-    child(item, "Name", spec["name"])
+    if spec["name"] is not None:
+        child(item, "Name", spec["name"])
     child(item, "Type", spec.get("type", 1))
     for field, key in (("Period", "period"), ("DaysOfWeek", "days"),
                        ("MonthItem", "month_item"), ("MonthPosition", "position"),
@@ -116,6 +124,7 @@ def cases():
         ("e10-several-unicode", [ex("Fête 日本語", first="2026-03-05"),
                                   ex("Earlier", first="2026-03-03"),
                                   ex("Later", first="2026-03-09")], False, False),
+        ("e11-unnamed", [ex(None)], False, False),
     ]
 
 
@@ -135,20 +144,22 @@ def com_cases():
     # These are created through Project's object model, not by opening MSPDI.
     # Type numbers and pattern fields match Project's PjExceptionType values.
     return [
-        ("k1-one-off", 1, "3/4/2026", "3/4/2026", {}),
-        ("k2-daily-n", 7, "3/4/2026", None,
+        ("k1-one-off", 1, project_date(2026, 3, 4), project_date(2026, 3, 4), {}),
+        ("k2-daily-n", 7, project_date(2026, 3, 4), None,
          {"Period": 3, "Occurrences": 5}),
-        ("k3-weekly-days", 6, "3/4/2026", "4/30/2026",
+        ("k3-weekly-days", 6, project_date(2026, 3, 4), project_date(2026, 4, 30),
          {"Period": 1, "DaysOfWeek": 18}),
-        ("k4-monthly-day", 4, "3/4/2026", "9/4/2026",
+        ("k4-monthly-day", 4, project_date(2026, 3, 4), project_date(2026, 9, 4),
          {"Period": 1, "MonthDay": 4}),
-        ("k5-monthly-position", 5, "3/4/2026", "9/8/2026",
+        ("k5-monthly-position", 5, project_date(2026, 3, 4), project_date(2026, 9, 8),
          {"Period": 1, "MonthPosition": 2, "MonthItem": 5}),
-        ("k6-yearly-date", 2, "3/4/2026", "3/4/2030",
+        ("k6-yearly-date", 2, project_date(2026, 3, 4), project_date(2030, 3, 4),
          {"Month": 3, "MonthDay": 4}),
-        ("k7-yearly-position", 3, "3/4/2026", "3/10/2030",
+        ("k7-yearly-position", 3, project_date(2026, 3, 4), project_date(2030, 3, 10),
          {"Month": 3, "MonthPosition": 2, "MonthItem": 5}),
-        ("k8-period-300", 7, "3/4/2026", "8/20/2027", {"Period": 300}),
+        ("k8-period-300", 7, project_date(2026, 3, 4), project_date(2027, 8, 20),
+         {"Period": 300}),
+        ("k9-unnamed", 1, project_date(2026, 3, 4), project_date(2026, 3, 4), {}),
     ]
 
 
@@ -156,12 +167,14 @@ def com_case(app, slug, kind, start, finish, fields):
     app.FileNew()
     project = app.ActiveProject
     try:
-        project.ProjectStart = "3/2/2026 8:00 AM"
+        project.ProjectStart = project_date(2026, 3, 2, 8)
         project.NewTasksCreatedAsManual = False
         task = project.Tasks.Add("Exception span")
-        task.Duration = "10d"
+        task.Duration = 4800
         calendar = project.BaseCalendars("Standard")
-        kwargs = {"Type": kind, "Start": start, "Name": slug, **fields}
+        kwargs = {"Type": kind, "Start": start, **fields}
+        if slug != "k9-unnamed":
+            kwargs["Name"] = slug
         if finish is not None:
             kwargs["Finish"] = finish
         calendar.Exceptions.Add(**kwargs)
@@ -206,11 +219,10 @@ def main():
                         os.remove(target)
                 print(f"Project refused optional {slug}: {error}", flush=True)
     finally:
-        for call in (lambda: app.FileCloseAll(0), lambda: app.Quit(0)):
-            try:
-                call()
-            except Exception:
-                pass
+        if app.Projects.Count:
+            print("Project still has open projects; leaving the instance running.", flush=True)
+        else:
+            app.Quit(0)
     return 0
 
 
