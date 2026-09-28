@@ -27,6 +27,8 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// tasks use their stored working Duration when available; manual tasks keep
 /// their manual duration and use the calendar span only when it is absent.
 /// An unrecognised calendar record refuses the import.
+/// A calendar whose default week is wholly closed is refused even if one of
+/// its alternate weeks opens a day, as in MSPDI import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)

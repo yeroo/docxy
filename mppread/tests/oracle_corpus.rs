@@ -544,11 +544,40 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             let expected_task = expected.iter().find(|t| t.uid == 1).unwrap();
             assert_eq!(task.duration_min, expected_task.duration_min);
             let expected_calendar = match stem.as_ref() {
-                "w12-task-calendar" | "w7-derived" => Some(3),
+                "w7-derived" => Some(3),
+                "w12-task-calendar" => Some(5),
                 "w8-inherited" => Some(2),
                 _ => None,
             };
             assert_eq!(task.calendar_uid, expected_calendar);
+            if stem == "w12-task-calendar" {
+                let calendar = imported.calendar(5).unwrap();
+                assert!(calendar.base_calendar_uid.is_none());
+                assert_ne!(imported.default_calendar_uid, 5);
+                assert!(oracle.resources.iter().all(|r| r.calendar_uid != Some(5)));
+            }
+            if [
+                "w8-inherited",
+                "w12-task-calendar",
+                "c1-com-summer",
+                "c2-com-out-of-order",
+            ]
+            .contains(&stem.as_ref())
+            {
+                let mut without_work_weeks = imported.clone();
+                for calendar in &mut without_work_weeks.calendars {
+                    calendar.work_weeks.clear();
+                }
+                assert_ne!(
+                    projcore::schedule::schedule(&without_work_weeks)
+                        .get(1)
+                        .unwrap()
+                        .early_finish,
+                    scheduled.get(1).unwrap().early_finish,
+                    "{}: task does not depend on an alternate work week",
+                    mpp.display()
+                );
+            }
         }
         if [
             "e1-range",
@@ -712,7 +741,7 @@ fn project_2024_oracles() {
             ("w9-unicode", 1, &["Fête 日本語"]),
             ("w10-unnamed", 1, &[""]),
             ("w11-exception", 1, &["With holiday"]),
-            ("w12-task-calendar", 3, &["Task summer"]),
+            ("w12-task-calendar", 5, &["Task summer"]),
             ("c1-com-summer", 1, &["COM Summer"]),
             ("c2-com-out-of-order", 1, &["Earlier", "Later"]),
         ];

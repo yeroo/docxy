@@ -78,6 +78,11 @@ def seed(path, slug, definitions, task_calendar=None, exception=False):
     if task_calendar:
         child(task, "CalendarUID", task_calendar)
     calendars = root.find(Q("Calendars"))
+    if slug == "w12-task-calendar":
+        task_cal = child(calendars, "Calendar")
+        child(task_cal, "UID", 5)
+        child(task_cal, "Name", "Task Summer")
+        child(task_cal, "IsBaseCalendar", 1)
     for calendar in list(calendars):
         uid = int(calendar.find(Q("UID")).text)
         old = calendar.find(Q("WorkWeeks"))
@@ -110,11 +115,11 @@ def cases():
         ("w6-two", {1: [("Earlier", 9, 13, {2: SUMMER}),
                          ("Later", 16, 20, {2: FIVE})]}, None, False),
         ("w7-derived", {3: [("Crew", 9, 20, {2: SUMMER})]}, 3, False),
-        ("w8-inherited", {1: [("Inherited", 9, 20, {2: SUMMER})]}, 2, False),
+        ("w8-inherited", {1: [("Inherited", 9, 20, {3: SUMMER})]}, 2, False),
         ("w9-unicode", {1: [("Fête 日本語", 9, 20, {2: SUMMER})]}, None, False),
         ("w10-unnamed", {1: [(None, 9, 20, {2: SUMMER})]}, None, False),
         ("w11-exception", {1: [("With holiday", 9, 20, {2: SUMMER})]}, None, True),
-        ("w12-task-calendar", {3: [("Task summer", 9, 20, summer)]}, 3, False),
+        ("w12-task-calendar", {5: [("Task summer", 9, 20, summer)]}, 5, False),
     ]
 
 
@@ -134,7 +139,7 @@ def com_case(app, slug, definitions):
     app.FileNew()
     try:
         project = app.ActiveProject
-        project.ProjectStart = date(2)
+        project.ProjectStart = date(6)
         project.NewTasksCreatedAsManual = False
         task = project.Tasks.Add("COM work week span")
         task.Duration = 960
@@ -183,7 +188,7 @@ def main():
                  {day: SUMMER for day in range(2, 7)})])
         com_case(app, "c2-com-out-of-order", [
             ("Later", 16, 20, {2: FIVE}),
-            ("Earlier", 9, 13, {6: [], 7: SUMMER}),
+            ("Earlier", 9, 13, {2: SUMMER, 6: [], 7: SUMMER}),
         ])
     finally:
         if app.Projects.Count:

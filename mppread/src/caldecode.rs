@@ -68,6 +68,32 @@ fn exception_name(value: &[u8]) -> Result<String, &'static str> {
     Ok(s)
 }
 
+fn tail_name(
+    value: &[u8],
+    end: usize,
+    name_len: usize,
+    label: &str,
+    strict_padding: bool,
+) -> Result<(String, usize), String> {
+    let padded = name_len
+        .checked_add(3)
+        .map(|n| n & !3)
+        .ok_or_else(|| format!("{label} name length overflow"))?;
+    let next = end
+        .checked_add(padded)
+        .filter(|&n| n <= value.len())
+        .ok_or_else(|| format!("{label} name past block"))?;
+    let name = if name_len == 0 {
+        String::new()
+    } else {
+        exception_name(&value[end..end + name_len]).map_err(|e| format!("{label} name: {e}"))?
+    };
+    if strict_padding && value[end + name_len..next].iter().any(|&b| b != 0) {
+        return Err(format!("{label} nonzero name padding"));
+    }
+    Ok((name, next))
+}
+
 fn working_time(
     start_tenths: u32,
     duration: i32,
@@ -253,21 +279,17 @@ fn exceptions(value: &[u8]) -> Result<(Vec<CalendarException>, Vec<WorkWeek>), S
             }
         }
         let name_len = u32_at(rec, 88) as usize;
-        let padded = name_len
-            .checked_add(3)
-            .map(|n| n & !3)
-            .ok_or("calendar exception name length overflow")?;
-        let next = end
-            .checked_add(padded)
-            .filter(|&n| n <= value.len())
-            .ok_or_else(|| format!("calendar exception {index} name past block"))?;
         // Project writes an empty <Name> for zero-length binary names.
-        exception.name = Some(if name_len == 0 {
-            String::new()
-        } else {
-            exception_name(&value[end..end + name_len])
-                .map_err(|e| format!("calendar exception {index} name: {e}"))?
-        });
+        // Exception padding has not been verified in every older corpus, so
+        // preserve its existing permissive treatment.
+        let (name, next) = tail_name(
+            value,
+            end,
+            name_len,
+            &format!("calendar exception {index}"),
+            false,
+        )?;
+        exception.name = Some(name);
         out.push(exception);
         offset = next;
     }
@@ -305,23 +327,14 @@ fn exceptions(value: &[u8]) -> Result<(Vec<CalendarException>, Vec<WorkWeek>), S
             return Err(format!("unrecognized calendar work-week {index} fields"));
         }
         let name_len = u32_at(rec, 432) as usize;
-        let padded = name_len
-            .checked_add(3)
-            .map(|n| n & !3)
-            .ok_or("calendar work-week name length overflow")?;
-        let next = end
-            .checked_add(padded)
-            .filter(|&n| n <= value.len())
-            .ok_or_else(|| format!("calendar work-week {index} name past block"))?;
-        week.name = Some(if name_len == 0 {
-            String::new()
-        } else {
-            exception_name(&value[end..end + name_len])
-                .map_err(|e| format!("calendar work-week {index} name: {e}"))?
-        });
-        if value[end + name_len..next].iter().any(|&b| b != 0) {
-            return Err(format!("calendar work-week {index} nonzero name padding"));
-        }
+        let (name, next) = tail_name(
+            value,
+            end,
+            name_len,
+            &format!("calendar work-week {index}"),
+            true,
+        )?;
+        week.name = Some(name);
         weeks.push(week);
         offset = next;
     }
@@ -699,6 +712,13 @@ pub(crate) mod tests {
                 .unwrap_err()
                 .contains("name: invalid UTF-16")
         );
+        let mut bad = block.clone();
+        bad[878] = 1;
+        assert!(
+            exceptions(&bad)
+                .unwrap_err()
+                .contains("nonzero name padding")
+        );
         let mut bad = block;
         bad.push(1);
         assert!(exceptions(&bad).unwrap_err().contains("trailing"));
@@ -742,6 +762,9 @@ pub(crate) mod tests {
             exceptions(&renamed(&[0, 0])).unwrap().0[0].name.as_deref(),
             Some("")
         );
+        let mut padded = renamed(&[0, 0]);
+        padded[518] = 1;
+        assert_eq!(exceptions(&padded).unwrap().0[0].name.as_deref(), Some(""));
         let control: Vec<_> = "A\nB"
             .encode_utf16()
             .chain([0])

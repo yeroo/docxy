@@ -1217,6 +1217,18 @@ mod tests {
         assert_eq!(task.early_start, project.tasks[0].stored_start.unwrap());
         assert_eq!(task.early_finish.to_mspdi(), "2026-03-03T08:00:00");
     }
+
+    #[test]
+    fn closed_default_week_is_refused_even_with_an_open_work_week() {
+        let mut s = fixture();
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+        let error = crate::project::project_from_mpp(&file_with_calendar(&s, true, &[5], false))
+            .unwrap_err();
+        assert!(
+            error.contains("calendar \"Alice\" (UID 5) has no working time"),
+            "{error}"
+        );
+    }
     #[test]
     fn negative_stored_duration_names_uid() {
         let mut s = fixture();

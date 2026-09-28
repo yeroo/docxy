@@ -163,7 +163,8 @@ The work-week decoder has twelve MSPDI-seeded and two COM-created Project-writte
 probes in `workweeks/`. They cover changed and inherited weekdays, a closed
 weekday, a working Saturday, five shifts, a 24-hour day, two sorted periods,
 resource calendars, Unicode and blank names, exceptions in the same block,
-and tasks crossing an alternate-week boundary on both project and task calendars.
+and tasks crossing an alternate-week boundary on both the project calendar
+and a standalone base task calendar that no resource uses.
 Regenerate the local, ignored `.mpp`/`.xml` pairs on a Windows machine with
 Microsoft Project and pywin32:
 
@@ -262,6 +263,8 @@ exceptions, work weeks, the default calendar and task calendar assignments are
 imported. Auto tasks keep their stored working Duration and task calendar;
 manual tasks keep their stored manual duration and use the calendar span only
 if it is absent.
+A calendar with a wholly closed default week is refused even if an alternate
+week opens working time, matching MSPDI import.
 Type 8 exceptions and record shapes not covered by the
 Project-written probes refuse the file. An invalid newest calendar table refuses
 import. Files without
