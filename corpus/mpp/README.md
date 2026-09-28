@@ -284,10 +284,12 @@ curl -sSL -o corpus/mpp/construction.mpp \
 ### Known decode gaps
 
 The importer validates the newest Project 2024 task layout and the MPP9 layout
-used by the three local legacy samples. The newest layout is checked against 46
-generated snapshots and 27 paired Project 2024 XML exports. All 46 MPP12
-snapshot files currently return a task-table error; that layout needs its own
-field map before it can be imported.
+used by the three local legacy samples. The newest layout is checked against
+generated snapshots and paired Project 2024 XML exports. MPP12 files may pass
+through the limited legacy task decoder; other MPP12 task tables are refused
+until their layout has a validated field map.
+Task Notes are decoded only on the current-layout path. Notes in legacy/MPP12
+files remain unread, including MPP12 files whose task rows can be imported.
 
 Current Project blank rows are identified by their short FixedMeta record and
 retained with their IDs and UIDs. Superseded task
@@ -347,6 +349,7 @@ values):
 | DurationFormat | +164 | u16, MSPDI format code |
 | CalendarUID | +178 | i32; -1 means project calendar |
 | PhysicalPercentComplete | Var2Data key `0x045f` | u16 block, written only when nonzero |
+| Notes | Var2Data key `0x000f` | RichEdit RTF followed by CRLF and NUL; the final `\\par` is omitted from exported text. Malformed RTF and unsupported escaped-byte code pages are refused. |
 
 Durations and work are rounded to whole minutes, as MSPDI import rounds
 seconds. Every numeric field is present on every task, zero included, since

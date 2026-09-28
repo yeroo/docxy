@@ -1262,14 +1262,7 @@ mod tests {
         let note = b"{\\rtf1\\ansi\\ansicpg1252\\deff0\\nouicompat\\deflang1033{\\fonttbl{\\f0\\fnil\\fcharset0 Segoe UI;}{\\f1\\fnil Segoe UI;}{\\f2\\fnil\\fcharset1 Segoe UI Symbol;}}\r\n{\\*\\generator Riched20 16.0.20026}\\viewkind4\\uc1 \r\n\\pard\\f0\\fs20 First line.\\par\r\nSecond line \\f1\\emdash  unicode \\f2\\u10003?\\f0  and \\u171?quotes\\u187?.\\par\r\n}\r\n\0";
         assert_eq!(note.len(), 314);
         let off = s.v2.len() as u32;
-        s.v2.extend_from_slice(&(note.len() as u32).to_le_bytes());
-        s.v2.extend_from_slice(note);
-        s.vm.extend_from_slice(&1u32.to_le_bytes());
-        s.vm.extend_from_slice(&off.to_le_bytes());
-        s.vm.extend_from_slice(&TASK_NOTES_KEY.to_le_bytes());
-        s.vm.extend_from_slice(&0x0b40u16.to_le_bytes());
-        s.vm[8..12].copy_from_slice(&3u32.to_le_bytes());
-        s.vm[20..24].copy_from_slice(&(s.v2.len() as u32).to_le_bytes());
+        add_var(&mut s, 1, TASK_NOTES_KEY, note);
         let bytes = file(&s, true);
         let expected = "First line.\r\nSecond line — unicode ✓ and «quotes».";
         assert_eq!(

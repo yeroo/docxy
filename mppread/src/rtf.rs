@@ -1,23 +1,57 @@
-//! Plain text from the small RTF dialect Project writes for task notes.
+//! Plain text from the RTF dialect Project writes for task notes.
+use std::collections::HashMap;
 
 #[derive(Clone, Copy)]
 struct State {
     hidden: bool,
+    font_table: bool,
     uc: usize,
     codepage: i32,
+    font: i32,
 }
 
-fn cp1252(byte: u8) -> char {
-    const EXT: [char; 32] = [
-        '€', '\u{0081}', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\u{008d}', 'Ž',
-        '\u{008f}', '\u{0090}', '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ',
-        '\u{009d}', 'ž', 'Ÿ',
-    ];
-    if (0x80..=0x9f).contains(&byte) {
-        EXT[(byte - 0x80) as usize]
-    } else {
-        char::from(byte)
-    }
+fn charset_page(charset: i32, ansi_page: i32) -> Option<i32> {
+    Some(match charset {
+        0 | 1 => ansi_page,
+        161 => 1253,
+        162 => 1254,
+        163 => 1258,
+        177 => 1255,
+        178 => 1256,
+        186 => 1257,
+        204 => 1251,
+        238 => 1250,
+        _ => return None,
+    })
+}
+
+fn hidden_destination(word: &[u8]) -> bool {
+    matches!(
+        word,
+        b"fonttbl"
+            | b"colortbl"
+            | b"stylesheet"
+            | b"info"
+            | b"generator"
+            | b"pict"
+            | b"object"
+            | b"objdata"
+            | b"nonshppict"
+            | b"shppict"
+            | b"footnote"
+            | b"fldinst"
+            | b"xe"
+            | b"tc"
+            | b"themedata"
+            | b"colorschememapping"
+            | b"latentstyles"
+            | b"datastore"
+            | b"listtable"
+            | b"listoverridetable"
+            | b"rsidtbl"
+            | b"mmathPr"
+    ) || word.starts_with(b"header")
+        || word.starts_with(b"footer")
 }
 
 fn push(out: &mut Vec<u16>, c: char) {
@@ -25,9 +59,17 @@ fn push(out: &mut Vec<u16>, c: char) {
 }
 
 fn skip_fallback(bytes: &[u8], pos: &mut usize, count: usize) -> Result<(), ()> {
-    for _ in 0..count {
+    let mut skipped = 0;
+    while skipped < count {
         if *pos >= bytes.len() {
-            return Err(());
+            break;
+        }
+        if bytes[*pos] == b'{' || bytes[*pos] == b'}' {
+            break;
+        }
+        if bytes[*pos] == b'\r' || bytes[*pos] == b'\n' {
+            *pos += 1;
+            continue;
         }
         if bytes[*pos] == b'\\' {
             *pos += 1;
@@ -42,16 +84,44 @@ fn skip_fallback(bytes: &[u8], pos: &mut usize, count: usize) -> Result<(), ()> 
                     return Err(());
                 }
                 *pos += 3;
-            } else if !bytes[*pos].is_ascii_alphabetic() {
-                *pos += 1;
+            } else if bytes[*pos].is_ascii_alphabetic() {
+                let start = *pos;
+                while bytes.get(*pos).is_some_and(u8::is_ascii_alphabetic) {
+                    *pos += 1;
+                }
+                let word = &bytes[start..*pos];
+                let num_start = *pos;
+                if bytes.get(*pos) == Some(&b'-') {
+                    *pos += 1;
+                }
+                while bytes.get(*pos).is_some_and(u8::is_ascii_digit) {
+                    *pos += 1;
+                }
+                if word == b"bin" {
+                    let n = std::str::from_utf8(&bytes[num_start..*pos])
+                        .map_err(|_| ())?
+                        .parse::<usize>()
+                        .map_err(|_| ())?;
+                    if bytes.get(*pos) == Some(&b' ') {
+                        *pos += 1;
+                    }
+                    *pos = pos
+                        .checked_add(n)
+                        .filter(|&end| end <= bytes.len())
+                        .ok_or(())?;
+                    skipped += 1;
+                    continue;
+                }
+                if bytes.get(*pos) == Some(&b' ') {
+                    *pos += 1;
+                }
             } else {
-                return Err(());
+                *pos += 1;
             }
-        } else if !matches!(bytes[*pos], b'{' | b'}' | b'\r' | b'\n') {
-            *pos += 1;
         } else {
-            return Err(());
+            *pos += 1;
         }
+        skipped += 1;
     }
     Ok(())
 }
@@ -64,9 +134,12 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
     let mut stack = Vec::new();
     let mut state = State {
         hidden: false,
+        font_table: false,
         uc: 1,
         codepage: 1252,
+        font: 0,
     };
+    let mut fonts = HashMap::new();
     let mut out = Vec::new();
     let mut group_start = false;
     let mut closed = false;
@@ -129,17 +202,27 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                     if bytes.get(pos) == Some(&b' ') {
                         pos += 1;
                     }
-                    if group_start
-                        && matches!(
-                            word,
-                            b"fonttbl" | b"colortbl" | b"stylesheet" | b"info" | b"generator"
-                        )
-                    {
+                    if group_start && hidden_destination(word) {
                         state.hidden = true;
+                        if word == b"fonttbl" {
+                            state.font_table = true;
+                        }
                     }
                     group_start = false;
                     match word {
                         b"ansicpg" => state.codepage = num.ok_or(())?,
+                        b"deff" => state.font = num.ok_or(())?,
+                        b"f" => state.font = num.ok_or(())?,
+                        b"fcharset" if state.font_table => {
+                            fonts.insert(state.font, num.ok_or(())?);
+                        }
+                        b"bin" => {
+                            let n = usize::try_from(num.ok_or(())?).map_err(|_| ())?;
+                            pos = pos
+                                .checked_add(n)
+                                .filter(|&end| end <= bytes.len())
+                                .ok_or(())?;
+                        }
                         b"uc" => state.uc = usize::try_from(num.ok_or(())?).map_err(|_| ())?,
                         b"u" => {
                             let value = num.ok_or(())?;
@@ -185,11 +268,29 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                             let value = u8::from_str_radix(hex, 16).map_err(|_| ())?;
                             pos += 2;
                             if !state.hidden {
-                                if state.codepage != 1252 {
-                                    return Err(());
-                                }
-                                push(&mut out, cp1252(value));
+                                let page = fonts
+                                    .get(&state.font)
+                                    .copied()
+                                    .map(|charset| charset_page(charset, state.codepage))
+                                    .unwrap_or(Some(state.codepage))
+                                    .ok_or(())?;
+                                push(
+                                    &mut out,
+                                    crate::rtf_codepage::decode(page, value).ok_or(())?,
+                                );
                                 final_par = false;
+                            }
+                        }
+                        b'\r' | b'\n' if !state.hidden => {
+                            if next == b'\r' && bytes.get(pos) == Some(&b'\n') {
+                                pos += 1;
+                            }
+                            out.extend([b'\r' as u16, b'\n' as u16]);
+                            final_par = true;
+                        }
+                        b'\r' | b'\n' => {
+                            if next == b'\r' && bytes.get(pos) == Some(&b'\n') {
+                                pos += 1;
                             }
                         }
                         b'\\' | b'{' | b'}' | b'~' | b'_' | b'-' if !state.hidden => {
@@ -274,6 +375,57 @@ mod tests {
         assert_eq!(
             plain_text(br"{\rtf1\uc1\u55357?\u56832?}", 1).unwrap(),
             "😀"
+        );
+    }
+
+    #[test]
+    fn embedded_objects_and_binary_payloads_do_not_become_notes() {
+        assert_eq!(
+            plain_text(
+                br"{\rtf1 A{\pict\wmetafile8 0100090000}{\object{\objdata 123}}B}",
+                1
+            )
+            .unwrap(),
+            "AB"
+        );
+        assert_eq!(
+            plain_text(b"{\\rtf1 A{\\pict\\bin4 {\0}X}B}", 1).unwrap(),
+            "AB"
+        );
+        assert_eq!(plain_text(b"{\\rtf1 A\\bin3 {\0}B}", 1).unwrap(), "AB");
+    }
+
+    #[test]
+    fn escaped_bytes_use_ansi_or_selected_font_charset() {
+        assert_eq!(
+            plain_text(br"{\rtf1\ansi\ansicpg1251 \'cf\'f0\'e8}", 1).unwrap(),
+            "При"
+        );
+        assert_eq!(
+            plain_text(
+                br"{\rtf1\ansi\ansicpg1252{\fonttbl{\f0\fcharset204 Calibri;}}\f0\'cf\'f0\'e8}",
+                1
+            )
+            .unwrap(),
+            "При"
+        );
+        assert_eq!(
+            plain_text(br"{\rtf1{\fonttbl{\f0\fcharset2 Symbol;}}\f0\'cf}", 1),
+            Err("invalid notes for UID 1".into())
+        );
+    }
+
+    #[test]
+    fn unicode_fallback_controls_and_group_boundaries() {
+        assert_eq!(plain_text(br"{\rtf1\uc2\u233?\emdash X}", 1).unwrap(), "éX");
+        assert_eq!(plain_text(br"{\rtf1{\uc2\u233?}X}", 1).unwrap(), "éX");
+        assert_eq!(
+            plain_text(br"{\rtf1\uc2\u233?}X", 1),
+            Err("invalid notes for UID 1".into())
+        );
+        assert_eq!(
+            plain_text(b"{\\rtf1 A\\\r\nB\\\nC}", 1).unwrap(),
+            "A\r\nB\r\nC"
         );
     }
 

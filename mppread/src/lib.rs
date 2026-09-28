@@ -23,6 +23,7 @@ mod overalloc;
 pub mod project;
 mod props;
 mod rtf;
+mod rtf_codepage;
 mod taskdecode;
 pub mod vardata;
 pub mod varmeta;
