@@ -353,6 +353,25 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             );
         }
     }
+    // Clearing the newly imported assignments/resources reproduces this
+    // importer's previous scheduling inputs. Their presence must not move a
+    // task, including plans that already carry a delayed assignment.
+    let mut previous_inputs = imported.clone();
+    previous_inputs.assignments.clear();
+    previous_inputs.resources.clear();
+    let old_schedule = projcore::schedule::schedule(&previous_inputs);
+    let new_schedule = projcore::schedule::schedule(&imported);
+    for task in &imported.tasks {
+        let old = old_schedule.get(task.uid).unwrap();
+        let new = new_schedule.get(task.uid).unwrap();
+        assert_eq!(
+            (new.early_start, new.early_finish),
+            (old.early_start, old.early_finish),
+            "{}: imported assignments moved task UID {}",
+            mpp.display(),
+            task.uid
+        );
+    }
     if source == Oracle::Project {
         let scheduled = projcore::schedule::schedule(&imported);
         let exceptions = &oracle
@@ -393,7 +412,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             }
             if task.uid == 55 && expected_task.name == "S43 delayed start" {
                 // Project's delayed assignment makes this task's Duration
-                // shorter than the working span; assignments are not imported.
+                // shorter than the working span; the assignment delay is not decoded.
                 assert_eq!(task.duration_min, expected_task.duration_min);
                 dropped[1] += 1;
                 continue;
@@ -627,6 +646,165 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         mpp.display()
     );
     true
+}
+
+fn compare_assignment_oracle(mpp: &Path, xml: &Path) {
+    use std::collections::HashMap;
+    let imported = mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
+    let expected = projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+    let expected_assignments: HashMap<_, _> = expected
+        .assignments
+        .iter()
+        .filter(|a| a.task_uid != 0)
+        .map(|a| (a.uid, a))
+        .collect();
+    assert_eq!(
+        imported.assignments.len(),
+        expected_assignments.len(),
+        "{} assignment count",
+        mpp.display()
+    );
+    let close = |a: Option<&projcore::Rate>, b: Option<&projcore::Rate>, what: &str| match (a, b) {
+        (None, None) => {}
+        (Some(a), Some(b)) => assert!(
+            (a.to_f64().unwrap() - b.to_f64().unwrap()).abs() <= 0.005,
+            "{} {what}: {} vs {}",
+            mpp.display(),
+            a.as_str(),
+            b.as_str()
+        ),
+        _ => panic!("{} {what}: {a:?} vs {b:?}", mpp.display()),
+    };
+    for a in &imported.assignments {
+        let e = expected_assignments
+            .get(&a.uid)
+            .unwrap_or_else(|| panic!("{} missing assignment UID {}", mpp.display(), a.uid));
+        assert_eq!(
+            (a.task_uid, a.resource_uid),
+            (e.task_uid, e.resource_uid),
+            "{} assignment UID {}",
+            mpp.display(),
+            a.uid
+        );
+        assert!(
+            (a.units - e.units).abs() < 1e-6,
+            "{} assignment UID {} units {} vs {}",
+            mpp.display(),
+            a.uid,
+            a.units,
+            e.units
+        );
+        assert_eq!(
+            a.work_min,
+            e.work_min,
+            "{} assignment UID {} work",
+            mpp.display(),
+            a.uid
+        );
+        assert_eq!(
+            (a.start, a.finish),
+            (e.start, e.finish),
+            "{} assignment UID {} dates",
+            mpp.display(),
+            a.uid
+        );
+        assert_eq!(
+            a.baselines.len(),
+            e.baselines.len(),
+            "{} assignment UID {} baseline count",
+            mpp.display(),
+            a.uid
+        );
+        for slot in 0..=10 {
+            let got = a.baseline(slot);
+            let want = e.baseline(slot);
+            assert_eq!(
+                got.is_some(),
+                want.is_some(),
+                "{} assignment UID {} baseline slot {slot}",
+                mpp.display(),
+                a.uid
+            );
+            if let (Some(g), Some(w)) = (got, want) {
+                assert_eq!(
+                    (g.start, g.finish, g.work_min),
+                    (w.start, w.finish, w.work_min),
+                    "{} assignment UID {} baseline slot {slot}",
+                    mpp.display(),
+                    a.uid
+                );
+                close(g.cost.as_ref(), w.cost.as_ref(), "baseline cost");
+                assert!(
+                    g.bcws.is_none() && g.bcwp.is_none() && w.bcws.is_none() && w.bcwp.is_none(),
+                    "Project XML carries no baseline BCWS/BCWP"
+                );
+            }
+        }
+        if a.resource_uid != -65535 {
+            let got = imported
+                .resources
+                .iter()
+                .find(|r| r.uid == a.resource_uid)
+                .unwrap();
+            let want = expected
+                .resources
+                .iter()
+                .find(|r| r.uid == a.resource_uid)
+                .unwrap();
+            assert_eq!(
+                (got.uid, got.id, &got.name, got.kind),
+                (want.uid, want.id, &want.name, want.kind),
+                "{} resource UID {}",
+                mpp.display(),
+                got.uid
+            );
+        }
+    }
+    // The same records survive the actual MSPDI Save As path.
+    let saved = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();
+    for a in &imported.assignments {
+        assert_eq!(
+            saved
+                .assignments
+                .iter()
+                .find(|s| s.uid == a.uid)
+                .unwrap()
+                .baselines,
+            a.baselines,
+            "{} save UID {}",
+            mpp.display(),
+            a.uid
+        );
+    }
+}
+
+#[test]
+fn assignment_oracles() {
+    let generated = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/assnbaseline");
+    if generated.exists() {
+        let cases = pairs(&generated, "");
+        assert_eq!(cases.len(), 3);
+        for (mpp, xml) in &cases {
+            compare_assignment_oracle(mpp, xml);
+        }
+    }
+    if let Ok(paired) = std::env::var("MPP_PAIRED_CORPUS") {
+        for stem in [
+            "18-resource-assignment",
+            "19-two-assignments",
+            "20-overallocation",
+            "21-material-resource",
+            "22-resource-rates",
+            "24-baseline",
+            "25-progress",
+        ] {
+            let dir = Path::new(&paired);
+            compare_assignment_oracle(
+                &dir.join(format!("{stem}.mpp")),
+                &dir.join(format!("{stem}.xml")),
+            );
+        }
+    }
 }
 
 #[test]

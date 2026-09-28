@@ -14,6 +14,7 @@
 //!   predecessor links, task modes and calendars into a `projcore` project for the
 //!   terminal and suite hosts.
 
+mod assndecode;
 mod caldecode;
 pub mod cfb;
 mod fixedmeta;
@@ -21,6 +22,8 @@ pub mod mpp;
 pub mod oleps;
 pub mod project;
 mod props;
+mod rscdecode;
+mod tabledecode;
 mod taskdecode;
 pub mod vardata;
 pub mod varmeta;

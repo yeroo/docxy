@@ -260,8 +260,16 @@ field map before it can be imported.
 Current Project blank rows are identified by their short FixedMeta record and
 omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
-row ID order. Resources, assignments, baselines, constraints, and custom fields
-are not imported. Newest-layout base and derived calendars, their weekdays,
+row ID order. Current Project resource identity/type and assignments with core
+planned fields are imported, including assignment Baseline and Baseline1..10
+Start/Finish/Work/Cost. Project's XML export omits assignment-baseline
+BCWS/BCWP even when assignment-level BCWS/BCWP are nonzero; the MPP importer
+leaves those baseline fields absent. Assignment progress, rates, contours,
+delays, resource details and other baselines remain unimported. Unsupported
+MPP9 assignment/resource layouts retain the previous task-only import;
+malformed current tables refuse the import. Generate the local, ignored
+assignment oracle pairs with `python corpus/tools/gen_mpp_assignment_baseline_cases.py`.
+Newest-layout base and derived calendars, their weekdays,
 exceptions, work weeks, the default calendar and task calendar assignments are
 imported. Auto tasks keep their stored working Duration and task calendar;
 manual tasks keep their stored manual duration and use the calendar span only

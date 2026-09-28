@@ -1,4 +1,4 @@
-//! Convert validated MPP metadata and tasks to a schedulable project.
+//! Convert validated MPP metadata, tasks, resources and assignments to a project.
 
 use projcore::editor::default_anchor;
 use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Project, Task};
@@ -8,8 +8,12 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// a task. Each decoded auto leaf is pinned
 /// with a Must-Start-On constraint at its start and given Project's stored
 /// working duration when available. Other durations use the working minutes
-/// between start and finish on the task's calendar. Splits and delayed
-/// assignments are not decoded, so those tasks can schedule an earlier finish
+/// between start and finish on the task's calendar. Current Project resource
+/// identity/type and assignment identity, planned work and dates are imported,
+/// together with saved baseline slots 0..10 (Start, Finish, Work, Cost).
+/// Project's MPP/XML has no assignment-baseline BCWS/BCWP; those remain absent.
+/// Assignment progress, rate tables, contours and delays are not decoded.
+/// Splits and delayed assignments can therefore schedule an earlier finish
 /// than their retained stored finish. A resource calendar can move a resourced
 /// task's finish earlier or later because projcore does not schedule on resource
 /// calendars; MSPDI import of the same plan behaves the same way. A **manual**
@@ -27,6 +31,8 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// tasks use their stored working Duration when available; manual tasks keep
 /// their manual duration and use the calendar span only when it is absent.
 /// An unrecognised calendar record refuses the import.
+/// A malformed current assignment/resource table refuses import. Files with
+/// no such table and older MPP9 layouts retain their task-only import.
 /// A calendar whose default week is wholly closed is refused even if one of
 /// its alternate weeks opens a day, as in MSPDI import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
@@ -173,6 +179,13 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             Ok(task)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let resources = crate::rscdecode::decode(bytes, legacy)
+        .map_err(|e| format!("cannot read the resources of this .mpp ({e})"))?
+        .unwrap_or_default();
+    let task_uids = tasks.iter().map(|t| t.uid).collect();
+    let assignments = crate::assndecode::decode(bytes, legacy, &task_uids, &resources)
+        .map_err(|e| format!("cannot read the assignments of this .mpp ({e})"))?
+        .unwrap_or_default();
     let start = tasks
         .iter()
         .filter_map(|t| t.stored_start)
@@ -183,6 +196,8 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         title: info.title,
         start_date: Some(start),
         tasks,
+        resources,
+        assignments,
         new_tasks_are_manual,
         ..cal_ref
     };
