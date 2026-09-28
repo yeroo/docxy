@@ -2,16 +2,24 @@ test project editing keys and prompts
   open ../fixtures/gantt-summary.xml
   key insert
   assert tasks is 4
-  assert selected_name is New task
+  assert selected_task is 0
+  assert selected_name is empty
+  assert cell is Name
+  assert undo_depth is 1
   key delete
   assert tasks is 4
-  assert selected_name is empty
+  assert undo_depth is 1
   key ctrl+z
-  assert selected_name is New task
+  assert tasks is 3
+  assert selected_name is Task 1
+  key insert insert
+  assert tasks is 5
+  assert selected_name is empty
   key left left
   assert cell is ID
-  key delete
+  key delete delete
   assert tasks is 3
+  assert selected_name is Task 1
   key ctrl+up down alt t r
   assert prompt is rename:Task 2
   type renamed
