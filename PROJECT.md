@@ -248,9 +248,12 @@ task: its bookings are placed first, and auto tasks level around them.
   Recurring tasks are validated against a UI-authored Project sample.
   Stored task IDs determine display order; stable UIDs connect predecessor
   links from `TBkndCons`. An unrecognized layout or malformed row causes an
-  import error. Imported automatic leaves and childless inserted subprojects
-  are pinned to decoded starts and durations; outline summaries roll up from
-  their children. Nonzero link lag still lacks a real-file oracle.
+  import error. Legacy MPP9 automatic leaves, including childless inserted
+  subprojects, are pinned to decoded starts. Current-layout tasks keep their
+  recorded constraints; an automatic leaf receives a Must-Start-On pin only
+  when the scheduler cannot otherwise reproduce its stored start. Automatic
+  leaves retain decoded durations, and outline summaries roll up from their
+  children. Nonzero link lag still lacks a real-file oracle.
 
 ## Desktop suite entry table
 

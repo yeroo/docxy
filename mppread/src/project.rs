@@ -10,7 +10,10 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// scheduled start differs from Project's stored start, the importer replaces
 /// its constraint with Must-Start-On only if that restores the stored start;
 /// Save As writes any accepted pin. Summary links and constraints, cross-project
-/// predecessors, and ALAP chains can cause these differences. Legacy MPP9
+/// predecessors, ALAP chains, leveling delay and resource calendars can cause
+/// these differences. On the `.mpp` path, an effective pin preserves the
+/// stored start, though its finish can still differ. MSPDI import does not
+/// add this pin, so both scheduled start and finish can move. Legacy MPP9
 /// leaves, including a childless inserted subproject, remain pinned with
 /// Must-Start-On at their stored start. Automatic leaves use Project's stored working duration when
 /// available. Other durations use the working minutes between start and finish
@@ -22,8 +25,7 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// and delays are not decoded. Splits and delayed assignments can therefore
 /// schedule an earlier finish than their retained stored finish. Resource
 /// calendars and leveling delay can move a task's finish because projcore does
-/// not apply either when scheduling; MSPDI import
-/// behaves the same way. A **manual** leaf keeps its mode, manual start,
+/// not apply either when scheduling. A **manual** leaf keeps its mode, manual start,
 /// finish and duration, which hold it where Project put it. Its recorded
 /// constraint is retained but does not move its manual dates. The project's
 /// new-task mode comes through too.
@@ -135,7 +137,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     Ok(project)
 }
 
-fn pin_unreproduced_starts(project: &mut Project) -> usize {
+fn pin_unreproduced_starts(project: &mut Project) {
     let candidates: Vec<usize> = project
         .tasks
         .iter()
@@ -152,12 +154,10 @@ fn pin_unreproduced_starts(project: &mut Project) -> usize {
         .collect();
     let mut pinned = std::collections::HashSet::new();
     let mut rejected = std::collections::HashSet::new();
-    let mut schedule_runs = 0;
+    let mut scheduled = projcore::schedule::schedule(project);
     // Each divergent candidate becomes pinned or rejected. Neither is
     // retried, so there are at most candidate-count passes.
     loop {
-        let scheduled = projcore::schedule::schedule(project);
-        schedule_runs += 1;
         let mut divergent = Vec::new();
         for &i in &candidates {
             if pinned.contains(&i) || rejected.contains(&i) {
@@ -180,7 +180,6 @@ fn pin_unreproduced_starts(project: &mut Project) -> usize {
             task.constraint_date = task.stored_start;
         }
         let trial = projcore::schedule::schedule(project);
-        schedule_runs += 1;
         let mut rejected_this_pass = false;
         for i in divergent {
             let task = &project.tasks[i];
@@ -199,15 +198,14 @@ fn pin_unreproduced_starts(project: &mut Project) -> usize {
         if rejected_this_pass && !pinned.is_empty() {
             // Restoring an ineffective pin may unfix another from the batch.
             // Those become rejected too; each cleanup pass shrinks pinned.
+            scheduled = projcore::schedule::schedule(project);
             loop {
-                let stable = projcore::schedule::schedule(project);
-                schedule_runs += 1;
                 let unstable: Vec<_> = pinned
                     .iter()
                     .copied()
                     .filter(|&i| {
                         let task = &project.tasks[i];
-                        stable
+                        scheduled
                             .get(task.uid)
                             .is_none_or(|result| Some(result.early_start) != task.stored_start)
                     })
@@ -221,10 +219,87 @@ fn pin_unreproduced_starts(project: &mut Project) -> usize {
                     pinned.remove(&i);
                     rejected.insert(i);
                 }
+                scheduled = projcore::schedule::schedule(project);
+            }
+        } else if !rejected_this_pass {
+            scheduled = trial;
+        }
+    }
+
+    // Batch pinning can pin a successor that an upstream pin already fixes.
+    // Try removing accepted pins from successors toward predecessors. A pin
+    // stays removed only if every start currently reproduced remains so.
+    let uid_to_index: std::collections::HashMap<_, _> = candidates
+        .iter()
+        .map(|&i| (project.tasks[i].uid, i))
+        .collect();
+    let mut successors = vec![Vec::new(); project.tasks.len()];
+    let mut indegree = vec![0usize; project.tasks.len()];
+    for &i in &candidates {
+        for predecessor in &project.tasks[i].predecessors {
+            if let Some(&before) = uid_to_index.get(&predecessor.uid) {
+                successors[before].push(i);
+                indegree[i] += 1;
             }
         }
     }
-    schedule_runs
+    // Descending row order here makes the reversed order use ascending rows
+    // for unrelated tasks.
+    let mut ready: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .copied()
+        .filter(|&i| indegree[i] == 0)
+        .map(std::cmp::Reverse)
+        .collect();
+    let mut order = Vec::with_capacity(candidates.len());
+    while let Some(&std::cmp::Reverse(i)) = ready.first() {
+        ready.pop_first();
+        order.push(i);
+        for &next in &successors[i] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.insert(std::cmp::Reverse(next));
+            }
+        }
+    }
+    // A malformed cycle has no topological order. The scheduler has already
+    // handled it; use row order for any nodes left over.
+    for &i in &candidates {
+        if indegree[i] > 0 {
+            order.push(i);
+        }
+    }
+    for i in order.into_iter().rev() {
+        if !pinned.contains(&i) {
+            continue;
+        }
+        let matching: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|&j| {
+                let task = &project.tasks[j];
+                scheduled
+                    .get(task.uid)
+                    .is_some_and(|result| Some(result.early_start) == task.stored_start)
+            })
+            .collect();
+        let task = &mut project.tasks[i];
+        (task.constraint, task.constraint_date) = originals[i];
+        let trial = projcore::schedule::schedule(project);
+        if matching.iter().all(|&j| {
+            let task = &project.tasks[j];
+            trial
+                .get(task.uid)
+                .is_some_and(|result| Some(result.early_start) == task.stored_start)
+        }) {
+            pinned.remove(&i);
+            scheduled = trial;
+        } else {
+            let task = &mut project.tasks[i];
+            task.constraint = ConstraintType::MustStartOn;
+            task.constraint_date = task.stored_start;
+        }
+    }
 }
 
 fn assignment_task_uids(tasks: &[Task]) -> std::collections::HashSet<i32> {
@@ -577,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn alap_to_asap_to_summary_chain_pins_divergent_starts() {
+    fn alap_to_asap_to_summary_chain_needs_only_upstream_pin() {
         let mut a = current(1, 1, "ALAP A", 1);
         a.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
         let mut b = later(
@@ -603,9 +678,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(rows[0].constraint, ConstraintType::MustStartOn); // A moved late.
-        assert_eq!(rows[1].constraint, ConstraintType::MustStartOn); // B moved with A in the same pass.
+        assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible); // A's pin restores B.
         assert_eq!(rows[0].constraint_date, rows[0].stored_start);
-        assert_eq!(rows[1].constraint_date, rows[1].stored_start);
+        assert_eq!(rows[1].constraint_date, None);
+    }
+
+    #[test]
+    fn independent_alap_divergences_both_need_pins() {
+        let mut a = current(1, 1, "ALAP A", 1);
+        a.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let mut b = current(2, 2, "ALAP B", 1);
+        b.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let tail = later(
+            current(3, 3, "Long tail", 1),
+            "2026-03-02 08:00",
+            "2026-03-20 08:00",
+        );
+        let rows = import_current(vec![current(0, 0, "Project", 0), a, b, tail]).unwrap();
+        for row in &rows[..2] {
+            assert_eq!(row.constraint, ConstraintType::MustStartOn);
+            assert_eq!(row.constraint_date, row.stored_start);
+        }
     }
 
     #[test]
@@ -689,8 +782,7 @@ mod tests {
             tasks: vec![milestone, elapsed],
             ..Project::default()
         };
-        let runs = super::pin_unreproduced_starts(&mut project);
-        assert_eq!(runs, 3);
+        super::pin_unreproduced_starts(&mut project);
         for task in &project.tasks {
             assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
             assert_eq!(task.constraint_date, None);
