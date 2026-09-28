@@ -19293,7 +19293,7 @@ impl Render for Docxy {
             .child(if self.active_is_sheet() {
                 "type or F2 to edit · Enter/Tab to move · =formula · Ctrl+S save"
             } else if self.active_is_project() {
-                "Enter/F2 edit · Tab next cell · Insert task · Delete clear cell (ID: task) · Alt+Shift+←/→ outline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
+                "Enter/F2 edit · Tab next cell · Insert blank row · Delete clear cell (ID: task) · Alt+Shift+←/→ outline · Ctrl+F find · Ctrl+Z/Y · Ctrl+S"
             } else {
                 "type · Ctrl+B/I/U · Ctrl+F find · Ctrl+C/X/V · Ctrl+Z/Y · Ctrl+S"
             })
