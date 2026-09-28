@@ -37,6 +37,7 @@ use crate::run::Run;
 use crate::script::{Action, Assertion, Case, Script, Step};
 use ctlcore::json::Json;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// How a step ended.
@@ -234,14 +235,19 @@ impl<'a> Runner<'a> {
                     format!("expected '{verb}' to be refused with '{message}', but it succeeded"),
                 ),
             },
-            Action::Open(path) | Action::OpenCopy(path) => {
+            Action::Open(path) | Action::OpenCopy(path) | Action::OpenCopyAs { path, .. } => {
                 self.last_reply = None;
                 let full = self.base.join(path);
                 if !full.is_file() {
                     return err(out, format!("no such file: {}", full.display()));
                 }
-                let full = if matches!(step.action, Action::OpenCopy(_)) {
-                    match copy_fixture(&full, &self.sandbox, case) {
+                let name = match &step.action {
+                    Action::OpenCopyAs { name, .. } => Some(name.as_str()),
+                    _ => None,
+                };
+                let full = if matches!(step.action, Action::OpenCopy(_) | Action::OpenCopyAs { .. })
+                {
+                    match copy_fixture(&full, &self.sandbox, case, name) {
                         Ok(copy) => copy,
                         Err(e) => return err(out, e),
                     }
@@ -691,15 +697,22 @@ fn shown(s: &str) -> String {
     }
 }
 
-/// Preserve the basename for titles and exports; never replace an existing copy.
-pub fn copy_fixture(source: &Path, sandbox: &Path, case: &str) -> Result<PathBuf, String> {
+/// Copy `source` into `<sandbox>/<case-slug>/`, named `target_name` if given
+/// (a plain filename; the caller validates it) or else the source basename;
+/// never replace an existing copy.
+pub fn copy_fixture(
+    source: &Path,
+    sandbox: &Path,
+    case: &str,
+    target_name: Option<&str>,
+) -> Result<PathBuf, String> {
     let dir = sandbox.join(crate::run::slug(case));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("open copy: create directory {}: {e}", dir.display()))?;
     let name = source
         .file_name()
         .ok_or_else(|| format!("open copy: source {} has no file name", source.display()))?;
-    let target = dir.join(name);
+    let target = dir.join(target_name.map(OsStr::new).unwrap_or(name));
     let mut input = std::fs::File::open(source)
         .map_err(|e| format!("open copy: read {}: {e}", source.display()))?;
     let mut output = std::fs::OpenOptions::new()

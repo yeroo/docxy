@@ -126,6 +126,7 @@ cold start, and every accepted and rejected form is a unit test.
 |---|---|
 | `open <path>` | the file, resolved **against the script's own directory** — never the working directory. A file the app could not read is an ERROR, not a silent green step: the loaders substitute an empty document and record the reason in `status`, so the step reads the status back and stops the case there |
 | `open copy:<path>` | copy that fixture to `<sandbox>/<case-slug>/<original filename>` and open the copy; refuses an existing destination. Use this for saves and exports so their outputs stay in the run sandbox and the original fixture stays untouched |
+| `open copy:"<path>" as <name>` | copy the same fixture under a distinct plain filename (no separators or `..`), so a case can open multiple tabs without the suite focusing an existing path; quotes keep a source path containing ` as ` unambiguous |
 | `call <verb> <json-object>` | send a raw control request, including Project verbs such as `call task.set {"uid":2,"duration":"3d"}`. JSON is parsed before launch and retained verbatim, including quoted `#`; trailing comments are not allowed. Non-object/invalid JSON is a script error; a refused request is an `ERROR` with the server message |
 | `call-error <verb> <json-object> => <message>` | require the app to refuse the request with a message containing the given text; a successful request or different refusal fails the step |
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
@@ -207,7 +208,9 @@ pass while the handler under test was broken — the one way this harness could 
 worse than nothing.
 `selection-set` is a setup exception: it places the caret through the editor API
 because the UI cannot place it by document offset, so it does not test clicking
-or dragging a selection.
+or dragging a selection. `window-size` and `window-zoom` are setup exceptions
+that call GPUI window APIs. `title-tab` calls the same handler methods as the
+title-bar arrows and dropdown items.
 
 ⚠️ **"The same entry point" means the handler, not the hitbox.** A verb calls
 the method a handler calls; it does not synthesize a pointer at a coordinate and
@@ -312,6 +315,10 @@ footer editor; `selection-set` refuses while it is open.
 | `status-read {}` | read the tab's status line as an ordered `items` array |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
+| `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
+| `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
+| `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
+| `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
 `ribbon-read` and `ribbon-click` work on document and Project tabs. The app
 does not model command enabled states. Extend Selection mode, native prompts,
@@ -397,7 +404,9 @@ Comparison is case-insensitive, and `is not` negates.
 
 `window`, `grid`, `chart-panel`, `cell:B3`, `cell:A1:C5`, `chart:0`, `gantt`,
 `bar:<id>` (for example `bar:3`), `project-hbar-table`, `project-hbar-chart`,
-`project-vbar`, `project-timeline`, `project-split`, `gallery`. `gantt` is the visible Project Gantt chart body,
+`project-vbar`, `project-timeline`, `project-split`, `gallery`, `title-tabs`,
+`tab-prev`, `tab-next`, `tab-more`, `tab-more-item:<index>` (the last exists while
+the more-tabs list is open). `gantt` is the visible Project Gantt chart body,
 excluding its header, divider and vertical scrollbar; `bar:<id>` addresses a task by
 displayed ID. The `project-hbar-*` and `project-vbar` regions are the Project tab's three
 scrollbar strips: under the table, under the chart, and down the right edge of the rows.

@@ -35,11 +35,11 @@ fn copied_fixture_keeps_its_name_and_isolated_sidecars_never_touch_the_original(
             .unwrap()
             .as_nanos()
     ));
-    let copy = copy_fixture(&source, &sandbox, "Export isolated").unwrap();
+    let copy = copy_fixture(&source, &sandbox, "Export isolated", None).unwrap();
     assert_eq!(copy, sandbox.join("export-isolated/gantt-summary.xml"));
     assert_eq!(std::fs::read(&copy).unwrap(), original);
     assert_eq!(
-        copy_fixture(&source, &sandbox, "Export isolated").unwrap_err(),
+        copy_fixture(&source, &sandbox, "Export isolated", None).unwrap_err(),
         format!(
             "open copy: {} already exists; use a fresh --sandbox",
             copy.display()
@@ -47,12 +47,12 @@ fn copied_fixture_keeps_its_name_and_isolated_sidecars_never_touch_the_original(
     );
     assert_eq!(std::fs::read(&copy).unwrap(), original);
     let missing = sandbox.join("missing.xml");
-    let err = copy_fixture(&missing, &sandbox, "Missing input").unwrap_err();
+    let err = copy_fixture(&missing, &sandbox, "Missing input", None).unwrap_err();
     assert!(
         err.starts_with(&format!("open copy: read {}:", missing.display())),
         "{err}"
     );
-    let err = copy_fixture(&source, &copy, "Blocked directory").unwrap_err();
+    let err = copy_fixture(&source, &copy, "Blocked directory", None).unwrap_err();
     assert!(
         err.starts_with(&format!(
             "open copy: create directory {}:",
@@ -66,4 +66,24 @@ fn copied_fixture_keeps_its_name_and_isolated_sidecars_never_touch_the_original(
     assert_eq!(std::fs::read(&source).unwrap(), original);
     assert_eq!(output.file_name().unwrap(), "gantt-summary.md");
     assert!(output.starts_with(&sandbox));
+}
+
+#[test]
+fn named_copies_are_distinct_and_refuse_overwrite() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let source = root.join("fixtures/basic.docx");
+    let sandbox = root.join("../target").join(format!(
+        "named-copy-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let a = copy_fixture(&source, &sandbox, "Many tabs", Some("tab-01.docx")).unwrap();
+    let b = copy_fixture(&source, &sandbox, "Many tabs", Some("tab-02.docx")).unwrap();
+    assert_ne!(a.canonicalize().unwrap(), b.canonicalize().unwrap());
+    assert_eq!(std::fs::read(&b).unwrap(), std::fs::read(&source).unwrap());
+    assert!(copy_fixture(&source, &sandbox, "Many tabs", Some("tab-01.docx")).is_err());
+    assert!(a.starts_with(&sandbox) && b.starts_with(&sandbox));
 }
