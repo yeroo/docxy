@@ -120,23 +120,21 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     }
                     "WBSMasks" if kept_as_element(&p) => {
                         let block = parse_element(&mut p, 0);
-                        if !block.children.is_empty() || !block.text.is_empty() {
+                        if !block.children.is_empty() {
                             proj.wbs_masks = Some(block);
                         }
                     }
-                    "ExtendedAttributes" => parse_extended_attribute_definitions(
+                    "ExtendedAttributes" => parse_definitions(
                         &mut p,
+                        "ExtendedAttribute",
                         &mut proj.extended_attribute_definitions,
                     ),
                     // Any other leaf is a project option docxy does not model:
-                    // keep its text so a save writes it back. A block with
-                    // child elements (OutlineCodes, WBSMasks, ...) is
-                    // consumed whole so its children can't be mistaken for
-                    // header fields. So is a prefixed element or one carrying
-                    // attributes: an option stores only a name and text, so
-                    // writing it back would lose its namespace binding (an
-                    // unbound `x:` prefix, or a foreign `xmlns` moved into
-                    // MSPDI's) or attributes such as `xsi:nil`.
+                    // keep its text so a save writes it back. Unknown blocks
+                    // with children (such as Views) and prefixed or attributed
+                    // OutlineCodes/WBSMasks wrappers are consumed whole. An
+                    // option stores only a name and text, so writing those
+                    // wrappers back would lose attributes or namespace bindings.
                     _ if !kept_as_element(&p) => p.skip_element(),
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
@@ -931,7 +929,7 @@ fn parse_extended_attribute(p: &mut XmlParser) -> Option<ExtendedAttributeValue>
     Some(attribute)
 }
 
-/// Parse one resource outline code value; `None` without a `FieldID`, which
+/// Parse one task or resource outline code value; `None` without a `FieldID`, which
 /// names it.
 fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
     let mut field_id = None;
@@ -955,13 +953,8 @@ fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
     Some(code)
 }
 
-/// Collect the custom field definitions of an `<ExtendedAttributes>` block,
-/// each `<ExtendedAttribute>` kept whole; any other child is skipped.
-fn parse_extended_attribute_definitions(p: &mut XmlParser, out: &mut Vec<XmlElement>) {
-    parse_definitions(p, "ExtendedAttribute", out);
-}
-
-/// Keep each matching definition whole; skip other children.
+/// Keep matching definitions in an `<OutlineCodes>` or
+/// `<ExtendedAttributes>` block whole; skip other children.
 fn parse_definitions(p: &mut XmlParser, child_name: &str, out: &mut Vec<XmlElement>) {
     loop {
         match p.next() {
@@ -5198,9 +5191,9 @@ mod tests {
              <OutlineCodes><OutlineCode><FieldID>2</FieldID><Alias>Team</Alias>\
              </OutlineCode></OutlineCodes>\
              <WBSMasks><VerifyUniqueCodes>1</VerifyUniqueCodes><GenerateCodes>0</GenerateCodes>\
-             <Prefix>PRJ&amp;</Prefix><WBSMask><Level>1</Level><Mask>0</Mask>\
+             <Prefix>PRJ&amp;</Prefix><WBSMask><Level>1</Level><Type>0</Type>\
              <Length>2</Length><Separator>.</Separator></WBSMask>\
-             <WBSMask><Level>2</Level><Mask>1</Mask><Length>0</Length>\
+             <WBSMask><Level>2</Level><Type>1</Type><Length>0</Length>\
              <Separator>-</Separator></WBSMask></WBSMasks>\
              <ExtendedAttributes><ExtendedAttribute><FieldID>3</FieldID>\
              </ExtendedAttribute></ExtendedAttributes>\
@@ -5230,7 +5223,7 @@ mod tests {
                     "WBSMask",
                     vec![
                         leaf("Level", "1"),
-                        leaf("Mask", "0"),
+                        leaf("Type", "0"),
                         leaf("Length", "2"),
                         leaf("Separator", "."),
                     ],
@@ -5239,7 +5232,7 @@ mod tests {
                     "WBSMask",
                     vec![
                         leaf("Level", "2"),
-                        leaf("Mask", "1"),
+                        leaf("Type", "1"),
                         leaf("Length", "0"),
                         leaf("Separator", "-"),
                     ],
@@ -5285,6 +5278,8 @@ mod tests {
             "<Project><OutlineCodes/><WBSMasks/>\
              <WBSMasks><Prefix>A</Prefix></WBSMasks>\
              <WBSMasks><Prefix>B</Prefix></WBSMasks><WBSMasks/>\
+             <WBSMasks>
+               </WBSMasks>\
              <Tasks/></Project>",
         )
         .unwrap();
@@ -5299,6 +5294,9 @@ mod tests {
         let empty = read_mspdi("<Project><OutlineCodes/><WBSMasks/><Tasks/></Project>").unwrap();
         assert!(empty.wbs_masks.is_none());
         assert!(!write_mspdi(&empty).contains("WBSMasks"));
+        let text_only = read_mspdi("<Project><WBSMasks>junk</WBSMasks><Tasks/></Project>").unwrap();
+        assert!(text_only.wbs_masks.is_none());
+        assert!(!write_mspdi(&text_only).contains("WBSMasks"));
     }
 
     #[test]

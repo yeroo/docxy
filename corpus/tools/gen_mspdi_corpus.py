@@ -647,9 +647,9 @@ def build():
         "    <VerifyUniqueCodes>1</VerifyUniqueCodes>",
         "    <GenerateCodes>1</GenerateCodes>",
         "    <Prefix>PRJ-</Prefix>",
-        "    <WBSMask><Level>1</Level><Mask>0</Mask><Length>2</Length>"
+        "    <WBSMask><Level>1</Level><Type>0</Type><Length>2</Length>"
         "<Separator>.</Separator></WBSMask>",
-        "    <WBSMask><Level>2</Level><Mask>1</Mask><Length>0</Length>"
+        "    <WBSMask><Level>2</Level><Type>1</Type><Length>0</Length>"
         "<Separator>-</Separator></WBSMask>",
     ])
     common = [("LevelAssignments", 1), ("LevelingCanSplit", 1),
