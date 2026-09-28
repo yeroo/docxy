@@ -4034,7 +4034,7 @@ mod tests {
         <GUID>651A2669-EF7E-F111-A0F9-34C93D776CA2</GUID><ID>1</ID><Name>Pour</Name>\
         <Active>0</Active><Manual>0</Manual><Type>1</Type><IsNull>0</IsNull>\
         <CreateDate>2026-07-13T23:14:00</CreateDate><Contact>Site lead</Contact>\
-        <WBS>1.2</WBS><WBSLevel>Level 2</WBS>\
+        <WBS>1.2</WBS><WBSLevel>Level 2</WBSLevel>\
         <OutlineNumber>9.9</OutlineNumber><OutlineLevel>1</OutlineLevel><Priority>900</Priority>\
         <Duration>PT8H0M0S</Duration><Work>PT16H30M0S</Work><EffortDriven>1</EffortDriven>\
         <Recurring>1</Recurring><OverAllocated>1</OverAllocated><Estimated>1</Estimated>\
