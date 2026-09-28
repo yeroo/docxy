@@ -114,10 +114,8 @@ def sorted_renumbered(app):
         add(p, n, days)
     p.Tasks(2).Predecessors = "1"
     # Sorting with permanent renumbering keeps each task's record and
-    # changes its ID: rows become B, D, A, C. The generated early-bound
-    # wrapper silently ignores Sort, so call it late-bound.
-    late = win32.dynamic.Dispatch(app._oleobj_)
-    late.Sort("Duration")  # further arguments turn it back into a no-op
+    # changes its ID: rows become B, D, A, C.
+    app.Sort(Key1="Duration", Ascending1=True, Renumber=True)
     ids = [(t.ID, t.Name) for t in p.Tasks]
     if ids != [(1, "B"), (2, "D"), (3, "A"), (4, "C")]:
         raise RuntimeError(f"Sort did not renumber: {ids}")

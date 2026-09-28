@@ -52,6 +52,8 @@ pub struct MppInfo {
 pub struct MppTask {
     pub id: u32,
     pub uid: u32,
+    /// A blank task row retained by Project's grid.
+    pub is_null: bool,
     pub name: String,
     pub start: Option<String>,
     pub finish: Option<String>,
@@ -69,6 +71,39 @@ pub struct MppTask {
     /// Recorded progress as Project stored it. `None` for a layout whose
     /// progress fields are not validated (MPP9).
     pub progress: Option<MppProgress>,
+    /// Task fields validated for the current MPP layout. Legacy MPP9 has none.
+    pub fields: Option<MppTaskFields>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MppTaskFields {
+    pub guid: Option<String>,
+    pub create_date: Option<String>,
+    pub wbs: Option<String>,
+    pub task_type: Option<projcore::TaskType>,
+    pub active: Option<bool>,
+    pub effort_driven: Option<bool>,
+    pub estimated: Option<bool>,
+    pub priority: Option<i32>,
+    pub deadline: Option<String>,
+    pub level_assignments: Option<bool>,
+    pub leveling_can_split: Option<bool>,
+    pub leveling_delay: Option<i64>,
+    pub leveling_delay_format: Option<i32>,
+    pub ignore_resource_calendar: Option<bool>,
+    pub earned_value_method: Option<i32>,
+    /// Project's recurrence needs a recurring task oracle; no offset is
+    /// validated for this field yet.
+    pub recurring: Option<bool>,
+    pub hide_bar: Option<bool>,
+    pub rollup: Option<bool>,
+    pub external_task: Option<bool>,
+    pub is_subproject: Option<bool>,
+    pub is_subproject_read_only: Option<bool>,
+    /// Project derives this at export from resource assignments and capacity
+    /// (see `task-fields/f4-overallocated`); it is not a validated task bit.
+    pub over_allocated: Option<bool>,
+    pub milestone: Option<bool>,
 }
 
 /// A task's recorded progress, work and cost, in MSPDI's units: whole minutes

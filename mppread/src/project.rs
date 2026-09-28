@@ -15,7 +15,8 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// rollup come through, and the **predecessor links** decode from the `TBkndCons`
 /// table. Each task's recorded **progress**, work and cost come through as
 /// read (the scheduler ignores them, as it does for MSPDI); Project's
-/// variances are not stored in the file and stay absent. Save As converts it
+/// variances are not stored in the file and stay absent. Validated task fields
+/// and blank grid rows come through too. Save As converts it
 /// to `.yppx`/MSPDI.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
@@ -42,20 +43,31 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let cal_ref = Project::default();
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // A task is a summary when the next task sits one WBS level deeper.
-    let levels: Vec<u32> = decoded
-        .iter()
-        .map(|t| t.outline_level.expect("validated task outline"))
-        .collect();
     let tasks: Vec<Task> = decoded
         .iter()
         .enumerate()
         .map(|(i, t)| -> Result<Task, String> {
-            let is_summary = levels.get(i + 1).is_some_and(|&nxt| nxt > levels[i]);
+            if t.is_null {
+                return Ok(Task {
+                    uid: t.uid as i32,
+                    id: t.id as i32,
+                    is_null: true,
+                    ..Task::default()
+                });
+            }
+            let level = t.outline_level.expect("validated task outline");
+            let is_summary = decoded[i + 1..]
+                .iter()
+                .find(|next| !next.is_null)
+                .is_some_and(|next| next.outline_level.is_some_and(|nxt| nxt > level))
+                || t.fields
+                    .as_ref()
+                    .is_some_and(|f| f.is_subproject == Some(true));
             let mut task = Task {
                 uid: t.uid as i32,
                 id: t.id as i32,
                 name: t.name.clone(),
-                outline_level: levels[i],
+                outline_level: level,
                 summary: is_summary,
                 duration_min: 480,
                 ..Task::default()
@@ -97,6 +109,31 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                     })
                     .transpose()
             };
+            if let Some(fields) = &t.fields {
+                task.guid = fields.guid.clone();
+                task.create_date = date(&fields.create_date, "create date")?;
+                task.wbs = fields.wbs.clone();
+                task.task_type = fields.task_type;
+                task.active = fields.active;
+                task.effort_driven = fields.effort_driven;
+                task.estimated = fields.estimated;
+                task.priority = fields.priority;
+                task.deadline = date(&fields.deadline, "deadline")?;
+                task.level_assignments = fields.level_assignments;
+                task.leveling_can_split = fields.leveling_can_split;
+                task.leveling_delay = fields.leveling_delay;
+                task.leveling_delay_format = fields.leveling_delay_format;
+                task.ignore_resource_calendar = fields.ignore_resource_calendar;
+                task.earned_value_method = fields.earned_value_method;
+                task.recurring = fields.recurring;
+                task.hide_bar = fields.hide_bar;
+                task.rollup = fields.rollup;
+                task.external_task = fields.external_task;
+                task.is_subproject = fields.is_subproject;
+                task.is_subproject_read_only = fields.is_subproject_read_only;
+                task.over_allocated = fields.over_allocated;
+                task.milestone = fields.milestone.unwrap_or(false);
+            }
             task.manual_start = date(&t.manual_start, "manual start")?;
             task.manual_finish = date(&t.manual_finish, "manual finish")?;
             task.manual_duration_min = t.manual_duration_min;

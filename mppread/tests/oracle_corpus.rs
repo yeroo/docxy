@@ -130,6 +130,64 @@ fn check_progress(
     }
 }
 
+fn check_task_fields(
+    a: &mppread::mpp::MppTask,
+    imported: &projcore::Task,
+    e: &projcore::Task,
+    at: &dyn Fn(&str) -> String,
+) {
+    let Some(f) = &a.fields else {
+        return;
+    }; // MPP9 has no validated task fields.
+    macro_rules! same {
+        ($field:ident) => {
+            assert_eq!(f.$field, e.$field, "{}", at(stringify!($field)));
+            assert_eq!(
+                imported.$field,
+                e.$field,
+                "{}",
+                at(concat!("imported ", stringify!($field)))
+            );
+        };
+    }
+    same!(guid);
+    same!(wbs);
+    same!(task_type);
+    same!(active);
+    same!(effort_driven);
+    same!(estimated);
+    same!(priority);
+    same!(level_assignments);
+    same!(leveling_can_split);
+    same!(leveling_delay);
+    same!(leveling_delay_format);
+    same!(ignore_resource_calendar);
+    same!(earned_value_method);
+    same!(hide_bar);
+    same!(rollup);
+    same!(external_task);
+    same!(is_subproject);
+    same!(is_subproject_read_only);
+    assert_eq!(f.milestone, Some(e.milestone), "{}", at("milestone"));
+    assert_eq!(
+        imported.milestone,
+        e.milestone,
+        "{}",
+        at("imported milestone")
+    );
+    let dt =
+        |d: Option<projcore::DateTime>| d.map(|d| d.to_mspdi().replace('T', " ")[..16].to_string());
+    assert_eq!(f.create_date, dt(e.create_date), "{}", at("create date"));
+    assert_eq!(f.deadline, dt(e.deadline), "{}", at("deadline"));
+    assert_eq!(
+        imported.create_date,
+        e.create_date,
+        "{}",
+        at("imported create date")
+    );
+    assert_eq!(imported.deadline, e.deadline, "{}", at("imported deadline"));
+}
+
 fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool {
     let bytes = std::fs::read(mpp).unwrap();
     let xml_text = std::fs::read_to_string(xml).unwrap();
@@ -147,21 +205,50 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         Err(error) => panic!("{}: {error}", mpp.display()),
     };
-    let actual: Vec<_> = decoded.iter().filter(|t| t.uid != 0).collect();
-    let expected: Vec<_> = oracle
-        .tasks
+    let expected: Vec<_> = oracle.tasks.iter().filter(|t| t.uid != 0).collect();
+    let expected_uids: std::collections::HashSet<_> = expected.iter().map(|t| t.uid).collect();
+    // Project's export omits a cross-project ghost predecessor even though
+    // its MPP task table and COM Tasks collection contain that external row.
+    let actual: Vec<_> = decoded
         .iter()
-        .filter(|t| t.uid != 0 && !nulls.contains(&t.uid))
+        .filter(|t| t.uid != 0 && expected_uids.contains(&(t.uid as i32)))
         .collect();
+    for ghost in decoded
+        .iter()
+        .filter(|t| t.uid != 0 && !expected_uids.contains(&(t.uid as i32)))
+    {
+        assert_eq!(
+            ghost.fields.as_ref().and_then(|f| f.external_task),
+            Some(true),
+            "{}: unexported UID {} must be external",
+            mpp.display(),
+            ghost.uid
+        );
+    }
     assert_eq!(
         actual.len(),
         expected.len(),
         "{}: task count",
         mpp.display()
     );
+    let omitted_external = decoded
+        .iter()
+        .any(|t| t.uid != 0 && !expected_uids.contains(&(t.uid as i32)));
     for (a, e) in actual.iter().zip(&expected) {
-        assert_eq!(a.id as i32, e.id, "{}: uid {} row ID", mpp.display(), e.uid);
+        if !omitted_external {
+            assert_eq!(a.id as i32, e.id, "{}: uid {} row ID", mpp.display(), e.uid);
+        }
         assert_eq!(a.uid as i32, e.uid, "{}: uid", mpp.display());
+        assert_eq!(
+            a.is_null,
+            nulls.contains(&e.uid),
+            "{}: uid {} IsNull",
+            mpp.display(),
+            e.uid
+        );
+        if a.is_null {
+            continue;
+        }
         assert_eq!(a.name, e.name, "{}: uid {} name", mpp.display(), e.uid);
         assert_eq!(
             a.outline_level,
@@ -255,12 +342,42 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     let imported = mppread::project::project_from_mpp(&bytes)
         .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
     assert_eq!(
-        imported.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
+        imported
+            .tasks
+            .iter()
+            .filter(|t| expected_uids.contains(&t.uid))
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
         actual.iter().map(|t| t.id as i32).collect::<Vec<_>>(),
         "{}: imported task IDs",
         mpp.display()
     );
-    for (t, e) in imported.tasks.iter().zip(&expected) {
+    for (t, e) in imported
+        .tasks
+        .iter()
+        .filter(|t| expected_uids.contains(&t.uid))
+        .zip(&expected)
+    {
+        assert_eq!(
+            t.is_null,
+            nulls.contains(&e.uid),
+            "{}: uid {} imported IsNull",
+            mpp.display(),
+            e.uid
+        );
+        if t.is_null {
+            continue;
+        }
+        assert_eq!(
+            t.summary,
+            e.summary,
+            "{}: uid {} imported summary",
+            mpp.display(),
+            e.uid
+        );
+        let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
+        let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
+        check_task_fields(a, t, e, &at);
         assert_eq!(
             t.manual,
             e.manual,
@@ -277,6 +394,32 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 e.uid
             );
         }
+    }
+    let written = projcore::mspdi::write_mspdi(&imported);
+    let round = projcore::mspdi::read_mspdi(&written).unwrap();
+    for e in &expected {
+        if nulls.contains(&e.uid) {
+            continue;
+        }
+        let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
+        let t = round.tasks.iter().find(|t| t.uid == e.uid).unwrap();
+        let at = |what: &str| format!("{}: uid {} round trip {what}", mpp.display(), e.uid);
+        check_task_fields(a, t, e, &at);
+    }
+    for ghost in decoded
+        .iter()
+        .filter(|t| t.fields.as_ref().and_then(|f| f.external_task) == Some(true))
+    {
+        assert_eq!(
+            round
+                .tasks
+                .iter()
+                .find(|t| t.uid == ghost.uid as i32)
+                .and_then(|t| t.external_task),
+            Some(true),
+            "{}: external ghost round trip",
+            mpp.display()
+        );
     }
     assert_eq!(
         mppread::mpp::decode_new_tasks_are_manual(&bytes),
@@ -295,6 +438,135 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
 
 #[test]
 fn project_2024_oracles() {
+    let task_fields = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/task-fields");
+    if task_fields.exists() {
+        let cases = pairs(&task_fields, "");
+        let expected_count = if task_fields.join("f6-recurring.mpp").exists() {
+            10
+        } else {
+            9
+        };
+        assert_eq!(cases.len(), expected_count);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (mpp, xml) in &cases {
+            let oracle =
+                projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+            let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
+            for t in &oracle.tasks {
+                if t.is_null {
+                    seen.insert("is_null");
+                    continue;
+                }
+                if t.uid == 0 {
+                    continue;
+                }
+                if t.guid.is_some() {
+                    seen.insert("guid");
+                }
+                if t.create_date.is_some() {
+                    seen.insert("create_date");
+                }
+                if t.wbs.as_deref().is_some_and(|w| w.contains("ABC")) {
+                    seen.insert("wbs");
+                }
+                if t.task_type
+                    .is_some_and(|kind| kind != projcore::TaskType::FixedUnits)
+                {
+                    seen.insert("task_type");
+                }
+                if t.active == Some(false) {
+                    seen.insert("active");
+                }
+                if t.effort_driven == Some(true) {
+                    seen.insert("effort_driven");
+                }
+                if t.estimated == Some(true) {
+                    seen.insert("estimated");
+                }
+                if t.priority.is_some_and(|p| p != 500) {
+                    seen.insert("priority");
+                }
+                if t.deadline.is_some() {
+                    seen.insert("deadline");
+                }
+                if t.level_assignments == Some(false) {
+                    seen.insert("level_assignments");
+                }
+                if t.leveling_can_split == Some(false) {
+                    seen.insert("leveling_can_split");
+                }
+                if t.leveling_delay.is_some_and(|d| d != 0) {
+                    seen.insert("leveling_delay");
+                }
+                if t.leveling_delay_format.is_some() {
+                    seen.insert("leveling_delay_format");
+                }
+                if t.ignore_resource_calendar == Some(true) {
+                    seen.insert("ignore_resource_calendar");
+                }
+                if t.earned_value_method == Some(1) {
+                    seen.insert("earned_value_method");
+                }
+                if t.hide_bar == Some(true) {
+                    seen.insert("hide_bar");
+                }
+                if t.rollup == Some(true) {
+                    seen.insert("rollup");
+                }
+                if t.is_subproject == Some(true) {
+                    seen.insert("is_subproject");
+                }
+                if t.is_subproject_read_only == Some(true) {
+                    seen.insert("is_subproject_read_only");
+                }
+                if t.over_allocated == Some(true) {
+                    seen.insert("over_allocated");
+                }
+                if t.milestone {
+                    seen.insert("milestone");
+                }
+            }
+            if decoded
+                .iter()
+                .any(|t| t.fields.as_ref().and_then(|f| f.external_task) == Some(true))
+            {
+                seen.insert("external_task");
+            }
+        }
+        for field in [
+            "is_null",
+            "guid",
+            "create_date",
+            "wbs",
+            "task_type",
+            "active",
+            "effort_driven",
+            "estimated",
+            "priority",
+            "deadline",
+            "level_assignments",
+            "leveling_can_split",
+            "leveling_delay",
+            "leveling_delay_format",
+            "ignore_resource_calendar",
+            "earned_value_method",
+            "hide_bar",
+            "rollup",
+            "is_subproject",
+            "is_subproject_read_only",
+            "external_task",
+            "over_allocated",
+            "milestone",
+        ] {
+            assert!(
+                seen.contains(field),
+                "no non-default Project oracle for {field}"
+            );
+        }
+    }
     let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     if snapshots.join("01-empty.mpp").exists() {
         let newest = pairs(&snapshots, "")

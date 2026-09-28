@@ -129,6 +129,22 @@ minutes. Generate them the same way:
 python corpus/tools/gen_mpp_lag_cases.py
 ```
 
+Nine paired task-field files in `task-fields/` cover the current-layout task
+flags, GUID, creation date, WBS, type, deadline, leveling fields, subprojects,
+over-allocation and blank rows. The cross-project predecessor case also has an
+external task in the binary table; Project omits that ghost row from its XML
+export. Generate the pairs on Windows with Project and pywin32:
+
+```powershell
+python corpus/tools/gen_mpp_task_field_cases.py
+```
+
+Project computes `OverAllocated` from resource assignments when it exports;
+the task-table decoder leaves it absent until resource and assignment decoding
+can reproduce that result. A Project-authored recurring task pair is still
+needed to locate its binary flag; importing a bare `<Recurring>1</Recurring>`
+does not make Project retain the recurrence.
+
 The generated `.mpp` and `.xml` files stay git-ignored. The generator sources
 are kept with the fetch scripts in `corpus/tools/`.
 
@@ -192,7 +208,7 @@ snapshot files currently return a task-table error; that layout needs its own
 field map before it can be imported.
 
 Current Project blank rows are identified by their short FixedMeta record and
-omitted, while their row IDs still count toward ID continuity. Superseded task
+retained with their IDs and UIDs. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
 row ID order. Resources, assignments, calendars, baselines, constraints, and
 custom fields are not imported. Task progress is (see below); assignment

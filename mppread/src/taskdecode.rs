@@ -2,7 +2,7 @@
 use crate::{
     cfb::Cfb,
     fixedmeta,
-    mpp::{MppPred, MppProgress, MppTask, decode_timestamp},
+    mpp::{MppPred, MppProgress, MppTask, MppTaskFields, decode_timestamp},
 };
 use projcore::mspdi::lag_from_link_lag;
 use projcore::{LagFormat, Rate};
@@ -19,6 +19,12 @@ struct TaskLayout {
     start: usize,
     finish: usize,
     level: usize,
+}
+struct CurrentStreams<'a> {
+    fm: &'a [u8],
+    fd: &'a [u8],
+    vm: &'a [u8],
+    v2: &'a [u8],
 }
 const NEWEST: TaskLayout = TaskLayout {
     length: 202,
@@ -189,6 +195,7 @@ fn validate_legacy_level(index: usize, uid: u32, level: u32, previous: u32) -> R
 struct VarFields {
     names: HashMap<u32, String>,
     physical_percent: HashMap<u32, u8>,
+    wbs: HashMap<u32, String>,
 }
 
 fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, String> {
@@ -206,6 +213,7 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
     let mut seen = HashSet::new();
     let mut names = HashMap::new();
     let mut physical_percent = HashMap::new();
+    let mut wbs = HashMap::new();
     for i in 0..count {
         let e = &vm[24 + i * 12..24 + (i + 1) * 12];
         let uid = u32_at(e, 0);
@@ -226,6 +234,9 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
         };
         if key == 0x000e {
             names.insert(uid, decode_name(v2, off, uid)?);
+        } else if key == 0x0010 {
+            // Explicit WBS override; default WBS is generated from the outline.
+            wbs.insert(uid, decode_name(v2, off, uid)?);
         } else if key == PHYSICAL_PERCENT_KEY {
             let value = &v2[header_end..end];
             let percent = (value.len() == 2)
@@ -241,6 +252,61 @@ fn var_fields(vm: &[u8], v2: &[u8], uids: &HashSet<u32>) -> Result<VarFields, St
     Ok(VarFields {
         names,
         physical_percent,
+        wbs,
+    })
+}
+
+fn guid_text(raw: &[u8]) -> String {
+    let a = u32::from_le_bytes(raw[..4].try_into().unwrap());
+    let b = u16::from_le_bytes(raw[4..6].try_into().unwrap());
+    let c = u16::from_le_bytes(raw[6..8].try_into().unwrap());
+    format!(
+        "{a:08X}-{b:04X}-{c:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        raw[8], raw[9], raw[10], raw[11], raw[12], raw[13], raw[14], raw[15]
+    )
+}
+
+/// Offsets and flag bits were diffed from Project's paired task-fields cases.
+fn current_fields(
+    rec: &[u8],
+    meta: &[u8],
+    fixed2: fixedmeta::Fixed2<'_>,
+    uid: u32,
+    wbs: String,
+) -> Result<MppTaskFields, String> {
+    let task_type = projcore::TaskType::from_code(i64::from(u16_at(rec, 140)))
+        .ok_or_else(|| format!("invalid task type for UID {uid}"))?;
+    let priority = i32::from(u16_at(rec, 78));
+    if priority > 1000 {
+        return Err(format!("invalid priority {priority} for UID {uid}"));
+    }
+    Ok(MppTaskFields {
+        guid: Some(guid_text(&fixed2.data[..16])),
+        create_date: decode_timestamp(rec, 128),
+        wbs: Some(wbs),
+        task_type: Some(task_type),
+        active: Some(fixed2.meta[8] & 0x40 != 0),
+        effort_driven: Some(meta[13] & 0x08 != 0),
+        estimated: Some(u16_at(rec, 164) & 32 != 0),
+        priority: Some(priority),
+        deadline: decode_timestamp(rec, 182),
+        level_assignments: Some(meta[16] & 0x04 != 0),
+        leveling_can_split: Some(meta[16] & 0x02 != 0),
+        leveling_delay: Some(i64::from(u32_at(rec, 70))),
+        // Project exports elapsed-day code 8 for every current-layout case,
+        // including delays entered as working days and elapsed days.
+        leveling_delay_format: Some(8),
+        ignore_resource_calendar: Some(fixed2.meta[77] & 0x08 != 0),
+        earned_value_method: Some(i32::from(
+            meta[26] & 0x80 == 0 && fixed2.meta[76] & 0x80 != 0,
+        )),
+        hide_bar: Some(meta[12] & 0x80 != 0),
+        rollup: Some(meta[12] & 0x04 != 0),
+        is_subproject: Some(meta[15] & 0x02 != 0),
+        is_subproject_read_only: Some(meta[15] & 0x80 != 0),
+        external_task: Some(meta[15] & 0x40 != 0),
+        milestone: Some(meta[10] & 0x02 != 0),
+        ..MppTaskFields::default()
     })
 }
 
@@ -448,7 +514,18 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             let fixed_count = u32_at(&fm, 8) as usize;
             let (f2m, f2d) = (read("Fixed2Meta")?, read("Fixed2Data")?);
             let fixed2 = fixedmeta::current_fixed2(&f2m, &f2d, fixed_count, &indexed)?;
-            let tasks = decode_current(&cfb, prefix, &fd, &vm, &v2, indexed, &fixed2)?;
+            let tasks = decode_current(
+                &cfb,
+                prefix,
+                CurrentStreams {
+                    fm: &fm,
+                    fd: &fd,
+                    vm: &vm,
+                    v2: &v2,
+                },
+                indexed,
+                &fixed2,
+            )?;
             let props = prefix.trim_end_matches("TBkndTask/").to_string() + "Props";
             let new_tasks_are_manual = cfb
                 .read_path(&props)
@@ -472,12 +549,11 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
 fn decode_current(
     cfb: &Cfb,
     prefix: &str,
-    fd: &[u8],
-    vm: &[u8],
-    v2: &[u8],
+    streams: CurrentStreams<'_>,
     indexed: Vec<fixedmeta::CurrentRecord>,
     fixed2: &[fixedmeta::Fixed2],
 ) -> Result<Vec<MppTask>, String> {
+    let CurrentStreams { fm, fd, vm, v2 } = streams;
     let uids: HashSet<_> = indexed
         .iter()
         .filter(|r| !r.is_null)
@@ -485,8 +561,15 @@ fn decode_current(
         .collect();
     let var = var_fields(vm, v2, &uids)?;
     let mut out = Vec::new();
+    let mut wbs_parts = [0u32; 21];
     for (row, fixed2) in indexed.into_iter().zip(fixed2) {
         if row.is_null {
+            out.push(MppTask {
+                id: row.id,
+                uid: row.uid,
+                is_null: true,
+                ..MppTask::default()
+            });
             continue;
         }
         if row.len != NEWEST.length {
@@ -517,6 +600,19 @@ fn decode_current(
         };
         let physical_percent = var.physical_percent.get(&row.uid).copied().unwrap_or(0);
         let progress = progress_fields(rec, physical_percent, row.uid)?;
+        if level > 0 {
+            wbs_parts[level as usize] += 1;
+            wbs_parts[level as usize + 1..].fill(0);
+        }
+        let default_wbs = if level == 0 {
+            "0".to_string()
+        } else {
+            (1..=level as usize)
+                .map(|i| wbs_parts[i].to_string())
+                .collect::<Vec<_>>()
+                .join(".")
+        };
+        let meta = &fm[16 + row.entry * 47..16 + (row.entry + 1) * 47];
         out.push(MppTask {
             id: row.id,
             uid: row.uid,
@@ -530,6 +626,14 @@ fn decode_current(
             manual_finish,
             manual_duration_min,
             progress: Some(progress),
+            fields: Some(current_fields(
+                rec,
+                meta,
+                *fixed2,
+                row.uid,
+                var.wbs.get(&row.uid).cloned().unwrap_or(default_wbs),
+            )?),
+            ..MppTask::default()
         });
     }
     links(cfb, prefix, &mut out, NEWEST_LINK)?;
@@ -743,7 +847,26 @@ mod tests {
         let decoded = decode(&file(&s, true)).unwrap();
         assert_eq!(
             decoded.iter().map(|t| (t.id, t.uid)).collect::<Vec<_>>(),
-            [(0, 0), (2, 1)]
+            [(0, 0), (1, 4), (2, 1)]
+        );
+        let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(
+            imported
+                .tasks
+                .iter()
+                .map(|t| (t.id, t.uid, t.is_null))
+                .collect::<Vec<_>>(),
+            [(1, 4, true), (2, 1, false)]
+        );
+        let xml = projcore::mspdi::write_mspdi(&imported);
+        let reread = projcore::mspdi::read_mspdi(&xml).unwrap();
+        assert_eq!(
+            reread
+                .tasks
+                .iter()
+                .map(|t| (t.id, t.uid, t.is_null))
+                .collect::<Vec<_>>(),
+            [(1, 4, true), (2, 1, false)]
         );
         s.fm[p..p + 2].copy_from_slice(&0u16.to_le_bytes());
         reject(&s); // a short record without the null marker is malformed
@@ -766,6 +889,139 @@ mod tests {
         assert_eq!(project.tasks[0].name, "B");
         let err = crate::project::project_from_mpp(&file(&s, false)).unwrap_err();
         assert!(err.starts_with("cannot read the task table of this .mpp ("));
+    }
+    #[test]
+    fn task_field_bits_values_and_round_trip() {
+        let mut s = fixture();
+        let m = 16 + 4 * 47;
+        s.fm[m + 10] |= 0x02; // milestone, f1-flags
+        s.fm[m + 12] |= 0x84; // hide bar, rollup, f1-flags
+        s.fm[m + 13] |= 0x08; // effort driven, f1-flags
+        s.fm[m + 15] |= 0x82; // subproject, read-only, f6-subprojects
+        s.fm[m + 16] |= 0x07; // leveling options, f1-flags
+        let d = 250;
+        s.fd[d + 70..d + 74].copy_from_slice(&28800u32.to_le_bytes());
+        s.fd[d + 78..d + 80].copy_from_slice(&317u16.to_le_bytes());
+        s.fd[d + 128..d + 132].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
+        s.fd[d + 140..d + 142].copy_from_slice(&2u16.to_le_bytes());
+        s.fd[d + 164..d + 166].copy_from_slice(&39u16.to_le_bytes());
+        s.fd[d + 182..d + 186].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
+        let f = 16 + 4 * 96;
+        s.f2m[f + 8] |= 0x40; // active, f1-flags
+        s.f2m[f + 76] |= 0x80; // physical EV, f2-values
+        s.f2m[f + 77] |= 0x08; // ignore resource calendar, f1-flags
+        let off = s.v2.len() as u32;
+        let value: Vec<u8> = "CUSTOM\0"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        s.v2.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        s.v2.extend_from_slice(&value);
+        s.vm.extend_from_slice(&1u32.to_le_bytes());
+        s.vm.extend_from_slice(&off.to_le_bytes());
+        s.vm.extend_from_slice(&0x0010u16.to_le_bytes());
+        s.vm.extend_from_slice(&0x0b40u16.to_le_bytes());
+        s.vm[8..12].copy_from_slice(&3u32.to_le_bytes());
+        s.vm[20..24].copy_from_slice(&(s.v2.len() as u32).to_le_bytes());
+        let bytes = file(&s, true);
+        let task = decode(&bytes).unwrap().remove(1);
+        let fields = task.fields.unwrap();
+        assert_eq!(fields.wbs.as_deref(), Some("CUSTOM"));
+        assert_eq!(fields.task_type, Some(projcore::TaskType::FixedWork));
+        assert_eq!(fields.priority, Some(317));
+        assert_eq!(fields.leveling_delay, Some(28800));
+        assert_eq!(fields.deadline, task.start);
+        assert_eq!(
+            (fields.active, fields.effort_driven, fields.estimated),
+            (Some(true), Some(true), Some(true))
+        );
+        assert_eq!(
+            (fields.hide_bar, fields.rollup, fields.milestone),
+            (Some(true), Some(true), Some(true))
+        );
+        assert_eq!(
+            (fields.is_subproject, fields.is_subproject_read_only),
+            (Some(true), Some(true))
+        );
+        assert_eq!(
+            (fields.ignore_resource_calendar, fields.earned_value_method),
+            (Some(true), Some(1))
+        );
+        let imported = crate::project::project_from_mpp(&bytes).unwrap();
+        let xml = projcore::mspdi::write_mspdi(&imported);
+        let reread = projcore::mspdi::read_mspdi(&xml).unwrap();
+        let (a, b) = (&imported.tasks[0], &reread.tasks[0]);
+        assert_eq!(
+            (
+                a.guid.clone(),
+                a.create_date,
+                a.wbs.clone(),
+                a.task_type,
+                a.active,
+                a.effort_driven,
+                a.estimated,
+                a.priority,
+                a.deadline
+            ),
+            (
+                b.guid.clone(),
+                b.create_date,
+                b.wbs.clone(),
+                b.task_type,
+                b.active,
+                b.effort_driven,
+                b.estimated,
+                b.priority,
+                b.deadline
+            )
+        );
+        assert_eq!(
+            (
+                a.level_assignments,
+                a.leveling_can_split,
+                a.leveling_delay,
+                a.leveling_delay_format,
+                a.ignore_resource_calendar,
+                a.earned_value_method
+            ),
+            (
+                b.level_assignments,
+                b.leveling_can_split,
+                b.leveling_delay,
+                b.leveling_delay_format,
+                b.ignore_resource_calendar,
+                b.earned_value_method
+            )
+        );
+        assert_eq!(
+            (
+                a.hide_bar,
+                a.rollup,
+                a.external_task,
+                a.is_subproject,
+                a.is_subproject_read_only,
+                a.over_allocated,
+                a.milestone
+            ),
+            (
+                b.hide_bar,
+                b.rollup,
+                b.external_task,
+                b.is_subproject,
+                b.is_subproject_read_only,
+                b.over_allocated,
+                b.milestone
+            )
+        );
+    }
+    #[test]
+    fn task_fields_reject_invalid_type_and_priority() {
+        let mut s = fixture();
+        s.fd[250 + 140..250 + 142].copy_from_slice(&3u16.to_le_bytes());
+        assert!(decode(&file(&s, true)).unwrap_err().contains("task type"));
+        s.fd[250 + 140..250 + 142].copy_from_slice(&0u16.to_le_bytes());
+        s.fd[250 + 78..250 + 80].copy_from_slice(&1001u16.to_le_bytes());
+        assert!(decode(&file(&s, true)).unwrap_err().contains("priority"));
     }
     #[test]
     fn refuses_structural_corruption() {
