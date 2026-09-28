@@ -501,18 +501,20 @@ fn close_dialog_save_preserves_an_untouched_text_cell_on_disk() {
     let dir = close_test_dir("untouched-cell-close-save");
     let path = dir.join("saved.xlsx");
     let mut t = untouched_text_cell();
+    t.path = Some(path.clone());
     t.dirty = true; // Another change caused the close dialog to ask.
     assert_eq!(
         close_step(&mut t, |_| Ok(CloseAnswer::Save)),
         CloseStep::Save
     );
-    prepare_sheet_save(&mut t);
+    assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
+        "in-place save asked"
+    )));
     let Surface::Sheet(v) = &t.surface else {
         panic!()
     };
     assert_eq!(v.editing.as_deref(), Some("007"));
     assert!(v.undo.is_empty());
-    finish_sheet_save(&mut t, Some(&path));
     assert!(!t.dirty, "{}", t.status);
     assert!(path.is_file(), "{}", t.status);
     a1_is_text_007(&tab_from_path(&path));
@@ -523,7 +525,10 @@ fn save_preserves_an_untouched_cell_editor_and_clean_tab() {
     let dir = close_test_dir("untouched-cell-save");
     let path = dir.join("saved.xlsx");
     let mut t = untouched_text_cell();
-    prepare_sheet_save(&mut t);
+    t.path = Some(path.clone());
+    assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
+        "in-place save asked"
+    )));
     assert!(!t.dirty);
     let Surface::Sheet(v) = &t.surface else {
         panic!()
@@ -531,9 +536,40 @@ fn save_preserves_an_untouched_cell_editor_and_clean_tab() {
     assert_eq!(v.editing.as_deref(), Some("007"));
     assert!(v.undo.is_empty());
     a1_is_text_007(&t);
-    finish_sheet_save(&mut t, Some(&path));
-    assert!(!t.dirty, "{}", t.status);
     assert!(path.is_file(), "{}", t.status);
+    a1_is_text_007(&tab_from_path(&path));
+}
+
+#[test]
+fn cancelled_save_as_keeps_an_untouched_cell_editor_open() {
+    let mut t = untouched_text_cell();
+    assert!(save_sheet_tab(&mut t, false, true, |_| None));
+    assert_eq!(t.status.as_ref(), "save cancelled");
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    a1_is_text_007(&t);
+}
+
+#[test]
+fn save_as_uses_the_picker_and_preserves_an_untouched_text_cell() {
+    let dir = close_test_dir("untouched-cell-save-as");
+    let path = dir.join("picked.xlsx");
+    let mut t = untouched_text_cell();
+    assert!(save_sheet_tab(&mut t, false, true, |suggested| {
+        assert_eq!(suggested, "basic.xlsx");
+        Some(path.clone())
+    }));
+    assert_eq!(t.path.as_deref(), Some(path.as_path()));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
     a1_is_text_007(&tab_from_path(&path));
 }
 
@@ -546,18 +582,21 @@ fn save_commits_a_changed_cell_editor_before_writing() {
     ] {
         let path = dir.join(format!("{buffer}.xlsx"));
         let mut t = untouched_text_cell();
+        t.path = Some(path.clone());
         let Surface::Sheet(v) = &mut t.surface else {
             panic!()
         };
+        v.anchor = (2, 2);
         v.editing = Some(buffer.into());
-        prepare_sheet_save(&mut t);
-        assert!(t.dirty, "{buffer}");
+        assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
+            "in-place save asked"
+        )));
         let Surface::Sheet(v) = &t.surface else {
             panic!()
         };
         assert!(v.editing.is_none(), "{buffer}");
         assert_eq!(v.undo.len(), 1, "{buffer}");
-        finish_sheet_save(&mut t, Some(&path));
+        assert_eq!(v.anchor, v.sel, "{buffer}");
         assert!(!t.dirty, "{}", t.status);
         assert!(path.is_file(), "{}", t.status);
         let reloaded = tab_from_path(&path);
@@ -570,6 +609,24 @@ fn save_commits_a_changed_cell_editor_before_writing() {
             "{buffer}"
         );
     }
+}
+
+#[test]
+fn preparing_a_changed_cell_for_save_marks_dirty_and_collapses_selection() {
+    let mut t = untouched_text_cell();
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.anchor = (2, 2);
+    v.editing = Some("abc".into());
+    prepare_sheet_save(&mut t);
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.undo.len(), 1);
+    assert!(v.editing.is_none());
+    assert_eq!(v.anchor, v.sel);
 }
 
 #[test]

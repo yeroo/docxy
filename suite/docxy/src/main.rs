@@ -10162,41 +10162,17 @@ impl Docxy {
     /// re-writes into the loaded package), preserving styles and formulas.
     /// `explicit_save_as` always asks where to go, even for a saved workbook.
     fn save_sheet(&mut self, explicit_save_as: bool, window: &mut Window, cx: &mut Context<Self>) {
-        // Commit a changed cell edit first, so the decision and write see it.
-        if let Some(tab) = self.tabs.get_mut(self.active) {
-            close::prepare_sheet_save(tab);
-        }
-        let Some(tab) = self.tabs.get(self.active) else {
+        let harness = self.harness.is_some();
+        let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        let decision = sheet_save_decision(
-            tab.path.as_deref(),
-            &tab.title,
-            self.harness.is_some(),
-            explicit_save_as,
-        );
-        match decision {
-            SheetSaveDecision::InPlace(path) => {
-                finish_sheet_save(&mut self.tabs[self.active], Some(&path))
-            }
-            // A never-saved workbook (or Save As) asks where to go,
-            // Excel-style, instead of silently dumping into the working
-            // directory.
-            SheetSaveDecision::Dialog { suggested } => {
-                let target = rfd::FileDialog::new()
-                    .add_filter("Excel workbook", &["xlsx"])
-                    .set_file_name(suggested)
-                    .save_file();
-                finish_sheet_save(&mut self.tabs[self.active], target.as_deref());
-            }
-            // ⚠️ Never in a harness instance: `rfd` runs its own modal loop on
-            // this thread and stops the control pump dead (see `open_args`),
-            // and `key ctrl+s` on the untitled workbook reaches here. Refusing
-            // in words is the only answer a test can read.
-            SheetSaveDecision::RefuseHarness(message) => {
-                self.tabs[self.active].status = message.into();
-                return self.refocus(window, cx);
-            }
+        if !save_sheet_tab(tab, harness, explicit_save_as, |suggested| {
+            rfd::FileDialog::new()
+                .add_filter("Excel workbook", &["xlsx"])
+                .set_file_name(suggested)
+                .save_file()
+        }) {
+            return self.refocus(window, cx);
         }
         self.backstage = false;
         self.bs_new = false;
@@ -12619,6 +12595,31 @@ fn sheet_save_decision(
     SheetSaveDecision::Dialog {
         suggested: format!("{stem}.xlsx"),
     }
+}
+
+/// Run the complete workbook Save sequence without a GPUI window. Returns
+/// false only when a harness cannot open the dialog needed to choose a target.
+fn save_sheet_tab(
+    tab: &mut DocTab,
+    harness: bool,
+    explicit_save_as: bool,
+    pick: impl FnOnce(String) -> Option<PathBuf>,
+) -> bool {
+    // Commit before choosing a target so the decision and write see the edit.
+    close::prepare_sheet_save(tab);
+    match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
+        SheetSaveDecision::InPlace(path) => finish_sheet_save(tab, Some(&path)),
+        SheetSaveDecision::Dialog { suggested } => {
+            let target = pick(suggested);
+            finish_sheet_save(tab, target.as_deref());
+        }
+        // A harness must never enter rfd's modal loop: it stops the control pump.
+        SheetSaveDecision::RefuseHarness(message) => {
+            tab.status = message.into();
+            return false;
+        }
+    }
+    true
 }
 
 /// The file a workbook is written to for a picked `path`: `.xlsx` is added
