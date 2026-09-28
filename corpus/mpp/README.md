@@ -177,7 +177,8 @@ records in Sunday-first order. A flag of one with otherwise zero bytes means
 the weekday is unstated; flag zero supplies a period count and working times
 as in the default week. In each stated 60-byte day, +4 is the `u32` total
 duration and +40 holds five `i32` cumulative durations, all in tenths of a
-minute. At +420/+422 are inclusive `u16` from/to day numbers
+minute. The unused period slots and +18..+19 reserved bytes are zero.
+At +420/+422 are inclusive `u16` from/to day numbers
 since 1983-12-31. At +424 is a Project-assigned `u32` identifier, at +428 a
 zero reserved `u32`, and at +432 a `u32` byte length for the four-byte-aligned
 UTF-16 name that follows the 436-byte fixed part. A zero-length name exports

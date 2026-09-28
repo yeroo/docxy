@@ -128,6 +128,23 @@ fn weekday_record(rec: &[u8], day: usize, work_week: bool) -> Result<Option<DayW
         }
         return Ok(None);
     }
+    if work_week {
+        if u16_at(rec, 18) != 0 {
+            return Err(format!(
+                "invalid calendar work-week weekday {day} reserved bytes"
+            ));
+        }
+        for slot in count..5 {
+            if u16_at(rec, 8 + slot * 2) != 0
+                || i32_at(rec, 20 + slot * 4) != 0
+                || i32_at(rec, 40 + slot * 4) != 0
+            {
+                return Err(format!(
+                    "invalid calendar work-week weekday {day} inactive period {slot}"
+                ));
+            }
+        }
+    }
     let mut times = Vec::with_capacity(count);
     let mut cumulative = 0u32;
     for period in 0..count {
@@ -709,6 +726,13 @@ pub(crate) mod tests {
         let mut bad = block.clone();
         bad[528..532].copy_from_slice(&1i32.to_le_bytes());
         assert!(exceptions(&bad).unwrap_err().contains("cumulative period"));
+        let mut bad = block.clone();
+        bad[428..430].copy_from_slice(&0u16.to_le_bytes()); // closed Sunday
+        bad[448..452].copy_from_slice(&1i32.to_le_bytes()); // inactive duration
+        assert!(exceptions(&bad).unwrap_err().contains("inactive period"));
+        let mut bad = block.clone();
+        bad[506..508].copy_from_slice(&1u16.to_le_bytes()); // Monday +18 reserved
+        assert!(exceptions(&bad).unwrap_err().contains("reserved bytes"));
         let mut bad = block.clone();
         bad[490..492].copy_from_slice(&2u16.to_le_bytes());
         bad[498..500].copy_from_slice(&6000u16.to_le_bytes());

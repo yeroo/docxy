@@ -167,6 +167,13 @@ def main():
         print("Microsoft Project is already running; close it first.")
         return 2
     os.makedirs(OUT, exist_ok=True)
+    # Older versions of this generator used c1/c2 names. Remove only those
+    # known stale outputs so the oracle's exact pair count stays meaningful.
+    for slug in ("c1-com-summer", "c2-com-out-of-order"):
+        for ext in (".mpp", ".xml"):
+            old = os.path.join(OUT, slug + ext)
+            if os.path.isfile(old):
+                os.remove(old)
     app = win32.Dispatch("MSProject.Application")
     try:
         app.Visible = False
