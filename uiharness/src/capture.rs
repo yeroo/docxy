@@ -1,15 +1,22 @@
-//! Taking the pixels: find the test instance's window from its process id, and
-//! read that window's contents into an [`Image`].
+//! Taking the pixels. On Windows: find the test instance's window from its
+//! process id, and read that window's contents into an [`Image`]. On macOS: ask
+//! the app to render itself offscreen, and read what it wrote
+//! ([`offscreen_capture`]).
 //!
-//! ## Why this lives on the harness side
+//! ## Why this lives on the harness side, except on macOS
 //!
 //! gpui has no window-to-image readback in a shipping build.
 //! `App::screen_capture_sources` is the screen-*sharing* source list (whole
 //! displays), `to_image_data` renders SVG, and `Window::render_to_image` — the
 //! one that sounds right — is behind `cfg(any(test, feature = "test-support"))`
 //! and re-renders the scene to an offscreen texture rather than reading what
-//! the compositor actually put on screen. So the app reports geometry and the
-//! harness takes the picture.
+//! the compositor actually put on screen. So on Windows the app reports
+//! geometry and the harness takes the picture.
+//!
+//! macOS is the exception, because there the harness *cannot* take it: the
+//! window is never on screen, and reading another process's pixels needs Screen
+//! Recording permission. A suite built with its `harness-capture` feature
+//! renders offscreen on request instead — see `docs/ui-test-harness.md`.
 //!
 //! ## Why `PrintWindow`
 //!
@@ -43,6 +50,9 @@ pub enum How {
     /// A copy off the screen, because `PrintWindow` came back blank. Whatever
     /// is in front of the window is in the picture.
     Screen,
+    /// macOS: the app rendered its last drawn frame to an offscreen texture
+    /// (the `capture` verb). Not what the compositor showed, and never on screen.
+    Offscreen,
 }
 
 impl std::fmt::Display for How {
@@ -50,6 +60,7 @@ impl std::fmt::Display for How {
         match self {
             How::PrintWindow => write!(f, "PrintWindow"),
             How::Screen => write!(f, "screen copy (PrintWindow came back blank)"),
+            How::Offscreen => write!(f, "offscreen render"),
         }
     }
 }
@@ -312,6 +323,67 @@ pub fn capture_pid(_pid: u32) -> Result<Capture, String> {
 #[cfg(not(windows))]
 pub fn become_dpi_aware() {}
 
+/// Turn the app's reply to the `capture` verb into a [`Capture`], reading the
+/// pixel file it names through `read`.
+///
+/// This is how a macOS harness gets its pixels. There, nothing outside the app
+/// can photograph a harness window without Screen Recording permission, and the
+/// window is never on screen to be photographed anyway. So the app renders its
+/// last drawn frame to an offscreen texture and writes the raw RGBA into its
+/// own sandbox, and this side reads it back. From here on it is an ordinary
+/// [`Capture`]: `content_origin` is the content's top-left in the same physical
+/// desktop pixels `rect` answers in, so the existing crop — a region's rect
+/// minus the capture's origin — lands on the right pixels unchanged.
+///
+/// ⚠️ The file travels beside the control channel rather than through it: a
+/// full window is several megabytes of RGBA, which is no size for a JSON reply.
+pub fn offscreen_capture<R>(reply: &ctlcore::json::Json, read: R) -> Result<Capture, String>
+where
+    R: FnOnce(&std::path::Path) -> std::io::Result<Vec<u8>>,
+{
+    use ctlcore::json::Json;
+    let field = |j: &Json, k: &str| -> Result<f64, String> {
+        j.get(k)
+            .and_then(Json::as_f64)
+            .ok_or_else(|| format!("the capture reply has no numeric '{k}': {reply}"))
+    };
+    let path = reply
+        .get_str("path")
+        .ok_or_else(|| format!("the capture reply has no 'path': {reply}"))?;
+    let (w, h) = (
+        field(reply, "width")? as u32,
+        field(reply, "height")? as u32,
+    );
+    let origin = reply
+        .get("content_origin")
+        .ok_or_else(|| format!("the capture reply has no 'content_origin': {reply}"))?;
+    let origin = (
+        field(origin, "x")?.round() as i32,
+        field(origin, "y")?.round() as i32,
+    );
+    let path = std::path::Path::new(path);
+    let px = read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let got = px.len();
+    let image = Image::from_rgba(w, h, px).ok_or_else(|| {
+        format!(
+            "{}: {got} bytes is not a {w}x{h} RGBA image; a torn or stale write \
+             would shear every row of the crop",
+            path.display()
+        )
+    })?;
+    if is_blank(&image) {
+        return Err(format!(
+            "the offscreen render came back blank ({w}x{h}, one flat colour): the \
+             drawable never received the scene, so there is nothing to assert on"
+        ));
+    }
+    Ok(Capture {
+        image,
+        origin,
+        how: How::Offscreen,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +406,83 @@ mod tests {
         let mut img = Image::new(4, 4);
         img.set_pixel(2, 1, [1, 0, 0, 0]);
         assert!(!is_blank(&img), "one differing pixel is enough");
+    }
+
+    use ctlcore::json::Json;
+
+    /// What the app answers for a 2x1 capture whose content starts at (10,20).
+    fn reply(w: u32, h: u32) -> Json {
+        Json::obj(vec![
+            ("path", Json::Str("/sandbox/suite/capture/last.rgba".into())),
+            ("width", Json::Num(w as f64)),
+            ("height", Json::Num(h as f64)),
+            ("scale", Json::Num(2.0)),
+            ("frame", Json::Num(7.0)),
+            (
+                "content_origin",
+                Json::obj(vec![("x", Json::Num(10.0)), ("y", Json::Num(20.0))]),
+            ),
+        ])
+    }
+
+    /// Two different pixels, so the image is not flat.
+    fn two_px() -> Vec<u8> {
+        vec![255, 0, 0, 255, 0, 0, 255, 255]
+    }
+
+    #[test]
+    fn an_offscreen_reply_becomes_a_capture_at_the_content_origin() {
+        let cap = offscreen_capture(&reply(2, 1), |p| {
+            assert_eq!(p, std::path::Path::new("/sandbox/suite/capture/last.rgba"));
+            Ok(two_px())
+        })
+        .unwrap();
+        assert_eq!((cap.image.w, cap.image.h), (2, 1));
+        assert_eq!(cap.image.px, two_px());
+        // The origin is what turns a desktop rect into a crop of this image.
+        assert_eq!(cap.origin, (10, 20));
+        assert_eq!(cap.how, How::Offscreen);
+    }
+
+    /// A file of the wrong size is a torn or stale write, never a picture to
+    /// crop: cropping it would silently shear every row.
+    #[test]
+    fn pixels_that_do_not_fill_the_stated_size_are_refused() {
+        let e = offscreen_capture(&reply(2, 2), |_| Ok(two_px()))
+            .err()
+            .unwrap();
+        assert!(e.contains("8 bytes") && e.contains("2x2"), "{e}");
+    }
+
+    /// The offscreen render's own failure mode: a drawable that never got the
+    /// scene. A flat image must stop the step, not reach a probe that would
+    /// then read "no border" off an empty picture and pass.
+    #[test]
+    fn a_blank_offscreen_render_is_refused() {
+        let e = offscreen_capture(&reply(2, 1), |_| Ok(vec![0; 8]))
+            .err()
+            .unwrap();
+        assert!(e.contains("blank"), "{e}");
+    }
+
+    #[test]
+    fn a_reply_missing_a_field_names_the_field() {
+        let mut r = reply(2, 1);
+        if let Json::Obj(fields) = &mut r {
+            fields.retain(|(k, _)| k != "content_origin");
+        }
+        let e = offscreen_capture(&r, |_| Ok(two_px())).err().unwrap();
+        assert!(e.contains("content_origin"), "{e}");
+    }
+
+    #[test]
+    fn a_pixel_file_that_cannot_be_read_says_which_file() {
+        let e = offscreen_capture(&reply(2, 1), |_| {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "gone"))
+        })
+        .err()
+        .unwrap();
+        assert!(e.contains("last.rgba") && e.contains("gone"), "{e}");
     }
 
     #[test]

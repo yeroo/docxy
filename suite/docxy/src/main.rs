@@ -9,6 +9,19 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+// ⚠️ `harness-capture` must never apply off macOS, and must never do so
+// silently. It turns on gpui's test-support, which also makes gpui draw every
+// dirty window on each effect flush WITHOUT presenting it. On Windows that
+// would let the harness's frame wait be satisfied by a frame that never reached
+// the screen, so `PrintWindow` would photograph the one before it: a capture
+// that quietly reads stale pixels. Windows captures through `PrintWindow` and
+// needs none of this.
+#[cfg(all(feature = "harness-capture", not(target_os = "macos")))]
+compile_error!(
+    "the `harness-capture` feature is macOS-only: it enables gpui test-support, \
+     whose draw-without-present would make Windows captures read stale pixels"
+);
+
 mod close;
 mod control;
 mod harness;

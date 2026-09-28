@@ -252,6 +252,30 @@ pub fn control_dir(root: &Path) -> PathBuf {
     root.join(CTL_APP).join("ctl")
 }
 
+/// Where the `capture` verb leaves its pixels: inside the sandbox, beside the
+/// control socket, one file that each capture overwrites. A driver reads it
+/// straight after the reply, and a full window is several megabytes, so
+/// keeping every capture would fill a run's directory for nothing.
+#[cfg(any(test, feature = "harness-capture"))]
+pub fn capture_path(root: &Path) -> PathBuf {
+    root.join(CTL_APP).join("capture").join("last.rgba")
+}
+
+/// The desktop pixel the offscreen image's (0,0) corresponds to, computed by
+/// the same [`screen_rect`] that `rect` answers with — so a region's rect minus
+/// this origin is exactly where the region sits in the image, rounding and
+/// all, and the driver's existing crop needs no second opinion about it.
+#[cfg(any(test, feature = "harness-capture"))]
+pub fn content_origin(win_origin: (f32, f32), scale: f32) -> (i32, i32) {
+    let r = screen_rect((0.0, 0.0, 0.0, 0.0), win_origin, scale);
+    (r.x, r.y)
+}
+
+/// What a build without offscreen capture answers `capture` with.
+#[cfg(any(test, not(feature = "harness-capture")))]
+pub const CAPTURE_UNAVAILABLE: &str = "this build cannot capture offscreen: rebuild the suite \
+     with `--features harness-capture` (macOS only) to take pictures of a harness window";
+
 /// This instance's control name — `suite-<AGWINTERM_SESSION_ID|pid>`, the same
 /// convention the terminal editors use.
 pub fn instance_name() -> String {
@@ -1719,6 +1743,12 @@ pub fn dispatch(
             Done::ok_drawn(Json::obj(vec![("frame", Json::Num(app.frame as f64))]))
         }
 
+        // The window's pixels, rendered offscreen by the app itself. macOS only:
+        // there a harness window is never on screen and reading another
+        // process's pixels needs Screen Recording, so the driver cannot take
+        // the picture from outside the way `PrintWindow` does on Windows.
+        "capture" => capture(app, window),
+
         // Where a named region is, on the desktop, in physical pixels — so the
         // harness can crop a window capture to it. The app answers because the
         // layout is the only thing that knows; see [`Region`].
@@ -1834,6 +1864,48 @@ fn press(
         return;
     }
     app.on_key(&key_event(stroke), window, cx);
+}
+
+/// Render the last drawn frame to an offscreen texture and leave the RGBA in
+/// the sandbox; reply with where it is and how to map a desktop rect onto it.
+///
+/// ⚠️ This renders the scene gpui last *drew*, not what a compositor showed:
+/// nothing here is ever on screen. That is what lets it work for a window that
+/// was never shown, and it is why a caller must settle first — the harness's
+/// `frame` verb is what draws on macOS, so a capture without one would render
+/// a stale scene.
+#[cfg(feature = "harness-capture")]
+fn capture(app: &crate::Docxy, window: &mut Window) -> Result<Done, String> {
+    let img = window
+        .render_to_image()
+        .map_err(|e| format!("the offscreen render failed: {e}"))?;
+    let path = capture_path(&crate::config_root());
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    std::fs::write(&path, img.as_raw()).map_err(|e| format!("{}: {e}", path.display()))?;
+    let win = window.bounds();
+    let scale = window.scale_factor();
+    let (ox, oy) = content_origin((f32::from(win.origin.x), f32::from(win.origin.y)), scale);
+    Done::ok(Json::obj(vec![
+        ("path", Json::Str(path.display().to_string())),
+        ("width", Json::Num(img.width() as f64)),
+        ("height", Json::Num(img.height() as f64)),
+        ("scale", Json::Num(scale as f64)),
+        ("frame", Json::Num(app.frame as f64)),
+        (
+            "content_origin",
+            Json::obj(vec![
+                ("x", Json::Num(ox as f64)),
+                ("y", Json::Num(oy as f64)),
+            ]),
+        ),
+    ]))
+}
+
+#[cfg(not(feature = "harness-capture"))]
+fn capture(_app: &crate::Docxy, _window: &mut Window) -> Result<Done, String> {
+    Err(CAPTURE_UNAVAILABLE.to_string())
 }
 
 #[cfg(test)]
@@ -2562,6 +2634,58 @@ mod tests {
     /// The discovery file must sit under the sandbox, not wherever
     /// `ctlcore::config_ctl_dir` would put it — that reads APPDATA and could
     /// name a different sandbox from the one holding session.json.
+    #[test]
+    fn a_capture_is_written_inside_the_sandbox_beside_the_control_socket() {
+        let root = Path::new("/runs/harness-42");
+        let p = capture_path(root);
+        assert_eq!(p, root.join("suite").join("capture").join("last.rgba"));
+        assert!(
+            p.starts_with(root),
+            "a capture must never leave the sandbox"
+        );
+    }
+
+    /// The contract the driver's crop depends on: a region's desktop rect,
+    /// minus the capture's content origin, is where that region sits in the
+    /// offscreen image. Checked against the very function `rect` answers with,
+    /// on fractional origins, a Retina scale, and a display left of the main one.
+    #[test]
+    fn a_region_rect_minus_the_content_origin_is_where_it_sits_in_the_image() {
+        let cases = [
+            ((370.0, 140.0), 1.0),
+            ((370.5, 140.25), 2.0),
+            ((-1920.0, -100.0), 1.0),
+            ((0.5, 0.25), 1.5),
+        ];
+        for (origin, scale) in cases {
+            let o = content_origin(origin, scale);
+            let corner = screen_rect((0.0, 0.0, 1.0, 1.0), origin, scale);
+            assert_eq!(
+                (corner.x - o.0, corner.y - o.1),
+                (0, 0),
+                "the window's own top-left must be image pixel (0,0) at {origin:?} x{scale}"
+            );
+            for (x, y) in [(10.0_f32, 20.0_f32), (333.3, 77.7)] {
+                let r = screen_rect((x, y, 5.0, 5.0), origin, scale);
+                let (ix, iy) = ((r.x - o.0) as f32, (r.y - o.1) as f32);
+                assert!(
+                    (ix - x * scale).abs() <= 1.0 && (iy - y * scale).abs() <= 1.0,
+                    "region at ({x},{y}) lands at ({ix},{iy}), not ~({},{}), at {origin:?} x{scale}",
+                    x * scale,
+                    y * scale
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_build_without_capture_names_the_feature_to_build_with() {
+        assert!(
+            CAPTURE_UNAVAILABLE.contains("harness-capture"),
+            "{CAPTURE_UNAVAILABLE}"
+        );
+    }
+
     #[test]
     fn control_dir_is_under_the_sandbox_root() {
         let root = Path::new(r"D:\runs\harness-42");
