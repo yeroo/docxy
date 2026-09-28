@@ -953,9 +953,12 @@ mod tests {
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&1i32.to_le_bytes());
         let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         assert_eq!(project.tasks[0].calendar_uid, Some(1));
+        s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
+            .copy_from_slice(&39u16.to_le_bytes());
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&99i32.to_le_bytes());
         let dangling = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         assert_eq!(dangling.tasks[0].calendar_uid, None);
+        assert_eq!(dangling.tasks[0].duration_min, span);
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&(-1i32).to_le_bytes());
         s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
             .copy_from_slice(&39u16.to_le_bytes());
@@ -1036,6 +1039,12 @@ mod tests {
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&99i32.to_le_bytes());
         let dangling = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         assert_eq!(dangling.tasks[0].calendar_uid, None);
+        assert_eq!(dangling.tasks[0].duration_min, 420);
+        let dangling_with_table =
+            crate::project::project_from_mpp(&file_with_task_calendar(&s, false, false, true))
+                .unwrap();
+        assert_eq!(dangling_with_table.tasks[0].calendar_uid, None);
+        assert_eq!(dangling_with_table.tasks[0].duration_min, 420);
 
         s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&3i32.to_le_bytes());
         make_manual(&mut s);

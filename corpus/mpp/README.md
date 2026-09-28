@@ -278,14 +278,15 @@ weeks or no weekly working time, the importer keeps the previous behavior:
 no task calendar and the span on the project calendar, even when a stored
 duration exists. Unknown DurationFormats and negative durations other than the
 absent marker refuse the file. Task CalendarUID is a signed i32 at +178:
--1 means the project calendar. An unknown nonnegative UID falls back to the
-project default; any other negative UID refuses the file.
+-1 means the project calendar. An unknown nonnegative UID keeps the project
+calendar and its working span; any other negative UID refuses the file.
 The stored value also covers a split or a delayed assignment, whose duration
 can be shorter than that span. The scheduler does not yet account for splits
-or a delayed assignment when calculating the task's finish. Resource-calendar
-exceptions and recurring exceptions it cannot expand can also make scheduled
-and stored finishes differ. Assignments themselves are not yet imported from
-`.mpp` (#342).
+or a delayed assignment when calculating the task's finish. Resource calendars
+(their working week, hours, work weeks and exceptions) are not used for
+scheduling (#220), and recurring exceptions the scheduler cannot expand can
+also make scheduled and stored finishes differ. Assignments themselves are
+not yet imported from `.mpp` (#342).
 
 Task progress, work and cost are decoded for the newest layout
 ([#181](https://github.com/yeroo/docxy/issues/181)) and imported as read; the

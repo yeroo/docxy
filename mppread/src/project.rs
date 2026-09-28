@@ -13,10 +13,11 @@ use std::collections::HashSet;
 /// undecoded work weeks in its base chain, it uses Project's stored duration
 /// and its own calendar where one is assigned. Otherwise it keeps the working
 /// span on the project calendar and no task calendar. An unknown task calendar
-/// UID falls back to the project default; invalid negative UIDs, stored
+/// UID keeps the project-calendar span; invalid negative UIDs, stored
 /// durations and duration formats refuse the file. Delayed assignments, splits,
-/// resource calendar exceptions and recurring exceptions the scheduler cannot
-/// expand can still make scheduled and stored finishes differ. A **manual**
+/// resource calendars (their weeks, hours, work weeks and exceptions; #220)
+/// and recurring exceptions the scheduler cannot expand can still make
+/// scheduled and stored finishes differ. A **manual**
 /// leaf keeps its mode and manual dates and duration instead, which hold it
 /// where Project put it without a constraint; the project's new-task mode
 /// comes through too.
@@ -118,10 +119,11 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             let effective_cal = cal_ref
                 .calendar(effective_uid)
                 .expect("validated or synthesized project calendar");
-            let faithful = cal_ref
-                .resolved_week(effective_cal)
-                .iter()
-                .any(DayWorking::working)
+            let faithful = (t.calendar_uid.is_none() || own_calendar.is_some())
+                && cal_ref
+                    .resolved_week(effective_cal)
+                    .iter()
+                    .any(DayWorking::working)
                 && !calendar_chain_has_work_weeks(&cal_ref, effective_uid, &work_week_uids);
             task.calendar_uid = if faithful { own_calendar } else { None };
             let project_span = || projcore::schedule::working_minutes_between(&cal_ref, s, f);
@@ -169,11 +171,10 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             } else if t.manual {
                 task.duration_min = t.manual_duration_min.unwrap_or_else(working_span);
             } else {
-                task.duration_min = if faithful {
-                    t.duration_min.unwrap_or_else(working_span)
-                } else {
-                    project_span()
-                };
+                task.duration_min = t
+                    .duration_min
+                    .filter(|_| faithful)
+                    .unwrap_or_else(working_span);
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }
