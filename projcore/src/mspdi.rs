@@ -2322,7 +2322,7 @@ fn write_calendar(s: &mut String, c: &Calendar) {
             // model week[] is Sun=0..Sat=6; MSPDI DayType is 1=Sun..7=Sat.
             s.push_str("        <WeekDay>\n");
             tag(s, 5, "DayType", &(idx + 1).to_string());
-            write_day_working(s, day);
+            write_day_working(s, day, 5);
             s.push_str("        </WeekDay>\n");
         }
         for (e, from, to) in legacy {
@@ -2330,7 +2330,7 @@ fn write_calendar(s: &mut String, c: &Calendar) {
             tag(s, 5, "DayType", "0");
             tag(s, 5, "DayWorking", if e.day.working() { "1" } else { "0" });
             write_time_period(s, from, to);
-            write_working_times(s, &e.day);
+            write_working_times(s, &e.day, 5);
             s.push_str("        </WeekDay>\n");
         }
         s.push_str("      </WeekDays>\n");
@@ -2352,16 +2352,7 @@ fn write_work_weeks(s: &mut String, weeks: &[WorkWeek]) {
     s.push_str("      <WorkWeeks>\n");
     for work_week in weeks {
         s.push_str("        <WorkWeek>\n");
-        if work_week.from.is_some() || work_week.to.is_some() {
-            s.push_str("          <TimePeriod>\n");
-            if let Some(from) = work_week.from {
-                tag(s, 6, "FromDate", &from.to_mspdi());
-            }
-            if let Some(to) = work_week.to {
-                tag(s, 6, "ToDate", &to.to_mspdi());
-            }
-            s.push_str("          </TimePeriod>\n");
-        }
+        write_optional_time_period(s, work_week.from, work_week.to, 5);
         if let Some(name) = &work_week.name {
             tag(s, 5, "Name", name);
         }
@@ -2371,20 +2362,7 @@ fn write_work_weeks(s: &mut String, weeks: &[WorkWeek]) {
                 let Some(day) = day else { continue };
                 s.push_str("            <WeekDay>\n");
                 tag(s, 7, "DayType", &(idx + 1).to_string());
-                tag(s, 7, "DayWorking", flag(day.working()));
-                if day.working() {
-                    s.push_str("              <WorkingTimes>\n");
-                    for slot in &day.times {
-                        s.push_str("                <WorkingTime>");
-                        s.push_str(&format!(
-                            "<FromTime>{}</FromTime><ToTime>{}</ToTime>",
-                            min_to_clock(slot.from),
-                            min_to_clock(slot.to)
-                        ));
-                        s.push_str("</WorkingTime>\n");
-                    }
-                    s.push_str("              </WorkingTimes>\n");
-                }
+                write_day_working(s, day, 7);
                 s.push_str("            </WeekDay>\n");
             }
             s.push_str("          </WeekDays>\n");
@@ -2407,16 +2385,7 @@ fn write_exception(s: &mut String, e: &CalendarException) {
     if let Some(entered) = e.entered_by_occurrences {
         tag(s, 5, "EnteredByOccurrences", flag(entered));
     }
-    if e.from.is_some() || e.to.is_some() {
-        s.push_str("          <TimePeriod>\n");
-        if let Some(from) = e.from {
-            tag(s, 6, "FromDate", &from.to_mspdi());
-        }
-        if let Some(to) = e.to {
-            tag(s, 6, "ToDate", &to.to_mspdi());
-        }
-        s.push_str("          </TimePeriod>\n");
-    }
+    write_optional_time_period(s, e.from, e.to, 5);
     int(s, "Occurrences", e.occurrences);
     if let Some(name) = &e.name {
         tag(s, 5, "Name", name);
@@ -2428,31 +2397,55 @@ fn write_exception(s: &mut String, e: &CalendarException) {
     int(s, "MonthPosition", e.month_position);
     int(s, "Month", e.month);
     int(s, "MonthDay", e.month_day);
-    write_day_working(s, &e.day);
+    write_day_working(s, &e.day, 5);
     s.push_str("        </Exception>\n");
 }
 
 /// A legacy weekday's `TimePeriod`.
 fn write_time_period(s: &mut String, from: DateTime, to: DateTime) {
-    s.push_str("          <TimePeriod>\n");
-    tag(s, 6, "FromDate", &from.to_mspdi());
-    tag(s, 6, "ToDate", &to.to_mspdi());
-    s.push_str("          </TimePeriod>\n");
+    write_optional_time_period(s, Some(from), Some(to), 5);
+}
+
+fn write_optional_time_period(
+    s: &mut String,
+    from: Option<DateTime>,
+    to: Option<DateTime>,
+    depth: usize,
+) {
+    if from.is_none() && to.is_none() {
+        return;
+    }
+    let indent = "  ".repeat(depth);
+    s.push_str(&format!("{indent}<TimePeriod>\n"));
+    if let Some(from) = from {
+        tag(s, depth + 1, "FromDate", &from.to_mspdi());
+    }
+    if let Some(to) = to {
+        tag(s, depth + 1, "ToDate", &to.to_mspdi());
+    }
+    s.push_str(&format!("{indent}</TimePeriod>\n"));
 }
 
 /// `DayWorking`, then `WorkingTimes` when the day works.
-fn write_day_working(s: &mut String, day: &DayWorking) {
-    tag(s, 5, "DayWorking", if day.working() { "1" } else { "0" });
-    write_working_times(s, day);
+fn write_day_working(s: &mut String, day: &DayWorking, depth: usize) {
+    tag(
+        s,
+        depth,
+        "DayWorking",
+        if day.working() { "1" } else { "0" },
+    );
+    write_working_times(s, day, depth);
 }
 
-fn write_working_times(s: &mut String, day: &DayWorking) {
+fn write_working_times(s: &mut String, day: &DayWorking, depth: usize) {
     if !day.working() {
         return;
     }
-    s.push_str("          <WorkingTimes>\n");
+    let indent = "  ".repeat(depth);
+    let child_indent = "  ".repeat(depth + 1);
+    s.push_str(&format!("{indent}<WorkingTimes>\n"));
     for w in &day.times {
-        s.push_str("            <WorkingTime>");
+        s.push_str(&format!("{child_indent}<WorkingTime>"));
         s.push_str(&format!(
             "<FromTime>{}</FromTime><ToTime>{}</ToTime>",
             min_to_clock(w.from),
@@ -2460,7 +2453,7 @@ fn write_working_times(s: &mut String, day: &DayWorking) {
         ));
         s.push_str("</WorkingTime>\n");
     }
-    s.push_str("          </WorkingTimes>\n");
+    s.push_str(&format!("{indent}</WorkingTimes>\n"));
 }
 
 /// Write an element kept as read: a leaf as `<Name>text</Name>`, else its

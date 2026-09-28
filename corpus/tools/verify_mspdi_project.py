@@ -138,6 +138,8 @@ def read_work_weeks(path):
         rows = []
         for week in cal.findall("p:WorkWeeks/p:WorkWeek", NS):
             period = week.find("p:TimePeriod", NS)
+            first = text(period, "FromDate") if period is not None else None
+            last = text(period, "ToDate") if period is not None else None
             stated = {}
             for day in week.findall("p:WeekDays/p:WeekDay", NS):
                 day_type = int(text(day, "DayType"))
@@ -149,7 +151,8 @@ def read_work_weeks(path):
                                for slot in day.findall("p:WorkingTimes/p:WorkingTime", NS))
                 stated[day_type] = (working, shifts if working else ())
             rows.append((text(week, "Name", ""),
-                         text(period, "FromDate")[:10], text(period, "ToDate")[:10],
+                         first[:10] if first else None,
+                         last[:10] if last else None,
                          stated))
         out[text(cal, "Name")] = rows
     return out
@@ -179,8 +182,9 @@ def project_work_weeks(project, names):
                     if slot.Start not in (None, "", "0", 0):
                         shifts.append((shift_time(slot.Start), shift_time(slot.Finish)))
                 days[day_type] = (bool(day.Working), tuple(shifts))
-            rows.append((week.Name or "", when(week.Start)[:10],
-                         when(week.Finish)[:10], days))
+            first, last = when(week.Start), when(week.Finish)
+            rows.append((week.Name or "", first[:10] if first else None,
+                         last[:10] if last else None, days))
         out[name] = rows
     return out
 

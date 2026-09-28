@@ -18,8 +18,8 @@ Project, as is file 23's derived calendar (#83). Files 24 and 25 (calendar
 exceptions, #126) were verified against Project Professional 2024 (build
 16.0.17932.21000), as generated and as projcore's write_mspdi writes them, as
 was file 26 (percentage and elapsed lags, #104), whose plan and values come
-from Project itself (gen_mpp_lag_cases.py), and file 27 (manual summaries,
-    #124), and file 28 (alternate work weeks, #218).
+from Project itself (gen_mpp_lag_cases.py), file 27 (manual summaries, #124),
+and file 28 (alternate work weeks, #218).
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -996,8 +996,8 @@ def build():
             task(10, "Z", 10 * D, dt(2), dt(13, "17:00:00"), slack=4 * D, critical=False),
         ])))
 
-    # 28 — alternate work weeks (#218), from the Project 2024 probe in
-    # .workbench/review/probe.py. Each task uses an SNET date to isolate one
+    # 28 — alternate work weeks (#218), from the Project 2024 precedence
+    # probe documented in corpus/mspdi/README.md. Each task uses SNET to isolate one
     # calendar cell. The oracle below was checked against Project 2024;
     # Alice's Saturday start also proves inheritance of the base work week.
     summer = ("Summer", "2026-03-09", "2026-03-20", [
