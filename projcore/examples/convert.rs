@@ -46,6 +46,17 @@ fn output_bytes(proj: &projcore::Project, target: &Path) -> Result<Vec<u8>, Stri
     }
 }
 
+fn has_ext(path: &Path, ext: &str) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
+fn fail(what: &str, msg: &str) -> ! {
+    eprintln!("{what}: {msg}");
+    std::process::exit(1);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,15 +69,4 @@ mod tests {
         assert!(error.contains("media/unknown.bin") && error.contains("save as .xml"));
         assert!(output_bytes(&project, Path::new("copy.xml")).is_ok());
     }
-}
-
-fn has_ext(path: &Path, ext: &str) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
-}
-
-fn fail(what: &str, msg: &str) -> ! {
-    eprintln!("{what}: {msg}");
-    std::process::exit(1);
 }
