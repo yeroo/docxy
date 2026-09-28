@@ -64,7 +64,7 @@ fn sheet_pending_edit_commits_before_asking_and_is_undoable() {
     v.anchor = (2, 2);
     let before = v.edit_string(0, 0);
     v.redo.push(v.snapshot());
-    v.editing = Some("12345".into());
+    v.begin_cell_edit(Some("12345".into()));
     assert_eq!(
         close_step(&mut t, |t| {
             assert!(t.dirty);
@@ -207,7 +207,7 @@ fn pending_sheet(text: &str) -> DocTab {
         panic!()
     };
     v.sel = (0, 0);
-    v.editing = Some(text.into());
+    v.begin_cell_edit(Some(text.into()));
     assert!(!t.dirty);
     t
 }
@@ -562,6 +562,51 @@ fn untouched_editor_stays_unchanged_after_selection_moves() {
 }
 
 #[test]
+fn ending_editor_clears_its_seed_and_origin() {
+    let mut t = untouched_text_cell();
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    assert!(v.edit_seed.is_some());
+    assert!(v.edit_origin.is_some());
+    v.end_cell_edit();
+    assert!(v.editing.is_none());
+    assert!(v.edit_seed.is_none());
+    assert!(v.edit_origin.is_none());
+    v.begin_cell_edit(Some(String::new()));
+    assert!(v.edit_seed.is_none());
+    assert_eq!(v.edit_origin, Some((v.active, 0, 0)));
+}
+
+#[test]
+fn structural_edit_commits_the_open_editor_before_shifting_cells() {
+    use gridcore::sheet::CellValue;
+
+    for (op, moved_to) in [(StructOp::InsertRow, (2, 1)), (StructOp::InsertCol, (1, 2))] {
+        let mut t = tab(Kind::Xlsx);
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.sel = (1, 1); // B2, which holds the number 10 in basic.xlsx.
+        v.begin_cell_edit(None);
+        v.editing = Some("42".into());
+
+        v.structural_edit(op);
+        assert!(v.editing.is_none());
+        assert_eq!(v.undo.len(), 2);
+        assert_eq!(
+            v.sheet().cell(moved_to.0, moved_to.1).map(|c| &c.value),
+            Some(&CellValue::Number(42.0))
+        );
+        assert!(!v.commit_edit());
+        assert_ne!(
+            v.sheet().cell(1, 1).map(|c| &c.value),
+            Some(&CellValue::Number(42.0))
+        );
+    }
+}
+
+#[test]
 fn window_close_leaves_an_untouched_cell_editor_open_and_the_cell_intact() {
     let mut tabs = vec![
         untouched_text_cell(),
@@ -694,7 +739,7 @@ fn close_dialog_save_collapses_a_range_when_it_commits_a_changed_cell() {
         panic!()
     };
     v.anchor = (2, 2);
-    v.editing = Some("abc".into());
+    v.begin_cell_edit(Some("abc".into()));
     assert_eq!(
         close_step(&mut t, |_| Ok(CloseAnswer::Save)),
         CloseStep::Save
@@ -774,7 +819,7 @@ fn save_commits_a_changed_cell_editor_before_writing() {
             panic!()
         };
         v.anchor = (2, 2);
-        v.editing = Some(buffer.into());
+        v.begin_cell_edit(Some(buffer.into()));
         assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
             "in-place save asked"
         )));
@@ -805,7 +850,7 @@ fn preparing_a_changed_cell_for_save_marks_dirty_and_collapses_selection() {
         panic!()
     };
     v.anchor = (2, 2);
-    v.editing = Some("abc".into());
+    v.begin_cell_edit(Some("abc".into()));
     prepare_sheet_save(&mut t);
     assert!(t.dirty);
     let Surface::Sheet(v) = &t.surface else {

@@ -11,3 +11,14 @@ test f2 enter on an untouched cell changes nothing
   assert dirty is false
   assert sel is A2
   assert cells unchanged
+
+# Escape must clear the old seed before type-to-replace opens a fresh editor.
+test f2 escape then typing the same text still commits
+  open copy:../fixtures/basic.xlsx
+  click A1
+  key f2
+  key escape
+  type Region
+  key enter
+  assert dirty is true
+  assert sel is A2
