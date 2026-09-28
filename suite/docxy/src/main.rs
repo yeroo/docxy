@@ -1623,6 +1623,52 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
     }
 }
 
+/// Decode Markdown without replacing characters that Save would write back.
+/// A BOM identifies UTF-16; without one, Markdown must be UTF-8 text.
+fn decode_markdown(bytes: &[u8]) -> Result<(String, Option<&'static str>), String> {
+    let utf16 = bytes
+        .strip_prefix(&[0xFF, 0xFE])
+        .map(|text| (text, true))
+        .or_else(|| bytes.strip_prefix(&[0xFE, 0xFF]).map(|text| (text, false)));
+    let decoded = if let Some(text) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
+        (
+            String::from_utf8(text.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
+            None,
+        )
+    } else if let Some((text, little_endian)) = utf16 {
+        if text.len() % 2 != 0 {
+            return Err("invalid UTF-16 text: odd byte count".into());
+        }
+        let (pairs, rest) = text.as_chunks::<2>();
+        debug_assert!(rest.is_empty());
+        let units = pairs.iter().map(|&pair| {
+            if little_endian {
+                u16::from_le_bytes(pair)
+            } else {
+                u16::from_be_bytes(pair)
+            }
+        });
+        let decoded = char::decode_utf16(units)
+            .collect::<Result<String, _>>()
+            .map_err(|e| format!("invalid UTF-16 text: {e}"))?;
+        (decoded, Some("UTF-16"))
+    } else {
+        // ASCII UTF-16 without a BOM is valid UTF-8 bytewise, but includes NULs.
+        if bytes.contains(&0) {
+            return Err("unsupported text encoding (contains NUL bytes)".into());
+        }
+        (
+            String::from_utf8(bytes.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
+            None,
+        )
+    };
+    // UTF-32LE shares the UTF-16LE BOM and decodes to NUL-interleaved text.
+    if decoded.0.contains('\0') {
+        return Err("unsupported text encoding (contains NUL characters)".into());
+    }
+    Ok(decoded)
+}
+
 fn doc_from_path(path: &PathBuf) -> Loaded {
     if html_bundle::doc_target(path, false) == html_bundle::DocTarget::Html {
         return match html_bundle::open(path) {
@@ -1643,15 +1689,24 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
         };
     }
     match std::fs::read(path) {
-        Ok(bytes) if is_markdown_path(path) => Loaded {
-            doc: docxcore::markdown::from_markdown(&String::from_utf8_lossy(&bytes)),
-            comments: vec![],
-            notes: vec![],
-            pkg: None,
-            markdown: true,
-            status: "loaded (markdown)".into(),
-            bundle_html: None,
-            load_failed: false,
+        Ok(bytes) if is_markdown_path(path) => match decode_markdown(&bytes) {
+            Ok((text, encoding)) => Loaded {
+                doc: docxcore::markdown::from_markdown(&text),
+                comments: vec![],
+                notes: vec![],
+                pkg: None,
+                markdown: true,
+                status: match encoding {
+                    Some(name) => format!("loaded (markdown, {name}; saves as UTF-8)").into(),
+                    None => "loaded (markdown)".into(),
+                },
+                bundle_html: None,
+                load_failed: false,
+            },
+            Err(e) => Loaded {
+                markdown: true,
+                ..Loaded::empty(format!("load error: {e}"))
+            },
         },
         // A 0-byte file (Explorer's "New → Word Document") has nothing to
         // lose: it opens as a new document that saves over it.
@@ -4113,7 +4168,14 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 // is asked directly (a missing one has nothing to lose, and
                 // the sidecar holds real content).
                 l.load_failed = match t.load_failed {
-                    Some(failed) => failed,
+                    // An older build could save a lossy Markdown sidecar with
+                    // `Some(false)`. Recheck its source before allowing Save.
+                    Some(failed) => {
+                        failed
+                            || path.as_ref().is_some_and(|p| {
+                                is_markdown_path(p) && p.exists() && doc_from_path(p).load_failed
+                            })
+                    }
                     None => path
                         .as_ref()
                         .is_some_and(|p| p.exists() && doc_from_path(p).load_failed),
@@ -12738,6 +12800,141 @@ mod load_failed_save_tests {
         tab
     }
 
+    fn utf16_bom(text: &str, little_endian: bool) -> Vec<u8> {
+        let mut bytes = if little_endian {
+            vec![0xFF, 0xFE]
+        } else {
+            vec![0xFE, 0xFF]
+        };
+        for unit in text.encode_utf16() {
+            let pair = if little_endian {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            };
+            bytes.extend_from_slice(&pair);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_non_utf8_markdown_file_refuses_save_in_place() {
+        let dir = temp("legacy-md");
+        let path = dir.join("broken.md");
+        let original = b"caf\xE9\n";
+        std::fs::write(&path, original).unwrap();
+        let loaded = doc_from_path(&path);
+        assert!(loaded.load_failed);
+        assert!(loaded.status.starts_with("load error: not UTF-8 text"));
+
+        let mut tab = refused_in_place(&path);
+        let copy = dir.join("copy.md");
+        assert!(save_doc_tab(&mut tab, Some(copy.clone())), "{}", tab.status);
+        assert!(!tab.load_failed && !tab.dirty);
+        assert_eq!(tab.path.as_deref(), Some(copy.as_path()));
+        assert!(!tab_from_path(&copy).load_failed);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bomless_utf16_markdown_refuses_save_in_place() {
+        let dir = temp("bomless-utf16-md");
+        for (name, little_endian) in [("le.md", true), ("be.md", false)] {
+            let path = dir.join(name);
+            let bytes = utf16_bom("# Title\n\nCafe\n", little_endian);
+            std::fs::write(&path, &bytes[2..]).unwrap();
+            let loaded = doc_from_path(&path);
+            assert!(loaded.load_failed);
+            assert_eq!(
+                loaded.status.as_ref(),
+                "load error: unsupported text encoding (contains NUL bytes)"
+            );
+            refused_in_place(&path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf32le_markdown_refuses_save_in_place() {
+        let dir = temp("utf32le-md");
+        for (name, text) in [("short.md", "a"), ("heading.md", "# Title\n")] {
+            let path = dir.join(name);
+            let mut bytes = vec![0xFF, 0xFE, 0x00, 0x00];
+            for c in text.chars() {
+                bytes.extend_from_slice(&(c as u32).to_le_bytes());
+            }
+            std::fs::write(&path, bytes).unwrap();
+            let loaded = doc_from_path(&path);
+            assert!(loaded.load_failed);
+            assert_eq!(
+                loaded.status.as_ref(),
+                "load error: unsupported text encoding (contains NUL characters)"
+            );
+            refused_in_place(&path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn markdown_with_a_bom_loads_its_text() {
+        let dir = temp("bom-md");
+        let text = "# Title\n\ncaf\u{e9}\n";
+        let mut utf8_bom = vec![0xEF, 0xBB, 0xBF];
+        utf8_bom.extend_from_slice(text.as_bytes());
+        for (name, bytes, status) in [
+            ("utf8.md", utf8_bom, "loaded (markdown)"),
+            (
+                "utf16le.md",
+                utf16_bom(text, true),
+                "loaded (markdown, UTF-16; saves as UTF-8)",
+            ),
+            (
+                "utf16be.md",
+                utf16_bom(text, false),
+                "loaded (markdown, UTF-16; saves as UTF-8)",
+            ),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let loaded = doc_from_path(&path);
+            assert!(!loaded.load_failed, "{name}: {}", loaded.status);
+            assert_eq!(loaded.status.as_ref(), status);
+            let Block::Paragraph(heading) = &loaded.doc.body[0] else {
+                panic!("{name}: first block is not a paragraph");
+            };
+            assert_eq!(heading.props.heading_level, Some(1));
+            assert_eq!(heading.plain_text(), "Title");
+            let Block::Paragraph(body) = &loaded.doc.body[1] else {
+                panic!("{name}: second block is not a paragraph");
+            };
+            assert_eq!(body.plain_text(), "caf\u{e9}");
+            assert!(!loaded.doc.plain_text().contains('\u{feff}'));
+
+            if name.starts_with("utf16") {
+                let mut tab = tab_from_path(&path);
+                assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
+                let saved = std::fs::read(&path).unwrap();
+                assert!(!saved.starts_with(&[0xFF, 0xFE]));
+                assert!(!saved.starts_with(&[0xFE, 0xFF]));
+                assert!(std::str::from_utf8(&saved).unwrap().contains("caf\u{e9}"));
+            }
+        }
+
+        for (name, bytes) in [
+            ("odd.md", vec![0xFF, 0xFE, 0x23]),
+            ("surrogate.md", vec![0xFE, 0xFF, 0xD8, 0x00]),
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            let loaded = doc_from_path(&path);
+            assert!(loaded.load_failed);
+            assert!(loaded.status.starts_with("load error: invalid UTF-16 text"));
+            refused_in_place(&path);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn only_a_load_failed_tab_saving_onto_its_own_file_is_refused() {
         let dir = temp("helper");
@@ -12844,6 +13041,9 @@ mod load_failed_save_tests {
             let mut tab = tab_from_path(&path);
             assert!(!tab.load_failed, "{}: {}", path.display(), tab.status);
             assert!(!tab.status.starts_with("load error"), "{}", tab.status);
+            if path.extension().is_some_and(|ext| ext == "md") {
+                assert_eq!(tab.status.as_ref(), "loaded (markdown)");
+            }
             tab.dirty = true;
             assert!(save_doc_tab(&mut tab, None), "{}", tab.status);
         }
