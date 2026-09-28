@@ -1623,52 +1623,6 @@ fn load_bytes(bytes: &[u8]) -> Loaded {
     }
 }
 
-/// Decode Markdown without replacing characters that Save would write back.
-/// A BOM identifies UTF-16; without one, Markdown must be UTF-8 text.
-fn decode_markdown(bytes: &[u8]) -> Result<(String, Option<&'static str>), String> {
-    let utf16 = bytes
-        .strip_prefix(&[0xFF, 0xFE])
-        .map(|text| (text, true))
-        .or_else(|| bytes.strip_prefix(&[0xFE, 0xFF]).map(|text| (text, false)));
-    let decoded = if let Some(text) = bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]) {
-        (
-            String::from_utf8(text.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
-            None,
-        )
-    } else if let Some((text, little_endian)) = utf16 {
-        if text.len() % 2 != 0 {
-            return Err("invalid UTF-16 text: odd byte count".into());
-        }
-        let (pairs, rest) = text.as_chunks::<2>();
-        debug_assert!(rest.is_empty());
-        let units = pairs.iter().map(|&pair| {
-            if little_endian {
-                u16::from_le_bytes(pair)
-            } else {
-                u16::from_be_bytes(pair)
-            }
-        });
-        let decoded = char::decode_utf16(units)
-            .collect::<Result<String, _>>()
-            .map_err(|e| format!("invalid UTF-16 text: {e}"))?;
-        (decoded, Some("UTF-16"))
-    } else {
-        // ASCII UTF-16 without a BOM is valid UTF-8 bytewise, but includes NULs.
-        if bytes.contains(&0) {
-            return Err("unsupported text encoding (contains NUL bytes)".into());
-        }
-        (
-            String::from_utf8(bytes.to_vec()).map_err(|e| format!("not UTF-8 text: {e}"))?,
-            None,
-        )
-    };
-    // UTF-32LE shares the UTF-16LE BOM and decodes to NUL-interleaved text.
-    if decoded.0.contains('\0') {
-        return Err("unsupported text encoding (contains NUL characters)".into());
-    }
-    Ok(decoded)
-}
-
 fn doc_from_path(path: &PathBuf) -> Loaded {
     if html_bundle::doc_target(path, false) == html_bundle::DocTarget::Html {
         return match html_bundle::open(path) {
@@ -1689,7 +1643,7 @@ fn doc_from_path(path: &PathBuf) -> Loaded {
         };
     }
     match std::fs::read(path) {
-        Ok(bytes) if is_markdown_path(path) => match decode_markdown(&bytes) {
+        Ok(bytes) if is_markdown_path(path) => match docxcore::markdown::decode_markdown(&bytes) {
             Ok((text, encoding)) => Loaded {
                 doc: docxcore::markdown::from_markdown(&text),
                 comments: vec![],
