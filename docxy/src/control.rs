@@ -134,7 +134,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
         }
         "doc.reload" => {
             let p = app.path.clone();
-            app.open_path(Path::new(&p));
+            app.open_path(Path::new(&p))?;
             Ok(path_info(app))
         }
         "doc.open" => {
@@ -142,7 +142,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
                 .get_str("path")
                 .ok_or("doc.open needs a 'path' string")?
                 .to_string();
-            app.open_path(Path::new(&p));
+            app.open_path(Path::new(&p))?;
             Ok(path_info(app))
         }
         other => Err(format!("unknown verb '{other}'")),
@@ -1073,6 +1073,34 @@ mod tests {
 
     fn app_with(paras: &[&str]) -> App {
         App::new(new_package(doc_with(paras)), "ctl-test.docx", false)
+    }
+
+    #[test]
+    fn markdown_reload_and_open_report_decode_failure_without_replacing_document() {
+        let dir = std::env::temp_dir().join(format!("docxy-control-md-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("note.md");
+        std::fs::write(&path, b"# Original\n").unwrap();
+        let path_text = path.to_str().unwrap();
+        let input = crate::load_input(path_text).unwrap();
+        let mut app = App::new(input.pkg, path_text, false);
+        let original = app.editor.doc.plain_text();
+
+        std::fs::write(&path, b"caf\xE9\n").unwrap();
+        for (verb, verb_args) in [
+            ("doc.reload", Json::Null),
+            (
+                "doc.open",
+                args(vec![("path", Json::Str(path_text.to_string()))]),
+            ),
+        ] {
+            let error = dispatch(&mut app, verb, &verb_args).unwrap_err();
+            assert!(error.contains("not UTF-8 text"), "{verb}: {error}");
+            assert_eq!(app.path, path_text);
+            assert_eq!(app.editor.doc.plain_text(), original);
+            assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\n");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     fn revision_app() -> App {

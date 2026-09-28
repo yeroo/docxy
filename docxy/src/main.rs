@@ -1911,7 +1911,7 @@ impl App {
                 false
             }
             BackstageEvent::Open(p) => {
-                self.open_path(&p);
+                let _ = self.open_path(&p);
                 self.backstage = None;
                 false
             }
@@ -2122,7 +2122,7 @@ impl App {
     }
 
     /// Replace the open document with one loaded from `path` (Markdown or `.docx`).
-    fn open_path(&mut self, path: &std::path::Path) {
+    fn open_path(&mut self, path: &std::path::Path) -> Result<(), String> {
         let p = path.display().to_string();
         match load_input(&p) {
             Ok(input) => {
@@ -2134,8 +2134,12 @@ impl App {
                     Some(n) => format!("opened {p} — {n}"),
                     None => format!("opened {p}"),
                 });
+                Ok(())
             }
-            Err(e) => self.status = Some(format!("cannot open {p}: {e}")),
+            Err(e) => {
+                self.status = Some(format!("cannot open {p}: {e}"));
+                Err(e)
+            }
         }
     }
 
@@ -6948,6 +6952,10 @@ mod tests {
         path
     }
 
+    fn remove_markdown_file(path: &std::path::Path) {
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     #[test]
     fn markdown_load_refuses_undecodable_bytes_without_changing_file() {
         for (tag, bytes, expected) in [
@@ -6979,7 +6987,7 @@ mod tests {
             assert!(error.contains(path.to_str().unwrap()), "{error}");
             assert!(error.contains(expected), "{tag}: {error}");
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
-            std::fs::remove_file(&path).unwrap();
+            remove_markdown_file(&path);
         }
     }
 
@@ -7026,7 +7034,7 @@ mod tests {
                 !input.pkg.document.plain_text().contains('\u{feff}'),
                 "{tag}"
             );
-            std::fs::remove_file(&path).unwrap();
+            remove_markdown_file(&path);
         }
     }
 
@@ -7036,7 +7044,7 @@ mod tests {
         let mut app = app_with(&["keep this document"]);
         let prior_path = app.path.clone();
         let prior_text = app.editor.doc.plain_text();
-        app.open_path(&path);
+        app.open_path(&path).unwrap_err();
         assert_eq!(app.path, prior_path);
         assert_eq!(app.editor.doc.plain_text(), prior_text);
         let expected = format!(
@@ -7046,7 +7054,7 @@ mod tests {
         );
         assert!(app.status.as_deref().unwrap().starts_with(&expected));
         assert_eq!(std::fs::read(&path).unwrap(), b"caf\xE9\n");
-        std::fs::remove_file(&path).unwrap();
+        remove_markdown_file(&path);
     }
 
     #[test]
@@ -7071,7 +7079,7 @@ mod tests {
             Some("UTF-16 Markdown; saves as UTF-8")
         );
         let mut app = app_with(&["before"]);
-        app.open_path(&path);
+        app.open_path(&path).unwrap();
         assert_eq!(
             app.status.as_deref(),
             Some(
@@ -7082,7 +7090,7 @@ mod tests {
                 .as_str()
             )
         );
-        std::fs::remove_file(&path).unwrap();
+        remove_markdown_file(&path);
 
         let path = markdown_file("notice-utf8", b"# Title\n");
         let input = load_input(path.to_str().unwrap()).unwrap();
@@ -7096,12 +7104,12 @@ mod tests {
         );
         assert!(app.status.is_none());
         let mut app = app_with(&["before"]);
-        app.open_path(&path);
+        app.open_path(&path).unwrap();
         assert_eq!(
             app.status.as_deref(),
             Some(format!("opened {}", path.display()).as_str())
         );
-        std::fs::remove_file(&path).unwrap();
+        remove_markdown_file(&path);
     }
 
     #[test]
@@ -11100,7 +11108,7 @@ mod html_bundle_tests {
 
     fn open_app(path: &std::path::Path) -> App {
         let mut app = App::new(new_package(Document::default()), "untitled.docx", false);
-        app.open_path(path);
+        app.open_path(path).unwrap();
         app
     }
 
@@ -11246,6 +11254,32 @@ mod html_bundle_tests {
     }
 
     #[test]
+    fn startup_bundle_retains_html_and_changed_original_warning() {
+        let dir = temp("startup-sibling");
+        let path = dir.join("sample.docx.html");
+        std::fs::write(&path, bundle_of(&sample_docx(), "sample.docx")).unwrap();
+        std::fs::write(dir.join("sample.docx"), b"edited elsewhere").unwrap();
+        let input = load_input(path.to_str().unwrap()).unwrap();
+        let app = startup_app(
+            input.pkg,
+            path.to_str().unwrap(),
+            input.format,
+            input.bundle,
+            input.encoding,
+            false,
+        );
+        assert_eq!(app.format, DocFormat::Html);
+        assert!(app.bundle_html.is_some());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("sample.docx changed since export")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn renamed_bundles_open_and_save_as_bundles() {
         for name in ["sample.docx (1).html", "sample.docx(1).html", "notes.html"] {
             let dir = temp("renamed");
@@ -11279,7 +11313,7 @@ mod html_bundle_tests {
         let err = load_input(&path.to_string_lossy()).err().unwrap();
         assert!(err.contains("not a docxy editable HTML file"), "{err}");
         let mut app = App::new(new_package(Document::default()), "untitled.docx", false);
-        app.open_path(&path);
+        app.open_path(&path).unwrap_err();
         assert!(
             app.status
                 .clone()
