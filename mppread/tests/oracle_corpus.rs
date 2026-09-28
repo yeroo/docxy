@@ -19,6 +19,28 @@ fn null_uids(xml: &str) -> std::collections::HashSet<i32> {
     out
 }
 
+fn duration_formats(xml: &str) -> std::collections::HashMap<i32, i32> {
+    let mut out = std::collections::HashMap::new();
+    for after_start in xml.split("<Task>").skip(1) {
+        let Some((task, _)) = after_start.split_once("</Task>") else {
+            continue;
+        };
+        let direct = task.split("<Baseline>").next().unwrap();
+        let uid = direct
+            .split_once("<UID>")
+            .and_then(|(_, s)| s.split_once("</UID>"))
+            .and_then(|(s, _)| s.trim().parse::<i32>().ok());
+        let format = direct
+            .split_once("<DurationFormat>")
+            .and_then(|(_, s)| s.split_once("</DurationFormat>"))
+            .and_then(|(s, _)| s.trim().parse::<i32>().ok());
+        if let (Some(uid), Some(format)) = (uid, format) {
+            out.insert(uid, format);
+        }
+    }
+    out
+}
+
 fn pairs(dir: &Path, suffix: &str) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -135,6 +157,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     let xml_text = std::fs::read_to_string(xml).unwrap();
     let oracle = projcore::mspdi::read_mspdi(&xml_text).unwrap();
     let nulls = null_uids(&xml_text);
+    let formats = duration_formats(&xml_text);
     let decoded = match mppread::mpp::decode_tasks(&bytes) {
         Ok(tasks) => tasks,
         Err(error) if may_refuse => {
@@ -254,6 +277,35 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     }
     let imported = mppread::project::project_from_mpp(&bytes)
         .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
+    if xml_text.contains("<Calendars>") {
+        let fields =
+            |c: &projcore::Calendar| (c.uid, c.name.clone(), c.base_calendar_uid, c.week.clone());
+        let expected_calendars: Vec<_> = oracle
+            .calendars
+            .iter()
+            .filter(|cal| {
+                // MPXJ adds an implicit resource-0 calendar omitted by Project XML.
+                !(source == Oracle::Mpxj
+                    && cal.name == "Unnamed Resource"
+                    && cal.base_calendar_uid.is_some()
+                    && cal.week.iter().all(Option::is_none)
+                    && !imported.calendars.iter().any(|got| got.uid == cal.uid))
+            })
+            .map(fields)
+            .collect();
+        assert_eq!(
+            imported.calendars.iter().map(fields).collect::<Vec<_>>(),
+            expected_calendars,
+            "{}: calendars",
+            mpp.display()
+        );
+        assert_eq!(
+            imported.default_calendar_uid,
+            oracle.default_calendar_uid,
+            "{}: default calendar UID",
+            mpp.display()
+        );
+    }
     assert_eq!(
         imported.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
         actual.iter().map(|t| t.id as i32).collect::<Vec<_>>(),
@@ -275,6 +327,108 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 "{}: uid {} imported manual duration",
                 mpp.display(),
                 e.uid
+            );
+        }
+    }
+    if source == Oracle::Project {
+        let scheduled = projcore::schedule::schedule(&imported);
+        let project_cal = imported.project_calendar();
+        let exceptions = &oracle
+            .calendar(oracle.default_calendar_uid)
+            .unwrap()
+            .exceptions;
+        let mut selected = 0usize;
+        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, own calendar, exception, nonworking start
+        for (task, expected_task) in imported.tasks.iter().zip(&expected) {
+            if task.summary || task.manual || expected_task.milestone {
+                continue;
+            }
+            // Splits are not decoded from .mpp; this known task has a work
+            // interruption that makes its duration shorter than its span.
+            if task.uid == 23 && expected_task.name == "S13 split task" {
+                dropped[0] += 1;
+                continue;
+            }
+            if task.uid == 55 && expected_task.name == "S43 delayed start" {
+                // Project's delayed assignment makes this task's Duration
+                // shorter than the working span; assignments are not imported.
+                dropped[1] += 1;
+                continue;
+            }
+            if formats
+                .get(&task.uid)
+                .is_some_and(|format| matches!(format & !32, 4 | 6 | 8 | 10 | 12))
+            {
+                dropped[2] += 1;
+                continue;
+            }
+            if expected_task
+                .calendar_uid
+                .is_some_and(|uid| uid >= 0 && uid != oracle.default_calendar_uid)
+            {
+                dropped[3] += 1;
+                continue;
+            }
+            let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
+            if exceptions.iter().any(|exception| {
+                exception.from.zip(exception.to).is_some_and(|(from, to)| {
+                    from.day_number() <= finish.day_number()
+                        && to.day_number() >= start.day_number()
+                })
+            }) {
+                dropped[4] += 1;
+                continue;
+            }
+            selected += 1;
+            assert_eq!(
+                task.duration_min,
+                expected_task.duration_min,
+                "{}: calendar duration UID {}",
+                mpp.display(),
+                task.uid
+            );
+            let working_start = project_cal
+                .day(start.day_number())
+                .iter()
+                .any(|slot| slot.from <= start.minute_of_day() && start.minute_of_day() < slot.to);
+            if !working_start {
+                // Project can retain a MustStartOn timestamp before work starts;
+                // projcore moves the scheduled start to the first working slot.
+                dropped[5] += 1;
+                continue;
+            }
+            let result = scheduled.get(task.uid).unwrap();
+            assert_eq!(
+                (result.early_start, result.early_finish),
+                (task.stored_start.unwrap(), task.stored_finish.unwrap()),
+                "{}: scheduled UID {}",
+                mpp.display(),
+                task.uid
+            );
+        }
+        if dropped.iter().any(|&n| n > 0) {
+            eprintln!(
+                "{}: selected {selected}, exclusions split/delayed-assignment/elapsed/task-calendar/exception/nonworking-start = {dropped:?}",
+                mpp.display()
+            );
+        }
+        let stem = mpp.file_stem().unwrap().to_string_lossy();
+        if [
+            "31-calendar-hours",
+            "32-calendar-6day",
+            "38-resource-calendar",
+        ]
+        .contains(&stem.as_ref())
+            || stem.starts_with("c1-")
+            || stem.starts_with("c2-")
+            || stem.starts_with("c3-")
+            || stem.starts_with("c4-")
+            || stem.starts_with("c5-")
+        {
+            assert!(
+                selected > 0,
+                "{}: no selected calendar duration oracle",
+                mpp.display()
             );
         }
     }
@@ -361,5 +515,21 @@ fn project_2024_oracles() {
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Mpxj);
         }
+    }
+    let calendar = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/calendar");
+    if calendar.exists() {
+        let cases = pairs(&calendar, "");
+        assert_eq!(cases.len(), 5);
+        assert_eq!(std::fs::read_dir(&calendar).unwrap().flatten().count(), 10);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+        }
+        let c1 = std::fs::read(calendar.join("c1-default-night.mpp")).unwrap();
+        assert_ne!(
+            mppread::project::project_from_mpp(&c1)
+                .unwrap()
+                .default_calendar_uid,
+            1
+        );
     }
 }

@@ -8,12 +8,13 @@
 //! - [`cfb`] — the OLE2 Compound File Binary container (MS-CFB).
 //! - [`oleps`] — OLE property sets (MS-OLEPS), the typed key/value streams.
 //! - [`mpp`] — [`mpp::read_mpp`] reads metadata; [`mpp::decode_tasks`] reads
-//!   task tables only after their counted indexes and fields validate.
+//!   task and calendar tables only after their counted indexes and fields validate.
 //!
 //! - [`project`] — convert decoded metadata, task dates, outline levels,
-//!   predecessor links and task modes into a `projcore` project for the
+//!   predecessor links, task modes and calendars into a `projcore` project for the
 //!   terminal and suite hosts.
 
+mod caldecode;
 pub mod cfb;
 mod fixedmeta;
 pub mod mpp;

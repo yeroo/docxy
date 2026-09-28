@@ -118,6 +118,18 @@ the same way:
 python corpus/tools/gen_mpp_manual_cases.py
 ```
 
+The calendar decoder has five Project-written probes in `calendar/`: a non-UID-1
+default base calendar, edited base hours, a resource calendar with two weekday
+overrides, a Unicode calendar name with five periods, and a derived 24-hour day.
+Generate them with a licensed Project desktop install and pywin32:
+
+```powershell
+python corpus/tools/gen_mpp_calendar_cases.py
+```
+
+The binary and XML pairs stay git-ignored. The oracle test checks their exact
+calendar UIDs, names, base links, weekdays and default calendar UID when present.
+
 It also checks six task-progress cases in `progress/` when present (see
 Known decode gaps). It also checks two link-lag cases in `lag/` when present
 ([#104](https://github.com/yeroo/docxy/issues/104)): percentage, elapsed and
