@@ -20,7 +20,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-/// The package's type map gives our regenerated main part its own content type.
 const CONTENT_TYPES_PART: &str = "[Content_Types].xml";
 const PROJECT_CONTENT_TYPE: &str = "application/vnd.yppx.project+xml";
 const CONTENT_TYPES_START: &str = concat!(
@@ -28,11 +27,7 @@ const CONTENT_TYPES_START: &str = concat!(
     "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">",
     "<Default Extension=\"xml\" ContentType=\"",
 );
-const CONTENT_TYPES_END: &str = "\"/></Types>\n";
-
-fn base_content_types() -> String {
-    format!("{CONTENT_TYPES_START}{PROJECT_CONTENT_TYPE}{CONTENT_TYPES_END}")
-}
+const CONTENT_TYPES_END: &str = "</Types>\n";
 
 /// Name of the main document part inside the package.
 pub const MAIN_PART: &str = "project.xml";
@@ -55,37 +50,11 @@ pub fn save_target(path: &Path) -> Result<PathBuf, String> {
 
 /// Serialize a [`Project`] into a `.yppx` package (bytes of a ZIP container).
 pub fn write_yppx(proj: &Project) -> Vec<u8> {
-    let mut content_types = base_content_types();
-    if !proj.package.defaults.is_empty() || !proj.package.overrides.is_empty() {
-        let insertion = content_types.find("</Types>").unwrap();
-        let mut extra = String::new();
-        for (extension, content_type) in &proj.package.defaults {
-            if extension.eq_ignore_ascii_case("xml") {
-                continue;
-            }
-            extra.push_str(&format!(
-                "<Default Extension=\"{}\" ContentType=\"{}\"/>",
-                escape_attr(extension),
-                escape_attr(content_type)
-            ));
-        }
-        for (part_name, content_type) in &proj.package.overrides {
-            if part_name
-                .trim_start_matches('/')
-                .eq_ignore_ascii_case(MAIN_PART)
-            {
-                continue;
-            }
-            extra.push_str(&format!(
-                "<Override PartName=\"{}\" ContentType=\"{}\"/>",
-                escape_attr(part_name),
-                escape_attr(content_type)
-            ));
-        }
-        content_types.insert_str(insertion, &extra);
-    }
     let mut entries = vec![
-        (CONTENT_TYPES_PART.to_string(), content_types.into_bytes()),
+        (
+            CONTENT_TYPES_PART.to_string(),
+            build_content_types(&proj.package).into_bytes(),
+        ),
         (MAIN_PART.to_string(), write_mspdi(proj).into_bytes()),
     ];
     let mut seen = HashSet::from([
@@ -98,6 +67,37 @@ pub fn write_yppx(proj: &Project) -> Vec<u8> {
         }
     }
     write_zip(&entries)
+}
+
+/// XML parts default to the project type, and the main part is `/project.xml`.
+/// Insert retained declarations before closing the map.
+fn build_content_types(package: &PackageParts) -> String {
+    let mut content_types = format!("{CONTENT_TYPES_START}{PROJECT_CONTENT_TYPE}\"/>");
+    for (extension, content_type) in &package.defaults {
+        if extension.eq_ignore_ascii_case("xml") {
+            continue;
+        }
+        content_types.push_str(&format!(
+            "<Default Extension=\"{}\" ContentType=\"{}\"/>",
+            escape_attr(extension),
+            escape_attr(content_type)
+        ));
+    }
+    for (part_name, content_type) in &package.overrides {
+        if part_name
+            .trim_start_matches('/')
+            .eq_ignore_ascii_case(MAIN_PART)
+        {
+            continue;
+        }
+        content_types.push_str(&format!(
+            "<Override PartName=\"{}\" ContentType=\"{}\"/>",
+            escape_attr(part_name),
+            escape_attr(content_type)
+        ));
+    }
+    content_types.push_str(CONTENT_TYPES_END);
+    content_types
 }
 
 fn escape_attr(value: &str) -> String {
@@ -151,7 +151,7 @@ fn read_content_types(xml: &str, package: &mut PackageParts) -> Option<()> {
     loop {
         match parser.next() {
             Event::Start => {
-                let name = local_name(parser.name()).to_string();
+                let name = local_name(parser.name());
                 if stack.is_empty() && (root_closed || name != "Types") {
                     return None;
                 }
@@ -172,10 +172,10 @@ fn read_content_types(xml: &str, package: &mut PackageParts) -> Option<()> {
                         overrides.push((part, kind));
                     }
                 }
-                stack.push(name);
+                stack.push(parser.name().to_string());
             }
             Event::End => {
-                if stack.pop().as_deref() != Some(local_name(parser.name())) {
+                if stack.pop().as_deref() != Some(parser.name()) {
                     return None;
                 }
                 if stack.is_empty() {
@@ -224,7 +224,10 @@ fn read_content_types(xml: &str, package: &mut PackageParts) -> Option<()> {
 pub fn read_yppx(bytes: &[u8]) -> Result<Project, String> {
     let zip = ZipArchive::open(bytes).ok_or("not a valid .yppx (ZIP) container")?;
     let part = zip
-        .read(MAIN_PART)
+        .entries()
+        .iter()
+        .find(|entry| entry.name.eq_ignore_ascii_case(MAIN_PART))
+        .and_then(|entry| zip.extract(entry))
         .ok_or_else(|| format!(".yppx package is missing its {MAIN_PART} part"))?;
     let xml = String::from_utf8(part).map_err(|_| format!("{MAIN_PART} is not valid UTF-8"))?;
     let mut project = read_mspdi(&xml)?;
@@ -260,6 +263,8 @@ mod tests {
     use super::*;
     use crate::datetime::DateTime;
     use crate::model::*;
+
+    const ORIGINAL_CONTENT_TYPES: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\"><Default Extension=\"xml\" ContentType=\"application/vnd.yppx.project+xml\"/></Types>\n";
 
     #[test]
     fn save_targets_add_native_extension_and_reject_lossy_formats() {
@@ -327,7 +332,7 @@ mod tests {
         assert_eq!(zip.entries().len(), 2);
         assert_eq!(
             zip.read("[Content_Types].xml").unwrap(),
-            base_content_types().as_bytes()
+            ORIGINAL_CONTENT_TYPES.as_bytes()
         );
     }
 
@@ -421,7 +426,7 @@ mod tests {
         assert_eq!(zip.read("views.xml").unwrap(), b"<views/>");
         assert_eq!(
             zip.read("[Content_Types].xml").unwrap(),
-            base_content_types().as_bytes()
+            ORIGINAL_CONTENT_TYPES.as_bytes()
         );
     }
 
@@ -472,6 +477,62 @@ mod tests {
     }
 
     #[test]
+    fn utf8_bom_content_type_map_keeps_overrides() {
+        let mut map = vec![0xef, 0xbb, 0xbf];
+        map.extend_from_slice(b"<Types><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></Types>");
+        let source = write_zip(&[
+            (CONTENT_TYPES_PART.into(), map),
+            (MAIN_PART.into(), write_mspdi(&sample()).into_bytes()),
+            ("views.xml".into(), b"<views/>".to_vec()),
+        ]);
+        let output = write_yppx(&read_yppx(&source).unwrap());
+        let types = String::from_utf8(
+            ZipArchive::open(&output)
+                .unwrap()
+                .read(CONTENT_TYPES_PART)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            types.contains(
+                "<Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/>"
+            )
+        );
+    }
+
+    #[test]
+    fn uppercase_main_part_is_read_and_rewritten() {
+        let source = write_zip(&[
+            (
+                CONTENT_TYPES_PART.into(),
+                ORIGINAL_CONTENT_TYPES.as_bytes().to_vec(),
+            ),
+            ("PROJECT.XML".into(), write_mspdi(&sample()).into_bytes()),
+        ]);
+        let project = read_yppx(&source).unwrap();
+        assert_eq!(project.name, "Demo");
+        let output = write_yppx(&project);
+        let zip = ZipArchive::open(&output).unwrap();
+        assert_eq!(zip.entries().len(), 2);
+        assert!(zip.read(MAIN_PART).is_some());
+    }
+
+    #[test]
+    fn mismatched_prefixes_discard_content_type_map() {
+        let source = with_parts(
+            "<a:Types><a:Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></b:Types>",
+            &[("views.xml", b"<views/>")],
+        );
+        let output = write_yppx(&read_yppx(&source).unwrap());
+        let zip = ZipArchive::open(&output).unwrap();
+        assert_eq!(
+            zip.read(CONTENT_TYPES_PART).unwrap(),
+            ORIGINAL_CONTENT_TYPES.as_bytes()
+        );
+        assert_eq!(zip.read("views.xml").unwrap(), b"<views/>");
+    }
+
+    #[test]
     fn lowercase_content_types_name_is_read() {
         let source = write_zip(&[
             ("[content_types].xml".into(), b"<Types><Override PartName=\"/views.xml\" ContentType=\"application/x-views\"/></Types>".to_vec()),
@@ -498,7 +559,7 @@ mod tests {
         let zip = ZipArchive::open(&output).unwrap();
         assert_eq!(
             zip.read(CONTENT_TYPES_PART).unwrap(),
-            base_content_types().as_bytes()
+            ORIGINAL_CONTENT_TYPES.as_bytes()
         );
         assert_eq!(zip.read("views.xml").unwrap(), b"<views/>");
     }
@@ -531,7 +592,10 @@ mod tests {
     #[test]
     fn duplicate_input_part_name_keeps_first_bytes() {
         let source = write_zip(&[
-            (CONTENT_TYPES_PART.into(), base_content_types().into_bytes()),
+            (
+                CONTENT_TYPES_PART.into(),
+                ORIGINAL_CONTENT_TYPES.as_bytes().to_vec(),
+            ),
             (MAIN_PART.into(), write_mspdi(&sample()).into_bytes()),
             ("Views.xml".into(), b"first".to_vec()),
             ("views.XML".into(), b"second".to_vec()),
