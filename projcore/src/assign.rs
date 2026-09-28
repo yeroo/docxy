@@ -477,10 +477,12 @@ impl OutlineIndex {
 ///   `RegularWork` = work − overtime, `RemainingWork` = work − actual work and
 ///   `RemainingCost` = cost − actual cost. Its planned-work spread (Type 1)
 ///   is dropped when its dates or work moved.
-/// - A task keeps its stored `Work`, `Cost`, `RemainingWork` and
-///   `RemainingCost` but moves each by how much its own contribution changed
-///   (work counting work resources only), and so do its outline summaries; a
-///   task moved in the outline takes its assignments and its own fixed cost
+/// - A task moves its stored `Work`, `Cost`, `RemainingWork`, `RemainingCost`,
+///   `OvertimeWork`, `RemainingOvertimeWork`, `OvertimeCost` and
+///   `RemainingOvertimeCost` by changes in its own contribution (work and
+///   overtime work counting work resources only), and `RegularWork` by the work change
+///   less the overtime change. Its outline summaries move by the same deltas;
+///   a task moved in the outline takes its assignments and its own fixed cost
 ///   from its old summaries to its new ones. An absent total stays absent.
 /// - A resource whose assignments changed (added, removed or refreshed) gets
 ///   its work, cost and remaining totals and its `Start`/`Finish` from them.
