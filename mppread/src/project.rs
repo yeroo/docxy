@@ -9,7 +9,11 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// its start and given Project's stored duration where validated, or the
 /// working span between its dates otherwise. Delayed assignments and splits
 /// can make its scheduled finish earlier than its stored finish, as on MSPDI
-/// import. A **manual** leaf keeps its mode and its manual start,
+/// import; a recurring calendar exception the scheduler cannot expand can
+/// also make those dates differ. Invalid stored durations, unrecognized
+/// duration formats and missing task calendar references refuse the file.
+/// A **manual** leaf keeps its mode and
+/// its manual start,
 /// finish and duration instead, which hold it where Project put it without a
 /// constraint; the project's new-task mode comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
@@ -19,7 +23,7 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// variances are not stored in the file and stay absent. Save As converts it
 /// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
 /// calendars, their weekdays and exceptions, and the project's default calendar.
-/// Work weeks and each task's own calendar assignment are not yet decoded. An
+/// Work weeks are not yet decoded. An
 /// unrecognised exception record refuses the import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
@@ -101,6 +105,15 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 .ok_or_else(|| format!("invalid finish date for UID {}", t.uid))?;
             task.stored_start = Some(s);
             task.stored_finish = Some(f);
+            if let Some(calendar_uid) = t.calendar_uid {
+                if cal_ref.calendar(calendar_uid).is_none() {
+                    return Err(format!(
+                        "task UID {} refers to missing calendar UID {calendar_uid}",
+                        t.uid
+                    ));
+                }
+            }
+            task.calendar_uid = t.calendar_uid;
             task.manual = t.manual;
             let date = |d: &Option<String>, what: &str| {
                 d.as_deref()

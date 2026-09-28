@@ -36,10 +36,12 @@ const MANUAL_START: usize = 50;
 const MANUAL_FINISH: usize = 54;
 const MANUAL_DURATION: usize = 58;
 const MANUAL_DURATION_FORMAT: usize = 62;
-/// Auto task Duration and DurationFormat in newest-layout FixedData. Both
-/// offsets match every task in the Project-written MSPDI snapshot pairs.
+/// Task Duration and DurationFormat in newest-layout FixedData, validated for
+/// every task; only auto leaves use the decoded working duration.
 const DURATION: usize = 84;
 const DURATION_FORMAT: usize = 164;
+/// -1 means the task uses the project calendar.
+const CALENDAR_UID: usize = 178;
 /// Recorded progress in the newest layout's 202-byte FixedData record, found
 /// by diffing Project's progress cases (corpus/tools/gen_mpp_progress_cases.py)
 /// and checked against its MSPDI export of every snapshot, paired plan and
@@ -352,10 +354,19 @@ fn stored_duration(rec: &[u8], uid: u32) -> Result<Option<i64>, String> {
     }
     match format & !32 {
         3 | 5 | 7 | 9 | 11 | 21 => Ok(Some(tenths_to_minutes(raw as i32))),
-        4 | 6 | 8 | 10 | 12 => Ok(None),
+        4 | 6 | 8 | 10 | 12 | 19 | 20 => Ok(None),
         _ => Err(format!(
             "unrecognized DurationFormat {format} for UID {uid}"
         )),
+    }
+}
+
+fn task_calendar_uid(rec: &[u8], uid: u32) -> Result<Option<i32>, String> {
+    let value = i32::from_le_bytes(rec[CALENDAR_UID..CALENDAR_UID + 4].try_into().unwrap());
+    match value {
+        -1 => Ok(None),
+        0.. => Ok(Some(value)),
+        _ => Err(format!("invalid task calendar UID {value} for UID {uid}")),
     }
 }
 
@@ -557,6 +568,7 @@ fn decode_current(
             manual_finish,
             manual_duration_min,
             duration_min: stored_duration(rec, row.uid)?,
+            calendar_uid: task_calendar_uid(rec, row.uid)?,
             progress: Some(progress),
         });
     }
@@ -653,6 +665,7 @@ mod tests {
             fd[o..o + 4].copy_from_slice(&uid.to_le_bytes());
             fd[o + 4..o + 8].copy_from_slice(&uid.to_le_bytes());
             fd[o + 172] = i as u8;
+            fd[o + CALENDAR_UID..o + CALENDAR_UID + 4].copy_from_slice(&(-1i32).to_le_bytes());
             for d in [0x68, 0x6c] {
                 fd[o + d..o + d + 4].copy_from_slice(&[0xc0, 0x12, 0x86, 0x3a]);
             }
@@ -799,11 +812,13 @@ mod tests {
     fn conversion_uses_stored_duration_and_falls_back_without_one() {
         let mut s = fixture();
         let rec = 250; // leaf B, UID 1
+        s.fd[rec + NEWEST.finish..rec + NEWEST.finish + 4]
+            .copy_from_slice(&[0xd8, 0x27, 0x86, 0x3a]); // same day, 17:00
         let span = crate::project::project_from_mpp(&file(&s, true))
             .unwrap()
             .tasks[0]
             .duration_min;
-        assert_eq!(span, 0); // fixture start and finish are the same instant
+        assert_eq!(span, 480); // 08:00 to 17:00 on Standard
 
         s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&9600u32.to_le_bytes());
         s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
@@ -826,6 +841,29 @@ mod tests {
                 .duration_min,
             span
         );
+        for format in [19u16, 20, 51, 52] {
+            s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&9600u32.to_le_bytes());
+            s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
+                .copy_from_slice(&format.to_le_bytes());
+            assert_eq!(decode(&file(&s, true)).unwrap()[1].duration_min, None);
+            assert_eq!(
+                crate::project::project_from_mpp(&file(&s, true))
+                    .unwrap()
+                    .tasks[0]
+                    .duration_min,
+                span
+            );
+        }
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&1i32.to_le_bytes());
+        let project = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, Some(1));
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&99i32.to_le_bytes());
+        assert!(
+            crate::project::project_from_mpp(&file(&s, true))
+                .unwrap_err()
+                .contains("missing calendar UID 99")
+        );
+        s.fd[rec + CALENDAR_UID..rec + CALENDAR_UID + 4].copy_from_slice(&(-1i32).to_le_bytes());
         s.fd[rec + DURATION_FORMAT..rec + DURATION_FORMAT + 2]
             .copy_from_slice(&39u16.to_le_bytes());
         s.fd[rec + DURATION..rec + DURATION + 4].copy_from_slice(&u32::MAX.to_le_bytes());

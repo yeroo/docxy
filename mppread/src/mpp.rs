@@ -69,6 +69,9 @@ pub struct MppTask {
     /// Project's stored working duration for a current-layout task. Absent
     /// for MPP9, missing values, and elapsed DurationFormats.
     pub duration_min: Option<i64>,
+    /// Assigned task calendar UID in the newest layout, or `None` when it
+    /// uses the project calendar (and for MPP9).
+    pub calendar_uid: Option<i32>,
     /// Recorded progress as Project stored it. `None` for a layout whose
     /// progress fields are not validated (MPP9).
     pub progress: Option<MppProgress>,

@@ -238,8 +238,8 @@ omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
 row ID order. Resources, assignments, baselines, constraints, and custom fields
 are not imported. Newest-layout base and derived calendars, their weekdays,
-exceptions and the default calendar are imported; work weeks and task calendar
-assignment are not. Type 8 exceptions and record shapes not covered by the
+exceptions, the default calendar, and task calendar assignments are imported;
+work weeks are not. Type 8 exceptions and record shapes not covered by the
 Project-written probes refuse the file. An invalid newest calendar table refuses
 import. Files without
 `TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
@@ -273,10 +273,16 @@ at +84 and DurationFormat as u16 at +164. Both fields match every task in the
 rounded stored duration for auto tasks with a working-time format; an absent
 duration, an elapsed format, or MPP9 falls back to the working span between
 stored dates.
+Percent DurationFormats also use the span fallback. Unknown DurationFormats and
+negative durations other than the absent marker refuse the file. Task
+CalendarUID is a signed i32 at +178: -1 means the project calendar. A task
+reference to a calendar absent from the decoded calendar table refuses the
+file.
 The stored value also covers a split or a delayed assignment, whose duration
 can be shorter than that span. The scheduler does not yet account for splits
-or a delayed assignment when calculating the task's finish; assignments
-themselves are not yet imported from `.mpp` (#342).
+or a delayed assignment when calculating the task's finish; a recurring
+exception it cannot expand can also make scheduled and stored finishes differ.
+Assignments themselves are not yet imported from `.mpp` (#342).
 
 Task progress, work and cost are decoded for the newest layout
 ([#181](https://github.com/yeroo/docxy/issues/181)) and imported as read; the

@@ -237,6 +237,21 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
         check_progress(a, e, source, &at);
+        if source == Oracle::Project {
+            let format = formats.get(&e.uid).expect("Project DurationFormat");
+            let duration = if matches!(format & !32, 4 | 6 | 8 | 10 | 12 | 19 | 20) {
+                None
+            } else {
+                Some(e.duration_min)
+            };
+            assert_eq!(a.duration_min, duration, "{}", at("stored duration"));
+            assert_eq!(
+                a.calendar_uid,
+                e.calendar_uid.filter(|&uid| uid >= 0),
+                "{}",
+                at("task calendar UID")
+            );
+        }
         assert_eq!(a.manual, e.manual, "{}", at("manual"));
         if e.manual {
             assert_eq!(
@@ -345,7 +360,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             .unwrap()
             .exceptions;
         let mut selected = 0usize;
-        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, own calendar, recurring exception, nonworking start
+        let mut dropped = [0usize; 5]; // split, delayed assignment, elapsed, recurring exception, nonworking start
         let mut compared_uids = Vec::new();
         for (task, expected_task) in imported.tasks.iter().zip(&expected) {
             if task.summary || task.manual || expected_task.milestone {
@@ -376,13 +391,6 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 dropped[1] += 1;
                 continue;
             }
-            if expected_task
-                .calendar_uid
-                .is_some_and(|uid| uid >= 0 && uid != oracle.default_calendar_uid)
-            {
-                dropped[3] += 1;
-                continue;
-            }
             let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
             if exceptions
                 .iter()
@@ -394,17 +402,22 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                     })
                 })
             {
-                dropped[4] += 1;
+                dropped[3] += 1;
                 continue;
             }
-            let working_start = project_cal
+            let task_cal = task
+                .calendar_uid
+                .and_then(|uid| imported.calendar(uid))
+                .map(|cal| imported.resolved_calendar(cal))
+                .unwrap_or_else(|| project_cal.clone());
+            let working_start = task_cal
                 .day(start.day_number())
                 .iter()
                 .any(|slot| slot.from <= start.minute_of_day() && start.minute_of_day() < slot.to);
             if !working_start {
                 // Project can retain a MustStartOn timestamp before work starts;
                 // projcore moves the scheduled start to the first working slot.
-                dropped[5] += 1;
+                dropped[4] += 1;
                 continue;
             }
             selected += 1;
@@ -420,7 +433,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         if dropped.iter().any(|&n| n > 0) {
             eprintln!(
-                "{}: selected {selected}, exclusions split/delayed-assignment/elapsed/task-calendar/recurring-exception/nonworking-start = {dropped:?}",
+                "{}: selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start = {dropped:?}",
                 mpp.display()
             );
         }
@@ -469,6 +482,18 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         if stem == "43-assignment-delay" {
             let task = imported.tasks.iter().find(|t| t.uid == 55).unwrap();
             assert_eq!(task.duration_min, 960, "delayed assignment UID 55 duration");
+        }
+        if stem == "21-task-calendar" {
+            assert!(
+                compared_uids.contains(&31),
+                "task-calendar UID 31 was not compared"
+            );
+        }
+        if stem == "32-calendar-6day" {
+            assert!(
+                compared_uids.contains(&49),
+                "six-day calendar UID 49 was not compared"
+            );
         }
         if [
             "e1-range",
