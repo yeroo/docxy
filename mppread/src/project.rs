@@ -238,7 +238,7 @@ fn pin_unreproduced_starts(project: &mut Project) {
         .iter()
         .map(|&i| (project.tasks[i].uid, i))
         .collect();
-    let mut order: Vec<usize> = projcore::schedule::effective_leaf_order(project)
+    let mut order: Vec<usize> = projcore::schedule::effective_leaf_pin_removal_order(project)
         .into_iter()
         .filter_map(|uid| uid_to_index.get(&uid).copied())
         .collect();
@@ -246,7 +246,7 @@ fn pin_unreproduced_starts(project: &mut Project) {
     // it in the order so cleanup remains exhaustive.
     let seen: std::collections::HashSet<_> = order.iter().copied().collect();
     order.extend(candidates.iter().copied().filter(|i| !seen.contains(i)));
-    for i in order.into_iter().rev() {
+    for i in order {
         if !pinned.contains(&i) {
             continue;
         }
@@ -684,6 +684,16 @@ mod tests {
             assert_eq!(row.constraint, ConstraintType::MustStartOn);
             assert_eq!(row.constraint_date, row.stored_start);
         }
+        let project = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: rows,
+            ..Project::default()
+        };
+        let pin_order: Vec<_> = projcore::schedule::effective_leaf_pin_removal_order(&project)
+            .into_iter()
+            .filter(|uid| *uid == 1 || *uid == 2)
+            .collect();
+        assert_eq!(pin_order, [1, 2]); // Unrelated ready rows keep ascending priority.
     }
 
     #[test]
