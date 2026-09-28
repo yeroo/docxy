@@ -1040,12 +1040,15 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path, snapshot: bool) {
         );
         // Generated snapshots decode Material resources as Cost (tracked as a
         // separate resource-type issue); Cost assignments default units to 1.
-        let decoded_as_cost = snapshot
+        let material_decoded_as_cost = snapshot
+            && expected.resources.iter().any(|r| {
+                r.uid == a.resource_uid && r.kind == projcore::model::ResourceType::Material
+            })
             && imported
                 .resources
                 .iter()
                 .any(|r| r.uid == a.resource_uid && r.kind == projcore::model::ResourceType::Cost);
-        if !decoded_as_cost {
+        if !material_decoded_as_cost {
             assert!(
                 (a.units - e.units).abs() < 1e-6,
                 "{} assignment UID {} units {} vs {}",
@@ -1102,31 +1105,48 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path, snapshot: bool) {
             }
         }
     }
-    // Generated snapshots have a known Material-versus-Cost resource type
-    // mismatch, tracked separately from assignment baseline decoding.
-    if !snapshot {
-        for got in &imported.resources {
-            let want = expected
-                .resources
-                .iter()
-                .find(|r| r.uid == got.uid)
-                .unwrap_or_else(|| panic!("{}: missing resource UID {}", mpp.display(), got.uid));
+    // Project XML exports a blank UID 0 placeholder that the importer omits.
+    assert_eq!(
+        imported.resources.len(),
+        expected.resources.iter().filter(|r| r.uid != 0).count(),
+        "{} resource count",
+        mpp.display()
+    );
+    for got in &imported.resources {
+        let want = expected
+            .resources
+            .iter()
+            .find(|r| r.uid == got.uid)
+            .unwrap_or_else(|| panic!("{}: missing resource UID {}", mpp.display(), got.uid));
+        assert_eq!(
+            (got.id, &got.name),
+            (want.id, &want.name),
+            "{} resource UID {}",
+            mpp.display(),
+            got.uid
+        );
+        // Generated snapshots encode Material resources as Cost; this is
+        // tracked separately from assignment baseline decoding.
+        if !(snapshot
+            && want.kind == projcore::model::ResourceType::Material
+            && got.kind == projcore::model::ResourceType::Cost)
+        {
             assert_eq!(
-                (got.id, &got.name, got.kind),
-                (want.id, &want.name, want.kind),
-                "{} resource UID {}",
+                got.kind,
+                want.kind,
+                "{} resource UID {} kind",
                 mpp.display(),
                 got.uid
             );
-            assert!(
-                (got.max_units - want.max_units).abs() < 1e-6,
-                "{} resource UID {} max units {} vs {}",
-                mpp.display(),
-                got.uid,
-                got.max_units,
-                want.max_units
-            );
         }
+        assert!(
+            (got.max_units - want.max_units).abs() < 1e-6,
+            "{} resource UID {} max units {} vs {}",
+            mpp.display(),
+            got.uid,
+            got.max_units,
+            want.max_units
+        );
     }
     // The same records survive the actual MSPDI Save As path.
     let saved = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();

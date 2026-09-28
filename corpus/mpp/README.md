@@ -304,7 +304,9 @@ marker is treated as absent. Assignment progress, rates, contours, delays,
 resource details and other baselines remain unimported. Unsupported
 MPP9 and other unvalidated assignment/resource layouts retain the previous
 task-only import;
-malformed current table structures refuse the import. Generate the local, ignored
+malformed current tables, invalid core assignment fields (units, work, dates,
+task/resource references), and invalid resource fields refuse the import.
+Generate the local, ignored
 assignment oracle pairs with `python corpus/tools/gen_mpp_assignment_baseline_cases.py`.
 Newest-layout base and derived calendars, their weekdays,
 exceptions, work weeks, the default calendar and task calendar assignments are

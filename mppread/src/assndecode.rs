@@ -401,7 +401,7 @@ mod tests {
         }
         let mut fields = vars();
         fields[2].2 = vec![0xff, 0xff, 0x2a, 0x3c];
-        assert!(decode(&file(rows(), fields), false, &tasks(), &resources()).is_ok());
+        assert!(slot(fields).start.is_some());
         let mut fields = vars();
         fields[2].2 = vec![0xd8, 0x27, 0x2c, 0x3c];
         let baseline = slot(fields);
