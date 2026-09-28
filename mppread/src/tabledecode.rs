@@ -78,10 +78,45 @@ pub(crate) fn read(
     if expected_meta_len != Some(fm.len()) {
         // A different complete entry stride identifies an older/unvalidated
         // layout. A torn index or impossible count is corruption.
-        if count > 0 && (fm.len() - 16) % count == 0 {
-            return Ok(None);
+        let payload = fm.len() - 16;
+        if count == 0 || payload == 0 || payload % count != 0 {
+            return Err(format!("{name}: FixedMeta count or length mismatch"));
         }
-        return Err(format!("{name}: FixedMeta count or length mismatch"));
+        let stride = payload / count;
+        if stride < meta_stride {
+            return Err(format!("{name}: FixedMeta count or length mismatch"));
+        }
+        // If the bytes form complete entries in the validated layout, the
+        // header count is wrong. In particular, a lowered count can otherwise
+        // masquerade as a larger unsupported stride.
+        if payload.is_multiple_of(meta_stride) && payload / meta_stride != count {
+            let actual = payload / meta_stride;
+            let offsets: Vec<_> = (0..actual)
+                .map(|i| u32_at(&fm, 16 + i * meta_stride + 4) as usize)
+                .collect();
+            let valid = offsets.first() == Some(&0)
+                && offsets.windows(2).all(|pair| pair[0] < pair[1])
+                && offsets.iter().enumerate().all(|(i, &off)| {
+                    let end = offsets.get(i + 1).copied().unwrap_or(fd.len());
+                    let len = end.saturating_sub(off);
+                    let kind = u16_at(&fm, 16 + i * meta_stride);
+                    end <= fd.len()
+                        && ((matches!(kind, 0 | 2) && len == row_len) || (kind == 4 && len == 16))
+                });
+            if valid {
+                return Err(format!("{name}: FixedMeta count or length mismatch"));
+            }
+        }
+        let offsets: Vec<_> = (0..count)
+            .map(|i| u32_at(&fm, 16 + i * stride + 4) as usize)
+            .collect();
+        if offsets.first() != Some(&0)
+            || offsets.windows(2).any(|pair| pair[0] >= pair[1])
+            || offsets.last().is_some_and(|&last| last >= fd.len())
+        {
+            return Err(format!("{name}: FixedMeta count or length mismatch"));
+        }
+        return Ok(None);
     }
     if count < stubs {
         return Err(format!("{name}: FixedMeta count or length mismatch"));
@@ -134,9 +169,7 @@ pub(crate) fn read(
         return Err(format!("{name}: invalid VarMeta header"));
     }
     let vars = u32_at(&vm, 8) as usize;
-    if 24usize
-        .checked_add(vars.checked_mul(12).ok_or("VarMeta count overflow")?)
-        .is_none_or(|n| n > vm.len())
+    if 24usize.checked_add(vars.checked_mul(12).ok_or("VarMeta count overflow")?) != Some(vm.len())
         || u32_at(&vm, 20) as usize != v2.len()
     {
         return Err(format!("{name}: VarMeta count or Var2Data length mismatch"));
@@ -166,37 +199,38 @@ pub(crate) fn read(
     Ok(Some(Table { rows, fields, v2 }))
 }
 
-pub(crate) fn name(bytes: &[u8], uid: u32) -> Result<String, String> {
-    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) || bytes[bytes.len() - 2..] != [0, 0] {
-        return Err(format!("invalid resource name for UID {uid}"));
-    }
-    let units: Vec<_> = bytes[..bytes.len() - 2]
-        .chunks_exact(2)
-        .map(|x| u16::from_le_bytes([x[0], x[1]]))
-        .collect();
-    let value =
-        String::from_utf16(&units).map_err(|_| format!("invalid resource name for UID {uid}"))?;
-    if value.chars().any(char::is_control) {
-        return Err(format!("invalid resource name for UID {uid}"));
-    }
-    Ok(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cfb::{Node, write_cfb_tree};
 
     fn fixture(stride: usize, kind: u16, offset: u32) -> Vec<u8> {
-        let mut fm = vec![0u8; 16 + stride];
+        fixture_with_counts(stride, kind, offset, 1, 1, false)
+    }
+
+    fn fixture_with_counts(
+        stride: usize,
+        kind: u16,
+        offset: u32,
+        actual: usize,
+        declared: u32,
+        var_trailer: bool,
+    ) -> Vec<u8> {
+        let mut fm = vec![0u8; 16 + stride * actual];
         fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
-        fm[8..12].copy_from_slice(&1u32.to_le_bytes());
-        fm[16..18].copy_from_slice(&kind.to_le_bytes());
-        fm[20..24].copy_from_slice(&offset.to_le_bytes());
-        let mut fd = vec![0u8; 110];
-        fd[..4].copy_from_slice(&7u32.to_le_bytes());
+        fm[8..12].copy_from_slice(&declared.to_le_bytes());
+        let mut fd = vec![0u8; 110 * actual];
+        for i in 0..actual {
+            let at = 16 + i * stride;
+            fm[at..at + 2].copy_from_slice(&kind.to_le_bytes());
+            fm[at + 4..at + 8].copy_from_slice(&(offset + i as u32 * 110).to_le_bytes());
+            fd[i * 110..i * 110 + 4].copy_from_slice(&(7 + i as u32).to_le_bytes());
+        }
         let mut vm = vec![0u8; 24];
         vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        if var_trailer {
+            vm.extend([0u8; 12]);
+        }
         write_cfb_tree(&[Node::Storage(
             "   114",
             vec![Node::Storage(
@@ -233,6 +267,41 @@ mod tests {
             read(&fixture(34, 0, 0), "TBkndAssn", 34, 110, 0x0f40)
                 .unwrap()
                 .is_some()
+        );
+        for count in [1, 2, 6] {
+            assert!(
+                read(
+                    &fixture_with_counts(34, 0, 0, 3, count, false),
+                    "TBkndAssn",
+                    34,
+                    110,
+                    0x0f40
+                )
+                .unwrap_err()
+                .contains("FixedMeta count or length mismatch")
+            );
+        }
+        assert!(
+            read(
+                &fixture_with_counts(34, 0, 0, 0, 1, false),
+                "TBkndAssn",
+                34,
+                110,
+                0x0f40
+            )
+            .unwrap_err()
+            .contains("FixedMeta count or length mismatch")
+        );
+        assert!(
+            read(
+                &fixture_with_counts(34, 0, 0, 1, 1, true),
+                "TBkndAssn",
+                34,
+                110,
+                0x0f40
+            )
+            .unwrap_err()
+            .contains("VarMeta count or Var2Data length mismatch")
         );
     }
 

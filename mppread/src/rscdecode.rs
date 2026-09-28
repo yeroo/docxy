@@ -33,7 +33,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<Vec<Resource>>
         };
         let name = table
             .field(uid, 1)
-            .map(|b| crate::tabledecode::name(b, uid))
+            .map(|b| name(b, uid))
             .transpose()?
             .unwrap_or_default();
         let max_units = f64_at(row, 8) / 10000.0;
@@ -50,6 +50,22 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<Vec<Resource>>
         });
     }
     Ok(Some(result))
+}
+
+fn name(bytes: &[u8], uid: u32) -> Result<String, String> {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) || bytes[bytes.len() - 2..] != [0, 0] {
+        return Err(format!("invalid resource name for UID {uid}"));
+    }
+    let units: Vec<_> = bytes[..bytes.len() - 2]
+        .chunks_exact(2)
+        .map(|x| u16::from_le_bytes([x[0], x[1]]))
+        .collect();
+    let value =
+        String::from_utf16(&units).map_err(|_| format!("invalid resource name for UID {uid}"))?;
+    if value.chars().any(char::is_control) {
+        return Err(format!("invalid resource name for UID {uid}"));
+    }
+    Ok(value)
 }
 
 #[cfg(test)]
