@@ -9,8 +9,8 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// manual tasks and summaries. For an untracked, local automatic leaf whose
 /// scheduled start differs from Project's stored start, the importer replaces
 /// its constraint with Must-Start-On only if that restores the stored start;
-/// Save As writes any accepted pin. Summary links and constraints, cross-project
-/// predecessors, ALAP chains, leveling delay and resource calendars can cause
+/// Save As writes any accepted pin. Cross-project predecessors, ALAP chains,
+/// leveling delay and resource calendars can cause
 /// these differences. On the `.mpp` path, an effective pin preserves the
 /// stored start, though its finish can still differ. MSPDI import does not
 /// add this pin, so both scheduled start and finish can move. Legacy MPP9
@@ -231,47 +231,22 @@ fn pin_unreproduced_starts(project: &mut Project) {
     // This costs one full schedule per accepted pin, in addition to at most
     // candidate-count accept/reject passes. The 48 newest snapshot files
     // currently need zero pins, so they incur no minimisation schedules.
+    if pinned.is_empty() {
+        return;
+    }
     let uid_to_index: std::collections::HashMap<_, _> = candidates
         .iter()
         .map(|&i| (project.tasks[i].uid, i))
         .collect();
-    let mut successors = vec![Vec::new(); project.tasks.len()];
-    let mut indegree = vec![0usize; project.tasks.len()];
-    for &i in &candidates {
-        for predecessor in &project.tasks[i].predecessors {
-            if let Some(&before) = uid_to_index.get(&predecessor.uid) {
-                successors[before].push(i);
-                indegree[i] += 1;
-            }
-        }
-    }
-    // Descending row order here makes the reversed order use ascending rows
-    // for unrelated tasks.
-    let mut ready: std::collections::BTreeSet<_> = candidates
-        .iter()
-        .copied()
-        .filter(|&i| indegree[i] == 0)
-        .map(std::cmp::Reverse)
+    let mut order: Vec<usize> = projcore::schedule::effective_leaf_pin_removal_order(project)
+        .into_iter()
+        .filter_map(|uid| uid_to_index.get(&uid).copied())
         .collect();
-    let mut order = Vec::with_capacity(candidates.len());
-    while let Some(&std::cmp::Reverse(i)) = ready.first() {
-        ready.pop_first();
-        order.push(i);
-        for &next in &successors[i] {
-            indegree[next] -= 1;
-            if indegree[next] == 0 {
-                ready.insert(std::cmp::Reverse(next));
-            }
-        }
-    }
-    // A malformed cycle has no topological order. The scheduler has already
-    // handled it; use row order for any nodes left over.
-    for &i in &candidates {
-        if indegree[i] > 0 {
-            order.push(i);
-        }
-    }
-    for i in order.into_iter().rev() {
+    // An unschedulable candidate has no result and cannot be pinned, but keep
+    // it in the order so cleanup remains exhaustive.
+    let seen: std::collections::HashSet<_> = order.iter().copied().collect();
+    order.extend(candidates.iter().copied().filter(|i| !seen.contains(i)));
+    for i in order {
         if !pinned.contains(&i) {
             continue;
         }
@@ -610,12 +585,17 @@ mod tests {
             late,
             early,
             summary,
-            current(4, 4, "Child", 2),
+            later(
+                current(4, 4, "Child", 2),
+                "2026-03-03 08:00",
+                "2026-03-04 08:00",
+            ),
             tail,
         ])
         .unwrap();
         assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
         assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[1].constraint_date, None);
     }
@@ -624,7 +604,11 @@ mod tests {
     fn alap_child_of_a_summary_predecessor_is_pinned_but_asap_sibling_is_not() {
         let mut late = current(2, 2, "ALAP child", 2);
         late.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
-        let mut successor = current(4, 4, "Successor", 1);
+        let mut successor = later(
+            current(4, 4, "Successor", 1),
+            "2026-03-03 08:00",
+            "2026-03-04 08:00",
+        );
         successor.predecessors.push(link(1));
         let tail = later(
             current(5, 5, "Long tail", 1),
@@ -642,9 +626,9 @@ mod tests {
         .unwrap();
         assert_eq!(rows[1].constraint, ConstraintType::MustStartOn);
         assert_eq!(rows[1].constraint_date, rows[1].stored_start);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[2].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[2].constraint_date, None);
-        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
     }
 
     #[test]
@@ -669,12 +653,17 @@ mod tests {
             a,
             b,
             summary,
-            current(4, 4, "C", 2),
+            later(
+                current(4, 4, "C", 2),
+                "2026-03-04 08:00",
+                "2026-03-05 08:00",
+            ),
             tail,
         ])
         .unwrap();
-        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn); // A moved late.
-        assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible); // A's pin restores B.
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[0].constraint_date, rows[0].stored_start);
         assert_eq!(rows[1].constraint_date, None);
     }
@@ -695,6 +684,16 @@ mod tests {
             assert_eq!(row.constraint, ConstraintType::MustStartOn);
             assert_eq!(row.constraint_date, row.stored_start);
         }
+        let project = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: rows,
+            ..Project::default()
+        };
+        let pin_order: Vec<_> = projcore::schedule::effective_leaf_pin_removal_order(&project)
+            .into_iter()
+            .filter(|uid| *uid == 1 || *uid == 2)
+            .collect();
+        assert_eq!(pin_order, [1, 2]); // Unrelated ready rows keep ascending priority.
     }
 
     #[test]
@@ -805,7 +804,7 @@ mod tests {
             lag_format: 8,
             ..Default::default()
         });
-        let rows = import_current(vec![
+        let decoded = vec![
             current(0, 0, "Project", 0),
             constrained,
             later(
@@ -816,17 +815,36 @@ mod tests {
             linked,
             later(
                 current(4, 4, "Child under link", 2),
+                "2026-03-10 08:00",
                 "2026-03-11 08:00",
-                "2026-03-12 08:00",
             ),
             current(5, 5, "Independent", 1),
-        ])
-        .unwrap();
+        ];
+        let unpinned =
+            super::import_tasks(decoded.clone(), &Project::default(), false, false).unwrap();
+        let project = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: unpinned,
+            ..Project::default()
+        };
+        let schedule = projcore::schedule::schedule(&project);
+        for uid in [2, 4] {
+            let child = project.tasks.iter().find(|t| t.uid == uid).unwrap();
+            assert_eq!(
+                Some(schedule.get(uid).unwrap().early_start),
+                child.stored_start
+            );
+        }
+        let rows = import_current(decoded).unwrap();
         assert_eq!(rows[0].constraint, ConstraintType::StartNoEarlierThan);
         for uid in [2, 4] {
             let child = rows.iter().find(|t| t.uid == uid).unwrap();
-            assert_eq!(child.constraint, ConstraintType::MustStartOn, "UID {uid}");
-            assert_eq!(child.constraint_date, child.stored_start, "UID {uid}");
+            assert_eq!(
+                child.constraint,
+                ConstraintType::AsSoonAsPossible,
+                "UID {uid}"
+            );
+            assert_eq!(child.constraint_date, None, "UID {uid}");
         }
         assert_eq!(rows[4].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[4].constraint_date, None);
@@ -836,8 +854,8 @@ mod tests {
     fn leaf_linked_to_a_summary_keeps_its_stored_start() {
         let mut linked_leaf = later(
             current(3, 3, "Linked leaf", 1),
+            "2026-03-03 08:00",
             "2026-03-04 08:00",
-            "2026-03-05 08:00",
         );
         linked_leaf.predecessors.push(crate::mpp::MppPred {
             pred_uid: 1,
@@ -845,16 +863,33 @@ mod tests {
             lag_format: 8,
             ..Default::default()
         });
-        let rows = import_current(vec![
+        let decoded = vec![
             current(0, 0, "Project", 0),
             current(1, 1, "Summary", 1),
             current(2, 2, "Child", 2),
             linked_leaf,
             current(4, 4, "Independent", 1),
-        ])
-        .unwrap();
-        assert_eq!(rows[2].constraint, ConstraintType::MustStartOn);
-        assert_eq!(rows[2].constraint_date, rows[2].stored_start);
+        ];
+        let unpinned =
+            super::import_tasks(decoded.clone(), &Project::default(), false, false).unwrap();
+        let project = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: unpinned,
+            ..Project::default()
+        };
+        let linked = project.tasks.iter().find(|t| t.uid == 3).unwrap();
+        assert_eq!(
+            Some(
+                projcore::schedule::schedule(&project)
+                    .get(3)
+                    .unwrap()
+                    .early_start
+            ),
+            linked.stored_start
+        );
+        let rows = import_current(decoded).unwrap();
+        assert_eq!(rows[2].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[2].constraint_date, None);
         assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
         assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
     }

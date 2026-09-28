@@ -17,7 +17,7 @@
 //! gets its own timeline with a shared origin before the project start, so
 //! cross-calendar dependencies still compare correctly in wall-clock space.
 //!
-//! ## Scope (v1)
+//! ## Scope
 //!
 //! Leaf tasks schedule via FS/SS/FF/SF links with lag, ASAP by default, honoring
 //! date constraints. ALAP tasks occupy their late dates. By default
@@ -35,6 +35,13 @@
 //! scheduled summary keeps its own dates: they floor its unconstrained
 //! subtasks' starts and extend the project finish (see [`Schedule::rolled_up`]
 //! and [`manual_warning`]).
+//! FS/SS links into an automatic summary drive leaves below automatic summary
+//! levels; a nested manual summary stops that inheritance. Links out of an
+//! automatic summary use its rolled start or finish, including nested manual
+//! spans. Links into a manual summary do not move it or its children, but can
+//! reduce their predecessors' slack. Start floors and backward date bounds on
+//! automatic summaries apply to their inherited leaves. FF/SF predecessors of
+//! a summary, and FNET/ALAP on a summary, are not scheduled.
 //!
 //! A leaf with recorded progress ([`Task::tracked`]) is scheduled from its
 //! actuals, which links, constraints, the deadline and leveling never move. A
@@ -60,6 +67,9 @@ use crate::model::{
     Calendar, ConstraintType, LagKind, LinkType, Predecessor, Project, ResourceType, Task, Tracked,
     Week, WorkCalendar, WorkingTime,
 };
+#[cfg(test)]
+use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// Maximum calendar days on either side of the scheduling anchor.
@@ -292,7 +302,8 @@ struct Scheduler<'a> {
     raw_anchor: i64,
     /// No timeline starts before this day, however far back a date lies.
     earliest_origin: i64,
-    /// Each task's working duration, which a percent lag is a share of.
+    /// Each task's stored working duration. Leaf percent lags use it; summary
+    /// percent lags use their rolled or manual span (see `percent_offset`).
     durations: HashMap<i32, i64>,
     /// The calendar summaries measure their spans and slack on.
     summary_cal: WorkCalendar,
@@ -305,9 +316,48 @@ struct Scheduler<'a> {
 
 struct LeafGraph {
     leaves: Vec<usize>,
-    idx_of: HashMap<i32, usize>,
+    by_uid: HashMap<i32, usize>,
     order: Vec<usize>,
-    succs: HashMap<i32, Vec<(i32, LinkType, Offset)>>,
+    incoming: HashMap<i32, Vec<Predecessor>>,
+    succs: HashMap<i32, Vec<EffectiveSuccessor>>,
+    groups: Vec<SuccessorGroup>,
+    groups_by_source: HashMap<i32, Vec<usize>>,
+    start_floors: HashMap<i32, i64>,
+    late_bounds: HashMap<i32, Vec<(ConstraintType, i64, Option<i32>)>>,
+    contributors: HashMap<i32, Vec<i32>>,
+    span_cache: RefCell<HashMap<i32, (i64, i64)>>,
+    #[cfg(test)]
+    span_scans: Cell<usize>,
+}
+
+#[derive(Clone)]
+struct EffectiveSuccessor {
+    uid: i32,
+    link: LinkType,
+    offset: Offset,
+    percent_summary: Option<Predecessor>,
+    /// An SS/SF link out of an auto summary only bounds a child that starts it.
+    start_of: Option<i32>,
+    /// A manual summary successor is a fixed backward bound.
+    fixed: Option<(i64, i64)>,
+}
+
+/// One summary-to-summary link without a contributors × targets edge set.
+struct SuccessorGroup {
+    sources: Vec<i32>,
+    targets: Vec<i32>,
+    link: LinkType,
+    offset: Offset,
+    percent_summary: Option<Predecessor>,
+    start_of: Option<i32>,
+}
+
+#[derive(Clone, Copy)]
+struct SuccessorAggregate {
+    uid: i32,
+    start: i64,
+    finish: i64,
+    milestone: bool,
 }
 
 struct ConstraintDates {
@@ -348,11 +398,49 @@ impl<'a> Scheduler<'a> {
         // and leaves without working time never place the anchor.
         let default_cal = proj.default_calendar_uid;
         let calendars = CalendarResolver::new(proj);
+        let by_uid: HashMap<i32, usize> = proj
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| (task.uid, index))
+            .collect();
+        let mut schedulable_sources = std::collections::HashSet::new();
+        let mut ancestors: Vec<(u32, i32)> = Vec::new();
+        for task in &proj.tasks {
+            while ancestors
+                .last()
+                .is_some_and(|&(level, _)| level >= task.outline_level)
+            {
+                ancestors.pop();
+            }
+            if task.summary {
+                if task.manual_summary_dates().is_some() && task.external_task != Some(true) {
+                    schedulable_sources.insert(task.uid);
+                }
+                ancestors.push((task.outline_level, task.uid));
+            } else if calendars.schedulable(task) && task.external_task != Some(true) {
+                schedulable_sources.insert(task.uid);
+                for &(_, uid) in &ancestors {
+                    if proj.tasks[by_uid[&uid]].external_task != Some(true) {
+                        schedulable_sources.insert(uid);
+                    }
+                }
+            }
+        }
         let schedulable = proj.tasks.iter().filter(|t| calendars.schedulable(t));
         // A tracked task stays on its actual start as a pinned one does.
         let pinned_starts = schedulable
             .clone()
             .filter_map(|t| fixed_start(t).map(|start| start.minutes()));
+        let manual_successor_starts = proj.tasks.iter().filter_map(|t| {
+            t.manual_summary_dates()
+                .filter(|_| {
+                    t.predecessors
+                        .iter()
+                        .any(|p| schedulable_sources.contains(&p.uid))
+                })
+                .map(|(start, _)| start.minutes())
+        });
         let raw_anchor = proj
             .start_date
             .or_else(|| {
@@ -365,26 +453,36 @@ impl<'a> Scheduler<'a> {
             .unwrap_or_else(|| DateTime::from_ymd_hm(2020, 1, 6, 8, 0))
             .minutes();
 
-        // Horizon: enough working minutes for all work + lag, plus a wide
+        // Horizon: enough working minutes for all work and resolved lag, plus a wide
         // margin, and enough wall-clock reach to cover any far constraint date.
         let work: i64 = proj.tasks.iter().map(|t| t.duration_min.max(0)).sum();
         let durations = durations(proj);
+        let summary_cal = summary_calendar(proj);
+        let manual_spans = manual_summary_spans(proj, &summary_cal);
+        // Every supported summary span lies within the two-sided
+        // HORIZON_DAYS window, so its working duration cannot exceed the
+        // window's wall minutes (MAX_LAG_MIN). Use that absolute bound for
+        // summary percent lags. It covers child constraints, outside links,
+        // nested percent links and manual dates without a circular estimate.
+        // Stored duration remains a floor; lag_minutes clamps at MAX_LAG_MIN.
+        let mut horizon_durations = durations.clone();
+        for task in proj.tasks.iter().filter(|task| task.summary) {
+            horizon_durations
+                .entry(task.uid)
+                .and_modify(|duration| *duration = (*duration).max(MAX_LAG_MIN))
+                .or_insert(MAX_LAG_MIN);
+        }
         // Elapsed lag is calendar minutes, which over-estimates the working
         // minutes it spans: safe for a working-minute budget.
         let lag: i64 = proj
             .tasks
             .iter()
             .flat_map(|t| &t.predecessors)
-            .map(|p| lag_minutes(p, &durations).saturating_abs())
+            .map(|p| lag_minutes(p, &horizon_durations).saturating_abs())
             .fold(0, i64::saturating_add);
         let min_total = work.saturating_add(lag).saturating_add(HORIZON_PADDING_MIN);
 
-        let leaf_uids: std::collections::HashSet<_> = proj
-            .tasks
-            .iter()
-            .filter(|t| !t.summary)
-            .map(|t| t.uid)
-            .collect();
+        let schedulable_source = |uid: i32| schedulable_sources.contains(&uid);
         let used_calendars: std::collections::HashSet<_> = proj
             .tasks
             .iter()
@@ -395,7 +493,7 @@ impl<'a> Scheduler<'a> {
         let backward_constraints = proj
             .tasks
             .iter()
-            .filter(|t| !t.summary && t.constraint_date.is_some())
+            .filter(|t| t.constraint_date.is_some())
             .filter(|t| is_backward(t.constraint));
         // A deadline bounds late dates like a backward constraint does.
         let deadlines = proj
@@ -404,7 +502,8 @@ impl<'a> Scheduler<'a> {
             .filter(|t| !t.summary && t.deadline.is_some());
         let has_backward_constraints =
             backward_constraints.clone().next().is_some() || deadlines.clone().next().is_some();
-        let linked = |t: &&Task| t.predecessors.iter().any(|p| leaf_uids.contains(&p.uid));
+        let linked =
+            |t: &&Task| t.summary || t.predecessors.iter().any(|p| schedulable_source(p.uid));
         // An unlinked deadline is floored at the anchor. Its raw date must not
         // add an unused prefix to every calendar's timeline.
         // A pinned start can precede the anchor, and a violated link into it
@@ -415,13 +514,16 @@ impl<'a> Scheduler<'a> {
             .chain(deadlines.filter(linked).filter_map(|t| t.deadline))
             .map(|date| date.minutes())
             .chain(pinned_starts.clone())
+            .chain(manual_successor_starts.clone())
             .min();
         let needs_backward_horizon = has_backward_constraints
             || pinned_starts.clone().next().is_some()
-            || proj.tasks.iter().filter(|t| !t.summary).any(|t| {
+            || manual_successor_starts.clone().next().is_some()
+            || proj.tasks.iter().any(|t| {
                 t.predecessors.iter().any(|p| {
-                    leaf_uids.contains(&p.uid)
-                        && (lag_minutes(p, &durations) < 0
+                    schedulable_source(p.uid)
+                        && (lag_minutes(p, &horizon_durations) < 0
+                            || (p.lag_format.kind() == LagKind::Percent && p.lag < 0)
                             || matches!(p.link, LinkType::StartFinish | LinkType::FinishFinish))
                 })
             });
@@ -469,8 +571,6 @@ impl<'a> Scheduler<'a> {
         });
         // A manual summary's span, and room after its start for the subtasks
         // it floors there.
-        let summary_cal = summary_calendar(proj);
-        let manual_spans = manual_summary_spans(proj, &summary_cal);
         let floor_reach = manual_spans.values().flat_map(|&(start, finish)| {
             let floored = weeks
                 .get(&default_cal)
@@ -550,6 +650,158 @@ impl<'a> Scheduler<'a> {
             LagKind::Elapsed => Offset::Elapsed(minutes),
             LagKind::Working | LagKind::Percent => Offset::Working(minutes),
         }
+    }
+
+    fn percent_offset(
+        &self,
+        base: Offset,
+        percent_summary: Option<&Predecessor>,
+        span: Option<(i64, i64)>,
+    ) -> Offset {
+        let (Some(link), Some((start, finish))) = (percent_summary, span) else {
+            return base;
+        };
+        let duration = working_minutes_on(
+            &self.summary_cal,
+            DateTime::from_minutes(start),
+            DateTime::from_minutes(finish),
+        );
+        let minutes = link
+            .lag_minutes(duration)
+            .unwrap_or(if link.lag < 0 { i64::MIN } else { i64::MAX })
+            .clamp(-MAX_LAG_MIN, MAX_LAG_MIN);
+        Offset::Working(minutes)
+    }
+
+    fn effective_offset(
+        &self,
+        p: &Predecessor,
+        graph: &LeafGraph,
+        span: Option<(i64, i64)>,
+    ) -> Offset {
+        let is_percent_summary = p.lag_format.kind() == LagKind::Percent
+            && graph
+                .by_uid
+                .get(&p.uid)
+                .is_some_and(|&i| self.proj.tasks[i].summary);
+        self.percent_offset(self.offset(p), is_percent_summary.then_some(p), span)
+    }
+
+    fn effective_span(
+        &self,
+        uid: i32,
+        graph: &LeafGraph,
+        mut lookup: impl FnMut(i32) -> Option<(i64, i64)>,
+    ) -> Option<(i64, i64)> {
+        if let Some(&span) = self.manual_spans.get(&uid) {
+            return Some(span);
+        }
+        if let Some(contributors) = graph.contributors.get(&uid) {
+            if let Some(&span) = graph.span_cache.borrow().get(&uid) {
+                return Some(span);
+            }
+            #[cfg(test)]
+            graph.span_scans.set(graph.span_scans.get() + 1);
+            let mut start = None;
+            let mut finish = None;
+            let mut complete = true;
+            for &member in contributors {
+                let span = self
+                    .manual_spans
+                    .get(&member)
+                    .copied()
+                    .or_else(|| lookup(member));
+                if let Some((s, f)) = span {
+                    start = Some(start.map_or(s, |old: i64| old.min(s)));
+                    finish = Some(finish.map_or(f, |old: i64| old.max(f)));
+                } else {
+                    complete = false;
+                }
+            }
+            let span = start.zip(finish);
+            if complete && let Some(span) = span {
+                graph.span_cache.borrow_mut().insert(uid, span);
+            }
+            return span;
+        }
+        lookup(uid)
+    }
+
+    fn absolute_span(
+        &self,
+        uid: i32,
+        graph: &LeafGraph,
+        start: &HashMap<i32, i64>,
+        finish: &HashMap<i32, i64>,
+    ) -> Option<(i64, i64)> {
+        self.effective_span(uid, graph, |member| {
+            start
+                .get(&member)
+                .copied()
+                .zip(finish.get(&member).copied())
+        })
+    }
+
+    fn leveled_span(
+        &self,
+        uid: i32,
+        graph: &LeafGraph,
+        start: &HashMap<i32, DateTime>,
+        finish: &HashMap<i32, DateTime>,
+    ) -> Option<(i64, i64)> {
+        self.effective_span(uid, graph, |member| {
+            start
+                .get(&member)
+                .zip(finish.get(&member))
+                .map(|(s, f)| (s.minutes(), f.minutes()))
+        })
+    }
+
+    fn aggregate_targets(
+        &self,
+        graph: &LeafGraph,
+        group_id: usize,
+        mut lookup: impl FnMut(i32) -> Option<(i64, i64)>,
+    ) -> Vec<SuccessorAggregate> {
+        // For a given calendar and milestone mode, inverse links are monotone
+        // in the successor endpoint. One minimum represents every target in
+        // that class, avoiding contributors × targets work in the late pass.
+        let mut by_class: HashMap<(i32, bool), SuccessorAggregate> = HashMap::new();
+        for &uid in &graph.groups[group_id].targets {
+            let Some(&(start, finish)) = lookup(uid).as_ref() else {
+                continue;
+            };
+            let task = &self.proj.tasks[graph.by_uid[&uid]];
+            let milestone = task.duration_min == 0;
+            let class = (self.calendar_uid(task), milestone);
+            by_class
+                .entry(class)
+                .and_modify(|agg| {
+                    agg.start = agg.start.min(start);
+                    agg.finish = agg.finish.min(finish);
+                })
+                .or_insert(SuccessorAggregate {
+                    uid,
+                    start,
+                    finish,
+                    milestone,
+                });
+        }
+        by_class.into_values().collect()
+    }
+
+    fn starts_summary(
+        &self,
+        source_uid: i32,
+        summary_uid: Option<i32>,
+        graph: &LeafGraph,
+        early: &HashMap<i32, i64>,
+        finish: &HashMap<i32, i64>,
+    ) -> bool {
+        summary_uid.is_none_or(|uid| {
+            self.absolute_span(uid, graph, early, finish)
+                .is_some_and(|(start, _)| early.get(&source_uid) == Some(&start))
+        })
     }
 
     fn tl(&self, task: &Task) -> &Timeline {
@@ -683,25 +935,188 @@ impl<'a> Scheduler<'a> {
             .iter()
             .map(|&i| (self.proj.tasks[i].uid, i))
             .collect();
-        let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
-        let mut succs: HashMap<i32, Vec<(i32, LinkType, Offset)>> = HashMap::new();
-        for &i in &leaves {
-            let task = &self.proj.tasks[i];
+        let by_uid: HashMap<i32, usize> = self
+            .proj
+            .tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| (t.uid, i))
+            .collect();
+        let mut contributors = HashMap::new();
+        let mut targets = HashMap::new();
+        for (i, task) in self
+            .proj
+            .tasks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.summary)
+        {
+            contributors.insert(
+                task.uid,
+                rollup_nodes(self.proj, i, &leaves)
+                    .map(|j| self.proj.tasks[j].uid)
+                    .collect::<Vec<_>>(),
+            );
+            targets.insert(task.uid, summary_targets(self.proj, i, &leaf_uids));
+        }
+        let mut incoming: HashMap<i32, Vec<Predecessor>> = HashMap::new();
+        let mut succs: HashMap<i32, Vec<EffectiveSuccessor>> = HashMap::new();
+        let mut groups = Vec::new();
+        let mut groups_by_source: HashMap<i32, Vec<usize>> = HashMap::new();
+        let mut start_floors: HashMap<i32, i64> = HashMap::new();
+        let mut late_bounds: HashMap<i32, Vec<(ConstraintType, i64, Option<i32>)>> = HashMap::new();
+        for task in &self.proj.tasks {
+            let recipients: Vec<i32> = if task.summary {
+                targets.get(&task.uid).cloned().unwrap_or_default()
+            } else if leaf_uids.contains(&task.uid) {
+                vec![task.uid]
+            } else {
+                Vec::new()
+            };
+            if task.summary && !self.manual_spans.contains_key(&task.uid) {
+                if let Some(date) = task.constraint_date {
+                    match task.constraint {
+                        ConstraintType::StartNoEarlierThan | ConstraintType::MustStartOn => {
+                            for &uid in &recipients {
+                                start_floors
+                                    .entry(uid)
+                                    .and_modify(|floor| *floor = (*floor).max(date.minutes()))
+                                    .or_insert(date.minutes());
+                            }
+                        }
+                        ConstraintType::FinishNoLaterThan
+                        | ConstraintType::MustFinishOn
+                        | ConstraintType::StartNoLaterThan => {
+                            for &uid in &recipients {
+                                late_bounds.entry(uid).or_default().push((
+                                    task.constraint,
+                                    date.minutes(),
+                                    (task.constraint == ConstraintType::StartNoLaterThan)
+                                        .then_some(task.uid),
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             for link in &task.predecessors {
-                if leaf_uids.contains(&link.uid) {
-                    succs.entry(link.uid).or_default().push((
-                        task.uid,
-                        link.link,
-                        self.offset(link),
-                    ));
+                let Some(&pred_idx) = by_uid.get(&link.uid) else {
+                    continue;
+                };
+                let pred = &self.proj.tasks[pred_idx];
+                if pred.external_task == Some(true) {
+                    continue;
+                }
+                if task.summary
+                    && !matches!(link.link, LinkType::FinishStart | LinkType::StartStart)
+                {
+                    continue;
+                }
+                let sources: Vec<i32> = if pred.summary {
+                    if self.manual_spans.contains_key(&pred.uid) {
+                        Vec::new()
+                    } else {
+                        contributors
+                            .get(&pred.uid)
+                            .into_iter()
+                            .flatten()
+                            .filter(|uid| leaf_uids.contains(uid))
+                            .copied()
+                            .collect()
+                    }
+                } else if leaf_uids.contains(&pred.uid) {
+                    vec![pred.uid]
+                } else {
+                    Vec::new()
+                };
+                let fixed = self.manual_spans.get(&task.uid).copied();
+                let start_of = matches!(link.link, LinkType::StartStart | LinkType::StartFinish)
+                    .then_some(pred.uid)
+                    .filter(|_| pred.summary);
+                let percent_summary = (pred.summary && link.lag_format.kind() == LagKind::Percent)
+                    .then(|| link.clone());
+                let incoming_valid = !sources.is_empty()
+                    || self.manual_spans.contains_key(&pred.uid)
+                    || pred.summary
+                        && contributors.get(&pred.uid).is_some_and(|members| {
+                            members
+                                .iter()
+                                .any(|uid| self.manual_spans.contains_key(uid))
+                        });
+                if fixed.is_none()
+                    && pred.summary
+                    && task.summary
+                    && !sources.is_empty()
+                    && !recipients.is_empty()
+                {
+                    let group_id = groups.len();
+                    for &source in &sources {
+                        groups_by_source.entry(source).or_default().push(group_id);
+                    }
+                    groups.push(SuccessorGroup {
+                        sources,
+                        targets: recipients.clone(),
+                        link: link.link,
+                        offset: self.offset(link),
+                        percent_summary,
+                        start_of,
+                    });
+                } else {
+                    for &source in &sources {
+                        if let Some(span) = fixed {
+                            succs.entry(source).or_default().push(EffectiveSuccessor {
+                                uid: task.uid,
+                                link: link.link,
+                                offset: self.offset(link),
+                                percent_summary: percent_summary.clone(),
+                                start_of,
+                                fixed: Some(span),
+                            });
+                        } else {
+                            for &recipient in &recipients {
+                                succs.entry(source).or_default().push(EffectiveSuccessor {
+                                    uid: recipient,
+                                    link: link.link,
+                                    offset: self.offset(link),
+                                    percent_summary: percent_summary.clone(),
+                                    start_of,
+                                    fixed: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                if fixed.is_none() && incoming_valid {
+                    for &recipient in &recipients {
+                        incoming.entry(recipient).or_default().push(link.clone());
+                    }
                 }
             }
         }
+        let order = topo_order(
+            self.proj,
+            &leaves,
+            &idx_of,
+            &succs,
+            &groups,
+            &groups_by_source,
+            ReadyOrder::Fifo,
+        );
         LeafGraph {
             leaves,
-            idx_of,
+            by_uid,
             order,
+            incoming,
             succs,
+            groups,
+            groups_by_source,
+            start_floors,
+            late_bounds,
+            contributors,
+            span_cache: RefCell::new(HashMap::new()),
+            #[cfg(test)]
+            span_scans: Cell::new(0),
         }
     }
 
@@ -716,6 +1131,7 @@ impl<'a> Scheduler<'a> {
         // actual dates backward through every intervening auto task;
         // ordinary late dates can float past a fixed task's own dates.
         let mut caps: HashMap<i32, (i64, i64)> = HashMap::new();
+        let mut group_caps: HashMap<usize, Vec<SuccessorAggregate>> = HashMap::new();
         for &i in graph.order.iter().rev() {
             let task = &self.proj.tasks[i];
             if fixed(task) {
@@ -726,14 +1142,62 @@ impl<'a> Scheduler<'a> {
                 );
                 continue;
             }
-            let cap = graph.succs.get(&task.uid).into_iter().flatten().filter_map(
-                |&(successor_uid, link, offset)| {
-                    let successor = &self.proj.tasks[graph.idx_of[&successor_uid]];
-                    let &(start, finish) = caps.get(&successor.uid)?;
-                    Some(self.fixed_successor_cap(task, successor, link, offset, start, finish))
-                },
-            );
-            if let Some(start) = cap.min() {
+            let starts_summary = |summary_uid: Option<i32>| {
+                summary_uid.is_none_or(|uid| {
+                    initial.get(task.uid).map(|r| r.early_start)
+                        == initial.get(uid).map(|r| r.early_start)
+                })
+            };
+            let mut bounds = Vec::new();
+            for edge in graph.succs.get(&task.uid).into_iter().flatten() {
+                if !starts_summary(edge.start_of) {
+                    continue;
+                }
+                let successor_uid = edge.uid;
+                let Some((start, finish)) =
+                    edge.fixed.or_else(|| caps.get(&successor_uid).copied())
+                else {
+                    continue;
+                };
+                let offset = self.percent_offset(
+                    edge.offset,
+                    edge.percent_summary.as_ref(),
+                    edge.percent_summary
+                        .as_ref()
+                        .and_then(|p| initial.get(p.uid))
+                        .map(|r| (r.early_start.minutes(), r.early_finish.minutes())),
+                );
+                bounds.push((successor_uid, edge.link, offset, start, finish));
+            }
+            for &group_id in graph.groups_by_source.get(&task.uid).into_iter().flatten() {
+                let group = &graph.groups[group_id];
+                if !starts_summary(group.start_of) {
+                    continue;
+                }
+                let targets = group_caps.entry(group_id).or_insert_with(|| {
+                    self.aggregate_targets(graph, group_id, |uid| caps.get(&uid).copied())
+                });
+                let offset = self.percent_offset(
+                    group.offset,
+                    group.percent_summary.as_ref(),
+                    group
+                        .percent_summary
+                        .as_ref()
+                        .and_then(|p| initial.get(p.uid))
+                        .map(|r| (r.early_start.minutes(), r.early_finish.minutes())),
+                );
+                for target in targets {
+                    bounds.push((target.uid, group.link, offset, target.start, target.finish));
+                }
+            }
+            let cap = bounds
+                .into_iter()
+                .map(|(uid, link, offset, start, finish)| {
+                    let successor = &self.proj.tasks[graph.by_uid[&uid]];
+                    self.fixed_successor_cap(task, successor, link, offset, start, finish)
+                })
+                .min();
+            if let Some(start) = cap {
                 let tl = self.tl(task);
                 let finish = if task.duration_min == 0 {
                     start
@@ -777,8 +1241,8 @@ impl<'a> Scheduler<'a> {
     }
 
     fn pass(&self, graph: &LeafGraph, alap: &HashMap<i32, i64>, legacy: bool) -> Schedule {
+        graph.span_cache.borrow_mut().clear();
         let leaves = &graph.leaves;
-        let idx_of = &graph.idx_of;
         let order = &graph.order;
         let succs = &graph.succs;
 
@@ -804,14 +1268,12 @@ impl<'a> Scheduler<'a> {
             let mut finish_link: Option<i64> = None;
             let mut fs_milestone_start: Option<i64> = None;
             let mut finish_bounds = Vec::new();
-            for p in &t.predecessors {
-                let Some(&pf_abs) = ef_abs.get(&p.uid) else {
+            for p in graph.incoming.get(&t.uid).into_iter().flatten() {
+                let Some((ps_abs, pf_abs)) = self.absolute_span(p.uid, graph, &es_abs, &ef_abs)
+                else {
                     continue;
                 };
-                let Some(&ps_abs) = es_abs.get(&p.uid) else {
-                    continue;
-                };
-                let offset = self.offset(p);
+                let offset = self.effective_offset(p, graph, Some((ps_abs, pf_abs)));
                 let (pf_abs, lag) = offset.forward(pf_abs);
                 let (ps_abs, _) = offset.forward(ps_abs);
                 let cand = match p.link {
@@ -909,6 +1371,10 @@ impl<'a> Scheduler<'a> {
                 && let Some(&floor) = self.floors.get(&t.uid)
             {
                 start_abs = start_abs.max(floor);
+            }
+            if let Some(&floor) = graph.start_floors.get(&t.uid) {
+                start_abs = start_abs.max(tl.snap(floor));
+                driven_start = driven_start.max(start_abs);
             }
             // Snap the constraint date as a start (next morning) or a finish
             // (this evening).
@@ -1019,6 +1485,13 @@ impl<'a> Scheduler<'a> {
             .max()
             .unwrap_or(self.anchor);
         let pre_start = self.pre_start_timelines(leaves, &linked_tasks);
+        let group_early: Vec<Vec<SuccessorAggregate>> = (0..graph.groups.len())
+            .map(|id| {
+                self.aggregate_targets(graph, id, |uid| {
+                    es_abs.get(&uid).copied().zip(ef_abs.get(&uid).copied())
+                })
+            })
+            .collect();
         // A task is critical at or below this much total slack
         // (`CriticalSlackLimit`), and with `MultipleCriticalPaths` each task
         // without successors ends a critical path of its own.
@@ -1028,6 +1501,7 @@ impl<'a> Scheduler<'a> {
         // ---- backward pass: late finish / late start ----
         let mut lf_abs: HashMap<i32, i64> = HashMap::new();
         let mut ls_abs: HashMap<i32, i64> = HashMap::new();
+        let mut group_late: HashMap<usize, Vec<SuccessorAggregate>> = HashMap::new();
         // Tasks whose late window was measured on a pre-start timeline.
         let mut late_tl: HashMap<i32, &Timeline> = HashMap::new();
         for &i in order.iter().rev() {
@@ -1047,7 +1521,10 @@ impl<'a> Scheduler<'a> {
             // SS/SF successor only bounds its start. With multiple critical
             // paths, one without successors must finish by its own early
             // finish instead.
-            let end_abs = if multiple_paths && !succs.contains_key(&t.uid) {
+            let end_abs = if multiple_paths
+                && !succs.contains_key(&t.uid)
+                && !graph.groups_by_source.contains_key(&t.uid)
+            {
                 ef_abs[&t.uid]
             } else {
                 project_finish_abs
@@ -1058,31 +1535,90 @@ impl<'a> Scheduler<'a> {
             // by the successor's own late start (FS, SS) or late finish (FF,
             // SF), even on the morning side of the index `finish_abs` holds.
             let mut bound_instant = end_abs;
+            let mut bounds = Vec::new();
             if let Some(list) = succs.get(&t.uid) {
-                for &(suid, link, offset) in list {
-                    let successor = &self.proj.tasks[idx_of[&suid]];
-                    let succ_tl = self.tl(successor);
-                    if let (Some(&sls), Some(&slf)) = (ls_abs.get(&suid), lf_abs.get(&suid)) {
-                        let inverse = if legacy {
-                            legacy_inverse_link(tl, link, offset, sls, slf, span)
-                        } else {
-                            inverse_link(
-                                tl,
-                                succ_tl,
-                                link,
-                                offset,
-                                SuccessorBound {
-                                    start: sls,
-                                    finish: slf,
-                                    milestone: successor.duration_min == 0,
-                                },
-                                span,
-                            )
-                        };
-                        finish_abs = finish_abs.min(inverse.finish);
-                        bound_instant = bound_instant.min(inverse.allowed_milestone);
+                for edge in list {
+                    if !self.starts_summary(t.uid, edge.start_of, graph, &es_abs, &ef_abs) {
+                        continue;
+                    }
+                    let suid = edge.uid;
+                    let successor = &self.proj.tasks[graph.by_uid[&suid]];
+                    if let Some((sls, slf)) = edge
+                        .fixed
+                        .or_else(|| ls_abs.get(&suid).copied().zip(lf_abs.get(&suid).copied()))
+                    {
+                        let offset = self.percent_offset(
+                            edge.offset,
+                            edge.percent_summary.as_ref(),
+                            self.absolute_span(
+                                edge.percent_summary.as_ref().map_or(t.uid, |p| p.uid),
+                                graph,
+                                &es_abs,
+                                &ef_abs,
+                            ),
+                        );
+                        bounds.push((
+                            suid,
+                            edge.link,
+                            offset,
+                            sls,
+                            slf,
+                            !successor.summary && successor.duration_min == 0,
+                        ));
                     }
                 }
+            }
+            for &group_id in graph.groups_by_source.get(&t.uid).into_iter().flatten() {
+                let group = &graph.groups[group_id];
+                if !self.starts_summary(t.uid, group.start_of, graph, &es_abs, &ef_abs) {
+                    continue;
+                }
+                let targets = group_late.entry(group_id).or_insert_with(|| {
+                    self.aggregate_targets(graph, group_id, |uid| {
+                        ls_abs.get(&uid).copied().zip(lf_abs.get(&uid).copied())
+                    })
+                });
+                let offset = self.percent_offset(
+                    group.offset,
+                    group.percent_summary.as_ref(),
+                    self.absolute_span(
+                        group.percent_summary.as_ref().map_or(t.uid, |p| p.uid),
+                        graph,
+                        &es_abs,
+                        &ef_abs,
+                    ),
+                );
+                for target in targets {
+                    bounds.push((
+                        target.uid,
+                        group.link,
+                        offset,
+                        target.start,
+                        target.finish,
+                        target.milestone,
+                    ));
+                }
+            }
+            for (suid, link, offset, sls, slf, milestone) in bounds {
+                let successor = &self.proj.tasks[graph.by_uid[&suid]];
+                let inverse = if legacy {
+                    legacy_inverse_link(tl, link, offset, sls, slf, span)
+                } else {
+                    inverse_link(
+                        tl,
+                        self.tl(successor),
+                        link,
+                        offset,
+                        SuccessorBound {
+                            start: sls,
+                            finish: slf,
+                            milestone,
+                        },
+                        span,
+                    )
+                };
+                finish_abs = finish_abs.min(inverse.finish);
+                bound_instant = bound_instant.min(inverse.allowed_milestone);
             }
             // Hard constraints (backward-affecting).
             let mut hard_finish_bound = false;
@@ -1205,6 +1741,24 @@ impl<'a> Scheduler<'a> {
                     }
                 }
             }
+            if let Some(bounds) = graph.late_bounds.get(&t.uid) {
+                for &(kind, date, start_of) in bounds {
+                    if !self.starts_summary(t.uid, start_of, graph, &es_abs, &ef_abs) {
+                        continue;
+                    }
+                    let bound = if kind == ConstraintType::StartNoLaterThan {
+                        let start = tl.snap(date);
+                        tl.abs_finish(tl.to_index(start) + span)
+                    } else {
+                        finish_instants(tl, date, self.date_floor(t, linked_tasks.contains(&t.uid)))
+                            .0
+                    };
+                    if bound < finish_abs {
+                        finish_abs = bound;
+                        hard_finish_bound = true;
+                    }
+                }
+            }
             let finish_index = tl.to_index(finish_abs);
             let (s_abs, f_abs) = if let Some((pre, s_abs, f_abs)) = pre_start_window {
                 late_tl.insert(t.uid, pre);
@@ -1281,7 +1835,14 @@ impl<'a> Scheduler<'a> {
             // A tracked task finishes where its actuals put it, not at its
             // start plus its duration.
             let finish = tracked.map(|_| tl.to_index(e_f));
-            let free = self.free_slack(t, tl, &es_abs, finish, graph, legacy);
+            let free = self.free_slack(
+                t,
+                tl,
+                (&es_abs, &ef_abs),
+                finish,
+                (graph, &group_early),
+                legacy,
+            );
             results.insert(
                 t.uid,
                 TaskResult {
@@ -1443,43 +2004,80 @@ impl<'a> Scheduler<'a> {
         &self,
         t: &Task,
         tl: &Timeline,
-        es_abs: &HashMap<i32, i64>,
+        early: (&HashMap<i32, i64>, &HashMap<i32, i64>),
         finish: Option<i64>,
-        graph: &LeafGraph,
+        graph_and_groups: (&LeafGraph, &[Vec<SuccessorAggregate>]),
         legacy: bool,
     ) -> Option<i64> {
-        let list = graph.succs.get(&t.uid)?;
+        let (graph, group_early) = graph_and_groups;
+        let (es_abs, ef_abs) = early;
         let ef_idx = finish.unwrap_or_else(|| tl.to_index(es_abs[&t.uid]) + t.duration_min);
         let mut min_gap: Option<i64> = None;
-        for &(suid, link, offset) in list {
-            if link != LinkType::FinishStart {
+        let mut bounds = Vec::new();
+        for edge in graph.succs.get(&t.uid).into_iter().flatten() {
+            if edge.link != LinkType::FinishStart {
                 continue;
             }
-            let succ = &self.proj.tasks[graph.idx_of[&suid]];
-            let succ_tl = self.tl(succ);
-            let succ_es = *es_abs.get(&suid)?;
-            if legacy {
-                let allowed =
-                    legacy_inverse_link(tl, LinkType::FinishStart, offset, succ_es, succ_es, 0)
-                        .finish;
-                let gap = tl.to_index(allowed) - ef_idx;
-                min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
+            let suid = edge.uid;
+            let succ = &self.proj.tasks[graph.by_uid[&suid]];
+            let Some(succ_es) = edge
+                .fixed
+                .map(|span| span.0)
+                .or_else(|| es_abs.get(&suid).copied())
+            else {
                 continue;
-            }
-            let inverse = inverse_link(
-                tl,
-                succ_tl,
-                LinkType::FinishStart,
-                offset,
-                SuccessorBound {
-                    start: succ_es,
-                    finish: succ_es,
-                    milestone: succ.duration_min == 0,
-                },
-                0,
+            };
+            let offset = self.percent_offset(
+                edge.offset,
+                edge.percent_summary.as_ref(),
+                edge.percent_summary
+                    .as_ref()
+                    .and_then(|p| self.absolute_span(p.uid, graph, es_abs, ef_abs)),
             );
+            bounds.push((
+                suid,
+                offset,
+                succ_es,
+                !succ.summary && succ.duration_min == 0,
+            ));
+        }
+        for &group_id in graph.groups_by_source.get(&t.uid).into_iter().flatten() {
+            let group = &graph.groups[group_id];
+            if group.link != LinkType::FinishStart {
+                continue;
+            }
+            let offset = self.percent_offset(
+                group.offset,
+                group.percent_summary.as_ref(),
+                group
+                    .percent_summary
+                    .as_ref()
+                    .and_then(|p| self.absolute_span(p.uid, graph, es_abs, ef_abs)),
+            );
+            for target in &group_early[group_id] {
+                bounds.push((target.uid, offset, target.start, target.milestone));
+            }
+        }
+        for (suid, offset, start, milestone) in bounds {
+            let succ = &self.proj.tasks[graph.by_uid[&suid]];
+            let inverse = if legacy {
+                legacy_inverse_link(tl, LinkType::FinishStart, offset, start, start, 0)
+            } else {
+                inverse_link(
+                    tl,
+                    self.tl(succ),
+                    LinkType::FinishStart,
+                    offset,
+                    SuccessorBound {
+                        start,
+                        finish: start,
+                        milestone,
+                    },
+                    0,
+                )
+            };
             let gap = tl.to_index(inverse.finish) - ef_idx;
-            min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
+            min_gap = Some(min_gap.map_or(gap, |old| old.min(gap)));
         }
         min_gap
     }
@@ -1901,42 +2499,105 @@ pub fn calendar_error(proj: &Project) -> Option<String> {
     None
 }
 
-/// Kahn topological sort of leaf tasks by predecessor links; on a cycle, the
+/// FIFO for CPM; highest row first when importer pin removal reverses the result.
+#[derive(Clone, Copy)]
+enum ReadyOrder {
+    Fifo,
+    HighestRowFirst,
+}
+
+enum ReadyQueue {
+    Fifo(std::collections::VecDeque<i32>),
+    HighestRowFirst(std::collections::BTreeSet<std::cmp::Reverse<usize>>),
+}
+
+impl ReadyQueue {
+    fn pop(&mut self, proj: &Project) -> Option<i32> {
+        match self {
+            Self::Fifo(queue) => queue.pop_front(),
+            Self::HighestRowFirst(rows) => rows
+                .pop_first()
+                .map(|std::cmp::Reverse(index)| proj.tasks[index].uid),
+        }
+    }
+
+    fn push(&mut self, uid: i32, idx_of: &HashMap<i32, usize>) {
+        match self {
+            Self::Fifo(queue) => queue.push_back(uid),
+            Self::HighestRowFirst(rows) => {
+                rows.insert(std::cmp::Reverse(idx_of[&uid]));
+            }
+        }
+    }
+}
+
+/// Kahn topological sort of leaf tasks by effective links; on a cycle, the
 /// remaining tasks are appended in input order (best effort).
 fn topo_order(
     proj: &Project,
     leaves: &[usize],
-    leaf_uids: &std::collections::HashSet<i32>,
     idx_of: &HashMap<i32, usize>,
+    succs: &HashMap<i32, Vec<EffectiveSuccessor>>,
+    groups: &[SuccessorGroup],
+    groups_by_source: &HashMap<i32, Vec<usize>>,
+    ready_order: ReadyOrder,
 ) -> Vec<usize> {
     let mut indeg: HashMap<i32, usize> = leaves.iter().map(|&i| (proj.tasks[i].uid, 0)).collect();
     let mut adj: HashMap<i32, Vec<i32>> = HashMap::new();
     for &i in leaves {
-        let t = &proj.tasks[i];
-        for p in &t.predecessors {
-            if leaf_uids.contains(&p.uid) {
-                adj.entry(p.uid).or_default().push(t.uid);
-                *indeg.get_mut(&t.uid).unwrap() += 1;
+        let source = proj.tasks[i].uid;
+        for edge in succs.get(&source).into_iter().flatten() {
+            if indeg.contains_key(&edge.uid) {
+                let uid = edge.uid;
+                adj.entry(source).or_default().push(uid);
+                *indeg.get_mut(&uid).unwrap() += 1;
             }
         }
     }
-    let mut queue: Vec<i32> = leaves
+    let mut groups_left: Vec<usize> = groups.iter().map(|group| group.sources.len()).collect();
+    for group in groups {
+        for &target in &group.targets {
+            if let Some(degree) = indeg.get_mut(&target) {
+                *degree += 1;
+            }
+        }
+    }
+    let initial: Vec<i32> = leaves
         .iter()
         .map(|&i| proj.tasks[i].uid)
         .filter(|u| indeg[u] == 0)
         .collect();
     let mut order = Vec::new();
-    let mut head = 0;
-    while head < queue.len() {
-        let u = queue[head];
-        head += 1;
+    let mut ready = match ready_order {
+        ReadyOrder::Fifo => ReadyQueue::Fifo(initial.into()),
+        ReadyOrder::HighestRowFirst => ReadyQueue::HighestRowFirst(
+            initial
+                .into_iter()
+                .map(|uid| std::cmp::Reverse(idx_of[&uid]))
+                .collect(),
+        ),
+    };
+    while let Some(u) = ready.pop(proj) {
         order.push(idx_of[&u]);
         if let Some(next) = adj.get(&u) {
             for &v in next {
                 let d = indeg.get_mut(&v).unwrap();
                 *d -= 1;
                 if *d == 0 {
-                    queue.push(v);
+                    ready.push(v, idx_of);
+                }
+            }
+        }
+        for &group_id in groups_by_source.get(&u).into_iter().flatten() {
+            groups_left[group_id] -= 1;
+            if groups_left[group_id] == 0 {
+                for &target in &groups[group_id].targets {
+                    if let Some(degree) = indeg.get_mut(&target) {
+                        *degree -= 1;
+                        if *degree == 0 {
+                            ready.push(target, idx_of);
+                        }
+                    }
                 }
             }
         }
@@ -1950,6 +2611,34 @@ fn topo_order(
         }
     }
     order
+}
+
+/// Leaves driven by a link or constraint on this auto summary. A nested
+/// manual summary is a fixed boundary, even though rollups include its leaves.
+fn summary_targets(
+    proj: &Project,
+    sidx: usize,
+    leaf_uids: &std::collections::HashSet<i32>,
+) -> Vec<i32> {
+    let level = proj.tasks[sidx].outline_level;
+    let mut manual_level = None;
+    let mut out = Vec::new();
+    for task in proj
+        .tasks
+        .iter()
+        .skip(sidx + 1)
+        .take_while(|t| t.outline_level > level)
+    {
+        if manual_level.is_some_and(|depth| task.outline_level <= depth) {
+            manual_level = None;
+        }
+        if manual_level.is_none() && task.summary && task.manual_summary_dates().is_some() {
+            manual_level = Some(task.outline_level);
+        } else if manual_level.is_none() && !task.summary && leaf_uids.contains(&task.uid) {
+            out.push(task.uid);
+        }
+    }
+    out
 }
 
 /// Project's warning on a manually scheduled task, from its shown finishes
@@ -2136,6 +2825,32 @@ pub fn schedule(proj: &Project) -> Schedule {
         }
     }
     main
+}
+
+/// Downstream-first order for removing importer date pins. It uses CPM's
+/// effective links, including summaries, and tries unrelated lower rows first.
+pub fn effective_leaf_pin_removal_order(proj: &Project) -> Vec<i32> {
+    let clean = without_unscheduled_rows(proj);
+    let engine = Scheduler::new(&clean);
+    let graph = engine.leaf_graph();
+    let idx_of: HashMap<i32, usize> = graph
+        .leaves
+        .iter()
+        .map(|&index| (clean.tasks[index].uid, index))
+        .collect();
+    topo_order(
+        &clean,
+        &graph.leaves,
+        &idx_of,
+        &graph.succs,
+        &graph.groups,
+        &graph.groups_by_source,
+        ReadyOrder::HighestRowFirst,
+    )
+    .into_iter()
+    .rev()
+    .map(|index| clean.tasks[index].uid)
+    .collect()
 }
 
 fn schedule_local(proj: &Project) -> Schedule {
@@ -2647,9 +3362,11 @@ impl Scheduler<'_> {
         t: &Task,
         tl: &Timeline,
         cpm: &TaskResult,
-        finish: &HashMap<i32, DateTime>,
+        graph: &LeafGraph,
+        leveled: (&HashMap<i32, DateTime>, &HashMap<i32, DateTime>),
         linked: bool,
     ) -> i64 {
+        let (start, finish) = leveled;
         let cpm_start = cpm.early_start.minutes();
         let honored = |c| self.proj.honor_constraints && t.constraint == c;
         if honored(ConstraintType::MustFinishOn) || honored(ConstraintType::MustStartOn) {
@@ -2657,15 +3374,19 @@ impl Scheduler<'_> {
         }
         let placed = tl.to_index(cpm_start);
         let mut s_abs = cpm_start;
-        for p in t
-            .predecessors
-            .iter()
+        for p in graph
+            .incoming
+            .get(&t.uid)
+            .into_iter()
+            .flatten()
             .filter(|p| p.link == LinkType::FinishStart)
         {
-            let Some(&now) = finish.get(&p.uid) else {
+            let Some((ps, now)) = self.leveled_span(p.uid, graph, start, finish) else {
                 continue;
             };
-            let (now, lag) = self.offset(p).forward(now.minutes());
+            let (now, lag) = self
+                .effective_offset(p, graph, Some((ps, now)))
+                .forward(now);
             let now = fs_milestone_instant(tl, now, lag);
             if tl.to_index(now) == placed {
                 s_abs = s_abs.max(now);
@@ -2705,16 +3426,9 @@ impl Scheduler<'_> {
             };
         }
 
-        let leaves: Vec<usize> = (0..self.proj.tasks.len())
-            .filter(|&i| !self.proj.tasks[i].summary && self.tl(&self.proj.tasks[i]).total > 0)
-            .collect();
-        let leaf_uids: std::collections::HashSet<i32> =
-            leaves.iter().map(|&i| self.proj.tasks[i].uid).collect();
-        let idx_of: HashMap<i32, usize> = leaves
-            .iter()
-            .map(|&i| (self.proj.tasks[i].uid, i))
-            .collect();
-        let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
+        let graph = self.leaf_graph();
+        let leaves = &graph.leaves;
+        let order = &graph.order;
 
         // Work-resource capacities and per-task assignments. An assignment
         // books its resource from its `Delay` into the task on; its stored
@@ -2742,15 +3456,12 @@ impl Scheduler<'_> {
         let mut bookings: HashMap<i32, Vec<Booking>> = HashMap::new();
         let mut start: HashMap<i32, DateTime> = HashMap::new();
         let mut finish: HashMap<i32, DateTime> = HashMap::new();
-        // Auto tasks whose leveled start or finish differs from CPM.
-        let mut moved_start = std::collections::HashSet::new();
-        let mut moved_finish = std::collections::HashSet::new();
 
         // Manual and tracked tasks never move, so book them before placing
         // anything else: auto tasks earlier in topological order must level
         // around them. An in-progress task is booked through its Stop..Resume
         // gap too.
-        for &i in &order {
+        for &i in order {
             let t = &self.proj.tasks[i];
             if !fixed(t) {
                 continue;
@@ -2762,7 +3473,7 @@ impl Scheduler<'_> {
             book(&mut bookings, res, s_idx, f_idx);
         }
 
-        for &i in &order {
+        for &i in order {
             let t = &self.proj.tasks[i];
             let cpm = base.get(t.uid).expect("leaf scheduled");
             // A manual or tracked task keeps its dates and passes no delay on.
@@ -2779,25 +3490,61 @@ impl Scheduler<'_> {
             // there: a delay that ends in nonworking time can move the
             // successor less than it moved the predecessor, or only its
             // instant (#104).
-            let floor = t
-                .predecessors
-                .iter()
+            let floor = graph
+                .incoming
+                .get(&t.uid)
+                .into_iter()
+                .flatten()
                 .filter_map(|p| {
-                    let delay = *delay.get(&p.uid)?;
-                    let Offset::Elapsed(lag) = self.offset(p) else {
-                        return Some(delay);
+                    let pred_task = &self.proj.tasks[graph.by_uid[&p.uid]];
+                    let (now_start, now_finish) = if pred_task.summary {
+                        self.leveled_span(p.uid, &graph, &start, &finish)?
+                    } else {
+                        (start.get(&p.uid)?.minutes(), finish.get(&p.uid)?.minutes())
                     };
                     let pred = base.get(p.uid)?;
                     let (was, now) = match p.link {
                         LinkType::FinishStart | LinkType::FinishFinish => {
-                            (pred.early_finish, *finish.get(&p.uid)?)
+                            (pred.early_finish.minutes(), now_finish)
                         }
                         LinkType::StartStart | LinkType::StartFinish => {
-                            (pred.early_start, *start.get(&p.uid)?)
+                            (pred.early_start.minutes(), now_start)
                         }
                     };
-                    let bound = |at: DateTime| tl.to_index(at.minutes().saturating_add(lag));
-                    Some(bound(now) - bound(was))
+                    let leveled_offset =
+                        self.effective_offset(p, &graph, Some((now_start, now_finish)));
+                    match leveled_offset {
+                        Offset::Elapsed(lag) => {
+                            let bound = |at: i64| tl.to_index(at.saturating_add(lag));
+                            let gap = bound(now) - bound(was);
+                            Some(if pred_task.summary { gap.max(0) } else { gap })
+                        }
+                        Offset::Working(leveled_lag)
+                            if pred_task.summary && p.lag_format.kind() == LagKind::Percent =>
+                        {
+                            let cpm_offset = self.percent_offset(
+                                Offset::Working(0),
+                                Some(p),
+                                Some((pred.early_start.minutes(), pred.early_finish.minutes())),
+                            );
+                            let Offset::Working(cpm_lag) = cpm_offset else {
+                                unreachable!("percent summary lag is working");
+                            };
+                            let succ_tl = self.tl(t);
+                            let cpm_bound =
+                                succ_tl.abs_start(succ_tl.to_index(was).saturating_add(cpm_lag));
+                            let leveled_bound = succ_tl
+                                .abs_start(succ_tl.to_index(now).saturating_add(leveled_lag));
+                            Some((tl.to_index(leveled_bound) - tl.to_index(cpm_bound)).max(0))
+                        }
+                        Offset::Working(_) => {
+                            if pred_task.summary {
+                                Some((tl.to_index(now) - tl.to_index(was)).max(0))
+                            } else {
+                                delay.get(&p.uid).copied()
+                            }
+                        }
+                    }
                 })
                 .max()
                 .unwrap_or(0);
@@ -2810,27 +3557,43 @@ impl Scheduler<'_> {
             // index (an elapsed lag into nonworking time, #104); a successor
             // that keeps that instant (a milestone, an SF finish) must follow.
             // Only the endpoint the link counts from matters.
-            let pred_moved = t.predecessors.iter().any(|p| match p.link {
-                LinkType::FinishStart | LinkType::FinishFinish => moved_finish.contains(&p.uid),
-                LinkType::StartStart | LinkType::StartFinish => moved_start.contains(&p.uid),
+            let pred_moved = graph.incoming.get(&t.uid).into_iter().flatten().any(|p| {
+                let Some(pred) = base.get(p.uid) else {
+                    return false;
+                };
+                let Some((s, f)) = self.leveled_span(p.uid, &graph, &start, &finish) else {
+                    return false;
+                };
+                match p.link {
+                    LinkType::FinishStart | LinkType::FinishFinish => {
+                        f != pred.early_finish.minutes()
+                    }
+                    LinkType::StartStart | LinkType::StartFinish => s != pred.early_start.minutes(),
+                }
             });
             let (s_abs, f_abs) = if placed == cpm_start_idx && floor == 0 && !pred_moved {
                 (cpm.early_start.minutes(), cpm.early_finish.minutes())
             } else {
                 let mut s_abs = tl.abs_start(placed);
                 if t.duration_min == 0 && placed == cpm_start_idx {
-                    let linked = t.predecessors.iter().any(|p| start.contains_key(&p.uid));
-                    s_abs = self.releveled_milestone(t, tl, cpm, &finish, linked);
+                    let linked = graph
+                        .incoming
+                        .get(&t.uid)
+                        .into_iter()
+                        .flatten()
+                        .any(|p| self.leveled_span(p.uid, &graph, &start, &finish).is_some());
+                    s_abs = self.releveled_milestone(t, tl, cpm, &graph, (&start, &finish), linked);
                 } else if t.duration_min == 0 {
                     let mut fs_instant: Option<i64> = None;
                     let mut start_bound = cpm.early_start.minutes();
-                    for p in &t.predecessors {
-                        let (Some(ps), Some(pf)) = (start.get(&p.uid), finish.get(&p.uid)) else {
+                    for p in graph.incoming.get(&t.uid).into_iter().flatten() {
+                        let Some((ps, pf)) = self.leveled_span(p.uid, &graph, &start, &finish)
+                        else {
                             continue;
                         };
-                        let offset = self.offset(p);
-                        let (pf, lag) = offset.forward(pf.minutes());
-                        let (ps, _) = offset.forward(ps.minutes());
+                        let offset = self.effective_offset(p, &graph, Some((ps, pf)));
+                        let (pf, lag) = offset.forward(pf);
+                        let (ps, _) = offset.forward(ps);
                         if p.link == LinkType::FinishStart {
                             let instant = fs_milestone_instant(tl, pf, lag);
                             if tl.to_index(instant) == placed {
@@ -2858,23 +3621,27 @@ impl Scheduler<'_> {
                         s_abs = instant.max(start_bound);
                     }
                 }
-                let bounds = t.predecessors.iter().filter_map(|p| {
-                    let offset = self.offset(p);
-                    match p.link {
-                        LinkType::StartFinish => start.get(&p.uid).map(|s| {
-                            let (s, lag) = offset.forward(s.minutes());
-                            sf_bound(tl, s, lag)
-                        }),
-                        // An elapsed FF lag keeps its instant, as in CPM.
-                        LinkType::FinishFinish if matches!(offset, Offset::Elapsed(_)) => {
-                            finish.get(&p.uid).map(|f| {
-                                let (f, _) = offset.forward(f.minutes());
-                                (tl.to_index(f), f)
-                            })
+                let bounds = graph
+                    .incoming
+                    .get(&t.uid)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| {
+                        let (ps, pf) = self.leveled_span(p.uid, &graph, &start, &finish)?;
+                        let offset = self.effective_offset(p, &graph, Some((ps, pf)));
+                        match p.link {
+                            LinkType::StartFinish => {
+                                let (s, lag) = offset.forward(ps);
+                                Some(sf_bound(tl, s, lag))
+                            }
+                            // An elapsed FF lag keeps its instant, as in CPM.
+                            LinkType::FinishFinish if matches!(offset, Offset::Elapsed(_)) => {
+                                let (f, _) = offset.forward(pf);
+                                Some((tl.to_index(f), f))
+                            }
+                            _ => None,
                         }
-                        _ => None,
-                    }
-                });
+                    });
                 (
                     s_abs,
                     finish_instant(
@@ -2885,18 +3652,14 @@ impl Scheduler<'_> {
                         bounds,
                         self.constraint_dates(
                             t,
-                            t.predecessors.iter().any(|p| start.contains_key(&p.uid)),
+                            graph.incoming.get(&t.uid).into_iter().flatten().any(|p| {
+                                self.leveled_span(p.uid, &graph, &start, &finish).is_some()
+                            }),
                         )
                         .and_then(|dates| dates.finish_bound),
                     ),
                 )
             };
-            if s_abs != cpm.early_start.minutes() {
-                moved_start.insert(t.uid);
-            }
-            if f_abs != cpm.early_finish.minutes() {
-                moved_finish.insert(t.uid);
-            }
             start.insert(t.uid, DateTime::from_minutes(s_abs));
             finish.insert(t.uid, DateTime::from_minutes(f_abs));
         }
@@ -2906,7 +3669,7 @@ impl Scheduler<'_> {
         let mut rollups = HashMap::new();
         for i in summaries_deepest_first(self.proj) {
             let t = &self.proj.tasks[i];
-            let uids: Vec<i32> = rollup_nodes(self.proj, i, &leaves)
+            let uids: Vec<i32> = rollup_nodes(self.proj, i, leaves)
                 .map(|k| self.proj.tasks[k].uid)
                 .collect();
             let cs = uids.iter().filter_map(|u| start.get(u).copied()).min();
@@ -3237,6 +4000,854 @@ mod tests {
     }
     fn fs(uid: i32) -> Predecessor {
         Predecessor::fs(uid)
+    }
+
+    fn summary_task(uid: i32, level: u32) -> Task {
+        let mut task = task(uid, "Summary", 0);
+        task.summary = true;
+        task.outline_level = level;
+        task
+    }
+
+    #[test]
+    fn summary_link_and_snet_constraint_drive_children() {
+        let a = summary_task(1, 1);
+        let mut a1 = task(2, "A1", 960);
+        a1.outline_level = 2;
+        let mut b = summary_task(3, 1);
+        b.predecessors.push(fs(1));
+        let mut b1 = task(4, "B1", 960);
+        b1.outline_level = 2;
+        let mut c = summary_task(5, 1);
+        c.constraint = ConstraintType::StartNoEarlierThan;
+        c.constraint_date = Some(at(9, 8));
+        let mut c1 = task(6, "C1", 960);
+        c1.outline_level = 2;
+        let result = schedule(&march2(vec![a, a1, b, b1, c, c1]));
+        assert_eq!(result.get(2).unwrap().early_start, at(2, 8));
+        assert_eq!(result.get(2).unwrap().early_finish, at(3, 17));
+        assert_eq!(result.get(4).unwrap().early_start, at(4, 8));
+        assert_eq!(result.get(6).unwrap().early_start, at(9, 8));
+    }
+
+    #[test]
+    fn summary_link_auto_and_manual_dates_match_measured_project_cases() {
+        for manual in [false, true] {
+            let x = task(1, "X", 1920);
+            let mut s = summary_task(2, 1);
+            s.predecessors.push(fs(1));
+            if manual {
+                s.manual = true;
+                s.manual_start = Some(at(2, 8));
+                s.manual_finish = Some(at(4, 17));
+            }
+            let mut a = task(3, "A", 960);
+            a.outline_level = 2;
+            let mut b = task(4, "B", 1440);
+            b.outline_level = 2;
+            b.predecessors.push(fs(3));
+            let mut y = task(5, "Y", 480);
+            y.predecessors.push(fs(2));
+            let result = schedule(&march2(vec![x, s, a, b, y]));
+            if manual {
+                assert_eq!(result.get(3).unwrap().early_start, at(2, 8));
+                assert_eq!(result.get(2).unwrap().early_finish, at(4, 17));
+                assert_eq!(result.get(1).unwrap().total_slack_min, -1920);
+                assert_eq!(result.get(5).unwrap().early_start, at(5, 8));
+                assert!(result.get(2).unwrap().total_slack_min >= 0);
+            } else {
+                assert_eq!(result.get(3).unwrap().early_start, at(6, 8));
+                assert_eq!(result.get(4).unwrap().early_start, at(10, 8));
+                assert_eq!(result.get(5).unwrap().early_start, at(13, 8));
+                assert_eq!(result.get(1).unwrap().total_slack_min, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn summary_link_reaches_nested_auto_children_but_stops_at_manual_summary() {
+        let driver = task(1, "Driver", 960);
+        let mut outer = summary_task(2, 1);
+        outer.predecessors.push(fs(1));
+        let inner = summary_task(3, 2);
+        let mut target = task(4, "Target", 480);
+        target.outline_level = 3;
+        let mut manual = summary_task(5, 2);
+        manual.manual = true;
+        manual.manual_start = Some(at(2, 8));
+        manual.manual_finish = Some(at(4, 17));
+        let mut inside = task(6, "Inside manual", 480);
+        inside.outline_level = 3;
+        let mut after = task(7, "After", 480);
+        after.predecessors.push(fs(2));
+        let result = schedule(&march2(vec![
+            driver, outer, inner, target, manual, inside, after,
+        ]));
+        assert_eq!(result.get(4).unwrap().early_start, at(4, 8));
+        assert_eq!(result.get(6).unwrap().early_start, at(2, 8));
+        assert_eq!(result.get(7).unwrap().early_start, at(5, 8));
+    }
+
+    #[test]
+    fn summary_link_out_uses_a_nested_manual_summary_without_leaf_contributors() {
+        let outer = summary_task(1, 1);
+        let mut manual = summary_task(2, 2);
+        manual.manual = true;
+        manual.manual_start = Some(at(2, 8));
+        manual.manual_finish = Some(at(4, 17));
+        let mut successor = task(3, "Successor", 480);
+        successor.predecessors.push(fs(1));
+        let result = schedule(&march2(vec![outer, manual, successor]));
+        assert_eq!(result.get(1).unwrap().early_finish, at(4, 17));
+        assert_eq!(result.get(3).unwrap().early_start, at(5, 8));
+    }
+
+    #[test]
+    fn summary_link_nested_manual_boundary_is_not_overwritten() {
+        let driver = task(1, "Driver", 960);
+        let mut outer = summary_task(2, 1);
+        outer.predecessors.push(fs(1));
+        let mut manual = summary_task(3, 2);
+        manual.manual = true;
+        manual.manual_start = Some(at(2, 8));
+        manual.manual_finish = Some(at(3, 17));
+        let mut nested = summary_task(4, 3);
+        nested.manual = true;
+        nested.manual_start = Some(at(2, 8));
+        nested.manual_finish = Some(at(2, 17));
+        let mut nested_leaf = task(5, "Nested", 480);
+        nested_leaf.outline_level = 4;
+        let mut after_nested = task(6, "Still inside manual", 480);
+        after_nested.outline_level = 3;
+        let mut sibling = task(7, "Driven sibling", 480);
+        sibling.outline_level = 2;
+        let result = schedule(&march2(vec![
+            driver,
+            outer,
+            manual,
+            nested,
+            nested_leaf,
+            after_nested,
+            sibling,
+        ]));
+        assert_eq!(result.get(6).unwrap().early_start, at(2, 8));
+        assert_eq!(result.get(7).unwrap().early_start, at(4, 8));
+    }
+
+    #[test]
+    fn summary_link_external_manual_predecessor_does_not_drive_local_leaf() {
+        let mut external = summary_task(1, 1);
+        external.external_task = Some(true);
+        external.manual = true;
+        external.manual_start = Some(at(9, 8));
+        external.manual_finish = Some(at(10, 17));
+        let mut local = task(2, "Local", 480);
+        local.predecessors.push(fs(1));
+        let result = schedule(&march2(vec![external, local]));
+        assert_eq!(result.get(2).unwrap().early_start, at(2, 8));
+    }
+
+    #[test]
+    fn summary_link_large_phases_use_linear_dependency_storage() {
+        let mut first = summary_task(1, 1);
+        first.name = "First phase".into();
+        let mut tasks = vec![first];
+        for uid in 2..=1001 {
+            let mut leaf = task(uid, "First", 480);
+            leaf.outline_level = 2;
+            tasks.push(leaf);
+        }
+        let mut second = summary_task(1002, 1);
+        second.predecessors.push(fs(1));
+        tasks.push(second);
+        for uid in 1003..=2002 {
+            let mut leaf = task(uid, "Second", 480);
+            leaf.outline_level = 2;
+            tasks.push(leaf);
+        }
+        let project = march2(tasks);
+        let engine = Scheduler::new(&project);
+        let graph = engine.leaf_graph();
+        let direct_edges: usize = graph.succs.values().map(Vec::len).sum();
+        let grouped_members: usize = graph
+            .groups
+            .iter()
+            .map(|g| g.sources.len() + g.targets.len())
+            .sum();
+        assert_eq!(graph.groups.len(), 1);
+        assert!(direct_edges + grouped_members <= 2_000);
+        let scheduled = engine.pass(&graph, &HashMap::new(), true);
+        assert_eq!(scheduled.get(1003).unwrap().early_start, at(3, 8));
+        assert!(graph.span_scans.get() <= 4);
+        assert_eq!(level(&project).start(1003), Some(at(3, 8)));
+    }
+
+    #[test]
+    fn summary_constraint_fnlt_reports_negative_slack_without_moving_children() {
+        let mut summary = summary_task(1, 1);
+        summary.constraint = ConstraintType::FinishNoLaterThan;
+        summary.constraint_date = Some(at(3, 17));
+        let mut a = task(2, "A", 960);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 960);
+        b.outline_level = 2;
+        b.predecessors.push(fs(2));
+        let result = schedule(&march2(vec![summary, a, b]));
+        assert_eq!(result.get(3).unwrap().early_start, at(4, 8));
+        assert!(result.get(3).unwrap().total_slack_min < 0);
+        assert!(result.get(2).unwrap().total_slack_min < 0);
+    }
+
+    #[test]
+    fn summary_link_cycle_and_empty_predecessor_are_best_effort() {
+        let mut empty = summary_task(1, 1);
+        empty.outline_level = 1;
+        let mut x = task(2, "X", 480);
+        x.predecessors.push(fs(1));
+        let mut summary = summary_task(3, 1);
+        summary.predecessors.push(fs(2));
+        let mut child = task(4, "Child", 480);
+        child.outline_level = 2;
+        x.predecessors.push(fs(4));
+        let project = march2(vec![empty, x, summary, child]);
+        let result = schedule(&project);
+        assert_eq!(result.get(2).unwrap().early_start, at(2, 8));
+        assert!(result.get(4).is_some());
+        let leveled = level(&project);
+        assert!(leveled.start(4).is_some());
+    }
+
+    #[test]
+    fn summary_link_outgoing_ss_ff_sf_uses_rolled_endpoints() {
+        for (link, lag, expected) in [
+            (LinkType::StartStart, 0, at(2, 8)),
+            (LinkType::FinishFinish, 0, at(3, 8)),
+            (LinkType::StartFinish, 960, at(3, 8)),
+        ] {
+            let summary = summary_task(1, 1);
+            let mut first = task(2, "First", 480);
+            first.outline_level = 2;
+            let mut last = task(3, "Last", 480);
+            last.outline_level = 2;
+            last.predecessors.push(fs(2));
+            let mut successor = task(4, "Successor", 480);
+            successor
+                .predecessors
+                .push(Predecessor::working(1, link, lag));
+            let result = schedule(&march2(vec![summary, first, last, successor]));
+            assert_eq!(result.get(4).unwrap().early_start, expected, "{link:?}");
+        }
+    }
+
+    #[test]
+    fn summary_link_start_bound_only_reaches_start_defining_child() {
+        let summary = summary_task(1, 1);
+        let mut first = task(2, "First", 480);
+        first.outline_level = 2;
+        let mut later = task(3, "Later", 480);
+        later.outline_level = 2;
+        later.constraint = ConstraintType::StartNoEarlierThan;
+        later.constraint_date = Some(at(6, 8));
+        let mut successor = task(4, "Successor", 2880);
+        successor
+            .predecessors
+            .push(Predecessor::working(1, LinkType::StartStart, 0));
+        let result = schedule(&march2(vec![summary, first, later, successor]));
+        assert_eq!(result.get(4).unwrap().early_start, at(2, 8));
+        assert!(result.get(2).unwrap().total_slack_min <= 0);
+        assert!(result.get(3).unwrap().total_slack_min >= 0);
+    }
+
+    #[test]
+    fn summary_link_alap_chain_caps_at_fixed_successor() {
+        let mut alap = task(1, "ALAP", 480);
+        alap.constraint = ConstraintType::AsLateAsPossible;
+        let mut summary = summary_task(2, 1);
+        summary.predecessors.push(fs(1));
+        let mut child = task(3, "Child", 480);
+        child.outline_level = 2;
+        let mut fixed = task(4, "Fixed", 480);
+        fixed.manual = true;
+        fixed.manual_start = Some(at(5, 8));
+        fixed.manual_finish = Some(at(5, 17));
+        fixed.predecessors.push(fs(2));
+        let long = task(5, "Long", 4800);
+        let result = schedule(&march2(vec![alap, summary, child, fixed, long]));
+        assert!(result.get(1).unwrap().early_finish < result.get(4).unwrap().early_start);
+    }
+
+    #[test]
+    fn summary_link_manual_successor_caps_alap_predecessor() {
+        let mut alap = task(1, "ALAP", 480);
+        alap.constraint = ConstraintType::AsLateAsPossible;
+        let mut summary = summary_task(2, 1);
+        summary.manual = true;
+        summary.manual_start = Some(at(5, 8));
+        summary.manual_finish = Some(at(5, 17));
+        summary.predecessors.push(fs(1));
+        let mut child = task(3, "Child", 480);
+        child.outline_level = 2;
+        let long = task(4, "Long", 4800);
+        let result = schedule(&march2(vec![alap, summary, child, long]));
+        assert!(result.get(1).unwrap().early_finish < at(5, 8));
+        assert_eq!(result.get(2).unwrap().early_start, at(5, 8));
+    }
+
+    #[test]
+    fn summary_constraint_mso_floors_auto_children_but_leaf_mso_keeps_own_date() {
+        let mut summary = summary_task(1, 1);
+        summary.constraint = ConstraintType::MustStartOn;
+        summary.constraint_date = Some(at(9, 8));
+        let mut auto = task(2, "Auto", 480);
+        auto.outline_level = 2;
+        let mut pinned = task(3, "Own MSO", 480);
+        pinned.outline_level = 2;
+        pinned.constraint = ConstraintType::MustStartOn;
+        pinned.constraint_date = Some(at(3, 8));
+        let result = schedule(&march2(vec![summary, auto, pinned]));
+        assert_eq!(result.get(2).unwrap().early_start, at(9, 8));
+        assert_eq!(result.get(3).unwrap().early_start, at(3, 8));
+    }
+
+    #[test]
+    fn summary_link_leveling_follows_leveled_rollup_and_inherited_link() {
+        let blocker = task(1, "Blocker", 480);
+        let summary = summary_task(2, 1);
+        let mut child = task(3, "Child", 480);
+        child.outline_level = 2;
+        let mut successor = task(4, "Successor", 480);
+        successor.predecessors.push(fs(2));
+        let mut next = summary_task(5, 1);
+        next.predecessors.push(fs(2));
+        let mut next_child = task(6, "Next child", 480);
+        next_child.outline_level = 2;
+        let project = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![blocker, summary, child, successor, next, next_child],
+            resources: vec![worker(1, "Team", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 3, 1, 1.0)],
+            ..Project::default()
+        };
+        let leveled = level(&project);
+        assert_eq!(leveled.start(3), Some(at(3, 8)));
+        assert_eq!(leveled.start(4), Some(at(4, 8)));
+        assert_eq!(leveled.start(6), Some(at(4, 8)));
+    }
+
+    #[test]
+    fn leveling_leaf_cross_calendar_delay_preserves_cpm_floor() {
+        let mut short_day = Calendar::standard(2);
+        for day in short_day.week.iter_mut().flatten() {
+            day.times.truncate(1);
+        }
+        let blocker = task(1, "Blocker", 60);
+        let mut a = task(2, "Four-hour A", 480);
+        a.calendar_uid = Some(2);
+        let mut b = task(3, "B", 480);
+        b.predecessors.push(fs(2));
+        let project = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![blocker, a, b],
+            calendars: vec![Calendar::standard(1), short_day],
+            resources: vec![worker(1, "Team", 1.0)],
+            assignments: vec![assign(1, 1, 1, 1.0), assign(2, 2, 1, 1.0)],
+            ..Project::default()
+        };
+        let cpm = schedule(&project);
+        let leveled = level(&project);
+        let expected = cpm.get(3).unwrap().early_start.minutes() + 60;
+        assert_eq!(leveled.start(3), Some(DateTime::from_minutes(expected)));
+        assert!(leveled.start(3).unwrap() >= cpm.get(3).unwrap().early_start);
+    }
+
+    #[test]
+    fn summary_link_lag_and_cross_calendar_match_direct_leaf_links() {
+        let mut special = Calendar::standard(2);
+        for day in special.week.iter_mut().flatten() {
+            for slot in &mut day.times {
+                slot.from += 60;
+                slot.to += 60;
+            }
+        }
+        let driver = task(1, "Driver", 480);
+        let mut summary = summary_task(2, 1);
+        summary
+            .predecessors
+            .push(Predecessor::working(1, LinkType::FinishStart, 480));
+        let mut child = task(3, "Child", 480);
+        child.outline_level = 2;
+        child.calendar_uid = Some(2);
+        let mut after = task(4, "After", 480);
+        after
+            .predecessors
+            .push(Predecessor::working(2, LinkType::FinishStart, 480));
+        let with_summary = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![driver.clone(), summary, child.clone(), after.clone()],
+            calendars: vec![Calendar::standard(1), special.clone()],
+            ..Project::default()
+        };
+        let mut direct_child = child;
+        direct_child
+            .predecessors
+            .push(Predecessor::working(1, LinkType::FinishStart, 480));
+        let mut direct_after = after;
+        direct_after.predecessors.clear();
+        direct_after
+            .predecessors
+            .push(Predecessor::working(3, LinkType::FinishStart, 480));
+        let direct = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![driver, direct_child, direct_after],
+            calendars: vec![Calendar::standard(1), special],
+            ..Project::default()
+        };
+        let actual = schedule(&with_summary);
+        let expected = schedule(&direct);
+        for uid in [1, 3, 4] {
+            let a = actual.get(uid).unwrap();
+            let b = expected.get(uid).unwrap();
+            assert_eq!(
+                (a.early_start, a.early_finish, a.total_slack_min),
+                (b.early_start, b.early_finish, b.total_slack_min),
+                "UID {uid}"
+            );
+        }
+    }
+
+    #[test]
+    fn summary_link_percent_lag_uses_rolled_or_manual_duration() {
+        for manual in [false, true] {
+            let mut summary = summary_task(1, 1);
+            if manual {
+                summary.manual = true;
+                summary.manual_start = Some(at(2, 8));
+                summary.manual_finish = Some(at(3, 17));
+            }
+            let mut child = task(2, "Child", if manual { 480 } else { 960 });
+            child.outline_level = 2;
+            let mut successor = task(3, "Successor", 480);
+            let mut percent = fs(1);
+            percent.lag = 50;
+            percent.lag_format = LagFormat::from_code(19).unwrap();
+            successor.predecessors.push(percent);
+            let project = march2(vec![summary, child, successor]);
+            let actual = schedule(&project);
+
+            let direct = task(4, "Direct two-day predecessor", 960);
+            let mut direct_successor = task(3, "Successor", 480);
+            let mut direct_percent = fs(4);
+            direct_percent.lag = 50;
+            direct_percent.lag_format = LagFormat::from_code(19).unwrap();
+            direct_successor.predecessors.push(direct_percent);
+            let expected = schedule(&march2(vec![direct, direct_successor]));
+            assert_eq!(
+                actual.get(3).unwrap().early_start,
+                expected.get(3).unwrap().early_start
+            );
+            assert_eq!(
+                actual.get(3).unwrap().late_start,
+                expected.get(3).unwrap().late_start
+            );
+            assert_eq!(
+                level(&project).start(3),
+                Some(expected.get(3).unwrap().early_start)
+            );
+            if !manual {
+                let child = actual.get(2).unwrap();
+                let direct = expected.get(4).unwrap();
+                assert_eq!(
+                    (
+                        child.late_start,
+                        child.total_slack_min,
+                        child.free_slack_min
+                    ),
+                    (
+                        direct.late_start,
+                        direct.total_slack_min,
+                        direct.free_slack_min
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn leveling_recomputes_percent_lag_from_stretched_summary() {
+        let summary = summary_task(1, 1);
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        let mut c = task(4, "C", 480);
+        let mut percent = fs(1);
+        percent.lag = 100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        let project = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![summary, a, b, c],
+            resources: vec![worker(1, "Team", 1.0)],
+            assignments: vec![assign(1, 2, 1, 1.0), assign(2, 3, 1, 1.0)],
+            ..Project::default()
+        };
+        assert_eq!(schedule(&project).get(4).unwrap().early_start, at(4, 8));
+        let leveled = level(&project);
+        assert_eq!(leveled.start(3), Some(at(3, 8)));
+        assert_eq!(leveled.start(4), Some(at(6, 8)));
+    }
+
+    #[test]
+    fn negative_summary_percent_lag_allocates_backward_horizon() {
+        let summary = summary_task(1, 1);
+        let mut child = task(2, "Child", 960);
+        child.outline_level = 2;
+        let mut successor = task(3, "Successor", 480);
+        let mut percent = Predecessor::working(1, LinkType::StartStart, 0);
+        percent.lag = -100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        successor.predecessors.push(percent);
+        let grouped = schedule(&march2(vec![summary, child, successor]));
+        let mut direct_successor = task(3, "Successor", 480);
+        let mut direct_percent = Predecessor::working(4, LinkType::StartStart, 0);
+        direct_percent.lag = -100;
+        direct_percent.lag_format = LagFormat::from_code(19).unwrap();
+        direct_successor.predecessors.push(direct_percent);
+        let direct = schedule(&march2(vec![task(4, "Direct", 960), direct_successor]));
+        assert_eq!(
+            grouped.get(3).unwrap().early_start,
+            direct.get(3).unwrap().early_start
+        );
+        assert!(grouped.get(3).unwrap().early_start < at(2, 8));
+    }
+
+    #[test]
+    fn summary_percent_lag_horizon_covers_long_child_gap() {
+        let summary = summary_task(1, 1);
+        let mut first = task(2, "First", 480);
+        first.outline_level = 2;
+        let mut second = task(3, "Second", 480);
+        second.outline_level = 2;
+        second
+            .predecessors
+            .push(Predecessor::working(2, LinkType::FinishStart, 100 * 480));
+        let mut successor = task(4, "Successor", 480);
+        let mut percent = fs(1);
+        percent.lag = 300;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        successor.predecessors.push(percent);
+        let project = march2(vec![summary, first, second, successor]);
+        let result = schedule(&project);
+        let span = result.get(1).unwrap();
+        let cal = summary_calendar(&project);
+        let rolled_work = working_minutes_on(&cal, span.early_start, span.early_finish);
+        let reference = Timeline::build(
+            &cal,
+            span.early_finish.minutes(),
+            span.early_finish.minutes(),
+            rolled_work * 3 + 480,
+            span.early_finish.minutes(),
+        );
+        let expected = reference.abs_start(rolled_work * 3);
+        assert_eq!(result.get(4).unwrap().early_start.minutes(), expected);
+    }
+
+    fn assert_summary_percent_fs_matches_full_timeline(
+        project: &Project,
+        summary_uid: i32,
+        successor_uid: i32,
+        percent: i64,
+    ) {
+        let result = schedule(project);
+        let span = result.get(summary_uid).unwrap();
+        let cal = summary_calendar(project);
+        let duration = working_minutes_on(&cal, span.early_start, span.early_finish);
+        let lag = duration * percent / 100;
+        let reference = Timeline::build(
+            &cal,
+            span.early_finish.minutes(),
+            span.early_finish.minutes(),
+            lag + 480,
+            span.early_finish.minutes(),
+        );
+        assert_eq!(
+            result.get(successor_uid).unwrap().early_start.minutes(),
+            reference.abs_start(lag)
+        );
+    }
+
+    #[test]
+    fn summary_percent_horizon_covers_far_child_constraint() {
+        let mut summary = summary_task(1, 1);
+        summary.duration_min = 960;
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        b.constraint = ConstraintType::StartNoEarlierThan;
+        b.constraint_date = Some(DateTime::from_ymd_hm(2027, 4, 6, 8, 0));
+        let mut c = task(4, "C", 480);
+        let mut percent = fs(1);
+        percent.lag = 100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        assert_summary_percent_fs_matches_full_timeline(&march2(vec![summary, a, b, c]), 1, 4, 100);
+    }
+
+    #[test]
+    fn summary_percent_horizon_covers_outside_predecessor_and_stored_floor() {
+        for stored in [0, 301 * 480] {
+            let predecessor = task(1, "Outside predecessor", 300 * 480);
+            let mut summary = summary_task(2, 1);
+            summary.duration_min = stored;
+            let mut a = task(3, "A", 480);
+            a.outline_level = 2;
+            let mut b = task(4, "B", 480);
+            b.outline_level = 2;
+            b.predecessors.push(fs(1));
+            let mut c = task(5, "C", 480);
+            let mut percent = fs(2);
+            percent.lag = 200;
+            percent.lag_format = LagFormat::from_code(19).unwrap();
+            c.predecessors.push(percent);
+            assert_summary_percent_fs_matches_full_timeline(
+                &march2(vec![predecessor, summary, a, b, c]),
+                2,
+                5,
+                200,
+            );
+        }
+    }
+
+    #[test]
+    fn summary_percent_horizon_covers_nested_percent_lags() {
+        let outer = summary_task(1, 1);
+        let mut nested = summary_task(2, 2);
+        nested.duration_min = 0;
+        let mut a = task(3, "A", 480);
+        a.outline_level = 3;
+        let mut b = task(4, "B", 480);
+        b.outline_level = 3;
+        b.predecessors
+            .push(Predecessor::working(3, LinkType::FinishStart, 100 * 480));
+        let mut c = task(5, "C", 480);
+        c.outline_level = 2;
+        let mut nested_percent = fs(2);
+        nested_percent.lag = 300;
+        nested_percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(nested_percent);
+        let mut successor = task(6, "Successor", 480);
+        let mut outer_percent = fs(1);
+        outer_percent.lag = 100;
+        outer_percent.lag_format = LagFormat::from_code(19).unwrap();
+        successor.predecessors.push(outer_percent);
+        assert_summary_percent_fs_matches_full_timeline(
+            &march2(vec![outer, nested, a, b, c, successor]),
+            1,
+            6,
+            100,
+        );
+    }
+
+    #[test]
+    fn negative_summary_percent_horizon_covers_far_child_constraint() {
+        let summary = summary_task(1, 1);
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        b.constraint = ConstraintType::StartNoEarlierThan;
+        b.constraint_date = Some(DateTime::from_ymd_hm(2027, 4, 6, 8, 0));
+        let mut c = task(4, "C", 480);
+        let mut percent = Predecessor::working(1, LinkType::StartStart, 0);
+        percent.lag = -100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        let project = march2(vec![summary, a, b, c]);
+        let result = schedule(&project);
+        let span = result.get(1).unwrap();
+        let cal = summary_calendar(&project);
+        let duration = working_minutes_on(&cal, span.early_start, span.early_finish);
+        let origin = Timeline::origin(&cal, span.early_start.minutes(), duration + 480);
+        let reference = Timeline::build(
+            &cal,
+            origin,
+            span.early_start.minutes(),
+            duration + 480,
+            span.early_start.minutes(),
+        );
+        let expected =
+            reference.abs_start(reference.to_index(span.early_start.minutes()) - duration);
+        assert_eq!(result.get(4).unwrap().early_start.minutes(), expected);
+        assert!(expected < at(2, 8).minutes());
+    }
+
+    #[test]
+    fn duration_only_manual_summary_percent_horizon_uses_resolved_span() {
+        for stored_duration in [0, 102 * 480] {
+            let mut summary = summary_task(1, 1);
+            summary.manual = true;
+            summary.manual_start = Some(at(2, 8));
+            summary.manual_duration_min = Some(102 * 480);
+            summary.duration_min = stored_duration;
+            let mut child = task(2, "Child", 480);
+            child.outline_level = 2;
+            let mut successor = task(3, "Successor", 480);
+            let mut percent = fs(1);
+            percent.lag = 400;
+            percent.lag_format = LagFormat::from_code(19).unwrap();
+            successor.predecessors.push(percent);
+            let project = march2(vec![summary, child, successor]);
+            let result = schedule(&project);
+            let span = result.get(1).unwrap();
+            let cal = summary_calendar(&project);
+            let rolled_work = working_minutes_on(&cal, span.early_start, span.early_finish);
+            let reference = Timeline::build(
+                &cal,
+                span.early_finish.minutes(),
+                span.early_finish.minutes(),
+                rolled_work * 4 + 480,
+                span.early_finish.minutes(),
+            );
+            let expected = reference.abs_start(rolled_work * 4);
+            assert_eq!(result.get(3).unwrap().early_start.minutes(), expected);
+        }
+    }
+
+    #[test]
+    fn leveling_percent_summary_lag_uses_successor_calendar() {
+        let mut short_day = Calendar::standard(2);
+        for day in short_day.week.iter_mut().flatten() {
+            day.times.truncate(1);
+        }
+        let summary = summary_task(1, 1);
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        let mut c = task(4, "Short-day C", 240);
+        c.calendar_uid = Some(2);
+        let mut percent = fs(1);
+        percent.lag = 100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        let project = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![summary, a, b, c],
+            calendars: vec![Calendar::standard(1), short_day],
+            resources: vec![worker(1, "Team", 1.0)],
+            assignments: vec![assign(1, 2, 1, 1.0), assign(2, 3, 1, 1.0)],
+            ..Project::default()
+        };
+        let cpm = schedule(&project);
+        let leveled = level(&project);
+        let summary_span = leveled.finish(3).unwrap();
+        let cal = CalendarResolver::new(&project).calendar(&project.calendars[1]);
+        let required = reach_after(&cal, summary_span.minutes(), 960);
+        assert!(leveled.start(4).unwrap().minutes() >= required);
+        assert_eq!(leveled.start(4), Some(at(10, 8)));
+        assert!(leveled.start(4).unwrap() > cpm.get(4).unwrap().early_start);
+    }
+
+    #[test]
+    fn finish_links_into_manual_summaries_do_not_bound_predecessors() {
+        for link in [LinkType::FinishFinish, LinkType::StartFinish] {
+            let predecessor = task(1, "Predecessor", 480);
+            let mut summary = summary_task(2, 1);
+            summary.manual = true;
+            summary.manual_start = Some(at(3, 8));
+            summary.manual_finish = Some(at(3, 17));
+            summary.predecessors.push(Predecessor::working(1, link, 0));
+            let mut child = task(3, "Child", 480);
+            child.outline_level = 2;
+            let linked = march2(vec![predecessor, summary, child]);
+            let mut unlinked = linked.clone();
+            unlinked.tasks[1].predecessors.clear();
+            let actual = schedule(&linked);
+            let expected = schedule(&unlinked);
+            for uid in [1, 2, 3] {
+                let a = actual.get(uid).unwrap();
+                let b = expected.get(uid).unwrap();
+                assert_eq!(
+                    (a.early_start, a.late_start, a.total_slack_min),
+                    (b.early_start, b.late_start, b.total_slack_min),
+                    "link {link:?}, UID {uid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn summary_link_group_matches_explicit_leaf_links_for_late_dates_and_alap() {
+        let mut shifted = Calendar::standard(2);
+        for day in shifted.week.iter_mut().flatten() {
+            for slot in &mut day.times {
+                slot.from += 60;
+                slot.to += 60;
+            }
+        }
+        for alap in [false, true] {
+            let source = summary_task(1, 1);
+            let mut first = task(2, "First", 960);
+            first.outline_level = 2;
+            if alap {
+                first.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut second = task(3, "Second", 480);
+            second.outline_level = 2;
+            let mut target = summary_task(4, 1);
+            target
+                .predecessors
+                .push(Predecessor::working(1, LinkType::FinishStart, 480));
+            let mut work = task(5, "Shifted target", 480);
+            work.outline_level = 2;
+            work.calendar_uid = Some(2);
+            if alap {
+                work.manual = true;
+                work.manual_start = Some(at(10, 9));
+                work.manual_finish = Some(at(10, 18));
+            }
+            let mut milestone = task(6, "Milestone target", 0);
+            milestone.outline_level = 2;
+            let with_group = Project {
+                start_date: Some(at(2, 8)),
+                tasks: vec![source, first, second, target, work, milestone],
+                calendars: vec![Calendar::standard(1), shifted.clone()],
+                ..Project::default()
+            };
+            let mut direct = with_group.clone();
+            direct.tasks[3].predecessors.clear();
+            for target in &mut direct.tasks[4..6] {
+                for source in [2, 3] {
+                    target.predecessors.push(Predecessor::working(
+                        source,
+                        LinkType::FinishStart,
+                        480,
+                    ));
+                }
+            }
+            let grouped = schedule(&with_group);
+            let expanded = schedule(&direct);
+            for uid in [2, 3, 5, 6] {
+                let actual = grouped.get(uid).unwrap();
+                let expected = expanded.get(uid).unwrap();
+                assert_eq!(
+                    (
+                        actual.early_start,
+                        actual.late_start,
+                        actual.total_slack_min,
+                        actual.free_slack_min
+                    ),
+                    (
+                        expected.early_start,
+                        expected.late_start,
+                        expected.total_slack_min,
+                        expected.free_slack_min
+                    ),
+                    "ALAP {alap}, UID {uid}"
+                );
+            }
+        }
     }
 
     #[test]
