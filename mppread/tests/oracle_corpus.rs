@@ -221,6 +221,7 @@ fn check_task_fields(
         same!(wbs);
     }
     same!(task_type);
+    same!(notes);
     same!(active);
     same!(effort_driven);
     same!(estimated);

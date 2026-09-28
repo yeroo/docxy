@@ -22,6 +22,7 @@ pub mod oleps;
 mod overalloc;
 pub mod project;
 mod props;
+mod rtf;
 mod taskdecode;
 pub mod vardata;
 pub mod varmeta;
