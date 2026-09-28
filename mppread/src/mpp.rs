@@ -105,8 +105,9 @@ pub struct MppTaskFields {
     pub is_subproject: Option<bool>,
     pub is_subproject_read_only: Option<bool>,
     /// Derived for the current layout from each direct assignment's units and
-    /// its resource availability. Absent when those optional tables cannot be
-    /// validated; Project does not store a task-local bit for this field.
+    /// its resource availability. A valid empty assignment table gives false;
+    /// missing or unrecognized assignments, or needed resources, leave it
+    /// absent. Project does not store a task-local bit for this field.
     pub over_allocated: Option<bool>,
     pub milestone: Option<bool>,
 }

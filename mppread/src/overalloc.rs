@@ -55,8 +55,9 @@ pub(crate) struct Resource {
     pub max_units: f64,
     /// Project's binary type: 0=work, 1=material, 2=cost.
     pub kind: u16,
-    /// (exclusive end in tenths of a minute since Project's epoch, capacity).
-    pub periods: Vec<(u32, f64)>,
+    /// Exclusive end, capacity, and whether Project exports this as an
+    /// availability period. A zero-capacity gap has `exported = false`.
+    pub periods: Vec<(u32, f64, bool)>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -69,7 +70,7 @@ pub(crate) struct Assignment {
     pub finish: u32,
 }
 
-fn availability(block: &[u8]) -> Result<Vec<(u32, f64)>, String> {
+fn availability(block: &[u8]) -> Result<Vec<(u32, f64, bool)>, String> {
     if block.len() < 36 || u16_at(block, 2) != 4 || u32_at(block, 4) != 16 {
         return Err("unrecognized availability block".into());
     }
@@ -82,18 +83,28 @@ fn availability(block: &[u8]) -> Result<Vec<(u32, f64)>, String> {
     let mut periods = Vec::new();
     for row in block[16..].chunks_exact(20) {
         let capacity = f64_at(row, 0) / 10_000.0;
+        let marker = u32_at(row, 8);
         let end = u32_at(row, 16);
+        if !matches!(marker, 0xfe | 0xff)
+            || row[12..16] != [0, 0, 0, 0]
+            || (marker == 0xfe && capacity != 0.0)
+        {
+            return Err("unrecognized availability interval".into());
+        }
         if !capacity.is_finite()
             || capacity < 0.0
-            || periods.last().is_some_and(|(last, _)| *last >= end)
+            || periods.last().is_some_and(|(last, _, _)| *last >= end)
         {
             return Err("invalid availability period".into());
         }
-        periods.push((end, capacity));
+        periods.push((end, capacity, marker == 0xff));
     }
     // Project writes a zero-capacity terminal sentinel after the exported
     // availability periods. Its boundary is still useful for validation.
-    if periods.last().is_none_or(|(_, cap)| *cap != 0.0) {
+    if periods
+        .last()
+        .is_none_or(|(_, cap, exported)| *cap != 0.0 || *exported)
+    {
         return Err("missing availability sentinel".into());
     }
     periods.pop();
@@ -264,14 +275,14 @@ pub(crate) fn assignment_overallocated(a: &Assignment, r: &Resource) -> bool {
         return a.units > r.max_units + 1e-9;
     }
     let mut begin = 0;
-    for &(end, capacity) in &r.periods {
+    for &(end, capacity, _) in &r.periods {
         if a.start < end && a.finish > begin && a.units > capacity + 1e-9 {
             return true;
         }
         begin = end;
     }
-    // Past the final availability period, Project has no capacity for this
-    // resource, even though FixedData still retains its last MaxUnits value.
+    // Project's f10 end case marks an assignment crossing the final boundary
+    // overallocated: capacity after that boundary is zero.
     a.finish > begin && a.units > 1e-9
 }
 
@@ -288,9 +299,15 @@ pub(crate) fn decode(cfb: &Cfb, tasks: &[MppTask]) -> Result<HashMap<u32, bool>,
         if !known.contains(&a.task_uid) {
             return Err("assignment for unknown task".into());
         }
-        if a.resource_uid < 0 {
+        if a.resource_uid == -65_535 {
             continue;
-        } // Project's unassigned sentinel
+        } // Project's unassigned sentinel (0xffff0001)
+        if a.resource_uid < 0 {
+            return Err(format!(
+                "assignment {} has unknown resource sentinel",
+                a.uid
+            ));
+        }
         let r = resources
             .get(&(a.resource_uid as u32))
             .ok_or_else(|| format!("assignment {} for unknown resource", a.uid))?;
@@ -341,17 +358,17 @@ mod tests {
                 .filter(|p| p.extension().is_some_and(|e| e == "mpp"))
             {
                 let stem = path.file_stem().unwrap().to_string_lossy();
+                // x-recurring's XML was saved after a legacy conversion and
+                // does not describe its current MPP's assignment records.
                 if stem.ends_with("-mpp12") || stem == "x-recurring" {
                     continue;
                 }
-                let xml = if stem == "x-overallocated" {
-                    base.join("../../.workbench/out/x-overallocated-current.xml")
-                } else {
-                    path.with_extension("xml")
-                };
-                if !xml.exists() {
-                    continue;
-                }
+                let xml = path.with_extension("xml");
+                assert!(
+                    xml.exists(),
+                    "missing Project oracle for {}",
+                    path.display()
+                );
                 let oracle =
                     projcore::mspdi::read_mspdi(&std::fs::read_to_string(&xml).unwrap()).unwrap();
                 let bytes = std::fs::read(&path).unwrap();
@@ -388,14 +405,25 @@ mod tests {
                         expected.uid
                     );
                     assert_eq!(
-                        actual.periods.len(),
+                        actual
+                            .periods
+                            .iter()
+                            .filter(|(_, _, exported)| *exported)
+                            .count(),
                         expected.availability_periods.len(),
                         "{} resource {} period count",
                         path.display(),
                         expected.uid
                     );
                     let mut from = 0;
-                    for (i, &(end, cap)) in actual.periods.iter().enumerate() {
+                    let mut exported_index = 0;
+                    for &(end, cap, exported) in &actual.periods {
+                        if !exported {
+                            from = end;
+                            continue;
+                        }
+                        let i = exported_index;
+                        exported_index += 1;
                         let p = &expected.availability_periods[i];
                         let from_date = if i == 0 {
                             "1984-01-01 00:00".to_string()
@@ -503,7 +531,12 @@ mod tests {
         b[12..16].copy_from_slice(&data_len.to_le_bytes());
         b
     }
-    fn synthetic(assignment: bool, corrupt: bool, include_assignment_table: bool) -> Cfb {
+    fn synthetic(
+        assignment: bool,
+        corrupt: bool,
+        include_assignment_table: bool,
+        resource_uid: i32,
+    ) -> Cfb {
         let mut resource_meta = fixed_header(4, 220, 37);
         for i in 0..4 {
             resource_meta[16 + i * 37 + 4..16 + i * 37 + 8]
@@ -537,7 +570,7 @@ mod tests {
                 meta[20..24].copy_from_slice(&0u32.to_le_bytes());
                 data[..4].copy_from_slice(&7u32.to_le_bytes());
                 data[4..8].copy_from_slice(&1u32.to_le_bytes());
-                data[8..12].copy_from_slice(&2u32.to_le_bytes());
+                data[8..12].copy_from_slice(&resource_uid.to_le_bytes());
                 data[12..20].copy_from_slice(&6000f64.to_le_bytes());
                 data[52..56].copy_from_slice(&[0xc0, 0x12, 0x2a, 0x3c]);
                 data[56..60].copy_from_slice(&[0xd8, 0x27, 0x2a, 0x3c]);
@@ -561,10 +594,12 @@ mod tests {
             uid: 1,
             ..MppTask::default()
         }];
-        assert!(decode(&synthetic(true, false, true), &tasks).unwrap()[&1]);
-        assert!(!decode(&synthetic(false, false, true), &tasks).unwrap()[&1]);
-        assert!(decode(&synthetic(true, true, true), &tasks).is_err());
-        assert!(decode(&synthetic(false, false, false), &tasks).is_err());
+        assert!(decode(&synthetic(true, false, true, 2), &tasks).unwrap()[&1]);
+        assert!(!decode(&synthetic(false, false, true, 2), &tasks).unwrap()[&1]);
+        assert!(decode(&synthetic(true, true, true, 2), &tasks).is_err());
+        assert!(decode(&synthetic(false, false, false, 2), &tasks).is_err());
+        assert!(decode(&synthetic(true, false, true, -1), &tasks).is_err());
+        assert!(!decode(&synthetic(true, false, true, -65_535), &tasks).unwrap()[&1]);
         let empty_only = Cfb::open(&write_cfb_tree(&[Node::Storage(
             "TBkndAssn",
             vec![
@@ -589,7 +624,7 @@ mod tests {
             uid: 2,
             max_units: 0.5,
             kind: 0,
-            periods: vec![(200, 1.0), (400, 0.5)],
+            periods: vec![(200, 1.0, true), (400, 0.5, true)],
         };
         assert!(assignment_overallocated(&a, &r));
         assert!(!assignment_overallocated(
@@ -600,5 +635,14 @@ mod tests {
         assert!(!assignment_overallocated(&a, &r));
         r.kind = 2;
         assert!(!assignment_overallocated(&a, &r));
+        r.kind = 0;
+        r.periods = vec![(200, 1.0, true), (400, 0.0, false), (500, 1.0, true)];
+        assert!(assignment_overallocated(&a, &r)); // Project's f10 gap case
+        r.periods = vec![(200, 1.0, true)];
+        assert!(assignment_overallocated(&a, &r)); // Project's f10 end case
+        assert!(!assignment_overallocated(
+            &Assignment { finish: 200, ..a },
+            &r
+        ));
     }
 }

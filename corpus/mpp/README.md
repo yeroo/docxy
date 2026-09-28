@@ -129,13 +129,15 @@ minutes. Generate them the same way:
 python corpus/tools/gen_mpp_lag_cases.py
 ```
 
-Eleven paired task-field files in `task-fields/` cover the current-layout task
+Twelve paired task-field files in `task-fields/` cover the current-layout task
 flags, GUID, creation date, WBS, type, deadline, leveling fields, subprojects,
 over-allocation and blank rows. The custom-mask case proves generated WBS codes
 have no explicit per-task binary value, so the decoder leaves them absent.
 The `f9-overalloc-edges` case pins assignment units against capacity, a
 resource availability change, a material resource, and direct assignments on
-summary tasks. Project rejects assigning the same resource twice to one task.
+summary tasks. `f10-availability-end-gap` pins assignments crossing an
+availability end and a gap. Project rejects assigning the same resource twice
+to one task.
 The cross-project predecessor case also has an external task in the binary
 table; Project omits that ghost row from its XML export. Generate the pairs on
 Windows with Project and pywin32:

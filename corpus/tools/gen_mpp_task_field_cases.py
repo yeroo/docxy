@@ -251,6 +251,46 @@ def overalloc_edges(app):
         raise AssertionError("assignment did not cross the capacity change")
 
 
+def availability_end_and_gap(app):
+    p = new_plan(app)
+    ending = p.Resources.Add("Ends")
+    ending.Availabilities.Item(1).AvailableTo = "3/3/2026 11:59 PM"
+    gapped = p.Resources.Add("Gap")
+    gapped.Availabilities.Item(1).AvailableTo = "3/2/2026 11:59 PM"
+    gapped.Availabilities.Add(AvailableFrom="3/4/2026 12:00 AM",
+                              AvailableTo="12/31/2049 11:59 PM", AvailableUnit=100)
+    end_task = add(p, "Crosses availability end", days=3)
+    end_task.Type = 1
+    end_task.Assignments.Add(ResourceID=ending.ID).Units = 1
+    gap_task = add(p, "Crosses availability gap", days=3)
+    gap_task.Type = 1
+    gap_task.Assignments.Add(ResourceID=gapped.ID).Units = 1
+    save(app, "f10-availability-end-gap", [
+        ("Crosses availability end", "OverAllocated", "1"),
+        ("Crosses availability gap", "OverAllocated", "1"),
+    ])
+    root = ET.parse(os.path.join(OUT, "f10-availability-end-gap.xml")).getroot()
+    named = {t.findtext(f"{NS}Name"): t for t in root.findall(f"{NS}Tasks/{NS}Task")}
+    resources = {r.findtext(f"{NS}Name"): r for r in root.findall(f"{NS}Resources/{NS}Resource")}
+    assignments = {a.findtext(f"{NS}TaskUID"): a
+                   for a in root.findall(f"{NS}Assignments/{NS}Assignment")}
+    for name, boundary in (("Crosses availability end", "2026-03-04T00:00:00"),
+                           ("Crosses availability gap", "2026-03-03T00:00:00")):
+        a = assignments[named[name].findtext(f"{NS}UID")]
+        if a.findtext(f"{NS}Overallocated") != "1" or not (
+            a.findtext(f"{NS}Start") < boundary < a.findtext(f"{NS}Finish")
+        ):
+            raise AssertionError(f"{name}: assignment did not overallocate across {boundary}")
+    end_periods = resources["Ends"].findall(f"{NS}AvailabilityPeriods/{NS}AvailabilityPeriod")
+    gap_periods = resources["Gap"].findall(f"{NS}AvailabilityPeriods/{NS}AvailabilityPeriod")
+    if (len(end_periods) != 1 or
+            end_periods[0].findtext(f"{NS}AvailableTo") != "2026-03-03T23:59:00"):
+        raise AssertionError("availability end did not export")
+    if ([p.findtext(f"{NS}AvailableFrom") for p in gap_periods] !=
+            ["1984-01-01T00:00:00", "2026-03-04T00:00:00"]):
+        raise AssertionError("availability gap did not export")
+
+
 def subprojects(app):
     p = new_plan(app)
     add(p, "Child task")
@@ -297,7 +337,8 @@ def wbs_mask(app):
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    cases = (flags, values, blanks, overflow, overalloc_edges, subprojects, external, wbs_mask)
+    cases = (flags, values, blanks, overflow, overalloc_edges, availability_end_and_gap,
+             subprojects, external, wbs_mask)
     selected = sys.argv[1:]
     app = win32.Dispatch("MSProject.Application")
     try:
