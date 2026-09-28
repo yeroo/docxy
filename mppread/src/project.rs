@@ -23,11 +23,12 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// variances are not stored in the file and stay absent. Save As converts it
 /// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
 /// calendars, their weekdays and exceptions, and the project's default calendar.
-/// Task calendar assignments are decoded. Work weeks are not yet decoded;
-/// tasks using one keep no task calendar. Auto tasks use the project-calendar
-/// span, as before stored Duration was read; manual tasks keep their manual
-/// duration and use that span only when it is absent. An
-/// unrecognised exception record refuses the import.
+/// Task calendar assignments and alternate work weeks are decoded. Auto
+/// tasks use their stored working Duration when available; manual tasks keep
+/// their manual duration and use the calendar span only when it is absent.
+/// An unrecognised calendar record refuses the import.
+/// A calendar whose default week is wholly closed is refused even if one of
+/// its alternate weeks opens a day, as in MSPDI import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)
@@ -52,19 +53,16 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .unwrap_or_else(|| "Imported project".into())
     });
     let mut cal_ref = Project::default();
-    let mut work_week_uids = std::collections::HashSet::new();
     let decoded_calendars = crate::caldecode::decode(bytes, legacy)
         .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?;
     let has_calendar_table = decoded_calendars.is_some();
     if let Some(crate::caldecode::DecodedCalendars {
         calendars,
         default_calendar_uid,
-        work_week_uids: weeks,
     }) = decoded_calendars
     {
         cal_ref.calendars = calendars;
         cal_ref.default_calendar_uid = default_calendar_uid;
-        work_week_uids = weeks;
     }
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // A task is a summary when the next task sits one WBS level deeper.
@@ -124,15 +122,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                     return Err(format!("unknown calendar UID {uid} for task UID {}", t.uid));
                 }
             }
-            let mut current = Some(own_calendar_uid.unwrap_or(cal_ref.default_calendar_uid));
-            let mut work_week_affected = false;
-            while let Some(uid) = current {
-                work_week_affected |= work_week_uids.contains(&uid);
-                current = cal_ref.calendar(uid).and_then(|cal| cal.base_calendar_uid);
-            }
-            if !work_week_affected {
-                task.calendar_uid = own_calendar_uid;
-            }
+            task.calendar_uid = own_calendar_uid;
             task.manual = t.manual;
             let date = |d: &Option<String>, what: &str| {
                 d.as_deref()
@@ -164,7 +154,6 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             // Pin only leaf tasks; a summary's dates roll up from its
             // children, so a constraint on it would fight the rollup. A
             // manual leaf is held by its pinned dates, not a constraint.
-            // A work-week-affected task has no assigned task calendar here.
             let span = || {
                 projcore::schedule::working_minutes_between_on(&cal_ref, task.calendar_uid, s, f)
             };
@@ -175,7 +164,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             } else {
                 task.duration_min = t
                     .duration_format
-                    .filter(|&fmt| !work_week_affected && crate::mpp::working_duration_format(fmt))
+                    .filter(|&fmt| crate::mpp::working_duration_format(fmt))
                     .and(t.duration_min)
                     .unwrap_or_else(span);
                 task.constraint = ConstraintType::MustStartOn;

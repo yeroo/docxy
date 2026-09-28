@@ -6,5 +6,6 @@
 # (mpp/mpp12/xml plus any stray file like a .gitkeep from the source repo)
 # and its manifest, ignored outright rather than by extension.
 /snapshots/
+/workweeks/
 manifest.json
 !README.md

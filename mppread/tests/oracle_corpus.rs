@@ -300,6 +300,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 c.base_calendar_uid,
                 c.week.clone(),
                 c.exceptions.clone(),
+                c.work_weeks.clone(),
             )
         };
         let expected_calendars: Vec<_> = oracle
@@ -527,6 +528,57 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 mpp.display()
             );
         }
+        if mpp
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|name| name == "workweeks")
+        {
+            // These probes have one intended auto task. A generic selected
+            // count could pass after dropping the task we meant to check.
+            assert!(
+                compared_uids.contains(&1),
+                "{}: work-week task was not date-compared",
+                mpp.display()
+            );
+            let task = imported.tasks.iter().find(|t| t.uid == 1).unwrap();
+            let expected_task = expected.iter().find(|t| t.uid == 1).unwrap();
+            assert_eq!(task.duration_min, expected_task.duration_min);
+            let expected_calendar = match stem.as_ref() {
+                "w7-derived" => Some(3),
+                "w12-task-calendar" => Some(5),
+                "w8-inherited" => Some(2),
+                _ => None,
+            };
+            assert_eq!(task.calendar_uid, expected_calendar);
+            if stem == "w12-task-calendar" {
+                let calendar = imported.calendar(5).unwrap();
+                assert!(calendar.base_calendar_uid.is_none());
+                assert_ne!(imported.default_calendar_uid, 5);
+                assert!(oracle.resources.iter().all(|r| r.calendar_uid != Some(5)));
+            }
+            if [
+                "w8-inherited",
+                "w12-task-calendar",
+                "m1-com-summer",
+                "m2-com-out-of-order",
+            ]
+            .contains(&stem.as_ref())
+            {
+                let mut without_work_weeks = imported.clone();
+                for calendar in &mut without_work_weeks.calendars {
+                    calendar.work_weeks.clear();
+                }
+                assert_ne!(
+                    projcore::schedule::schedule(&without_work_weeks)
+                        .get(1)
+                        .unwrap()
+                        .early_finish,
+                    scheduled.get(1).unwrap().early_finish,
+                    "{}: task does not depend on an alternate work week",
+                    mpp.display()
+                );
+            }
+        }
         if [
             "e1-range",
             "e2-weekend-working",
@@ -672,5 +724,59 @@ fn project_2024_oracles() {
                 .default_calendar_uid,
             1
         );
+    }
+    let workweeks = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/workweeks");
+    if workweeks.exists() {
+        let cases = pairs(&workweeks, "");
+        assert_eq!(cases.len(), 14);
+        let expected: &[(&str, i32, &[&str])] = &[
+            ("w1-summer", 1, &["Summer"]),
+            ("w2-partial", 1, &["Partial"]),
+            ("w3-weekend", 1, &["Weekend"]),
+            ("w4-five-periods", 1, &["Five"]),
+            ("w5-daylong", 1, &["Daylong"]),
+            ("w6-two", 1, &["Earlier", "Later"]),
+            ("w7-derived", 3, &["Crew"]),
+            ("w8-inherited", 1, &["Inherited"]),
+            ("w9-unicode", 1, &["Fête 日本語"]),
+            ("w10-unnamed", 1, &[""]),
+            ("w11-exception", 1, &["With holiday"]),
+            ("w12-task-calendar", 5, &["Task summer"]),
+            ("m1-com-summer", 1, &["COM Summer"]),
+            ("m2-com-out-of-order", 1, &["Earlier", "Later"]),
+        ];
+        for (mpp, xml) in &cases {
+            let stem = mpp.file_stem().unwrap().to_str().unwrap();
+            let (_, uid, names) = expected.iter().find(|(name, _, _)| *name == stem).unwrap();
+            let oracle =
+                projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
+            let weeks = &oracle.calendar(*uid).unwrap().work_weeks;
+            assert_eq!(
+                weeks
+                    .iter()
+                    .map(|w| w.name.as_deref().unwrap_or(""))
+                    .collect::<Vec<_>>(),
+                *names
+            );
+            for (index, week) in weeks.iter().enumerate() {
+                let (first, last) =
+                    if (stem == "w6-two" || stem == "m2-com-out-of-order") && index == 0 {
+                        (9, 13)
+                    } else if (stem == "w6-two" || stem == "m2-com-out-of-order") && index == 1 {
+                        (16, 20)
+                    } else {
+                        (9, 20)
+                    };
+                assert_eq!(
+                    week.from.unwrap().to_mspdi(),
+                    format!("2026-03-{first:02}T00:00:00")
+                );
+                assert_eq!(
+                    week.to.unwrap().to_mspdi(),
+                    format!("2026-03-{last:02}T23:59:00")
+                );
+            }
+            check_pair(mpp, xml, false, Oracle::Project);
+        }
     }
 }
