@@ -1528,6 +1528,21 @@ fn probe_with_reflow(
     .into_any_element()
 }
 
+/// Track a probe's previous bounds while the more-tabs list is open, so a
+/// resize or layout change can re-anchor it on the following frame.
+fn probe_tracked(
+    cell: &std::rc::Rc<std::cell::RefCell<Probes>>,
+    name: &'static str,
+    track: bool,
+) -> AnyElement {
+    if track {
+        let expected = cell.borrow().get(name);
+        probe_with_reflow(cell, name, move |b| expected != Some(b))
+    } else {
+        probe(cell, name)
+    }
+}
+
 /// Parse a delimiter word/char: "tab" -> \t, "space" -> ' ', else the first
 /// character (default comma).
 fn parse_delim(s: &str) -> char {
@@ -15387,8 +15402,9 @@ fn block_el(b: &Block, path: Vec<usize>, marker: Option<&str>, ctx: RenderCtx) -
 
 impl Docxy {
     fn tab_more_close(&mut self, cx: &mut Context<Self>) {
-        // A deferred sheet handle can sit above the modal backdrop. Never carry
-        // a fill armed by a press there into the next grid gesture.
+        // The priority-1 backdrop sits above the deferred sheet handle, so a
+        // press cannot reach it while the list is open. Clear any earlier fill
+        // anyway, so it cannot leak into the next grid gesture.
         self.sheet_fill = None;
         self.grid_release(cx);
         self.tab_more_open = false;
@@ -18622,12 +18638,7 @@ impl Render for Docxy {
                     .cursor_pointer()
                     .text_color(fg)
                     .child("▾")
-                    .child(if self.tab_more_open {
-                        let expected = self.probes.borrow().get("tab-more");
-                        probe_with_reflow(&self.probes, "tab-more", move |b| expected != Some(b))
-                    } else {
-                        probe(&self.probes, "tab-more")
-                    })
+                    .child(probe_tracked(&self.probes, "tab-more", self.tab_more_open))
                     .on_click(cx.listener(|this, _, _, cx| this.tab_more_toggle(cx))),
             );
         } else {
@@ -18736,14 +18747,11 @@ impl Render for Docxy {
                 .relative()
                 .bg(bg)
                 .track_focus(&self.focus)
-                .child({
-                    let expected = self.probes.borrow().get("suite-root");
-                    if self.tab_more_open {
-                        probe_with_reflow(&self.probes, "suite-root", move |b| expected != Some(b))
-                    } else {
-                        probe(&self.probes, "suite-root")
-                    }
-                })
+                .child(probe_tracked(
+                    &self.probes,
+                    "suite-root",
+                    self.tab_more_open,
+                ))
                 .child(title_bar)
                 .child(backstage)
                 .when_some(tab_popup, |d, popup| d.child(popup))
@@ -19382,14 +19390,7 @@ impl Render for Docxy {
                 }
             }))
             .bg(bg)
-            .child({
-                let expected = self.probes.borrow().get("suite-root");
-                if self.tab_more_open {
-                    probe_with_reflow(&self.probes, "suite-root", move |b| expected != Some(b))
-                } else {
-                    probe(&self.probes, "suite-root")
-                }
-            })
+            .child(probe_tracked(&self.probes, "suite-root", self.tab_more_open))
             .child(title_bar)
             .child(ribbon_tabs)
             .when_some(ribbon_body, |d, r| d.child(r))
@@ -22894,8 +22895,8 @@ mod grid_geom_tests {
         assert!(!arm_fill(&mut fill, Some((9, 9, 9, 9)), false, false));
         assert_eq!(fill.expect("the first fill stays armed").src, src);
 
-        // The deferred handle can receive a press above the more-tabs backdrop.
-        // That press must leave the fill unarmed even without a grid gesture.
+        // The priority-1 more-tabs backdrop prevents presses on the deferred
+        // handle. Keep the guard as defence in depth if that order changes.
         let mut fill = None;
         assert!(!arm_fill(&mut fill, Some(src), false, true));
         assert!(fill.is_none());

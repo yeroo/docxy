@@ -61,6 +61,8 @@ test title bar keeps caption controls visible with twenty tabs
   assert reply.active is 19
   assert reply.active_visible is true
   call title-tab {"action":"more"}
+  # Smoke test only: settle's frame polling redraws; this cannot observe the prepaint re-anchor.
+  # Picks use the handler, so this does not test hit order over a sheet fill handle.
   call window-size {"w":700,"h":600}
   shot tab-more-item:0
   type Blocked
