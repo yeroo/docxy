@@ -18,7 +18,7 @@ workspace = true
 # Blocking HTTP with rustls TLS; native certs so corporate TLS-inspection roots work.
 ureq = { version = "2.10", features = ["tls", "native-certs"] }
 # Local mail store. Bundled SQLite (no system-lib dep); bundled enables FTS5 (-DSQLITE_ENABLE_FTS5), so search needs no extra feature.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 # Shared rich-text editing model (compose editor buffer <-> email HTML).
 editcore = { version = "0.1.0", path = "../editcore" }
 
