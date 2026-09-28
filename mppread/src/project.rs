@@ -8,8 +8,9 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// a task. Each decoded auto leaf is pinned
 /// with a Must-Start-On constraint at its start and given Project's stored
 /// working duration when available. Other durations use the working minutes
-/// between start and finish. Splits are not decoded, so a split task can
-/// schedule an earlier finish than its retained stored finish. A **manual**
+/// between start and finish on the task's calendar. Splits and delayed
+/// assignments are not decoded, so those tasks can schedule an earlier finish
+/// than their retained stored finish. A **manual**
 /// leaf keeps its mode and its manual start,
 /// finish and duration instead, which hold it where Project put it without a
 /// constraint; the project's new-task mode comes through too.
@@ -20,7 +21,7 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// variances are not stored in the file and stay absent. Save As converts it
 /// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
 /// calendars, their weekdays and exceptions, and the project's default calendar.
-/// Work weeks and each task's own calendar assignment are not yet decoded. An
+/// Task calendar assignments are decoded. Work weeks are not yet decoded. An
 /// unrecognised exception record refuses the import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
@@ -46,9 +47,10 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .unwrap_or_else(|| "Imported project".into())
     });
     let mut cal_ref = Project::default();
-    if let Some((calendars, default_calendar_uid)) = crate::caldecode::decode(bytes, legacy)
-        .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?
-    {
+    let decoded_calendars = crate::caldecode::decode(bytes, legacy)
+        .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?;
+    let has_calendar_table = decoded_calendars.is_some();
+    if let Some((calendars, default_calendar_uid)) = decoded_calendars {
         cal_ref.calendars = calendars;
         cal_ref.default_calendar_uid = default_calendar_uid;
     }
@@ -102,6 +104,15 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                 .ok_or_else(|| format!("invalid finish date for UID {}", t.uid))?;
             task.stored_start = Some(s);
             task.stored_finish = Some(f);
+            if let Some(uid) = t
+                .calendar_uid
+                .filter(|&uid| uid != -1 && has_calendar_table)
+            {
+                if cal_ref.calendar(uid).is_none() {
+                    return Err(format!("unknown calendar UID {uid} for task UID {}", t.uid));
+                }
+                task.calendar_uid = Some(uid);
+            }
             task.manual = t.manual;
             let date = |d: &Option<String>, what: &str| {
                 d.as_deref()
@@ -136,15 +147,27 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             if is_summary {
                 task.duration_min = 0;
             } else if t.manual {
-                task.duration_min = t
-                    .manual_duration_min
-                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
+                task.duration_min = t.manual_duration_min.unwrap_or_else(|| {
+                    projcore::schedule::working_minutes_between_on(
+                        &cal_ref,
+                        task.calendar_uid,
+                        s,
+                        f,
+                    )
+                });
             } else {
                 task.duration_min = t
                     .duration_format
-                    .filter(|fmt| matches!(fmt & !32, 3 | 5 | 7 | 9 | 11))
+                    .filter(|&fmt| crate::mpp::working_duration_format(fmt))
                     .and(t.duration_min)
-                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
+                    .unwrap_or_else(|| {
+                        projcore::schedule::working_minutes_between_on(
+                            &cal_ref,
+                            task.calendar_uid,
+                            s,
+                            f,
+                        )
+                    });
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }

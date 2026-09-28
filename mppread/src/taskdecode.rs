@@ -54,6 +54,7 @@ struct ProgressLayout {
     duration: usize,
     remaining_duration: usize,
     duration_format: usize,
+    calendar_uid: usize,
     percent_complete: usize,
     percent_work_complete: usize,
     actual_start: usize,
@@ -72,6 +73,7 @@ const NEWEST_PROGRESS: ProgressLayout = ProgressLayout {
     duration: 84,
     remaining_duration: 88,
     duration_format: 164,
+    calendar_uid: 178,
     percent_complete: 92,
     percent_work_complete: 94,
     actual_start: 120,
@@ -322,8 +324,11 @@ fn manual_fields(rec: &[u8], uid: u32) -> Result<ManualFields, String> {
     }
     // DurationFormat without its estimated (`?`) bit.
     let duration = match u16_at(rec, MANUAL_DURATION_FORMAT) & !32 {
-        // Minutes, hours, days, weeks, months, or blank: working time.
-        3 | 5 | 7 | 9 | 11 | 21 => Some(raw as i64 / 10),
+        // Manual blank (21) carries a usable duration. An auto blank format
+        // falls back to its date span because its stored Duration is unverified.
+        format if crate::mpp::working_duration_format(format) || format == 21 => {
+            Some(raw as i64 / 10)
+        }
         // Elapsed units have no oracle yet: keep the duration unknown.
         4 | 6 | 8 | 10 | 12 => None,
         format => {
@@ -340,6 +345,13 @@ fn tenths_to_minutes(tenths: i32) -> i64 {
     (f64::from(tenths) / 10.0).round() as i64
 }
 
+fn duration_at(rec: &[u8], off: usize, what: &str, uid: u32) -> Result<i64, String> {
+    let tenths = i32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
+    (tenths >= 0)
+        .then(|| tenths_to_minutes(tenths))
+        .ok_or_else(|| format!("negative {what} for UID {uid}"))
+}
+
 fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProgress, String> {
     let at = NEWEST_PROGRESS;
     let percent = |off: usize, what: &str| {
@@ -349,12 +361,6 @@ fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProg
             .ok_or_else(|| format!("invalid {what} {value} for UID {uid}"))
     };
     let f64_at = |off: usize| f64::from_le_bytes(rec[off..off + 8].try_into().unwrap());
-    let duration = |off: usize, what: &str| {
-        let tenths = i32::from_le_bytes(rec[off..off + 4].try_into().unwrap());
-        (tenths >= 0)
-            .then(|| tenths_to_minutes(tenths))
-            .ok_or_else(|| format!("negative {what} for UID {uid}"))
-    };
     let work = |off: usize, what: &str| {
         let value = f64_at(off);
         (value.is_finite() && value >= 0.0)
@@ -383,8 +389,8 @@ fn progress_fields(rec: &[u8], physical_percent: u8, uid: u32) -> Result<MppProg
         actual_finish,
         stop: decode_timestamp(rec, at.stop),
         resume: decode_timestamp(rec, at.resume),
-        actual_duration_min: duration(at.actual_duration, "actual duration")?,
-        remaining_duration_min: duration(at.remaining_duration, "remaining duration")?,
+        actual_duration_min: duration_at(rec, at.actual_duration, "actual duration", uid)?,
+        remaining_duration_min: duration_at(rec, at.remaining_duration, "remaining duration", uid)?,
         work_min: work(at.work, "work")?,
         actual_work_min: work(at.actual_work, "actual work")?,
         remaining_work_min: work(at.remaining_work, "remaining work")?,
@@ -524,14 +530,7 @@ fn decode_current(
             (None, None, None)
         };
         let physical_percent = var.physical_percent.get(&row.uid).copied().unwrap_or(0);
-        let duration_tenths = i32::from_le_bytes(
-            rec[NEWEST_PROGRESS.duration..NEWEST_PROGRESS.duration + 4]
-                .try_into()
-                .unwrap(),
-        );
-        if duration_tenths < 0 {
-            return Err(format!("negative duration for UID {}", row.uid));
-        }
+        let duration_min = duration_at(rec, NEWEST_PROGRESS.duration, "duration", row.uid)?;
         let progress = progress_fields(rec, physical_percent, row.uid)?;
         out.push(MppTask {
             id: row.id,
@@ -545,8 +544,13 @@ fn decode_current(
             manual_start,
             manual_finish,
             manual_duration_min,
-            duration_min: Some(tenths_to_minutes(duration_tenths)),
+            duration_min: Some(duration_min),
             duration_format: Some(u16_at(rec, NEWEST_PROGRESS.duration_format)),
+            calendar_uid: Some(i32::from_le_bytes(
+                rec[NEWEST_PROGRESS.calendar_uid..NEWEST_PROGRESS.calendar_uid + 4]
+                    .try_into()
+                    .unwrap(),
+            )),
             progress: Some(progress),
         });
     }
@@ -1045,11 +1049,15 @@ mod tests {
         put(&mut s, 0x6c, &[0xd8, 0x27, 0x2b, 0x3c]); // Tue 17:00
         put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
         put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &3i32.to_le_bytes());
         let decoded = decode(&file(&s, true)).unwrap();
         assert_eq!(decoded[1].duration_min, Some(480));
         assert_eq!(decoded[1].duration_format, Some(7));
+        assert_eq!(decoded[1].calendar_uid, Some(3));
         let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
         let task = &imported.tasks[0];
+        // Without TBkndCal, the import keeps synthesized Standard.
+        assert_eq!(task.calendar_uid, None);
         assert_eq!(task.duration_min, 480);
         assert_eq!(task.stored_start.unwrap().to_mspdi(), "2026-03-02T08:00:00");
         assert_eq!(

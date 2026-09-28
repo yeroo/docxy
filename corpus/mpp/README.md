@@ -238,8 +238,8 @@ omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
 row ID order. Resources, assignments, baselines, constraints, and custom fields
 are not imported. Newest-layout base and derived calendars, their weekdays,
-exceptions and the default calendar are imported; work weeks and task calendar
-assignment are not. Type 8 exceptions and record shapes not covered by the
+exceptions, the default calendar and task calendar assignments are imported;
+work weeks are not. Type 8 exceptions and record shapes not covered by the
 Project-written probes refuse the file. An invalid newest calendar table refuses
 import. Files without
 `TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
@@ -280,20 +280,22 @@ values):
 | Cost, ActualCost, RemainingCost | +32, +40, +56 | f64 in MSPDI's units, which Project's export rounds to two decimals |
 | ActualDuration, RemainingDuration | +80, +88 | i32, tenths of a minute |
 | Duration | +84 | i32, tenths of a minute |
-| DurationFormat | +164 | u16, MSPDI format code |
 | PercentComplete, PercentWorkComplete | +92, +94 | u16 |
 | ActualStart, ActualFinish | +120, +124 | timestamp; NA (no date) before the task starts or finishes |
 | Resume, Stop | +132, +136 | timestamp; NA on a task not started |
+| DurationFormat | +164 | u16, MSPDI format code |
+| CalendarUID | +178 | i32; -1 means project calendar |
 | PhysicalPercentComplete | Var2Data key `0x045f` | u16 block, written only when nonzero |
 
 Durations and work are rounded to whole minutes, as MSPDI import rounds
 seconds. Every numeric field is present on every task, zero included, since
 Project's export writes them all; only the four dates can be absent.
 For auto leaves with a working DurationFormat, the importer uses stored
-Duration. Elapsed or unknown formats still use the working Start–Finish span
-because the project model does not retain DurationFormat. Split segments are
-not decoded: a split task retains Project's stored Start and Finish but can
-schedule an earlier Finish when its stored Duration omits the gap.
+Duration and the task's assigned calendar. Elapsed or unknown formats still
+use the working Start–Finish span on that calendar because the project model
+does not retain DurationFormat. Split segments and delayed assignments are
+not decoded: those tasks retain Project's stored Start and Finish but can
+schedule an earlier Finish when their stored Duration omits the gap.
 StartVariance, FinishVariance and WorkVariance are **not stored**: Project
 derives them at export from the baseline (Var2Data keeps the baseline
 duration, start and finish under keys `0x001b`, `0x002b` and `0x002c`), and

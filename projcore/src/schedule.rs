@@ -1999,6 +1999,22 @@ pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime
     working_minutes_on(&cal, start, finish)
 }
 
+/// Working minutes on a task calendar, with the scheduler's default-calendar
+/// fallback when the requested calendar is unavailable.
+pub fn working_minutes_between_on(
+    proj: &Project,
+    calendar_uid: Option<i32>,
+    start: DateTime,
+    finish: DateTime,
+) -> i64 {
+    let calendars = CalendarResolver::new(proj);
+    let cal = calendars
+        .resolve(calendar_uid)
+        .map(|cal| calendars.calendar(cal))
+        .unwrap_or_else(|| proj.project_calendar());
+    working_minutes_on(&cal, start, finish)
+}
+
 /// Working minutes between two wall-clock instants on one calendar, counted
 /// through the same timeline the scheduler uses.
 pub(crate) fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: DateTime) -> i64 {

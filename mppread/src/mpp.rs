@@ -70,6 +70,8 @@ pub struct MppTask {
     /// Both are absent for the legacy MPP9 layout.
     pub duration_min: Option<i64>,
     pub duration_format: Option<u16>,
+    /// Task CalendarUID as stored (-1 means no own calendar); absent for MPP9.
+    pub calendar_uid: Option<i32>,
     /// Recorded progress as Project stored it. `None` for a layout whose
     /// progress fields are not validated (MPP9).
     pub progress: Option<MppProgress>,
@@ -114,6 +116,12 @@ pub struct MppPred {
 
 /// A malformed or unrecognized task table is refused by the importer.
 pub type MppError = String;
+
+/// Auto task DurationFormat codes measured in working time.
+/// The estimated bit does not change the calendar units.
+pub fn working_duration_format(code: u16) -> bool {
+    matches!(code & !32, 3 | 5 | 7 | 9 | 11)
+}
 
 /// Decode task rows only when the binary table has a recognized structure.
 pub fn decode_tasks(bytes: &[u8]) -> Result<Vec<MppTask>, MppError> {

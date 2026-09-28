@@ -237,7 +237,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
         check_progress(a, e, source, &at);
-        if !e.summary && a.duration_min.is_some() {
+        if !e.summary && a.progress.is_some() {
             assert_eq!(
                 a.duration_min,
                 Some(e.duration_min),
@@ -250,6 +250,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 "{}",
                 at("stored DurationFormat")
             );
+            assert_eq!(a.calendar_uid, e.calendar_uid, "{}", at("CalendarUID"));
         }
         assert_eq!(a.manual, e.manual, "{}", at("manual"));
         if e.manual {
@@ -353,7 +354,6 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     }
     if source == Oracle::Project {
         let scheduled = projcore::schedule::schedule(&imported);
-        let project_cal = imported.project_calendar();
         let exceptions = &oracle
             .calendar(oracle.default_calendar_uid)
             .unwrap()
@@ -361,7 +361,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let mut selected = 0usize;
         let mut duration_compared = 0usize;
         let mut split_duration_compared = false;
-        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, own calendar, recurring exception, nonworking start
+        let mut dropped = [0usize; 5]; // split, delayed assignment, elapsed, recurring exception, nonworking start
         let mut compared_uids = Vec::new();
         for (task, expected_task) in imported.tasks.iter().zip(&expected) {
             if task.summary || task.manual || expected_task.milestone {
@@ -369,7 +369,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             }
             if formats
                 .get(&task.uid)
-                .is_some_and(|format| matches!(format & !32, 3 | 5 | 7 | 9 | 11))
+                .is_some_and(|&format| mppread::mpp::working_duration_format(format as u16))
             {
                 assert_eq!(
                     task.duration_min,
@@ -393,6 +393,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             if task.uid == 55 && expected_task.name == "S43 delayed start" {
                 // Project's delayed assignment makes this task's Duration
                 // shorter than the working span; assignments are not imported.
+                assert_eq!(task.duration_min, expected_task.duration_min);
                 dropped[1] += 1;
                 continue;
             }
@@ -401,13 +402,6 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 .is_some_and(|format| matches!(format & !32, 4 | 6 | 8 | 10 | 12))
             {
                 dropped[2] += 1;
-                continue;
-            }
-            if expected_task
-                .calendar_uid
-                .is_some_and(|uid| uid >= 0 && uid != oracle.default_calendar_uid)
-            {
-                dropped[3] += 1;
                 continue;
             }
             let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
@@ -421,7 +415,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                     })
                 })
             {
-                dropped[4] += 1;
+                dropped[3] += 1;
                 continue;
             }
             selected += 1;
@@ -432,14 +426,18 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 mpp.display(),
                 task.uid
             );
-            let working_start = project_cal
+            let calendar = imported
+                .calendar(task.calendar_uid.unwrap_or(imported.default_calendar_uid))
+                .map(|cal| imported.resolved_calendar(cal))
+                .unwrap_or_else(|| imported.project_calendar());
+            let working_start = calendar
                 .day(start.day_number())
                 .iter()
                 .any(|slot| slot.from <= start.minute_of_day() && start.minute_of_day() < slot.to);
             if !working_start {
                 // Project can retain a MustStartOn timestamp before work starts;
                 // projcore moves the scheduled start to the first working slot.
-                dropped[5] += 1;
+                dropped[4] += 1;
                 continue;
             }
             let result = scheduled.get(task.uid).unwrap();
@@ -454,7 +452,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         if dropped.iter().any(|&n| n > 0) {
             eprintln!(
-                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/task-calendar/recurring-exception/nonworking-start = {dropped:?}",
+                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start = {dropped:?}",
                 mpp.display()
             );
         }
@@ -463,6 +461,28 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             assert!(
                 split_duration_compared,
                 "{}: split task duration was not compared",
+                mpp.display()
+            );
+        }
+        if stem == "21-task-calendar" {
+            assert!(
+                compared_uids.contains(&31),
+                "{}: UID 31 date was not compared",
+                mpp.display()
+            );
+        }
+        if stem == "32-calendar-6day" {
+            assert!(
+                compared_uids.contains(&49),
+                "{}: UID 49 date was not compared",
+                mpp.display()
+            );
+        }
+        if stem == "43-assignment-delay" {
+            assert_eq!(
+                dropped[1],
+                1,
+                "{}: delayed assignment was not excluded from date check",
                 mpp.display()
             );
         }
