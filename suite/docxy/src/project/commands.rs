@@ -693,6 +693,11 @@ pub(crate) fn project_input(
     if let Some(act) = key_act(key, m) {
         return Some(act);
     }
+    if m.control && !m.alt && !m.platform {
+        // Shift is ignored, as it is for the plain arrows.
+        navigate(tab, |v| v.ctrl_key(key));
+        return None;
+    }
     if !m.control && !m.alt && !m.platform {
         let typed = text
             .map(|s| s.chars().filter(|c| !c.is_control()).collect::<String>())
@@ -703,12 +708,22 @@ pub(crate) fn project_input(
             }
             return None;
         }
-        let before = (v.cursor_row(), v.selected_uid());
-        v.key(key, m.shift);
+        navigate(tab, |v| v.key(key, m.shift));
+    }
+    None
+}
+
+/// Run a cursor move and, when it handled the key, complete it, revealing the
+/// row only when it changed.
+fn navigate(tab: &mut DocTab, step: impl FnOnce(&mut ProjectView) -> bool) {
+    let Surface::Project(v) = &mut tab.surface else {
+        return;
+    };
+    let before = (v.cursor_row(), v.selected_uid());
+    if step(v) {
         let changed = before != (v.cursor_row(), v.selected_uid());
         complete_project(tab, changed);
     }
-    None
 }
 
 fn find_status(
