@@ -4,8 +4,7 @@ use std::collections::HashMap;
 #[derive(Clone, Copy)]
 struct State {
     hidden: bool,
-    font_table: bool,
-    font_table_depth: usize,
+    font_table: Option<usize>,
     uc: usize,
     codepage: i32,
     font: i32,
@@ -16,6 +15,12 @@ struct State {
 struct FontInfo {
     charset: Option<i32>,
     codepage: Option<i32>,
+}
+
+fn in_font_entry(state: State, depth: usize) -> bool {
+    state
+        .font_table
+        .is_some_and(|table_depth| depth == table_depth || depth == table_depth + 1)
 }
 
 fn decode_note_byte(value: u8, state: State, fonts: &HashMap<i32, FontInfo>) -> Result<char, ()> {
@@ -197,8 +202,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
     let mut stack = Vec::new();
     let mut state = State {
         hidden: false,
-        font_table: false,
-        font_table_depth: 0,
+        font_table: None,
         uc: 1,
         codepage: 1252,
         font: 0,
@@ -239,8 +243,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                     if group_start && hidden_destination(word) {
                         state.hidden = true;
                         if word == b"fonttbl" {
-                            state.font_table = true;
-                            state.font_table_depth = stack.len();
+                            state.font_table = Some(stack.len());
                         }
                     }
                     group_start = false;
@@ -251,12 +254,10 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                             state.font = state.default_font;
                         }
                         b"f" => state.font = num.ok_or(())?,
-                        b"fcharset"
-                            if state.font_table && stack.len() == state.font_table_depth + 1 =>
-                        {
+                        b"fcharset" if in_font_entry(state, stack.len()) => {
                             fonts.entry(state.font).or_default().charset = Some(num.ok_or(())?);
                         }
-                        b"cpg" if state.font_table && stack.len() == state.font_table_depth + 1 => {
+                        b"cpg" if in_font_entry(state, stack.len()) => {
                             fonts.entry(state.font).or_default().codepage = Some(num.ok_or(())?);
                         }
                         b"plain" => state.font = state.default_font,
@@ -476,6 +477,22 @@ mod tests {
         assert_eq!(
             plain_text(
                 br"{\rtf1{\fonttbl{\f0\fcharset204 Arial;{\*\fontfile\cpg1252 Foo.ttf;}}}\f0\'cf}",
+                1
+            )
+            .unwrap(),
+            "П"
+        );
+        assert_eq!(
+            plain_text(
+                br"{\rtf1\ansicpg1251{\fonttbl\f0\fcharset0 Calibri;}\f0 caf\'e9}",
+                1
+            )
+            .unwrap(),
+            "café"
+        );
+        assert_eq!(
+            plain_text(
+                br"{\rtf1\ansicpg1252{\fonttbl\f0\fcharset204 Arial;}\f0\'cf}",
                 1
             )
             .unwrap(),
