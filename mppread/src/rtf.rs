@@ -244,6 +244,8 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                         state.hidden = true;
                         if word == b"fonttbl" {
                             state.font_table = Some(stack.len());
+                        } else {
+                            state.font_table = None;
                         }
                     }
                     group_start = false;
@@ -303,6 +305,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                         b'*' => {
                             if group_start {
                                 state.hidden = true;
+                                state.font_table = None;
                             }
                         }
                         b'\'' => {
@@ -366,7 +369,14 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
 }
 
 pub(crate) fn plain_text(bytes: &[u8], uid: u32) -> Result<String, String> {
-    parse(bytes).map_err(|_| format!("invalid notes for UID {uid}"))
+    let note = parse(bytes).map_err(|_| format!("invalid notes for UID {uid}"))?;
+    if note
+        .chars()
+        .any(|c| matches!(c as u32, 0..=8 | 11 | 12 | 14..=31 | 0xfffe | 0xffff))
+    {
+        return Err(format!("invalid notes for UID {uid}"));
+    }
+    Ok(note)
 }
 
 #[cfg(test)]
@@ -400,8 +410,8 @@ mod tests {
     #[test]
     fn unicode_fallback_count_and_signed_units() {
         assert_eq!(
-            plain_text(br"{\rtf1\uc2\u233?X\uc1\u-1?}", 1).unwrap(),
-            "é\u{ffff}"
+            plain_text(br"{\rtf1\uc2\u233?X\uc1\u-32768?}", 1).unwrap(),
+            "é\u{8000}"
         );
         assert_eq!(
             plain_text(br"{\rtf1\uc1\u55357?\u56832?}", 1).unwrap(),
@@ -484,6 +494,14 @@ mod tests {
         );
         assert_eq!(
             plain_text(
+                br"{\rtf1{\fonttbl\f0\fcharset204 Arial{\*\fontfile\cpg1252 a.ttf;};}\f0\'cf}",
+                1
+            )
+            .unwrap(),
+            "П"
+        );
+        assert_eq!(
+            plain_text(
                 br"{\rtf1\ansicpg1251{\fonttbl\f0\fcharset0 Calibri;}\f0 caf\'e9}",
                 1
             )
@@ -547,6 +565,10 @@ mod tests {
             br"plain".as_slice(),
             br"{\rtf1 missing".as_slice(),
             br"{\rtf1\'zz}".as_slice(),
+            br"{\rtf1\u1?}".as_slice(),
+            br"{\rtf1\'01}".as_slice(),
+            b"{\\rtf1 \x01}".as_slice(),
+            br"{\rtf1\u-1?}".as_slice(),
             br"{\rtf1 A\'+9B}".as_slice(),
             br"{\rtfgarbage x}".as_slice(),
             br"{\rtf}".as_slice(),
