@@ -31,11 +31,11 @@ comshimcore = { path = "../comshimcore" }
 gridcore = { path = "../gridcore" }
 # The #[implement] macro expands to `::windows_core::…` paths, so windows-core
 # must be a named dependency.
-windows-core = "0.58"
-windows = { version = "0.58", features = [
-    "implement",
+windows-core = "0.62"
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_System_Registry",
@@ -45,10 +45,11 @@ windows = { version = "0.58", features = [
 # The oracle differential test (tests/typelib_faithful.rs) introspects both
 # Excel's registered typelib and our generated one via the same COM APIs.
 [target.'cfg(windows)'.dev-dependencies]
-windows-core = "0.58"
-windows = { version = "0.58", features = [
+windows-core = "0.62"
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_Ole",
     "Win32_System_Variant",
 ] }

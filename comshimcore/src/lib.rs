@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use windows::Win32::Foundation::{
-    BOOL, CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, DISP_E_MEMBERNOTFOUND,
+    CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, DISP_E_BADINDEX, DISP_E_MEMBERNOTFOUND,
     E_POINTER, S_FALSE, S_OK,
 };
 use windows::Win32::System::Com::{
@@ -25,10 +25,13 @@ use windows::Win32::System::Com::{
     DISPATCH_PROPERTYPUT, DISPATCH_PROPERTYPUTREF, DISPPARAMS, EXCEPINFO, IClassFactory,
     IClassFactory_Impl, IDispatch, IDispatch_Impl, ITypeInfo, REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
 };
+use windows::Win32::System::Variant::VARIANT;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage,
 };
-use windows::core::{BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Result, VARIANT, implement};
+use windows::core::{
+    BOOL, BSTR, GUID, HRESULT, IUnknown, Interface, PCWSTR, Ref, Result, implement,
+};
 
 pub mod typelib;
 
@@ -248,7 +251,7 @@ pub unsafe fn unhandled(
 
 /// A do-nothing IDispatch: resolves any name, swallows any put, returns itself
 /// for any get — so a client can walk unmodeled property chains without faulting.
-#[implement(IDispatch)]
+#[implement(IDispatch, Agile = false)]
 struct NullObject;
 
 pub fn null_dispatch() -> IDispatch {
@@ -399,7 +402,7 @@ pub fn app_dropped_is_last() -> bool {
 // Class factory + server / DLL plumbing (generic over the app's root object).
 // -----------------------------------------------------------------------
 
-#[implement(IClassFactory)]
+#[implement(IClassFactory, Agile = false)]
 struct ShimFactory {
     create: fn() -> IDispatch,
 }
@@ -407,7 +410,7 @@ struct ShimFactory {
 impl IClassFactory_Impl for ShimFactory_Impl {
     fn CreateInstance(
         &self,
-        punkouter: Option<&IUnknown>,
+        punkouter: Ref<'_, IUnknown>,
         riid: *const GUID,
         ppvobject: *mut *mut c_void,
     ) -> Result<()> {
@@ -507,5 +510,51 @@ pub fn dll_can_unload_now() -> HRESULT {
         S_FALSE
     } else {
         S_OK
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The interfaces an agile `#[implement]` object answers and a shim object
+    /// must not: the free-threaded marshaler's `IMarshal`, and `IAgileObject`.
+    /// See `tests/agility.rs` for why.
+    const IID_IMARSHAL: GUID = GUID::from_u128(0x00000003_0000_0000_c000_000000000046);
+    const IID_IAGILEOBJECT: GUID = GUID::from_u128(0x94ea2b94_e9cc_49e0_c0ff_ee64ca8f5b90);
+
+    fn answers(obj: &IUnknown, iid: &GUID) -> bool {
+        let mut p = std::ptr::null_mut();
+        let hr = unsafe { obj.query(iid, &mut p) };
+        if hr.is_ok() && !p.is_null() {
+            // Balance the reference the successful query added.
+            drop(unsafe { IUnknown::from_raw(p) });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The attribute is only half the fix: this is the runtime proof that the
+    /// macro honoured it, on the two objects comshimcore owns — the shared
+    /// dispatch object and the class factory every shim server registers.
+    #[test]
+    fn shim_objects_refuse_the_free_threaded_marshaler() {
+        let dispatch: IUnknown = null_dispatch().cast().unwrap();
+        let factory: IClassFactory = ShimFactory {
+            create: null_dispatch,
+        }
+        .into();
+        let factory: IUnknown = factory.cast().unwrap();
+        for (name, obj) in [("dispatch object", &dispatch), ("class factory", &factory)] {
+            assert!(
+                !answers(obj, &IID_IMARSHAL),
+                "the {name} hands out IMarshal, so COM may call it off the server's thread"
+            );
+            assert!(
+                !answers(obj, &IID_IAGILEOBJECT),
+                "the {name} claims IAgileObject"
+            );
+        }
     }
 }
