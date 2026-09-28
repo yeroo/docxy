@@ -93,6 +93,21 @@ fn push(out: &mut Vec<u16>, c: char) {
     out.extend(c.encode_utf16(&mut [0; 2]).iter().copied());
 }
 
+/// Push one UTF-16 unit of note text (from `\u` or `\'hh`). A CR is stored as
+/// `\n`, the model's one newline (#531), and a LF straight after it is the
+/// same break. `cr_end` is where such a CR's `\n` ended, so only a text LF
+/// right after it pairs with it: a paragraph or line mark is its own break.
+fn push_text_unit(out: &mut Vec<u16>, unit: u16, cr_end: &mut Option<usize>) {
+    match unit {
+        0x0d => {
+            out.push(u16::from(b'\n'));
+            *cr_end = Some(out.len());
+        }
+        0x0a if *cr_end == Some(out.len()) => *cr_end = None,
+        _ => out.push(unit),
+    }
+}
+
 fn read_word<'a>(bytes: &'a [u8], pos: &mut usize) -> Result<(&'a [u8], Option<i32>), ()> {
     let start = *pos;
     while bytes.get(*pos).is_some_and(u8::is_ascii_alphabetic) {
@@ -213,6 +228,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
     let mut group_start = false;
     let mut closed = false;
     let mut final_par = false;
+    let mut cr_end = None;
     while pos < bytes.len() {
         let b = bytes[pos];
         if closed {
@@ -271,13 +287,13 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                                 return Err(());
                             }
                             if !state.hidden {
-                                out.push(value as u16);
+                                push_text_unit(&mut out, value as u16, &mut cr_end);
                                 final_par = false;
                             }
                             skip_fallback(bytes, &mut pos, state.uc)?;
                         }
                         b"par" | b"line" if !state.hidden => {
-                            out.extend([b'\r' as u16, b'\n' as u16]);
+                            out.push(u16::from(b'\n'));
                             final_par = word == b"par";
                         }
                         b"tab" | b"emdash" | b"endash" | b"bullet" | b"lquote" | b"rquote"
@@ -311,7 +327,12 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                         b'\'' => {
                             let value = read_hex(bytes, &mut pos)?;
                             if !state.hidden {
-                                push(&mut out, decode_note_byte(value, state, &fonts)?);
+                                match decode_note_byte(value, state, &fonts)? {
+                                    c @ ('\r' | '\n') => {
+                                        push_text_unit(&mut out, c as u16, &mut cr_end)
+                                    }
+                                    c => push(&mut out, c),
+                                }
                                 final_par = false;
                             }
                         }
@@ -320,7 +341,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                                 pos += 1;
                             }
                             if !state.hidden {
-                                out.extend([b'\r' as u16, b'\n' as u16]);
+                                out.push(u16::from(b'\n'));
                                 final_par = true;
                             }
                         }
@@ -363,7 +384,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
     // RichEdit ends every note with a paragraph marker, which Project's XML
     // export does not include as part of Notes.
     if final_par {
-        out.truncate(out.len() - 2);
+        out.pop();
     }
     String::from_utf16(&out).map_err(|_| ())
 }
@@ -388,7 +409,7 @@ mod tests {
         let rtf = b"{\\rtf1\\ansi\\ansicpg1252{\\fonttbl{\\f0 Arial;}}\r\n{\\*\\generator RichEdit}\\uc1 First line.\\par\r\nSecond \\emdash  \\u10003? and \\u171?quotes\\u187?.\\par\r\n}\r\n\0";
         assert_eq!(
             plain_text(rtf, 8).unwrap(),
-            "First line.\r\nSecond — ✓ and «quotes»."
+            "First line.\nSecond — ✓ and «quotes»."
         );
     }
 
@@ -403,8 +424,23 @@ mod tests {
 
     #[test]
     fn line_break_is_kept_when_it_is_the_note_content() {
-        assert_eq!(plain_text(br"{\rtf1 A\line}", 1).unwrap(), "A\r\n");
-        assert_eq!(plain_text(br"{\rtf1 A\line\par}", 1).unwrap(), "A\r\n");
+        assert_eq!(plain_text(br"{\rtf1 A\line}", 1).unwrap(), "A\n");
+        assert_eq!(plain_text(br"{\rtf1 A\line\par}", 1).unwrap(), "A\n");
+    }
+
+    /// Issue #531: a note never holds a CR, however the RTF spells the break.
+    #[test]
+    fn carriage_returns_in_note_text_read_as_lf() {
+        assert_eq!(plain_text(br"{\rtf1 A\u13?\u10?B}", 1).unwrap(), "A\nB");
+        assert_eq!(plain_text(br"{\rtf1 A\'0d B}", 1).unwrap(), "A\n B");
+        assert_eq!(plain_text(br"{\rtf1 A\'0d\'0aB\par}", 1).unwrap(), "A\nB");
+        assert_eq!(plain_text(br"{\rtf1 A\u13?B\u10?C}", 1).unwrap(), "A\nB\nC");
+        // A paragraph or line mark is a break of its own, never the LF of a
+        // text CR before it, as the same note reads from MSPDI.
+        assert_eq!(plain_text(br"{\rtf1 A\'0d\par B}", 1).unwrap(), "A\n\nB");
+        assert_eq!(plain_text(br"{\rtf1 A\u13?\line B}", 1).unwrap(), "A\n\nB");
+        assert_eq!(plain_text(b"{\\rtf1 A\\u13?\\\nB}", 1).unwrap(), "A\n\nB");
+        assert_eq!(plain_text(br"{\rtf1 A\'0d\par}", 1).unwrap(), "A\n");
     }
 
     #[test]
@@ -534,7 +570,7 @@ mod tests {
     #[test]
     fn rich_edit_bullets_are_not_note_text() {
         let note = br"{\rtf1{\fonttbl{\f1\fnil\fcharset2 Symbol;}}\pard{\pntext\f1\'b7\tab}{\*\pn\pnlvlblt\pnf1{\pntxtb\'b7}}\fi-360\li720 item 1\par item 2\par}";
-        assert_eq!(plain_text(note, 1).unwrap(), "item 1\r\nitem 2");
+        assert_eq!(plain_text(note, 1).unwrap(), "item 1\nitem 2");
     }
 
     #[test]
@@ -553,10 +589,7 @@ mod tests {
             plain_text(br"{\rtf1\uc2\u233?}X", 1),
             Err("invalid notes for UID 1".into())
         );
-        assert_eq!(
-            plain_text(b"{\\rtf1 A\\\r\nB\\\nC}", 1).unwrap(),
-            "A\r\nB\r\nC"
-        );
+        assert_eq!(plain_text(b"{\\rtf1 A\\\r\nB\\\nC}", 1).unwrap(), "A\nB\nC");
     }
 
     #[test]

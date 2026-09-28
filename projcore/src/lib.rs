@@ -14,6 +14,7 @@
 //! - [`schedule`] — the Critical Path Method engine (forward/backward passes
 //!   over working-time calendars).
 //! - [`gantt`] — export a scheduled project as a Markdown/Mermaid Gantt chart.
+//! - [`text`] — text conventions shared by the readers (newlines in notes).
 //! - [`yppx`] — the native `.yppx` OPC package (ZIP container), the
 //!   project-scheduling analog of `.docx`/`.xlsx`.
 
@@ -24,6 +25,7 @@ pub mod gantt;
 pub mod model;
 pub mod mspdi;
 pub mod schedule;
+pub mod text;
 pub mod yppx;
 
 pub use datetime::DateTime;
@@ -32,3 +34,4 @@ pub use model::{
     LagKind, LagUnit, LinkType, Predecessor, Project, Rate, Resource, Task, TaskType, Week,
     WorkCalendar, WorkWeek, WorkingTime,
 };
+pub use text::normalize_newlines;

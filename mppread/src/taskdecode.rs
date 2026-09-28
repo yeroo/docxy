@@ -1291,7 +1291,7 @@ mod tests {
         let off = s.v2.len() as u32;
         add_var(&mut s, 1, TASK_NOTES_KEY, note);
         let bytes = file(&s, true);
-        let expected = "First line.\r\nSecond line — unicode ✓ and «quotes».";
+        let expected = "First line.\nSecond line — unicode ✓ and «quotes».";
         assert_eq!(
             decode(&bytes).unwrap()[1]
                 .fields

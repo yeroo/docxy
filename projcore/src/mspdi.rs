@@ -174,6 +174,14 @@ fn text_of(p: &mut XmlParser) -> String {
     element_text(p).0
 }
 
+/// A task, resource or assignment `Notes` value: [`text_of`] with its line
+/// breaks normalised to `\n`. The reader keeps raw CR bytes and decodes
+/// `&#13;` to `\r`, so without this a note would depend on how the file was
+/// saved or checked out (#531).
+fn note_text(p: &mut XmlParser) -> String {
+    crate::normalize_newlines(&text_of(p))
+}
+
 /// Like [`text_of`], but `None` when the element has a child element, so a
 /// block is never flattened into the text of its leaves.
 fn leaf_text_of(p: &mut XmlParser) -> Option<String> {
@@ -367,7 +375,7 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "HyperlinkAddress" => t.hyperlink_address = Some(text_of(p)),
                     "HyperlinkSubAddress" => t.hyperlink_sub_address = Some(text_of(p)),
                     "IgnoreResourceCalendar" => t.ignore_resource_calendar = opt_bool_of(p),
-                    "Notes" => t.notes = Some(text_of(p)),
+                    "Notes" => t.notes = Some(note_text(p)),
                     "EarnedValueMethod" => t.earned_value_method = opt_i32_of(p),
                     "Recurring" => t.recurring = opt_bool_of(p),
                     "HideBar" => t.hide_bar = opt_bool_of(p),
@@ -602,7 +610,7 @@ fn parse_resource(p: &mut XmlParser) -> Resource {
                     "OvertimeWork" => r.overtime_work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => r.cost = rate_of(p),
                     "EmailAddress" => r.email_address = Some(text_of(p)),
-                    "Notes" => r.notes = Some(text_of(p)),
+                    "Notes" => r.notes = Some(note_text(p)),
                     "AvailableFrom" => r.available_from = DateTime::parse_mspdi(&text_of(p)),
                     "AvailableTo" => r.available_to = DateTime::parse_mspdi(&text_of(p)),
                     "ExtendedAttribute" => {
@@ -731,7 +739,7 @@ fn parse_assignment(p: &mut XmlParser) -> Assignment {
                     "Delay" => a.delay = opt_int_of(p),
                     "LevelingDelay" => a.leveling_delay = opt_int_of(p),
                     "LevelingDelayFormat" => a.leveling_delay_format = opt_u8_of(p),
-                    "Notes" => a.notes = Some(text_of(p)),
+                    "Notes" => a.notes = Some(note_text(p)),
                     "ExtendedAttribute" => {
                         a.extended_attributes.extend(parse_extended_attribute(p));
                     }
@@ -4305,13 +4313,64 @@ mod tests {
         let proj = task_project(
             "<Task><UID>1</UID><Notes>Line 1&#13;\nLine 2 &amp; &lt;x&gt;</Notes></Task>",
         );
-        let expected = "Line 1\r\nLine 2 & <x>";
+        let expected = "Line 1\nLine 2 & <x>";
         assert_eq!(proj.tasks[0].notes.as_deref(), Some(expected));
         let xml = write_mspdi(&proj);
-        assert!(xml.contains("<Notes>Line 1&#13;\nLine 2 &amp; &lt;x&gt;</Notes>"));
+        assert!(xml.contains("<Notes>Line 1\nLine 2 &amp; &lt;x&gt;</Notes>"));
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj).unwrap()).unwrap();
         assert_eq!(package.tasks, proj.tasks);
+    }
+
+    /// Issue #531: a note reads with `\n` line breaks whether the file holds
+    /// raw CR LF or CR bytes or `&#13;` references, for every owner of Notes.
+    #[test]
+    fn notes_line_breaks_read_as_lf_for_tasks_resources_and_assignments() {
+        for (notes, expected) in [
+            ("a\r\nb\rc", "a\nb\nc"),
+            ("a&#13;&#10;b", "a\nb"),
+            ("a&#13;\nb", "a\nb"),
+            ("a&#xD;&#xA;b", "a\nb"),
+            ("a&#xd;&#xa;b", "a\nb"),
+            ("&#13;&#10;", "\n"),
+            ("a\nb", "a\nb"),
+        ] {
+            let task = task_project(&format!("<Task><UID>1</UID><Notes>{notes}</Notes></Task>"));
+            assert_eq!(
+                task.tasks[0].notes.as_deref(),
+                Some(expected),
+                "task {notes:?}"
+            );
+            let resource = resource_project(&format!(
+                "<Resource><UID>1</UID><ID>1</ID><Name>R</Name><Notes>{notes}</Notes></Resource>"
+            ));
+            let resource = resource.resources[0].notes.as_deref();
+            assert_eq!(resource, Some(expected), "resource {notes:?}");
+            let assignment = assignment_project(&format!(
+                "<Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+                 <Notes>{notes}</Notes></Assignment>"
+            ));
+            let assignment = assignment.assignments[0].notes.as_deref();
+            assert_eq!(assignment, Some(expected), "assignment {notes:?}");
+        }
+    }
+
+    /// The writer still escapes a CR it is given (a conformant reader would
+    /// otherwise drop it), and reading that back gives the model's `\n`.
+    #[test]
+    fn written_cr_in_a_note_is_escaped_and_reads_back_as_lf() {
+        let mut proj = task_project("<Task><UID>1</UID><Notes>x</Notes></Task>");
+        proj.tasks[0].notes = Some("Line 1\r\nLine 2\rLine 3".into());
+        let xml = write_mspdi(&proj);
+        assert!(
+            xml.contains("<Notes>Line 1&#13;\nLine 2&#13;Line 3</Notes>"),
+            "{xml}"
+        );
+        let back = read_mspdi(&xml).unwrap();
+        assert_eq!(
+            back.tasks[0].notes.as_deref(),
+            Some("Line 1\nLine 2\nLine 3")
+        );
     }
 
     #[test]
@@ -6688,7 +6747,7 @@ mod tests {
 
     /// A work resource carrying every field #199 keeps: two rate tables, two
     /// availability periods, two baselines and two custom field values, with
-    /// XML specials and a CR LF in its text.
+    /// XML specials and a CR LF in its notes, which reads as LF (#531).
     const RESOURCE_RATES: &str = "<Resource><UID>1</UID><ID>1</ID><Name>Alice</Name>\
         <Type>1</Type><EmailAddress>a&amp;b@example.com</EmailAddress><MaxUnits>1</MaxUnits>\
         <AvailableFrom>2026-03-02T08:00:00</AvailableFrom><AvailableTo>2049-12-31T23:59:00</AvailableTo>\
@@ -6786,7 +6845,7 @@ mod tests {
                 overtime_work_min: Some(480),
                 cost: Rate::parse("2000.50"),
                 email_address: Some("a&b@example.com".into()),
-                notes: Some("Keys <desk>\r\nBadge".into()),
+                notes: Some("Keys <desk>\nBadge".into()),
                 available_from: at(2026, 3, 2, 8, 0),
                 available_to: at(2049, 12, 31, 23, 59),
                 extended_attributes: vec![
@@ -6845,8 +6904,7 @@ mod tests {
             "<AvailableTo>2049-12-31T23:59:00</AvailableTo>",
             "<OvertimeWork>PT8H0M0S</OvertimeWork>",
             "<Cost>2000.50</Cost>",
-            // The CR is escaped, or a conformant reader would drop it.
-            "<Notes>Keys &lt;desk&gt;&#13;\nBadge</Notes>",
+            "<Notes>Keys &lt;desk&gt;\nBadge</Notes>",
             "<FieldID>205520904</FieldID>",
             "<Value>Ops</Value>",
             "<ValueGUID>{8C2A3B1E-0000-4000-8000-000000000001}</ValueGUID>",
