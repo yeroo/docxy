@@ -1,25 +1,25 @@
 # Distinct names make distinct canonical paths; the suite otherwise reuses a tab.
 test title bar keeps caption controls visible with twenty tabs
-  open copy:../fixtures/basic.docx as tab-01.docx
-  open copy:../fixtures/basic.docx as tab-02.docx
-  open copy:../fixtures/basic.docx as tab-03.docx
-  open copy:../fixtures/basic.docx as tab-04.docx
-  open copy:../fixtures/basic.docx as tab-05.docx
-  open copy:../fixtures/basic.docx as tab-06.docx
-  open copy:../fixtures/basic.docx as tab-07.docx
-  open copy:../fixtures/basic.docx as tab-08.docx
-  open copy:../fixtures/basic.docx as tab-09.docx
-  open copy:../fixtures/basic.docx as tab-10.docx
-  open copy:../fixtures/basic.docx as tab-11.docx
-  open copy:../fixtures/basic.docx as tab-12.docx
-  open copy:../fixtures/basic.docx as tab-13.docx
-  open copy:../fixtures/basic.docx as tab-14.docx
-  open copy:../fixtures/basic.docx as tab-15.docx
-  open copy:../fixtures/basic.docx as tab-16.docx
-  open copy:../fixtures/basic.docx as tab-17.docx
-  open copy:../fixtures/basic.docx as tab-18.docx
-  open copy:../fixtures/basic.docx as tab-19.docx
-  open copy:../fixtures/basic.docx as tab-20.docx
+  open copy:"../fixtures/basic.docx" as tab-01.docx
+  open copy:"../fixtures/basic.docx" as tab-02.docx
+  open copy:"../fixtures/basic.docx" as tab-03.docx
+  open copy:"../fixtures/basic.docx" as tab-04.docx
+  open copy:"../fixtures/basic.docx" as tab-05.docx
+  open copy:"../fixtures/basic.docx" as tab-06.docx
+  open copy:"../fixtures/basic.docx" as tab-07.docx
+  open copy:"../fixtures/basic.docx" as tab-08.docx
+  open copy:"../fixtures/basic.docx" as tab-09.docx
+  open copy:"../fixtures/basic.docx" as tab-10.docx
+  open copy:"../fixtures/basic.docx" as tab-11.docx
+  open copy:"../fixtures/basic.docx" as tab-12.docx
+  open copy:"../fixtures/basic.docx" as tab-13.docx
+  open copy:"../fixtures/basic.docx" as tab-14.docx
+  open copy:"../fixtures/basic.docx" as tab-15.docx
+  open copy:"../fixtures/basic.docx" as tab-16.docx
+  open copy:"../fixtures/basic.docx" as tab-17.docx
+  open copy:"../fixtures/basic.docx" as tab-18.docx
+  open copy:"../fixtures/basic.docx" as tab-19.docx
+  open copy:"../fixtures/basic.docx" as tab-20.docx
   call close-tab {"index":0}
   assert tabs is 20
   shot title-tabs
@@ -60,6 +60,11 @@ test title bar keeps caption controls visible with twenty tabs
   call title-bar {}
   assert reply.active is 19
   assert reply.active_visible is true
+  call title-tab {"action":"more"}
+  type Blocked
+  assert dirty is false
+  key escape
+  call-error title-tab {"action":"pick","index":0} => the more-tabs list is closed
   call title-tab {"action":"more"}
   shot tab-more-item:0
   call title-tab {"action":"pick","index":0}
@@ -105,3 +110,5 @@ test title bar keeps caption controls visible with twenty tabs
   assert reply.tabs is 2
   assert reply.overflow is false
   assert reply.controls_clear is true
+  call title-tab {"action":"more"}
+  call-error title-tab {"action":"pick","index":0} => the more-tabs list is closed

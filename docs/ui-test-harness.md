@@ -126,7 +126,7 @@ cold start, and every accepted and rejected form is a unit test.
 |---|---|
 | `open <path>` | the file, resolved **against the script's own directory** — never the working directory. A file the app could not read is an ERROR, not a silent green step: the loaders substitute an empty document and record the reason in `status`, so the step reads the status back and stops the case there |
 | `open copy:<path>` | copy that fixture to `<sandbox>/<case-slug>/<original filename>` and open the copy; refuses an existing destination. Use this for saves and exports so their outputs stay in the run sandbox and the original fixture stays untouched |
-| `open copy:<path> as <name>` | copy the same fixture under a distinct plain filename (no separators or `..`), so a case can open multiple tabs without the suite focusing an existing path |
+| `open copy:"<path>" as <name>` | copy the same fixture under a distinct plain filename (no separators or `..`), so a case can open multiple tabs without the suite focusing an existing path; quotes keep a source path containing ` as ` unambiguous |
 | `call <verb> <json-object>` | send a raw control request, including Project verbs such as `call task.set {"uid":2,"duration":"3d"}`. JSON is parsed before launch and retained verbatim, including quoted `#`; trailing comments are not allowed. Non-object/invalid JSON is a script error; a refused request is an `ERROR` with the server message |
 | `call-error <verb> <json-object> => <message>` | require the app to refuse the request with a message containing the given text; a successful request or different refusal fails the step |
 | `click <cell> [shift] [double]` | the cell's click handler (press, click, release) |
@@ -301,9 +301,9 @@ footer editor; `selection-set` refuses while it is open.
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `controls_clear`, `active_visible`, `theme_visible`, `drag_ok`, and logical-pixel right edges. `caption_left` uses the pinned title-bar control width (102 px on Windows/Linux, zero on macOS) because the dependency's controls cannot be probed from the app child |
-| `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown and `pick` with an `index` uses the same dropdown selection handler |
+| `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
-| `window-zoom {}` | maximize through the same GPUI window action as a caption-button click; use a fresh harness window for restored geometry on Windows, where this pinned GPUI action only maximizes |
+| `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
 `ribbon-read` and `ribbon-click` work on document and Project tabs. The app
 does not model command enabled states. Extend Selection mode, native prompts,

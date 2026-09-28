@@ -105,7 +105,10 @@ pub enum Action {
     /// Copy a fixture into the run sandbox before opening it.
     OpenCopy(String),
     /// Copy a fixture under a unique plain filename before opening it.
-    OpenCopyAs { path: String, name: String },
+    OpenCopyAs {
+        path: String,
+        name: String,
+    },
     /// Raw control request with an object payload, parsed before launch.
     Call {
         verb: String,
@@ -363,14 +366,47 @@ fn parse_step(head: &str, rest: &str, line: usize) -> Result<Action, ScriptError
                 if path.is_empty() {
                     return Err(err(line, "'open copy:' needs a path"));
                 }
-                if let Some((source, name)) = path.rsplit_once(" as ") {
-                    if source.is_empty() || name.is_empty() || name == "." || name.contains("..")
-                        || name.contains('/') || name.contains('\\') || name.contains(':') {
-                        return Err(err(line, "'open copy:... as' needs a plain target filename"));
+                // Only a quoted source may use `as`; otherwise a real path
+                // containing those words would be parsed as a rename.
+                let (source, name) = if let Some(quoted) = path.strip_prefix('"') {
+                    let close = quoted
+                        .find('"')
+                        .ok_or_else(|| err(line, "unclosed open copy path quote"))?;
+                    let source = &quoted[..close];
+                    let tail = &quoted[close + 1..];
+                    if tail.is_empty() {
+                        (source, None)
+                    } else if let Some(name) = tail.strip_prefix(" as ") {
+                        (source, Some(name))
+                    } else {
+                        return Err(err(
+                            line,
+                            "expected ' as <name>' after quoted open copy path",
+                        ));
                     }
-                    Ok(Action::OpenCopyAs { path: source.into(), name: name.into() })
                 } else {
-                    Ok(Action::OpenCopy(path.into()))
+                    (path, None)
+                };
+                if let Some(name) = name {
+                    if source.is_empty()
+                        || name.is_empty()
+                        || name == "."
+                        || name.contains("..")
+                        || name.contains('/')
+                        || name.contains('\\')
+                        || name.contains(':')
+                    {
+                        return Err(err(
+                            line,
+                            "'open copy:... as' needs a plain target filename",
+                        ));
+                    }
+                    Ok(Action::OpenCopyAs {
+                        path: source.into(),
+                        name: name.into(),
+                    })
+                } else {
+                    Ok(Action::OpenCopy(source.into()))
                 }
             } else {
                 Ok(Action::Open(path.into()))
@@ -619,9 +655,9 @@ pub fn validate_region(name: &str) -> Result<String, String> {
         None => (full.as_str(), None),
     };
     match head.to_ascii_lowercase().as_str() {
-        "window" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more" | "grid" | "chart-panel" | "gantt" | "project-hbar-table"
-        | "project-hbar-chart" | "project-vbar" | "project-timeline" | "project-split"
-        | "gallery" => {
+        "window" | "title-tabs" | "tab-prev" | "tab-next" | "tab-more" | "grid" | "chart-panel"
+        | "gantt" | "project-hbar-table" | "project-hbar-chart" | "project-vbar"
+        | "project-timeline" | "project-split" | "gallery" => {
             if arg.is_some() {
                 return Err(format!("'{head}' takes no argument"));
             }
@@ -659,8 +695,11 @@ pub fn validate_region(name: &str) -> Result<String, String> {
             Ok(full.clone())
         }
         "tab-more-item" => {
-            let a = arg.filter(|a| !a.is_empty()).ok_or("'tab-more-item' needs an index")?;
-            a.parse::<usize>().map_err(|_| "'tab-more-item' needs a numeric index")?;
+            let a = arg
+                .filter(|a| !a.is_empty())
+                .ok_or("'tab-more-item' needs an index")?;
+            a.parse::<usize>()
+                .map_err(|_| "'tab-more-item' needs a numeric index")?;
             Ok(full.clone())
         }
         other => Err(format!("unknown region '{other}' ({REGION_WORDS})")),
@@ -902,13 +941,49 @@ test a pointed range dashes
 
     #[test]
     fn named_fixture_copies_need_plain_unique_filenames() {
-        let script = parse_script("test copies\n  open copy:../fixtures/basic.docx as tab-07.docx\n").unwrap();
-        assert_eq!(script.cases[0].steps[0].action, Action::OpenCopyAs {
-            path: "../fixtures/basic.docx".into(), name: "tab-07.docx".into()
-        });
-        for name in ["../escape.docx", "sub/file.docx", "sub\\file.docx", "..docx", "C:drive.docx"] {
-            assert!(parse_script(&format!("test bad\n  open copy:basic.docx as {name}\n")).is_err(), "{name}");
+        let script =
+            parse_script("test copies\n  open copy:\"../fixtures/basic.docx\" as tab-07.docx\n")
+                .unwrap();
+        assert_eq!(
+            script.cases[0].steps[0].action,
+            Action::OpenCopyAs {
+                path: "../fixtures/basic.docx".into(),
+                name: "tab-07.docx".into()
+            }
+        );
+        for name in [
+            "../escape.docx",
+            "sub/file.docx",
+            "sub\\file.docx",
+            "..docx",
+            "C:drive.docx",
+        ] {
+            assert!(
+                parse_script(&format!("test bad\n  open copy:\"basic.docx\" as {name}\n")).is_err(),
+                "{name}"
+            );
         }
+        let legacy =
+            parse_script("test path\n  open copy:\"../fixtures/save as draft.docx\"\n").unwrap();
+        assert_eq!(
+            legacy.cases[0].steps[0].action,
+            Action::OpenCopy("../fixtures/save as draft.docx".into())
+        );
+        let bare = parse_script("test path\n  open copy:../fixtures/save as draft.docx\n").unwrap();
+        assert_eq!(
+            bare.cases[0].steps[0].action,
+            Action::OpenCopy("../fixtures/save as draft.docx".into())
+        );
+        let renamed =
+            parse_script("test path\n  open copy:\"../fixtures/save as draft.docx\" as tab.docx\n")
+                .unwrap();
+        assert_eq!(
+            renamed.cases[0].steps[0].action,
+            Action::OpenCopyAs {
+                path: "../fixtures/save as draft.docx".into(),
+                name: "tab.docx".into()
+            }
+        );
     }
 
     #[test]

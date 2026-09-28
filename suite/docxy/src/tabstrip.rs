@@ -8,6 +8,34 @@ pub const ARROW_W: f32 = 22.0;
 pub const MORE_W: f32 = 28.0;
 pub const DRAG_MIN_W: f32 = 40.0;
 
+#[derive(Debug, Clone, Copy)]
+pub struct TitleGeometry {
+    pub content_w: f32,
+    pub caption_left: f32,
+}
+
+/// Account for the Root shadow/border, TitleBar's own padding and its controls.
+/// All arguments are logical pixels. The caption edge is in viewport coordinates.
+#[allow(clippy::too_many_arguments)]
+pub fn title_geometry(
+    viewport_w: f32,
+    inset_left: f32,
+    inset_right: f32,
+    border_left: f32,
+    border_right: f32,
+    title_left_pad: f32,
+    caption_w: f32,
+    fullscreen_pad: f32,
+) -> TitleGeometry {
+    let caption_left = viewport_w - inset_right - border_right - caption_w;
+    let content_w =
+        (caption_left - inset_left - border_left - title_left_pad - fullscreen_pad).max(0.0);
+    TitleGeometry {
+        content_w,
+        caption_left,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     None,
@@ -180,5 +208,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn title_content_reserves_client_shadow_and_border_on_both_sides() {
+        let server = title_geometry(600.0, 0.0, 0.0, 0.0, 0.0, 12.0, 102.0, 0.0);
+        assert_eq!(server.content_w, 486.0);
+        assert_eq!(server.caption_left, 498.0);
+        let client = title_geometry(600.0, 12.0, 12.0, 1.0, 1.0, 12.0, 102.0, 0.0);
+        assert_eq!(client.content_w, 460.0);
+        assert_eq!(client.caption_left, 485.0);
+        let tiled_right = title_geometry(600.0, 12.0, 0.0, 1.0, 0.0, 12.0, 102.0, 12.0);
+        assert_eq!(tiled_right.content_w, 461.0);
+        assert_eq!(tiled_right.caption_left, 498.0);
     }
 }

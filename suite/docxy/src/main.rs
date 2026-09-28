@@ -4418,6 +4418,39 @@ fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     }
 }
 
+/// The pinned gpui-component Root wraps TitleBar in window_border: client
+/// shadows are its padding and each untiled edge adds a 1px inner border.
+/// The pinned TitleBar separately adds left padding and a fullscreen inset.
+fn title_bar_geometry(window: &Window) -> tabstrip::TitleGeometry {
+    #[cfg(target_os = "macos")]
+    const TITLE_LEFT_PAD: f32 = 80.0;
+    #[cfg(not(target_os = "macos"))]
+    const TITLE_LEFT_PAD: f32 = 12.0;
+    let caption_w = if cfg!(any(target_os = "macos", target_family = "wasm")) {
+        0.0
+    } else {
+        3.0 * f32::from(gpui_component::TITLE_BAR_HEIGHT)
+    };
+    let padding = gpui_component::window_paddings(window);
+    let (border_left, border_right) = match window.window_decorations() {
+        Decorations::Server => (0.0, 0.0),
+        Decorations::Client { tiling } => (
+            if tiling.left { 0.0 } else { 1.0 },
+            if tiling.right { 0.0 } else { 1.0 },
+        ),
+    };
+    tabstrip::title_geometry(
+        f32::from(window.viewport_size().width),
+        f32::from(padding.left),
+        f32::from(padding.right),
+        border_left,
+        border_right,
+        TITLE_LEFT_PAD,
+        caption_w,
+        if window.is_fullscreen() { 12.0 } else { 0.0 },
+    )
+}
+
 impl Docxy {
     fn new(cx: &mut Context<Self>) -> Self {
         let session: Session = std::fs::read(session_path())
@@ -12396,6 +12429,9 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            return;
+        }
         if self.project_prompt_open() {
             return;
         }
@@ -12453,6 +12489,9 @@ impl Docxy {
 
     /// Shift+Tab decreases the paragraph indent (Word's outdent).
     fn shift_tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            return;
+        }
         if self.project_prompt_open() {
             return;
         }
@@ -12486,6 +12525,13 @@ impl Docxy {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab_more_open {
+            if ev.keystroke.key == "escape" {
+                self.tab_more_open = false;
+                cx.notify();
+            }
+            return; // the modal list owns keys; do not edit the surface below
+        }
         if self.project_edit_open() && !self.backstage {
             return self.project_key(ev, window, cx);
         }
@@ -18181,8 +18227,10 @@ impl Docxy {
     }
 
     fn tab_more_toggle(&mut self, cx: &mut Context<Self>) {
-        self.tab_more_open = !self.tab_more_open;
-        cx.notify();
+        if self.tab_layout.more {
+            self.tab_more_open = !self.tab_more_open;
+            cx.notify();
+        }
     }
 
     fn tab_more_pick(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -18233,9 +18281,11 @@ impl Docxy {
             .id("tab-more-backdrop")
             .absolute()
             .inset_0()
+            .occlude()
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
                     this.tab_more_open = false;
                     cx.notify();
                 }),
@@ -18245,7 +18295,7 @@ impl Docxy {
                     .id("tab-more-menu")
                     .absolute()
                     .left(px(left))
-                    .top(px(34.))
+                    .top(gpui_component::TITLE_BAR_HEIGHT)
                     .w(px(220.))
                     .max_h(px(400.))
                     .overflow_y_scroll()
@@ -18327,23 +18377,10 @@ impl Render for Docxy {
 
         // --- title bar: wordmark + document tab chips + theme toggle ---
         let theme_pref = self.theme_pref;
-        // The pinned gpui-component TitleBar gives #bar flex-shrink:0. Give
-        // our sole child a definite width so its min-content cannot move the
-        // caption controls outside the viewport. These are logical pixels.
-        #[cfg(target_os = "macos")]
-        const TITLE_LEFT_PAD: f32 = 80.0;
-        #[cfg(not(target_os = "macos"))]
-        const TITLE_LEFT_PAD: f32 = 12.0;
-        #[cfg(any(target_os = "macos", target_family = "wasm"))]
-        const CAPTION_W: f32 = 0.0;
-        #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
-        const CAPTION_W: f32 = 3.0 * 34.0; // pinned title_bar.rs TITLE_BAR_HEIGHT
-        let viewport_w = f32::from(window.viewport_size().width);
-        let title_w = (viewport_w
-            - TITLE_LEFT_PAD
-            - CAPTION_W
-            - if window.is_fullscreen() { 12.0 } else { 0.0 })
-        .max(0.0);
+        // The pinned TitleBar gives #bar flex-shrink:0. A definite width,
+        // accounting for Root's client decoration insets, keeps the caption
+        // controls inside the viewport.
+        let title_w = title_bar_geometry(window).content_w;
         let chrome = self.probes.borrow();
         let left_w = chrome
             .get("title-left")

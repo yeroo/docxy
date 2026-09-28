@@ -37,6 +37,7 @@ use crate::run::Run;
 use crate::script::{Action, Assertion, Case, Script, Step};
 use ctlcore::json::Json;
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// How a step ended.
@@ -244,7 +245,8 @@ impl<'a> Runner<'a> {
                     Action::OpenCopyAs { name, .. } => Some(name.as_str()),
                     _ => None,
                 };
-                let full = if matches!(step.action, Action::OpenCopy(_) | Action::OpenCopyAs { .. }) {
+                let full = if matches!(step.action, Action::OpenCopy(_) | Action::OpenCopyAs { .. })
+                {
                     match copy_fixture_as(&full, &self.sandbox, case, name) {
                         Ok(copy) => copy,
                         Err(e) => return err(out, e),
@@ -700,14 +702,19 @@ pub fn copy_fixture(source: &Path, sandbox: &Path, case: &str) -> Result<PathBuf
     copy_fixture_as(source, sandbox, case, None)
 }
 
-fn copy_fixture_as(source: &Path, sandbox: &Path, case: &str, target_name: Option<&str>) -> Result<PathBuf, String> {
+fn copy_fixture_as(
+    source: &Path,
+    sandbox: &Path,
+    case: &str,
+    target_name: Option<&str>,
+) -> Result<PathBuf, String> {
     let dir = sandbox.join(crate::run::slug(case));
     std::fs::create_dir_all(&dir)
         .map_err(|e| format!("open copy: create directory {}: {e}", dir.display()))?;
     let name = source
         .file_name()
         .ok_or_else(|| format!("open copy: source {} has no file name", source.display()))?;
-    let target = dir.join(target_name.unwrap_or_else(|| name.to_str().unwrap_or_default()));
+    let target = dir.join(target_name.map(OsStr::new).unwrap_or(name));
     let mut input = std::fs::File::open(source)
         .map_err(|e| format!("open copy: read {}: {e}", source.display()))?;
     let mut output = std::fs::OpenOptions::new()
@@ -740,8 +747,14 @@ mod tests {
 
     #[test]
     fn named_copies_are_distinct_and_refuse_overwrite() {
-        let root = std::env::temp_dir().join(format!("uiharness-copy-{}-{}", std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "uiharness-copy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir(&root).unwrap();
         let source = root.join("source.docx");
         std::fs::write(&source, b"fixture").unwrap();

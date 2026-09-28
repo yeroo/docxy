@@ -1460,7 +1460,9 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
 /// press plus one move per cell crossed plus the release, ordinary `key`/`type`
 /// input uses [`crate::Docxy::on_key`], action-bound Tab variants use their
 /// `tab_key`/`shift_tab_key` handlers, and `select-chart` is the press on a chart
-/// card.
+/// card. `title-tab` invokes the same tab arrow/dropdown handler methods as the
+/// title-bar elements. `window-size` and `window-zoom` are window setup verbs
+/// that call GPUI's window APIs directly.
 /// `selection-set` is setup: it uses the editor's caret API after validating
 /// both offsets because the UI has no pointer-by-offset operation.
 /// A verb that reached past those into the state they maintain could pass while
@@ -1506,11 +1508,7 @@ pub fn dispatch(
             let strip = read("title-tabs")?;
             let drag = read("title-drag")?;
             let theme = read("title-theme")?;
-            #[cfg(any(target_os = "macos", target_family = "wasm"))]
-            let caption_w = 0.0;
-            #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
-            let caption_w = 102.0;
-            let caption_left = f32::from(window.viewport_size().width) - caption_w;
+            let caption_left = crate::title_bar_geometry(window).caption_left;
             let content_right = f32::from(content.origin.x + content.size.width);
             let strip_right = f32::from(strip.origin.x + strip.size.width);
             let content_left = f32::from(content.origin.x);
