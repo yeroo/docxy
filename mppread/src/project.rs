@@ -16,11 +16,14 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// table. Each task's recorded **progress**, work and cost come through as
 /// read (the scheduler ignores them, as it does for MSPDI); Project's
 /// variances are not stored in the file and stay absent. Save As converts it
-/// to `.yppx`/MSPDI.
+/// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
+/// calendars, their own weekdays, and the project's default calendar; calendar
+/// exceptions and each task's own calendar assignment are not yet decoded.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)
         .map_err(|e| format!("cannot read the task table of this .mpp ({e})"))?;
+    let legacy = table.legacy;
     let new_tasks_are_manual = table
         .new_tasks_are_manual
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
@@ -39,7 +42,13 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
             .map(|t| t.name.clone())
             .unwrap_or_else(|| "Imported project".into())
     });
-    let cal_ref = Project::default();
+    let mut cal_ref = Project::default();
+    if let Some((calendars, default_calendar_uid)) = crate::caldecode::decode(bytes, legacy)
+        .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?
+    {
+        cal_ref.calendars = calendars;
+        cal_ref.default_calendar_uid = default_calendar_uid;
+    }
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // A task is a summary when the next task sits one WBS level deeper.
     let levels: Vec<u32> = decoded
@@ -146,7 +155,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         start_date: Some(start),
         tasks,
         new_tasks_are_manual,
-        ..Project::default()
+        ..cal_ref
     })
 }
 

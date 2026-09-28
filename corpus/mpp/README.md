@@ -118,6 +118,18 @@ the same way:
 python corpus/tools/gen_mpp_manual_cases.py
 ```
 
+The calendar decoder has five Project-written probes in `calendar/`: a non-UID-1
+default base calendar, edited base hours, a resource calendar with two weekday
+overrides, a Unicode calendar name with five periods, and a derived 24-hour day.
+Generate them with a licensed Project desktop install and pywin32:
+
+```powershell
+python corpus/tools/gen_mpp_calendar_cases.py
+```
+
+The binary and XML pairs stay git-ignored. The oracle test checks their exact
+calendar UIDs, names, base links, weekdays and default calendar UID when present.
+
 It also checks six task-progress cases in `progress/` when present (see
 Known decode gaps). It also checks two link-lag cases in `lag/` when present
 ([#104](https://github.com/yeroo/docxy/issues/104)): percentage, elapsed and
@@ -194,9 +206,12 @@ field map before it can be imported.
 Current Project blank rows are identified by their short FixedMeta record and
 omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
-row ID order. Resources, assignments, calendars, baselines, constraints, and
-custom fields are not imported. Task progress is (see below); assignment
-progress needs assignments first.
+row ID order. Resources, assignments, baselines, constraints, and custom fields
+are not imported. Newest-layout base and derived calendars, their weekdays,
+and the default calendar are imported; exceptions and task calendar assignment
+are not. An invalid newest calendar table refuses import. Files without
+`TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
+imported (see below); assignment progress needs assignments first.
 
 Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
 byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and

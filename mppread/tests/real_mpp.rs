@@ -368,3 +368,23 @@ fn progress_survives_save_as_mspdi_when_present() {
     // UID 34 is complete and UID 50 half done in this step.
     assert_eq!(in_progress, 2);
 }
+
+#[test]
+fn resource_calendars_survive_mpp_saves_when_present() {
+    let Ok(bytes) = std::fs::read(corpus("corpus/mpp/snapshots/38-resource-calendar.mpp")) else {
+        return;
+    };
+    let imported = mppread::project::project_from_mpp(&bytes).unwrap();
+    let fields =
+        |c: &projcore::Calendar| (c.uid, c.name.clone(), c.base_calendar_uid, c.week.clone());
+    for saved in [
+        projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap(),
+        projcore::yppx::read_yppx(&projcore::yppx::write_yppx(&imported)).unwrap(),
+    ] {
+        assert_eq!(
+            imported.calendars.iter().map(fields).collect::<Vec<_>>(),
+            saved.calendars.iter().map(fields).collect::<Vec<_>>()
+        );
+        assert_eq!(imported.default_calendar_uid, saved.default_calendar_uid);
+    }
+}

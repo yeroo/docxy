@@ -407,6 +407,7 @@ fn cost_rate(value: f64) -> Option<Rate> {
 pub(crate) struct Table {
     pub tasks: Vec<MppTask>,
     pub new_tasks_are_manual: Result<bool, String>,
+    pub legacy: bool,
 }
 
 pub(crate) fn decode(bytes: &[u8]) -> Result<Vec<MppTask>, String> {
@@ -429,6 +430,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
         return Ok(Table {
             tasks: Vec::new(),
             new_tasks_are_manual: Ok(false),
+            legacy: false,
         });
     }
     let Some(meta_path) = paths.iter().find(|p| p.ends_with("TBkndTask/FixedMeta")) else {
@@ -457,6 +459,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             Ok(Table {
                 tasks,
                 new_tasks_are_manual,
+                legacy: false,
             })
         }
         fixedmeta::TaskIndex::Legacy(indexed) => {
@@ -464,6 +467,7 @@ pub(crate) fn decode_table(bytes: &[u8]) -> Result<Table, String> {
             Ok(Table {
                 tasks: decode_legacy(&cfb, prefix, &fd, &vm, &v2, indexed, &uids)?,
                 new_tasks_are_manual: Ok(false),
+                legacy: true,
             })
         }
     }
