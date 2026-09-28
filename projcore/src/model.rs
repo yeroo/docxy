@@ -1702,6 +1702,14 @@ impl Project {
             .map(|(_, v)| v.as_str())
     }
 
+    /// Working days per month, using Project's default when the option is invalid.
+    pub fn days_per_month(&self) -> f64 {
+        self.option("DaysPerMonth")
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .filter(|days| days.is_finite() && *days > 0.0)
+            .unwrap_or(20.0)
+    }
+
     /// Whether new tasks are effort driven; Project's default is no.
     pub fn new_tasks_effort_driven(&self) -> bool {
         self.new_tasks_effort_driven.unwrap_or(false)
@@ -1813,6 +1821,24 @@ impl Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn days_per_month_uses_positive_finite_option_or_project_default() {
+        let mut project = Project::default();
+        assert_eq!(project.days_per_month(), 20.0);
+        for (text, expected) in [
+            ("22", 22.0),
+            (" 22 ", 22.0),
+            ("0", 20.0),
+            ("-3", 20.0),
+            ("inf", 20.0),
+            ("NaN", 20.0),
+            ("abc", 20.0),
+        ] {
+            project.options = vec![("DaysPerMonth".into(), text.into())];
+            assert_eq!(project.days_per_month(), expected, "{text}");
+        }
+    }
 
     #[test]
     fn unnamed_summary_uses_title_then_file_stem() {

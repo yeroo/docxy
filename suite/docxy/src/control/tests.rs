@@ -364,7 +364,7 @@ fn agent_save_reports_cell_error_before_missing_or_invalid_destination() {
         let before = snapshot(&tabs[0]);
         assert_eq!(
             call(&mut tabs, 0, "proj.save", save_args).unwrap_err(),
-            "Invalid duration (try 3d, 4h, 2w)"
+            "Invalid duration (try 3d, 4h, 2w, 1mo)"
         );
         assert_eq!(snapshot(&tabs[0]), before);
         assert_eq!(view(&tabs[0]).cell.as_ref().unwrap().buf, "bad duration");

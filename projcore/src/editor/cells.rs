@@ -659,8 +659,8 @@ fn elapsed_unit_min(unit: LagUnit) -> Option<f64> {
     })
 }
 
-/// Working minutes in one unit, as `parse_duration` counts them. A working
-/// month needs the project's days per month, which the model lacks.
+/// Working minutes in one unit, as `parse_duration` counts them. Working
+/// months remain unsupported in the Predecessors cell.
 fn working_unit_min(unit: LagUnit, proj: &Project) -> Option<f64> {
     match unit {
         LagUnit::Minute => Some(1.0),
@@ -685,8 +685,7 @@ fn unit_suffix(unit: LagUnit) -> &'static str {
 /// Parse a signed lag as the Predecessors cell spells it: a number and a unit
 /// (`m`, `h`, `d`, `w` working; `em`, `eh`, `ed`, `ew`, `emo` elapsed; `%` of
 /// the predecessor's duration), optionally marked estimated with `?`. The
-/// unit sets the lag's format. Working months are refused: the model has no
-/// days per month to count them with.
+/// unit sets the lag's format. Working months remain unsupported here.
 pub fn parse_lag(text: &str, proj: &Project) -> Option<(i64, LagFormat)> {
     let t = text.trim().to_ascii_lowercase();
     let (t, estimated) = match t.strip_suffix('?') {
@@ -714,6 +713,8 @@ pub fn parse_lag(text: &str, proj: &Project) -> Option<(i64, LagFormat)> {
     let value = if unit == LagUnit::Percent {
         num.parse::<i64>().ok()?
     } else if !elapsed {
+        // Only the lag's own numeric part may precede its single-letter unit.
+        num.parse::<f64>().ok()?;
         parse_duration(&format!("{num}{}", unit_suffix(unit)), proj)?
     } else if let Ok(exact) = num.parse::<i64>() {
         exact.checked_mul(elapsed_unit_min(unit)? as i64)?

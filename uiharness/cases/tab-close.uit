@@ -81,7 +81,7 @@ test inactive invalid Project edit refuses and correction clears the error
   assert tabs is 2
   assert tab is 0
   assert cell_edit is banana
-  assert status is Invalid duration (try 3d, 4h, 2w)
+  assert status is Invalid duration (try 3d, 4h, 2w, 1mo)
   key home delete delete delete delete delete delete
   type 2d
   key enter

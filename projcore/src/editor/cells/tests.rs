@@ -2532,10 +2532,13 @@ fn every_supported_lag_format_reads_back_what_the_cell_shows() {
 fn lag_grammar_refuses_what_it_cannot_schedule() {
     let ed = editor();
     let p = ed.project();
-    // Elapsed percent is unsupported; a working month has no days per month.
+    // Elapsed percent and working-month lags are unsupported in this cell.
     for text in [
         "2FS+50e%",
         "2FS+1mo",
+        "2FS+1month",
+        "2FS+1 month",
+        "2FS+1 month?",
         "2FS+1.5%",
         "2FS+2e",
         "2FS+%",

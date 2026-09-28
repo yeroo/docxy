@@ -119,7 +119,7 @@ fn invalid_project_buffer_refuses_even_discard_and_correction_clears_status() {
     let step = close_step(&mut t, |_| panic!("invalid buffer asked"));
     assert_eq!(
         step,
-        CloseStep::Refuse("Invalid duration (try 3d, 4h, 2w)".into())
+        CloseStep::Refuse("Invalid duration (try 3d, 4h, 2w, 1mo)".into())
     );
     let Surface::Project(v) = &mut t.surface else {
         panic!()

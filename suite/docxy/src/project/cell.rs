@@ -1,7 +1,7 @@
 //! Entry-table edit state and transitions, shared by keyboard, mouse and host actions.
 use super::*;
 use projcore::editor::{
-    duration_suffix, format_duration_exact, parse_cell_date, parse_task_duration,
+    DURATION_HINT, duration_suffix, format_duration_exact, parse_cell_date, parse_task_duration,
     parse_task_predecessors,
 };
 
@@ -225,7 +225,7 @@ pub(crate) fn apply_cell(
         COL_NAME => ed.rename(uid, buf)?,
         COL_DURATION => {
             let (min, estimated) = parse_task_duration(buf, ed.project())
-                .ok_or("Invalid duration (try 3d, 4h, 2w)")?;
+                .ok_or_else(|| format!("Invalid duration ({DURATION_HINT})"))?;
             ed.set_duration_min(uid, min, estimated)?;
         }
         COL_START | COL_FINISH => {
