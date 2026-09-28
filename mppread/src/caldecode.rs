@@ -126,7 +126,7 @@ fn hours(value: &[u8], base: bool) -> Result<[Option<DayWorking>; 7], String> {
     Ok(week)
 }
 
-fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
+fn exceptions(value: &[u8]) -> Result<(Vec<CalendarException>, bool), String> {
     if value.len() < 428 {
         return Err("truncated calendar exception header".into());
     }
@@ -261,7 +261,7 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
     if offset.checked_add(4).is_none_or(|n| n > value.len()) {
         return Err("truncated calendar work-week header".into());
     }
-    Ok(out)
+    Ok((out, u32_at(value, offset) != 0))
 }
 
 fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, String> {
@@ -303,7 +303,14 @@ fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, Strin
     Ok(names)
 }
 
-pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>, i32)>, String> {
+#[derive(Debug, PartialEq)]
+pub(crate) struct DecodedCalendars {
+    pub calendars: Vec<Calendar>,
+    pub default_calendar_uid: i32,
+    pub work_week_uids: HashSet<i32>,
+}
+
+pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, String> {
     if legacy {
         return Ok(None);
     }
@@ -408,6 +415,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
         }
     }
     let mut calendars = Vec::with_capacity(rows.len());
+    let mut work_week_uids = HashSet::new();
     let mut resources = None;
     for (uid, base_uid, resource_uid) in rows {
         // FixedData also contains unnamed internal/unused calendar rows.
@@ -429,7 +437,13 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
             return Err(format!("missing calendar name for UID {uid}"));
         };
         let (week, exceptions) = match fields.get(&(uid, 8)) {
-            Some(value) => (hours(value, base_uid.is_none())?, exceptions(value)?),
+            Some(value) => {
+                let (exceptions, has_work_weeks) = exceptions(value)?;
+                if has_work_weeks {
+                    work_week_uids.insert(uid);
+                }
+                (hours(value, base_uid.is_none())?, exceptions)
+            }
             None if base_uid.is_some() => (std::array::from_fn(|_| None), Vec::new()),
             // A base without a key-8 block uses Project's built-in week,
             // regardless of its name. MPXJ applies the same default.
@@ -486,7 +500,11 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
             "default calendar UID {default_uid} has no working time"
         ));
     }
-    Ok(Some((calendars, default_uid)))
+    Ok(Some(DecodedCalendars {
+        calendars,
+        default_calendar_uid: default_uid,
+        work_week_uids,
+    }))
 }
 
 #[cfg(test)]
@@ -519,7 +537,8 @@ pub(crate) mod tests {
             crate::mpp::MPP_EPOCH_DAYS,
             DateTime::from_ymd_hm(1983, 12, 31, 0, 0).day_number()
         );
-        let ex = exceptions(&exception_block()).unwrap();
+        let (ex, has_work_weeks) = exceptions(&exception_block()).unwrap();
+        assert!(!has_work_weeks);
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name.as_deref(), Some("Holiday"));
         assert_eq!(ex[0].from.unwrap().to_mspdi(), "2025-01-15T00:00:00");
@@ -527,11 +546,11 @@ pub(crate) mod tests {
         assert_eq!(ex[0].kind, Some(1));
         assert_eq!(ex[0].occurrences, Some(1));
         assert!(!ex[0].entered_by_occurrences.unwrap());
-        assert!(exceptions(&vec![0; 428]).unwrap().is_empty());
+        assert!(exceptions(&vec![0; 428]).unwrap().0.is_empty());
 
         let mut alternate = exception_block();
         alternate[500..504].copy_from_slice(&0x0100_0230u32.to_le_bytes());
-        assert_eq!(exceptions(&alternate).unwrap(), ex);
+        assert_eq!(exceptions(&alternate).unwrap().0, ex);
     }
 
     #[test]
@@ -539,14 +558,14 @@ pub(crate) mod tests {
         let mut monthly = exception_block();
         monthly[496..500].copy_from_slice(&4u32.to_le_bytes());
         monthly[500..504].copy_from_slice(&[4, 2, 44, 1]);
-        let decoded = exceptions(&monthly).unwrap();
+        let decoded = exceptions(&monthly).unwrap().0;
         assert_eq!(decoded[0].month_day, Some(4));
         assert_eq!(decoded[0].period, Some(300));
 
         let mut daily = exception_block();
         daily[496..500].copy_from_slice(&7u32.to_le_bytes());
         daily[500..504].copy_from_slice(&[44, 1, 5, 6]);
-        let decoded = exceptions(&daily).unwrap();
+        let decoded = exceptions(&daily).unwrap().0;
         assert_eq!(decoded[0].period, Some(300));
     }
 
@@ -562,11 +581,11 @@ pub(crate) mod tests {
             b
         };
         assert_eq!(
-            exceptions(&renamed(&[])).unwrap()[0].name.as_deref(),
+            exceptions(&renamed(&[])).unwrap().0[0].name.as_deref(),
             Some("")
         );
         assert_eq!(
-            exceptions(&renamed(&[0, 0])).unwrap()[0].name.as_deref(),
+            exceptions(&renamed(&[0, 0])).unwrap().0[0].name.as_deref(),
             Some("")
         );
         let control: Vec<_> = "A\nB"
@@ -575,7 +594,7 @@ pub(crate) mod tests {
             .flat_map(u16::to_le_bytes)
             .collect();
         assert_eq!(
-            exceptions(&renamed(&control)).unwrap()[0].name.as_deref(),
+            exceptions(&renamed(&control)).unwrap().0[0].name.as_deref(),
             Some("A\nB")
         );
         let error = exceptions(&renamed(&[0, 0xd8, 0, 0])).unwrap_err();
@@ -736,9 +755,14 @@ pub(crate) mod tests {
         }
         vm.drain(36..48); // remove the base calendar's key-8 entry
         vm[8..12].copy_from_slice(&3u32.to_le_bytes());
-        let (calendars, uid) = decode(&file_with_default(fm, fd, vm, v2, "Workdays"), false)
+        let DecodedCalendars {
+            calendars,
+            default_calendar_uid: uid,
+            work_week_uids,
+        } = decode(&file_with_default(fm, fd, vm, v2, "Workdays"), false)
             .unwrap()
             .unwrap();
+        assert!(work_week_uids.is_empty());
         assert_eq!(uid, 1);
         assert_eq!(calendars[0].name, "Workdays");
         assert_eq!(calendars[0].week, Calendar::standard_week().map(Some));
@@ -747,7 +771,12 @@ pub(crate) mod tests {
     #[test]
     fn decodes_base_and_derived_weekdays() {
         let (fm, fd, vm, v2) = fixture();
-        let (cals, default) = decode(&file(fm, fd, vm, v2), false).unwrap().unwrap();
+        let DecodedCalendars {
+            calendars: cals,
+            default_calendar_uid: default,
+            work_week_uids,
+        } = decode(&file(fm, fd, vm, v2), false).unwrap().unwrap();
+        assert!(work_week_uids.is_empty());
         assert_eq!(default, 1);
         assert_eq!(
             cals.iter()
@@ -864,5 +893,44 @@ pub(crate) mod tests {
         assert!(crate::taskdecode::decode_table(&bytes).unwrap().legacy);
         let project = crate::project::project_from_mpp(&bytes).unwrap();
         assert_eq!(project.calendars, vec![Calendar::standard(1)]);
+    }
+
+    #[test]
+    fn current_corpora_have_no_calendar_work_weeks() {
+        let snapshots =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
+        let paired = std::env::var("MPP_PAIRED_CORPUS").ok();
+        let mut checked = 0usize;
+        for dir in [Some(snapshots), paired.map(std::path::PathBuf::from)]
+            .into_iter()
+            .flatten()
+        {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|ext| ext != "mpp")
+                    || path
+                        .file_stem()
+                        .is_some_and(|stem| stem.to_string_lossy().ends_with("-mpp12"))
+                {
+                    continue;
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                let legacy = crate::taskdecode::decode_table(&bytes).unwrap().legacy;
+                if let Some(DecodedCalendars { work_week_uids, .. }) =
+                    decode(&bytes, legacy).unwrap()
+                {
+                    assert!(
+                        work_week_uids.is_empty(),
+                        "{} has work weeks: {work_week_uids:?}",
+                        path.display()
+                    );
+                }
+                checked += 1;
+            }
+        }
+        eprintln!("calendar work-week counts checked in {checked} current corpus files");
     }
 }

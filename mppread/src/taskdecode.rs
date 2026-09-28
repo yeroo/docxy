@@ -730,8 +730,26 @@ mod tests {
             ],
         )])
     }
-    fn file_with_calendar(s: &Streams, closed: bool) -> Vec<u8> {
-        let (cal_fm, cal_fd, cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
+    fn file_with_calendar(
+        s: &Streams,
+        closed: bool,
+        work_week_uids: &[i32],
+        independent: bool,
+    ) -> Vec<u8> {
+        let (cal_fm, mut cal_fd, cal_vm, mut cal_v2) = crate::caldecode::tests::fixture();
+        if independent {
+            cal_fd[76..80].copy_from_slice(&(-1i32).to_le_bytes());
+        }
+        for &uid in work_week_uids {
+            let entry = match uid {
+                1 => 36,
+                5 => 60,
+                _ => panic!("fixture has no calendar UID {uid}"),
+            };
+            let off =
+                u32::from_le_bytes(cal_vm[entry + 4..entry + 8].try_into().unwrap()) as usize + 4;
+            cal_v2[off + 424..off + 428].copy_from_slice(&1u32.to_le_bytes());
+        }
         if closed {
             // The fourth VarMeta entry is UID 5's weekday block. Override
             // every inherited day with a day having zero working periods.
@@ -1132,22 +1150,26 @@ mod tests {
         put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
         put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
-        let project = crate::project::project_from_mpp(&file_with_calendar(&s, false)).unwrap();
+        let project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[], false)).unwrap();
         assert_eq!(project.tasks[0].calendar_uid, Some(5));
         assert_eq!(project.tasks[0].duration_min, 480);
 
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &9i32.to_le_bytes());
         assert_eq!(
-            crate::project::project_from_mpp(&file_with_calendar(&s, false)).unwrap_err(),
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[], false))
+                .unwrap_err(),
             "unknown calendar UID 9 for task UID 1"
         );
 
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &(-1i32).to_le_bytes());
-        let project = crate::project::project_from_mpp(&file_with_calendar(&s, false)).unwrap();
+        let project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[], false)).unwrap();
         assert_eq!(project.tasks[0].calendar_uid, None);
 
         put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
-        let error = crate::project::project_from_mpp(&file_with_calendar(&s, true)).unwrap_err();
+        let error = crate::project::project_from_mpp(&file_with_calendar(&s, true, &[], false))
+            .unwrap_err();
         assert!(
             error.contains("calendar \"Alice\" (UID 5) has no working time"),
             "{error}"
@@ -1156,6 +1178,44 @@ mod tests {
             error.contains("task \"B\" (UID 1) cannot be scheduled"),
             "{error}"
         );
+    }
+    #[test]
+    fn calendars_with_work_weeks_use_the_original_span_fallback() {
+        let mut s = fixture();
+        put(&mut s, 0x68, &[0xc0, 0x12, 0x2a, 0x3c]); // Mon 08:00
+        put(&mut s, 0x6c, &[0xd8, 0x27, 0x2b, 0x3c]); // Tue 17:00
+        put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+
+        for weeks in [&[5][..], &[1][..]] {
+            let project =
+                crate::project::project_from_mpp(&file_with_calendar(&s, false, weeks, false))
+                    .unwrap();
+            assert_eq!(project.tasks[0].calendar_uid, None);
+            assert_eq!(project.tasks[0].duration_min, 960);
+        }
+
+        // A closed default week on the task's own calendar does not refuse
+        // the task when its stored work-week count says it has alternate hours.
+        let project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, true, &[5], false)).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, None);
+        assert_eq!(project.tasks[0].duration_min, 960);
+
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &(-1i32).to_le_bytes());
+        let project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[1], false)).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, None);
+        assert_eq!(project.tasks[0].duration_min, 960);
+
+        // Only the default calendar has a work week; an independent task
+        // calendar still uses its stored Duration.
+        put(&mut s, NEWEST_PROGRESS.calendar_uid, &5i32.to_le_bytes());
+        let project =
+            crate::project::project_from_mpp(&file_with_calendar(&s, false, &[1], true)).unwrap();
+        assert_eq!(project.tasks[0].calendar_uid, Some(5));
+        assert_eq!(project.tasks[0].duration_min, 480);
     }
     #[test]
     fn negative_stored_duration_names_uid() {
