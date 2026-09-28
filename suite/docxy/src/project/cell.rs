@@ -362,21 +362,21 @@ pub(crate) fn project_cell_input(tab: &mut DocTab, key: &str, text: Option<&str>
         // Save commits the buffer before host dispatch; other chords cannot alter it.
         return;
     }
-    if key == "enter" || key == "tab" {
+    // Up and Down commit and move a row, as Enter does, in Project.
+    if matches!(key, "enter" | "tab" | "up" | "down") {
         if commit_project_cell(tab) {
             if let Surface::Project(v) = &mut tab.surface {
                 v.key(
-                    if key == "enter" {
-                        "down"
-                    } else if m.shift {
-                        "left"
-                    } else {
-                        "right"
+                    match key {
+                        "enter" => "down",
+                        "up" | "down" => key,
+                        _ if m.shift => "left",
+                        _ => "right",
                     },
                     false,
                 );
             }
-            complete_project(tab, key == "enter");
+            complete_project(tab, key != "tab");
         }
     } else if let Surface::Project(v) = &mut tab.surface {
         if key == "escape" {
