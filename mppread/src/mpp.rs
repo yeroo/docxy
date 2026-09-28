@@ -93,6 +93,11 @@ pub struct MppTaskFields {
     /// ordinary numeric outline mask. Custom masks remain unknown.
     pub wbs: Option<String>,
     pub task_type: Option<projcore::TaskType>,
+    /// Current 202-byte task record: constraint type at +64 and date at +66.
+    /// Checked against Project XML for the paired snapshot corpus (types 0/2/4/7).
+    /// Types 1/3/5/6 follow MSPDI's code mapping but lack paired samples.
+    pub constraint_type: Option<projcore::ConstraintType>,
+    pub constraint_date: Option<String>,
     pub active: Option<bool>,
     pub effort_driven: Option<bool>,
     pub estimated: Option<bool>,
@@ -557,6 +562,20 @@ pub fn decode_timestamp(data: &[u8], off: usize) -> Option<String> {
         secs / 3600,
         (secs % 3600) / 60
     ))
+}
+
+/// A task/property timestamp with NA allowed but an out-of-day time refused.
+/// Callers validate that four bytes are available and add field-specific errors.
+pub(crate) fn decode_checked_timestamp(data: &[u8], off: usize) -> Result<Option<String>, ()> {
+    let days = u16le(data, off + 2);
+    if days == 0xffff {
+        return Ok(None);
+    }
+    let time = u16le(data, off);
+    if time != 0xffff && time >= 14400 {
+        return Err(());
+    }
+    Ok(decode_timestamp(data, off))
 }
 
 /// Decode an MPP duration (a 4-byte value in tenths of a minute) at `off` into

@@ -5,25 +5,34 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
-/// a task. Each decoded automatic task without local children, including an
-/// inserted subproject, is pinned with a Must-Start-On constraint at its start
-/// and given Project's stored working duration when available. Other durations
-/// use the working minutes between start and finish on the task's calendar.
+/// a task. Current-layout tasks keep their recorded constraints, including
+/// manual tasks and summaries. For an untracked, local automatic leaf whose
+/// scheduled start differs from Project's stored start, the importer replaces
+/// its constraint with Must-Start-On only if that restores the stored start;
+/// Save As writes any accepted pin. Summary links and constraints, cross-project
+/// predecessors, ALAP chains, leveling delay and resource calendars can cause
+/// these differences. On the `.mpp` path, an effective pin preserves the
+/// stored start, though its finish can still differ. MSPDI import does not
+/// add this pin, so both scheduled start and finish can move. Legacy MPP9
+/// leaves, including a childless inserted subproject, remain pinned with
+/// Must-Start-On at their stored start. Automatic leaves use Project's stored working duration when
+/// available. Other durations use the working minutes between start and finish
+/// on the task's calendar.
 /// Current Project resource identity/type and assignment identity, planned
 /// work and dates are imported, together with saved baseline slots 0..10
 /// (Start, Finish, Work, Cost). Project's MPP/XML has no assignment-baseline
 /// BCWS/BCWP; those remain absent. Assignment progress, rate tables, contours
 /// and delays are not decoded. Splits and delayed assignments can therefore
-/// schedule an earlier finish than their retained stored finish. A resource calendar
-/// can move a resourced task's finish earlier or later because projcore does
-/// not schedule on resource calendars; MSPDI import behaves the same way. A **manual**
-/// leaf keeps its mode and its manual start, finish and duration instead,
-/// which hold it where Project put it without a constraint; the project's
+/// schedule an earlier finish than their retained stored finish. Resource
+/// calendars and leveling delay can move a task's finish because projcore does
+/// not apply either when scheduling. A **manual** leaf keeps its mode, manual start,
+/// finish and duration, which hold it where Project put it. Its recorded
+/// constraint is retained but does not move its manual dates. The project's
 /// new-task mode comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
 /// rollup come through, and the **predecessor links** decode from the `TBkndCons`
 /// table. Each task's recorded **progress**, work and cost come through as
-/// read (the scheduler ignores them, as it does for MSPDI); Project's
+/// read. The scheduler uses actuals for tracked tasks; Project's
 /// variances are not stored in the file and stay absent. Validated task fields
 /// and blank grid rows come through too. Save As converts it to `.yppx`/MSPDI.
 /// Current Project calendar tables keep base and derived calendars, their
@@ -43,6 +52,16 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let legacy = table.legacy;
     let new_tasks_are_manual = table
         .new_tasks_are_manual
+        .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
+    let project_start = table
+        .project_start
+        .and_then(|value| {
+            value
+                .map(|d| {
+                    parse_mpp_dt(&d).ok_or_else(|| "invalid project StartDate in Props".to_string())
+                })
+                .transpose()
+        })
         .map_err(|e| format!("cannot read the project options of this .mpp ({e})"))?;
     let decoded = table.tasks;
     let name = [
@@ -71,7 +90,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         cal_ref.calendars = calendars;
         cal_ref.default_calendar_uid = default_calendar_uid;
     }
-    let tasks = import_tasks(decoded, &cal_ref, has_calendar_table)?;
+    let tasks = import_tasks(decoded, &cal_ref, has_calendar_table, legacy)?;
     let resources_present = crate::tabledecode::present(bytes, "TBkndRsc")?;
     let assignments_present = crate::tabledecode::present(bytes, "TBkndAssn")?;
     if !legacy && assignments_present && !resources_present {
@@ -92,12 +111,14 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         // No resource table, or one whose layout has not been validated.
         (Vec::new(), Vec::new())
     };
-    let start = tasks
-        .iter()
-        .filter_map(|t| t.stored_start)
-        .min()
-        .unwrap_or_else(default_anchor);
-    let project = Project {
+    let start = project_start.unwrap_or_else(|| {
+        tasks
+            .iter()
+            .filter_map(|t| t.stored_start)
+            .min()
+            .unwrap_or_else(default_anchor)
+    });
+    let mut project = Project {
         name,
         title: info.title,
         start_date: Some(start),
@@ -110,7 +131,170 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     if let Some(error) = projcore::schedule::calendar_error(&project) {
         return Err(format!("cannot read the calendars of this .mpp ({error})"));
     }
+    if !legacy {
+        pin_unreproduced_starts(&mut project);
+    }
     Ok(project)
+}
+
+fn reproduces(schedule: &projcore::schedule::Schedule, task: &Task) -> bool {
+    schedule
+        .get(task.uid)
+        .is_some_and(|result| Some(result.early_start) == task.stored_start)
+}
+
+fn pin_unreproduced_starts(project: &mut Project) {
+    let candidates: Vec<usize> = project
+        .tasks
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            !t.is_null && !t.summary && !t.manual && t.tracked().is_none() && !t.is_external_leaf()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let originals: Vec<_> = project
+        .tasks
+        .iter()
+        .map(|t| (t.constraint, t.constraint_date))
+        .collect();
+    let mut pinned = std::collections::HashSet::new();
+    let mut rejected = std::collections::HashSet::new();
+    let mut scheduled = projcore::schedule::schedule(project);
+    // Each divergent candidate becomes pinned or rejected. Neither is
+    // retried, so there are at most candidate-count passes.
+    loop {
+        let mut divergent = Vec::new();
+        for &i in &candidates {
+            if pinned.contains(&i) || rejected.contains(&i) {
+                continue;
+            }
+            let task = &project.tasks[i];
+            // A missing schedule row does not enter the divergent set.
+            if scheduled.get(task.uid).is_some() && !reproduces(&scheduled, task) {
+                divergent.push(i);
+            }
+        }
+        if divergent.is_empty() {
+            break;
+        }
+        for &i in &divergent {
+            let task = &mut project.tasks[i];
+            task.constraint = ConstraintType::MustStartOn;
+            task.constraint_date = task.stored_start;
+        }
+        let trial = projcore::schedule::schedule(project);
+        let mut rejected_this_pass = false;
+        for i in divergent {
+            let task = &project.tasks[i];
+            if reproduces(&trial, task) {
+                pinned.insert(i);
+            } else {
+                let task = &mut project.tasks[i];
+                (task.constraint, task.constraint_date) = originals[i];
+                rejected.insert(i);
+                rejected_this_pass = true;
+            }
+        }
+        if rejected_this_pass && !pinned.is_empty() {
+            // Restoring an ineffective pin may unfix another from the batch.
+            // Those become rejected too; each cleanup pass shrinks pinned.
+            scheduled = projcore::schedule::schedule(project);
+            loop {
+                let unstable: Vec<_> = pinned
+                    .iter()
+                    .copied()
+                    .filter(|&i| {
+                        let task = &project.tasks[i];
+                        !reproduces(&scheduled, task)
+                    })
+                    .collect();
+                if unstable.is_empty() {
+                    break;
+                }
+                for i in unstable {
+                    let task = &mut project.tasks[i];
+                    (task.constraint, task.constraint_date) = originals[i];
+                    pinned.remove(&i);
+                    rejected.insert(i);
+                }
+                scheduled = projcore::schedule::schedule(project);
+            }
+        } else if !rejected_this_pass {
+            scheduled = trial;
+        }
+    }
+
+    // Batch pinning can pin a successor that an upstream pin already fixes.
+    // Try removing accepted pins from successors toward predecessors. A pin
+    // stays removed only if every start currently reproduced remains so.
+    // This costs one full schedule per accepted pin, in addition to at most
+    // candidate-count accept/reject passes. The 48 newest snapshot files
+    // currently need zero pins, so they incur no minimisation schedules.
+    let uid_to_index: std::collections::HashMap<_, _> = candidates
+        .iter()
+        .map(|&i| (project.tasks[i].uid, i))
+        .collect();
+    let mut successors = vec![Vec::new(); project.tasks.len()];
+    let mut indegree = vec![0usize; project.tasks.len()];
+    for &i in &candidates {
+        for predecessor in &project.tasks[i].predecessors {
+            if let Some(&before) = uid_to_index.get(&predecessor.uid) {
+                successors[before].push(i);
+                indegree[i] += 1;
+            }
+        }
+    }
+    // Descending row order here makes the reversed order use ascending rows
+    // for unrelated tasks.
+    let mut ready: std::collections::BTreeSet<_> = candidates
+        .iter()
+        .copied()
+        .filter(|&i| indegree[i] == 0)
+        .map(std::cmp::Reverse)
+        .collect();
+    let mut order = Vec::with_capacity(candidates.len());
+    while let Some(&std::cmp::Reverse(i)) = ready.first() {
+        ready.pop_first();
+        order.push(i);
+        for &next in &successors[i] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                ready.insert(std::cmp::Reverse(next));
+            }
+        }
+    }
+    // A malformed cycle has no topological order. The scheduler has already
+    // handled it; use row order for any nodes left over.
+    for &i in &candidates {
+        if indegree[i] > 0 {
+            order.push(i);
+        }
+    }
+    for i in order.into_iter().rev() {
+        if !pinned.contains(&i) {
+            continue;
+        }
+        let matching: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|&j| reproduces(&scheduled, &project.tasks[j]))
+            .collect();
+        let task = &mut project.tasks[i];
+        (task.constraint, task.constraint_date) = originals[i];
+        let trial = projcore::schedule::schedule(project);
+        if matching
+            .iter()
+            .all(|&j| reproduces(&trial, &project.tasks[j]))
+        {
+            pinned.remove(&i);
+            scheduled = trial;
+        } else {
+            let task = &mut project.tasks[i];
+            task.constraint = ConstraintType::MustStartOn;
+            task.constraint_date = task.stored_start;
+        }
+    }
 }
 
 fn assignment_task_uids(tasks: &[Task]) -> std::collections::HashSet<i32> {
@@ -124,11 +308,23 @@ fn import_tasks(
     decoded: Vec<crate::mpp::MppTask>,
     cal_ref: &Project,
     has_calendar_table: bool,
+    legacy: bool,
 ) -> Result<Vec<Task>, String> {
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
     // Only a local deeper row can form a schedulable outline summary. Project
     // labels childless inserted subprojects as summaries in XML, but they must
     // remain leaves here so the scheduler includes them.
+    let summaries: Vec<bool> = decoded
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            !t.is_null
+                && decoded[i + 1..]
+                    .iter()
+                    .find(|next| !next.is_null)
+                    .is_some_and(|next| next.outline_level > t.outline_level)
+        })
+        .collect();
     let tasks: Vec<Task> = decoded
         .iter()
         .enumerate()
@@ -142,10 +338,7 @@ fn import_tasks(
                 });
             }
             let level = t.outline_level.expect("validated task outline");
-            let outline_summary = decoded[i + 1..]
-                .iter()
-                .find(|next| !next.is_null)
-                .is_some_and(|next| next.outline_level.is_some_and(|nxt| nxt > level));
+            let outline_summary = summaries[i];
             let mut task = Task {
                 uid: t.uid as i32,
                 id: t.id as i32,
@@ -208,6 +401,10 @@ fn import_tasks(
                 task.notes = fields.notes.clone();
                 task.wbs = fields.wbs.clone();
                 task.task_type = fields.task_type;
+                if let Some(constraint) = fields.constraint_type {
+                    task.constraint = constraint;
+                    task.constraint_date = date(&fields.constraint_date, "constraint date")?;
+                }
                 task.active = fields.active;
                 task.effort_driven = fields.effort_driven;
                 task.estimated = fields.estimated;
@@ -248,8 +445,7 @@ fn import_tasks(
                 task.actual_cost = Some(p.actual_cost.clone());
                 task.remaining_cost = Some(p.remaining_cost.clone());
             }
-            // Pin auto leaves and childless inserted subprojects. Outline
-            // summaries roll up from children; manual leaves use stored dates.
+            // Outline summaries roll up; manual leaves use their own dates.
             let span =
                 || projcore::schedule::working_minutes_between_on(cal_ref, task.calendar_uid, s, f);
             if outline_summary {
@@ -262,8 +458,10 @@ fn import_tasks(
                     .filter(|&fmt| crate::mpp::working_duration_format(fmt))
                     .and(t.duration_min)
                     .unwrap_or_else(span);
-                task.constraint = ConstraintType::MustStartOn;
-                task.constraint_date = Some(s);
+                if legacy {
+                    task.constraint = ConstraintType::MustStartOn;
+                    task.constraint_date = Some(s);
+                }
             }
             Ok(task)
         })
@@ -293,6 +491,7 @@ pub(crate) fn parse_mpp_dt(s: &str) -> Option<DateTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::cfb::{Node, write_cfb_tree};
 
     #[test]
@@ -335,7 +534,19 @@ mod tests {
     }
 
     fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> {
-        super::import_tasks(decoded, &Project::default(), false)
+        super::import_tasks(decoded, &Project::default(), false, true)
+    }
+
+    fn import_current(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> {
+        let tasks = super::import_tasks(decoded, &Project::default(), false, false)?;
+        let start_date = tasks.iter().filter_map(|t| t.stored_start).min();
+        let mut project = Project {
+            start_date,
+            tasks,
+            ..Project::default()
+        };
+        super::pin_unreproduced_starts(&mut project);
+        Ok(project.tasks)
     }
 
     fn task(id: u32, uid: u32, name: &str, level: u32) -> crate::mpp::MppTask {
@@ -357,6 +568,295 @@ mod tests {
             is_null: true,
             ..crate::mpp::MppTask::default()
         }
+    }
+
+    fn current(id: u32, uid: u32, name: &str, level: u32) -> crate::mpp::MppTask {
+        let mut row = task(id, uid, name, level);
+        row.fields = Some(crate::mpp::MppTaskFields {
+            constraint_type: Some(ConstraintType::AsSoonAsPossible),
+            ..crate::mpp::MppTaskFields::default()
+        });
+        row
+    }
+    fn later(mut row: crate::mpp::MppTask, start: &str, finish: &str) -> crate::mpp::MppTask {
+        row.start = Some(start.into());
+        row.finish = Some(finish.into());
+        row
+    }
+
+    fn link(pred_uid: u32) -> crate::mpp::MppPred {
+        crate::mpp::MppPred {
+            pred_uid,
+            kind: 1,
+            lag_format: 8,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn alap_predecessor_of_a_summary_is_pinned_but_asap_is_not() {
+        let mut late = current(1, 1, "ALAP predecessor", 1);
+        late.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let early = current(2, 2, "ASAP predecessor", 1);
+        let mut summary = current(3, 3, "Summary", 1);
+        summary.predecessors = vec![link(1), link(2)];
+        let tail = later(
+            current(5, 5, "Long tail", 1),
+            "2026-03-02 08:00",
+            "2026-03-20 08:00",
+        );
+        let rows = import_current(vec![
+            current(0, 0, "Project", 0),
+            late,
+            early,
+            summary,
+            current(4, 4, "Child", 2),
+            tail,
+        ])
+        .unwrap();
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[1].constraint_date, None);
+    }
+
+    #[test]
+    fn alap_child_of_a_summary_predecessor_is_pinned_but_asap_sibling_is_not() {
+        let mut late = current(2, 2, "ALAP child", 2);
+        late.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let mut successor = current(4, 4, "Successor", 1);
+        successor.predecessors.push(link(1));
+        let tail = later(
+            current(5, 5, "Long tail", 1),
+            "2026-03-02 08:00",
+            "2026-03-20 08:00",
+        );
+        let rows = import_current(vec![
+            current(0, 0, "Project", 0),
+            current(1, 1, "Summary", 1),
+            late,
+            current(3, 3, "ASAP sibling", 2),
+            successor,
+            tail,
+        ])
+        .unwrap();
+        assert_eq!(rows[1].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[1].constraint_date, rows[1].stored_start);
+        assert_eq!(rows[2].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[2].constraint_date, None);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
+    }
+
+    #[test]
+    fn alap_to_asap_to_summary_chain_needs_only_upstream_pin() {
+        let mut a = current(1, 1, "ALAP A", 1);
+        a.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let mut b = later(
+            current(2, 2, "ASAP B", 1),
+            "2026-03-03 08:00",
+            "2026-03-04 08:00",
+        );
+        b.predecessors.push(link(1));
+        let mut summary = current(3, 3, "Summary", 1);
+        summary.predecessors.push(link(2));
+        let tail = later(
+            current(5, 5, "Long tail", 1),
+            "2026-03-02 08:00",
+            "2026-03-20 08:00",
+        );
+        let rows = import_current(vec![
+            current(0, 0, "Project", 0),
+            a,
+            b,
+            summary,
+            current(4, 4, "C", 2),
+            tail,
+        ])
+        .unwrap();
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn); // A moved late.
+        assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible); // A's pin restores B.
+        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        assert_eq!(rows[1].constraint_date, None);
+    }
+
+    #[test]
+    fn independent_alap_divergences_both_need_pins() {
+        let mut a = current(1, 1, "ALAP A", 1);
+        a.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let mut b = current(2, 2, "ALAP B", 1);
+        b.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let tail = later(
+            current(3, 3, "Long tail", 1),
+            "2026-03-02 08:00",
+            "2026-03-20 08:00",
+        );
+        let rows = import_current(vec![current(0, 0, "Project", 0), a, b, tail]).unwrap();
+        for row in &rows[..2] {
+            assert_eq!(row.constraint, ConstraintType::MustStartOn);
+            assert_eq!(row.constraint_date, row.stored_start);
+        }
+    }
+
+    #[test]
+    fn external_predecessor_does_not_lose_its_constraint_but_local_leaf_is_pinned() {
+        let mut external = current(1, 1, "External", 1);
+        external.fields.as_mut().unwrap().external_task = Some(true);
+        let mut local = later(
+            current(2, 2, "Local", 1),
+            "2026-03-10 08:00",
+            "2026-03-11 08:00",
+        );
+        local.predecessors.push(link(1));
+        let rows = import_current(vec![current(0, 0, "Project", 0), external, local]).unwrap();
+        assert_eq!(rows[0].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[1].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[1].constraint_date, rows[1].stored_start);
+    }
+
+    #[test]
+    fn tracked_leaf_under_snet_summary_keeps_its_constraint() {
+        let mut summary = current(1, 1, "SNET summary", 1);
+        summary.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::StartNoEarlierThan);
+        summary.fields.as_mut().unwrap().constraint_date = Some("2026-03-09 08:00".into());
+        let child = later(
+            current(2, 2, "Tracked child", 2),
+            "2026-03-09 08:00",
+            "2026-03-10 08:00",
+        );
+        let tasks = super::import_tasks(
+            vec![current(0, 0, "Project", 0), summary, child],
+            &Project::default(),
+            false,
+            false,
+        )
+        .unwrap();
+        let mut project = Project {
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks,
+            ..Project::default()
+        };
+        project.tasks[1].actual_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        assert!(project.tasks[1].tracked().is_some());
+        super::pin_unreproduced_starts(&mut project);
+        assert_eq!(
+            project.tasks[1].constraint,
+            ConstraintType::AsSoonAsPossible
+        );
+        assert_eq!(project.tasks[1].constraint_date, None);
+    }
+
+    #[test]
+    fn ineffective_pin_on_closed_start_preserves_asap() {
+        let mut calendar = projcore::Calendar::standard(1);
+        for day in calendar.week.iter_mut().flatten() {
+            if let Some(first) = day.times.first_mut() {
+                first.from = 510; // Standard now opens 08:30.
+            }
+        }
+        let start = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        let milestone = Task {
+            uid: 1,
+            id: 1,
+            name: "Kickoff".into(),
+            stored_start: Some(start),
+            stored_finish: Some(start),
+            duration_min: 0,
+            ..Task::default()
+        };
+        let elapsed = Task {
+            uid: 2,
+            id: 2,
+            name: "Elapsed".into(),
+            stored_start: Some(start),
+            stored_finish: Some(DateTime::from_ymd_hm(2026, 3, 5, 8, 0)),
+            duration_min: 3 * 1440,
+            ..Task::default()
+        };
+        let mut project = Project {
+            start_date: Some(start),
+            calendars: vec![calendar],
+            tasks: vec![milestone, elapsed],
+            ..Project::default()
+        };
+        super::pin_unreproduced_starts(&mut project);
+        for task in &project.tasks {
+            assert_eq!(task.constraint, ConstraintType::AsSoonAsPossible);
+            assert_eq!(task.constraint_date, None);
+            assert_eq!(
+                projcore::schedule::schedule(&project)
+                    .get(task.uid)
+                    .unwrap()
+                    .early_start,
+                DateTime::from_ymd_hm(2026, 3, 2, 8, 30)
+            );
+        }
+    }
+
+    #[test]
+    fn current_leaves_under_constrained_or_linked_summaries_keep_their_dates() {
+        let mut constrained = current(1, 1, "SNET parent", 1);
+        let fields = constrained.fields.as_mut().unwrap();
+        fields.constraint_type = Some(ConstraintType::StartNoEarlierThan);
+        fields.constraint_date = Some("2026-03-09 08:00".into());
+        let mut linked = current(3, 3, "Linked parent", 1);
+        linked.predecessors.push(crate::mpp::MppPred {
+            pred_uid: 1,
+            kind: 1,
+            lag_format: 8,
+            ..Default::default()
+        });
+        let rows = import_current(vec![
+            current(0, 0, "Project", 0),
+            constrained,
+            later(
+                current(2, 2, "Child under SNET", 2),
+                "2026-03-09 08:00",
+                "2026-03-10 08:00",
+            ),
+            linked,
+            later(
+                current(4, 4, "Child under link", 2),
+                "2026-03-11 08:00",
+                "2026-03-12 08:00",
+            ),
+            current(5, 5, "Independent", 1),
+        ])
+        .unwrap();
+        assert_eq!(rows[0].constraint, ConstraintType::StartNoEarlierThan);
+        for uid in [2, 4] {
+            let child = rows.iter().find(|t| t.uid == uid).unwrap();
+            assert_eq!(child.constraint, ConstraintType::MustStartOn, "UID {uid}");
+            assert_eq!(child.constraint_date, child.stored_start, "UID {uid}");
+        }
+        assert_eq!(rows[4].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[4].constraint_date, None);
+    }
+
+    #[test]
+    fn leaf_linked_to_a_summary_keeps_its_stored_start() {
+        let mut linked_leaf = later(
+            current(3, 3, "Linked leaf", 1),
+            "2026-03-04 08:00",
+            "2026-03-05 08:00",
+        );
+        linked_leaf.predecessors.push(crate::mpp::MppPred {
+            pred_uid: 1,
+            kind: 1,
+            lag_format: 8,
+            ..Default::default()
+        });
+        let rows = import_current(vec![
+            current(0, 0, "Project", 0),
+            current(1, 1, "Summary", 1),
+            current(2, 2, "Child", 2),
+            linked_leaf,
+            current(4, 4, "Independent", 1),
+        ])
+        .unwrap();
+        assert_eq!(rows[2].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[2].constraint_date, rows[2].stored_start);
+        assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[3].constraint, ConstraintType::AsSoonAsPossible);
     }
 
     #[test]
@@ -446,19 +946,26 @@ mod tests {
     }
 
     #[test]
-    fn childless_subproject_keeps_its_duration_and_start_pin() {
+    fn childless_subproject_keeps_its_duration_and_recorded_constraint() {
         let mut sub = task(1, 1, "Inserted plan", 1);
+        sub.start = Some("2026-03-04 08:00".into());
+        sub.finish = Some("2026-03-05 08:00".into());
         sub.fields = Some(crate::mpp::MppTaskFields {
             is_subproject: Some(true),
+            constraint_type: Some(ConstraintType::StartNoEarlierThan),
+            constraint_date: Some("2026-03-04 08:00".into()),
             ..crate::mpp::MppTaskFields::default()
         });
-        let rows = import_tasks(vec![task(0, 0, "Project", 0), sub]).unwrap();
+        let rows = import_current(vec![task(0, 0, "Project", 0), sub]).unwrap();
         assert_eq!(rows.len(), 1);
         assert!(!rows[0].summary);
         assert_eq!(rows[0].is_subproject, Some(true));
         assert!(rows[0].duration_min > 0);
-        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
-        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        assert_eq!(rows[0].constraint, ConstraintType::StartNoEarlierThan);
+        assert_eq!(
+            rows[0].constraint_date.unwrap().to_mspdi(),
+            "2026-03-04T08:00:00"
+        );
         let project = Project {
             start_date: rows[0].stored_start,
             tasks: rows,
@@ -467,7 +974,7 @@ mod tests {
         let scheduled = projcore::schedule::schedule(&project);
         assert_eq!(
             scheduled.get(1).map(|r| r.early_start),
-            project.tasks[0].stored_start
+            project.tasks[0].constraint_date
         );
     }
 

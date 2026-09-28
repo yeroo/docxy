@@ -389,6 +389,14 @@ The older `mppread::mpp::tasks` and `task_names` functions remain exploratory
 heuristic probes. They are not used by the importer. Their output may be
 partial or wrong for a file that `decode_tasks` correctly refuses.
 
+## Constraint cases
+
+On Windows with Microsoft Project and pywin32 installed, run
+`python corpus/tools/gen_mpp_constraint_cases.py` to generate two optional
+`constraints/` MPP/XML pairs. They cover all eight task constraint codes,
+manual tasks, summaries, and a project start distinct from task dates. The
+script can also generate one case by name (`all_types` or `rows`).
+
 ## What already works on a real .mpp
 
 ```sh

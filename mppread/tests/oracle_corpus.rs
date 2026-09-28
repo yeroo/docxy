@@ -259,6 +259,33 @@ fn check_task_fields(
     );
     let dt =
         |d: Option<projcore::DateTime>| d.map(|d| d.to_mspdi().replace('T', " ")[..16].to_string());
+    if require_fields {
+        assert_eq!(
+            f.constraint_type,
+            Some(e.constraint),
+            "{}",
+            at("decoded constraint type")
+        );
+        assert_eq!(
+            f.constraint_date,
+            dt(e.constraint_date),
+            "{}",
+            at("decoded constraint date")
+        );
+        if (imported.constraint, imported.constraint_date) != (e.constraint, e.constraint_date) {
+            assert!(
+                !imported.manual && !imported.summary,
+                "{}",
+                at("unexpected pin row")
+            );
+            assert_eq!(
+                (imported.constraint, imported.constraint_date),
+                (projcore::ConstraintType::MustStartOn, imported.stored_start),
+                "{}",
+                at("imported pin")
+            );
+        }
+    }
     assert_eq!(f.create_date, dt(e.create_date), "{}", at("create date"));
     assert_eq!(f.deadline, dt(e.deadline), "{}", at("deadline"));
     assert_eq!(
@@ -485,6 +512,14 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     }
     let imported = mppread::project::project_from_mpp(&bytes)
         .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
+    if source == Oracle::Project && !may_refuse {
+        assert_eq!(
+            imported.start_date,
+            oracle.start_date,
+            "{}: project StartDate",
+            mpp.display()
+        );
+    }
     if xml_text.contains("<Calendars>") {
         let fields = |c: &projcore::Calendar| {
             (
@@ -1291,6 +1326,42 @@ fn project_2024_oracles() {
             );
         }
     }
+    let constraints = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/constraints");
+    let cases = pairs(&constraints, "");
+    if !cases.is_empty() {
+        let mut seen = [false; 8];
+        for (mpp, xml) in &cases {
+            assert!(
+                mpp.file_stem()
+                    .is_some_and(|stem| stem == "k1-all-types" || stem == "k2-rows"),
+                "unknown generated constraint pair {}",
+                mpp.display()
+            );
+            check_pair(mpp, xml, false, Oracle::Project);
+            let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
+            let imported =
+                mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
+            for task in decoded.iter().filter(|t| !t.is_null) {
+                let constraint = task
+                    .fields
+                    .as_ref()
+                    .and_then(|f| f.constraint_type)
+                    .unwrap();
+                seen[constraint.code() as usize] = true;
+            }
+            if mpp.file_stem().is_some_and(|stem| stem == "k2-rows") {
+                let child = imported.tasks.iter().find(|t| t.name == "Child").unwrap();
+                assert_eq!(child.constraint, projcore::ConstraintType::MustStartOn);
+                assert_eq!(child.constraint_date, child.stored_start);
+            }
+        }
+        if cases.len() == 2 {
+            assert!(
+                seen.iter().all(|&value| value),
+                "generated pairs omit a constraint code: {seen:?}"
+            );
+        }
+    }
     let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
     if snapshots.join("01-empty.mpp").exists() {
         let newest = pairs(&snapshots, "")
@@ -1312,12 +1383,35 @@ fn project_2024_oracles() {
             }));
         }
         let mut recurring_count = 0;
+        let mut constraint_counts = [0usize; 8];
+        let mut start_divergence_pins = 0usize;
+        let mut first_pins = std::collections::HashMap::new();
         for (mpp, xml) in &newest {
             // The two standalone XML exports were saved after a legacy-MPP
             // conversion: their GUIDs differ from the current .mpp, and
             // x-recurring's occurrence Manual values and new-task option changed
             // too. check_pair excludes only those established differences.
             check_pair(mpp, xml, false, Oracle::Project);
+            let imported =
+                mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap()).unwrap();
+            let decoded = mppread::mpp::decode_tasks(&std::fs::read(mpp).unwrap()).unwrap();
+            for task in imported.tasks.iter().filter(|t| !t.is_null) {
+                let original = decoded
+                    .iter()
+                    .find(|raw| raw.uid as i32 == task.uid)
+                    .and_then(|raw| raw.fields.as_ref())
+                    .and_then(|fields| fields.constraint_type)
+                    .unwrap();
+                constraint_counts[original.code() as usize] += 1;
+                if original != task.constraint
+                    && task.constraint == projcore::ConstraintType::MustStartOn
+                {
+                    start_divergence_pins += 1;
+                    first_pins
+                        .entry(task.uid)
+                        .or_insert_with(|| mpp.file_stem().unwrap().to_string_lossy().to_string());
+                }
+            }
             if mpp.file_stem().is_some_and(|s| s == "x-recurring") {
                 let oracle =
                     projcore::mspdi::read_mspdi(&std::fs::read_to_string(xml).unwrap()).unwrap();
@@ -1435,6 +1529,13 @@ fn project_2024_oracles() {
                 );
             }
         }
+        assert_eq!(constraint_counts[2], 167, "MSO count in newest snapshots");
+        assert_eq!(constraint_counts[4], 34, "SNET count in newest snapshots");
+        assert_eq!(constraint_counts[7], 28, "FNLT count in newest snapshots");
+        assert_eq!(
+            start_divergence_pins, 0,
+            "unexpected effective pins in newest snapshots: {first_pins:?}"
+        );
         assert_eq!(
             recurring_count, 5,
             "recurring summary plus four occurrences"
