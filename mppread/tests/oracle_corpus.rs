@@ -199,6 +199,9 @@ fn check_task_fields(
 
 fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool {
     let custom_wbs_mask = mpp.file_stem().is_some_and(|s| s == "f8-wbs-mask");
+    // Snapshot MPP12 pairs may decode through the legacy index without
+    // validated task fields; the current Project pairs must have them.
+    let require_fields = source == Oracle::Project && !may_refuse;
     let bytes = std::fs::read(mpp).unwrap();
     let xml_text = std::fs::read_to_string(xml).unwrap();
     let oracle = projcore::mspdi::read_mspdi(&xml_text).unwrap();
@@ -443,7 +446,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at, custom_wbs_mask, source == Oracle::Project);
+        check_task_fields(a, t, e, &at, custom_wbs_mask, require_fields);
         assert_eq!(
             t.manual,
             e.manual,
@@ -470,7 +473,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let t = round.tasks.iter().find(|t| t.uid == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} round trip {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at, custom_wbs_mask, source == Oracle::Project);
+        check_task_fields(a, t, e, &at, custom_wbs_mask, require_fields);
     }
     for ghost in decoded
         .iter()
