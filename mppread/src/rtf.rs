@@ -5,6 +5,7 @@ use std::collections::HashMap;
 struct State {
     hidden: bool,
     font_table: bool,
+    font_table_depth: usize,
     uc: usize,
     codepage: i32,
     font: i32,
@@ -15,6 +16,23 @@ struct State {
 struct FontInfo {
     charset: Option<i32>,
     codepage: Option<i32>,
+}
+
+fn decode_note_byte(value: u8, state: State, fonts: &HashMap<i32, FontInfo>) -> Result<char, ()> {
+    let font = fonts.get(&state.font).copied().unwrap_or_default();
+    let page = font
+        .codepage
+        .or_else(|| {
+            font.charset
+                .map(|charset| charset_page(charset, state.codepage))
+                .unwrap_or(Some(state.codepage))
+        })
+        .ok_or(())?;
+    if page == 42 {
+        char::from_u32(0xf000 + u32::from(value)).ok_or(())
+    } else {
+        crate::rtf_codepage::decode(page, value).ok_or(())
+    }
 }
 
 fn charset_page(charset: i32, ansi_page: i32) -> Option<i32> {
@@ -29,6 +47,7 @@ fn charset_page(charset: i32, ansi_page: i32) -> Option<i32> {
         178 => 1256,
         186 => 1257,
         204 => 1251,
+        222 => 874,
         238 => 1250,
         _ => return None,
     })
@@ -179,6 +198,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
     let mut state = State {
         hidden: false,
         font_table: false,
+        font_table_depth: 0,
         uc: 1,
         codepage: 1252,
         font: 0,
@@ -220,6 +240,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                         state.hidden = true;
                         if word == b"fonttbl" {
                             state.font_table = true;
+                            state.font_table_depth = stack.len();
                         }
                     }
                     group_start = false;
@@ -230,10 +251,12 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                             state.font = state.default_font;
                         }
                         b"f" => state.font = num.ok_or(())?,
-                        b"fcharset" if state.font_table => {
+                        b"fcharset"
+                            if state.font_table && stack.len() == state.font_table_depth + 1 =>
+                        {
                             fonts.entry(state.font).or_default().charset = Some(num.ok_or(())?);
                         }
-                        b"cpg" if state.font_table => {
+                        b"cpg" if state.font_table && stack.len() == state.font_table_depth + 1 => {
                             fonts.entry(state.font).or_default().codepage = Some(num.ok_or(())?);
                         }
                         b"plain" => state.font = state.default_font,
@@ -284,21 +307,7 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
                         b'\'' => {
                             let value = read_hex(bytes, &mut pos)?;
                             if !state.hidden {
-                                let font = fonts.get(&state.font).copied().unwrap_or_default();
-                                let page = font
-                                    .codepage
-                                    .or_else(|| {
-                                        font.charset
-                                            .map(|charset| charset_page(charset, state.codepage))
-                                            .unwrap_or(Some(state.codepage))
-                                    })
-                                    .ok_or(())?;
-                                let character = if page == 42 {
-                                    char::from_u32(0xf000 + u32::from(value)).ok_or(())?
-                                } else {
-                                    crate::rtf_codepage::decode(page, value).ok_or(())?
-                                };
-                                push(&mut out, character);
+                                push(&mut out, decode_note_byte(value, state, &fonts)?);
                                 final_par = false;
                             }
                         }
@@ -330,11 +339,13 @@ fn parse(bytes: &[u8]) -> Result<String, ()> {
             }
             0 => return Err(()),
             _ => {
-                if b >= 0x80 {
-                    return Err(());
-                }
                 if !state.hidden {
-                    push(&mut out, b as char);
+                    let character = if b >= 0x80 {
+                        decode_note_byte(b, state, &fonts)?
+                    } else {
+                        b as char
+                    };
+                    push(&mut out, character);
                     final_par = false;
                 }
                 pos += 1;
@@ -456,6 +467,32 @@ mod tests {
         assert_eq!(
             plain_text(br"{\rtf1\ansicpg1252\'81}", 1).unwrap(),
             "\u{0081}"
+        );
+        assert_eq!(plain_text(br"{\rtf1\ansicpg874\'ca}", 1).unwrap(), "ส");
+        assert_eq!(
+            plain_text(br"{\rtf1{\fonttbl{\f0\fcharset222 Thai;}}\f0\'ca}", 1).unwrap(),
+            "ส"
+        );
+        assert_eq!(
+            plain_text(
+                br"{\rtf1{\fonttbl{\f0\fcharset204 Arial;{\*\fontfile\cpg1252 Foo.ttf;}}}\f0\'cf}",
+                1
+            )
+            .unwrap(),
+            "П"
+        );
+    }
+
+    #[test]
+    fn raw_eight_bit_text_uses_the_selected_code_page() {
+        assert_eq!(
+            plain_text(b"{\\rtf1\\ansicpg1252 caf\xe9}", 1).unwrap(),
+            "café"
+        );
+        assert_eq!(plain_text(b"{\\rtf1\\ansicpg1251 \xcf}", 1).unwrap(), "П");
+        assert_eq!(
+            plain_text(b"{\\rtf1{\\fonttbl raw\xff}ok}", 1).unwrap(),
+            "ok"
         );
     }
 

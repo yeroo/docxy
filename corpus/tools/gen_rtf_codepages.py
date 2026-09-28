@@ -28,7 +28,8 @@ def main():
         "// Zero denotes a byte Windows cannot decode (or maps to U+FFFD).",
         "",
     ]
-    for page in range(1250, 1259):
+    pages = [874, *range(1250, 1259)]
+    for page in pages:
         values = table(page)
         lines.append(f"const CP{page}: [u16; 128] = [")
         for i in range(0, 128, 8):
@@ -39,7 +40,7 @@ def main():
         "    if byte < 0x80 { return Some(char::from(byte)); }",
         "    let table = match page {",
     ]
-    for page in range(1250, 1259):
+    for page in pages:
         lines.append(f"        {page} => &CP{page},")
     lines += [
         "        _ => return None,",
