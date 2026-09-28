@@ -1059,6 +1059,8 @@ pub struct AssignmentBaseline {
     /// Recorded work in whole minutes; None when omitted or invalid.
     pub work_min: Option<i64>,
     pub cost: Option<Rate>,
+    pub bcws: Option<Rate>,
+    pub bcwp: Option<Rate>,
 }
 
 /// A working-time slot within a day, in minutes-of-day (`from` inclusive,

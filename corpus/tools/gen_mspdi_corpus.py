@@ -510,6 +510,7 @@ def build():
                 "</ExtendedAttribute>"
                 f"<Baseline><Number>0</Number><Start>{dt(2)}</Start>"
                 f"<Finish>{dt(3, '17:00:00')}</Finish><Work>PT16H0M0S</Work><Cost>970</Cost>"
+                "<BCWS>230</BCWS><BCWP>205.5</BCWP>"
                 "</Baseline>"
                 f"<TimephasedData><Type>1</Type><UID>1</UID><Start>{dt(2)}</Start>"
                 f"<Finish>{dt(3)}</Finish><Unit>2</Unit><Value>PT8H0M0S</Value></TimephasedData>"
