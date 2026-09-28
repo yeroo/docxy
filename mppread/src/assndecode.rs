@@ -93,47 +93,27 @@ pub(crate) fn decode(
                 (0x121 + delta, 0x122 + delta, 0x127 + delta, 0x128 + delta)
             };
             let field = |key| table.field(uid, key);
-            let numeric = |key: u16, what: &str| -> Result<Option<f64>, String> {
-                field(key)
-                    .map(|b| {
-                        if b.len() != 8 {
-                            return Err(format!(
-                                "invalid baseline {what} length for assignment UID {uid}"
-                            ));
-                        }
-                        Ok(f64_at(b, 0))
-                    })
-                    .transpose()
-            };
-            let s = field(sk)
-                .map(|b| date(b, uid, "baseline start"))
-                .transpose()?
-                .flatten();
-            let f = field(fk)
-                .map(|b| date(b, uid, "baseline finish"))
-                .transpose()?
-                .flatten();
-            let w = numeric(wk, "work")?;
-            let c = numeric(ck, "cost")?;
-            if s.is_none() && f.is_none() && w.unwrap_or(0.0) == 0.0 && c.unwrap_or(0.0) == 0.0 {
-                continue;
-            }
-            if s.zip(f).is_some_and(|(s, f)| s > f) {
-                return Err(format!("baseline dates reversed for assignment UID {uid}"));
+            let numeric = |key: u16| field(key).filter(|b| b.len() == 8).map(|b| f64_at(b, 0));
+            let mut s = field(sk).and_then(|b| date(b, uid, "baseline start").ok().flatten());
+            let mut f = field(fk).and_then(|b| date(b, uid, "baseline finish").ok().flatten());
+            if s.zip(f).is_some_and(|(start, finish)| start > finish) {
+                s = None;
+                f = None;
             }
             let work_min = if resource.is_some_and(|r| r.kind == ResourceType::Cost) {
                 None
             } else {
-                // Project writes -0.000001 for an assignment baseline with
-                // no work. It rounds to zero minutes in the XML export.
-                w.filter(|&v| v != 0.0 && v != -0.000001)
-                    .map(|v| work(v, uid, "baseline work"))
-                    .transpose()?
+                // Project writes -0.000001 for absent baseline work and cost.
+                numeric(wk)
+                    .filter(|&v| v != 0.0 && v != -0.000001)
+                    .and_then(|v| work(v, uid, "baseline work").ok())
             };
-            let cost = c
-                .filter(|&v| v != 0.0)
-                .map(|v| money(v, uid, "baseline cost"))
-                .transpose()?;
+            let cost = numeric(ck)
+                .filter(|&v| v != 0.0 && v != -0.000001)
+                .and_then(|v| money(v, uid, "baseline cost").ok());
+            if s.is_none() && f.is_none() && work_min.is_none() && cost.is_none() {
+                continue;
+            }
             baselines.push(AssignmentBaseline {
                 number: slot,
                 start: s,
@@ -292,7 +272,7 @@ mod tests {
         assert!(result[1].baselines.is_empty());
     }
     #[test]
-    fn refuses_bad_indexes_references_and_baseline_payloads() {
+    fn refuses_bad_indexes_references_and_core_payloads() {
         let good = file(rows(), vars());
         assert_eq!(
             decode(&good, false, &tasks(), &resources())
@@ -325,23 +305,31 @@ mod tests {
                 .unwrap_err()
                 .contains("duplicate VarMeta")
         );
-        let mut short = vars();
-        short[0].2 = vec![1];
+        for units in [-1.0, f64::NAN] {
+            let mut bad = rows();
+            bad[0][12..20].copy_from_slice(&units.to_le_bytes());
+            assert!(
+                decode(&file(bad, vars()), false, &tasks(), &resources())
+                    .unwrap_err()
+                    .contains("invalid units")
+            );
+        }
+        let mut bad = rows();
+        bad[0][20..28].copy_from_slice(&(-1.0f64).to_le_bytes());
         assert!(
-            decode(&file(rows(), short), false, &tasks(), &resources())
+            decode(&file(bad, vars()), false, &tasks(), &resources())
                 .unwrap_err()
-                .contains("length")
+                .contains("invalid work")
         );
-        let mut date = vars();
-        date[2].2 = vec![0x40, 0x38, 0x2a, 0x3c];
-        assert!(
-            decode(&file(rows(), date), false, &tasks(), &resources())
-                .unwrap_err()
-                .contains("time")
-        );
-        let mut midnight = vars();
-        midnight[2].2 = vec![0xff, 0xff, 0x2a, 0x3c];
-        assert!(decode(&file(rows(), midnight), false, &tasks(), &resources()).is_ok());
+        for offset in [52, 56] {
+            let mut bad = rows();
+            bad[0][offset..offset + 4].copy_from_slice(&[0x40, 0x38, 0x2a, 0x3c]);
+            assert!(
+                decode(&file(bad, vars()), false, &tasks(), &resources())
+                    .unwrap_err()
+                    .contains("time")
+            );
+        }
         let mut reversed = rows();
         reversed[0][52..56].copy_from_slice(&[0xd8, 0x27, 0x2c, 0x3c]);
         assert!(
@@ -359,6 +347,83 @@ mod tests {
             .unwrap_err()
             .contains("count")
         );
+    }
+
+    #[test]
+    fn drops_undecodable_baseline_fields() {
+        let slot = |fields: Vec<(u32, u16, Vec<u8>)>| {
+            let assignments = decode(&file(rows(), fields), false, &tasks(), &resources())
+                .unwrap()
+                .unwrap();
+            assert_eq!(assignments.len(), 2);
+            assert_eq!(assignments[0].baselines.len(), 3);
+            assignments[0].baselines[0].clone()
+        };
+        for payload in [
+            vec![1],
+            f64::NAN.to_le_bytes().to_vec(),
+            (-1.0f64).to_le_bytes().to_vec(),
+        ] {
+            let mut fields = vars();
+            fields[0].2 = payload;
+            let baseline = slot(fields);
+            assert!(baseline.work_min.is_none());
+            assert!(
+                baseline.cost.is_some() && baseline.start.is_some() && baseline.finish.is_some()
+            );
+        }
+        for payload in [vec![1], f64::INFINITY.to_le_bytes().to_vec()] {
+            let mut fields = vars();
+            fields[1].2 = payload;
+            let baseline = slot(fields);
+            assert!(baseline.cost.is_none());
+            assert_eq!(baseline.work_min, Some(960));
+            assert!(baseline.start.is_some() && baseline.finish.is_some());
+        }
+        for index in [2, 3] {
+            for payload in [vec![1], vec![0x40, 0x38, 0x2a, 0x3c]] {
+                let mut fields = vars();
+                fields[index].2 = payload;
+                let baseline = slot(fields);
+                assert!(if index == 2 {
+                    baseline.start.is_none()
+                } else {
+                    baseline.finish.is_none()
+                });
+                assert!(if index == 2 {
+                    baseline.finish.is_some()
+                } else {
+                    baseline.start.is_some()
+                });
+                assert_eq!(baseline.work_min, Some(960));
+                assert!(baseline.cost.is_some());
+            }
+        }
+        let mut fields = vars();
+        fields[2].2 = vec![0xff, 0xff, 0x2a, 0x3c];
+        assert!(decode(&file(rows(), fields), false, &tasks(), &resources()).is_ok());
+        let mut fields = vars();
+        fields[2].2 = vec![0xd8, 0x27, 0x2c, 0x3c];
+        let baseline = slot(fields);
+        assert!(baseline.start.is_none() && baseline.finish.is_none());
+        assert_eq!(baseline.work_min, Some(960));
+        assert!(baseline.cost.is_some());
+
+        let mut fields = vars();
+        fields[0].2 = (-0.000001f64).to_le_bytes().to_vec();
+        fields[1].2 = (-0.000001f64).to_le_bytes().to_vec();
+        fields.drain(2..4);
+        let assignments = decode(&file(rows(), fields), false, &tasks(), &resources())
+            .unwrap()
+            .unwrap();
+        assert!(assignments[0].baselines.iter().all(|b| b.number != 0));
+
+        let mut fields = vars();
+        fields[0].2 = (-0.000001f64).to_le_bytes().to_vec();
+        fields[1].2 = (-0.000001f64).to_le_bytes().to_vec();
+        let baseline = slot(fields);
+        assert!(baseline.start.is_some() && baseline.finish.is_some());
+        assert!(baseline.work_min.is_none() && baseline.cost.is_none());
     }
 
     #[test]

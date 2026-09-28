@@ -995,7 +995,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     true
 }
 
-fn compare_assignment_oracle(mpp: &Path, xml: &Path) {
+fn compare_assignment_oracle(mpp: &Path, xml: &Path, snapshot: bool) {
     use std::collections::HashMap;
     let imported = mppread::project::project_from_mpp(&std::fs::read(mpp).unwrap())
         .unwrap_or_else(|e| panic!("{}: {e}", mpp.display()));
@@ -1038,14 +1038,23 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path) {
             mpp.display(),
             a.uid
         );
-        assert!(
-            (a.units - e.units).abs() < 1e-6,
-            "{} assignment UID {} units {} vs {}",
-            mpp.display(),
-            a.uid,
-            a.units,
-            e.units
-        );
+        // Generated snapshots decode Material resources as Cost (tracked as a
+        // separate resource-type issue); Cost assignments default units to 1.
+        let decoded_as_cost = snapshot
+            && imported
+                .resources
+                .iter()
+                .any(|r| r.uid == a.resource_uid && r.kind == projcore::model::ResourceType::Cost);
+        if !decoded_as_cost {
+            assert!(
+                (a.units - e.units).abs() < 1e-6,
+                "{} assignment UID {} units {} vs {}",
+                mpp.display(),
+                a.uid,
+                a.units,
+                e.units
+            );
+        }
         assert_eq!(
             a.work_min,
             e.work_min,
@@ -1093,27 +1102,31 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path) {
             }
         }
     }
-    for got in &imported.resources {
-        let want = expected
-            .resources
-            .iter()
-            .find(|r| r.uid == got.uid)
-            .unwrap_or_else(|| panic!("{}: missing resource UID {}", mpp.display(), got.uid));
-        assert_eq!(
-            (got.id, &got.name, got.kind),
-            (want.id, &want.name, want.kind),
-            "{} resource UID {}",
-            mpp.display(),
-            got.uid
-        );
-        assert!(
-            (got.max_units - want.max_units).abs() < 1e-6,
-            "{} resource UID {} max units {} vs {}",
-            mpp.display(),
-            got.uid,
-            got.max_units,
-            want.max_units
-        );
+    // Generated snapshots have a known Material-versus-Cost resource type
+    // mismatch, tracked separately from assignment baseline decoding.
+    if !snapshot {
+        for got in &imported.resources {
+            let want = expected
+                .resources
+                .iter()
+                .find(|r| r.uid == got.uid)
+                .unwrap_or_else(|| panic!("{}: missing resource UID {}", mpp.display(), got.uid));
+            assert_eq!(
+                (got.id, &got.name, got.kind),
+                (want.id, &want.name, want.kind),
+                "{} resource UID {}",
+                mpp.display(),
+                got.uid
+            );
+            assert!(
+                (got.max_units - want.max_units).abs() < 1e-6,
+                "{} resource UID {} max units {} vs {}",
+                mpp.display(),
+                got.uid,
+                got.max_units,
+                want.max_units
+            );
+        }
     }
     // The same records survive the actual MSPDI Save As path.
     let saved = projcore::mspdi::read_mspdi(&projcore::mspdi::write_mspdi(&imported)).unwrap();
@@ -1135,6 +1148,12 @@ fn compare_assignment_oracle(mpp: &Path, xml: &Path) {
 
 #[test]
 fn assignment_oracles() {
+    let snapshots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/snapshots");
+    if snapshots.join("01-empty.mpp").exists() {
+        for (mpp, xml) in pairs(&snapshots, "") {
+            compare_assignment_oracle(&mpp, &xml, true);
+        }
+    }
     let generated = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/assnbaseline");
     if generated.exists() {
         let cases = pairs(&generated, "");
@@ -1149,7 +1168,7 @@ fn assignment_oracles() {
             {
                 continue;
             }
-            compare_assignment_oracle(mpp, xml);
+            compare_assignment_oracle(mpp, xml, false);
         }
     }
     if let Ok(paired) = std::env::var("MPP_PAIRED_CORPUS") {
@@ -1166,6 +1185,7 @@ fn assignment_oracles() {
             compare_assignment_oracle(
                 &dir.join(format!("{stem}.mpp")),
                 &dir.join(format!("{stem}.xml")),
+                false,
             );
         }
     }
