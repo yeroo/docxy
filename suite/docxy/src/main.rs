@@ -354,9 +354,15 @@ struct SheetView {
     /// The other corner of the selection range; equals `sel` when a single cell
     /// is selected. `range()` normalizes the two into (r0,c0,r1,c1).
     anchor: (u32, u32),
-    /// When `Some`, the selected cell is being edited and this is the in-progress
-    /// input buffer (a leading `=` marks a formula).
+    /// When `Some`, the cell at `edit_origin` is being edited, even if selection
+    /// has moved. This is its in-progress buffer (a leading `=` marks a formula).
     editing: Option<String>,
+    /// Original buffer only for an editor opened from the stored cell. Meaningful
+    /// while `editing` is Some; `begin_cell_edit` sets it.
+    edit_seed: Option<String>,
+    /// Sheet and cell where the current edit began, even if selection moves.
+    /// Meaningful while `editing` is Some; `begin_cell_edit` sets it.
+    edit_origin: Option<(usize, u32, u32)>,
     /// Caret position within `editing`, as a char index (0..=len). Only
     /// meaningful while `editing` is `Some`.
     edit_caret: usize,
@@ -906,6 +912,33 @@ enum StructOp {
 }
 
 impl SheetView {
+    fn end_cell_edit(&mut self) {
+        self.editing = None;
+        self.edit_seed = None;
+        self.edit_origin = None;
+    }
+
+    fn begin_cell_edit(&mut self, initial: Option<String>) {
+        let (r, c) = self.sel;
+        let (buf, seed) = match initial {
+            Some(buf) => (buf, None),
+            None => {
+                let seed = self.edit_string(r, c);
+                (seed.clone(), Some(seed))
+            }
+        };
+        self.editing = Some(buf);
+        self.edit_seed = seed;
+        self.edit_origin = Some((self.active, r, c));
+    }
+
+    fn edit_untouched(&self) -> bool {
+        self.editing
+            .as_deref()
+            .zip(self.edit_seed.as_deref())
+            .is_some_and(|(buf, seed)| buf == seed)
+    }
+
     /// Snapshot before a mutation; share the history limit across all edits.
     fn push_undo(&mut self) {
         self.undo.push(self.snapshot());
@@ -917,16 +950,128 @@ impl SheetView {
 
     /// Commit the cell buffer without moving the selection, including undo/recalc.
     fn commit_edit(&mut self) -> bool {
+        let untouched = self.edit_untouched();
+        debug_assert!(self.editing.is_none() || self.edit_origin.is_some());
         let Some(buf) = self.editing.take() else {
             return false;
         };
+        // Every production editor is opened by `begin_cell_edit`. Keep a safe
+        // destination if a legacy caller ever opens one without an origin.
+        let origin = self
+            .edit_origin
+            .unwrap_or((self.active, self.sel.0, self.sel.1));
+        self.end_cell_edit();
+        // A seeded editor left unchanged must not reparse text such as "007".
+        if untouched {
+            return false;
+        }
         self.push_undo();
-        let (r, c) = self.sel;
-        let style = self.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+        let style = self.pkg.workbook.sheets[origin.0]
+            .cell(origin.1, origin.2)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
         let cell = parse_cell_input(&buf, style);
-        self.engine
-            .set_cell(&mut self.pkg.workbook, (self.active, r, c), cell);
+        self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
         true
+    }
+
+    /// Commit an open editor before moving rows or columns under its origin.
+    fn structural_edit(&mut self, op: StructOp) {
+        use gridcore::edit;
+
+        self.commit_edit();
+        self.push_undo();
+        let s = self.active;
+        let (r, c) = self.sel;
+        let wb = &mut self.pkg.workbook;
+        let shift = match op {
+            StructOp::InsertRow => {
+                edit::insert_rows(wb, s, r, 1);
+                (true, r, 1i64)
+            }
+            StructOp::DeleteRow => {
+                edit::delete_rows(wb, s, r, 1);
+                (true, r, -1)
+            }
+            StructOp::InsertCol => {
+                edit::insert_cols(wb, s, c, 1);
+                (false, c, 1)
+            }
+            StructOp::DeleteCol => {
+                edit::delete_cols(wb, s, c, 1);
+                (false, c, -1)
+            }
+        };
+        // Charts the UI authored live outside the workbook until they're
+        // saved, so the workbook's structural edit never sees them. Their refs
+        // are written to the file all the same, and Excel re-reads them.
+        let name = self.pkg.workbook.sheets[s].name.clone();
+        let shift = gridcore::formula::EditShift {
+            rows: shift.0,
+            at: shift.1,
+            delta: shift.2,
+        };
+        // Every authored chart, not just the ones ON the edited sheet: a
+        // chart elsewhere can name these cells outright (`Data!$B$2:$B$10`)
+        // and has to follow them. `home` is what keeps the UNqualified refs
+        // — which mean the chart's own sheet — out of it.
+        for ch in self.charts.iter_mut() {
+            edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
+        }
+        self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+    }
+
+    /// The contiguous region around the selection to sort, as `(start, bottom)`
+    /// data-row bounds (header excluded). A header is inferred when the top row
+    /// carries a text label over numeric data in *any* column. `None` when
+    /// there's nothing to sort.
+    fn sort_bounds(&self) -> Option<(u32, u32)> {
+        use gridcore::sheet::CellValue;
+        let s = self.active;
+        let (max_r, max_c) = self.extent();
+        let sh = &self.pkg.workbook.sheets[s];
+        let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
+        let sr = self.sel.0;
+        if !row_used(sr) {
+            return None;
+        }
+        let mut top = sr;
+        while top > 0 && row_used(top - 1) {
+            top -= 1;
+        }
+        let mut bottom = sr;
+        while bottom < max_r && row_used(bottom + 1) {
+            bottom += 1;
+        }
+        let header = (0..=max_c).any(|c| {
+            matches!(
+                sh.cell(top, c).map(|cl| &cl.value),
+                Some(CellValue::Text(_))
+            ) && (top + 1..=bottom).any(|r| {
+                matches!(
+                    sh.cell(r, c).map(|cl| &cl.value),
+                    Some(CellValue::Number(_))
+                )
+            })
+        });
+        let start = if header { top + 1 } else { top };
+        (bottom > start).then_some((start, bottom))
+    }
+
+    /// Commit the editor before computing bounds or sorting its row.
+    fn sort_with_pending_edit(
+        &mut self,
+        field: Option<(u32, u32, u32, u32)>,
+        keys: &[(u32, bool)],
+    ) -> (bool, bool) {
+        let committed = self.commit_edit();
+        let Some((start, bottom)) = sort_rows_from(field, self.sort_bounds()) else {
+            return (committed, false);
+        };
+        self.push_undo();
+        gridcore::edit::sort_rows(&mut self.pkg.workbook, self.active, start, bottom, keys);
+        self.engine = gridcore::engine::Engine::new(&self.pkg.workbook);
+        (committed, true)
     }
 
     fn sheet(&self) -> &gridcore::sheet::Sheet {
@@ -935,7 +1080,8 @@ impl SheetView {
             .min(self.pkg.workbook.sheets.len().saturating_sub(1))]
     }
     /// The text to seed the editor with when re-editing a cell: `=formula` for a
-    /// formula, the raw literal otherwise (unformatted, so it round-trips).
+    /// formula, the raw literal otherwise. `commit_edit` preserves the stored
+    /// cell when this seed is left untouched, even if reparsing would change it.
     fn edit_string(&self, row: u32, col: u32) -> String {
         use gridcore::sheet::CellValue;
         let sh = self.sheet();
@@ -1030,7 +1176,7 @@ impl SheetView {
             .min(self.pkg.workbook.sheets.len().saturating_sub(1));
         self.sel = snap.sel;
         self.anchor = snap.anchor;
-        self.editing = None;
+        self.end_cell_edit();
     }
     /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right.
     fn range(&self) -> (u32, u32, u32, u32) {
@@ -3915,6 +4061,8 @@ fn new_sheet_surface() -> Surface {
         sel: (0, 0),
         anchor: (0, 0),
         editing: None,
+        edit_seed: None,
+        edit_origin: None,
         edit_caret: 0,
         engine,
         undo: vec![],
@@ -3941,6 +4089,8 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
                     sel: (0, 0),
                     anchor: (0, 0),
                     editing: None,
+                    edit_seed: None,
+                    edit_origin: None,
                     edit_caret: 0,
                     engine,
                     undo: vec![],
@@ -4536,7 +4686,7 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
             v.anchor = (row, col);
-            v.editing = None;
+            v.end_cell_edit();
         }
         cx.notify();
     }
@@ -6497,7 +6647,7 @@ impl Docxy {
         }
         if let Some(v) = self.active_sheet_mut() {
             v.sel = (row, col);
-            v.editing = None;
+            v.end_cell_edit();
         }
         cx.notify();
     }
@@ -6508,7 +6658,7 @@ impl Docxy {
             v.active = idx.min(v.pkg.workbook.sheets.len().saturating_sub(1));
             v.sel = (0, 0);
             v.anchor = (0, 0);
-            v.editing = None;
+            v.end_cell_edit();
         } else {
             return;
         }
@@ -6597,7 +6747,7 @@ impl Docxy {
             v.active = idx;
             v.sel = (0, 0);
             v.anchor = (0, 0);
-            v.editing = None;
+            v.end_cell_edit();
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
         }
         // We just switched sheets, same as `select_sheet`.
@@ -6648,7 +6798,7 @@ impl Docxy {
             }
             v.sel = (0, 0);
             v.anchor = (0, 0);
-            v.editing = None;
+            v.end_cell_edit();
             v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
         }
         // The chart list was just re-indexed and the view may have moved.
@@ -6871,8 +7021,7 @@ impl Docxy {
         self.range_pick = None;
         self.ref_msg = None;
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
-            v.editing = Some(initial.unwrap_or_else(|| v.edit_string(r, c)));
+            v.begin_cell_edit(initial);
             v.edit_caret_to_end();
         }
         cx.notify();
@@ -6938,7 +7087,7 @@ impl Docxy {
             let (r, c) = v.sel;
             v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
             v.anchor = v.sel;
-            v.editing = None;
+            v.end_cell_edit();
         }
         cx.notify();
     }
@@ -6951,7 +7100,7 @@ impl Docxy {
         if let Some(v) = self.active_sheet_mut() {
             let (r, c) = v.sel;
             v.sel = ((r as i32 + dr).max(0) as u32, (c as i32 + dc).max(0) as u32);
-            v.editing = None;
+            v.end_cell_edit();
         }
         cx.notify();
     }
@@ -7804,59 +7953,22 @@ impl Docxy {
         cx.notify();
     }
 
-    /// The contiguous region around the selection to sort, as `(start, bottom)`
-    /// data-row bounds (header excluded). A header is inferred when the top row
-    /// carries a text label over numeric data in *any* column. `None` when
-    /// there's nothing to sort.
     fn sheet_sort_bounds(&self) -> Option<(u32, u32)> {
-        use gridcore::sheet::CellValue;
-        let v = self.active_sheet()?;
-        let s = v.active;
-        let (max_r, max_c) = v.extent();
-        let sh = &v.pkg.workbook.sheets[s];
-        let row_used = |r: u32| (0..=max_c).any(|c| sh.cell(r, c).is_some_and(|cl| !cl.is_blank()));
-        let sr = v.sel.0;
-        if !row_used(sr) {
-            return None;
-        }
-        let mut top = sr;
-        while top > 0 && row_used(top - 1) {
-            top -= 1;
-        }
-        let mut bottom = sr;
-        while bottom < max_r && row_used(bottom + 1) {
-            bottom += 1;
-        }
-        let header = (0..=max_c).any(|c| {
-            matches!(
-                sh.cell(top, c).map(|cl| &cl.value),
-                Some(CellValue::Text(_))
-            ) && (top + 1..=bottom).any(|r| {
-                matches!(
-                    sh.cell(r, c).map(|cl| &cl.value),
-                    Some(CellValue::Number(_))
-                )
-            })
-        });
-        let start = if header { top + 1 } else { top };
-        (bottom > start).then_some((start, bottom))
+        self.active_sheet()?.sort_bounds()
     }
 
     /// Sort the current region by the selected column (header-aware). Rows move
     /// as whole units (all columns + styles); blanks sort last. Formula refs are
     /// not re-based, so this targets value tables (the common case).
     fn sheet_sort(&mut self, ascending: bool, cx: &mut Context<Self>) {
-        let Some((start, bottom)) = self.sheet_sort_bounds() else {
+        let Some(v) = self.active_sheet_mut() else {
             return;
         };
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            let sc = v.sel.1;
-            gridcore::edit::sort_rows(&mut v.pkg.workbook, s, start, bottom, &[(sc, ascending)]);
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        let keys = [(v.sel.1, ascending)];
+        let (committed, sorted) = v.sort_with_pending_edit(None, &keys);
+        if committed || sorted {
+            self.mark_sheet_dirty();
         }
-        self.mark_sheet_dirty();
         cx.notify();
     }
 
@@ -7873,63 +7985,21 @@ impl Docxy {
             .as_deref()
             .and_then(parse_ref_text)
             .map(|r| r.range);
-        let Some((start, bottom)) = sort_rows_from(field, self.sheet_sort_bounds()) else {
+        let Some(v) = self.active_sheet_mut() else {
             return;
         };
-        self.sheet_snapshot();
-        if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            gridcore::edit::sort_rows(&mut v.pkg.workbook, s, start, bottom, &keys);
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+        let (committed, sorted) = v.sort_with_pending_edit(field, &keys);
+        if committed || sorted {
+            self.mark_sheet_dirty();
         }
-        self.mark_sheet_dirty();
         cx.notify();
     }
 
     /// Insert/delete a whole row or column at the selection (Home ▸ Cells), then
     /// rebuild the recalc engine so shifted formulas re-evaluate.
     fn sheet_structural(&mut self, op: StructOp, cx: &mut Context<Self>) {
-        use gridcore::edit;
-        self.sheet_snapshot();
         if let Some(v) = self.active_sheet_mut() {
-            let s = v.active;
-            let (r, c) = v.sel;
-            let wb = &mut v.pkg.workbook;
-            let shift = match op {
-                StructOp::InsertRow => {
-                    edit::insert_rows(wb, s, r, 1);
-                    (true, r, 1i64)
-                }
-                StructOp::DeleteRow => {
-                    edit::delete_rows(wb, s, r, 1);
-                    (true, r, -1)
-                }
-                StructOp::InsertCol => {
-                    edit::insert_cols(wb, s, c, 1);
-                    (false, c, 1)
-                }
-                StructOp::DeleteCol => {
-                    edit::delete_cols(wb, s, c, 1);
-                    (false, c, -1)
-                }
-            };
-            // Charts the UI authored live outside the workbook until they're
-            // saved, so `structural_edit` never sees them. Their refs are
-            // written to the file all the same, and Excel re-reads them.
-            let name = v.pkg.workbook.sheets[s].name.clone();
-            let shift = gridcore::formula::EditShift {
-                rows: shift.0,
-                at: shift.1,
-                delta: shift.2,
-            };
-            // Every authored chart, not just the ones ON the edited sheet: a
-            // chart elsewhere can name these cells outright (`Data!$B$2:$B$10`)
-            // and has to follow them. `home` is what keeps the UNqualified refs
-            // — which mean the chart's own sheet — out of it.
-            for ch in v.charts.iter_mut() {
-                edit::shift_chart_refs(&mut ch.data, &name, ch.sheet == s, &shift);
-            }
-            v.engine = gridcore::engine::Engine::new(&v.pkg.workbook);
+            v.structural_edit(op);
         }
         self.mark_sheet_dirty();
         cx.notify();
@@ -8378,7 +8448,7 @@ impl Docxy {
                 v.pivot_views.push(d);
                 v.sel = (0, 0);
                 v.anchor = (0, 0);
-                v.editing = None;
+                v.end_cell_edit();
             }
             // A brand-new sheet, so the chart selection and any open field are
             // pointing at the one we came from.
@@ -9541,7 +9611,7 @@ impl Docxy {
                         let (mr, mc) = v.extent();
                         v.sel = (0, 0);
                         v.anchor = (mr, mc);
-                        v.editing = None;
+                        v.end_cell_edit();
                     }
                     cx.notify();
                 }
@@ -9606,7 +9676,7 @@ impl Docxy {
                 // of shutting that panel — the same dismissal as its close box.
                 self.chart_panel_event(PanelEvent::Dismiss);
                 if let Some(v) = self.active_sheet_mut() {
-                    v.editing = None;
+                    v.end_cell_edit();
                 }
                 cx.notify();
             }
@@ -9677,7 +9747,7 @@ impl Docxy {
                                 v.edit_insert(c);
                             } else if !protected {
                                 // Start a fresh edit with the typed char.
-                                v.editing = Some(String::new());
+                                v.begin_cell_edit(Some(String::new()));
                                 v.edit_caret = 0;
                                 v.edit_insert(c);
                             }
