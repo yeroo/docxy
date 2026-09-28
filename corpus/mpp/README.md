@@ -298,11 +298,15 @@ row ID order. Current Project resource identity/type and assignments with core
 planned fields are imported, including assignment Baseline and Baseline1..10
 Start/Finish/Work/Cost. Project's XML export omits assignment-baseline
 BCWS/BCWP even when assignment-level BCWS/BCWP are nonzero; the MPP importer
-leaves those baseline fields absent. Assignment progress, rates, contours,
-delays, resource details and other baselines remain unimported. Unsupported
+leaves those baseline fields absent. Invalid assignment baseline fields are
+dropped without refusing the file; Project's `-0.000001` baseline Work/Cost
+marker is treated as absent. Assignment progress, rates, contours, delays,
+resource details and other baselines remain unimported. Unsupported
 MPP9 and other unvalidated assignment/resource layouts retain the previous
 task-only import;
-malformed current tables refuse the import. Generate the local, ignored
+malformed current tables, invalid core assignment fields (units, work, dates,
+task/resource references), and invalid resource fields refuse the import.
+Generate the local, ignored
 assignment oracle pairs with `python corpus/tools/gen_mpp_assignment_baseline_cases.py`.
 Newest-layout base and derived calendars, their weekdays,
 exceptions, work weeks, the default calendar and task calendar assignments are
