@@ -375,6 +375,7 @@ mod tests {
             return; // The private Project corpus is not shipped with the source.
         }
         let mut checked = 0;
+        let mut snapshot_pairs = 0;
         for folder in [
             "task-fields",
             "snapshots",
@@ -386,11 +387,17 @@ mod tests {
             let Ok(entries) = std::fs::read_dir(base.join(folder)) else {
                 continue;
             };
-            for path in entries
+            // Sorted, so the first failing file is the same on every machine.
+            // `read_dir` order is whatever the filesystem keeps: macOS reached
+            // 31-calendar-hours first and Windows another file, and a failure
+            // common to every snapshot looked like one peculiar to 31.
+            let mut paths: Vec<_> = entries
                 .flatten()
                 .map(|e| e.path())
                 .filter(|p| p.extension().is_some_and(|e| e == "mpp"))
-            {
+                .collect();
+            paths.sort();
+            for path in paths {
                 let stem = path.file_stem().unwrap().to_string_lossy();
                 // x-recurring's XML was saved after a legacy conversion and
                 // does not describe its current MPP's assignment records.
@@ -412,13 +419,26 @@ mod tests {
                 let mut aa = assignments(&cfb)
                     .unwrap_or_else(|e| panic!("{} assignments: {e}", path.display()));
                 normalize_cost_units(&mut aa, &rr);
-                assert_eq!(
-                    rr.len(),
-                    oracle.resources.len(),
-                    "{} resource count",
+                // ⚠️ Project's XML always lists an implicit unassigned resource
+                // with UID 0. The decoder deliberately leaves it out: nothing
+                // looks it up, because unassigned work carries the binary
+                // sentinel -65535 instead. So compare only the real resources,
+                // and pin both halves of that so neither side can drift
+                // unnoticed — a count that included UID 0 on one side only is
+                // exactly what broke this test on every snapshot.
+                assert!(
+                    oracle.resources.iter().any(|r| r.uid == 0),
+                    "{} XML no longer lists Project's implicit UID-0 resource",
                     path.display()
                 );
-                for expected in &oracle.resources {
+                assert!(
+                    !rr.contains_key(&0),
+                    "{} decoder returned Project's implicit UID-0 resource",
+                    path.display()
+                );
+                let real: Vec<_> = oracle.resources.iter().filter(|r| r.uid != 0).collect();
+                assert_eq!(rr.len(), real.len(), "{} resource count", path.display());
+                for expected in real {
                     let actual = &rr[&(expected.uid as u32)];
                     assert!(
                         (actual.max_units - expected.max_units).abs() < 1e-9,
@@ -553,9 +573,21 @@ mod tests {
                     }
                 }
                 checked += 1;
+                if folder == "snapshots" {
+                    snapshot_pairs += 1;
+                }
             }
         }
-        assert!(checked >= 50, "only {checked} Project pairs checked");
+        // The fetched corpus (yeroo/mpp-corpus) provides only `snapshots/`: 47
+        // eligible pairs today. The other folders are generated locally with
+        // Project (corpus/tools/gen_mpp_task_field_cases.py) and are checked on
+        // top when present, so they cannot be what this guard counts on. Fewer
+        // snapshot pairs than a complete fetch means a partial fetch.
+        assert!(
+            snapshot_pairs >= 47,
+            "only {snapshot_pairs} snapshot pairs checked ({checked} in all); \
+             a complete corpus/tools/fetch-mpp-corpus.* fetch provides 47"
+        );
     }
 
     fn fixed_header(count: u32, data_len: u32, stride: usize) -> Vec<u8> {
