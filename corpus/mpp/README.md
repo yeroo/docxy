@@ -157,8 +157,28 @@ type, +76..+79 are type-specific recurrence bytes (including `u16` periods at
 length. +80 holds a Project-assigned exception identifier that does not appear
 in MSPDI. Types 2/3 are yearly by date/position, 4/5 monthly by date/position,
 6 weekly, and 7 every N days. Type 8 has no binary probe and is not decoded.
-The decoder refuses Type 8, unknown types and malformed records; the later
-work-week records are a separate decode gap.
+The decoder refuses Type 8, unknown types and malformed records.
+
+The work-week decoder has twelve MSPDI-seeded and two COM-created Project-written
+probes in `workweeks/`. They cover changed and inherited weekdays, a closed
+weekday, a working Saturday, five shifts, a 24-hour day, two sorted periods,
+resource calendars, Unicode and blank names, exceptions in the same block,
+and tasks crossing an alternate-week boundary on both project and task calendars.
+Regenerate the local, ignored `.mpp`/`.xml` pairs on a Windows machine with
+Microsoft Project and pywin32:
+
+```powershell
+python corpus/tools/gen_mpp_workweek_cases.py
+```
+
+After the four-byte work-week count, each record has seven 60-byte weekday
+records in Sunday-first order. A flag of one with otherwise zero bytes means
+the weekday is unstated; flag zero supplies a period count and working times
+as in the default week. At +420/+422 are inclusive `u16` from/to day numbers
+since 1983-12-31. At +424 is a Project-assigned `u32` identifier, at +428 a
+zero reserved `u32`, and at +432 a `u32` byte length for the four-byte-aligned
+UTF-16 name that follows the 436-byte fixed part. A zero-length name exports
+as an empty `<Name>`. The decoder checks the complete nonempty work-week tail.
 
 It also checks six task-progress cases in `progress/` when present (see
 Known decode gaps). It also checks two link-lag cases in `lag/` when present
@@ -238,11 +258,10 @@ omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
 row ID order. Resources, assignments, baselines, constraints, and custom fields
 are not imported. Newest-layout base and derived calendars, their weekdays,
-exceptions, the default calendar and task calendar assignments are imported;
-work weeks are not decoded. Tasks using a calendar with work weeks keep the
-earlier import behaviour: their task calendar is not assigned. Auto tasks use
-the Start–Finish span on the project calendar; manual tasks keep their stored
-manual duration and use that span only if it is absent.
+exceptions, work weeks, the default calendar and task calendar assignments are
+imported. Auto tasks keep their stored working Duration and task calendar;
+manual tasks keep their stored manual duration and use the calendar span only
+if it is absent.
 Type 8 exceptions and record shapes not covered by the
 Project-written probes refuse the file. An invalid newest calendar table refuses
 import. Files without
