@@ -130,6 +130,32 @@ python corpus/tools/gen_mpp_calendar_cases.py
 The binary and XML pairs stay git-ignored. The oracle test checks their exact
 calendar UIDs, names, base links, weekdays and default calendar UID when present.
 
+The exception decoder has ten Project-written probes in `exceptions/`: multi-day
+holidays, a working Saturday with two periods, daily/weekly/monthly/yearly
+recurrences, a derived calendar exception, several sorted exceptions, and a
+Unicode name. Generate them with:
+
+```powershell
+python corpus/tools/gen_mpp_exception_cases.py
+```
+
+The `.xml` output is Project's own rewrite of each temporary MSPDI seed. The
+oracle test compares every exception field in the decoded `.mpp` to that XML.
+
+In newest Project files, key 8 of `TBkndCal/Var2Data` starts with seven
+60-byte weekday records. At byte 420 is a `u16` exception count and a zero
+`u16`. Each exception has a 92-byte fixed record followed by a length-prefixed,
+four-byte-aligned UTF-16 name; a four-byte work-week count follows the last
+exception. In each fixed record, +0/+2 are inclusive from/to days since
+1983-12-31, +4 is occurrences, +8 is EnteredByOccurrences, +14 is the working
+period count, +20 has five `u16` period starts and +32 five `i32` durations
+(tenths of a minute), +52 has cumulative durations, +72 is the MSPDI exception
+type, +76..+79 are type-specific recurrence bytes, and +88 is the name byte
+length. +80 holds a Project-assigned exception identifier that does not appear
+in MSPDI. Types 2/3 are yearly by date/position, 4/5 monthly by date/position,
+6 weekly, and 7 every N days. The decoder rejects unknown types or malformed
+records; the later work-week records are a separate decode gap.
+
 It also checks six task-progress cases in `progress/` when present (see
 Known decode gaps). It also checks two link-lag cases in `lag/` when present
 ([#104](https://github.com/yeroo/docxy/issues/104)): percentage, elapsed and
@@ -208,8 +234,8 @@ omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
 row ID order. Resources, assignments, baselines, constraints, and custom fields
 are not imported. Newest-layout base and derived calendars, their weekdays,
-and the default calendar are imported; exceptions and task calendar assignment
-are not. An invalid newest calendar table refuses import. Files without
+exceptions and the default calendar are imported; work weeks and task calendar
+assignment are not. An invalid newest calendar table refuses import. Files without
 `TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
 imported (see below); assignment progress needs assignments first.
 

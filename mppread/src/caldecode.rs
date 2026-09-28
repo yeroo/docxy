@@ -1,6 +1,6 @@
 //! Validated calendar-table decoding for current Project `.mpp` files.
 use crate::{cfb::Cfb, props};
-use projcore::{Calendar, DayWorking, WorkingTime};
+use projcore::{Calendar, CalendarException, DateTime, DayWorking, WorkingTime};
 use std::collections::{HashMap, HashSet};
 
 fn u16_at(b: &[u8], o: usize) -> u16 {
@@ -96,6 +96,148 @@ fn hours(value: &[u8], base: bool) -> Result<[Option<DayWorking>; 7], String> {
         week[day] = Some(DayWorking { times });
     }
     Ok(week)
+}
+
+fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
+    if value.len() < 428 {
+        return Err("truncated calendar exception header".into());
+    }
+    let count = u16_at(value, 420) as usize;
+    if u16_at(value, 422) != 0 {
+        return Err("invalid calendar exception header".into());
+    }
+    let mut offset = 424usize;
+    let mut out = Vec::with_capacity(count.min(64));
+    for index in 0..count {
+        let end = offset
+            .checked_add(92)
+            .filter(|&n| n <= value.len())
+            .ok_or_else(|| format!("truncated calendar exception {index}"))?;
+        let rec = &value[offset..end];
+        let first = u16_at(rec, 0);
+        let last = u16_at(rec, 2);
+        if last < first {
+            return Err(format!("calendar exception {index} ends before it starts"));
+        }
+        if u16_at(rec, 6) != 0
+            || rec[9..14].iter().any(|&b| b != 0)
+            || rec[73..76].iter().any(|&b| b != 0)
+            || rec[79] != 0
+            || u32_at(rec, 84) != 0
+        {
+            return Err(format!("unrecognized calendar exception {index} fields"));
+        }
+        let occurrences = u32_at(rec, 4);
+        let entered = u32_at(rec, 8);
+        if occurrences == 0 || occurrences > i32::MAX as u32 || entered > 1 {
+            return Err(format!("invalid calendar exception {index} recurrence"));
+        }
+        let period_count = u16_at(rec, 14) as usize;
+        if period_count > 5 {
+            return Err(format!("invalid calendar exception {index} period count"));
+        }
+        if u16_at(rec, 16) != (if period_count > 0 { u16_at(rec, 20) } else { 0 })
+            || u16_at(rec, 18) != 0
+        {
+            return Err(format!("invalid calendar exception {index} first period"));
+        }
+        let mut times = Vec::with_capacity(period_count);
+        let mut cumulative = 0u32;
+        for p in 0..period_count {
+            let start = i32::from(u16_at(rec, 20 + 2 * p));
+            let duration = i32_at(rec, 32 + 4 * p);
+            if start < 0 || start % 10 != 0 || duration <= 0 || duration % 10 != 0 {
+                return Err(format!("invalid calendar exception {index} period {p}"));
+            }
+            let from = start as u32 / 10;
+            let to = from
+                .checked_add(duration as u32 / 10)
+                .ok_or("calendar exception period overflow")?;
+            if to > 1440 || times.last().is_some_and(|t: &WorkingTime| from < t.to) {
+                return Err(format!("invalid calendar exception {index} period order"));
+            }
+            cumulative = cumulative
+                .checked_add(duration as u32)
+                .ok_or("calendar exception cumulative period overflow")?;
+            if i32_at(rec, 52 + 4 * p) != cumulative as i32 {
+                return Err(format!(
+                    "invalid calendar exception {index} cumulative period"
+                ));
+            }
+            times.push(WorkingTime { from, to });
+        }
+        let kind = u32_at(rec, 72);
+        let b = &rec[76..80];
+        let mut exception = CalendarException {
+            from: Some(DateTime::from_minutes(
+                (DateTime::from_ymd_hm(1983, 12, 31, 0, 0).day_number() + i64::from(first)) * 1440,
+            )),
+            to: Some(DateTime::from_minutes(
+                (DateTime::from_ymd_hm(1983, 12, 31, 0, 0).day_number() + i64::from(last)) * 1440
+                    + 1439,
+            )),
+            kind: Some(kind as i32),
+            occurrences: Some(occurrences as i32),
+            entered_by_occurrences: Some(entered != 0),
+            day: DayWorking { times },
+            ..CalendarException::default()
+        };
+        match kind {
+            // Project's generated snapshots carry 0x0230 in this otherwise
+            // unused pattern word for a one-off day; the Project-written
+            // standalone probes carry zero. Both export the same Type 1 shape.
+            1 if b == [0, 0, 0, 0] || b == [0x30, 0x02, 0, 0] => {}
+            2 if b[2] == 0 => {
+                exception.month = Some(i32::from(b[0]));
+                exception.month_day = Some(i32::from(b[1]));
+            }
+            3 => {
+                exception.month = Some(i32::from(b[0]));
+                exception.month_position = Some(i32::from(b[1]));
+                exception.month_item = Some(i32::from(b[2]));
+            }
+            4 if b[1] == 0 => {
+                exception.month_day = Some(i32::from(b[0]));
+                exception.period = Some(i32::from(b[2]));
+            }
+            5 => {
+                exception.month_position = Some(i32::from(b[0]));
+                exception.month_item = Some(i32::from(b[1]));
+                exception.period = Some(i32::from(b[2]));
+            }
+            6 if b[1] == 0 => {
+                exception.days_of_week = Some(i32::from(b[0]));
+                exception.period = Some(i32::from(b[2]));
+            }
+            7 if b[1] == 0 && b[2] == 0 => {
+                exception.period = Some(i32::from(b[0]));
+            }
+            _ => {
+                return Err(format!(
+                    "unknown calendar exception {index} recurrence type {kind}"
+                ));
+            }
+        }
+        let name_len = u32_at(rec, 88) as usize;
+        let padded = name_len
+            .checked_add(3)
+            .map(|n| n & !3)
+            .ok_or("calendar exception name length overflow")?;
+        let next = end
+            .checked_add(padded)
+            .filter(|&n| n <= value.len())
+            .ok_or_else(|| format!("calendar exception {index} name past block"))?;
+        if name_len != 0 {
+            let raw = &value[end..end + name_len];
+            exception.name = Some(name(raw)?);
+        }
+        out.push(exception);
+        offset = next;
+    }
+    if offset.checked_add(4).is_none_or(|n| n > value.len()) {
+        return Err("truncated calendar work-week header".into());
+    }
+    Ok(out)
 }
 
 fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, String> {
@@ -262,12 +404,12 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
         } else {
             return Err(format!("missing calendar name for UID {uid}"));
         };
-        let week = match fields.get(&(uid, 8)) {
-            Some(value) => hours(value, base_uid.is_none())?,
-            None if base_uid.is_some() => std::array::from_fn(|_| None),
+        let (week, exceptions) = match fields.get(&(uid, 8)) {
+            Some(value) => (hours(value, base_uid.is_none())?, exceptions(value)?),
+            None if base_uid.is_some() => (std::array::from_fn(|_| None), Vec::new()),
             // A base without a key-8 block uses Project's built-in week,
             // regardless of its name. MPXJ applies the same default.
-            None => Calendar::standard_week().map(Some),
+            None => (Calendar::standard_week().map(Some), Vec::new()),
         };
         calendars.push(Calendar {
             uid,
@@ -275,7 +417,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
             base_calendar_uid: base_uid,
             is_baseline_calendar: false,
             week,
-            exceptions: Vec::new(),
+            exceptions,
             work_weeks: Vec::new(),
         });
     }
@@ -327,6 +469,65 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<(Vec<Calendar>
 mod tests {
     use super::*;
     use crate::cfb::{Node, write_cfb_tree};
+
+    fn exception_block() -> Vec<u8> {
+        let mut b = vec![0u8; 424 + 92];
+        b[420..422].copy_from_slice(&1u16.to_le_bytes());
+        let rec = &mut b[424..516];
+        rec[0..2].copy_from_slice(&0x3a8fu16.to_le_bytes());
+        rec[2..4].copy_from_slice(&0x3a8fu16.to_le_bytes());
+        rec[4..8].copy_from_slice(&1u32.to_le_bytes());
+        rec[72..76].copy_from_slice(&1u32.to_le_bytes());
+        let name: Vec<u8> = "Holiday"
+            .encode_utf16()
+            .chain([0])
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        rec[88..92].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        b.extend_from_slice(&name);
+        b.extend_from_slice(&[0; 4]);
+        b
+    }
+
+    #[test]
+    fn decodes_one_exception_and_empty_header() {
+        let ex = exceptions(&exception_block()).unwrap();
+        assert_eq!(ex.len(), 1);
+        assert_eq!(ex[0].name.as_deref(), Some("Holiday"));
+        assert_eq!(ex[0].from.unwrap().to_mspdi(), "2025-01-15T00:00:00");
+        assert_eq!(ex[0].to.unwrap().to_mspdi(), "2025-01-15T23:59:00");
+        assert_eq!(ex[0].kind, Some(1));
+        assert_eq!(ex[0].occurrences, Some(1));
+        assert!(!ex[0].entered_by_occurrences.unwrap());
+        assert!(exceptions(&vec![0; 428]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn refuses_malformed_exceptions() {
+        let mut b = exception_block();
+        b.truncate(424 + 91);
+        assert!(exceptions(&b).is_err(), "truncated record");
+
+        let mut b = exception_block();
+        b[512..516].copy_from_slice(&1000u32.to_le_bytes());
+        assert!(exceptions(&b).is_err(), "name past block");
+
+        let mut b = exception_block();
+        b[438..440].copy_from_slice(&1u16.to_le_bytes());
+        b[440..442].copy_from_slice(&15000u16.to_le_bytes());
+        b[444..446].copy_from_slice(&15000u16.to_le_bytes());
+        b[456..460].copy_from_slice(&100i32.to_le_bytes());
+        b[476..480].copy_from_slice(&100i32.to_le_bytes());
+        assert!(exceptions(&b).is_err(), "period past midnight");
+
+        let mut b = exception_block();
+        b[424..426].copy_from_slice(&0x3a90u16.to_le_bytes());
+        assert!(exceptions(&b).is_err(), "backward date range");
+
+        let mut b = exception_block();
+        b[496..500].copy_from_slice(&99u32.to_le_bytes());
+        assert!(exceptions(&b).is_err(), "unknown recurrence type");
+    }
 
     fn fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut fd = vec![0u8; 64];
