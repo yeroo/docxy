@@ -182,7 +182,8 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let resources = crate::rscdecode::decode(bytes, legacy)
         .map_err(|e| format!("cannot read the resources of this .mpp ({e})"))?
         .unwrap_or_default();
-    let task_uids = tasks.iter().map(|t| t.uid).collect();
+    let mut task_uids: std::collections::HashSet<i32> = tasks.iter().map(|t| t.uid).collect();
+    task_uids.insert(0); // Project summary assignments can reference UID 0.
     let assignments = crate::assndecode::decode(bytes, legacy, &task_uids, &resources)
         .map_err(|e| format!("cannot read the assignments of this .mpp ({e})"))?
         .unwrap_or_default();
@@ -208,7 +209,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
 }
 
 /// Parse an `mppread`-decoded `YYYY-MM-DD HH:MM` timestamp into a `DateTime`.
-fn parse_mpp_dt(s: &str) -> Option<DateTime> {
+pub(crate) fn parse_mpp_dt(s: &str) -> Option<DateTime> {
     let (date, time) = s.split_once(' ')?;
     let mut d = date.split('-');
     let (y, mo, da) = (

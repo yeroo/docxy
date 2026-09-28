@@ -6,8 +6,10 @@ Close Project gracefully if interrupted; never force-kill WINPROJ.EXE.
 """
 
 import os
+import re
 import sys
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta
 
 import win32com.client as win32
 
@@ -34,8 +36,9 @@ def save(app, slug):
         assert len(exported) == 4
     if slug == "a1-slots-progress":
         assert len(exported) == 1
-        assert [b.findtext("{*}Number") for b in exported[0].findall("{*}Baseline")] == ["0", "1", "10"]
-        assert len({b.findtext("{*}Cost") for b in exported[0].findall("{*}Baseline")}) == 3
+        assert [b.findtext("{*}Number") for b in exported[0].findall("{*}Baseline")] == [str(n) for n in range(11)]
+        for field in ("Start", "Finish", "Work", "Cost"):
+            assert len({b.findtext("{*}" + field) for b in exported[0].findall("{*}Baseline")}) == 11
         assert float(exported[0].findtext("{*}BCWS")) > 0
         assert float(exported[0].findtext("{*}BCWP")) > 0
     if slug == "a2-material-cost-unassigned":
@@ -44,6 +47,9 @@ def save(app, slug):
                      for r in root.findall(".//{*}Resource")}
         assert resources["Concrete"] == ("0", "0")
         assert resources["Travel"] == ("0", "1")
+    if slug == "a3-deleted-rows":
+        assert len(exported) == 1
+        assert exported[0].findtext("{*}ResourceUID") == "1"
     for assn in root.findall(".//{*}Assignment"):
         uid = assn.findtext("{*}UID")
         fields = {name: assn.findtext("{*}" + name) for name in
@@ -54,13 +60,36 @@ def save(app, slug):
                               ("Number", "Start", "Finish", "Work", "Cost", "BCWS", "BCWP")})
         assert all(b["BCWS"] is None and b["BCWP"] is None for b in baselines)
         print(slug, "XML assignment", uid, fields, "baselines", baselines, flush=True)
+    by_uid = {int(a.findtext("{*}UID")): a for a in exported}
+    resource_types = {r.findtext("{*}UID"): (r.findtext("{*}Type"),r.findtext("{*}IsCostResource"))
+                      for r in root.findall(".//{*}Resource")}
+    seen = set()
     for task in app.ActiveProject.Tasks:
         if task is None:
             continue
         for assn in task.Assignments:
+            uid = int(assn.UniqueID) & 0xfffff  # Project's COM UID carries a high type tag.
+            assert uid in by_uid, (slug, uid)
+            seen.add(uid)
+            for baseline in by_uid[uid].findall("{*}Baseline"):
+                slot = int(baseline.findtext("{*}Number"))
+                prefix = "Baseline" + (str(slot) if slot else "")
+                for field in ("Start", "Finish"):
+                    value = baseline.findtext("{*}" + field)
+                    if value is not None:
+                        assert str(getattr(assn, prefix + field))[:19].replace(" ", "T") == value, (slug, uid, slot, field)
+                value = baseline.findtext("{*}Work")
+                if value is not None:
+                    hours, mins, secs = map(int, re.fullmatch(r"PT(\d+)H(\d+)M(\d+)S", value).groups())
+                    scale = 60 if resource_types.get(by_uid[uid].findtext("{*}ResourceUID")) == ("0", "0") else 1
+                    assert abs(float(getattr(assn, prefix + "Work")) * scale - (hours * 60 + mins + secs / 60)) < 0.02
+                value = baseline.findtext("{*}Cost")
+                if value is not None:
+                    assert abs(float(getattr(assn, prefix + "Cost")) * 100 - float(value)) < 0.02
             print(slug, "COM baseline", assn.UniqueID,
                   assn.BaselineStart, assn.BaselineFinish, assn.BaselineWork, assn.BaselineCost,
                   assn.Baseline1Cost, assn.Baseline10Cost, flush=True)
+    assert seen == {uid for uid, assn in by_uid.items() if assn.findtext("{*}ResourceUID") != "-65535"}
     app.FileCloseEx(0)
 
 
@@ -92,14 +121,13 @@ def cases(app):
     t = add(p, "Changing", 2)
     t.Assignments.Add(ResourceID=r.ID)
     app.BaselineSave(All=True)
-    t.Duration = "3d"
-    app.BaselineSave(All=True, Copy=win32.constants.pjCopyCurrent,
-                     Into=win32.constants.pjIntoBaseline1)
-    t.Duration = "4d"
-    app.BaselineSave(All=True, Copy=win32.constants.pjCopyCurrent,
-                     Into=win32.constants.pjIntoBaseline10)
+    for slot in range(1, 11):
+        t.Start = (datetime(2026, 3, 2, 8) + timedelta(weeks=slot)).strftime("%m/%d/%Y %I:%M %p")
+        t.Duration = f"{slot + 2}d"
+        app.BaselineSave(All=True, Copy=win32.constants.pjCopyCurrent,
+                         Into=win32.constants.pjIntoBaseline1 + slot - 1)
     t.PercentComplete = 50
-    p.StatusDate = "3/3/2026 5:00 PM"
+    p.StatusDate = "5/18/2026 5:00 PM"
     save(app, "a1-slots-progress")
 
     app.FileNew()
@@ -119,6 +147,22 @@ def cases(app):
     add(p, "Unassigned", 1)
     app.BaselineSave(All=True)
     save(app, "a2-material-cost-unassigned")
+
+    app.FileNew()
+    p = app.ActiveProject
+    p.ProjectStart = ANCHOR
+    p.NewTasksCreatedAsManual = False
+    keeper = p.Resources.Add("Keeper")
+    removed = p.Resources.Add("Removed")
+    task = add(p, "Keeps an assignment", 2)
+    old = task.Assignments.Add(ResourceID=keeper.ID)
+    old.Delete()
+    task.Assignments.Add(ResourceID=keeper.ID)
+    removed.Delete()
+    # A blank Resource Sheet row has no name but still occupies an ID.
+    p.Resources.Add("")
+    app.BaselineSave(All=True)
+    save(app, "a3-deleted-rows")
 
 
 def main():

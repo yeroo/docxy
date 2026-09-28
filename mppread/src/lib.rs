@@ -1,4 +1,5 @@
-//! `mppread` — read MS Project `.mpp` metadata and validated task tables.
+//! `mppread` — read MS Project `.mpp` metadata and validated task,
+//! resource and assignment tables, including saved assignment baselines.
 //!
 //! A `.mpp` file (like `.doc`/`.xls`) is a **compound file**: a
 //! filesystem-in-a-file of storages and streams. This crate reads that

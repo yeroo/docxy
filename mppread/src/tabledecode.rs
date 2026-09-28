@@ -1,6 +1,7 @@
 //! Strict readers for the current Project resource and assignment tables.
 use crate::cfb::Cfb;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 pub(crate) fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes(b[at..at + 2].try_into().unwrap())
@@ -17,7 +18,16 @@ pub(crate) fn f64_at(b: &[u8], at: usize) -> f64 {
 
 pub(crate) struct Table {
     pub rows: Vec<Vec<u8>>,
-    pub fields: HashMap<(u32, u16), Vec<u8>>,
+    fields: HashMap<(u32, u16), Range<usize>>,
+    v2: Vec<u8>,
+}
+
+impl Table {
+    pub(crate) fn field(&self, uid: u32, key: u16) -> Option<&[u8]> {
+        self.fields
+            .get(&(uid, key))
+            .map(|range| &self.v2[range.clone()])
+    }
 }
 
 pub(crate) fn read(
@@ -54,49 +64,55 @@ pub(crate) fn read(
     }
     let count = u32_at(&fm, 8) as usize;
     let stubs = if name == "TBkndRsc" { 3 } else { 0 };
-    let data_len = count
-        .checked_sub(stubs)
-        .and_then(|n| n.checked_mul(row_len))
-        .and_then(|n| n.checked_add(stubs * 16));
     if 16usize.checked_add(
         count
             .checked_mul(meta_stride)
             .ok_or("FixedMeta count overflow")?,
     ) != Some(fm.len())
-        || data_len != Some(fd.len())
+        || count < stubs
     {
         return Err(format!(
             "{name}: FixedMeta count or FixedData length mismatch"
         ));
     }
-    let mut rows = Vec::with_capacity(count);
-    let mut uids = HashSet::new();
+    let mut rows = Vec::with_capacity(count.saturating_sub(stubs));
+    let mut indexed_uids = HashSet::new();
+    let mut live_uids = HashSet::new();
+    let mut previous_end = 0;
     for i in 0..count {
         let m = &fm[16 + i * meta_stride..16 + (i + 1) * meta_stride];
         let off = u32_at(m, 4) as usize;
-        let expected_off = if i < stubs {
-            i * 16
+        let end = if i + 1 < count {
+            u32_at(&fm, 16 + (i + 1) * meta_stride + 4) as usize
         } else {
-            stubs * 16 + (i - stubs) * row_len
+            fd.len()
         };
+        let len = end
+            .checked_sub(off)
+            .ok_or_else(|| format!("{name}: FixedMeta offset order at record {i}"))?;
         let kind = u16_at(m, 0);
         let kind_ok = if i < stubs {
-            kind == 4
-        } else if name == "TBkndAssn" {
-            matches!(kind, 0 | 2)
+            kind == 4 && len == 16
         } else {
-            kind == 0
+            (matches!(kind, 0 | 2) && len == row_len) || (kind == 4 && len == 16)
         };
-        if off != expected_off || !kind_ok {
+        if off != previous_end || end > fd.len() || !kind_ok {
             return Err(format!("{name}: unrecognized FixedMeta record {i}"));
         }
-        let len = if i < stubs { 16 } else { row_len };
-        let row = fd[off..off + len].to_vec();
-        let uid = u32_at(&row, 0);
-        if i >= stubs && !uids.insert(uid) {
+        previous_end = end;
+        if i < stubs || kind == 4 {
+            continue;
+        }
+        let row = &fd[off..end];
+        let uid = u32_at(row, if name == "TBkndRsc" { 4 } else { 0 });
+        indexed_uids.insert(uid);
+        if kind == 2 {
+            continue;
+        }
+        if !live_uids.insert(uid) {
             return Err(format!("{name}: duplicate UID {uid}"));
         }
-        rows.push(row);
+        rows.push(row.to_vec());
     }
     if vm.len() < 24 || vm[..4] != [0xba, 0xad, 0xdf, 0xfa] {
         return Err(format!("{name}: invalid VarMeta header"));
@@ -117,7 +133,7 @@ pub(crate) fn read(
             u32_at(entry, 4) as usize,
             u16_at(entry, 8),
         );
-        if u16_at(entry, 10) != marker || !uids.contains(&uid) {
+        if u16_at(entry, 10) != marker || !indexed_uids.contains(&uid) {
             return Err(format!("{name}: invalid VarMeta entry {i}"));
         }
         let Some(head) = off.checked_add(4).filter(|&n| n <= v2.len()) else {
@@ -127,11 +143,11 @@ pub(crate) fn read(
         let Some(end) = head.checked_add(len).filter(|&n| n <= v2.len()) else {
             return Err(format!("{name}: Var2Data length at entry {i}"));
         };
-        if fields.insert((uid, key), v2[head..end].to_vec()).is_some() {
+        if fields.insert((uid, key), head..end).is_some() {
             return Err(format!("{name}: duplicate VarMeta key ({uid},{key})"));
         }
     }
-    Ok(Some(Table { rows, fields }))
+    Ok(Some(Table { rows, fields, v2 }))
 }
 
 pub(crate) fn name(bytes: &[u8], uid: u32) -> Result<String, String> {
@@ -148,4 +164,49 @@ pub(crate) fn name(bytes: &[u8], uid: u32) -> Result<String, String> {
         return Err(format!("invalid resource name for UID {uid}"));
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cfb::{Node, write_cfb_tree};
+
+    #[test]
+    fn shared_var_block_is_stored_once() {
+        let mut fm = vec![0u8; 50];
+        fm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        fm[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let mut fd = vec![0u8; 110];
+        fd[..4].copy_from_slice(&7u32.to_le_bytes());
+        let mut vm = vec![0u8; 48];
+        vm[..4].copy_from_slice(&[0xba, 0xad, 0xdf, 0xfa]);
+        vm[8..12].copy_from_slice(&2u32.to_le_bytes());
+        let mut v2 = vec![42u8; 65536];
+        v2.splice(0..0, 65536u32.to_le_bytes());
+        vm[20..24].copy_from_slice(&(v2.len() as u32).to_le_bytes());
+        for i in 0..2 {
+            let at = 24 + i * 12;
+            vm[at..at + 4].copy_from_slice(&7u32.to_le_bytes());
+            vm[at + 8..at + 10].copy_from_slice(&((i + 1) as u16).to_le_bytes());
+            vm[at + 10..at + 12].copy_from_slice(&0x0f40u16.to_le_bytes());
+        }
+        let bytes = write_cfb_tree(&[Node::Storage(
+            "   114",
+            vec![Node::Storage(
+                "TBkndAssn",
+                vec![
+                    Node::Stream("FixedMeta", fm),
+                    Node::Stream("FixedData", fd),
+                    Node::Stream("VarMeta", vm),
+                    Node::Stream("Var2Data", v2),
+                ],
+            )],
+        )]);
+        let table = read(&bytes, "TBkndAssn", 34, 110, 0x0f40).unwrap().unwrap();
+        assert_eq!(table.v2.len(), 65540);
+        assert_eq!(
+            table.field(7, 1).unwrap().as_ptr(),
+            table.field(7, 2).unwrap().as_ptr()
+        );
+    }
 }

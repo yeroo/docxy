@@ -13,39 +13,25 @@ fn date(bytes: &[u8], uid: u32, what: &str) -> Result<Option<DateTime>, String> 
     if day == 0xffff {
         return Ok(None);
     }
-    if t >= 14400 {
+    if t >= 14400 && t != 0xffff {
         return Err(format!("invalid {what} time for assignment UID {uid}"));
     }
     let s = crate::mpp::decode_timestamp(bytes, 0)
         .ok_or_else(|| format!("invalid {what} for assignment UID {uid}"))?;
-    let (d, hm) = s.split_once(' ').unwrap();
-    let mut ds = d.split('-');
-    let (y, m, day): (i64, u32, u32) = (
-        ds.next().unwrap().parse().unwrap(),
-        ds.next().unwrap().parse().unwrap(),
-        ds.next().unwrap().parse().unwrap(),
-    );
-    let (h, minute) = hm.split_once(':').unwrap();
-    Ok(Some(DateTime::from_ymd_hm(
-        y,
-        m,
-        day,
-        h.parse().unwrap(),
-        minute.parse().unwrap(),
-    )))
+    crate::project::parse_mpp_dt(&s)
+        .map(Some)
+        .ok_or_else(|| format!("invalid {what} for assignment UID {uid}"))
 }
 fn money(v: f64, uid: u32, what: &str) -> Result<Rate, String> {
-    if !v.is_finite() || !(0.0..=1e15).contains(&v) {
+    if !v.is_finite() {
         return Err(format!("invalid {what} for assignment UID {uid}"));
     }
-    Rate::parse(&format!("{v:.2}"))
+    crate::taskdecode::cost_rate(v)
         .ok_or_else(|| format!("invalid {what} for assignment UID {uid}"))
 }
 fn work(v: f64, uid: u32, what: &str) -> Result<i64, String> {
-    if !v.is_finite() || v < 0.0 || v > (i64::MAX as f64) {
-        return Err(format!("invalid {what} for assignment UID {uid}"));
-    }
-    Ok((v / 1000.0).round() as i64)
+    crate::taskdecode::work_minutes(v)
+        .ok_or_else(|| format!("invalid {what} for assignment UID {uid}"))
 }
 
 pub(crate) fn decode(
@@ -64,11 +50,15 @@ pub(crate) fn decode(
     let mut out = Vec::new();
     for row in &table.rows {
         let (uid, task_uid, resource_uid) = (u32_at(row, 0), i32_at(row, 4), i32_at(row, 8));
-        // Project may carry an internal summary assignment, but its XML omits it.
+        // A task-0/resource-0 row is an internal placeholder absent from
+        // Project XML. Other task-0 rows are real summary/budget assignments.
         if task_uid == 0 && resource_uid == 0 {
             continue;
         }
-        if uid > i32::MAX as u32 || !task_uids.contains(&task_uid) {
+        if uid > i32::MAX as u32 {
+            return Err(format!("assignment UID {uid} is out of range"));
+        }
+        if !task_uids.contains(&task_uid) {
             return Err(format!(
                 "assignment UID {uid} refers to unknown task UID {task_uid}"
             ));
@@ -82,7 +72,7 @@ pub(crate) fn decode(
         // carries UID/task/resource at +0/+4/+8, units at +12 (1/10000),
         // work at +20 (1/1000 minute), and Start/Finish at +52/+56.
         let raw_units = f64_at(row, 12) / 10000.0;
-        if !raw_units.is_finite() || !(0.0..=1000.0).contains(&raw_units) {
+        if !raw_units.is_finite() || raw_units < 0.0 {
             return Err(format!("invalid units for assignment UID {uid}"));
         }
         let resource = resources.iter().find(|r| r.uid == resource_uid);
@@ -104,7 +94,7 @@ pub(crate) fn decode(
                 let delta = 9 * (u16::from(slot) - 1);
                 (0x121 + delta, 0x122 + delta, 0x127 + delta, 0x128 + delta)
             };
-            let field = |key| table.fields.get(&(uid, key));
+            let field = |key| table.field(uid, key);
             let numeric = |key: u16, what: &str| -> Result<Option<f64>, String> {
                 field(key)
                     .map(|b| {
@@ -335,12 +325,15 @@ mod tests {
                 .contains("length")
         );
         let mut date = vars();
-        date[2].2 = vec![0xff, 0xff, 0x2a, 0x3c];
+        date[2].2 = vec![0x40, 0x38, 0x2a, 0x3c];
         assert!(
             decode(&file(rows(), date), false, &tasks(), &resources())
                 .unwrap_err()
                 .contains("time")
         );
+        let mut midnight = vars();
+        midnight[2].2 = vec![0xff, 0xff, 0x2a, 0x3c];
+        assert!(decode(&file(rows(), midnight), false, &tasks(), &resources()).is_ok());
         assert!(
             decode(
                 &file_with_count(rows(), vars(), Some(3)),
@@ -350,6 +343,54 @@ mod tests {
             )
             .unwrap_err()
             .contains("count")
+        );
+    }
+
+    #[test]
+    fn project_deletion_probe_skips_superseded_rows() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../corpus/mpp/assnbaseline/a3-deleted-rows.mpp");
+        let Ok(bytes) = std::fs::read(path) else {
+            return;
+        };
+        let resources = crate::rscdecode::decode(&bytes, false).unwrap().unwrap();
+        assert_eq!(
+            resources
+                .iter()
+                .map(|r| (r.uid, r.id, r.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, 1, "Keeper"), (3, 2, "")]
+        );
+        let assignments = decode(&bytes, false, &[1].into_iter().collect(), &resources)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            assignments.iter().map(|a| a.uid).collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    #[test]
+    fn accepts_signed_cost_large_units_and_summary_assignment() {
+        let mut records = rows();
+        records[0][4..8].copy_from_slice(&0i32.to_le_bytes());
+        records[0][12..20].copy_from_slice(&20_000_000f64.to_le_bytes());
+        let mut fields = vars();
+        fields[1].2 = (-25f64).to_le_bytes().to_vec();
+        let decoded = decode(
+            &file(records[..1].to_vec(), fields),
+            false,
+            &[0].into_iter().collect(),
+            &resources(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].task_uid, 0);
+        assert_eq!(decoded[0].units, 2000.0);
+        assert_eq!(
+            decoded[0].baselines[0].cost.as_ref().unwrap().to_f64(),
+            Some(-25.0)
         );
     }
 }
