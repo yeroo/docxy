@@ -113,9 +113,12 @@ def sorted_renumbered(app):
     for n, days in (("A", 3), ("B", 1), ("C", 4), ("D", 2)):
         add(p, n, days)
     p.Tasks(2).Predecessors = "1"
-    # Sorting with permanent renumbering keeps each task's record and
-    # changes its ID: rows become B, D, A, C.
-    app.Sort(Key1="Duration", Ascending1=True, Renumber=True)
+    # With pywin32 and Project 16.0, the late-bound Sort("Duration") call
+    # from #122 returned with A,B,C,D unchanged in this session. Try it first;
+    # the named-argument call below did sort and permanently renumber the rows.
+    app.Sort("Duration")
+    if [(t.ID, t.Name) for t in p.Tasks] != [(1, "B"), (2, "D"), (3, "A"), (4, "C")]:
+        app.Sort(Key1="Duration", Ascending1=True, Renumber=True)
     ids = [(t.ID, t.Name) for t in p.Tasks]
     if ids != [(1, "B"), (2, "D"), (3, "A"), (4, "C")]:
         raise RuntimeError(f"Sort did not renumber: {ids}")

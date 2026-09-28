@@ -136,10 +136,12 @@ fn check_task_fields(
     e: &projcore::Task,
     at: &dyn Fn(&str) -> String,
     custom_wbs_mask: bool,
+    require_fields: bool,
 ) {
     let Some(f) = &a.fields else {
+        assert!(!require_fields, "{}", at("fields"));
         return;
-    }; // MPP9 has no validated task fields.
+    }; // MPP9 and legacy layouts have no validated task fields.
     macro_rules! same {
         ($field:ident) => {
             assert_eq!(f.$field, e.$field, "{}", at(stringify!($field)));
@@ -392,13 +394,24 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         if t.is_null {
             continue;
         }
-        assert_eq!(
-            t.summary,
-            e.summary,
-            "{}: uid {} imported summary",
-            mpp.display(),
-            e.uid
-        );
+        if t.is_subproject == Some(true) {
+            // A childless inserted subproject must remain a schedulable leaf.
+            // Preserving Project's Summary=1 needs the projcore follow-up.
+            assert!(
+                !t.summary,
+                "{}: uid {} imported subproject summary",
+                mpp.display(),
+                e.uid
+            );
+        } else {
+            assert_eq!(
+                t.summary,
+                e.summary,
+                "{}: uid {} imported summary",
+                mpp.display(),
+                e.uid
+            );
+        }
         if t.is_subproject == Some(true) {
             assert_eq!(
                 t.duration_min,
@@ -430,7 +443,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at, custom_wbs_mask);
+        check_task_fields(a, t, e, &at, custom_wbs_mask, source == Oracle::Project);
         assert_eq!(
             t.manual,
             e.manual,
@@ -457,7 +470,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         let a = actual.iter().find(|a| a.uid as i32 == e.uid).unwrap();
         let t = round.tasks.iter().find(|t| t.uid == e.uid).unwrap();
         let at = |what: &str| format!("{}: uid {} round trip {what}", mpp.display(), e.uid);
-        check_task_fields(a, t, e, &at, custom_wbs_mask);
+        check_task_fields(a, t, e, &at, custom_wbs_mask, source == Oracle::Project);
     }
     for ghost in decoded
         .iter()

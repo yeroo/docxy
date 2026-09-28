@@ -60,8 +60,9 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
 fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> {
     let cal_ref = Project::default();
     let decoded: Vec<_> = decoded.into_iter().filter(|t| t.uid != 0).collect();
-    // Outline summaries own the next deeper row; Project also labels an
-    // inserted subproject as a summary even when its children live elsewhere.
+    // Only a local deeper row can form a schedulable outline summary. Project
+    // labels childless inserted subprojects as summaries in XML, but they must
+    // remain leaves here so the scheduler includes them.
     let tasks: Vec<Task> = decoded
         .iter()
         .enumerate()
@@ -79,16 +80,12 @@ fn import_tasks(decoded: Vec<crate::mpp::MppTask>) -> Result<Vec<Task>, String> 
                 .iter()
                 .find(|next| !next.is_null)
                 .is_some_and(|next| next.outline_level.is_some_and(|nxt| nxt > level));
-            let project_summary = t
-                .fields
-                .as_ref()
-                .is_some_and(|f| f.is_subproject == Some(true));
             let mut task = Task {
                 uid: t.uid as i32,
                 id: t.id as i32,
                 name: t.name.clone(),
                 outline_level: level,
-                summary: outline_summary || project_summary,
+                summary: outline_summary,
                 duration_min: 480,
                 ..Task::default()
             };
@@ -295,11 +292,21 @@ mod tests {
         });
         let rows = import_tasks(vec![task(0, 0, "Project", 0), sub]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].summary);
+        assert!(!rows[0].summary);
         assert_eq!(rows[0].is_subproject, Some(true));
         assert!(rows[0].duration_min > 0);
         assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
         assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        let project = Project {
+            start_date: rows[0].stored_start,
+            tasks: rows,
+            ..Project::default()
+        };
+        let scheduled = projcore::schedule::schedule(&project);
+        assert_eq!(
+            scheduled.get(1).map(|r| r.early_start),
+            project.tasks[0].stored_start
+        );
     }
 
     #[test]
