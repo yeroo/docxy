@@ -305,6 +305,58 @@ jobs:
         with:
           files: out/*.exe
 
+  linux-packages:
+    name: Linux packages (desktop suite tarball)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: suite
+
+      # The same packages the `desktop suite (linux)` CI job installs.
+      - name: System packages gpui needs on Linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends             pkg-config clang cmake             libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev             libx11-dev libx11-xcb-dev libxkbcommon-dev libxkbcommon-x11-dev             libwayland-dev libvulkan-dev             libfontconfig-dev libfreetype-dev libasound2-dev libssl-dev libzstd-dev
+
+      - name: Build desktop suite
+        run: cargo build --release --manifest-path suite/Cargo.toml --features html-export
+
+      # The terminal apps' Linux binaries come from the `build` matrix; this adds the
+      # desktop suite, which is a gpui app (X11 and Wayland).
+      - name: Package suite tarball
+        run: |
+          mkdir -p out/docxy-suite
+          cp suite/target/release/suite out/docxy-suite/docxy-suite
+          cp LICENSE out/docxy-suite/ 2>/dev/null || true
+          tar -C out -czf out/docxy-suite-linux-x86_64.tar.gz docxy-suite
+          ( cd out && sha256sum docxy-suite-linux-x86_64.tar.gz > docxy-suite-linux-x86_64.tar.gz.sha256 )
+          tar -tzf out/docxy-suite-linux-x86_64.tar.gz
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-packages
+          path: |
+            out/*.tar.gz
+            out/*.tar.gz.sha256
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.tar.gz
+            out/*.tar.gz.sha256
+
   macos-packages:
     name: macOS packages (tarball + .dmg)
     runs-on: macos-latest # arm64
