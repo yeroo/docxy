@@ -344,7 +344,9 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "IsNull" => t.is_null = bool_of(p),
                     "GUID" => t.guid = guid_of(p),
                     "CreateDate" => t.create_date = DateTime::parse_mspdi(&text_of(p)),
+                    "Contact" => t.contact = Some(text_of(p)),
                     "WBS" => t.wbs = Some(text_of(p)),
+                    "WBSLevel" => t.wbs_level = Some(text_of(p)),
                     "Type" => t.task_type = opt_int_of(p).and_then(TaskType::from_code),
                     "Active" => t.active = opt_bool_of(p),
                     "EffortDriven" => t.effort_driven = opt_bool_of(p),
@@ -359,10 +361,13 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "LevelingCanSplit" => t.leveling_can_split = opt_bool_of(p),
                     "LevelingDelay" => t.leveling_delay = opt_int_of(p),
                     "LevelingDelayFormat" => t.leveling_delay_format = opt_i32_of(p),
+                    "PreLeveledStart" => t.pre_leveled_start = DateTime::parse_mspdi(&text_of(p)),
+                    "PreLeveledFinish" => t.pre_leveled_finish = DateTime::parse_mspdi(&text_of(p)),
                     "Hyperlink" => t.hyperlink = Some(text_of(p)),
                     "HyperlinkAddress" => t.hyperlink_address = Some(text_of(p)),
                     "HyperlinkSubAddress" => t.hyperlink_sub_address = Some(text_of(p)),
                     "IgnoreResourceCalendar" => t.ignore_resource_calendar = opt_bool_of(p),
+                    "Notes" => t.notes = Some(text_of(p)),
                     "EarnedValueMethod" => t.earned_value_method = opt_i32_of(p),
                     "Recurring" => t.recurring = opt_bool_of(p),
                     "HideBar" => t.hide_bar = opt_bool_of(p),
@@ -371,6 +376,17 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "ExternalTaskProject" => t.external_task_project = Some(text_of(p)),
                     "IsSubproject" => t.is_subproject = opt_bool_of(p),
                     "IsSubprojectReadOnly" => t.is_subproject_read_only = opt_bool_of(p),
+                    "SubprojectName" => t.subproject_name = Some(text_of(p)),
+                    "DisplayAsSummary" => t.display_as_summary = opt_bool_of(p),
+                    "IsPublished" => t.is_published = opt_bool_of(p),
+                    "StatusManager" => t.status_manager = Some(text_of(p)),
+                    "CommitmentStart" => t.commitment_start = DateTime::parse_mspdi(&text_of(p)),
+                    "CommitmentFinish" => t.commitment_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "CommitmentType" => {
+                        t.commitment_type = opt_int_of(p)
+                            .filter(|n| (0..=2).contains(n))
+                            .map(|n| n as i32);
+                    }
                     "Work" => t.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => t.cost = rate_of(p),
                     "FixedCost" => t.fixed_cost = rate_of(p),
@@ -1776,7 +1792,9 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     // Every row states it, as Project writes it.
     tag(s, 3, "IsNull", flag(t.is_null));
     opt_date(s, "CreateDate", t.create_date);
+    opt_text(s, "Contact", t.contact.as_deref());
     opt_text(s, "WBS", t.wbs.as_ref());
+    opt_text(s, "WBSLevel", t.wbs_level.as_deref());
     opt_text(s, "OutlineNumber", computed.outline_number);
     tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
     opt_text(s, "Priority", t.priority);
@@ -1805,9 +1823,11 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     if task {
         tag(s, 3, "Summary", flag(t.summary));
     }
+    opt_flag(s, "DisplayAsSummary", t.display_as_summary);
     opt_flag(s, "Critical", result.map(|r| r.critical));
     opt_flag(s, "IsSubproject", t.is_subproject);
     opt_flag(s, "IsSubprojectReadOnly", t.is_subproject_read_only);
+    opt_text(s, "SubprojectName", t.subproject_name.as_deref());
     opt_flag(s, "ExternalTask", t.external_task);
     opt_text(s, "ExternalTaskProject", t.external_task_project.as_ref());
     if let Some(r) = result {
@@ -1898,10 +1918,13 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_flag(s, "LevelingCanSplit", t.leveling_can_split);
     opt_text(s, "LevelingDelay", t.leveling_delay);
     opt_text(s, "LevelingDelayFormat", t.leveling_delay_format);
+    opt_date(s, "PreLeveledStart", t.pre_leveled_start);
+    opt_date(s, "PreLeveledFinish", t.pre_leveled_finish);
     opt_text(s, "Hyperlink", t.hyperlink.as_deref());
     opt_text(s, "HyperlinkAddress", t.hyperlink_address.as_deref());
     opt_text(s, "HyperlinkSubAddress", t.hyperlink_sub_address.as_deref());
     opt_flag(s, "IgnoreResourceCalendar", t.ignore_resource_calendar);
+    opt_text(s, "Notes", t.notes.as_deref());
     opt_flag(s, "HideBar", t.hide_bar);
     opt_flag(s, "Rollup", t.rollup);
     opt_text(s, "BCWS", t.bcws.as_ref().map(Rate::as_str));
@@ -1959,6 +1982,11 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         s.push_str("      </Baseline>\n");
     }
     write_outline_codes(s, &t.outline_codes);
+    opt_flag(s, "IsPublished", t.is_published);
+    opt_text(s, "StatusManager", t.status_manager.as_deref());
+    opt_date(s, "CommitmentStart", t.commitment_start);
+    opt_date(s, "CommitmentFinish", t.commitment_finish);
+    opt_text(s, "CommitmentType", t.commitment_type);
     write_timephased_data(s, &t.timephased_data);
     s.push_str("    </Task>\n");
 }
@@ -4005,20 +4033,28 @@ mod tests {
     const TASK_FIELDS: &str = "<Task><UID>1</UID>\
         <GUID>651A2669-EF7E-F111-A0F9-34C93D776CA2</GUID><ID>1</ID><Name>Pour</Name>\
         <Active>0</Active><Manual>0</Manual><Type>1</Type><IsNull>0</IsNull>\
-        <CreateDate>2026-07-13T23:14:00</CreateDate><WBS>1.2</WBS>\
+        <CreateDate>2026-07-13T23:14:00</CreateDate><Contact>Site lead</Contact>\
+        <WBS>1.2</WBS><WBSLevel>Level 2</WBSLevel>\
         <OutlineNumber>9.9</OutlineNumber><OutlineLevel>1</OutlineLevel><Priority>900</Priority>\
         <Duration>PT8H0M0S</Duration><Work>PT16H30M0S</Work><EffortDriven>1</EffortDriven>\
         <Recurring>1</Recurring><OverAllocated>1</OverAllocated><Estimated>1</Estimated>\
         <IsSubproject>1</IsSubproject><IsSubprojectReadOnly>1</IsSubprojectReadOnly>\
+        <SubprojectName>Concrete</SubprojectName><DisplayAsSummary>1</DisplayAsSummary>\
         <ExternalTask>1</ExternalTask><Cost>1250.50</Cost>\
         <Deadline>2026-03-20T17:00:00</Deadline><LevelAssignments>0</LevelAssignments>\
         <LevelingCanSplit>0</LevelingCanSplit><LevelingDelay>4800</LevelingDelay>\
         <LevelingDelayFormat>7</LevelingDelayFormat>\
+        <PreLeveledStart>2026-03-18T08:00:00</PreLeveledStart>\
+        <PreLeveledFinish>2026-03-18T17:00:00</PreLeveledFinish>\
         <Hyperlink>Survey plan</Hyperlink>\
         <HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>\
         <HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>\
-        <IgnoreResourceCalendar>1</IgnoreResourceCalendar>\
-        <HideBar>1</HideBar><Rollup>1</Rollup><EarnedValueMethod>1</EarnedValueMethod></Task>";
+        <IgnoreResourceCalendar>1</IgnoreResourceCalendar><Notes>Check forms</Notes>\
+        <HideBar>1</HideBar><Rollup>1</Rollup><EarnedValueMethod>1</EarnedValueMethod>\
+        <IsPublished>0</IsPublished><StatusManager>Alice</StatusManager>\
+        <CommitmentStart>2026-03-19T08:00:00</CommitmentStart>\
+        <CommitmentFinish>2026-03-19T17:00:00</CommitmentFinish>\
+        <CommitmentType>2</CommitmentType></Task>";
 
     #[test]
     fn task_fields_are_read() {
@@ -4033,7 +4069,9 @@ mod tests {
                 duration_min: 480,
                 guid: Some("651A2669-EF7E-F111-A0F9-34C93D776CA2".into()),
                 create_date: Some(DateTime::from_ymd_hm(2026, 7, 13, 23, 14)),
+                contact: Some("Site lead".into()),
                 wbs: Some("1.2".into()),
+                wbs_level: Some("Level 2".into()),
                 task_type: Some(TaskType::FixedDuration),
                 active: Some(false),
                 effort_driven: Some(true),
@@ -4044,10 +4082,13 @@ mod tests {
                 leveling_can_split: Some(false),
                 leveling_delay: Some(4800),
                 leveling_delay_format: Some(7),
+                pre_leveled_start: Some(DateTime::from_ymd_hm(2026, 3, 18, 8, 0)),
+                pre_leveled_finish: Some(DateTime::from_ymd_hm(2026, 3, 18, 17, 0)),
                 hyperlink: Some("Survey plan".into()),
                 hyperlink_address: Some("https://example.com/a?x=1&y=2".into()),
                 hyperlink_sub_address: Some("Gantt Chart!1".into()),
                 ignore_resource_calendar: Some(true),
+                notes: Some("Check forms".into()),
                 earned_value_method: Some(1),
                 recurring: Some(true),
                 hide_bar: Some(true),
@@ -4055,6 +4096,13 @@ mod tests {
                 external_task: Some(true),
                 is_subproject: Some(true),
                 is_subproject_read_only: Some(true),
+                subproject_name: Some("Concrete".into()),
+                display_as_summary: Some(true),
+                is_published: Some(false),
+                status_manager: Some("Alice".into()),
+                commitment_start: Some(DateTime::from_ymd_hm(2026, 3, 19, 8, 0)),
+                commitment_finish: Some(DateTime::from_ymd_hm(2026, 3, 19, 17, 0)),
+                commitment_type: Some(2),
                 work_min: Some(990),
                 cost: Rate::parse("1250.50"),
                 over_allocated: Some(true),
@@ -4073,7 +4121,9 @@ mod tests {
             "<Active>0</Active>",
             "<Type>1</Type>",
             "<CreateDate>2026-07-13T23:14:00</CreateDate>",
+            "<Contact>Site lead</Contact>",
             "<WBS>1.2</WBS>",
+            "<WBSLevel>Level 2</WBSLevel>",
             "<Priority>900</Priority>",
             "<Work>PT16H30M0S</Work>",
             "<EffortDriven>1</EffortDriven>",
@@ -4082,6 +4132,8 @@ mod tests {
             "<Estimated>1</Estimated>",
             "<IsSubproject>1</IsSubproject>",
             "<IsSubprojectReadOnly>1</IsSubprojectReadOnly>",
+            "<SubprojectName>Concrete</SubprojectName>",
+            "<DisplayAsSummary>1</DisplayAsSummary>",
             "<ExternalTask>1</ExternalTask>",
             "<Cost>1250.50</Cost>",
             "<Deadline>2026-03-20T17:00:00</Deadline>",
@@ -4089,13 +4141,21 @@ mod tests {
             "<LevelingCanSplit>0</LevelingCanSplit>",
             "<LevelingDelay>4800</LevelingDelay>",
             "<LevelingDelayFormat>7</LevelingDelayFormat>",
+            "<PreLeveledStart>2026-03-18T08:00:00</PreLeveledStart>",
+            "<PreLeveledFinish>2026-03-18T17:00:00</PreLeveledFinish>",
             "<Hyperlink>Survey plan</Hyperlink>",
             "<HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>",
             "<HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>",
             "<IgnoreResourceCalendar>1</IgnoreResourceCalendar>",
+            "<Notes>Check forms</Notes>",
             "<HideBar>1</HideBar>",
             "<Rollup>1</Rollup>",
             "<EarnedValueMethod>1</EarnedValueMethod>",
+            "<IsPublished>0</IsPublished>",
+            "<StatusManager>Alice</StatusManager>",
+            "<CommitmentStart>2026-03-19T08:00:00</CommitmentStart>",
+            "<CommitmentFinish>2026-03-19T17:00:00</CommitmentFinish>",
+            "<CommitmentType>2</CommitmentType>",
         ] {
             assert!(xml.contains(element), "missing {element}");
         }
@@ -4122,6 +4182,54 @@ mod tests {
             assert!(xml.contains(&format!("<{name}></{name}>")));
         }
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+    }
+
+    #[test]
+    fn empty_task_text_elements_are_kept() {
+        let names = [
+            "Contact",
+            "WBSLevel",
+            "SubprojectName",
+            "Notes",
+            "StatusManager",
+        ];
+        let source = format!(
+            "<Task><UID>1</UID>{}</Task>",
+            names
+                .iter()
+                .map(|name| format!("<{name}/>"))
+                .collect::<String>()
+        );
+        let proj = task_project(&source);
+        let task = &proj.tasks[0];
+        for value in [
+            &task.contact,
+            &task.wbs_level,
+            &task.subproject_name,
+            &task.notes,
+            &task.status_manager,
+        ] {
+            assert_eq!(value.as_deref(), Some(""));
+        }
+        let xml = write_mspdi(&proj);
+        for name in names {
+            assert!(xml.contains(&format!("<{name}></{name}>")), "{name}: {xml}");
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+    }
+
+    #[test]
+    fn task_notes_survive_save() {
+        let proj = task_project(
+            "<Task><UID>1</UID><Notes>Line 1&#13;\nLine 2 &amp; &lt;x&gt;</Notes></Task>",
+        );
+        let expected = "Line 1\r\nLine 2 & <x>";
+        assert_eq!(proj.tasks[0].notes.as_deref(), Some(expected));
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Notes>Line 1&#13;\nLine 2 &amp; &lt;x&gt;</Notes>"));
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks, proj.tasks);
     }
 
     #[test]
@@ -4178,12 +4286,14 @@ mod tests {
 
     /// Optional task elements #80 keeps. IsNull is not among them: every row
     /// states it.
-    const NEW_TASK_ELEMENTS: [&str; 29] = [
+    const NEW_TASK_ELEMENTS: [&str; 41] = [
         "GUID",
         "Active",
         "Type",
         "CreateDate",
+        "Contact",
         "WBS",
+        "WBSLevel",
         "Priority",
         "Work",
         "EffortDriven",
@@ -4192,6 +4302,8 @@ mod tests {
         "Estimated",
         "IsSubproject",
         "IsSubprojectReadOnly",
+        "SubprojectName",
+        "DisplayAsSummary",
         "ExternalTask",
         "FixedCost",
         "FixedCostAccrual",
@@ -4201,13 +4313,21 @@ mod tests {
         "LevelingCanSplit",
         "LevelingDelay",
         "LevelingDelayFormat",
+        "PreLeveledStart",
+        "PreLeveledFinish",
         "Hyperlink",
         "HyperlinkAddress",
         "HyperlinkSubAddress",
         "IgnoreResourceCalendar",
+        "Notes",
         "HideBar",
         "Rollup",
         "EarnedValueMethod",
+        "IsPublished",
+        "StatusManager",
+        "CommitmentStart",
+        "CommitmentFinish",
+        "CommitmentType",
     ];
 
     /// The `<Tasks>` section of a written file.
@@ -4292,6 +4412,14 @@ mod tests {
             "<LevelingDelayFormat>x</LevelingDelayFormat>",
             "<EarnedValueMethod>x</EarnedValueMethod>",
             "<GUID></GUID>",
+            "<DisplayAsSummary>maybe</DisplayAsSummary>",
+            "<IsPublished>2</IsPublished>",
+            "<PreLeveledStart>soon</PreLeveledStart>",
+            "<PreLeveledFinish>soon</PreLeveledFinish>",
+            "<CommitmentStart>soon</CommitmentStart>",
+            "<CommitmentFinish>soon</CommitmentFinish>",
+            "<CommitmentType>3</CommitmentType>",
+            "<CommitmentType>x</CommitmentType>",
         ] {
             let proj = task_project(&format!("<Task><UID>1</UID>{element}</Task>"));
             assert_eq!(
@@ -4362,6 +4490,11 @@ mod tests {
             value: Some("A".into()),
             value_guid: Some("C8A6D07D-4E0D-4F63-9A8B-0D1E2F3A4B5C".into()),
             duration_format: Some(7),
+        }];
+        t.outline_codes = vec![OutlineCodeValue {
+            field_id: "188744105".into(),
+            value_id: Some("1".into()),
+            ..OutlineCodeValue::default()
         }];
         let progress = task_project(PROGRESS).tasks.remove(0);
         let t = &mut proj.tasks[0];
@@ -4436,7 +4569,9 @@ mod tests {
                 "Type",
                 "IsNull",
                 "CreateDate",
+                "Contact",
                 "WBS",
+                "WBSLevel",
                 "OutlineNumber",
                 "OutlineLevel",
                 "Priority",
@@ -4457,9 +4592,11 @@ mod tests {
                 "Estimated",
                 "Milestone",
                 "Summary",
+                "DisplayAsSummary",
                 "Critical",
                 "IsSubproject",
                 "IsSubprojectReadOnly",
+                "SubprojectName",
                 "ExternalTask",
                 "EarlyStart",
                 "EarlyFinish",
@@ -4502,10 +4639,13 @@ mod tests {
                 "LevelingCanSplit",
                 "LevelingDelay",
                 "LevelingDelayFormat",
+                "PreLeveledStart",
+                "PreLeveledFinish",
                 "Hyperlink",
                 "HyperlinkAddress",
                 "HyperlinkSubAddress",
                 "IgnoreResourceCalendar",
+                "Notes",
                 "HideBar",
                 "Rollup",
                 "BCWS",
@@ -4529,6 +4669,14 @@ mod tests {
                 "Baseline",
                 "Number",
                 "Duration",
+                "OutlineCode",
+                "FieldID",
+                "ValueID",
+                "IsPublished",
+                "StatusManager",
+                "CommitmentStart",
+                "CommitmentFinish",
+                "CommitmentType",
                 "TimephasedData",
                 "Type",
                 "UID",

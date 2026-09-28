@@ -685,7 +685,7 @@ def build():
 
     add("20-task-fields.xml", ["task-fields", "round-trip", "blank-row", "summary", "link",
                                "link-fs", "custom-fields"],
-        "Task type, estimate, active, deadline, levelling, hyperlink, custom fields and a blank row "
+        "Task type, estimate, active, deadline, levelling, hyperlink, notes, commitment metadata, custom fields and a blank row "
         "survive saves.",
         project("task-fields", "\n".join([
             task(1, "Phase", 3 * D, dt(2), dt(4, "17:00:00"), **CRIT, summary=True,
@@ -708,17 +708,29 @@ def build():
             # Its link from the blank row is ignored: Pour follows Excavate.
             task(4, "Pour", D, dt(4), dt(4, "17:00:00"), **CRIT, outline=2,
                  preds=[(2, FS, 0), (3, FS, 0)],
-                 fields=ident(4) + [("Active", 1), ("Type", 2), ("WBS", "1.2"),
+                 fields=ident(4) + [("Active", 1), ("Type", 2),
+                                    ("Contact", "Site lead"), ("WBS", "1.2"),
+                                    ("WBSLevel", "Level 2"),
                                     ("Priority", 500), ("Estimated", 1),
+                                    ("DisplayAsSummary", 0),
                                     ("EffortDriven", 0), ("Work", iso(0)),
                                     ("Deadline", dt(20, "17:00:00")),
                                     ("LevelAssignments", 0), ("LevelingCanSplit", 0),
                                     ("LevelingDelay", 4800), ("LevelingDelayFormat", 7),
+                                    ("SubprojectName", "Concrete phase"),
+                                    ("PreLeveledStart", dt(4)),
+                                    ("PreLeveledFinish", dt(4, "17:00:00")),
                                     ("Hyperlink", "Pour instructions"),
                                     ("HyperlinkAddress", "https://example.com/a?x=1&amp;y=2"),
                                     ("HyperlinkSubAddress", "Gantt Chart!4"),
-                                    ("IgnoreResourceCalendar", 1), ("HideBar", 1),
-                                    ("EarnedValueMethod", 1), ("Rollup", 0)],
+                                    ("IgnoreResourceCalendar", 1),
+                                    ("Notes", "Check forms &amp; rebar"),
+                                    ("HideBar", 1), ("EarnedValueMethod", 1),
+                                    ("Rollup", 0), ("IsPublished", 0),
+                                    ("StatusManager", "Alice"),
+                                    ("CommitmentStart", dt(5)),
+                                    ("CommitmentFinish", dt(5, "17:00:00")),
+                                    ("CommitmentType", 2)],
                  ext=[[("FieldID", 188743731), ("Value", "M&amp;E")]]),
             # Inactive: Project drops it from the schedule; docxy does not yet.
             task(5, "Inspect", D, dt(2), dt(2, "17:00:00"), slack=2 * D, critical=False,
