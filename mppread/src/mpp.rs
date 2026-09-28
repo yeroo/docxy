@@ -475,7 +475,7 @@ pub fn read_mpp(bytes: &[u8]) -> Result<MppInfo, String> {
 /// Project corpus stores day 0x3a86 for 2025-01-06 in its XML export; using
 /// 1984-01-01 here would produce 2025-01-07. Legacy samples likewise shift
 /// from Tuesday starts to Monday starts with this epoch.
-const MPP_EPOCH_DAYS: i64 = 5112;
+pub(crate) const MPP_EPOCH_DAYS: i64 = 5112;
 
 fn u16le(b: &[u8], o: usize) -> u16 {
     if o + 2 <= b.len() {

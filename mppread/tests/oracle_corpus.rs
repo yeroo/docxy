@@ -278,8 +278,15 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     let imported = mppread::project::project_from_mpp(&bytes)
         .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
     if xml_text.contains("<Calendars>") {
-        let fields =
-            |c: &projcore::Calendar| (c.uid, c.name.clone(), c.base_calendar_uid, c.week.clone());
+        let fields = |c: &projcore::Calendar| {
+            (
+                c.uid,
+                c.name.clone(),
+                c.base_calendar_uid,
+                c.week.clone(),
+                c.exceptions.clone(),
+            )
+        };
         let expected_calendars: Vec<_> = oracle
             .calendars
             .iter()
@@ -338,7 +345,8 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             .unwrap()
             .exceptions;
         let mut selected = 0usize;
-        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, own calendar, exception, nonworking start
+        let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, own calendar, recurring exception, nonworking start
+        let mut compared_uids = Vec::new();
         for (task, expected_task) in imported.tasks.iter().zip(&expected) {
             if task.summary || task.manual || expected_task.milestone {
                 continue;
@@ -370,12 +378,16 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 continue;
             }
             let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
-            if exceptions.iter().any(|exception| {
-                exception.from.zip(exception.to).is_some_and(|(from, to)| {
-                    from.day_number() <= finish.day_number()
-                        && to.day_number() >= start.day_number()
+            if exceptions
+                .iter()
+                .filter(|e| e.scheduled().is_none())
+                .any(|exception| {
+                    exception.from.zip(exception.to).is_some_and(|(from, to)| {
+                        from.day_number() <= finish.day_number()
+                            && to.day_number() >= start.day_number()
+                    })
                 })
-            }) {
+            {
                 dropped[4] += 1;
                 continue;
             }
@@ -405,14 +417,72 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 mpp.display(),
                 task.uid
             );
+            compared_uids.push(task.uid);
         }
         if dropped.iter().any(|&n| n > 0) {
             eprintln!(
-                "{}: selected {selected}, exclusions split/delayed-assignment/elapsed/task-calendar/exception/nonworking-start = {dropped:?}",
+                "{}: selected {selected}, exclusions split/delayed-assignment/elapsed/task-calendar/recurring-exception/nonworking-start = {dropped:?}",
                 mpp.display()
             );
         }
         let stem = mpp.file_stem().unwrap().to_string_lossy();
+        let recurrence = oracle
+            .calendar(oracle.default_calendar_uid)
+            .and_then(|cal| cal.exceptions.first());
+        match stem.as_ref() {
+            "e6-monthly-position" | "k5-monthly-position" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month_position),
+                    (Some(5), Some(7), Some(1))
+                );
+            }
+            "e7-yearly-date" | "k6-yearly-date" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month),
+                    (Some(2), Some(5), Some(2))
+                );
+            }
+            "e8-yearly-position" | "k7-yearly-position" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month, e.month_position),
+                    (Some(3), Some(5), Some(2), Some(1))
+                );
+            }
+            _ => {}
+        }
+        if stem == "33-calendar-holiday" {
+            let task = imported.tasks.iter().find(|t| t.uid == 5).unwrap();
+            assert_eq!(
+                task.duration_min,
+                4800,
+                "{}: holiday UID 5 duration",
+                mpp.display()
+            );
+            assert!(
+                compared_uids.contains(&5),
+                "{}: holiday UID 5 was not compared",
+                mpp.display()
+            );
+        }
+        if [
+            "e1-range",
+            "e2-weekend-working",
+            "e10-several-unicode",
+            "e11-unnamed",
+            "k1-one-off",
+            "k9-unnamed",
+        ]
+        .contains(&stem.as_ref())
+        {
+            assert!(
+                compared_uids.contains(&1),
+                "{}: one-off exception task was not compared",
+                mpp.display()
+            );
+        }
         if [
             "31-calendar-hours",
             "32-calendar-6day",
@@ -489,6 +559,17 @@ fn project_2024_oracles() {
     if manual.exists() {
         let cases = pairs(&manual, "");
         assert_eq!(cases.len(), 9);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+        }
+    }
+    let exceptions = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/exceptions");
+    if exceptions.exists() {
+        let cases = pairs(&exceptions, "");
+        assert_eq!(
+            cases.len(),
+            19 + usize::from(exceptions.join("k8-period-300.mpp").exists())
+        );
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Project);
         }
