@@ -7,8 +7,10 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// is its project summary and supplies a fallback name, but is not imported as
 /// a task. Current-layout tasks keep their recorded constraints, including
 /// manual tasks and summaries. An automatic leaf under a linked or constrained
-/// summary, or linked to a summary, remains pinned to its stored start until
-/// projcore schedules summary links and constraints. Legacy MPP9 leaves,
+/// summary, or linked from a summary, replaces its recorded constraint with
+/// Must-Start-On at its stored start. An ALAP leaf linked into a summary, or
+/// under a summary that precedes another task, is pinned too. Save As writes
+/// these pins until projcore schedules summary links and constraints. Legacy MPP9 leaves,
 /// including a childless inserted subproject, remain pinned with Must-Start-On at their
 /// stored start. Automatic leaves use Project's stored working duration when
 /// available. Other durations use the working minutes between start and finish
@@ -164,6 +166,17 @@ fn import_tasks(
         .filter(|(_, summary)| **summary)
         .map(|(t, _)| t.uid)
         .collect();
+    let predecessors_of_summaries: std::collections::HashSet<_> = decoded
+        .iter()
+        .zip(&summaries)
+        .filter(|(_, summary)| **summary)
+        .flat_map(|(t, _)| t.predecessors.iter().map(|p| p.pred_uid))
+        .collect();
+    let summaries_with_successors: std::collections::HashSet<_> = decoded
+        .iter()
+        .flat_map(|t| t.predecessors.iter().map(|p| p.pred_uid))
+        .filter(|uid| summary_uids.contains(uid))
+        .collect();
     let mut ancestor_stack: Vec<usize> = Vec::new();
     let mut needs_summary_pin = vec![false; decoded.len()];
     for (i, t) in decoded.iter().enumerate() {
@@ -191,6 +204,14 @@ fn import_tasks(
             .predecessors
             .iter()
             .any(|p| summary_uids.contains(&p.pred_uid));
+        if t.fields.as_ref().and_then(|f| f.constraint_type)
+            == Some(ConstraintType::AsLateAsPossible)
+        {
+            needs_summary_pin[i] |= predecessors_of_summaries.contains(&t.uid)
+                || ancestor_stack
+                    .iter()
+                    .any(|&parent| summaries_with_successors.contains(&decoded[parent].uid));
+        }
         if summaries[i] {
             ancestor_stack.push(i);
         }
@@ -439,6 +460,57 @@ mod tests {
             ..crate::mpp::MppTaskFields::default()
         });
         row
+    }
+
+    fn link(pred_uid: u32) -> crate::mpp::MppPred {
+        crate::mpp::MppPred {
+            pred_uid,
+            kind: 1,
+            lag_format: 8,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn alap_predecessor_of_a_summary_is_pinned_but_asap_is_not() {
+        let mut late = current(1, 1, "ALAP predecessor", 1);
+        late.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let early = current(2, 2, "ASAP predecessor", 1);
+        let mut summary = current(3, 3, "Summary", 1);
+        summary.predecessors = vec![link(1), link(2)];
+        let rows = import_current(vec![
+            current(0, 0, "Project", 0),
+            late,
+            early,
+            summary,
+            current(4, 4, "Child", 2),
+        ])
+        .unwrap();
+        assert_eq!(rows[0].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[0].constraint_date, rows[0].stored_start);
+        assert_eq!(rows[1].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[1].constraint_date, None);
+    }
+
+    #[test]
+    fn alap_child_of_a_summary_predecessor_is_pinned_but_asap_sibling_is_not() {
+        let mut late = current(2, 2, "ALAP child", 2);
+        late.fields.as_mut().unwrap().constraint_type = Some(ConstraintType::AsLateAsPossible);
+        let mut successor = current(4, 4, "Successor", 1);
+        successor.predecessors.push(link(1));
+        let rows = import_current(vec![
+            current(0, 0, "Project", 0),
+            current(1, 1, "Summary", 1),
+            late,
+            current(3, 3, "ASAP sibling", 2),
+            successor,
+        ])
+        .unwrap();
+        assert_eq!(rows[1].constraint, ConstraintType::MustStartOn);
+        assert_eq!(rows[1].constraint_date, rows[1].stored_start);
+        assert_eq!(rows[2].constraint, ConstraintType::AsSoonAsPossible);
+        assert_eq!(rows[2].constraint_date, None);
+        assert_eq!(rows[3].constraint, ConstraintType::MustStartOn);
     }
 
     #[test]
