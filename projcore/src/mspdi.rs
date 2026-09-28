@@ -129,12 +129,13 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                         "ExtendedAttribute",
                         &mut proj.extended_attribute_definitions,
                     ),
-                    // Any other leaf is a project option docxy does not model:
-                    // keep its text so a save writes it back. Unknown blocks
-                    // with children (such as Views) and prefixed or attributed
-                    // OutlineCodes/WBSMasks wrappers are consumed whole. An
-                    // option stores only a name and text, so writing those
-                    // wrappers back would lose attributes or namespace bindings.
+                    // A prefixed or attributed element (leaf or block) is
+                    // consumed here, including OutlineCodes/WBSMasks wrappers:
+                    // an option stores only name and text, so writing it back
+                    // would lose namespace bindings or attributes like xsi:nil.
+                    // The final arm keeps plain unknown leaves as options.
+                    // Plain unknown blocks such as Views reach that arm, but
+                    // leaf_text_of returns None and drops them whole.
                     _ if !kept_as_element(&p) => p.skip_element(),
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
