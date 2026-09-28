@@ -279,6 +279,8 @@ values):
 | Work, ActualWork, RemainingWork | +8, +16, +24 | f64, thousandths of a minute |
 | Cost, ActualCost, RemainingCost | +32, +40, +56 | f64 in MSPDI's units, which Project's export rounds to two decimals |
 | ActualDuration, RemainingDuration | +80, +88 | i32, tenths of a minute |
+| Duration | +84 | i32, tenths of a minute |
+| DurationFormat | +164 | u16, MSPDI format code |
 | PercentComplete, PercentWorkComplete | +92, +94 | u16 |
 | ActualStart, ActualFinish | +120, +124 | timestamp; NA (no date) before the task starts or finishes |
 | Resume, Stop | +132, +136 | timestamp; NA on a task not started |
@@ -287,6 +289,11 @@ values):
 Durations and work are rounded to whole minutes, as MSPDI import rounds
 seconds. Every numeric field is present on every task, zero included, since
 Project's export writes them all; only the four dates can be absent.
+For auto leaves with a working DurationFormat, the importer uses stored
+Duration. Elapsed or unknown formats still use the working Start–Finish span
+because the project model does not retain DurationFormat. Split segments are
+not decoded: a split task retains Project's stored Start and Finish but can
+schedule an earlier Finish when its stored Duration omits the gap.
 StartVariance, FinishVariance and WorkVariance are **not stored**: Project
 derives them at export from the baseline (Var2Data keeps the baseline
 duration, start and finish under keys `0x001b`, `0x002b` and `0x002c`), and

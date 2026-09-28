@@ -6,9 +6,11 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// Build a project from a structurally recognized `.mpp` task table. Task UID 0
 /// is its project summary and supplies a fallback name, but is not imported as
 /// a task. Each decoded auto leaf is pinned
-/// with a Must-Start-On constraint at its start and given a duration equal to
-/// the working minutes between its start and finish, so the scheduler reproduces
-/// the real dates. A **manual** leaf keeps its mode and its manual start,
+/// with a Must-Start-On constraint at its start and given Project's stored
+/// working duration when available. Other durations use the working minutes
+/// between start and finish. Splits are not decoded, so a split task can
+/// schedule an earlier finish than its retained stored finish. A **manual**
+/// leaf keeps its mode and its manual start,
 /// finish and duration instead, which hold it where Project put it without a
 /// constraint; the project's new-task mode comes through too.
 /// The **outline levels** (WBS depth) decode too, so summary tasks and their
@@ -138,7 +140,11 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
                     .manual_duration_min
                     .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
             } else {
-                task.duration_min = projcore::schedule::working_minutes_between(&cal_ref, s, f);
+                task.duration_min = t
+                    .duration_format
+                    .filter(|fmt| matches!(fmt & !32, 3 | 5 | 7 | 9 | 11))
+                    .and(t.duration_min)
+                    .unwrap_or_else(|| projcore::schedule::working_minutes_between(&cal_ref, s, f));
                 task.constraint = ConstraintType::MustStartOn;
                 task.constraint_date = Some(s);
             }

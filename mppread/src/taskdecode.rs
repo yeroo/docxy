@@ -51,7 +51,9 @@ struct ProgressLayout {
     actual_cost: usize,
     remaining_cost: usize,
     actual_duration: usize,
+    duration: usize,
     remaining_duration: usize,
+    duration_format: usize,
     percent_complete: usize,
     percent_work_complete: usize,
     actual_start: usize,
@@ -67,7 +69,9 @@ const NEWEST_PROGRESS: ProgressLayout = ProgressLayout {
     actual_cost: 40,
     remaining_cost: 56,
     actual_duration: 80,
+    duration: 84,
     remaining_duration: 88,
+    duration_format: 164,
     percent_complete: 92,
     percent_work_complete: 94,
     actual_start: 120,
@@ -520,6 +524,14 @@ fn decode_current(
             (None, None, None)
         };
         let physical_percent = var.physical_percent.get(&row.uid).copied().unwrap_or(0);
+        let duration_tenths = i32::from_le_bytes(
+            rec[NEWEST_PROGRESS.duration..NEWEST_PROGRESS.duration + 4]
+                .try_into()
+                .unwrap(),
+        );
+        if duration_tenths < 0 {
+            return Err(format!("negative duration for UID {}", row.uid));
+        }
         let progress = progress_fields(rec, physical_percent, row.uid)?;
         out.push(MppTask {
             id: row.id,
@@ -533,6 +545,8 @@ fn decode_current(
             manual_start,
             manual_finish,
             manual_duration_min,
+            duration_min: Some(tenths_to_minutes(duration_tenths)),
+            duration_format: Some(u16_at(rec, NEWEST_PROGRESS.duration_format)),
             progress: Some(progress),
         });
     }
@@ -1022,6 +1036,49 @@ mod tests {
         put(s, 132, &[0xc0, 0x12, 0x2b, 0x3c]);
         put(s, 136, &[0xd8, 0x27, 0x2a, 0x3c]);
         add_var(s, 1, PHYSICAL_PERCENT_KEY, &40u16.to_le_bytes());
+    }
+    #[test]
+    fn stored_duration_and_format_control_auto_import() {
+        let mut s = fixture();
+        // Two working days, with one day's work stored by Project.
+        put(&mut s, 0x68, &[0xc0, 0x12, 0x2a, 0x3c]); // Mon 08:00
+        put(&mut s, 0x6c, &[0xd8, 0x27, 0x2b, 0x3c]); // Tue 17:00
+        put(&mut s, NEWEST_PROGRESS.duration, &4800i32.to_le_bytes());
+        put(&mut s, NEWEST_PROGRESS.duration_format, &7u16.to_le_bytes());
+        let decoded = decode(&file(&s, true)).unwrap();
+        assert_eq!(decoded[1].duration_min, Some(480));
+        assert_eq!(decoded[1].duration_format, Some(7));
+        let imported = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        let task = &imported.tasks[0];
+        assert_eq!(task.duration_min, 480);
+        assert_eq!(task.stored_start.unwrap().to_mspdi(), "2026-03-02T08:00:00");
+        assert_eq!(
+            task.stored_finish.unwrap().to_mspdi(),
+            "2026-03-03T17:00:00"
+        );
+
+        // An elapsed format keeps the span: projcore cannot schedule elapsed duration.
+        put(&mut s, NEWEST_PROGRESS.duration_format, &8u16.to_le_bytes());
+        let elapsed = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(elapsed.tasks[0].duration_min, 960);
+
+        // An unknown format likewise keeps the span.
+        put(
+            &mut s,
+            NEWEST_PROGRESS.duration_format,
+            &21u16.to_le_bytes(),
+        );
+        let unknown = crate::project::project_from_mpp(&file(&s, true)).unwrap();
+        assert_eq!(unknown.tasks[0].duration_min, 960);
+    }
+    #[test]
+    fn negative_stored_duration_names_uid() {
+        let mut s = fixture();
+        put(&mut s, NEWEST_PROGRESS.duration, &(-1i32).to_le_bytes());
+        assert_eq!(
+            decode(&file(&s, true)).unwrap_err(),
+            "negative duration for UID 1"
+        );
     }
     #[test]
     fn progress_decodes_in_mspdi_units_and_imports_as_read() {

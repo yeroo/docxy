@@ -237,6 +237,20 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
         check_progress(a, e, source, &at);
+        if !e.summary && a.duration_min.is_some() {
+            assert_eq!(
+                a.duration_min,
+                Some(e.duration_min),
+                "{}",
+                at("stored duration")
+            );
+            assert_eq!(
+                a.duration_format.map(i32::from),
+                formats.get(&e.uid).copied(),
+                "{}",
+                at("stored DurationFormat")
+            );
+        }
         assert_eq!(a.manual, e.manual, "{}", at("manual"));
         if e.manual {
             assert_eq!(
@@ -345,11 +359,30 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
             .unwrap()
             .exceptions;
         let mut selected = 0usize;
+        let mut duration_compared = 0usize;
+        let mut split_duration_compared = false;
         let mut dropped = [0usize; 6]; // split, delayed assignment, elapsed, own calendar, recurring exception, nonworking start
         let mut compared_uids = Vec::new();
         for (task, expected_task) in imported.tasks.iter().zip(&expected) {
             if task.summary || task.manual || expected_task.milestone {
                 continue;
+            }
+            if formats
+                .get(&task.uid)
+                .is_some_and(|format| matches!(format & !32, 3 | 5 | 7 | 9 | 11))
+            {
+                assert_eq!(
+                    task.duration_min,
+                    expected_task.duration_min,
+                    "{}: stored working duration UID {}",
+                    mpp.display(),
+                    task.uid
+                );
+                duration_compared += 1;
+                if mpp.file_stem().is_some_and(|stem| stem == "13-split-task") && task.uid == 23 {
+                    assert_eq!(task.duration_min, 1920);
+                    split_duration_compared = true;
+                }
             }
             // Splits are not decoded from .mpp; this known task has a work
             // interruption that makes its duration shorter than its span.
@@ -421,11 +454,18 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         }
         if dropped.iter().any(|&n| n > 0) {
             eprintln!(
-                "{}: selected {selected}, exclusions split/delayed-assignment/elapsed/task-calendar/recurring-exception/nonworking-start = {dropped:?}",
+                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/task-calendar/recurring-exception/nonworking-start = {dropped:?}",
                 mpp.display()
             );
         }
         let stem = mpp.file_stem().unwrap().to_string_lossy();
+        if stem == "13-split-task" {
+            assert!(
+                split_duration_compared,
+                "{}: split task duration was not compared",
+                mpp.display()
+            );
+        }
         let recurrence = oracle
             .calendar(oracle.default_calendar_uid)
             .and_then(|cal| cal.exceptions.first());
