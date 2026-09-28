@@ -181,6 +181,7 @@ Project's warning have no MSPDI field; projcore's unit tests check them.
 | `25-derived-calendar-holiday` | exceptions on a derived calendar | the base's holiday beats a weekday the derived calendar states; the derived calendar's own exception beats the base's holiday |
 | `26-lag-percent-elapsed` | percentage and elapsed lags | ±% of the predecessor's duration, ±elapsed days across a weekend on FS/SS/FF/SF links, an estimated elapsed week, a working lag in hours; the lag and its `LagFormat` survive MSPDI and `.yppx` |
 | `27-manual-summary` | manually scheduled summaries | a manual summary keeps its own Start/Finish: a short one under an auto summary (whose slack its fixed span bounds), one whose finish is the project finish, its start flooring an ASAP subtask, a link pushing one past it and an MSO subtask ignoring it |
+| `28-work-weeks` | alternate work weeks | date-ranged weekday changes, non-working Friday, extra Saturday inherited by Alice, fallback to the calendar's default week and base chain, and exception precedence (#218) |
 
 See `manifest.json` for machine-readable tags.
 

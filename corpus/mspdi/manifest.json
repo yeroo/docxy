@@ -276,6 +276,18 @@
         "constraint"
       ],
       "desc": "Manual summaries keep their own dates: a short one under an auto summary, one whose finish is the project finish, a start floor a link overrides and a constrained subtask ignores."
+    },
+    {
+      "file": "28-work-weeks.xml",
+      "category": "calendar",
+      "tags": [
+        "calendar",
+        "work-week",
+        "derived-calendar",
+        "calendar-exception",
+        "round-trip"
+      ],
+      "desc": "Named alternate work weeks change hours and working days, inherit unstated days, and yield to exceptions across the base chain."
     }
   ]
 }

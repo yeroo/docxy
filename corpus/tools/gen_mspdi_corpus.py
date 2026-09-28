@@ -19,7 +19,7 @@ exceptions, #126) were verified against Project Professional 2024 (build
 16.0.17932.21000), as generated and as projcore's write_mspdi writes them, as
 was file 26 (percentage and elapsed lags, #104), whose plan and values come
 from Project itself (gen_mpp_lag_cases.py), and file 27 (manual summaries,
-#124).
+    #124), and file 28 (alternate work weeks, #218).
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -178,6 +178,25 @@ def exceptions(exs):
             out += working_times(times)
         out.append("    </Exception>")
     out.append("    </Exceptions>")
+    return "\n".join(out)
+
+
+def work_weeks(weeks):
+    """Named alternate weeks: (name, first, last, stated weekdays).
+
+    Each weekday is (MSPDI DayType, working times). Missing weekdays inherit
+    that calendar's own default week, then its base calendar.
+    """
+    out = ["    <WorkWeeks>"]
+    for name, first, last, days in weeks:
+        out += ["      <WorkWeek>",
+                f"        <TimePeriod><FromDate>{first}T00:00:00</FromDate>"
+                f"<ToDate>{last}T23:59:00</ToDate></TimePeriod>",
+                f"        <Name>{name}</Name>", "        <WeekDays>"]
+        out += [weekday(day_type, bool(times), times)
+                for day_type, times in sorted(days)]
+        out += ["        </WeekDays>", "      </WorkWeek>"]
+    out.append("    </WorkWeeks>")
     return "\n".join(out)
 
 
@@ -976,6 +995,78 @@ def build():
                  cdate=dt(3)),
             task(10, "Z", 10 * D, dt(2), dt(13, "17:00:00"), slack=4 * D, critical=False),
         ])))
+
+    # 28 — alternate work weeks (#218), from the Project 2024 probe in
+    # .workbench/review/probe.py. Each task uses an SNET date to isolate one
+    # calendar cell. The oracle below was checked against Project 2024;
+    # Alice's Saturday start also proves inheritance of the base work week.
+    summer = ("Summer", "2026-03-09", "2026-03-20", [
+        (2, [("07:00:00", "12:00:00"), ("13:00:00", "18:00:00")]),
+        (6, []), (7, [("08:00:00", "12:00:00")])])
+    crew_week = ("Crew", "2026-03-09", "2026-03-13", [
+        (4, [("08:00:00", "09:00:00")]),
+        (5, [("12:00:00", "13:00:00")])])
+    late = ("Late", "2026-03-16", "2026-03-20", [
+        (2, [("10:00:00", "11:00:00")])])
+    standard_days = [weekday(1, False, []), weekday(2, True, SHIFT),
+                     weekday(3, True, [("09:00:00", "12:00:00")])]
+    standard_days += [weekday(i, True, SHIFT) for i in (4, 5, 6)]
+    standard_days.append(weekday(7, False, []))
+    holiday = [("Holiday", "2026-03-11", "2026-03-11", [])]
+    standard_28 = ("  <Calendar><UID>1</UID><Name>Standard</Name>"
+                   "<IsBaseCalendar>1</IsBaseCalendar>\n<WeekDays>\n"
+                   + "\n".join(standard_days + [exception_legacy(holiday[0])])
+                   + "\n</WeekDays>\n" + exceptions(holiday) + "\n"
+                   + work_weeks([summer]) + "\n  </Calendar>")
+
+    def derived(uid, name, own_days, weeks=()):
+        return (f"  <Calendar><UID>{uid}</UID><Name>{name}</Name>"
+                "<IsBaseCalendar>0</IsBaseCalendar>"
+                "<BaseCalendarUID>1</BaseCalendarUID>\n<WeekDays>\n"
+                + "\n".join(own_days) + "\n</WeekDays>\n"
+                + (work_weeks(weeks) + "\n" if weeks else "")
+                + "  </Calendar>")
+
+    alice_28 = derived(2, "Alice", [weekday(2, True, [("10:00:00", "12:00:00")])])
+    bob_28 = derived(3, "Bob", [weekday(3, True, [("14:00:00", "16:00:00")])],
+                     [crew_week])
+    carol_28 = derived(4, "Carol", [weekday(2, True, [("15:00:00", "16:00:00")])],
+                       [late])
+    resources_28 = "\n".join(
+        f"    <Resource><UID>{uid}</UID><ID>{uid}</ID><Name>{name}</Name>"
+        f"<Type>1</Type><MaxUnits>1</MaxUnits><CalendarUID>{uid + 1}</CalendarUID></Resource>"
+        for uid, name in enumerate(("Alice", "Bob", "Carol"), 1))
+    cases_28 = [
+        # name, minutes, constraint, Project start, Project finish, calendar, slack (min)
+        ("Summer Mon", 120, dt(9, "07:00:00"), dt(9, "07:00:00"), dt(9, "09:00:00"), 1, 3240),
+        ("Summer Tue", 120, dt(10, "09:00:00"), dt(10, "09:00:00"), dt(10, "11:00:00"), 1, 2640),
+        ("Holiday", 120, dt(11), dt(12), dt(12, "10:00:00"), 1, 2460),
+        ("Summer Fri/Sat", 180, dt(12, "16:00:00"), dt(12, "16:00:00"),
+         dt(14, "10:00:00"), 1, 1980),
+        ("Summer end", 180, dt(19, "16:00:00"), dt(19, "16:00:00"),
+         dt(23, "10:00:00"), 1, 0),
+        ("Alice Mon", 90, dt(9, "10:00:00"), dt(9, "10:00:00"),
+         dt(9, "11:30:00"), 2, 2190),
+        ("Alice Fri", 90, dt(13), dt(14), dt(14, "09:30:00"), 2, 1410),
+        ("Bob Wed", 60, dt(11), dt(12, "12:00:00"), dt(12, "13:00:00"), 3, 2040),
+        ("Bob Thu", 60, dt(12, "12:00:00"), dt(12, "12:00:00"),
+         dt(12, "13:00:00"), 3, 2040),
+        ("Bob Mon", 120, dt(9, "07:00:00"), dt(9, "07:00:00"),
+         dt(9, "09:00:00"), 3, 2700),
+        ("Carol Mon", 60, dt(16, "10:00:00"), dt(16, "10:00:00"),
+         dt(16, "11:00:00"), 4, 1140),
+    ]
+    add("28-work-weeks.xml", ["calendar", "work-week", "derived-calendar",
+                               "calendar-exception", "round-trip"],
+        "Named alternate work weeks change hours and working days, inherit "
+        "unstated days, and yield to exceptions across the base chain.",
+        project("work-weeks", "\n".join(
+            task(uid, name, duration, start, finish, slack=slack, critical=(uid == 5),
+                 ctype=SNET, cdate=constraint, calendar=cal)
+            for uid, (name, duration, constraint, start, finish, cal, slack)
+            in enumerate(cases_28, 1)),
+            resources_xml=resources_28,
+            calendars=[standard_28, alice_28, bob_28, carol_28]))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",
