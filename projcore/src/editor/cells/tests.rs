@@ -2450,6 +2450,7 @@ fn lag_pred(uid: i32, lag: i64, code: i64) -> Predecessor {
         link: LinkType::FinishStart,
         lag,
         lag_format: LagFormat::from_code(code).unwrap(),
+        ..Predecessor::fs(uid)
     }
 }
 
@@ -2504,7 +2505,7 @@ fn every_supported_lag_format_reads_back_what_the_cell_shows() {
             let mut task = p.tasks[1].clone();
             task.predecessors = vec![pred];
             let text = format_predecessors(&task, p);
-            let back = parse_predecessors(&text, p).unwrap()[0];
+            let back = parse_predecessors(&text, p).unwrap()[0].clone();
             assert_eq!(back.lag, lag, "{text}");
             let month_in_days = format.kind() == LagKind::Working
                 && format.unit() == LagUnit::Month
@@ -2638,19 +2639,20 @@ fn re_entering_a_cell_keeps_links_shown_in_a_fallback_unit() {
         uid: 20,
         ..lag_pred(20, 100, 7)
     };
-    ed.set_predecessors(30, vec![month, odd]).unwrap();
+    ed.set_predecessors(30, vec![month.clone(), odd.clone()])
+        .unwrap();
     let task = &ed.project().tasks[2];
     let text = format_predecessors(task, ed.project());
     assert_eq!(text, "1FS+20d, 2FS+100m");
     // Unchanged text is no edit.
     let depth = ed.undo_depth();
     let same = parse_task_predecessors(&text, task, ed.project()).unwrap();
-    assert_eq!(same, vec![month, odd]);
+    assert_eq!(same, vec![month.clone(), odd]);
     ed.set_predecessors(30, same).unwrap();
     assert_eq!(ed.undo_depth(), depth);
     // Add an elapsed lag to a third link: the other two keep their formats.
     let mut ed2 = editor();
-    ed2.set_predecessors(30, vec![month]).unwrap();
+    ed2.set_predecessors(30, vec![month.clone()]).unwrap();
     let task = &ed2.project().tasks[2];
     let edited = format!("{}, 2FS+2ed", format_predecessors(task, ed2.project()));
     let parsed = parse_task_predecessors(&edited, task, ed2.project()).unwrap();

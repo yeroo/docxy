@@ -13,6 +13,7 @@ use crate::model::{
 use crate::schedule::{Leveled, Schedule, level, schedule};
 
 const UNDO_CAP: usize = 100;
+const EXTERNAL_TASK_DATES: &str = "External task: its dates come from its own project";
 
 mod cells;
 mod effort;
@@ -251,9 +252,11 @@ impl Editor {
     }
 
     /// The duration shown alongside [`Self::disp_start`]/[`Self::disp_finish`]:
-    /// a leaf's own duration, or a summary's working time between its displayed
-    /// (leveled when leveling is on) dates. `None` for an unknown or
-    /// unscheduled task.
+    /// a local leaf's own duration, or the working time between displayed dates
+    /// for a summary (on its summary calendar) or an external leaf (on its own
+    /// calendar, falling back to its stored duration if that calendar has no
+    /// working time). Dates are leveled when leveling is on. `None` for an
+    /// unknown or unscheduled task.
     pub fn disp_duration_min(&self, uid: i32) -> Option<i64> {
         let task = self.proj.task(uid)?;
         let start = self.disp_start(uid)?;
@@ -707,7 +710,7 @@ impl Editor {
         (start, finish, self.disp_duration_min(t.uid))
     }
 
-    pub fn update_task(&mut self, uid: i32, patch: TaskPatch) -> Result<(), String> {
+    pub fn update_task(&mut self, uid: i32, mut patch: TaskPatch) -> Result<(), String> {
         let i = self.index(uid)?;
         if patch.name.is_none()
             && patch.duration_min.is_none()
@@ -746,6 +749,16 @@ impl Editor {
             && patch
                 .estimated
                 .is_some_and(|e| estimate_after(t.estimated, e) != t.estimated);
+        if t.is_external_leaf() && (duration_changed || mode_changed || estimate_changed) {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
+        if t.is_external_leaf() {
+            // Re-entering unchanged schedule cells is a no-op even if an
+            // imported milestone flag is inconsistent.
+            patch.duration_min = None;
+            patch.estimated = None;
+            patch.manual = None;
+        }
         if patch.name.as_ref().is_none_or(|name| *name == t.name)
             && patch
                 .duration_min
@@ -842,6 +855,9 @@ impl Editor {
     /// Record row `i`'s scheduled start and finish as its stored dates.
     fn stamp_dates(&mut self, i: usize) {
         let task = &self.proj.tasks[i];
+        if task.is_external_leaf() {
+            return;
+        }
         let start = task
             .pinned_dates()
             .or_else(|| task.manual_summary_dates())
@@ -1062,6 +1078,7 @@ impl Editor {
                             r.early_start,
                             r.early_finish,
                         )),
+                        ..Baseline::default()
                     },
                 ))
             })
@@ -1101,6 +1118,8 @@ impl Editor {
                         finish: Some(span.1),
                         work_min: Some(a.work_min),
                         cost,
+                        bcws: None,
+                        bcwp: None,
                     },
                 ))
             })
@@ -1579,8 +1598,11 @@ fn autolink(proj: &mut Project, at: usize) -> bool {
     else {
         return false;
     };
+    let mut new_link = Predecessor::fs(a_uid);
+    new_link.cross_project = link.cross_project.take();
+    new_link.cross_project_name = link.cross_project_name.take();
     link.uid = n_uid;
-    proj.tasks[n].predecessors = vec![Predecessor::fs(a_uid)];
+    proj.tasks[n].predecessors = vec![new_link];
     true
 }
 
@@ -1724,6 +1746,40 @@ mod tests {
     use crate::schedule::TaskResult;
 
     #[test]
+    fn package_parts_survive_edit_undo_and_redo() {
+        use crate::yppx::{read_yppx, write_yppx};
+        use opccore::zip::ZipArchive;
+        use opccore::zipwrite::write_zip;
+
+        let map = b"<Types><Override PartName=\"/views.xml\" ContentType=\"application/vnd.yppx.views+xml\"/></Types>";
+        let views = b"<views><table name=\"Entry\"/></views>";
+        let entries = vec![
+            ("[Content_Types].xml".to_string(), map.to_vec()),
+            (
+                "project.xml".to_string(),
+                crate::mspdi::write_mspdi(editor().project()).into_bytes(),
+            ),
+            ("views.xml".to_string(), views.to_vec()),
+        ];
+        let mut ed = Editor::new(read_yppx(&write_zip(&entries)).unwrap());
+        ed.set_duration_min(1, 960, false).unwrap();
+        for stage in 0..3 {
+            let output = write_yppx(ed.project());
+            let zip = ZipArchive::open(&output).unwrap();
+            assert_eq!(zip.read("views.xml").unwrap(), views, "stage {stage}");
+            let types = String::from_utf8(zip.read("[Content_Types].xml").unwrap()).unwrap();
+            assert!(types.contains(
+                "<Override PartName=\"/views.xml\" ContentType=\"application/vnd.yppx.views+xml\"/>"
+            ));
+            match stage {
+                0 => assert!(ed.undo()),
+                1 => assert!(ed.redo()),
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
     fn restored_dirty_state_survives_empty_history() {
         for dirty in [false, true] {
             let mut ed = Editor::restored(untitled_project(), dirty);
@@ -1764,6 +1820,157 @@ mod tests {
     }
 
     #[test]
+    fn external_task_date_edits_are_refused_without_stamping() {
+        for manual in [false, true] {
+            let mut proj = editor().project().clone();
+            let task = &mut proj.tasks[0];
+            task.external_task = Some(true);
+            task.manual = manual;
+            task.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+            task.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+            if manual {
+                task.manual_start = task.stored_start;
+                task.manual_finish = task.stored_finish;
+            }
+            let mut ed = Editor::new(proj);
+            let before = ed.project().task(1).unwrap().clone();
+            let depth = ed.undo_depth();
+            let day = DateTime::from_ymd_hm(2026, 3, 16, 8, 0);
+            let results = [
+                ed.set_start(1, day),
+                ed.set_start_at(1, day),
+                ed.set_finish(1, day),
+                ed.set_duration(1, "2d"),
+                ed.set_duration_min(1, 960, false),
+                ed.set_constraint(1, "SNET 2026-03-16"),
+                ed.move_task(1, "5d").map(|_| ()),
+            ];
+            for result in results {
+                assert_eq!(result.unwrap_err(), EXTERNAL_TASK_DATES);
+            }
+            assert_eq!(ed.undo_depth(), depth);
+            assert_eq!(ed.project().task(1).unwrap(), &before);
+            let saved = crate::mspdi::write_mspdi(ed.project());
+            let back = crate::mspdi::read_mspdi(&saved).unwrap();
+            assert_eq!(back.task(1).unwrap().stored_start, before.stored_start);
+            assert_eq!(back.task(1).unwrap().stored_finish, before.stored_finish);
+            assert_eq!(ed.set_manual(1, !manual).unwrap_err(), EXTERNAL_TASK_DATES);
+        }
+    }
+
+    #[test]
+    fn external_resource_edits_keep_dates_and_duration() {
+        for manual in [false, true] {
+            let mut proj = editor().project().clone();
+            let task = &mut proj.tasks[0];
+            task.external_task = Some(true);
+            task.manual = manual;
+            task.effort_driven = Some(true);
+            task.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+            task.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+            task.manual_start = task.stored_start;
+            task.manual_finish = task.stored_finish;
+            task.manual_duration_min = Some(480);
+            let mut ed = Editor::new(proj);
+            ed.set_resources(1, &["Bob".into()]).unwrap();
+            let before = ed.project().task(1).unwrap().clone();
+
+            ed.set_resources(1, &["Bob[50%]".into()]).unwrap();
+            assert_eq!(ed.project().task(1).unwrap(), &before);
+            let bob = ed
+                .project()
+                .assignments
+                .iter()
+                .find(|a| a.task_uid == 1)
+                .unwrap();
+            assert_eq!(bob.work_min, 240);
+            assert!(
+                crate::assign::assignment_span(ed.project(), ed.schedule(), bob)
+                    .unwrap()
+                    .1
+                    <= before.stored_finish.unwrap()
+            );
+            ed.set_resources(1, &["Bob[50%]".into(), "Alice".into()])
+                .unwrap();
+            assert_eq!(ed.project().task(1).unwrap(), &before);
+            let mut work: Vec<_> = ed
+                .project()
+                .assignments
+                .iter()
+                .filter(|a| a.task_uid == 1)
+                .map(|a| {
+                    assert!(
+                        crate::assign::assignment_span(ed.project(), ed.schedule(), a)
+                            .unwrap()
+                            .1
+                            <= before.stored_finish.unwrap()
+                    );
+                    a.work_min
+                })
+                .collect();
+            work.sort();
+            assert_eq!(work, [240, 480]);
+        }
+    }
+
+    #[test]
+    fn external_stamp_guard_keeps_dates_even_with_a_different_manual_start() {
+        let mut proj = editor().project().clone();
+        let task = &mut proj.tasks[0];
+        task.external_task = Some(true);
+        task.manual = true;
+        task.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        task.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+        task.manual_start = Some(DateTime::from_ymd_hm(2026, 3, 16, 8, 0));
+        let mut ed = Editor::new(proj);
+        let before = ed.project().task(1).unwrap().clone();
+        ed.stamp_pinned_dates(1);
+        assert_eq!(ed.project().task(1).unwrap(), &before);
+    }
+
+    #[test]
+    fn unchanged_external_mode_and_duration_are_noops() {
+        for manual in [false, true] {
+            for estimated in [false, true] {
+                let mut proj = editor().project().clone();
+                proj.tasks[0].external_task = Some(true);
+                proj.tasks[0].manual = manual;
+                proj.tasks[0].milestone = true;
+                proj.tasks[0].estimated = Some(estimated);
+                let mut ed = Editor::new(proj);
+                let before = ed.project().task(1).unwrap().clone();
+                let depth = ed.undo_depth();
+                ed.set_manual(1, manual).unwrap();
+                ed.set_duration_min(1, 480, estimated).unwrap();
+                ed.set_duration(1, if estimated { "1d?" } else { "1d" })
+                    .unwrap();
+                assert_eq!(ed.undo_depth(), depth);
+                assert_eq!(ed.project().task(1).unwrap(), &before);
+                ed.update_task(
+                    1,
+                    TaskPatch {
+                        name: Some("Renamed".into()),
+                        manual: Some(manual),
+                        ..TaskPatch::default()
+                    },
+                )
+                .unwrap();
+                assert_eq!(ed.project().task(1).unwrap().name, "Renamed");
+                assert_eq!(ed.project().task(1).unwrap().duration_min, 480);
+                assert_eq!(ed.set_manual(1, !manual).unwrap_err(), EXTERNAL_TASK_DATES);
+                assert_eq!(
+                    ed.set_duration_min(1, 480, !estimated).unwrap_err(),
+                    EXTERNAL_TASK_DATES
+                );
+                assert_eq!(
+                    ed.set_duration_min(1, 960, false).unwrap_err(),
+                    EXTERNAL_TASK_DATES
+                );
+            }
+        }
+    }
+
+    #[test]
     fn set_baseline_captures_durations_and_preserves_other_slots_and_history() {
         let saved = Baseline {
             number: 1,
@@ -1793,7 +2000,7 @@ mod tests {
             },
         ];
         for task in &mut proj.tasks {
-            task.set_baseline_slot(saved);
+            task.set_baseline_slot(saved.clone());
             task.set_baseline_slot(Baseline {
                 duration_min: Some(60),
                 ..Baseline::default()
@@ -1872,11 +2079,19 @@ mod tests {
             start: Some(DateTime::from_ymd_hm(2026, 1, 1, 8, 0)),
             finish: Some(DateTime::from_ymd_hm(2026, 1, 1, 9, 0)),
             cost,
-            baselines: vec![AssignmentBaseline {
-                number: 1,
-                work_min: Some(1),
-                ..AssignmentBaseline::default()
-            }],
+            baselines: vec![
+                AssignmentBaseline {
+                    number: 0,
+                    bcws: rate("5"),
+                    bcwp: rate("5"),
+                    ..AssignmentBaseline::default()
+                },
+                AssignmentBaseline {
+                    number: 1,
+                    work_min: Some(1),
+                    ..AssignmentBaseline::default()
+                },
+            ],
             timephased_data: vec![record(1), record(4), record(5), record(16)],
             ..Assignment::default()
         };
@@ -1898,6 +2113,7 @@ mod tests {
             assert_eq!(b.finish, Some(monday.add_minutes(9 * 60)), "{}", a.uid);
             assert_eq!(b.work_min, Some(480));
             assert_eq!(b.cost.as_ref().map(Rate::as_str), Some(cost), "{}", a.uid);
+            assert_eq!((b.bcws.clone(), b.bcwp.clone()), (None, None), "{}", a.uid);
             assert_eq!(a.baseline(1).unwrap().work_min, Some(1));
             let kinds: Vec<u8> = a.timephased_data.iter().map(|t| t.kind).collect();
             assert_eq!(kinds, [1, 16]);
@@ -3242,7 +3458,7 @@ mod tests {
             ),
             (
                 "set_predecessors",
-                Box::new(move |ed| ed.set_predecessors(3, vec![fs1])),
+                Box::new(move |ed| ed.set_predecessors(3, vec![fs1.clone()])),
             ),
             (
                 "assign_resource",
@@ -3340,7 +3556,7 @@ mod tests {
         assert_eq!(back.tasks, ed.project().tasks);
         // A new link to the blank row is still refused.
         let mut added = ed.project().task(2).unwrap().predecessors.clone();
-        added.push(links[1]);
+        added.push(links[1].clone());
         assert_eq!(
             ed.set_predecessors(2, added).unwrap_err(),
             "No task with ID 3"
@@ -3899,6 +4115,31 @@ mod tests {
             assert_eq!(preds(&ed, 2), [(1, LinkType::FinishStart, 960)]);
             assert_eq!(ed.project().tasks.len(), 2);
         }
+    }
+
+    #[test]
+    fn autolink_moves_cross_project_fields_with_the_external_endpoint() {
+        let mut proj = chain(LinkType::FinishStart, 0, Some(true))
+            .project()
+            .clone();
+        proj.tasks[0].external_task = Some(true);
+        let link = &mut proj.tasks[1].predecessors[0];
+        link.cross_project = Some(true);
+        link.cross_project_name = Some(r"C:\plans\other.mpp\7".into());
+        let mut ed = Editor::new(proj);
+        let at = ed.add_task(Some(1), "N", 480, false).unwrap();
+        let new_uid = ed.project().tasks[at].uid;
+        let to_external = &ed.project().task(new_uid).unwrap().predecessors[0];
+        assert_eq!(to_external.uid, 1);
+        assert_eq!(to_external.cross_project, Some(true));
+        assert_eq!(
+            to_external.cross_project_name.as_deref(),
+            Some(r"C:\plans\other.mpp\7")
+        );
+        let to_new = &ed.project().task(2).unwrap().predecessors[0];
+        assert_eq!(to_new.uid, new_uid);
+        assert_eq!(to_new.cross_project, None);
+        assert_eq!(to_new.cross_project_name, None);
     }
 
     #[test]
@@ -4674,7 +4915,7 @@ mod tests {
         let mut ed = Editor::new(proj);
         let mut retained = Predecessor::fs(1);
         retained.lag = 60;
-        ed.set_predecessors(2, vec![retained]).unwrap();
+        ed.set_predecessors(2, vec![retained.clone()]).unwrap();
         assert_eq!(ed.project().task(2).unwrap().predecessors, [retained]);
         let before = state(&ed);
         assert!(
@@ -4762,6 +5003,7 @@ mod tests {
             start: Some(DateTime::from_ymd_hm(2026, 1, 5, 8, 0)),
             finish: Some(DateTime::from_ymd_hm(2026, 1, 5, 17, 0)),
             duration_min: Some(480),
+            ..Baseline::default()
         };
         proj.tasks[0].set_baseline_slot(slot(0));
         proj.tasks[0].set_baseline_slot(slot(1));

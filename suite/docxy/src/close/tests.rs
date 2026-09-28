@@ -82,10 +82,11 @@ fn sheet_pending_edit_commits_before_asking_and_is_undoable() {
     };
     assert_eq!(v.undo.len(), 1);
     assert!(v.redo.is_empty());
-    assert_eq!(v.anchor, (2, 2));
+    assert_eq!(v.anchor, v.sel);
     let snap = v.undo.pop().unwrap();
     v.restore(snap);
     assert_eq!(v.edit_string(0, 0), before);
+    assert_eq!(v.anchor, (2, 2));
     assert!(!v.commit_edit());
     assert!(v.undo.is_empty());
 }
@@ -497,6 +498,164 @@ fn a_cancelled_single_close_keeps_an_untouched_cell_editor_open_as_seeded() {
 }
 
 #[test]
+fn close_dialog_save_preserves_an_untouched_text_cell_on_disk() {
+    let dir = close_test_dir("untouched-cell-close-save");
+    let path = dir.join("saved.xlsx");
+    let mut t = untouched_text_cell();
+    t.path = Some(path.clone());
+    t.dirty = true; // Another change caused the close dialog to ask.
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.anchor = (2, 2);
+    assert_eq!(
+        close_step(&mut t, |_| Ok(CloseAnswer::Save)),
+        CloseStep::Save
+    );
+    assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
+        "in-place save asked"
+    )));
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    assert_eq!(v.anchor, (2, 2));
+    assert!(!t.dirty, "{}", t.status);
+    assert!(path.is_file(), "{}", t.status);
+    a1_is_text_007(&tab_from_path(&path));
+}
+
+#[test]
+fn close_dialog_save_collapses_a_range_when_it_commits_a_changed_cell() {
+    let mut t = untouched_text_cell();
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.anchor = (2, 2);
+    v.editing = Some("abc".into());
+    assert_eq!(
+        close_step(&mut t, |_| Ok(CloseAnswer::Save)),
+        CloseStep::Save
+    );
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.anchor, v.sel);
+    assert!(v.editing.is_none());
+    assert_eq!(v.undo.len(), 1);
+}
+
+#[test]
+fn save_preserves_an_untouched_cell_editor_and_clean_tab() {
+    let dir = close_test_dir("untouched-cell-save");
+    let path = dir.join("saved.xlsx");
+    let mut t = untouched_text_cell();
+    t.path = Some(path.clone());
+    assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
+        "in-place save asked"
+    )));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    a1_is_text_007(&t);
+    assert!(path.is_file(), "{}", t.status);
+    a1_is_text_007(&tab_from_path(&path));
+}
+
+#[test]
+fn cancelled_save_as_keeps_an_untouched_cell_editor_open() {
+    let mut t = untouched_text_cell();
+    assert!(save_sheet_tab(&mut t, false, true, |_| None));
+    assert_eq!(t.status.as_ref(), "save cancelled");
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    a1_is_text_007(&t);
+}
+
+#[test]
+fn save_as_uses_the_picker_and_preserves_an_untouched_text_cell() {
+    let dir = close_test_dir("untouched-cell-save-as");
+    let path = dir.join("picked.xlsx");
+    let mut t = untouched_text_cell();
+    assert!(save_sheet_tab(&mut t, false, true, |suggested| {
+        assert_eq!(suggested, "basic.xlsx");
+        Some(path.clone())
+    }));
+    assert_eq!(t.path.as_deref(), Some(path.as_path()));
+    assert!(!t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("007"));
+    assert!(v.undo.is_empty());
+    a1_is_text_007(&tab_from_path(&path));
+}
+
+#[test]
+fn save_commits_a_changed_cell_editor_before_writing() {
+    let dir = close_test_dir("changed-cell-save");
+    for (buffer, expected) in [
+        ("abc", gridcore::sheet::CellValue::Text("abc".into())),
+        ("008", gridcore::sheet::CellValue::Number(8.0)),
+    ] {
+        let path = dir.join(format!("{buffer}.xlsx"));
+        let mut t = untouched_text_cell();
+        t.path = Some(path.clone());
+        let Surface::Sheet(v) = &mut t.surface else {
+            panic!()
+        };
+        v.anchor = (2, 2);
+        v.editing = Some(buffer.into());
+        assert!(save_sheet_tab(&mut t, false, false, |_| panic!(
+            "in-place save asked"
+        )));
+        let Surface::Sheet(v) = &t.surface else {
+            panic!()
+        };
+        assert!(v.editing.is_none(), "{buffer}");
+        assert_eq!(v.undo.len(), 1, "{buffer}");
+        assert_eq!(v.anchor, v.sel, "{buffer}");
+        assert!(!t.dirty, "{}", t.status);
+        assert!(path.is_file(), "{}", t.status);
+        let reloaded = tab_from_path(&path);
+        let Surface::Sheet(v) = &reloaded.surface else {
+            panic!("{}", reloaded.status)
+        };
+        assert_eq!(
+            v.sheet().cell(0, 0).map(|c| &c.value),
+            Some(&expected),
+            "{buffer}"
+        );
+    }
+}
+
+#[test]
+fn preparing_a_changed_cell_for_save_marks_dirty_and_collapses_selection() {
+    let mut t = untouched_text_cell();
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.anchor = (2, 2);
+    v.editing = Some("abc".into());
+    prepare_sheet_save(&mut t);
+    assert!(t.dirty);
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.undo.len(), 1);
+    assert!(v.editing.is_none());
+    assert_eq!(v.anchor, v.sel);
+}
+
+#[test]
 fn a_tab_that_failed_to_load_stays_unsaveable_after_a_restart() {
     let dir = close_test_dir("load-failed-source");
     let path = dir.join("broken.docx");
@@ -586,6 +745,35 @@ fn a_session_from_before_the_mark_asks_the_file_whether_it_loads() {
     assert_eq!(doc_text(&r), text);
     assert!(save_doc_tab(&mut r, None), "{}", r.status);
     assert!(!tab_from_path(&gone).load_failed);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_session_from_before_strict_markdown_decoding_cannot_overwrite_its_source() {
+    let dir = close_test_dir("legacy-markdown-session");
+    let path = dir.join("legacy.md");
+    // The old decoder saved its replacement characters in the sidecar and
+    // marked the tab as loaded. Recreate that persisted state.
+    std::fs::write(&path, "caf\u{fffd}\n").unwrap();
+    let mut tab = tab_from_path(&path);
+    assert!(!tab.load_failed);
+    tab.dirty = true;
+    let persisted = persist_tab(&dir, 0, &tab);
+    assert!(persisted.hot.is_some());
+    assert_eq!(persisted.load_failed, Some(false));
+
+    let original = b"caf\xE9\n";
+    std::fs::write(&path, original).unwrap();
+    let mut restored = restore_tab(&persisted);
+    assert!(restored.load_failed, "{}", restored.status);
+    assert!(
+        restored.status.starts_with("load error"),
+        "{}",
+        restored.status
+    );
+    assert!(!save_doc_tab(&mut restored, None));
+    assert_eq!(restored.status.as_ref(), DOC_LOAD_FAILED_SAVE);
+    assert_eq!(std::fs::read(&path).unwrap(), original);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

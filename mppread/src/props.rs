@@ -45,6 +45,35 @@ pub(crate) fn entries(b: &[u8]) -> Result<HashMap<u32, &[u8]>, String> {
 
 /// `NewTasksAreManual`: a 2-byte value, `0`, `1`, or `0x00ff`.
 pub(crate) const NEW_TASKS_ARE_MANUAL: u32 = 0x0240_13c8;
+/// Project's default base calendar name, observed changing from Standard to
+/// Night in the paired c1 calendar probe.
+const DEFAULT_CALENDAR_NAME: u32 = 0x0240_000e;
+
+pub(crate) fn default_calendar_name(b: &[u8]) -> Result<Option<String>, String> {
+    let entries = entries(b)?;
+    let Some(raw) = entries.get(&DEFAULT_CALENDAR_NAME) else {
+        return Ok(None);
+    };
+    if raw.len() < 4 || !raw.len().is_multiple_of(2) {
+        return Err("invalid default calendar name in Props".into());
+    }
+    let units: Vec<_> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let end = units
+        .iter()
+        .position(|&u| u == 0)
+        .ok_or("unterminated default calendar name")?;
+    if end == 0 || units[end..].iter().any(|&u| u != 0) {
+        return Err("invalid default calendar name padding".into());
+    }
+    let name =
+        String::from_utf16(&units[..end]).map_err(|_| "invalid UTF-16 default calendar name")?;
+    Ok(Some(name))
+}
 
 pub(crate) fn new_tasks_are_manual(b: &[u8]) -> Result<bool, String> {
     match entries(b)?.get(&NEW_TASKS_ARE_MANUAL) {

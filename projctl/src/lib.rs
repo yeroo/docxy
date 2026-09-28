@@ -307,6 +307,7 @@ fn link_add(ed: &mut Editor, args: &Json) -> Result<Json, String> {
             link,
             lag,
             lag_format,
+            ..Predecessor::fs(pred)
         },
     )?;
     task_get(ed, args)
@@ -774,7 +775,7 @@ mod tests {
         dispatch_editor(&mut ed, "link.add", &link)
             .unwrap()
             .unwrap();
-        let pred = ed.project().tasks[1].predecessors[0];
+        let pred = &ed.project().tasks[1].predecessors[0];
         assert_eq!(pred.link, LinkType::StartStart);
         assert_eq!((pred.lag, pred.lag_format.code()), (240, 5));
         dispatch_editor(&mut ed, "link.del", &link)

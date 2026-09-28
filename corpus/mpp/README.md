@@ -118,6 +118,48 @@ the same way:
 python corpus/tools/gen_mpp_manual_cases.py
 ```
 
+The calendar decoder has five Project-written probes in `calendar/`: a non-UID-1
+default base calendar, edited base hours, a resource calendar with two weekday
+overrides, a Unicode calendar name with five periods, and a derived 24-hour day.
+Generate them with a licensed Project desktop install and pywin32:
+
+```powershell
+python corpus/tools/gen_mpp_calendar_cases.py
+```
+
+The binary and XML pairs stay git-ignored. The oracle test checks their exact
+calendar UIDs, names, base links, weekdays and default calendar UID when present.
+
+The exception decoder has eleven MSPDI-seeded and eight COM-created Project-written
+probes in `exceptions/` (plus one optional Period 300 COM case): multi-day
+holidays, a working Saturday with two periods, daily/weekly/monthly/yearly
+recurrences, a derived calendar exception, several sorted exceptions, and a
+Unicode name. Generate them with:
+
+```powershell
+python corpus/tools/gen_mpp_exception_cases.py
+```
+
+The `.xml` output is Project's own export: a rewrite of the temporary MSPDI
+seed for `e*` cases, and an export of the COM-built project for `k*` cases. The
+oracle test compares every exception field in the decoded `.mpp` to that XML.
+
+In newest Project files, key 8 of `TBkndCal/Var2Data` starts with seven
+60-byte weekday records. At byte 420 is a `u16` exception count and a zero
+`u16`. Each exception has a 92-byte fixed record followed by a length-prefixed,
+four-byte-aligned UTF-16 name; a four-byte work-week count follows the last
+exception. In each fixed record, +0/+2 are inclusive from/to days since
+1983-12-31, +4 is occurrences, +8 is EnteredByOccurrences, +14 is the working
+period count, +20 has five `u16` period starts and +32 five `i32` durations
+(tenths of a minute), +52 has cumulative durations, +72 is the MSPDI exception
+type, +76..+79 are type-specific recurrence bytes (including `u16` periods at
++78 for Types 4–6 and +76 for Type 7), and +88 is the name byte
+length. +80 holds a Project-assigned exception identifier that does not appear
+in MSPDI. Types 2/3 are yearly by date/position, 4/5 monthly by date/position,
+6 weekly, and 7 every N days. Type 8 has no binary probe and is not decoded.
+The decoder refuses Type 8, unknown types and malformed records; the later
+work-week records are a separate decode gap.
+
 It also checks six task-progress cases in `progress/` when present (see
 Known decode gaps). It also checks two link-lag cases in `lag/` when present
 ([#104](https://github.com/yeroo/docxy/issues/104)): percentage, elapsed and
@@ -194,9 +236,18 @@ field map before it can be imported.
 Current Project blank rows are identified by their short FixedMeta record and
 omitted, while their row IDs still count toward ID continuity. Superseded task
 records after a move are ignored by their FixedMeta kind. Tasks are emitted in
-row ID order. Resources, assignments, calendars, baselines, constraints, and
-custom fields are not imported. Task progress is (see below); assignment
-progress needs assignments first.
+row ID order. Resources, assignments, baselines, constraints, and custom fields
+are not imported. Newest-layout base and derived calendars, their weekdays,
+exceptions, the default calendar and task calendar assignments are imported;
+work weeks are not decoded. Tasks using a calendar with work weeks keep the
+earlier import behaviour: their task calendar is not assigned. Auto tasks use
+the Start–Finish span on the project calendar; manual tasks keep their stored
+manual duration and use that span only if it is absent.
+Type 8 exceptions and record shapes not covered by the
+Project-written probes refuse the file. An invalid newest calendar table refuses
+import. Files without
+`TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
+imported (see below); assignment progress needs assignments first.
 
 Task mode is decoded for the newest layout. The manual flag is bit `0x80` of
 byte 8 of the task's `Fixed2Meta` entry, and a manual task's start, finish and
@@ -232,14 +283,26 @@ values):
 | Work, ActualWork, RemainingWork | +8, +16, +24 | f64, thousandths of a minute |
 | Cost, ActualCost, RemainingCost | +32, +40, +56 | f64 in MSPDI's units, which Project's export rounds to two decimals |
 | ActualDuration, RemainingDuration | +80, +88 | i32, tenths of a minute |
+| Duration | +84 | i32, tenths of a minute |
 | PercentComplete, PercentWorkComplete | +92, +94 | u16 |
 | ActualStart, ActualFinish | +120, +124 | timestamp; NA (no date) before the task starts or finishes |
 | Resume, Stop | +132, +136 | timestamp; NA on a task not started |
+| DurationFormat | +164 | u16, MSPDI format code |
+| CalendarUID | +178 | i32; -1 means project calendar |
 | PhysicalPercentComplete | Var2Data key `0x045f` | u16 block, written only when nonzero |
 
 Durations and work are rounded to whole minutes, as MSPDI import rounds
 seconds. Every numeric field is present on every task, zero included, since
 Project's export writes them all; only the four dates can be absent.
+For auto leaves with a working DurationFormat, the importer uses stored
+Duration and the task's assigned calendar. Elapsed or unknown formats still
+use the working Start–Finish span on that calendar because the project model
+does not retain DurationFormat. Split segments and delayed assignments are
+not decoded: those tasks retain Project's stored Start and Finish but can
+schedule an earlier Finish when their stored Duration omits the gap.
+Resource calendars are not used by projcore's scheduler: a resourced task's
+Duration may move its scheduled Finish earlier or later than Project's stored
+Finish. MSPDI import of the same plan has the same limitation.
 StartVariance, FinishVariance and WorkVariance are **not stored**: Project
 derives them at export from the baseline (Var2Data keeps the baseline
 duration, start and finish under keys `0x001b`, `0x002b` and `0x002c`), and

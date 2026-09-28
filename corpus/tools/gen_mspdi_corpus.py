@@ -18,8 +18,8 @@ Project, as is file 23's derived calendar (#83). Files 24 and 25 (calendar
 exceptions, #126) were verified against Project Professional 2024 (build
 16.0.17932.21000), as generated and as projcore's write_mspdi writes them, as
 was file 26 (percentage and elapsed lags, #104), whose plan and values come
-from Project itself (gen_mpp_lag_cases.py), and file 27 (manual summaries,
-#124).
+from Project itself (gen_mpp_lag_cases.py), file 27 (manual summaries, #124),
+and file 28 (alternate work weeks, #218).
 
 Every file isolates exactly ONE feature (one link type, one constraint, one
 rollup rule) so a failing assertion points at a single code path, mirroring
@@ -50,7 +50,8 @@ def iso(minutes):
 def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
          outline=1, summary=False, milestone=False, preds=(), ctype=None,
          cdate=None, calendar=None, baselines=(), manual=None, manual_start=None,
-         manual_finish=None, manual_duration=None, fields=(), ext=()):
+         manual_finish=None, manual_duration=None, fields=(), ext=(), outline_codes=(),
+         timephased=()):
     """One <Task>. `preds` is a list of (uid, type_code, link_lag) or
     (uid, type_code, link_lag, lag_format): LinkLag is tenths of a minute, or
     the percentage itself for LagFormat 19; the format defaults to 7 (days).
@@ -109,6 +110,14 @@ def task(uid, name, dur_min, start, finish, *, slack, critical, oid=None,
             if value is not None:
                 lines.append(f"        <{tag}>{value}</{tag}>")
         lines.append("      </Baseline>")
+    for code in outline_codes:
+        lines.append("      <OutlineCode>")
+        lines += [f"        <{tag}>{value}</{tag}>" for tag, value in code]
+        lines.append("      </OutlineCode>")
+    for record in timephased:
+        lines += ["      <TimephasedData>"]
+        lines += [f"        <{tag}>{value}</{tag}>" for tag, value in record]
+        lines.append("      </TimephasedData>")
     lines.append("    </Task>")
     return "\n".join(lines)
 
@@ -172,6 +181,25 @@ def exceptions(exs):
     return "\n".join(out)
 
 
+def work_weeks(weeks):
+    """Named alternate weeks: (name, first, last, stated weekdays).
+
+    Each weekday is (MSPDI DayType, working times). Missing weekdays inherit
+    that calendar's own default week, then its base calendar.
+    """
+    out = ["    <WorkWeeks>"]
+    for name, first, last, days in weeks:
+        out += ["      <WorkWeek>",
+                f"        <TimePeriod><FromDate>{first}T00:00:00</FromDate>"
+                f"<ToDate>{last}T23:59:00</ToDate></TimePeriod>",
+                f"        <Name>{name}</Name>", "        <WeekDays>"]
+        out += [weekday(day_type, bool(times), times)
+                for day_type, times in sorted(days)]
+        out += ["        </WeekDays>", "      </WorkWeek>"]
+    out.append("    </WorkWeeks>")
+    return "\n".join(out)
+
+
 def standard_calendar(uid=1, name="Standard", saturday=False, exs=()):
     """Standard's week. `exs` are its date-range exceptions, written in both
     forms as Project writes them: legacy `DayType 0` weekdays and
@@ -193,7 +221,8 @@ def standard_calendar(uid=1, name="Standard", saturday=False, exs=()):
 
 
 def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
-            calendars=None, new_tasks_are_manual=None, extended_attributes=""):
+            calendars=None, new_tasks_are_manual=None, extended_attributes="",
+            outline_codes="", wbs_masks=""):
     calendars = calendars or [standard_calendar()]
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -210,6 +239,10 @@ def project(name, tasks_xml, *, resources_xml="", assignments_xml="",
     ]
     if new_tasks_are_manual is not None:
         parts.append(f"  <NewTasksAreManual>{new_tasks_are_manual}</NewTasksAreManual>")
+    if outline_codes:
+        parts += ["  <OutlineCodes>", outline_codes, "  </OutlineCodes>"]
+    if wbs_masks:
+        parts += ["  <WBSMasks>", wbs_masks, "  </WBSMasks>"]
     if extended_attributes:
         # Custom field definitions (#268): after the header, before the tasks.
         parts += ["  <ExtendedAttributes>", extended_attributes, "  </ExtendedAttributes>"]
@@ -477,6 +510,7 @@ def build():
                 "</ExtendedAttribute>"
                 f"<Baseline><Number>0</Number><Start>{dt(2)}</Start>"
                 f"<Finish>{dt(3, '17:00:00')}</Finish><Work>PT16H0M0S</Work><Cost>970</Cost>"
+                "<BCWS>230</BCWS><BCWP>205.5</BCWP>"
                 "</Baseline>"
                 f"<TimephasedData><Type>1</Type><UID>1</UID><Start>{dt(2)}</Start>"
                 f"<Finish>{dt(3)}</Finish><Unit>2</Unit><Value>PT8H0M0S</Value></TimephasedData>"
@@ -619,6 +653,25 @@ def build():
         "      <Formula>[Duration]*2</Formula>",
         "    </ExtendedAttribute>",
     ])
+    outline_definitions = "\n".join([
+        "    <OutlineCode>",
+        "      <FieldID>188744105</FieldID><FieldName>Task Outline Code1</FieldName>",
+        "      <Alias>Zone &amp; trade</Alias>",
+        "      <Masks><Mask><Level>1</Level><Type>0</Type><Length>2</Length>"
+        "<Separator>.</Separator></Mask></Masks>",
+        "      <Values><Value><ValueID>1</ValueID><Description>Civil</Description></Value>"
+        "<Value><ValueID>2</ValueID><Description>M&amp;E</Description></Value></Values>",
+        "    </OutlineCode>",
+    ])
+    wbs_mask = "\n".join([
+        "    <VerifyUniqueCodes>1</VerifyUniqueCodes>",
+        "    <GenerateCodes>1</GenerateCodes>",
+        "    <Prefix>PRJ-</Prefix>",
+        "    <WBSMask><Level>1</Level><Type>0</Type><Length>2</Length>"
+        "<Separator>.</Separator></WBSMask>",
+        "    <WBSMask><Level>2</Level><Type>1</Type><Length>0</Length>"
+        "<Separator>-</Separator></WBSMask>",
+    ])
     common = [("LevelAssignments", 1), ("LevelingCanSplit", 1),
               ("LevelingDelay", 0), ("LevelingDelayFormat", 8),
               ("IgnoreResourceCalendar", 0), ("HideBar", 0), ("EarnedValueMethod", 0),
@@ -632,7 +685,7 @@ def build():
 
     add("20-task-fields.xml", ["task-fields", "round-trip", "blank-row", "summary", "link",
                                "link-fs", "custom-fields"],
-        "Task type, estimate, active, deadline, levelling, custom fields and a blank row "
+        "Task type, estimate, active, deadline, levelling, hyperlink, notes, commitment metadata, custom fields and a blank row "
         "survive saves.",
         project("task-fields", "\n".join([
             task(1, "Phase", 3 * D, dt(2), dt(4, "17:00:00"), **CRIT, summary=True,
@@ -647,25 +700,44 @@ def build():
                  ext=[[("FieldID", 188743731), ("Value", "Civil"),
                        ("ValueGUID", "7F2B5E61-7C21-4E0A-9B55-3C8D12A4E101")],
                       [("FieldID", 188743783), ("Value", iso(4 * D)),
-                       ("DurationFormat", 7)]]),
+                       ("DurationFormat", 7)]],
+                 outline_codes=[[("FieldID", 188744105), ("ValueID", 1)],
+                                [("FieldID", 188744105), ("ValueID", 2),
+                                 ("ValueGUID", "7F2B5E61-7C21-4E0A-9B55-3C8D12A4E102")]]),
             blank_row(3, 3, ident(3)),
             # Its link from the blank row is ignored: Pour follows Excavate.
             task(4, "Pour", D, dt(4), dt(4, "17:00:00"), **CRIT, outline=2,
                  preds=[(2, FS, 0), (3, FS, 0)],
-                 fields=ident(4) + [("Active", 1), ("Type", 2), ("WBS", "1.2"),
+                 fields=ident(4) + [("Active", 1), ("Type", 2),
+                                    ("Contact", "Site lead"), ("WBS", "1.2"),
+                                    ("WBSLevel", "Level 2"),
                                     ("Priority", 500), ("Estimated", 1),
+                                    ("DisplayAsSummary", 0),
                                     ("EffortDriven", 0), ("Work", iso(0)),
                                     ("Deadline", dt(20, "17:00:00")),
                                     ("LevelAssignments", 0), ("LevelingCanSplit", 0),
                                     ("LevelingDelay", 4800), ("LevelingDelayFormat", 7),
-                                    ("IgnoreResourceCalendar", 1), ("HideBar", 1),
-                                    ("EarnedValueMethod", 1), ("Rollup", 0)],
+                                    ("SubprojectName", "Concrete phase"),
+                                    ("PreLeveledStart", dt(4)),
+                                    ("PreLeveledFinish", dt(4, "17:00:00")),
+                                    ("Hyperlink", "Pour instructions"),
+                                    ("HyperlinkAddress", "https://example.com/a?x=1&amp;y=2"),
+                                    ("HyperlinkSubAddress", "Gantt Chart!4"),
+                                    ("IgnoreResourceCalendar", 1),
+                                    ("Notes", "Check forms &amp; rebar"),
+                                    ("HideBar", 1), ("EarnedValueMethod", 1),
+                                    ("Rollup", 0), ("IsPublished", 0),
+                                    ("StatusManager", "Alice"),
+                                    ("CommitmentStart", dt(5)),
+                                    ("CommitmentFinish", dt(5, "17:00:00")),
+                                    ("CommitmentType", 2)],
                  ext=[[("FieldID", 188743731), ("Value", "M&amp;E")]]),
             # Inactive: Project drops it from the schedule; docxy does not yet.
             task(5, "Inspect", D, dt(2), dt(2, "17:00:00"), slack=2 * D, critical=False,
                  fields=ident(5) + [("Active", 0), ("Type", 1), ("WBS", "2"),
                                     ("Priority", 500), ("Estimated", 1)] + common),
-        ]), extended_attributes=definitions))
+        ]), extended_attributes=definitions, outline_codes=outline_definitions,
+        wbs_masks=wbs_mask))
 
     # 21 — B misses its Deadline by 5 days. The deadline bounds late finish
     # only: dates stay put and A and B both get -5d total slack (#100).
@@ -677,7 +749,7 @@ def build():
                  preds=[(1, FS, 0)], fields=[("Deadline", dt(6, "17:00:00"))]),
         ])))
 
-    # 22 — recorded progress survives saves (#81): a complete task, an
+    # 22 — recorded progress survives saves (#81, #182): a complete task, an
     # in-progress task stopped Thu 5 and resuming Fri 6, and a not-started
     # task, each with an assignment carrying its actuals; the in-progress
     # assignment also has two baseline slots. Shapes follow a Project 2024
@@ -729,8 +801,8 @@ def build():
             ("RemainingWork", iso(D))]),
     ])
     add("22-progress.xml", ["progress", "assignment", "round-trip", "link", "link-fs"],
-        "Percent complete, actuals, stop/resume, remaining values, variances and "
-        "assignment baselines survive saves.",
+        "Percent complete, actuals, stop/resume, overtime, earned value, task "
+        "timephased data, remaining values, variances and assignment baselines survive saves.",
         project("progress", "\n".join([
             task(1, "Excavate", 2 * D, dt(2), dt(3, "17:00:00"), slack=0, critical=False,
                  fields=[
@@ -739,7 +811,18 @@ def build():
                 ("PercentComplete", 100), ("PercentWorkComplete", 100),
                 ("ActualStart", dt(2)), ("ActualFinish", dt(3, "17:00:00")),
                 ("ActualDuration", iso(2 * D)), ("ActualCost", "800"),
-                ("ActualWork", iso(2 * D)), ("PhysicalPercentComplete", 0)]),
+                ("ActualWork", iso(2 * D)), ("PhysicalPercentComplete", 0),
+                ("ResumeValid", 1), ("OvertimeCost", "80.25"),
+                ("OvertimeWork", iso(60)), ("ActualOvertimeCost", "80.25"),
+                ("ActualOvertimeWork", iso(60)), ("RegularWork", iso(2 * D - 60)),
+                ("RemainingOvertimeCost", "0"), ("RemainingOvertimeWork", iso(0)),
+                ("ACWP", "800.25"), ("CV", "-12.5"),
+                ("BCWS", "805.5"), ("BCWP", "787.75"),
+                ("ActualWorkProtected", iso(2 * D)),
+                ("ActualOvertimeWorkProtected", iso(60))],
+                 timephased=[[("Type", 2), ("UID", 1), ("Start", dt(2)),
+                              ("Finish", dt(3, "17:00:00")), ("Unit", 2),
+                              ("Value", iso(2 * D))]]),
             task(2, "Pour", 4 * D, dt(4), dt(9, "17:00:00"), **CRIT, preds=[(1, FS, 0)],
                  fields=[
                 ("Stop", dt(5, "17:00:00")), ("Resume", dt(6)),
@@ -749,13 +832,35 @@ def build():
                 ("ActualDuration", iso(2 * D)), ("ActualCost", "800"),
                 ("ActualWork", iso(2 * D)), ("RemainingDuration", iso(2 * D)),
                 ("RemainingCost", "800"), ("RemainingWork", iso(2 * D)),
-                ("PhysicalPercentComplete", 40)]),
+                ("PhysicalPercentComplete", 40),
+                ("ResumeValid", 1), ("OvertimeCost", "120.50"),
+                ("OvertimeWork", iso(90)), ("ActualOvertimeCost", "40.25"),
+                ("ActualOvertimeWork", iso(30)), ("RegularWork", iso(4 * D - 90)),
+                ("RemainingOvertimeCost", "80.25"),
+                ("RemainingOvertimeWork", iso(60)),
+                ("ACWP", "801.125"), ("CV", "-7.75"),
+                ("BCWS", "1600.25"), ("BCWP", "799.75"),
+                ("ActualWorkProtected", iso(2 * D)),
+                ("ActualOvertimeWorkProtected", iso(30))],
+                 timephased=[[("Type", 2), ("UID", 2), ("Start", dt(4)),
+                              ("Finish", dt(5, "17:00:00")), ("Unit", 2),
+                              ("Value", iso(2 * D))],
+                             [("Type", 99), ("UID", 2), ("Start", dt(6)),
+                              ("Finish", dt(6, "17:00:00")), ("Unit", 2),
+                              ("Value", "3.5")]]),
             task(3, "Cure", D, dt(10), dt(10, "17:00:00"), **CRIT, preds=[(2, FS, 0)],
                  fields=[
                 ("StartVariance", 4800), ("FinishVariance", 4800),
                 ("PercentComplete", 0), ("PercentWorkComplete", 0),
                 ("RemainingDuration", iso(D)), ("RemainingCost", "400"),
-                ("RemainingWork", iso(D)), ("PhysicalPercentComplete", 0)]),
+                ("RemainingWork", iso(D)), ("PhysicalPercentComplete", 0),
+                ("ResumeValid", 0), ("OvertimeCost", "0"),
+                ("OvertimeWork", iso(0)), ("ActualOvertimeCost", "0"),
+                ("ActualOvertimeWork", iso(0)), ("RegularWork", iso(D)),
+                ("RemainingOvertimeCost", "0"), ("RemainingOvertimeWork", iso(0)),
+                ("ACWP", "0"), ("CV", "0"), ("BCWS", "0"), ("BCWP", "0"),
+                ("ActualWorkProtected", iso(0)),
+                ("ActualOvertimeWorkProtected", iso(0))]),
         ]), resources_xml=progress_res, assignments_xml=progress_asn))
 
     # 23 — a derived calendar keeps its base through a save (#83): "Crew"
@@ -903,6 +1008,78 @@ def build():
                  cdate=dt(3)),
             task(10, "Z", 10 * D, dt(2), dt(13, "17:00:00"), slack=4 * D, critical=False),
         ])))
+
+    # 28 — alternate work weeks (#218), from the Project 2024 precedence
+    # probe documented in corpus/mspdi/README.md. Each task uses SNET to isolate one
+    # calendar cell. The oracle below was checked against Project 2024;
+    # Alice's Saturday start also proves inheritance of the base work week.
+    summer = ("Summer", "2026-03-09", "2026-03-20", [
+        (2, [("07:00:00", "12:00:00"), ("13:00:00", "18:00:00")]),
+        (6, []), (7, [("08:00:00", "12:00:00")])])
+    crew_week = ("Crew", "2026-03-09", "2026-03-13", [
+        (4, [("08:00:00", "09:00:00")]),
+        (5, [("12:00:00", "13:00:00")])])
+    late = ("Late", "2026-03-16", "2026-03-20", [
+        (2, [("10:00:00", "11:00:00")])])
+    standard_days = [weekday(1, False, []), weekday(2, True, SHIFT),
+                     weekday(3, True, [("09:00:00", "12:00:00")])]
+    standard_days += [weekday(i, True, SHIFT) for i in (4, 5, 6)]
+    standard_days.append(weekday(7, False, []))
+    holiday = [("Holiday", "2026-03-11", "2026-03-11", [])]
+    standard_28 = ("  <Calendar><UID>1</UID><Name>Standard</Name>"
+                   "<IsBaseCalendar>1</IsBaseCalendar>\n<WeekDays>\n"
+                   + "\n".join(standard_days + [exception_legacy(holiday[0])])
+                   + "\n</WeekDays>\n" + exceptions(holiday) + "\n"
+                   + work_weeks([summer]) + "\n  </Calendar>")
+
+    def derived(uid, name, own_days, weeks=()):
+        return (f"  <Calendar><UID>{uid}</UID><Name>{name}</Name>"
+                "<IsBaseCalendar>0</IsBaseCalendar>"
+                "<BaseCalendarUID>1</BaseCalendarUID>\n<WeekDays>\n"
+                + "\n".join(own_days) + "\n</WeekDays>\n"
+                + (work_weeks(weeks) + "\n" if weeks else "")
+                + "  </Calendar>")
+
+    alice_28 = derived(2, "Alice", [weekday(2, True, [("10:00:00", "12:00:00")])])
+    bob_28 = derived(3, "Bob", [weekday(3, True, [("14:00:00", "16:00:00")])],
+                     [crew_week])
+    carol_28 = derived(4, "Carol", [weekday(2, True, [("15:00:00", "16:00:00")])],
+                       [late])
+    resources_28 = "\n".join(
+        f"    <Resource><UID>{uid}</UID><ID>{uid}</ID><Name>{name}</Name>"
+        f"<Type>1</Type><MaxUnits>1</MaxUnits><CalendarUID>{uid + 1}</CalendarUID></Resource>"
+        for uid, name in enumerate(("Alice", "Bob", "Carol"), 1))
+    cases_28 = [
+        # name, minutes, constraint, Project start, Project finish, calendar, slack (min)
+        ("Summer Mon", 120, dt(9, "07:00:00"), dt(9, "07:00:00"), dt(9, "09:00:00"), 1, 3240),
+        ("Summer Tue", 120, dt(10, "09:00:00"), dt(10, "09:00:00"), dt(10, "11:00:00"), 1, 2640),
+        ("Holiday", 120, dt(11), dt(12), dt(12, "10:00:00"), 1, 2460),
+        ("Summer Fri/Sat", 180, dt(12, "16:00:00"), dt(12, "16:00:00"),
+         dt(14, "10:00:00"), 1, 1980),
+        ("Summer end", 180, dt(19, "16:00:00"), dt(19, "16:00:00"),
+         dt(23, "10:00:00"), 1, 0),
+        ("Alice Mon", 90, dt(9, "10:00:00"), dt(9, "10:00:00"),
+         dt(9, "11:30:00"), 2, 2190),
+        ("Alice Fri", 90, dt(13), dt(14), dt(14, "09:30:00"), 2, 1410),
+        ("Bob Wed", 60, dt(11), dt(12, "12:00:00"), dt(12, "13:00:00"), 3, 2040),
+        ("Bob Thu", 60, dt(12, "12:00:00"), dt(12, "12:00:00"),
+         dt(12, "13:00:00"), 3, 2040),
+        ("Bob Mon", 120, dt(9, "07:00:00"), dt(9, "07:00:00"),
+         dt(9, "09:00:00"), 3, 2700),
+        ("Carol Mon", 60, dt(16, "10:00:00"), dt(16, "10:00:00"),
+         dt(16, "11:00:00"), 4, 1140),
+    ]
+    add("28-work-weeks.xml", ["calendar", "work-week", "derived-calendar",
+                               "calendar-exception", "round-trip"],
+        "Named alternate work weeks change hours and working days, inherit "
+        "unstated days, and yield to exceptions across the base chain.",
+        project("work-weeks", "\n".join(
+            task(uid, name, duration, start, finish, slack=slack, critical=(uid == 5),
+                 ctype=SNET, cdate=constraint, calendar=cal)
+            for uid, (name, duration, constraint, start, finish, cal, slack)
+            in enumerate(cases_28, 1)),
+            resources_xml=resources_28,
+            calendars=[standard_28, alice_28, bob_28, carol_28]))
 
     manifest = {
         "anchor": "2026-03-02T08:00:00",

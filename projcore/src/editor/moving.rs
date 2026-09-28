@@ -21,6 +21,9 @@ impl Editor {
     /// which links or leveling can hold later than the moved-to date.
     pub fn move_task(&mut self, uid: i32, text: &str) -> Result<DateTime, String> {
         let task = &self.proj.tasks[self.index(uid)?];
+        if task.is_external_leaf() {
+            return Err(EXTERNAL_TASK_DATES.into());
+        }
         if task.is_null {
             return Err("The row has no task to move".into());
         }

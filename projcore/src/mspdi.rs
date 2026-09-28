@@ -115,19 +115,27 @@ pub fn read_mspdi(xml: &str) -> Result<Project, String> {
                     "Resources" => parse_resources(&mut p, &mut proj.resources),
                     "Assignments" => parse_assignments(&mut p, &mut proj.assignments),
                     "Calendars" => parse_calendars(&mut p, &mut proj.calendars),
-                    "ExtendedAttributes" => parse_extended_attribute_definitions(
+                    "OutlineCodes" if kept_as_element(&p) => {
+                        parse_definitions(&mut p, "OutlineCode", &mut proj.outline_code_definitions)
+                    }
+                    "WBSMasks" if kept_as_element(&p) => {
+                        let block = parse_element(&mut p, 0);
+                        if !block.children.is_empty() {
+                            proj.wbs_masks = Some(block);
+                        }
+                    }
+                    "ExtendedAttributes" => parse_definitions(
                         &mut p,
+                        "ExtendedAttribute",
                         &mut proj.extended_attribute_definitions,
                     ),
-                    // Any other leaf is a project option docxy does not model:
-                    // keep its text so a save writes it back. A block with
-                    // child elements (OutlineCodes, WBSMasks, ...) is
-                    // consumed whole so its children can't be mistaken for
-                    // header fields. So is a prefixed element or one carrying
-                    // attributes: an option stores only a name and text, so
-                    // writing it back would lose its namespace binding (an
-                    // unbound `x:` prefix, or a foreign `xmlns` moved into
-                    // MSPDI's) or attributes such as `xsi:nil`.
+                    // A prefixed or attributed element (leaf or block) is
+                    // consumed here, including OutlineCodes/WBSMasks wrappers:
+                    // an option stores only name and text, so writing it back
+                    // would lose namespace bindings or attributes like xsi:nil.
+                    // The final arm keeps plain unknown leaves as options.
+                    // Plain unknown blocks such as Views reach that arm, but
+                    // leaf_text_of returns None and drops them whole.
                     _ if !kept_as_element(&p) => p.skip_element(),
                     _ => {
                         if let Some(text) = leaf_text_of(&mut p) {
@@ -332,10 +340,13 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "ExtendedAttribute" => {
                         t.extended_attributes.extend(parse_extended_attribute(p));
                     }
+                    "OutlineCode" => t.outline_codes.extend(parse_outline_code(p)),
                     "IsNull" => t.is_null = bool_of(p),
                     "GUID" => t.guid = guid_of(p),
                     "CreateDate" => t.create_date = DateTime::parse_mspdi(&text_of(p)),
+                    "Contact" => t.contact = Some(text_of(p)),
                     "WBS" => t.wbs = Some(text_of(p)),
+                    "WBSLevel" => t.wbs_level = Some(text_of(p)),
                     "Type" => t.task_type = opt_int_of(p).and_then(TaskType::from_code),
                     "Active" => t.active = opt_bool_of(p),
                     "EffortDriven" => t.effort_driven = opt_bool_of(p),
@@ -350,14 +361,32 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "LevelingCanSplit" => t.leveling_can_split = opt_bool_of(p),
                     "LevelingDelay" => t.leveling_delay = opt_int_of(p),
                     "LevelingDelayFormat" => t.leveling_delay_format = opt_i32_of(p),
+                    "PreLeveledStart" => t.pre_leveled_start = DateTime::parse_mspdi(&text_of(p)),
+                    "PreLeveledFinish" => t.pre_leveled_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "Hyperlink" => t.hyperlink = Some(text_of(p)),
+                    "HyperlinkAddress" => t.hyperlink_address = Some(text_of(p)),
+                    "HyperlinkSubAddress" => t.hyperlink_sub_address = Some(text_of(p)),
                     "IgnoreResourceCalendar" => t.ignore_resource_calendar = opt_bool_of(p),
+                    "Notes" => t.notes = Some(text_of(p)),
                     "EarnedValueMethod" => t.earned_value_method = opt_i32_of(p),
                     "Recurring" => t.recurring = opt_bool_of(p),
                     "HideBar" => t.hide_bar = opt_bool_of(p),
                     "Rollup" => t.rollup = opt_bool_of(p),
                     "ExternalTask" => t.external_task = opt_bool_of(p),
+                    "ExternalTaskProject" => t.external_task_project = Some(text_of(p)),
                     "IsSubproject" => t.is_subproject = opt_bool_of(p),
                     "IsSubprojectReadOnly" => t.is_subproject_read_only = opt_bool_of(p),
+                    "SubprojectName" => t.subproject_name = Some(text_of(p)),
+                    "DisplayAsSummary" => t.display_as_summary = opt_bool_of(p),
+                    "IsPublished" => t.is_published = opt_bool_of(p),
+                    "StatusManager" => t.status_manager = Some(text_of(p)),
+                    "CommitmentStart" => t.commitment_start = DateTime::parse_mspdi(&text_of(p)),
+                    "CommitmentFinish" => t.commitment_finish = DateTime::parse_mspdi(&text_of(p)),
+                    "CommitmentType" => {
+                        t.commitment_type = opt_int_of(p)
+                            .filter(|n| (0..=2).contains(n))
+                            .map(|n| n as i32);
+                    }
                     "Work" => t.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => t.cost = rate_of(p),
                     "FixedCost" => t.fixed_cost = rate_of(p),
@@ -372,6 +401,7 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "ActualFinish" => t.actual_finish = DateTime::parse_mspdi(&text_of(p)),
                     "Stop" => t.stop = DateTime::parse_mspdi(&text_of(p)),
                     "Resume" => t.resume = DateTime::parse_mspdi(&text_of(p)),
+                    "ResumeValid" => t.resume_valid = opt_bool_of(p),
                     "ActualDuration" => t.actual_duration_min = try_iso8601_to_minutes(&text_of(p)),
                     "RemainingDuration" => {
                         t.remaining_duration_min = try_iso8601_to_minutes(&text_of(p));
@@ -380,6 +410,28 @@ fn parse_task(p: &mut XmlParser) -> Result<(Task, Option<i32>), String> {
                     "RemainingWork" => t.remaining_work_min = try_iso8601_to_minutes(&text_of(p)),
                     "ActualCost" => t.actual_cost = rate_of(p),
                     "RemainingCost" => t.remaining_cost = rate_of(p),
+                    "OvertimeCost" => t.overtime_cost = rate_of(p),
+                    "OvertimeWork" => t.overtime_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "ActualOvertimeCost" => t.actual_overtime_cost = rate_of(p),
+                    "ActualOvertimeWork" => {
+                        t.actual_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "RegularWork" => t.regular_work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "RemainingOvertimeCost" => t.remaining_overtime_cost = rate_of(p),
+                    "RemainingOvertimeWork" => {
+                        t.remaining_overtime_work_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ACWP" => t.acwp = rate_of(p),
+                    "CV" => t.cv = rate_of(p),
+                    "BCWS" => t.bcws = rate_of(p),
+                    "BCWP" => t.bcwp = rate_of(p),
+                    "ActualWorkProtected" => {
+                        t.actual_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "ActualOvertimeWorkProtected" => {
+                        t.actual_overtime_work_protected_min = try_iso8601_to_minutes(&text_of(p));
+                    }
+                    "TimephasedData" => t.timephased_data.extend(parse_timephased_data(p)),
                     "StartVariance" => t.start_variance = opt_int_of(p),
                     "FinishVariance" => t.finish_variance = opt_int_of(p),
                     "WorkVariance" => t.work_variance = rate_of(p),
@@ -414,6 +466,9 @@ fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
                     "Start" => baseline.start = DateTime::parse_mspdi(&text_of(p)),
                     "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
                     "Duration" => baseline.duration_min = try_iso8601_to_minutes(&text_of(p)),
+                    "DurationFormat" => baseline.duration_format = opt_u8_of(p),
+                    "Work" => baseline.work_min = try_iso8601_to_minutes(&text_of(p)),
+                    "Cost" => baseline.cost = rate_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -422,8 +477,7 @@ fn parse_baseline(p: &mut XmlParser, t: &mut Task) {
         }
     }
     if let Some(number) = number {
-        if baseline.start.is_some() || baseline.finish.is_some() || baseline.duration_min.is_some()
-        {
+        if baseline != Baseline::default() {
             baseline.number = number;
             t.set_baseline_slot(baseline);
         }
@@ -435,6 +489,8 @@ fn parse_predecessor(p: &mut XmlParser) -> Result<Option<Predecessor>, i64> {
     let mut uid: Option<i32> = None;
     let mut link = LinkType::FinishStart;
     let mut link_lag: i64 = 0;
+    let mut cross_project = None;
+    let mut cross_project_name = None;
     // An absent LagFormat is days, as docxy has always read it.
     let mut format_code = LagFormat::DAYS.code();
     loop {
@@ -447,6 +503,8 @@ fn parse_predecessor(p: &mut XmlParser) -> Result<Option<Predecessor>, i64> {
                         link = LinkType::from_code(int_of(p)).unwrap_or(LinkType::FinishStart)
                     }
                     "LinkLag" => link_lag = int_of(p),
+                    "CrossProject" => cross_project = opt_bool_of(p),
+                    "CrossProjectName" => cross_project_name = Some(text_of(p)),
                     "LagFormat" => format_code = int_of(p),
                     _ => p.skip_element(),
                 }
@@ -462,6 +520,8 @@ fn parse_predecessor(p: &mut XmlParser) -> Result<Option<Predecessor>, i64> {
         link,
         lag,
         lag_format,
+        cross_project,
+        cross_project_name,
     }))
 }
 
@@ -743,6 +803,8 @@ fn parse_assignment_baseline(p: &mut XmlParser, a: &mut Assignment) {
                     "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
                     "Work" => baseline.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => baseline.cost = rate_of(p),
+                    "BCWS" => baseline.bcws = rate_of(p),
+                    "BCWP" => baseline.bcwp = rate_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -886,7 +948,7 @@ fn parse_extended_attribute(p: &mut XmlParser) -> Option<ExtendedAttributeValue>
     Some(attribute)
 }
 
-/// Parse one resource outline code value; `None` without a `FieldID`, which
+/// Parse one task or resource outline code value; `None` without a `FieldID`, which
 /// names it.
 fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
     let mut field_id = None;
@@ -910,12 +972,12 @@ fn parse_outline_code(p: &mut XmlParser) -> Option<OutlineCodeValue> {
     Some(code)
 }
 
-/// Collect the custom field definitions of an `<ExtendedAttributes>` block,
-/// each `<ExtendedAttribute>` kept whole; any other child is skipped.
-fn parse_extended_attribute_definitions(p: &mut XmlParser, out: &mut Vec<XmlElement>) {
+/// Keep matching definitions in an `<OutlineCodes>` or
+/// `<ExtendedAttributes>` block whole; skip other children.
+fn parse_definitions(p: &mut XmlParser, child_name: &str, out: &mut Vec<XmlElement>) {
     loop {
         match p.next() {
-            Event::Start if p.name() == "ExtendedAttribute" && kept_as_element(p) => {
+            Event::Start if p.name() == child_name && kept_as_element(p) => {
                 out.push(parse_element(p, 1));
             }
             Event::Start => p.skip_element(),
@@ -932,7 +994,7 @@ fn kept_as_element(p: &XmlParser) -> bool {
     !p.name().contains(':') && p.attrs().is_empty()
 }
 
-/// How deep a kept definition goes, counting its `<ExtendedAttribute>` as 1.
+/// How deep a kept definition goes, counting its root as 1.
 /// Project's deepest is 4 (`ExtendedAttribute/ValueList/Value/ID`); the bound
 /// keeps a crafted file from overflowing the stack of the recursive reader,
 /// writer, and the tree's derived `Clone`/`PartialEq`/`Drop`.
@@ -1020,6 +1082,7 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
         is_baseline_calendar: false,
         week: Default::default(),
         exceptions: Vec::new(),
+        work_weeks: Vec::new(),
     };
     let mut is_base = false;
     let mut base_uid: Option<i32> = None;
@@ -1036,6 +1099,7 @@ fn parse_calendar(p: &mut XmlParser) -> Calendar {
                     "BaseCalendarUID" => base_uid = opt_i32_of(p),
                     "WeekDays" => parse_weekdays(p, &mut cal.week, &mut legacy),
                     "Exceptions" => parse_exceptions(p, &mut cal.exceptions),
+                    "WorkWeeks" => parse_work_weeks(p, &mut cal.work_weeks),
                     _ => p.skip_element(),
                 }
             }
@@ -1144,6 +1208,45 @@ fn parse_time_period(p: &mut XmlParser) -> (Option<DateTime>, Option<DateTime>) 
         }
     }
     (from, to)
+}
+
+fn parse_work_weeks(p: &mut XmlParser, out: &mut Vec<WorkWeek>) {
+    loop {
+        match p.next() {
+            Event::Start => {
+                if p.name() == "WorkWeek" {
+                    out.push(parse_work_week(p));
+                } else {
+                    p.skip_element();
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+}
+
+fn parse_work_week(p: &mut XmlParser) -> WorkWeek {
+    let mut work_week = WorkWeek::default();
+    let mut legacy = Vec::new();
+    loop {
+        match p.next() {
+            Event::Start => {
+                let name = p.name().to_string();
+                match name.as_str() {
+                    "TimePeriod" => {
+                        (work_week.from, work_week.to) = parse_time_period(p);
+                    }
+                    "Name" => work_week.name = Some(text_of(p)),
+                    "WeekDays" => parse_weekdays(p, &mut work_week.week, &mut legacy),
+                    _ => p.skip_element(),
+                }
+            }
+            Event::End | Event::Eof => break,
+            _ => {}
+        }
+    }
+    work_week
 }
 
 fn parse_exceptions(p: &mut XmlParser, out: &mut Vec<CalendarException>) {
@@ -1382,11 +1485,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// Emits the fields projcore models — enough for MS Project to open the file
 /// and for our own reader to round-trip — plus every project-level option the
 /// reader kept verbatim in [`Project::options`]: the schema's in
-/// [`PROJECT_HEADER`] order, then any others in read order. The custom field
-/// definitions in [`Project::extended_attribute_definitions`] follow, as one
-/// `<ExtendedAttributes>` block. Other elements outside the model (views,
-/// outline codes, WBS masks) are not preserved: this is a model-faithful
-/// writer, not a byte-faithful one. Each task's stored
+/// [`PROJECT_HEADER`] order, then any others in read order. Outline code
+/// definitions, WBS masks and extended attribute definitions follow in schema
+/// order. Other elements outside the model (views, etc.) are not preserved:
+/// this is a model-faithful writer, not a byte-faithful one. Each task's stored
 /// `Start`/`Finish` are written when present (e.g. after scheduling and
 /// stamping them back), so a scheduled project exports with dates Project can
 /// display without recalculating.
@@ -1423,8 +1525,17 @@ pub fn write_mspdi(proj: &Project) -> String {
             tag(&mut s, 1, name, text);
         }
     }
-    // After the header leaves (and the schema's OutlineCodes and WBSMasks,
-    // which docxy does not keep), before Calendars and Tasks.
+    // Definition blocks follow header leaves and precede Calendars and Tasks.
+    if !proj.outline_code_definitions.is_empty() {
+        s.push_str("  <OutlineCodes>\n");
+        for definition in &proj.outline_code_definitions {
+            write_element(&mut s, 2, definition);
+        }
+        s.push_str("  </OutlineCodes>\n");
+    }
+    if let Some(block) = &proj.wbs_masks {
+        write_element(&mut s, 1, block);
+    }
     if !proj.extended_attribute_definitions.is_empty() {
         s.push_str("  <ExtendedAttributes>\n");
         for definition in &proj.extended_attribute_definitions {
@@ -1657,6 +1768,13 @@ fn opt_work(s: &mut String, name: &str, value: Option<i64>) {
 /// fields and none of the elements every task otherwise states.
 fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     let task = !t.is_null;
+    // Display dates for an external placeholder are not local calculations.
+    // Keep its stored Start/Finish; do not synthesize Critical or slack.
+    let result = if t.is_external_leaf() {
+        None
+    } else {
+        computed.result
+    };
     s.push_str("    <Task>\n");
     tag(s, 3, "UID", &t.uid.to_string());
     opt_text(s, "GUID", t.guid.as_ref());
@@ -1674,7 +1792,9 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     // Every row states it, as Project writes it.
     tag(s, 3, "IsNull", flag(t.is_null));
     opt_date(s, "CreateDate", t.create_date);
+    opt_text(s, "Contact", t.contact.as_deref());
     opt_text(s, "WBS", t.wbs.as_ref());
+    opt_text(s, "WBSLevel", t.wbs_level.as_deref());
     opt_text(s, "OutlineNumber", computed.outline_number);
     tag(s, 3, "OutlineLevel", &t.outline_level.to_string());
     opt_text(s, "Priority", t.priority);
@@ -1692,6 +1812,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_text(s, "Work", t.work_min.map(min_to_iso));
     opt_date(s, "Stop", t.stop);
     opt_date(s, "Resume", t.resume);
+    opt_flag(s, "ResumeValid", t.resume_valid);
     opt_flag(s, "EffortDriven", t.effort_driven);
     opt_flag(s, "Recurring", t.recurring);
     opt_flag(s, "OverAllocated", t.over_allocated);
@@ -1702,11 +1823,14 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     if task {
         tag(s, 3, "Summary", flag(t.summary));
     }
-    opt_flag(s, "Critical", computed.result.map(|r| r.critical));
+    opt_flag(s, "DisplayAsSummary", t.display_as_summary);
+    opt_flag(s, "Critical", result.map(|r| r.critical));
     opt_flag(s, "IsSubproject", t.is_subproject);
     opt_flag(s, "IsSubprojectReadOnly", t.is_subproject_read_only);
+    opt_text(s, "SubprojectName", t.subproject_name.as_deref());
     opt_flag(s, "ExternalTask", t.external_task);
-    if let Some(r) = computed.result {
+    opt_text(s, "ExternalTaskProject", t.external_task_project.as_ref());
+    if let Some(r) = result {
         tag(s, 3, "EarlyStart", &r.early_start.to_mspdi());
         tag(s, 3, "EarlyFinish", &r.early_finish.to_mspdi());
         tag(s, 3, "LateStart", &r.late_start.to_mspdi());
@@ -1719,7 +1843,7 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         "WorkVariance",
         t.work_variance.as_ref().map(Rate::as_str),
     );
-    if let Some(r) = computed.result {
+    if let Some(r) = result {
         // Slack is working minutes in the model, tenths of a minute in MSPDI.
         for (name, min) in [
             ("FreeSlack", r.free_slack_min),
@@ -1739,11 +1863,28 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_text(s, "PercentComplete", t.percent_complete);
     opt_text(s, "PercentWorkComplete", t.percent_work_complete);
     opt_text(s, "Cost", t.cost.as_ref().map(Rate::as_str));
+    opt_text(
+        s,
+        "OvertimeCost",
+        t.overtime_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(s, "OvertimeWork", t.overtime_work_min.map(min_to_iso));
     opt_date(s, "ActualStart", t.actual_start);
     opt_date(s, "ActualFinish", t.actual_finish);
     opt_text(s, "ActualDuration", t.actual_duration_min.map(min_to_iso));
     opt_text(s, "ActualCost", t.actual_cost.as_ref().map(Rate::as_str));
+    opt_text(
+        s,
+        "ActualOvertimeCost",
+        t.actual_overtime_cost.as_ref().map(Rate::as_str),
+    );
     opt_text(s, "ActualWork", t.actual_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "ActualOvertimeWork",
+        t.actual_overtime_work_min.map(min_to_iso),
+    );
+    opt_text(s, "RegularWork", t.regular_work_min.map(min_to_iso));
     opt_text(
         s,
         "RemainingDuration",
@@ -1755,6 +1896,18 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         t.remaining_cost.as_ref().map(Rate::as_str),
     );
     opt_text(s, "RemainingWork", t.remaining_work_min.map(min_to_iso));
+    opt_text(
+        s,
+        "RemainingOvertimeCost",
+        t.remaining_overtime_cost.as_ref().map(Rate::as_str),
+    );
+    opt_text(
+        s,
+        "RemainingOvertimeWork",
+        t.remaining_overtime_work_min.map(min_to_iso),
+    );
+    opt_text(s, "ACWP", t.acwp.as_ref().map(Rate::as_str));
+    opt_text(s, "CV", t.cv.as_ref().map(Rate::as_str));
     if task || t.constraint != ConstraintType::AsSoonAsPossible {
         tag(s, 3, "ConstraintType", &t.constraint.code().to_string());
     }
@@ -1765,19 +1918,43 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
     opt_flag(s, "LevelingCanSplit", t.leveling_can_split);
     opt_text(s, "LevelingDelay", t.leveling_delay);
     opt_text(s, "LevelingDelayFormat", t.leveling_delay_format);
+    opt_date(s, "PreLeveledStart", t.pre_leveled_start);
+    opt_date(s, "PreLeveledFinish", t.pre_leveled_finish);
+    opt_text(s, "Hyperlink", t.hyperlink.as_deref());
+    opt_text(s, "HyperlinkAddress", t.hyperlink_address.as_deref());
+    opt_text(s, "HyperlinkSubAddress", t.hyperlink_sub_address.as_deref());
     opt_flag(s, "IgnoreResourceCalendar", t.ignore_resource_calendar);
+    opt_text(s, "Notes", t.notes.as_deref());
     opt_flag(s, "HideBar", t.hide_bar);
     opt_flag(s, "Rollup", t.rollup);
+    opt_text(s, "BCWS", t.bcws.as_ref().map(Rate::as_str));
+    opt_text(s, "BCWP", t.bcwp.as_ref().map(Rate::as_str));
     opt_text(s, "PhysicalPercentComplete", t.physical_percent_complete);
     opt_text(s, "EarnedValueMethod", t.earned_value_method);
     for p in &t.predecessors {
         s.push_str("      <PredecessorLink>\n");
         tag(s, 4, "PredecessorUID", &p.uid.to_string());
         tag(s, 4, "Type", &p.link.code().to_string());
+        if let Some(value) = p.cross_project {
+            tag(s, 4, "CrossProject", flag(value));
+        }
+        if let Some(name) = &p.cross_project_name {
+            tag(s, 4, "CrossProjectName", name);
+        }
         tag(s, 4, "LinkLag", &link_lag_of(p).to_string());
         tag(s, 4, "LagFormat", &p.lag_format.code().to_string());
         s.push_str("      </PredecessorLink>\n");
     }
+    opt_text(
+        s,
+        "ActualWorkProtected",
+        t.actual_work_protected_min.map(min_to_iso),
+    );
+    opt_text(
+        s,
+        "ActualOvertimeWorkProtected",
+        t.actual_overtime_work_protected_min.map(min_to_iso),
+    );
     write_extended_attributes(s, &t.extended_attributes);
     let mut baselines: Vec<_> = t.baselines.iter().collect();
     baselines.sort_by_key(|b| b.number);
@@ -1793,8 +1970,24 @@ fn write_task(s: &mut String, t: &Task, computed: &Computed) {
         if let Some(duration) = baseline.duration_min {
             tag(s, 4, "Duration", &min_to_iso(duration));
         }
+        if let Some(format) = baseline.duration_format {
+            tag(s, 4, "DurationFormat", &format.to_string());
+        }
+        if let Some(work) = baseline.work_min {
+            tag(s, 4, "Work", &min_to_iso(work));
+        }
+        if let Some(cost) = baseline.cost.as_ref() {
+            tag(s, 4, "Cost", cost.as_str());
+        }
         s.push_str("      </Baseline>\n");
     }
+    write_outline_codes(s, &t.outline_codes);
+    opt_flag(s, "IsPublished", t.is_published);
+    opt_text(s, "StatusManager", t.status_manager.as_deref());
+    opt_date(s, "CommitmentStart", t.commitment_start);
+    opt_date(s, "CommitmentFinish", t.commitment_finish);
+    opt_text(s, "CommitmentType", t.commitment_type);
+    write_timephased_data(s, &t.timephased_data);
     s.push_str("    </Task>\n");
 }
 
@@ -1908,17 +2101,7 @@ fn write_resource(s: &mut String, r: &Resource) {
         }
         s.push_str("      </Baseline>\n");
     }
-    for code in &r.outline_codes {
-        s.push_str("      <OutlineCode>\n");
-        tag(s, 4, "FieldID", &code.field_id);
-        if let Some(value_id) = &code.value_id {
-            tag(s, 4, "ValueID", value_id);
-        }
-        if let Some(guid) = &code.value_guid {
-            tag(s, 4, "ValueGUID", guid);
-        }
-        s.push_str("      </OutlineCode>\n");
-    }
+    write_outline_codes(s, &r.outline_codes);
     if !r.availability_periods.is_empty() {
         s.push_str("      <AvailabilityPeriods>\n");
         for period in &r.availability_periods {
@@ -1974,6 +2157,20 @@ fn write_resource(s: &mut String, r: &Resource) {
     }
     write_timephased_data(s, &r.timephased_data);
     s.push_str("    </Resource>\n");
+}
+
+fn write_outline_codes(s: &mut String, codes: &[OutlineCodeValue]) {
+    for code in codes {
+        s.push_str("      <OutlineCode>\n");
+        tag(s, 4, "FieldID", &code.field_id);
+        if let Some(value_id) = &code.value_id {
+            tag(s, 4, "ValueID", value_id);
+        }
+        if let Some(guid) = &code.value_guid {
+            tag(s, 4, "ValueGUID", guid);
+        }
+        s.push_str("      </OutlineCode>\n");
+    }
 }
 
 /// Custom field values, in the schema's child order.
@@ -2082,8 +2279,14 @@ fn write_assignment(s: &mut String, a: &Assignment) {
         if let Some(work) = baseline.work_min {
             tag(s, 4, "Work", &min_to_iso(work));
         }
-        if let Some(cost) = &baseline.cost {
-            tag(s, 4, "Cost", cost.as_str());
+        for (name, value) in [
+            ("Cost", &baseline.cost),
+            ("BCWS", &baseline.bcws),
+            ("BCWP", &baseline.bcwp),
+        ] {
+            if let Some(value) = value {
+                tag(s, 4, name, value.as_str());
+            }
         }
         s.push_str("      </Baseline>\n");
     }
@@ -2155,7 +2358,7 @@ fn write_calendar(s: &mut String, c: &Calendar) {
             // model week[] is Sun=0..Sat=6; MSPDI DayType is 1=Sun..7=Sat.
             s.push_str("        <WeekDay>\n");
             tag(s, 5, "DayType", &(idx + 1).to_string());
-            write_day_working(s, day);
+            write_day_working(s, day, 5);
             s.push_str("        </WeekDay>\n");
         }
         for (e, from, to) in legacy {
@@ -2163,7 +2366,7 @@ fn write_calendar(s: &mut String, c: &Calendar) {
             tag(s, 5, "DayType", "0");
             tag(s, 5, "DayWorking", if e.day.working() { "1" } else { "0" });
             write_time_period(s, from, to);
-            write_working_times(s, &e.day);
+            write_working_times(s, &e.day, 5);
             s.push_str("        </WeekDay>\n");
         }
         s.push_str("      </WeekDays>\n");
@@ -2175,7 +2378,34 @@ fn write_calendar(s: &mut String, c: &Calendar) {
         }
         s.push_str("      </Exceptions>\n");
     }
+    if !c.work_weeks.is_empty() {
+        write_work_weeks(s, &c.work_weeks);
+    }
     s.push_str("    </Calendar>\n");
+}
+
+fn write_work_weeks(s: &mut String, weeks: &[WorkWeek]) {
+    s.push_str("      <WorkWeeks>\n");
+    for work_week in weeks {
+        s.push_str("        <WorkWeek>\n");
+        write_optional_time_period(s, work_week.from, work_week.to, 5);
+        if let Some(name) = &work_week.name {
+            tag(s, 5, "Name", name);
+        }
+        if work_week.week.iter().any(Option::is_some) {
+            s.push_str("          <WeekDays>\n");
+            for (idx, day) in work_week.week.iter().enumerate() {
+                let Some(day) = day else { continue };
+                s.push_str("            <WeekDay>\n");
+                tag(s, 7, "DayType", &(idx + 1).to_string());
+                write_day_working(s, day, 7);
+                s.push_str("            </WeekDay>\n");
+            }
+            s.push_str("          </WeekDays>\n");
+        }
+        s.push_str("        </WorkWeek>\n");
+    }
+    s.push_str("      </WorkWeeks>\n");
 }
 
 /// One `Exception`, its elements in schema order. An optional field the
@@ -2191,16 +2421,7 @@ fn write_exception(s: &mut String, e: &CalendarException) {
     if let Some(entered) = e.entered_by_occurrences {
         tag(s, 5, "EnteredByOccurrences", flag(entered));
     }
-    if e.from.is_some() || e.to.is_some() {
-        s.push_str("          <TimePeriod>\n");
-        if let Some(from) = e.from {
-            tag(s, 6, "FromDate", &from.to_mspdi());
-        }
-        if let Some(to) = e.to {
-            tag(s, 6, "ToDate", &to.to_mspdi());
-        }
-        s.push_str("          </TimePeriod>\n");
-    }
+    write_optional_time_period(s, e.from, e.to, 5);
     int(s, "Occurrences", e.occurrences);
     if let Some(name) = &e.name {
         tag(s, 5, "Name", name);
@@ -2212,31 +2433,55 @@ fn write_exception(s: &mut String, e: &CalendarException) {
     int(s, "MonthPosition", e.month_position);
     int(s, "Month", e.month);
     int(s, "MonthDay", e.month_day);
-    write_day_working(s, &e.day);
+    write_day_working(s, &e.day, 5);
     s.push_str("        </Exception>\n");
 }
 
 /// A legacy weekday's `TimePeriod`.
 fn write_time_period(s: &mut String, from: DateTime, to: DateTime) {
-    s.push_str("          <TimePeriod>\n");
-    tag(s, 6, "FromDate", &from.to_mspdi());
-    tag(s, 6, "ToDate", &to.to_mspdi());
-    s.push_str("          </TimePeriod>\n");
+    write_optional_time_period(s, Some(from), Some(to), 5);
+}
+
+fn write_optional_time_period(
+    s: &mut String,
+    from: Option<DateTime>,
+    to: Option<DateTime>,
+    depth: usize,
+) {
+    if from.is_none() && to.is_none() {
+        return;
+    }
+    let indent = "  ".repeat(depth);
+    s.push_str(&format!("{indent}<TimePeriod>\n"));
+    if let Some(from) = from {
+        tag(s, depth + 1, "FromDate", &from.to_mspdi());
+    }
+    if let Some(to) = to {
+        tag(s, depth + 1, "ToDate", &to.to_mspdi());
+    }
+    s.push_str(&format!("{indent}</TimePeriod>\n"));
 }
 
 /// `DayWorking`, then `WorkingTimes` when the day works.
-fn write_day_working(s: &mut String, day: &DayWorking) {
-    tag(s, 5, "DayWorking", if day.working() { "1" } else { "0" });
-    write_working_times(s, day);
+fn write_day_working(s: &mut String, day: &DayWorking, depth: usize) {
+    tag(
+        s,
+        depth,
+        "DayWorking",
+        if day.working() { "1" } else { "0" },
+    );
+    write_working_times(s, day, depth);
 }
 
-fn write_working_times(s: &mut String, day: &DayWorking) {
+fn write_working_times(s: &mut String, day: &DayWorking, depth: usize) {
     if !day.working() {
         return;
     }
-    s.push_str("          <WorkingTimes>\n");
+    let indent = "  ".repeat(depth);
+    let child_indent = "  ".repeat(depth + 1);
+    s.push_str(&format!("{indent}<WorkingTimes>\n"));
     for w in &day.times {
-        s.push_str("            <WorkingTime>");
+        s.push_str(&format!("{child_indent}<WorkingTime>"));
         s.push_str(&format!(
             "<FromTime>{}</FromTime><ToTime>{}</ToTime>",
             min_to_clock(w.from),
@@ -2244,7 +2489,7 @@ fn write_working_times(s: &mut String, day: &DayWorking) {
         ));
         s.push_str("</WorkingTime>\n");
     }
-    s.push_str("          </WorkingTimes>\n");
+    s.push_str(&format!("{indent}</WorkingTimes>\n"));
 }
 
 /// Write an element kept as read: a leaf as `<Name>text</Name>`, else its
@@ -2940,7 +3185,7 @@ mod tests {
 
         let b = &proj.tasks[1];
         assert_eq!(b.predecessors.len(), 1);
-        let pred = b.predecessors[0];
+        let pred = &b.predecessors[0];
         assert_eq!(pred.uid, 1);
         assert_eq!(pred.link, LinkType::FinishStart);
         assert_eq!(pred.lag, 480); // 4800 tenths-of-min = 2 days = 8h/day
@@ -3087,6 +3332,74 @@ mod tests {
     }
 
     #[test]
+    fn work_weeks_read_write_in_project_order_and_keep_unstated_days() {
+        let xml = include_str!("../../corpus/mspdi/28-work-weeks.xml");
+        let mut project = read_mspdi(xml).unwrap();
+        assert_eq!(project.calendar(1).unwrap().work_weeks.len(), 1);
+        let summer = &project.calendar(1).unwrap().work_weeks[0];
+        assert_eq!(summer.name.as_deref(), Some("Summer"));
+        assert_eq!(summer.from.unwrap().to_mspdi(), "2026-03-09T00:00:00");
+        assert_eq!(summer.to.unwrap().to_mspdi(), "2026-03-20T23:59:00");
+        assert_eq!(
+            summer.week.iter().map(Option::is_some).collect::<Vec<_>>(),
+            [false, true, false, false, false, true, true]
+        );
+        assert_eq!(summer.week[1].as_ref().unwrap().minutes(), 600);
+        assert!(!summer.week[5].as_ref().unwrap().working());
+        assert_eq!(summer.week[6].as_ref().unwrap().minutes(), 240);
+        assert!(project.calendar(2).unwrap().work_weeks.is_empty());
+        assert_eq!(
+            project.calendar(3).unwrap().work_weeks[0]
+                .week
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            [false, false, false, true, true, false, false]
+        );
+
+        // An incomplete work week is kept exactly even though it cannot
+        // schedule until both dates exist.
+        project.calendars[0].work_weeks.push(WorkWeek {
+            from: Some(DateTime::from_ymd_hm(2026, 4, 1, 0, 0)),
+            week: std::array::from_fn(|_| None),
+            ..WorkWeek::default()
+        });
+        let written = write_mspdi(&project);
+        let standard = calendar_block(&written, 1);
+        assert!(standard.find("<Exceptions>").unwrap() < standard.find("<WorkWeeks>").unwrap());
+        let first = standard
+            .split("<WorkWeek>")
+            .nth(1)
+            .unwrap()
+            .split("</WorkWeek>")
+            .next()
+            .unwrap();
+        assert!(first.find("<TimePeriod>").unwrap() < first.find("<Name>").unwrap());
+        assert!(first.find("<Name>").unwrap() < first.find("<WeekDays>").unwrap());
+        let days: Vec<&str> = first
+            .split("<DayType>")
+            .skip(1)
+            .map(|part| part.split("</DayType>").next().unwrap())
+            .collect();
+        assert_eq!(days, ["2", "6", "7"]);
+        let second = standard
+            .split("<WorkWeek>")
+            .nth(2)
+            .unwrap()
+            .split("</WorkWeek>")
+            .next()
+            .unwrap();
+        assert!(second.contains("<FromDate>2026-04-01T00:00:00</FromDate>"));
+        assert!(
+            !second.contains("<ToDate>")
+                && !second.contains("<Name>")
+                && !second.contains("<WeekDays>")
+        );
+        assert!(!calendar_block(&written, 2).contains("<WorkWeeks>"));
+        assert_eq!(read_mspdi(&written).unwrap().calendars, project.calendars);
+    }
+
+    #[test]
     fn reader_decides_base_or_derived_from_both_flags() {
         let cases = [
             // IsBaseCalendar wins over a stray BaseCalendarUID.
@@ -3192,6 +3505,24 @@ mod tests {
                 .unwrap_err()
                 .contains("Closed")
         );
+    }
+
+    #[test]
+    fn external_leaf_on_an_empty_calendar_can_be_read() {
+        let mut proj = empty_calendar_project();
+        proj.tasks[0].external_task = Some(true);
+        proj.tasks[0].calendar_uid = Some(3);
+        let back = read_mspdi(&write_mspdi(&proj)).unwrap();
+        assert_eq!(back.tasks[0].external_task, Some(true));
+        assert!(
+            !crate::schedule::schedule(&back)
+                .get(back.tasks[0].uid)
+                .unwrap()
+                .critical
+        );
+        let mut summary = back;
+        summary.tasks[0].summary = true;
+        assert!(read_mspdi(&write_mspdi(&summary)).is_ok());
     }
 
     #[test]
@@ -3354,8 +3685,9 @@ mod tests {
             start: Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0)),
             finish: Some(DateTime::from_ymd_hm(2026, 3, 13, 17, 0)),
             duration_min: Some(2400),
+            ..Baseline::default()
         };
-        assert_eq!(proj.tasks[0].baselines, vec![expected]);
+        assert_eq!(proj.tasks[0].baselines, vec![expected.clone()]);
         let xml = write_mspdi(&proj);
         let baseline = xml
             .split("<Baseline>")
@@ -3369,6 +3701,89 @@ mod tests {
             "<Number>1</Number>\n        <Start>2026-03-09T08:00:00</Start>\n        <Finish>2026-03-13T17:00:00</Finish>\n        <Duration>PT40H0M0S</Duration>"
         );
         assert_eq!(read_mspdi(&xml).unwrap().tasks[0].baselines, vec![expected]);
+    }
+
+    #[test]
+    fn task_baseline_work_and_cost_survive_issue_round_trip() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml").replacen(
+            "    </Task>",
+            "      <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish><Duration>PT8H0M0S</Duration><Work>PT8H0M0S</Work><Cost>100000</Cost></Baseline>\n    </Task>",
+            1,
+        );
+        let proj = read_mspdi(&source).unwrap();
+        let expected = Baseline {
+            start: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            finish: Some(DateTime::from_ymd_hm(2026, 3, 3, 17, 0)),
+            duration_min: Some(480),
+            work_min: Some(480),
+            cost: Rate::parse("100000"),
+            ..Baseline::default()
+        };
+        assert_eq!(proj.tasks[0].baseline(0), Some(&expected));
+        let xml = write_mspdi(&proj);
+        let baseline = xml
+            .split("<Baseline>")
+            .nth(1)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            baseline.trim(),
+            "<Number>0</Number>\n        <Start>2026-03-02T08:00:00</Start>\n        <Finish>2026-03-03T17:00:00</Finish>\n        <Duration>PT8H0M0S</Duration>\n        <Work>PT8H0M0S</Work>\n        <Cost>100000</Cost>"
+        );
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks[0].baseline(0),
+            Some(&expected)
+        );
+    }
+
+    #[test]
+    fn task_baseline_new_fields_keep_their_slots_and_yppx_values() {
+        let proj = project_with_baselines(
+            "<Baseline><Number>0</Number><DurationFormat>7</DurationFormat><Work>PT0H0M0S</Work><Cost>0</Cost></Baseline>\
+             <Baseline><Number>3</Number><Start>2026-03-02T08:00:00</Start><Finish>2026-03-03T17:00:00</Finish><Duration>PT8H0M0S</Duration><DurationFormat>8</DurationFormat><Work>PT8H0M0S</Work><Cost>+001000.50</Cost></Baseline>",
+        );
+        assert_eq!(proj.tasks[0].baseline(0).unwrap().duration_format, Some(7));
+        assert_eq!(proj.tasks[0].baseline(0).unwrap().work_min, Some(0));
+        assert_eq!(
+            proj.tasks[0]
+                .baseline(0)
+                .unwrap()
+                .cost
+                .as_ref()
+                .map(Rate::as_str),
+            Some("0")
+        );
+        assert_eq!(proj.tasks[0].baseline(3).unwrap().duration_format, Some(8));
+        assert_eq!(proj.tasks[0].baseline(3).unwrap().work_min, Some(480));
+        assert_eq!(
+            proj.tasks[0]
+                .baseline(3)
+                .unwrap()
+                .cost
+                .as_ref()
+                .map(Rate::as_str),
+            Some("+001000.50")
+        );
+        let xml = write_mspdi(&proj);
+        let slot_three = xml
+            .split("<Baseline>")
+            .nth(2)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert_eq!(
+            slot_three.trim(),
+            "<Number>3</Number>\n        <Start>2026-03-02T08:00:00</Start>\n        <Finish>2026-03-03T17:00:00</Finish>\n        <Duration>PT8H0M0S</Duration>\n        <DurationFormat>8</DurationFormat>\n        <Work>PT8H0M0S</Work>\n        <Cost>+001000.50</Cost>"
+        );
+        assert_eq!(
+            read_mspdi(&xml).unwrap().tasks[0].baselines,
+            proj.tasks[0].baselines
+        );
+        let back = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(back.tasks[0].baselines, proj.tasks[0].baselines);
     }
 
     #[test]
@@ -3401,6 +3816,9 @@ mod tests {
             "<Start>2026-03-09T08:00:00</Start>",
             "<Finish>2026-03-13T17:00:00</Finish>",
             "<Duration>PT0H0M0S</Duration>",
+            "<DurationFormat>0</DurationFormat>",
+            "<Work>PT0H0M0S</Work>",
+            "<Cost>0</Cost>",
         ] {
             let proj =
                 project_with_baselines(&format!("<Baseline><Number>1</Number>{field}</Baseline>"));
@@ -3420,6 +3838,32 @@ mod tests {
                 read_mspdi(&xml).unwrap().tasks[0].baselines,
                 proj.tasks[0].baselines
             );
+        }
+    }
+
+    #[test]
+    fn invalid_task_baseline_fields_do_not_create_a_slot() {
+        for field in [
+            "<DurationFormat/>",
+            "<DurationFormat>256</DurationFormat>",
+            "<Work/>",
+            "<Work>invalid</Work>",
+            "<Cost/>",
+            "<Cost>invalid</Cost>",
+        ] {
+            let proj =
+                project_with_baselines(&format!("<Baseline><Number>3</Number>{field}</Baseline>"));
+            assert!(proj.tasks[0].baselines.is_empty(), "{field}");
+            let proj = project_with_baselines(&format!(
+                "<Baseline><Number>3</Number><Start>2026-03-02T08:00:00</Start>{field}</Baseline>"
+            ));
+            assert_eq!(
+                proj.tasks[0].baseline(3).unwrap().start,
+                Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0))
+            );
+            assert_eq!(proj.tasks[0].baseline(3).unwrap().duration_format, None);
+            assert_eq!(proj.tasks[0].baseline(3).unwrap().work_min, None);
+            assert_eq!(proj.tasks[0].baseline(3).unwrap().cost, None);
         }
     }
 
@@ -3589,16 +4033,28 @@ mod tests {
     const TASK_FIELDS: &str = "<Task><UID>1</UID>\
         <GUID>651A2669-EF7E-F111-A0F9-34C93D776CA2</GUID><ID>1</ID><Name>Pour</Name>\
         <Active>0</Active><Manual>0</Manual><Type>1</Type><IsNull>0</IsNull>\
-        <CreateDate>2026-07-13T23:14:00</CreateDate><WBS>1.2</WBS>\
+        <CreateDate>2026-07-13T23:14:00</CreateDate><Contact>Site lead</Contact>\
+        <WBS>1.2</WBS><WBSLevel>Level 2</WBSLevel>\
         <OutlineNumber>9.9</OutlineNumber><OutlineLevel>1</OutlineLevel><Priority>900</Priority>\
         <Duration>PT8H0M0S</Duration><Work>PT16H30M0S</Work><EffortDriven>1</EffortDriven>\
         <Recurring>1</Recurring><OverAllocated>1</OverAllocated><Estimated>1</Estimated>\
         <IsSubproject>1</IsSubproject><IsSubprojectReadOnly>1</IsSubprojectReadOnly>\
+        <SubprojectName>Concrete</SubprojectName><DisplayAsSummary>1</DisplayAsSummary>\
         <ExternalTask>1</ExternalTask><Cost>1250.50</Cost>\
         <Deadline>2026-03-20T17:00:00</Deadline><LevelAssignments>0</LevelAssignments>\
         <LevelingCanSplit>0</LevelingCanSplit><LevelingDelay>4800</LevelingDelay>\
-        <LevelingDelayFormat>7</LevelingDelayFormat><IgnoreResourceCalendar>1</IgnoreResourceCalendar>\
-        <HideBar>1</HideBar><Rollup>1</Rollup><EarnedValueMethod>1</EarnedValueMethod></Task>";
+        <LevelingDelayFormat>7</LevelingDelayFormat>\
+        <PreLeveledStart>2026-03-18T08:00:00</PreLeveledStart>\
+        <PreLeveledFinish>2026-03-18T17:00:00</PreLeveledFinish>\
+        <Hyperlink>Survey plan</Hyperlink>\
+        <HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>\
+        <HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>\
+        <IgnoreResourceCalendar>1</IgnoreResourceCalendar><Notes>Check forms</Notes>\
+        <HideBar>1</HideBar><Rollup>1</Rollup><EarnedValueMethod>1</EarnedValueMethod>\
+        <IsPublished>0</IsPublished><StatusManager>Alice</StatusManager>\
+        <CommitmentStart>2026-03-19T08:00:00</CommitmentStart>\
+        <CommitmentFinish>2026-03-19T17:00:00</CommitmentFinish>\
+        <CommitmentType>2</CommitmentType></Task>";
 
     #[test]
     fn task_fields_are_read() {
@@ -3613,7 +4069,9 @@ mod tests {
                 duration_min: 480,
                 guid: Some("651A2669-EF7E-F111-A0F9-34C93D776CA2".into()),
                 create_date: Some(DateTime::from_ymd_hm(2026, 7, 13, 23, 14)),
+                contact: Some("Site lead".into()),
                 wbs: Some("1.2".into()),
+                wbs_level: Some("Level 2".into()),
                 task_type: Some(TaskType::FixedDuration),
                 active: Some(false),
                 effort_driven: Some(true),
@@ -3624,7 +4082,13 @@ mod tests {
                 leveling_can_split: Some(false),
                 leveling_delay: Some(4800),
                 leveling_delay_format: Some(7),
+                pre_leveled_start: Some(DateTime::from_ymd_hm(2026, 3, 18, 8, 0)),
+                pre_leveled_finish: Some(DateTime::from_ymd_hm(2026, 3, 18, 17, 0)),
+                hyperlink: Some("Survey plan".into()),
+                hyperlink_address: Some("https://example.com/a?x=1&y=2".into()),
+                hyperlink_sub_address: Some("Gantt Chart!1".into()),
                 ignore_resource_calendar: Some(true),
+                notes: Some("Check forms".into()),
                 earned_value_method: Some(1),
                 recurring: Some(true),
                 hide_bar: Some(true),
@@ -3632,6 +4096,13 @@ mod tests {
                 external_task: Some(true),
                 is_subproject: Some(true),
                 is_subproject_read_only: Some(true),
+                subproject_name: Some("Concrete".into()),
+                display_as_summary: Some(true),
+                is_published: Some(false),
+                status_manager: Some("Alice".into()),
+                commitment_start: Some(DateTime::from_ymd_hm(2026, 3, 19, 8, 0)),
+                commitment_finish: Some(DateTime::from_ymd_hm(2026, 3, 19, 17, 0)),
+                commitment_type: Some(2),
                 work_min: Some(990),
                 cost: Rate::parse("1250.50"),
                 over_allocated: Some(true),
@@ -3650,7 +4121,9 @@ mod tests {
             "<Active>0</Active>",
             "<Type>1</Type>",
             "<CreateDate>2026-07-13T23:14:00</CreateDate>",
+            "<Contact>Site lead</Contact>",
             "<WBS>1.2</WBS>",
+            "<WBSLevel>Level 2</WBSLevel>",
             "<Priority>900</Priority>",
             "<Work>PT16H30M0S</Work>",
             "<EffortDriven>1</EffortDriven>",
@@ -3659,6 +4132,8 @@ mod tests {
             "<Estimated>1</Estimated>",
             "<IsSubproject>1</IsSubproject>",
             "<IsSubprojectReadOnly>1</IsSubprojectReadOnly>",
+            "<SubprojectName>Concrete</SubprojectName>",
+            "<DisplayAsSummary>1</DisplayAsSummary>",
             "<ExternalTask>1</ExternalTask>",
             "<Cost>1250.50</Cost>",
             "<Deadline>2026-03-20T17:00:00</Deadline>",
@@ -3666,10 +4141,21 @@ mod tests {
             "<LevelingCanSplit>0</LevelingCanSplit>",
             "<LevelingDelay>4800</LevelingDelay>",
             "<LevelingDelayFormat>7</LevelingDelayFormat>",
+            "<PreLeveledStart>2026-03-18T08:00:00</PreLeveledStart>",
+            "<PreLeveledFinish>2026-03-18T17:00:00</PreLeveledFinish>",
+            "<Hyperlink>Survey plan</Hyperlink>",
+            "<HyperlinkAddress>https://example.com/a?x=1&amp;y=2</HyperlinkAddress>",
+            "<HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>",
             "<IgnoreResourceCalendar>1</IgnoreResourceCalendar>",
+            "<Notes>Check forms</Notes>",
             "<HideBar>1</HideBar>",
             "<Rollup>1</Rollup>",
             "<EarnedValueMethod>1</EarnedValueMethod>",
+            "<IsPublished>0</IsPublished>",
+            "<StatusManager>Alice</StatusManager>",
+            "<CommitmentStart>2026-03-19T08:00:00</CommitmentStart>",
+            "<CommitmentFinish>2026-03-19T17:00:00</CommitmentFinish>",
+            "<CommitmentType>2</CommitmentType>",
         ] {
             assert!(xml.contains(element), "missing {element}");
         }
@@ -3679,6 +4165,104 @@ mod tests {
         assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
         let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
         assert_eq!(package.tasks, proj.tasks);
+    }
+
+    #[test]
+    fn empty_task_hyperlink_elements_are_kept() {
+        let proj = task_project(
+            "<Task><UID>1</UID><Hyperlink/><HyperlinkAddress></HyperlinkAddress><HyperlinkSubAddress/></Task>",
+        );
+        let task = &proj.tasks[0];
+        assert_eq!(task.hyperlink.as_deref(), Some(""));
+        assert_eq!(task.hyperlink_address.as_deref(), Some(""));
+        assert_eq!(task.hyperlink_sub_address.as_deref(), Some(""));
+
+        let xml = write_mspdi(&proj);
+        for name in ["Hyperlink", "HyperlinkAddress", "HyperlinkSubAddress"] {
+            assert!(xml.contains(&format!("<{name}></{name}>")));
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+    }
+
+    #[test]
+    fn empty_task_text_elements_are_kept() {
+        let names = [
+            "Contact",
+            "WBSLevel",
+            "SubprojectName",
+            "Notes",
+            "StatusManager",
+        ];
+        let source = format!(
+            "<Task><UID>1</UID>{}</Task>",
+            names
+                .iter()
+                .map(|name| format!("<{name}/>"))
+                .collect::<String>()
+        );
+        let proj = task_project(&source);
+        let task = &proj.tasks[0];
+        for value in [
+            &task.contact,
+            &task.wbs_level,
+            &task.subproject_name,
+            &task.notes,
+            &task.status_manager,
+        ] {
+            assert_eq!(value.as_deref(), Some(""));
+        }
+        let xml = write_mspdi(&proj);
+        for name in names {
+            assert!(xml.contains(&format!("<{name}></{name}>")), "{name}: {xml}");
+        }
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+    }
+
+    #[test]
+    fn task_notes_survive_save() {
+        let proj = task_project(
+            "<Task><UID>1</UID><Notes>Line 1&#13;\nLine 2 &amp; &lt;x&gt;</Notes></Task>",
+        );
+        let expected = "Line 1\r\nLine 2 & <x>";
+        assert_eq!(proj.tasks[0].notes.as_deref(), Some(expected));
+        let xml = write_mspdi(&proj);
+        assert!(xml.contains("<Notes>Line 1&#13;\nLine 2 &amp; &lt;x&gt;</Notes>"));
+        assert_eq!(read_mspdi(&xml).unwrap().tasks, proj.tasks);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks, proj.tasks);
+    }
+
+    #[test]
+    fn task_hyperlink_survives_save() {
+        let source = include_str!("../../corpus/mspdi/01-single-task.xml");
+        let xml = source.replace(
+            "<Name>Dig foundation</Name>",
+            "<Name>Dig foundation</Name>\n      <Hyperlink>Site survey</Hyperlink>\n      <HyperlinkAddress>https://example.com/survey.pdf</HyperlinkAddress>\n      <HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>",
+        );
+        assert_ne!(xml, source);
+        let proj = read_mspdi(&xml).unwrap();
+        let task = &proj.tasks[0];
+        assert_eq!(task.hyperlink.as_deref(), Some("Site survey"));
+        assert_eq!(
+            task.hyperlink_address.as_deref(),
+            Some("https://example.com/survey.pdf")
+        );
+        assert_eq!(task.hyperlink_sub_address.as_deref(), Some("Gantt Chart!1"));
+
+        let saved = write_mspdi(&proj);
+        for element in [
+            "<Hyperlink>Site survey</Hyperlink>",
+            "<HyperlinkAddress>https://example.com/survey.pdf</HyperlinkAddress>",
+            "<HyperlinkSubAddress>Gantt Chart!1</HyperlinkSubAddress>",
+        ] {
+            assert!(saved.contains(element), "missing {element}");
+        }
+        let back = read_mspdi(&saved).unwrap();
+        assert_eq!(back.tasks, proj.tasks);
+        let result = crate::schedule::schedule(&back);
+        let task = result.get(1).unwrap();
+        assert_eq!(task.early_start, DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
+        assert_eq!(task.early_finish, DateTime::from_ymd_hm(2026, 3, 3, 17, 0));
     }
 
     #[test]
@@ -3702,12 +4286,14 @@ mod tests {
 
     /// Optional task elements #80 keeps. IsNull is not among them: every row
     /// states it.
-    const NEW_TASK_ELEMENTS: [&str; 26] = [
+    const NEW_TASK_ELEMENTS: [&str; 41] = [
         "GUID",
         "Active",
         "Type",
         "CreateDate",
+        "Contact",
         "WBS",
+        "WBSLevel",
         "Priority",
         "Work",
         "EffortDriven",
@@ -3716,6 +4302,8 @@ mod tests {
         "Estimated",
         "IsSubproject",
         "IsSubprojectReadOnly",
+        "SubprojectName",
+        "DisplayAsSummary",
         "ExternalTask",
         "FixedCost",
         "FixedCostAccrual",
@@ -3725,10 +4313,21 @@ mod tests {
         "LevelingCanSplit",
         "LevelingDelay",
         "LevelingDelayFormat",
+        "PreLeveledStart",
+        "PreLeveledFinish",
+        "Hyperlink",
+        "HyperlinkAddress",
+        "HyperlinkSubAddress",
         "IgnoreResourceCalendar",
+        "Notes",
         "HideBar",
         "Rollup",
         "EarnedValueMethod",
+        "IsPublished",
+        "StatusManager",
+        "CommitmentStart",
+        "CommitmentFinish",
+        "CommitmentType",
     ];
 
     /// The `<Tasks>` section of a written file.
@@ -3813,6 +4412,14 @@ mod tests {
             "<LevelingDelayFormat>x</LevelingDelayFormat>",
             "<EarnedValueMethod>x</EarnedValueMethod>",
             "<GUID></GUID>",
+            "<DisplayAsSummary>maybe</DisplayAsSummary>",
+            "<IsPublished>2</IsPublished>",
+            "<PreLeveledStart>soon</PreLeveledStart>",
+            "<PreLeveledFinish>soon</PreLeveledFinish>",
+            "<CommitmentStart>soon</CommitmentStart>",
+            "<CommitmentFinish>soon</CommitmentFinish>",
+            "<CommitmentType>3</CommitmentType>",
+            "<CommitmentType>x</CommitmentType>",
         ] {
             let proj = task_project(&format!("<Task><UID>1</UID>{element}</Task>"));
             assert_eq!(
@@ -3862,6 +4469,7 @@ mod tests {
         let mut proj = task_project(TASK_FIELDS);
         let t = &mut proj.tasks[0];
         t.manual = true;
+        t.external_task = Some(false);
         t.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0));
         t.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 2, 17, 0));
         t.manual_start = t.stored_start;
@@ -3883,6 +4491,11 @@ mod tests {
             value_guid: Some("C8A6D07D-4E0D-4F63-9A8B-0D1E2F3A4B5C".into()),
             duration_format: Some(7),
         }];
+        t.outline_codes = vec![OutlineCodeValue {
+            field_id: "188744105".into(),
+            value_id: Some("1".into()),
+            ..OutlineCodeValue::default()
+        }];
         let progress = task_project(PROGRESS).tasks.remove(0);
         let t = &mut proj.tasks[0];
         t.percent_complete = progress.percent_complete;
@@ -3901,6 +4514,26 @@ mod tests {
         t.start_variance = progress.start_variance;
         t.finish_variance = progress.finish_variance;
         t.work_variance = progress.work_variance.clone();
+        t.resume_valid = Some(false);
+        t.overtime_cost = Rate::parse("12.25");
+        t.overtime_work_min = Some(0);
+        t.actual_overtime_cost = Rate::parse("2.5");
+        t.actual_overtime_work_min = Some(30);
+        t.regular_work_min = Some(450);
+        t.remaining_overtime_cost = Rate::parse("9.75");
+        t.remaining_overtime_work_min = Some(15);
+        t.acwp = Rate::parse("101.25");
+        t.cv = Rate::parse("-3.5");
+        t.bcws = Rate::parse("105");
+        t.bcwp = Rate::parse("97.75");
+        t.actual_work_protected_min = Some(60);
+        t.actual_overtime_work_protected_min = Some(0);
+        t.timephased_data.push(TimephasedValue {
+            kind: 2,
+            uid: Some(1),
+            value: Some("PT1H0M0S".into()),
+            ..TimephasedValue::default()
+        });
         proj.tasks.insert(
             0,
             Task {
@@ -3911,6 +4544,8 @@ mod tests {
             },
         );
         proj.tasks[1].predecessors.push(Predecessor::fs(2));
+        proj.tasks[1].predecessors[0].cross_project = Some(true);
+        proj.tasks[1].predecessors[0].cross_project_name = Some(r"C:\plans\other.mpp\7".into());
         let mut xml = String::new();
         let sched = crate::schedule::schedule(&proj);
         write_task(
@@ -3934,7 +4569,9 @@ mod tests {
                 "Type",
                 "IsNull",
                 "CreateDate",
+                "Contact",
                 "WBS",
+                "WBSLevel",
                 "OutlineNumber",
                 "OutlineLevel",
                 "Priority",
@@ -3948,15 +4585,18 @@ mod tests {
                 "Work",
                 "Stop",
                 "Resume",
+                "ResumeValid",
                 "EffortDriven",
                 "Recurring",
                 "OverAllocated",
                 "Estimated",
                 "Milestone",
                 "Summary",
+                "DisplayAsSummary",
                 "Critical",
                 "IsSubproject",
                 "IsSubprojectReadOnly",
+                "SubprojectName",
                 "ExternalTask",
                 "EarlyStart",
                 "EarlyFinish",
@@ -3974,14 +4614,23 @@ mod tests {
                 "PercentComplete",
                 "PercentWorkComplete",
                 "Cost",
+                "OvertimeCost",
+                "OvertimeWork",
                 "ActualStart",
                 "ActualFinish",
                 "ActualDuration",
                 "ActualCost",
+                "ActualOvertimeCost",
                 "ActualWork",
+                "ActualOvertimeWork",
+                "RegularWork",
                 "RemainingDuration",
                 "RemainingCost",
                 "RemainingWork",
+                "RemainingOvertimeCost",
+                "RemainingOvertimeWork",
+                "ACWP",
+                "CV",
                 "ConstraintType",
                 "CalendarUID",
                 "ConstraintDate",
@@ -3990,16 +4639,28 @@ mod tests {
                 "LevelingCanSplit",
                 "LevelingDelay",
                 "LevelingDelayFormat",
+                "PreLeveledStart",
+                "PreLeveledFinish",
+                "Hyperlink",
+                "HyperlinkAddress",
+                "HyperlinkSubAddress",
                 "IgnoreResourceCalendar",
+                "Notes",
                 "HideBar",
                 "Rollup",
+                "BCWS",
+                "BCWP",
                 "PhysicalPercentComplete",
                 "EarnedValueMethod",
                 "PredecessorLink",
                 "PredecessorUID",
                 "Type",
+                "CrossProject",
+                "CrossProjectName",
                 "LinkLag",
                 "LagFormat",
+                "ActualWorkProtected",
+                "ActualOvertimeWorkProtected",
                 "ExtendedAttribute",
                 "FieldID",
                 "Value",
@@ -4008,8 +4669,35 @@ mod tests {
                 "Baseline",
                 "Number",
                 "Duration",
+                "OutlineCode",
+                "FieldID",
+                "ValueID",
+                "IsPublished",
+                "StatusManager",
+                "CommitmentStart",
+                "CommitmentFinish",
+                "CommitmentType",
+                "TimephasedData",
+                "Type",
+                "UID",
+                "Value",
             ]
         );
+        proj.tasks[1].external_task = Some(true);
+        proj.tasks[1].external_task_project = Some(r"C:\plans\other.mpp".into());
+        let mut external_xml = String::new();
+        write_task(
+            &mut external_xml,
+            &proj.tasks[1],
+            &Computed {
+                outline_number: Some("2"),
+                result: sched.get(1),
+            },
+        );
+        let external_flag = external_xml.find("<ExternalTask>1</ExternalTask>").unwrap();
+        let external_path = external_xml.find("<ExternalTaskProject>").unwrap();
+        let early = external_xml.find("<StartVariance>").unwrap();
+        assert!(external_flag < external_path && external_path < early);
         // IsNull sits between Type and CreateDate on a blank row.
         let blank = Task {
             uid: 3,
@@ -4038,6 +4726,123 @@ mod tests {
                 "CreateDate",
                 "OutlineLevel"
             ]
+        );
+    }
+
+    #[test]
+    fn task_tracking_fields_keep_values_and_timephased_order() {
+        let source = "<Task><UID>1</UID><ID>1</ID><Name>Tracked</Name>\
+            <ResumeValid>0</ResumeValid><OvertimeCost>001.250</OvertimeCost>\
+            <OvertimeWork>PT0H0M0S</OvertimeWork>\
+            <ActualOvertimeCost>-2.50</ActualOvertimeCost>\
+            <ActualOvertimeWork>PT1H0M0S</ActualOvertimeWork>\
+            <RegularWork>PT7H0M0S</RegularWork>\
+            <RemainingOvertimeCost>0</RemainingOvertimeCost>\
+            <RemainingOvertimeWork>PT0H30M0S</RemainingOvertimeWork>\
+            <ACWP>3.125</ACWP><CV>-0.5</CV><BCWS>007</BCWS><BCWP>8.</BCWP>\
+            <ActualWorkProtected>PT1H0M0S</ActualWorkProtected>\
+            <ActualOvertimeWorkProtected>PT0H0M0S</ActualOvertimeWorkProtected>\
+            <TimephasedData><Type>2</Type><UID>1</UID><Value>PT1H0M0S</Value></TimephasedData>\
+            <TimephasedData><Type>99</Type><UID>1</UID><Value>4.25</Value></TimephasedData>\
+            </Task>";
+        let proj = task_project(source);
+        let task = &proj.tasks[0];
+        assert_eq!(task.resume_valid, Some(false));
+        assert_eq!(task.overtime_work_min, Some(0));
+        assert_eq!(task.actual_overtime_work_min, Some(60));
+        assert_eq!(task.regular_work_min, Some(420));
+        assert_eq!(task.remaining_overtime_work_min, Some(30));
+        assert_eq!(task.actual_work_protected_min, Some(60));
+        assert_eq!(task.actual_overtime_work_protected_min, Some(0));
+        for (value, expected) in [
+            (&task.overtime_cost, "001.250"),
+            (&task.actual_overtime_cost, "-2.50"),
+            (&task.remaining_overtime_cost, "0"),
+            (&task.acwp, "3.125"),
+            (&task.cv, "-0.5"),
+            (&task.bcws, "007"),
+            (&task.bcwp, "8."),
+        ] {
+            assert_eq!(value.as_ref().map(Rate::as_str), Some(expected));
+        }
+        assert_eq!(
+            task.timephased_data
+                .iter()
+                .map(|v| v.kind)
+                .collect::<Vec<_>>(),
+            [2, 99]
+        );
+        let saved = write_mspdi(&proj);
+        assert_eq!(read_mspdi(&saved).unwrap().tasks[0], *task);
+        let package = crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap();
+        assert_eq!(package.tasks[0], *task);
+
+        let absent = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Name>Invalid</Name>\
+             <ResumeValid>maybe</ResumeValid><OvertimeWork>8h</OvertimeWork>\
+             <ActualOvertimeCost>free</ActualOvertimeCost></Task>",
+        );
+        let saved = write_mspdi(&absent);
+        for name in [
+            "ResumeValid",
+            "OvertimeWork",
+            "ActualOvertimeCost",
+            "BCWS",
+            "TimephasedData",
+        ] {
+            assert!(!task_xml(&saved).contains(&format!("<{name}>")), "{name}");
+        }
+    }
+
+    #[test]
+    fn task_overtime_work_rounds_to_whole_minutes() {
+        let proj = task_project(
+            "<Task><UID>1</UID><ID>1</ID><Name>A</Name>\
+             <ActualOvertimeWork>PT1M30S</ActualOvertimeWork></Task>",
+        );
+        assert_eq!(proj.tasks[0].actual_overtime_work_min, Some(2));
+        assert!(
+            task_xml(&write_mspdi(&proj))
+                .contains("<ActualOvertimeWork>PT0H2M0S</ActualOvertimeWork>")
+        );
+    }
+
+    #[test]
+    fn resource_and_assignment_tracking_fields_still_survive_save() {
+        let xml = "<Project><Tasks><Task><UID>1</UID><ID>1</ID><Name>T</Name>\
+            <Duration>PT8H0M0S</Duration></Task></Tasks><Resources>\
+            <Resource><UID>1</UID><ID>1</ID><Name>R</Name><Type>1</Type>\
+            <ActualOvertimeWork>PT1H0M0S</ActualOvertimeWork>\
+            <ActualOvertimeCost>2.25</ActualOvertimeCost>\
+            <RemainingOvertimeWork>PT2H0M0S</RemainingOvertimeWork>\
+            <RemainingOvertimeCost>3.25</RemainingOvertimeCost>\
+            <ACWP>4.25</ACWP><BCWS>5.25</BCWS><BCWP>6.25</BCWP><CV>7.25</CV>\
+            <TimephasedData><Type>2</Type><UID>1</UID><Value>PT1H0M0S</Value></TimephasedData>\
+            </Resource></Resources><Assignments>\
+            <Assignment><UID>1</UID><TaskUID>1</TaskUID><ResourceUID>1</ResourceUID>\
+            <ActualOvertimeWork>PT3H0M0S</ActualOvertimeWork>\
+            <ActualOvertimeCost>12.25</ActualOvertimeCost>\
+            <RemainingOvertimeWork>PT4H0M0S</RemainingOvertimeWork>\
+            <RemainingOvertimeCost>13.25</RemainingOvertimeCost>\
+            <ACWP>14.25</ACWP><BCWS>15.25</BCWS><BCWP>16.25</BCWP><CV>17.25</CV>\
+            <TimephasedData><Type>2</Type><UID>1</UID><Value>PT3H0M0S</Value></TimephasedData>\
+            </Assignment></Assignments></Project>";
+        let project = read_mspdi(xml).unwrap();
+        let saved = read_mspdi(&write_mspdi(&project)).unwrap();
+        assert_eq!(saved.resources, project.resources);
+        assert_eq!(saved.assignments, project.assignments);
+        assert_eq!(saved.resources[0].timephased_data[0].kind, 2);
+        assert_eq!(saved.assignments[0].timephased_data[0].kind, 2);
+        assert_eq!(
+            saved.resources[0]
+                .actual_overtime_cost
+                .as_ref()
+                .map(Rate::as_str),
+            Some("2.25")
+        );
+        assert_eq!(
+            saved.assignments[0].bcwp.as_ref().map(Rate::as_str),
+            Some("16.25")
         );
     }
 
@@ -4683,6 +5488,188 @@ mod tests {
     }
 
     #[test]
+    fn outline_definitions_wbs_masks_and_task_values_round_trip_in_schema_order() {
+        let proj = read_mspdi(
+            "<Project><Author>Me</Author><OutlineCodes>\
+             <OutlineCode><FieldID>1</FieldID><FieldName>Region</FieldName>\
+             <Masks><Mask><Level>1</Level><Separator>.</Separator></Mask></Masks>\
+             <Values><Value><ValueID>1</ValueID><Description>A&amp;B</Description>\
+             <Children><Value><ValueID>2</ValueID><Description>&lt;West&gt;</Description>\
+             </Value></Children></Value></Values></OutlineCode></OutlineCodes>\
+             <OutlineCodes><OutlineCode><FieldID>2</FieldID><Alias>Team</Alias>\
+             </OutlineCode></OutlineCodes>\
+             <WBSMasks><VerifyUniqueCodes>1</VerifyUniqueCodes><GenerateCodes>0</GenerateCodes>\
+             <Prefix>PRJ&amp;</Prefix><WBSMask><Level>1</Level><Type>0</Type>\
+             <Length>2</Length><Separator>.</Separator></WBSMask>\
+             <WBSMask><Level>2</Level><Type>1</Type><Length>0</Length>\
+             <Separator>-</Separator></WBSMask></WBSMasks>\
+             <ExtendedAttributes><ExtendedAttribute><FieldID>3</FieldID>\
+             </ExtendedAttribute></ExtendedAttributes>\
+             <Tasks><Task><UID>1</UID><Name>Work</Name><OutlineLevel>1</OutlineLevel>\
+             <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start></Baseline>\
+             <OutlineCode><FieldID>1</FieldID><ValueID>1</ValueID></OutlineCode>\
+             <OutlineCode><FieldID>2</FieldID><ValueGUID>abc</ValueGUID></OutlineCode>\
+             <TimephasedData><Type>1</Type><UID>1</UID><Start>2026-03-02T08:00:00</Start>\
+             <Finish>2026-03-02T17:00:00</Finish><Unit>0</Unit><Value>PT8H0M0S</Value>\
+             </TimephasedData></Task></Tasks></Project>",
+        )
+        .unwrap();
+        assert_eq!(proj.outline_code_definitions.len(), 2);
+        assert_eq!(
+            proj.outline_code_definitions[0].children[3].children[0].children[2].children[0]
+                .children[1]
+                .text,
+            "<West>"
+        );
+        assert_eq!(
+            proj.wbs_masks.as_ref().unwrap().children,
+            vec![
+                leaf("VerifyUniqueCodes", "1"),
+                leaf("GenerateCodes", "0"),
+                leaf("Prefix", "PRJ&"),
+                node(
+                    "WBSMask",
+                    vec![
+                        leaf("Level", "1"),
+                        leaf("Type", "0"),
+                        leaf("Length", "2"),
+                        leaf("Separator", "."),
+                    ],
+                ),
+                node(
+                    "WBSMask",
+                    vec![
+                        leaf("Level", "2"),
+                        leaf("Type", "1"),
+                        leaf("Length", "0"),
+                        leaf("Separator", "-"),
+                    ],
+                ),
+            ]
+        );
+        assert_eq!(proj.tasks[0].outline_codes.len(), 2);
+        let xml = write_mspdi(&proj);
+        assert_eq!(xml.matches("<OutlineCodes>").count(), 1);
+        assert_eq!(xml.matches("<WBSMasks>").count(), 1);
+        assert!(xml.contains("<Description>A&amp;B</Description>"));
+        let positions = [
+            "<Author>",
+            "<OutlineCodes>",
+            "<WBSMasks>",
+            "<ExtendedAttributes>",
+            "<Tasks>",
+        ]
+        .map(|tag| xml.find(tag).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let task = task_xml(&xml);
+        let positions =
+            ["<Baseline>", "<OutlineCode>", "<TimephasedData>"].map(|tag| task.find(tag).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        for back in [
+            read_mspdi(&xml).unwrap(),
+            crate::yppx::read_yppx(&crate::yppx::write_yppx(&proj)).unwrap(),
+        ] {
+            assert_eq!(back.outline_code_definitions, proj.outline_code_definitions);
+            assert_eq!(back.wbs_masks, proj.wbs_masks);
+            assert_eq!(back.tasks[0].outline_codes, proj.tasks[0].outline_codes);
+        }
+    }
+
+    #[test]
+    fn empty_and_repeated_header_blocks_follow_defined_rules() {
+        let plain = task_project("<Task><UID>1</UID></Task>");
+        let saved = write_mspdi(&plain);
+        assert!(!saved.contains("OutlineCodes"));
+        assert!(!saved.contains("WBSMasks"));
+        assert!(!saved.contains("<OutlineCode>"));
+        let proj = read_mspdi(
+            "<Project><OutlineCodes/><WBSMasks/>\
+             <WBSMasks><Prefix>A</Prefix></WBSMasks>\
+             <WBSMasks><Prefix>B</Prefix></WBSMasks><WBSMasks/>\
+             <WBSMasks>
+               </WBSMasks>\
+             <Tasks/></Project>",
+        )
+        .unwrap();
+        assert!(proj.outline_code_definitions.is_empty());
+        assert_eq!(
+            proj.wbs_masks,
+            Some(node("WBSMasks", vec![leaf("Prefix", "B")]))
+        );
+        let saved = write_mspdi(&proj);
+        assert!(!saved.contains("OutlineCodes"));
+        assert_eq!(saved.matches("<WBSMasks>").count(), 1);
+        let empty = read_mspdi("<Project><OutlineCodes/><WBSMasks/><Tasks/></Project>").unwrap();
+        assert!(empty.wbs_masks.is_none());
+        assert!(!write_mspdi(&empty).contains("WBSMasks"));
+        let text_only = read_mspdi("<Project><WBSMasks>junk</WBSMasks><Tasks/></Project>").unwrap();
+        assert!(text_only.wbs_masks.is_none());
+        assert!(!write_mspdi(&text_only).contains("WBSMasks"));
+    }
+
+    #[test]
+    fn unsafe_children_and_wrappers_in_header_blocks_are_skipped() {
+        let proj = read_mspdi(
+            r#"<Project xmlns:x="urn:x">
+               <OutlineCodes><OutlineCode><FieldID>1</FieldID>
+                 <x:Extra><Inner>bad</Inner></x:Extra>
+                 <Alias x:flag="yes"><Inner>bad</Inner></Alias>
+                 <Name xmlns:y="urn:y"><Inner>bad</Inner></Name>
+                 <Value>safe</Value>
+               </OutlineCode></OutlineCodes>
+               <OutlineCodes x:flag="yes"><OutlineCode><FieldID>bad</FieldID></OutlineCode></OutlineCodes>
+               <x:OutlineCodes><OutlineCode><FieldID>bad</FieldID></OutlineCode></x:OutlineCodes>
+               <WBSMasks><Prefix>safe</Prefix>
+                 <x:Other><Inner>bad</Inner></x:Other>
+                 <WBSMask x:flag="yes"><Inner>bad</Inner></WBSMask>
+                 <Wrapper xmlns:y="urn:y"><Inner>bad</Inner></Wrapper>
+               </WBSMasks>
+               <WBSMasks x:flag="yes"><Prefix>bad</Prefix></WBSMasks>
+               <x:WBSMasks><Prefix>bad</Prefix></x:WBSMasks>
+               <Tasks/></Project>"#,
+        )
+        .unwrap();
+        assert_eq!(
+            proj.outline_code_definitions,
+            vec![node(
+                "OutlineCode",
+                vec![leaf("FieldID", "1"), leaf("Value", "safe")]
+            )]
+        );
+        assert_eq!(
+            proj.wbs_masks,
+            Some(node("WBSMasks", vec![leaf("Prefix", "safe")]))
+        );
+        let xml = write_mspdi(&proj);
+        assert!(!xml.contains("bad") && !xml.contains("x:") && !xml.contains("xmlns:y"));
+        assert_eq!(read_mspdi(&xml).unwrap().wbs_masks, proj.wbs_masks);
+    }
+
+    #[test]
+    fn wbs_mask_descendants_stop_at_definition_depth_limit() {
+        let deep = 10_000;
+        let xml = format!(
+            "<Project><WBSMasks><Prefix>P</Prefix><WBSMask>{}x{}</WBSMask>\
+             </WBSMasks><Tasks/></Project>",
+            "<a>".repeat(deep),
+            "</a>".repeat(deep)
+        );
+        let proj = read_mspdi(&xml).unwrap();
+        let mask = proj.wbs_masks.as_ref().unwrap();
+        let mut depth = 1;
+        let mut element = &mask.children[1];
+        while let Some(child) = element.children.first() {
+            element = child;
+            depth += 1;
+        }
+        assert_eq!((depth, element.text.as_str()), (MAX_DEFINITION_DEPTH, ""));
+        assert_eq!(
+            read_mspdi(&write_mspdi(&proj)).unwrap().wbs_masks,
+            proj.wbs_masks
+        );
+    }
+
+    #[test]
     fn definitions_past_the_depth_bound_are_dropped_not_overflowed() {
         let deep = 10_000;
         let xml = format!(
@@ -4866,8 +5853,9 @@ mod tests {
         <Resume>2026-03-04T08:00:00</Resume><StartVariance>0</StartVariance>\
         <Units>1</Units><Work>PT32H0M0S</Work>\
         <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start>\
-        <Finish>2026-03-05T17:00:00</Finish><Work>PT32H0M0S</Work><Cost>800</Cost></Baseline>\
-        <Baseline><Number>3</Number><Work>PT4H0M0S</Work></Baseline></Assignment>";
+        <Finish>2026-03-05T17:00:00</Finish><Work>PT32H0M0S</Work><Cost>800</Cost>\
+        <BCWS>8.</BCWS><BCWP>7.25</BCWP></Baseline>\
+        <Baseline><Number>3</Number><BCWS>5</BCWS></Baseline></Assignment>";
 
     /// Assignment elements #81 keeps.
     const PROGRESS_ASSIGNMENT_ELEMENTS: [&str; 14] = [
@@ -4981,10 +5969,12 @@ mod tests {
                         finish: d(5, 17),
                         work_min: Some(1920),
                         cost: Rate::parse("800"),
+                        bcws: Rate::parse("8."),
+                        bcwp: Rate::parse("7.25"),
                     },
                     AssignmentBaseline {
                         number: 3,
-                        work_min: Some(240),
+                        bcws: Rate::parse("5"),
                         ..AssignmentBaseline::default()
                     },
                 ],
@@ -5032,6 +6022,28 @@ mod tests {
         ] {
             assert!(assignment_xml(&xml).contains(element), "missing {element}");
         }
+        let assignment = assignment_xml(&xml);
+        let slot_zero = assignment
+            .split("<Baseline>")
+            .nth(1)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert!(
+            slot_zero
+                .contains("<Cost>800</Cost>\n        <BCWS>8.</BCWS>\n        <BCWP>7.25</BCWP>")
+        );
+        let slot_three = assignment
+            .split("<Baseline>")
+            .nth(2)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert!(slot_three.contains("<Number>3</Number>"));
+        assert!(slot_three.contains("<BCWS>5</BCWS>"));
+        assert!(!slot_three.contains("<BCWP>"));
         let back = read_mspdi(&xml).unwrap();
         assert_eq!(back.tasks, proj.tasks);
         assert_eq!(back.assignments, proj.assignments);
@@ -5330,9 +6342,11 @@ mod tests {
                 "Finish",
                 "Work",
                 "Cost",
+                "BCWS",
+                "BCWP",
                 "Baseline",
                 "Number",
-                "Work",
+                "BCWS",
                 "TimephasedData",
                 "Type",
                 "UID",
@@ -6266,7 +7280,7 @@ mod tests {
             (4800, None, 480),
         ] {
             let proj = read_mspdi(&lag_xml(link_lag, format)).unwrap();
-            let pred = proj.tasks[1].predecessors[0];
+            let pred = &proj.tasks[1].predecessors[0];
             assert_eq!(pred.lag, lag, "{link_lag} {format:?}");
             assert_eq!(pred.lag_format.code(), format.unwrap_or(7));
         }
@@ -6277,7 +7291,7 @@ mod tests {
         for format in supported_lag_formats() {
             for link_lag in [0, 10, -10, 50, -25, 28800, -28800, 1234560] {
                 let proj = read_mspdi(&lag_xml(link_lag, Some(format.code()))).unwrap();
-                let pred = proj.tasks[1].predecessors[0];
+                let pred = &proj.tasks[1].predecessors[0];
                 assert_eq!(pred.lag_format, format);
                 let saved = write_mspdi(&proj);
                 assert!(

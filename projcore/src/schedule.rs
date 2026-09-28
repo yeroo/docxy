@@ -1869,12 +1869,16 @@ impl<'a> CalendarResolver<'a> {
     }
 }
 
-/// Reject tasks that have no working time and are leaves either in the stored
-/// schedule or in the outline the editor uses to recompute summary flags.
-pub(crate) fn calendar_error(proj: &Project) -> Option<String> {
+/// Reject local tasks that have no working time and are leaves either in the
+/// stored schedule or in the outline the editor uses to recompute summary flags.
+/// External leaves need no working calendar because they are not scheduled.
+pub fn calendar_error(proj: &Project) -> Option<String> {
     let calendars = CalendarResolver::new(proj);
     for (i, task) in proj.tasks.iter().enumerate() {
-        if task.is_null || (task.summary && proj.is_outline_summary(i)) {
+        if task.is_null
+            || task.external_task == Some(true)
+            || (task.summary && proj.is_outline_summary(i))
+        {
             continue;
         }
         let Some(cal) = calendars.resolve(task.calendar_uid) else {
@@ -2096,16 +2100,47 @@ fn manual_summary_floors(proj: &Project, spans: &HashMap<i32, (i64, i64)>) -> Ha
 /// bounds and critical path. When no active leaf can be scheduled, dormant
 /// dates bound the project; a summary with only dormant subtasks keeps its
 /// own rollup.
+/// External leaves, their links, and their assignments are excluded from CPM.
+/// A dated external leaf reports its stored Start/Finish with zero slack and
+/// is never critical. An undated one has no result. Neither drives successors,
+/// rollups, project bounds, or the critical path.
 pub fn schedule(proj: &Project) -> Schedule {
-    let clean = without_blank_rows(proj);
-    let dormant = dormant_uids(&clean);
-    if dormant.is_empty() {
-        return Scheduler::new(&clean).run();
+    let clean = without_unscheduled_rows(proj);
+    let mut main = schedule_local(&clean);
+    for task in &proj.tasks {
+        if task.is_external_leaf() {
+            if let Some(start) = task.stored_start {
+                let finish = task.stored_finish.unwrap_or(start);
+                main.results.insert(
+                    task.uid,
+                    TaskResult {
+                        uid: task.uid,
+                        early_start: start,
+                        early_finish: finish,
+                        late_start: start,
+                        late_finish: finish,
+                        total_slack_min: 0,
+                        free_slack_min: 0,
+                        start_slack_min: 0,
+                        finish_slack_min: 0,
+                        critical: false,
+                    },
+                );
+            }
+        }
     }
-    let active = without_tasks(&clean, &dormant);
+    main
+}
+
+fn schedule_local(proj: &Project) -> Schedule {
+    let dormant = dormant_uids(proj);
+    if dormant.is_empty() {
+        return Scheduler::new(proj).run();
+    }
+    let active = without_tasks(proj, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let mut main = active_scheduler.run();
-    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler, &main);
+    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler, &main);
     if dormant_bounds {
         main.project_start = other.project_start;
         main.project_finish = other.project_finish;
@@ -2219,30 +2254,42 @@ fn dormant_view(proj: &Project, dormant: &std::collections::HashSet<i32>) -> Pro
     view
 }
 
-/// The project the scheduler sees: blank rows (`is_null`) removed, with the
-/// links and assignments that name them. A blank row therefore gets no
-/// result, never bounds a summary, and cannot drive another task.
-fn without_blank_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
-    if !proj.tasks.iter().any(|t| t.is_null) {
-        return std::borrow::Cow::Borrowed(proj);
-    }
-    let blank: std::collections::HashSet<i32> = proj
+/// The scheduler sees neither blank rows nor external leaves. Their links and
+/// assignments cannot enter the local CPM or resource-leveling passes.
+fn without_unscheduled_rows(proj: &Project) -> std::borrow::Cow<'_, Project> {
+    let removed: std::collections::HashSet<i32> = proj
         .tasks
         .iter()
-        .filter(|t| t.is_null)
+        .filter(|t| t.is_null || t.is_external_leaf())
         .map(|t| t.uid)
         .collect();
-    std::borrow::Cow::Owned(without_tasks(proj, &blank))
+    if removed.is_empty() {
+        std::borrow::Cow::Borrowed(proj)
+    } else {
+        std::borrow::Cow::Owned(without_tasks(proj, &removed))
+    }
 }
 
 /// Working minutes between two wall-clock instants under the project's default
-/// calendar. Used when importing a file that stores computed wall-clock
-/// start/finish (a `.mpp`) but not an explicit working-minute duration: the
-/// duration is `working_minutes_between(start, finish)`. A summary's duration
-/// is measured by [`task_duration_min`] instead, which falls back to the leaves'
-/// calendars when this one has no working time.
+/// calendar. Summaries use [`task_duration_min`] to account for leaf calendars.
 pub fn working_minutes_between(proj: &Project, start: DateTime, finish: DateTime) -> i64 {
-    let cal = proj.project_calendar();
+    working_minutes_between_on(proj, None, start, finish)
+}
+
+/// Working minutes on a task calendar, including exceptions, with the
+/// scheduler's default-calendar fallback when the requested one is unavailable.
+/// The MPP importer uses this for Start–Finish span fallbacks.
+pub fn working_minutes_between_on(
+    proj: &Project,
+    calendar_uid: Option<i32>,
+    start: DateTime,
+    finish: DateTime,
+) -> i64 {
+    let calendars = CalendarResolver::new(proj);
+    let cal = calendars
+        .resolve(calendar_uid)
+        .map(|cal| calendars.calendar(cal))
+        .unwrap_or_else(|| proj.project_calendar());
     working_minutes_on(&cal, start, finish)
 }
 
@@ -2255,11 +2302,10 @@ pub(crate) fn working_minutes_on(cal: &WorkCalendar, start: DateTime, finish: Da
     (tl.to_index(b) - tl.to_index(a)).max(0)
 }
 
-/// A task's scheduled duration in working minutes: a leaf's own
-/// `duration_min`, or for a summary the working time spanned by its scheduled
-/// early start/finish (rolled up, or a manual summary's own span). The stored `duration_min` of a summary is never
-/// recomputed, so every surface that shows one must derive it here. `None` when
-/// the task has no schedule result.
+/// A task's scheduled duration in working minutes: a local leaf's own
+/// `duration_min`, or the working time between scheduled dates for a summary
+/// or external leaf. A summary's stored duration is never recomputed, so
+/// surfaces derive it here. `None` when the task has no schedule result.
 pub fn task_duration_min(proj: &Project, sched: &Schedule, task: &Task) -> Option<i64> {
     let r = sched.get(task.uid)?;
     Some(summary_or_leaf_min(
@@ -2280,6 +2326,20 @@ pub(crate) fn summary_or_leaf_min(
 ) -> i64 {
     if task.summary {
         working_minutes_on(&summary_calendar(proj), start, finish)
+    } else if task.is_external_leaf() {
+        let calendars = CalendarResolver::new(proj);
+        if let Some(cal) = calendars.resolve(task.calendar_uid) {
+            if !has_working_time(&calendars.week(cal)) {
+                return task.duration_min;
+            }
+            working_minutes_on(&calendars.calendar(cal), start, finish)
+        } else {
+            working_minutes_on(
+                &WorkCalendar::weekly(Calendar::standard_week()),
+                start,
+                finish,
+            )
+        }
     } else {
         task.duration_min
     }
@@ -2303,7 +2363,7 @@ fn summary_calendar(proj: &Project) -> WorkCalendar {
     WorkCalendar::union(
         proj.tasks
             .iter()
-            .filter(|t| calendars.schedulable(t))
+            .filter(|t| !t.is_external_leaf() && calendars.schedulable(t))
             .filter_map(|t| calendars.resolve(t.calendar_uid))
             .filter(|cal| seen.insert(cal.uid))
             .map(|cal| calendars.calendar(cal))
@@ -2338,9 +2398,12 @@ impl Leveled {
 /// Resource-level a project: run CPM, then delay tasks so that no work resource
 /// is booked beyond its capacity, never scheduling a task before its CPM early
 /// start and never breaking a dependency (a predecessor's leveling delay is
-/// propagated to its successors, preserving every link's gap).
+/// propagated to its successors, preserving every local link's gap).
 /// Inactive tasks book no resource capacity and report their CPM dates; an
 /// active predecessor's leveling delay does not propagate to an inactive one.
+/// External leaves, their links, and their assignments are excluded. A dated
+/// external leaf reports its stored Start/Finish; an undated one has no result.
+/// Neither affects local successors, rollups, or project finish.
 ///
 /// v1 scope: a single-pass, topological-order serial leveler operating in the
 /// default calendar's working-minute space; resource occupation is the task's
@@ -2353,16 +2416,30 @@ impl Leveled {
 /// other. Multi-calendar leveling and task splitting are out of scope.
 /// If the default calendar has no working time, return the CPM dates unchanged.
 pub fn level(proj: &Project) -> Leveled {
-    let clean = without_blank_rows(proj);
-    let dormant = dormant_uids(&clean);
-    if dormant.is_empty() {
-        return Scheduler::new(&clean).level();
+    let clean = without_unscheduled_rows(proj);
+    let mut main = level_local(&clean);
+    for task in &proj.tasks {
+        if task.is_external_leaf() {
+            if let Some(start) = task.stored_start {
+                main.start.insert(task.uid, start);
+                main.finish
+                    .insert(task.uid, task.stored_finish.unwrap_or(start));
+            }
+        }
     }
-    let active = without_tasks(&clean, &dormant);
+    main
+}
+
+fn level_local(proj: &Project) -> Leveled {
+    let dormant = dormant_uids(proj);
+    if dormant.is_empty() {
+        return Scheduler::new(proj).level();
+    }
+    let active = without_tasks(proj, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let active_result = active_scheduler.run();
     let mut main = active_scheduler.level_from_base(&active_result);
-    let (other, dormant_bounds) = dormant_pass(&clean, &dormant, &active_scheduler, &active_result);
+    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler, &active_result);
     if dormant_bounds {
         main.project_finish = other.project_finish;
     }
@@ -3240,6 +3317,7 @@ mod tests {
                 link: LinkType::FinishStart,
                 lag: 900,
                 lag_format: LagFormat::from_code(4).unwrap(),
+                ..Predecessor::fs(1)
             });
             let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 6 * 480)]));
             let m = sched.get(1).unwrap();
@@ -3262,6 +3340,7 @@ mod tests {
             link: LinkType::FinishFinish,
             lag: 2880,
             lag_format: LagFormat::from_code(8).unwrap(),
+            ..Predecessor::fs(1)
         });
         let sched = schedule(&march2(vec![a, b]));
         assert_eq!(
@@ -3411,6 +3490,7 @@ mod tests {
                 link: LinkType::FinishStart,
                 lag: 1440,
                 lag_format: LagFormat::from_code(8).unwrap(),
+                ..Predecessor::fs(1)
             });
             let sched = schedule(&march2(vec![a, milestone, task(3, "Long", 5 * 480)]));
             let a = sched.get(1).unwrap();
@@ -3472,6 +3552,7 @@ mod tests {
                 link: LinkType::FinishStart,
                 lag: 1440,
                 lag_format: LagFormat::from_code(8).unwrap(),
+                ..Predecessor::fs(1)
             });
             let proj = Project {
                 calendars: vec![Calendar::standard(1), every_day.clone()],
@@ -3586,6 +3667,7 @@ mod tests {
                 link: LinkType::FinishStart,
                 lag: 900,
                 lag_format: LagFormat::from_code(4).unwrap(),
+                ..Predecessor::fs(1)
             });
             let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 6 * 480)]));
             let m = sched.get(1).unwrap();
@@ -6428,6 +6510,57 @@ mod tests {
     }
 
     #[test]
+    fn external_calendar_does_not_widen_local_summary_duration() {
+        let mut proj = closed_default(
+            vec![phase(1), child(2, "A", 480, 3), child(3, "B", 480, 3)],
+            vec![Calendar::standard(3)],
+        );
+        proj.tasks[2].predecessors.push(fs(2));
+        let plain = schedule(&proj);
+        let expected = task_duration_min(&proj, &plain, &proj.tasks[0]);
+        assert_eq!(expected, Some(960));
+
+        let all_day = weekly(
+            4,
+            &[
+                (0, 0, 1440),
+                (1, 0, 1440),
+                (2, 0, 1440),
+                (3, 0, 1440),
+                (4, 0, 1440),
+                (5, 0, 1440),
+                (6, 0, 1440),
+            ],
+        );
+        proj.calendars.push(all_day);
+        let mut external = child(4, "External", 480, 4);
+        external.external_task = Some(true);
+        external.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        external.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 9, 17, 0));
+        proj.tasks.push(external);
+        let with_external = schedule(&proj);
+        assert_eq!(with_external.rolled_up(1), plain.rolled_up(1));
+        assert_eq!(
+            task_duration_min(&proj, &with_external, &proj.tasks[0]),
+            expected
+        );
+    }
+
+    #[test]
+    fn external_only_span_uses_its_own_calendar_or_stored_duration() {
+        let mut external = child(1, "External", 480, 3);
+        external.external_task = Some(true);
+        external.stored_start = Some(DateTime::from_ymd_hm(2026, 3, 9, 8, 0));
+        external.stored_finish = Some(DateTime::from_ymd_hm(2026, 3, 20, 17, 0));
+        let mut proj = closed_default(vec![external], vec![Calendar::standard(3)]);
+        let sched = schedule(&proj);
+        assert_eq!(task_duration_min(&proj, &sched, &proj.tasks[0]), Some(4800));
+        proj.tasks[0].calendar_uid = Some(1);
+        let sched = schedule(&proj);
+        assert_eq!(task_duration_min(&proj, &sched, &proj.tasks[0]), Some(480));
+    }
+
+    #[test]
     fn summary_duration_unions_every_leaf_calendar() {
         // Standard Mon-Fri, a Saturday morning, and a long Monday overlapping
         // both Standard shifts: Monday counts 08:00-18:00 once, not twice.
@@ -7167,6 +7300,7 @@ mod tests {
             link,
             lag,
             lag_format: LagFormat::from_code(code).unwrap(),
+            ..Predecessor::fs(uid)
         }
     }
 
@@ -7323,7 +7457,7 @@ mod tests {
         q.constraint = ConstraintType::StartNoEarlierThan;
         q.constraint_date = Some(at(6, 8));
         let eh19 = lag_link(16, LinkType::FinishStart, 19 * 60, 6);
-        let z_preds = vec![Predecessor::fs(5), eh19];
+        let z_preds = vec![Predecessor::fs(5), eh19.clone()];
         let mut z = task(17, "Z", 0);
         z.predecessors = z_preds.clone();
         let z2 = milestone(18, "Z2", z_preds, fnlt, at(13, 17));
@@ -8531,6 +8665,7 @@ mod tests {
                 } else {
                     LagFormat::from_code(4).unwrap()
                 },
+                ..Predecessor::fs(1)
             });
             let p = Project {
                 calendars: vec![Calendar::standard(1), cal.clone()],
@@ -8570,6 +8705,7 @@ mod tests {
                 } else {
                     LagFormat::from_code(4).unwrap()
                 },
+                ..Predecessor::fs(1)
             });
             let p = Project {
                 calendars: vec![Calendar::standard(1), cal.clone()],

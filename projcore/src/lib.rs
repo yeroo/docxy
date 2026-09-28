@@ -30,5 +30,5 @@ pub use datetime::DateTime;
 pub use model::{
     Assignment, Baseline, Calendar, CalendarException, ConstraintType, DayWorking, LagFormat,
     LagKind, LagUnit, LinkType, Predecessor, Project, Rate, Resource, Task, TaskType, Week,
-    WorkCalendar, WorkingTime,
+    WorkCalendar, WorkWeek, WorkingTime,
 };

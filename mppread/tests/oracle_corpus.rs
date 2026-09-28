@@ -19,6 +19,28 @@ fn null_uids(xml: &str) -> std::collections::HashSet<i32> {
     out
 }
 
+fn duration_formats(xml: &str) -> std::collections::HashMap<i32, i32> {
+    let mut out = std::collections::HashMap::new();
+    for after_start in xml.split("<Task>").skip(1) {
+        let Some((task, _)) = after_start.split_once("</Task>") else {
+            continue;
+        };
+        let direct = task.split("<Baseline>").next().unwrap();
+        let uid = direct
+            .split_once("<UID>")
+            .and_then(|(_, s)| s.split_once("</UID>"))
+            .and_then(|(s, _)| s.trim().parse::<i32>().ok());
+        let format = direct
+            .split_once("<DurationFormat>")
+            .and_then(|(_, s)| s.split_once("</DurationFormat>"))
+            .and_then(|(s, _)| s.trim().parse::<i32>().ok());
+        if let (Some(uid), Some(format)) = (uid, format) {
+            out.insert(uid, format);
+        }
+    }
+    out
+}
+
 fn pairs(dir: &Path, suffix: &str) -> Vec<(PathBuf, PathBuf)> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -135,6 +157,7 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     let xml_text = std::fs::read_to_string(xml).unwrap();
     let oracle = projcore::mspdi::read_mspdi(&xml_text).unwrap();
     let nulls = null_uids(&xml_text);
+    let formats = duration_formats(&xml_text);
     let decoded = match mppread::mpp::decode_tasks(&bytes) {
         Ok(tasks) => tasks,
         Err(error) if may_refuse => {
@@ -214,6 +237,21 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
         assert_eq!(got, want, "{}: uid {} predecessors", mpp.display(), e.uid);
         let at = |what: &str| format!("{}: uid {} {what}", mpp.display(), e.uid);
         check_progress(a, e, source, &at);
+        if !e.summary && a.progress.is_some() {
+            assert_eq!(
+                a.duration_min,
+                Some(e.duration_min),
+                "{}",
+                at("stored duration")
+            );
+            assert_eq!(
+                a.duration_format.map(i32::from),
+                formats.get(&e.uid).copied(),
+                "{}",
+                at("stored DurationFormat")
+            );
+            assert_eq!(a.calendar_uid, e.calendar_uid, "{}", at("CalendarUID"));
+        }
         assert_eq!(a.manual, e.manual, "{}", at("manual"));
         if e.manual {
             assert_eq!(
@@ -254,6 +292,42 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
     }
     let imported = mppread::project::project_from_mpp(&bytes)
         .unwrap_or_else(|e| panic!("{}: decoded import: {e}", mpp.display()));
+    if xml_text.contains("<Calendars>") {
+        let fields = |c: &projcore::Calendar| {
+            (
+                c.uid,
+                c.name.clone(),
+                c.base_calendar_uid,
+                c.week.clone(),
+                c.exceptions.clone(),
+            )
+        };
+        let expected_calendars: Vec<_> = oracle
+            .calendars
+            .iter()
+            .filter(|cal| {
+                // MPXJ adds an implicit resource-0 calendar omitted by Project XML.
+                !(source == Oracle::Mpxj
+                    && cal.name == "Unnamed Resource"
+                    && cal.base_calendar_uid.is_some()
+                    && cal.week.iter().all(Option::is_none)
+                    && !imported.calendars.iter().any(|got| got.uid == cal.uid))
+            })
+            .map(fields)
+            .collect();
+        assert_eq!(
+            imported.calendars.iter().map(fields).collect::<Vec<_>>(),
+            expected_calendars,
+            "{}: calendars",
+            mpp.display()
+        );
+        assert_eq!(
+            imported.default_calendar_uid,
+            oracle.default_calendar_uid,
+            "{}: default calendar UID",
+            mpp.display()
+        );
+    }
     assert_eq!(
         imported.tasks.iter().map(|t| t.id).collect::<Vec<_>>(),
         actual.iter().map(|t| t.id as i32).collect::<Vec<_>>(),
@@ -275,6 +349,216 @@ fn check_pair(mpp: &Path, xml: &Path, may_refuse: bool, source: Oracle) -> bool 
                 "{}: uid {} imported manual duration",
                 mpp.display(),
                 e.uid
+            );
+        }
+    }
+    if source == Oracle::Project {
+        let scheduled = projcore::schedule::schedule(&imported);
+        let exceptions = &oracle
+            .calendar(oracle.default_calendar_uid)
+            .unwrap()
+            .exceptions;
+        let mut selected = 0usize;
+        let mut duration_compared = 0usize;
+        let mut split_duration_compared = false;
+        let mut dropped = [0usize; 5]; // split, delayed assignment, elapsed, recurring exception, nonworking start
+        let mut compared_uids = Vec::new();
+        for (task, expected_task) in imported.tasks.iter().zip(&expected) {
+            if task.summary || task.manual || expected_task.milestone {
+                continue;
+            }
+            if formats
+                .get(&task.uid)
+                .is_some_and(|&format| mppread::mpp::working_duration_format(format as u16))
+            {
+                assert_eq!(
+                    task.duration_min,
+                    expected_task.duration_min,
+                    "{}: stored working duration UID {}",
+                    mpp.display(),
+                    task.uid
+                );
+                duration_compared += 1;
+                if mpp.file_stem().is_some_and(|stem| stem == "13-split-task") && task.uid == 23 {
+                    assert_eq!(task.duration_min, 1920);
+                    split_duration_compared = true;
+                }
+            }
+            // Splits are not decoded from .mpp; this known task has a work
+            // interruption that makes its duration shorter than its span.
+            if task.uid == 23 && expected_task.name == "S13 split task" {
+                dropped[0] += 1;
+                continue;
+            }
+            if task.uid == 55 && expected_task.name == "S43 delayed start" {
+                // Project's delayed assignment makes this task's Duration
+                // shorter than the working span; assignments are not imported.
+                assert_eq!(task.duration_min, expected_task.duration_min);
+                dropped[1] += 1;
+                continue;
+            }
+            if formats
+                .get(&task.uid)
+                .is_some_and(|format| matches!(format & !32, 4 | 6 | 8 | 10 | 12))
+            {
+                dropped[2] += 1;
+                continue;
+            }
+            let (start, finish) = (task.stored_start.unwrap(), task.stored_finish.unwrap());
+            if exceptions
+                .iter()
+                .filter(|e| e.scheduled().is_none())
+                .any(|exception| {
+                    exception.from.zip(exception.to).is_some_and(|(from, to)| {
+                        from.day_number() <= finish.day_number()
+                            && to.day_number() >= start.day_number()
+                    })
+                })
+            {
+                dropped[3] += 1;
+                continue;
+            }
+            selected += 1;
+            assert_eq!(
+                task.duration_min,
+                expected_task.duration_min,
+                "{}: calendar duration UID {}",
+                mpp.display(),
+                task.uid
+            );
+            let calendar = imported
+                .calendar(task.calendar_uid.unwrap_or(imported.default_calendar_uid))
+                .map(|cal| imported.resolved_calendar(cal))
+                .unwrap_or_else(|| imported.project_calendar());
+            let working_start = calendar
+                .day(start.day_number())
+                .iter()
+                .any(|slot| slot.from <= start.minute_of_day() && start.minute_of_day() < slot.to);
+            if !working_start {
+                // Project can retain a MustStartOn timestamp before work starts;
+                // projcore moves the scheduled start to the first working slot.
+                dropped[4] += 1;
+                continue;
+            }
+            let result = scheduled.get(task.uid).unwrap();
+            assert_eq!(
+                (result.early_start, result.early_finish),
+                (task.stored_start.unwrap(), task.stored_finish.unwrap()),
+                "{}: scheduled UID {}",
+                mpp.display(),
+                task.uid
+            );
+            compared_uids.push(task.uid);
+        }
+        if dropped.iter().any(|&n| n > 0) {
+            eprintln!(
+                "{}: duration-compared {duration_compared}, date-selected {selected}, exclusions split/delayed-assignment/elapsed/recurring-exception/nonworking-start = {dropped:?}",
+                mpp.display()
+            );
+        }
+        let stem = mpp.file_stem().unwrap().to_string_lossy();
+        if stem == "13-split-task" {
+            assert!(
+                split_duration_compared,
+                "{}: split task duration was not compared",
+                mpp.display()
+            );
+        }
+        if stem == "21-task-calendar" {
+            assert!(
+                compared_uids.contains(&31),
+                "{}: UID 31 date was not compared",
+                mpp.display()
+            );
+        }
+        if stem == "32-calendar-6day" {
+            assert!(
+                compared_uids.contains(&49),
+                "{}: UID 49 date was not compared",
+                mpp.display()
+            );
+        }
+        if stem == "43-assignment-delay" {
+            assert_eq!(
+                dropped[1],
+                1,
+                "{}: delayed assignment was not excluded from date check",
+                mpp.display()
+            );
+        }
+        let recurrence = oracle
+            .calendar(oracle.default_calendar_uid)
+            .and_then(|cal| cal.exceptions.first());
+        match stem.as_ref() {
+            "e6-monthly-position" | "k5-monthly-position" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month_position),
+                    (Some(5), Some(7), Some(1))
+                );
+            }
+            "e7-yearly-date" | "k6-yearly-date" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month),
+                    (Some(2), Some(5), Some(2))
+                );
+            }
+            "e8-yearly-position" | "k7-yearly-position" => {
+                let e = recurrence.unwrap();
+                assert_eq!(
+                    (e.kind, e.occurrences, e.month, e.month_position),
+                    (Some(3), Some(5), Some(2), Some(1))
+                );
+            }
+            _ => {}
+        }
+        if stem == "33-calendar-holiday" {
+            let task = imported.tasks.iter().find(|t| t.uid == 5).unwrap();
+            assert_eq!(
+                task.duration_min,
+                4800,
+                "{}: holiday UID 5 duration",
+                mpp.display()
+            );
+            assert!(
+                compared_uids.contains(&5),
+                "{}: holiday UID 5 was not compared",
+                mpp.display()
+            );
+        }
+        if [
+            "e1-range",
+            "e2-weekend-working",
+            "e10-several-unicode",
+            "e11-unnamed",
+            "k1-one-off",
+            "k9-unnamed",
+        ]
+        .contains(&stem.as_ref())
+        {
+            assert!(
+                compared_uids.contains(&1),
+                "{}: one-off exception task was not compared",
+                mpp.display()
+            );
+        }
+        if [
+            "31-calendar-hours",
+            "32-calendar-6day",
+            "38-resource-calendar",
+        ]
+        .contains(&stem.as_ref())
+            || stem.starts_with("c1-")
+            || stem.starts_with("c2-")
+            || stem.starts_with("c3-")
+            || stem.starts_with("c4-")
+            || stem.starts_with("c5-")
+        {
+            assert!(
+                selected > 0,
+                "{}: no selected calendar duration oracle",
+                mpp.display()
             );
         }
     }
@@ -339,6 +623,17 @@ fn project_2024_oracles() {
             check_pair(mpp, xml, false, Oracle::Project);
         }
     }
+    let exceptions = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/exceptions");
+    if exceptions.exists() {
+        let cases = pairs(&exceptions, "");
+        assert_eq!(
+            cases.len(),
+            19 + usize::from(exceptions.join("k8-period-300.mpp").exists())
+        );
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+        }
+    }
     // Recorded progress (#181): states, work, costs, variances after a
     // baseline, a split, and fractional values.
     let progress = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/progress");
@@ -361,5 +656,21 @@ fn project_2024_oracles() {
         for (mpp, xml) in &cases {
             check_pair(mpp, xml, false, Oracle::Mpxj);
         }
+    }
+    let calendar = Path::new(env!("CARGO_MANIFEST_DIR")).join("../corpus/mpp/calendar");
+    if calendar.exists() {
+        let cases = pairs(&calendar, "");
+        assert_eq!(cases.len(), 5);
+        assert_eq!(std::fs::read_dir(&calendar).unwrap().flatten().count(), 10);
+        for (mpp, xml) in &cases {
+            check_pair(mpp, xml, false, Oracle::Project);
+        }
+        let c1 = std::fs::read(calendar.join("c1-default-night.mpp")).unwrap();
+        assert_ne!(
+            mppread::project::project_from_mpp(&c1)
+                .unwrap()
+                .default_calendar_uid,
+            1
+        );
     }
 }

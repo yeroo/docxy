@@ -16,7 +16,7 @@
 //! [Mermaid `gantt`]: https://mermaid.js.org/syntax/gantt.html
 
 use crate::datetime::DateTime;
-use crate::model::Project;
+use crate::model::{Project, Task};
 use crate::schedule::Schedule;
 
 /// Render just the Mermaid `gantt` diagram body (no code fence).
@@ -42,7 +42,9 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
             // Top-level summaries define sections; deeper ones just group under
             // the enclosing section.
             if task.outline_level <= 1 {
-                section = sanitize(&task.name).or(Some("Section".into()));
+                section = sanitize(&task.name)
+                    .or_else(|| summary_fallback(proj, task))
+                    .or(Some("Section".into()));
             }
             continue;
         }
@@ -70,7 +72,9 @@ pub fn to_mermaid(proj: &Project, sched: &Schedule) -> String {
         } else {
             format!("{}, ", tags.join(", "))
         };
-        let dur = duration_str(proj, task.duration_min);
+        let duration_min =
+            crate::schedule::summary_or_leaf_min(proj, task, r.early_start, r.early_finish);
+        let dur = duration_str(proj, duration_min);
         out.push_str(&format!("    {name} :{tagstr}{date}, {dur}\n"));
     }
     out
@@ -103,7 +107,9 @@ pub fn to_markdown(proj: &Project, sched: &Schedule) -> String {
         let Some(r) = sched.get(task.uid) else {
             continue;
         };
-        let name = sanitize(&task.name).unwrap_or_else(|| format!("Task {}", task.uid));
+        let name = sanitize(&task.name)
+            .or_else(|| summary_fallback(proj, task))
+            .unwrap_or_else(|| format!("Task {}", task.uid));
         let name = name.replace('|', "\\|");
         let name = if task.summary {
             format!("**{name}**")
@@ -247,6 +253,13 @@ fn sanitize(s: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+/// A pathless project can still name its UID 0 row from project metadata.
+fn summary_fallback(proj: &Project, task: &Task) -> Option<String> {
+    (task.is_project_summary() && task.name.trim().is_empty())
+        .then(|| sanitize(&proj.title).or_else(|| sanitize(&proj.name)))
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +347,66 @@ mod tests {
         assert!(m.contains("Sign-off :"));
         assert!(m.contains("milestone"));
         assert!(m.contains(", 0d"));
+    }
+
+    #[test]
+    fn unnamed_project_summary_uses_metadata_in_table_and_section() {
+        for (title, project_name, expected_row, expected_section) in [
+            (
+                "Warehouse fit-out",
+                "Other",
+                "Warehouse fit-out",
+                "Warehouse fit-out",
+            ),
+            ("", "site-plan", "site-plan", "site-plan"),
+            ("", "", "Task 0", "Section"),
+        ] {
+            let mut summary = task(0, "", 0);
+            summary.summary = true;
+            summary.outline_level = 0;
+            let proj = Project {
+                title: title.into(),
+                name: project_name.into(),
+                start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+                tasks: vec![summary, task(5, "", 480)],
+                ..Project::default()
+            };
+            let sched = schedule(&proj);
+            let md = to_markdown(&proj, &sched);
+            assert!(md.contains(&format!("| **{expected_row}** |")), "{md}");
+            assert!(md.contains("| Task 5 |"), "{md}");
+            assert!(
+                to_mermaid(&proj, &sched).contains(&format!("    section {expected_section}\n"))
+            );
+        }
+    }
+
+    #[test]
+    fn unnamed_non_project_summary_keeps_section_fallback() {
+        let mut summary = task(1, "", 0);
+        summary.summary = true;
+        let mut leaf = task(2, "A", 480);
+        leaf.outline_level = 2;
+        let proj = Project {
+            title: "Warehouse fit-out".into(),
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![summary, leaf],
+            ..Project::default()
+        };
+        assert!(to_mermaid(&proj, &schedule(&proj)).contains("    section Section\n"));
+    }
+
+    #[test]
+    fn unnamed_non_summary_uid_zero_keeps_task_fallback() {
+        let proj = Project {
+            title: "Warehouse fit-out".into(),
+            start_date: Some(DateTime::from_ymd_hm(2026, 3, 2, 8, 0)),
+            tasks: vec![task(0, "", 480)],
+            ..Project::default()
+        };
+        let sched = schedule(&proj);
+        assert!(to_markdown(&proj, &sched).contains("| Task 0 |"));
+        assert!(to_mermaid(&proj, &sched).contains("    Task 0 :"));
     }
 
     #[test]
