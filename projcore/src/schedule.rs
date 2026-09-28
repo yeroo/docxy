@@ -20,14 +20,17 @@
 //! ## Scope (v1)
 //!
 //! Leaf tasks schedule via FS/SS/FF/SF links with lag, ASAP by default, honoring
-//! date constraints. By default MSO/MFO/FNLT/SNLT override conflicting links;
+//! date constraints. ALAP tasks occupy their late dates. By default
+//! MSO/MFO/FNLT/SNLT override conflicting links;
 //! disabling HonorConstraints lets the links delay those tasks instead. Both
 //! modes report link conflicts as negative total slack within the timeline's
 //! bounded horizon. Constraints before the project start do not pull unlinked
 //! tasks before it, but a deadline there still reports its miss as negative
 //! slack. A task's deadline bounds only its late finish, like an FNLT would,
-//! whatever HonorConstraints says: it never moves scheduled dates, and a
-//! missed one shows as negative total slack on the task and its drivers.
+//! whatever HonorConstraints says. It pulls an ALAP task earlier, but does not
+//! directly move ASAP tasks. It can move an ALAP task and its successors
+//! through their links. A missed deadline shows as negative total slack on
+//! the task and its drivers.
 //! Summary tasks roll up from their descendants, except that a manually
 //! scheduled summary keeps its own dates: they floor its unconstrained
 //! subtasks' starts and extend the project finish (see [`Schedule::rolled_up`]
@@ -262,6 +265,17 @@ impl Timeline {
     fn snap(&self, abs: i64) -> i64 {
         self.abs_start(self.to_index(abs))
     }
+
+    /// Latest working start no later than `abs`, including the last minute of
+    /// the previous period when `abs` lies in a nonworking gap.
+    fn start_at_or_before(&self, abs: i64) -> i64 {
+        let snapped = self.snap(abs);
+        if snapped <= abs {
+            snapped
+        } else {
+            self.abs_start(self.to_index(abs).saturating_sub(1))
+        }
+    }
 }
 
 /// A scheduler bound to a project: owns one timeline per calendar and the
@@ -285,6 +299,13 @@ struct Scheduler<'a> {
     floors: HashMap<i32, i64>,
 }
 
+struct LeafGraph {
+    leaves: Vec<usize>,
+    idx_of: HashMap<i32, usize>,
+    order: Vec<usize>,
+    succs: HashMap<i32, Vec<(i32, LinkType, Offset)>>,
+}
+
 struct ConstraintDates {
     start: i64,
     finish: i64,
@@ -301,6 +322,13 @@ struct ConstraintDates {
 }
 
 impl<'a> Scheduler<'a> {
+    fn schedulable_alap(&self, task: &Task) -> bool {
+        !task.summary
+            && task.constraint == ConstraintType::AsLateAsPossible
+            && !fixed(task)
+            && self.tl(task).total > 0
+    }
+
     /// The same exception-aware leaf test used by the CPM and leveling passes.
     fn has_leaf(&self) -> bool {
         self.proj
@@ -611,8 +639,36 @@ impl<'a> Scheduler<'a> {
     }
 
     fn run(&self) -> Schedule {
-        // Exclude unschedulable leaves before either pass so they cannot affect
-        // dependencies, project finish, or summary dates with empty timelines.
+        self.run_with_alap_override(&HashMap::new())
+    }
+
+    fn run_with_alap_override(&self, forced: &HashMap<i32, i64>) -> Schedule {
+        let graph = self.leaf_graph();
+        let has_alap = graph
+            .leaves
+            .iter()
+            .any(|&i| self.schedulable_alap(&self.proj.tasks[i]));
+        let legacy = !has_alap && forced.is_empty();
+        let initial = self.pass(&graph, &HashMap::new(), legacy);
+        if legacy {
+            return initial;
+        }
+        let mut alap: HashMap<i32, i64> = self
+            .proj
+            .tasks
+            .iter()
+            .filter(|t| self.schedulable_alap(t))
+            .filter_map(|t| initial.get(t.uid).map(|r| (t.uid, r.late_start.minutes())))
+            .collect();
+        alap.extend(forced);
+        debug_assert!(!alap.is_empty());
+        self.cap_alap_for_fixed(&graph, &initial, &mut alap, forced);
+        self.pass(&graph, &alap, false)
+    }
+
+    fn leaf_graph(&self) -> LeafGraph {
+        // Exclude unschedulable leaves before either pass so they cannot
+        // affect dependencies, project finish, or summary dates.
         let leaves: Vec<usize> = (0..self.proj.tasks.len())
             .filter(|&i| !self.proj.tasks[i].summary && self.tl(&self.proj.tasks[i]).total > 0)
             .collect();
@@ -622,22 +678,104 @@ impl<'a> Scheduler<'a> {
             .iter()
             .map(|&i| (self.proj.tasks[i].uid, i))
             .collect();
-
         let order = topo_order(self.proj, &leaves, &leaf_uids, &idx_of);
-
-        // Successors of each leaf (for backward pass + free slack).
         let mut succs: HashMap<i32, Vec<(i32, LinkType, Offset)>> = HashMap::new();
         for &i in &leaves {
-            let t = &self.proj.tasks[i];
-            for p in &t.predecessors {
-                if leaf_uids.contains(&p.uid) {
-                    succs
-                        .entry(p.uid)
-                        .or_default()
-                        .push((t.uid, p.link, self.offset(p)));
+            let task = &self.proj.tasks[i];
+            for link in &task.predecessors {
+                if leaf_uids.contains(&link.uid) {
+                    succs.entry(link.uid).or_default().push((
+                        task.uid,
+                        link.link,
+                        self.offset(link),
+                    ));
                 }
             }
         }
+        LeafGraph {
+            leaves,
+            idx_of,
+            order,
+            succs,
+        }
+    }
+
+    fn cap_alap_for_fixed(
+        &self,
+        graph: &LeafGraph,
+        initial: &Schedule,
+        alap: &mut HashMap<i32, i64>,
+        forced: &HashMap<i32, i64>,
+    ) {
+        // A fixed leaf cannot follow an ALAP predecessor. Propagate its
+        // actual dates backward through every intervening auto task;
+        // ordinary late dates can float past a fixed task's own dates.
+        let mut caps: HashMap<i32, (i64, i64)> = HashMap::new();
+        for &i in graph.order.iter().rev() {
+            let task = &self.proj.tasks[i];
+            if fixed(task) {
+                let result = initial.get(task.uid).expect("leaf scheduled");
+                caps.insert(
+                    task.uid,
+                    (result.early_start.minutes(), result.early_finish.minutes()),
+                );
+                continue;
+            }
+            let cap = graph.succs.get(&task.uid).into_iter().flatten().filter_map(
+                |&(successor_uid, link, offset)| {
+                    let successor = &self.proj.tasks[graph.idx_of[&successor_uid]];
+                    let &(start, finish) = caps.get(&successor.uid)?;
+                    Some(self.fixed_successor_cap(task, successor, link, offset, start, finish))
+                },
+            );
+            if let Some(start) = cap.min() {
+                let tl = self.tl(task);
+                let finish = if task.duration_min == 0 {
+                    start
+                } else {
+                    tl.abs_finish(tl.to_index(start) + task.duration_min)
+                };
+                caps.insert(task.uid, (start, finish));
+                if let Some(floor) = alap.get_mut(&task.uid)
+                    && !forced.contains_key(&task.uid)
+                {
+                    *floor = (*floor).min(start);
+                }
+            }
+        }
+    }
+
+    fn fixed_successor_cap(
+        &self,
+        predecessor: &Task,
+        successor: &Task,
+        link: LinkType,
+        offset: Offset,
+        start: i64,
+        finish: i64,
+    ) -> i64 {
+        let pred_tl = self.tl(predecessor);
+        let succ_tl = self.tl(successor);
+        inverse_link(
+            pred_tl,
+            succ_tl,
+            link,
+            offset,
+            SuccessorBound {
+                start,
+                finish,
+                milestone: successor.duration_min == 0,
+            },
+            predecessor.duration_min,
+        )
+        .start
+    }
+
+    fn pass(&self, graph: &LeafGraph, alap: &HashMap<i32, i64>, legacy: bool) -> Schedule {
+        let leaves = &graph.leaves;
+        let idx_of = &graph.idx_of;
+        let order = &graph.order;
+        let succs = &graph.succs;
 
         // ---- forward pass: early start / early finish ----
         let mut es: HashMap<i32, i64> = HashMap::new(); // index space (own calendar)
@@ -650,7 +788,7 @@ impl<'a> Scheduler<'a> {
         let mut resume_idx: HashMap<i32, i64> = HashMap::new();
         let mut driven_ef: HashMap<i32, i64> = HashMap::new();
         let mut linked_tasks = std::collections::HashSet::new();
-        for &i in &order {
+        for &i in order {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
             let mut linked_start: Option<i64> = None;
@@ -837,10 +975,18 @@ impl<'a> Scheduler<'a> {
                     driven_start = start_abs;
                 }
             }
-            // A binding FS milestone occupies the finish instant, even in a
-            // nonworking gap, as does a binding MFO/FNLT milestone or one with
-            // an SNET at a period's end. Later start-type links/constraints
-            // still snap.
+            if let Some(&late_start) = alap.get(&t.uid)
+                && late_start > start_abs
+            {
+                start_abs = late_start;
+                if t.duration_min == 0 {
+                    held_milestone = Some(late_start);
+                }
+            }
+            // A binding FS or ALAP milestone occupies its exact finish or
+            // late-start instant, even in a nonworking gap. So do binding
+            // MFO/FNLT and period-end SNET milestones. Later start-type
+            // links/constraints still snap.
             let s_abs =
                 if fs_milestone_start == Some(start_abs) || held_milestone == Some(start_abs) {
                     start_abs
@@ -866,7 +1012,7 @@ impl<'a> Scheduler<'a> {
             .chain(self.manual_spans.values().map(|&(_, finish)| finish))
             .max()
             .unwrap_or(self.anchor);
-        let pre_start = self.pre_start_timelines(&leaves, &linked_tasks);
+        let pre_start = self.pre_start_timelines(leaves, &linked_tasks);
         // A task is critical at or below this much total slack
         // (`CriticalSlackLimit`), and with `MultipleCriticalPaths` each task
         // without successors ends a critical path of its own.
@@ -908,35 +1054,27 @@ impl<'a> Scheduler<'a> {
             let mut bound_instant = end_abs;
             if let Some(list) = succs.get(&t.uid) {
                 for &(suid, link, offset) in list {
-                    let lag = offset.index_lag();
-                    let sls = ls_abs.get(&suid).map(|&x| offset.backward(x).0);
-                    let slf = lf_abs.get(&suid).map(|&x| offset.backward(x).0);
-                    let cand = match link {
-                        // this.finish ≤ succ.late_start − lag
-                        LinkType::FinishStart => sls.map(|x| tl.abs_finish(tl.to_index(x) - lag)),
-                        // succ.start ≥ this.start + lag ⇒ bound this.start, then finish
-                        LinkType::StartStart => sls.map(|x| {
-                            let this_start = tl.abs_start(tl.to_index(x) - lag);
-                            tl.abs_finish(tl.to_index(this_start) + span)
-                        }),
-                        // this.finish ≤ succ.late_finish − lag
-                        LinkType::FinishFinish => slf.map(|x| tl.abs_finish(tl.to_index(x) - lag)),
-                        LinkType::StartFinish => slf.map(|x| {
-                            let this_start = tl.abs_start(tl.to_index(x) - lag);
-                            tl.abs_finish(tl.to_index(this_start) + span)
-                        }),
-                    };
-                    if let Some(c) = cand {
-                        finish_abs = finish_abs.min(c);
-                        let endpoint = match link {
-                            LinkType::FinishStart | LinkType::StartStart => sls,
-                            LinkType::FinishFinish | LinkType::StartFinish => slf,
+                    let successor = &self.proj.tasks[idx_of[&suid]];
+                    let succ_tl = self.tl(successor);
+                    if let (Some(&sls), Some(&slf)) = (ls_abs.get(&suid), lf_abs.get(&suid)) {
+                        let inverse = if legacy {
+                            legacy_inverse_link(tl, link, offset, sls, slf, span)
+                        } else {
+                            inverse_link(
+                                tl,
+                                succ_tl,
+                                link,
+                                offset,
+                                SuccessorBound {
+                                    start: sls,
+                                    finish: slf,
+                                    milestone: successor.duration_min == 0,
+                                },
+                                span,
+                            )
                         };
-                        let allowed = match endpoint {
-                            Some(x) if span == 0 && lag == 0 => x,
-                            _ => c,
-                        };
-                        bound_instant = bound_instant.min(allowed);
+                        finish_abs = finish_abs.min(inverse.finish);
+                        bound_instant = bound_instant.min(inverse.allowed_milestone);
                     }
                 }
             }
@@ -1043,9 +1181,9 @@ impl<'a> Scheduler<'a> {
                 }
             }
             // A deadline bounds the late finish like an FNLT, but it is not a
-            // constraint: it applies whatever HonorConstraints says and never
-            // moves scheduled dates. A pre-start window has already taken it
-            // into account.
+            // constraint: it applies whatever HonorConstraints says. The
+            // outer run() can place an ALAP task at the late start it bounds.
+            // A pre-start window has already taken it into account.
             if let Some(deadline) = t.deadline.filter(|_| !pinned && pre_start_window.is_none()) {
                 let floor = self.date_floor(t, linked_tasks.contains(&t.uid));
                 let (df, milestone) = finish_instants(tl, deadline.minutes(), floor);
@@ -1073,9 +1211,8 @@ impl<'a> Scheduler<'a> {
                 // reuse the early instants unless a hard date set that bound.
                 (es_abs[&t.uid], ef_abs[&t.uid])
             } else {
-                // A binding MFO/FNLT/deadline milestone sits on its own
-                // instant (an FNLT or deadline capped by the successor bound),
-                // which can be the morning side of that date's index.
+                // A binding MFO/FNLT/deadline milestone keeps its own instant,
+                // capped by a successor on the same working index.
                 if let Some(m) = milestone_late {
                     debug_assert_eq!(tl.to_index(m), finish_index);
                 }
@@ -1093,7 +1230,7 @@ impl<'a> Scheduler<'a> {
 
         // ---- assemble leaf results ----
         let mut results: HashMap<i32, TaskResult> = HashMap::new();
-        for &i in &leaves {
+        for &i in leaves {
             let t = &self.proj.tasks[i];
             let tl = self.tl(t);
             let e_s = es_abs[&t.uid];
@@ -1138,7 +1275,7 @@ impl<'a> Scheduler<'a> {
             // A tracked task finishes where its actuals put it, not at its
             // start plus its duration.
             let finish = tracked.map(|_| tl.to_index(e_f));
-            let free = self.free_slack(t, tl, &es_abs, finish, &succs);
+            let free = self.free_slack(t, tl, &es_abs, finish, graph, legacy);
             results.insert(
                 t.uid,
                 TaskResult {
@@ -1169,7 +1306,7 @@ impl<'a> Scheduler<'a> {
         let mut rollups = HashMap::new();
         for i in summaries_deepest_first(self.proj) {
             let t = &self.proj.tasks[i];
-            let nodes: Vec<Node> = rollup_nodes(self.proj, i, &leaves)
+            let nodes: Vec<Node> = rollup_nodes(self.proj, i, leaves)
                 .filter_map(|k| {
                     let r = results.get(&self.proj.tasks[k].uid)?;
                     Some(if self.proj.tasks[k].summary {
@@ -1302,17 +1439,40 @@ impl<'a> Scheduler<'a> {
         tl: &Timeline,
         es_abs: &HashMap<i32, i64>,
         finish: Option<i64>,
-        succs: &HashMap<i32, Vec<(i32, LinkType, Offset)>>,
+        graph: &LeafGraph,
+        legacy: bool,
     ) -> Option<i64> {
-        let list = succs.get(&t.uid)?;
+        let list = graph.succs.get(&t.uid)?;
         let ef_idx = finish.unwrap_or_else(|| tl.to_index(es_abs[&t.uid]) + t.duration_min);
         let mut min_gap: Option<i64> = None;
         for &(suid, link, offset) in list {
             if link != LinkType::FinishStart {
                 continue;
             }
-            let (succ_es, lag) = offset.backward(*es_abs.get(&suid)?);
-            let gap = tl.to_index(succ_es) - lag - ef_idx;
+            let succ = &self.proj.tasks[graph.idx_of[&suid]];
+            let succ_tl = self.tl(succ);
+            let succ_es = *es_abs.get(&suid)?;
+            if legacy {
+                let allowed =
+                    legacy_inverse_link(tl, LinkType::FinishStart, offset, succ_es, succ_es, 0)
+                        .finish;
+                let gap = tl.to_index(allowed) - ef_idx;
+                min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
+                continue;
+            }
+            let inverse = inverse_link(
+                tl,
+                succ_tl,
+                LinkType::FinishStart,
+                offset,
+                SuccessorBound {
+                    start: succ_es,
+                    finish: succ_es,
+                    milestone: succ.duration_min == 0,
+                },
+                0,
+            );
+            let gap = tl.to_index(inverse.finish) - ef_idx;
             min_gap = Some(min_gap.map_or(gap, |m: i64| m.min(gap)));
         }
         min_gap
@@ -1452,22 +1612,129 @@ impl Offset {
             Offset::Elapsed(lag) => (abs.saturating_add(lag), 0),
         }
     }
+}
 
-    /// The lag left to apply in index space once the instant is shifted.
-    fn index_lag(self) -> i64 {
-        match self {
-            Offset::Working(lag) => lag,
-            Offset::Elapsed(_) => 0,
+/// The predecessor window allowed by one successor link.
+struct InverseLink {
+    start: i64,
+    finish: i64,
+    /// Exact instant for zero-duration predecessors under a date bound.
+    allowed_milestone: i64,
+}
+
+struct SuccessorBound {
+    start: i64,
+    finish: i64,
+    milestone: bool,
+}
+
+/// Preserve the original CPM late-date arithmetic for plans without ALAP.
+/// Their output is part of the scheduler's existing compatibility contract.
+fn legacy_inverse_link(
+    tl: &Timeline,
+    link: LinkType,
+    offset: Offset,
+    succ_start: i64,
+    succ_finish: i64,
+    span: i64,
+) -> InverseLink {
+    let endpoint = match link {
+        LinkType::FinishStart | LinkType::StartStart => succ_start,
+        LinkType::FinishFinish | LinkType::StartFinish => succ_finish,
+    };
+    let (endpoint, lag) = match offset {
+        Offset::Working(lag) => (endpoint, lag),
+        Offset::Elapsed(lag) => (endpoint.saturating_sub(lag), 0),
+    };
+    let (start, finish) = match link {
+        LinkType::FinishStart | LinkType::FinishFinish => {
+            let finish = tl.abs_finish(tl.to_index(endpoint) - lag);
+            (tl.abs_start(tl.to_index(finish) - span), finish)
         }
+        LinkType::StartStart | LinkType::StartFinish => {
+            let start = tl.abs_start(tl.to_index(endpoint) - lag);
+            (start, tl.abs_finish(tl.to_index(start) + span))
+        }
+    };
+    InverseLink {
+        start,
+        finish,
+        allowed_milestone: if span == 0 && lag == 0 {
+            endpoint
+        } else {
+            finish
+        },
     }
+}
 
-    /// [`Self::forward`] mirrored for a successor's late instant: the lag is
-    /// still to be subtracted in index space.
-    fn backward(self, abs: i64) -> (i64, i64) {
-        match self {
-            Offset::Working(lag) => (abs, lag),
-            Offset::Elapsed(lag) => (abs.saturating_sub(lag), 0),
+/// Invert a link for plans with a schedulable ALAP task. Other plans retain
+/// [`legacy_inverse_link`] so their established late dates do not change.
+/// The ALAP late dates and fixed-successor caps use this calendar-aware path.
+fn inverse_link(
+    pred_tl: &Timeline,
+    succ_tl: &Timeline,
+    link: LinkType,
+    offset: Offset,
+    successor: SuccessorBound,
+    span: i64,
+) -> InverseLink {
+    let endpoint = match link {
+        LinkType::FinishStart | LinkType::StartStart => successor.start,
+        LinkType::FinishFinish | LinkType::StartFinish => successor.finish,
+    };
+    let (working_lag, elapsed_lag) = match offset {
+        Offset::Working(lag) => (lag, 0),
+        Offset::Elapsed(lag) => (0, lag),
+    };
+    // The successor's next working start shares an index with the previous
+    // evening. Forward scheduling accepts a predecessor endpoint throughout
+    // that gap, so the inverse keeps the morning side of the index.
+    let bound = if link == LinkType::FinishStart
+        && successor.milestone
+        && matches!(offset, Offset::Working(0) | Offset::Elapsed(_))
+    {
+        // A zero-lag or elapsed FS milestone keeps the predecessor's exact
+        // finish plus elapsed time, without snapping to a working morning.
+        endpoint.saturating_sub(elapsed_lag)
+    } else if matches!(offset, Offset::Elapsed(_))
+        && matches!(link, LinkType::FinishFinish | LinkType::StartFinish)
+    {
+        // An elapsed FF/SF forward link keeps the successor's exact finish,
+        // including an instant outside working time.
+        endpoint.saturating_sub(elapsed_lag)
+    } else {
+        let morning = succ_tl.abs_start(succ_tl.to_index(endpoint) - working_lag);
+        morning.saturating_sub(elapsed_lag)
+    };
+    let (start, finish) = match link {
+        LinkType::FinishStart | LinkType::FinishFinish => {
+            let finish = pred_tl.abs_finish(pred_tl.to_index(bound));
+            let start = if span == 0 {
+                finish
+            } else {
+                pred_tl.abs_start(pred_tl.to_index(finish) - span)
+            };
+            (start, finish)
         }
+        LinkType::StartStart | LinkType::StartFinish => {
+            let start = pred_tl.start_at_or_before(bound);
+            let finish = if span == 0 {
+                start
+            } else {
+                pred_tl.abs_finish(pred_tl.to_index(start) + span)
+            };
+            (start, finish)
+        }
+    };
+    let allowed_milestone = match offset {
+        Offset::Working(0) if span == 0 => endpoint,
+        Offset::Elapsed(_) if span == 0 => bound,
+        _ => finish,
+    };
+    InverseLink {
+        start,
+        finish,
+        allowed_milestone,
     }
 }
 
@@ -1873,7 +2140,7 @@ fn schedule_local(proj: &Project) -> Schedule {
     let active = without_tasks(proj, &dormant);
     let active_scheduler = Scheduler::new(&active);
     let mut main = active_scheduler.run();
-    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler);
+    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler, &main);
     if dormant_bounds {
         main.project_start = other.project_start;
         main.project_finish = other.project_finish;
@@ -1896,6 +2163,7 @@ fn dormant_pass(
     clean: &Project,
     dormant: &std::collections::HashSet<i32>,
     active: &Scheduler<'_>,
+    active_result: &Schedule,
 ) -> (Schedule, bool) {
     let dormant_bounds = !active.has_leaf();
     let mut view = dormant_view(clean, dormant);
@@ -1914,7 +2182,21 @@ fn dormant_pass(
         view.start_date
             .get_or_insert(DateTime::from_minutes(active.anchor));
     }
-    (Scheduler::new(&view).run(), dormant_bounds)
+    let view_scheduler = Scheduler::new(&view);
+    let forced: HashMap<i32, i64> = view
+        .tasks
+        .iter()
+        .filter(|t| !dormant.contains(&t.uid) && view_scheduler.schedulable_alap(t))
+        .filter_map(|t| {
+            active_result
+                .get(t.uid)
+                .map(|r| (t.uid, r.early_start.minutes()))
+        })
+        .collect();
+    (
+        view_scheduler.run_with_alap_override(&forced),
+        dormant_bounds,
+    )
 }
 
 /// Inactive tasks and summaries with no active descendants have no effect on
@@ -2155,8 +2437,9 @@ fn level_local(proj: &Project) -> Leveled {
     }
     let active = without_tasks(proj, &dormant);
     let active_scheduler = Scheduler::new(&active);
-    let mut main = active_scheduler.level();
-    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler);
+    let active_result = active_scheduler.run();
+    let mut main = active_scheduler.level_from_base(&active_result);
+    let (other, dormant_bounds) = dormant_pass(proj, &dormant, &active_scheduler, &active_result);
     if dormant_bounds {
         main.project_finish = other.project_finish;
     }
@@ -2396,6 +2679,10 @@ impl Scheduler<'_> {
 
     fn level(&self) -> Leveled {
         let base = self.run();
+        self.level_from_base(&base)
+    }
+
+    fn level_from_base(&self, base: &Schedule) -> Leveled {
         let tl = self
             .timelines
             .get(&self.default_cal)
@@ -2910,6 +3197,649 @@ mod tests {
     }
     fn fs(uid: i32) -> Predecessor {
         Predecessor::fs(uid)
+    }
+
+    #[test]
+    fn alap_leaf_uses_project_finish_or_earlier_deadline() {
+        for (deadline, start, finish) in [
+            (None, at(12, 8), at(13, 17)),
+            (Some(at(6, 17)), at(5, 8), at(6, 17)),
+        ] {
+            let mut side = task(2, "Side", 960);
+            side.constraint = ConstraintType::AsLateAsPossible;
+            side.deadline = deadline;
+            let sched = schedule(&march2(vec![task(1, "Long", 4800), side]));
+            let long = sched.get(1).unwrap();
+            let side = sched.get(2).unwrap();
+            assert_eq!(
+                (long.early_start, long.early_finish),
+                (at(2, 8), at(13, 17))
+            );
+            assert_eq!((side.early_start, side.early_finish), (start, finish));
+            assert_eq!((side.late_start, side.late_finish), (start, finish));
+            assert_eq!(side.total_slack_min, 0);
+            assert!(side.critical);
+            assert_eq!(sched.project_finish, at(13, 17));
+        }
+    }
+
+    #[test]
+    fn alap_predecessor_moves_asap_successor_to_its_late_dates() {
+        let mut a = task(1, "A", 960);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 960);
+        b.predecessors.push(fs(1));
+        let sched = schedule(&march2(vec![a, b, task(3, "Long", 4800)]));
+        for (uid, start, finish) in [(1, at(10, 8), at(11, 17)), (2, at(12, 8), at(13, 17))] {
+            let result = sched.get(uid).unwrap();
+            assert_eq!((result.early_start, result.early_finish), (start, finish));
+            assert_eq!(result.total_slack_min, 0);
+            assert!(result.critical);
+        }
+        assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn two_linked_alap_tasks_use_one_backward_window() {
+        let mut a = task(1, "A", 960);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 960);
+        b.constraint = ConstraintType::AsLateAsPossible;
+        b.predecessors.push(fs(1));
+        let sched = schedule(&march2(vec![a, b, task(3, "Long", 4800)]));
+        for (uid, start, finish) in [(1, at(10, 8), at(11, 17)), (2, at(12, 8), at(13, 17))] {
+            let result = sched.get(uid).unwrap();
+            assert_eq!((result.early_start, result.early_finish), (start, finish));
+            assert_eq!(result.total_slack_min, 0);
+            assert!(result.critical);
+        }
+        assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn cross_calendar_working_lag_does_not_extend_project_finish() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        let mut a = task(1, "A", 480);
+        a.calendar_uid = Some(2);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 480);
+        b.predecessors
+            .push(Predecessor::working(1, LinkType::FinishStart, 480));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), every_day],
+            ..march2(vec![a, b, task(3, "Long", 11 * 480)])
+        };
+        let sched = schedule(&proj);
+        assert_eq!(sched.project_finish, at(16, 17));
+        assert_eq!(sched.get(1).unwrap().early_finish, at(12, 17));
+        assert_eq!(sched.get(2).unwrap().early_start, at(16, 8));
+        assert_eq!(sched.get(2).unwrap().early_finish, at(16, 17));
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 0);
+        assert_eq!(sched.get(1).unwrap().free_slack_min, 0);
+        assert_eq!(sched.get(2).unwrap().total_slack_min, 0);
+        assert_eq!(sched.get(3).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn linked_alap_milestone_uses_evening_late_instant() {
+        for alap in [false, true] {
+            let mut milestone = task(1, "M", 0);
+            if alap {
+                milestone.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 960);
+            b.predecessors.push(fs(1));
+            let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 4800)]));
+            let m = sched.get(1).unwrap();
+            assert_eq!((m.late_start, m.late_finish), (at(11, 17), at(11, 17)));
+            if alap {
+                assert_eq!((m.early_start, m.early_finish), (at(11, 17), at(11, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(12, 8));
+                assert_eq!(sched.project_finish, at(13, 17));
+            }
+        }
+    }
+
+    #[test]
+    fn deadline_free_elapsed_fs_milestone_keeps_evening_convention() {
+        for alap in [false, true] {
+            let mut milestone = task(1, "M", 0);
+            if alap {
+                milestone.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 900,
+                lag_format: LagFormat::from_code(4).unwrap(),
+                ..Predecessor::fs(1)
+            });
+            let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 6 * 480)]));
+            let m = sched.get(1).unwrap();
+            assert_eq!((m.late_start, m.late_finish), (at(6, 17), at(6, 17)));
+            if alap {
+                assert_eq!((m.early_start, m.early_finish), (at(6, 17), at(6, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(9, 8));
+                assert_eq!(sched.project_finish, at(9, 17));
+            }
+        }
+    }
+
+    #[test]
+    fn elapsed_ff_alap_preserves_successors_exact_finish() {
+        let mut a = task(1, "A", 4 * 480);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(Predecessor {
+            uid: 1,
+            link: LinkType::FinishFinish,
+            lag: 2880,
+            lag_format: LagFormat::from_code(8).unwrap(),
+            ..Predecessor::fs(1)
+        });
+        let sched = schedule(&march2(vec![a, b]));
+        assert_eq!(
+            (
+                sched.get(1).unwrap().early_start,
+                sched.get(1).unwrap().early_finish
+            ),
+            (at(2, 8), at(5, 17))
+        );
+        assert_eq!(sched.get(2).unwrap().early_finish, at(7, 17));
+        assert_eq!(sched.project_finish, at(7, 17));
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn dormant_successor_follows_active_alap_placement() {
+        let mut a = task(1, "A", 960);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut d = task(2, "D", 960);
+        d.active = Some(false);
+        d.predecessors.push(fs(1));
+        let proj = march2(vec![a, d, task(3, "Long", 4800)]);
+        let sched = schedule(&proj);
+        assert_eq!(
+            (
+                sched.get(1).unwrap().early_start,
+                sched.get(1).unwrap().early_finish
+            ),
+            (at(12, 8), at(13, 17))
+        );
+        assert_eq!(sched.get(2).unwrap().early_start, at(16, 8));
+        assert_eq!(sched.project_finish, at(13, 17));
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(1), Some(at(12, 8)));
+        assert_eq!(leveled.finish(1), Some(at(13, 17)));
+        assert_eq!(leveled.start(2), Some(at(16, 8)));
+    }
+
+    #[test]
+    fn fixed_active_alap_does_not_change_dormant_late_dates() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        for with_manual_alap in [false, true] {
+            let mut a = task(1, "Dormant A", 480);
+            a.calendar_uid = Some(2);
+            a.active = Some(false);
+            let mut b = task(2, "Dormant B", 480);
+            b.active = Some(false);
+            b.predecessors
+                .push(Predecessor::working(1, LinkType::FinishStart, 480));
+            let mut tasks = vec![task(3, "Long", 6 * 480), a, b];
+            if with_manual_alap {
+                let mut pinned = manual(4, "Pinned", 480, at(2, 8));
+                pinned.constraint = ConstraintType::AsLateAsPossible;
+                tasks.push(pinned);
+            }
+            let proj = Project {
+                calendars: vec![Calendar::standard(1), every_day.clone()],
+                ..march2(tasks)
+            };
+            let sched = schedule(&proj);
+            let a = sched.get(1).unwrap();
+            assert_eq!(a.late_finish, at(7, 17), "manual={with_manual_alap}");
+            assert_eq!(a.total_slack_min, 2400, "manual={with_manual_alap}");
+            let leveled = level(&proj);
+            assert_eq!(leveled.start(1), Some(a.early_start));
+            assert_eq!(leveled.finish(1), Some(a.early_finish));
+            assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
+            assert_eq!(leveled.project_finish, sched.project_finish);
+        }
+    }
+
+    #[test]
+    fn cross_calendar_fs_late_finish_uses_successors_morning_side() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        let mut x = task(1, "X", 5 * 480);
+        x.calendar_uid = Some(2);
+        let mut a = task(2, "A", 480);
+        a.calendar_uid = Some(2);
+        a.predecessors.push(fs(1));
+        let mut b = task(3, "B", 480);
+        b.predecessors.push(fs(2));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), every_day],
+            ..march2(vec![x, a, b])
+        };
+        let sched = schedule(&proj);
+        assert_eq!(sched.get(2).unwrap().late_finish, at(8, 17));
+        assert_eq!(sched.get(2).unwrap().total_slack_min, 480);
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 480);
+        assert_eq!(sched.get(3).unwrap().total_slack_min, 0);
+    }
+
+    #[test]
+    fn fs_milestone_successor_uses_its_exact_late_instant() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        for (alap, lag, finish, slack) in [
+            (false, 0, at(6, 17), 1920),
+            (true, 0, at(6, 17), 0),
+            (true, 480, at(5, 17), 0),
+        ] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            if alap {
+                a.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut milestone = task(2, "M", 0);
+            milestone.deadline = Some(at(6, 17));
+            milestone
+                .predecessors
+                .push(Predecessor::working(1, LinkType::FinishStart, lag));
+            let proj = Project {
+                calendars: vec![Calendar::standard(1), every_day.clone()],
+                ..march2(vec![a, milestone, task(3, "Long", 4800)])
+            };
+            let sched = schedule(&proj);
+            assert_eq!(sched.get(1).unwrap().late_finish, finish, "lag={lag}");
+            assert_eq!(sched.get(1).unwrap().total_slack_min, slack, "lag={lag}");
+            if alap {
+                assert_eq!(sched.get(1).unwrap().early_finish, finish, "lag={lag}");
+                assert_eq!(sched.get(2).unwrap().early_start, at(6, 17));
+            }
+        }
+    }
+
+    #[test]
+    fn elapsed_fs_milestone_successor_preserves_project_finish() {
+        for alap in [false, true] {
+            let mut a = task(1, "A", 480);
+            if alap {
+                a.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut milestone = task(2, "M", 0);
+            milestone.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 1440,
+                lag_format: LagFormat::from_code(8).unwrap(),
+                ..Predecessor::fs(1)
+            });
+            let sched = schedule(&march2(vec![a, milestone, task(3, "Long", 5 * 480)]));
+            let a = sched.get(1).unwrap();
+            assert_eq!((a.late_start, a.late_finish), (at(5, 8), at(5, 17)));
+            if alap {
+                assert_eq!((a.early_start, a.early_finish), (at(5, 8), at(5, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(6, 17));
+                assert_eq!(sched.project_finish, at(6, 17));
+            } else {
+                assert_eq!(a.total_slack_min, 1440);
+            }
+        }
+    }
+
+    #[test]
+    fn cross_calendar_alap_fs_uses_sunday_before_monday_successor() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        let mut a = task(1, "A", 480);
+        a.calendar_uid = Some(2);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 480);
+        b.predecessors.push(fs(1));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), every_day],
+            ..march2(vec![a, b, task(3, "Long", 6 * 480)])
+        };
+        let sched = schedule(&proj);
+        assert_eq!(
+            (
+                sched.get(1).unwrap().early_start,
+                sched.get(1).unwrap().early_finish
+            ),
+            (at(8, 8), at(8, 17))
+        );
+        assert_eq!(sched.get(2).unwrap().early_start, at(9, 8));
+        assert_eq!(sched.project_finish, at(9, 17));
+    }
+
+    #[test]
+    fn elapsed_fs_lag_is_subtracted_after_successor_calendar_snap() {
+        let mut every_day = Calendar::standard(2);
+        let monday = every_day.week[1].clone();
+        for day in &mut every_day.week {
+            *day = monday.clone();
+        }
+        for alap in [false, true] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            if alap {
+                a.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 1440,
+                lag_format: LagFormat::from_code(8).unwrap(),
+                ..Predecessor::fs(1)
+            });
+            let proj = Project {
+                calendars: vec![Calendar::standard(1), every_day.clone()],
+                ..march2(vec![a, b, task(3, "Long", 6 * 480)])
+            };
+            let sched = schedule(&proj);
+            let a = sched.get(1).unwrap();
+            assert_eq!((a.late_start, a.late_finish), (at(7, 8), at(7, 17)));
+            if alap {
+                assert_eq!((a.early_start, a.early_finish), (at(7, 8), at(7, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(9, 8));
+                assert_eq!(sched.project_finish, at(9, 17));
+            } else {
+                assert_eq!(a.total_slack_min, 2400);
+            }
+        }
+    }
+
+    #[test]
+    fn cross_calendar_ss_alap_starts_before_successor_bound() {
+        let mut evenings = Calendar::standard(2);
+        for day in &mut evenings.week {
+            *day = Some(DayWorking {
+                times: vec![WorkingTime {
+                    from: 18 * 60,
+                    to: 22 * 60,
+                }],
+            });
+        }
+        let mut a = task(1, "A", 240);
+        a.calendar_uid = Some(2);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = task(2, "B", 960);
+        b.predecessors
+            .push(Predecessor::working(1, LinkType::StartStart, 0));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), evenings],
+            ..march2(vec![a, b, task(3, "Long", 4800)])
+        };
+        let sched = schedule(&proj);
+        assert_eq!(
+            (
+                sched.get(1).unwrap().early_start,
+                sched.get(1).unwrap().early_finish
+            ),
+            (at(11, 21).add_minutes(59), at(12, 21).add_minutes(59))
+        );
+        assert_eq!(
+            (
+                sched.get(2).unwrap().early_start,
+                sched.get(2).unwrap().early_finish
+            ),
+            (at(12, 8), at(13, 17))
+        );
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 0);
+        assert_eq!(sched.get(2).unwrap().total_slack_min, 0);
+        assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn ss_inverse_in_alap_plan_uses_last_working_minute_before_gap() {
+        let mut later = Calendar::standard(2);
+        for weekday in 1..=5 {
+            later.week[weekday] = Some(DayWorking {
+                times: vec![
+                    WorkingTime {
+                        from: 9 * 60,
+                        to: 12 * 60,
+                    },
+                    WorkingTime {
+                        from: 13 * 60,
+                        to: 18 * 60,
+                    },
+                ],
+            });
+        }
+        let mut p = task(1, "P", 60);
+        p.calendar_uid = Some(2);
+        p.constraint = ConstraintType::StartNoEarlierThan;
+        p.constraint_date = Some(at(6, 15));
+        let mut s = task(2, "S", 480);
+        s.predecessors
+            .push(Predecessor::working(1, LinkType::StartStart, 0));
+        let mut side = task(4, "ALAP side", 0);
+        side.constraint = ConstraintType::AsLateAsPossible;
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), later],
+            ..march2(vec![p, s, task(3, "Long", 6 * 480), side])
+        };
+        let sched = schedule(&proj);
+        assert_eq!(
+            sched.get(1).unwrap().late_start,
+            at(6, 17).add_minutes(59),
+            "{}",
+            sched.get(1).unwrap().late_start.to_mspdi()
+        );
+        assert_eq!(sched.get(1).unwrap().total_slack_min, 179);
+        assert_eq!(sched.project_finish, at(9, 17));
+    }
+
+    #[test]
+    fn elapsed_fs_milestone_keeps_shifted_instant() {
+        for alap in [false, true] {
+            let mut milestone = task(1, "M", 0);
+            milestone.deadline = Some(at(9, 8));
+            if alap {
+                milestone.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag: 900,
+                lag_format: LagFormat::from_code(4).unwrap(),
+                ..Predecessor::fs(1)
+            });
+            let sched = schedule(&march2(vec![milestone, b, task(3, "Long", 6 * 480)]));
+            let m = sched.get(1).unwrap();
+            assert_eq!((m.late_start, m.late_finish), (at(8, 17), at(8, 17)));
+            if alap {
+                assert_eq!((m.early_start, m.early_finish), (at(8, 17), at(8, 17)));
+                assert_eq!(sched.get(2).unwrap().early_start, at(9, 8));
+                assert_eq!(sched.project_finish, at(9, 17));
+            }
+        }
+    }
+
+    #[test]
+    fn cross_calendar_ss_alap_does_not_violate_fixed_successor() {
+        let mut later = Calendar::standard(2);
+        for day in later.week.iter_mut().flatten() {
+            day.times = vec![
+                WorkingTime {
+                    from: 9 * 60,
+                    to: 12 * 60,
+                },
+                WorkingTime {
+                    from: 13 * 60,
+                    to: 18 * 60,
+                },
+            ];
+        }
+        let mut a = task(1, "A", 480);
+        a.calendar_uid = Some(2);
+        a.constraint = ConstraintType::AsLateAsPossible;
+        let mut b = manual(2, "B", 960, at(5, 8));
+        b.predecessors
+            .push(Predecessor::working(1, LinkType::StartStart, 0));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), later],
+            ..march2(vec![a, b, task(3, "Long", 4800)])
+        };
+        let sched = schedule(&proj);
+        assert!(sched.get(1).unwrap().early_start <= sched.get(2).unwrap().early_start);
+        assert!(sched.get(2).unwrap().total_slack_min >= 0);
+    }
+
+    #[test]
+    fn alap_predecessor_stops_before_fixed_successors() {
+        for tracked in [false, true] {
+            let mut a = task(1, "A", 960);
+            a.constraint = ConstraintType::AsLateAsPossible;
+            let mut b = if tracked {
+                in_progress(2, "B", 960, at(5, 8), (None, None), Some(480))
+            } else {
+                manual(2, "B", 960, at(5, 8))
+            };
+            b.predecessors.push(fs(1));
+            let sched = schedule(&march2(vec![a, b, task(3, "Long", 4800)]));
+            let a = sched.get(1).unwrap();
+            let b = sched.get(2).unwrap();
+            assert_eq!((a.early_start, a.early_finish), (at(3, 8), at(4, 17)));
+            assert_eq!((b.early_start, b.early_finish), (at(5, 8), at(6, 17)));
+            assert!(b.total_slack_min >= 0, "tracked={tracked}");
+            assert_eq!(sched.project_finish, at(13, 17));
+        }
+    }
+
+    #[test]
+    fn alap_predecessor_respects_each_fixed_successor_link_type() {
+        for link_type in [
+            LinkType::FinishStart,
+            LinkType::StartStart,
+            LinkType::FinishFinish,
+            LinkType::StartFinish,
+        ] {
+            let mut a = task(1, "A", 960);
+            a.constraint = ConstraintType::AsLateAsPossible;
+            let mut b = manual(2, "B", 960, at(5, 8));
+            b.predecessors.push(Predecessor::working(1, link_type, 0));
+            let sched = schedule(&march2(vec![a, b, task(3, "Long", 4800)]));
+            assert!(sched.get(2).unwrap().total_slack_min >= 0, "{link_type:?}");
+        }
+    }
+
+    #[test]
+    fn fixed_successor_cap_propagates_through_an_intermediate_task() {
+        for middle_alap in [false, true] {
+            let mut a = task(1, "A", 960);
+            a.constraint = ConstraintType::AsLateAsPossible;
+            let mut c = task(3, "C", 480);
+            c.predecessors.push(fs(1));
+            if middle_alap {
+                c.constraint = ConstraintType::AsLateAsPossible;
+            }
+            let mut b = manual(2, "B", 960, at(6, 8));
+            b.predecessors.push(fs(3));
+            let sched = schedule(&march2(vec![a, c, b, task(4, "Long", 4800)]));
+            let a = sched.get(1).unwrap();
+            let c = sched.get(3).unwrap();
+            let b = sched.get(2).unwrap();
+            assert_eq!((a.early_start, a.early_finish), (at(3, 8), at(4, 17)));
+            assert_eq!((c.early_start, c.early_finish), (at(5, 8), at(5, 17)));
+            assert_eq!((b.early_start, b.early_finish), (at(6, 8), at(9, 17)));
+            assert!(b.total_slack_min >= 0, "middle_alap={middle_alap}");
+            assert_eq!(sched.project_finish, at(13, 17));
+        }
+    }
+
+    #[test]
+    fn alap_milestone_keeps_project_finish_instant() {
+        let mut milestone = task(2, "Side milestone", 0);
+        milestone.constraint = ConstraintType::AsLateAsPossible;
+        let sched = schedule(&march2(vec![task(1, "Long", 4800), milestone]));
+        let result = sched.get(2).unwrap();
+        assert_eq!(
+            (result.early_start, result.early_finish),
+            (at(13, 17), at(13, 17))
+        );
+        assert_eq!(result.total_slack_min, 0);
+        assert!(result.critical);
+        assert_eq!(sched.project_finish, at(13, 17));
+    }
+
+    #[test]
+    fn impossible_alap_deadline_keeps_link_driven_dates_and_negative_slack() {
+        let mut side = task(2, "Side", 960);
+        side.predecessors.push(fs(1));
+        side.deadline = Some(at(6, 17));
+        let asap = schedule(&march2(vec![task(1, "Long", 4800), side.clone()]));
+        side.constraint = ConstraintType::AsLateAsPossible;
+        let alap = schedule(&march2(vec![task(1, "Long", 4800), side]));
+        let expected = asap.get(2).unwrap();
+        let actual = alap.get(2).unwrap();
+        assert_eq!(
+            (actual.early_start, actual.early_finish),
+            (at(16, 8), at(17, 17))
+        );
+        assert_eq!(
+            (actual.early_start, actual.early_finish),
+            (expected.early_start, expected.early_finish)
+        );
+        assert_eq!(actual.total_slack_min, expected.total_slack_min);
+        assert!(actual.total_slack_min < 0);
+        assert!(actual.critical);
+    }
+
+    #[test]
+    fn fixed_alap_tasks_keep_their_pinned_and_actual_dates() {
+        let mut pinned = manual(2, "Pinned", 960, at(2, 8));
+        pinned.constraint = ConstraintType::AsLateAsPossible;
+        let mut tracked = in_progress(3, "Tracked", 960, at(2, 8), (None, None), Some(480));
+        tracked.constraint = ConstraintType::AsLateAsPossible;
+        let sched = schedule(&march2(vec![task(1, "Long", 4800), pinned, tracked]));
+        for uid in [2, 3] {
+            let result = sched.get(uid).unwrap();
+            assert_eq!(
+                (result.early_start, result.early_finish),
+                (at(2, 8), at(3, 17))
+            );
+        }
+    }
+
+    #[test]
+    fn leveling_starts_from_alap_cpm_dates() {
+        let mut side = task(2, "Side", 960);
+        side.constraint = ConstraintType::AsLateAsPossible;
+        let proj = Project {
+            resources: vec![worker(1, "Crew", 1.0)],
+            assignments: vec![assign(1, 2, 1, 1.0)],
+            ..march2(vec![task(1, "Long", 4800), side])
+        };
+        let sched = schedule(&proj);
+        let leveled = level(&proj);
+        assert_eq!(leveled.start(2), Some(sched.get(2).unwrap().early_start));
+        assert_eq!(leveled.finish(2), Some(sched.get(2).unwrap().early_finish));
+        assert_eq!(leveled.project_finish, sched.project_finish);
     }
 
     /// Phase (summary) over A and B, B after A, then C after B. With
@@ -7703,5 +8633,112 @@ mod tests {
             let s = schedule(&march2(vec![t]));
             assert_eq!(span(&s, 1), expected, "{case}");
         }
+    }
+    /// Late dates and slack measured on origin/main (28c2628) for plans with
+    /// no ALAP task. Keep the original CPM answers across link kinds.
+    #[test]
+    fn non_alap_late_dates_match_main() {
+        let mut cal = Calendar::standard(2);
+        let monday = cal.week[1].clone();
+        for day in &mut cal.week {
+            *day = monday.clone();
+        }
+        for (link, lag, a_day, a_slack, b_slack) in [
+            (LinkType::FinishStart, 480, 7, 2400, 1440),
+            (LinkType::FinishStart, 900, 8, 2880, 1920),
+            (LinkType::StartStart, 480, 8, 2880, 1920),
+            (LinkType::StartStart, 900, 9, 3360, 1920),
+            (LinkType::FinishFinish, 480, 8, 2880, 1920),
+            (LinkType::FinishFinish, 900, 8, 2880, 2400),
+            (LinkType::StartFinish, 480, 9, 3360, 2400),
+            (LinkType::StartFinish, 900, 9, 3360, 2400),
+        ] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            let mut b = task(2, "B", 480);
+            b.predecessors.push(Predecessor {
+                uid: 1,
+                link,
+                lag,
+                lag_format: if lag == 480 {
+                    LagFormat::DAYS
+                } else {
+                    LagFormat::from_code(4).unwrap()
+                },
+                ..Predecessor::fs(1)
+            });
+            let p = Project {
+                calendars: vec![Calendar::standard(1), cal.clone()],
+                ..march2(vec![a, b, task(3, "Long", 6 * 480)])
+            };
+            let s = schedule(&p);
+            let a = s.get(1).unwrap();
+            let b = s.get(2).unwrap();
+            assert_eq!(
+                (a.late_start, a.late_finish, a.total_slack_min),
+                (at(a_day, 8), at(a_day, 17), a_slack),
+                "{link:?} lag={lag}"
+            );
+            assert_eq!(
+                (b.late_start, b.late_finish, b.total_slack_min),
+                (at(9, 8), at(9, 17), b_slack),
+                "{link:?} lag={lag}"
+            );
+            assert_eq!(s.project_finish, at(9, 17));
+        }
+        for (deadline, lag, a_day, a_slack, m_day, m_slack) in [
+            (None, 0, 9, 3360, 9, 2400),
+            (Some(at(6, 17)), 0, 6, 1920, 6, 1920),
+            (None, 900, 8, 2880, 9, 2400),
+            (Some(at(6, 17)), 900, 5, 1440, 6, 1920),
+        ] {
+            let mut a = task(1, "A", 480);
+            a.calendar_uid = Some(2);
+            let mut m = task(2, "M", 0);
+            m.deadline = deadline;
+            m.predecessors.push(Predecessor {
+                uid: 1,
+                link: LinkType::FinishStart,
+                lag,
+                lag_format: if lag == 0 {
+                    LagFormat::DAYS
+                } else {
+                    LagFormat::from_code(4).unwrap()
+                },
+                ..Predecessor::fs(1)
+            });
+            let p = Project {
+                calendars: vec![Calendar::standard(1), cal.clone()],
+                ..march2(vec![a, m, task(3, "Long", 6 * 480)])
+            };
+            let s = schedule(&p);
+            let a = s.get(1).unwrap();
+            let m = s.get(2).unwrap();
+            assert_eq!(
+                (a.late_start, a.late_finish, a.total_slack_min),
+                (at(a_day, 8), at(a_day, 17), a_slack),
+                "deadline={deadline:?} lag={lag}"
+            );
+            assert_eq!(
+                (m.late_start, m.late_finish, m.total_slack_min),
+                (at(m_day, 17), at(m_day, 17), m_slack),
+                "deadline={deadline:?} lag={lag}"
+            );
+            assert_eq!(s.project_finish, at(9, 17));
+        }
+        // Origin/main also reports zero free slack for this cross-calendar
+        // working-lag FS link, despite the successor's SNET gap.
+        let a = task(1, "A", 4 * 480);
+        let mut s = task(2, "S", 480);
+        s.calendar_uid = Some(2);
+        s.constraint = ConstraintType::StartNoEarlierThan;
+        s.constraint_date = Some(at(9, 8));
+        s.predecessors
+            .push(Predecessor::working(1, LinkType::FinishStart, 480));
+        let proj = Project {
+            calendars: vec![Calendar::standard(1), cal],
+            ..march2(vec![a, s])
+        };
+        assert_eq!(schedule(&proj).get(1).unwrap().free_slack_min, 0);
     }
 }
