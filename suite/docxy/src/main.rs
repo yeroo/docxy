@@ -357,6 +357,10 @@ struct SheetView {
     /// When `Some`, the selected cell is being edited and this is the in-progress
     /// input buffer (a leading `=` marks a formula).
     editing: Option<String>,
+    /// Original buffer only for an editor opened from the stored cell.
+    edit_seed: Option<String>,
+    /// Sheet and cell where the current edit began, even if selection moves.
+    edit_origin: Option<(usize, u32, u32)>,
     /// Caret position within `editing`, as a char index (0..=len). Only
     /// meaningful while `editing` is `Some`.
     edit_caret: usize,
@@ -906,6 +910,27 @@ enum StructOp {
 }
 
 impl SheetView {
+    fn begin_cell_edit(&mut self, initial: Option<String>) {
+        let (r, c) = self.sel;
+        let (buf, seed) = match initial {
+            Some(buf) => (buf, None),
+            None => {
+                let seed = self.edit_string(r, c);
+                (seed.clone(), Some(seed))
+            }
+        };
+        self.editing = Some(buf);
+        self.edit_seed = seed;
+        self.edit_origin = Some((self.active, r, c));
+    }
+
+    fn edit_untouched(&self) -> bool {
+        self.editing
+            .as_deref()
+            .zip(self.edit_seed.as_deref())
+            .is_some_and(|(buf, seed)| buf == seed)
+    }
+
     /// Snapshot before a mutation; share the history limit across all edits.
     fn push_undo(&mut self) {
         self.undo.push(self.snapshot());
@@ -917,19 +942,26 @@ impl SheetView {
 
     /// Commit the cell buffer without moving the selection, including undo/recalc.
     fn commit_edit(&mut self) -> bool {
+        let untouched = self.edit_untouched();
         let Some(buf) = self.editing.take() else {
             return false;
         };
-        let (r, c) = self.sel;
-        // An untouched editor must not reparse a stored value such as text "007".
-        if buf == self.edit_string(r, c) {
+        let origin = self
+            .edit_origin
+            .take()
+            .unwrap_or((self.active, self.sel.0, self.sel.1));
+        self.edit_seed = None;
+        // A seeded editor left unchanged must not reparse text such as "007".
+        if untouched {
             return false;
         }
         self.push_undo();
-        let style = self.sheet().cell(r, c).map(|cl| cl.style).unwrap_or(0);
+        let style = self.pkg.workbook.sheets[origin.0]
+            .cell(origin.1, origin.2)
+            .map(|cl| cl.style)
+            .unwrap_or(0);
         let cell = parse_cell_input(&buf, style);
-        self.engine
-            .set_cell(&mut self.pkg.workbook, (self.active, r, c), cell);
+        self.engine.set_cell(&mut self.pkg.workbook, origin, cell);
         true
     }
 
@@ -1036,6 +1068,8 @@ impl SheetView {
         self.sel = snap.sel;
         self.anchor = snap.anchor;
         self.editing = None;
+        self.edit_seed = None;
+        self.edit_origin = None;
     }
     /// The selection rectangle as (r0, c0, r1, c1), top-left to bottom-right.
     fn range(&self) -> (u32, u32, u32, u32) {
@@ -3920,6 +3954,8 @@ fn new_sheet_surface() -> Surface {
         sel: (0, 0),
         anchor: (0, 0),
         editing: None,
+        edit_seed: None,
+        edit_origin: None,
         edit_caret: 0,
         engine,
         undo: vec![],
@@ -3946,6 +3982,8 @@ fn sheet_from_path(path: &PathBuf) -> (Surface, SharedString) {
                     sel: (0, 0),
                     anchor: (0, 0),
                     editing: None,
+                    edit_seed: None,
+                    edit_origin: None,
                     edit_caret: 0,
                     engine,
                     undo: vec![],
@@ -6876,8 +6914,7 @@ impl Docxy {
         self.range_pick = None;
         self.ref_msg = None;
         if let Some(v) = self.active_sheet_mut() {
-            let (r, c) = v.sel;
-            v.editing = Some(initial.unwrap_or_else(|| v.edit_string(r, c)));
+            v.begin_cell_edit(initial);
             v.edit_caret_to_end();
         }
         cx.notify();
@@ -9682,7 +9719,7 @@ impl Docxy {
                                 v.edit_insert(c);
                             } else if !protected {
                                 // Start a fresh edit with the typed char.
-                                v.editing = Some(String::new());
+                                v.begin_cell_edit(Some(String::new()));
                                 v.edit_caret = 0;
                                 v.edit_insert(c);
                             }

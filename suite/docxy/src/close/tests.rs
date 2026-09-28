@@ -385,7 +385,7 @@ fn untouched_text_cell() -> DocTab {
         (active, 0, 0),
         gridcore::sheet::Cell::text("007"),
     );
-    v.editing = Some(v.edit_string(0, 0));
+    v.begin_cell_edit(None);
     assert_eq!(v.editing.as_deref(), Some("007"));
     t
 }
@@ -430,7 +430,7 @@ fn untouched_commit_keeps_every_cell_kind() {
         v.engine
             .set_cell(&mut v.pkg.workbook, (v.active, 0, 0), cell.clone());
         let before = v.sheet().cell(0, 0).cloned();
-        v.editing = Some(v.edit_string(0, 0));
+        v.begin_cell_edit(None);
         v.redo.push(v.snapshot());
 
         assert!(!v.commit_edit(), "{cell:?}");
@@ -466,6 +466,99 @@ fn changed_commit_still_parses_and_records_undo() {
             Some(&Cell::text("007"))
         );
     }
+}
+
+#[test]
+fn fresh_entry_equal_to_stored_text_still_commits() {
+    use gridcore::sheet::{Cell, CellValue};
+
+    let mut t = tab(Kind::Xlsx);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    v.engine
+        .set_cell(&mut v.pkg.workbook, (v.active, 0, 0), Cell::text("5"));
+    v.begin_cell_edit(Some(String::new()));
+    v.editing = Some("5".into());
+
+    assert!(v.commit_edit());
+    assert_eq!(v.undo.len(), 1);
+    assert_eq!(
+        v.sheet().cell(0, 0).map(|c| &c.value),
+        Some(&CellValue::Number(5.0))
+    );
+}
+
+#[test]
+fn close_commits_fresh_entry_equal_to_stored_text() {
+    use gridcore::sheet::{Cell, CellValue};
+
+    let mut t = tab(Kind::Xlsx);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    v.engine
+        .set_cell(&mut v.pkg.workbook, (v.active, 0, 0), Cell::text("5"));
+    v.begin_cell_edit(Some(String::new()));
+    v.editing = Some("5".into());
+
+    assert_eq!(
+        close_step(&mut t, |t| {
+            assert!(t.dirty);
+            Ok(CloseAnswer::Cancel)
+        }),
+        CloseStep::Keep
+    );
+    let Surface::Sheet(v) = &t.surface else {
+        panic!()
+    };
+    assert_eq!(v.undo.len(), 1);
+    assert_eq!(
+        v.sheet().cell(0, 0).map(|c| &c.value),
+        Some(&CellValue::Number(5.0))
+    );
+}
+
+#[test]
+fn changed_editor_commits_to_its_origin_after_selection_moves() {
+    use gridcore::sheet::{Cell, CellValue};
+
+    let mut t = tab(Kind::Xlsx);
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    v.sel = (0, 0);
+    v.engine
+        .set_cell(&mut v.pkg.workbook, (v.active, 0, 0), Cell::text("007"));
+    let b2_before = v.sheet().cell(1, 1).cloned();
+    v.begin_cell_edit(None);
+    v.editing = Some("008".into());
+    v.sel = (1, 1);
+
+    assert!(v.commit_edit());
+    assert_eq!(
+        v.sheet().cell(0, 0).map(|c| &c.value),
+        Some(&CellValue::Number(8.0))
+    );
+    assert_eq!(v.sheet().cell(1, 1), b2_before.as_ref());
+}
+
+#[test]
+fn untouched_editor_stays_unchanged_after_selection_moves() {
+    let mut t = untouched_text_cell();
+    let Surface::Sheet(v) = &mut t.surface else {
+        panic!()
+    };
+    let a1_before = v.sheet().cell(0, 0).cloned();
+    let b2_before = v.sheet().cell(1, 1).cloned();
+    v.sel = (1, 1);
+
+    assert!(!v.commit_edit());
+    assert!(v.undo.is_empty());
+    assert_eq!(v.sheet().cell(0, 0), a1_before.as_ref());
+    assert_eq!(v.sheet().cell(1, 1), b2_before.as_ref());
 }
 
 #[test]

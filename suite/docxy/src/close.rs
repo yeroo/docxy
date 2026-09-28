@@ -41,15 +41,13 @@ pub(crate) fn commit_pending_for_exit(tabs: &mut [DocTab]) {
     }
 }
 
-/// Commit a sheet's open cell editor only when its buffer differs from what
-/// the cell would seed it with. An editor opened and left as seeded must not
-/// rewrite the cell. `commit_edit` also skips unchanged buffers, but taking the
-/// buffer here would close the editor; cancelled close or Save As must leave it open.
+/// Commit a sheet's open cell editor unless it was seeded from a cell and left
+/// unchanged. `commit_edit` also skips that case, but taking the buffer here
+/// would close the editor; cancelled close or Save As must leave it open.
 fn commit_changed_cell(tab: &mut DocTab) {
     if let Surface::Sheet(v) = &mut tab.surface
-        && v.editing
-            .as_deref()
-            .is_some_and(|buf| buf != v.edit_string(v.sel.0, v.sel.1))
+        && v.editing.is_some()
+        && !v.edit_untouched()
     {
         let changed = v.commit_edit();
         tab.dirty |= changed;
