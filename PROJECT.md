@@ -63,8 +63,9 @@ typed when their text parses: `NewTasksEffortDriven`, `NewTasksEstimated`,
 A save writes them in canonical form (`true` as `1`), keeps unparseable text
 verbatim, and leaves an option the file did not state absent. docxy acts on
 them: new tasks take the stated task type, effort-driven default and estimated
-default duration, Insert autolinks, and the critical flag follows the slack
-limit and multiple critical paths (Project's defaults apply when absent).
+default duration, a task added between two others autolinks, and the critical
+flag follows the slack limit and multiple critical paths (Project's defaults
+apply when absent).
 
 `projcore::editor::Editor` owns the editable project, its 100-entry undo history,
 selection, dirty flag, computed schedule and optional leveling overlay. Validated
@@ -300,21 +301,23 @@ there, and typing into it then committing appends a task (`1 day?`, or
 typed), as one undo step. A new plan starts there, so typing a name creates its
 first task. Commands that act on the selected task (Delete on ID,
 milestone, indent/outdent, clear resources, the task prompts) do nothing on the
-entry row; Insert appends, and Find searches from the first task.
+entry row; Insert inserts a blank row just above it, and Find searches from the
+first task.
 
-Task › Insert › Blank Row (keytip Alt, T, B) inserts an empty row above the
-selected row, or just above the entry row, as one undo step, and selects it, as
-Project's Insert Task › Blank Row does. The row is outside the outline and the
+Task › Insert › Blank Row (keytip Alt, T, B) and the Insert key insert an empty
+row above the selected row, or just above the entry row, as one undo step, and
+select it, keeping the column, as Project's Insert Task › Blank Row does. The row is outside the outline and the
 schedule until something is typed into it; then it becomes a task at the level
 of the task above where it sits (a summary's first child). yppxy has the same
 command on its ribbon and on `N`.
 
-Arrow keys move the cell cursor. Insert adds a task. Delete clears the active
-Name, Predecessors, or Resource Names cell; on the ID column, it deletes the
-task (a summary asks first: Enter deletes it with its subtasks, Esc cancels).
-Task › Editing › Delete Task deletes the selected task from any column. An
-inserted task (here, in yppxy and through projctl's `task.add`) is 1 day,
-estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
+Arrow keys move the cell cursor. Insert inserts a blank row above the current
+row, keeping the column. Delete clears the active Name, Predecessors, or
+Resource Names cell; on the ID column, it deletes the task (a summary asks
+first: Enter deletes it with its subtasks, Esc cancels). Task › Editing › Delete
+Task deletes the selected task from any column. A task added with Task › Insert
+› Task (keytip Alt, T, N; here, in yppxy and through projctl's `task.add`) is 1
+day, estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
 `Autolink` on (the default) it is linked into the finish-to-start chain it
 splits: A→B becomes A→N→B, N→B keeping the lag. Alt+Shift+Right/Left
 indent/outdent; Alt+Right/Left pan the Gantt;
