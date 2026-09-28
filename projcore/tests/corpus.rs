@@ -866,6 +866,8 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     );
     assert_eq!(alice.extended_attributes[0].field_id, "205520904");
     assert_eq!(alice.baseline(0).unwrap().cost, Rate::parse("970"));
+    assert_eq!(a.baseline(0).unwrap().bcws, Rate::parse("230"));
+    assert_eq!(a.baseline(0).unwrap().bcwp, Rate::parse("205.5"));
     // #199: the assignment's cost, table, delays, notes and timephased work.
     assert_eq!(
         (&a.cost, a.cost_rate_table, a.overtime_work_min),
@@ -892,6 +894,23 @@ fn resource_fields_fixture_keeps_rate_units_flags_and_contours() {
     );
     // What the issue saw dropped comes back from a save, element for element.
     let saved = write_mspdi(&proj);
+    fn assignment_baseline(xml: &str) -> &str {
+        let assignment = xml.split("<Assignment>").nth(1).unwrap();
+        assignment
+            .split("<Baseline>")
+            .nth(1)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap()
+    }
+    for source in [&xml, &saved] {
+        let baseline = assignment_baseline(source);
+        let cost = baseline.find("<Cost>970</Cost>").unwrap();
+        let bcws = baseline.find("<BCWS>230</BCWS>").unwrap();
+        let bcwp = baseline.find("<BCWP>205.5</BCWP>").unwrap();
+        assert!(cost < bcws && bcws < bcwp);
+    }
     let section = |xml: &str, name: &str| {
         let open = xml.find(&format!("<{name}>")).unwrap();
         xml[open..xml.find(&format!("</{name}>")).unwrap()].to_string()

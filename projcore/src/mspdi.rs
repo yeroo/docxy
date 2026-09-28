@@ -787,6 +787,8 @@ fn parse_assignment_baseline(p: &mut XmlParser, a: &mut Assignment) {
                     "Finish" => baseline.finish = DateTime::parse_mspdi(&text_of(p)),
                     "Work" => baseline.work_min = try_iso8601_to_minutes(&text_of(p)),
                     "Cost" => baseline.cost = rate_of(p),
+                    "BCWS" => baseline.bcws = rate_of(p),
+                    "BCWP" => baseline.bcwp = rate_of(p),
                     _ => p.skip_element(),
                 }
             }
@@ -2249,8 +2251,14 @@ fn write_assignment(s: &mut String, a: &Assignment) {
         if let Some(work) = baseline.work_min {
             tag(s, 4, "Work", &min_to_iso(work));
         }
-        if let Some(cost) = &baseline.cost {
-            tag(s, 4, "Cost", cost.as_str());
+        for (name, value) in [
+            ("Cost", &baseline.cost),
+            ("BCWS", &baseline.bcws),
+            ("BCWP", &baseline.bcwp),
+        ] {
+            if let Some(value) = value {
+                tag(s, 4, name, value.as_str());
+            }
         }
         s.push_str("      </Baseline>\n");
     }
@@ -5697,8 +5705,9 @@ mod tests {
         <Resume>2026-03-04T08:00:00</Resume><StartVariance>0</StartVariance>\
         <Units>1</Units><Work>PT32H0M0S</Work>\
         <Baseline><Number>0</Number><Start>2026-03-02T08:00:00</Start>\
-        <Finish>2026-03-05T17:00:00</Finish><Work>PT32H0M0S</Work><Cost>800</Cost></Baseline>\
-        <Baseline><Number>3</Number><Work>PT4H0M0S</Work></Baseline></Assignment>";
+        <Finish>2026-03-05T17:00:00</Finish><Work>PT32H0M0S</Work><Cost>800</Cost>\
+        <BCWS>8.</BCWS><BCWP>7.25</BCWP></Baseline>\
+        <Baseline><Number>3</Number><BCWS>5</BCWS></Baseline></Assignment>";
 
     /// Assignment elements #81 keeps.
     const PROGRESS_ASSIGNMENT_ELEMENTS: [&str; 14] = [
@@ -5812,10 +5821,12 @@ mod tests {
                         finish: d(5, 17),
                         work_min: Some(1920),
                         cost: Rate::parse("800"),
+                        bcws: Rate::parse("8."),
+                        bcwp: Rate::parse("7.25"),
                     },
                     AssignmentBaseline {
                         number: 3,
-                        work_min: Some(240),
+                        bcws: Rate::parse("5"),
                         ..AssignmentBaseline::default()
                     },
                 ],
@@ -5863,6 +5874,28 @@ mod tests {
         ] {
             assert!(assignment_xml(&xml).contains(element), "missing {element}");
         }
+        let assignment = assignment_xml(&xml);
+        let slot_zero = assignment
+            .split("<Baseline>")
+            .nth(1)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert!(
+            slot_zero
+                .contains("<Cost>800</Cost>\n        <BCWS>8.</BCWS>\n        <BCWP>7.25</BCWP>")
+        );
+        let slot_three = assignment
+            .split("<Baseline>")
+            .nth(2)
+            .unwrap()
+            .split("</Baseline>")
+            .next()
+            .unwrap();
+        assert!(slot_three.contains("<Number>3</Number>"));
+        assert!(slot_three.contains("<BCWS>5</BCWS>"));
+        assert!(!slot_three.contains("<BCWP>"));
         let back = read_mspdi(&xml).unwrap();
         assert_eq!(back.tasks, proj.tasks);
         assert_eq!(back.assignments, proj.assignments);
@@ -6161,9 +6194,11 @@ mod tests {
                 "Finish",
                 "Work",
                 "Cost",
+                "BCWS",
+                "BCWP",
                 "Baseline",
                 "Number",
-                "Work",
+                "BCWS",
                 "TimephasedData",
                 "Type",
                 "UID",

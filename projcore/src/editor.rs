@@ -1118,6 +1118,8 @@ impl Editor {
                         finish: Some(span.1),
                         work_min: Some(a.work_min),
                         cost,
+                        bcws: None,
+                        bcwp: None,
                     },
                 ))
             })
