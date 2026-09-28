@@ -457,7 +457,9 @@ impl<'a> Scheduler<'a> {
         // margin, and enough wall-clock reach to cover any far constraint date.
         let work: i64 = proj.tasks.iter().map(|t| t.duration_min.max(0)).sum();
         let durations = durations(proj);
-        let horizon_durations = horizon_lag_durations(proj, &durations);
+        let summary_cal = summary_calendar(proj);
+        let manual_spans = manual_summary_spans(proj, &summary_cal);
+        let horizon_durations = horizon_lag_durations(proj, &durations, &manual_spans);
         // Elapsed lag is calendar minutes, which over-estimates the working
         // minutes it spans: safe for a working-minute budget.
         let lag: i64 = proj
@@ -557,8 +559,6 @@ impl<'a> Scheduler<'a> {
         });
         // A manual summary's span, and room after its start for the subtasks
         // it floors there.
-        let summary_cal = summary_calendar(proj);
-        let manual_spans = manual_summary_spans(proj, &summary_cal);
         let floor_reach = manual_spans.values().flat_map(|&(start, finish)| {
             let floored = weeks
                 .get(&default_cal)
@@ -2340,18 +2340,32 @@ fn durations(proj: &Project) -> HashMap<i32, i64> {
     out
 }
 
-/// A conservative base for sizing timelines before summary rollups exist.
-/// Every descendant leaf can contribute to a summary's working span; a
-/// manual summary can also extend beyond its children.
-fn horizon_lag_durations(proj: &Project, stored: &HashMap<i32, i64>) -> HashMap<i32, i64> {
+/// An intentionally generous estimate for sizing timelines before summary
+/// rollups exist. Child link gaps and nested manual spans can widen an auto
+/// summary beyond the sum of its leaf durations.
+fn horizon_lag_durations(
+    proj: &Project,
+    stored: &HashMap<i32, i64>,
+    manual_spans: &HashMap<i32, (i64, i64)>,
+) -> HashMap<i32, i64> {
     let tasks = &proj.tasks;
-    let mut prefix = vec![0i64; tasks.len() + 1];
+    let mut leaf_prefix = vec![0i64; tasks.len() + 1];
+    let mut gap_prefix = vec![0i64; tasks.len() + 1];
+    let mut manual_prefix = vec![0i64; tasks.len() + 1];
     for (i, task) in tasks.iter().enumerate() {
-        prefix[i + 1] = prefix[i].saturating_add(if task.summary {
+        leaf_prefix[i + 1] = leaf_prefix[i].saturating_add(if task.summary {
             0
         } else {
             task.duration_min.max(0)
         });
+        gap_prefix[i + 1] = task.predecessors.iter().fold(gap_prefix[i], |sum, link| {
+            sum.saturating_add(lag_minutes(link, stored).saturating_abs())
+        });
+        manual_prefix[i + 1] = manual_prefix[i].saturating_add(
+            manual_spans
+                .get(&task.uid)
+                .map_or(0, |&(start, finish)| finish.saturating_sub(start)),
+        );
     }
     let mut ends = vec![tasks.len(); tasks.len()];
     let mut stack = Vec::new();
@@ -2367,13 +2381,14 @@ fn horizon_lag_durations(proj: &Project, stored: &HashMap<i32, i64>) -> HashMap<
     }
     let mut result = stored.clone();
     for (i, task) in tasks.iter().enumerate().filter(|(_, task)| task.summary) {
-        let descendants = prefix[ends[i]].saturating_sub(prefix[i + 1]);
-        let manual = task.manual_summary_dates().map_or(0, |(start, finish)| {
-            finish.map_or(0, |finish| {
-                finish.minutes().saturating_sub(start.minutes()).max(0)
-            })
-        });
-        result.insert(task.uid, descendants.max(manual));
+        let descendants = leaf_prefix[ends[i]]
+            .saturating_sub(leaf_prefix[i + 1])
+            .saturating_add(gap_prefix[ends[i]].saturating_sub(gap_prefix[i + 1]))
+            .saturating_add(manual_prefix[ends[i]].saturating_sub(manual_prefix[i + 1]));
+        let own_manual = manual_spans
+            .get(&task.uid)
+            .map_or(0, |&(start, finish)| finish.saturating_sub(start));
+        result.insert(task.uid, stored[&task.uid].max(descendants).max(own_manual));
     }
     result
 }
@@ -2525,8 +2540,7 @@ pub fn calendar_error(proj: &Project) -> Option<String> {
     None
 }
 
-/// Kahn topological sort of leaf tasks by effective links; on a cycle, the
-/// remaining tasks are appended in input order (best effort).
+/// FIFO for CPM; highest row first when importer pin removal reverses the result.
 #[derive(Clone, Copy)]
 enum ReadyOrder {
     Fifo,
@@ -2558,6 +2572,8 @@ impl ReadyQueue {
     }
 }
 
+/// Kahn topological sort of leaf tasks by effective links; on a cycle, the
+/// remaining tasks are appended in input order (best effort).
 fn topo_order(
     proj: &Project,
     leaves: &[usize],
@@ -3547,21 +3563,20 @@ impl Scheduler<'_> {
                         Offset::Working(leveled_lag)
                             if pred_task.summary && p.lag_format.kind() == LagKind::Percent =>
                         {
-                            let base_span = base.get(p.uid)?;
-                            let Offset::Working(cpm_lag) = self.effective_offset(
+                            let cpm_offset = self.effective_offset(
                                 p,
                                 &graph,
-                                Some((
-                                    base_span.early_start.minutes(),
-                                    base_span.early_finish.minutes(),
-                                )),
-                            ) else {
-                                unreachable!()
+                                Some((pred.early_start.minutes(), pred.early_finish.minutes())),
+                            );
+                            let Offset::Working(cpm_lag) = cpm_offset else {
+                                return None;
                             };
-                            Some(
-                                (tl.to_index(now) + leveled_lag - tl.to_index(was) - cpm_lag)
-                                    .max(0),
-                            )
+                            let succ_tl = self.tl(t);
+                            let cpm_bound =
+                                succ_tl.abs_start(succ_tl.to_index(was).saturating_add(cpm_lag));
+                            let leveled_bound = succ_tl
+                                .abs_start(succ_tl.to_index(now).saturating_add(leveled_lag));
+                            Some((tl.to_index(leveled_bound) - tl.to_index(cpm_bound)).max(0))
                         }
                         Offset::Working(_) => {
                             if pred_task.summary {
@@ -4545,6 +4560,104 @@ mod tests {
             direct.get(3).unwrap().early_start
         );
         assert!(grouped.get(3).unwrap().early_start < at(2, 8));
+    }
+
+    #[test]
+    fn summary_percent_lag_horizon_covers_long_child_gap() {
+        let summary = summary_task(1, 1);
+        let mut first = task(2, "First", 480);
+        first.outline_level = 2;
+        let mut second = task(3, "Second", 480);
+        second.outline_level = 2;
+        second
+            .predecessors
+            .push(Predecessor::working(2, LinkType::FinishStart, 100 * 480));
+        let mut successor = task(4, "Successor", 480);
+        let mut percent = fs(1);
+        percent.lag = 300;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        successor.predecessors.push(percent);
+        let project = march2(vec![summary, first, second, successor]);
+        let result = schedule(&project);
+        let span = result.get(1).unwrap();
+        let cal = summary_calendar(&project);
+        let rolled_work = working_minutes_on(&cal, span.early_start, span.early_finish);
+        let reference = Timeline::build(
+            &cal,
+            span.early_finish.minutes(),
+            span.early_finish.minutes(),
+            rolled_work * 3 + 480,
+            span.early_finish.minutes(),
+        );
+        let expected = reference.abs_start(rolled_work * 3);
+        assert_eq!(result.get(4).unwrap().early_start.minutes(), expected);
+    }
+
+    #[test]
+    fn duration_only_manual_summary_percent_horizon_uses_resolved_span() {
+        for stored_duration in [0, 102 * 480] {
+            let mut summary = summary_task(1, 1);
+            summary.manual = true;
+            summary.manual_start = Some(at(2, 8));
+            summary.manual_duration_min = Some(102 * 480);
+            summary.duration_min = stored_duration;
+            let mut child = task(2, "Child", 480);
+            child.outline_level = 2;
+            let mut successor = task(3, "Successor", 480);
+            let mut percent = fs(1);
+            percent.lag = 400;
+            percent.lag_format = LagFormat::from_code(19).unwrap();
+            successor.predecessors.push(percent);
+            let project = march2(vec![summary, child, successor]);
+            let result = schedule(&project);
+            let span = result.get(1).unwrap();
+            let cal = summary_calendar(&project);
+            let rolled_work = working_minutes_on(&cal, span.early_start, span.early_finish);
+            let reference = Timeline::build(
+                &cal,
+                span.early_finish.minutes(),
+                span.early_finish.minutes(),
+                rolled_work * 4 + 480,
+                span.early_finish.minutes(),
+            );
+            let expected = reference.abs_start(rolled_work * 4);
+            assert_eq!(result.get(3).unwrap().early_start.minutes(), expected);
+        }
+    }
+
+    #[test]
+    fn leveling_percent_summary_lag_uses_successor_calendar() {
+        let mut short_day = Calendar::standard(2);
+        for day in short_day.week.iter_mut().flatten() {
+            day.times.truncate(1);
+        }
+        let summary = summary_task(1, 1);
+        let mut a = task(2, "A", 480);
+        a.outline_level = 2;
+        let mut b = task(3, "B", 480);
+        b.outline_level = 2;
+        let mut c = task(4, "Short-day C", 240);
+        c.calendar_uid = Some(2);
+        let mut percent = fs(1);
+        percent.lag = 100;
+        percent.lag_format = LagFormat::from_code(19).unwrap();
+        c.predecessors.push(percent);
+        let project = Project {
+            start_date: Some(at(2, 8)),
+            tasks: vec![summary, a, b, c],
+            calendars: vec![Calendar::standard(1), short_day],
+            resources: vec![worker(1, "Team", 1.0)],
+            assignments: vec![assign(1, 2, 1, 1.0), assign(2, 3, 1, 1.0)],
+            ..Project::default()
+        };
+        let cpm = schedule(&project);
+        let leveled = level(&project);
+        let summary_span = leveled.finish(3).unwrap();
+        let cal = CalendarResolver::new(&project).calendar(&project.calendars[1]);
+        let required = reach_after(&cal, summary_span.minutes(), 960);
+        assert!(leveled.start(4).unwrap().minutes() >= required);
+        assert_eq!(leveled.start(4), Some(at(10, 8)));
+        assert!(leveled.start(4).unwrap() > cpm.get(4).unwrap().early_start);
     }
 
     #[test]
