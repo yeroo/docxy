@@ -17,8 +17,9 @@ use projcore::{ConstraintType, DateTime, LagFormat, LinkType, Predecessor, Proje
 /// read (the scheduler ignores them, as it does for MSPDI); Project's
 /// variances are not stored in the file and stay absent. Save As converts it
 /// to `.yppx`/MSPDI. Current Project calendar tables keep base and derived
-/// calendars, their own weekdays, and the project's default calendar; calendar
-/// exceptions and each task's own calendar assignment are not yet decoded.
+/// calendars, their weekdays and exceptions, and the project's default calendar.
+/// Work weeks and each task's own calendar assignment are not yet decoded. An
+/// unrecognised exception record refuses the import.
 pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let info = crate::read_mpp(bytes)?;
     let table = crate::taskdecode::decode_table(bytes)

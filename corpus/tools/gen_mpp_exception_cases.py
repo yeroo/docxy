@@ -11,6 +11,7 @@ import sys
 import tempfile
 from xml.etree import ElementTree as ET
 
+import pywintypes
 import win32com.client as win32
 
 
@@ -119,6 +120,13 @@ def cases():
 
 
 def main():
+    try:
+        win32.GetActiveObject("MSProject.Application")
+    except pywintypes.com_error:
+        pass
+    else:
+        print("Microsoft Project is already running; close it first.")
+        return 2
     os.makedirs(OUT, exist_ok=True)
     app = win32.Dispatch("MSProject.Application")
     try:

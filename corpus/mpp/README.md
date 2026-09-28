@@ -153,8 +153,9 @@ period count, +20 has five `u16` period starts and +32 five `i32` durations
 type, +76..+79 are type-specific recurrence bytes, and +88 is the name byte
 length. +80 holds a Project-assigned exception identifier that does not appear
 in MSPDI. Types 2/3 are yearly by date/position, 4/5 monthly by date/position,
-6 weekly, and 7 every N days. The decoder rejects unknown types or malformed
-records; the later work-week records are a separate decode gap.
+6 weekly, and 7 every N days. Type 8 has no binary probe and is not decoded.
+The decoder refuses Type 8, unknown types and malformed records; the later
+work-week records are a separate decode gap.
 
 It also checks six task-progress cases in `progress/` when present (see
 Known decode gaps). It also checks two link-lag cases in `lag/` when present
@@ -235,7 +236,9 @@ records after a move are ignored by their FixedMeta kind. Tasks are emitted in
 row ID order. Resources, assignments, baselines, constraints, and custom fields
 are not imported. Newest-layout base and derived calendars, their weekdays,
 exceptions and the default calendar are imported; work weeks and task calendar
-assignment are not. An invalid newest calendar table refuses import. Files without
+assignment are not. Type 8 exceptions and record shapes not covered by the
+Project-written probes refuse the file. An invalid newest calendar table refuses
+import. Files without
 `TBkndCal`, and MPP9 files, keep a synthesized Standard. Task progress is
 imported (see below); assignment progress needs assignments first.
 

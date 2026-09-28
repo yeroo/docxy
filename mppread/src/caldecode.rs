@@ -47,7 +47,7 @@ fn name(value: &[u8]) -> Result<String, String> {
 }
 
 fn hours(value: &[u8], base: bool) -> Result<[Option<DayWorking>; 7], String> {
-    // Seven 60-byte Sunday-first records, then eight trailing bytes. Start and
+    // Seven 60-byte Sunday-first records; exceptions start at byte 420. Start and
     // duration are tenths of a minute. An inherited base day uses Project's
     // built-in Standard pattern; a derived day inherits its base calendar.
     if value.len() < 428 {
@@ -119,6 +119,8 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
         if last < first {
             return Err(format!("calendar exception {index} ends before it starts"));
         }
+        // These reserved bytes are zero in both the COM-built snapshots and
+        // the Project-resaved MSPDI probes, unlike the Type 1 pattern word.
         if u16_at(rec, 6) != 0
             || rec[9..14].iter().any(|&b| b != 0)
             || rec[73..76].iter().any(|&b| b != 0)
@@ -170,11 +172,10 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
         let b = &rec[76..80];
         let mut exception = CalendarException {
             from: Some(DateTime::from_minutes(
-                (DateTime::from_ymd_hm(1983, 12, 31, 0, 0).day_number() + i64::from(first)) * 1440,
+                (crate::mpp::MPP_EPOCH_DAYS + i64::from(first)) * 1440,
             )),
             to: Some(DateTime::from_minutes(
-                (DateTime::from_ymd_hm(1983, 12, 31, 0, 0).day_number() + i64::from(last)) * 1440
-                    + 1439,
+                (crate::mpp::MPP_EPOCH_DAYS + i64::from(last)) * 1440 + 1439,
             )),
             kind: Some(kind as i32),
             occurrences: Some(occurrences as i32),
@@ -183,10 +184,10 @@ fn exceptions(value: &[u8]) -> Result<Vec<CalendarException>, String> {
             ..CalendarException::default()
         };
         match kind {
-            // Project's generated snapshots carry 0x0230 in this otherwise
-            // unused pattern word for a one-off day; the Project-written
-            // standalone probes carry zero. Both export the same Type 1 shape.
-            1 if b == [0, 0, 0, 0] || b == [0x30, 0x02, 0, 0] => {}
+            // Type 1's pattern word varies by creation path (0x0230 in
+            // COM-built snapshots, zero in MSPDI-resaved probes). It does not
+            // appear in Project's XML for one-off exceptions.
+            1 => {}
             2 if b[2] == 0 => {
                 exception.month = Some(i32::from(b[0]));
                 exception.month_day = Some(i32::from(b[1]));
@@ -491,6 +492,10 @@ mod tests {
 
     #[test]
     fn decodes_one_exception_and_empty_header() {
+        assert_eq!(
+            crate::mpp::MPP_EPOCH_DAYS,
+            DateTime::from_ymd_hm(1983, 12, 31, 0, 0).day_number()
+        );
         let ex = exceptions(&exception_block()).unwrap();
         assert_eq!(ex.len(), 1);
         assert_eq!(ex[0].name.as_deref(), Some("Holiday"));
@@ -500,6 +505,10 @@ mod tests {
         assert_eq!(ex[0].occurrences, Some(1));
         assert!(!ex[0].entered_by_occurrences.unwrap());
         assert!(exceptions(&vec![0; 428]).unwrap().is_empty());
+
+        let mut alternate = exception_block();
+        alternate[500..504].copy_from_slice(&0x1234u32.to_le_bytes());
+        assert_eq!(exceptions(&alternate).unwrap(), ex);
     }
 
     #[test]
