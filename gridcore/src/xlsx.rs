@@ -522,8 +522,11 @@ fn parse_workbook_xml(
             Event::End => {
                 if local(p.name()) == "definedName" {
                     if let Some(n) = cur_name.take() {
-                        // Skip Excel's internal names (print areas etc.).
-                        if !n.0.starts_with("_xlnm.") && !n.2.is_empty() {
+                        // Excel's built-in names (print area and titles) load
+                        // like any other so they follow structural edits.
+                        // Not `_FilterDatabase`: it mirrors the sheet's
+                        // `<autoFilter ref>`, which nothing moves yet.
+                        if !n.0.eq_ignore_ascii_case("_xlnm._FilterDatabase") && !n.2.is_empty() {
                             names.push(n);
                         }
                     }
@@ -985,6 +988,12 @@ fn parse_worksheet(
     let mut dv_formula: u8 = 0; // 0 = none, 1 = formula1, 2 = formula2
     let mut dv_buf = String::new();
 
+    // Inside the sheet's own `<rowBreaks>` (true) or `<colBreaks>` (false).
+    // A custom view (`<customSheetView>`) carries breaks of its own under the
+    // same names; those are the view's, not the sheet's, and stay verbatim.
+    let mut in_breaks: Option<bool> = None;
+    let mut in_custom_views = false;
+
     loop {
         match p.next() {
             Event::Start => match local(p.name()) {
@@ -1079,6 +1088,14 @@ fn parse_worksheet(
                         sheet.freeze = (rows, cols);
                     }
                 }
+                "customSheetViews" => in_custom_views = true,
+                "rowBreaks" if !in_custom_views => in_breaks = Some(true),
+                "colBreaks" if !in_custom_views => in_breaks = Some(false),
+                "brk" => match in_breaks {
+                    Some(true) => sheet.row_breaks.extend(page_break(&p)),
+                    Some(false) => sheet.col_breaks.extend(page_break(&p)),
+                    None => {}
+                },
                 // Sheet protection: preserve the whole flag/password attribute set
                 // verbatim so it round-trips untouched.
                 "sheetProtection" => {
@@ -1194,6 +1211,8 @@ fn parse_worksheet(
             }
             Event::End => match local(p.name()) {
                 "row" => cur_row += 1,
+                "rowBreaks" | "colBreaks" => in_breaks = None,
+                "customSheetViews" => in_custom_views = false,
                 "formula" if in_cf_formula => {
                     in_cf_formula = false;
                     cf_formulas.push(std::mem::take(&mut cf_formula_buf));
@@ -1448,6 +1467,20 @@ fn parse_cell_body(
         spill,
         meta: None,
     }
+}
+
+/// The `<brk>` the parser is on; `None` when its `id` is unreadable.
+fn page_break(p: &XmlParser) -> Option<crate::sheet::PageBreak> {
+    let id = p.attr("id").parse().ok()?;
+    let mut attrs = String::new();
+    for a in p.attrs().iter().filter(|a| a.name != "id") {
+        attrs.push(' ');
+        attrs.push_str(a.name);
+        attrs.push_str("=\"");
+        attrs.push_str(&esc_raw_attr(a.value));
+        attrs.push('"');
+    }
+    Some(crate::sheet::PageBreak { id, attrs })
 }
 
 /// Local name (strip any namespace prefix).
@@ -1980,7 +2013,10 @@ fn saved_parts(pkg: &SheetPackage) -> Vec<(String, Vec<u8>)> {
     // must be patched into the <sheet name="…"> attributes (in order).
     if let Some(p) = parts.iter_mut().find(|(n, _)| n == "xl/workbook.xml") {
         let xml = String::from_utf8_lossy(&p.1).into_owned();
-        p.1 = patch_sheet_names(&xml, &wb.sheets).into_bytes();
+        let xml = patch_sheet_names(&xml, &wb.sheets);
+        // Same for defined names: a structural edit or a rename moves them in
+        // the model (print area and titles included).
+        p.1 = patch_defined_names(&xml, &wb.defined_names, wb.sheets.len()).into_bytes();
     }
 
     // --- calc chain: drop it, ask Excel to recalculate ---------------------
@@ -2149,15 +2185,18 @@ fn find_element(hay: &str, tag: &str) -> Option<usize> {
     let needle = format!("<{tag}");
     let bytes = hay.as_bytes();
     let mut i = 0;
+    // Stepped a byte at a time, so compared as bytes: `i` can land inside a
+    // multi-byte character, where slicing the `str` would panic. A match
+    // starts at an ASCII `<`, which is always a char boundary.
     while i < hay.len() {
         // Skip over comments wholesale.
-        if hay[i..].starts_with("<!--") {
+        if bytes[i..].starts_with(b"<!--") {
             // Unterminated comment: nothing usable after it.
             let rel = hay[i..].find("-->")?;
             i += rel + 3;
             continue;
         }
-        if hay[i..].starts_with(&needle) {
+        if bytes[i..].starts_with(needle.as_bytes()) {
             let after = bytes.get(i + needle.len()).copied();
             if matches!(
                 after,
@@ -2253,7 +2292,79 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     let out = set_merge_cells(&out, &sheet.merges);
     // Sheet protection: <sheetProtection> right after </sheetData> (schema order
     // puts it ahead of mergeCells/conditionalFormatting).
-    set_sheet_protection(&out, sheet.protection.as_deref())
+    let out = set_sheet_protection(&out, sheet.protection.as_deref());
+    // Page breaks (manual and automatic): rewritten only where a structural
+    // edit moved them.
+    let out = set_page_breaks(out, "rowBreaks", &sheet.row_breaks);
+    set_page_breaks(out, "colBreaks", &sheet.col_breaks)
+}
+
+/// Sync one `<rowBreaks>` / `<colBreaks>` element from the model. It is left
+/// byte-for-byte alone while it holds exactly the model's breaks, rewritten
+/// (with its counts) when they differ, dropped when none are left, and never
+/// created: nothing adds breaks yet, so a missing element has nothing to say.
+fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak]) -> String {
+    let Some((start, end)) = sheet_breaks_span(&xml, tag) else {
+        return xml;
+    };
+    if parse_page_breaks(&xml[start..end]) == breaks {
+        return xml;
+    }
+    let block = if breaks.is_empty() {
+        String::new()
+    } else {
+        let manual = breaks.iter().filter(|b| b.is_manual()).count();
+        let mut block = format!(
+            "<{tag} count=\"{}\" manualBreakCount=\"{manual}\">",
+            breaks.len()
+        );
+        for b in breaks {
+            block.push_str(&format!("<brk id=\"{}\"{}/>", b.id, b.attrs));
+        }
+        block.push_str(&format!("</{tag}>"));
+        block
+    };
+    xml.replace_range(start..end, &block);
+    xml
+}
+
+/// Where the sheet's own `<rowBreaks>` / `<colBreaks>` element is, found with
+/// the loader's parser so a comment can't end it early. Custom views hold
+/// breaks under the same names inside `<customSheetViews>`; those are skipped.
+fn sheet_breaks_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
+    // Most sheets have no breaks: don't parse the whole part to learn that.
+    find_element(xml, tag)?;
+    let mut p = XmlParser::new(xml);
+    let mut in_views = false;
+    loop {
+        match p.next() {
+            Event::Start => match local(p.name()) {
+                "customSheetViews" => in_views = true,
+                name if name == tag && !in_views => {
+                    let start = p.start_pos();
+                    return p.skip_element_complete().then(|| (start, p.pos()));
+                }
+                _ => {}
+            },
+            Event::End if local(p.name()) == "customSheetViews" => in_views = false,
+            Event::Eof => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The `<brk>` children of one breaks element, read as the loader reads them.
+fn parse_page_breaks(fragment: &str) -> Vec<crate::sheet::PageBreak> {
+    let mut out = Vec::new();
+    let mut p = XmlParser::new(fragment);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "brk" => out.extend(page_break(&p)),
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Sync the `<sheetProtection>` element from the model: drop any existing one,
@@ -2473,6 +2584,84 @@ fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Write each `<definedName>`'s definition back from the model where it
+/// differs, replacing only the element's content. Elements are found with the
+/// loader's parser, and their text compared as the loader read it, so CDATA
+/// and comments neither look like changes nor cut an element short. A
+/// `localSheetId` names a model sheet only while the `<sheet>` elements line
+/// up with the model one-to-one (a sheet whose part was missing at load
+/// breaks that, as in `patch_sheet_names`); otherwise scoped names are left
+/// as they are. So is a name whose (name, scope) more than one model entry
+/// shares: the loader demotes an unresolvable scope to global, and other
+/// writers repeat names, so which entry belongs to which element can't be
+/// told. An element with child elements is left alone too.
+fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> String {
+    let aligned = xml.matches("<sheet ").count() == sheet_count;
+    // (content start, content end, new content), in document order.
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == "definedName" => {
+                let body_start = p.pos();
+                if xml[..body_start].ends_with("/>") {
+                    continue;
+                }
+                let key = defined_name_key(&p, aligned);
+                let mut text = String::new();
+                let mut depth = 0usize;
+                let mut nested = false;
+                let body_end = loop {
+                    match p.next() {
+                        Event::Text => XmlParser::append_decoded(p.text(), &mut text),
+                        Event::Start => {
+                            depth += 1;
+                            nested = true;
+                        }
+                        Event::End if depth > 0 => depth -= 1,
+                        Event::End => break xml[..p.pos()].rfind("</"),
+                        Event::Eof => break None,
+                    }
+                };
+                let Some(body_end) = body_end else {
+                    break;
+                };
+                let model = key.filter(|_| !nested).and_then(|(name, scope)| {
+                    let mut hits = names
+                        .iter()
+                        .filter(|d| d.scope == scope && d.name.eq_ignore_ascii_case(&name));
+                    match (hits.next(), hits.next()) {
+                        (Some(d), None) => Some(d),
+                        _ => None,
+                    }
+                });
+                if let Some(d) = model.filter(|d| d.formula != text) {
+                    edits.push((body_start, body_end, esc_text(&d.formula)));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    let mut out = xml.to_string();
+    for (start, end, text) in edits.into_iter().rev() {
+        out.replace_range(start..end, &text);
+    }
+    out
+}
+
+/// The (name, model scope) of the `<definedName>` start tag the parser is on;
+/// `None` for a scope that doesn't name a model sheet reliably (see
+/// [`patch_defined_names`]).
+fn defined_name_key(p: &XmlParser, aligned: bool) -> Option<(String, Option<usize>)> {
+    let scope = match p.attr("localSheetId") {
+        "" => None,
+        _ if !aligned => return None,
+        v => Some(v.parse::<usize>().ok()?),
+    };
+    Some((decode(p.attr("name")), scope))
 }
 
 pub(crate) fn esc_attr(s: &str) -> String {
@@ -5660,9 +5849,18 @@ mod tests {
         assert_eq!(xf.numfmt, NumFmt::Date);
         assert!(xf.bold);
         assert_eq!(xf.color, Some((255, 0, 0)));
-        // Defined names: real ones load, built-in _xlnm ones are skipped.
-        assert_eq!(wb.defined_names.len(), 1);
+        // Defined names: real ones and the built-in print area load (the
+        // print area has to follow structural edits), keeping its scope.
+        assert_eq!(wb.defined_names.len(), 2);
         assert_eq!(wb.defined_name("total", 0), Some("Data!$B$2"));
+        assert_eq!(
+            wb.defined_names[1],
+            DefinedName {
+                name: "_xlnm.Print_Area".into(),
+                scope: Some(0),
+                formula: "Data!$A$1:$C$3".into(),
+            }
+        );
         // Column width + row attrs + merges.
         assert_eq!(s.col_width(1), 20.0);
         assert!(s.row_attrs.get(&0).unwrap().contains("customHeight"));
@@ -7888,5 +8086,559 @@ mod kind_tests {
         assert_eq!(workbook_ct(&out), XLTX_CT);
         let out = load_xlsx(&save_xlsx_for_path(&xltx(), "out.XLSX")).unwrap();
         assert_eq!(workbook_ct(&out), XLSX_CT);
+    }
+}
+
+/// References kept outside the cells (defined names, print area and titles,
+/// page breaks) follow row/column inserts and deletes into the saved
+/// file (#611).
+#[cfg(test)]
+mod print_setup_tests {
+    use super::*;
+    use crate::edit::{delete_rows, insert_cols, insert_rows, rename_sheet};
+
+    const NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+    /// A workbook of `sheets` (name, worksheet body inside `<worksheet>`; None
+    /// leaves the sheet's part out of the package) with `names` as the
+    /// `<definedNames>` content.
+    fn book(names: &str, sheets: &[(&str, Option<&str>)]) -> Vec<u8> {
+        let mut sheet_els = String::new();
+        let mut rels = String::new();
+        let mut parts: Vec<(String, Vec<u8>)> = Vec::new();
+        for (i, (name, body)) in sheets.iter().enumerate() {
+            let n = i + 1;
+            sheet_els.push_str(&format!(
+                r#"<sheet name="{name}" sheetId="{n}" r:id="rId{n}"/>"#
+            ));
+            rels.push_str(&format!(
+                r#"<Relationship Id="rId{n}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{n}.xml"/>"#
+            ));
+            if let Some(body) = body {
+                parts.push((
+                    format!("xl/worksheets/sheet{n}.xml"),
+                    format!(r#"<?xml version="1.0"?><worksheet xmlns="{NS}">{body}</worksheet>"#)
+                        .into_bytes(),
+                ));
+            }
+        }
+        let workbook = format!(
+            r#"<?xml version="1.0"?><workbook xmlns="{NS}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheet_els}</sheets><definedNames>{names}</definedNames></workbook>"#
+        );
+        let wb_rels = format!(
+            r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">{rels}</Relationships>"#
+        );
+        let root_rels = r#"<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#;
+        let content_types = r#"<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#;
+        parts.extend([
+            ("[Content_Types].xml".into(), content_types.into()),
+            ("_rels/.rels".into(), root_rels.into()),
+            ("xl/workbook.xml".into(), workbook.into_bytes()),
+            ("xl/_rels/workbook.xml.rels".into(), wb_rels.into_bytes()),
+        ]);
+        write_zip(&parts)
+    }
+
+    const PRINT_NAMES: &str = concat!(
+        r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Report!$A$1:$D$20</definedName>"#,
+        r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Report!$A:$A,Report!$1:$2</definedName>"#,
+    );
+
+    fn report(names: &str, after_data: &str) -> SheetPackage {
+        let body = format!(
+            r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>{after_data}"#
+        );
+        load_xlsx(&book(names, &[("Report", Some(&body))])).expect("fixture loads")
+    }
+
+    /// Save, reload, and return the reloaded package with the text of `part`.
+    fn saved(pkg: &SheetPackage, part: &str) -> (SheetPackage, String) {
+        let re = load_xlsx(&save_xlsx(pkg)).expect("saved file reloads");
+        let xml = String::from_utf8_lossy(re.part(part).expect("part present")).into_owned();
+        (re, xml)
+    }
+
+    fn row_ids(sheet: &Sheet) -> Vec<u32> {
+        sheet.row_breaks.iter().map(|b| b.id).collect()
+    }
+
+    fn col_ids(sheet: &Sheet) -> Vec<u32> {
+        sheet.col_breaks.iter().map(|b| b.id).collect()
+    }
+
+    #[test]
+    fn issue_repro_print_area_titles_and_break_follow_row_and_col_insert() {
+        let mut pkg = report(
+            PRINT_NAMES,
+            r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks>"#,
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Report!$B$2:$E$21</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Report!$B:$B,Report!$2:$3</definedName>"#),
+            "{wb}"
+        );
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<rowBreaks count="1" manualBreakCount="1"><brk id="14" max="16383" man="1"/></rowBreaks>"#),
+            "{ws}"
+        );
+        assert_eq!(row_ids(&re.workbook.sheets[0]), vec![14]);
+    }
+
+    #[test]
+    fn a_break_moves_when_rows_or_cols_go_in_at_or_above_it() {
+        let breaks = concat!(
+            r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks>"#,
+            r#"<colBreaks count="1" manualBreakCount="1"><brk id="13" max="1048575" man="1"/></colBreaks>"#,
+        );
+        for (at, want) in [(0, 16), (12, 16), (13, 16), (14, 13), (40, 13)] {
+            let mut pkg = report("", breaks);
+            insert_rows(&mut pkg.workbook, 0, at, 3);
+            assert_eq!(
+                row_ids(&pkg.workbook.sheets[0]),
+                vec![want],
+                "row insert at {at}"
+            );
+            assert_eq!(col_ids(&pkg.workbook.sheets[0]), vec![13], "cols untouched");
+            let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+            assert!(
+                ws.contains(&format!(r#"<brk id="{want}" max="16383" man="1"/>"#)),
+                "{ws}"
+            );
+
+            let mut pkg = report("", breaks);
+            insert_cols(&mut pkg.workbook, 0, at, 3);
+            assert_eq!(
+                col_ids(&pkg.workbook.sheets[0]),
+                vec![want],
+                "col insert at {at}"
+            );
+            assert_eq!(row_ids(&pkg.workbook.sheets[0]), vec![13], "rows untouched");
+            let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+            assert!(
+                ws.contains(&format!(r#"<brk id="{want}" max="1048575" man="1"/>"#)),
+                "{ws}"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_breaks_row_removes_it_and_recounts() {
+        // An automatic break (no `man`) at 5, manual ones at 13 and 20.
+        let mut pkg = report(
+            "",
+            concat!(
+                r#"<rowBreaks count="3" manualBreakCount="2"><brk id="5" max="16383"/>"#,
+                r#"<brk id="13" max="16383" man="1"/><brk id="20" max="16383" man="1"/></rowBreaks>"#,
+            ),
+        );
+        delete_rows(&mut pkg.workbook, 0, 13, 2); // starts exactly at the break
+        assert_eq!(row_ids(&pkg.workbook.sheets[0]), vec![5, 18]);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(concat!(
+                r#"<rowBreaks count="2" manualBreakCount="1"><brk id="5" max="16383"/>"#,
+                r#"<brk id="18" max="16383" man="1"/></rowBreaks>"#,
+            )),
+            "{ws}"
+        );
+
+        // The last break going takes the element with it.
+        let mut pkg = report(
+            "",
+            r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks><pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>"#,
+        );
+        delete_rows(&mut pkg.workbook, 0, 10, 5);
+        let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(!ws.contains("rowBreaks") && !ws.contains("<brk"), "{ws}");
+        assert!(ws.contains("<pageMargins "), "{ws}");
+        assert!(re.workbook.sheets[0].row_breaks.is_empty());
+    }
+
+    #[test]
+    fn a_user_name_follows_an_insert_and_still_resolves() {
+        let body = r#"<sheetData><row r="1"><c r="B1"><f>Rate*2</f><v>14</v></c></row><row r="5"><c r="A5"><v>7</v></c></row></sheetData>"#;
+        let mut pkg = load_xlsx(&book(
+            r#"<definedName name="Rate">Report!$A$5</definedName>"#,
+            &[("Report", Some(body))],
+        ))
+        .unwrap();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        pkg.workbook.sheets[0].set_cell(5, 0, crate::sheet::Cell::number(9.0)); // A6
+        let (mut re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="Rate">Report!$A$6</definedName>"#),
+            "{wb}"
+        );
+        let mut eng = crate::engine::Engine::new(&re.workbook);
+        eng.recalc_all(&mut re.workbook);
+        let b2 = re.workbook.sheets[0].cell(1, 1).unwrap();
+        assert_eq!(b2.formula.as_deref(), Some("Rate*2"));
+        assert_eq!(b2.value, CellValue::Number(18.0));
+    }
+
+    /// The `<definedNames>…</definedNames>` element of a workbook.xml.
+    fn names_el(wb: &str) -> &str {
+        let s = wb.find("<definedNames>").unwrap();
+        let e = wb.find("</definedNames>").unwrap() + "</definedNames>".len();
+        &wb[s..e]
+    }
+
+    #[test]
+    fn untouched_names_and_breaks_keep_their_bytes() {
+        let names = concat!(
+            r#"<definedName name="_xlnm.Print_Area" localSheetId="0">'Report'!$A$1:$D$20</definedName>"#,
+            r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Report!$A$1:$A$20</definedName>"#,
+            r#"<definedName name="Far">'Other'!$A$1</definedName>"#,
+            r#"<definedName name="Mixed">Other!$A$1 + 0</definedName>"#,
+        );
+        let breaks = r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1" /></rowBreaks>"#;
+        let data = r#"<sheetData/>"#;
+        let body = format!("{data}{breaks}");
+        let file = book(names, &[("Report", Some(&body)), ("Other", Some(data))]);
+
+        // No structural edit: everything byte-for-byte.
+        let pkg = load_xlsx(&file).unwrap();
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert_eq!(
+            names_el(&wb),
+            format!("<definedNames>{names}</definedNames>")
+        );
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(breaks), "{ws}");
+
+        // An insert on Other's columns reaches none of Report's names or
+        // breaks, and the names on Other lie to its left.
+        let mut pkg = load_xlsx(&file).unwrap();
+        insert_cols(&mut pkg.workbook, 1, 5, 1);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert_eq!(
+            names_el(&wb),
+            format!("<definedNames>{names}</definedNames>")
+        );
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(breaks), "{ws}");
+
+        // An insert on Report moves its print area (and only that); the
+        // quoted name on Other and _FilterDatabase keep their exact text.
+        let mut pkg = load_xlsx(&file).unwrap();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"localSheetId="0">Report!$A$2:$D$21</definedName>"#),
+            "{wb}"
+        );
+        assert!(wb.contains(r#"<definedName name="_xlnm._FilterDatabase" localSheetId="0" hidden="1">Report!$A$1:$A$20</definedName>"#), "{wb}");
+        assert!(
+            wb.contains(r#"<definedName name="Far">'Other'!$A$1</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="Mixed">Other!$A$1 + 0</definedName>"#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn a_wholly_deleted_area_reads_ref_error_as_excel_writes_it() {
+        let mut pkg = report(PRINT_NAMES, "");
+        delete_rows(&mut pkg.workbook, 0, 0, 20);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Report!#REF!</definedName>"#),
+            "{wb}"
+        );
+        // The titles' rows went too; their column area stays as it was.
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Report!$A:$A,Report!#REF!</definedName>"#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn scoped_names_are_left_alone_when_sheet_ids_do_not_line_up() {
+        // The second sheet's part is missing, so the model has two sheets and
+        // localSheetId 2 is the model's sheet 1.
+        let data = r#"<sheetData/>"#;
+        let names = concat!(
+            r#"<definedName name="Local" localSheetId="2">Third!$A$1</definedName>"#,
+            r#"<definedName name="Global">Third!$A$1</definedName>"#,
+        );
+        let mut pkg = load_xlsx(&book(
+            names,
+            &[
+                ("Report", Some(data)),
+                ("Gone", None),
+                ("Third", Some(data)),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(pkg.workbook.sheets.len(), 2);
+        assert_eq!(pkg.workbook.defined_name("Local", 1), Some("Third!$A$1"));
+        insert_rows(&mut pkg.workbook, 1, 0, 1);
+        assert_eq!(pkg.workbook.defined_name("Local", 1), Some("Third!$A$2"));
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="Local" localSheetId="2">Third!$A$1</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="Global">Third!$A$2</definedName>"#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_other_attributes_of_names_and_breaks() {
+        let names = r#"<definedName name="Rate" comment="a &amp; b" hidden="1" function="0">Report!$A$5</definedName>"#;
+        let mut pkg = report(
+            names,
+            r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" min="2" max="40" man="1" pt="1"/></rowBreaks>"#,
+        );
+        insert_rows(&mut pkg.workbook, 0, 0, 2);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="Rate" comment="a &amp; b" hidden="1" function="0">Report!$A$7</definedName>"#),
+            "{wb}"
+        );
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(r#"<brk id="15" min="2" max="40" man="1" pt="1"/>"#),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_sheet_rename_reaches_the_saved_names() {
+        let mut pkg = report(PRINT_NAMES, "");
+        rename_sheet(&mut pkg.workbook, 0, "Q1 Report");
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"localSheetId="0">'Q1 Report'!$A$1:$D$20</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"localSheetId="0">'Q1 Report'!$A:$A,'Q1 Report'!$1:$2</definedName>"#),
+            "{wb}"
+        );
+        assert_eq!(re.workbook.sheets[0].name, "Q1 Report");
+    }
+
+    #[test]
+    fn escaped_name_text_is_compared_decoded() {
+        // The text decodes to `"R&D"`, which `esc_text` would write back as
+        // `"R&amp;D"`: only a decoded compare sees that nothing changed.
+        let names = r#"<definedName name="Label">&quot;R&amp;D&quot;</definedName>"#;
+        let mut pkg = report(names, "");
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+    }
+
+    #[test]
+    fn a_custom_views_breaks_are_its_own_and_stay_put() {
+        // `<customSheetViews>` precedes the sheet's own breaks, and each view
+        // keeps breaks under the same element names.
+        let view = concat!(
+            r#"<customSheetViews><customSheetView guid="{00000000-0000-0000-0000-000000000001}">"#,
+            r#"<rowBreaks count="1" manualBreakCount="1"><brk id="4" max="16383" man="1"/></rowBreaks>"#,
+            r#"<colBreaks count="1" manualBreakCount="1"><brk id="2" max="1048575" man="1"/></colBreaks>"#,
+            r#"</customSheetView></customSheetViews>"#,
+        );
+        let own = r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks>"#;
+        let body =
+            format!(r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>{view}{own}"#);
+        let file = book("", &[("Report", Some(&body))]);
+
+        let pkg = load_xlsx(&file).unwrap();
+        assert_eq!(row_ids(&pkg.workbook.sheets[0]), vec![13]);
+        assert!(pkg.workbook.sheets[0].col_breaks.is_empty());
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(&format!("{view}{own}")), "{ws}");
+
+        let mut pkg = load_xlsx(&file).unwrap();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(&format!(
+                r#"{view}<rowBreaks count="1" manualBreakCount="1"><brk id="14" max="16383" man="1"/></rowBreaks>"#
+            )),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_gt_inside_a_quoted_name_attribute_is_not_the_tag_end() {
+        let names = concat!(
+            r#"<definedName name="Rate" comment="rate > 0">Report!$A$5</definedName>"#,
+            r#"<definedName name="Top" comment='a "quoted" > b'>Report!$A$1</definedName>"#,
+        );
+        let mut pkg = report(names, "");
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="Rate" comment="rate > 0">Report!$A$6</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(
+                r#"<definedName name="Top" comment='a "quoted" > b'>Report!$A$2</definedName>"#
+            ),
+            "{wb}"
+        );
+        assert_eq!(re.workbook.defined_name("Rate", 0), Some("Report!$A$6"));
+
+        // And with no edit the file keeps its bytes.
+        let pkg = report(names, "");
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+    }
+
+    #[test]
+    fn names_sharing_a_key_in_the_model_are_not_cross_written() {
+        // `Total` scoped to the missing second sheet loads as global, next to
+        // the real global `Total`: two model entries, one key.
+        let data = r#"<sheetData/>"#;
+        let names = concat!(
+            r#"<definedName name="Total" localSheetId="1">Report!$A$1</definedName>"#,
+            r#"<definedName name="Total">Report!$B$9</definedName>"#,
+        );
+        let file = book(names, &[("Report", Some(data)), ("Gone", None)]);
+        let pkg = load_xlsx(&file).unwrap();
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+
+        // Same when a writer repeated a global name outright.
+        let names = concat!(
+            r#"<definedName name="Dup">Report!$A$1</definedName>"#,
+            r#"<definedName name="Dup">Report!$B$9</definedName>"#,
+        );
+        let mut pkg = report(names, "");
+        insert_rows(&mut pkg.workbook, 0, 20, 1);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+    }
+
+    #[test]
+    fn a_union_with_a_deleted_area_still_moves_its_other_areas() {
+        let mut pkg = report(PRINT_NAMES, "");
+        delete_rows(&mut pkg.workbook, 0, 0, 20);
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Report!$B:$B,Report!#REF!</definedName>"#),
+            "{wb}"
+        );
+        // Also once it has been through a save and reload.
+        let mut re = re;
+        insert_cols(&mut re.workbook, 0, 0, 1);
+        let (_, wb) = saved(&re, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"localSheetId="0">Report!$C:$C,Report!#REF!</definedName>"#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn cdata_and_comments_in_names_are_read_as_the_loader_reads_them() {
+        let names = concat!(
+            r#"<definedName name="Cdata"><![CDATA[Report!$A$30]]></definedName>"#,
+            r#"<definedName name="Noted">Report!$A$31<!-- not </definedName> yet --></definedName>"#,
+            r#"<definedName name="Moves"><![CDATA[Report!$A$5]]></definedName>"#,
+        );
+        let file = || {
+            let body = r#"<sheetData/>"#;
+            load_xlsx(&book(names, &[("Report", Some(body))])).unwrap()
+        };
+        // Plain save, and an edit below them: byte-identical.
+        let (_, wb) = saved(&file(), "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+        let mut pkg = file();
+        insert_rows(&mut pkg.workbook, 0, 40, 1);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+
+        // An edit that moves them rewrites the whole content, well-formed.
+        let mut pkg = file();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(concat!(
+                r#"<definedName name="Cdata">Report!$A$31</definedName>"#,
+                r#"<definedName name="Noted">Report!$A$32</definedName>"#,
+                r#"<definedName name="Moves">Report!$A$6</definedName>"#,
+            )),
+            "{wb}"
+        );
+        assert_eq!(re.workbook.defined_name("Noted", 0), Some("Report!$A$32"));
+    }
+
+    #[test]
+    fn a_comment_inside_a_breaks_element_does_not_end_it() {
+        let breaks = concat!(
+            r#"<rowBreaks count="2" manualBreakCount="2"><!-- </rowBreaks> -->"#,
+            r#"<brk id="5" max="16383" man="1"/><brk id="13" max="16383" man="1"/></rowBreaks>"#,
+        );
+        let pkg = report("", breaks);
+        assert_eq!(row_ids(&pkg.workbook.sheets[0]), vec![5, 13]);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(breaks), "{ws}");
+
+        let mut pkg = report("", breaks);
+        insert_rows(&mut pkg.workbook, 0, 10, 1);
+        let (re, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(concat!(
+                r#"<rowBreaks count="2" manualBreakCount="2"><brk id="5" max="16383" man="1"/>"#,
+                r#"<brk id="14" max="16383" man="1"/></rowBreaks></worksheet>"#,
+            )),
+            "{ws}"
+        );
+        assert_eq!(row_ids(&re.workbook.sheets[0]), vec![5, 14]);
+    }
+
+    #[test]
+    fn a_rename_reaches_deleted_areas_in_the_saved_names() {
+        let mut pkg = report(PRINT_NAMES, "");
+        delete_rows(&mut pkg.workbook, 0, 0, 20);
+        rename_sheet(&mut pkg.workbook, 0, "Q1");
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(
+                r#"<definedName name="_xlnm.Print_Area" localSheetId="0">Q1!#REF!</definedName>"#
+            ),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Q1!$A:$A,Q1!#REF!</definedName>"#),
+            "{wb}"
+        );
+    }
+
+    #[test]
+    fn non_ascii_text_around_names_and_breaks_is_scanned_safely() {
+        // Element lookups step byte by byte; text such as `Ü` before the
+        // element they look for must not panic them.
+        let names = r#"<definedName name="Größe">'Übersicht'!$A$5</definedName>"#;
+        let body = concat!(
+            r#"<sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Ärger</t></is></c></row></sheetData>"#,
+            r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks>"#,
+        );
+        let mut pkg = load_xlsx(&book(names, &[("Übersicht", Some(body))])).unwrap();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="Größe">Übersicht!$A$6</definedName>"#),
+            "{wb}"
+        );
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(r#"<brk id="14" max="16383" man="1"/>"#), "{ws}");
     }
 }

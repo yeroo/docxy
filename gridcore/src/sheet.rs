@@ -272,6 +272,29 @@ pub struct Sheet {
     /// `None` when the sheet is unprotected. Advisory in the viewer; enforced by
     /// Excel on open.
     pub protection: Option<String>,
+    /// Page breaks (manual and automatic) from the sheet's own `<rowBreaks>` /
+    /// `<colBreaks>`, not a custom view's. A save rewrites those elements only
+    /// when these differ from what the part holds, and never adds one the file
+    /// didn't have.
+    pub row_breaks: Vec<PageBreak>,
+    pub col_breaks: Vec<PageBreak>,
+}
+
+/// One `<brk>`: `id` is the 0-based first row (column) of the page that starts
+/// at the break, so a break follows that row through inserts and deletes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageBreak {
+    pub id: u32,
+    /// The element's other attributes (`min`, `max`, `man`, `pt`), raw and
+    /// with a leading space, written back as they came.
+    pub attrs: String,
+}
+
+impl PageBreak {
+    /// Manual (user-inserted) as opposed to automatic.
+    pub fn is_manual(&self) -> bool {
+        self.attrs.contains(" man=\"1\"") || self.attrs.contains(" man=\"true\"")
+    }
 }
 
 impl Sheet {
