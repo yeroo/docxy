@@ -917,10 +917,13 @@ impl Editor {
                 rescale_work(proj, i, old, new);
             }
         })?;
-        // Only a date change restamps a manual task. An auto task's stored
-        // dates never reach a save (it writes the schedule's), so a rename or
-        // a level change need not touch them. A blank row's new dates are
-        // stamped by edit_row; a newly pinned task's here.
+        // Only a date change restamps a manual task. A save writes most auto
+        // tasks' scheduled dates, not their stored ones; it keeps the stored
+        // dates only where the schedule does not reproduce Project (leveled
+        // tasks, plans scheduled from the finish; see mspdi's
+        // scheduled_dates), which a rename or a level change must not
+        // overwrite either. A blank row's new dates are stamped by edit_row; a
+        // newly pinned task's here.
         if duration_changed || (mode_changed && patch.manual == Some(true)) {
             self.stamp_pinned_dates(uid);
         }
@@ -3776,17 +3779,9 @@ mod tests {
             DateTime::from_ymd_hm(2026, 3, 5, 8, 0)
         );
         let back = crate::mspdi::read_mspdi(&crate::mspdi::write_mspdi(ed.project())).unwrap();
-        // The lag moved Pour and its summary: the save writes each auto
-        // task's dates where the schedule puts them now (#343), everything
-        // else as the model holds it.
-        let mut expected = ed.project().tasks.clone();
-        for t in expected.iter_mut().filter(|t| !t.manual && !t.is_null) {
-            let r = ed.schedule().get(t.uid).unwrap();
-            t.stored_start = t.stored_start.and(Some(r.early_start));
-            t.stored_finish = t.stored_finish.and(Some(r.early_finish));
-        }
-        assert_ne!(expected, ed.project().tasks, "the lag moved a stored date");
-        assert_eq!(back.tasks, expected);
+        // Pour is leveled (LevelingDelay 4800), which the schedule does not
+        // model: it and its summary save the dates Project wrote (#343).
+        assert_eq!(back.tasks, ed.project().tasks);
         // A new link to the blank row is still refused.
         let mut added = ed.project().task(2).unwrap().predecessors.clone();
         added.push(links[1].clone());

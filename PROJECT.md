@@ -46,11 +46,19 @@ Built bottom-up, each a pure module:
 
 The model is **pure input** — the scheduler never mutates it; it returns a
 separate `Schedule`. MSPDI's own computed `Start`/`Finish` are captured as
-`stored_*` and used as an **oracle** for the scheduler. The editor rewrites them
-for a manual task whose dates it edits, so a save's `Start`/`Finish` agree with
-its `ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
-open). A manual summary saves its own dates there too, as Project does; a
-summary switched back to auto saves its rolled-up span. Likewise the editor
+`stored_*` and used as an **oracle** for the scheduler. A save writes an auto
+task's `Start`/`Finish` from docxy's schedule (its `EarlyStart`/`EarlyFinish`),
+not its stored dates, which go stale once anything the task depends on moves.
+It keeps the stored dates where they are not docxy's to compute (manual tasks,
+blank rows, external placeholders, tasks the schedule skips, auto summaries with
+nothing scheduled below them) and where docxy's schedule is known not to
+reproduce Project: every task of a plan scheduled from its finish, and a task
+Project's leveling delayed (its own or an assignment's `LevelingDelay`) with
+the summaries above it. The editor rewrites the stored dates for a manual task
+whose dates it edits, so a save's `Start`/`Finish` agree with its
+`ManualStart`/`ManualDuration` (Project does not reschedule manual tasks on
+open). A manual summary saves its own dates there too, as Project does; a task
+or summary switched back to auto is restamped where it is now scheduled. Likewise the editor
 refreshes the stored assignment dates, costs and remaining work, and the
 resource, task and summary totals, that an edit made stale
 (`assign::refresh`, run from `Editor::reschedule` during an edit); values no

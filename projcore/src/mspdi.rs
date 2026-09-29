@@ -1501,13 +1501,19 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// [`PROJECT_HEADER`] order, then any others in read order. Outline code
 /// definitions, WBS masks and extended attribute definitions follow in schema
 /// order. Other elements outside the model (views, etc.) are not preserved:
-/// this is a model-faithful writer, not a byte-faithful one. An auto-scheduled
-/// task's stored `Start`/`Finish` are written as the dates docxy schedules it
-/// to (its `EarlyStart`/`EarlyFinish`), not the ones it was read with (one it
-/// was read without stays absent), so a scheduled
-/// project exports with dates Project can display without recalculating. Manual
-/// tasks, blank rows, external placeholders and tasks the schedule skips keep
-/// their stored dates, written when present; see `scheduled_dates`.
+/// this is a model-faithful writer, not a byte-faithful one.
+///
+/// An auto-scheduled task's stored `Start`/`Finish` are written as the dates
+/// docxy schedules it to (its `EarlyStart`/`EarlyFinish`), not the ones it was
+/// read with (one it was read without stays absent), so a scheduled project
+/// exports with dates Project can display without recalculating. The stored
+/// dates are kept, written when present, for manual tasks, blank rows,
+/// external placeholders, tasks the schedule skips and auto summaries with
+/// nothing scheduled below them, and where the schedule is known not to
+/// reproduce Project: every task of a plan scheduled from its finish
+/// (`ScheduleFromStart` 0), a task Project's leveling delayed (its own or an
+/// assignment's `LevelingDelay`) and the summaries above it. See
+/// `scheduled_dates`.
 ///
 /// The header always says `<ProjectExternallyEdited>0</ProjectExternallyEdited>`,
 /// whatever the source said: the saved `<Duration>`s are docxy's own and
@@ -1518,7 +1524,8 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// values read from a file. That schedule honours each calendar's daily
 /// (`Type 1`) exceptions. Known limit: recurring exceptions (`Type` 2-8, or a
 /// `Period` above 1) are written back but not scheduled, so on a plan with one
-/// these fields, and an auto task's `Start`/`Finish`, can differ from Project's.
+/// these fields, and an auto task's `Start`/`Finish`, can differ from Project's
+/// where an occurrence falls in the task's span.
 ///
 /// Assignment and resource values are written as the model holds them, never
 /// recomputed here: Project trusts them, and an unedited file keeps its own.
@@ -1563,11 +1570,12 @@ pub fn write_mspdi(proj: &Project) -> String {
     s.push_str("  <Tasks>\n");
     let sched = crate::schedule::schedule(proj);
     let numbers = outline_numbers(&proj.tasks);
-    for (t, number) in proj.tasks.iter().zip(&numbers) {
+    let dates = scheduled_dates(proj, &sched);
+    for ((t, number), &dates) in proj.tasks.iter().zip(&numbers).zip(&dates) {
         let computed = Computed {
             outline_number: number.as_deref(),
             result: sched.get(t.uid).filter(|_| !t.is_null),
-            dates: scheduled_dates(t, &sched),
+            dates,
         };
         write_task(&mut s, t, &computed);
     }
@@ -1716,22 +1724,74 @@ struct Computed<'a> {
     dates: Option<(DateTime, DateTime)>,
 }
 
-/// Where the schedule puts an auto-scheduled task, which a save writes as its
-/// `Start`/`Finish`: Project trusts those, and the ones the task was read with
-/// are stale once anything it depends on moved (#343). `None` keeps the stored
-/// dates: a blank row's and an external placeholder's are not ours, a manual
-/// task's are what it is pinned to (and a TBD one's absent Start is what keeps
-/// it TBD on reload), a task the schedule skips has none, and an auto summary
-/// with nothing scheduled below it spans its own stored dates, so writing its
-/// project-start fallback would pin it there.
-fn scheduled_dates(t: &Task, sched: &crate::schedule::Schedule) -> Option<(DateTime, DateTime)> {
-    if t.is_null || t.is_external_leaf() || t.manual {
-        return None;
+/// Where the schedule puts each task, which a save writes as its
+/// `Start`/`Finish` (by row): Project trusts those, and the ones an auto task
+/// was read with are stale once anything it depends on moved (#343). `None`
+/// keeps the stored dates:
+///
+/// - a blank row's and an external placeholder's are not ours;
+/// - a manual task's are what it is pinned to (and a TBD one's absent Start is
+///   what keeps it TBD on reload);
+/// - a task the schedule skips has none;
+/// - an auto summary with nothing scheduled below it spans its own stored
+///   dates, which the schedule only clamps;
+/// - where the schedule is known not to reproduce Project, Project's dates are
+///   the better ones: a plan scheduled from its finish (docxy schedules
+///   forward), a task Project's leveling delayed (the task's or an
+///   assignment's `LevelingDelay`, which the unleveled schedule ignores), and
+///   an auto summary over such a task, whose rollup would not contain the
+///   dates its subtask keeps.
+fn scheduled_dates(
+    proj: &Project,
+    sched: &crate::schedule::Schedule,
+) -> Vec<Option<(DateTime, DateTime)>> {
+    if proj.option("ScheduleFromStart").and_then(parse_bool) == Some(false) {
+        return vec![None; proj.tasks.len()];
     }
-    if t.summary && sched.rolled_up(t.uid).is_none() {
-        return None;
+    let delayed = |delay: Option<i64>| delay.is_some_and(|d| d != 0);
+    let leveled: std::collections::HashSet<i32> = proj
+        .assignments
+        .iter()
+        .filter(|a| delayed(a.leveling_delay))
+        .map(|a| a.task_uid)
+        .chain(
+            proj.tasks
+                .iter()
+                .filter(|t| delayed(t.leveling_delay))
+                .map(|t| t.uid),
+        )
+        .collect();
+    // Rows kept because a subtask is leveled: every outline ancestor of one.
+    let mut kept = vec![false; proj.tasks.len()];
+    let mut ancestors: Vec<usize> = Vec::new();
+    for (i, t) in proj.tasks.iter().enumerate().filter(|(_, t)| !t.is_null) {
+        while ancestors
+            .last()
+            .is_some_and(|&k| proj.tasks[k].outline_level >= t.outline_level)
+        {
+            ancestors.pop();
+        }
+        if !t.summary && leveled.contains(&t.uid) {
+            kept[i] = true;
+            for &k in &ancestors {
+                kept[k] = true;
+            }
+        }
+        ancestors.push(i);
     }
-    sched.get(t.uid).map(|r| (r.early_start, r.early_finish))
+    proj.tasks
+        .iter()
+        .zip(kept)
+        .map(|(t, kept)| {
+            if kept || t.is_null || t.is_external_leaf() || t.manual {
+                return None;
+            }
+            if t.summary && sched.rolled_up(t.uid).is_none() {
+                return None;
+            }
+            sched.get(t.uid).map(|r| (r.early_start, r.early_finish))
+        })
+        .collect()
 }
 
 fn flag(value: bool) -> &'static str {
@@ -4646,22 +4706,86 @@ mod tests {
     }
 
     /// An auto summary with nothing scheduled below it spans its own stored
-    /// dates, from the project start when it has none. Saving that fallback
-    /// would pin it there; a blank row keeps what it stores.
+    /// dates, which the schedule clamps (a Finish before the Start becomes
+    /// the Start): it saves them as read. A blank row keeps what it stores.
     #[test]
     fn empty_auto_summary_and_blank_row_keep_their_stored_dates() {
         let mut proj = task_project(
-            "<Task><UID>1</UID><OutlineLevel>1</OutlineLevel><Summary>1</Summary></Task>             <Task><UID>2</UID><OutlineLevel>2</OutlineLevel><IsNull>1</IsNull></Task>",
+            "<Task><UID>1</UID><OutlineLevel>1</OutlineLevel><Summary>1</Summary>             <Start>2026-03-10T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish></Task>             <Task><UID>2</UID><OutlineLevel>2</OutlineLevel><IsNull>1</IsNull></Task>",
         );
         proj.tasks[1].stored_start = Some(DateTime::from_ymd_hm(2026, 3, 11, 8, 0));
         let sched = crate::schedule::schedule(&proj);
         assert!(proj.tasks[0].summary && proj.tasks[1].is_null);
-        assert!(sched.get(1).is_some() && sched.rolled_up(1).is_none());
+        assert!(sched.rolled_up(1).is_none());
+        let r = sched.get(1).unwrap();
+        assert_eq!(r.early_finish, DateTime::from_ymd_hm(2026, 3, 10, 8, 0));
         let xml = write_mspdi(&proj);
-        assert!(!one_task_xml(&xml, 1).contains("<Start>"), "{xml}");
+        let summary = one_task_xml(&xml, 1);
+        assert!(
+            summary.contains("<Start>2026-03-10T08:00:00</Start>"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("<Finish>2026-03-05T17:00:00</Finish>"),
+            "{summary}"
+        );
         assert!(
             one_task_xml(&xml, 2).contains("<Start>2026-03-11T08:00:00</Start>"),
             "{xml}"
+        );
+    }
+
+    /// Project's leveling delays a task in a way the unleveled schedule does
+    /// not model: a task delayed by its own or an assignment's LevelingDelay,
+    /// and the summary above it, save the dates Project wrote. Another auto
+    /// task in the plan still saves its scheduled dates.
+    #[test]
+    fn leveled_tasks_and_their_summary_keep_their_stored_dates() {
+        let xml = "<Project><StartDate>2026-03-02T08:00:00</StartDate><Tasks>            <Task><UID>1</UID><OutlineLevel>1</OutlineLevel><Summary>1</Summary>              <Start>2026-03-05T08:00:00</Start><Finish>2026-03-06T17:00:00</Finish></Task>            <Task><UID>2</UID><OutlineLevel>2</OutlineLevel><Duration>PT16H0M0S</Duration>              <Start>2026-03-05T08:00:00</Start><Finish>2026-03-06T17:00:00</Finish>              <LevelingDelay>4800</LevelingDelay><LevelingDelayFormat>7</LevelingDelayFormat>              <PreLeveledStart>2026-03-04T08:00:00</PreLeveledStart></Task>            <Task><UID>3</UID><OutlineLevel>1</OutlineLevel><Duration>PT8H0M0S</Duration>              <Start>2026-03-11T08:00:00</Start><Finish>2026-03-11T17:00:00</Finish></Task>            <Task><UID>4</UID><OutlineLevel>1</OutlineLevel><Duration>PT8H0M0S</Duration>              <Start>2026-03-12T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish></Task>            </Tasks><Assignments><Assignment><UID>1</UID><TaskUID>4</TaskUID>              <ResourceUID>-65535</ResourceUID><LevelingDelay>4800</LevelingDelay>            </Assignment></Assignments></Project>";
+        let proj = read_mspdi(xml).unwrap();
+        let sched = crate::schedule::schedule(&proj);
+        let march2 = DateTime::from_ymd_hm(2026, 3, 2, 8, 0);
+        for uid in [1, 2, 3, 4] {
+            assert_eq!(sched.get(uid).unwrap().early_start, march2, "UID {uid}");
+        }
+        let saved = write_mspdi(&proj);
+        for (uid, start) in [
+            (1, "2026-03-05"),
+            (2, "2026-03-05"),
+            (3, "2026-03-02"),
+            (4, "2026-03-12"),
+        ] {
+            let task = one_task_xml(&saved, uid);
+            assert!(
+                task.contains(&format!("<Start>{start}T08:00:00</Start>")),
+                "{task}"
+            );
+        }
+    }
+
+    /// docxy schedules forward even when a plan is scheduled from its
+    /// finish, so such a plan saves every task's dates as Project wrote them.
+    #[test]
+    fn a_plan_scheduled_from_its_finish_keeps_its_stored_dates() {
+        let source = include_str!("../../corpus/mspdi/02-link-fs.xml")
+            .replacen(
+                "<Start>2026-03-04T08:00:00</Start><Finish>2026-03-05T17:00:00</Finish>",
+                "<Start>2026-03-11T08:00:00</Start><Finish>2026-03-12T17:00:00</Finish>",
+                1,
+            )
+            .replacen(
+                "<Name>link-fs</Name>",
+                "<Name>link-fs</Name><ScheduleFromStart>0</ScheduleFromStart>",
+                1,
+            );
+        let proj = read_mspdi(&source).unwrap();
+        assert_eq!(proj.option("ScheduleFromStart"), Some("0"));
+        let xml = write_mspdi(&proj);
+        let b = one_task_xml(&xml, 2);
+        assert!(b.contains("<Start>2026-03-11T08:00:00</Start>"), "{b}");
+        assert!(
+            b.contains("<EarlyStart>2026-03-04T08:00:00</EarlyStart>"),
+            "{b}"
         );
     }
 
