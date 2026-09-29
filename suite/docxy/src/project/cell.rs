@@ -364,6 +364,9 @@ pub(crate) fn project_below_click(tab: &mut DocTab) {
 }
 
 fn cell_click(tab: &mut DocTab, target: ClickTarget, col: Option<usize>, double: bool) {
+    // A levelling pass asked for first runs first, in the order the user
+    // gave them; see [`flush_level_pass`].
+    flush_level_pass(tab);
     let Surface::Project(v) = &tab.surface else {
         return;
     };

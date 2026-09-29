@@ -2575,8 +2575,8 @@ fn app_state_is_busy_over_edit_over_ready() {
     assert_eq!(project_app_state(v(&t)), AppState::Edit, "prompt");
     press(&mut t, "escape");
     assert_eq!(project_app_state(v(&t)), AppState::Ready);
-    // Not reachable through the UI (asking for a pass commits the cell),
-    // but the precedence is defined.
+    // Not reachable through the UI (asking for a pass commits the cell, and
+    // input runs a pending pass before it opens one), but defined.
     press(&mut t, "f2");
     vm(&mut t).busy = Some((0, true));
     assert_eq!(project_app_state(v(&t)), AppState::Busy);
@@ -2610,19 +2610,69 @@ fn a_level_pass_is_asked_for_then_run_by_a_flush() {
 }
 
 #[test]
-fn level_twice_before_a_flush_resolves_against_the_pending_pass() {
+fn level_twice_is_a_round_trip() {
     let mut t = tab();
-    request_level_pass(&mut t, ProjectAct::Level).unwrap();
-    request_level_pass(&mut t, ProjectAct::Level).unwrap();
-    flush_level_pass(&mut t);
-    assert!(!v(&t).ed.leveled(), "toggled on, then back off");
+    for leveled in [true, false] {
+        request_level_pass(&mut t, ProjectAct::Level).unwrap();
+        flush_level_pass(&mut t);
+        assert_eq!(v(&t).ed.leveled(), leveled);
+    }
+    // A second request runs the first before it resolves its own target.
     request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
     request_level_pass(&mut t, ProjectAct::Level).unwrap();
+    assert!(v(&t).ed.leveled(), "the Level All ran first");
     flush_level_pass(&mut t);
-    assert!(
-        !v(&t).ed.leveled(),
-        "Level after a pending Level All turns it off"
+    assert!(!v(&t).ed.leveled(), "then Level turned it off");
+}
+
+#[test]
+fn keys_clicks_and_prompts_run_a_pending_pass_before_they_reach_the_plan() {
+    let busy = || {
+        let mut t = tab();
+        request_level_pass(&mut t, ProjectAct::LevelAll).unwrap();
+        t
+    };
+    let settled = |t: &DocTab, how: &str| {
+        assert!(v(t).busy.is_none(), "{how}");
+        assert!(v(t).ed.leveled(), "{how}");
+    };
+    // A key that opens the cell editor: the pass runs first, so the editor
+    // is open over a settled plan (Edit, never Busy with an editor).
+    let mut t = busy();
+    assert_eq!(
+        project_input(&mut t, "f2", None, Modifiers::default()),
+        None
     );
+    settled(&t, "F2");
+    assert_eq!(project_app_state(v(&t)), AppState::Edit);
+    // A typed edit lands after the pass, so Undo takes back the edit and
+    // leaves the levelling the user asked for first.
+    let mut t = busy();
+    project_input(&mut t, "x", Some("x"), Modifiers::default());
+    settled(&t, "typing");
+    project_input(&mut t, "enter", None, Modifiers::default());
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert!(
+        v(&t).ed.leveled(),
+        "Undo reverts the edit, not the levelling"
+    );
+    let mut t = busy();
+    project_cell_click(&mut t, 0, Some(COL_NAME), true);
+    settled(&t, "double-click");
+    let mut t = busy();
+    project_entry_click(&mut t, Some(COL_NAME), false);
+    settled(&t, "entry row click");
+    let mut t = busy();
+    project_below_click(&mut t);
+    settled(&t, "click below the rows");
+    let mut t = busy();
+    toggle_project_collapse(&mut t, 1);
+    settled(&t, "outline toggle");
+    let mut t = busy();
+    vm(&mut t).open_prompt(PromptKind::Find);
+    let p = vm(&mut t).prompt.take().unwrap();
+    commit_prompt(&mut t, p);
+    settled(&t, "prompt commit");
 }
 
 #[test]

@@ -699,7 +699,9 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
 }
 
 pub(super) fn apply_save(tab: &mut DocTab, target: &Path) -> Result<usize, String> {
-    // The saved starts are the leveled ones: run a pass asked for first.
+    // Levelling changes only the displayed dates, not what is written, but a
+    // pass asked for runs first so the save's message is the last word and
+    // the tab it reports on is settled.
     flush_level_pass(tab);
     if !commit_project_cell(tab) {
         return Err(tab.status.to_string());

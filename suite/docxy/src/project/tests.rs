@@ -788,6 +788,9 @@ fn save_runs_a_pending_level_pass_first() {
     let mut tab = edited_tab();
     request_level_pass(&mut tab, ProjectAct::LevelAll).unwrap();
     apply_save(&mut tab, &dir.path("leveled.xml")).unwrap();
+    // Run before the save, not left for later: the tab is settled and the
+    // save's message is not overwritten by the levelling one.
     assert!(view(&tab).busy.is_none());
     assert!(view(&tab).ed.leveled());
+    assert!(tab.status.starts_with("saved "), "{}", tab.status);
 }

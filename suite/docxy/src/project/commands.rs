@@ -607,6 +607,9 @@ pub(crate) fn project_input(
     text: Option<&str>,
     m: Modifiers,
 ) -> Option<ProjectAct> {
+    // A levelling pass asked for first runs first, in the order the user
+    // gave them; see [`flush_level_pass`].
+    flush_level_pass(tab);
     let Surface::Project(v) = &mut tab.surface else {
         return None;
     };
@@ -759,6 +762,9 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
 }
 
 pub(crate) fn commit_prompt(tab: &mut DocTab, prompt: ProjectPrompt) {
+    // A levelling pass asked for first runs first, in the order the user
+    // gave them; see [`flush_level_pass`].
+    flush_level_pass(tab);
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
@@ -859,10 +865,10 @@ fn next_pass_token() -> u64 {
 
 /// Ask for a levelling pass instead of running it, so the frame that says
 /// `Busy` is drawn first; render schedules it and [`finish_level_pass`] or
-/// [`flush_level_pass`] runs it. The target is resolved now, against the
-/// pass already pending if there is one, so Level twice in a row is a round
-/// trip. Returns the pass's token.
+/// [`flush_level_pass`] runs it. A pass still pending runs first, so the
+/// target is resolved against the plan it left. Returns the pass's token.
 pub(crate) fn request_level_pass(tab: &mut DocTab, act: ProjectAct) -> Option<u64> {
+    flush_level_pass(tab);
     if !commit_project_cell(tab) {
         return None;
     }
@@ -870,9 +876,8 @@ pub(crate) fn request_level_pass(tab: &mut DocTab, act: ProjectAct) -> Option<u6
         return None;
     };
     v.cancel_prompt();
-    let leveled = v.busy.map_or(v.ed.leveled(), |(_, want)| want);
     let token = next_pass_token();
-    v.busy = Some((token, level_target(act, leveled)));
+    v.busy = Some((token, level_target(act, v.ed.leveled())));
     v.scheduled = None;
     Some(token)
 }
@@ -886,8 +891,10 @@ pub(crate) fn finish_level_pass(tab: &mut DocTab, token: u64) -> bool {
     }
 }
 
-/// Run `tab`'s pending levelling pass now, if it has one. Called wherever
-/// the plan is read out or saved, so nothing sees a pass half-asked-for.
+/// Run `tab`'s pending levelling pass now, if it has one. Called before any
+/// input reaches the plan (keys, clicks, prompts, acts) and wherever it is
+/// read out or saved, so nothing sees a pass half-asked-for and edits apply
+/// in the order the user gave them.
 pub(crate) fn flush_level_pass(tab: &mut DocTab) -> bool {
     let Surface::Project(v) = &mut tab.surface else {
         return false;
@@ -908,10 +915,17 @@ pub(crate) fn flush_level_passes(tabs: &mut [DocTab]) -> bool {
 }
 
 pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
+    use ProjectAct::*;
+    // The host asks for a pass and runs it a frame later; run at once, it is
+    // the same two steps.
+    if matches!(act, Level | LevelAll | ClearLeveling) {
+        request_level_pass(tab, act);
+        flush_level_pass(tab);
+        return;
+    }
     if !commit_project_cell(tab) {
         return;
     }
-    use ProjectAct::*;
     let Surface::Project(v) = &mut tab.surface else {
         return;
     };
@@ -1022,9 +1036,8 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                     .into(),
                 );
             }
-            Level | LevelAll | ClearLeveling => {
-                status = Some(level_to(v, level_target(act, v.ed.leveled())).into());
-            }
+            // Handled above, through the pass.
+            Level | LevelAll | ClearLeveling => {}
             Recalc => status = Some("Rescheduled (automatic on every edit)".into()),
             Undo => {
                 status = Some(
@@ -1100,6 +1113,9 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
 /// cell edit commits first, as on any click away, and a failed commit keeps
 /// the outline as it is. The cursor stays unless the rows it was on hide.
 pub(crate) fn toggle_project_collapse(tab: &mut DocTab, uid: i32) {
+    // A levelling pass asked for first runs first, in the order the user
+    // gave them; see [`flush_level_pass`].
+    flush_level_pass(tab);
     if !commit_project_cell(tab) {
         return;
     }
