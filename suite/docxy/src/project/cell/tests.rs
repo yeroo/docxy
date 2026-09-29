@@ -1198,11 +1198,23 @@ fn f11_commits_the_cell_before_the_new_project_and_an_invalid_cell_stays() {
     );
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "invalid");
     assert_eq!(v(&t).ed.project(), &before);
-    // With a modifier, F11 is just another key to the cell editor.
-    let shift = Modifiers {
-        shift: true,
+    // With a modifier, F11 is just another key to a valid cell: no commit.
+    let with = |shift, control, alt| Modifiers {
+        shift,
+        control,
+        alt,
         ..Modifiers::default()
     };
-    assert_eq!(project_input(&mut t, "f11", None, shift), None);
-    assert_eq!(v(&t).cell.as_ref().unwrap().buf, "invalid");
+    for m in [
+        with(true, false, false),
+        with(false, true, false),
+        with(false, false, true),
+        with(true, true, false),
+    ] {
+        let mut t = tab();
+        edit(&mut t, COL_NAME, "Named");
+        assert_eq!(project_input(&mut t, "f11", None, m), None, "{m:?}");
+        assert_eq!(v(&t).cell.as_ref().unwrap().buf, "Named", "{m:?}");
+        assert_eq!(v(&t).ed.project().task(10).unwrap().name, "Task 1");
+    }
 }
