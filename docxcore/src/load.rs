@@ -3110,13 +3110,13 @@ mod tests {
 
     #[test]
     fn field_result_props_are_the_first_result_runs_642() {
-        let bold = field_result_props(&format!(
+        let bold = field_result_props(
             "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
              <w:r><w:rPr><w:i/></w:rPr><w:instrText> PAGE </w:instrText></w:r>\
              <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
              <w:r><w:rPr><w:b/><w:color w:val=\"FF0000\"/></w:rPr><w:t>1</w:t></w:r>\
-             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>"
-        ));
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
         assert!(bold.bold && !bold.italic);
         assert_eq!(bold.color.as_deref(), Some("FF0000"));
         let simple = field_result_props(
