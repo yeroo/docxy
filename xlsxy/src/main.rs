@@ -2033,10 +2033,13 @@ impl App {
     }
 
     fn save(&mut self) {
-        self.save_current();
+        let _ = self.save_current();
     }
 
-    fn save_current(&mut self) -> bool {
+    /// Write the workbook to `self.path`. A failure's message is both the
+    /// status line and the `Err`, so a caller that reports it (the control
+    /// surface's `wb.save`) says exactly what the status bar says.
+    fn save_current(&mut self) -> Result<(), String> {
         let bytes = self.package_bytes();
         match export_atomic(
             self.import_source.as_deref().map(Path::new),
@@ -2046,18 +2049,19 @@ impl App {
             Ok(()) => {
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
-                true
+                Ok(())
             }
             Err(e) => {
-                self.status = Some(format!("save failed: {e}"));
-                false
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                Err(msg)
             }
         }
     }
 
     fn save_as(&mut self, path: String) {
         let previous = std::mem::replace(&mut self.path, path);
-        if self.save_current() {
+        if self.save_current().is_ok() {
             self.import_source = None;
         } else {
             // A failed Save As must retain protection for the imported file.
