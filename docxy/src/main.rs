@@ -8983,6 +8983,38 @@ mod tests {
         assert!(pdf.contains("(Live) Tj") && !pdf.contains("(H) Tj"));
     }
 
+    /// An app on a Word-style document: the body ends with its own `w:sectPr`.
+    fn app_with_trailing_sect_pr() -> App {
+        app_with_blocks(vec![
+            Block::Paragraph(MPara {
+                props: ParProps::default(),
+                content: vec![Inline::Run(Run {
+                    text: "body".to_string(),
+                    props: RunProps::default(),
+                })],
+            }),
+            Block::SectionProperties(docxcore::model::SectionProperties {
+                raw: r#"<w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr>"#.to_string(),
+                property_change: None,
+            }),
+        ])
+    }
+
+    #[test]
+    fn pdf_export_prints_a_header_created_on_a_document_with_its_own_sect_pr() {
+        let mut app = app_with_trailing_sect_pr();
+        assert!(app.editor.doc.trailing_section_properties().is_some());
+        app.run_act(ribbon::Act::EditHeader);
+        app.on_key(key(KeyCode::Char('H')));
+        app.on_key(key(KeyCode::F(6)));
+        let pdf =
+            String::from_utf8_lossy(&to_pdf(&app.editor.doc, &app.pdf_options())).into_owned();
+        assert!(
+            pdf.contains("(H) Tj"),
+            "the new header is missing from the PDF"
+        );
+    }
+
     #[test]
     fn protected_find_replace_and_cross_format_save_as_are_rejected_preflight() {
         let mut app = app_with(&["x y x"]);

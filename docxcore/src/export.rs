@@ -40,8 +40,11 @@ pub struct PdfOptions {
     /// Main document relationships, resolving each section's header/footer
     /// references to part names.
     pub rels: Relationships,
-    /// The final section's `w:sectPr` when the body carries no trailing
-    /// [`Block::SectionProperties`].
+    /// The final section's `w:sectPr`, taking precedence over the printed
+    /// document's trailing [`Block::SectionProperties`]: editors keep a copy of
+    /// the body while section edits (a new header, a landscape section) land
+    /// in the package, so [`PdfOptions::from_package`] sets it to the package's
+    /// authoritative `Package::sect_pr`.
     pub last_sect_pr: Option<String>,
     /// `w:evenAndOddHeaders` (settings.xml): even pages use the `even` variant.
     pub even_and_odd_headers: bool,
@@ -236,19 +239,23 @@ fn start_tags<'a>(xml: &'a str, tag: &str) -> impl Iterator<Item = &'a str> + us
     })
 }
 
-/// A numeric attribute (twips etc.) as f32.
+/// A numeric attribute (twips etc.) as f32; `inf`/`NaN` count as absent.
 fn num_attr(el: &str, key: &str) -> Option<f32> {
-    xml_attr_value(el, key)?.trim().parse::<f32>().ok()
+    xml_attr_value(el, key)?
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|v| v.is_finite())
 }
 
-/// An on/off element: present and its `w:val` isn't `0`/`false`/`off`.
-fn flag_on(el: Option<&str>) -> bool {
-    el.is_some_and(|el| {
-        !matches!(
-            xml_attr_value(el, "w:val").as_deref(),
-            Some("0" | "false" | "off")
-        )
-    })
+/// Word's limit on newspaper columns in a section.
+const MAX_COLS: usize = 45;
+/// Word's largest starting page number (`w:pgNumType w:start`).
+const MAX_PAGE_START: f32 = 32767.0;
+
+/// An on/off element in `xml` (`w:titlePg`, `w:pageBreakBefore`, …).
+fn flag_on(xml: &str, elem: &str) -> bool {
+    crate::package::settings_flag_of(xml, elem).unwrap_or(false)
 }
 
 fn twips(v: f32) -> f32 {
@@ -281,7 +288,7 @@ impl SectionLayout {
         let cols_el = start_tag(sect, "w:cols");
         let num = cols_el
             .and_then(|el| num_attr(el, "w:num"))
-            .map_or(1, |n| n.max(1.0) as usize);
+            .map_or(1, |n| n.clamp(1.0, MAX_COLS as f32) as usize);
         let space = cols_el
             .and_then(|el| num_attr(el, "w:space"))
             .map_or(36.0, twips);
@@ -306,6 +313,7 @@ impl SectionLayout {
                         num_attr(el, "w:space").map_or(0.0, twips),
                     ))
                 })
+                .take(MAX_COLS)
                 .collect()
         };
         let cols = if !explicit.is_empty() {
@@ -344,7 +352,7 @@ impl SectionLayout {
         };
         let num_start = num_type
             .and_then(|el| num_attr(el, "w:start"))
-            .map(|n| n.max(0.0) as u32);
+            .map(|n| n.clamp(0.0, MAX_PAGE_START) as u32);
         let start = match start_tag(sect, "w:type")
             .and_then(|el| xml_attr_value(el, "w:val"))
             .as_deref()
@@ -370,7 +378,7 @@ impl SectionLayout {
             cols,
             col_sep,
             valign,
-            title_pg: flag_on(start_tag(sect, "w:titlePg")),
+            title_pg: flag_on(sect, "w:titlePg"),
             num_fmt,
             num_start,
             borders: parse_page_borders(sect),
@@ -511,10 +519,10 @@ fn split_sections<'d>(
             start = i + 1;
         }
     }
-    let last = doc
-        .trailing_section_properties()
-        .map(|s| s.raw.as_str())
-        .or(opts.last_sect_pr.as_deref())
+    let last = opts
+        .last_sect_pr
+        .as_deref()
+        .or(doc.trailing_section_properties().map(|s| s.raw.as_str()))
         .unwrap_or("");
     out.push((start..end, last));
     out
@@ -673,9 +681,10 @@ fn heading_size(p: &Paragraph, base: f32) -> f32 {
 
 /// Direct `w:pageBreakBefore` (kept verbatim in `raw_props`).
 fn page_break_before(p: &Paragraph) -> bool {
-    p.props.raw_props.iter().any(|raw| {
-        raw.trim_start().starts_with("<w:pageBreakBefore") && flag_on(Some(raw.as_str()))
-    })
+    p.props
+        .raw_props
+        .iter()
+        .any(|raw| flag_on(raw, "w:pageBreakBefore"))
 }
 
 fn emit_blocks(flow: &mut dyn Flow, blocks: &[Block], opts: &PdfOptions) {
@@ -947,7 +956,7 @@ impl<'a> Pager<'a> {
             Some(n) if first => n,
             _ => self.next_number,
         };
-        self.next_number = number + 1;
+        self.next_number = number.saturating_add(1);
         let even = number.is_multiple_of(2);
         let (left, right) = s.h_margins(even, opts);
         let width = s.w - left - right;
@@ -1177,10 +1186,20 @@ fn border_rules(
 impl Flow for Pager<'_> {
     fn next_line(&mut self, lh: f32) -> (f32, f32, f32) {
         self.y -= lh;
-        let bottom = self.pages.last().map_or(0.0, |p| p.body_bottom);
-        if self.y < bottom {
+        // Move on until the line fits: a continuous column set that starts low
+        // on the page can have no room in any of its columns. A line taller
+        // than an empty page is placed anyway.
+        loop {
+            let bottom = self.pages.last().map_or(0.0, |p| p.body_bottom);
+            if self.y >= bottom {
+                break;
+            }
+            let new_page = self.region.col + 1 >= self.region.xs.len();
             self.advance_column();
             self.y -= lh;
+            if new_page {
+                break;
+            }
         }
         self.mark_low();
         let (x, w) = self.region.xs[self.region.col];
@@ -2644,5 +2663,83 @@ mod tests {
         assert_eq!(pages[0].media, "0 0 612.00 792.00");
         let (x, y) = pages[0].at("x");
         assert!(close(x, 72.0) && close(y, 720.0 - LH));
+    }
+
+    #[test]
+    fn absurd_column_counts_and_page_starts_are_clamped() {
+        for num in ["inf", "1e12", "NaN", "-3"] {
+            let d = doc(vec![
+                text_para("x"),
+                trailing(&format!(r#"<w:sectPr><w:cols w:num="{num}"/></w:sectPr>"#)),
+            ]);
+            assert_eq!(pages_of(&d, &PdfOptions::default()).len(), 1, "w:num={num}");
+        }
+        let many: String = (0..100).map(|_| r#"<w:col w:w="100"/>"#).collect();
+        let d = doc(vec![
+            text_para("x"),
+            trailing(&format!(
+                r#"<w:sectPr><w:cols w:num="100" w:equalWidth="0">{many}</w:cols></w:sectPr>"#
+            )),
+        ]);
+        assert_eq!(pages_of(&d, &PdfOptions::default()).len(), 1);
+        let sect = SectionLayout::parse(
+            r#"<w:sectPr><w:cols w:num="1e12"/></w:sectPr>"#,
+            &PdfOptions::default(),
+        );
+        assert_eq!(sect.cols.len(), MAX_COLS);
+
+        // A start past u32 range: numbering saturates instead of overflowing.
+        let d = doc(vec![
+            para(vec![
+                fld_simple("PAGE", "0"),
+                page_break(),
+                fld_simple("PAGE", "0"),
+            ]),
+            trailing(r#"<w:sectPr><w:pgNumType w:start="4294967295"/></w:sectPr>"#),
+        ]);
+        let pages = pages_of(&d, &PdfOptions::default());
+        assert!(pages[0].exact("32767") && pages[1].exact("32768"));
+        let d = doc(vec![
+            text_para("x"),
+            trailing(r#"<w:sectPr><w:pgNumType w:start="inf" w:fmt="upperLetter"/></w:sectPr>"#),
+        ]);
+        assert_eq!(pages_of(&d, &PdfOptions::default()).len(), 1);
+    }
+
+    #[test]
+    fn a_continuous_column_set_with_no_room_left_moves_to_the_next_page() {
+        // 33 lines fill the page to within one line of the bottom margin.
+        let mut blocks: Vec<Block> = (0..32).map(|i| text_para(&format!("l{i}"))).collect();
+        blocks.push(sect_para("l32", BLANK_SECT));
+        blocks.push(para(vec![
+            run("left", RunProps::default()),
+            col_break(),
+            run("right", RunProps::default()),
+        ]));
+        blocks.push(trailing(
+            r#"<w:sectPr><w:type w:val="continuous"/><w:cols w:num="2" w:space="720" w:sep="1"/></w:sectPr>"#,
+        ));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].has("l32"));
+        for (_, y, t) in &pages[0].texts {
+            assert!(*y >= 72.0, "{t:?} below the bottom margin at {y}");
+        }
+        assert!(!pages[0].content.contains(" l S"), "no separator on page 1");
+        let (left, right) = (pages[1].at("left"), pages[1].at("right"));
+        assert!(close(left.0, 72.0) && close(right.0, 324.0) && close(left.1, right.1));
+    }
+
+    #[test]
+    fn the_packages_final_section_wins_over_the_printed_documents_copy() {
+        // An editor's copy of the body keeps the sectPr it was loaded with.
+        let d = doc(vec![text_para("x"), trailing(BLANK_SECT)]);
+        let opts = PdfOptions {
+            last_sect_pr: Some(
+                r#"<w:sectPr><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>"#.to_string(),
+            ),
+            ..PdfOptions::default()
+        };
+        assert_eq!(pages_of(&d, &opts)[0].media, "0 0 792.00 612.00");
     }
 }

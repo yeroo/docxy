@@ -166,7 +166,7 @@ pub enum HeaderVariant {
 }
 
 impl HeaderVariant {
-    pub fn as_ooxml(self) -> &'static str {
+    fn as_ooxml(self) -> &'static str {
         match self {
             Self::Default => "default",
             Self::First => "first",
@@ -772,13 +772,10 @@ impl Package {
         self.protection().label()
     }
 
-    /// Watermarks in headers that are actually applied by document section
-    /// relationships. Each inherited header is associated with every section in
-    /// which it remains effective rather than merely scanning orphan header parts.
     /// Each section's `w:sectPr` XML in document order: every paragraph section
     /// break, then the trailing body sectPr. Even an empty trailing value stands
     /// for the one implicit section of a document without sectPr.
-    pub fn section_sect_prs(&self) -> Vec<&str> {
+    fn section_sect_prs(&self) -> Vec<&str> {
         let mut sections: Vec<&str> = self
             .document
             .body
@@ -802,11 +799,9 @@ impl Package {
             .unwrap_or_default()
     }
 
-    /// Every section's applied header/footer parts; see [`section_header_parts`].
-    pub fn section_header_parts(&self) -> Vec<SectionParts> {
-        section_header_parts(&self.section_sect_prs(), &self.document_rels())
-    }
-
+    /// Watermarks in headers that are actually applied by document section
+    /// relationships. Each inherited header is associated with every section in
+    /// which it remains effective rather than merely scanning orphan header parts.
     pub fn watermarks(&self) -> Vec<Watermark> {
         const VARIANTS: [HeaderVariant; 3] = [
             HeaderVariant::Default,
@@ -1630,7 +1625,7 @@ fn tag_attr(attrs: &str, name: &str) -> Option<String> {
 /// A bare `contains("<w:autoHyphenation")` reads Word's explicit
 /// `<w:autoHyphenation w:val="false"/>` as ON, and matches the unrelated
 /// `<w:autoHyphenationZone>` too.
-fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
+pub(crate) fn settings_flag_of(xml: &str, elem: &str) -> Option<bool> {
     let open = format!("<{elem}");
     let mut from = 0usize;
     while let Some(rel) = xml[from..].find(&open) {
