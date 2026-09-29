@@ -40,7 +40,7 @@ use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
     format_with, sheet_to_csv,
 };
-use gridcore::xlsx::{SheetPackage, load_xlsx, new_xlsx, save_xlsx};
+use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx_for_path};
 
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
@@ -238,7 +238,17 @@ fn main() -> ExitCode {
                 pivots.refreshed, pivots.skipped
             );
         }
-        let bytes = save_xlsx(&pkg);
+        // The saved file's type follows `out`: a template or macro workbook
+        // written as .xlsx must say it is a workbook, or Excel refuses it.
+        if let Some(kind) = SpreadsheetKind::from_path(&out) {
+            if !kind.allows_macros() && pkg.has_vba_project() {
+                eprintln!(
+                    "note: VB project not saved in macro-free .{} workbook",
+                    kind.extension()
+                );
+            }
+        }
+        let bytes = save_xlsx_for_path(&pkg, &out);
         // Recalculation is an in-place save for .xlsx, but a conversion for
         // CSV/TSV input. Never replace the imported text file with an XLSX.
         if let Err(e) = export_atomic(
@@ -886,6 +896,8 @@ struct DvPicker {
 enum ConfirmAction {
     Exit,
     DeleteSheet,
+    /// Save As to a macro-free type (`.xlsx`/`.xltx`) drops the VBA project.
+    SaveWithoutMacros(String),
 }
 
 // The Yes/No modal itself lives in `backstage::Confirm<ConfirmAction>` (shared
@@ -2029,7 +2041,8 @@ impl App {
             let xml = model_part_xml(&self.model_rels, &self.model_measures);
             self.pkg.set_part(MODEL_PART, xml.into_bytes());
         }
-        save_xlsx(&self.pkg)
+        // The file's type follows the path it is written to.
+        save_xlsx_for_path(&self.pkg, &self.path)
     }
 
     fn save(&mut self) {
@@ -2055,13 +2068,44 @@ impl App {
         }
     }
 
-    fn save_as(&mut self, path: String) {
+    fn save_as(&mut self, path: String) -> bool {
         let previous = std::mem::replace(&mut self.path, path);
         if self.save_current() {
             self.import_source = None;
+            true
         } else {
             // A failed Save As must retain protection for the imported file.
             self.path = previous;
+            false
+        }
+    }
+
+    /// Save As, first asking (as Excel does) before a macro-free type drops
+    /// the workbook's VBA project.
+    fn request_save_as(&mut self, path: String) {
+        let drops_macros = SpreadsheetKind::from_path(&path).is_some_and(|k| !k.allows_macros());
+        if drops_macros && self.pkg.has_vba_project() {
+            self.confirm = Some(
+                backstage::Confirm::new(
+                    "The following features cannot be saved in macro-free workbooks: \
+                     VB project. Save without them?",
+                    ConfirmAction::SaveWithoutMacros(path),
+                    Color::Green,
+                )
+                .default_no(),
+            );
+        } else {
+            self.save_as(path);
+        }
+    }
+
+    /// Yes to [`ConfirmAction::SaveWithoutMacros`]: once the file is written
+    /// without them, the open workbook drops its macros too, so a later Save
+    /// As neither asks again nor writes them back into an `.xlsm`. A failed
+    /// write keeps them.
+    fn save_as_without_macros(&mut self, path: String) {
+        if self.save_as(path) {
+            self.pkg.remove_vba_project();
         }
     }
 
@@ -3016,7 +3060,11 @@ impl App {
         match outcome {
             backstage::ConfirmOutcome::Pending => false,
             backstage::ConfirmOutcome::Cancelled => {
-                self.confirm = None;
+                if let Some(ConfirmAction::SaveWithoutMacros(_)) =
+                    self.confirm.take().map(|c| c.action().clone())
+                {
+                    self.status = Some("Save As cancelled — the VB project is kept".into());
+                }
                 false
             }
             backstage::ConfirmOutcome::Confirmed(action) => {
@@ -3025,6 +3073,10 @@ impl App {
                     ConfirmAction::Exit => true,
                     ConfirmAction::DeleteSheet => {
                         self.delete_current_sheet();
+                        false
+                    }
+                    ConfirmAction::SaveWithoutMacros(path) => {
+                        self.save_as_without_macros(path);
                         false
                     }
                 }
@@ -3097,7 +3149,7 @@ impl App {
         };
         let path = dir.join(&fname);
         self.backstage = None;
-        self.save_as(path.to_string_lossy().into_owned());
+        self.request_save_as(path.to_string_lossy().into_owned());
     }
 
     // --- welcome / start screen ----------------------------------------------
@@ -4226,7 +4278,7 @@ impl App {
             PromptKind::RowHeight => self.commit_row_height(&text),
             PromptKind::SaveAs => {
                 if !text.is_empty() {
-                    self.save_as(text);
+                    self.request_save_as(text);
                 }
             }
             PromptKind::RenameSheet => {
@@ -4401,7 +4453,7 @@ impl App {
 /// (green).
 impl backstage::BackstageHost for App {
     fn extensions(&self) -> &'static [&'static str] {
-        &["xlsx", "csv", "tsv"]
+        &["xlsx", "xlsm", "xltx", "xltm", "csv", "tsv"]
     }
 
     fn default_save_name(&self) -> String {
@@ -6391,6 +6443,7 @@ fn run_tui(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gridcore::xlsx::save_xlsx;
 
     #[test]
     fn imported_csv_stays_protected_until_successful_save_as_or_new() {
@@ -6436,6 +6489,163 @@ mod tests {
             std::fs::remove_file(file).unwrap();
         }
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    /// A macro workbook: `.xlsm`-typed, with a VBA project behind the `.bin`
+    /// Default, as Excel writes one.
+    fn xlsm_pkg() -> SheetPackage {
+        let bytes = gridcore::xlsx::save_xlsx_as(&new_xlsx(), SpreadsheetKind::MacroWorkbook);
+        let mut pkg = load_xlsx(&bytes).unwrap();
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                "</Relationships>",
+                r#"<Relationship Id="rId9" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        let ct = String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).replace(
+            "</Types>",
+            r#"<Default Extension="bin" ContentType="application/vnd.ms-office.vbaProject"/></Types>"#,
+        );
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        pkg.set_part("xl/vbaProject.bin", b"VBA".to_vec());
+        assert!(pkg.has_vba_project());
+        pkg
+    }
+
+    fn saved_content_types(path: &Path) -> String {
+        let pkg = load_xlsx(&std::fs::read(path).unwrap()).unwrap();
+        String::from_utf8_lossy(pkg.part("[Content_Types].xml").unwrap()).into_owned()
+    }
+
+    fn macro_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("xlsxy-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// #601: Save As `.xlsx` from a macro workbook asks first; Yes writes a
+    /// real `.xlsx` and the open workbook drops its macros too, so a later
+    /// Save As neither asks again nor writes them back.
+    #[test]
+    fn save_as_xlsx_from_a_macro_workbook_asks_and_yes_drops_the_macros() {
+        let dir = macro_dir("macros-yes");
+        let mut app = App::new(xlsm_pkg(), dir.join("in.xlsm").to_str().unwrap());
+        app.modified = true;
+        app.commit_save_as(dir.clone(), "out.xlsx".into());
+        let c = app
+            .confirm
+            .as_ref()
+            .expect("Save As asks before dropping macros");
+        assert!(
+            c.prompt()
+                .contains("cannot be saved in macro-free workbooks: VB project")
+        );
+        let out = dir.join("out.xlsx");
+        assert!(!out.exists(), "nothing is written before the answer");
+
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        assert!(app.confirm.is_none());
+        let ct = saved_content_types(&out);
+        assert!(
+            ct.contains("spreadsheetml.sheet.main+xml") && !ct.contains("macroEnabled"),
+            "{ct}"
+        );
+        assert!(!ct.contains("vbaProject"), "{ct}");
+        assert!(
+            !load_xlsx(&std::fs::read(&out).unwrap())
+                .unwrap()
+                .has_vba_project()
+        );
+        assert_eq!(Path::new(&app.path), out);
+        assert!(!app.modified);
+        assert!(!app.pkg.has_vba_project());
+
+        app.commit_save_as(dir.clone(), "again.xlsx".into());
+        assert!(app.confirm.is_none(), "a later Save As does not ask again");
+        assert!(dir.join("again.xlsx").exists());
+        app.commit_save_as(dir.clone(), "back.xlsm".into());
+        assert!(app.confirm.is_none());
+        let back = load_xlsx(&std::fs::read(dir.join("back.xlsm")).unwrap()).unwrap();
+        assert!(!back.has_vba_project(), "the dropped macros stay dropped");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Yes, but the write fails: nothing changes, the macros included.
+    #[test]
+    fn a_failed_save_without_macros_keeps_them() {
+        let dir = macro_dir("macros-fail");
+        let source = dir.join("in.xlsm");
+        let mut app = App::new(xlsm_pkg(), source.to_str().unwrap());
+        app.modified = true;
+        app.commit_save_as(dir.join("missing-parent"), "out.xlsx".into());
+        assert!(app.confirm.is_some());
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Char('y'))));
+        assert!(app.status.as_deref().unwrap().contains("save failed"));
+        assert!(app.pkg.has_vba_project());
+        assert_eq!(Path::new(&app.path), source);
+        assert!(app.modified);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// No keeps everything: the path, the unsaved flag and the macros.
+    #[test]
+    fn save_as_xlsx_from_a_macro_workbook_no_keeps_everything() {
+        let dir = macro_dir("macros-no");
+        let source = dir.join("in.xlsm");
+        let mut app = App::new(xlsm_pkg(), source.to_str().unwrap());
+        app.modified = true;
+        // The typed-path prompt asks too.
+        app.open_prompt(PromptKind::SaveAs);
+        app.prompt.as_mut().unwrap().text = dir.join("out.xlsx").to_string_lossy().into_owned();
+        app.commit_prompt();
+        assert!(app.confirm.is_some());
+        // Dropping macros is destructive: Enter alone means No.
+        assert!(!app.confirm_key(KeyEvent::from(KeyCode::Enter)));
+        assert!(app.confirm.is_none());
+        assert!(!dir.join("out.xlsx").exists());
+        assert_eq!(Path::new(&app.path), source);
+        assert!(app.modified);
+        assert!(app.pkg.has_vba_project());
+        assert!(app.status.as_deref().unwrap().contains("cancelled"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A macro-enabled target keeps the macros and needs no question; a
+    /// template saved as `.xlsx` becomes a workbook.
+    #[test]
+    fn save_writes_the_type_of_the_target_path() {
+        let dir = macro_dir("macros-kind");
+        let mut app = App::new(xlsm_pkg(), dir.join("in.xlsm").to_str().unwrap());
+        app.commit_save_as(dir.clone(), "copy.xltm".into());
+        assert!(app.confirm.is_none());
+        let ct = saved_content_types(&dir.join("copy.xltm"));
+        assert!(ct.contains("template.macroEnabled.main+xml"), "{ct}");
+        assert!(ct.contains("vbaProject"), "{ct}");
+        assert!(app.pkg.has_vba_project());
+
+        let template = gridcore::xlsx::save_xlsx_as(&new_xlsx(), SpreadsheetKind::Template);
+        let mut app = App::new(
+            load_xlsx(&template).unwrap(),
+            dir.join("t.xltx").to_str().unwrap(),
+        );
+        app.commit_save_as(dir.clone(), "budget.xlsx".into());
+        assert!(app.confirm.is_none());
+        let ct = saved_content_types(&dir.join("budget.xlsx"));
+        assert!(
+            ct.contains("spreadsheetml.sheet.main+xml") && !ct.contains("template"),
+            "{ct}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_file_browser_offers_every_workbook_type() {
+        let app = App::new(new_xlsx(), "t.xlsx");
+        let exts = backstage::BackstageHost::extensions(&app);
+        for ext in ["xlsx", "xlsm", "xltx", "xltm"] {
+            assert!(exts.contains(&ext), "{ext}");
+        }
     }
 
     #[test]
