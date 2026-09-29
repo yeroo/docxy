@@ -844,11 +844,19 @@ fn parse_paragraph(p: &mut XmlParser, rels: &Relationships) -> Paragraph {
 /// One instance runs per inline loop, and only runs parsed *directly* by that
 /// loop open or close a field, so `raw` (the source slice from the begin run's
 /// `<w:r>` to the end run's `</w:r>`) is always well-formed: any element between
-/// them is inside it whole. A field is left as loose markers, exactly as before,
-/// when its end is never seen by the same loop (it spans paragraphs, or sits in
-/// another container), or when a child parsed between begin and end brought
-/// field markers of its own (an unwrapped smart tag or content control holding
-/// half of a field), since those can't be paired reliably.
+/// them is inside it whole. A field is left as loose markers, exactly as before:
+/// - when its end is never seen by the same loop (it spans paragraphs, or sits
+///   in another container);
+/// - when its begin shares a run with another marker (a previous field's end),
+///   or a new begin follows its end in the same run, since the slice would cut
+///   into the other field;
+/// - when a child between begin and end brought field markers of its own (an
+///   unwrapped smart tag or content control holding half of a field), since
+///   those can't be paired reliably;
+/// - when its runs hold something a Field would hide or lose: a tracked change
+///   (review must still see it), a picture, object, text box, chart, SmartArt,
+///   equation or note reference, a tab or break (a TOC entry's tab leader, a
+///   line break in a result), or a comment's range or reference mark.
 #[derive(Default)]
 struct FieldCollapse {
     open: Option<OpenFieldSpan>,
@@ -861,7 +869,7 @@ struct OpenFieldSpan {
     idx: usize,
     /// Source position of the begin run's `<w:r>`.
     start: usize,
-    /// Set when a nested container brought field markers of its own.
+    /// Set when the span can't become a Field (see [`FieldCollapse`]).
     broken: bool,
 }
 
@@ -885,7 +893,9 @@ impl FieldCollapse {
         // result would vanish), and loose markers from a nested container
         // can't be paired.
         let taints = pushed.iter().any(|i| {
-            holds_revision(i) || (!marker_run && (holds_object(i) || has_field_marker(i)))
+            holds_revision(i)
+                || (!marker_run && (holds_object(i) || holds_layout(i) || has_field_marker(i)))
+                || holds_comment_mark(i)
         });
         if taints {
             if let Some(open) = self.open.as_mut() {
@@ -980,6 +990,34 @@ fn holds_object(inline: &Inline) -> bool {
         | Inline::FootnoteRef { .. } => true,
         Inline::Hyperlink(h) => h.content.iter().any(holds_object),
         Inline::Revision { content, .. } => content.iter().any(holds_object),
+        _ => false,
+    }
+}
+
+/// Whether an inline is, or holds, a tab or a break: layout a Field's text
+/// can't carry (a `HYPERLINK \\l` TOC entry's tab leader, a manual line or
+/// page break in a result).
+fn holds_layout(inline: &Inline) -> bool {
+    match inline {
+        Inline::Tab(_) | Inline::Break(_) => true,
+        Inline::Hyperlink(h) => h.content.iter().any(holds_layout),
+        Inline::Revision { content, .. } => content.iter().any(holds_layout),
+        _ => false,
+    }
+}
+
+/// Whether an inline is, or holds, a comment's range or reference mark: the
+/// comment's anchors must stay loose so deleting the comment removes them.
+fn holds_comment_mark(inline: &Inline) -> bool {
+    const MARKS: [&str; 3] = [
+        "<w:commentRangeStart",
+        "<w:commentRangeEnd",
+        "<w:commentReference",
+    ];
+    match inline {
+        Inline::Raw(raw) => MARKS.iter().any(|m| raw.contains(m)),
+        Inline::Hyperlink(h) => h.content.iter().any(holds_comment_mark),
+        Inline::Revision { content, .. } => content.iter().any(holds_comment_mark),
         _ => false,
     }
 }
@@ -3140,6 +3178,80 @@ mod tests {
         assert!(nested.italic && !nested.bold);
         let plain = field_result_props(PAGE_FIELD);
         assert!(!plain.bold && !plain.italic && !plain.vanish);
+    }
+
+    #[test]
+    fn a_field_whose_result_holds_a_tab_or_break_stays_loose_642() {
+        // A TOC entry built from a HYPERLINK \l field: text, tab, PAGEREF.
+        let toc = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> HYPERLINK \\l \"_Toc1\" </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+            <w:r><w:t>Intro</w:t></w:r><w:r><w:tab/></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> PAGEREF _Toc1 \\h </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+            <w:r><w:t>7</w:t></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        let d = doc(&format!(
+            "<w:document><w:body><w:p><w:pPr><w:tabs>\
+             <w:tab w:val=\"right\" w:leader=\"dot\" w:pos=\"9000\"/></w:tabs></w:pPr>\
+             {toc}</w:p></w:body></w:document>"
+        ));
+        let p = first_para(&d);
+        assert!(
+            p.content.iter().any(|i| matches!(i, Inline::Tab(_))),
+            "{:?}",
+            kinds(&p.content)
+        );
+        assert!(!p.content.iter().any(|i| matches!(i, Inline::Field { .. })));
+        let opts = crate::render::RenderOptions {
+            width: 40,
+            ..Default::default()
+        };
+        let line = crate::render::render(&d, &opts)[0].plain();
+        assert!(
+            line.contains("Intro....") && line.trim_end().ends_with('7'),
+            "{line:?}"
+        );
+        // A REF result with a manual line break.
+        let d = para_doc(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> REF addr </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>Line 1</w:t><w:br/><w:t>Line 2</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        let p = first_para(&d);
+        assert!(
+            p.content.iter().any(|i| matches!(i, Inline::Break(_))),
+            "{:?}",
+            kinds(&p.content)
+        );
+        assert!(!p.content.iter().any(|i| matches!(i, Inline::Field { .. })));
+    }
+
+    #[test]
+    fn a_field_holding_a_comments_marks_stays_loose_642() {
+        let d = para_doc(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> PAGE </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:commentRangeStart w:id=\"5\"/><w:r><w:t>1</w:t></w:r><w:commentRangeEnd w:id=\"5\"/>\
+             <w:r><w:commentReference w:id=\"5\"/></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        assert!(
+            !first_para(&d)
+                .content
+                .iter()
+                .any(|i| matches!(i, Inline::Field { .. }))
+        );
+        // Deleting the comment removes all of its marks from the saved file.
+        let mut ed = crate::editor::Editor::new(d);
+        ed.remove_comment_markers("5");
+        let out = crate::serialize::document_to_xml(&ed.doc);
+        assert!(!out.contains("comment"), "{out}");
     }
 
     #[test]

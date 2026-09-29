@@ -2184,7 +2184,7 @@ pub(crate) fn is_field_unit(inline: &Inline) -> bool {
 
 /// `text` without [`FIELD_CHAR`]s, for the entry points that insert text: the
 /// stand-in adds nothing, so callers must count what is left.
-fn without_field_chars(text: &str) -> String {
+pub(crate) fn without_field_chars(text: &str) -> String {
     text.chars().filter(|&c| c != FIELD_CHAR).collect()
 }
 

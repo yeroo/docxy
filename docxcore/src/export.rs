@@ -1375,8 +1375,9 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     segs.push(Seg::default());
                 }
             }
-            // A simple field: PAGE/NUMPAGES/SECTIONPAGES get the page's value when
-            // written; any other field keeps its cached result.
+            // A field (a `w:fldSimple`, a complex field loaded as one unit, or a
+            // `w:sym` symbol): PAGE/NUMPAGES/SECTIONPAGES get the page's value
+            // when written; any other field keeps its cached result.
             Inline::Field { raw, text } => {
                 let kind = crate::field::instr_of(raw)
                     .as_deref()

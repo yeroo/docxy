@@ -197,10 +197,7 @@ pub fn append(ed: &mut Editor, text: &str) {
 /// ([`crate::editor::FIELD_CHAR`], from text an agent read back) is dropped:
 /// it is not a character to write into the document.
 pub fn parse_markdown_blocks(text: &str) -> Result<Vec<Block>, String> {
-    let text: String = text
-        .chars()
-        .filter(|&c| c != crate::editor::FIELD_CHAR)
-        .collect();
+    let text = crate::editor::without_field_chars(text);
     if text.trim().is_empty() {
         return Err("empty markdown".to_string());
     }
