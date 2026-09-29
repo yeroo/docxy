@@ -1140,3 +1140,229 @@ fn the_persisted_mark_holds_over_a_file_that_loads_at_restart() {
     assert_eq!(std::fs::read(&path).unwrap(), before);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- AutoRecover tick (#632) ----------------------------------------------
+
+/// A config root for one AutoRecover test, passed to `write_session` directly:
+/// no test here sets `DOCXY_CONFIG_DIR`.
+struct Root(PathBuf);
+impl Root {
+    fn new(name: &str) -> Self {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/autorecover-tests")
+            .join(format!("{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+    fn session(&self) -> Session {
+        serde_json::from_slice(&std::fs::read(session_path_in(&self.0)).unwrap()).unwrap()
+    }
+}
+impl Drop for Root {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn prefs() -> Prefs {
+    Prefs {
+        theme: ThemePref::default(),
+        ask_on_close: false,
+        autorecover_minutes: 10,
+    }
+}
+
+#[test]
+fn autorecover_skips_the_write_when_nothing_is_unsaved() {
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx), tab(Kind::Project)];
+    assert!(
+        !autorecover_prepare(&mut tabs),
+        "a clean session writes nothing"
+    );
+    tabs[1].dirty = true;
+    assert!(autorecover_prepare(&mut tabs), "one unsaved tab is enough");
+}
+
+#[test]
+fn autorecover_writes_an_unsaved_edit_that_a_crash_restores_as_recovered() {
+    let root = Root::new("doc");
+    let original = root.0.join("original.docx");
+    std::fs::copy(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures/basic.docx"),
+        &original,
+    )
+    .unwrap();
+    let before = std::fs::read(&original).unwrap();
+    let mut t = tab_from_path(&original);
+    let Surface::Doc(ed) = &mut t.surface else {
+        panic!("{}", t.status)
+    };
+    ed.insert_str("recover me");
+    t.dirty = true; // as `with_editor` leaves it
+    let mut tabs = vec![t];
+
+    assert!(autorecover_prepare(&mut tabs));
+    write_session(&root.0, &tabs, 0, prefs());
+    let session = root.session();
+    assert!(session.tabs[0].dirty);
+    let hot = PathBuf::from(session.tabs[0].hot.as_deref().unwrap());
+    assert!(hot.starts_with(hot_dir_in(&root.0)), "{}", hot.display());
+
+    let now = std::time::SystemTime::now();
+    let crashed = restore_session(&session, true, now);
+    assert!(doc_text(&crashed[0]).contains("recover me"));
+    assert!(crashed[0].dirty);
+    assert_eq!(crashed[0].path.as_deref(), Some(original.as_path()));
+    assert!(
+        crashed[0].status.starts_with("recovered"),
+        "{}",
+        crashed[0].status
+    );
+    // Restore reads the copy and never writes the original.
+    assert_eq!(std::fs::read(&original).unwrap(), before);
+
+    let clean = restore_session(&session, false, now);
+    assert_eq!(clean[0].status.as_ref(), "unsaved — restored");
+    assert!(doc_text(&clean[0]).contains("recover me"));
+}
+
+#[test]
+fn a_crash_does_not_label_clean_tabs_recovered() {
+    let root = Root::new("clean");
+    let mut tabs = vec![tab(Kind::Docx), tab(Kind::Xlsx)];
+    tabs[1].dirty = true;
+    write_session(&root.0, &tabs, 0, prefs());
+    let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
+    assert!(
+        !restored[0].status.starts_with("recovered"),
+        "{}",
+        restored[0].status
+    );
+    assert!(
+        restored[1].status.starts_with("recovered"),
+        "{}",
+        restored[1].status
+    );
+}
+
+#[test]
+fn autorecover_leaves_an_open_cell_edit_open() {
+    let mut tabs = vec![pending_sheet("Still typing")];
+    tabs.push(tab(Kind::Docx));
+    tabs[1].dirty = true;
+    assert!(autorecover_prepare(&mut tabs));
+    let Surface::Sheet(v) = &tabs[0].surface else {
+        panic!()
+    };
+    assert_eq!(v.editing.as_deref(), Some("Still typing"));
+    assert!(!tabs[0].dirty, "an uncommitted cell edit is not committed");
+}
+
+#[test]
+fn autorecover_captures_an_open_header_and_stays_in_header_mode() {
+    let root = Root::new("hf");
+    let mut tabs = vec![tab(Kind::Docx)];
+    let part = open_hf(&mut tabs[0], true, "Recovered header");
+    assert!(autorecover_prepare(&mut tabs));
+    assert!(tabs[0].hf_edit.is_some(), "the header editor stays open");
+    write_session(&root.0, &tabs, 0, prefs());
+    let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
+    assert!(part_text(&restored[0], &part).contains("Recovered header"));
+}
+
+#[test]
+fn autorecover_is_on_by_default_and_the_setting_round_trips() {
+    assert_eq!(Session::default().autorecover_minutes, 10);
+    let old: Session = serde_json::from_str(r#"{"tabs":[],"active":0}"#).unwrap();
+    assert_eq!(
+        old.autorecover_minutes, 10,
+        "a session from before the setting"
+    );
+    let root = Root::new("setting");
+    let prefs = Prefs {
+        autorecover_minutes: 0,
+        ..prefs()
+    };
+    write_session(&root.0, &[tab(Kind::Docx)], 0, prefs);
+    assert_eq!(root.session().autorecover_minutes, 0, "off is kept");
+}
+
+fn persisted_tab(
+    kind: Kind,
+    path: Option<&std::path::Path>,
+    hot: Option<&std::path::Path>,
+) -> PersistTab {
+    PersistTab {
+        kind,
+        title: "Recovered?".into(),
+        path: path.map(|p| p.display().to_string()),
+        dirty: true,
+        hot: hot.map(|p| p.display().to_string()),
+        unreadable: Vec::new(),
+        markdown: false,
+        load_failed: Some(false),
+    }
+}
+
+fn crash_restore(tabs: Vec<PersistTab>) -> Vec<DocTab> {
+    let session = Session {
+        tabs,
+        ..Session::default()
+    };
+    restore_session(&session, true, std::time::SystemTime::now())
+}
+
+/// Only content that came from a readable sidecar is an AutoRecover copy: a
+/// tab that fell back to its file or a placeholder lost its edits, and a load
+/// error must stay a load error.
+#[test]
+fn a_crash_labels_only_tabs_whose_sidecar_was_read() {
+    let root = Root::new("sources");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures");
+    let empty_docx = root.0.join("tab-0.docx");
+    std::fs::write(&empty_docx, b"").unwrap();
+    let broken_xlsx = root.0.join("tab-1.xlsx");
+    std::fs::write(&broken_xlsx, b"not a workbook").unwrap();
+    let gone = root.0.join("missing.docx");
+    let original = root.0.join("original.docx");
+    std::fs::copy(fixtures.join("basic.docx"), &original).unwrap();
+    let sheet = root.0.join("original.xlsx");
+    std::fs::copy(fixtures.join("basic.xlsx"), &sheet).unwrap();
+
+    let restored = crash_restore(vec![
+        // Never saved, 0-byte sidecar: a placeholder with a load error.
+        persisted_tab(Kind::Docx, None, Some(&empty_docx)),
+        // A file, no sidecar recorded: the file is reloaded.
+        persisted_tab(Kind::Docx, Some(&original), None),
+        // A file, the recorded sidecar is gone.
+        persisted_tab(Kind::Docx, Some(&original), Some(&gone)),
+        // A workbook whose sidecar cannot be read.
+        persisted_tab(Kind::Xlsx, Some(&sheet), Some(&broken_xlsx)),
+        // A workbook with no sidecar.
+        persisted_tab(Kind::Xlsx, Some(&sheet), None),
+    ]);
+    assert!(
+        restored[0].status.starts_with("load error"),
+        "{}",
+        restored[0].status
+    );
+    for t in &restored {
+        assert!(!t.status.starts_with("recovered"), "{}", t.status);
+    }
+}
+
+#[test]
+fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
+    let root = Root::new("sheet-project");
+    let mut tabs = vec![tab(Kind::Xlsx), tab(Kind::Project)];
+    for t in &mut tabs {
+        t.dirty = true;
+    }
+    write_session(&root.0, &tabs, 0, prefs());
+    let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
+    for t in &restored {
+        assert!(t.dirty);
+        assert!(t.status.starts_with("recovered"), "{}", t.status);
+    }
+}

@@ -96,6 +96,18 @@ fn relaunch_restores_the_tab_list_quit_left() {
         ],
     );
     assert_eq!(task.get_str("name"), Some("Restart"), "{task}");
+    // `quit` is a clean exit, so the dirty tab is restored, not recovered from
+    // a crash (#632): `quit` must clear the run marker as a window close does.
+    let dirty = call(
+        &driver,
+        "tab-select",
+        &[("tab", Json::Str("gantt-summary".into()))],
+    );
+    assert_eq!(
+        dirty.get_str("status"),
+        Some("unsaved — restored"),
+        "{dirty}"
+    );
     // The unsaved edit lives in the session, not in the file.
     assert_eq!(
         std::fs::read(&plans[0]).unwrap(),
