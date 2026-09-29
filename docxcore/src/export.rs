@@ -1283,6 +1283,27 @@ fn same_style(a: &PCell, b: &PCell) -> bool {
         && a.field.map(|f| f.0) == b.field.map(|f| f.0)
 }
 
+/// A hyperlink's visible text in source order: its runs (with their
+/// formatting), then its content's runs, nested links, tracked changes' runs,
+/// and fields' results (a TOC entry's PAGEREF page number is a field in the
+/// link). A field has no run formatting of its own (`None`).
+fn link_pieces<'a>(
+    runs: &'a [Run],
+    content: &'a [Inline],
+    out: &mut Vec<(&'a str, Option<&'a RunProps>)>,
+) {
+    out.extend(runs.iter().map(|r| (r.text.as_str(), Some(&r.props))));
+    for inline in content {
+        match inline {
+            Inline::Run(r) => out.push((r.text.as_str(), Some(&r.props))),
+            Inline::Hyperlink(link) => link_pieces(&link.runs, &link.content, out),
+            Inline::Revision { content, .. } => link_pieces(&[], content, out),
+            Inline::Field { text, .. } => out.push((text.as_str(), None)),
+            _ => {}
+        }
+    }
+}
+
 /// An open complex field while its paragraph is flattened.
 struct OpenField {
     instr: String,
@@ -1341,11 +1362,18 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
                     .unwrap_or_default();
                 let rc: Rc<str> = Rc::from(target.as_str());
-                for run in h.visible_runs() {
-                    let eff =
-                        styles.effective_run(pstyle, run.props.style_id.as_deref(), &run.props);
-                    let font = font_index(eff.bold || heading, eff.italic);
-                    for ch in run.text.chars() {
+                let mut pieces = Vec::new();
+                link_pieces(&h.runs, &h.content, &mut pieces);
+                for (text, props) in pieces {
+                    let (font, strike) = match props {
+                        Some(props) => {
+                            let eff =
+                                styles.effective_run(pstyle, props.style_id.as_deref(), props);
+                            (font_index(eff.bold || heading, eff.italic), eff.strike)
+                        }
+                        None => (font_index(heading, false), false),
+                    };
+                    for ch in text.chars() {
                         push(
                             &mut segs,
                             PCell {
@@ -1353,7 +1381,7 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                                 font,
                                 color: (0.0, 0.0, 0.55),
                                 underline: true,
-                                strike: eff.strike,
+                                strike,
                                 link: Some(rc.clone()),
                                 field: None,
                             },
@@ -2482,6 +2510,27 @@ mod tests {
                 page.texts
             );
         }
+    }
+
+    #[test]
+    fn a_toc_entrys_page_number_field_is_exported_inside_its_link_642() {
+        // A `TOC \h` entry: the PAGEREF field (collapsed into one Field on
+        // load) sits inside the entry's link.
+        let body = crate::load::parse_document_xml(
+            r#"<w:document><w:body><w:p><w:hyperlink w:anchor="_Toc1"><w:r><w:t>Intro</w:t></w:r><w:r><w:tab/></w:r><w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText> PAGEREF _Toc1 \h </w:instrText></w:r><w:r><w:fldChar w:fldCharType="separate"/></w:r><w:r><w:t>7</w:t></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r></w:hyperlink></w:p></w:body></w:document>"#,
+            &crate::load::Relationships::default(),
+        );
+        assert!(matches!(
+            &body.body[0],
+            Block::Paragraph(p) if matches!(&p.content[0], Inline::Hyperlink(h) if h.content.iter().any(|i| matches!(i, Inline::Field { .. })))
+        ));
+        let pages = pages_of(&body, &PdfOptions::default());
+        assert!(pages[0].has("Intro"), "{:?}", pages[0].texts);
+        assert!(
+            pages[0].has("7"),
+            "the page number is exported: {:?}",
+            pages[0].texts
+        );
     }
 
     #[test]
