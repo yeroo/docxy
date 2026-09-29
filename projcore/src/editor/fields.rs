@@ -14,9 +14,8 @@
 //! default in both: Active (Yes), Priority (500), Effort Driven and Type (the
 //! plan's defaults for new tasks), Fixed Cost Accrual (Prorated, as costs
 //! accrue when it is absent or Invalid), Constraint Type (As Soon As
-//! Possible), Leveling Delay (0 edays). WBS is the live outline number unless
-//! the plan has a WBS code mask; then it is the stored code, else the outline
-//! number. Estimated and Milestone are what the
+//! Possible), Leveling Delay (0 edays). WBS is the stored code, else the outline
+//! number; edits do not renumber a stored code yet. Estimated and Milestone are what the
 //! grid shows (a summary is estimated when a leaf below it is; a zero-length
 //! leaf is a milestone). A blank row reads only its ID and Unique ID; every
 //! other field is empty text and null.
@@ -408,22 +407,11 @@ impl<'a> FieldReader<'a> {
             Field::Active => flag(task.is_active()),
             Field::OutlineNumber => optional_text(self.outline_number(task.uid)),
             Field::OutlineLevel => int(i64::from(task.outline_level)),
-            Field::Wbs => {
-                // Without a WBS code mask, Project's WBS is the outline number
-                // and renumbers with the outline, so a stored code goes stale
-                // on the first structural edit. With one, the code is the
-                // plan's own and stays as read.
-                let masked = proj
-                    .wbs_masks
-                    .as_ref()
-                    .is_some_and(|block| block.children.iter().any(|mask| mask.name == "WBSMask"));
-                let live = self.outline_number(task.uid);
-                optional_text(if masked {
-                    task.wbs.as_deref().or(live)
-                } else {
-                    live
-                })
-            }
+            // The stored code (a file's, or an MPP override), else the outline
+            // number. Structural edits do not renumber a stored code yet, and
+            // a save writes the same one, so the field shows what the plan
+            // holds.
+            Field::Wbs => optional_text(task.wbs.as_deref().or(self.outline_number(task.uid))),
             Field::LevelingDelay => {
                 // Stored in tenths of a minute; Project shows it in elapsed
                 // days unless the file gives another format.

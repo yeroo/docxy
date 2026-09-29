@@ -166,8 +166,7 @@ fn every_listed_field_reads_a_representative_value() {
         ("Active", "Yes", FieldValue::Bool(true)),
         ("Outline Number", "1", FieldValue::Text(s("1"))),
         ("Outline Level", "1", FieldValue::Int(1)),
-        // No WBS code mask: the live outline number, not the stored code.
-        ("WBS", "1", FieldValue::Text(s("1"))),
+        ("WBS", "A.1", FieldValue::Text(s("A.1"))),
         ("Leveling Delay", "1 eday", m(1440)),
         ("Type", "Fixed Work", FieldValue::Text(s("Fixed Work"))),
         ("Effort Driven", "Yes", FieldValue::Bool(true)),
@@ -572,52 +571,27 @@ fn the_project_summary_row_reads_its_rollup_and_stored_values() {
 }
 
 #[test]
-fn wbs_follows_the_outline_unless_the_plan_has_a_code_mask() {
+fn wbs_is_the_stored_code_else_the_live_outline_number() {
     let tasks = vec![
         Task {
-            wbs: Some("1".into()),
+            wbs: Some("ABC.42".into()),
             ..task(1, "A", 480)
         },
         Task {
             wbs: Some("2".into()),
             ..task(2, "B", 480)
         },
+        task(3, "C", 480),
     ];
-    let mut ed = editor(tasks.clone());
+    let mut ed = editor(tasks);
+    assert_eq!(read(&ed, 1, "WBS").text, "ABC.42");
+    assert_eq!(read(&ed, 3, "WBS").text, "3");
+    // Indents move the outline numbers. A stored code stays as the plan
+    // holds it (a save writes it unchanged); a task without one reads its
+    // live number.
+    ed.indent(2, 1).unwrap();
+    ed.indent(3, 1).unwrap();
     assert_eq!(read(&ed, 2, "WBS").text, "2");
-    ed.indent(2, 1).unwrap();
-    assert_eq!(read(&ed, 2, "WBS").text, "1.1");
-    ed.add_task(Some(2), "C", 480, false).unwrap();
-    let added = ed.project().tasks[2].uid;
-    assert_eq!(read(&ed, added, "WBS").text, "1.2");
-
-    // 20-task-fields has a code mask: its stored codes stay, even one that
-    // is not the outline number, and a task without one reads its number.
-    let mut proj =
-        crate::mspdi::read_mspdi(include_str!("../../../../corpus/mspdi/20-task-fields.xml"))
-            .unwrap();
-    proj.tasks[0].wbs = Some("PRJ-01".into());
-    proj.tasks[1].wbs = None;
-    let (first, second) = (proj.tasks[0].uid, proj.tasks[1].uid);
-    let ed = Editor::new(proj);
-    assert_eq!(read(&ed, first, "WBS").text, "PRJ-01");
-    assert_eq!(
-        read(&ed, second, "WBS").text,
-        FieldReader::new(&ed).outline_number(second).unwrap()
-    );
-    // A block of settings with no mask in it is not a code mask.
-    let mut p = untitled_project();
-    p.tasks = tasks;
-    p.wbs_masks = Some(crate::model::XmlElement {
-        name: "WBSMasks".into(),
-        text: String::new(),
-        children: vec![crate::model::XmlElement {
-            name: "GenerateCodes".into(),
-            text: "0".into(),
-            children: vec![],
-        }],
-    });
-    let mut ed = Editor::new(p);
-    ed.indent(2, 1).unwrap();
-    assert_eq!(read(&ed, 2, "WBS").text, "1.1");
+    assert_eq!(read(&ed, 3, "WBS").text, "1.2");
+    assert_eq!(read(&ed, 1, "WBS").text, "ABC.42");
 }
