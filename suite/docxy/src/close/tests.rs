@@ -138,12 +138,7 @@ fn invalid_project_buffer_refuses_even_discard_and_correction_clears_status() {
 fn header_and_footer_buffers_are_flushed_before_asking() {
     for is_header in [true, false] {
         let mut t = tab(Kind::Docx);
-        let part_name = t
-            .pkg
-            .as_mut()
-            .unwrap()
-            .create_hf(is_header, "default")
-            .unwrap();
+        let part_name = create_hf(&mut t, is_header);
         let mut editor = Editor::new(empty_doc());
         editor.insert_str("Pending margin text");
         t.hf_edit = Some(HfEdit {
@@ -221,13 +216,23 @@ fn sheet_a1(t: &DocTab) -> String {
 }
 
 /// An open header/footer editor holding `text`; returns its part name.
-fn open_hf(t: &mut DocTab, is_header: bool, text: &str) -> String {
-    let part_name = t
-        .pkg
-        .as_mut()
+/// Create a default header (or footer) part the way `enter_hf` does: through
+/// the body editor, whose final section (with the new reference) Save and the
+/// hot-exit sidecar write.
+fn create_hf(t: &mut DocTab, is_header: bool) -> String {
+    edit_final_sect_pr(t, true, |pkg| pkg.create_hf(is_header, "default"))
+        .flatten()
         .unwrap()
-        .create_hf(is_header, "default")
-        .unwrap();
+}
+
+/// The part a tab's final section references for its default header (or
+/// footer), if any.
+fn referenced_hf(t: &DocTab, is_header: bool) -> Option<String> {
+    hf_part_name_typed(t.pkg.as_ref()?, final_sect_pr(t)?, is_header, "default")
+}
+
+fn open_hf(t: &mut DocTab, is_header: bool, text: &str) -> String {
+    let part_name = create_hf(t, is_header);
     let mut editor = Editor::new(empty_doc());
     editor.insert_str(text);
     t.hf_edit = Some(HfEdit {
@@ -280,6 +285,11 @@ fn window_close_flushes_open_header_and_footer_on_every_tab() {
         assert!(restored[i].dirty);
         assert!(restored[i].hf_edit.is_none());
         assert!(part_text(&restored[i], part).contains(text), "{i}");
+        assert_eq!(
+            referenced_hf(&restored[i], i == 1).as_ref(),
+            Some(part),
+            "{i}"
+        );
     }
     assert!(!restored[0].dirty);
 }
@@ -301,6 +311,7 @@ fn window_close_does_not_stop_at_an_invalid_project_buffer() {
     assert_eq!(sheet_a1(&restored[1]), "After invalid");
     assert!(restored[1].dirty);
     assert!(part_text(&restored[2], &header).contains("After invalid"));
+    assert_eq!(referenced_hf(&restored[2], true), Some(header));
     assert!(restored[2].dirty);
 }
 
@@ -1274,6 +1285,7 @@ fn autorecover_captures_an_open_header_and_stays_in_header_mode() {
     write_session(&root.0, &tabs, 0, prefs());
     let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
     assert!(part_text(&restored[0], &part).contains("Recovered header"));
+    assert_eq!(referenced_hf(&restored[0], true), Some(part));
 }
 
 #[test]
