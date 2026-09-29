@@ -4128,10 +4128,9 @@ impl App {
                 self.save();
                 false
             }
-            "wq" | "x" => {
-                self.save();
-                true
-            }
+            // Quit only when the save landed: a failed save keeps the
+            // editor open with its edits and the failure on the status line.
+            "wq" | "x" => self.save_current().is_ok(),
             "q" => {
                 if self.modified {
                     self.status = Some("Unsaved changes (use :q! to discard)".to_string());
@@ -7478,6 +7477,31 @@ mod tests {
         app.vim_key(KeyCode::Char(':'), false, false);
         app.vim_key(KeyCode::Char('q'), false, false);
         assert!(app.vim_key(KeyCode::Enter, false, false));
+    }
+
+    #[test]
+    fn vim_wq_stays_open_when_the_save_fails() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-609-wq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The parent directory does not exist, so the save fails.
+        let book = dir.join("missing").join("book.xlsx");
+        let mut app = App::new(new_xlsx(), book.to_str().unwrap());
+        app.os_clip = None;
+        app.modified = true;
+        for cmd in ["wq", "x"] {
+            assert!(!app.vim_run_command(cmd), ":{cmd} quit after a failed save");
+            assert!(app.modified);
+            assert!(
+                app.status.as_deref().unwrap().starts_with("save failed: "),
+                "{:?}",
+                app.status
+            );
+        }
+        // Once the save can land, :wq quits.
+        std::fs::create_dir_all(book.parent().unwrap()).unwrap();
+        assert!(app.vim_run_command("wq"));
+        assert!(!app.modified);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
