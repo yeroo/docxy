@@ -82,13 +82,16 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let decoded_calendars = crate::caldecode::decode(bytes, legacy)
         .map_err(|e| format!("cannot read the calendars of this .mpp ({e})"))?;
     let has_calendar_table = decoded_calendars.is_some();
+    let mut resource_calendars = Vec::new();
     if let Some(crate::caldecode::DecodedCalendars {
         calendars,
         default_calendar_uid,
+        resource_calendars: links,
     }) = decoded_calendars
     {
         cal_ref.calendars = calendars;
         cal_ref.default_calendar_uid = default_calendar_uid;
+        resource_calendars = links;
     }
     let tasks = import_tasks(decoded, &cal_ref, has_calendar_table, legacy)?;
     let resources_present = crate::tabledecode::present(bytes, "TBkndRsc")?;
@@ -99,7 +102,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
     let decoded_resources = crate::rscdecode::decode(bytes, legacy)
         .map_err(|e| format!("cannot read the resources of this .mpp ({e})"))?;
     let task_uids = assignment_task_uids(&tasks);
-    let (resources, assignments) = if let Some(resources) = decoded_resources {
+    let (mut resources, assignments) = if let Some(resources) = decoded_resources {
         let decoded_assignments = crate::assndecode::decode(bytes, legacy, &task_uids, &resources)
             .map_err(|e| format!("cannot read the assignments of this .mpp ({e})"))?;
         if assignments_present && decoded_assignments.is_none() {
@@ -111,6 +114,7 @@ pub fn project_from_mpp(bytes: &[u8]) -> Result<Project, String> {
         // No resource table, or one whose layout has not been validated.
         (Vec::new(), Vec::new())
     };
+    link_resource_calendars(&mut resources, &resource_calendars);
     let start = project_start.unwrap_or_else(|| {
         tasks
             .iter()
@@ -470,6 +474,17 @@ pub(crate) fn parse_mpp_dt(s: &str) -> Option<DateTime> {
         hh.parse().ok()?,
         mm.parse().ok()?,
     ))
+}
+
+/// Give each resource its own calendar, from the `(resource UID, calendar
+/// UID)` pairs the calendar rows name. Project schedules a resource's
+/// assignments on it; a save writes it as the resource's `CalendarUID`.
+fn link_resource_calendars(resources: &mut [projcore::Resource], links: &[(i32, i32)]) {
+    for resource in resources {
+        if let Some(&(_, cal)) = links.iter().find(|&&(uid, _)| uid == resource.uid) {
+            resource.calendar_uid = Some(cal);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -961,6 +976,21 @@ mod tests {
             crate::assndecode::decode(&bytes, false, &uids, &resources)
                 .unwrap_err()
                 .contains("unknown task UID 4")
+        );
+    }
+
+    #[test]
+    fn a_resource_takes_the_calendar_its_calendar_row_names() {
+        let resource = |uid| projcore::Resource {
+            uid,
+            ..projcore::Resource::default()
+        };
+        let mut resources = [resource(1), resource(2)];
+        link_resource_calendars(&mut resources, &[(1, 5), (3, 6)]);
+        assert_eq!(
+            resources.map(|r| r.calendar_uid),
+            [Some(5), None],
+            "resource 2 names no calendar; resource 3 is not in the plan"
         );
     }
 

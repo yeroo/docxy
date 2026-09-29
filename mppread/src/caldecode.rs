@@ -414,6 +414,9 @@ fn resource_names(cfb: &Cfb, prefix: &str) -> Result<HashMap<i32, String>, Strin
 pub(crate) struct DecodedCalendars {
     pub calendars: Vec<Calendar>,
     pub default_calendar_uid: i32,
+    /// `(resource UID, calendar UID)` for each resource's own calendar, as
+    /// the calendar row names its resource.
+    pub resource_calendars: Vec<(i32, i32)>,
 }
 
 pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalendars>, String> {
@@ -528,6 +531,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
     }
     fields.retain(|&(uid, _), _| uids.contains(&uid));
     let mut calendars = Vec::with_capacity(rows.len());
+    let mut resource_calendars = Vec::new();
     let mut resources = None;
     let mut live_resource_names: Option<HashMap<i32, String>> = None;
     for (uid, base_uid, resource_uid) in rows {
@@ -579,6 +583,9 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
             // regardless of its name. MPXJ applies the same default.
             None => (Calendar::standard_week().map(Some), Vec::new(), Vec::new()),
         };
+        if resource_uid > 0 {
+            resource_calendars.push((resource_uid, uid));
+        }
         calendars.push(Calendar {
             uid,
             name: calendar_name,
@@ -633,6 +640,7 @@ pub(crate) fn decode(bytes: &[u8], legacy: bool) -> Result<Option<DecodedCalenda
     Ok(Some(DecodedCalendars {
         calendars,
         default_calendar_uid: default_uid,
+        resource_calendars,
     }))
 }
 
@@ -1171,6 +1179,7 @@ pub(crate) mod tests {
         let DecodedCalendars {
             calendars,
             default_calendar_uid: uid,
+            ..
         } = decode(&file_with_default(fm, fd, vm, v2, "Workdays"), false)
             .unwrap()
             .unwrap();
@@ -1185,8 +1194,11 @@ pub(crate) mod tests {
         let DecodedCalendars {
             calendars: cals,
             default_calendar_uid: default,
+            resource_calendars,
         } = decode(&file(fm, fd, vm, v2), false).unwrap().unwrap();
         assert_eq!(default, 1);
+        // Calendar 5 is resource 1's own; the base names no resource.
+        assert_eq!(resource_calendars, [(1, 5)]);
         assert_eq!(
             cals.iter()
                 .map(|c| (c.uid, c.base_calendar_uid))
