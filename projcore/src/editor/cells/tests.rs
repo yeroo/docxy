@@ -637,6 +637,49 @@ fn an_unspellable_format_is_replaced_when_the_estimate_or_a_reset_changes_it() {
 }
 
 #[test]
+fn an_untyped_duration_change_commits_the_format_with_the_estimate() {
+    let with = |format: u8, estimated: Option<bool>, manual: bool| {
+        let mut p = editor().project().clone();
+        p.tasks[0].duration_format = Some(format);
+        p.tasks[0].estimated = estimated;
+        let mut ed = Editor::new(p);
+        if manual {
+            ed.set_manual(10, true).unwrap();
+        }
+        ed
+    };
+    let task = |ed: &Editor| {
+        let t = ed.project().task(10).unwrap();
+        (t.duration_format, t.estimated)
+    };
+    let later = |ed: &mut Editor| {
+        let start = ed.disp_start(10).unwrap();
+        ed.set_finish(10, start.add_days(3)).unwrap();
+        assert_ne!(ed.project().task(10).unwrap().duration_min, 480);
+    };
+    // Estimated weeks (41): a later finish or a milestone toggle commits the
+    // estimate and drops the bit.
+    let mut ed = with(41, Some(true), true);
+    later(&mut ed);
+    assert_eq!(task(&ed), (Some(9), Some(false)));
+    let mut ed = with(41, Some(true), false);
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(task(&ed), (Some(9), Some(false)));
+    // Elapsed days (8) cannot state the new working minutes: days.
+    let mut ed = with(8, None, true);
+    later(&mut ed);
+    assert_eq!(task(&ed), (None, None));
+    // Estimated null (53): days, committed.
+    let mut ed = with(53, Some(true), false);
+    ed.toggle_milestone(10).unwrap();
+    assert_eq!(task(&ed), (None, Some(false)));
+    // A working format without the bit is kept.
+    let mut ed = with(9, None, true);
+    later(&mut ed);
+    assert_eq!(task(&ed), (Some(9), None));
+}
+
+#[test]
 fn exact_duration_text_prefers_the_task_s_unit() {
     let p = untitled_project();
     for (min, unit, expected) in [

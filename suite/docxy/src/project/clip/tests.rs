@@ -95,6 +95,9 @@ fn pasting_a_duration_back_keeps_its_unit_and_is_no_edit() {
             .unwrap()
             .duration_format = Some(format);
     }
+    // New tasks are not estimated, so Ctrl+Delete below keeps the estimate:
+    // only the reset itself can replace the elapsed format.
+    p.new_tasks_estimated = Some(false);
     t.surface = Surface::Project(ProjectView::new(p, false));
     t.dirty = false;
     let before = v(&t).ed.project().clone();

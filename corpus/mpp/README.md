@@ -370,8 +370,9 @@ Project's export writes them all; only the four dates can be absent.
 For auto leaves with a working DurationFormat, the importer uses stored
 Duration and the task's assigned calendar. Elapsed or unknown formats still
 use the working Start–Finish span on that calendar because the scheduler
-has no elapsed durations; the task keeps its DurationFormat for display and
-save. Split segments and delayed assignments are
+has no elapsed durations, and such a task reads as days (no DurationFormat),
+since an elapsed code beside working minutes would misstate them on save. A
+working DurationFormat is kept for display and save. Split segments and delayed assignments are
 not decoded: those tasks retain Project's stored Start and Finish but can
 schedule an earlier Finish when their stored Duration omits the gap.
 Resource calendars are not used by projcore's scheduler: a resourced task's

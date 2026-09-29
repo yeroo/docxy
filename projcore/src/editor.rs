@@ -1701,9 +1701,19 @@ fn apply_duration(t: &mut Task, min: i64, changed: bool) {
     }
 }
 
-/// Typing a duration without `?` commits an estimated one, as in Project.
+/// A duration changed without being typed (a manual task's new finish, a
+/// milestone toggle) commits an estimated one, as in Project. Its format
+/// then drops the estimated bit with the estimate, and a format with no
+/// working unit (elapsed, null), which would misstate the new working
+/// minutes, becomes days.
 fn commit_estimate(t: &mut Task) {
     t.estimated = estimate_after(t.estimated, false);
+    if t.estimated != Some(true) {
+        t.duration_format = t.duration_format.map(|f| f & !32).filter(|&f| f != 7);
+    }
+    if t.duration_unit().is_none() {
+        t.duration_format = None;
+    }
 }
 
 /// A task's `Estimated` after a duration typed with (`true`) or without `?`:
