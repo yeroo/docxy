@@ -1450,12 +1450,27 @@ fn menu_open(
         }
         Json::Obj(fields) if fields.len() == 1 => match fields[0].0.as_str() {
             "row" => {
-                let uid = fields[0].1.as_i64().ok_or("'row' must be a task uid")?;
+                let uid = match &fields[0].1 {
+                    Json::Null => None,
+                    other => Some(
+                        other
+                            .as_i64()
+                            .ok_or("'row' must be a task uid, or null for the entry row")?,
+                    ),
+                };
                 let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface)
                 else {
                     return Err("a row menu needs a Project tab".into());
                 };
                 let tasks = &v.ed.project().tasks;
+                // The entry row below the last task: a right-click there
+                // opens the same menu, for no task.
+                let Some(uid) = uid else {
+                    let probe = format!("project-cell:entry:{}", v.col);
+                    let row = tasks.len();
+                    let at = menu_point(app, window, Some(&probe), |b| b.center());
+                    return app.open_row_menu(row, None, at, window, cx);
+                };
                 let row = tasks
                     .iter()
                     .position(|t| i64::from(t.uid) == uid)
@@ -1497,10 +1512,14 @@ fn menu_open(
 /// Refuse a menu verb while the window draws no menu: the backstage covers
 /// the tab, and the more-tabs list hides an open menu.
 fn refuse_under_cover(app: &crate::Docxy) -> Result<(), String> {
-    if app.backstage {
+    cover_refusal(app.backstage, app.tab_more_open)
+}
+
+fn cover_refusal(backstage: bool, tab_more_open: bool) -> Result<(), String> {
+    if backstage {
         return Err("File (backstage) is open; no menu shows".into());
     }
-    if app.tab_more_open {
+    if tab_more_open {
         return Err("the more-tabs list is open; no menu shows".into());
     }
     Ok(())
@@ -3145,6 +3164,23 @@ mod tests {
         assert!(closes_menu("backstage", &action("open")));
         assert!(closes_menu("backstage", &action("close")));
         assert!(!closes_menu("backstage", &action("read")), "a read");
+    }
+
+    /// #397: no menu opens or runs while File or the more-tabs list covers
+    /// the tab, since the window draws none then.
+    #[test]
+    fn menus_are_refused_under_the_backstage_and_the_more_tabs_list() {
+        assert_eq!(cover_refusal(false, false), Ok(()));
+        assert!(
+            cover_refusal(true, false)
+                .unwrap_err()
+                .contains("backstage")
+        );
+        assert!(
+            cover_refusal(false, true)
+                .unwrap_err()
+                .contains("more-tabs list")
+        );
     }
 
     /// #397: `menu-click` takes a label or a path of labels, not both.

@@ -13,8 +13,10 @@ pub(crate) enum MenuTarget {
     Document,
     /// A Project task row's context menu; `None` is the entry row.
     Row(Option<i32>),
-    /// A ribbon split button's drop-down: tab, group and the primary's label.
+    /// A ribbon split button's drop-down: tab, group and the primary's label
+    /// (and its id, which the drawn arrow knows it by; not reported).
     Ribbon {
+        id: String,
         tab: String,
         group: String,
         label: String,
@@ -29,7 +31,9 @@ impl MenuTarget {
                 "row",
                 uid.map_or(Json::Null, |u| Json::Num(u as f64)),
             )]),
-            Self::Ribbon { tab, group, label } => Json::obj(vec![(
+            Self::Ribbon {
+                tab, group, label, ..
+            } => Json::obj(vec![(
                 "ribbon",
                 Json::Arr(vec![
                     Json::Str(tab.clone()),
@@ -178,6 +182,21 @@ pub(crate) fn target_stands(
         }
         (MenuTarget::Document | MenuTarget::Ribbon { .. }, _) => Ok(()),
     }
+}
+
+/// Whether a press on split button `id`'s arrow opens its menu. Office
+/// toggles the drop-down: a press on the arrow of the menu that is open shuts
+/// it. The backdrop's press handler may run first and close the menu before
+/// the arrow's sees it, so the arrow is told both what is open now and what
+/// this same press already closed.
+pub(crate) fn split_arrow_opens(
+    id: &str,
+    open: Option<&MenuTarget>,
+    closed_by_this_press: Option<&MenuTarget>,
+) -> bool {
+    let mine =
+        |t: Option<&MenuTarget>| matches!(t, Some(MenuTarget::Ribbon { id: i, .. }) if i == id);
+    !(mine(open) || mine(closed_by_this_press))
 }
 
 /// The item a `menu-click` names: `{label}` among the top-level items, or
@@ -437,6 +456,7 @@ mod tests {
         assert_eq!(items[3].get("enabled"), Some(&Json::Bool(false)));
         assert_eq!(
             MenuTarget::Ribbon {
+                id: "pr-baseline".into(),
                 tab: "Project".into(),
                 group: "Schedule".into(),
                 label: "Set Baseline".into()
@@ -490,12 +510,38 @@ mod tests {
         assert_eq!(target_stands(&MenuTarget::Document, None), Ok(()));
         assert!(target_stands(&MenuTarget::Document, Some(None)).is_err());
         let ribbon = MenuTarget::Ribbon {
+            id: "pr-baseline".into(),
             tab: "Project".into(),
             group: "Schedule".into(),
             label: "Set Baseline".into(),
         };
         assert_eq!(target_stands(&ribbon, Some(Some(1))), Ok(()));
         assert_eq!(target_stands(&ribbon, None), Ok(()));
+    }
+
+    #[test]
+    fn a_split_arrow_toggles_its_own_menu_shut_in_either_handler_order() {
+        let split = |id: &str| MenuTarget::Ribbon {
+            id: id.into(),
+            tab: "Project".into(),
+            group: "Schedule".into(),
+            label: "Set Baseline".into(),
+        };
+        let (mine, other) = (split("pr-baseline"), split("pr-other"));
+        // Nothing open: the arrow opens its menu.
+        assert!(split_arrow_opens("pr-baseline", None, None));
+        // Its own menu open, the arrow's handler first: it shuts.
+        assert!(!split_arrow_opens("pr-baseline", Some(&mine), None));
+        // The backdrop's handler first closed it in this same press: it stays shut.
+        assert!(!split_arrow_opens("pr-baseline", None, Some(&mine)));
+        // Another menu open or just closed: this arrow opens its own.
+        assert!(split_arrow_opens("pr-baseline", Some(&other), None));
+        assert!(split_arrow_opens("pr-baseline", None, Some(&other)));
+        assert!(split_arrow_opens(
+            "pr-baseline",
+            None,
+            Some(&MenuTarget::Row(Some(1)))
+        ));
     }
 
     #[test]

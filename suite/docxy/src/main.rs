@@ -1377,6 +1377,9 @@ struct Docxy {
     // The open menu (a right-click's context menu or a split button's
     // drop-down), drawn from the same model the harness reads.
     menu: Option<menu::Menu>,
+    // The menu the backdrop last closed and where that press was, so a press
+    // on a split button's arrow can tell it just shut the arrow's own menu.
+    menu_closed_at: Option<(menu::MenuTarget, Point<Pixels>)>,
     // Floating mini formatting toolbar shown after a drag-selection (window coords).
     mini_bar: Option<Point<Pixels>>,
     // Document zoom factor (1.0 = 100%), controlled from the status bar.
@@ -5694,6 +5697,7 @@ impl Docxy {
             range_pick: None,
             keytips: KeyTip::Off,
             menu: None,
+            menu_closed_at: None,
             mini_bar: None,
             zoom: 1.0,
             ruler_guide: None,
@@ -16638,27 +16642,21 @@ impl Docxy {
     /// The split button whose primary is `primary_id`: where it is, and its
     /// menu with the live enabled and checked states.
     fn split_menu_for(&self, primary_id: &str) -> Option<(menu::MenuTarget, Vec<menu::MenuItem>)> {
-        let kind = self.ribbon_kind();
-        let mut tabs = ribbon_for(kind).tabs;
-        if kind == Kind::Docx && self.caret_table().is_some() {
-            tabs.push(table_tab());
-        }
-        if kind == Kind::Project && self.project_gantt_showing() {
-            tabs.push(gantt_format_tab());
-        }
-        tabs.iter().find_map(|tab| {
-            tab.groups.iter().find_map(|group| {
-                group.items.iter().find_map(|control| match control {
-                    Control::Split { primary, menu } if primary.id == primary_id => Some((
-                        menu::MenuTarget::Ribbon {
-                            tab: tab.name.into(),
-                            group: group.title.into(),
-                            label: primary.label.into(),
-                        },
-                        menu::split_menu(menu, act_enabled, |a| self.act_active(a)),
-                    )),
-                    _ => None,
-                })
+        // The arrow is drawn on the active tab only, and `menu-open`
+        // selects the named tab first.
+        let tab = self.active_ribbon_tab_def();
+        tab.groups.iter().find_map(|group| {
+            group.items.iter().find_map(|control| match control {
+                Control::Split { primary, menu } if primary.id == primary_id => Some((
+                    menu::MenuTarget::Ribbon {
+                        id: primary.id.into(),
+                        tab: tab.name.into(),
+                        group: group.title.into(),
+                        label: primary.label.into(),
+                    },
+                    menu::split_menu(menu, act_enabled, |a| self.act_active(a)),
+                )),
+                _ => None,
             })
         })
     }
@@ -16770,8 +16768,10 @@ impl Docxy {
             .inset_0()
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _w, cx| {
-                    this.close_menu();
+                cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
+                    if let Some(m) = this.menu.take() {
+                        this.menu_closed_at = Some((m.target, ev.position));
+                    }
                     cx.notify();
                 }),
             )
@@ -19182,7 +19182,20 @@ impl Docxy {
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    let _ = this.open_split_menu(primary_id, ev.position, cx);
+                    // A press on the arrow of the open menu shuts it, whichever
+                    // of this handler and the backdrop's runs first.
+                    let closed = this
+                        .menu_closed_at
+                        .take()
+                        .filter(|(_, at)| *at == ev.position)
+                        .map(|(t, _)| t);
+                    let open = this.menu.as_ref().map(|m| &m.target);
+                    if menu::split_arrow_opens(primary_id, open, closed.as_ref()) {
+                        let _ = this.open_split_menu(primary_id, ev.position, cx);
+                    } else {
+                        this.close_menu();
+                        cx.notify();
+                    }
                 }),
             );
         div()
