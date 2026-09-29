@@ -40,6 +40,14 @@ fn commit(t: &mut DocTab, act: ProjectAct, text: &str) {
     commit_prompt(t, p);
 }
 
+/// Delete the selected task by Project's route: Delete on the ID column.
+/// The cursor's column is put back afterwards.
+fn delete_task(t: &mut DocTab) {
+    let col = std::mem::replace(&mut vm(t).col, COL_ID);
+    apply_project_act(t, ProjectAct::ClearCell);
+    vm(t).col = col;
+}
+
 fn press(t: &mut DocTab, key: &str) {
     if let Some(act) = project_input(t, key, None, Modifiers::default()) {
         apply_project_act(t, act);
@@ -62,7 +70,7 @@ fn completion_reveals_selection_changes_without_disturbing_other_inputs() {
     for act in ProjectAct::RIBBON
         .iter()
         .copied()
-        .filter(|a| !matches!(a, AddTask | InsertBlankRow | DeleteTask))
+        .filter(|a| !matches!(a, AddTask | InsertBlankRow))
     {
         apply_project_act(&mut t, act);
         assert_eq!(take_reveal(&t), None, "{act:?}");
@@ -95,7 +103,7 @@ fn completion_reveals_selection_changes_without_disturbing_other_inputs() {
     project_input(&mut t, "home", None, ctrl());
     assert_eq!(take_reveal(&t), Some(0));
     let old_uid = v(&t).ed.selected_uid();
-    apply_project_act(&mut t, DeleteTask);
+    delete_task(&mut t);
     assert_eq!(v(&t).ed.sel(), 0);
     assert_ne!(v(&t).ed.selected_uid(), old_uid);
     assert_eq!(take_reveal(&t), Some(0));
@@ -252,51 +260,145 @@ fn project_instruction_paths_exist() {
                     _ => panic!("unexpected control"),
                 };
                 for c in cmds {
-                    paths.push((t.name, g.title, c.label, c.act, c.key_tip));
+                    assert_eq!(c.tip.body, "", "{}: the screentip has a title only", c.id);
+                    paths.push((t.name, g.title, c.label, c.tip.title, c.act, c.key_tip));
                 }
             }
         }
     }
-    for (tab, group, label, act) in [
-        ("Task", "Schedule", "Indent Task", Indent),
-        ("Task", "Schedule", "Outdent Task", Outdent),
-        ("Task", "Schedule", "Link the Selected Tasks", AddLink),
-        ("Task", "Schedule", "Unlink Tasks", UnlinkTasks),
-        ("Task", "Schedule", "Inactivate", Inactivate),
-        ("Task", "Tasks", "Manually Schedule", ManuallySchedule),
-        ("Task", "Tasks", "Auto Schedule", AutoSchedule),
-        ("Task", "Tasks", "Move", MoveTask),
-        ("Task", "Insert", "Task", AddTask),
-        ("Task", "Insert", "Blank Row", InsertBlankRow),
-        ("Task", "Insert", "Milestone", Milestone),
-        ("Task", "Properties", "Information", Constraint),
-        ("Task", "Editing", "Find", Find),
-        ("Task", "Editing", "Scroll to Task", ScrollToTask),
-        ("Resource", "Assignments", "Assign Resources", Assign),
-        ("Resource", "Level", "Level All", LevelAll),
-        ("Resource", "Level", "Clear Leveling", ClearLeveling),
-        ("Report", "Export", "Export Gantt", ExportGantt),
-        ("Project", "Schedule", "Calculate Project", Recalc),
-        ("Project", "Schedule", "Set Baseline", Baseline),
-        ("Project", "Schedule", "Clear Baseline", ClearBaseline),
-        ("View", "Data", "Show Subtasks", ShowSubtasks),
-        ("View", "Data", "Hide Subtasks", HideSubtasks),
-        ("View", "Split View", "Timeline", Timeline),
+    // (tab, group, Project's label, Project's screentip, act) — Project 2024.
+    let want = [
+        ("Task", "Schedule", "Indent", "Indent Task", Indent),
+        ("Task", "Schedule", "Outdent", "Outdent Task", Outdent),
+        (
+            "Task",
+            "Schedule",
+            "Unlink Tasks",
+            "Unlink Tasks",
+            UnlinkTasks,
+        ),
+        (
+            "Task",
+            "Schedule",
+            "Link Tasks",
+            "Link the Selected Tasks",
+            AddLink,
+        ),
+        ("Task", "Schedule", "Inactivate", "Inactivate", Inactivate),
+        (
+            "Task",
+            "Tasks",
+            "Manually Schedule",
+            "Manually Schedule",
+            ManuallySchedule,
+        ),
+        (
+            "Task",
+            "Tasks",
+            "Auto Schedule",
+            "Auto Schedule",
+            AutoSchedule,
+        ),
+        ("Task", "Tasks", "Move", "Move Task", MoveTask),
+        ("Task", "Insert", "Task", "Task", AddTask),
+        ("Task", "Insert", "Milestone", "Insert Milestone", Milestone),
+        (
+            "Task",
+            "Insert",
+            "Blank Row",
+            "Insert Blank Row",
+            InsertBlankRow,
+        ),
+        (
+            "Task",
+            "Properties",
+            "Information...",
+            "View Task Information",
+            Constraint,
+        ),
+        ("Task", "Editing", "Find...", "Find...", Find),
+        (
+            "Task",
+            "Editing",
+            "Scroll to Task",
+            "Scroll to Task",
+            ScrollToTask,
+        ),
+        (
+            "Resource",
+            "Assignments",
+            "Assign Resources...",
+            "Assign Resources...",
+            Assign,
+        ),
+        ("Resource", "Level", "Level All", "Level All", LevelAll),
+        (
+            "Resource",
+            "Level",
+            "Clear Leveling",
+            "Clear Leveling",
+            ClearLeveling,
+        ),
+        (
+            "Project",
+            "Schedule",
+            "Calculate Project",
+            "Calculate Project",
+            Recalc,
+        ),
+        (
+            "Project",
+            "Schedule",
+            "Set Baseline",
+            "Set Baseline",
+            Baseline,
+        ),
+        (
+            "Project",
+            "Schedule",
+            "Clear Baseline",
+            "Clear Baseline",
+            ClearBaseline,
+        ),
+        (
+            "View",
+            "Data",
+            "Show Subtasks",
+            "Show Subtasks",
+            ShowSubtasks,
+        ),
+        (
+            "View",
+            "Data",
+            "Hide Subtasks",
+            "Hide Subtasks",
+            HideSubtasks,
+        ),
+        ("View", "Split View", "Timeline", "Timeline View", Timeline),
         (
             "Gantt Chart Format",
             "Bar Styles",
             "Critical Tasks",
+            "Critical Tasks",
             CriticalTasks,
         ),
-        ("Gantt Chart Format", "Bar Styles", "Baseline", BaselineBars),
-    ] {
+        (
+            "Gantt Chart Format",
+            "Bar Styles",
+            "Baseline",
+            "Baseline",
+            BaselineBars,
+        ),
+    ];
+    for (tab, group, label, tip, act) in want {
         let path = format!("{tab} > {group} > {label}");
-        let Some((_, _, _, found, key)) = paths
+        let Some((_, _, _, found_tip, found, key)) = paths
             .iter()
             .find(|p| (p.0, p.1, p.2) == (tab, group, label))
         else {
             panic!("missing ribbon path {path}");
         };
+        assert_eq!(*found_tip, tip, "{path} screentip");
         assert!(matches!(found, Act::Project(a) if *a == act), "{path}");
         let t = tabs.iter().find(|t| t.name == tab).unwrap();
         assert!(
@@ -304,14 +406,64 @@ fn project_instruction_paths_exist() {
             "{path} KeyTip {key}"
         );
     }
-    for gone in [Save, Level] {
+    // Only Project's commands: nothing on the ribbon beyond the list above.
+    assert_eq!(paths.len(), want.len(), "commands on the Project ribbon");
+    // Project's Report groups are not implemented; the tab stays (#72).
+    let report = r.tabs.iter().find(|t| t.name == "Report").unwrap();
+    assert!(report.groups.is_empty());
+}
+
+/// docxy's own commands are off Project's ribbon (#370); each keeps its
+/// keyboard, cell or backstage route.
+#[test]
+fn docxy_only_commands_are_off_the_ribbon() {
+    use ProjectAct::*;
+    let r = project_ribbon();
+    let fmt = gantt_format_tab();
+    let cmds: Vec<_> = r
+        .tabs
+        .iter()
+        .chain([&fmt])
+        .flat_map(|t| &t.groups)
+        .flat_map(|g| &g.items)
+        .flat_map(|item| match item {
+            Control::Large(c) | Control::Toggle(c) => vec![c],
+            Control::Column(commands) => commands.iter().collect(),
+            _ => vec![],
+        })
+        .collect();
+    for id in [
+        "pr-rename",
+        "pr-duration",
+        "pr-delete",
+        "pr-clear",
+        "pr-export",
+        "pr-left",
+        "pr-right",
+        "pr-start",
+    ] {
+        assert!(!cmds.iter().any(|c| c.id == id), "{id} is on the ribbon");
+    }
+    for gone in [Save, Level, ExportGantt, ScrollLeft, ScrollRight, GoToStart] {
         assert!(
-            !paths
+            !cmds
                 .iter()
-                .any(|p| matches!(p.3, Act::Project(a) if a == gone)),
+                .any(|c| matches!(c.act, Act::Project(a) if a == gone)),
             "{gone:?} is not on Project's ribbon"
         );
     }
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    let ctrl = Modifiers {
+        control: true,
+        ..Modifiers::default()
+    };
+    assert_eq!(key_act("e", ctrl), Some(ExportGantt));
+    assert_eq!(key_act("left", alt), Some(ScrollLeft));
+    assert_eq!(key_act("right", alt), Some(ScrollRight));
+    assert_eq!(key_act("home", alt), Some(GoToStart));
 }
 
 #[test]
@@ -561,6 +713,17 @@ fn keys_and_whole_route_enforce_modifiers() {
         ),
         Some(Level)
     );
+    assert_eq!(key_act("delete", ctrl()), Some(ResetCell));
+    for m in [
+        ctrl_shift(),
+        ctrl_alt(),
+        Modifiers {
+            platform: true,
+            ..ctrl()
+        },
+    ] {
+        assert_eq!(key_act("delete", m), None, "{m:?}");
+    }
     let mut t = tab();
     vm(&mut t).ed.rename(1, "Changed").unwrap();
     let before = v(&t).ed.project().clone();
@@ -600,7 +763,7 @@ fn keys_and_whole_route_enforce_modifiers() {
         assert_eq!(v(&t).ed.project(), &before);
         assert_eq!(v(&t).ed.sel(), sel);
     }
-    apply_project_act(&mut t, Rename);
+    apply_project_act(&mut t, Constraint);
     let buf = v(&t).prompt.as_ref().unwrap().buf.clone();
     for key in ["enter", "escape", "backspace", "n"] {
         for m in [
@@ -627,20 +790,23 @@ fn keys_and_whole_route_enforce_modifiers() {
 #[test]
 fn prompts_bind_uid_cancel_and_edit_unicode_without_dispatching_commands() {
     let mut t = tab();
-    apply_project_act(&mut t, ProjectAct::Rename);
+    apply_project_act(&mut t, ProjectAct::MoveTask);
     let p = v(&t).prompt.clone().unwrap();
-    assert_eq!(p.buf, "Second");
+    assert_eq!(p.uid, Some(2));
     vm(&mut t).ed.select(0);
     commit_prompt(
         &mut t,
         ProjectPrompt {
-            buf: "Bound".into(),
+            buf: "1d".into(),
             ..p
         },
     );
-    assert_eq!(v(&t).ed.project().tasks[0].name, "First");
-    assert_eq!(v(&t).ed.project().tasks[1].name, "Bound");
-    apply_project_act(&mut t, ProjectAct::Duration);
+    let moved = |t: &DocTab, i: usize| {
+        v(t).ed.project().tasks[i].constraint == projcore::ConstraintType::StartNoEarlierThan
+    };
+    assert!(!moved(&t, 0));
+    assert!(moved(&t, 1), "the prompt edits the task it opened on");
+    apply_project_act(&mut t, ProjectAct::MoveTask);
     project_input(&mut t, "n", Some("n"), Modifiers::default());
     project_input(&mut t, "x", Some("λ"), Modifiers::default());
     project_input(&mut t, "backspace", None, Modifiers::default());
@@ -652,16 +818,16 @@ fn prompts_bind_uid_cancel_and_edit_unicode_without_dispatching_commands() {
     project_input(&mut t, "escape", None, Modifiers::default());
     assert!(v(&t).prompt.is_none());
     assert_eq!(t.status, status);
-    apply_project_act(&mut t, ProjectAct::Rename);
+    apply_project_act(&mut t, ProjectAct::Constraint);
     vm(&mut t).select_row(1);
     assert!(v(&t).prompt.is_none());
-    apply_project_act(&mut t, ProjectAct::Rename);
+    apply_project_act(&mut t, ProjectAct::Constraint);
     apply_project_act(&mut t, ProjectAct::Undo);
     assert!(v(&t).prompt.is_none());
     // An empty plan has only the entry row, where task prompts do not open.
     let mut empty = new_project_tab();
     let status = empty.status.clone();
-    apply_project_act(&mut empty, ProjectAct::Rename);
+    apply_project_act(&mut empty, ProjectAct::Constraint);
     assert!(v(&empty).prompt.is_none());
     assert_eq!(empty.status, status);
     assert!(!empty.dirty);
@@ -671,11 +837,6 @@ fn prompts_bind_uid_cancel_and_edit_unicode_without_dispatching_commands() {
 fn rejection_preserves_model_geometry_and_both_history_stacks() {
     use ProjectAct::*;
     for (act, text, message) in [
-        (
-            Duration,
-            "banana",
-            "Couldn't read duration 'banana' (try 3d, 4h, 2w, 1mo)",
-        ),
         (AddLink, "abc", "Predecessor must be a task ID (number)"),
         (AddLink, "999", "No other task with ID 999"),
         (AddLink, "2", "No other task with ID 2"),
@@ -723,15 +884,11 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
     use ProjectAct::*;
     for (act, text, changes_geometry) in [
         (AddTask, None, true),
-        (DeleteTask, None, true),
         (Indent, None, true),
         (Outdent, None, true),
-        (Rename, Some("Renamed"), false),
-        (Duration, Some("3d"), true),
         (AddLink, Some("1"), true),
         (Constraint, Some("SNET 2026-01-08"), true),
         (Assign, Some("Alice"), false),
-        (ClearResources, None, false),
         (Baseline, None, false),
         (ClearBaseline, None, false),
         (Milestone, None, true),
@@ -751,9 +908,6 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
                 .add_predecessor(2, 1, LinkType::FinishStart, 0)
                 .unwrap();
         }
-        if act == ClearResources {
-            vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
-        }
         let before = v(&t).ed.project().clone();
         let before_geom = geometry(&t);
         if let Some(text) = text {
@@ -770,11 +924,8 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
                 assert_eq!(after.tasks.len(), 3);
                 assert_eq!(v(&t).ed.sel(), 2);
             }
-            DeleteTask => assert_eq!(after.tasks.len(), 1),
             Indent => assert_eq!(after.task(2).unwrap().outline_level, 2),
             Outdent => assert_eq!(after.task(2).unwrap().outline_level, 1),
-            Rename => assert_eq!(after.task(2).unwrap().name, "Renamed"),
-            Duration => assert_eq!(after.task(2).unwrap().duration_min, 3 * 480),
             AddLink => assert_eq!(after.task(2).unwrap().predecessors[0].uid, 1),
             Constraint => assert_ne!(
                 before.task(2).unwrap().constraint,
@@ -784,7 +935,6 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
                 assert_eq!(after.resources.len(), 1);
                 assert_eq!(after.assignments.len(), 1);
             }
-            ClearResources => assert!(after.assignments.is_empty()),
             Milestone => assert!(after.task(2).unwrap().milestone),
             Baseline => assert!(after.tasks.iter().all(|t| {
                 t.baseline(0)
@@ -807,6 +957,48 @@ fn every_edit_undoes_and_redoes_model_and_geometry_through_command_paths() {
         assert_eq!(geometry(&t), after_geom);
         assert_eq!(t.status.as_ref(), "Redo");
         assert_eq!(t.dirty, v(&t).ed.dirty());
+    }
+}
+
+/// The removed docxy-only buttons' routes (#370): Rename and Duration are cell
+/// edits, Delete Task is Delete on the ID column and Clear Resources is Delete
+/// on the Resource Names cell; each undoes and redoes as one step.
+#[test]
+fn cell_routes_for_removed_ribbon_commands_undo_and_redo() {
+    for (route, col, text, changes_geometry) in [
+        ("delete task", COL_ID, None, true),
+        ("rename", COL_NAME, Some("Renamed"), false),
+        ("duration", COL_DURATION, Some("3d"), true),
+        ("clear resources", COL_RESOURCES, None, false),
+    ] {
+        let mut t = tab();
+        if col == COL_RESOURCES {
+            vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+        }
+        let before = v(&t).ed.project().clone();
+        let before_geom = geometry(&t);
+        vm(&mut t).col = col;
+        match text {
+            Some(text) => {
+                project_input(&mut t, "text", Some(text), Modifiers::default());
+                press(&mut t, "enter");
+                assert!(v(&t).cell.is_none(), "{route}");
+            }
+            None => press(&mut t, "delete"),
+        }
+        let after = v(&t).ed.project().clone();
+        assert_ne!(before, after, "{route}");
+        assert_eq!(geometry(&t) != before_geom, changes_geometry, "{route}");
+        match route {
+            "delete task" => assert_eq!(after.tasks.len(), 1),
+            "rename" => assert_eq!(after.task(2).unwrap().name, "Renamed"),
+            "duration" => assert_eq!(after.task(2).unwrap().duration_min, 3 * 480),
+            _ => assert!(after.assignments.is_empty()),
+        }
+        apply_project_act(&mut t, ProjectAct::Undo);
+        assert_eq!(v(&t).ed.project(), &before, "{route}");
+        apply_project_act(&mut t, ProjectAct::Redo);
+        assert_eq!(v(&t).ed.project(), &after, "{route}");
     }
 }
 
@@ -845,6 +1037,67 @@ fn assignment_find_leveling_recalc_and_navigation_statuses() {
     apply_project_act(&mut t, ProjectAct::ScrollRight);
     apply_project_act(&mut t, ProjectAct::GoToStart);
     assert_eq!(v(&t).gantt_x.get(), 0.);
+}
+
+/// Project's Alt+Home moves the timescale to the project start; it replaces
+/// the ribbon's Go to Start (#370). Plain Home still moves the cell cursor.
+#[test]
+fn alt_home_goes_to_start() {
+    let mut t = tab();
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    vm(&mut t).col = COL_DURATION;
+    vm(&mut t).pan_gantt(true);
+    vm(&mut t).pan_gantt(true);
+    assert!(v(&t).gantt_x.get() > 0.);
+    let (sel, col) = (v(&t).ed.sel(), v(&t).col);
+    let act = project_input(&mut t, "home", None, alt);
+    assert_eq!(act, Some(ProjectAct::GoToStart));
+    apply_project_act(&mut t, act.unwrap());
+    assert_eq!(v(&t).gantt_x.get(), 0.);
+    assert_eq!((v(&t).ed.sel(), v(&t).col), (sel, col), "the cursor stays");
+    vm(&mut t).pan_gantt(true);
+    press(&mut t, "home");
+    assert_eq!(v(&t).col, COL_ID, "plain Home goes to the row's first cell");
+    assert!(v(&t).gantt_x.get() > 0., "plain Home leaves the timescale");
+}
+
+/// Project's Alt keys get past the KeyTips overlay (pressing Alt starts it),
+/// so Alt+Home works after F10 as Alt+Left/Right do; KeyTip letters and
+/// digits never do.
+#[test]
+fn project_alt_keys_bypass_keytips_but_letters_do_not() {
+    let alt = Modifiers {
+        alt: true,
+        ..Modifiers::default()
+    };
+    let alt_shift = Modifiers { shift: true, ..alt };
+    for (key, m) in [
+        ("left", alt),
+        ("right", alt),
+        ("home", alt),
+        ("right", alt_shift),
+        ("left", alt_shift),
+        ("-", alt_shift),
+        ("=", alt_shift),
+    ] {
+        assert!(project_alt_key(key, m), "{key} {m:?}");
+    }
+    let ctrl_alt = Modifiers {
+        control: true,
+        ..alt
+    };
+    assert!(!project_alt_key("home", ctrl_alt));
+    assert!(!project_alt_key("home", Modifiers::default()));
+    assert!(!project_alt_key("alt", alt));
+    for c in ('a'..='z').chain('0'..='9') {
+        let key = c.to_string();
+        for m in [alt, alt_shift] {
+            assert!(!project_alt_key(&key, m), "KeyTip {key} {m:?}");
+        }
+    }
 }
 
 #[test]
@@ -926,7 +1179,7 @@ fn deleting_a_summary_asks_first_and_escape_changes_nothing() {
     let mut t = summary_tab();
     let before = v(&t).ed.project().clone();
     let depth = v(&t).ed.undo_depth();
-    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    delete_task(&mut t);
     let prompt = v(&t).prompt.clone().expect("a summary delete asks first");
     assert_eq!(prompt.kind, PromptKind::ConfirmDelete);
     assert_eq!(prompt.kind.name(), "delete");
@@ -955,7 +1208,7 @@ fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
     let mut t = summary_tab();
     let before = v(&t).ed.project().clone();
     let depth = v(&t).ed.undo_depth();
-    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    delete_task(&mut t);
     project_input(&mut t, "enter", None, Modifiers::default());
     assert!(v(&t).prompt.is_none());
     assert!(v(&t).ed.project().tasks.is_empty());
@@ -968,7 +1221,7 @@ fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
     project_cell_click(&mut t, 0, None, false);
 
     // The prompt bar's Delete button commits through the same path as Enter.
-    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    delete_task(&mut t);
     let prompt = vm(&mut t).prompt.take().unwrap();
     commit_prompt(&mut t, prompt);
     assert!(v(&t).ed.project().tasks.is_empty());
@@ -978,7 +1231,7 @@ fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
 fn deleting_a_leaf_needs_no_confirmation() {
     let mut t = summary_tab();
     vm(&mut t).ed.select(1);
-    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    delete_task(&mut t);
     assert!(v(&t).prompt.is_none());
     assert_eq!(v(&t).ed.project().tasks.len(), 1);
     assert!(!v(&t).ed.project().tasks[0].summary);
@@ -1003,13 +1256,9 @@ fn task_commands_do_nothing_on_the_entry_row() {
     let before = v(&t).ed.project().clone();
     let status = t.status.clone();
     for act in [
-        DeleteTask,
         Milestone,
         Indent,
         Outdent,
-        ClearResources,
-        Rename,
-        Duration,
         AddLink,
         Constraint,
         Assign,
@@ -1200,8 +1449,8 @@ fn f3_from_the_entry_row_starts_at_the_first_task_after_undo_and_redo() {
 fn deleting_every_task_latches_the_entry_row_through_undo() {
     let mut t = tab();
     project_cell_click(&mut t, 0, None, false);
-    apply_project_act(&mut t, ProjectAct::DeleteTask);
-    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    delete_task(&mut t);
+    delete_task(&mut t);
     assert!(v(&t).ed.project().tasks.is_empty());
     assert!(v(&t).entry, "an emptied plan latches the entry row");
     // Undo brings a task back above the cursor, which stays on the entry row.
@@ -1934,14 +2183,6 @@ fn delete_on_an_empty_field_blank_row_or_entry_row_is_a_no_op() {
 }
 
 #[test]
-fn ribbon_delete_task_from_name_still_deletes() {
-    let mut t = tab();
-    vm(&mut t).col = COL_NAME;
-    apply_project_act(&mut t, ProjectAct::DeleteTask);
-    assert_eq!(v(&t).ed.project().tasks.len(), 1);
-}
-
-#[test]
 fn delete_inside_an_open_cell_edit_edits_the_buffer() {
     let mut t = tab();
     vm(&mut t).col = COL_NAME;
@@ -1952,25 +2193,6 @@ fn delete_inside_an_open_cell_edit_edits_the_buffer() {
     assert_eq!(v(&t).cell.as_ref().unwrap().buf, "econd");
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), 0);
-}
-
-#[test]
-fn ribbon_delete_task_shortcut_names_the_id_column() {
-    let ribbon = project_ribbon();
-    let command = ribbon
-        .tabs
-        .iter()
-        .flat_map(|t| &t.groups)
-        .flat_map(|g| &g.items)
-        .flat_map(|item| match item {
-            Control::Large(c) | Control::Toggle(c) => vec![c],
-            Control::Column(commands) => commands.iter().collect(),
-            _ => vec![],
-        })
-        .find(|c| c.id == "pr-delete")
-        .unwrap();
-    assert!(matches!(command.act, Act::Project(ProjectAct::DeleteTask)));
-    assert_eq!(command.tip.shortcut, "Delete on the ID column");
 }
 
 #[test]
@@ -2185,4 +2407,202 @@ fn an_open_prompt_swallows_f11() {
         None
     );
     assert!(v(&t).prompt.is_some());
+}
+
+/// The Duration cell as the table shows it.
+fn duration_text(t: &DocTab, i: usize) -> String {
+    let ed = &v(t).ed;
+    project_row(ed, &ed.project().tasks[i])[COL_DURATION].clone()
+}
+
+#[test]
+fn ctrl_delete_on_duration_resets_it_to_a_new_tasks_day_as_one_undo_step() {
+    let mut t = tab();
+    vm(&mut t).ed.mark_saved();
+    vm(&mut t).col = COL_DURATION;
+    let before = v(&t).ed.project().clone();
+    assert_eq!(duration_text(&t, 1), "2d");
+    chord(&mut t, "delete", ctrl());
+    let after = v(&t).ed.project().clone();
+    assert_eq!(after.tasks.len(), 2);
+    assert_eq!(after.tasks[1].duration_min, 480);
+    assert_eq!(duration_text(&t, 1), "1d?");
+    assert_eq!(after.tasks[1].name, before.tasks[1].name);
+    assert_eq!(after.tasks[0], before.tasks[0]);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    assert!(t.dirty);
+    // Already the default: no second undo step.
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.project(), &after);
+    assert_eq!(v(&t).ed.undo_depth(), 1);
+    chord(&mut t, "z", ctrl());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(duration_text(&t, 1), "2d");
+}
+
+#[test]
+fn ctrl_delete_on_duration_follows_the_plans_day_and_estimate() {
+    let mut t = tab();
+    let mut p = v(&t).ed.project().clone();
+    p.hours_per_day = 7.0;
+    p.new_tasks_estimated = Some(false);
+    t.surface = Surface::Project(ProjectView::new(p, false));
+    vm(&mut t).ed.set_duration(2, "2d?").unwrap();
+    vm(&mut t).ed.select(1);
+    vm(&mut t).col = COL_DURATION;
+    assert_eq!(duration_text(&t, 1), "2d?");
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.project().tasks[1].duration_min, 420);
+    assert_eq!(duration_text(&t, 1), "1d");
+}
+
+#[test]
+fn ctrl_delete_on_a_milestones_duration_makes_it_a_one_day_task() {
+    let mut t = tab();
+    vm(&mut t).ed.toggle_milestone(2).unwrap();
+    assert!(v(&t).ed.project().tasks[1].milestone);
+    vm(&mut t).col = COL_DURATION;
+    chord(&mut t, "delete", ctrl());
+    let task = &v(&t).ed.project().tasks[1];
+    assert_eq!(task.duration_min, 480);
+    assert!(!task.milestone);
+    assert_eq!(duration_text(&t, 1), "1d?");
+}
+
+#[test]
+fn ctrl_delete_on_a_summarys_duration_refuses_unless_it_is_manual() {
+    let mut t = summary_tab();
+    vm(&mut t).col = COL_DURATION;
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    assert_eq!(
+        t.status.as_ref(),
+        "Summary dates and duration are read-only"
+    );
+
+    vm(&mut t).ed.set_manual(1, true).unwrap();
+    vm(&mut t).ed.set_duration_min(1, 1440, false).unwrap();
+    let depth = v(&t).ed.undo_depth();
+    chord(&mut t, "delete", ctrl());
+    assert_eq!(v(&t).ed.disp_duration_min(1), Some(480));
+    // A summary takes no estimate.
+    assert_eq!(duration_text(&t, 0), "1d");
+    assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+}
+
+#[test]
+fn ctrl_delete_on_name_predecessors_and_resources_clears_as_delete_does() {
+    for col in [COL_NAME, COL_PREDECESSORS, COL_RESOURCES] {
+        let setup = || {
+            let mut t = tab();
+            vm(&mut t)
+                .ed
+                .add_predecessor(2, 1, LinkType::FinishStart, 0)
+                .unwrap();
+            vm(&mut t).ed.assign_resource(2, "Alice").unwrap();
+            vm(&mut t).ed.mark_saved();
+            vm(&mut t).col = col;
+            t
+        };
+        let mut cleared = setup();
+        press(&mut cleared, "delete");
+        let mut t = setup();
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), v(&cleared).ed.project(), "{col}");
+        assert_ne!(v(&t).ed.project(), &before, "{col}");
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1, "{col}");
+        chord(&mut t, "z", ctrl());
+        assert_eq!(v(&t).ed.project(), &before, "{col}");
+    }
+}
+
+#[test]
+fn ctrl_delete_on_task_mode_resets_it_to_the_mode_for_new_tasks() {
+    for new_manual in [false, true] {
+        let mut t = tab();
+        vm(&mut t).ed.set_new_tasks_manual(new_manual);
+        vm(&mut t).ed.set_manual(2, !new_manual).unwrap();
+        vm(&mut t).col = COL_MODE;
+        let before = v(&t).ed.project().clone();
+        let depth = v(&t).ed.undo_depth();
+        chord(&mut t, "delete", ctrl());
+        let after = v(&t).ed.project().clone();
+        assert_eq!(after.tasks[1].manual, new_manual);
+        assert_eq!(after.tasks[0], before.tasks[0]);
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        // Already the default: no second undo step.
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &after);
+        assert_eq!(v(&t).ed.undo_depth(), depth + 1);
+        chord(&mut t, "z", ctrl());
+        assert_eq!(v(&t).ed.project(), &before);
+    }
+}
+
+#[test]
+fn ctrl_delete_on_id_start_and_finish_changes_nothing_and_keeps_the_task() {
+    for col in [COL_ID, COL_START, COL_FINISH] {
+        let mut t = tab();
+        vm(&mut t).ed.mark_saved();
+        vm(&mut t).col = col;
+        let before = v(&t).ed.project().clone();
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &before);
+        assert_eq!(v(&t).ed.undo_depth(), 0);
+        assert!(v(&t).prompt.is_none());
+        assert!(!t.dirty);
+        assert_eq!(
+            t.status.as_ref(),
+            format!("{} can't be cleared", COLUMNS[col])
+        );
+    }
+    let mut t = summary_tab();
+    vm(&mut t).col = COL_ID;
+    chord(&mut t, "delete", ctrl());
+    assert!(
+        v(&t).prompt.is_none(),
+        "a summary is not offered for deletion"
+    );
+    assert_eq!(v(&t).ed.project().tasks.len(), 2);
+}
+
+#[test]
+fn ctrl_delete_on_a_blank_row_or_the_entry_row_is_a_no_op() {
+    let mut t = tab();
+    vm(&mut t).ed.insert_blank_row(Some(2)).unwrap();
+    vm(&mut t).ed.mark_saved();
+    vm(&mut t).ed.select(1);
+    let before = v(&t).ed.project().clone();
+    let depth = v(&t).ed.undo_depth();
+    for col in 0..COLUMN_COUNT {
+        vm(&mut t).col = col;
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &before, "{col}");
+        assert!(v(&t).ed.project().tasks[1].is_null, "{col}");
+        assert_eq!(v(&t).ed.undo_depth(), depth, "{col}");
+        assert!(!t.dirty, "{col}");
+    }
+    for col in [COL_NAME, COL_DURATION, COL_MODE, COL_ID] {
+        project_entry_click(&mut t, Some(col), false);
+        chord(&mut t, "delete", ctrl());
+        assert_eq!(v(&t).ed.project(), &before, "{col}");
+        assert_eq!(v(&t).ed.undo_depth(), depth, "{col}");
+    }
+}
+
+#[test]
+fn ctrl_delete_inside_an_open_cell_edit_stays_in_the_editor() {
+    let mut t = tab();
+    vm(&mut t).col = COL_DURATION;
+    let before = v(&t).ed.project().clone();
+    vm(&mut t).open_cell(None).unwrap();
+    chord(&mut t, "delete", ctrl());
+    assert!(v(&t).cell.is_some());
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), 0);
 }

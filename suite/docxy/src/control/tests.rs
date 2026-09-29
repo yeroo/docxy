@@ -196,7 +196,7 @@ fn reads_and_rejected_edits_preserve_prompt_selection_history_and_scroll() {
     vm(&mut tabs[0]).ed.mark_saved();
     vm(&mut tabs[0]).ed.select(1);
     vm(&mut tabs[0]).gantt_x.set(20.);
-    vm(&mut tabs[0]).open_prompt(PromptKind::Rename);
+    vm(&mut tabs[0]).open_prompt(PromptKind::Move);
     let before = snapshot(&tabs[0]);
     for (verb, a) in [
         ("proj.path", Json::Null),
@@ -258,8 +258,8 @@ fn each_agent_edit_is_undoable_and_changes_only_its_inactive_target() {
                 .add_predecessor(2, 1, LinkType::FinishStart, 0)
                 .unwrap();
         }
-        vm(&mut tabs[0]).open_prompt(PromptKind::Rename);
-        vm(&mut tabs[1]).open_prompt(PromptKind::Rename);
+        vm(&mut tabs[0]).open_prompt(PromptKind::Move);
+        vm(&mut tabs[1]).open_prompt(PromptKind::Move);
         let untouched = snapshot(&tabs[0]);
         let before = view(&tabs[1]).ed.project().clone();
         let depth = view(&tabs[1]).ed.undo_depth();
@@ -379,7 +379,7 @@ fn save_policy_preserves_binding_history_and_source_on_refusal() {
     let bytes = std::fs::read(&source).unwrap();
     let mut tabs = vec![project_tab_from_path(&source)];
     apply_project_act(&mut tabs[0], ProjectAct::Baseline);
-    vm(&mut tabs[0]).open_prompt(PromptKind::Rename);
+    vm(&mut tabs[0]).open_prompt(PromptKind::Move);
     let before = snapshot(&tabs[0]);
     for target in [dir.join("bad.mpp"), source.join("bad.xml")] {
         assert!(call(&mut tabs, 0, "proj.save", path_args(&target)).is_err());
@@ -443,7 +443,7 @@ fn reload_commits_only_a_successful_load() {
         .base_handle
         .set_offset(point(px(0.), px(-24.)));
     tabs[0].dirty = true;
-    vm(&mut tabs[0]).open_prompt(PromptKind::Rename);
+    vm(&mut tabs[0]).open_prompt(PromptKind::Move);
     let before = snapshot(&tabs[0]);
     std::fs::remove_file(&source).unwrap();
     assert!(call(&mut tabs, 0, "proj.reload", Json::Null).is_err());
@@ -535,7 +535,7 @@ fn open_focuses_loaded_duplicates_recovers_placeholders_and_preserves_failed_sta
     assert_eq!(tabs.len(), 2);
     vm(&mut tabs[1]).ed.rename(1, "unsaved").unwrap();
     tabs[1].dirty = true;
-    vm(&mut tabs[1]).open_prompt(PromptKind::Rename);
+    vm(&mut tabs[1]).open_prompt(PromptKind::Move);
     let before = snapshot(&tabs[1]);
     let (_, effect) = call(
         &mut tabs,

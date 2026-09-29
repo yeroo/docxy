@@ -13558,7 +13558,7 @@ impl Docxy {
         let ctrl = m.control || m.platform;
         let shift = m.shift;
         let key = ev.keystroke.key.clone();
-        if self.active_is_project() && m.alt && !ctrl && matches!(key.as_str(), "left" | "right") {
+        if self.active_is_project() && project_alt_key(&key, *m) {
             self.keytips = KeyTip::Off;
             return self.project_key(ev, window, cx);
         }
@@ -28825,6 +28825,18 @@ mod ribbon_fit_tests {
         let (icon_only, shown) = home_titles(1180.);
         assert!(icon_only);
         assert_eq!(shown, ["Font", "Paragraph", "Styles", "Editing"]);
+    }
+
+    /// Project's Report tab has no groups yet (#370); its body lays out empty,
+    /// with no overflow indicator.
+    #[test]
+    fn an_empty_tab_fits_with_nothing_shown() {
+        let ribbon = super::project_ribbon();
+        let report = ribbon.tabs.iter().find(|t| t.name == "Report").unwrap();
+        assert!(report.groups.is_empty());
+        for width in [0., 400., 1600.] {
+            assert_eq!(ribbon_fit(&report.groups, width), (false, Vec::new()));
+        }
     }
 
     #[test]

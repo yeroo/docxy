@@ -7,12 +7,9 @@ pub(crate) enum ProjectAct {
     AddTask,
     /// Task › Insert › Blank Row: an empty row above the selected one.
     InsertBlankRow,
-    DeleteTask,
     Milestone,
     Indent,
     Outdent,
-    Rename,
-    Duration,
     AddLink,
     UnlinkTasks,
     Inactivate,
@@ -24,13 +21,8 @@ pub(crate) enum ProjectAct {
     ClearBaseline,
     Recalc,
     Assign,
-    ClearResources,
     LevelAll,
     ClearLeveling,
-    ExportGantt,
-    ScrollLeft,
-    ScrollRight,
-    GoToStart,
     /// View › Data › Outline: Show Subtasks / Hide Subtasks.
     ShowSubtasks,
     HideSubtasks,
@@ -43,6 +35,13 @@ pub(crate) enum ProjectAct {
     BaselineBars,
     // Keyboard/QAT/backstage/status bar only; excluded from the ribbon inventory.
     Level,
+    /// Ctrl+E and File › Export.
+    ExportGantt,
+    /// Alt+Left / Alt+Right: pan the timescale.
+    ScrollLeft,
+    ScrollRight,
+    /// Alt+Home: the timescale back to the project start.
+    GoToStart,
     /// The status bar's `New Tasks: …` item: the plan's mode for new tasks.
     NewTasksMode,
     Save,
@@ -51,6 +50,9 @@ pub(crate) enum ProjectAct {
     FindNext,
     /// Delete key: clear the active cell (the task itself on the ID column).
     ClearCell,
+    /// Ctrl+Delete: clear the active cell, or reset it to its default; never
+    /// deletes the task.
+    ResetCell,
     /// Ctrl+C / Ctrl+X / Ctrl+V on the cursor cell (see `clip.rs`).
     Copy,
     Cut,
@@ -64,12 +66,9 @@ impl ProjectAct {
     pub const RIBBON: &[Self] = &[
         Self::AddTask,
         Self::InsertBlankRow,
-        Self::DeleteTask,
         Self::Milestone,
         Self::Indent,
         Self::Outdent,
-        Self::Rename,
-        Self::Duration,
         Self::AddLink,
         Self::UnlinkTasks,
         Self::Inactivate,
@@ -81,13 +80,8 @@ impl ProjectAct {
         Self::ClearBaseline,
         Self::Recalc,
         Self::Assign,
-        Self::ClearResources,
         Self::LevelAll,
         Self::ClearLeveling,
-        Self::ExportGantt,
-        Self::ScrollLeft,
-        Self::ScrollRight,
-        Self::GoToStart,
         Self::ShowSubtasks,
         Self::HideSubtasks,
         Self::Find,
@@ -98,13 +92,22 @@ impl ProjectAct {
     ];
 }
 
-/// The Project document ribbon. Tabs, groups and command names follow Microsoft
-/// Project so written instructions ("Project tab > Schedule > Set Baseline") can
-/// be followed as they are; docxy-only extras sit in the nearest group.
+/// The Project document ribbon. Tabs, groups, command labels and screentips
+/// follow Microsoft Project 2024, so written instructions can be followed as
+/// they are, whether they name a command by its label ("Task › Schedule ›
+/// Indent") or by its screentip ("Indent Task"). Only Project's own commands
+/// are here; docxy's extras keep their keyboard and cell routes.
 pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
     use ProjectAct::*;
+    // `cmd` for a command whose screentip is its label, `cmds` when Project's
+    // screentip differs from the label.
     let cmd = |id, icon, label, act, shortcut, key| {
         cmdt(id, icon, label, Act::Project(act), shortcut).key(key)
+    };
+    let cmds = |id, icon, label, tip, act, shortcut, key| {
+        rs::cmd(id, icon, label, Act::Project(act))
+            .tip(tip, "", shortcut)
+            .key(key)
     };
     rs::Ribbon::new(vec![
         rs::tab(
@@ -116,17 +119,19 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                     125,
                     vec![
                         rs::column(vec![
-                            cmd(
+                            cmds(
                                 "pr-indent",
                                 "indent-increase",
+                                "Indent",
                                 "Indent Task",
                                 Indent,
                                 "Alt+Shift+Right",
                                 "I",
                             ),
-                            cmd(
+                            cmds(
                                 "pr-outdent",
                                 "indent-decrease",
+                                "Outdent",
                                 "Outdent Task",
                                 Outdent,
                                 "Alt+Shift+Left",
@@ -141,9 +146,10 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "U",
                             ),
                         ]),
-                        Control::Large(cmd(
+                        Control::Large(cmds(
                             "pr-link",
                             "copy",
+                            "Link Tasks",
                             "Link the Selected Tasks",
                             AddLink,
                             "Alt, T, P  (Ctrl+F2)",
@@ -182,10 +188,11 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                                 "A",
                             ),
                         ]),
-                        Control::Large(cmd(
+                        Control::Large(cmds(
                             "pr-move",
                             "indent-increase",
                             "Move",
+                            "Move Task",
                             MoveTask,
                             "Alt, T, V",
                             "V",
@@ -205,18 +212,20 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                             "N",
                         )),
                         rs::column(vec![
-                            cmd(
+                            cmds(
                                 "pr-milestone",
                                 "symbol",
                                 "Milestone",
+                                "Insert Milestone",
                                 Milestone,
                                 "Alt, T, M",
                                 "M",
                             ),
-                            cmd(
+                            cmds(
                                 "pr-blank-row",
                                 "table-insert-row",
                                 "Blank Row",
+                                "Insert Blank Row",
                                 InsertBlankRow,
                                 "Insert",
                                 "B",
@@ -227,41 +236,21 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Properties",
                     70,
-                    vec![
-                        Control::Large(cmd(
-                            "pr-constraint",
-                            "print-layout",
-                            "Information",
-                            Constraint,
-                            "Alt, T, C",
-                            "C",
-                        )),
-                        rs::column(vec![
-                            cmd("pr-rename", "font-name", "Rename", Rename, "Alt, T, R", "R"),
-                            cmd(
-                                "pr-duration",
-                                "rule",
-                                "Duration",
-                                Duration,
-                                "Alt, T, D",
-                                "D",
-                            ),
-                        ]),
-                    ],
+                    vec![Control::Large(cmds(
+                        "pr-constraint",
+                        "print-layout",
+                        "Information...",
+                        "View Task Information",
+                        Constraint,
+                        "Alt, T, C",
+                        "C",
+                    ))],
                 ),
                 rs::group(
                     "Editing",
                     60,
                     vec![rs::column(vec![
-                        cmd("pr-find", "find", "Find", Find, "Ctrl+F / F3 next", "F"),
-                        cmd(
-                            "pr-delete",
-                            "table-delete-row",
-                            "Delete Task",
-                            DeleteTask,
-                            "Delete on the ID column",
-                            "X",
-                        ),
+                        cmd("pr-find", "find", "Find...", Find, "Ctrl+F / F3 next", "F"),
                         cmd(
                             "pr-scroll-to-task",
                             "align-left",
@@ -281,24 +270,14 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Assignments",
                     90,
-                    vec![
-                        Control::Large(cmd(
-                            "pr-assign",
-                            "comment",
-                            "Assign Resources",
-                            Assign,
-                            "Alt, U, A",
-                            "A",
-                        )),
-                        rs::column(vec![cmd(
-                            "pr-clear",
-                            "table-delete-row",
-                            "Clear Resources",
-                            ClearResources,
-                            "Alt, U, R",
-                            "R",
-                        )]),
-                    ],
+                    vec![Control::Large(cmd(
+                        "pr-assign",
+                        "comment",
+                        "Assign Resources...",
+                        Assign,
+                        "Alt, U, A",
+                        "A",
+                    ))],
                 ),
                 rs::group(
                     "Level",
@@ -324,22 +303,9 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 ),
             ],
         ),
-        rs::tab(
-            "Report",
-            "R",
-            vec![rs::group(
-                "Export",
-                90,
-                vec![Control::Large(cmd(
-                    "pr-export",
-                    "save",
-                    "Export Gantt",
-                    ExportGantt,
-                    "Ctrl+E",
-                    "E",
-                ))],
-            )],
-        ),
+        // Project's Report groups (View Reports, Export › Visual Reports) are
+        // not implemented; the tab stays so the tab set is Project's (#72).
+        rs::tab("Report", "R", Vec::new()),
         rs::tab(
             "Project",
             "P",
@@ -405,44 +371,15 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                 rs::group(
                     "Split View",
                     70,
-                    vec![rs::column(vec![cmd(
+                    vec![rs::column(vec![cmds(
                         "pr-timeline",
                         "rule",
                         "Timeline",
+                        "Timeline View",
                         Timeline,
                         "Alt, W, T",
                         "T",
                     )])],
-                ),
-                rs::group(
-                    "Zoom",
-                    90,
-                    vec![rs::column(vec![
-                        cmd(
-                            "pr-left",
-                            "indent-decrease",
-                            "Scroll Left",
-                            ScrollLeft,
-                            "Alt+Left",
-                            "L",
-                        ),
-                        cmd(
-                            "pr-right",
-                            "indent-increase",
-                            "Scroll Right",
-                            ScrollRight,
-                            "Alt+Right",
-                            "R",
-                        ),
-                        cmd(
-                            "pr-start",
-                            "indent-decrease",
-                            "Go to Start",
-                            GoToStart,
-                            "Alt, W, G",
-                            "G",
-                        ),
-                    ])],
                 ),
             ],
         ),
@@ -510,8 +447,6 @@ fn selected_task_inactive(v: &ProjectView) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PromptKind {
-    Rename,
-    Duration,
     Predecessor,
     Constraint,
     Move,
@@ -523,8 +458,6 @@ pub(crate) enum PromptKind {
 impl PromptKind {
     pub fn name(self) -> &'static str {
         match self {
-            Self::Rename => "rename",
-            Self::Duration => "duration",
             Self::Predecessor => "predecessor",
             Self::Constraint => "constraint",
             Self::Move => "move",
@@ -539,8 +472,6 @@ impl PromptKind {
     }
     fn label(self) -> &'static str {
         match self {
-            Self::Rename => "Rename",
-            Self::Duration => "Duration (3d / 4h / 2w)",
             Self::Predecessor => "Predecessor ID",
             Self::Constraint => "Constraint (TYPE [date])",
             Self::Move => "Move task by (1d / 1w / 4w; -1d back)",
@@ -581,7 +512,6 @@ impl ProjectView {
         }
         let task = self.ed.project().tasks.get(self.ed.sel());
         let buf = match kind {
-            PromptKind::Rename => task.map(|t| t.name.clone()).unwrap_or_default(),
             PromptKind::Constraint => task.map(constraint_hint).unwrap_or_default(),
             _ => String::new(),
         };
@@ -615,6 +545,14 @@ impl ProjectView {
     }
 }
 
+/// Whether an Alt chord is one of Project's own keys (Alt+Left/Right,
+/// Alt+Home, Alt+Shift+arrows and ±). Those reach the Project surface even
+/// while KeyTips are up: pressing Alt starts KeyTips, and none of these keys
+/// is a KeyTip letter, so the overlay would otherwise swallow them.
+pub(crate) fn project_alt_key(key: &str, m: Modifiers) -> bool {
+    m.alt && !m.control && !m.platform && key_act(key, m).is_some()
+}
+
 pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
     use ProjectAct::*;
     if m.platform {
@@ -633,6 +571,8 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
             ("=", true) | ("+", _) => Some(ShowSubtasks),
             ("right", false) => Some(ScrollRight),
             ("left", false) => Some(ScrollLeft),
+            // Project: move the timescale to the project start.
+            ("home", false) => Some(GoToStart),
             _ => None,
         };
     }
@@ -650,6 +590,7 @@ pub(crate) fn key_act(key: &str, m: Modifiers) -> Option<ProjectAct> {
             "c" if !m.shift => Some(Copy),
             "x" if !m.shift => Some(Cut),
             "v" if !m.shift => Some(Paste),
+            "delete" if !m.shift => Some(ResetCell),
             _ => None,
         };
     }
@@ -777,8 +718,6 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
     }
     let uid = p.uid.ok_or("No task selected")?;
     match p.kind {
-        PromptKind::Rename => v.ed.rename(uid, &p.buf)?,
-        PromptKind::Duration => v.ed.set_duration(uid, &p.buf)?,
         PromptKind::Predecessor => {
             let id = p
                 .buf
@@ -891,7 +830,6 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 let at = v.ed.insert_blank_row(v.selected_uid())?;
                 v.select_row(at);
             }
-            DeleteTask => delete_selected_task(v)?,
             ClearCell => {
                 if let Some(uid) = v.selected_uid() {
                     match v.col {
@@ -906,6 +844,11 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                         }
                         _ => status = Some(format!("{} can't be cleared", COLUMNS[v.col])),
                     }
+                }
+            }
+            ResetCell => {
+                if let Some(uid) = v.selected_uid() {
+                    status = reset_cell(&mut v.ed, uid, v.col)?;
                 }
             }
             Milestone => {
@@ -925,8 +868,6 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 status = Some(format!("New tasks: {}", task_mode_name(manual)));
             }
             Indent | Outdent => {} // shared no-op-at-limit policy below
-            Rename => v.open_prompt(PromptKind::Rename),
-            Duration => v.open_prompt(PromptKind::Duration),
             AddLink => v.open_prompt(PromptKind::Predecessor),
             UnlinkTasks => {
                 if let Some(uid) = v.selected_uid() {
@@ -953,11 +894,6 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
             Constraint => v.open_prompt(PromptKind::Constraint),
             Assign => v.open_prompt(PromptKind::Assign),
             Find => v.open_prompt(PromptKind::Find),
-            ClearResources => {
-                if let Some(uid) = v.selected_uid() {
-                    status = assign_status(&mut v.ed, uid, "")?;
-                }
-            }
             Baseline => {
                 if !v.ed.project().tasks.is_empty() {
                     v.ed.set_baseline();
@@ -1067,11 +1003,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     };
     complete_project(
         tab,
-        matches!(
-            act,
-            AddTask | InsertBlankRow | DeleteTask | FindNext | Undo | Redo
-        ) || reveal_clear
-            || moved,
+        matches!(act, AddTask | InsertBlankRow | FindNext | Undo | Redo) || reveal_clear || moved,
     );
 }
 

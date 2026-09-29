@@ -70,7 +70,7 @@ fn ctrl_c_x_v_map_to_the_clipboard_acts() {
         }
     }
     // A prompt or an open cell editor keeps the chords.
-    vm(&mut t).open_prompt(PromptKind::Rename);
+    vm(&mut t).open_prompt(PromptKind::Move);
     assert_eq!(project_input(&mut t, "c", None, ctrl(false, false)), None);
     vm(&mut t).cancel_prompt();
     vm(&mut t).open_cell(None).unwrap();

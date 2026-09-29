@@ -1,12 +1,16 @@
 test project invalid prompts preserve the schedule
   open ../fixtures/gantt-summary.xml
-  key down alt t d
+  # Duration is a cell edit (#370): a bad one stays open with its text.
+  key down right
+  assert cell is Duration
   type banana
   key enter
-  assert prompt is none
-  assert status is Couldn't read duration 'banana' (try 3d, 4h, 2w, 1mo)
+  assert cell_edit is banana
+  assert status is Invalid duration (try 3d, 4h, 2w, 1mo)
   assert dirty is false
   assert bar_2 is on-track 0-0
+  key escape
+  assert cell_edit is none
   key alt t p
   type 999
   key enter
@@ -23,10 +27,10 @@ test project invalid prompts preserve the schedule
   key ctrl+alt+z alt+down ctrl+n
   assert selected_task is 1
   assert tasks is 3
-  key alt t d
-  type 3d
+  key alt t c
+  type mso
   key ctrl+enter alt+escape ctrl+backspace tab shift+tab f10
-  assert prompt is duration:3d
+  assert prompt is constraint:mso
   assert dirty is false
   shot window
   key escape
