@@ -272,9 +272,10 @@ pub struct Sheet {
     /// `None` when the sheet is unprotected. Advisory in the viewer; enforced by
     /// Excel on open.
     pub protection: Option<String>,
-    /// Manual page breaks from `<rowBreaks>` / `<colBreaks>`. A save rewrites
-    /// those elements only when these differ from what the part holds, and
-    /// never adds one the file didn't have.
+    /// Page breaks (manual and automatic) from the sheet's own `<rowBreaks>` /
+    /// `<colBreaks>`, not a custom view's. A save rewrites those elements only
+    /// when these differ from what the part holds, and never adds one the file
+    /// didn't have.
     pub row_breaks: Vec<PageBreak>,
     pub col_breaks: Vec<PageBreak>,
 }

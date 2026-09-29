@@ -942,7 +942,8 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
         }
     }
 
-    // Manual page breaks stay with the row (column) that starts their page.
+    // Page breaks (manual and automatic) stay with the row (column) that
+    // starts their page.
     let sheet = &mut wb.sheets[idx];
     let breaks = if shift.rows {
         &mut sheet.row_breaks

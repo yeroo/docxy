@@ -988,8 +988,11 @@ fn parse_worksheet(
     let mut dv_formula: u8 = 0; // 0 = none, 1 = formula1, 2 = formula2
     let mut dv_buf = String::new();
 
-    // Inside `<rowBreaks>` (true) or `<colBreaks>` (false).
+    // Inside the sheet's own `<rowBreaks>` (true) or `<colBreaks>` (false).
+    // A custom view (`<customSheetView>`) carries breaks of its own under the
+    // same names; those are the view's, not the sheet's, and stay verbatim.
     let mut in_breaks: Option<bool> = None;
+    let mut in_custom_views = false;
 
     loop {
         match p.next() {
@@ -1085,15 +1088,16 @@ fn parse_worksheet(
                         sheet.freeze = (rows, cols);
                     }
                 }
-                // Sheet protection: preserve the whole flag/password attribute set
-                // verbatim so it round-trips untouched.
-                "rowBreaks" => in_breaks = Some(true),
-                "colBreaks" => in_breaks = Some(false),
+                "customSheetViews" => in_custom_views = true,
+                "rowBreaks" if !in_custom_views => in_breaks = Some(true),
+                "colBreaks" if !in_custom_views => in_breaks = Some(false),
                 "brk" => match in_breaks {
                     Some(true) => sheet.row_breaks.extend(page_break(&p)),
                     Some(false) => sheet.col_breaks.extend(page_break(&p)),
                     None => {}
                 },
+                // Sheet protection: preserve the whole flag/password attribute set
+                // verbatim so it round-trips untouched.
                 "sheetProtection" => {
                     let mut attrs = String::new();
                     for a in p.attrs() {
@@ -1208,6 +1212,7 @@ fn parse_worksheet(
             Event::End => match local(p.name()) {
                 "row" => cur_row += 1,
                 "rowBreaks" | "colBreaks" => in_breaks = None,
+                "customSheetViews" => in_custom_views = false,
                 "formula" if in_cf_formula => {
                     in_cf_formula = false;
                     cf_formulas.push(std::mem::take(&mut cf_formula_buf));
@@ -1464,7 +1469,6 @@ fn parse_cell_body(
     }
 }
 
-/// Local name (strip any namespace prefix).
 /// The `<brk>` the parser is on; `None` when its `id` is unreadable.
 fn page_break(p: &XmlParser) -> Option<crate::sheet::PageBreak> {
     let id = p.attr("id").parse().ok()?;
@@ -1479,6 +1483,7 @@ fn page_break(p: &XmlParser) -> Option<crate::sheet::PageBreak> {
     Some(crate::sheet::PageBreak { id, attrs })
 }
 
+/// Local name (strip any namespace prefix).
 fn local(name: &str) -> &str {
     match name.rfind(':') {
         Some(i) => &name[i + 1..],
@@ -2288,7 +2293,8 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
     // Sheet protection: <sheetProtection> right after </sheetData> (schema order
     // puts it ahead of mergeCells/conditionalFormatting).
     let out = set_sheet_protection(&out, sheet.protection.as_deref());
-    // Manual page breaks: rewritten only where a structural edit moved them.
+    // Page breaks (manual and automatic): rewritten only where a structural
+    // edit moved them.
     let out = set_page_breaks(out, "rowBreaks", &sheet.row_breaks);
     set_page_breaks(out, "colBreaks", &sheet.col_breaks)
 }
@@ -2298,20 +2304,8 @@ fn splice_worksheet(source: &str, sheet: &Sheet, sheet_data: &str) -> String {
 /// (with its counts) when they differ, dropped when none are left, and never
 /// created: nothing adds breaks yet, so a missing element has nothing to say.
 fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak]) -> String {
-    let Some(start) = find_element(&xml, tag) else {
+    let Some((start, end)) = sheet_breaks_span(&xml, tag) else {
         return xml;
-    };
-    let Some(gt) = xml[start..].find('>').map(|i| start + i) else {
-        return xml;
-    };
-    let end = if xml[..=gt].ends_with("/>") {
-        gt + 1
-    } else {
-        let close = format!("</{tag}>");
-        match xml[gt..].find(&close) {
-            Some(i) => gt + i + close.len(),
-            None => return xml,
-        }
     };
     if parse_page_breaks(&xml[start..end]) == breaks {
         return xml;
@@ -2332,6 +2326,48 @@ fn set_page_breaks(mut xml: String, tag: &str, breaks: &[crate::sheet::PageBreak
     };
     xml.replace_range(start..end, &block);
     xml
+}
+
+/// Where the sheet's own `<rowBreaks>` / `<colBreaks>` element is. Custom views
+/// hold breaks under the same names inside `<customSheetViews>`, which the
+/// schema puts ahead of the sheet's, so the search starts past it.
+fn sheet_breaks_span(xml: &str, tag: &str) -> Option<(usize, usize)> {
+    let from = match find_element(xml, "customSheetViews") {
+        Some(start) => element_end(xml, start, "customSheetViews")?,
+        None => 0,
+    };
+    let start = from + find_element(&xml[from..], tag)?;
+    Some((start, element_end(xml, start, tag)?))
+}
+
+/// Byte offset just past the element `<tag …>` that starts at `start`: past
+/// its `/>` when self-closing, else past its `</tag>` (not nested).
+fn element_end(xml: &str, start: usize, tag: &str) -> Option<usize> {
+    let tag_end = start_tag_end(xml, start)?;
+    if xml[..tag_end].ends_with("/>") {
+        return Some(tag_end);
+    }
+    let close = format!("</{tag}>");
+    xml[tag_end..]
+        .find(&close)
+        .map(|i| tag_end + i + close.len())
+}
+
+/// Byte offset just past the `>` that closes the start tag at `start`. A `>`
+/// inside a quoted attribute value (`comment="rate > 0"`) is legal XML and
+/// doesn't count.
+fn start_tag_end(xml: &str, start: usize) -> Option<usize> {
+    let mut quote = None;
+    for (i, &b) in xml.as_bytes()[start..].iter().enumerate() {
+        match quote {
+            Some(q) if b == q => quote = None,
+            Some(_) => {}
+            None if b == b'"' || b == b'\'' => quote = Some(b),
+            None if b == b'>' => return Some(start + i + 1),
+            None => {}
+        }
+    }
+    None
 }
 
 /// The `<brk>` children of one breaks element, read as the loader reads them.
@@ -2571,13 +2607,16 @@ fn patch_sheet_names(xml: &str, sheets: &[Sheet]) -> String {
 /// differs, replacing only the element's text. A `localSheetId` names a model
 /// sheet only while the `<sheet>` elements line up with the model one-to-one
 /// (a sheet whose part was missing at load breaks that, as in
-/// `patch_sheet_names`); otherwise scoped names are left as they are.
+/// `patch_sheet_names`); otherwise scoped names are left as they are. So is a
+/// name whose (name, scope) more than one model entry shares: the loader
+/// demotes an unresolvable scope to global, and other writers repeat names,
+/// so which entry belongs to which element can't be told.
 fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> String {
     let aligned = xml.matches("<sheet ").count() == sheet_count;
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     while let Some(start) = find_element(rest, "definedName") {
-        let Some(tag_end) = rest[start..].find('>').map(|i| start + i + 1) else {
+        let Some(tag_end) = start_tag_end(rest, start) else {
             break;
         };
         let tag = &rest[start..tag_end];
@@ -2589,16 +2628,14 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
         let Some(text_end) = rest[tag_end..].find("</definedName>").map(|i| tag_end + i) else {
             break;
         };
-        let scope = match tag_attr(tag, "localSheetId") {
-            None => Some(None),
-            Some(v) if aligned => v.parse::<usize>().ok().map(Some),
-            Some(_) => None,
-        };
-        let model = tag_attr(tag, "name").zip(scope).and_then(|(name, scope)| {
-            let name = decode(name);
-            names
+        let model = defined_name_key(tag, aligned).and_then(|(name, scope)| {
+            let mut hits = names
                 .iter()
-                .find(|d| d.scope == scope && d.name.eq_ignore_ascii_case(&name))
+                .filter(|d| d.scope == scope && d.name.eq_ignore_ascii_case(&name));
+            match (hits.next(), hits.next()) {
+                (Some(d), None) => Some(d),
+                _ => None,
+            }
         });
         let text = &rest[tag_end..text_end];
         out.push_str(&rest[..tag_end]);
@@ -2612,25 +2649,20 @@ fn patch_defined_names(xml: &str, names: &[DefinedName], sheet_count: usize) -> 
     out
 }
 
-/// The raw value of attribute `attr` in one start tag (`<x a="1" b='2'>`).
-fn tag_attr<'a>(tag: &'a str, attr: &str) -> Option<&'a str> {
-    let bytes = tag.as_bytes();
-    let mut from = 0;
-    while let Some(i) = tag[from..].find(attr).map(|i| from + i) {
-        from = i + attr.len();
-        let before_ws = i > 0 && bytes[i - 1].is_ascii_whitespace();
-        let rest = tag[from..].trim_start();
-        if !before_ws || !rest.starts_with('=') {
-            continue;
-        }
-        let rest = rest[1..].trim_start();
-        let Some(q) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
-            continue;
-        };
-        let body = &rest[1..];
-        return body.find(q).map(|e| &body[..e]);
+/// The (name, model scope) a `<definedName …>` start tag stands for, read
+/// with the loader's parser; `None` for a scope that doesn't name a model
+/// sheet reliably (see [`patch_defined_names`]).
+fn defined_name_key(tag: &str, aligned: bool) -> Option<(String, Option<usize>)> {
+    let mut p = XmlParser::new(tag);
+    if p.next() != Event::Start {
+        return None;
     }
-    None
+    let scope = match p.attr("localSheetId") {
+        "" => None,
+        _ if !aligned => return None,
+        v => Some(v.parse::<usize>().ok()?),
+    };
+    Some((decode(p.attr("name")), scope))
 }
 
 pub(crate) fn esc_attr(s: &str) -> String {
@@ -8059,7 +8091,7 @@ mod kind_tests {
 }
 
 /// References kept outside the cells (defined names, print area and titles,
-/// manual page breaks) follow row/column inserts and deletes into the saved
+/// page breaks) follow row/column inserts and deletes into the saved
 /// file (#611).
 #[cfg(test)]
 mod print_setup_tests {
@@ -8401,13 +8433,118 @@ mod print_setup_tests {
 
     #[test]
     fn escaped_name_text_is_compared_decoded() {
-        // `&amp;` decodes to `&`: an edit elsewhere must not rewrite the
-        // element just because its raw and decoded text differ.
-        let names = r#"<definedName name="Label">"R&amp;D"</definedName>"#;
+        // The text decodes to `"R&D"`, which `esc_text` would write back as
+        // `"R&amp;D"`: only a decoded compare sees that nothing changed.
+        let names = r#"<definedName name="Label">&quot;R&amp;D&quot;</definedName>"#;
         let mut pkg = report(names, "");
         insert_rows(&mut pkg.workbook, 0, 0, 1);
         let (_, wb) = saved(&pkg, "xl/workbook.xml");
         assert!(wb.contains(names), "{wb}");
+    }
+
+    #[test]
+    fn a_custom_views_breaks_are_its_own_and_stay_put() {
+        // `<customSheetViews>` precedes the sheet's own breaks, and each view
+        // keeps breaks under the same element names.
+        let view = concat!(
+            r#"<customSheetViews><customSheetView guid="{00000000-0000-0000-0000-000000000001}">"#,
+            r#"<rowBreaks count="1" manualBreakCount="1"><brk id="4" max="16383" man="1"/></rowBreaks>"#,
+            r#"<colBreaks count="1" manualBreakCount="1"><brk id="2" max="1048575" man="1"/></colBreaks>"#,
+            r#"</customSheetView></customSheetViews>"#,
+        );
+        let own = r#"<rowBreaks count="1" manualBreakCount="1"><brk id="13" max="16383" man="1"/></rowBreaks>"#;
+        let body =
+            format!(r#"<sheetData><row r="1"><c r="A1"><v>1</v></c></row></sheetData>{view}{own}"#);
+        let file = book("", &[("Report", Some(&body))]);
+
+        let pkg = load_xlsx(&file).unwrap();
+        assert_eq!(row_ids(&pkg.workbook.sheets[0]), vec![13]);
+        assert!(pkg.workbook.sheets[0].col_breaks.is_empty());
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(ws.contains(&format!("{view}{own}")), "{ws}");
+
+        let mut pkg = load_xlsx(&file).unwrap();
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (_, ws) = saved(&pkg, "xl/worksheets/sheet1.xml");
+        assert!(
+            ws.contains(&format!(
+                r#"{view}<rowBreaks count="1" manualBreakCount="1"><brk id="14" max="16383" man="1"/></rowBreaks>"#
+            )),
+            "{ws}"
+        );
+    }
+
+    #[test]
+    fn a_gt_inside_a_quoted_name_attribute_is_not_the_tag_end() {
+        let names = concat!(
+            r#"<definedName name="Rate" comment="rate > 0">Report!$A$5</definedName>"#,
+            r#"<definedName name="Top" comment='a "quoted" > b'>Report!$A$1</definedName>"#,
+        );
+        let mut pkg = report(names, "");
+        insert_rows(&mut pkg.workbook, 0, 0, 1);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="Rate" comment="rate > 0">Report!$A$6</definedName>"#),
+            "{wb}"
+        );
+        assert!(
+            wb.contains(
+                r#"<definedName name="Top" comment='a "quoted" > b'>Report!$A$2</definedName>"#
+            ),
+            "{wb}"
+        );
+        assert_eq!(re.workbook.defined_name("Rate", 0), Some("Report!$A$6"));
+
+        // And with no edit the file keeps its bytes.
+        let pkg = report(names, "");
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+    }
+
+    #[test]
+    fn names_sharing_a_key_in_the_model_are_not_cross_written() {
+        // `Total` scoped to the missing second sheet loads as global, next to
+        // the real global `Total`: two model entries, one key.
+        let data = r#"<sheetData/>"#;
+        let names = concat!(
+            r#"<definedName name="Total" localSheetId="1">Report!$A$1</definedName>"#,
+            r#"<definedName name="Total">Report!$B$9</definedName>"#,
+        );
+        let file = book(names, &[("Report", Some(data)), ("Gone", None)]);
+        let pkg = load_xlsx(&file).unwrap();
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+
+        // Same when a writer repeated a global name outright.
+        let names = concat!(
+            r#"<definedName name="Dup">Report!$A$1</definedName>"#,
+            r#"<definedName name="Dup">Report!$B$9</definedName>"#,
+        );
+        let mut pkg = report(names, "");
+        insert_rows(&mut pkg.workbook, 0, 20, 1);
+        let (_, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(wb.contains(names), "{wb}");
+    }
+
+    #[test]
+    fn a_union_with_a_deleted_area_still_moves_its_other_areas() {
+        let mut pkg = report(PRINT_NAMES, "");
+        delete_rows(&mut pkg.workbook, 0, 0, 20);
+        insert_cols(&mut pkg.workbook, 0, 0, 1);
+        let (re, wb) = saved(&pkg, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"<definedName name="_xlnm.Print_Titles" localSheetId="0">Report!$B:$B,Report!#REF!</definedName>"#),
+            "{wb}"
+        );
+        // Also once it has been through a save and reload.
+        let mut re = re;
+        insert_cols(&mut re.workbook, 0, 0, 1);
+        let (_, wb) = saved(&re, "xl/workbook.xml");
+        assert!(
+            wb.contains(r#"localSheetId="0">Report!$C:$C,Report!#REF!</definedName>"#),
+            "{wb}"
+        );
     }
 
     #[test]
