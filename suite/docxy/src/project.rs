@@ -693,7 +693,7 @@ pub(super) fn save_decision(tab: &DocTab, harness: bool, explicit_save_as: bool)
     }
     if harness {
         return SaveDecision::RefuseHarness(
-            "This project needs Save As, and a harness instance cannot open the Save As dialog"
+            "This project needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb"
                 .into(),
         );
     }

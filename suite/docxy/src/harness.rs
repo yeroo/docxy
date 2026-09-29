@@ -386,6 +386,120 @@ pub fn drag_args(args: &Json) -> Result<DragEnds, String> {
     Ok((cell_arg(args, "from")?, cell_arg(args, "to")?))
 }
 
+/// What a document refuses to be saved as.
+const DOC_SAVE_FORMATS: &str = "Documents can be saved as .docx, .md or .html";
+
+/// The extension `save-as` gives a path that has none, for a `format`.
+fn format_extension(format: &str) -> Option<&'static str> {
+    Some(match format {
+        "docx" => ".docx",
+        "md" => ".md",
+        "html" => ".docx.html",
+        "xlsx" => ".xlsx",
+        "yppx" => ".yppx",
+        "xml" => ".xml",
+        _ => return None,
+    })
+}
+
+/// The format a document path saves as, by the app's own rules
+/// (`is_markdown_path`, `htmlbundle::is_html_path`), or the refusal. Any other
+/// extension is refused: `save_doc_tab` would write a Word package under it.
+fn doc_save_format(path: &Path, html_ok: bool) -> Result<&'static str, String> {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase());
+    if crate::is_markdown_path(path) {
+        Ok("md")
+    } else if htmlbundle::is_html_path(&path.to_string_lossy()) {
+        if html_ok {
+            Ok("html")
+        } else {
+            Err("this build cannot write editable HTML (.html)".into())
+        }
+    } else if ext.as_deref() == Some("docx") {
+        Ok("docx")
+    } else {
+        Err(DOC_SAVE_FORMATS.into())
+    }
+}
+
+/// Resolve a `save-as` request to the file the dialog would have answered
+/// with and the format it writes (#699). `raw` is the path as given: a
+/// relative one resolves against `base`, the active file's directory, where
+/// the dialog opens; a path with no extension takes `format`'s, or the tab
+/// kind's default (the Save As dialog's first filter). The extension rules
+/// are the app's own: `sheet_save_target`, `yppx::save_target`, and
+/// [`doc_save_format`]. `format`, when given, must be one the tab kind saves
+/// and must agree with an explicit extension.
+fn save_as_target(
+    kind: crate::Kind,
+    base: Option<&Path>,
+    raw: &str,
+    format: Option<&str>,
+    html_ok: bool,
+) -> Result<(PathBuf, &'static str), String> {
+    use crate::Kind;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("save-as needs a non-empty 'path'".into());
+    }
+    let given = PathBuf::from(raw);
+    let mut path = if given.is_absolute() {
+        given
+    } else {
+        base.ok_or(
+            "this tab has never been saved, so a relative 'path' has no folder: give an absolute path",
+        )?
+        .join(given)
+    };
+    let kind_formats: &[&str] = match kind {
+        Kind::Docx => &["docx", "md", "html"],
+        Kind::Xlsx => &["xlsx"],
+        Kind::Project => &["yppx", "xml"],
+        Kind::Look => return Err("this tab cannot be saved as a file".into()),
+    };
+    if let Some(f) = format {
+        if !kind_formats.contains(&f) {
+            // The refusal the kind's own rule gives that extension.
+            let probe = Path::new("x").with_extension(f);
+            return Err(match kind {
+                Kind::Xlsx => crate::sheet_save_target(&probe).err(),
+                Kind::Project => projcore::yppx::save_target(&probe).err(),
+                _ => None,
+            }
+            .unwrap_or_else(|| DOC_SAVE_FORMATS.into()));
+        }
+    }
+    if path.extension().is_none() {
+        let ext = format_extension(format.unwrap_or(kind_formats[0])).unwrap_or_default();
+        let mut name = path.file_name().unwrap_or_default().to_os_string();
+        name.push(ext);
+        path.set_file_name(name);
+    }
+    let (path, written) = match kind {
+        Kind::Xlsx => (crate::sheet_save_target(&path)?, "xlsx"),
+        Kind::Project => {
+            let path = projcore::yppx::save_target(&path)?;
+            let yppx = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("yppx"));
+            (path, if yppx { "yppx" } else { "xml" })
+        }
+        _ => {
+            let written = doc_save_format(&path, html_ok)?;
+            (path, written)
+        }
+    };
+    if let Some(f) = format.filter(|f| *f != written) {
+        return Err(format!(
+            "'format' {f} does not match {}, which saves as {written}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+    }
+    Ok((path, written))
+}
+
 /// A cell or range argument (`"A1"` or `"A1:C5"`), as its two corners.
 pub fn range_arg(args: &Json, key: &str) -> Result<DragEnds, String> {
     let text = arg_str(args, key)?.trim();
@@ -2410,6 +2524,60 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
 
+        // Save As without the native dialog (#699), which a harness instance
+        // must never open (its modal loop stops the control pump). The target
+        // the dialog would have answered with goes to the same save functions
+        // its answer feeds; success is what they return.
+        "save-as" => {
+            app.refuse_under_dialog()?;
+            let raw = match args.get("path") {
+                Some(Json::Str(path)) => path.as_str(),
+                Some(_) => return Err("'path' must be a string".into()),
+                None => return Err("save-as needs a 'path'".into()),
+            };
+            let format = match args.get("format") {
+                None => None,
+                Some(Json::Str(f)) => Some(f.as_str()),
+                Some(_) => return Err("'format' must be a string".into()),
+            };
+            let overwrite = arg_flag(args, "overwrite")?;
+            let tab = app.tabs.get(app.active).ok_or("no tab is open")?;
+            let base = tab.path.as_deref().and_then(Path::parent);
+            let (target, written) = save_as_target(
+                tab.kind,
+                base,
+                raw,
+                format,
+                crate::doc_html_save_allowed(tab),
+            )?;
+            // The dialog asks before replacing a file; a case says so up front.
+            if target.exists() && !overwrite {
+                return Err(format!(
+                    "{} already exists; pass \"overwrite\": true to replace it",
+                    target.display()
+                ));
+            }
+            let saved = match tab.kind {
+                crate::Kind::Xlsx => app.save_sheet_as(&target, window, cx),
+                crate::Kind::Project => app.save_project_to(&target, window, cx).is_ok(),
+                _ => app.save_doc_to(Some(target.clone()), window, cx),
+            };
+            let tab = &app.tabs[app.active];
+            if !saved {
+                return Err(tab.status.to_string());
+            }
+            Done::ok(Json::obj(vec![
+                (
+                    "path",
+                    str_or_null(tab.path.as_ref().map(|p| p.display().to_string())),
+                ),
+                ("format", Json::Str(written.into())),
+                ("title", Json::Str(tab.title.to_string())),
+                ("dirty", Json::Bool(tab.dirty)),
+                ("status", Json::Str(tab.status.to_string())),
+            ]))
+        }
+
         // The fill handle (#699): the handle's own press, one move per cell
         // crossed, the release — what a pointer dragging the handle does. The
         // `drag` verb presses the grid instead, so it sweeps a selection.
@@ -4108,6 +4276,114 @@ mod tests {
     }
 
     /// A malformed range, and a half-given pair.
+    /// #699: `save-as` resolves the path the dialog would have answered with,
+    /// by the app's own extension rules, and refuses what the dialog would
+    /// not produce.
+    #[test]
+    fn save_as_resolves_the_target_and_format_by_the_apps_rules() {
+        use crate::Kind;
+        let base = Path::new("/sandbox/case");
+        let ok = |kind, raw: &str, format: Option<&str>| {
+            save_as_target(kind, Some(base), raw, format, true)
+        };
+        let at = |name: &str| base.join(name);
+
+        assert_eq!(
+            ok(Kind::Docx, "out.docx", None),
+            Ok((at("out.docx"), "docx"))
+        );
+        assert_eq!(ok(Kind::Docx, "out.md", None), Ok((at("out.md"), "md")));
+        assert_eq!(
+            ok(Kind::Docx, "out.markdown", None),
+            Ok((at("out.markdown"), "md"))
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.html", None),
+            Ok((at("out.html"), "html"))
+        );
+        assert_eq!(ok(Kind::Docx, "out", None), Ok((at("out.docx"), "docx")));
+        assert_eq!(ok(Kind::Docx, "out", Some("md")), Ok((at("out.md"), "md")));
+        assert_eq!(
+            ok(Kind::Docx, "out", Some("html")),
+            Ok((at("out.docx.html"), "html"))
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.txt", None),
+            Err(DOC_SAVE_FORMATS.into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.xlsx", None),
+            Err(DOC_SAVE_FORMATS.into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out", Some("pdf")),
+            Err(DOC_SAVE_FORMATS.into())
+        );
+        assert_eq!(
+            ok(Kind::Docx, "out.md", Some("docx")),
+            Err("'format' docx does not match out.md, which saves as md".into())
+        );
+        assert_eq!(
+            save_as_target(Kind::Docx, Some(base), "out.html", None, false),
+            Err("this build cannot write editable HTML (.html)".into())
+        );
+
+        assert_eq!(
+            ok(Kind::Xlsx, "book.xlsx", None),
+            Ok((at("book.xlsx"), "xlsx"))
+        );
+        assert_eq!(ok(Kind::Xlsx, "book", None), Ok((at("book.xlsx"), "xlsx")));
+        assert_eq!(
+            ok(Kind::Xlsx, "book.csv", None),
+            Err("Workbooks can only be saved as .xlsx".into())
+        );
+        assert_eq!(
+            ok(Kind::Xlsx, "book", Some("docx")),
+            Err("Workbooks can only be saved as .xlsx".into())
+        );
+
+        assert_eq!(
+            ok(Kind::Project, "plan", None),
+            Ok((at("plan.yppx"), "yppx"))
+        );
+        assert_eq!(
+            ok(Kind::Project, "plan.xml", None),
+            Ok((at("plan.xml"), "xml"))
+        );
+        assert_eq!(
+            ok(Kind::Project, "plan", Some("xml")),
+            Ok((at("plan.xml"), "xml"))
+        );
+        assert!(
+            ok(Kind::Project, "plan.mpp", None)
+                .unwrap_err()
+                .contains("can only be saved as .yppx or .xml")
+        );
+
+        let abs = if cfg!(windows) {
+            "C:/elsewhere/x.docx"
+        } else {
+            "/elsewhere/x.docx"
+        };
+        assert_eq!(
+            save_as_target(Kind::Docx, None, abs, None, true),
+            Ok((PathBuf::from(abs), "docx"))
+        );
+        assert!(
+            save_as_target(Kind::Docx, None, "x.docx", None, true)
+                .unwrap_err()
+                .contains("never been saved")
+        );
+        assert_eq!(
+            ok(Kind::Docx, "  ", None),
+            Err("save-as needs a non-empty 'path'".into())
+        );
+        assert_eq!(
+            ok(Kind::Look, "x.docx", None),
+            Err("this tab cannot be saved as a file".into())
+        );
+    }
+
     /// #699: `fill-drag`'s `from` takes a cell or a range.
     #[test]
     fn range_arg_takes_a_cell_or_a_range() {

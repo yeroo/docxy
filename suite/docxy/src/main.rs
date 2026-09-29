@@ -11843,12 +11843,24 @@ impl Docxy {
     /// Save the active document tab to `target` (Save As, or the first save of
     /// an untitled document to a picked path) or to its own file (`None`).
     fn save_doc(&mut self, target: Option<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_doc_to(target, window, cx);
+    }
+
+    /// [`save_doc`](Self::save_doc), reporting whether the file was written:
+    /// the harness's `save-as` passes the dialog's answer here and judges the
+    /// save by this rather than by the tab afterwards.
+    fn save_doc_to(
+        &mut self,
+        target: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         self.flush_hf(); // commit any open header/footer edits into the package first
         let Some(tab) = self.tabs.get(self.active) else {
-            return;
+            return false;
         };
         if !matches!(tab.surface, Surface::Doc(_)) {
-            return;
+            return false;
         }
         // A never-saved document asks where to go, like a never-saved
         // workbook, instead of writing `<cwd>/<title>` over whatever is there.
@@ -11862,22 +11874,25 @@ impl Docxy {
                 // this thread and stops the control pump dead (see `save_sheet_tab`).
                 DocSaveTarget::RefuseHarness => {
                     self.tabs[self.active].status = DOC_NEVER_SAVED_HARNESS.into();
-                    return self.refocus(window, cx);
+                    self.refocus(window, cx);
+                    return false;
                 }
                 DocSaveTarget::NeedsDialog => match self.pick_doc_save_target() {
                     Some(picked) => Some(picked),
                     None => {
                         self.tabs[self.active].status = "save cancelled".into();
-                        return self.refocus(window, cx);
+                        self.refocus(window, cx);
+                        return false;
                     }
                 },
             },
         };
-        save_doc_tab(&mut self.tabs[self.active], target);
+        let saved = save_doc_tab(&mut self.tabs[self.active], target);
         self.backstage = false;
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+        saved
     }
 
     /// Serialize the active spreadsheet back to `.xlsx` (lossless — save_xlsx
@@ -11900,6 +11915,47 @@ impl Docxy {
         self.bs_new = false;
         self.persist();
         self.refocus(window, cx);
+    }
+
+    /// Save the active workbook as `target`, as the Save As dialog's answer
+    /// does. Returns whether the file was written; the tab's status says why
+    /// not.
+    fn save_sheet_as(
+        &mut self,
+        target: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return false;
+        };
+        let saved = save_sheet_to(tab, target);
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+        saved
+    }
+
+    /// Save the active Project as `target`, as the Save As dialog's answer
+    /// does (`finish_project_save` is that answer's path, through the same
+    /// `apply_save`).
+    fn save_project_to(
+        &mut self,
+        target: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<usize, String> {
+        if !self.commit_active_project_cell() {
+            self.refocus(window, cx);
+            return Err(self.tabs[self.active].status.to_string());
+        }
+        let result = apply_save(&mut self.tabs[self.active], target);
+        self.backstage = false;
+        self.bs_new = false;
+        self.persist();
+        self.refocus(window, cx);
+        result
     }
 
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11931,11 +11987,11 @@ impl Docxy {
             .add_filter("Markdown", &["md", "markdown"]);
         // An open bundle can always be saved as one (it rewraps itself); a new
         // one needs the engine this build may not carry.
-        let from_bundle = self
+        if self
             .tabs
             .get(self.active)
-            .is_some_and(|t| t.bundle_html.is_some());
-        if from_bundle || html_bundle::can_export() {
+            .is_some_and(doc_html_save_allowed)
+        {
             dialog = dialog.add_filter("Editable HTML (*.docx.html)", &["html"]);
         }
         // The name is written as picked (the dialog already asked about
@@ -14149,8 +14205,15 @@ impl Docxy {
 }
 
 /// What a harness instance says when asked to save a never-saved document.
-const DOC_NEVER_SAVED_HARNESS: &str =
-    "this document has never been saved, and a harness instance cannot open the Save As dialog";
+const DOC_NEVER_SAVED_HARNESS: &str = "this document has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
+
+/// Whether a document tab may be saved as an editable-HTML page: an open
+/// bundle can always be (it rewraps itself), a new one needs the engine this
+/// build may not carry. The Save As dialog offers the HTML filter on this, and
+/// the harness's `save-as` accepts `.html` on it.
+fn doc_html_save_allowed(tab: &DocTab) -> bool {
+    tab.bundle_html.is_some() || html_bundle::can_export()
+}
 
 /// Where a document Save goes, decided before anything is written.
 #[derive(Debug, PartialEq, Eq)]
@@ -14172,11 +14235,9 @@ fn doc_save_target(path: Option<&std::path::Path>, harness: bool) -> DocSaveTarg
 }
 
 /// What a harness instance says when asked to save a never-saved workbook.
-const SHEET_NEVER_SAVED_HARNESS: &str =
-    "this workbook has never been saved, and a harness instance cannot open the Save As dialog";
+const SHEET_NEVER_SAVED_HARNESS: &str = "this workbook has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 /// What a harness instance says when asked to Save As a workbook.
-const SHEET_SAVE_AS_HARNESS: &str =
-    "This workbook needs Save As, and a harness instance cannot open the Save As dialog";
+const SHEET_SAVE_AS_HARNESS: &str = "This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb";
 
 /// Where a workbook Save goes, decided before any dialog opens.
 #[derive(Debug, PartialEq, Eq)]
@@ -14223,7 +14284,9 @@ fn save_sheet_tab(
     // Commit before choosing a target so the decision and write see the edit.
     close::prepare_sheet_save(tab);
     match sheet_save_decision(tab.path.as_deref(), &tab.title, harness, explicit_save_as) {
-        SheetSaveDecision::InPlace(path) => finish_sheet_save(tab, Some(&path)),
+        SheetSaveDecision::InPlace(path) => {
+            finish_sheet_save(tab, Some(&path));
+        }
         // A never-saved workbook or Save As asks where to go, Excel-style.
         SheetSaveDecision::Dialog { suggested } => {
             let target = pick(suggested);
@@ -14252,24 +14315,32 @@ fn sheet_save_target(path: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Save As a workbook tab to `target` without a dialog: the commit a Save
+/// makes first, then the write the dialog's answer feeds. Returns whether the
+/// file was written.
+fn save_sheet_to(tab: &mut DocTab, target: &std::path::Path) -> bool {
+    close::prepare_sheet_save(tab);
+    finish_sheet_save(tab, Some(target))
+}
+
 /// Write the workbook tab to `target` (`None` is a cancelled dialog). The tab
 /// is rebound (title, path, clean) only after a successful write; either way
-/// its status says what happened. The Markdown flag is a document's and is
-/// never touched here.
-fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
+/// its status says what happened, and the result is whether it was written.
+/// The Markdown flag is a document's and is never touched here.
+fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) -> bool {
     let Some(target) = target else {
         tab.status = "save cancelled".into();
-        return;
+        return false;
     };
     let Surface::Sheet(v) = &tab.surface else {
         tab.status = "this tab is not a workbook and cannot be saved as one".into();
-        return;
+        return false;
     };
     let path = match sheet_save_target(target) {
         Ok(path) => path,
         Err(e) => {
             tab.status = e.into();
-            return;
+            return false;
         }
     };
     let bytes = sheet_bytes(v);
@@ -14279,8 +14350,12 @@ fn finish_sheet_save(tab: &mut DocTab, target: Option<&std::path::Path>) {
             tab.status = format!("saved {} bytes → {}", bytes.len(), path.display()).into();
             tab.path = Some(path);
             tab.dirty = false;
+            true
         }
-        Err(e) => tab.status = format!("save failed: {e}").into(),
+        Err(e) => {
+            tab.status = format!("save failed: {e}").into();
+            false
+        }
     }
 }
 
@@ -14397,6 +14472,34 @@ mod load_failed_save_tests {
         assert_eq!(tab.path.as_deref(), Some(path));
         assert_eq!(std::fs::read(path).ok(), before, "{}", path.display());
         tab
+    }
+
+    /// #699: a Save As to `.md` (what the harness's `save-as` feeds) rebinds
+    /// the tab as Markdown, so the next plain Save writes Markdown too, and
+    /// a Save As back to `.docx` writes a Word package again.
+    #[test]
+    fn a_markdown_save_as_makes_later_saves_markdown() {
+        let dir = temp("md-save-as");
+        let source = dir.join("basic.docx");
+        std::fs::write(&source, basic_docx()).unwrap();
+        let mut tab = tab_from_path(&source);
+        let md = dir.join("notes.md");
+        assert!(save_doc_tab(&mut tab, Some(md.clone())));
+        assert!(tab.markdown);
+        assert_eq!(tab.path.as_deref(), Some(md.as_path()));
+        tab.dirty = true;
+        std::fs::write(&md, b"stale").unwrap();
+        assert!(save_doc_tab(&mut tab, None));
+        let written = std::fs::read(&md).unwrap();
+        assert!(
+            !written.starts_with(b"PK"),
+            "a plain save wrote a Word package"
+        );
+        assert_ne!(written, b"stale");
+        let docx = dir.join("back.docx");
+        assert!(save_doc_tab(&mut tab, Some(docx.clone())));
+        assert!(!tab.markdown);
+        assert!(std::fs::read(&docx).unwrap().starts_with(b"PK"));
     }
 
     fn utf16_bom(text: &str, little_endian: bool) -> Vec<u8> {
@@ -14654,7 +14757,8 @@ mod load_failed_save_tests {
 mod sheet_save_tests {
     use super::{
         DocTab, Kind, SHEET_NEVER_SAVED_HARNESS, SHEET_SAVE_AS_HARNESS, SheetSaveDecision, Surface,
-        finish_sheet_save, new_sheet_surface, sheet_bytes, sheet_save_decision, sheet_save_target,
+        finish_sheet_save, new_sheet_surface, save_sheet_to, sheet_bytes, sheet_save_decision,
+        sheet_save_target,
     };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14739,7 +14843,7 @@ mod sheet_save_tests {
         }
         assert_eq!(
             SHEET_SAVE_AS_HARNESS,
-            "This workbook needs Save As, and a harness instance cannot open the Save As dialog"
+            "This workbook needs Save As, and a harness instance cannot open the Save As dialog; use the harness save-as verb"
         );
     }
 
@@ -14762,7 +14866,7 @@ mod sheet_save_tests {
         );
         assert_eq!(
             SHEET_NEVER_SAVED_HARNESS,
-            "this workbook has never been saved, and a harness instance cannot open the Save As dialog"
+            "this workbook has never been saved, and a harness instance cannot open the Save As dialog; use the harness save-as verb"
         );
     }
 
@@ -14808,6 +14912,39 @@ mod sheet_save_tests {
             tab.status.as_ref(),
             format!("saved {} bytes → {}", expected.len(), target.display())
         );
+    }
+
+    /// #699: the harness's `save-as` writes a workbook through this, and
+    /// judges the save by what it returns, not by the tab afterwards: a failed
+    /// write onto the tab's own clean path would otherwise look like success.
+    #[test]
+    fn save_sheet_to_reports_whether_it_wrote() {
+        let dir = Scratch::new();
+        let target = dir.path("copy.xlsx");
+        let mut tab = sheet_tab(None, "Untitled.xlsx");
+        assert!(save_sheet_to(&mut tab, &target));
+        assert!(target.is_file());
+        assert_eq!(tab.path.as_deref(), Some(target.as_path()));
+        assert!(!tab.dirty);
+
+        // A clean tab whose write fails stays bound and clean, so only the
+        // result says it failed: here the target is a directory.
+        let folder = dir.path("folder.xlsx");
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut clean = sheet_tab(Some(folder.clone()), "folder.xlsx");
+        clean.dirty = false;
+        assert!(!save_sheet_to(&mut clean, &folder));
+        assert!(clean.status.starts_with("save failed"), "{}", clean.status);
+        assert_eq!(clean.path.as_deref(), Some(folder.as_path()));
+        assert!(!clean.dirty);
+
+        let mut other = sheet_tab(None, "Untitled.xlsx");
+        assert!(!save_sheet_to(&mut other, &dir.path("copy.csv")));
+        assert_eq!(
+            other.status.as_ref(),
+            "Workbooks can only be saved as .xlsx"
+        );
+        assert!(other.path.is_none());
     }
 
     #[test]
