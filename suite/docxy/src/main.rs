@@ -24293,9 +24293,10 @@ fn main() {
                         true
                     };
                     // Only an accepted close is a clean exit; a cancelled one
-                    // keeps running, marker and all.
+                    // keeps running, marker and all. The persist above already
+                    // wrote everything, so only the marker is left to clear.
                     if close {
-                        this.clean_exit();
+                        recover::clear_running(&config_root());
                     }
                     close
                 })
