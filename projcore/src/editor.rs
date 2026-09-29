@@ -1136,7 +1136,8 @@ impl Editor {
     }
 
     /// Project › Schedule › Set Baseline: record the plan as it is scheduled
-    /// now in the Baseline (slot 0) of every scheduled task, and of the
+    /// now in the Baseline (slot 0) of every scheduled task, with its stored
+    /// work and cost (absent ones stay absent), and of the
     /// assignments and resources (see `baseline_assignments`), as one undo
     /// step. Baseline1..10 stay.
     pub fn set_baseline(&mut self) {
@@ -1160,6 +1161,8 @@ impl Editor {
                             r.early_start,
                             r.early_finish,
                         )),
+                        work_min: t.work_min,
+                        cost: t.cost.clone(),
                         ..Baseline::default()
                     },
                 ))
@@ -2146,6 +2149,8 @@ mod tests {
                 uid: 2,
                 outline_level: 2,
                 duration_min: 960,
+                work_min: Some(960),
+                cost: crate::model::Rate::parse("40000"),
                 ..Task::default()
             },
             Task {
@@ -2172,6 +2177,8 @@ mod tests {
             let baseline = task.baseline(0).unwrap();
             let r = ed.schedule().get(task.uid).unwrap();
             assert_eq!(baseline.duration_min, Some(expected));
+            assert_eq!(baseline.work_min, task.work_min);
+            assert_eq!(baseline.cost, task.cost);
             assert_eq!(baseline.start, Some(r.early_start));
             assert_eq!(baseline.finish, Some(r.early_finish));
             assert_eq!(task.baseline(1), Some(&saved));
