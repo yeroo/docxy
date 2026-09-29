@@ -1,5 +1,5 @@
 test project status bar reports Ready, Edit and Busy
-  open copy:../../corpus/mspdi/11-resource-assignment.xml
+  open copy:../fixtures/project-status.xml
   call status-read {}
   assert reply.items.0.id is state
   assert reply.items.0.text is Ready
