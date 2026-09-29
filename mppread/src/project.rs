@@ -404,9 +404,12 @@ fn import_tasks(
             task.manual_finish = date(&t.manual_finish, "manual finish")?;
             task.manual_duration_min = t.manual_duration_min;
             // The unit the duration shows (and saves) in, as the MSPDI reader
-            // keeps it: days is no format, and a code past `u8` is none.
+            // keeps it: days is no format. Only a working code goes with the
+            // working minutes imported above; an elapsed or null one would
+            // make a save misstate them, so it reads as days.
             task.duration_format = t
                 .duration_format
+                .filter(|&f| crate::mpp::working_duration_format(f))
                 .and_then(|f| u8::try_from(f).ok())
                 .filter(|&f| f != 7);
             if let Some(p) = &t.progress {
@@ -592,8 +595,9 @@ mod tests {
             .iter()
             .map(|t| t.duration_format)
             .collect();
-        // Days is no format, as the MSPDI reader keeps it.
-        assert_eq!(formats, [Some(9), Some(41), Some(8), None, None, None]);
+        // Days is no format, as the MSPDI reader keeps it; an elapsed code
+        // (8) or an unknown one is not carried beside working minutes.
+        assert_eq!(formats, [Some(9), Some(41), None, None, None, None]);
     }
 
     #[test]

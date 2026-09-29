@@ -84,10 +84,11 @@ fn pasting_a_duration_back_keeps_its_unit_and_is_no_edit() {
     // A manual summary over A, then B, C, D as leaves.
     vm(&mut t).ed.add_task(None, "C", 800, false).unwrap();
     vm(&mut t).ed.add_task(None, "D", 480, false).unwrap();
+    vm(&mut t).ed.add_task(None, "E", 0, false).unwrap();
     vm(&mut t).ed.indent(2, 1).unwrap();
     vm(&mut t).ed.set_manual(1, true).unwrap();
     let mut p = v(&t).ed.project().clone();
-    for (uid, format) in [(1, 9), (2, 9), (3, 9), (4, 8)] {
+    for (uid, format) in [(1, 9), (2, 9), (3, 9), (4, 8), (5, 9)] {
         p.tasks
             .iter_mut()
             .find(|t| t.uid == uid)
@@ -98,8 +99,8 @@ fn pasting_a_duration_back_keeps_its_unit_and_is_no_edit() {
     t.dirty = false;
     let before = v(&t).ed.project().clone();
     // Summary (days text), a weeks leaf, a weeks leaf of 800 min
-    // (`0.3333w`), an elapsed-days leaf (days text).
-    for (row, text) in [(0, "2d"), (1, "0.4w"), (2, "0.3333w"), (3, "1d")] {
+    // (`0.3333w`), an elapsed-days leaf (days text), a weeks milestone.
+    for (row, text) in [(0, "2d"), (1, "0.4w"), (2, "0.3333w"), (3, "1d"), (4, "0w")] {
         at(&mut t, row, COL_DURATION);
         let copied = project_copy_text(v(&t));
         assert_eq!(copied, text, "row {row}");
@@ -108,6 +109,10 @@ fn pasting_a_duration_back_keeps_its_unit_and_is_no_edit() {
         assert_eq!(v(&t).ed.undo_depth(), 0, "row {row}");
         assert!(!t.dirty, "row {row}");
     }
+    // Ctrl+Delete gives the elapsed leaf a new task's day, in days.
+    reset_cell(&mut vm(&mut t).ed, 4, COL_DURATION).unwrap();
+    let d = v(&t).ed.project().task(4).unwrap();
+    assert_eq!((d.duration_min, d.duration_format), (480, None));
 }
 
 #[test]

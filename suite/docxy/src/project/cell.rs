@@ -181,7 +181,8 @@ pub(crate) fn cell_edit_text(ed: &ProjectEditor, task: &Task, col: usize) -> Str
     } else {
         task.duration_min
     };
-    if min == 0 {
+    // A zero in days reads as a bare `0`; in another unit it keeps it (`0w`).
+    if min == 0 && (task.summary || task.duration_unit().is_none_or(|u| u == LagUnit::Day)) {
         "0".into()
     } else if task.summary {
         // A summary's `?` is its subtasks'; it takes no estimate. Its
@@ -297,8 +298,8 @@ pub(crate) fn reset_cell(
             }
             let proj = ed.project();
             let (min, estimated) = (proj.days_to_minutes(1.0), proj.new_tasks_estimated());
-            // A new task's duration is in days.
-            ed.set_duration_typed(uid, min, estimated, LagUnit::Day)?;
+            // A new task's duration, in days.
+            ed.reset_duration(uid, min, estimated)?;
             Ok(None)
         }
         COL_MODE => {

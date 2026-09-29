@@ -67,8 +67,9 @@ pub struct TaskPatch {
     /// [`parse_task_duration_unit`]); only with `duration_min`. It becomes
     /// the task's format, except that a stored estimated variant of the same
     /// unit stays when `estimated` is `Some(true)`. Summaries, external
-    /// leaves, and re-entering the same minutes on a task whose format has no
-    /// working unit keep their format. `None` keeps the stored format.
+    /// leaves, and re-entering the same minutes and estimate on a task whose
+    /// format has no working unit keep their format (except through
+    /// [`Editor::reset_duration`]). `None` keeps the stored format.
     pub duration_format: Option<u8>,
 }
 
@@ -664,8 +665,9 @@ impl Editor {
         self.set_duration_typed(uid, min, estimated, unit)
     }
 
-    /// Set a duration typed in `unit`, which becomes the task's
-    /// `DurationFormat`: its Duration and slack then show in that unit.
+    /// Set a duration typed in `unit`, which gives the task's
+    /// `DurationFormat` (its Duration and slack then show in that unit), with
+    /// the exceptions [`TaskPatch::duration_format`] lists.
     pub fn set_duration_typed(
         &mut self,
         uid: i32,
@@ -744,7 +746,34 @@ impl Editor {
         (start, finish, self.disp_duration_min(t.uid))
     }
 
-    pub fn update_task(&mut self, uid: i32, mut patch: TaskPatch) -> Result<(), String> {
+    /// Reset a duration to what a new task gets, as Ctrl+Delete does:
+    /// `min` in days, estimated or not. Unlike a re-entered duration, it
+    /// replaces a format no cell can spell (elapsed, null) too.
+    pub fn reset_duration(&mut self, uid: i32, min: i64, estimated: bool) -> Result<(), String> {
+        self.update_task_with(
+            uid,
+            TaskPatch {
+                duration_min: Some(min),
+                estimated: Some(estimated),
+                duration_format: duration_format_code(LagUnit::Day),
+                ..TaskPatch::default()
+            },
+            false,
+        )
+    }
+
+    pub fn update_task(&mut self, uid: i32, patch: TaskPatch) -> Result<(), String> {
+        self.update_task_with(uid, patch, true)
+    }
+
+    /// [`Self::update_task`]; `reentry` keeps a format no cell can spell
+    /// when the same duration and estimate are entered again.
+    fn update_task_with(
+        &mut self,
+        uid: i32,
+        mut patch: TaskPatch,
+        reentry: bool,
+    ) -> Result<(), String> {
         let i = self.index(uid)?;
         if patch.name.is_none()
             && patch.duration_min.is_none()
@@ -788,13 +817,14 @@ impl Editor {
                 .is_some_and(|e| estimate_after(t.estimated, e) != t.estimated);
         // A summary's duration shows in days, and an external leaf's dates
         // are not ours: neither takes a typed unit. Nor does re-entering the
-        // same minutes on a task whose format has no working unit (elapsed,
-        // null), which its cells cannot spell.
+        // same minutes and estimate on a task whose format has no working
+        // unit (elapsed, null), which its cells cannot spell.
         let unspellable = t.duration_format.is_some() && t.duration_unit().is_none();
+        let reentered = reentry && patch.duration_min == Some(current) && !estimate_changed;
         let format = patch
             .duration_format
             .filter(|_| !t.summary && !t.is_external_leaf())
-            .filter(|_| !(unspellable && patch.duration_min == Some(current)))
+            .filter(|_| !(unspellable && reentered))
             .map(|code| format_after(t.duration_format, code, patch.estimated == Some(true)));
         let format_changed = format.is_some_and(|f| f != t.duration_format);
         if t.is_external_leaf() && (duration_changed || mode_changed || estimate_changed) {

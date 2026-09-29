@@ -606,6 +606,37 @@ fn summaries_external_leaves_and_unspellable_formats_keep_their_format() {
 }
 
 #[test]
+fn an_unspellable_format_is_replaced_when_the_estimate_or_a_reset_changes_it() {
+    let with = |format: u8, estimated: Option<bool>| {
+        let mut p = editor().project().clone();
+        p.tasks[0].duration_format = Some(format);
+        p.tasks[0].estimated = estimated;
+        Editor::new(p)
+    };
+    let task = |ed: &Editor| {
+        let t = ed.project().task(10).unwrap();
+        (t.duration_format, t.estimated)
+    };
+    // Estimated null days (53) retyped without `?`: days, committed.
+    let mut ed = with(53, Some(true));
+    ed.set_duration_typed(10, 480, false, LagUnit::Day).unwrap();
+    assert_eq!(task(&ed), (None, Some(false)));
+    // Elapsed days (8) retyped with `?`: days, estimated.
+    let mut ed = with(8, None);
+    ed.set_duration(10, "1d?").unwrap();
+    assert_eq!(task(&ed), (None, Some(true)));
+    // The same text and estimate keeps it.
+    let mut ed = with(8, None);
+    ed.set_duration(10, "1d").unwrap();
+    assert_eq!((task(&ed), ed.undo_depth()), ((Some(8), None), 0));
+    // A reset to a new task's day replaces it even at the same minutes.
+    let mut ed = with(8, None);
+    ed.reset_duration(10, 480, false).unwrap();
+    assert_eq!(task(&ed), (None, None));
+    assert_eq!(ed.undo_depth(), 1);
+}
+
+#[test]
 fn exact_duration_text_prefers_the_task_s_unit() {
     let p = untitled_project();
     for (min, unit, expected) in [
