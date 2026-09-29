@@ -48,7 +48,9 @@ mod win {
     use gridcore::sheet::{
         Align, Cell, CellValue, Styles, Xf, cell_name, parse_cell_name, parse_range_name,
     };
-    use gridcore::xlsx::{SheetPackage, load_xlsx, new_xlsx, save_xlsx};
+    use gridcore::xlsx::{
+        SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx, save_xlsx_as,
+    };
 
     use windows::Win32::Foundation::{DISP_E_BADINDEX, E_FAIL, E_NOTIMPL, E_POINTER, S_OK};
     use windows::Win32::System::Com::{
@@ -290,13 +292,31 @@ mod win {
                 .unwrap_or_default()
         }
 
-        fn save_as(&mut self, path: &str) -> std::io::Result<()> {
+        /// Write the workbook as `kind` (`None`: keep the loaded type). A
+        /// macro-free kind drops the VBA project without asking, as Excel does
+        /// under automation with `DisplayAlerts = False`.
+        fn save_as(&mut self, path: &str, kind: Option<SpreadsheetKind>) -> std::io::Result<()> {
             self.recalc_if_dirty();
-            let bytes = save_xlsx(&self.pkg);
+            let bytes = match kind {
+                Some(kind) => save_xlsx_as(&self.pkg, kind),
+                None => save_xlsx(&self.pkg),
+            };
             std::fs::write(path, bytes)?;
             self.path = Some(path.to_string());
             self.saved = true;
             Ok(())
+        }
+    }
+
+    /// The file type `SaveAs(path, FileFormat)` writes: Excel's
+    /// `XlFileFormat` decides, then the path's extension, else the loaded type.
+    fn kind_for(fmt: Option<i32>, path: &str) -> Option<SpreadsheetKind> {
+        match fmt {
+            Some(51) => Some(SpreadsheetKind::Workbook), // xlOpenXMLWorkbook
+            Some(52) => Some(SpreadsheetKind::MacroWorkbook), // xlOpenXMLWorkbookMacroEnabled
+            Some(53) => Some(SpreadsheetKind::MacroTemplate), // xlOpenXMLTemplateMacroEnabled
+            Some(54) => Some(SpreadsheetKind::Template), // xlOpenXMLTemplate
+            _ => SpreadsheetKind::from_path(path),
         }
     }
 
@@ -570,15 +590,24 @@ mod win {
     unsafe fn vt_wb_saveas(
         t: &Workbook_Impl,
         filename: *const VARIANT,
-        _fmt: *const VARIANT,
+        fmt: *const VARIANT,
     ) -> HRESULT {
         let Some(path) = (unsafe { filename.as_ref() }).and_then(variant_to_string) else {
             log("SaveAs(early): missing Filename");
             return E_FAIL;
         };
-        log(&format!("SaveAs(early) '{path}'"));
+        let fmt = (unsafe { fmt.as_ref() }).and_then(|v| {
+            let vt = unsafe { vt_of(v) };
+            if vt == VT_EMPTY || vt == VT_ERROR {
+                None
+            } else {
+                i32::try_from(v).ok()
+            }
+        });
+        log(&format!("SaveAs(early) '{path}' fmt={fmt:?}"));
         let book = t.book;
-        let res = reg(|r| r.books.get_mut(book).map(|b| b.save_as(&path)));
+        let kind = kind_for(fmt, &path);
+        let res = reg(|r| r.books.get_mut(book).map(|b| b.save_as(&path, kind)));
         match res {
             Some(Ok(())) => S_OK,
             Some(Err(e)) => {
@@ -1156,10 +1185,16 @@ mod win {
                         };
                         let fmt = arg_i32(params, 1);
                         log(&format!("SaveAs '{path}' fmt={fmt:?}"));
-                        // 51 = xlOpenXMLWorkbook (.xlsx); other formats fall back
-                        // to .xlsx today (gridcore writes OOXML) rather than fault.
-                        let ok =
-                            reg(|r| r.books.get_mut(book).map(|b| b.save_as(&path)).transpose());
+                        // The OOXML formats (51-54) pick the file type; any other
+                        // format falls back to the path's extension, else the
+                        // loaded type (gridcore writes OOXML) rather than fault.
+                        let kind = kind_for(fmt, &path);
+                        let ok = reg(|r| {
+                            r.books
+                                .get_mut(book)
+                                .map(|b| b.save_as(&path, kind))
+                                .transpose()
+                        });
                         match ok {
                             Ok(Some(())) => {}
                             Ok(None) => return Err(DISP_E_BADINDEX.into()),
@@ -1174,7 +1209,10 @@ mod win {
                         let res = reg(|r| {
                             let path = r.books.get(book).and_then(|b| b.path.clone());
                             match path {
-                                Some(p) => r.books.get_mut(book).map(|b| b.save_as(&p)),
+                                Some(p) => {
+                                    let kind = SpreadsheetKind::from_path(&p);
+                                    r.books.get_mut(book).map(|b| b.save_as(&p, kind))
+                                }
                                 None => Some(Ok(())), // no path yet — no-op
                             }
                         });
@@ -2383,6 +2421,52 @@ mod win {
                 }
                 Ok(())
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn file_format_picks_the_kind_before_the_extension() {
+            use SpreadsheetKind::*;
+            assert_eq!(kind_for(Some(51), "x.xlsm"), Some(Workbook));
+            assert_eq!(kind_for(Some(52), "x"), Some(MacroWorkbook));
+            assert_eq!(kind_for(Some(53), "x.xlsx"), Some(MacroTemplate));
+            assert_eq!(kind_for(Some(54), "x.xlsx"), Some(Template));
+            assert_eq!(kind_for(None, "x.XLTX"), Some(Template));
+            assert_eq!(kind_for(Some(6), "x.csv"), None);
+            assert_eq!(kind_for(None, "x"), None);
+        }
+
+        /// #601: `SaveAs "x.xlsx", 51` on a macro workbook writes a real
+        /// `.xlsx`: no macro type, no VBA project.
+        #[test]
+        fn save_as_xlsx_drops_the_vba_project() {
+            let mut pkg =
+                load_xlsx(&save_xlsx_as(&new_xlsx(), SpreadsheetKind::MacroWorkbook)).unwrap();
+            let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+                .replace(
+                    "</Relationships>",
+                    r#"<Relationship Id="rId9" Type="http://schemas.microsoft.com/office/2006/relationships/vbaProject" Target="vbaProject.bin"/></Relationships>"#,
+                );
+            pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+            pkg.set_part("xl/vbaProject.bin", b"VBA".to_vec());
+            let mut book = Book::new();
+            book.pkg = pkg;
+            let path =
+                std::env::temp_dir().join(format!("xlcomshim-601-{}.xlsx", std::process::id()));
+            let path = path.to_str().unwrap();
+            book.save_as(path, kind_for(Some(51), path)).unwrap();
+            let saved = load_xlsx(&std::fs::read(path).unwrap()).unwrap();
+            std::fs::remove_file(path).unwrap();
+            assert!(!saved.has_vba_project());
+            assert!(saved.part("xl/vbaProject.bin").is_none());
+            let ct =
+                String::from_utf8_lossy(saved.part("[Content_Types].xml").unwrap()).into_owned();
+            assert!(ct.contains("spreadsheetml.sheet.main+xml"), "{ct}");
+            assert!(!ct.contains("macroEnabled"), "{ct}");
         }
     }
 }
