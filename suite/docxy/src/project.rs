@@ -856,10 +856,7 @@ pub(crate) fn status_items(tab: &DocTab) -> Vec<(&'static str, String)> {
     if let Surface::Project(v) = &tab.surface {
         items.push((
             "state",
-            tab_app_state(tab)
-                .unwrap_or(AppState::Ready)
-                .label()
-                .to_string(),
+            project_dialog_state(v, &tab.dialogs).label().to_string(),
         ));
         items.push((
             "new-tasks",

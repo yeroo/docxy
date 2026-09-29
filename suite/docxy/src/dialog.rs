@@ -2,10 +2,12 @@
 //!
 //! A dialog is a value on its document tab's [`DialogStack`], never a native
 //! modal loop: the window draws the top one over everything, the keyboard
-//! reaches it through [`DialogStack::key`], and the harness verbs
-//! `dialog-read`, `dialog-set`, `dialog-tab` and `dialog-click` drive the same
-//! functions the rendered controls call. A modal loop would block the harness
-//! pump; this cannot.
+//! reaches it through [`DialogStack::key_button`], and the harness verbs
+//! `dialog-read`, `dialog-set`, `dialog-tab` and `dialog-click` drive it. The
+//! drawn buttons, Enter/Escape and `dialog-click` all press through
+//! [`DialogStack::click`]. Controls are drawn read-only for now: `Control::set`
+//! is the handler a form's widgets will call, and today only `dialog-set` calls
+//! it. A modal loop would block the harness pump; this cannot.
 //!
 //! Staged values live in the [`Dialog`] until an accept button hands it to its
 //! owner, so Cancel discards by construction: it drops the dialog.
@@ -213,8 +215,9 @@ impl Control {
         Json::obj(out)
     }
 
-    /// The control's own input handler: the rendered widget and `dialog-set`
-    /// both come through here. `args` is the verb's argument object: `value`,
+    /// The control's input handler. `dialog-set` calls it, and so will a form's
+    /// editable widget once one is drawn (today's overlay draws controls
+    /// read-only). `args` is the verb's argument object: `value`,
     /// or for a grid `{row, column, value}`, `{insert_row}` or `{delete_row}`.
     fn set(&mut self, args: &Json) -> Result<(), String> {
         let label = &shown(&self.label);
@@ -233,8 +236,11 @@ impl Control {
             ControlKind::Label => return Err(format!("'{label}' is a label; it cannot be set")),
             ControlKind::Text | ControlKind::Date | ControlKind::Duration => Value::Text(text()?),
             ControlKind::Number => match value()? {
-                Json::Num(n) => Value::Text(n.to_string()),
-                Json::Str(s) if s.trim().parse::<f64>().is_ok() => Value::Text(s.clone()),
+                Json::Num(n) if n.is_finite() => Value::Text(n.to_string()),
+                // Rust parses "NaN", "inf" and "1e999"; a field takes none of them.
+                Json::Str(s) if s.trim().parse::<f64>().is_ok_and(f64::is_finite) => {
+                    Value::Text(s.clone())
+                }
                 _ => return Err(format!("'{label}' takes a number")),
             },
             ControlKind::Checkbox => match value()? {

@@ -283,6 +283,16 @@ fn values_are_checked_against_the_controls_kind() {
     );
     set(&mut s, "Percent complete", r#"{"value":25}"#).unwrap();
     assert_eq!(text(&s, "percent"), "25");
+    // Rust's float parser takes these; a number field must not.
+    for bad in ["NaN", "inf", "-infinity", "1e999"] {
+        let v = format!(r#"{{"value":"{bad}"}}"#);
+        assert_eq!(
+            set(&mut s, "Percent complete", &v).unwrap_err(),
+            "'Percent complete:' takes a number",
+            "{bad}"
+        );
+    }
+    assert_eq!(text(&s, "percent"), "25");
 
     // Dropdown, radio and list take an item's label, which must exist.
     let e = set(&mut s, "Calendar", r#"{"value":"Weekend"}"#).unwrap_err();
@@ -321,6 +331,7 @@ fn values_are_checked_against_the_controls_kind() {
 #[test]
 fn a_control_on_another_tab_needs_dialog_tab_first() {
     let mut s = stack();
+    s.set("Name", &args(r#"{"value":"Staged"}"#)).unwrap();
     let cell = r#"{"row":0,"column":"Type","value":"SS"}"#;
     assert_eq!(
         s.set("Predecessors", &args(cell)).unwrap_err(),
@@ -333,10 +344,18 @@ fn a_control_on_another_tab_needs_dialog_tab_first() {
     assert_eq!(controls.len(), 1);
     assert_eq!(controls[0].get_str("kind"), Some("grid"));
     s.set("Predecessors", &args(cell)).unwrap();
-    // The first page's staged values survive the page switch.
-    s.set("Name", &args(r#"{"value":"x"}"#)).unwrap_err();
+    assert_eq!(
+        s.set("Name", &args(r#"{"value":"x"}"#)).unwrap_err(),
+        "'Name:' is on the 'General' tab; switch with dialog-tab first"
+    );
+    // Each page's staged values survive switching away and back.
     s.select_tab("General").unwrap();
-    assert_eq!(text(&s, "name"), "Design");
+    assert_eq!(text(&s, "name"), "Staged");
+    s.select_tab("Predecessors").unwrap();
+    assert_eq!(
+        s.top().unwrap().value("predecessors"),
+        Some(&Value::Rows(vec![vec!["1".into(), "SS".into()]]))
+    );
 }
 
 #[test]

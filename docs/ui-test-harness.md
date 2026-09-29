@@ -252,7 +252,8 @@ State keys, as the app reports them after every driving verb:
 | Key | |
 |---|---|
 | `tab`, `title`, `dirty`, `status`, `sheet_tab` | the active tab |
-| `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor or prompt is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
+| `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
+| `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
@@ -483,10 +484,13 @@ The rules for addressing:
 - An unknown control, button or tab is refused, and the refusal lists what
   exists.
 
-`dialog-set` goes through the control's own input handler, the one its widget
-calls. It refuses a disabled or hidden control, a control on another tab, a
+`dialog-set` goes through the control's input handler, the one a form's
+editable widget will call. The overlay draws controls **read-only** today, so a
+green `dialog-set` says the model accepted the value, not that a drawn widget
+works. (The drawn buttons, Enter/Escape and `dialog-click` do share one press
+handler.) It refuses a disabled or hidden control, a control on another tab, a
 label, and a value of the wrong shape: a checkbox takes a bool, a number
-something that parses, and an item control one of its items. Dates and durations
+a finite number, and an item control one of its items. Dates and durations
 are staged as text: the owner checks them on OK, and an OK the owner refuses
 leaves the dialog open with its staged values. A disabled button refuses
 `dialog-click`.

@@ -1,6 +1,6 @@
 //! Project commands and prompt policy: pure DocTab functions first, window host glue last.
 use super::*;
-use crate::dialog::{ButtonRole, Dialog, DialogOwner};
+use crate::dialog::{ButtonRole, Dialog, DialogOwner, DialogStack};
 use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -857,16 +857,21 @@ pub(crate) fn project_app_state(v: &ProjectView) -> AppState {
     }
 }
 
-/// A Project tab's status-bar state: [`project_app_state`], and `Edit` while
-/// a dialog is open over it. `None` off a Project.
+/// A Project's status-bar state: [`project_app_state`], and `Edit` while a
+/// dialog is open over it.
+pub(crate) fn project_dialog_state(v: &ProjectView, dialogs: &DialogStack) -> AppState {
+    match project_app_state(v) {
+        AppState::Ready if dialogs.is_open() => AppState::Edit,
+        state => state,
+    }
+}
+
+/// [`project_dialog_state`] for any tab: `None` off a Project.
 pub(crate) fn tab_app_state(tab: &DocTab) -> Option<AppState> {
     let Surface::Project(v) = &tab.surface else {
         return None;
     };
-    Some(match project_app_state(v) {
-        AppState::Ready if tab.dialogs.is_open() => AppState::Edit,
-        state => state,
-    })
+    Some(project_dialog_state(v, &tab.dialogs))
 }
 
 /// A fresh token for a levelling pass, unique for the process, so a frame

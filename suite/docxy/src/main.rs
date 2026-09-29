@@ -20279,11 +20279,14 @@ impl Render for Docxy {
         // Project's status bar names the plan's mode for new tasks; a click
         // switches it.
         // Its leftmost item is the application state, as in Project.
-        let new_tasks = match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Project(v)) => Some((
-                tab_app_state(&self.tabs[self.active])
-                    .unwrap_or(AppState::Ready)
-                    .label(),
+        let new_tasks = match self.tabs.get(self.active) {
+            Some(
+                tab @ DocTab {
+                    surface: Surface::Project(v),
+                    ..
+                },
+            ) => Some((
+                project_dialog_state(v, &tab.dialogs).label(),
                 v.ed.project().new_tasks_are_manual,
             )),
             _ => None,
