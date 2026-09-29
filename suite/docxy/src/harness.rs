@@ -1463,12 +1463,20 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
         // The Project status bar's Ready / Edit / Busy; null off a Project.
         (
             "app_state",
-            match app.tabs.get(app.active).map(|t| &t.surface) {
-                Some(crate::Surface::Project(v)) => {
-                    Json::Str(crate::project_app_state(v).label().into())
-                }
-                _ => Json::Null,
-            },
+            app.tabs
+                .get(app.active)
+                .and_then(crate::tab_app_state)
+                .map_or(Json::Null, |s| Json::Str(s.label().into())),
+        ),
+        // The active tab's top dialog's id, or `none`; `dialog-read` has the rest.
+        (
+            "dialog",
+            Json::Str(
+                app.tabs
+                    .get(app.active)
+                    .map_or("none", |t| t.dialogs.top_id())
+                    .into(),
+            ),
         ),
     ];
     if let Some(v) = app.active_sheet() {
@@ -1520,6 +1528,25 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
         out.extend(crate::project_state(v, body_h));
     }
     Json::Obj(out)
+}
+
+/// Refuse a verb that stands for a pointer gesture while the active tab has a
+/// dialog open: the dialog's backdrop covers the whole window, title bar and
+/// ribbon included, so a person could not make that gesture either.
+fn refuse_under_dialog(app: &crate::Docxy) -> Result<(), String> {
+    match app.active_dialogs().and_then(|d| d.top()) {
+        Some(d) => Err(format!("a dialog is open: {}", d.title)),
+        None => Ok(()),
+    }
+}
+
+/// The active tab's dialogs, for a verb that drives one.
+fn open_dialogs(app: &mut crate::Docxy) -> Result<&mut crate::dialog::DialogStack, String> {
+    app.tabs
+        .get_mut(app.active)
+        .map(|t| &mut t.dialogs)
+        .filter(|d| d.is_open())
+        .ok_or_else(|| crate::dialog::NONE_OPEN.into())
 }
 
 // ---- the verb table -------------------------------------------------------
@@ -1648,6 +1675,7 @@ pub fn dispatch(
             ]))
         }
         "title-tab" => {
+            refuse_under_dialog(app)?;
             match arg_str(args, "action")? {
                 "prev" => app.tab_prev(window, cx),
                 "next" => app.tab_next(window, cx),
@@ -1668,6 +1696,7 @@ pub fn dispatch(
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
         "selection-set" => {
+            refuse_under_dialog(app)?;
             let (start, end) = (arg_usize(args, "start")?, arg_usize(args, "end")?);
             if app.hf_active() {
                 return Err("selection-set cannot address the body while a header or footer is being edited".into());
@@ -1679,13 +1708,58 @@ pub fn dispatch(
             app.refocus(window, cx);
             Done::ok(state(app, window))
         }
+        // Dialogs (#393). There is no `dialog-open`: a dialog opens through
+        // the verb a person would use (`key`, `ribbon-click`, `click-cell`).
+        "dialog-read" => Done::ok(app.tabs.get(app.active).map_or_else(
+            || crate::dialog::DialogStack::default().to_json(),
+            |t| t.dialogs.to_json(),
+        )),
+        // The control's input handler, which a form's editable widget will
+        // call too; today's overlay draws controls read-only.
+        "dialog-set" => {
+            let control = arg_str(args, "control")?.to_string();
+            let dialogs = open_dialogs(app)?;
+            dialogs.set(&control, args)?;
+            let reply = dialogs.to_json();
+            cx.notify();
+            Done::ok(reply)
+        }
+        "dialog-tab" => {
+            let tab = arg_str(args, "tab")?.to_string();
+            let dialogs = open_dialogs(app)?;
+            dialogs.select_tab(&tab)?;
+            let reply = dialogs.to_json();
+            cx.notify();
+            Done::ok(reply)
+        }
+        // The same press as the drawn button, Enter or Escape. The reply is
+        // the state after the button's handler, with whatever dialog is on
+        // top now (a child it opened, the parent, or `{open: false}`).
+        "dialog-click" => {
+            let button = arg_str(args, "button")?.to_string();
+            open_dialogs(app)?;
+            app.dialog_press(&button)?;
+            app.refocus(window, cx);
+            let Json::Obj(mut out) = state(app, window) else {
+                unreachable!("state is an object")
+            };
+            let dialog = app.tabs[app.active].dialogs.to_json();
+            match out.iter_mut().find(|(k, _)| k == "dialog") {
+                Some((_, v)) => *v = dialog,
+                None => out.push(("dialog".into(), dialog)),
+            }
+            Done::ok(Json::Obj(out))
+        }
         "status-read" => {
             let tab = app.tabs.get(app.active).ok_or("there is no active tab")?;
             Done::ok(status_json(&crate::status_items(tab)))
         }
         "backstage" => {
             match arg_str(args, "action")? {
-                "open" => app.open_backstage(cx),
+                "open" => {
+                    refuse_under_dialog(app)?;
+                    app.open_backstage(cx)
+                }
                 "close" => app.backstage_back(window, cx),
                 "read" => {}
                 _ => return Err("'action' must be open, close or read".into()),
@@ -1722,6 +1796,7 @@ pub fn dispatch(
             Done::ok(ribbon_json(app))
         }
         "ribbon-click" => {
+            refuse_under_dialog(app)?;
             ribbon_surface(app)?;
             let tab = arg_str(args, "tab")?.to_string();
             let command = arg_str(args, "command")?.to_string();
@@ -1731,6 +1806,7 @@ pub fn dispatch(
             Done::ok(state(app, window))
         }
         "close-tab" => {
+            refuse_under_dialog(app)?;
             let index = match args.get("index") {
                 Some(_) => arg_usize(args, "index")?,
                 None => app.active,
@@ -1753,6 +1829,7 @@ pub fn dispatch(
         }
         // The same handler as the Backstage rail item, not a synthetic click.
         "backstage-close" => {
+            refuse_under_dialog(app)?;
             app.backstage_close(window, cx);
             Done::ok(state(app, window))
         }
@@ -1797,6 +1874,7 @@ pub fn dispatch(
         // A click on a cell: press, click, release — the three events the
         // pointer delivers, in that order.
         "click-cell" => {
+            refuse_under_dialog(app)?;
             let cell = cell_arg(args, "cell")?;
             let (shift, dbl) = (arg_flag(args, "shift")?, arg_flag(args, "double")?);
             if app.active_is_project() {
@@ -1827,6 +1905,7 @@ pub fn dispatch(
         // A drag: the press plants the anchor, each cell crossed is a move, the
         // release commits whatever the moves armed.
         "drag" => {
+            refuse_under_dialog(app)?;
             let (from, to) = drag_args(args)?;
             sheet(app)?;
             app.grid_press_cell(from, cx);
@@ -1877,6 +1956,7 @@ pub fn dispatch(
         // Select a chart, as pressing its card does (press then release, with
         // no travel in between — the release ends the move the press armed).
         "select-chart" => {
+            refuse_under_dialog(app)?;
             let idx = arg_usize(args, "index")?;
             sheet(app)?;
             let n = app.chart_count();
@@ -1893,6 +1973,7 @@ pub fn dispatch(
 
         // Give a reference field the keyboard, as clicking it does.
         "focus-field" => {
+            refuse_under_dialog(app)?;
             let target = parse_field(arg_str(args, "field")?)?;
             if target.is_bar() && app.bar_field != Some(target) {
                 return Err(format!(

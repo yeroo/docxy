@@ -607,6 +607,7 @@ fn project_tab(
         hf_edit: None,
         bundle_html: None,
         load_failed: false,
+        dialogs: crate::dialog::DialogStack::default(),
     }
 }
 
@@ -832,7 +833,10 @@ pub(crate) fn new_tasks_label(manual: bool) -> String {
 pub(crate) fn status_items(tab: &DocTab) -> Vec<(&'static str, String)> {
     let mut items = Vec::new();
     if let Surface::Project(v) = &tab.surface {
-        items.push(("state", project_app_state(v).label().to_string()));
+        items.push((
+            "state",
+            project_dialog_state(v, &tab.dialogs).label().to_string(),
+        ));
         items.push((
             "new-tasks",
             new_tasks_label(v.ed.project().new_tasks_are_manual),

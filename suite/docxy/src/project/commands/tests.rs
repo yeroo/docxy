@@ -1,4 +1,5 @@
 use super::*;
+use crate::dialog_host::{dialog_click, dialog_key};
 use core::prelude::v1::test;
 
 fn v(t: &DocTab) -> &ProjectView {
@@ -1174,33 +1175,65 @@ fn summary_tab() -> DocTab {
     t
 }
 
+/// A key as the window delivers it: an open dialog takes it first, as
+/// `on_key` does, and only then does the Project see it.
+fn key(t: &mut DocTab, key: &str, text: Option<&str>, m: Modifiers) {
+    if dialog_key(t, key, m) {
+        return;
+    }
+    if let Some(act) = project_input(t, key, text, m) {
+        apply_project_act(t, act);
+    }
+}
+
 #[test]
 fn deleting_a_summary_asks_first_and_escape_changes_nothing() {
     let mut t = summary_tab();
     let before = v(&t).ed.project().clone();
     let depth = v(&t).ed.undo_depth();
     delete_task(&mut t);
-    let prompt = v(&t).prompt.clone().expect("a summary delete asks first");
-    assert_eq!(prompt.kind, PromptKind::ConfirmDelete);
-    assert_eq!(prompt.kind.name(), "delete");
-    assert_eq!(
-        prompt_label(&prompt, &v(&t).ed).as_ref(),
-        "Delete 'First' and its 1 subtask? Enter = delete, Esc = cancel"
-    );
+    assert!(v(&t).prompt.is_none(), "a message box, not the prompt bar");
+    let d = t.dialogs.top().expect("a summary delete asks first");
+    assert_eq!(d.id, "delete-summary");
+    assert_eq!(d.text.as_deref(), Some("Delete 'First' and its 1 subtask?"));
+    let labels: Vec<_> = d
+        .buttons
+        .iter()
+        .map(|b| (b.label.as_str(), b.default))
+        .collect();
+    assert_eq!(labels, [("Yes", true), ("No", false)]);
+    assert_eq!(tab_app_state(&t), Some(AppState::Edit));
     assert_eq!(v(&t).ed.project(), &before);
 
-    // Typing and backspace do not edit a yes/no prompt's buffer.
-    project_input(&mut t, "d", Some("d"), Modifiers::default());
-    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "");
-    vm(&mut t).prompt.as_mut().unwrap().buf = "x".into();
-    project_input(&mut t, "backspace", None, Modifiers::default());
-    assert_eq!(v(&t).prompt.as_ref().unwrap().buf, "x");
+    // Typing, chords and Tab reach neither the dialog nor the plan under it.
+    for (k, text, m) in [
+        ("d", Some("d"), Modifiers::default()),
+        ("backspace", None, Modifiers::default()),
+        ("delete", None, Modifiers::default()),
+        ("tab", None, Modifiers::default()),
+        ("z", None, ctrl()),
+        ("enter", None, ctrl()),
+        ("alt", None, Modifiers::default()),
+    ] {
+        key(&mut t, k, text, m);
+        assert_eq!(t.dialogs.top_id(), "delete-summary", "{k}");
+    }
+    assert_eq!(v(&t).ed.project(), &before);
+    assert_eq!(v(&t).ed.undo_depth(), depth);
+    assert!(v(&t).cell.is_none() && v(&t).prompt.is_none());
 
-    project_input(&mut t, "escape", None, Modifiers::default());
-    assert!(v(&t).prompt.is_none());
+    key(&mut t, "escape", None, Modifiers::default());
+    assert!(!t.dialogs.is_open());
+    assert_eq!(tab_app_state(&t), Some(AppState::Ready));
     assert_eq!(v(&t).ed.project(), &before);
     assert_eq!(v(&t).ed.undo_depth(), depth);
     assert!(!t.dirty);
+
+    // No is the same as Escape.
+    delete_task(&mut t);
+    dialog_click(&mut t, "No").unwrap();
+    assert!(!t.dialogs.is_open());
+    assert_eq!(v(&t).ed.project(), &before);
 }
 
 #[test]
@@ -1209,8 +1242,8 @@ fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
     let before = v(&t).ed.project().clone();
     let depth = v(&t).ed.undo_depth();
     delete_task(&mut t);
-    project_input(&mut t, "enter", None, Modifiers::default());
-    assert!(v(&t).prompt.is_none());
+    key(&mut t, "enter", None, Modifiers::default());
+    assert!(!t.dialogs.is_open());
     assert!(v(&t).ed.project().tasks.is_empty());
     assert_eq!(v(&t).ed.undo_depth(), depth + 1);
     assert!(t.dirty);
@@ -1220,11 +1253,30 @@ fn confirming_a_summary_delete_removes_its_subtree_in_one_undo_step() {
     assert!(v(&t).on_entry_row());
     project_cell_click(&mut t, 0, None, false);
 
-    // The prompt bar's Delete button commits through the same path as Enter.
+    // The drawn Yes button and `dialog-click` press it through the same path
+    // as Enter; a label is matched without regard to case.
     delete_task(&mut t);
-    let prompt = vm(&mut t).prompt.take().unwrap();
-    commit_prompt(&mut t, prompt);
+    dialog_click(&mut t, "yes").unwrap();
     assert!(v(&t).ed.project().tasks.is_empty());
+    assert_eq!(
+        dialog_click(&mut t, "Yes").unwrap_err(),
+        crate::dialog::NONE_OPEN
+    );
+}
+
+#[test]
+fn the_delete_message_box_counts_the_subtasks() {
+    let mut t = summary_tab();
+    let uid = v(&t).selected_uid().unwrap();
+    let d = delete_summary_dialog(&v(&t).ed, uid, 2);
+    assert_eq!(
+        d.text.as_deref(),
+        Some("Delete 'First' and its 2 subtasks?")
+    );
+    assert_eq!(d.title, "Delete Task");
+    vm(&mut t).ed.select(1);
+    delete_task(&mut t);
+    assert!(!t.dialogs.is_open(), "a leaf is deleted without asking");
 }
 
 #[test]
@@ -1567,7 +1619,7 @@ fn move_prompts_for_an_amount_and_reports_the_new_start() {
     assert_eq!((prompt.kind, prompt.uid), (PromptKind::Move, Some(2)));
     assert_eq!(prompt.kind.name(), "move");
     assert_eq!(
-        prompt_label(&prompt, &v(&t).ed).as_ref(),
+        prompt_label(&prompt).as_ref(),
         "Move task by (1d / 1w / 4w; -1d back)"
     );
     for c in ["1", "w"] {
@@ -2118,10 +2170,8 @@ fn delete_on_id_deletes_the_task_and_a_summary_asks_first() {
     let mut t = summary_tab();
     vm(&mut t).col = COL_ID;
     press(&mut t, "delete");
-    assert_eq!(
-        v(&t).prompt.as_ref().unwrap().kind,
-        PromptKind::ConfirmDelete
-    );
+    assert_eq!(t.dialogs.top_id(), "delete-summary");
+    assert!(v(&t).prompt.is_none());
     assert_eq!(v(&t).ed.project().tasks.len(), 2);
 }
 

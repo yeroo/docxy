@@ -51,6 +51,39 @@ fn cell_state_is_reported_and_only_successful_agent_changes_cancel_it() {
     call(&mut tabs, 0, "proj.reload", Json::Null).unwrap();
     assert!(view(&tabs[0]).cell.is_none());
 }
+
+/// An agent's edit, reload or save dismisses an open dialog, as it does the
+/// prompt: a delete confirmation must not outlive the plan it asked about.
+#[test]
+fn successful_agent_changes_dismiss_an_open_dialog() {
+    let ask = |t: &mut DocTab| {
+        let d = delete_summary_dialog(&view(t).ed, 1, 1);
+        t.dialogs.push(d);
+    };
+    let mut tabs = vec![tab()];
+    ask(&mut tabs[0]);
+    call(&mut tabs, 0, "proj.path", Json::Null).unwrap();
+    assert!(call(&mut tabs, 0, "task.del", args(r#"{"uid":999}"#)).is_err());
+    assert_eq!(tabs[0].dialogs.top_id(), "delete-summary");
+    call(
+        &mut tabs,
+        0,
+        "task.set",
+        args(r#"{"uid":1,"name":"Agent"}"#),
+    )
+    .unwrap();
+    assert!(!tabs[0].dialogs.is_open());
+
+    ask(&mut tabs[0]);
+    call(&mut tabs, 0, "proj.reload", Json::Null).unwrap();
+    assert!(!tabs[0].dialogs.is_open());
+
+    let dir = scratch();
+    ask(&mut tabs[0]);
+    call(&mut tabs, 0, "proj.save", path_args(&dir.join("saved.xml"))).unwrap();
+    assert!(!tabs[0].dialogs.is_open());
+}
+
 fn scratch() -> PathBuf {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
