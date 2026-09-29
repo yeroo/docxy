@@ -24,6 +24,8 @@ compile_error!(
 
 mod close;
 mod control;
+mod dialog;
+mod dialog_host;
 mod harness;
 mod html_bundle;
 mod project;
@@ -1267,6 +1269,10 @@ struct DocTab {
     /// Only ever about the file at `path`: an unreadable hot-exit copy
     /// reopens that file instead of marking the tab.
     load_failed: bool,
+    /// This document's open dialogs, the top one last (#393). A dialog is
+    /// app state, never a native modal loop: it draws over the window, takes
+    /// every key while open, and the harness drives it as the pointer would.
+    dialogs: dialog::DialogStack,
 }
 
 /// Live header/footer edit session: an editor over the parsed header/footer
@@ -2875,6 +2881,7 @@ impl Loaded {
             hf_edit: None,
             bundle_html: self.bundle_html,
             load_failed: self.load_failed,
+            dialogs: crate::dialog::DialogStack::default(),
         }
     }
 }
@@ -3000,6 +3007,7 @@ fn tab_from_path(path: &PathBuf) -> DocTab {
             hf_edit: None,
             bundle_html: None,
             load_failed: false,
+            dialogs: crate::dialog::DialogStack::default(),
         }
     } else {
         doc_from_path(path).into_tab(Kind::Docx, title, Some(path.clone()), false)
@@ -5452,6 +5460,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 hf_edit: None,
                 bundle_html: None,
                 load_failed: false,
+                dialogs: crate::dialog::DialogStack::default(),
             }
         }
         // A document with no sidecar reloads its file, bundle included; the
@@ -5477,6 +5486,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                 hf_edit: None,
                 bundle_html: None,
                 load_failed: false,
+                dialogs: crate::dialog::DialogStack::default(),
             }
         }
     };
@@ -5843,6 +5853,7 @@ impl Docxy {
             hf_edit: None,
             bundle_html: None,
             load_failed: false,
+            dialogs: crate::dialog::DialogStack::default(),
         };
         self.tabs.push(match kind {
             Kind::Project => new_project_tab(),
@@ -13450,6 +13461,10 @@ impl Docxy {
     /// Insert a tab at the caret (bound to the Tab key via an action, since gpui
     /// swallows Tab for focus traversal before on_key_down sees it).
     fn tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // An open dialog takes Tab too; see `on_key`.
+        if self.dialog_takes_key("tab", Modifiers::default(), cx) {
+            return;
+        }
         if self.tab_more_open {
             return;
         }
@@ -13510,6 +13525,13 @@ impl Docxy {
 
     /// Shift+Tab decreases the paragraph indent (Word's outdent).
     fn shift_tab_key(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        if self.dialog_takes_key("tab", shift, cx) {
+            return;
+        }
         if self.tab_more_open {
             return;
         }
@@ -13546,6 +13568,11 @@ impl Docxy {
     }
 
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        // An open dialog takes every key first (#393): nothing under it, not
+        // the tab list, KeyTips or a Project shortcut, may see one.
+        if self.dialog_takes_key(&ev.keystroke.key, ev.keystroke.modifiers, cx) {
+            return;
+        }
         if self.tab_more_open {
             if ev.keystroke.key == "escape" {
                 self.tab_more_close(cx);
@@ -14233,6 +14260,7 @@ mod sheet_save_tests {
             hf_edit: None,
             bundle_html: None,
             load_failed: false,
+            dialogs: crate::dialog::DialogStack::default(),
         }
     }
 
@@ -19677,6 +19705,7 @@ impl Render for Docxy {
         let tab_popup = self
             .tab_more_open
             .then(|| self.tab_more_popup(window, pal, cx));
+        let dialog = self.dialog_overlay(pal, cx);
 
         if self.backstage {
             let backstage = self.backstage_view(bg, fg, dim, sidebar, cx);
@@ -19693,6 +19722,7 @@ impl Render for Docxy {
                 .child(title_bar)
                 .child(backstage)
                 .when_some(tab_popup, |d, popup| d.child(popup))
+                .when_some(dialog, |d, dialog| d.child(dialog))
                 .into_any_element();
         }
 
@@ -20249,9 +20279,14 @@ impl Render for Docxy {
         // Project's status bar names the plan's mode for new tasks; a click
         // switches it.
         // Its leftmost item is the application state, as in Project.
-        let new_tasks = match self.tabs.get(self.active).map(|t| &t.surface) {
-            Some(Surface::Project(v)) => Some((
-                project_app_state(v).label(),
+        let new_tasks = match self.tabs.get(self.active) {
+            Some(
+                tab @ DocTab {
+                    surface: Surface::Project(v),
+                    ..
+                },
+            ) => Some((
+                project_dialog_state(v, &tab.dialogs).label(),
                 v.ed.project().new_tasks_are_manual,
             )),
             _ => None,
@@ -20428,6 +20463,7 @@ impl Render for Docxy {
             .when_some(context_menu, |d, m| d.child(m))
             .when_some(sheet_fmt_panel, |d, p| d.child(p))
             .when_some(tab_popup, |d, popup| d.child(popup))
+            .when_some(dialog, |d, dialog| d.child(dialog))
             // A vertical guide line down the page while a ruler marker is dragged.
             .when_some(self.ruler_guide, |d, gx| {
                 d.child(div().absolute().top_0().bottom_0().left(px(gx)).w(px(1.)).bg(Hsla { a: 0.6, ..hsla_u(BRAND) }))
