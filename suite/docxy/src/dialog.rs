@@ -27,6 +27,10 @@ use ctlcore::json::Json;
 pub(crate) enum DialogOwner {
     /// Delete this summary task and its subtasks.
     DeleteSummary { uid: i32 },
+    /// Word's Page Setup, for the caret's sections (#649).
+    PageSetup,
+    /// Word's Columns, for the caret's sections (#649).
+    Columns,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,
@@ -406,6 +410,9 @@ pub(crate) struct Dialog {
     pub owner: DialogOwner,
     /// The control typed keys go to (an index into `controls`).
     pub focus: Option<usize>,
+    /// The values the dialog opened on, one per control (see
+    /// [`Dialog::changed`]); empty for a dialog that does not track them.
+    pub opened: Vec<Value>,
 }
 
 impl Dialog {
@@ -435,6 +442,7 @@ impl Dialog {
                 .collect(),
             owner,
             focus: None,
+            opened: Vec::new(),
         }
     }
 
@@ -493,7 +501,34 @@ impl Dialog {
     /// Set one control through its input handler.
     pub fn set(&mut self, control: &str, args: &Json) -> Result<(), String> {
         let i = self.control_index(control)?;
-        self.controls[i].set(args)
+        self.set_at(i, args)
+    }
+
+    /// Every change to a control's value comes here: its input handler, then
+    /// the owner's reaction (Page Setup's paper size follows its width).
+    fn set_at(&mut self, i: usize, args: &Json) -> Result<(), String> {
+        self.controls[i].set(args)?;
+        match self.owner {
+            DialogOwner::PageSetup => crate::page_setup::after_set(self, i),
+            DialogOwner::Columns => crate::page_setup::after_columns_set(self, i),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Whether a control's value differs from the one the dialog opened on
+    /// (as kept in step by the owner's reactions): the values OK writes when
+    /// it applies to several targets at once.
+    pub fn changed(&self, name: &str) -> bool {
+        let Some(i) = self.controls.iter().position(|c| c.name == name) else {
+            return false;
+        };
+        self.opened.get(i) != Some(&self.controls[i].value)
+    }
+
+    /// Take the current values as the ones the dialog opened on.
+    pub fn mark_opened(&mut self) {
+        self.opened = self.controls.iter().map(|c| c.value.clone()).collect();
     }
 
     /// The controls Tab steps through on the current tab, in order.
@@ -541,7 +576,7 @@ impl Dialog {
         let mut text = c.text();
         edit(&mut text);
         let i = self.focus.unwrap_or_default();
-        self.controls[i].set(&Json::obj(vec![("value", Json::Str(text))]))
+        self.set_at(i, &Json::obj(vec![("value", Json::Str(text))]))
     }
 
     /// A typed character: appended to the focused field. A character the
@@ -579,7 +614,7 @@ impl Dialog {
             }
             _ => return Ok(()),
         };
-        self.controls[index].set(&Json::obj(vec![("value", value)]))
+        self.set_at(index, &Json::obj(vec![("value", value)]))
     }
 
     /// Up or Down on the focused radio group or dropdown: the item before or
@@ -821,6 +856,7 @@ mod tests_support {
             ],
             owner: DialogOwner::Test,
             focus: None,
+            opened: Vec::new(),
         }
     }
 }

@@ -160,6 +160,17 @@ impl Editor {
     /// Refused (with the reason) when the caret is not in a body paragraph:
     /// a table cell, a text box, or another story cannot carry a sectPr.
     pub fn insert_section_break(&mut self, start: SectionStart) -> Result<(), String> {
+        self.insert_section_break_with(start, |_| {})
+    }
+
+    /// [`Editor::insert_section_break`], then `edit` on the section after the
+    /// break, all as one undo step: Page Setup's and Columns' "This point
+    /// forward".
+    pub fn insert_section_break_with(
+        &mut self,
+        start: SectionStart,
+        edit: impl FnOnce(&mut SectionSetup),
+    ) -> Result<(), String> {
         let at = match self.selection_range() {
             Some((lo, _)) => lo,
             None => self.caret.clone(),
@@ -175,6 +186,7 @@ impl Editor {
         let old = self.sect_raw(slot).to_string();
         let mut setup = SectionSetup::parse(&old);
         setup.start = start;
+        edit(&mut setup);
         let closing = setup.apply(&old);
 
         self.anchor = None;
@@ -410,6 +422,21 @@ mod tests {
         assert_eq!(start_of(&s[3]), SectionStart::NextPage);
         e.insert_section_break(SectionStart::OddPage).unwrap();
         assert_eq!(start_of(&e.sections()[4]), SectionStart::OddPage);
+    }
+
+    #[test]
+    fn a_break_and_an_edit_of_the_section_after_it_undo_together() {
+        let mut e = three();
+        e.caret = Caret::top(1, 1);
+        let before = e.doc.clone();
+        e.insert_section_break_with(SectionStart::NextPage, |s| s.set_landscape(true))
+            .unwrap();
+        let s = e.sections();
+        assert!(!SectionSetup::parse(&s[1]).page.landscape);
+        assert!(SectionSetup::parse(&s[2]).page.landscape);
+        assert_eq!(start_of(&s[2]), SectionStart::NextPage);
+        assert!(e.undo());
+        assert_eq!(e.doc, before, "one undo step");
     }
 
     #[test]

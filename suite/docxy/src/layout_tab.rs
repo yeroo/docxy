@@ -12,6 +12,7 @@
 //! toggle was. Settings edits (hyphenation, mirrored margins) write the
 //! package and have no undo, as before.
 use super::*;
+use crate::dialog::Dialog;
 use docxcore::model::BreakKind;
 use docxcore::sect::{LineNumbering, LnRestart, Paper, SectionSetup, SectionStart};
 
@@ -533,9 +534,11 @@ impl Docxy {
                 }
                 return;
             }
-            LayoutAct::PageSetup(_) | LayoutAct::MoreColumns | LayoutAct::Unavailable => {
-                self.set_status("This dialog is not available yet");
+            LayoutAct::PageSetup(page) => {
+                self.open_layout_dialog(|t| crate::page_setup::page_setup_dialog(t, page))
             }
+            LayoutAct::MoreColumns => self.open_layout_dialog(crate::page_setup::columns_dialog),
+            LayoutAct::Unavailable => {}
             _ => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
                     if let Err(e) = layout_apply(tab, act) {
@@ -546,7 +549,19 @@ impl Docxy {
         }
         self.refocus(window, cx);
     }
+
+    /// Open a Page Setup or Columns dialog over the active document, or say
+    /// why it cannot open.
+    fn open_layout_dialog(&mut self, build: impl FnOnce(&DocTab) -> Result<Dialog, String>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        match build(tab) {
+            Ok(d) => tab.dialogs.push(d),
+            Err(e) => tab.status = e.into(),
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

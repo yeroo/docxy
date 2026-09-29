@@ -6,18 +6,33 @@ use super::*;
 use crate::dialog::{self, ControlKind, Dialog, DialogOwner, DialogStack, NONE_OPEN};
 
 /// Apply an accepted dialog to what it belongs to. An error refuses the
-/// press and leaves the dialog open.
-fn apply_dialog(surface: &mut Surface, dialog: &Dialog) -> Result<(), String> {
+/// press and leaves the dialog open. `Ok(true)` when it changed a document
+/// (a Project tracks its own changes).
+fn apply_dialog(
+    surface: &mut Surface,
+    pkg: Option<&mut Package>,
+    dialog: &Dialog,
+) -> Result<bool, String> {
     match dialog.owner {
         DialogOwner::DeleteSummary { uid } => {
             let Surface::Project(v) = surface else {
                 return Err("this dialog belongs to a Project".into());
             };
             v.ed.delete_task(uid)?;
-            Ok(())
+            Ok(false)
+        }
+        DialogOwner::PageSetup | DialogOwner::Columns => {
+            let (Surface::Doc(ed), Some(pkg)) = (surface, pkg) else {
+                return Err("this dialog belongs to a .docx document".into());
+            };
+            match dialog.owner {
+                DialogOwner::PageSetup => crate::page_setup::apply_page_setup(ed, pkg, dialog)?,
+                _ => crate::page_setup::apply_columns(ed, pkg, dialog)?,
+            }
+            Ok(true)
         }
         #[cfg(test)]
-        DialogOwner::Test => Ok(()),
+        DialogOwner::Test => Ok(false),
     }
 }
 
@@ -26,9 +41,19 @@ pub(crate) fn dialog_click(tab: &mut DocTab, button: &str) -> Result<(), String>
     // A levelling pass asked for first runs first, as before any edit.
     flush_level_pass(tab);
     let DocTab {
-        dialogs, surface, ..
+        dialogs,
+        surface,
+        pkg,
+        ..
     } = tab;
-    dialogs.click(button, |d| apply_dialog(surface, d))?;
+    let mut changed = false;
+    dialogs.click(button, |d| {
+        changed = apply_dialog(surface, pkg.as_mut(), d)?;
+        Ok(())
+    })?;
+    if changed {
+        tab.dirty = true;
+    }
     complete_project(tab, true);
     Ok(())
 }

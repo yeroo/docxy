@@ -30,6 +30,7 @@ mod harness;
 mod html_bundle;
 mod layout_tab;
 mod menu;
+mod page_setup;
 mod project;
 mod recover;
 #[cfg(test)]
