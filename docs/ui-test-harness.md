@@ -296,7 +296,9 @@ replaces the saved reply, and `open` clears it.
 editor. `doc` returns only those document fields. `text` is the main story;
 each paragraph contributes a final `\n`, including a table cell paragraph.
 Tab is `\t`, and line/page/column breaks are `\u000B`/`\u000C`/`\u000E`.
-Cached field and revision text has no editor caret and contributes no offset.
+A field that shows a result contributes one U+FFFC (it is edited as one unit);
+its cached result text, like revision text, has no editor caret and
+contributes no offset.
 Text boxes appear in `textboxes` as separate stories.
 
 `ruler` reports the last painted ruler geometry in logical pixels rounded to

@@ -1268,27 +1268,6 @@ fn same_style(a: &PCell, b: &PCell) -> bool {
         && a.field.map(|f| f.0) == b.field.map(|f| f.0)
 }
 
-/// A hyperlink's visible text in source order: its runs (with their
-/// formatting), then its content's runs, nested links, tracked changes' runs,
-/// and fields' results (a TOC entry's PAGEREF page number is a field in the
-/// link). A field has no run formatting of its own (`None`).
-fn link_pieces<'a>(
-    runs: &'a [Run],
-    content: &'a [Inline],
-    out: &mut Vec<(&'a str, Option<&'a RunProps>)>,
-) {
-    out.extend(runs.iter().map(|r| (r.text.as_str(), Some(&r.props))));
-    for inline in content {
-        match inline {
-            Inline::Run(r) => out.push((r.text.as_str(), Some(&r.props))),
-            Inline::Hyperlink(link) => link_pieces(&link.runs, &link.content, out),
-            Inline::Revision { content, .. } => link_pieces(&[], content, out),
-            Inline::Field { text, .. } => out.push((text.as_str(), None)),
-            _ => {}
-        }
-    }
-}
-
 /// An open complex field while its paragraph is flattened.
 struct OpenField {
     instr: String,
@@ -1347,17 +1326,9 @@ fn flatten_segments(p: &Paragraph, heading: bool, styles: &StyleSheet) -> Vec<Se
                     .or_else(|| h.anchor.as_ref().map(|a| format!("#{a}")))
                     .unwrap_or_default();
                 let rc: Rc<str> = Rc::from(target.as_str());
-                let mut pieces = Vec::new();
-                link_pieces(&h.runs, &h.content, &mut pieces);
-                for (text, props) in pieces {
-                    let (font, strike) = match props {
-                        Some(props) => {
-                            let eff =
-                                styles.effective_run(pstyle, props.style_id.as_deref(), props);
-                            (font_index(eff.bold || heading, eff.italic), eff.strike)
-                        }
-                        None => (font_index(heading, false), false),
-                    };
+                for (text, props) in h.visible_pieces() {
+                    let eff = styles.effective_run(pstyle, props.style_id.as_deref(), &props);
+                    let (font, strike) = (font_index(eff.bold || heading, eff.italic), eff.strike);
                     for ch in text.chars() {
                         push(
                             &mut segs,

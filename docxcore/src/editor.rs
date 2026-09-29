@@ -2095,7 +2095,7 @@ fn collect_paths(body: &[Block], prefix: &mut Vec<usize>, out: &mut Vec<Vec<usiz
 
 /// How many caret offsets an inline occupies: its characters for a run, one
 /// for a tab or break, one for a field that shows a result (edited as one unit,
-/// like Word: see [`is_field_unit`]), and zero for everything the editor treats
+/// like Word), and zero for everything the editor treats
 /// as an opaque, uneditable anchor (revisions, drawings, a field with nothing
 /// to show, …). A hyperlink occupies its
 /// `runs` plus its `content` counted by these same rules, so the plain text of
@@ -2162,7 +2162,8 @@ fn push_editor_text(content: &[Inline], out: &mut String) {
 
 /// The character a field stands for in editor text ([`editor_text`], and the
 /// automation text built from it): U+FFFC OBJECT REPLACEMENT CHARACTER. It is
-/// never inserted as text: typing or pasting it adds nothing.
+/// never inserted as text: typing, pasting, replacing or splicing Markdown
+/// (`agent::parse_markdown_blocks`) with it adds nothing.
 pub const FIELD_CHAR: char = '\u{FFFC}';
 
 /// Whether an inline is a field edited as one unit: Backspace or Delete next to
@@ -2671,8 +2672,9 @@ fn content_delete(content: &mut Vec<Inline>, idx: usize) {
                     }
                     // A link with no editable text left goes, as in Word. Its
                     // bookmarks and proofing marks stay where it was; anything
-                    // still showing inside it (a tracked change, a field, a
-                    // picture) keeps the link, zero-width.
+                    // still showing inside it (a tracked change, a picture, an
+                    // empty field) keeps the link, zero-width. A field with a
+                    // result is editable, one offset, so its link is not empty.
                     if h.runs.is_empty() && h.content.iter().all(is_marker) {
                         let kept = std::mem::take(&mut h.content);
                         content.splice(i..=i, kept);
