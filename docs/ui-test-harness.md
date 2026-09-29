@@ -311,7 +311,7 @@ footer editor; `selection-set` refuses while it is open.
 |---|---|
 | `selection-set {"start":5,"end":1}` | set main-story anchor and caret through `Editor`; backward selections keep the larger anchor; both offsets are validated before either changes |
 | `ribbon-read {}` | list File, ribbon tabs and the contextual tabs — Table while the caret is in a table, Gantt Chart Format while a Project's Gantt shows — with groups, commands, galleries and Quick Access Toolbar |
-| `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command id or unique label on a valid tab, contextual tabs included, and invoke the same action handler as its button |
+| `ribbon-click {"tab":"Home","command":"Bold"}` | resolve a command on a valid tab, contextual tabs included, by id, else by unique label, else by unique screentip title, and invoke the same action handler as its button |
 | `status-read {}` | read the tab's status line as an ordered `items` array |
 | `backstage {"action":"open"}` | enter File; `read` reports its open state and rail items; `close` returns to the tab |
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
@@ -321,7 +321,12 @@ footer editor; `selection-set` refuses while it is open.
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
 `ribbon-read` and `ribbon-click` work on document and Project tabs. The app
-does not model command enabled states. Extend Selection mode, native prompts,
+does not model command enabled states. Each command carries a `label` and a
+screentip `tip.title`; on the Project ribbon they are Microsoft Project 2024's,
+and they differ for icon-only commands (Indent is `Indent Task`, Link Tasks is
+`Link the Selected Tasks`), so `ribbon-click` finds a command by either name.
+The Project ribbon holds only Project's commands, and its Report tab has no
+groups yet (`groups: []`). Extend Selection mode, native prompts,
 and backstage pages are not represented by these verbs.
 
 Close a dirty tab with `call close-tab {"answer":"save"}` (`discard` and
@@ -349,7 +354,7 @@ one while leveling is on.
 the chart shows (a day partly in view counts), clamped to that span; they are
 what the Timeline's view box covers. Dragging the box scrolls the chart, but
 the harness has no pointer-drag verb for it, so cases move the chart with keys
-(Scroll to Task, Go to Start) instead.
+(Task › Editing › Scroll to Task, and Alt+Home for the project start) instead.
 
 Project cells use Enter/F2 or a double-click to edit the current value; typing
 any printable character replaces it. Left/Right move between columns, and
@@ -366,12 +371,16 @@ it reports `<column> can't be cleared`. On the ID column Delete deletes the task
 (a summary asks first: Enter deletes it with its subtasks, Esc cancels, and
 typed text is ignored while that prompt is open; the state's `prompt` reads
 `delete:`). Alt+Shift+Right/Left indent/outdent, Alt+Right/Left pan the Gantt,
-and Ctrl+Shift+L toggles leveling. Ctrl+F2 opens the Predecessor prompt
-(Link the Selected Tasks) and Ctrl+Shift+F2 removes the selected task's links
+Alt+Home moves it back to the project start, and Ctrl+Shift+L toggles leveling.
+Ctrl+F2 opens the Predecessor prompt (Task › Schedule › Link Tasks, screentip
+Link the Selected Tasks) and Ctrl+Shift+F2 removes the selected task's links
 (Unlink Tasks) as one undo step. Former bare-letter commands
-(`n x d p c a b L`) now type into cells. Duration, predecessor, constraint,
-resource, baseline, and Rename commands remain on the ribbon; ribbon Rename
-still opens a Name prompt. Predecessors in cells use **displayed IDs**. Ctrl+F
+(`n x d p c a b L`) now type into cells. Predecessor, constraint, resource and
+baseline commands are on the ribbon under Project's names; renaming and
+durations are cell edits, and there is no ribbon Delete Task, Clear Resources,
+Export Gantt, Scroll Left/Right or Go to Start (Project has none): use Delete on
+the ID or Resource Names cell, Ctrl+E, Alt+Left/Right and Alt+Home.
+Predecessors in cells use **displayed IDs**. Ctrl+F
 opens Find; F3 repeats and reveals the selected row. Ctrl+Z/Y undo/redo, Ctrl+S
 saves, and Ctrl+E exports Markdown. Use `open copy:` before save/export. Project
 ribbon KeyTips are File/Task/Resource/Report/Project/View = F/T/U/R/P/W after

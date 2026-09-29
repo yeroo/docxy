@@ -99,8 +99,10 @@ pub const EXPANDED_H: u16 = 7;
 pub struct Ribbon<A> {
     tabs: Vec<&'static str>,
     active: usize,
-    /// Groups per tab (aligned with `tabs`); a tab with no groups (e.g. File)
-    /// has no in-ribbon body — the app opens a backstage instead.
+    /// Groups per tab (aligned with `tabs`). A tab with no groups has no
+    /// in-ribbon body: `set_active` skips it as a backstage tab (File, which
+    /// the app opens as a backstage), while `show_tab` selects it and draws
+    /// an empty body (yppxy's Report).
     tab_groups: Vec<Vec<Group<A>>>,
     placed: Vec<Placed<A>>,
     tab_cols: Vec<(u16, u16)>, // (start, end_exclusive) of each tab header
@@ -179,7 +181,19 @@ impl<A: Copy + PartialEq> Ribbon<A> {
         }
     }
 
-    /// Whether tab `i` has an in-ribbon body (no body = a backstage tab).
+    /// Switch to tab `i` even when it has no groups, for an app whose empty
+    /// tab is a ribbon tab with nothing on it yet rather than a backstage
+    /// (yppxy's Report). The body lays out empty.
+    pub fn show_tab(&mut self, i: usize) {
+        if i < self.tabs.len() {
+            self.active = i;
+            self.layout();
+        }
+    }
+
+    /// Whether tab `i` has groups to draw. Apps whose only groupless tab is
+    /// File treat `false` as "open the backstage"; an app with an empty
+    /// ribbon tab tells File apart by its label instead.
     pub fn tab_has_body(&self, i: usize) -> bool {
         self.tab_groups.get(i).is_some_and(|g| !g.is_empty())
     }
@@ -550,6 +564,20 @@ mod tests {
         assert_eq!(r.active_tab(), 1);
         r.set_active(2);
         assert_eq!(r.active_tab(), 2);
+    }
+
+    #[test]
+    fn show_tab_selects_an_empty_tab_with_nothing_to_focus() {
+        let mut r = sample();
+        r.show_tab(0);
+        assert_eq!(r.active_tab(), 0);
+        assert_eq!(r.button_count(), 0);
+        assert!(matches!(r.nav(Focus::Tab(0), Dir::Down), Focus::Tab(0)));
+        r.show_tab(9); // out of range: ignored
+        assert_eq!(r.active_tab(), 0);
+        r.show_tab(1);
+        assert_eq!(r.active_tab(), 1);
+        assert!(r.button_count() > 0);
     }
 
     #[test]

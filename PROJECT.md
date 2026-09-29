@@ -317,19 +317,32 @@ and last task, keeping the column, and Ctrl+Home/End to the first task's first
 field and the last task's last field. Insert inserts a blank row above the
 current row, keeping the column. Delete clears the active Name, Predecessors, or
 Resource Names cell; on the ID column, it deletes the task (a summary asks
-first: Enter deletes it with its subtasks, Esc cancels). Task › Editing › Delete
-Task deletes the selected task from any column. A task added with Task › Insert
+first: Enter deletes it with its subtasks, Esc cancels). A task added with Task › Insert
 › Task (keytip Alt, T, N; here, in yppxy and through projctl's `task.add`) is 1
 day, estimated unless the plan's `NewTasksEstimated` is off, and with the plan's
 `Autolink` on (the default) it is linked into the finish-to-start chain it
 splits: A→B becomes A→N→B, N→B keeping the lag. Alt+Shift+Right/Left
-indent/outdent; Alt+Right/Left pan the Gantt;
+indent/outdent; Alt+Right/Left pan the Gantt and Alt+Home moves it back to
+the project start, as in Project;
 Ctrl+Shift+L toggles leveling. Ctrl+F2 links the selected task (it opens
-the Predecessor prompt, as Task › Schedule › Link the Selected Tasks does) and
+the Predecessor prompt, as Task › Schedule › Link Tasks does) and
 Ctrl+Shift+F2 removes its links, as Project does. Ctrl+F, F3, Ctrl+Z/Y/S/E
 retain find, repeat find,
 undo/redo, save, and export. The former bare-letter commands are available on
-the ribbon; letters now start cell edits. Ribbon Rename still opens its Name prompt.
+the ribbon; letters now start cell edits.
+
+The ribbon (suite and yppxy) holds only Microsoft Project's commands, each with
+Project 2024's label and screentip, which differ for icon-only commands:
+Task › Schedule › Indent / Outdent / Link Tasks show the screentips Indent
+Task, Outdent Task and Link the Selected Tasks; Information... is View Task
+Information; Move, Milestone and Blank Row are Move Task, Insert Milestone and
+Insert Blank Row; View › Timeline is Timeline View. The harness's
+`ribbon-click` finds a command by either name. docxy's extras have no ribbon
+button: rename and set durations in the cells (yppxy: Enter/F2 and `d`),
+delete a task with Delete on its ID (yppxy `x`), clear resources with Delete
+on Resource Names (yppxy: Assign with an empty name), export with Ctrl+E or
+File › Export, and scroll the Gantt with Alt+Left/Right and Alt+Home (yppxy
+h/l and Alt+Home). The Report tab stays, with no groups yet.
 
 Ctrl+C / Ctrl+X / Ctrl+V copy, cut and paste cells through the system clipboard
 as tab-separated text (#369). Copy takes the cursor cell's edit text (a

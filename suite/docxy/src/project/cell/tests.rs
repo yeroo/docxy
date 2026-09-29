@@ -305,7 +305,7 @@ fn invalid_inputs_and_click_away_preserve_everything() {
         assert_eq!(v(&t).col, col);
         project_cell_click(&mut t, 1, Some(COL_NAME), true);
         project_cell_click(&mut t, 1, None, false);
-        apply_project_act(&mut t, ProjectAct::Rename);
+        apply_project_act(&mut t, ProjectAct::Constraint);
         assert!(!commit_project_cell(&mut t));
         assert!(v(&t).prompt.is_none());
         assert_eq!(v(&t).ed.sel(), 0);
@@ -366,7 +366,7 @@ fn clicking_prompts_and_tab_share_commit_policy() {
     assert_eq!(v(&t).cell.as_ref().unwrap().col, COL_DURATION);
     key(&mut t, "escape");
     edit(&mut t, COL_NAME, "Next");
-    apply_project_act(&mut t, ProjectAct::Duration);
+    apply_project_act(&mut t, ProjectAct::MoveTask);
     assert!(v(&t).cell.is_none() && v(&t).prompt.is_some());
     project_cell_click(&mut t, 0, Some(COL_NAME), false);
     assert!(v(&t).prompt.is_none());
