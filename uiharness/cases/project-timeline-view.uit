@@ -12,6 +12,7 @@ test project timeline highlights the chart's visible range and follows its scrol
   assert timeline_view_finish is Thu 3/26/26
   assert dirty is false
   shot project-timeline
-  key alt w g
+  # Project's Alt+Home: the timescale back to the project start.
+  key alt+home
   assert timeline_view_start is Mon 1/5/26
   shot window

@@ -22,8 +22,8 @@ test project ribbon KeyTips dispatch and cancel prompts
   assert ribbon_tab is Project
   key e
   assert status is Rescheduled (automatic on every edit)
-  key alt t r
-  assert prompt is rename:New task
+  key alt t v
+  assert prompt is move:
   open ../fixtures/gantt-summary.xml
   assert prompt is none
   assert selected_name is Task 1

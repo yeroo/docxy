@@ -20,15 +20,19 @@ test project editing keys and prompts
   key delete delete
   assert tasks is 3
   assert selected_name is Task 1
-  key ctrl+up down alt t r
-  assert prompt is rename:Task 2
+  # Rename and Duration are cell edits, as in Project (#370): F2 edits the
+  # Name in place and Tab commits it, moving to Duration on the same row.
+  key ctrl+up down right right f2
+  assert cell is Name
+  assert cell_edit is Task 2
   type renamed
-  key enter
+  key tab
   assert selected_name is Task 2renamed
   assert dirty is true
-  key alt t d
+  assert cell is Duration
   type 3d
-  key enter
+  key tab
+  assert cell D2 is 3d
   assert bar_2 is on-track 0-2
   key alt t p
   type 3
