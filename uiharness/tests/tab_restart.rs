@@ -52,7 +52,10 @@ fn relaunch_restores_the_tab_list_quit_left() {
     call(
         &driver,
         "task.set",
-        &[("uid", Json::Num(2.)), ("name", Json::Str("Restart".into()))],
+        &[
+            ("uid", Json::Num(2.)),
+            ("name", Json::Str("Restart".into())),
+        ],
     );
     // Leave a different tab active than the one just edited.
     call(
