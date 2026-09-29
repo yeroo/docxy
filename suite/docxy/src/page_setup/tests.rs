@@ -265,3 +265,176 @@ fn a_markdown_tab_has_no_page_setup() {
     let err = page_setup_dialog(&t, PageSetupTab::Margins).unwrap_err();
     assert!(err.contains(".docx"), "{err}");
 }
+
+// ---- Columns ----------------------------------------------------------------
+
+fn open_columns(t: &mut DocTab) {
+    let d = columns_dialog(t).unwrap();
+    t.dialogs.push(d);
+}
+
+fn visible(t: &DocTab) -> Vec<&'static str> {
+    t.dialogs
+        .top()
+        .unwrap()
+        .controls
+        .iter()
+        .filter(|c| c.visible && (c.name.starts_with("width") || c.name.starts_with("space")))
+        .map(|c| c.name)
+        .collect()
+}
+
+fn enabled(t: &DocTab, name: &str) -> bool {
+    let d = t.dialogs.top().unwrap();
+    d.controls.iter().find(|c| c.name == name).unwrap().enabled
+}
+
+#[test]
+fn columns_opens_on_the_caret_sections_columns() {
+    let mut t = three_sections();
+    open_columns(&mut t);
+    let d = t.dialogs.top().unwrap();
+    assert_eq!((d.id, d.title.as_str()), ("columns", "Columns"));
+    assert_eq!(shown(&t, "preset"), "One");
+    assert_eq!(shown(&t, "num"), "1");
+    assert_eq!(shown(&t, "width1"), "6.5");
+    assert_eq!(visible(&t), ["width1"]);
+    assert_eq!(shown(&t, "equal"), "checked");
+    assert_eq!(shown(&t, "sep"), "unchecked");
+    assert_eq!(
+        items(&t, "apply"),
+        ["This section", "This point forward", "Whole document"]
+    );
+}
+
+#[test]
+fn a_preset_and_line_between_apply_to_this_section_in_one_step() {
+    let mut t = three_sections();
+    let before = ed(&t).doc.clone();
+    open_columns(&mut t);
+    set(&mut t, "Presets", s("Two"));
+    assert_eq!(shown(&t, "num"), "2");
+    assert_eq!(visible(&t), ["width1", "space1", "width2"]);
+    assert_eq!(shown(&t, "width1"), "3");
+    assert!(!enabled(&t, "width2"), "equal columns follow column 1");
+    set(&mut t, "Line between", Json::Bool(true));
+    ok(&mut t).unwrap();
+    let s = setups(&t);
+    let c = &s[1].columns;
+    assert_eq!(
+        (c.count(), c.space, c.sep, c.equal_width()),
+        (2, 720, true, true)
+    );
+    assert_eq!(s[0].columns.count(), 1);
+    assert_eq!(s[2].columns.count(), 1);
+    assert!(ed_mut(&mut t).undo());
+    assert_eq!(ed(&t).doc, before);
+}
+
+#[test]
+fn left_and_right_presets_write_unequal_widths() {
+    let mut t = three_sections();
+    open_columns(&mut t);
+    set(&mut t, "Presets", s("Left"));
+    assert_eq!(
+        (
+            shown(&t, "width1"),
+            shown(&t, "space1"),
+            shown(&t, "width2")
+        ),
+        ("1.83".into(), "0.5".into(), "4.17".into())
+    );
+    assert_eq!(shown(&t, "equal"), "unchecked");
+    ok(&mut t).unwrap();
+    let c = setups(&t)[1].columns.clone();
+    assert_eq!(c.cols.iter().map(|c| c.w).collect::<Vec<_>>(), [2635, 6005]);
+    assert!(!c.equal_width());
+}
+
+#[test]
+fn the_number_and_column_one_spread_equal_columns() {
+    let mut t = three_sections();
+    open_columns(&mut t);
+    set(&mut t, "Number of columns", Json::Num(4.0));
+    assert_eq!(visible(&t).len(), 7, "4 widths and 3 spacings");
+    assert_eq!(shown(&t, "width3"), "1.25");
+    assert_eq!(shown(&t, "preset"), "", "no preset has four columns");
+    set(&mut t, "Number of columns", Json::Num(3.0));
+    assert_eq!(shown(&t, "preset"), "Three");
+    // With equal columns, column 1's width sets the spacing and every width.
+    set(&mut t, "Width 1", s("2"));
+    assert_eq!(
+        (shown(&t, "space1"), shown(&t, "width3")),
+        ("0.25".into(), "2".into())
+    );
+    ok(&mut t).unwrap();
+    let c = &setups(&t)[1].columns;
+    assert_eq!((c.count(), c.space, c.equal_width()), (3, 360, true));
+}
+
+#[test]
+fn unequal_widths_must_fit_the_text_width() {
+    let mut t = three_sections();
+    open_columns(&mut t);
+    set(&mut t, "Number of columns", Json::Num(2.0));
+    set(&mut t, "Equal column width", Json::Bool(false));
+    assert!(enabled(&t, "width2"));
+    set(&mut t, "Width 1", s("2"));
+    set(&mut t, "Width 2", s("3"));
+    assert_eq!(shown(&t, "preset"), "Left");
+    let before = ed(&t).doc.clone();
+    assert_eq!(
+        ok(&mut t).unwrap_err(),
+        "The columns take 5.5\" but the text is 6.5\" wide"
+    );
+    assert!(t.dialogs.is_open());
+    assert_eq!(ed(&t).doc, before);
+    set(&mut t, "Width 2", s("4"));
+    ok(&mut t).unwrap();
+    let c = &setups(&t)[1].columns;
+    assert_eq!(
+        c.cols.iter().map(|c| (c.w, c.space)).collect::<Vec<_>>(),
+        [(2880, 720), (5760, 0)]
+    );
+    // Too many columns refuses.
+    open_columns(&mut t);
+    set(&mut t, "Number of columns", Json::Num(13.0));
+    assert_eq!(
+        ok(&mut t).unwrap_err(),
+        "Number of columns must be a whole number from 1 to 12"
+    );
+}
+
+#[test]
+fn this_point_forward_starts_a_continuous_section() {
+    let mut t = three_sections();
+    let before = ed(&t).doc.clone();
+    open_columns(&mut t);
+    set(&mut t, "Presets", s("Three"));
+    set(&mut t, "apply", s("This point forward"));
+    ok(&mut t).unwrap();
+    let s = setups(&t);
+    assert_eq!(s.len(), 4);
+    assert_eq!(s[1].columns.count(), 1);
+    assert_eq!(s[2].columns.count(), 3);
+    assert_eq!(s[2].start, SectionStart::Continuous);
+    assert!(ed_mut(&mut t).undo());
+    assert_eq!(ed(&t).doc, before);
+}
+
+#[test]
+fn whole_document_with_only_line_between_keeps_each_sections_columns() {
+    let mut t = three_sections();
+    ed_mut(&mut t).edit_section_setups(&[2], |s| s.columns = s.columns.equal(3, 720));
+    open_columns(&mut t);
+    set(&mut t, "Line between", Json::Bool(true));
+    set(&mut t, "apply", s("Whole document"));
+    ok(&mut t).unwrap();
+    let s = setups(&t);
+    assert_eq!(
+        s.iter()
+            .map(|s| (s.columns.count(), s.columns.sep))
+            .collect::<Vec<_>>(),
+        [(1, true), (1, true), (3, true)]
+    );
+}

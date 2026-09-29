@@ -411,20 +411,297 @@ fn check_setup(s: &SectionSetup, gutter_at_top: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Columns reacting to a change (the Columns dialog, below).
-pub(crate) fn after_columns_set(_d: &mut Dialog, _i: usize) {}
+// ---- Columns ----------------------------------------------------------------
 
-/// The Columns dialog (step 6).
-pub(crate) fn columns_dialog(_tab: &DocTab) -> Result<Dialog, String> {
-    Err("This dialog is not available yet".into())
+/// The most columns Word lays out.
+const MAX_COLUMNS: usize = 12;
+/// How far explicit widths and spacings may miss the text width: 0.01".
+const FIT_SLACK: i32 = 15;
+/// Half of 0.01", in twips, rounded up: how far a shown value may be off.
+const ROUNDING: i32 = 8;
+const PRESETS: [&str; 5] = ["One", "Two", "Three", "Left", "Right"];
+const WIDTH: [&str; MAX_COLUMNS] = [
+    "width1", "width2", "width3", "width4", "width5", "width6", "width7", "width8", "width9",
+    "width10", "width11", "width12",
+];
+const SPACE: [&str; MAX_COLUMNS] = [
+    "space1", "space2", "space3", "space4", "space5", "space6", "space7", "space8", "space9",
+    "space10", "space11", "space12",
+];
+
+/// The text width the dialog lays columns out in (a hidden control, kept in
+/// twips).
+fn text_width_of(d: &Dialog) -> i32 {
+    text_of(d, "text_width").parse().unwrap_or(9360)
 }
 
-pub(crate) fn apply_columns(
-    _ed: &mut Editor,
-    _pkg: &mut Package,
-    _d: &Dialog,
-) -> Result<(), String> {
-    Err("This dialog is not available yet".into())
+fn columns_count(d: &Dialog) -> usize {
+    text_of(d, "num")
+        .trim()
+        .parse::<usize>()
+        .unwrap_or(1)
+        .clamp(1, MAX_COLUMNS)
+}
+
+fn is_on(d: &Dialog, name: &str) -> bool {
+    d.value(name) == Some(&Value::Bool(true))
+}
+
+/// Show one row per column: a width for each, a spacing after all but the
+/// last. With Equal column width on, only the first row takes input.
+fn show_rows(d: &mut Dialog) {
+    let n = columns_count(d);
+    let equal = is_on(d, "equal");
+    for k in 0..MAX_COLUMNS {
+        for (names, shown) in [(&WIDTH, k < n), (&SPACE, k + 1 < n)] {
+            if let Some(i) = index(d, names[k]) {
+                d.controls[i].visible = shown;
+                d.controls[i].enabled = k == 0 || !equal;
+            }
+        }
+    }
+}
+
+/// Fill the rows with `n` equal columns `space` apart across the text width.
+fn fill_equal(d: &mut Dialog, n: usize, space: i32) {
+    let tw = text_width_of(d);
+    let w = (tw - space * (n as i32 - 1)) / n as i32;
+    for k in 0..MAX_COLUMNS {
+        set_value(d, WIDTH[k], Value::Text(inches(w)));
+        set_value(d, SPACE[k], Value::Text(inches(space)));
+    }
+}
+
+/// The preset the rows match, if any.
+fn matching_preset(d: &Dialog) -> Option<usize> {
+    let n = columns_count(d);
+    if is_on(d, "equal") {
+        return (n <= 3).then(|| n - 1);
+    }
+    let w = |k: usize| twips_of(&text_of(d, WIDTH[k])).unwrap_or(0);
+    (n == 2 && w(0) != w(1)).then(|| if w(0) < w(1) { 3 } else { 4 })
+}
+
+/// The Columns dialog reacting to a change, as Word's does: a preset sets the
+/// number and widths; the number of columns or Equal column width spreads
+/// the columns evenly; with equal columns, column 1's width or spacing sets
+/// every column's.
+pub(crate) fn after_columns_set(d: &mut Dialog, i: usize) {
+    let name = d.controls[i].name;
+    let space = || 720;
+    match name {
+        "preset" => {
+            let Some(p) = chosen(d, "preset") else {
+                return;
+            };
+            let tw = text_width_of(d);
+            if p < 3 {
+                set_value(d, "num", Value::Text((p + 1).to_string()));
+                set_value(d, "equal", Value::Bool(true));
+                fill_equal(d, p + 1, space());
+            } else {
+                let cols = docxcore::sect::Columns::default().two_unequal(tw, p == 3);
+                set_value(d, "num", Value::Text("2".into()));
+                set_value(d, "equal", Value::Bool(false));
+                for (k, c) in cols.cols.iter().enumerate() {
+                    set_value(d, WIDTH[k], Value::Text(inches(c.w)));
+                    set_value(d, SPACE[k], Value::Text(inches(c.space)));
+                }
+            }
+        }
+        "num" | "equal" => {
+            let space = twips_of(&text_of(d, "space1")).unwrap_or(space());
+            let n = columns_count(d);
+            fill_equal(d, n, if n > 1 { space } else { 720 });
+        }
+        "width1" | "space1" if is_on(d, "equal") => {
+            let n = columns_count(d) as i32;
+            let tw = text_width_of(d);
+            let (Some(w), Some(s)) = (
+                twips_of(&text_of(d, "width1")),
+                twips_of(&text_of(d, "space1")),
+            ) else {
+                return;
+            };
+            let (w, s) = if name == "width1" && n > 1 {
+                (w, (tw - n * w) / (n - 1))
+            } else {
+                ((tw - s * (n - 1)) / n, s)
+            };
+            for k in 0..MAX_COLUMNS {
+                if k > 0 || name != "width1" {
+                    set_value(d, WIDTH[k], Value::Text(inches(w)));
+                }
+                if k > 0 || name != "space1" {
+                    set_value(d, SPACE[k], Value::Text(inches(s)));
+                }
+            }
+        }
+        _ => {}
+    }
+    show_rows(d);
+    if name != "preset" {
+        let p = matching_preset(d);
+        set_value(d, "preset", Value::Choice(p));
+    }
+}
+
+/// The Columns dialog on the caret section's columns.
+pub(crate) fn columns_dialog(tab: &DocTab) -> Result<Dialog, String> {
+    let (ed, pkg) = body_of(tab)?;
+    let s = caret_setup(ed);
+    let tw = s.text_width(pkg.has_gutter_at_top());
+    let c = &s.columns;
+    let n = c.count() as usize;
+    let mut d = Dialog::message(
+        "columns",
+        "Columns",
+        String::new(),
+        &[],
+        DialogOwner::Columns,
+    );
+    d.text = None;
+    let mut hidden = Control::new(
+        "text_width",
+        "Text width",
+        ControlKind::Label,
+        Value::Text(tw.to_string()),
+    );
+    hidden.visible = false;
+    d.controls = vec![
+        choice(
+            "preset",
+            "Presets:",
+            ControlKind::Radio,
+            &PRESETS,
+            None,
+            None,
+        ),
+        Control::new(
+            "num",
+            "&Number of columns:",
+            ControlKind::Number,
+            Value::Text(n.to_string()),
+        ),
+    ];
+    let equal_w = (tw - c.space * (n as i32 - 1)) / n as i32;
+    for k in 0..MAX_COLUMNS {
+        let (w, sp) = match c.cols.get(k) {
+            Some(col) => (col.w, col.space),
+            None => (equal_w, c.space),
+        };
+        d.controls.push(Control::new(
+            WIDTH[k],
+            &format!("Width {}:", k + 1),
+            ControlKind::Number,
+            Value::Text(inches(w)),
+        ));
+        d.controls.push(Control::new(
+            SPACE[k],
+            &format!("Spacing {}:", k + 1),
+            ControlKind::Number,
+            Value::Text(inches(sp)),
+        ));
+    }
+    d.controls.extend([
+        Control::new(
+            "equal",
+            "&Equal column width",
+            ControlKind::Checkbox,
+            Value::Bool(c.equal_width()),
+        ),
+        Control::new(
+            "sep",
+            "Line &between",
+            ControlKind::Checkbox,
+            Value::Bool(c.sep),
+        ),
+        apply_to(ed),
+        hidden,
+    ]);
+    show_rows(&mut d);
+    let p = matching_preset(&d);
+    set_value(&mut d, "preset", Value::Choice(p));
+    d.buttons = ok_cancel();
+    d.mark_opened();
+    Ok(d)
+}
+
+/// Apply an accepted Columns dialog: one undo step on the body editor. This
+/// point forward starts the new section with a Continuous break.
+pub(crate) fn apply_columns(ed: &mut Editor, _pkg: &mut Package, d: &Dialog) -> Result<(), String> {
+    let n: usize = text_of(d, "num")
+        .trim()
+        .parse()
+        .ok()
+        .filter(|n| (1..=MAX_COLUMNS).contains(n))
+        .ok_or("Number of columns must be a whole number from 1 to 12")?;
+    let equal = is_on(d, "equal");
+    let sep = is_on(d, "sep");
+    let widths = (0..n)
+        .map(|k| field(d, WIDTH[k]))
+        .collect::<Result<Vec<_>, _>>()?;
+    let spaces = (0..n)
+        .map(|k| if k + 1 < n { field(d, SPACE[k]) } else { Ok(0) })
+        .collect::<Result<Vec<_>, _>>()?;
+    if widths.iter().chain(&spaces).any(|v| *v < 0) {
+        return Err("Widths and spacings cannot be negative".into());
+    }
+    let layout_changed = ["preset", "num", "equal"]
+        .into_iter()
+        .chain(WIDTH)
+        .chain(SPACE)
+        .any(|name| d.changed(name));
+    let tw = text_width_of(d);
+    let total: i32 = if equal {
+        widths[0] * n as i32 + spaces[0] * (n as i32 - 1)
+    } else {
+        widths.iter().sum::<i32>() + spaces.iter().sum::<i32>()
+    };
+    // Each value is shown to 0.01", so it may be up to half of that off the
+    // twips it stands for: allow that on top of the 0.01" slack.
+    let slack = FIT_SLACK + ROUNDING * (2 * n as i32 - 1);
+    if layout_changed && n > 1 && (total - tw).abs() > slack {
+        return Err(format!(
+            "The columns take {}\" but the text is {}\" wide",
+            inches(total),
+            inches(tw)
+        ));
+    }
+    let sep_changed = d.changed("sep");
+    let space = if n > 1 { spaces[0] } else { 720 };
+    let cols = docxcore::sect::Columns {
+        num: n as i32,
+        space,
+        sep,
+        cols: if equal || n == 1 {
+            Vec::new()
+        } else {
+            widths
+                .iter()
+                .zip(&spaces)
+                .map(|(&w, &space)| docxcore::sect::Column { w, space })
+                .collect()
+        },
+    };
+    let edit = |s: &mut SectionSetup| {
+        if layout_changed {
+            s.columns = docxcore::sect::Columns {
+                sep: s.columns.sep,
+                ..cols.clone()
+            };
+        }
+        if sep_changed {
+            s.columns.sep = sep;
+        }
+    };
+    match targets(ed, d) {
+        Some(k) => {
+            ed.edit_section_setups(&k, edit);
+        }
+        None => ed.insert_section_break_with(SectionStart::Continuous, edit)?,
+    }
+    Ok(())
 }
 
 #[cfg(test)]
