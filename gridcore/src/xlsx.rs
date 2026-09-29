@@ -721,6 +721,7 @@ fn parse_styles(xml: &str) -> Styles {
                         font_name: font.name.clone(),
                         border: false,
                         wrap: false,
+                        quote_prefix: matches!(p.attr("quotePrefix"), "1" | "true"),
                     });
                 }
                 "alignment" if in_cellxfs => {
@@ -913,6 +914,9 @@ fn splice_styles(orig: &str, authored: &[Xf]) -> String {
         }
         if apply_border {
             x.push_str(" applyBorder=\"1\"");
+        }
+        if xf.quote_prefix {
+            x.push_str(" quotePrefix=\"1\"");
         }
         let horiz = xf.align.attr();
         if horiz.is_some() || xf.wrap {
@@ -6027,6 +6031,34 @@ mod tests {
         assert_eq!(xf2.fill, Some((0xAB, 0xCD, 0xEF)));
         assert_eq!(xf2.align, Align::Center);
         assert_eq!(xf2.code.as_deref(), Some("0.00"));
+    }
+
+    #[test]
+    fn quote_prefix_round_trips_through_styles() {
+        let mut pkg = new_xlsx();
+        let cell = crate::entry::entry_cell(&mut pkg.workbook, 0, 0, 0, "'007", None).unwrap();
+        assert!(pkg.workbook.styles.xf(cell.style).quote_prefix);
+        pkg.workbook.sheets[0].set_cell(0, 0, cell);
+        let bytes = save_xlsx(&pkg);
+        let re = load_xlsx(&bytes).unwrap();
+        let cell = re.workbook.sheets[0].cell(0, 0).unwrap();
+        assert_eq!(cell.value, crate::sheet::CellValue::Text("007".into()));
+        assert!(re.workbook.styles.xf(cell.style).quote_prefix);
+        let styles = String::from_utf8(re.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        assert!(styles.contains("quotePrefix=\"1\""), "{styles}");
+        let shared = String::from_utf8(re.part("xl/sharedStrings.xml").unwrap().to_vec())
+            .unwrap_or_default();
+        let sheet =
+            String::from_utf8(re.part(&re.sheet_parts[0].clone()).unwrap().to_vec()).unwrap();
+        assert!(!shared.contains("'007") && !sheet.contains("'007"));
+        assert!(
+            shared.contains(">007<") || sheet.contains(">007<"),
+            "{shared}{sheet}"
+        );
+        // Saved again untouched, the loaded quote-prefixed xf stays as it was.
+        let again = load_xlsx(&save_xlsx(&re)).unwrap();
+        let c = again.workbook.sheets[0].cell(0, 0).unwrap();
+        assert!(again.workbook.styles.xf(c.style).quote_prefix);
     }
 
     #[test]

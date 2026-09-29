@@ -29,8 +29,9 @@ mod skill;
 use backstage::BackstageHost as _;
 
 use gridcore::comments::Comment;
-use gridcore::edit::{input_text_of, parse_input, replace_all_in_sheet};
+use gridcore::edit::{fill_changes, parse_input, replace_all_in_sheet};
 use gridcore::engine::Engine;
+use gridcore::entry::{entry_cell, entry_ctx, input_text_styled};
 use gridcore::formula::translate_formula;
 use gridcore::frame::Agg;
 use gridcore::model::{
@@ -38,7 +39,7 @@ use gridcore::model::{
 };
 use gridcore::sheet::{
     Align, Cell, CellValue, MAX_COLS, MAX_ROWS, NumFmt, Sheet, Xf, cell_name, col_name,
-    format_with, sheet_to_csv,
+    date_unrepresentable, format_with, sheet_to_csv,
 };
 use gridcore::xlsx::{SheetPackage, SpreadsheetKind, load_xlsx, new_xlsx, save_xlsx_for_path};
 
@@ -1131,12 +1132,13 @@ impl App {
     }
 
     /// What editing an existing cell starts from: the formula with `=`, or
-    /// the value as it would be re-entered.
+    /// the value as it would be re-entered (a quote prefix's `'` included).
     fn current_input_text(&self) -> String {
         let (r, c) = self.cur;
+        let styles = &self.pkg.workbook.styles;
         self.sheet()
             .cell(r, c)
-            .map(input_text_of)
+            .map(|cl| input_text_styled(cl, &styles.xf(cl.style)))
             .unwrap_or_default()
     }
 
@@ -1161,9 +1163,26 @@ impl App {
             }
         }
         let (r, c) = self.cur;
-        let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-        let mut cell = parse_input(&text);
-        cell.style = style;
+        let cell = match entry_cell(
+            &mut self.pkg.workbook,
+            self.sheet,
+            r,
+            c,
+            &text,
+            now_serial(),
+        ) {
+            Ok(cell) => cell,
+            Err(e) => {
+                // Refused (too long): keep the editor open with the text.
+                self.status = Some(e.to_string());
+                self.edit = Some(EditState {
+                    cursor: text.chars().count(),
+                    text,
+                    replace: false,
+                });
+                return false;
+            }
+        };
         self.apply(vec![(r, c, cell)]);
         true
     }
@@ -2728,11 +2747,20 @@ impl App {
                 let value = p.values[p.sel].clone();
                 self.dv_picker = None;
                 let (r, c) = self.cur;
-                let style = self.sheet().cell(r, c).map(|x| x.style).unwrap_or(0);
-                let mut cell = parse_input(&value);
-                cell.style = style;
-                self.apply(vec![(r, c, cell)]);
-                self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
+                match entry_cell(
+                    &mut self.pkg.workbook,
+                    self.sheet,
+                    r,
+                    c,
+                    &value,
+                    now_serial(),
+                ) {
+                    Ok(cell) => {
+                        self.apply(vec![(r, c, cell)]);
+                        self.status = Some(format!("Set {} = {value}", cell_name(r, c)));
+                    }
+                    Err(e) => self.status = Some(e.to_string()),
+                }
             }
             _ => {}
         }
@@ -3820,42 +3848,7 @@ impl App {
     /// translating relative refs — or, on a single cell, pull from the
     /// neighbor above/left.
     fn fill(&mut self, down: bool) {
-        let (r1, c1, r2, c2) = self.selection();
-        let single = r1 == r2 && c1 == c2;
-        let mut changes = Vec::new();
-        let copy_from = |sr: u32, sc: u32, tr: u32, tc: u32, changes: &mut Vec<_>| {
-            let mut cell = self.pkg.workbook.sheets[self.sheet]
-                .cell(sr, sc)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(f) = &cell.formula {
-                if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64)
-                {
-                    cell.formula = Some(t);
-                }
-            }
-            changes.push((tr, tc, cell));
-        };
-        if single {
-            let (r, c) = self.cur;
-            if down && r > 0 {
-                copy_from(r - 1, c, r, c, &mut changes);
-            } else if !down && c > 0 {
-                copy_from(r, c - 1, r, c, &mut changes);
-            }
-        } else if down {
-            for c in c1..=c2 {
-                for r in r1 + 1..=r2 {
-                    copy_from(r1, c, r, c, &mut changes);
-                }
-            }
-        } else {
-            for r in r1..=r2 {
-                for c in c1 + 1..=c2 {
-                    copy_from(r, c1, r, c, &mut changes);
-                }
-            }
-        }
+        let changes = fill_changes(self.sheet(), self.selection(), self.cur, down);
         if changes.is_empty() {
             return;
         }
@@ -3914,7 +3907,10 @@ impl App {
             self.status = Some("Nothing to find".to_string());
             return;
         }
-        let changes = replace_all_in_sheet(self.sheet(), find, with);
+        let wb = &mut self.pkg.workbook;
+        let ctx = entry_ctx(wb, now_serial());
+        let changes =
+            replace_all_in_sheet(&wb.sheets[self.sheet], &mut wb.styles, &ctx, find, with);
         let n = changes.len();
         if n == 0 {
             self.status = Some(format!("Not found: {find}"));
@@ -4791,6 +4787,10 @@ fn draw(app: &mut App, f: &mut Frame) {
                 match cell {
                     Some(cl) if formula_view && cl.formula.is_some() => {
                         format!("={}", cl.formula.as_ref().unwrap())
+                    }
+                    // A date/time it cannot show fills the cell with `#`.
+                    Some(cl) if date_unrepresentable(&xf, &cl.value, date1904) => {
+                        "#".repeat(w as usize)
                     }
                     Some(cl) => format_with(&xf, &cl.value, date1904),
                     None => String::new(),

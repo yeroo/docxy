@@ -57,7 +57,7 @@
 //! keys per cell there (or on the busiest mutating verb, `cell.set`) isn't
 //! worth it when nothing consumes it.
 
-use crate::{App, comment_author, iso_now, parse_input};
+use crate::{App, comment_author, iso_now, now_serial};
 use ctlcore::json::Json;
 use gridcore::engine::{Engine, cell_to_value, eval_formula_at};
 use gridcore::format::{FormatPatch, FormatValue, apply_patch_to_xf, xf_format_fields};
@@ -695,12 +695,10 @@ fn cell_set(app: &mut App, args: &Json) -> Result<Json, String> {
             Engine::validate(body).map_err(|e| format!("formula error: {e}"))?;
         }
     }
-    let style = app.pkg.workbook.sheets[si]
-        .cell(r, c)
-        .map(|x| x.style)
-        .unwrap_or(0);
-    let mut cell = parse_input(text);
-    cell.style = style;
+    // Typed the way the grid types it: the cell's format decides, a
+    // recognised shape takes its format, and an over-long entry is refused.
+    let cell = gridcore::entry::entry_cell(&mut app.pkg.workbook, si, r, c, text, now_serial())
+        .map_err(|e| format!("cell.set: {e}"))?;
     app.apply_on(si, vec![(r, c, cell)]);
     let s = &app.pkg.workbook.sheets[si];
     match s.cell(r, c) {
@@ -809,8 +807,11 @@ fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
         }
     }
 
-    // Pass 1: validate every formula before touching anything (atomicity).
+    // Pass 1: validate every formula and length before touching anything
+    // (atomicity).
     for (r, c, text) in &entries {
+        gridcore::entry::check_len(text)
+            .map_err(|e| format!("range.set: {} at {}", e, cell_name(*r, *c)))?;
         if let Some(body) = text.strip_prefix('=') {
             if !body.is_empty() {
                 Engine::validate(body).map_err(|e| {
@@ -821,16 +822,13 @@ fn range_set(app: &mut App, args: &Json) -> Result<Json, String> {
     }
 
     // Pass 2: every entry validated — build the changes and apply as one group.
-    let sheet = &app.pkg.workbook.sheets[si];
-    let changes: Vec<(u32, u32, Cell)> = entries
-        .into_iter()
-        .map(|(r, c, text)| {
-            let style = sheet.cell(r, c).map(|x| x.style).unwrap_or(0);
-            let mut cell = parse_input(&text);
-            cell.style = style;
-            (r, c, cell)
-        })
-        .collect();
+    let today = now_serial();
+    let mut changes: Vec<(u32, u32, Cell)> = Vec::with_capacity(entries.len());
+    for (r, c, text) in entries {
+        let cell = gridcore::entry::entry_cell(&mut app.pkg.workbook, si, r, c, &text, today)
+            .map_err(|e| format!("range.set: {} at {}", e, cell_name(r, c)))?;
+        changes.push((r, c, cell));
+    }
     let n = changes.len();
     app.apply_on(si, changes);
     Ok(Json::obj(vec![("set", Json::Num(n as f64))]))
@@ -896,9 +894,12 @@ fn wb_replace_all(app: &mut App, args: &Json) -> Result<Json, String> {
     }
     let text = args.get_str("text").ok_or("wb.replace-all needs 'text'")?;
     let mut replaced = 0usize;
+    let today = now_serial();
     app.structural(|wb| {
+        let ctx = gridcore::entry::entry_ctx(wb, today);
         for sheet in &mut wb.sheets {
-            let changes = gridcore::edit::replace_all_in_sheet(sheet, query, text);
+            let changes =
+                gridcore::edit::replace_all_in_sheet(sheet, &mut wb.styles, &ctx, query, text);
             replaced += changes.len();
             for (r, c, nc) in changes {
                 sheet.set_cell(r, c, nc);
@@ -1225,6 +1226,91 @@ mod tests {
             ]),
         )
         .unwrap();
+    }
+
+    fn get(app: &mut App, r: &str) -> Json {
+        dispatch(
+            app,
+            "cell.get",
+            &Json::obj(vec![("ref", Json::Str(r.into()))]),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn cell_set_apostrophe_is_a_quote_prefix_not_text_599() {
+        let mut a = app();
+        set(&mut a, "A1", "'007");
+        let g = get(&mut a, "A1");
+        assert_eq!(g.get_str("value"), Some("007"));
+        assert_eq!(g.get_str("text"), Some("007"));
+        let cell = a.pkg.workbook.sheets[0].cell(0, 0).unwrap().clone();
+        assert!(a.pkg.workbook.styles.xf(cell.style).quote_prefix);
+        // Saved: the shared string has no apostrophe, the xf says quotePrefix.
+        let re = gridcore::xlsx::load_xlsx(&gridcore::xlsx::save_xlsx(&a.pkg)).unwrap();
+        let styles = String::from_utf8(re.part("xl/styles.xml").unwrap().to_vec()).unwrap();
+        assert!(styles.contains("quotePrefix=\"1\""), "{styles}");
+        let shared = re
+            .part("xl/sharedStrings.xml")
+            .map(|b| String::from_utf8(b.to_vec()).unwrap())
+            .unwrap_or_default();
+        assert!(!shared.contains("'007"), "{shared}");
+        // The editor starts from the apostrophe again.
+        a.cur = (0, 0);
+        assert_eq!(a.current_input_text(), "'007");
+    }
+
+    #[test]
+    fn cell_set_refuses_more_than_32767_characters_658() {
+        let mut a = app();
+        set(&mut a, "A1", "old");
+        let long = "y".repeat(32_768);
+        let err = cell_set(
+            &mut a,
+            &Json::obj(vec![
+                ("ref", Json::Str("A1".into())),
+                ("text", Json::Str(long)),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("32767"), "{err}");
+        assert_eq!(get(&mut a, "A1").get_str("value"), Some("old"));
+        set(&mut a, "A2", &"y".repeat(32_767));
+        let err = dispatch(
+            &mut a,
+            "range.set",
+            &Json::obj(vec![
+                ("start", Json::Str("B1".into())),
+                (
+                    "rows",
+                    Json::Arr(vec![Json::Arr(vec![
+                        Json::Str("fine".into()),
+                        Json::Str("y".repeat(32_768)),
+                    ])]),
+                ),
+            ]),
+        )
+        .unwrap_err();
+        assert!(err.contains("C1"), "{err}");
+        assert!(
+            a.pkg.workbook.sheets[0].cell(0, 1).is_none(),
+            "nothing applied"
+        );
+    }
+
+    #[test]
+    fn cell_set_recognises_a_date_and_reports_its_format_653() {
+        let mut a = app();
+        set(&mut a, "A1", "1/15/2024");
+        let g = get(&mut a, "A1");
+        assert_eq!(g.get("value").and_then(Json::as_f64), Some(45306.0));
+        let fmt = g.get("format").expect("a format");
+        assert_eq!(fmt.get_str("numFmt"), Some("m/d/yyyy"));
+        set(&mut a, "A2", "1,234");
+        assert_eq!(
+            get(&mut a, "A2").get("value").and_then(Json::as_f64),
+            Some(1234.0)
+        );
     }
 
     #[test]

@@ -9971,7 +9971,7 @@ fn month_num(s: &str) -> Option<u32> {
 }
 
 /// Two-digit year → four-digit, Excel's 0-29 → 2000s, 30-99 → 1900s rule.
-fn norm_year(y: i64) -> i64 {
+pub(crate) fn norm_year(y: i64) -> i64 {
     if y < 30 {
         2000 + y
     } else if y < 100 {
@@ -10243,7 +10243,7 @@ fn matrix_inverse(a: &[Vec<f64>]) -> Option<Vec<Vec<f64>>> {
     Some(m.iter().map(|row| row[n..].to_vec()).collect())
 }
 
-fn days_in_month(year: i64, month: u32) -> u32 {
+pub(crate) fn days_in_month(year: i64, month: u32) -> u32 {
     match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
@@ -11511,6 +11511,12 @@ mod tests {
             eval_str("TEXT(45306,\"yyyy-mm-dd\")", &g),
             Value::Str("2024-01-15".into())
         );
+        // A date TEXT cannot show keeps today's General fallback: the cell
+        // display's `####` (#673) is a display rule, not a TEXT() one.
+        assert_eq!(
+            eval_str("TEXT(-1,\"yyyy-mm-dd\")", &g),
+            Value::Str("-1".into())
+        );
         // The runtime renders sections, conditions, and literal codes…
         assert_eq!(
             eval_str("TEXT(-1234,\"$#,##0;[Red]($#,##0)\")", &g),
@@ -11524,8 +11530,13 @@ mod tests {
             eval_str("TEXT(45306.25,\"dddd h:mm AM/PM\")", &g),
             Value::Str("Monday 6:00 AM".into())
         );
-        // …and refuses what it can't honestly do (fractions).
-        let ast = parse("TEXT(1234,\"# ?/?\")").unwrap();
+        // Fractions of the `# ?/?` family render…
+        assert_eq!(
+            eval_str("TEXT(1.25,\"# ?/?\")", &g),
+            Value::Str("1 1/4".into())
+        );
+        // …and it refuses what it can't honestly do (other fraction shapes).
+        let ast = parse("TEXT(1234,\"0 ?/? x\")").unwrap();
         let mut ev = Eval::new(&g, 0, (0, 0));
         let _ = ev.eval(&ast);
         assert!(ev.unsupported);

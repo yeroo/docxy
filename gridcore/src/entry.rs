@@ -1,0 +1,1071 @@
+//! Typed cell entry: what a committed editor buffer becomes, the way Excel
+//! reads it.
+//!
+//! Every host that commits typed text (the xlsxy grid and its control verbs,
+//! gridwasm, the desktop suite's sheet tab) goes through [`entry_cell`], so
+//! they cannot drift apart. The rules, in order:
+//!
+//! 1. More than [`MAX_CELL_CHARS`] UTF-16 units is refused.
+//! 2. A cell formatted Text (`@`) takes the entry exactly as typed.
+//! 3. A leading `'` makes the rest text and sets the xf's `quotePrefix`.
+//! 4. `=…` is a formula.
+//! 5. `TRUE`/`FALSE` and error literals.
+//! 6. Numbers: sign, parentheses, `$`, thousands, `%` before or after, and an
+//!    exponent. Then fractions (`1 1/4`), then dates and times.
+//! 7. A `+`, `-` or `@` prefix that makes a valid formula.
+//! 8. Anything else is text.
+//!
+//! A recognised shape carries Excel's matching number format, applied only
+//! when the cell's format is General. A plain number typed into a percent
+//! cell is divided by 100 when its magnitude is at least 1 (Excel's
+//! automatic percent entry).
+
+use crate::formula::{ExcelError, days_in_month, norm_year};
+use crate::sheet::{
+    Cell, CellValue, NumFmt, Styles, Workbook, Xf, classify_format_code, parts_to_serial,
+    serial_to_parts,
+};
+
+/// Excel's cell limit, in UTF-16 code units.
+pub const MAX_CELL_CHARS: usize = 32_767;
+
+/// What the parser needs besides the text and the cell's format.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EntryCtx {
+    /// The workbook uses the 1904 date system.
+    pub date1904: bool,
+    /// The host's clock as a 1900-system serial (the same value it gives
+    /// `Engine::clock`). A date typed without a year (`3/4`) takes its year;
+    /// with no clock it stays text rather than guess.
+    pub today: Option<f64>,
+}
+
+/// A parsed entry: the cell (its `style` unset) and what the entry asks of
+/// the cell's format.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Entry {
+    pub cell: Cell,
+    /// The number format the recognised shape carries (`#,##0`, `m/d/yyyy`…).
+    pub format: Option<&'static str>,
+    /// Entered with a leading apostrophe.
+    pub quote_prefix: bool,
+    /// The entry holds a line feed (Alt+Enter), which turns on Wrap Text.
+    pub wrap: bool,
+}
+
+/// Why an entry was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EntryError {
+    /// Longer than [`MAX_CELL_CHARS`]; `len` is its UTF-16 length.
+    TooLong { len: usize },
+}
+
+impl std::fmt::Display for EntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EntryError::TooLong { len } => write!(
+                f,
+                "the entry is {len} characters; a cell holds at most {MAX_CELL_CHARS}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for EntryError {}
+
+/// Refuse text a cell cannot hold.
+pub fn check_len(text: &str) -> Result<(), EntryError> {
+    let len = text.encode_utf16().count();
+    if len > MAX_CELL_CHARS {
+        return Err(EntryError::TooLong { len });
+    }
+    Ok(())
+}
+
+/// The cell's format is General: no code, or the `General` code the loader
+/// synthesizes for `numFmtId="0"`.
+pub fn is_general(xf: &Xf) -> bool {
+    xf.numfmt == NumFmt::General
+        && xf
+            .code
+            .as_deref()
+            .is_none_or(|c| c.is_empty() || c.eq_ignore_ascii_case("general"))
+}
+
+/// The cell's format is Text (`@`, builtin 49).
+pub fn is_text(xf: &Xf) -> bool {
+    xf.numfmt == NumFmt::Text || xf.code.as_deref() == Some("@")
+}
+
+/// The cell's format is a percent format.
+pub fn is_percent(xf: &Xf) -> bool {
+    matches!(xf.numfmt, NumFmt::Percent { .. })
+        || xf
+            .code
+            .as_deref()
+            .is_some_and(|c| matches!(classify_format_code(c), NumFmt::Percent { .. }))
+}
+
+/// Parse typed `text` as an entry into a cell formatted `xf`.
+pub fn parse_entry(text: &str, xf: &Xf, ctx: &EntryCtx) -> Result<Entry, EntryError> {
+    check_len(text)?;
+    let wrap = text.contains('\n');
+    let entry = |cell: Cell, format: Option<&'static str>| Entry {
+        cell,
+        format,
+        quote_prefix: false,
+        wrap,
+    };
+    if text.is_empty() {
+        return Ok(entry(Cell::default(), None));
+    }
+    if is_text(xf) {
+        return Ok(entry(Cell::text(text), None));
+    }
+    if let Some(rest) = text.strip_prefix('\'') {
+        return Ok(Entry {
+            quote_prefix: true,
+            ..entry(Cell::text(rest), None)
+        });
+    }
+    if let Some(body) = text.strip_prefix('=') {
+        if !body.is_empty() {
+            return Ok(entry(Cell::formula(body), None));
+        }
+    }
+    let t = text.trim();
+    if t.eq_ignore_ascii_case("TRUE") || t.eq_ignore_ascii_case("FALSE") {
+        let b = t.eq_ignore_ascii_case("TRUE");
+        return Ok(entry(value_cell(CellValue::Bool(b)), None));
+    }
+    if ExcelError::from_code(t).is_some() {
+        return Ok(entry(
+            value_cell(CellValue::Error(t.to_ascii_uppercase())),
+            None,
+        ));
+    }
+    if let Some((mut n, shape)) = parse_number(t) {
+        if !shape.percent && is_percent(xf) && n.abs() >= 1.0 {
+            n /= 100.0;
+        }
+        return Ok(entry(Cell::number(n), shape.format()));
+    }
+    if let Some((n, format)) = parse_fraction(t) {
+        return Ok(entry(Cell::number(n), Some(format)));
+    }
+    if let Some((n, format)) = parse_date_time(t, ctx) {
+        return Ok(entry(Cell::number(n), Some(format)));
+    }
+    if let Some(src) = formula_prefix(t) {
+        return Ok(entry(Cell::formula(&src), None));
+    }
+    Ok(entry(Cell::text(text), None))
+}
+
+/// The xf a committed entry leaves on a cell formatted `base`.
+pub fn entry_xf(base: &Xf, e: &Entry) -> Xf {
+    let mut xf = base.clone();
+    if let Some(code) = e.format {
+        if is_general(base) {
+            xf.numfmt = classify_format_code(code);
+            xf.code = Some(code.to_string());
+        }
+    }
+    xf.quote_prefix = e.quote_prefix;
+    if e.wrap {
+        xf.wrap = true;
+    }
+    xf
+}
+
+/// The style index for `e` on a cell whose style is `base`: `base` itself
+/// when nothing changes, else an interned xf.
+pub fn entry_style(styles: &mut Styles, base: u32, e: &Entry) -> u32 {
+    let old = styles.xf(base);
+    let new = entry_xf(&old, e);
+    if new == old { base } else { styles.intern(new) }
+}
+
+/// The context a workbook gives an entry, with the host's clock.
+pub fn entry_ctx(wb: &Workbook, today: Option<f64>) -> EntryCtx {
+    EntryCtx {
+        date1904: wb.date1904,
+        today,
+    }
+}
+
+/// Parse `text` typed into (sheet, row, col) and resolve its style: the cell
+/// ready for `Engine::set_cell`. Only the style table is touched here (a new
+/// xf may be interned); the cell itself is left to the caller.
+pub fn entry_cell(
+    wb: &mut Workbook,
+    sheet: usize,
+    row: u32,
+    col: u32,
+    text: &str,
+    today: Option<f64>,
+) -> Result<Cell, EntryError> {
+    let base = wb
+        .sheets
+        .get(sheet)
+        .and_then(|s| s.cell(row, col))
+        .map(|c| c.style)
+        .unwrap_or(0);
+    let ctx = entry_ctx(wb, today);
+    let e = parse_entry(text, &wb.styles.xf(base), &ctx)?;
+    let style = entry_style(&mut wb.styles, base, &e);
+    Ok(Cell { style, ..e.cell })
+}
+
+/// Ctrl+Enter: `text`, typed at `active`, entered into every cell of the
+/// range `(r1, c1, r2, c2)` on `sheet`. A formula moves its relative
+/// references with each cell, as a fill would; each cell's own format rules
+/// apply. All or nothing: a refused entry changes no style.
+pub fn entry_range(
+    wb: &mut Workbook,
+    sheet: usize,
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+    active: (u32, u32),
+    text: &str,
+    today: Option<f64>,
+) -> Result<Vec<(u32, u32, Cell)>, EntryError> {
+    check_len(text)?;
+    let mut out = Vec::new();
+    for r in r1..=r2 {
+        for c in c1..=c2 {
+            let dr = r as i64 - active.0 as i64;
+            let dc = c as i64 - active.1 as i64;
+            let moved = text
+                .strip_prefix('=')
+                .filter(|body| !body.is_empty())
+                .and_then(|body| crate::formula::translate_formula(body, dr, dc))
+                .map(|body| format!("={body}"));
+            let cell = match moved {
+                Some(t) if check_len(&t).is_ok() => entry_cell(wb, sheet, r, c, &t, today)?,
+                _ => entry_cell(wb, sheet, r, c, text, today)?,
+            };
+            out.push((r, c, cell));
+        }
+    }
+    Ok(out)
+}
+
+/// The text the editor and formula bar show for a cell: [`crate::edit::input_text_of`]
+/// with the apostrophe of a quote-prefixed text put back.
+pub fn input_text_styled(cell: &Cell, xf: &Xf) -> String {
+    let text = crate::edit::input_text_of(cell);
+    if xf.quote_prefix && cell.formula.is_none() && matches!(cell.value, CellValue::Text(_)) {
+        format!("'{text}")
+    } else {
+        text
+    }
+}
+
+fn value_cell(value: CellValue) -> Cell {
+    Cell {
+        value,
+        ..Cell::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Numbers
+// ---------------------------------------------------------------------------
+
+/// What a recognised number looked like, which picks its format.
+#[derive(Clone, Copy, Debug, Default)]
+struct NumShape {
+    thousands: bool,
+    decimals: bool,
+    percent: bool,
+    currency: bool,
+    exponent: bool,
+}
+
+impl NumShape {
+    fn format(self) -> Option<&'static str> {
+        Some(if self.exponent {
+            "0.00E+00"
+        } else if self.currency {
+            if self.decimals {
+                "$#,##0.00_);($#,##0.00)"
+            } else {
+                "$#,##0_);($#,##0)"
+            }
+        } else if self.percent {
+            if self.decimals { "0.00%" } else { "0%" }
+        } else if self.thousands {
+            if self.decimals { "#,##0.00" } else { "#,##0" }
+        } else {
+            return None;
+        })
+    }
+}
+
+/// Excel's number grammar: `(…)` or a sign for negatives, `$`, thousands
+/// separators in groups of three, `%` before or after, and an exponent.
+fn parse_number(t: &str) -> Option<(f64, NumShape)> {
+    let mut shape = NumShape::default();
+    let mut s = t;
+    let mut negative = false;
+    if let Some(inner) = s.strip_prefix('(').and_then(|x| x.strip_suffix(')')) {
+        negative = true;
+        s = inner.trim();
+    }
+    let mut signed = negative;
+    let mut take_sign = |s: &mut &str, negative: &mut bool| {
+        if signed {
+            return;
+        }
+        if let Some(r) = s.strip_prefix('-') {
+            *negative = true;
+            signed = true;
+            *s = r;
+        } else if let Some(r) = s.strip_prefix('+') {
+            signed = true;
+            *s = r;
+        }
+    };
+    take_sign(&mut s, &mut negative);
+    if let Some(r) = s.strip_prefix('$') {
+        shape.currency = true;
+        s = r.trim_start();
+        take_sign(&mut s, &mut negative);
+    }
+    if let Some(r) = s.strip_prefix('%') {
+        shape.percent = true;
+        s = r.trim_start();
+    } else if let Some(r) = s.strip_suffix('%') {
+        shape.percent = true;
+        s = r.trim_end();
+    }
+    if shape.currency && shape.percent {
+        return None;
+    }
+    let (mant, exp) = match s.find(['e', 'E']) {
+        Some(i) => (&s[..i], Some(&s[i + 1..])),
+        None => (s, None),
+    };
+    let (int, frac) = match mant.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mant, None),
+    };
+    if !frac.is_none_or(|f| f.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let digits: String = if int.contains(',') {
+        let groups: Vec<&str> = int.split(',').collect();
+        let ok = (1..=3).contains(&groups[0].len())
+            && groups[1..].iter().all(|g| g.len() == 3)
+            && groups.iter().all(|g| g.bytes().all(|b| b.is_ascii_digit()));
+        if !ok || exp.is_some() {
+            return None;
+        }
+        shape.thousands = true;
+        groups.concat()
+    } else {
+        if !int.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        int.to_string()
+    };
+    if digits.is_empty() && frac.is_none_or(str::is_empty) {
+        return None;
+    }
+    shape.decimals = frac.is_some_and(|f| !f.is_empty());
+    let mut src = digits;
+    if let Some(f) = frac {
+        src.push('.');
+        src.push_str(f);
+    }
+    if let Some(e) = exp {
+        let body = e.strip_prefix(['+', '-']).unwrap_or(e);
+        if body.is_empty() || !body.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        shape.exponent = true;
+        src.push('e');
+        src.push_str(e);
+    }
+    let mut n: f64 = src.parse().ok()?;
+    if shape.percent {
+        n /= 100.0;
+    }
+    if negative {
+        n = -n;
+    }
+    n.is_finite().then_some((n, shape))
+}
+
+/// `[-]W N/D` — a whole number, a space and a proper fraction.
+fn parse_fraction(t: &str) -> Option<(f64, &'static str)> {
+    let (negative, s) = match t.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, t),
+    };
+    let (whole, frac) = s.split_once(' ')?;
+    let (num, den) = frac.trim_start().split_once('/')?;
+    let all_digits = |x: &str| !x.is_empty() && x.bytes().all(|b| b.is_ascii_digit());
+    if !all_digits(whole) || !all_digits(num) || !all_digits(den) {
+        return None;
+    }
+    let (w, n, d): (f64, f64, f64) = (whole.parse().ok()?, num.parse().ok()?, den.parse().ok()?);
+    if d == 0.0 {
+        return None;
+    }
+    let v = w + n / d;
+    let format = if den.len() == 1 { "# ?/?" } else { "# ??/??" };
+    v.is_finite()
+        .then_some((if negative { -v } else { v }, format))
+}
+
+// ---------------------------------------------------------------------------
+// Dates and times
+// ---------------------------------------------------------------------------
+
+/// A month from its full English name or three-letter abbreviation.
+fn month_name(s: &str) -> Option<u32> {
+    const M: [&str; 12] = [
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    ];
+    let s = s.to_ascii_lowercase();
+    M.iter()
+        .position(|m| s == *m || (s.len() == 3 && m.starts_with(&s)))
+        .map(|i| i as u32 + 1)
+}
+
+fn num(s: &str) -> Option<i64> {
+    if s.is_empty() || s.len() > 4 || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+
+/// A year as typed: four digits as is, one or two by Excel's 00–29/30–99
+/// rule; three digits are not a year.
+fn year(s: &str) -> Option<i64> {
+    let y = num(s)?;
+    match s.len() {
+        1 | 2 => Some(norm_year(y)),
+        4 => Some(y),
+        _ => None,
+    }
+}
+
+/// A date or a time or both: the serial and the format Excel gives it.
+fn parse_date_time(t: &str, ctx: &EntryCtx) -> Option<(f64, &'static str)> {
+    if let Some((n, f)) = parse_time(t) {
+        return Some((n, f));
+    }
+    if let Some((serial, f)) = parse_date(t, ctx) {
+        return Some((serial, f));
+    }
+    // A date, a space, then a time: try every split, rightmost first.
+    for (i, _) in t.match_indices(' ').collect::<Vec<_>>().into_iter().rev() {
+        let (d, tm) = (t[..i].trim_end(), t[i + 1..].trim_start());
+        if let (Some((day, _)), Some((frac, _))) = (parse_date(d, ctx), parse_time(tm)) {
+            if frac < 1.0 {
+                return Some((day + frac, "m/d/yyyy h:mm"));
+            }
+        }
+    }
+    None
+}
+
+/// `h:mm`, `h:mm:ss`, an optional `AM`/`PM`/`a`/`p`, or `h AM`.
+fn parse_time(t: &str) -> Option<(f64, &'static str)> {
+    let lower = t.to_ascii_lowercase();
+    let mut body = lower.as_str();
+    let mut pm = None;
+    for (suf, is_pm) in [("am", false), ("pm", true), ("a", false), ("p", true)] {
+        if let Some(rest) = body.strip_suffix(suf) {
+            pm = Some(is_pm);
+            body = rest.trim_end();
+            break;
+        }
+    }
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() > 3 || (parts.len() == 1 && pm.is_none()) {
+        return None;
+    }
+    let mut h = num(parts[0])?;
+    let m = match parts.get(1) {
+        Some(p) if p.len() <= 2 => num(p)?,
+        Some(_) => return None,
+        None => 0,
+    };
+    let sec: f64 = match parts.get(2) {
+        Some(p) => {
+            let (whole, frac) = p.split_once('.').unwrap_or((p, "0"));
+            if whole.len() > 2 || num(whole).is_none() || !frac.bytes().all(|b| b.is_ascii_digit())
+            {
+                return None;
+            }
+            p.parse().ok()?
+        }
+        None => 0.0,
+    };
+    if m >= 60 || sec >= 60.0 {
+        return None;
+    }
+    let seconds = parts.len() == 3;
+    let format = match pm {
+        Some(is_pm) => {
+            if !(0..=12).contains(&h) {
+                return None;
+            }
+            h %= 12;
+            if is_pm {
+                h += 12;
+            }
+            if seconds {
+                "h:mm:ss AM/PM"
+            } else {
+                "h:mm AM/PM"
+            }
+        }
+        None if h >= 24 => "[h]:mm:ss",
+        None if seconds => "h:mm:ss",
+        None => "h:mm",
+    };
+    Some((
+        (h as f64 * 3600.0 + m as f64 * 60.0 + sec) / 86_400.0,
+        format,
+    ))
+}
+
+/// A calendar date in the forms Excel's en-US entry reads.
+fn parse_date(t: &str, ctx: &EntryCtx) -> Option<(f64, &'static str)> {
+    // A date starts and ends on a digit or a letter, and `/`/`-` separate two
+    // parts: `-1/2` is a formula prefix, `1//2` nothing at all.
+    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    if !edge(t.chars().next()) || !edge(t.chars().last()) {
+        return None;
+    }
+    let seps = |a: char, b: char| {
+        matches!(a, '/' | '-') && matches!(b, '/' | '-' | ' ' | ',')
+            || matches!(a, ' ' | ',') && matches!(b, '/' | '-')
+    };
+    if t.chars().zip(t.chars().skip(1)).any(|(a, b)| seps(a, b)) {
+        return None;
+    }
+    let parts: Vec<&str> = t
+        .split(['/', '-', ' ', ','])
+        .filter(|p| !p.is_empty())
+        .collect();
+    // Separators other than those are not a date.
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let this_year = || {
+        let today = ctx.today?;
+        serial_to_parts(today.floor(), false).map(|p| p.year)
+    };
+    let (y, m, d, format): (i64, u32, u32, &'static str) =
+        if let Some(mi) = parts.iter().position(|p| month_name(p).is_some()) {
+            let m = month_name(parts[mi])?;
+            let others: Vec<&str> = parts
+                .iter()
+                .enumerate()
+                .filter(|&(i, _)| i != mi)
+                .map(|(_, p)| *p)
+                .collect();
+            match (mi, others.as_slice()) {
+                // 15-Jan-2024, January 15, 2024
+                (1, [d, y]) | (0, [d, y]) => (year(y)?, m, num(d)? as u32, "d-mmm-yy"),
+                // 15-Jan
+                (1, [d]) => (this_year()?, m, num(d)? as u32, "d-mmm"),
+                // Jan-2024 (a year), Jan-15 (a day of this year)
+                (0, [x]) => {
+                    let v = num(x)?;
+                    if x.len() <= 2 && (1..=31).contains(&v) {
+                        (this_year()?, m, v as u32, "d-mmm")
+                    } else {
+                        (year(x)?, m, 1, "mmm-yy")
+                    }
+                }
+                _ => return None,
+            }
+        } else {
+            // All numeric, and `/` or `-` only between them.
+            if t.contains([' ', ',']) {
+                return None;
+            }
+            let n: Vec<i64> = parts.iter().map(|p| num(p)).collect::<Option<_>>()?;
+            match parts.as_slice() {
+                [a, _, _] if a.len() == 4 => (n[0], n[1] as u32, n[2] as u32, "m/d/yyyy"),
+                [_, _, y] => (year(y)?, n[0] as u32, n[1] as u32, "m/d/yyyy"),
+                // 1/2024: a month and a year.
+                [_, y] if y.len() == 4 || n[1] > 31 => (year(y)?, n[0] as u32, 1, "mmm-yy"),
+                // 3/4: a month and a day of this year.
+                [_, _] => (this_year()?, n[0] as u32, n[1] as u32, "d-mmm"),
+                _ => return None,
+            }
+        };
+    let first_year = if ctx.date1904 { 1904 } else { 1900 };
+    if !(first_year..=9999).contains(&y) || !(1..=12).contains(&m) {
+        return None;
+    }
+    if d < 1 || d > days_in_month(y, m) {
+        return None;
+    }
+    let serial = parts_to_serial(y, m, d, 0, ctx.date1904);
+    (serial >= 0.0).then_some((serial, format))
+}
+
+// ---------------------------------------------------------------------------
+// Formula prefixes
+// ---------------------------------------------------------------------------
+
+/// `+2+3` → `2+3`, `+A99` → `+A99`, `-L1` → `-L1`, `@SUM(1,2)` → `SUM(1,2)`:
+/// the formula source a `+ - @` prefix makes, when it parses.
+fn formula_prefix(t: &str) -> Option<String> {
+    let mut chars = t.chars();
+    let first = chars.next()?;
+    let rest = chars.as_str();
+    if rest.is_empty() {
+        return None;
+    }
+    let src = match first {
+        '+' if rest.starts_with(|c: char| c.is_ascii_digit() || c == '.') => rest,
+        '+' | '-' => t,
+        '@' => rest,
+        _ => return None,
+    };
+    crate::engine::Engine::validate(src).ok()?;
+    Some(src.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 2024-09-30 as a 1900-system serial.
+    const TODAY: f64 = 45_565.0;
+
+    fn ctx() -> EntryCtx {
+        EntryCtx {
+            date1904: false,
+            today: Some(TODAY),
+        }
+    }
+
+    fn general(text: &str) -> Entry {
+        parse_entry(text, &Xf::default(), &ctx()).unwrap()
+    }
+
+    fn number(text: &str) -> (f64, Option<&'static str>) {
+        let e = general(text);
+        match e.cell.value {
+            CellValue::Number(n) if e.cell.formula.is_none() => (n, e.format),
+            other => panic!("{text:?} → {other:?} (formula {:?})", e.cell.formula),
+        }
+    }
+
+    fn is_text_entry(text: &str) -> bool {
+        let e = general(text);
+        e.cell.formula.is_none() && e.cell.value == CellValue::Text(text.to_string())
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-6
+    }
+
+    #[test]
+    fn numbers_with_separators_parentheses_percent_and_exponent() {
+        let rows: &[(&str, f64, Option<&str>)] = &[
+            ("42", 42.0, None),
+            ("-2.5", -2.5, None),
+            ("+5", 5.0, None),
+            ("-5", -5.0, None),
+            (".5", 0.5, None),
+            ("1,234", 1234.0, Some("#,##0")),
+            ("1,234.5", 1234.5, Some("#,##0.00")),
+            ("1,234,567", 1_234_567.0, Some("#,##0")),
+            ("(42)", -42.0, None),
+            ("1,000%", 10.0, Some("0%")),
+            ("(5%)", -0.05, Some("0%")),
+            ("%5", 0.05, Some("0%")),
+            ("50%", 0.5, Some("0%")),
+            ("12.5%", 0.125, Some("0.00%")),
+            ("1E3", 1000.0, Some("0.00E+00")),
+            ("1.5e-3", 0.0015, Some("0.00E+00")),
+        ];
+        for &(text, want, fmt) in rows {
+            let (n, f) = number(text);
+            assert!(close(n, want), "{text}: {n} != {want}");
+            assert_eq!(f, fmt, "{text}");
+        }
+    }
+
+    #[test]
+    fn currency_takes_excels_currency_code() {
+        let whole = Some("$#,##0_);($#,##0)");
+        let cents = Some("$#,##0.00_);($#,##0.00)");
+        for (text, want, fmt) in [
+            ("$5", 5.0, whole),
+            ("$1,234.56", 1234.56, cents),
+            ("-$5", -5.0, whole),
+            ("$-5", -5.0, whole),
+            ("($5)", -5.0, whole),
+            ("$ 5", 5.0, whole),
+        ] {
+            let (n, f) = number(text);
+            assert!(close(n, want), "{text}: {n}");
+            assert_eq!(f, fmt, "{text}");
+        }
+        // And the code renders.
+        let xf = Xf {
+            code: whole.map(str::to_string),
+            ..Xf::default()
+        };
+        assert_eq!(
+            crate::sheet::format_with(&xf, &CellValue::Number(-5.0), false),
+            "($5)"
+        );
+    }
+
+    #[test]
+    fn fractions_take_a_fraction_format() {
+        for (text, want) in [("0 1/2", 0.5), ("1 1/4", 1.25), ("-1 1/2", -1.5)] {
+            let (n, f) = number(text);
+            assert!(close(n, want), "{text}: {n}");
+            assert_eq!(f, Some("# ?/?"), "{text}");
+        }
+        assert_eq!(number("3 5/16").1, Some("# ??/??"));
+    }
+
+    #[test]
+    fn malformed_numbers_stay_text() {
+        for text in [
+            "1,23", "$", "1 1/0", "1,,2", "1.2.3", "$5%", "(-5)", "1,234E3", "e5", "5e", "12abc",
+            "%", "()", "1 1/2x",
+        ] {
+            assert!(is_text_entry(text), "{text:?} should stay text");
+        }
+    }
+
+    #[test]
+    fn dates_and_times_take_excels_formats() {
+        let rows: &[(&str, f64, &str)] = &[
+            ("1/15/2024", 45306.0, "m/d/yyyy"),
+            ("1/15/24", 45306.0, "m/d/yyyy"),
+            ("2024-01-15", 45306.0, "m/d/yyyy"),
+            ("15-Jan-2024", 45306.0, "d-mmm-yy"),
+            ("January 15, 2024", 45306.0, "d-mmm-yy"),
+            ("Jan-2024", 45292.0, "mmm-yy"),
+            ("9:30", 0.395833, "h:mm"),
+            ("9:30 PM", 0.895833, "h:mm AM/PM"),
+            ("9:30 p", 0.895833, "h:mm AM/PM"),
+            ("25:00", 1.041667, "[h]:mm:ss"),
+            ("12:00 AM", 0.0, "h:mm AM/PM"),
+            ("9:30:15", 0.396007, "h:mm:ss"),
+            ("1/15/2024 9:30", 45306.395833, "m/d/yyyy h:mm"),
+        ];
+        for &(text, want, fmt) in rows {
+            let (n, f) = number(text);
+            assert!(close(n, want), "{text}: {n} != {want}");
+            assert_eq!(f, Some(fmt), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_date_without_a_year_takes_the_clocks_year() {
+        // 3/4 → 4 March 2024 (the clock's year).
+        let (n, f) = number("3/4");
+        assert_eq!(n, parts_to_serial(2024, 3, 4, 0, false));
+        assert_eq!(f, Some("d-mmm"));
+        // With no clock it stays text rather than guess.
+        let no_clock = EntryCtx::default();
+        let e = parse_entry("3/4", &Xf::default(), &no_clock).unwrap();
+        assert_eq!(e.cell.value, CellValue::Text("3/4".into()));
+    }
+
+    #[test]
+    fn two_digit_years_follow_excels_split() {
+        assert_eq!(number("1/1/29").0, parts_to_serial(2029, 1, 1, 0, false));
+        assert_eq!(number("1/1/30").0, parts_to_serial(1930, 1, 1, 0, false));
+        assert_eq!(number("1/1/99").0, parts_to_serial(1999, 1, 1, 0, false));
+        assert_eq!(number("1/1/00").0, parts_to_serial(2000, 1, 1, 0, false));
+    }
+
+    #[test]
+    fn impossible_dates_and_times_stay_text() {
+        for text in [
+            "2/30/2024",
+            "13/1/2024",
+            "1/15/202",
+            "9:75",
+            "13:00 PM",
+            "1/2/3/4",
+            "1//2",
+            "1/2-",
+        ] {
+            assert!(is_text_entry(text), "{text:?} should stay text");
+        }
+    }
+
+    #[test]
+    fn the_1904_system_counts_from_1904() {
+        let c = EntryCtx {
+            date1904: true,
+            today: Some(TODAY),
+        };
+        let serial = |t: &str| match parse_entry(t, &Xf::default(), &c).unwrap().cell.value {
+            CellValue::Number(n) => n,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(serial("1/1/1904"), 0.0);
+        assert_eq!(serial("1/15/2024"), 43844.0);
+    }
+
+    #[test]
+    fn formula_prefixes() {
+        for (text, src) in [
+            ("+2+3", "2+3"),
+            ("-2+3", "-2+3"),
+            ("-L1", "-L1"),
+            ("@SUM(1,2)", "SUM(1,2)"),
+            ("+A99", "+A99"),
+        ] {
+            let e = general(text);
+            assert_eq!(e.cell.formula.as_deref(), Some(src), "{text}");
+        }
+        // A doubled sign is a formula too, as in Excel.
+        assert_eq!(general("--5").cell.formula.as_deref(), Some("--5"));
+        // Plain signed numbers stay numbers; bare prefixes and bodies that
+        // don't parse stay text.
+        assert_eq!(number("+5").0, 5.0);
+        assert_eq!(general("-1/2").cell.formula.as_deref(), Some("-1/2"));
+        assert_eq!(number("-5").0, -5.0);
+        for text in ["+", "-", "@", "+(", "-)x", "@@"] {
+            assert!(is_text_entry(text), "{text:?} should stay text");
+        }
+    }
+
+    #[test]
+    fn formulas_booleans_errors_and_text() {
+        assert_eq!(general("=A1+1").cell.formula.as_deref(), Some("A1+1"));
+        assert!(is_text_entry("="));
+        assert_eq!(general("true").cell.value, CellValue::Bool(true));
+        assert_eq!(general("#n/a").cell.value, CellValue::Error("#N/A".into()));
+        assert!(is_text_entry("hello"));
+        assert_eq!(general("").cell, Cell::default());
+    }
+
+    #[test]
+    fn a_leading_apostrophe_is_a_quote_prefix_not_text() {
+        let e = general("'007");
+        assert_eq!(e.cell.value, CellValue::Text("007".into()));
+        assert!(e.quote_prefix);
+        // An apostrophe alone is an empty text cell, still quote-prefixed.
+        let e = general("'");
+        assert_eq!(e.cell.value, CellValue::Text(String::new()));
+        assert!(e.quote_prefix);
+        assert!(!general("007").quote_prefix);
+    }
+
+    #[test]
+    fn a_line_feed_asks_for_wrap() {
+        let e = general("ab\ncd");
+        assert!(e.wrap);
+        assert_eq!(e.cell.value, CellValue::Text("ab\ncd".into()));
+        assert!(!general("abcd").wrap);
+    }
+
+    #[test]
+    fn the_length_limit_counts_utf16_units() {
+        let at = "y".repeat(MAX_CELL_CHARS);
+        assert!(parse_entry(&at, &Xf::default(), &ctx()).is_ok());
+        let over = "y".repeat(MAX_CELL_CHARS + 1);
+        assert_eq!(
+            parse_entry(&over, &Xf::default(), &ctx()),
+            Err(EntryError::TooLong {
+                len: MAX_CELL_CHARS + 1
+            })
+        );
+        // 16,384 surrogate pairs are 32,768 units, though only 16,384 chars.
+        let pairs = "\u{1F600}".repeat(16_384);
+        assert_eq!(pairs.chars().count(), 16_384);
+        assert!(parse_entry(&pairs, &Xf::default(), &ctx()).is_err());
+    }
+
+    fn fmt_xf(code: &str) -> Xf {
+        Xf {
+            numfmt: classify_format_code(code),
+            code: Some(code.to_string()),
+            ..Xf::default()
+        }
+    }
+
+    #[test]
+    fn a_text_cell_takes_every_entry_as_typed() {
+        let xf = fmt_xf("@");
+        for text in ["007", "1/15/2024", "=1+2", "TRUE", "'x", "+2+3"] {
+            let e = parse_entry(text, &xf, &ctx()).unwrap();
+            assert_eq!(e.cell.value, CellValue::Text(text.into()), "{text}");
+            assert!(e.cell.formula.is_none(), "{text}");
+            assert!(!e.quote_prefix, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_percent_cell_divides_a_typed_number_of_at_least_one() {
+        let xf = fmt_xf("0.00%");
+        let n = |t: &str| match parse_entry(t, &xf, &ctx()).unwrap().cell.value {
+            CellValue::Number(n) => n,
+            other => panic!("{other:?}"),
+        };
+        for (text, want) in [
+            ("12.5", 0.125),
+            ("1", 0.01),
+            ("-3", -0.03),
+            ("0.5", 0.5),
+            ("0", 0.0),
+            ("12.5%", 0.125),
+        ] {
+            assert!(close(n(text), want), "{text}: {}", n(text));
+        }
+    }
+
+    #[test]
+    fn format_predicates_read_codes_and_classifications() {
+        assert!(is_general(&Xf::default()));
+        assert!(is_general(&Xf {
+            code: Some("General".into()),
+            ..Xf::default()
+        }));
+        assert!(!is_general(&fmt_xf("0.00")));
+        assert!(is_text(&fmt_xf("@")));
+        assert!(is_text(&Xf {
+            numfmt: NumFmt::Text,
+            ..Xf::default()
+        }));
+        assert!(is_percent(&fmt_xf("0%")));
+        assert!(is_percent(&Xf {
+            numfmt: NumFmt::Percent { decimals: 2 },
+            ..Xf::default()
+        }));
+        assert!(!is_percent(&fmt_xf("0.00")));
+    }
+
+    #[test]
+    fn a_recognised_format_lands_only_on_a_general_cell() {
+        let e = general("1/15/2024");
+        let on_general = entry_xf(&Xf::default(), &e);
+        assert_eq!(on_general.code.as_deref(), Some("m/d/yyyy"));
+        assert_eq!(on_general.numfmt, NumFmt::Date);
+        // A cell that already has a format keeps it (#654: 5 into a date cell).
+        let dated = fmt_xf("m/d/yyyy");
+        let e = parse_entry("5", &dated, &ctx()).unwrap();
+        assert_eq!(entry_xf(&dated, &e), dated);
+        let fixed = fmt_xf("0.00");
+        assert_eq!(entry_xf(&fixed, &general("50%")), fixed);
+    }
+
+    #[test]
+    fn entry_style_keeps_the_index_when_nothing_changes() {
+        let mut styles = Styles::default();
+        let bold = styles.intern(Xf {
+            bold: true,
+            ..Xf::default()
+        });
+        assert_eq!(entry_style(&mut styles, bold, &general("hello")), bold);
+        // A quote prefix interns a sibling that keeps the bold.
+        let q = entry_style(&mut styles, bold, &general("'007"));
+        assert_ne!(q, bold);
+        assert!(styles.xf(q).bold && styles.xf(q).quote_prefix);
+        // Plain input into the quote-prefixed cell clears it again.
+        let back = entry_style(&mut styles, q, &general("7"));
+        assert!(!styles.xf(back).quote_prefix);
+        assert!(styles.xf(back).bold);
+    }
+
+    #[test]
+    fn styled_input_text_puts_the_apostrophe_back() {
+        let quoted = Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        };
+        assert_eq!(input_text_styled(&Cell::text("007"), &quoted), "'007");
+        assert_eq!(input_text_styled(&Cell::text("007"), &Xf::default()), "007");
+        assert_eq!(input_text_styled(&Cell::number(7.0), &quoted), "7");
+        // Re-entering the styled text gives back the same cell and prefix.
+        let e = parse_entry("'007", &quoted, &ctx()).unwrap();
+        assert_eq!(e.cell, Cell::text("007"));
+        assert_eq!(entry_xf(&quoted, &e), quoted);
+    }
+
+    #[test]
+    fn loaded_styles_drive_the_rules() {
+        // numFmtId 0 / 49 / 10 exactly as a file's styles.xml gives them.
+        let mut pkg = crate::xlsx::new_xlsx();
+        let styles_path = "xl/styles.xml";
+        let xml = String::from_utf8(pkg.part(styles_path).unwrap().to_vec()).unwrap();
+        let xml = xml.replacen(
+            "</cellXfs>",
+            "<xf numFmtId=\"49\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/>\
+             <xf numFmtId=\"10\" fontId=\"0\" fillId=\"0\" borderId=\"0\" xfId=\"0\" applyNumberFormat=\"1\"/></cellXfs>",
+            1,
+        );
+        pkg.set_part(styles_path, xml.into_bytes());
+        let pkg = crate::xlsx::load_xlsx(&crate::xlsx::save_xlsx(&pkg)).unwrap();
+        let styles = &pkg.workbook.styles;
+        let n = styles.xfs.len() as u32;
+        let (general_xf, text_xf, pct_xf) = (styles.xf(0), styles.xf(n - 2), styles.xf(n - 1));
+        assert!(is_general(&general_xf), "{general_xf:?}");
+        assert!(is_text(&text_xf), "{text_xf:?}");
+        assert!(is_percent(&pct_xf), "{pct_xf:?}");
+        let e = parse_entry("007", &text_xf, &ctx()).unwrap();
+        assert_eq!(e.cell.value, CellValue::Text("007".into()));
+        let e = parse_entry("12.5", &pct_xf, &ctx()).unwrap();
+        assert_eq!(e.cell.value, CellValue::Number(0.125));
+    }
+
+    #[test]
+    fn entry_range_moves_a_formula_with_each_cell() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        let wb = &mut pkg.workbook;
+        let cells = entry_range(wb, 0, (0, 1, 2, 1), (0, 1), "=A1*10", None).unwrap();
+        let formulas: Vec<_> = cells.iter().map(|(_, _, c)| c.formula.clone()).collect();
+        assert_eq!(
+            formulas,
+            vec![
+                Some("A1*10".to_string()),
+                Some("A2*10".to_string()),
+                Some("A3*10".to_string())
+            ]
+        );
+        // The active cell need not be the top-left one.
+        let cells = entry_range(wb, 0, (0, 1, 1, 1), (1, 1), "=A2", None).unwrap();
+        assert_eq!(cells[0].2.formula.as_deref(), Some("A1"));
+        let cells = entry_range(wb, 0, (0, 0, 0, 1), (0, 0), "5", None).unwrap();
+        assert!(
+            cells
+                .iter()
+                .all(|(_, _, c)| c.value == CellValue::Number(5.0))
+        );
+    }
+
+    #[test]
+    fn entry_cell_resolves_the_cells_style_in_the_workbook() {
+        let mut pkg = crate::xlsx::new_xlsx();
+        let wb = &mut pkg.workbook;
+        let cell = entry_cell(wb, 0, 0, 0, "1,234", Some(TODAY)).unwrap();
+        assert_eq!(cell.value, CellValue::Number(1234.0));
+        assert_eq!(wb.styles.xf(cell.style).code.as_deref(), Some("#,##0"));
+        let err = entry_cell(wb, 0, 0, 0, &"y".repeat(MAX_CELL_CHARS + 1), None);
+        assert!(matches!(err, Err(EntryError::TooLong { .. })));
+    }
+}

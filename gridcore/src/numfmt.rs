@@ -5,7 +5,8 @@
 //! into sections and tokens, then rendered against a value.
 //!
 //! Honesty contract: [`parse_format`] returns `None` for constructs we don't
-//! model (fractions, locale-dependent day names beyond English, etc.), and
+//! model (locale-dependent day names beyond English, fraction shapes other
+//! than `# ?/?`-style, etc.), and
 //! callers fall back — `TEXT()` marks itself unsupported rather than
 //! fabricating output, and cell display falls back to the classified
 //! approximation.
@@ -64,6 +65,17 @@ struct Section {
     is_text: bool,
     has_percent: bool,
     exp: Option<(bool, usize)>,
+    /// A fraction section (`# ?/?`, `# ??/??`, `?/?`): the numerator and
+    /// denominator placeholder counts, and whether a whole-number part leads.
+    fraction: Option<Fraction>,
+}
+
+/// The shape of a fraction section.
+#[derive(Clone, Copy, Debug)]
+struct Fraction {
+    whole: bool,
+    num_digits: usize,
+    den_digits: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -149,6 +161,7 @@ fn parse_section(src: &str) -> Option<Section> {
             is_text: false,
             has_percent: false,
             exp: None,
+            fraction: None,
         });
     }
 
@@ -386,14 +399,16 @@ fn analyze(mut toks: Vec<Tok>, condition: Option<(CmpOp, f64)>) -> Option<Sectio
     if is_date && (has_percent || exp.is_some()) {
         return None;
     }
-    // Fraction formats ("# ?/?") aren't modeled — refuse rather than guess.
+    // Fraction formats: only the plain `# ?/?` family is modeled; any other
+    // section with a `?` and a `/` is refused rather than guessed.
+    let mut fraction = None;
     if !is_date
         && toks.iter().any(|t| matches!(t, Tok::Digit('?')))
         && toks
             .iter()
             .any(|t| matches!(t, Tok::Lit(s) if s.contains('/')))
     {
-        return None;
+        fraction = Some(fraction_shape(&toks)?);
     }
 
     // Comma classification: a comma between digit placeholders → grouping;
@@ -470,7 +485,94 @@ fn analyze(mut toks: Vec<Tok>, condition: Option<(CmpOp, f64)>) -> Option<Sectio
         is_text,
         has_percent,
         exp,
+        fraction,
     })
+}
+
+/// Recognise `[digits " "] digits "/" digits` — the fraction shapes Excel
+/// itself assigns (`# ?/?`, `# ??/??`) and their whole-less forms.
+fn fraction_shape(toks: &[Tok]) -> Option<Fraction> {
+    let digits = |from: usize| {
+        toks[from..]
+            .iter()
+            .take_while(|t| matches!(t, Tok::Digit(_)))
+            .count()
+    };
+    let mut i = 0;
+    let lead = digits(0);
+    let whole = matches!(toks.get(lead), Some(Tok::Lit(s)) if s == " ");
+    if whole {
+        if lead == 0 {
+            return None;
+        }
+        i = lead + 1;
+    }
+    let num_digits = digits(i);
+    i += num_digits;
+    if num_digits == 0 || !matches!(toks.get(i), Some(Tok::Lit(s)) if s == "/") {
+        return None;
+    }
+    i += 1;
+    let den_digits = digits(i);
+    i += den_digits;
+    if den_digits == 0 || i != toks.len() {
+        return None;
+    }
+    Some(Fraction {
+        whole,
+        num_digits,
+        den_digits,
+    })
+}
+
+/// Render through a fraction section: the closest fraction whose denominator
+/// fits the placeholders, `?` padding with spaces as Excel does.
+fn render_fraction(f: Fraction, x: f64, original: f64) -> String {
+    let max_den = 10u64.pow(f.den_digits.min(6) as u32) - 1;
+    let a = x.abs();
+    let (mut whole, rest) = if f.whole {
+        (a.trunc() as u64, a.fract())
+    } else {
+        (0, a)
+    };
+    let (mut num, mut den) = (0u64, 1u64);
+    let mut best = f64::INFINITY;
+    for d in 1..=max_den {
+        let n = (rest * d as f64).round() as u64;
+        let err = (rest - n as f64 / d as f64).abs();
+        if err < best - 1e-12 {
+            best = err;
+            num = n;
+            den = d;
+        }
+    }
+    if f.whole && num == den {
+        whole += 1;
+        num = 0;
+    }
+    let mut out = String::new();
+    if original < 0.0 && (whole > 0 || num > 0) {
+        out.push('-');
+    }
+    let frac_width = f.num_digits + 1 + f.den_digits;
+    if f.whole {
+        if whole > 0 || num == 0 {
+            out.push_str(&whole.to_string());
+        }
+        out.push(' ');
+        if num == 0 {
+            out.push_str(&" ".repeat(frac_width));
+            return out;
+        }
+    }
+    let n = num.to_string();
+    let d = den.to_string();
+    out.push_str(&" ".repeat(f.num_digits.saturating_sub(n.len())));
+    out.push_str(&n);
+    out.push('/');
+    out.push_str(&d);
+    out.push_str(&" ".repeat(f.den_digits.saturating_sub(d.len())));
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +626,11 @@ impl NumFormat {
     /// Is this format date-flavored (drives right-alignment etc.)?
     pub fn is_date(&self) -> bool {
         self.sections.first().is_some_and(|s| s.is_date)
+    }
+
+    /// Does `v` render through a date/time section of this format?
+    pub fn is_date_for(&self, v: f64) -> bool {
+        self.pick_section(v).is_some_and(|s| s.is_date)
     }
 
     fn pick_section(&self, v: f64) -> Option<&Section> {
@@ -586,6 +693,9 @@ fn render_section(
     }
     if sect.is_date {
         return render_date(sect, x, date1904);
+    }
+    if let Some(f) = sect.fraction {
+        return render_fraction(f, x, original);
     }
     render_number(sect, x, explicit_sign)
 }
@@ -990,9 +1100,19 @@ mod tests {
 
     #[test]
     fn refusals() {
-        assert!(parse_format("# ?/?").is_none()); // fractions
+        assert!(parse_format("0 ?/? x").is_none()); // an unmodeled fraction shape
         assert!(parse_format("0;0;0;0;0").is_none()); // too many sections
         assert!(parse_format("0\u{4e2d}0").is_none()); // opaque letter
+    }
+
+    #[test]
+    fn fraction_sections() {
+        assert_eq!(fmt("# ?/?", 1.25), "1 1/4");
+        assert_eq!(fmt("# ?/?", 0.5), " 1/2");
+        assert_eq!(fmt("# ?/?", -1.5), "-1 1/2");
+        assert_eq!(fmt("# ?/?", 2.0), "2    ");
+        assert_eq!(fmt("# ??/??", 0.3125), "  5/16");
+        assert_eq!(fmt("?/?", 1.5), "3/2");
     }
 
     #[test]

@@ -1379,6 +1379,10 @@ pub struct Xf {
     /// Wrap long text onto multiple lines within the cell (`<alignment
     /// wrapText="1">`). Rendered as wrapped lines; drives auto-fit row height.
     pub wrap: bool,
+    /// The cell's text was entered with a leading apostrophe (`quotePrefix="1"`):
+    /// the value is text even where it reads as a number, and the editor shows
+    /// the apostrophe again.
+    pub quote_prefix: bool,
 }
 
 /// A differential format (`<dxf>`) referenced by a conditional-formatting rule.
@@ -1757,10 +1761,32 @@ pub fn format_value(value: &CellValue, fmt: NumFmt, date1904: bool) -> String {
     }
 }
 
+/// What a cell shows for a date or time it cannot display. The grids widen
+/// it to fill the column, as Excel does.
+pub const UNREPRESENTABLE: &str = "########";
+
+/// Is `value` a number shown through a date/time format that cannot display
+/// it (negative, or past 9999-12-31)? Excel fills such a cell with `#`.
+pub fn date_unrepresentable(xf: &Xf, value: &CellValue, date1904: bool) -> bool {
+    let CellValue::Number(n) = value else {
+        return false;
+    };
+    if !n.is_finite() || serial_to_parts(*n, date1904).is_some() {
+        return false;
+    }
+    if let Some(fmt) = xf.code.as_deref().and_then(crate::numfmt::parse_format) {
+        return fmt.is_date_for(*n);
+    }
+    matches!(xf.numfmt, NumFmt::Date | NumFmt::Time | NumFmt::DateTime)
+}
+
 /// Render a cell value through its full style: the real format-code runtime
 /// when the code is known and renderable, the classified approximation
-/// otherwise.
+/// otherwise. A date or time that cannot be shown is [`UNREPRESENTABLE`].
 pub fn format_with(xf: &Xf, value: &CellValue, date1904: bool) -> String {
+    if date_unrepresentable(xf, value, date1904) {
+        return UNREPRESENTABLE.to_string();
+    }
     if let Some(code) = &xf.code {
         if let Some(fmt) = crate::numfmt::parse_format(code) {
             match value {
@@ -1806,6 +1832,48 @@ pub fn sheet_to_csv(sheet: &Sheet, styles: &Styles, date1904: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undisplayable_date_or_time_is_a_hash_run() {
+        let coded = |code: &str| Xf {
+            numfmt: classify_format_code(code),
+            code: Some(code.to_string()),
+            ..Xf::default()
+        };
+        let neg = CellValue::Number(-1.0);
+        for code in ["yyyy-mm-dd", "m/d/yyyy", "h:mm", "[h]:mm", "m/d/yyyy h:mm"] {
+            assert_eq!(
+                format_with(&coded(code), &neg, false),
+                UNREPRESENTABLE,
+                "{code}"
+            );
+        }
+        // Past 9999-12-31 too.
+        let huge = CellValue::Number(3_000_000.0);
+        assert_eq!(
+            format_with(&coded("m/d/yyyy"), &huge, false),
+            UNREPRESENTABLE
+        );
+        // A classified date with no renderable code.
+        let classified = Xf {
+            numfmt: NumFmt::Date,
+            ..Xf::default()
+        };
+        assert!(date_unrepresentable(&classified, &neg, false));
+        // General still shows -1, a representable date still renders, and a
+        // format whose negative section is not a date shows the number.
+        assert_eq!(format_with(&Xf::default(), &neg, false), "-1");
+        assert_eq!(
+            format_with(&coded("yyyy-mm-dd"), &CellValue::Number(45306.0), false),
+            "2024-01-15"
+        );
+        assert_eq!(format_with(&coded("yyyy-mm-dd;0"), &neg, false), "1");
+        assert!(!date_unrepresentable(
+            &coded("yyyy-mm-dd"),
+            &CellValue::Text("x".into()),
+            false
+        ));
+    }
 
     #[test]
     fn range_readers_take_a_column_of_cells_as_numbers_or_labels() {

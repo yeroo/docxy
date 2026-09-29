@@ -203,13 +203,15 @@ impl Session {
                             }
                         }
                     }
-                    let style = self.pkg.workbook.sheets[self.active]
-                        .cell(r, c)
-                        .map(|x| x.style)
-                        .unwrap_or(0);
-                    let mut cell = parse_input(text);
-                    cell.style = style;
-                    self.apply(vec![(r, c, cell)]);
+                    let today = self.engine.clock;
+                    let wb = &mut self.pkg.workbook;
+                    match gridcore::entry::entry_cell(wb, self.active, r, c, text, today) {
+                        Ok(cell) => self.apply(vec![(r, c, cell)]),
+                        Err(e) => {
+                            self.err = Some(e.to_string());
+                            return None;
+                        }
+                    }
                 }
             }
             "clear" => {
@@ -517,7 +519,8 @@ impl Session {
         self.engine = engine;
     }
 
-    /// The raw editable source of a cell: `=FORMULA` or the raw value text.
+    /// The raw editable source of a cell: `=FORMULA` or the raw value text,
+    /// with a quote prefix's apostrophe put back.
     fn cell_src(&self, row: u32, col: u32) -> String {
         let Some(cell) = self.pkg.workbook.sheets[self.active].cell(row, col) else {
             return String::new();
@@ -526,6 +529,9 @@ impl Session {
             return format!("={f}");
         }
         match &cell.value {
+            CellValue::Text(s) if self.pkg.workbook.styles.xf(cell.style).quote_prefix => {
+                format!("'{s}")
+            }
             CellValue::Empty => String::new(),
             CellValue::Number(n) => {
                 // Shortest round-trip text (Rust's f64 Display is shortest).
@@ -1863,24 +1869,23 @@ impl Session {
                     })?;
                 }
             }
+            gridcore::entry::check_len(text)
+                .map_err(|e| format!("range.set: {e} at {}", cell_name(*r, *c)))?;
         }
 
         // Pass 2: every entry validated — build the changes and apply as one
         // undo group, on the target sheet (temporarily swapping `active`,
         // same trick `ctl_cell_set` already uses, since `apply` targets
         // `self.active`).
+        let today = self.engine.clock;
+        let mut changes: Vec<(u32, u32, Cell)> = Vec::with_capacity(entries.len());
+        for (r, c, text) in entries {
+            let cell = gridcore::entry::entry_cell(&mut self.pkg.workbook, si, r, c, &text, today)
+                .map_err(|e| format!("range.set: {e} at {}", cell_name(r, c)))?;
+            changes.push((r, c, cell));
+        }
         let prev_active = self.active;
         self.active = si;
-        let sheet = &self.pkg.workbook.sheets[si];
-        let changes: Vec<(u32, u32, Cell)> = entries
-            .into_iter()
-            .map(|(r, c, text)| {
-                let style = sheet.cell(r, c).map(|x| x.style).unwrap_or(0);
-                let mut cell = parse_input(&text);
-                cell.style = style;
-                (r, c, cell)
-            })
-            .collect();
         let n = changes.len();
         let undo_steps = if changes.is_empty() { 0 } else { 1 };
         self.apply(changes);
@@ -2401,9 +2406,12 @@ impl Session {
         }
         let text = args.get_str("text").ok_or("wb.replace-all needs 'text'")?;
         let mut replaced = 0usize;
+        let today = self.engine.clock;
         self.structural(|wb| {
+            let ctx = gridcore::entry::entry_ctx(wb, today);
             for sheet in &mut wb.sheets {
-                let changes = gridcore::edit::replace_all_in_sheet(sheet, query, text);
+                let changes =
+                    gridcore::edit::replace_all_in_sheet(sheet, &mut wb.styles, &ctx, query, text);
                 replaced += changes.len();
                 for (r, c, nc) in changes {
                     sheet.set_cell(r, c, nc);
@@ -3344,6 +3352,34 @@ mod tests {
         );
         let out = s.ctl(r#"{"verb":"cell.get","args":{"ref":"B4"}}"#);
         assert!(out.contains("SUM(B1:B3)"), "{out}");
+    }
+
+    #[test]
+    fn set_refuses_an_entry_over_the_cell_limit_658() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set	0	0	old");
+        s.err = None;
+        s.dispatch(&format!("set	0	0	{}", "y".repeat(32_768)));
+        let err = s.err.clone().expect("an error");
+        assert!(err.contains("32767"), "{err}");
+        assert_eq!(s.cell_src(0, 0), "old");
+        let r = s.ctl(&format!(
+            r#"{{"verb":"cell.set","args":{{"ref":"A1","text":"{}"}}}}"#,
+            "y".repeat(32_768)
+        ));
+        assert!(r.contains("32767"), "{r}");
+    }
+
+    #[test]
+    fn set_reads_entries_the_way_excel_does() {
+        let mut s = Session::open(&sample_xlsx()).expect("open");
+        s.dispatch("set	20	0	'007");
+        assert_eq!(s.cell_src(20, 0), "'007");
+        let cell = s.pkg.workbook.sheets[s.active].cell(20, 0).unwrap().clone();
+        assert_eq!(cell.value, CellValue::Text("007".into()));
+        s.dispatch("set	21	0	$1,234.56");
+        let cell = s.pkg.workbook.sheets[s.active].cell(21, 0).unwrap().clone();
+        assert_eq!(cell.value, CellValue::Number(1234.56));
     }
 
     #[test]

@@ -12,53 +12,22 @@
 
 use std::collections::BTreeMap;
 
-use crate::formula::{EditShift, ExcelError, adjust_formula_for_edit, rename_sheet_in_formula};
-use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Workbook};
+use crate::entry::EntryCtx;
+use crate::formula::{
+    EditShift, adjust_formula_for_edit, rename_sheet_in_formula, translate_formula,
+};
+use crate::sheet::{Cell, CellValue, MAX_COLS, MAX_ROWS, Sheet, Styles, Workbook, Xf};
 
-/// Interpret typed input as Excel would: formulas, numbers (incl. percent),
-/// booleans, error constants, text.
+/// Interpret typed input as Excel would, value only: [`crate::entry::parse_entry`]
+/// for a General cell in the 1900 date system with no clock. Typed entry into
+/// a real cell goes through [`crate::entry::entry_cell`], which also honours
+/// the cell's format and sets the style the entry asks for; this is for the
+/// callers that only need the value (pasted fields, previews). Text over the
+/// cell limit stays text here.
 pub fn parse_input(text: &str) -> Cell {
-    if let Some(body) = text.strip_prefix('=') {
-        if !body.is_empty() {
-            return Cell::formula(body);
-        }
-    }
-    if text.is_empty() {
-        return Cell::default();
-    }
-    let t = text.trim();
-    if let Ok(n) = t.parse::<f64>() {
-        if n.is_finite() {
-            return Cell::number(n);
-        }
-    }
-    if let Some(pct) = t.strip_suffix('%') {
-        if let Ok(n) = pct.trim().parse::<f64>() {
-            let v = n / 100.0;
-            if v.is_finite() {
-                return Cell::number(v);
-            }
-        }
-    }
-    if t.eq_ignore_ascii_case("TRUE") {
-        return Cell {
-            value: CellValue::Bool(true),
-            ..Cell::default()
-        };
-    }
-    if t.eq_ignore_ascii_case("FALSE") {
-        return Cell {
-            value: CellValue::Bool(false),
-            ..Cell::default()
-        };
-    }
-    if ExcelError::from_code(t).is_some() {
-        return Cell {
-            value: CellValue::Error(t.to_ascii_uppercase()),
-            ..Cell::default()
-        };
-    }
-    Cell::text(text)
+    crate::entry::parse_entry(text, &Xf::default(), &EntryCtx::default())
+        .map(|e| e.cell)
+        .unwrap_or_else(|_| Cell::text(text))
 }
 
 /// The text a cell would show in the formula bar (`=formula`, or the value
@@ -80,27 +49,86 @@ pub fn input_text_of(cell: &Cell) -> String {
 
 /// The literal find/replace algorithm shared by the TUI's Find & Replace and
 /// the `wb.replace-all` control verb: every cell whose *input text* (its
-/// `=formula` source, or the value as it would be re-entered) contains
-/// `find` gets `find` replaced with `with`, then reparsed via
-/// [`parse_input`], preserving the cell's style. Returns the `(row, col,
-/// new_cell)` changes for one sheet — pure; callers decide how to apply
-/// them (one sheet under one undo group, or every sheet under one
-/// structural snapshot).
-pub fn replace_all_in_sheet(sheet: &Sheet, find: &str, with: &str) -> Vec<(u32, u32, Cell)> {
-    sheet
-        .cells
-        .iter()
-        .filter_map(|(&(r, c), cell)| {
-            let text = input_text_of(cell);
-            if text.contains(find) {
-                let mut newcell = parse_input(&text.replace(find, with));
-                newcell.style = cell.style;
-                Some((r, c, newcell))
-            } else {
-                None
+/// `=formula` source, or the value as it would be re-entered, with a quote
+/// prefix's apostrophe) contains `find` gets `find` replaced with `with`,
+/// then re-read as a typed entry into that cell ([`crate::entry`]): a Text
+/// cell keeps text, a quote-prefixed cell stays text, a recognised shape in a
+/// General cell takes its format (interned into `styles`). The percent-cell
+/// rule is not applied: the input text of a percent cell is its plain value,
+/// so re-reading it must not divide it again. A result over the cell limit
+/// leaves that cell as it was. Returns the `(row, col, new_cell)` changes for
+/// one sheet; callers decide how to apply them (one sheet under one undo
+/// group, or every sheet under one structural snapshot).
+pub fn replace_all_in_sheet(
+    sheet: &Sheet,
+    styles: &mut Styles,
+    ctx: &EntryCtx,
+    find: &str,
+    with: &str,
+) -> Vec<(u32, u32, Cell)> {
+    let mut out = Vec::new();
+    for (&(r, c), cell) in &sheet.cells {
+        let xf = styles.xf(cell.style);
+        let text = crate::entry::input_text_styled(cell, &xf);
+        if !text.contains(find) {
+            continue;
+        }
+        let read_as = if crate::entry::is_percent(&xf) {
+            Xf::default()
+        } else {
+            xf
+        };
+        let Ok(e) = crate::entry::parse_entry(&text.replace(find, with), &read_as, ctx) else {
+            continue;
+        };
+        let style = crate::entry::entry_style(styles, cell.style, &e);
+        out.push((r, c, Cell { style, ..e.cell }));
+    }
+    out
+}
+
+/// Excel's Fill Down / Fill Right (Ctrl+D / Ctrl+R) over the selection
+/// `(r1, c1, r2, c2)`: a range copies its first row down (or first column
+/// right), a single cell at `cur` pulls from the cell above (or left).
+/// Relative references move with the copy and the source's style comes
+/// along. Pure: returns the `(row, col, cell)` changes.
+pub fn fill_changes(
+    sheet: &Sheet,
+    (r1, c1, r2, c2): (u32, u32, u32, u32),
+    cur: (u32, u32),
+    down: bool,
+) -> Vec<(u32, u32, Cell)> {
+    let mut changes = Vec::new();
+    let mut copy_from = |sr: u32, sc: u32, tr: u32, tc: u32| {
+        let mut cell = sheet.cell(sr, sc).cloned().unwrap_or_default();
+        if let Some(f) = &cell.formula {
+            if let Some(t) = translate_formula(f, tr as i64 - sr as i64, tc as i64 - sc as i64) {
+                cell.formula = Some(t);
             }
-        })
-        .collect()
+        }
+        changes.push((tr, tc, cell));
+    };
+    if r1 == r2 && c1 == c2 {
+        let (r, c) = cur;
+        if down && r > 0 {
+            copy_from(r - 1, c, r, c);
+        } else if !down && c > 0 {
+            copy_from(r, c - 1, r, c);
+        }
+    } else if down {
+        for c in c1..=c2 {
+            for r in r1 + 1..=r2 {
+                copy_from(r1, c, r, c);
+            }
+        }
+    } else {
+        for r in r1..=r2 {
+            for c in c1 + 1..=c2 {
+                copy_from(r, c1, r, c);
+            }
+        }
+    }
+    changes
 }
 
 /// Insert `count` blank rows before 0-based row `at` on sheet `idx`.
@@ -2034,7 +2062,8 @@ mod tests {
         );
         sheet.set_cell(1, 0, Cell::formula("foo+1")); // "foo" only inside the formula
         sheet.set_cell(2, 0, Cell::text("no match here"));
-        let changes = replace_all_in_sheet(&sheet, "foo", "QUX");
+        let mut styles = Styles::default();
+        let changes = replace_all_in_sheet(&sheet, &mut styles, &EntryCtx::default(), "foo", "QUX");
         assert_eq!(changes.len(), 2);
         let at = |r: u32| changes.iter().find(|(cr, _, _)| *cr == r).unwrap();
         let (_, _, c0) = at(0);
@@ -2051,6 +2080,94 @@ mod tests {
             ..Sheet::default()
         };
         sheet.set_cell(0, 0, Cell::text("nothing to see"));
-        assert!(replace_all_in_sheet(&sheet, "zzz", "y").is_empty());
+        let mut styles = Styles::default();
+        assert!(
+            replace_all_in_sheet(&sheet, &mut styles, &EntryCtx::default(), "zzz", "y").is_empty()
+        );
+    }
+
+    #[test]
+    fn replace_all_keeps_a_quote_prefixed_cell_text() {
+        let mut styles = Styles::default();
+        let quoted = styles.intern(Xf {
+            quote_prefix: true,
+            ..Xf::default()
+        });
+        let mut sheet = Sheet::default();
+        sheet.set_cell(
+            0,
+            0,
+            Cell {
+                style: quoted,
+                ..Cell::text("007")
+            },
+        );
+        let changes = replace_all_in_sheet(&sheet, &mut styles, &EntryCtx::default(), "0", "1");
+        let (_, _, c) = &changes[0];
+        assert_eq!(c.value, CellValue::Text("117".into()));
+        assert_eq!(c.style, quoted);
+    }
+
+    #[test]
+    fn replace_all_does_not_divide_a_percent_cell_again() {
+        let mut styles = Styles::default();
+        let pct = styles.intern(Xf {
+            numfmt: crate::sheet::NumFmt::Percent { decimals: 0 },
+            code: Some("0%".into()),
+            ..Xf::default()
+        });
+        let mut sheet = Sheet::default();
+        sheet.set_cell(
+            0,
+            0,
+            Cell {
+                style: pct,
+                ..Cell::number(5.0)
+            },
+        );
+        let changes = replace_all_in_sheet(&sheet, &mut styles, &EntryCtx::default(), "5", "6");
+        assert_eq!(changes[0].2.value, CellValue::Number(6.0));
+        assert_eq!(changes[0].2.style, pct);
+    }
+
+    #[test]
+    fn replace_all_formats_a_recognised_entry_in_a_general_cell() {
+        let mut styles = Styles::default();
+        let mut sheet = Sheet::default();
+        sheet.set_cell(0, 0, Cell::text("1.234"));
+        let changes = replace_all_in_sheet(&sheet, &mut styles, &EntryCtx::default(), ".", ",");
+        let (_, _, c) = &changes[0];
+        assert_eq!(c.value, CellValue::Number(1234.0));
+        assert_eq!(styles.xf(c.style).code.as_deref(), Some("#,##0"));
+    }
+
+    #[test]
+    fn fill_changes_copies_down_and_right_translating_refs() {
+        let mut sheet = Sheet::default();
+        sheet.set_cell(
+            0,
+            1,
+            Cell {
+                style: 3,
+                ..Cell::formula("A1*2")
+            },
+        );
+        sheet.set_cell(0, 3, Cell::text("x"));
+        let down = fill_changes(&sheet, (0, 1, 3, 1), (0, 1), true);
+        assert_eq!(down.len(), 3);
+        assert_eq!(down[2].0, 3);
+        assert_eq!(down[2].2.formula.as_deref(), Some("A4*2"));
+        assert_eq!(down[2].2.style, 3);
+        let right = fill_changes(&sheet, (0, 3, 0, 5), (0, 3), false);
+        assert_eq!(right.len(), 2);
+        assert!(
+            right
+                .iter()
+                .all(|(_, _, c)| c.value == CellValue::Text("x".into()))
+        );
+        // A single cell pulls from above; nothing above row 0.
+        let one = fill_changes(&sheet, (1, 1, 1, 1), (1, 1), true);
+        assert_eq!(one[0].2.formula.as_deref(), Some("A2*2"));
+        assert!(fill_changes(&sheet, (0, 0, 0, 0), (0, 0), true).is_empty());
     }
 }
