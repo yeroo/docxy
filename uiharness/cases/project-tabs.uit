@@ -14,7 +14,7 @@ test issue 396 proj.new makes a blank plan that takes tasks without a fixture
   call proj.new {}
   assert reply.tab is 1
   assert reply.path is null
-  assert reply.name is Untitled
+  assert reply.name is Project1
   assert reply.tasks is 0
   assert reply.modified is false
   assert reply.imported is false

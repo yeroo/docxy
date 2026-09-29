@@ -279,7 +279,7 @@ fn new_project_reply_is_the_apps_blank_plan() {
     let reply = new_project_reply(&tabs, 1);
     assert_eq!(reply.get("tab"), Some(&Json::Num(1.)));
     assert_eq!(reply.get("path"), Some(&Json::Null));
-    assert_eq!(reply.get_str("name"), Some("Untitled"));
+    assert_eq!(reply.get_str("name"), Some("Project1"));
     assert_eq!(reply.get("tasks"), Some(&Json::Num(0.)));
     assert_eq!(reply.get("modified"), Some(&Json::Bool(false)));
     assert_eq!(reply.get("imported"), Some(&Json::Bool(false)));

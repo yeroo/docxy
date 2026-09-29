@@ -400,3 +400,34 @@ fn headless_save_keeps_every_valued_resource_and_assignment_element() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// #407: a new plan is named `Project1`, as Microsoft Project names one, in
+/// the saved `<Name>` and the Gantt export, through a `.yppx` round trip.
+#[test]
+fn a_new_plan_is_named_project1() {
+    let dir = std::env::temp_dir().join(format!("yppxy-cli-new-name-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |args: &[&Path]| {
+        let result = Command::new(env!("CARGO_BIN_EXE_yppxy"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    let yppx = dir.join("new.yppx");
+    let xml = dir.join("new.xml");
+    let md = dir.join("new.md");
+    run(&[Path::new("--save"), &yppx]);
+    run(&[&yppx, Path::new("--save"), &xml]);
+    run(&[&yppx, Path::new("--gantt-md"), &md]);
+    let xml_text = std::fs::read_to_string(&xml).unwrap();
+    assert!(xml_text.contains("<Name>Project1</Name>"), "{xml_text}");
+    let md_text = std::fs::read_to_string(&md).unwrap();
+    assert!(md_text.starts_with("# Project1\n"), "{md_text}");
+    assert!(md_text.contains("title Project1\n"), "{md_text}");
+    std::fs::remove_dir_all(dir).unwrap();
+}

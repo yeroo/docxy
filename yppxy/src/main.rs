@@ -1049,8 +1049,21 @@ impl App {
     }
 }
 
-/// A few summary lines for the backstage preview / Info pane.
-fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
+/// The name to show for `proj`: its own, else the file stem of `path` (as
+/// Project shows the file name for a saved plan with no title), else the
+/// name of a new plan (#407).
+fn display_name<'a>(proj: &'a Project, path: Option<&Path>) -> std::borrow::Cow<'a, str> {
+    if !proj.name.is_empty() {
+        return proj.name.as_str().into();
+    }
+    path.and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned().into())
+        .unwrap_or(projcore::editor::NEW_PROJECT_NAME.into())
+}
+
+/// A few summary lines for the backstage preview / Info pane of the plan
+/// loaded from `path` (`None` for a new one).
+fn project_preview(proj: &Project, sched: &Schedule, path: Option<&Path>) -> Vec<String> {
     let fin = sched.project_finish.parts();
     let start = sched.project_start.parts();
     // Blank rows (#80) are not tasks.
@@ -1065,14 +1078,7 @@ fn project_preview(proj: &Project, sched: &Schedule) -> Vec<String> {
         .filter(|t| !t.summary && sched.get(t.uid).is_some_and(|r| r.critical))
         .count();
     let mut out = vec![
-        format!(
-            "Project: {}",
-            if proj.name.is_empty() {
-                "Untitled"
-            } else {
-                &proj.name
-            }
-        ),
+        format!("Project: {}", display_name(proj, path)),
         format!(
             "Start:   {:04}-{:02}-{:02}",
             start.year, start.month, start.day
@@ -1124,17 +1130,21 @@ impl backstage::BackstageHost for App {
         match load(&path.to_string_lossy()) {
             Ok(p) => {
                 let s = schedule(&p);
-                project_preview(&p, &s)
+                project_preview(&p, &s, Some(path))
             }
             Err(e) => vec![format!("(cannot preview: {e})")],
         }
     }
 
     fn info_lines(&self) -> Vec<Line<'static>> {
-        project_preview(self.ed.project(), self.ed.schedule())
-            .into_iter()
-            .map(Line::from)
-            .collect()
+        project_preview(
+            self.ed.project(),
+            self.ed.schedule(),
+            self.path.as_deref().map(Path::new),
+        )
+        .into_iter()
+        .map(Line::from)
+        .collect()
     }
 
     fn accent(&self) -> Color {
@@ -1698,11 +1708,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .filter(|t| app.ed.schedule().get(t.uid).is_some_and(|r| r.critical) && !t.summary)
         .count();
-    let name = if app.ed.project().name.is_empty() {
-        "Untitled"
-    } else {
-        &app.ed.project().name
-    };
+    let name = display_name(app.ed.project(), app.path.as_deref().map(Path::new));
     let title = format!(
         " {name}{}   finish {:04}-{:02}-{:02}   {} task(s), {crit} critical ",
         if app.ed.dirty() { " *" } else { "" },
@@ -2497,13 +2503,29 @@ mod tests {
             projcore::mspdi::read_mspdi(include_str!("../../corpus/mspdi/20-task-fields.xml"))
                 .unwrap();
         let sched = projcore::schedule::schedule(&proj);
-        let lines = project_preview(&proj, &sched);
+        let lines = project_preview(&proj, &sched, None);
         assert!(
             lines.contains(&"Tasks:   3 (2 critical)".to_string()),
             "{lines:?}"
         );
         let rows: Vec<_> = lines.iter().skip(5).map(|l| l.trim()).collect();
         assert_eq!(rows, ["▾ Phase", "• Excavate", "", "• Pour", "• Inspect"]);
+    }
+
+    /// #407: a plan with no name is shown by its file stem, never `Untitled`;
+    /// only a plan with no file falls back to Project's new-plan name.
+    #[test]
+    fn a_nameless_plan_is_shown_by_its_file_stem() {
+        let proj = projcore::mspdi::read_mspdi("<Project><Tasks/></Project>").unwrap();
+        assert_eq!(proj.name, "");
+        let sched = projcore::schedule::schedule(&proj);
+        let foo = Path::new("x/foo.xml");
+        assert_eq!(project_preview(&proj, &sched, Some(foo))[0], "Project: foo");
+        assert_eq!(project_preview(&proj, &sched, None)[0], "Project: Project1");
+        assert_eq!(display_name(&proj, Some(foo)), "foo");
+        assert_eq!(display_name(&proj, None), "Project1");
+        let named = new_project();
+        assert_eq!(display_name(&named, Some(foo)), "Project1");
     }
 
     #[test]
