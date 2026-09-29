@@ -1476,10 +1476,36 @@ impl Probes {
     }
 }
 
+/// Where a split button's drop-down opens: under the whole button, at its
+/// lower left, as Office drops it, so the list never covers the arrow that
+/// toggles it. The pointer and `menu-open` both anchor here; `None` when the
+/// button has not been laid out.
+fn split_menu_anchor(probes: &Probes, primary_id: &str) -> Option<Point<Pixels>> {
+    probes
+        .current(&format!("ribbon-split:{primary_id}"))
+        .map(|b| b.bottom_left())
+}
+
 #[cfg(test)]
 mod probes_tests {
-    use super::Probes;
+    use super::{Probes, split_menu_anchor};
     use gpui::{Bounds, point, px, size};
+
+    #[test]
+    fn a_split_menu_drops_below_the_whole_button() {
+        let mut p = Probes::default();
+        assert_eq!(split_menu_anchor(&p, "pr-baseline"), None);
+        p.next.push((
+            "ribbon-split:pr-baseline".into(),
+            Bounds::new(point(px(80.), px(70.)), size(px(50.), px(70.))),
+        ));
+        // Below the arrow (the button's bottom edge), not at the press.
+        assert_eq!(
+            split_menu_anchor(&p, "pr-baseline"),
+            Some(point(px(80.), px(140.)))
+        );
+        assert_eq!(split_menu_anchor(&p, "pr-other"), None);
+    }
 
     #[test]
     fn current_reads_the_frame_on_screen_and_falls_back_to_the_one_before() {
@@ -19191,7 +19217,9 @@ impl Docxy {
                         .map(|(t, _)| t);
                     let open = this.menu.as_ref().map(|m| &m.target);
                     if menu::split_arrow_opens(primary_id, open, closed.as_ref()) {
-                        let _ = this.open_split_menu(primary_id, ev.position, cx);
+                        let at = split_menu_anchor(&this.probes.borrow(), primary_id)
+                            .unwrap_or(ev.position);
+                        let _ = this.open_split_menu(primary_id, at, cx);
                     } else {
                         this.close_menu();
                         cx.notify();

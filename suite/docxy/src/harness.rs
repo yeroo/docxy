@@ -1410,8 +1410,9 @@ fn split_primary(
 }
 
 /// Where `menu-open` opens a menu: on the target's own probe when the last
-/// frame drew it (a cell's middle, a split button's lower left), else the
-/// middle of the window. The menu keeps itself inside the window.
+/// frame drew it (a cell's middle; a split button uses the pointer's own
+/// `split_menu_anchor`), else the middle of the window. The menu keeps
+/// itself inside the window.
 fn menu_point(
     app: &crate::Docxy,
     window: &Window,
@@ -1497,8 +1498,9 @@ fn menu_open(
                 let def = ribbon_tab_def(app, tab)?;
                 let id = split_primary(&def, group, label)?;
                 app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), tab)?, window, cx);
-                let probe = format!("ribbon-split:{id}");
-                let at = menu_point(app, window, Some(&probe), |b| b.bottom_left());
+                // Where the pointer's press on the arrow opens it too.
+                let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
+                let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
                 app.open_split_menu(id, at, cx)
             }
             other => Err(format!(

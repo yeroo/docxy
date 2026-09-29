@@ -112,8 +112,10 @@ test Set Baseline's split menu sets and clears the baseline
   assert reply.tabs.4.groups.0.commands.1.enabled is true
   assert reply.tabs.4.groups.0.commands.3.label is Clear Baseline...
   assert reply.tabs.4.groups.0.commands.3.menu is pr-baseline
-  # menu-close closes as Esc does.
+  # menu-close closes as Esc does. With the tab drawn, the menu drops
+  # below the whole button, where the pointer's press on the arrow drops it.
   call menu-open {"target":{"ribbon":["Project","Schedule","Set Baseline"]}}
+  shot window
   call menu-close {}
   assert reply.menu is nothing
 
