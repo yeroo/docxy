@@ -71,7 +71,7 @@ impl Relationships {
         self.map.len()
     }
     /// Every relationship as `(id, target, external)`, in no particular order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str, bool)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (&str, &str, bool)> {
         self.map
             .iter()
             .map(|(id, (target, external))| (id.as_str(), target.as_str(), *external))

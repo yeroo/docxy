@@ -127,3 +127,36 @@ fn from_package_on_a_plain_document_keeps_the_default_page() {
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0].0, "0 0 612.00 792.00");
 }
+
+#[test]
+fn rejecting_a_tracked_orientation_change_prints_the_old_orientation() {
+    // The final section was changed portrait -> landscape with tracking on.
+    let document = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="{W}" xmlns:r="{R}"><w:body><w:p><w:r><w:t>x</w:t></w:r></w:p><w:sectPr><w:pgSz w:w="15840" w:h="12240" w:orient="landscape"/><w:sectPrChange w:id="1" w:author="a" w:date="2026-09-29T00:00:00Z"><w:sectPr><w:pgSz w:w="12240" w:h="15840"/></w:sectPr></w:sectPrChange></w:sectPr></w:body></w:document>"#
+    );
+    let content_types = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#;
+    let root_rels = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{REL}/officeDocument" Target="word/document.xml"/></Relationships>"#
+    );
+    let bytes = write_zip(&[
+        (
+            "[Content_Types].xml".to_string(),
+            content_types.as_bytes().to_vec(),
+        ),
+        ("_rels/.rels".to_string(), root_rels.into_bytes()),
+        ("word/document.xml".to_string(), document.into_bytes()),
+    ]);
+    let pkg = load_package(&bytes).expect("load");
+    let opts = PdfOptions::from_package(&pkg, Rc::new(StyleSheet::default()));
+    let mut editor = docxcore::editor::Editor::new(pkg.document.clone());
+    assert_eq!(pages(&to_pdf(&editor.doc, &opts))[0].0, "0 0 792.00 612.00");
+    editor.reject_all_revisions();
+    assert_eq!(
+        pages(&to_pdf(&editor.doc, &opts))[0].0,
+        "0 0 612.00 792.00",
+        "the editor's document, not the package's copy, is printed"
+    );
+}

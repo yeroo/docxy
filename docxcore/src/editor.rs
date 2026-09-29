@@ -1630,6 +1630,12 @@ impl Editor {
         }
     }
 
+    /// Replace the document's final section properties as one undo step.
+    pub fn set_trailing_section_properties(&mut self, section: SectionProperties) {
+        self.checkpoint(EditKind::Structural);
+        self.doc.set_trailing_section_properties(section);
+    }
+
     /// Set (or clear) the section break carried by the caret's paragraph. A
     /// section break ends a section here, so the following content becomes a new
     /// section. Returns false if the caret isn't in a paragraph.

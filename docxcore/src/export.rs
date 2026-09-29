@@ -40,11 +40,8 @@ pub struct PdfOptions {
     /// Main document relationships, resolving each section's header/footer
     /// references to part names.
     pub rels: Relationships,
-    /// The final section's `w:sectPr`, taking precedence over the printed
-    /// document's trailing [`Block::SectionProperties`]: editors keep a copy of
-    /// the body while section edits (a new header, a landscape section) land
-    /// in the package, so [`PdfOptions::from_package`] sets it to the package's
-    /// authoritative `Package::sect_pr`.
+    /// The final section's `w:sectPr` when the printed document carries no
+    /// trailing [`Block::SectionProperties`] of its own.
     pub last_sect_pr: Option<String>,
     /// `w:evenAndOddHeaders` (settings.xml): even pages use the `even` variant.
     pub even_and_odd_headers: bool,
@@ -264,6 +261,10 @@ fn twips(v: f32) -> f32 {
 
 impl SectionLayout {
     fn parse(sect: &str, opts: &PdfOptions) -> SectionLayout {
+        // A tracked `w:sectPrChange` holds the old values; lay out the current.
+        let (current, _) =
+            crate::load::split_property_change_container(sect, PropertyScope::Section);
+        let sect = current.as_str();
         let pg_sz = start_tag(sect, "w:pgSz");
         let pg_mar = start_tag(sect, "w:pgMar");
         let size = |key: &str, fallback: f32| {
@@ -519,10 +520,10 @@ fn split_sections<'d>(
             start = i + 1;
         }
     }
-    let last = opts
-        .last_sect_pr
-        .as_deref()
-        .or(doc.trailing_section_properties().map(|s| s.raw.as_str()))
+    let last = doc
+        .trailing_section_properties()
+        .map(|s| s.raw.as_str())
+        .or(opts.last_sect_pr.as_deref())
         .unwrap_or("");
     out.push((start..end, last));
     out
@@ -585,6 +586,9 @@ struct Frag {
     /// A page field: its kind, and whether this frag holds the field's first
     /// cell (and so draws the value) or only the tail of its cached result.
     field: Option<(PageField, bool)>,
+    /// The body section a field sits in (SECTIONPAGES); header and footer
+    /// fields count the page's own section.
+    sect: Option<usize>,
 }
 
 type Link = ((f32, f32, f32, f32), String);
@@ -623,6 +627,8 @@ struct Page {
     min_base: f32,
     regions: usize,
     multi_col: bool,
+    /// Every section with a column set on the page.
+    members: Vec<usize>,
     /// Formatted PAGE, NUMPAGES and SECTIONPAGES values.
     values: [String; 3],
 }
@@ -818,6 +824,7 @@ fn place_line(
                 underline: c0.underline,
                 strike: c0.strike,
                 field,
+                sect: None,
             },
             link,
         );
@@ -933,6 +940,12 @@ impl<'a> Pager<'a> {
                 } else {
                     let top = self.region.low;
                     self.start_region(i, top);
+                    // The page belongs to the section at its top, so a restart
+                    // numbers the next page; titlePg likewise has no page of
+                    // this section to apply to.
+                    if let Some(n) = self.sects[i].num_start {
+                        self.next_number = n;
+                    }
                 }
             }
             SectStart::NextPage => self.new_page(i, true, false),
@@ -1022,6 +1035,7 @@ impl<'a> Pager<'a> {
             min_base: f32::INFINITY,
             regions: 0,
             multi_col: false,
+            members: Vec::new(),
             values: Default::default(),
         });
         self.start_region(sect, body_top);
@@ -1040,6 +1054,9 @@ impl<'a> Pager<'a> {
         }
         page.regions += 1;
         page.multi_col |= xs.len() > 1;
+        if !page.members.contains(&sect) {
+            page.members.push(sect);
+        }
         self.region = Region {
             sect,
             top,
@@ -1092,9 +1109,12 @@ impl<'a> Pager<'a> {
     /// Vertical alignment, page borders and field values, once every page exists.
     fn finish(mut self) -> Vec<Page> {
         let total = self.pages.len();
+        // A section counts every page it has content on.
         let mut per_section: HashMap<usize, usize> = HashMap::new();
         for page in &self.pages {
-            *per_section.entry(page.sect).or_default() += 1;
+            for &sect in &page.members {
+                *per_section.entry(sect).or_default() += 1;
+            }
         }
         for page in &mut self.pages {
             let s = &self.sects[page.sect];
@@ -1128,11 +1148,19 @@ impl<'a> Pager<'a> {
                     s, self.opts, page.w, page.h, page.left, page.right,
                 ));
             }
+            let section_pages = |sect: usize| per_section.get(&sect).copied().unwrap_or(1);
             page.values = [
                 format_page_number(page.number, s.num_fmt),
                 total.to_string(),
-                per_section[&page.sect].to_string(),
+                section_pages(page.sect).to_string(),
             ];
+            // A body SECTIONPAGES counts its own section's pages.
+            for f in &mut page.frags {
+                if let (Some((PageField::SectionPages, true)), Some(sect)) = (f.field, f.sect) {
+                    f.text = section_pages(sect).to_string();
+                    f.field = None;
+                }
+            }
         }
         self.pages
     }
@@ -1207,7 +1235,10 @@ impl Flow for Pager<'_> {
         page.min_base = page.min_base.min(self.y);
         (x, w, self.y)
     }
-    fn push(&mut self, frag: Frag, link: Option<Link>) {
+    fn push(&mut self, mut frag: Frag, link: Option<Link>) {
+        if frag.field.is_some() {
+            frag.sect = Some(self.region.sect);
+        }
         let page = self.pages.last_mut().expect("a page exists");
         page.frags.push(frag);
         page.links.extend(link);
@@ -2731,15 +2762,66 @@ mod tests {
     }
 
     #[test]
-    fn the_packages_final_section_wins_over_the_printed_documents_copy() {
-        // An editor's copy of the body keeps the sectPr it was loaded with.
-        let d = doc(vec![text_para("x"), trailing(BLANK_SECT)]);
+    fn the_printed_documents_final_section_wins_and_last_sect_pr_is_the_fallback() {
         let opts = PdfOptions {
             last_sect_pr: Some(
                 r#"<w:sectPr><w:pgSz w:w="15840" w:h="12240"/></w:sectPr>"#.to_string(),
             ),
             ..PdfOptions::default()
         };
+        let d = doc(vec![text_para("x"), trailing(BLANK_SECT)]);
+        assert_eq!(pages_of(&d, &opts)[0].media, "0 0 612.00 792.00");
+        let d = doc(vec![text_para("x")]);
         assert_eq!(pages_of(&d, &opts)[0].media, "0 0 792.00 612.00");
+    }
+
+    #[test]
+    fn a_continuous_section_restarts_numbering_on_its_next_page() {
+        let mut blocks = vec![
+            sect_para("intro", BLANK_SECT),
+            para(vec![
+                run("count=", RunProps::default()),
+                fld_simple("SECTIONPAGES", "0"),
+            ]),
+        ];
+        blocks.extend((0..40).map(|i| text_para(&format!("l{i}"))));
+        blocks.push(para(vec![
+            run("page=", RunProps::default()),
+            fld_simple("PAGE", "0"),
+        ]));
+        blocks.push(trailing(
+            r#"<w:sectPr><w:type w:val="continuous"/><w:pgNumType w:start="1"/></w:sectPr>"#,
+        ));
+        let pages = pages_of(&doc(blocks), &PdfOptions::default());
+        assert_eq!(pages.len(), 2);
+        assert!(pages[0].has("intro") && pages[0].has("count="));
+        // The start page belongs to the first section; the restart numbers page 2.
+        assert!(
+            pages[1].has("page=") && pages[1].exact("1"),
+            "{:?}",
+            pages[1].texts
+        );
+        // The section has content on both pages.
+        assert!(pages[0].exact("2"), "{:?}", pages[0].texts);
+    }
+
+    #[test]
+    fn a_tracked_section_change_lays_out_the_current_values() {
+        let opts = PdfOptions {
+            last_sect_pr: Some(
+                r#"<w:sectPr><w:headerReference w:type="default" r:id="rD"/><w:headerReference w:type="first" r:id="rT"/><w:sectPrChange w:id="1" w:author="a"><w:sectPr><w:titlePg/><w:pgSz w:w="15840" w:h="12240"/></w:sectPr></w:sectPrChange></w:sectPr>"#
+                    .to_string(),
+            ),
+            ..with_parts(&[
+                ("rD", "header1.xml", vec![text_para("DEF")]),
+                ("rT", "header2.xml", vec![text_para("FIRST")]),
+            ])
+        };
+        let pages = pages_of(&doc(vec![text_para("x")]), &opts);
+        assert_eq!(pages[0].media, "0 0 612.00 792.00");
+        assert!(
+            pages[0].has("DEF") && !pages[0].has("FIRST"),
+            "titlePg was removed"
+        );
     }
 }

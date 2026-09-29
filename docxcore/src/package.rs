@@ -174,7 +174,7 @@ impl HeaderVariant {
         }
     }
 
-    pub fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Self::Default => 0,
             Self::First => 1,
@@ -212,7 +212,7 @@ pub struct Watermark {
 
 /// The header or footer part a section applies for one variant.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppliedPart {
+pub(crate) struct AppliedPart {
     pub relationship_id: String,
     pub part_name: String,
     /// True when this section inherits the reference from an earlier one
@@ -225,7 +225,7 @@ pub struct AppliedPart {
 /// inheritance. Whether a first/even variant is shown depends on `w:titlePg`
 /// and `w:evenAndOddHeaders`, which the caller checks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SectionParts {
+pub(crate) struct SectionParts {
     pub headers: [Option<AppliedPart>; 3],
     pub footers: [Option<AppliedPart>; 3],
 }
@@ -234,7 +234,7 @@ pub struct SectionParts {
 /// `w:sectPr` XML in document order (the trailing body sectPr last). A section
 /// without a reference of some variant inherits the previous section's; a
 /// reference that doesn't resolve through `rels` clears the variant.
-pub fn section_header_parts(sect_prs: &[&str], rels: &Relationships) -> Vec<SectionParts> {
+pub(crate) fn section_header_parts(sect_prs: &[&str], rels: &Relationships) -> Vec<SectionParts> {
     const VARIANTS: [HeaderVariant; 3] = [
         HeaderVariant::Default,
         HeaderVariant::First,
@@ -709,16 +709,19 @@ impl Package {
     pub fn set_sect_pr(&mut self, xml: String) {
         let (raw, property_change) =
             crate::load::split_property_change_container(&xml, PropertyScope::Section);
-        let section = SectionProperties {
-            raw,
-            property_change,
-        };
-        if let Some(current) = self.document.trailing_section_properties_mut() {
-            *current = section;
-        } else {
-            self.document.body.push(Block::SectionProperties(section));
-        }
+        self.document
+            .set_trailing_section_properties(SectionProperties {
+                raw,
+                property_change,
+            });
         self.sect_pr = xml;
+    }
+
+    /// Replace the trailing section properties with an already-split section
+    /// (an editor's copy, tracked change included).
+    pub fn set_trailing_section(&mut self, section: SectionProperties) {
+        self.sect_pr = section.raw.clone();
+        self.document.set_trailing_section_properties(section);
     }
 
     fn set_current_sect_pr_raw(&mut self, raw: String) {
@@ -792,7 +795,7 @@ impl Package {
     }
 
     /// The main document relationships (`word/_rels/document.xml.rels`).
-    pub fn document_rels(&self) -> Relationships {
+    pub(crate) fn document_rels(&self) -> Relationships {
         self.part("word/_rels/document.xml.rels")
             .and_then(decode_xml_part)
             .map(|xml| parse_rels_xml(&xml))

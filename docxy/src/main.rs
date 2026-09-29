@@ -1646,12 +1646,15 @@ impl App {
                 self.status = Some("Inserted 2×2 table".to_string());
             }
             Columns => {
-                let next = match self.pkg.columns() {
-                    1 => 2,
-                    2 => 3,
-                    _ => 1,
-                };
-                self.pkg.set_columns(next);
+                let next = self.edit_final_sect_pr(true, |pkg| {
+                    let next = match pkg.columns() {
+                        1 => 2,
+                        2 => 3,
+                        _ => 1,
+                    };
+                    pkg.set_columns(next);
+                    next
+                });
                 self.modified = true;
                 self.dirty = true;
                 self.status = Some(format!("Columns: {next}"));
@@ -3114,23 +3117,25 @@ impl App {
         };
         let part = match existing {
             Some(p) => p,
-            None => match self.pkg.create_hf(is_header, "default") {
-                Some(p) => {
-                    if is_header {
-                        self.header_part = Some(p.clone());
-                    } else {
-                        self.footer_part = Some(p.clone());
+            None => {
+                match self.edit_final_sect_pr(true, |pkg| pkg.create_hf(is_header, "default")) {
+                    Some(p) => {
+                        if is_header {
+                            self.header_part = Some(p.clone());
+                        } else {
+                            self.footer_part = Some(p.clone());
+                        }
+                        self.modified = true;
+                        self.status = Some(format!("Created a {what}."));
+                        p
                     }
-                    self.modified = true;
-                    self.status = Some(format!("Created a {what}."));
-                    p
+                    None => {
+                        self.status = Some(format!("Couldn't create a {what}."));
+                        self.dirty = true;
+                        return;
+                    }
                 }
-                None => {
-                    self.status = Some(format!("Couldn't create a {what}."));
-                    self.dirty = true;
-                    return;
-                }
-            },
+            }
         };
         // Start from the current content, or one empty paragraph if new/empty.
         let src = if is_header {
@@ -3193,6 +3198,33 @@ impl App {
         self.dirty = true;
     }
 
+    /// Run a package edit of the final section's `w:sectPr` against the body
+    /// editor's current copy, then mirror the result back into that editor's
+    /// document — the one the page view shows, save writes and PDF export
+    /// prints. `undoable` makes the mirror its own undo step; otherwise it
+    /// rides on a checkpoint the caller just took.
+    fn edit_final_sect_pr<R>(&mut self, undoable: bool, edit: impl FnOnce(&mut Package) -> R) -> R {
+        let editor = match &mut self.hf_edit {
+            Some(hf) => &mut hf.body,
+            None => &mut self.editor,
+        };
+        if let Some(section) = editor.doc.trailing_section_properties() {
+            self.pkg.set_trailing_section(section.clone());
+        }
+        let out = edit(&mut self.pkg);
+        if let Some(section) = self.pkg.document.trailing_section_properties()
+            && editor.doc.trailing_section_properties() != Some(section)
+        {
+            let section = section.clone();
+            if undoable {
+                editor.set_trailing_section_properties(section);
+            } else {
+                editor.doc.set_trailing_section_properties(section);
+            }
+        }
+        out
+    }
+
     /// Insert a section break at the caret: content up to here keeps the current
     /// page geometry; the rest of the document becomes a new section with the
     /// given orientation. (Works cleanly when the caret is in the final section.)
@@ -3203,7 +3235,7 @@ impl App {
         if !self.mutation_allowed(protection::MutationKind::Formatting) {
             return;
         }
-        let current = self.pkg.sect_pr().to_string();
+        let current = self.edit_final_sect_pr(false, |pkg| pkg.sect_pr().to_string());
         let break_sect = if current.is_empty() {
             "<w:sectPr><w:pgSz w:w=\"12240\" w:h=\"15840\"/></w:sectPr>".to_string()
         } else {
@@ -3214,7 +3246,11 @@ impl App {
             self.dirty = true;
             return;
         }
-        self.pkg.set_sect_pr(orient_sectpr(&current, landscape));
+        // Rides on the section break's undo checkpoint, so Ctrl+Z restores the
+        // old final section too.
+        self.edit_final_sect_pr(false, |pkg| {
+            pkg.set_sect_pr(orient_sectpr(&current, landscape))
+        });
         self.refresh_watermark_state();
         self.modified = true;
         self.dirty = true;
@@ -9012,6 +9048,60 @@ mod tests {
         assert!(
             pdf.contains("(H) Tj"),
             "the new header is missing from the PDF"
+        );
+    }
+
+    #[test]
+    fn a_header_created_on_a_document_with_its_own_sect_pr_survives_save() {
+        let mut app = app_with_trailing_sect_pr();
+        let dir = std::env::temp_dir().join(format!("docxy-hf-save-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        app.path = dir.join("t.docx").to_string_lossy().into_owned();
+        app.run_act(ribbon::Act::EditHeader);
+        app.on_key(key(KeyCode::Char('H')));
+        app.on_key(key(KeyCode::F(6)));
+        let raw = &app.editor.doc.trailing_section_properties().unwrap().raw;
+        assert!(
+            raw.contains("headerReference"),
+            "mirrored into the editor: {raw}"
+        );
+        app.save();
+        let bytes = std::fs::read(dir.join("t.docx")).expect("saved");
+        let reloaded = docxcore::package::load_package(&bytes).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            reloaded.sect_pr().contains("headerReference"),
+            "{}",
+            reloaded.sect_pr()
+        );
+    }
+
+    #[test]
+    fn inserting_a_section_mirrors_the_final_sect_pr_and_undo_restores_it() {
+        let mut app = app_with_trailing_sect_pr();
+        let before = app.editor.doc.trailing_section_properties().cloned();
+        app.insert_section(true);
+        let raw = &app.editor.doc.trailing_section_properties().unwrap().raw;
+        assert!(raw.contains("landscape"), "{raw}");
+        assert!(app.editor.undo());
+        assert_eq!(
+            app.editor.doc.trailing_section_properties().cloned(),
+            before
+        );
+    }
+
+    #[test]
+    fn toggling_columns_mirrors_into_the_editor_as_an_undo_step() {
+        let mut app = app_with_trailing_sect_pr();
+        let before = app.editor.doc.trailing_section_properties().cloned();
+        app.run_act(ribbon::Act::Columns);
+        let raw = &app.editor.doc.trailing_section_properties().unwrap().raw;
+        assert!(raw.contains(r#"w:num="2""#), "{raw}");
+        assert!(app.editor.undo());
+        assert_eq!(
+            app.editor.doc.trailing_section_properties().cloned(),
+            before
         );
     }
 
