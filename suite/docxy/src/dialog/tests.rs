@@ -108,6 +108,7 @@ fn form() -> Dialog {
         owner: DialogOwner::Test,
         focus: None,
         opened: Vec::new(),
+        react: None,
     };
     d.controls = d.controls.into_iter().map(general).collect();
     preds.page = Some(1);

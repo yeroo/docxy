@@ -413,6 +413,27 @@ pub(crate) struct Dialog {
     /// The values the dialog opened on, one per control (see
     /// [`Dialog::changed`]); empty for a dialog that does not track them.
     pub opened: Vec<Value>,
+    /// The owner's reaction to a change of control `i` (whose value was
+    /// `before`): Page Setup's paper size following its sides, say. Set by the
+    /// dialog's builder.
+    pub react: Option<Reaction>,
+}
+
+/// See [`Dialog::react`]. Two dialogs compare equal whatever their
+/// reactions: a function pointer has no meaningful identity.
+#[derive(Clone, Copy)]
+pub(crate) struct Reaction(pub fn(&mut Dialog, usize, &Value));
+
+impl PartialEq for Reaction {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for Reaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reaction")
+    }
 }
 
 impl Dialog {
@@ -443,6 +464,7 @@ impl Dialog {
             owner,
             focus: None,
             opened: Vec::new(),
+            react: None,
         }
     }
 
@@ -509,10 +531,8 @@ impl Dialog {
     fn set_at(&mut self, i: usize, args: &Json) -> Result<(), String> {
         let before = self.controls[i].value.clone();
         self.controls[i].set(args)?;
-        match self.owner {
-            DialogOwner::PageSetup => crate::page_setup::after_set(self, i, &before),
-            DialogOwner::Columns => crate::page_setup::after_columns_set(self, i),
-            _ => {}
+        if let Some(Reaction(react)) = self.react {
+            react(self, i, &before);
         }
         Ok(())
     }
@@ -858,6 +878,7 @@ mod tests_support {
             owner: DialogOwner::Test,
             focus: None,
             opened: Vec::new(),
+            react: None,
         }
     }
 }

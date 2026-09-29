@@ -339,12 +339,21 @@ fn this_point_forward_checks_the_section_the_break_lands_in() {
     assert!(t.dialogs.is_open());
     assert_eq!(ed(&t).doc, before, "nothing changed");
 
+    // Equal columns write only their number and spacing, and Word sizes them
+    // to the section: Two fits section 0's 2" of text (r4 m1).
+    let mut t = narrow_first_section_and_a_forward_selection();
+    open_columns(&mut t);
+    set(&mut t, "Presets", s("Two"));
+    set(&mut t, "apply", s("This point forward"));
+    ok(&mut t).unwrap();
+    let sec = setups(&t);
+    assert_eq!(sec[1].columns.count(), 2, "the section after the break");
+    assert!(sec[1].columns.equal_width());
+    // Unequal columns laid out on the caret section's 6.5" do not fit it.
     let mut t = narrow_first_section_and_a_forward_selection();
     let before = ed(&t).doc.clone();
     open_columns(&mut t);
-    // Two equal columns across the caret section's 6.5" of text do not fit
-    // section 0's 2" of text.
-    set(&mut t, "Presets", s("Two"));
+    set(&mut t, "Presets", s("Left"));
     set(&mut t, "apply", s("This point forward"));
     assert_eq!(
         ok(&mut t).unwrap_err(),
@@ -681,4 +690,237 @@ fn whole_document_with_only_line_between_keeps_each_sections_columns() {
             .collect::<Vec<_>>(),
         [(1, true), (1, true), (3, true)]
     );
+}
+
+// ---- r4: the page invariant, over every short edit sequence ------------------
+
+/// One edit a person makes in Page Setup.
+#[derive(Clone, Copy, Debug)]
+enum Step {
+    Width(&'static str),
+    Height(&'static str),
+    Pick(&'static str),
+    Orient(&'static str),
+    Top(&'static str),
+}
+
+/// Type Width and Height, clear a side, retype a side's old value, pick each
+/// kind of paper, turn the page both ways, type a margin.
+const STEPS: [Step; 12] = [
+    Step::Width("7"),
+    Step::Width("11"),
+    Step::Width(""),
+    Step::Width("8.5"),
+    Step::Height("8.5"),
+    Step::Height("14"),
+    Step::Pick("A4"),
+    Step::Pick("Legal"),
+    Step::Pick("Custom"),
+    Step::Orient("Landscape"),
+    Step::Orient("Portrait"),
+    Step::Top("2"),
+];
+
+fn step(t: &mut DocTab, st: Step) {
+    let (page, name, value) = match st {
+        Step::Width(v) => ("Paper", "width", v),
+        Step::Height(v) => ("Paper", "height", v),
+        Step::Pick(v) => ("Paper", "paper", v),
+        Step::Orient(v) => ("Margins", "orientation", v),
+        Step::Top(v) => ("Margins", "top", v),
+    };
+    t.dialogs.select_tab(page).unwrap();
+    set(t, name, s(value));
+}
+
+/// Every sequence of `len` steps, in a fixed order.
+fn sequences(len: usize) -> Vec<Vec<Step>> {
+    let mut out = vec![Vec::new()];
+    for _ in 0..len {
+        out = out
+            .into_iter()
+            .flat_map(|seq| {
+                STEPS.iter().map(move |&st| {
+                    let mut next = seq.clone();
+                    next.push(st);
+                    next
+                })
+            })
+            .collect();
+    }
+    out
+}
+
+/// What the dialog shows for the page part: the nine fields in twips, and
+/// Landscape.
+fn shown_page(t: &DocTab) -> ([String; 9], bool) {
+    let names = [
+        "top", "right", "bottom", "left", "gutter", "header", "footer", "width", "height",
+    ];
+    (
+        names.map(|n| shown(t, n)),
+        shown(t, "orientation") == "Landscape",
+    )
+}
+
+fn page_of(s: &SectionSetup) -> ([String; 9], bool) {
+    let m = s.margins;
+    (
+        [
+            m.top, m.right, m.bottom, m.left, m.gutter, m.header, m.footer, s.page.w, s.page.h,
+        ]
+        .map(inches),
+        s.page.landscape,
+    )
+}
+
+fn seed(t: &mut DocTab, k: usize, (w, h, landscape, code): (i32, i32, bool, i32), m: [i32; 4]) {
+    ed_mut(t).edit_section_setups(&[k], |s| {
+        (s.page.w, s.page.h, s.page.landscape, s.page.code) = (w, h, landscape, Some(code));
+        (
+            s.margins.top,
+            s.margins.right,
+            s.margins.bottom,
+            s.margins.left,
+        ) = (m[0], m[1], m[2], m[3]);
+    });
+}
+
+/// r4: after OK the section holds exactly what the dialog showed: its sides,
+/// orientation and every margin, with the paper code of those sides. Every
+/// sequence of up to four steps; one that ends refused (an empty side) is
+/// skipped.
+#[test]
+fn ok_writes_the_page_the_dialog_shows_for_every_short_sequence() {
+    let mut t = one_section();
+    seed(&mut t, 0, (12240, 15840, false, 1), [720, 1080, 1440, 1800]);
+    let start = ed(&t).doc.clone();
+    let (mut checked, mut refused) = (0, 0);
+    for len in 0..=4 {
+        for seq in sequences(len) {
+            *ed_mut(&mut t) = Editor::new(start.clone());
+            ed_mut(&mut t).caret = Caret::top(1, 0);
+            t.dialogs.clear();
+            open(&mut t, PageSetupTab::Margins);
+            for &st in &seq {
+                step(&mut t, st);
+            }
+            let want = shown_page(&t);
+            if ok(&mut t).is_err() {
+                refused += 1;
+                continue;
+            }
+            let got = &setups(&t)[0];
+            assert_eq!(page_of(got), want, "{seq:?}");
+            assert_eq!(
+                got.page.code,
+                Paper::matching(got.page.w, got.page.h).map(Paper::code),
+                "{seq:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(
+        checked > 15_000 && refused > 1_000,
+        "{checked} checked, {refused} refused"
+    );
+}
+
+/// r4, several sections: with Whole document, each section gets OK's
+/// automatic part (its own rotation when Orientation changed, a picked
+/// paper) and then only the fields the person changed, those that differ
+/// from what the automatic part gives the caret section.
+#[test]
+fn whole_document_adds_only_the_persons_fields_to_each_section() {
+    let mut t = three_sections();
+    seed(&mut t, 0, (12240, 15840, false, 1), [720, 1080, 1440, 1800]);
+    seed(&mut t, 1, (16838, 11906, true, 9), [1000, 1100, 1200, 1300]);
+    seed(&mut t, 2, (12240, 20160, false, 5), [500, 600, 700, 800]);
+    let start = ed(&t).doc.clone();
+    let mut checked = 0;
+    for len in 0..=3 {
+        for seq in sequences(len) {
+            *ed_mut(&mut t) = Editor::new(start.clone());
+            ed_mut(&mut t).caret = Caret::top(1, 0);
+            let before = setups(&t);
+            t.dialogs.clear();
+            open(&mut t, PageSetupTab::Margins);
+            for &st in &seq {
+                step(&mut t, st);
+            }
+            set(&mut t, "apply", s("Whole document"));
+            let (shown_fields, landscape) = shown_page(&t);
+            if ok(&mut t).is_err() {
+                continue;
+            }
+            // The expected result, from the steps and SectionSetup alone.
+            let pick = seq.iter().rev().find_map(|st| match st {
+                Step::Pick(p) => Paper::ALL.into_iter().find(|q| q.label() == *p),
+                _ => None,
+            });
+            let turn = landscape != before[1].page.landscape;
+            let automatic = |s: &SectionSetup| {
+                let mut s = s.clone();
+                if turn {
+                    s.set_landscape(landscape);
+                }
+                if let Some(p) = pick {
+                    s.page.set_paper(p);
+                }
+                s
+            };
+            let caret = page_of(&automatic(&before[1])).0;
+            let mine: Vec<usize> = (0..9).filter(|&f| shown_fields[f] != caret[f]).collect();
+            for (k, own) in before.iter().enumerate() {
+                let mut want = automatic(own);
+                for &f in &mine {
+                    let v = super::twips_of(&shown_fields[f]).unwrap();
+                    match f {
+                        0 => want.margins.top = v,
+                        1 => want.margins.right = v,
+                        2 => want.margins.bottom = v,
+                        3 => want.margins.left = v,
+                        4 => want.margins.gutter = v,
+                        5 => want.margins.header = v,
+                        6 => want.margins.footer = v,
+                        7 => want.page.w = v,
+                        _ => want.page.h = v,
+                    }
+                }
+                if turn || pick.is_some() || mine.iter().any(|&f| f >= 7) {
+                    want.page.code = Paper::matching(want.page.w, want.page.h).map(Paper::code);
+                }
+                assert_eq!(setups(&t)[k], want, "section {k}: {seq:?}");
+            }
+            // The caret section shows what the dialog showed.
+            assert_eq!(
+                page_of(&setups(&t)[1]),
+                (shown_fields, landscape),
+                "{seq:?}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > 1_000, "{checked}");
+}
+
+/// r4 m2: unequal columns on several sections are checked against each
+/// section's own text width, and the refusal names the section.
+#[test]
+fn unequal_columns_on_several_sections_fit_each_one() {
+    let mut t = three_sections();
+    ed_mut(&mut t).edit_section_setups(&[2], |s| s.page.set_custom(8640, 15840));
+    let before = ed(&t).doc.clone();
+    open_columns(&mut t);
+    set(&mut t, "Presets", s("Left"));
+    set(&mut t, "apply", s("Whole document"));
+    assert_eq!(
+        ok(&mut t).unwrap_err(),
+        "Section 3: The columns take 6.5\" but the text is 4\" wide"
+    );
+    assert_eq!(ed(&t).doc, before, "nothing changed");
+    // Equal columns go to every section: Word sizes them to each.
+    set(&mut t, "Presets", s("Two"));
+    ok(&mut t).unwrap();
+    assert!(setups(&t).iter().all(|s| s.columns.count() == 2));
 }
