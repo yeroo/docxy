@@ -1932,26 +1932,32 @@ pub fn rename_sheet_in_expr(e: &Expr, old: &str, new: &str) -> Expr {
 /// text can't be read. Unlike cell formulas, a name may be a union of areas
 /// (`Report!$A:$A,Report!$1:$2`, as print titles are), which the parser has no
 /// operator for: such a definition is rewritten one comma-separated area at a
-/// time, and left alone entirely if any area fails to parse. Areas the edit
-/// didn't reach keep their original spelling, and an area that was deleted
-/// outright reads `Sheet!#REF!`, as Excel writes it.
-pub fn rewrite_defined_name(src: &str, f: impl Fn(&Expr) -> Expr) -> Option<String> {
+/// time. Areas the edit didn't reach keep their original spelling, and an
+/// area that was deleted outright reads `Sheet!#REF!`, as Excel writes it.
+/// Such an area doesn't parse and has nothing left to move, so it passes
+/// through (with its sheet renamed when `renamed` is `(old, new)`); any other
+/// area that fails to parse leaves the whole name alone.
+pub fn rewrite_defined_name(
+    src: &str,
+    f: impl Fn(&Expr) -> Expr,
+    renamed: Option<(&str, &str)>,
+) -> Option<String> {
     let pieces = if parse(src).is_ok() {
         vec![src]
     } else {
-        let pieces = split_top_level_commas(src);
-        if pieces.len() < 2 {
-            return None;
-        }
-        pieces
+        split_top_level_commas(src)
     };
     let mut out = Vec::with_capacity(pieces.len());
     let mut changed = false;
     for piece in pieces {
-        // An area an earlier delete removed (`Sheet!#REF!`, as written above)
-        // doesn't parse and has nothing left to move; it mustn't pin the rest.
-        if is_deleted_area(piece) {
-            out.push(piece.to_string());
+        if let Some(sheet) = deleted_area_sheet(piece) {
+            match (sheet, renamed) {
+                (Some(sheet), Some((old, new))) if sheet.eq_ignore_ascii_case(old) => {
+                    changed = true;
+                    out.push(format!("{}#REF!", sheet_prefix(new)));
+                }
+                _ => out.push(piece.to_string()),
+            }
             continue;
         }
         let ast = parse(piece).ok()?;
@@ -1966,10 +1972,19 @@ pub fn rewrite_defined_name(src: &str, f: impl Fn(&Expr) -> Expr) -> Option<Stri
     changed.then(|| out.join(","))
 }
 
-/// `#REF!` or `Sheet!#REF!` (quoted sheet names included).
-fn is_deleted_area(piece: &str) -> bool {
+/// For a deleted area, `#REF!` or `Sheet!#REF!`, its sheet (unquoted; `None`
+/// for a bare `#REF!`). `None` for anything else.
+fn deleted_area_sheet(piece: &str) -> Option<Option<String>> {
     let t = piece.trim();
-    t == "#REF!" || t.ends_with("!#REF!")
+    if t == "#REF!" {
+        return Some(None);
+    }
+    let q = t.strip_suffix("!#REF!")?;
+    let sheet = match q.strip_prefix('\'').and_then(|q| q.strip_suffix('\'')) {
+        Some(inner) => inner.replace("''", "'"),
+        None => q.to_string(),
+    };
+    Some(Some(sheet))
 }
 
 /// `src` split on the commas that separate a union's areas: outside quotes,
@@ -11193,23 +11208,26 @@ mod tests {
         };
         // A union moves area by area.
         assert_eq!(
-            rewrite_defined_name("Report!$A:$A,Report!$1:$2", rows(0, 1)).as_deref(),
+            rewrite_defined_name("Report!$A:$A,Report!$1:$2", rows(0, 1), None).as_deref(),
             Some("Report!$A:$A,Report!$2:$3")
         );
         // Commas inside a quoted sheet name or a call don't split.
         assert_eq!(
-            rewrite_defined_name("'a,b'!$A$1,'a,b'!$3:$3", |e| rename_sheet_in_expr(
-                e, "a,b", "C"
-            ))
+            rewrite_defined_name(
+                "'a,b'!$A$1,'a,b'!$3:$3",
+                |e| rename_sheet_in_expr(e, "a,b", "C"),
+                Some(("a,b", "C"))
+            )
             .as_deref(),
             Some("C!$A$1,C!$3:$3")
         );
         assert_eq!(
-            rewrite_defined_name("Report!$A$9,INDEX(Report!$A:$A,1)", rows(0, 1)).as_deref(),
+            rewrite_defined_name("Report!$A$9,INDEX(Report!$A:$A,1)", rows(0, 1), None).as_deref(),
             Some("Report!$A$10,INDEX(Report!$A:$A,1)")
         );
         assert_eq!(
-            rewrite_defined_name("INDEX(Report!$A$1:$A$5,2),Report!$3:$3", rows(0, 1)).as_deref(),
+            rewrite_defined_name("INDEX(Report!$A$1:$A$5,2),Report!$3:$3", rows(0, 1), None)
+                .as_deref(),
             Some("INDEX(Report!$A$2:$A$6,2),Report!$4:$4")
         );
         // An area a delete already removed passes through; the rest still move.
@@ -11226,43 +11244,72 @@ mod tests {
             )
         };
         assert_eq!(
-            rewrite_defined_name("Report!$A:$A,Report!#REF!", cols).as_deref(),
+            rewrite_defined_name("Report!$A:$A,Report!#REF!", cols, None).as_deref(),
             Some("Report!$B:$B,Report!#REF!")
         );
         assert_eq!(
-            rewrite_defined_name("'My Report'!#REF!,Report!$A:$A", cols).as_deref(),
+            rewrite_defined_name("'My Report'!#REF!,Report!$A:$A", cols, None).as_deref(),
             Some("'My Report'!#REF!,Report!$B:$B")
         );
         // Nothing moved: no rewrite, whatever the printer would spell.
-        assert_eq!(rewrite_defined_name("'Other'!$A$1", rows(0, 1)), None);
+        assert_eq!(rewrite_defined_name("'Other'!$A$1", rows(0, 1), None), None);
         assert_eq!(
-            rewrite_defined_name("'Report'!$A$1,Other!$1:$1", rows(5, 1)),
+            rewrite_defined_name("'Report'!$A$1,Other!$1:$1", rows(5, 1), None),
             None
         );
         // Only the areas that moved are respelled.
         assert_eq!(
-            rewrite_defined_name("'Other'!$A$1 , Report!$A$9", rows(0, 1)).as_deref(),
+            rewrite_defined_name("'Other'!$A$1 , Report!$A$9", rows(0, 1), None).as_deref(),
             Some("'Other'!$A$1 ,Report!$A$10")
         );
         // An area that won't parse leaves the whole name alone.
         assert_eq!(
-            rewrite_defined_name("Report!$A$9,Report!!", rows(0, 1)),
+            rewrite_defined_name("Report!$A$9,Report!!", rows(0, 1), None),
             None
         );
         // A deleted area is `Sheet!#REF!`, as Excel writes it.
         assert_eq!(
-            rewrite_defined_name("'My Report'!$A$1:$B$2", |e| adjust_for_edit(
-                e,
-                false,
-                "My Report",
-                &EditShift {
-                    rows: true,
-                    at: 0,
-                    delta: -2
-                }
-            ))
+            rewrite_defined_name(
+                "'My Report'!$A$1:$B$2",
+                |e| adjust_for_edit(
+                    e,
+                    false,
+                    "My Report",
+                    &EditShift {
+                        rows: true,
+                        at: 0,
+                        delta: -2
+                    }
+                ),
+                None
+            )
             .as_deref(),
             Some("'My Report'!#REF!")
+        );
+        // A rename reaches the sheet of a deleted area too, alone or in a union.
+        let ren = |e: &Expr| rename_sheet_in_expr(e, "report", "Q1 Plan");
+        assert_eq!(
+            rewrite_defined_name(
+                "Report!$A:$A,Report!#REF!",
+                ren,
+                Some(("report", "Q1 Plan"))
+            )
+            .as_deref(),
+            Some("'Q1 Plan'!$A:$A,'Q1 Plan'!#REF!")
+        );
+        assert_eq!(
+            rewrite_defined_name("Report!#REF!", ren, Some(("report", "Q1 Plan"))).as_deref(),
+            Some("'Q1 Plan'!#REF!")
+        );
+        let ren = |e: &Expr| rename_sheet_in_expr(e, "It's", "Plan");
+        assert_eq!(
+            rewrite_defined_name("'It''s'!#REF!,Other!#REF!", ren, Some(("It's", "Plan")))
+                .as_deref(),
+            Some("Plan!#REF!,Other!#REF!")
+        );
+        assert_eq!(
+            rewrite_defined_name("#REF!", ren, Some(("It's", "Plan"))),
+            None
         );
     }
 

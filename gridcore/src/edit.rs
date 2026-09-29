@@ -682,9 +682,11 @@ pub fn rename_sheet(wb: &mut Workbook, idx: usize, new_name: &str) {
         }
     }
     for dn in &mut wb.defined_names {
-        if let Some(updated) = crate::formula::rewrite_defined_name(&dn.formula, |e| {
-            crate::formula::rename_sheet_in_expr(e, &old, new_name)
-        }) {
+        if let Some(updated) = crate::formula::rewrite_defined_name(
+            &dn.formula,
+            |e| crate::formula::rename_sheet_in_expr(e, &old, new_name),
+            Some((&old, new_name)),
+        ) {
             dn.formula = updated;
         }
     }
@@ -935,9 +937,11 @@ fn structural_edit(wb: &mut Workbook, idx: usize, shift: EditShift) {
     }
     for dn in &mut wb.defined_names {
         // Defined names have no home sheet; only sheet-qualified refs shift.
-        if let Some(updated) = crate::formula::rewrite_defined_name(&dn.formula, |e| {
-            crate::formula::adjust_for_edit(e, false, &target_name, &shift)
-        }) {
+        if let Some(updated) = crate::formula::rewrite_defined_name(
+            &dn.formula,
+            |e| crate::formula::adjust_for_edit(e, false, &target_name, &shift),
+            None,
+        ) {
             dn.formula = updated;
         }
     }
