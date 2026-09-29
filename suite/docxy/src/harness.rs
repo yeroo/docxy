@@ -2006,8 +2006,8 @@ pub fn dispatch(
             || crate::dialog::DialogStack::default().to_json(),
             |t| t.dialogs.to_json(),
         )),
-        // The control's input handler, which a form's editable widget will
-        // call too; today's overlay draws controls read-only.
+        // The control's input handler, the one the overlay's editable widgets
+        // call too (#649).
         "dialog-set" => {
             let control = arg_str(args, "control")?.to_string();
             let dialogs = open_dialogs(app)?;

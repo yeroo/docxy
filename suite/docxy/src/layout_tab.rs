@@ -527,8 +527,13 @@ impl Docxy {
         match act {
             LayoutAct::Menu(menu) => {
                 let id = menu_id(menu);
-                let at = split_menu_anchor(&self.probes.borrow(), id)
-                    .unwrap_or_else(|| point(px(0.), px(0.)));
+                // The button's own place once a frame has drawn the tab; a
+                // KeyTip that switched to the tab a moment ago has none yet,
+                // so drop the menu about where the button sits.
+                let at = split_menu_anchor(&self.probes.borrow(), id).unwrap_or_else(|| {
+                    let n = MENUS.iter().position(|m| m.0 == menu).unwrap_or(0);
+                    point(px(12. + 64. * n as f32), px(140.))
+                });
                 if let Err(e) = self.open_split_menu(id, at, cx) {
                     self.set_status(e);
                 }

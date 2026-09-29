@@ -210,7 +210,7 @@ impl Docxy {
                 .min_w(px(96.))
                 .px_1()
                 .border_1()
-                .border_color(if focused { hsla_u(BRAND) } else { pal.border })
+                .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
                 .bg(pal.panel)
                 .child(SharedString::from(text))
         };
