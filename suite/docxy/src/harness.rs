@@ -1565,6 +1565,7 @@ fn closes_menu(verb: &str, args: &Json) -> bool {
             | "backstage-close"
             | "theme-set"
             | "ask-on-close"
+            | "autorecover"
             | "dialog-set"
             | "dialog-tab"
             | "dialog-click"
@@ -1658,6 +1659,10 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
         ("tab", Json::Num(app.active as f64)),
         ("tabs", Json::Num(app.tabs.len() as f64)),
         ("ask_on_close", Json::Bool(app.ask_on_close)),
+        (
+            "autorecover_minutes",
+            Json::Num(f64::from(app.autorecover_minutes)),
+        ),
         (
             "ribbon_tab",
             Json::Str(
@@ -2151,6 +2156,22 @@ pub fn dispatch(
             app.set_ask_on_close(*on, cx);
             Done::ok(state(app, window))
         }
+        // The Settings AutoRecover interval, in minutes; 0 turns it off.
+        "autorecover" => {
+            let minutes = u32::try_from(arg_usize(args, "minutes")?)
+                .map_err(|_| "'minutes' is too large".to_string())?;
+            app.set_autorecover_minutes(minutes, cx);
+            Done::ok(state(app, window))
+        }
+        // One AutoRecover tick now, as the timer would run it once the
+        // interval is up, so a test need not wait minutes. `wrote` says
+        // whether anything was unsaved and so written. Runs even when the
+        // setting is off: it is the tick, not the schedule.
+        "autorecover-now" => {
+            let wrote = app.autorecover_tick();
+            cx.notify();
+            Done::ok(Json::obj(vec![("wrote", Json::Bool(wrote))]))
+        }
         "ping" => Done::ok(Json::obj(vec![
             ("instance", Json::Str(instance_name(true))),
             ("pid", Json::Num(std::process::id() as f64)),
@@ -2436,7 +2457,9 @@ pub fn dispatch(
         // Persist and go. The reply is written first (see the pump).
         "quit" => {
             crate::close::commit_pending_for_exit(&mut app.tabs);
-            app.persist();
+            // Not through `on_window_should_close`: clear the run marker here
+            // too, or every harness relaunch would look like a crash (#632).
+            app.clean_exit();
             Ok(Done {
                 result: Json::obj(vec![("quitting", Json::Bool(true))]),
                 quit: true,

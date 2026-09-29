@@ -30,6 +30,7 @@ mod harness;
 mod html_bundle;
 mod menu;
 mod project;
+mod recover;
 #[cfg(test)]
 mod ribbon_export;
 mod style_gallery;
@@ -189,7 +190,7 @@ struct PersistTab {
     load_failed: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct Session {
     tabs: Vec<PersistTab>,
     active: usize,
@@ -197,6 +198,35 @@ struct Session {
     theme: ThemePref,
     #[serde(default)]
     ask_on_close: bool,
+    /// Minutes between AutoRecover writes while a tab is unsaved; 0 is off.
+    /// A session written before the setting existed gets Word's 10.
+    #[serde(default = "autorecover_default")]
+    autorecover_minutes: u32,
+}
+
+fn autorecover_default() -> u32 {
+    recover::DEFAULT_MINUTES
+}
+
+// Not derived: a fresh install (no session.json) must get AutoRecover on, not 0.
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active: 0,
+            theme: ThemePref::default(),
+            ask_on_close: false,
+            autorecover_minutes: recover::DEFAULT_MINUTES,
+        }
+    }
+}
+
+/// The settings `session.json` carries besides the tabs.
+#[derive(Clone, Copy)]
+struct Prefs {
+    theme: ThemePref,
+    ask_on_close: bool,
+    autorecover_minutes: u32,
 }
 
 /// Environment variable that redirects every file the app persists — the
@@ -232,8 +262,8 @@ fn config_root_from(over: Option<std::ffi::OsString>, os_config: Option<PathBuf>
     }
 }
 
-fn session_path() -> PathBuf {
-    config_root().join("docxy").join("session.json")
+fn session_path_in(root: &std::path::Path) -> PathBuf {
+    root.join("docxy").join("session.json")
 }
 
 // ---- ribbon tabs -----------------------------------------------------------
@@ -1304,6 +1334,12 @@ struct Docxy {
     /// Off by default: work is hot-persisted and restored regardless, so closing
     /// is normally silent.
     ask_on_close: bool,
+    /// Minutes between AutoRecover writes while a tab is unsaved (#632); 0 is off.
+    autorecover_minutes: u32,
+    /// When the hot-exit state was last written by any `persist`, or an
+    /// AutoRecover tick last found nothing to write: the timer's clock. A
+    /// `Cell` because `persist` takes `&self`.
+    last_persist: std::cell::Cell<std::time::Instant>,
     applied: Option<ThemeMode>,
     // Find & replace bar (Ctrl+F). Self-managed text fields (no gpui-component
     // InputState entity) — keystrokes route here while `find_open`.
@@ -5344,8 +5380,55 @@ fn file_name(path: &std::path::Path) -> String {
 
 /// Directory holding hot-exit sidecars (`.docx`, `.xlsx`, or `.yppx` by tab kind),
 /// kept in sync on each persist so unsaved edits survive a restart.
-fn hot_dir() -> PathBuf {
-    config_root().join("docxy").join("hot")
+fn hot_dir_in(root: &std::path::Path) -> PathBuf {
+    root.join("docxy").join("hot")
+}
+
+/// Write every tab's hot sidecar, then `session.json`, under `root`.
+///
+/// Both go through `write_atomic`, so a kill mid-write (more likely now that
+/// AutoRecover writes while the user types, #632) leaves the previous file
+/// whole rather than a truncated `session.json` that restores no tabs.
+/// ⚠️ The sidecars and the session are still two steps: killed between them
+/// after a tab close or reorder, the old session can pair `tab-N` with another
+/// tab's `path`. The AutoRecover tick never reorders, so it does not widen this.
+fn write_session(root: &std::path::Path, tabs: &[DocTab], active: usize, prefs: Prefs) {
+    let hd = hot_dir_in(root);
+    let _ = std::fs::create_dir_all(&hd);
+    let tabs = tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| persist_tab(&hd, i, t))
+        .collect();
+    let session = Session {
+        tabs,
+        active,
+        theme: prefs.theme,
+        ask_on_close: prefs.ask_on_close,
+        autorecover_minutes: prefs.autorecover_minutes,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&session) {
+        let p = session_path_in(root);
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = opccore::fsio::write_atomic(&p, json.as_bytes());
+    }
+}
+
+/// The in-memory half of an AutoRecover tick: fold open header/footer edits
+/// into the package (without leaving header/footer mode) and say whether
+/// anything is unsaved, i.e. whether the tick should write.
+///
+/// Nothing else from `close::commit_pending_for_exit` runs here: committing a
+/// sheet or Project cell editor would close the user's in-progress edit under
+/// them, and a level pass rewrites the status. So text still in an open cell
+/// editor is not in the recovery copy until it is committed.
+fn autorecover_prepare(tabs: &mut [DocTab]) -> bool {
+    for t in tabs.iter_mut() {
+        flush_hf_tab(t);
+    }
+    tabs.iter().any(|t| t.dirty)
 }
 
 /// Serialize a document to `.docx` bytes, adding a numbering part when it uses
@@ -5526,6 +5609,29 @@ fn restore_tab(t: &PersistTab) -> DocTab {
     tab
 }
 
+/// Restore every tab of a session. After a crash, a tab that comes back dirty
+/// (only a readable sidecar keeps `dirty`) is labelled as an AutoRecover copy,
+/// aged from its sidecar's mtime. Its `path` still names the original, which
+/// restore never writes: that waits for the user's Save.
+fn restore_session(session: &Session, crashed: bool, now: std::time::SystemTime) -> Vec<DocTab> {
+    session
+        .tabs
+        .iter()
+        .map(|t| {
+            let mut tab = restore_tab(t);
+            if crashed && tab.dirty && !tab.load_failed {
+                let saved = t
+                    .hot
+                    .as_ref()
+                    .and_then(|h| std::fs::metadata(h).ok())
+                    .and_then(|m| m.modified().ok());
+                tab.status = recover::recovered_status(saved, now).into();
+            }
+            tab
+        })
+        .collect()
+}
+
 fn persist_tab(hd: &std::path::Path, i: usize, t: &DocTab) -> PersistTab {
     // Write the tab's live content to a sidecar so unsaved edits are
     // held across a restart (closing never loses work). Docs → .docx,
@@ -5648,21 +5754,23 @@ mod frame_border_tests {
 
 impl Docxy {
     fn new(cx: &mut Context<Self>) -> Self {
-        let session: Session = std::fs::read(session_path())
+        let root = config_root();
+        let session: Session = std::fs::read(session_path_in(&root))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
+        // Asked before this run writes its own marker.
+        let crashed = recover::was_unclean(&root);
+        recover::mark_running(&root);
 
-        let mut tabs = Vec::new();
-        for t in &session.tabs {
-            tabs.push(restore_tab(t));
-        }
+        let mut tabs = restore_session(&session, crashed, std::time::SystemTime::now());
         if tabs.is_empty() {
             tabs.push(sample_doc().into_tab(Kind::Docx, "sample.docx".into(), None, false));
         }
         let active = session.active.min(tabs.len().saturating_sub(1));
-        let this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
-        this.persist();
+        let mut this = Self::build(tabs, active, session.theme, session.ask_on_close, cx);
+        this.autorecover_minutes = session.autorecover_minutes;
+        this.persist_to(&root);
         this
     }
 
@@ -5691,6 +5799,8 @@ impl Docxy {
             clip: None,
             theme_pref,
             ask_on_close,
+            autorecover_minutes: recover::DEFAULT_MINUTES,
+            last_persist: std::cell::Cell::new(std::time::Instant::now()),
             applied: None,
             find_open: false,
             find_query: String::new(),
@@ -5751,27 +5861,57 @@ impl Docxy {
     }
 
     fn persist(&self) {
-        let hd = hot_dir();
-        let _ = std::fs::create_dir_all(&hd);
-        let tabs = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| persist_tab(&hd, i, t))
-            .collect();
-        let session = Session {
-            tabs,
-            active: self.active,
+        self.persist_to(&config_root());
+    }
+
+    fn persist_to(&self, root: &std::path::Path) {
+        write_session(root, &self.tabs, self.active, self.prefs());
+        // Any write restarts the AutoRecover clock: the copy is fresh.
+        self.last_persist.set(std::time::Instant::now());
+    }
+
+    fn prefs(&self) -> Prefs {
+        Prefs {
             theme: self.theme_pref,
             ask_on_close: self.ask_on_close,
-        };
-        if let Ok(json) = serde_json::to_string_pretty(&session) {
-            let p = session_path();
-            if let Some(dir) = p.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let _ = std::fs::write(p, json);
+            autorecover_minutes: self.autorecover_minutes,
         }
+    }
+
+    /// One AutoRecover tick: write the hot-exit state if any tab is unsaved.
+    /// Returns whether it wrote. The timer and the harness `autorecover-now`
+    /// verb both come here.
+    fn autorecover_tick(&mut self) -> bool {
+        let wrote = autorecover_prepare(&mut self.tabs);
+        if wrote {
+            self.persist();
+        } else {
+            // A check that found nothing unsaved restarts the clock too, or a
+            // clean session would be re-checked every second from now on. An
+            // edit made after it is still written within one interval.
+            self.last_persist.set(std::time::Instant::now());
+        }
+        wrote
+    }
+
+    /// Whether the timer should tick now: on, and a whole interval since the
+    /// last write of any kind or the last tick.
+    fn autorecover_due(&self) -> bool {
+        recover::due(self.autorecover_minutes, self.last_persist.get().elapsed())
+    }
+
+    /// A clean exit (window close accepted, or the harness `quit`): persist,
+    /// then remove the run marker so the next launch does not report a crash.
+    fn clean_exit(&self) {
+        let root = config_root();
+        self.persist_to(&root);
+        recover::clear_running(&root);
+    }
+
+    fn set_autorecover_minutes(&mut self, minutes: u32, cx: &mut Context<Self>) {
+        self.autorecover_minutes = minutes;
+        self.persist();
+        cx.notify();
     }
 
     fn refocus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -19581,6 +19721,41 @@ impl Docxy {
                 .child(div().text_size(px(11.)).text_color(dim).child(
                     "Off: closing the window is silent — your work is kept and reopened next launch. Closing a single tab with unsaved changes always asks.",
                 ))
+                // One button that cycles the interval, as simple as the
+                // toggle above; Word's File › Options › Save equivalent.
+                .child(
+                    div()
+                        .id("bs-autorecover")
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .mt_2()
+                        .py_1()
+                        .cursor_pointer()
+                        .rounded_sm()
+                        .hover(|d| d.bg(sidebar))
+                        .child(
+                            div()
+                                .text_color(fg)
+                                .child("Save AutoRecover information:"),
+                        )
+                        .child(
+                            div()
+                                .px_2()
+                                .rounded(px(3.))
+                                .border_1()
+                                .border_color(hsla_u(BRAND))
+                                .text_color(fg)
+                                .child(recover::choice_label(self.autorecover_minutes)),
+                        )
+                        .on_click(cx.listener(|this, _, _w, cx| {
+                            let next = recover::next_choice(this.autorecover_minutes);
+                            this.set_autorecover_minutes(next, cx);
+                        })),
+                )
+                .child(div().text_size(px(11.)).text_color(dim).child(
+                    "While a document has unsaved changes, a recovery copy is kept this often. After a crash it reopens as recovered and unsaved; the original file is not changed until you save.",
+                ))
                 .into_any_element()
         };
 
@@ -24081,7 +24256,7 @@ fn main() {
                     // ⚠️ Not in a harness instance — the same modal-loop trap as
                     // `open_args`, and here it would wedge the shutdown the
                     // runner waits on after the `quit` verb.
-                    if this.harness.is_none()
+                    let close = if this.harness.is_none()
                         && this.ask_on_close
                         && this.tabs.iter().any(|t| t.dirty)
                     {
@@ -24095,9 +24270,45 @@ fn main() {
                         )
                     } else {
                         true
+                    };
+                    // Only an accepted close is a clean exit; a cancelled one
+                    // keeps running, marker and all.
+                    if close {
+                        this.clean_exit();
                     }
+                    close
                 })
             });
+            // AutoRecover (#632): wake when the interval is up (and at least
+            // every `recover::POLL`), and write the hot-exit state when a whole
+            // interval has passed since the last write or check while
+            // something is unsaved. Re-reading the setting on each wake is
+            // what makes a change apply without a restart. Ends when the view
+            // is gone.
+            let ticker = view.downgrade();
+            window
+                .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                    loop {
+                        let Ok(wait) = ticker.read_with(cx, |this, _| {
+                            recover::wake_after(
+                                this.autorecover_minutes,
+                                this.last_persist.get().elapsed(),
+                            )
+                        }) else {
+                            break;
+                        };
+                        cx.background_executor().timer(wait).await;
+                        let ticked = ticker.update(cx, |this, cx| {
+                            if this.autorecover_due() && this.autorecover_tick() {
+                                cx.notify();
+                            }
+                        });
+                        if ticked.is_err() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
             cx.new(|cx| Root::new(view, window, cx))
         })
         .expect("failed to open docxy window");
@@ -29109,7 +29320,7 @@ mod edit_caret_tests {
 
 #[cfg(test)]
 mod config_root_tests {
-    use super::{CONFIG_DIR_ENV, config_root, config_root_from, hot_dir, session_path};
+    use super::{CONFIG_DIR_ENV, config_root, config_root_from, hot_dir_in, session_path_in};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
 
@@ -29195,20 +29406,26 @@ mod config_root_tests {
         let over = Path::new(r"D:\runs\harness-42");
         unsafe { std::env::set_var(CONFIG_DIR_ENV, over) };
         assert_eq!(config_root(), over);
-        assert_eq!(session_path(), over.join("docxy").join("session.json"));
-        assert_eq!(hot_dir(), over.join("docxy").join("hot"));
-        assert!(session_path().starts_with(over));
-        assert!(hot_dir().starts_with(over));
+        assert_eq!(
+            session_path_in(&config_root()),
+            over.join("docxy").join("session.json")
+        );
+        assert_eq!(hot_dir_in(&config_root()), over.join("docxy").join("hot"));
+        assert!(session_path_in(&config_root()).starts_with(over));
+        assert!(hot_dir_in(&config_root()).starts_with(over));
 
         // Unset again: back to the OS config dir, which is what a normal launch
         // must keep doing — the harness is opt-in, never a mode you fall into.
         unsafe { std::env::remove_var(CONFIG_DIR_ENV) };
         let real = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         assert_eq!(config_root(), real);
-        assert_eq!(session_path(), real.join("docxy").join("session.json"));
-        assert_eq!(hot_dir(), real.join("docxy").join("hot"));
-        assert!(!session_path().starts_with(over));
-        assert!(!hot_dir().starts_with(over));
+        assert_eq!(
+            session_path_in(&config_root()),
+            real.join("docxy").join("session.json")
+        );
+        assert_eq!(hot_dir_in(&config_root()), real.join("docxy").join("hot"));
+        assert!(!session_path_in(&config_root()).starts_with(over));
+        assert!(!hot_dir_in(&config_root()).starts_with(over));
     }
 }
 
