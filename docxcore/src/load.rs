@@ -904,9 +904,9 @@ impl FieldCollapse {
             match event {
                 FieldEvent::Begin => {
                     // A begin after another marker in the same run (the end of
-                    // a previous field, say) shares its run: the slice would
-                    // start inside that other field.
-                    let shares_run = !events[..k].iter().all(|e| matches!(e, FieldEvent::Begin));
+                    // a previous field, or an outer field's begin) shares its
+                    // run: its slice would start inside that other field.
+                    let shares_run = k > 0;
                     self.open.push(OpenFieldSpan {
                         idx: n,
                         start,
@@ -3217,7 +3217,8 @@ mod tests {
         assert!(!out.contains("comment"), "{out}");
     }
 
-    /// `inner` between a PAGE-like field's separate and end, as `code`'s result.
+    /// An `ADDIN EN.CITE` field whose result (between separate and end) is
+    /// `inner`.
     fn field_around(inner: &str) -> String {
         format!(
             "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
@@ -3295,6 +3296,29 @@ mod tests {
                 .iter()
                 .any(|i| matches!(i, Inline::Raw(r) if r.contains("w:name=\"_ENREF_1\"")))
         );
+    }
+
+    #[test]
+    fn two_begins_in_one_run_leave_both_fields_loose_642() {
+        // { { REF bm } \* MERGEFORMAT } with both begins packed in one run.
+        let d = para_doc(
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> REF bm </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>x</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>\
+             <w:r><w:instrText> \\* MERGEFORMAT </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>x</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        );
+        let p = first_para(&d);
+        assert!(
+            !p.content.iter().any(|i| matches!(i, Inline::Field { .. })),
+            "{:?}",
+            kinds(&p.content)
+        );
+        assert_round_trips(&d);
     }
 
     #[test]
