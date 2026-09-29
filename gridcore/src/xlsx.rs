@@ -1699,76 +1699,45 @@ struct ElementSpan {
     value: (usize, usize),
 }
 
-/// The first element with local name `local` (any namespace prefix) whose
-/// attribute `attr` has a (decoded) value `want` accepts. Writers differ in quote
-/// style, whitespace, and `/>` versus `></X>`, so all of them are read.
+/// The first element with local name `name` (any namespace prefix) whose
+/// attribute `attr` has a (decoded) value `want` accepts. The same parser
+/// that reads rels finds it, so quote style, whitespace, `/>` versus `></X>`,
+/// and comments, CDATA and processing instructions are treated alike.
 fn find_element_by_attr(
     xml: &str,
-    local: &str,
+    name: &str,
     attr: &str,
     want: impl Fn(&str) -> bool,
 ) -> Option<ElementSpan> {
-    let bytes = xml.as_bytes();
-    let local_of = |name: &str| name.rsplit(':').next().unwrap_or(name).to_string();
-    let mut from = 0;
-    while let Some(rel) = xml[from..].find('<') {
-        let start = from + rel;
-        let name_end = start
-            + 1
-            + xml[start + 1..].find(|c: char| c.is_whitespace() || c == '/' || c == '>')?;
-        let qname = &xml[start + 1..name_end];
-        if qname.is_empty() || local_of(qname) != local {
-            from = start + 1;
-            continue;
-        }
-        // Walk the attributes, quote-aware, to the end of the start tag.
-        let mut i = name_end;
-        let mut hit = None;
-        let (tag_end, self_closed) = loop {
-            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
-                i += 1;
-            }
-            match bytes.get(i)? {
-                b'>' => break (i + 1, false),
-                b'/' if bytes.get(i + 1) == Some(&b'>') => break (i + 2, true),
-                _ => {
-                    let eq = i + xml[i..].find('=')?;
-                    let name = xml[i..eq].trim();
-                    let mut q = eq + 1;
-                    while bytes.get(q).is_some_and(u8::is_ascii_whitespace) {
-                        q += 1;
-                    }
-                    let quote = *bytes.get(q)?;
-                    if quote != b'"' && quote != b'\'' {
+    let mut p = XmlParser::new(xml);
+    loop {
+        match p.next() {
+            Event::Start if local(p.name()) == name => {
+                let value = p
+                    .attrs()
+                    .iter()
+                    .find(|a| local(a.name) == attr && want(&decode(a.value)))
+                    .map(|a| {
+                        let at = a.value.as_ptr() as usize - xml.as_ptr() as usize;
+                        (at, at + a.value.len())
+                    });
+                if let Some(value) = value {
+                    let start = p.start_pos();
+                    // A truncated element has no span to remove or rewrite.
+                    if !p.skip_element_complete() {
                         return None;
                     }
-                    let vs = q + 1;
-                    let ve = vs + xml[vs..].find(quote as char)?;
-                    if hit.is_none() && local_of(name) == attr && want(&decode(&xml[vs..ve])) {
-                        hit = Some((vs, ve));
-                    }
-                    i = ve + 1;
+                    return Some(ElementSpan {
+                        start,
+                        end: p.pos(),
+                        value,
+                    });
                 }
             }
-        };
-        let end = if self_closed {
-            tag_end
-        } else {
-            let close = format!("</{qname}");
-            match xml[tag_end..].find(&close) {
-                Some(c) => {
-                    let c = tag_end + c;
-                    c + xml[c..].find('>')? + 1
-                }
-                None => tag_end,
-            }
-        };
-        if let Some(value) = hit {
-            return Some(ElementSpan { start, end, value });
+            Event::Eof => return None,
+            _ => {}
         }
-        from = tag_end;
     }
-    None
 }
 
 /// The `<Override>` whose PartName is `part_name` (OPC part names compare
@@ -7476,6 +7445,44 @@ mod kind_tests {
         let el = find_element_by_attr(&xml, "Relationship", "Id", |v| v == "a").unwrap();
         xml.replace_range(el.start..el.end, "");
         assert_eq!(xml, "<R></R>");
+    }
+
+    /// A commented-out copy ahead of the real element is not the element:
+    /// the live relationship goes, and the live Override is the one retyped.
+    #[test]
+    fn commented_out_copies_are_not_elements() {
+        let mut pkg = xlsm();
+        let ct = content_types(&pkg).replace(
+            "<Default Extension=\"rels\"",
+            &format!(
+                "<!-- <Override PartName=\"/xl/workbook.xml\" ContentType=\"{XLSM_CT}\"/> --><Default Extension=\"rels\""
+            ),
+        );
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace(
+                "<Relationship Id=\"rId1\"",
+                "<!-- <Relationship Id=\"rId9\" Type=\"x\" Target=\"old.bin\"/> --><Relationship Id=\"rId1\"",
+            );
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let ct = content_types(&out);
+        let live = ct.rsplit("-->").next().unwrap();
+        assert!(
+            !live.contains("macroEnabled"),
+            "the live Override was retyped: {ct}"
+        );
+        assert!(live.contains(XLSX_CT), "{ct}");
+        let rels =
+            String::from_utf8_lossy(out.part("xl/_rels/workbook.xml.rels").unwrap()).into_owned();
+        let live = rels.rsplit("-->").next().unwrap();
+        assert!(
+            !live.contains("vbaProject"),
+            "the live relationship went: {rels}"
+        );
+        assert!(!out.has_vba_project());
+        assert!(out.part("xl/vbaProject.bin").is_none());
     }
 
     #[test]
