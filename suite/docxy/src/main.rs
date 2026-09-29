@@ -23979,6 +23979,21 @@ fn window_options(bounds: Bounds<Pixels>, harness: bool) -> WindowOptions {
     }
 }
 
+/// When the app quits: as soon as its last window closes, on every platform.
+///
+/// gpui's `QuitMode::Default` resolves to `Explicit` on **macOS** (the
+/// document-app convention of staying alive with no windows) and to
+/// `LastWindowClosed` elsewhere. That convention needs an application menu, a
+/// File › New and a Dock "reopen" to bring a window back; the suite has none of
+/// them, so under `Default` closing its only window left an invisible process
+/// in the Dock (#594). Nothing is lost by quitting here: the window's
+/// `on_window_should_close` handler commits pending edits and persists the
+/// hot-exit session before gpui removes the window, and gpui only checks for
+/// an empty window list after that.
+fn quit_mode() -> QuitMode {
+    QuitMode::LastWindowClosed
+}
+
 fn main() {
     // The command line: files to open (e.g. double-clicking a document in
     // Explorer, opened on top of the restored hot-exit session), plus the
@@ -24023,7 +24038,10 @@ fn main() {
             }
         }
     };
-    gpui_platform::application().with_assets(DocxyAssets).run(move |cx: &mut App| {
+    let app = gpui_platform::application()
+        .with_assets(DocxyAssets)
+        .with_quit_mode(quit_mode());
+    app.run(move |cx: &mut App| {
         gpui_component::init(cx);
         // Tab / Shift-Tab are reserved by gpui's focus system; bind them to
         // actions so the document can insert a tab / outdent instead.
@@ -24084,6 +24102,23 @@ fn main() {
         })
         .expect("failed to open docxy window");
     });
+}
+
+#[cfg(test)]
+mod quit_mode_tests {
+    use super::quit_mode;
+    use gpui::QuitMode;
+
+    /// Closing the only window ends the process on every platform, macOS
+    /// included (#594), rather than gpui's `Default`, which keeps a windowless
+    /// app alive on macOS.
+    ///
+    /// ⚠️ This pins what `main` asks gpui for; that `main` actually passes it
+    /// to the application builder is not something a unit test can reach.
+    #[test]
+    fn the_app_quits_when_its_last_window_closes() {
+        assert_eq!(quit_mode(), QuitMode::LastWindowClosed);
+    }
 }
 
 #[cfg(test)]
