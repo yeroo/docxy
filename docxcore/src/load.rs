@@ -854,16 +854,20 @@ impl FieldCollapse {
         is_run: bool,
     ) {
         use crate::field::FieldEvent;
-        if !is_run || out.len() != n + 1 {
-            if let Some(open) = self.open.as_mut() {
-                if out[n.min(out.len())..].iter().any(has_field_marker) {
-                    open.broken = true;
-                }
-            }
-            return;
-        }
+        let pushed = &out[n.min(out.len())..];
         let run = p.raw_slice(start, p.pos());
-        if !run.contains("<w:fldChar") {
+        let marker_run = is_run && is_field_marker_run(run, pushed);
+        // Tracked changes can't be edited inside a Field (review would lose
+        // them), and loose markers from a nested container can't be paired.
+        let taints = pushed
+            .iter()
+            .any(|i| holds_revision(i) || (!marker_run && has_field_marker(i)));
+        if taints {
+            if let Some(open) = self.open.as_mut() {
+                open.broken = true;
+            }
+        }
+        if !marker_run {
             return;
         }
         let events = crate::field::field_events(run);
@@ -872,11 +876,16 @@ impl FieldCollapse {
                 FieldEvent::Begin => match self.open.as_mut() {
                     Some(open) => open.depth += 1,
                     None => {
+                        // A begin after another marker in the same run (the
+                        // end of a previous field, say) shares its run: the
+                        // slice would start inside that other field.
+                        let shares_run =
+                            !events[..k].iter().all(|e| matches!(e, FieldEvent::Begin));
                         self.open = Some(OpenFieldSpan {
                             depth: 1,
                             idx: n,
                             start,
-                            broken: false,
+                            broken: taints || shares_run,
                         })
                     }
                 },
@@ -904,12 +913,45 @@ impl FieldCollapse {
     }
 }
 
+/// Whether a run the loop parsed directly (source `run`, which pushed
+/// `pushed`) is a complex-field marker run: kept raw, with a `w:fldChar` of its
+/// own. A drawing, picture or object whose text box holds a field is not: those
+/// markers belong to the text box's own paragraphs.
+fn is_field_marker_run(run: &str, pushed: &[Inline]) -> bool {
+    const CONTAINERS: [&str; 5] = [
+        "<w:drawing",
+        "<w:pict",
+        "<w:object",
+        "<mc:AlternateContent",
+        "<w:txbxContent",
+    ];
+    matches!(pushed, [Inline::Raw(_)])
+        && run.contains("<w:fldChar")
+        && !CONTAINERS.iter().any(|c| run.contains(c))
+}
+
 /// Whether an inline (or anything inside it) holds loose complex-field markers.
 fn has_field_marker(inline: &Inline) -> bool {
     match inline {
         Inline::Raw(raw) => raw.contains("<w:fldChar"),
         Inline::Hyperlink(h) => h.content.iter().any(has_field_marker),
         Inline::Revision { content, .. } => content.iter().any(has_field_marker),
+        _ => false,
+    }
+}
+
+/// Whether an inline is, or holds, a tracked change: an insertion, deletion or
+/// unsupported revision record, or a formatting change on a run or tab.
+fn holds_revision(inline: &Inline) -> bool {
+    match inline {
+        Inline::Revision { .. } | Inline::UnsupportedRevision { .. } => true,
+        Inline::Run(r) => r.props.property_change.is_some(),
+        Inline::Tab(props) => props.property_change.is_some(),
+        Inline::Hyperlink(h) => {
+            h.runs.iter().any(|r| r.props.property_change.is_some())
+                || h.content.iter().any(holds_revision)
+        }
+        Inline::Raw(raw) => raw.contains("<w:rPrChange"),
         _ => false,
     }
 }
@@ -2819,6 +2861,104 @@ mod tests {
             out.matches("<w:smartTag").count(),
             out.matches("</w:smartTag>").count()
         );
+    }
+
+    #[test]
+    fn a_run_holding_one_fields_end_and_the_next_begin_leaves_both_loose_642() {
+        let instr = |i: &str| format!("<w:r><w:instrText> {i} </w:instrText></w:r>");
+        let sep = "<w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>";
+        let begin = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>";
+        let end = "<w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        let shared =
+            "<w:r><w:fldChar w:fldCharType=\"end\"/><w:fldChar w:fldCharType=\"begin\"/></w:r>";
+        // One field's end and the next field's begin in one run.
+        let body = format!(
+            "{begin}{}{sep}<w:r><w:t>1</w:t></w:r>{shared}{}{sep}<w:r><w:t>2</w:t></w:r>{end}",
+            instr("PAGE"),
+            instr("NUMPAGES")
+        );
+        // A stray end (its field began in an earlier paragraph) then a begin.
+        let stray = format!(
+            "<w:r><w:t>x</w:t></w:r>{shared}{}{sep}<w:r><w:t>2</w:t></w:r>{end}",
+            instr("NUMPAGES")
+        );
+        for inner in [body, stray] {
+            let d = para_doc(&inner);
+            let p = first_para(&d);
+            assert!(
+                !p.content.iter().any(|i| matches!(i, Inline::Field { .. })),
+                "{:?}",
+                kinds(&p.content)
+            );
+            let out = crate::serialize::document_to_xml(&d);
+            assert!(out.contains(shared), "the shared run is kept whole");
+            for kind in ["begin", "separate", "end"] {
+                let marker = format!("fldCharType=\"{kind}\"");
+                assert_eq!(out.matches(&marker).count(), inner.matches(&marker).count());
+            }
+        }
+    }
+
+    #[test]
+    fn a_field_whose_result_holds_tracked_changes_stays_loose_642() {
+        let tracked = "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+            <w:r><w:instrText> PAGE </w:instrText></w:r>\
+            <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+            <w:del w:id=\"1\" w:author=\"A\"><w:r><w:delText>1</w:delText></w:r></w:del>\
+            <w:ins w:id=\"2\" w:author=\"A\"><w:r><w:t>2</w:t></w:r></w:ins>\
+            <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>";
+        let d = para_doc(tracked);
+        assert_eq!(
+            kinds(&first_para(&d).content),
+            ["Raw", "Raw", "Raw", "Revision", "Revision", "Raw"]
+        );
+        assert_eq!(d.revisions().len(), 2, "review still sees both changes");
+        let mut ed = crate::editor::Editor::new(d);
+        ed.accept_all_revisions();
+        let out = crate::serialize::document_to_xml(&ed.doc);
+        assert!(!out.contains("<w:ins ") && !out.contains("<w:del "), "{out}");
+        // A formatting change on a result run, or a deleted instruction.
+        for inner in [
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:r><w:instrText> PAGE </w:instrText></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:rPr><w:b/><w:rPrChange w:id=\"3\" w:author=\"A\"><w:rPr/></w:rPrChange></w:rPr><w:t>1</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+            "<w:r><w:fldChar w:fldCharType=\"begin\"/></w:r>\
+             <w:del w:id=\"4\" w:author=\"A\"><w:r><w:delInstrText> PAGE </w:delInstrText></w:r></w:del>\
+             <w:r><w:fldChar w:fldCharType=\"separate\"/></w:r>\
+             <w:r><w:t>1</w:t></w:r>\
+             <w:r><w:fldChar w:fldCharType=\"end\"/></w:r>",
+        ] {
+            let d = para_doc(inner);
+            assert!(
+                !first_para(&d)
+                    .content
+                    .iter()
+                    .any(|i| matches!(i, Inline::Field { .. })),
+                "{inner}"
+            );
+            assert!(!d.revisions().is_empty());
+        }
+    }
+
+    #[test]
+    fn a_field_inside_a_text_box_stays_in_the_text_box_642() {
+        let d = para_doc(&format!(
+            "<w:r><w:t>host</w:t></w:r>\
+             <w:r><w:pict><v:shape><v:textbox><w:txbxContent>\
+             <w:p><w:r><w:t>Page </w:t></w:r>{PAGE_FIELD}</w:p>\
+             </w:txbxContent></v:textbox></v:shape></w:pict></w:r>"
+        ));
+        let p = first_para(&d);
+        assert_eq!(kinds(&p.content), ["Run", "Other"]);
+        match &p.content[1] {
+            Inline::TextBox { blocks, .. } => match &blocks[0] {
+                Block::Paragraph(inner) => assert_eq!(kinds(&inner.content), ["Run", "Field"]),
+                other => panic!("expected a paragraph, got {other:?}"),
+            },
+            other => panic!("expected a text box, got {other:?}"),
+        }
     }
 
     #[test]
