@@ -5483,10 +5483,26 @@ fn doc_to_docx(doc: &Document, comments: &[Comment], base: Option<&Package>) -> 
     docxcore::package::save_package(&pkg)
 }
 
+/// One tab as a relaunch restores it. The app goes through
+/// [`restore_session`]; the tests of single-tab restore come here.
+#[cfg(test)]
 fn restore_tab(t: &PersistTab) -> DocTab {
+    restore_tab_sourced(t).0
+}
+
+/// [`restore_tab`], plus whether the tab's content came from a readable
+/// hot-exit sidecar. Only such a tab holds an AutoRecover copy; a tab that
+/// fell back to its file, or to a placeholder, keeps `t.dirty` in some arms
+/// but lost its unsaved content (#632).
+fn restore_tab_sourced(t: &PersistTab) -> (DocTab, bool) {
     if t.kind == Kind::Project {
-        return restore_project_tab(t);
+        // Every fallback in `restore_project_tab` (sidecar missing or
+        // unreadable) comes back clean, so dirty means the sidecar loaded.
+        let tab = restore_project_tab(t);
+        let from_hot = tab.dirty;
+        return (tab, from_hot);
     }
+    let mut from_hot = false;
     let path = t.path.as_ref().map(PathBuf::from);
     // Prefer the hot-exit sidecar (current, possibly unsaved content); fall
     // back to the real file on disk, then to an empty doc.
@@ -5538,6 +5554,8 @@ fn restore_tab(t: &PersistTab) -> DocTab {
                         .as_ref()
                         .is_some_and(|p| p.exists() && doc_from_path(p).load_failed),
                 };
+                // A load-failed tab's sidecar holds only the placeholder.
+                from_hot = !l.load_failed;
                 l.status = if l.load_failed {
                     format!("load error: {DOC_LOAD_FAILED_SAVE}").into()
                 } else if t.dirty {
@@ -5555,6 +5573,7 @@ fn restore_tab(t: &PersistTab) -> DocTab {
         // file; a never-saved sheet keeps path=None → Save prompts Save As).
         (Kind::Xlsx, Some(hp)) => {
             let (surface, _) = sheet_from_path(hp);
+            from_hot = !matches!(surface, Surface::Placeholder);
             let status = if t.dirty {
                 "unsaved — restored"
             } else {
@@ -5606,20 +5625,22 @@ fn restore_tab(t: &PersistTab) -> DocTab {
     };
     // The hot sidecar is always .docx; restore the Markdown flag from session.
     tab.markdown = t.markdown || tab.markdown;
-    tab
+    (tab, from_hot)
 }
 
-/// Restore every tab of a session. After a crash, a tab that comes back dirty
-/// (only a readable sidecar keeps `dirty`) is labelled as an AutoRecover copy,
-/// aged from its sidecar's mtime. Its `path` still names the original, which
-/// restore never writes: that waits for the user's Save.
+/// Restore every tab of a session. After a crash, a dirty tab whose content
+/// came from a readable sidecar is labelled as an AutoRecover copy, aged from
+/// the sidecar's mtime. A tab that fell back to its file or a placeholder keeps
+/// its own status (a load error included), since it holds no recovered edits.
+/// A recovered tab's `path` still names the original, which restore never
+/// writes: that waits for the user's Save.
 fn restore_session(session: &Session, crashed: bool, now: std::time::SystemTime) -> Vec<DocTab> {
     session
         .tabs
         .iter()
         .map(|t| {
-            let mut tab = restore_tab(t);
-            if crashed && tab.dirty && !tab.load_failed {
+            let (mut tab, from_hot) = restore_tab_sourced(t);
+            if crashed && from_hot && tab.dirty {
                 let saved = t
                     .hot
                     .as_ref()

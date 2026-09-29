@@ -1287,3 +1287,82 @@ fn autorecover_is_on_by_default_and_the_setting_round_trips() {
     write_session(&root.0, &[tab(Kind::Docx)], 0, prefs);
     assert_eq!(root.session().autorecover_minutes, 0, "off is kept");
 }
+
+fn persisted_tab(
+    kind: Kind,
+    path: Option<&std::path::Path>,
+    hot: Option<&std::path::Path>,
+) -> PersistTab {
+    PersistTab {
+        kind,
+        title: "Recovered?".into(),
+        path: path.map(|p| p.display().to_string()),
+        dirty: true,
+        hot: hot.map(|p| p.display().to_string()),
+        unreadable: Vec::new(),
+        markdown: false,
+        load_failed: Some(false),
+    }
+}
+
+fn crash_restore(tabs: Vec<PersistTab>) -> Vec<DocTab> {
+    let session = Session {
+        tabs,
+        ..Session::default()
+    };
+    restore_session(&session, true, std::time::SystemTime::now())
+}
+
+/// Only content that came from a readable sidecar is an AutoRecover copy: a
+/// tab that fell back to its file or a placeholder lost its edits, and a load
+/// error must stay a load error.
+#[test]
+fn a_crash_labels_only_tabs_whose_sidecar_was_read() {
+    let root = Root::new("sources");
+    let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../uiharness/fixtures");
+    let empty_docx = root.0.join("tab-0.docx");
+    std::fs::write(&empty_docx, b"").unwrap();
+    let broken_xlsx = root.0.join("tab-1.xlsx");
+    std::fs::write(&broken_xlsx, b"not a workbook").unwrap();
+    let gone = root.0.join("missing.docx");
+    let original = root.0.join("original.docx");
+    std::fs::copy(fixtures.join("basic.docx"), &original).unwrap();
+    let sheet = root.0.join("original.xlsx");
+    std::fs::copy(fixtures.join("basic.xlsx"), &sheet).unwrap();
+
+    let restored = crash_restore(vec![
+        // Never saved, 0-byte sidecar: a placeholder with a load error.
+        persisted_tab(Kind::Docx, None, Some(&empty_docx)),
+        // A file, no sidecar recorded: the file is reloaded.
+        persisted_tab(Kind::Docx, Some(&original), None),
+        // A file, the recorded sidecar is gone.
+        persisted_tab(Kind::Docx, Some(&original), Some(&gone)),
+        // A workbook whose sidecar cannot be read.
+        persisted_tab(Kind::Xlsx, Some(&sheet), Some(&broken_xlsx)),
+        // A workbook with no sidecar.
+        persisted_tab(Kind::Xlsx, Some(&sheet), None),
+    ]);
+    assert!(
+        restored[0].status.starts_with("load error"),
+        "{}",
+        restored[0].status
+    );
+    for t in &restored {
+        assert!(!t.status.starts_with("recovered"), "{}", t.status);
+    }
+}
+
+#[test]
+fn a_crash_still_labels_sheet_and_project_sidecars_it_read() {
+    let root = Root::new("sheet-project");
+    let mut tabs = vec![tab(Kind::Xlsx), tab(Kind::Project)];
+    for t in &mut tabs {
+        t.dirty = true;
+    }
+    write_session(&root.0, &tabs, 0, prefs());
+    let restored = restore_session(&root.session(), true, std::time::SystemTime::now());
+    for t in &restored {
+        assert!(t.dirty);
+        assert!(t.status.starts_with("recovered"), "{}", t.status);
+    }
+}
