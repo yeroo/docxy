@@ -1,5 +1,6 @@
 //! Project commands and prompt policy: pure DocTab functions first, window host glue last.
 use super::*;
+use crate::dialog::{ButtonRole, Dialog, DialogOwner};
 use projcore::editor::{AssignOutcome, FindOutcome, constraint_hint};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -452,8 +453,6 @@ pub(crate) enum PromptKind {
     Move,
     Assign,
     Find,
-    /// Yes/no: delete the prompt's summary and its subtasks.
-    ConfirmDelete,
 }
 impl PromptKind {
     pub fn name(self) -> &'static str {
@@ -463,12 +462,7 @@ impl PromptKind {
             Self::Move => "move",
             Self::Assign => "assign",
             Self::Find => "find",
-            Self::ConfirmDelete => "delete",
         }
-    }
-    /// A confirmation has no input box, so typing must not fill its buffer.
-    fn takes_text(self) -> bool {
-        self != Self::ConfirmDelete
     }
     fn label(self) -> &'static str {
         match self {
@@ -477,24 +471,13 @@ impl PromptKind {
             Self::Move => "Move task by (1d / 1w / 4w; -1d back)",
             Self::Assign => "Assign resource (empty to clear)",
             Self::Find => "Find",
-            Self::ConfirmDelete => "Delete",
         }
     }
 }
 
-/// The prompt bar's label. A delete confirmation names the task and how many
-/// subtasks go with it, read from the editor so it cannot go stale.
-pub(crate) fn prompt_label(p: &ProjectPrompt, ed: &ProjectEditor) -> SharedString {
-    if p.kind != PromptKind::ConfirmDelete {
-        return p.kind.label().into();
-    }
-    let Some(uid) = p.uid else {
-        return p.kind.label().into();
-    };
-    let name = ed.project().task(uid).map_or("", |t| &t.name);
-    let n = ed.subtree_len(uid).unwrap_or(0);
-    let noun = if n == 1 { "subtask" } else { "subtasks" };
-    format!("Delete '{name}' and its {n} {noun}? Enter = delete, Esc = cancel").into()
+/// The prompt bar's label.
+pub(crate) fn prompt_label(p: &ProjectPrompt) -> SharedString {
+    p.kind.label().into()
 }
 
 #[derive(Clone, Debug)]
@@ -636,14 +619,12 @@ pub(crate) fn project_input(
             "escape" => {}
             "enter" => commit_prompt(tab, prompt),
             "backspace" => {
-                if prompt.kind.takes_text() {
-                    prompt.buf.pop();
-                }
+                prompt.buf.pop();
                 v.prompt = Some(prompt);
             }
             "tab" => v.prompt = Some(prompt),
             _ => {
-                if let Some(text) = text.filter(|_| prompt.kind.takes_text()) {
+                if let Some(text) = text {
                     prompt.buf.extend(text.chars().filter(|c| !c.is_control()));
                 }
                 v.prompt = Some(prompt);
@@ -760,9 +741,6 @@ fn commit_edit(v: &mut ProjectView, p: ProjectPrompt) -> Result<Option<String>, 
             return Ok(Some(format!("Moved to {}", date(Some(start)))));
         }
         PromptKind::Assign => return assign_status(&mut v.ed, uid, &p.buf),
-        PromptKind::ConfirmDelete => {
-            v.ed.delete_task(uid)?;
-        }
         PromptKind::Find => unreachable!(),
     }
     Ok(None)
@@ -796,16 +774,33 @@ pub(crate) fn complete_project(tab: &mut DocTab, reveal: bool) {
     }
 }
 
-fn delete_selected_task(v: &mut ProjectView) -> Result<(), String> {
-    if let Some(uid) = v.selected_uid() {
-        // A summary takes its subtasks with it, so ask first.
-        if v.ed.subtree_len(uid)? > 0 {
-            v.open_prompt(PromptKind::ConfirmDelete);
-        } else {
-            v.ed.delete_task(uid)?;
-        }
+/// Delete the selected task. A summary takes its subtasks with it, so it is
+/// not deleted here: the message box that asks first is returned, for the
+/// caller to open on the tab.
+fn delete_selected_task(v: &mut ProjectView) -> Result<Option<Dialog>, String> {
+    let Some(uid) = v.selected_uid() else {
+        return Ok(None);
+    };
+    let n = v.ed.subtree_len(uid)?;
+    if n > 0 {
+        return Ok(Some(delete_summary_dialog(&v.ed, uid, n)));
     }
-    Ok(())
+    v.ed.delete_task(uid)?;
+    Ok(None)
+}
+
+/// The yes/no message box a summary's delete asks: Yes deletes the summary
+/// and its `n` subtasks, No (and Escape) leaves the plan alone.
+pub(crate) fn delete_summary_dialog(ed: &ProjectEditor, uid: i32, n: usize) -> Dialog {
+    let name = ed.project().task(uid).map_or("", |t| &t.name);
+    let noun = if n == 1 { "subtask" } else { "subtasks" };
+    Dialog::message(
+        "delete-summary",
+        "Delete Task",
+        format!("Delete '{name}' and its {n} {noun}?"),
+        &[("Yes", ButtonRole::Accept), ("No", ButtonRole::Cancel)],
+        DialogOwner::DeleteSummary { uid },
+    )
 }
 
 /// The leveled state a levelling command asks for, given the state it acts
@@ -860,6 +855,18 @@ pub(crate) fn project_app_state(v: &ProjectView) -> AppState {
     } else {
         AppState::Ready
     }
+}
+
+/// A Project tab's status-bar state: [`project_app_state`], and `Edit` while
+/// a dialog is open over it. `None` off a Project.
+pub(crate) fn tab_app_state(tab: &DocTab) -> Option<AppState> {
+    let Surface::Project(v) = &tab.surface else {
+        return None;
+    };
+    Some(match project_app_state(v) {
+        AppState::Ready if tab.dialogs.is_open() => AppState::Edit,
+        state => state,
+    })
 }
 
 /// A fresh token for a levelling pass, unique for the process, so a frame
@@ -940,6 +947,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     let before = (v.cursor_row(), v.display_row());
     let mut status = None;
     let mut reveal_clear = false;
+    let mut dialog = None;
     let result: Result<(), String> = (|| {
         match act {
             AddTask => {
@@ -960,7 +968,7 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                 if let Some(uid) = v.selected_uid() {
                     match v.col {
                         COL_ID => {
-                            delete_selected_task(v)?;
+                            dialog = delete_selected_task(v)?;
                             reveal_clear = true;
                         }
                         COL_NAME | COL_PREDECESSORS | COL_RESOURCES => {
@@ -1100,6 +1108,9 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
     }
     if let Some(status) = status {
         tab.status = status.into();
+    }
+    if let Some(dialog) = dialog {
+        tab.dialogs.push(dialog);
     }
     if matches!(act, Indent | Outdent) {
         indent_project(tab, if act == Indent { 1 } else { -1 });
@@ -1263,17 +1274,6 @@ impl Docxy {
         }
         self.refocus(window, cx);
     }
-    /// The prompt bar's confirm button: the same commit as Enter.
-    pub(crate) fn project_prompt_confirm(&mut self) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        if let Surface::Project(v) = &mut tab.surface {
-            if let Some(prompt) = v.prompt.take() {
-                commit_prompt(tab, prompt);
-            }
-        }
-    }
     pub(crate) fn project_prompt_cancel(&mut self) {
         if let Some(Surface::Project(v)) = self.tabs.get_mut(self.active).map(|t| &mut t.surface) {
             v.cancel_prompt();
@@ -1413,7 +1413,6 @@ impl Docxy {
             return None;
         };
         let prompt = v.prompt.as_ref()?;
-        let confirm = !prompt.kind.takes_text();
         Some(
             h_flex()
                 .w_full()
@@ -1428,40 +1427,23 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(12.))
-                        .text_color(if confirm { pal.fg } else { pal.dim })
-                        .child(prompt_label(prompt, &v.ed)),
+                        .text_color(pal.dim)
+                        .child(prompt_label(prompt)),
                 )
-                // A yes/no question gets a button, not an input box.
-                .when(confirm, |bar| {
-                    bar.child(
-                        div()
-                            .id("project-prompt-confirm")
-                            .px_2()
-                            .cursor_pointer()
-                            .text_color(hsla_u(BRAND))
-                            .child(prompt.kind.label())
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.project_prompt_confirm();
-                                this.refocus(window, cx);
-                            })),
-                    )
-                })
-                .when(!confirm, |bar| {
-                    bar.child(
-                        h_flex()
-                            .min_w(px(180.))
-                            .max_w(px(500.))
-                            .h(px(24.))
-                            .px_2()
-                            .items_center()
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(hsla_u(BRAND))
-                            .text_color(pal.fg)
-                            .child(prompt.buf.clone())
-                            .child(div().w(px(1.5)).h(px(14.)).bg(hsla_u(BRAND))),
-                    )
-                })
+                .child(
+                    h_flex()
+                        .min_w(px(180.))
+                        .max_w(px(500.))
+                        .h(px(24.))
+                        .px_2()
+                        .items_center()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(hsla_u(BRAND))
+                        .text_color(pal.fg)
+                        .child(prompt.buf.clone())
+                        .child(div().w(px(1.5)).h(px(14.)).bg(hsla_u(BRAND))),
+                )
                 .child(
                     div()
                         .id("project-prompt-cancel")

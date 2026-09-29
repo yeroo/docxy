@@ -1,0 +1,89 @@
+test no dialog is open to begin with
+  open ../fixtures/gantt-summary.xml
+  call dialog-read {}
+  assert reply.open is false
+  assert dialog is none
+  call-error dialog-click {"button":"Yes"} => no dialog is open
+  call-error dialog-set {"control":"Name","value":"x"} => no dialog is open
+  call-error dialog-tab {"tab":"General"} => no dialog is open
+
+# #393: the summary delete confirmation is a message box on the dialog model.
+test deleting a summary asks in a message box, and No keeps the plan
+  open ../fixtures/gantt-summary.xml
+  click A1
+  assert cell is ID
+  assert selected_name is Task 1
+  key delete
+  assert tasks is 3
+  assert dialog is delete-summary
+  assert prompt is none
+  assert app_state is Edit
+  call dialog-read {}
+  assert reply.open is true
+  assert reply.id is delete-summary
+  assert reply.depth is 1
+  assert reply.title is Delete Task
+  assert reply.text is Delete 'Task 1' and its 2 subtasks?
+  assert reply.tab is null
+  assert reply.buttons.0.label is Yes
+  assert reply.buttons.0.default is true
+  assert reply.buttons.0.enabled is true
+  assert reply.buttons.1.label is No
+  assert reply.buttons.1.default is false
+  call-error dialog-click {"button":"Maybe"} => no button 'Maybe'; buttons: Yes, No
+  call-error dialog-set {"control":"Name","value":"x"} => no control 'Name'; this dialog has none
+  call dialog-click {"button":"No"}
+  assert reply.dialog.open is false
+  assert reply.tasks is 3
+  assert dialog is none
+  assert tasks is 3
+  assert dirty is false
+  assert app_state is Ready
+
+test Yes deletes the summary and its subtasks as one undo step
+  open ../fixtures/gantt-summary.xml
+  click A1
+  key delete
+  call dialog-click {"button":"Yes"}
+  assert reply.dialog.open is false
+  assert tasks is 0
+  assert dirty is true
+  key ctrl+z
+  assert tasks is 3
+
+test the keyboard answers the message box and nothing under it sees a key
+  open ../fixtures/gantt-summary.xml
+  click A1
+  key delete
+  # Typing, Tab, a chord and KeyTips all stop at the dialog: Alt O would
+  # switch to Gantt Chart Format, Alt P B would set a baseline.
+  type x
+  key tab
+  key ctrl+z
+  key alt o
+  key alt p b
+  assert ribbon_tab is not Gantt Chart Format
+  assert undo_depth is 0
+  assert dialog is delete-summary
+  assert tasks is 3
+  assert cell is ID
+  assert cell_edit is none
+  key escape
+  assert dialog is none
+  assert tasks is 3
+  key delete
+  key enter
+  assert dialog is none
+  assert tasks is 0
+
+test pointer verbs are refused under a dialog
+  open ../fixtures/gantt-summary.xml
+  click A1
+  key delete
+  call-error click-cell {"cell":"B2"} => a dialog is open: Delete Task
+  call-error ribbon-click {"tab":"Task","command":"Milestone"} => a dialog is open: Delete Task
+  call-error title-tab {"action":"next"} => a dialog is open: Delete Task
+  call-error backstage {"action":"open"} => a dialog is open: Delete Task
+  call-error close-tab {} => a dialog is open: Delete Task
+  assert dialog is delete-summary
+  assert tasks is 3

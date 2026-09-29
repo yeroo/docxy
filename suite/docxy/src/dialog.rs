@@ -1,0 +1,668 @@
+//! Dialogs as app state (#393).
+//!
+//! A dialog is a value on its document tab's [`DialogStack`], never a native
+//! modal loop: the window draws the top one over everything, the keyboard
+//! reaches it through [`DialogStack::key`], and the harness verbs
+//! `dialog-read`, `dialog-set`, `dialog-tab` and `dialog-click` drive the same
+//! functions the rendered controls call. A modal loop would block the harness
+//! pump; this cannot.
+//!
+//! Staged values live in the [`Dialog`] until an accept button hands it to its
+//! owner, so Cancel discards by construction: it drops the dialog.
+//!
+//! The vocabulary exists before the dialogs that need most of it (the issue
+//! asks for it first), so the control kinds and the nested-dialog role have no
+//! caller outside the tests until the first form dialog ships.
+#![cfg_attr(not(test), allow(dead_code))]
+
+use ctlcore::json::Json;
+
+/// What an accept button applies the dialog to. The app matches it in
+/// `apply_dialog`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialogOwner {
+    /// Delete this summary task and its subtasks.
+    DeleteSummary { uid: i32 },
+    /// A dialog the model tests build; the app never applies one.
+    #[cfg(test)]
+    Test,
+}
+
+/// A dialog a button opens on top of its own, built from the parent when the
+/// button is pressed. An enum rather than a constructor function so buttons
+/// stay comparable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildDialog {
+    #[cfg(test)]
+    Test,
+}
+
+impl ChildDialog {
+    fn build(self, _parent: &Dialog) -> Dialog {
+        match self {
+            #[cfg(test)]
+            Self::Test => tests_support::child(_parent),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ButtonRole {
+    /// Hand the staged values to the owner and close (OK, Yes).
+    Accept,
+    /// Hand them to the owner and stay open (Apply).
+    Apply,
+    /// Close and discard (Cancel, No). Escape presses it.
+    Cancel,
+    /// Open a nested dialog on top of this one.
+    Open(ChildDialog),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Button {
+    pub label: String,
+    pub enabled: bool,
+    /// Enter presses it.
+    pub default: bool,
+    pub role: ButtonRole,
+}
+
+impl Button {
+    pub fn new(label: &str, role: ButtonRole) -> Self {
+        Self {
+            label: label.into(),
+            enabled: true,
+            default: false,
+            role,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlKind {
+    Text,
+    Number,
+    Date,
+    Duration,
+    Checkbox,
+    Radio,
+    Dropdown,
+    List,
+    Grid,
+    Label,
+}
+
+impl ControlKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Number => "number",
+            Self::Date => "date",
+            Self::Duration => "duration",
+            Self::Checkbox => "checkbox",
+            Self::Radio => "radio",
+            Self::Dropdown => "dropdown",
+            Self::List => "list",
+            Self::Grid => "grid",
+            Self::Label => "label",
+        }
+    }
+    fn has_items(self) -> bool {
+        matches!(self, Self::Radio | Self::Dropdown | Self::List)
+    }
+}
+
+/// A control's staged value.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Value {
+    /// Text, number, date and duration fields, and a label's text. Dates and
+    /// durations stay text until the owner parses them on OK, as Project's
+    /// own dialogs report a bad date only then.
+    Text(String),
+    Bool(bool),
+    /// The selected item of a radio group, dropdown or list.
+    Choice(Option<usize>),
+    /// A grid's rows, one string per column.
+    Rows(Vec<Vec<String>>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Control {
+    /// Stable, for scripts; the label is what a person reads.
+    pub name: &'static str,
+    pub label: String,
+    pub kind: ControlKind,
+    pub value: Value,
+    pub enabled: bool,
+    pub visible: bool,
+    /// The tab it sits on; `None` shows on every tab.
+    pub page: Option<usize>,
+    /// Radio, dropdown and list choices, in order.
+    pub items: Vec<String>,
+    /// A grid's column headings.
+    pub columns: Vec<String>,
+}
+
+impl Control {
+    pub fn new(name: &'static str, label: &str, kind: ControlKind, value: Value) -> Self {
+        Self {
+            name,
+            label: label.into(),
+            kind,
+            value,
+            enabled: true,
+            visible: true,
+            page: None,
+            items: Vec::new(),
+            columns: Vec::new(),
+        }
+    }
+
+    /// What the control shows.
+    pub fn text(&self) -> String {
+        match &self.value {
+            Value::Text(s) => s.clone(),
+            Value::Bool(b) => if *b { "checked" } else { "unchecked" }.into(),
+            Value::Choice(i) => i
+                .and_then(|i| self.items.get(i))
+                .cloned()
+                .unwrap_or_default(),
+            Value::Rows(rows) => match rows.len() {
+                1 => "1 row".into(),
+                n => format!("{n} rows"),
+            },
+        }
+    }
+
+    fn to_json(&self) -> Json {
+        let value = match &self.value {
+            Value::Text(s) if self.kind == ControlKind::Number => s
+                .trim()
+                .parse::<f64>()
+                .map_or_else(|_| Json::Str(s.clone()), Json::Num),
+            Value::Text(s) => Json::Str(s.clone()),
+            Value::Bool(b) => Json::Bool(*b),
+            Value::Choice(i) => i
+                .and_then(|i| self.items.get(i))
+                .map_or(Json::Null, |s| Json::Str(s.clone())),
+            Value::Rows(rows) => rows_json(rows),
+        };
+        let mut out = vec![
+            ("name", Json::Str(self.name.into())),
+            ("label", Json::Str(shown(&self.label))),
+            ("kind", Json::Str(self.kind.name().into())),
+            ("value", value),
+            ("text", Json::Str(self.text())),
+            ("enabled", Json::Bool(self.enabled)),
+            ("visible", Json::Bool(self.visible)),
+        ];
+        if self.kind.has_items() {
+            out.push(("items", strs(&self.items)));
+            out.push((
+                "selected",
+                match &self.value {
+                    Value::Choice(Some(i)) => Json::Num(*i as f64),
+                    _ => Json::Null,
+                },
+            ));
+        }
+        if let Value::Rows(rows) = &self.value {
+            out.push(("columns", strs(&self.columns)));
+            out.push(("rows", rows_json(rows)));
+        }
+        Json::obj(out)
+    }
+
+    /// The control's own input handler: the rendered widget and `dialog-set`
+    /// both come through here. `args` is the verb's argument object: `value`,
+    /// or for a grid `{row, column, value}`, `{insert_row}` or `{delete_row}`.
+    fn set(&mut self, args: &Json) -> Result<(), String> {
+        let label = &shown(&self.label);
+        if !self.visible {
+            return Err(format!("'{label}' is hidden"));
+        }
+        if !self.enabled {
+            return Err(format!("'{label}' is disabled"));
+        }
+        let value = || args.get("value").ok_or("missing argument 'value'");
+        let text = || match value()? {
+            Json::Str(s) => Ok(s.clone()),
+            _ => Err(format!("'{label}' takes text")),
+        };
+        self.value = match self.kind {
+            ControlKind::Label => return Err(format!("'{label}' is a label; it cannot be set")),
+            ControlKind::Text | ControlKind::Date | ControlKind::Duration => Value::Text(text()?),
+            ControlKind::Number => match value()? {
+                Json::Num(n) => Value::Text(n.to_string()),
+                Json::Str(s) if s.trim().parse::<f64>().is_ok() => Value::Text(s.clone()),
+                _ => return Err(format!("'{label}' takes a number")),
+            },
+            ControlKind::Checkbox => match value()? {
+                Json::Bool(b) => Value::Bool(*b),
+                _ => return Err(format!("'{label}' takes true or false")),
+            },
+            ControlKind::Radio | ControlKind::Dropdown | ControlKind::List => {
+                let want = text()?;
+                let i = self
+                    .items
+                    .iter()
+                    .position(|item| fold(item) == fold(&want))
+                    .ok_or_else(|| {
+                        format!(
+                            "'{label}' has no item '{want}'; items: {}",
+                            self.items.join(", ")
+                        )
+                    })?;
+                Value::Choice(Some(i))
+            }
+            ControlKind::Grid => {
+                let mut rows = match &self.value {
+                    Value::Rows(rows) => rows.clone(),
+                    _ => Vec::new(),
+                };
+                self.edit_grid(&mut rows, args)?;
+                Value::Rows(rows)
+            }
+        };
+        Ok(())
+    }
+
+    fn edit_grid(&self, rows: &mut Vec<Vec<String>>, args: &Json) -> Result<(), String> {
+        let label = &shown(&self.label);
+        let index = |key: &str| {
+            args.get(key)
+                .map(|v| {
+                    v.as_usize()
+                        .ok_or_else(|| format!("'{key}' must be a whole number, not below zero"))
+                })
+                .transpose()
+        };
+        if let Some(at) = index("insert_row")? {
+            if at > rows.len() {
+                return Err(format!(
+                    "'{label}' has {} rows; insert at 0..={}",
+                    rows.len(),
+                    rows.len()
+                ));
+            }
+            rows.insert(at, vec![String::new(); self.columns.len()]);
+            return Ok(());
+        }
+        if let Some(at) = index("delete_row")? {
+            if at >= rows.len() {
+                return Err(no_row(label, at, rows.len()));
+            }
+            rows.remove(at);
+            return Ok(());
+        }
+        let row = index("row")?
+            .ok_or("a grid takes {row, column, value}, {insert_row} or {delete_row}")?;
+        if row >= rows.len() {
+            return Err(no_row(label, row, rows.len()));
+        }
+        let column = match args.get("column") {
+            Some(Json::Str(name)) => self
+                .columns
+                .iter()
+                .position(|c| fold(c) == fold(name))
+                .ok_or_else(|| {
+                    format!(
+                        "'{label}' has no column '{name}'; columns: {}",
+                        self.columns.join(", ")
+                    )
+                })?,
+            Some(v) => v
+                .as_usize()
+                .filter(|c| *c < self.columns.len())
+                .ok_or_else(|| {
+                    format!(
+                        "'column' must be a column name or 0..{}",
+                        self.columns.len()
+                    )
+                })?,
+            None => return Err("missing argument 'column'".into()),
+        };
+        let Some(Json::Str(value)) = args.get("value") else {
+            return Err(format!("'{label}' cells take text"));
+        };
+        rows[row][column] = value.clone();
+        Ok(())
+    }
+}
+
+fn no_row(label: &str, row: usize, len: usize) -> String {
+    match len {
+        0 => format!("'{label}' has no rows"),
+        n => format!("'{label}' has no row {row}; rows 0..{}", n - 1),
+    }
+}
+
+fn strs(items: &[String]) -> Json {
+    Json::Arr(items.iter().cloned().map(Json::Str).collect())
+}
+
+fn rows_json(rows: &[Vec<String>]) -> Json {
+    Json::Arr(rows.iter().map(|r| strs(r)).collect())
+}
+
+/// A label as it is drawn: without its `&` accelerator mark.
+fn shown(label: &str) -> String {
+    label.replace('&', "")
+}
+
+/// How a label is matched: case-insensitive, without `&` accelerator marks or
+/// a trailing colon, so `"&Name:"` answers to `name`.
+fn fold(label: &str) -> String {
+    label
+        .replace('&', "")
+        .trim()
+        .trim_end_matches(':')
+        .trim()
+        .to_lowercase()
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Dialog {
+    /// Stable, for scripts: `delete-summary`.
+    pub id: &'static str,
+    pub title: String,
+    /// A message box's message.
+    pub text: Option<String>,
+    /// Tab (page) labels; empty for a single-page dialog.
+    pub tabs: Vec<String>,
+    pub tab: usize,
+    pub controls: Vec<Control>,
+    pub buttons: Vec<Button>,
+    pub owner: DialogOwner,
+}
+
+impl Dialog {
+    /// A message box: a title, a message and buttons. The first button is the
+    /// default, as in Office's message boxes.
+    pub fn message(
+        id: &'static str,
+        title: &str,
+        text: String,
+        buttons: &[(&str, ButtonRole)],
+        owner: DialogOwner,
+    ) -> Self {
+        Self {
+            id,
+            title: title.into(),
+            text: Some(text),
+            tabs: Vec::new(),
+            tab: 0,
+            controls: Vec::new(),
+            buttons: buttons
+                .iter()
+                .enumerate()
+                .map(|(i, (label, role))| Button {
+                    default: i == 0,
+                    ..Button::new(label, *role)
+                })
+                .collect(),
+            owner,
+        }
+    }
+
+    /// The controls on the current tab, as a person sees them.
+    fn on_page(&self, c: &Control) -> bool {
+        c.page.is_none_or(|p| p == self.tab)
+    }
+
+    pub fn page_controls(&self) -> impl Iterator<Item = &Control> {
+        self.controls.iter().filter(|c| self.on_page(c))
+    }
+
+    /// Find a control by its visible label, then by its name. A label two
+    /// controls share is refused rather than guessed.
+    fn control_index(&self, want: &str) -> Result<usize, String> {
+        let by_label: Vec<usize> = (0..self.controls.len())
+            .filter(|&i| fold(&self.controls[i].label) == fold(want))
+            .collect();
+        let found = match by_label.as_slice() {
+            [i] => Some(*i),
+            [] => self.controls.iter().position(|c| c.name == want),
+            many => {
+                let names: Vec<&str> = many.iter().map(|&i| self.controls[i].name).collect();
+                return Err(format!(
+                    "'{want}' names {} controls; use a name: {}",
+                    many.len(),
+                    names.join(", ")
+                ));
+            }
+        };
+        let i = found.ok_or_else(|| {
+            let names: Vec<String> = self
+                .page_controls()
+                .filter(|c| c.visible)
+                .map(|c| shown(&c.label))
+                .collect();
+            match names.as_slice() {
+                [] => format!("no control '{want}'; this dialog has none"),
+                names => format!("no control '{want}'; controls: {}", names.join(", ")),
+            }
+        })?;
+        let c = &self.controls[i];
+        if !self.on_page(c) {
+            let page = c
+                .page
+                .and_then(|p| self.tabs.get(p))
+                .map_or("", String::as_str);
+            return Err(format!(
+                "'{}' is on the '{page}' tab; switch with dialog-tab first",
+                shown(&c.label)
+            ));
+        }
+        Ok(i)
+    }
+
+    /// Set one control through its input handler.
+    pub fn set(&mut self, control: &str, args: &Json) -> Result<(), String> {
+        let i = self.control_index(control)?;
+        self.controls[i].set(args)
+    }
+
+    /// Switch to a tab by its label.
+    pub fn select_tab(&mut self, want: &str) -> Result<(), String> {
+        if self.tabs.is_empty() {
+            return Err(format!("'{}' has no tabs", self.title));
+        }
+        self.tab = self
+            .tabs
+            .iter()
+            .position(|t| fold(t) == fold(want))
+            .ok_or_else(|| format!("no tab '{want}'; tabs: {}", self.tabs.join(", ")))?;
+        Ok(())
+    }
+
+    fn button_index(&self, want: &str) -> Result<usize, String> {
+        let i = self
+            .buttons
+            .iter()
+            .position(|b| fold(&b.label) == fold(want))
+            .ok_or_else(|| {
+                let labels: Vec<String> = self.buttons.iter().map(|b| shown(&b.label)).collect();
+                format!("no button '{want}'; buttons: {}", labels.join(", "))
+            })?;
+        if !self.buttons[i].enabled {
+            return Err(format!("'{}' is disabled", shown(&self.buttons[i].label)));
+        }
+        Ok(i)
+    }
+
+    /// The staged value of a control, by name, for the owner applying it.
+    pub fn value(&self, name: &str) -> Option<&Value> {
+        self.controls
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| &c.value)
+    }
+
+    fn to_json(&self, depth: usize) -> Json {
+        Json::obj(vec![
+            ("open", Json::Bool(true)),
+            ("id", Json::Str(self.id.into())),
+            ("depth", Json::Num(depth as f64)),
+            ("title", Json::Str(self.title.clone())),
+            ("text", self.text.clone().map_or(Json::Null, Json::Str)),
+            ("tabs", strs(&self.tabs)),
+            (
+                "tab",
+                self.tabs
+                    .get(self.tab)
+                    .cloned()
+                    .map_or(Json::Null, Json::Str),
+            ),
+            (
+                "controls",
+                Json::Arr(self.page_controls().map(Control::to_json).collect()),
+            ),
+            (
+                "buttons",
+                Json::Arr(
+                    self.buttons
+                        .iter()
+                        .map(|b| {
+                            Json::obj(vec![
+                                ("label", Json::Str(shown(&b.label))),
+                                ("enabled", Json::Bool(b.enabled)),
+                                ("default", Json::Bool(b.default)),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    }
+}
+
+/// A tab's open dialogs, the top one last. Only the top one takes input.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct DialogStack(Vec<Dialog>);
+
+impl DialogStack {
+    pub fn top(&self) -> Option<&Dialog> {
+        self.0.last()
+    }
+    pub fn is_open(&self) -> bool {
+        !self.0.is_empty()
+    }
+    pub fn depth(&self) -> usize {
+        self.0.len()
+    }
+    pub fn push(&mut self, dialog: Dialog) {
+        self.0.push(dialog);
+    }
+    /// Dismiss every dialog without applying any: the document under them
+    /// changed some other way (an agent's edit, a reload).
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    fn top_mut(&mut self) -> Result<&mut Dialog, String> {
+        self.0.last_mut().ok_or_else(|| NONE_OPEN.into())
+    }
+
+    /// The top dialog's id, or `none`: the `dialog` state key.
+    pub fn top_id(&self) -> &'static str {
+        self.top().map_or("none", |d| d.id)
+    }
+
+    /// `dialog-read`: the top dialog, or `{open: false}`.
+    pub fn to_json(&self) -> Json {
+        match self.top() {
+            Some(d) => d.to_json(self.depth()),
+            None => Json::obj(vec![("open", Json::Bool(false))]),
+        }
+    }
+
+    pub fn set(&mut self, control: &str, args: &Json) -> Result<(), String> {
+        self.top_mut()?.set(control, args)
+    }
+
+    pub fn select_tab(&mut self, tab: &str) -> Result<(), String> {
+        self.top_mut()?.select_tab(tab)
+    }
+
+    /// Press a button on the top dialog. Cancel drops it; Open pushes its
+    /// child; Accept and Apply hand it to `apply` (the owner), and Accept
+    /// closes it once the owner took it. An owner that refuses leaves the
+    /// dialog open with its staged values, and the refusal is the error.
+    pub fn click(
+        &mut self,
+        button: &str,
+        apply: impl FnOnce(&Dialog) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let top = self.top_mut()?;
+        let role = top.buttons[top.button_index(button)?].role;
+        match role {
+            ButtonRole::Cancel => {
+                self.0.pop();
+            }
+            ButtonRole::Open(child) => {
+                let child = child.build(top);
+                self.0.push(child);
+            }
+            ButtonRole::Accept | ButtonRole::Apply => {
+                apply(top)?;
+                if role == ButtonRole::Accept {
+                    self.0.pop();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The button a key presses on the top dialog: Enter the default, Escape
+    /// the cancel button. `None` for every other key, which the dialog
+    /// swallows: nothing under it may see a key while it is open.
+    pub fn key_button(&self, key: &str, plain: bool) -> Option<String> {
+        let top = self.top()?;
+        if !plain {
+            return None;
+        }
+        let b = match key {
+            "enter" => top.buttons.iter().find(|b| b.default),
+            "escape" => top.buttons.iter().find(|b| b.role == ButtonRole::Cancel),
+            _ => None,
+        }?;
+        b.enabled.then(|| b.label.clone())
+    }
+}
+
+pub(crate) const NONE_OPEN: &str = "no dialog is open";
+
+#[cfg(test)]
+mod tests_support {
+    use super::*;
+
+    /// A child that shows the parent's title, so a test can see it was built
+    /// from the parent it was opened over.
+    pub(super) fn child(parent: &Dialog) -> Dialog {
+        Dialog {
+            id: "child",
+            title: format!("{} › Details", parent.title),
+            text: None,
+            tabs: Vec::new(),
+            tab: 0,
+            controls: vec![Control::new(
+                "note",
+                "Note:",
+                ControlKind::Text,
+                Value::Text(String::new()),
+            )],
+            buttons: vec![
+                Button {
+                    default: true,
+                    ..Button::new("OK", ButtonRole::Accept)
+                },
+                Button::new("Cancel", ButtonRole::Cancel),
+            ],
+            owner: DialogOwner::Test,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

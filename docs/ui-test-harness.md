@@ -177,7 +177,9 @@ times out with nothing on stderr to say why. The reload prompt, the Save As
 dialog a `key ctrl+s` on a never-saved workbook would raise, and the
 unsaved-changes prompt on close are each gated on `harness.is_none()`; anything
 new in that family needs the same guard, and should refuse in words instead
-(`tab.status`), which a case can read.
+(`tab.status`), which a case can read. The app's own dialogs are not in that
+family: they are app state that never runs a loop of their own (see
+[Dialogs](#dialogs)).
 
 ### The fixture
 
@@ -375,10 +377,11 @@ between columns.
 Insert inserts a blank row above the current row (above the entry row when the
 cursor is on it) and keeps the column. Delete clears the active Name,
 Predecessors, or Resource Names cell; on Task Mode, Duration, Start, or Finish
-it reports `<column> can't be cleared`. On the ID column Delete deletes the task
-(a summary asks first: Enter deletes it with its subtasks, Esc cancels, and
-typed text is ignored while that prompt is open; the state's `prompt` reads
-`delete:`). Ctrl+Delete clears or resets the cell as one undo step: Name,
+it reports `<column> can't be cleared`. On the ID column Delete deletes the task.
+A summary asks first in the `delete-summary` message box (see
+[Dialogs](#dialogs)): Yes or Enter deletes it with its subtasks as one undo
+step, No or Escape cancels, and nothing else reaches the plan while it is open.
+The state's `dialog` reads `delete-summary`, and `prompt` stays `none`. Ctrl+Delete clears or resets the cell as one undo step: Name,
 Predecessors and Resource Names clear as with Delete, Duration becomes 1 day
 (`1d?` unless the plan's `NewTasksEstimated` is off; an auto summary's is
 refused), and Task Mode becomes the plan's mode for new tasks. On ID, Start and
@@ -430,6 +433,81 @@ task IDs.
 `nothing` is how a script writes "this key is null" (`assert chart_sel is
 nothing`); `null` and `none` read the same, and `empty` matches an empty string.
 Comparison is case-insensitive, and `is not` negates.
+
+### Dialogs
+
+A dialog is app state on its document tab, **never a native modal loop**, so the
+control pump cannot block on one (#393). Dialogs stack: a button can open a
+child over its parent, and only the top one takes input. The window draws the
+top dialog over a backdrop that covers everything, title bar and ribbon
+included. The only dialog today is the Project `delete-summary` message box;
+`project-dialog.uit` drives it.
+
+There is no `dialog-open`. A dialog opens through the verb a person would use
+(`key`, `ribbon-click`, `click-cell {double}`), so a case covers the real entry
+point. Four verbs read and drive it:
+
+| Verb | Args | Reply |
+|---|---|---|
+| `dialog-read` | `{}` | the top dialog, or `{open: false}` |
+| `dialog-set` | `{control, value}`; a grid takes `{control, row, column, value}`, `{control, insert_row: n}` or `{control, delete_row: n}` | the dialog after the edit |
+| `dialog-tab` | `{tab}` | the dialog on that tab |
+| `dialog-click` | `{button}` | `state` after the button's handler, with `dialog` set to the dialog now on top (the child it opened, the parent, or `{open: false}`) |
+
+`dialog-read` replies `{open, id, depth, title, text, tabs, tab, controls,
+buttons}`. `id` is stable (`delete-summary`), `depth` counts from 1, `text` is
+a message box's message (null otherwise), and `tab` is the current tab's label
+(null for a dialog without tabs). Each button is `{label, enabled, default}`.
+Each control is `{name, label, kind, value, text, enabled, visible}`:
+
+- `kind` is one of `text`, `number`, `date`, `duration`, `checkbox`, `radio`,
+  `dropdown`, `list`, `grid` and `label`.
+- `value` is typed: a checkbox's is a bool, a number's a number, an item
+  control's the selected item's label (or null), and a grid's its rows.
+  `text` is what the control shows.
+- `radio`, `dropdown` and `list` add `items` (in order) and `selected` (an
+  index, or null). A `grid` adds `columns` and `rows`.
+
+`controls` lists **only the current tab's controls**, because that is what a
+person sees. To read a staged value on another tab, `dialog-tab` to it first. A
+hidden control on the current tab is listed with `visible: false`.
+
+The rules for addressing:
+
+- A control is found by its visible label, case-insensitively and without its
+  `&` accelerator mark or trailing colon (`"&Name:"` answers to `name`), then by
+  its `name`. A label two controls share is refused, naming the candidates.
+- Buttons are found by label in the same way. `OK`, `Cancel`, `Yes` and `No`
+  are ordinary labels.
+- A tab is found by its label.
+- An unknown control, button or tab is refused, and the refusal lists what
+  exists.
+
+`dialog-set` goes through the control's own input handler, the one its widget
+calls. It refuses a disabled or hidden control, a control on another tab, a
+label, and a value of the wrong shape: a checkbox takes a bool, a number
+something that parses, and an item control one of its items. Dates and durations
+are staged as text: the owner checks them on OK, and an OK the owner refuses
+leaves the dialog open with its staged values. A disabled button refuses
+`dialog-click`.
+
+Staged values stay in the dialog until an accept button (OK, Yes) hands them to
+its owner, which applies them as one undo step. Cancel and No drop the dialog,
+and its staged values with it. Apply hands them over and stays open.
+
+While a dialog is open on the active tab:
+
+- **Keys go to the dialog first**, before the tab list, KeyTips and every
+  Project key path. Enter presses the default button and Escape the cancel
+  button. Every other key does nothing, including Tab, Ctrl chords, Alt and
+  typed text.
+- **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
+  `drag`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
+  `backstage {open}`, `backstage-close`, `close-tab` and `selection-set`.
+- The state reads `dialog: <id>` (`none` on every surface when nothing is open),
+  and a Project's `app_state` reads `Edit`.
+- A control-pipe edit, reload or save of that Project dismisses its dialogs
+  unapplied, as it cancels a prompt.
 
 ### Regions
 
@@ -771,5 +849,6 @@ stale pixels is exactly the failure a pixel assertion cannot notice by itself.
   render, which needs the `harness-capture` build. Linux has neither yet.
 - **CI.** It needs a desktop session for `PrintWindow`.
 - **Mail editing and advanced document UI.** Document text, selection, ribbon,
-  status and File rail are covered. Menus, dialogs, pane contents and pointer
-  gestures in document text still need harness drivers.
+  status and File rail are covered, and dialogs have the `dialog-*` verbs.
+  Menus, pane contents and pointer gestures in document text still need
+  harness drivers.

@@ -174,6 +174,7 @@ pub(crate) fn project_verb(
                 if let Surface::Project(v) = &mut tab.surface {
                     v.cancel_prompt();
                 }
+                tab.dialogs.clear();
                 Ok((
                     path_info(tab, index),
                     Effect {
@@ -202,6 +203,8 @@ pub(crate) fn project_verb(
                 v.cancel_prompt();
                 v.cell = None;
                 v.refresh_schedule_layout();
+                // A dialog over the old plan would apply to the new one.
+                tab.dialogs.clear();
                 tab.dirty = false;
                 tab.status = loaded.status;
                 Ok((
@@ -222,6 +225,7 @@ pub(crate) fn project_verb(
                 if projctl::MUTATING.contains(&verb) {
                     tab.dirty = v.ed.dirty();
                     v.cancel_prompt();
+                    tab.dialogs.clear();
                     v.cell = None;
                     v.latch_entry_row();
                     effect.repaint = true;
