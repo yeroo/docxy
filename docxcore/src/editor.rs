@@ -419,6 +419,7 @@ impl Editor {
         if ch == FIELD_CHAR {
             return;
         }
+        self.drop_collapsed_anchor();
         if self.has_selection() {
             self.delete_selection();
         }
@@ -462,6 +463,10 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self) {
+        // Only a collapsed anchor: `insert_hrule` moves the caret to the end
+        // of the paragraph before calling this, so deleting a real selection
+        // here would delete from the anchor to the paragraph end.
+        self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
         let off = self.caret.offset;
         let new_idx = {
@@ -501,6 +506,9 @@ impl Editor {
             },
             None => return false,
         };
+        // Before the caret moves to 0, or `insert_newline` would no longer
+        // see the anchor as collapsed.
+        self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.content.clear();
@@ -518,6 +526,8 @@ impl Editor {
     /// Insert a horizontal line at the caret (Insert ▸ Horizontal Line): give the
     /// current paragraph a bottom border, then drop to a fresh paragraph below.
     pub fn insert_hrule(&mut self) {
+        // Before `move_end` moves the caret off a click's anchor.
+        self.drop_collapsed_anchor();
         self.checkpoint(EditKind::Structural);
         if let Some(p) = para_mut(&mut self.doc.body, &self.caret.path) {
             p.props.borders.bottom = Some(BorderKind::Single);
@@ -570,6 +580,7 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        self.drop_collapsed_anchor();
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -622,6 +633,7 @@ impl Editor {
     }
 
     pub fn delete_forward(&mut self) {
+        self.drop_collapsed_anchor();
         if self.has_selection() {
             self.delete_selection();
             return;
@@ -858,6 +870,21 @@ impl Editor {
         self.anchor = None;
     }
 
+    /// Forget an anchor that sits on the caret. A click plants one there so a
+    /// drag can extend from it, and it is no selection; but an edit moves the
+    /// caret and would leave it behind, turning what was just typed (or the
+    /// paragraph mark Enter made) into a selection the next key replaces.
+    /// Every edit that moves the caret through content calls this first,
+    /// before its undo checkpoint and before it moves the caret (so undo
+    /// restores a plain caret), including the ones that reach
+    /// `insert_newline` only after moving it (`insert_hrule`,
+    /// `hrule_autoformat`).
+    fn drop_collapsed_anchor(&mut self) {
+        if self.anchor.as_ref() == Some(&self.caret) {
+            self.anchor = None;
+        }
+    }
+
     pub fn has_selection(&self) -> bool {
         self.selection_range().is_some()
     }
@@ -1019,6 +1046,7 @@ impl Editor {
         if clip.paras.is_empty() {
             return;
         }
+        self.drop_collapsed_anchor();
         if self.has_selection() {
             self.delete_selection();
         }
@@ -3686,6 +3714,89 @@ mod tests {
         ed.caret = Caret::top(0, 1);
         ed.delete_forward();
         assert_eq!(top_text(&ed), vec!["bcd"]);
+    }
+
+    /// "xy" with the caret at 1 and an anchor on it: the state a plain click
+    /// (or an empty-range harness `selection-set`) leaves (#698).
+    fn clicked_at_1() -> Editor {
+        let mut ed = Editor::new(doc(&["xy"]));
+        ed.set_caret(Caret::top(0, 1));
+        ed.extend_selection(true);
+        assert!(!ed.has_selection());
+        ed
+    }
+
+    #[test]
+    fn typing_after_a_click_leaves_no_selection_698() {
+        let mut ed = clicked_at_1();
+        ed.insert_str("ab");
+        assert_eq!(top_text(&ed), vec!["xaby"]);
+        assert_eq!(ed.caret, Caret::top(0, 3));
+        assert_eq!(ed.anchor, None);
+        assert!(!ed.has_selection());
+        assert!(ed.undo());
+        assert_eq!(top_text(&ed), vec!["xy"]);
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn deleting_after_a_click_leaves_no_selection_698() {
+        let mut ed = clicked_at_1();
+        ed.backspace();
+        assert_eq!(top_text(&ed), vec!["y"]);
+        assert_eq!(ed.caret, Caret::top(0, 0));
+        assert!(!ed.has_selection());
+
+        let mut ed = clicked_at_1();
+        ed.delete_forward();
+        assert_eq!(top_text(&ed), vec!["x"]);
+        assert_eq!(ed.caret, Caret::top(0, 1));
+        assert!(!ed.has_selection());
+    }
+
+    #[test]
+    fn tab_after_a_click_leaves_no_selection_698() {
+        let mut ed = clicked_at_1();
+        ed.insert_tab();
+        assert_eq!(ed.caret, Caret::top(0, 2));
+        assert!(!ed.has_selection());
+        ed.insert_char('z');
+        assert_eq!(top_text(&ed), vec!["x\tzy"]);
+    }
+
+    #[test]
+    fn enter_after_a_click_leaves_no_selection_698() {
+        let mut ed = clicked_at_1();
+        ed.insert_newline();
+        assert_eq!(top_text(&ed), vec!["x", "y"]);
+        assert_eq!(ed.caret, Caret::top(1, 0));
+        assert_eq!(ed.anchor, None);
+        // A stale anchor would select the new paragraph mark, and this key
+        // would merge the paragraphs back together.
+        ed.insert_char('z');
+        assert_eq!(top_text(&ed), vec!["x", "zy"]);
+    }
+
+    #[test]
+    fn horizontal_line_after_a_click_leaves_no_selection_698() {
+        let mut ed = clicked_at_1();
+        ed.insert_hrule();
+        assert_eq!(ed.anchor, None);
+        // A stale anchor at (0, 1) would select "y" and the new paragraph
+        // mark, and this key would replace them.
+        ed.insert_char('z');
+        assert_eq!(top_text(&ed), vec!["xy", "z"]);
+    }
+
+    #[test]
+    fn rule_autoformat_after_a_click_leaves_no_selection_698() {
+        let mut ed = Editor::new(doc(&["---"]));
+        ed.set_caret(Caret::top(0, 3));
+        ed.extend_selection(true);
+        assert!(ed.hrule_autoformat());
+        assert_eq!(ed.anchor, None);
+        ed.insert_char('z');
+        assert_eq!(top_text(&ed), vec!["", "z"]);
     }
 
     #[test]

@@ -2903,6 +2903,63 @@ const BRAND: u32 = 0x2AA79B; // teal wordmark/accent (reads on light + dark)
 const LINK: u32 = 0x2f6fdb;
 const FILE_FG: u32 = 0xffffff;
 
+/// Put the caret where a click landed. With `extend` (Shift) the click keeps
+/// the anchor, or starts one at the old caret; otherwise it collapses any
+/// selection, and `plant` (a press that may start a drag) leaves the anchor on
+/// the new caret so the drag extends from it. Goes through
+/// `Editor::set_caret`, so typing after the click is its own undo step instead
+/// of coalescing with the typing before it.
+fn place_click_caret(ed: &mut Editor, caret: Caret, extend: bool, plant: bool) {
+    if extend {
+        ed.extend_selection(true);
+    } else {
+        ed.clear_selection();
+    }
+    ed.set_caret(caret);
+    if plant && !extend {
+        ed.extend_selection(true);
+    }
+}
+
+#[cfg(test)]
+mod click_caret_tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    fn typed_hello() -> Editor {
+        let mut ed = Editor::new(docxcore::markdown::from_markdown("x\n"));
+        ed.set_caret(Caret::at(vec![0], 0));
+        ed.delete_forward();
+        ed.insert_str("hello");
+        ed
+    }
+
+    #[test]
+    fn a_click_starts_a_new_undo_step_698() {
+        for plant in [false, true] {
+            let mut ed = typed_hello();
+            place_click_caret(&mut ed, Caret::at(vec![0], 2), false, plant);
+            ed.insert_str("ab");
+            assert_eq!(ed.doc.body[0].plain_text(), "heabllo");
+            assert!(!ed.has_selection());
+            assert!(ed.undo());
+            assert_eq!(ed.doc.body[0].plain_text(), "hello", "plant {plant}");
+        }
+    }
+
+    #[test]
+    fn a_press_plants_the_anchor_and_shift_click_extends_698() {
+        let mut ed = typed_hello();
+        place_click_caret(&mut ed, Caret::at(vec![0], 2), false, true);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![0], 2)));
+        place_click_caret(&mut ed, Caret::at(vec![0], 4), true, true);
+        assert_eq!(ed.anchor, Some(Caret::at(vec![0], 2)));
+        assert_eq!(ed.caret, Caret::at(vec![0], 4));
+        place_click_caret(&mut ed, Caret::at(vec![0], 1), false, false);
+        assert_eq!(ed.anchor, None);
+    }
+}
+
 fn empty_doc() -> Document {
     docxcore::markdown::from_markdown("# Untitled\n\n")
 }
@@ -11948,13 +12005,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         if let Some(ed) = self.edit_target() {
-            if extend {
-                ed.extend_selection(true); // anchor at the current caret if none, else keep it
-            } else {
-                ed.clear_selection();
-            }
-            ed.caret = Caret::at(path, offset);
-            ed.clamp();
+            place_click_caret(ed, Caret::at(path, offset), extend, false);
         }
         self.focus.focus(window, cx);
         self.focused = true;
@@ -11974,16 +12025,7 @@ impl Docxy {
         self.mini_bar = None;
         self.close_menu();
         if let Some(ed) = self.edit_target() {
-            if extend {
-                ed.extend_selection(true); // anchor at the current caret if none
-            } else {
-                ed.clear_selection();
-            }
-            ed.caret = Caret::at(path, offset);
-            if !extend {
-                ed.extend_selection(true); // plant the anchor here so a drag extends from it
-            }
-            ed.clamp();
+            place_click_caret(ed, Caret::at(path, offset), extend, true);
         }
         self.selecting = true;
         self.focus.focus(window, cx);
