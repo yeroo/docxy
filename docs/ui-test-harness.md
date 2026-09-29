@@ -212,7 +212,10 @@ worse than nothing.
 because the UI cannot place it by document offset, so it does not test clicking
 or dragging a selection. `window-size` and `window-zoom` are setup exceptions
 that call GPUI window APIs. `title-tab` calls the same handler methods as the
-title-bar arrows and dropdown items.
+title-bar arrows and dropdown items, and `tab-select` calls `select_tab`, the
+tab chip's click handler. `proj.new` calls `add_tab(Kind::Project)`, the
+Backstage › New › Project card's handler; F11 also commits the active plan's
+pending cell edit first, and `proj.new` does not.
 
 ⚠️ **"The same entry point" means the handler, not the hitbox.** A verb calls
 the method a handler calls; it does not synthesize a pointer at a coordinate and
@@ -322,6 +325,9 @@ footer editor; `selection-set` refuses while it is open.
 | `theme-set {"theme":"dark"}` | set the window theme as the title bar's theme button does (`light`, `dark` or `auto`); replies with the preference and the mode it resolved to |
 | `title-bar {}` | read the measured title content, active chip, tab strip, theme button and drag space; reports tab count, active/first/visible indices, layout mode, `overflow`, `controls_clear`, `active_visible`, `active_dirty_visible` (the active tab is dirty and its bullet lies inside the chip), `theme_visible`, `drag_w`, `drag_ok`, and logical-pixel right edges. `caption_left` comes from a separate probe of Root's inner box minus the pinned caption-control width (102 px on Windows/Linux, zero on macOS) |
 | `title-tab {"action":"prev"}` | use the previous/next overflow arrow's tab-selection handler; `more` toggles the dropdown only while its button is shown (overflow or more-only), and `pick` with an `index` selects a tab after `more` has opened the list |
+| `tab-list {}` | read every open tab in strip order: `{active, tabs:[{index, title, kind, path, dirty, imported}]}`. `kind` is `docx`, `xlsx`, `project` or `mail`; `path` is `null` for a tab never saved; `imported` is true only for a Project read from `.mpp` |
+| `tab-select {"tab":"schedule"}` | make a tab active as clicking its chip does, and reply with the state. `tab` is an index or a case-insensitive title/path substring over **all** tabs, the rule the `proj.*` verbs use; a miss (`no tab matches 'x'`), an ambiguous match (`several tabs match 'x' (2, 3)`) and an index past the end (`no tab at index 9`) are refused. The Backstage stays as it was, as it does for a chip click |
+| `proj.new {}` | make a blank Project and activate it, as Backstage › New › Project does; replies with `proj.path` for it (`tab`, `path: null`, `name: Untitled`, 0 `tasks`, `imported`, the cell state). It takes no `tab` and no `name`: the plan is the app's, so name it by saving it (`proj.save {"path":…}`). The Project control server accepts it too |
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
@@ -347,6 +353,15 @@ An optional `index` targets an inactive tab; it defaults to the active tab.
 `call backstage-close {}` calls the Backstage Close handler without supplying
 an answer. `call ask-on-close {"on":true}` uses the same setting handler as
 Settings; closing a dirty single tab always asks regardless of this window setting.
+
+`project-tabs.uit` drives several plans at once: a blank one from `proj.new`
+that takes tasks without a fixture, two opened plans switched between by title
+with `tab-select`, and `tab-list` read after each step. Assert one tab's entry
+with a dotted path, e.g. `assert reply.tabs.2.dirty is true`. What a relaunch
+restores is checked by the ignored desktop test
+`uiharness/tests/tab_restart.rs`: it quits with two plans and a blank one, one
+dirty and another active, relaunches the same sandbox and requires the same
+`tab-list` reply back. A relaunch is not a script step.
 
 Project `bar_<id>` values are `<kind> <start>-<end>` in inclusive day offsets
 from the Gantt chart's scale origin, or `none` when the task has no schedule result.
@@ -532,7 +547,8 @@ While a dialog is open on the active tab:
   typed text.
 - **Pointer verbs are refused** with `a dialog is open: <title>`: `click-cell`,
   `drag`, `ribbon-click`, `select-chart`, `focus-field`, `title-tab`,
-  `backstage {open}`, `backstage-close`, `close-tab` and `selection-set`.
+  `tab-select`, `proj.new`, `backstage {open}`, `backstage-close`, `close-tab`
+  and `selection-set`.
 - The state reads `dialog: <id>` (`none` on every surface when nothing is open),
   and a Project's `app_state` reads `Edit`.
 - A control-pipe edit, reload or save of that Project dismisses its dialogs
@@ -872,6 +888,13 @@ so `settle` could be satisfied by a frame that was never put on screen and
 stale pixels is exactly the failure a pixel assertion cannot notice by itself.
 
 ## Not covered
+
+- **More than one window.** The suite has one window, so there is no
+  `window-list` or `window-new`, and no New Window or Arrange All to drive.
+  `tab-list` covers the tabs of that window.
+- **The drawn window title and a recent-files list.** The title bar draws the
+  tab strip, not a `Project1 - <app>` title, and Backstage's Open lists the
+  open tabs, not a recent-files list, so neither is there to report.
 
 - **Capture on Linux.** `shot`, `window` and every pixel assertion work on
   Windows through `PrintWindow` and on macOS through the app's own offscreen

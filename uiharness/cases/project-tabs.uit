@@ -1,0 +1,102 @@
+# #396: list, switch and create plans. Run against a fresh harness instance:
+# the cases share it, and tab 0 is the sample.docx it starts with. The
+# relaunch half is the ignored desktop test:
+# cargo test -p uiharness --test tab_restart -- --ignored --nocapture
+
+test issue 396 proj.new makes a blank plan that takes tasks without a fixture
+  call tab-list {}
+  assert reply.active is 0
+  assert reply.tabs.0.title is sample.docx
+  assert reply.tabs.0.kind is docx
+  assert reply.tabs.0.path is null
+  call-error proj.new {"tab":0} => proj.new does not take 'tab'
+  call-error proj.new {"name":"Plan"} => proj.new does not take 'name'; name the plan with proj.save
+  call proj.new {}
+  assert reply.tab is 1
+  assert reply.path is null
+  assert reply.name is Untitled
+  assert reply.tasks is 0
+  assert reply.modified is false
+  assert reply.imported is false
+  assert tab is 1
+  assert tabs is 2
+  assert title is Untitled.yppx
+  assert dirty is false
+  call task.add {"name":"Blank plan task","duration":"2d"}
+  call task.list {}
+  assert reply.count is 1
+  assert reply.tasks.0.name is Blank plan task
+  assert dirty is true
+  call tab-list {}
+  assert reply.active is 1
+  assert reply.tabs.1.title is Untitled.yppx
+  assert reply.tabs.1.kind is project
+  assert reply.tabs.1.path is null
+  assert reply.tabs.1.dirty is true
+  assert reply.tabs.1.imported is false
+
+test issue 396 tab-select switches between two plans by title as the chip click does
+  open copy:../fixtures/gantt-summary.xml
+  open copy:../fixtures/project-rows.xml
+  call tab-list {}
+  assert reply.active is 3
+  assert reply.tabs.2.title is gantt-summary.xml
+  assert reply.tabs.2.kind is project
+  assert reply.tabs.2.path is not null
+  assert reply.tabs.2.dirty is false
+  assert reply.tabs.3.title is project-rows.xml
+  assert reply.tabs.3.dirty is false
+  call tab-select {"tab":"GANTT-SUMMARY"}
+  assert reply.tab is 2
+  assert reply.title is gantt-summary.xml
+  call task.set {"uid":2,"name":"Edited while active"}
+  assert dirty is true
+  call tab-select {"tab":"project-rows"}
+  assert tab is 3
+  assert title is project-rows.xml
+  assert dirty is false
+  call tab-list {}
+  assert reply.active is 3
+  assert reply.tabs.2.dirty is true
+  assert reply.tabs.3.dirty is false
+  call tab-select {"tab":1}
+  assert title is Untitled.yppx
+  call tab-select {"tab":"SAMPLE.docx"}
+  assert tab is 0
+  call-error tab-select {"tab":"no-such-plan"} => no tab matches 'no-such-plan'
+  call-error tab-select {"tab":".xml"} => several tabs match '.xml' (2, 3)
+  call-error tab-select {"tab":9} => no tab at index 9
+  call-error tab-select {"tab":true} => 'tab' must be a tab index or a title/path substring
+  call-error tab-select {} => tab-select needs 'tab'
+  assert tab is 0
+
+test issue 396 closing one plan leaves the other's entry and tasks unchanged
+  call tab-select {"tab":"project-rows"}
+  call task.list {}
+  assert reply.count is 6
+  assert reply.tasks.0.name is Outer
+  call tab-select {"tab":"gantt-summary"}
+  call close-tab {"answer":"discard"}
+  assert tabs is 3
+  call tab-list {}
+  assert reply.tabs.2.title is project-rows.xml
+  assert reply.tabs.2.kind is project
+  assert reply.tabs.2.dirty is false
+  assert reply.tabs.1.title is Untitled.yppx
+  assert reply.tabs.1.dirty is true
+  call task.list {"tab":"project-rows"}
+  assert reply.count is 6
+  assert reply.tasks.0.name is Outer
+  call-error tab-select {"tab":"gantt-summary"} => no tab matches 'gantt-summary'
+
+test issue 396 tab-select and proj.new are refused under a dialog
+  call tab-select {"tab":"project-rows"}
+  click A1
+  assert selected_name is Outer
+  key delete
+  assert dialog is delete-summary
+  call-error tab-select {"tab":0} => a dialog is open: Delete Task
+  call-error proj.new {} => a dialog is open: Delete Task
+  assert tabs is 3
+  call dialog-click {"button":"No"}
+  assert dialog is none
