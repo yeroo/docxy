@@ -1526,9 +1526,10 @@ fn try_iso8601_to_minutes(s: &str) -> Option<i64> {
 /// plan with one still saves the schedule's dates: recurring exceptions
 /// (`Type` 2-8, or a `Period` above 1) are written back but not scheduled, and
 /// an untracked split (a gap in a task's work that is not a recorded
-/// Stop/Resume) is not modelled. A `.mpp` import does not decode assignment
-/// `LevelingDelay`, so a plan leveled only through its assignments passes the
-/// check. On such a plan these fields and an auto
+/// Stop/Resume) is not modelled. A `.mpp` import decodes neither assignment
+/// `LevelingDelay` nor `ScheduleFromStart`, so the check cannot see them there:
+/// a plan leveled only through its assignments, or scheduled from its finish,
+/// passes it. On such a plan these fields and an auto
 /// task's `Start`/`Finish` can differ from Project's, and the difference
 /// spreads through links, rollups and late dates to other tasks.
 ///
@@ -1783,8 +1784,9 @@ fn scheduled_dates(
 /// whose duration already includes it, not the task.
 ///
 /// Known limits, not checked: recurring calendar exceptions and untracked
-/// splits, and on a `.mpp` import an assignment `LevelingDelay`, which the
-/// importer does not decode; see [`write_mspdi`].
+/// splits, and on a `.mpp` import an assignment `LevelingDelay` and
+/// `ScheduleFromStart`, neither of which the importer decodes; see
+/// [`write_mspdi`].
 fn schedule_reproduces(proj: &Project) -> bool {
     let nonzero = |value: Option<i64>| value.is_some_and(|v| v != 0);
     if proj.option("ScheduleFromStart").and_then(parse_bool) == Some(false) {

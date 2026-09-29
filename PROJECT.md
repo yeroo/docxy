@@ -61,8 +61,8 @@ calendar, as Project makes one per resource, does not count). Known limits no
 cheap check detects, where a save still writes docxy's dates and they can
 differ from Project's, spreading through links and rollups: recurring calendar
 exceptions (`Type` 2-8), which are not scheduled, untracked splits, and on a
-`.mpp` import an assignment `LevelingDelay`, which the importer does not decode
-(it does decode each resource's calendar). An assignment `Delay` is not such an
+`.mpp` import an assignment `LevelingDelay` or `ScheduleFromStart` 0, neither
+of which the importer decodes (it does decode each resource's calendar). An assignment `Delay` is not such an
 input: it moves the assignment within its task, whose duration includes it. The
 editor rewrites the stored dates for a manual task
 whose dates it edits, so a save's `Start`/`Finish` agree with its
@@ -76,7 +76,8 @@ edit touched are saved exactly as read. Project-level options the model does not
 currency, file identity, ...) are kept verbatim in
 `Project::options` and written back on save. docxy still schedules forward
 when `ScheduleFromStart` is 0, and a save then keeps every task's stored
-`Start`/`Finish`. Six options are
+`Start`/`Finish`; a `.mpp` import does not decode the option, so there it
+cannot. Six options are
 typed when their text parses: `NewTasksEffortDriven`, `NewTasksEstimated`,
 `DefaultTaskType`, `Autolink`, `CriticalSlackLimit` and `MultipleCriticalPaths`.
 A save writes them in canonical form (`true` as `1`), keeps unparseable text
