@@ -660,13 +660,7 @@ impl DurationUnit {
 
     fn minutes(self, proj: &Project) -> f64 {
         if self.elapsed {
-            match self.unit {
-                LagUnit::Minute => 1.0,
-                LagUnit::Hour => 60.0,
-                LagUnit::Week => 10080.0,
-                LagUnit::Month => 43200.0,
-                LagUnit::Day | LagUnit::Percent => 1440.0,
-            }
+            super::cells::elapsed_unit_min(self.unit).unwrap_or(1440.0)
         } else {
             proj.working_unit_min(self.unit)
                 .or_else(|| proj.working_unit_min(LagUnit::Day))

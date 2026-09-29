@@ -665,7 +665,7 @@ pub fn format_duration_exact(min: i64, proj: &Project, unit: Option<LagUnit>) ->
 }
 
 /// Calendar minutes in one elapsed unit; `None` for a percentage.
-fn elapsed_unit_min(unit: LagUnit) -> Option<f64> {
+pub(super) fn elapsed_unit_min(unit: LagUnit) -> Option<f64> {
     Some(match unit {
         LagUnit::Minute => 1.0,
         LagUnit::Hour => 60.0,
