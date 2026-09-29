@@ -258,6 +258,7 @@ State keys, as the app reports them after every driving verb:
 | `app_state` | a Project tab's status-bar state, `Ready`, `Edit` (a cell editor, prompt or dialog is open) or `Busy` (a levelling pass is pending); `null` on other tabs |
 | `dialog` | the active tab's top dialog's id, or `none`, on every surface; `dialog-click`'s reply carries the `dialog-read` object under this key instead |
 | `tabs`, `ask_on_close` | open tab count and whether window close asks about unsaved changes |
+| `menu` | the open menu's `{target}`, or null; `menu-read` has its items |
 | `sheet`, `sel`, `anchor`, `range` | the sheet and its selection |
 | `editing`, `edit` | whether a cell edit is open, and its text |
 | `chart_sel`, `panel_chart`, `charts` | chart selection and the panel |
@@ -331,8 +332,11 @@ footer editor; `selection-set` refuses while it is open.
 | `window-size {"w":600,"h":700}` | resize the harness window in logical pixels; accepts width 300..4096 and height 200..4096 |
 | `window-zoom {}` | call GPUI's zoom action; on Windows it maximizes, while the native caption Max button uses the OS control area. Use a fresh harness window for restored geometry on Windows |
 
-`ribbon-read` and `ribbon-click` work on document and Project tabs. The app
-does not model command enabled states. Each command carries a `label` and a
+`ribbon-read` and `ribbon-click` work on document and Project tabs. Each
+command's `enabled` is the predicate its button draws with (every ribbon
+command is enabled today), and a command inside a split button's menu carries
+`menu`, the split's id (Set Baseline's `Set Baseline...` and `Clear
+Baseline...` read `menu: "pr-baseline"`). Each command carries a `label` and a
 screentip `tip.title`; on the Project ribbon they are Microsoft Project 2024's,
 and they differ for icon-only commands (Indent is `Indent Task`, Link Tasks is
 `Link the Selected Tasks`), so `ribbon-click` finds a command by either name.
@@ -553,6 +557,76 @@ While a dialog is open on the active tab:
   and a Project's `app_state` reads `Edit`.
 - A control-pipe edit, reload or save of that Project dismisses its dialogs
   unapplied, as it cancels a prompt.
+
+### Menus
+
+A menu is app state, like a dialog, drawn from the same model the harness reads
+(#397). One opens through the opener its pointer gesture uses, and an item is
+clicked through the item's own click handler, the one the drawn item calls.
+Menus open today:
+
+- **the task-row menu** on a Project: right-click a row's table cells (not its
+  Gantt bar). It selects the row as a left click does, committing an open cell
+  edit, and lists Project's Gantt Chart row menu in Project's order;
+- **Set Baseline's split menu**: the lower half of Project › Schedule › Set
+  Baseline (`Set Baseline...`, `Clear Baseline...`);
+- **the document menu** (Cut, Copy, Paste, Bold, Italic, Underline, New
+  Comment): right-click a document or sheet body. It never opens on a Project.
+
+| Verb | Args | Reply |
+|---|---|---|
+| `menu-open` | `{target}`: `"document"`, `{"row": <task uid>}` (`{"row": null}` is the entry row below the last task) or `{"ribbon": [tab, group, command]}` | the menu, as `menu-read` |
+| `menu-read` | `{}` | `{open: true, target, items}`, or `{open: false}` |
+| `menu-click` | `{label}` among the top-level items, or `{path: [labels]}` through submenus | `state` after the item's handler; the menu closes first |
+| `menu-close` | `{}` | `state`, as Esc leaves it |
+
+Each item is `{id, label, enabled, checked, key_tip, submenu}` (`submenu` null
+or the submenu's items), a separator `{separator: true}` and a section heading
+`{heading}`. An item with no command behind it yet is drawn greyed and read
+`enabled: false`, so the order stays Project's: on the row menu those are
+Paste Special..., Text Styles..., Font..., Fill Down, Clear Contents, Notes...,
+Add to Timeline and Hyperlink.... The rest follow the row: Scroll to Task,
+Inactivate Task, Manually/Auto Schedule, Assign Resources... and
+Information... need a real task, Delete Task any task row (a blank one too), and
+Cut, Copy, Paste and Insert Task any row, the entry row included. `checked`
+is the ribbon's pressed state (Inactivate Task, the task's mode). Delete Task
+deletes the selected task whatever column the cursor is on; a summary asks
+first, in the `delete-summary` dialog.
+
+A press on a split button's arrow while its own menu is open shuts the menu,
+as in Office; the harness's `menu-open` always opens.
+
+`state` has `menu`: null, or `{target}`. The menu opens at the target's drawn
+position when the last frame drew it, else in the middle of the window; either
+way it keeps itself inside the window.
+
+Refusals change nothing, and each names what it refuses: `menu-open` under a
+dialog, a `row` off a Project tab, an unknown uid, a task hidden under a
+collapsed summary (there is no row to right-click), a ribbon command that has
+no menu, `"document"` on a Project, and the targets without a menu yet
+(`cell`, `bar`, `column`, the ribbon's own right-click); `menu-click` with no
+menu open, on a disabled item, an unknown or ambiguous label, a heading, or an
+item that opens a submenu; `menu-click` and `menu-close` under a dialog;
+`menu-open` and `menu-click` while File (the backstage) or the more-tabs list
+is open, since the window draws no menu then;
+`menu-close` with no menu open. `menu-click` also refuses when the menu no
+longer fits its target: a row menu whose task is no longer the selected one,
+or the document menu on a Project.
+
+A menu belongs to the moment it opened in. What moves on from it closes it:
+another tab, the backstage, a command run from anywhere, a control-pipe verb
+that edits, reloads, saves or focuses the plan, and every harness verb that
+stands for a press outside the menu (`click-cell`, `drag`, `select-chart`,
+`focus-field`, `ribbon-click`, `title-tab`, `close-tab`, `selection-set`,
+`open`, `backstage` open and close (not `read`), `backstage-close`,
+`theme-set`, `ask-on-close` and the
+`dialog-*` drivers), which closes it first and then goes on, as the press
+would. Reads leave it open.
+
+While a menu is open it takes every key: Esc closes it, and so, until menus
+take arrows and Enter, does any other key, Tab included. None reaches the
+document or cell under it. A press outside the menu closes it too.
+`project-menus.uit` drives all three menus.
 
 ### Regions
 

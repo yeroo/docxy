@@ -402,6 +402,11 @@ impl Docxy {
         self.flush_project_passes(cx);
         let outcome = project_verb(&mut self.tabs, self.active, verb, args)?;
         Some(outcome.map(|(result, effect)| {
+            // What drops the tab's dialogs (an edit, a reload, a save) or
+            // moves the focus drops an open menu too (#397).
+            if effect.repaint || effect.focus.is_some() {
+                self.close_menu();
+            }
             if let Some(i) = effect.focus {
                 self.select_tab(i, window, cx);
             }

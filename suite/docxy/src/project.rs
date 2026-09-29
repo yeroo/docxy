@@ -976,6 +976,16 @@ fn editable_row_cells(
                 .when(col == COL_NAME && edit.is_none(), |d| d.pl(px(8. + indent)))
                 .child(probe(probes, format!("project-cell:{probe_row}:{col}")))
                 .child(content)
+                // Right-click selects the cell, then opens the row's menu.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        if this.active == index {
+                            let _ = this.open_row_menu(row, Some(col), ev.position, window, cx);
+                        }
+                    }),
+                )
                 .on_click(cx.listener(move |this, ev: &ClickEvent, window, cx| {
                     cx.stop_propagation();
                     if let Some(tab) = this.tabs.get_mut(index) {
@@ -1183,21 +1193,48 @@ pub(super) fn project_el(
                                                         d.font_weight(FontWeight::BOLD)
                                                     })
                                                     .when(i == cursor_row, |d| d.bg(pal.sel))
-                                                    .child(pane(
-                                                        table_w,
-                                                        table_x,
-                                                        editable_row_cells(
-                                                            v,
-                                                            pal,
-                                                            task,
-                                                            i,
-                                                            index,
-                                                            indent,
-                                                            &row_probes,
-                                                            window,
-                                                            cx,
-                                                        ),
-                                                    ))
+                                                    // The row's menu opens on its table,
+                                                    // past the cells too; the chart has
+                                                    // its own (bar) menu, not yet drawn.
+                                                    .child(
+                                                        div()
+                                                            .flex_none()
+                                                            .on_mouse_down(
+                                                                MouseButton::Right,
+                                                                cx.listener(
+                                                                    move |this,
+                                                                          ev: &MouseDownEvent,
+                                                                          window,
+                                                                          cx| {
+                                                                        cx.stop_propagation();
+                                                                        if this.active == index {
+                                                                            let _ = this.open_row_menu(
+                                                                                i,
+                                                                                None,
+                                                                                ev.position,
+                                                                                window,
+                                                                                cx,
+                                                                            );
+                                                                        }
+                                                                    },
+                                                                ),
+                                                            )
+                                                            .child(pane(
+                                                                table_w,
+                                                                table_x,
+                                                                editable_row_cells(
+                                                                    v,
+                                                                    pal,
+                                                                    task,
+                                                                    i,
+                                                                    index,
+                                                                    indent,
+                                                                    &row_probes,
+                                                                    window,
+                                                                    cx,
+                                                                ),
+                                                            )),
+                                                    )
                                                     .child(chart_pane(
                                                         gantt_w,
                                                         gantt_x,

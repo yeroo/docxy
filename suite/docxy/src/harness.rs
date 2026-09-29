@@ -31,7 +31,7 @@ use crate::{CONFIG_DIR_ENV, RefTarget, SheetView};
 use ctlcore::json::Json;
 use docxcore::editor::{Editor, FlatDocument, StoryOffset};
 use docxcore::model::{Align, VertAlign};
-use gpui::{App, Context, Entity, KeyDownEvent, Keystroke, Window, px, size};
+use gpui::{App, Context, Entity, KeyDownEvent, Keystroke, Pixels, Point, Window, point, px, size};
 use gridcore::sheet::{cell_name, parse_cell_name, parse_range_name};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -1124,6 +1124,8 @@ struct RibbonCommand {
     key_tip: String,
     act: crate::Act,
     gallery: bool,
+    /// The id of the split button or drop-down whose menu holds it.
+    menu: Option<String>,
 }
 
 impl RibbonCommand {
@@ -1136,10 +1138,17 @@ impl RibbonCommand {
             key_tip: cmd.key_tip.into(),
             act: cmd.act,
             gallery: false,
+            menu: None,
+        }
+    }
+    fn in_menu(cmd: &crate::rs::Cmd<crate::Act>, owner: &crate::rs::Cmd<crate::Act>) -> Self {
+        Self {
+            menu: Some(owner.id.into()),
+            ..Self::from_cmd(cmd)
         }
     }
     fn json(&self, checked: &impl Fn(&RibbonCommand) -> bool) -> Json {
-        Json::obj(vec![
+        let mut fields = vec![
             ("id", Json::Str(self.id.clone())),
             ("label", Json::Str(self.label.clone())),
             (
@@ -1151,7 +1160,13 @@ impl RibbonCommand {
             ),
             ("key_tip", Json::Str(self.key_tip.clone())),
             ("checked", Json::Bool(checked(self))),
-        ])
+            // The predicate the button draws with (#397).
+            ("enabled", Json::Bool(crate::act_enabled(self.act))),
+        ];
+        if let Some(menu) = &self.menu {
+            fields.push(("menu", Json::Str(menu.clone())));
+        }
+        Json::obj(fields)
     }
 }
 
@@ -1163,11 +1178,11 @@ fn control_commands(control: &crate::Control<crate::Act>, out: &mut Vec<RibbonCo
         Control::Column(cs) => out.extend(cs.iter().map(RibbonCommand::from_cmd)),
         Control::Split { primary, menu } => {
             out.push(RibbonCommand::from_cmd(primary));
-            out.extend(menu.iter().map(RibbonCommand::from_cmd));
+            out.extend(menu.iter().map(|c| RibbonCommand::in_menu(c, primary)));
         }
         Control::Dropdown { cmd, items } => {
             out.push(RibbonCommand::from_cmd(cmd));
-            out.extend(items.iter().map(RibbonCommand::from_cmd));
+            out.extend(items.iter().map(|c| RibbonCommand::in_menu(c, cmd)));
         }
         Control::Gallery(g) => out.extend(g.items.iter().map(|item| RibbonCommand {
             id: format!("{}:{}", g.id, item.label),
@@ -1177,6 +1192,7 @@ fn control_commands(control: &crate::Control<crate::Act>, out: &mut Vec<RibbonCo
             key_tip: String::new(),
             act: item.act,
             gallery: true,
+            menu: None,
         })),
         Control::Rows(rows) => {
             for cell in rows.iter().flatten() {
@@ -1323,10 +1339,21 @@ fn resolve_ribbon_command(
     tab_name: &str,
     query: &str,
 ) -> Result<crate::Act, String> {
-    let kind = app.ribbon_kind();
     if tab_name == "File" {
         return Err("File is backstage; use the backstage verb".into());
     }
+    let tab = ribbon_tab_def(app, tab_name)?;
+    let commands = tab_commands(&tab);
+    resolve_commands(&commands, tab_name, query)
+}
+
+/// A ribbon tab's definition as the active document shows it, contextual
+/// tabs included only while they show.
+fn ribbon_tab_def(
+    app: &crate::Docxy,
+    tab_name: &str,
+) -> Result<crate::rs::Tab<crate::Act>, String> {
+    let kind = app.ribbon_kind();
     ribbon_tab_by_name(kind, tab_name)?;
     let in_table = app.caret_table().is_some();
     let tab = if tab_name == "Table" {
@@ -1346,8 +1373,204 @@ fn resolve_ribbon_command(
             .find(|t| t.name == tab_name)
             .ok_or_else(|| format!("'{tab_name}' is not a ribbon tab for the active document"))?
     };
-    let commands = tab_commands(&tab);
-    resolve_commands(&commands, tab_name, query)
+    Ok(tab)
+}
+
+/// The split button a `menu-open {"ribbon": [tab, group, label]}` names:
+/// the id of its primary command, found by the primary's label as drawn.
+fn split_primary(
+    tab: &crate::rs::Tab<crate::Act>,
+    group: &str,
+    label: &str,
+) -> Result<&'static str, String> {
+    let g = tab
+        .groups
+        .iter()
+        .find(|g| g.title == group)
+        .ok_or_else(|| format!("no group '{group}' on tab '{}'", tab.name))?;
+    for control in &g.items {
+        if let crate::Control::Split { primary, .. } = control {
+            if primary.label == label {
+                return Ok(primary.id);
+            }
+        }
+    }
+    let mut commands = Vec::new();
+    for control in &g.items {
+        control_commands(control, &mut commands);
+    }
+    Err(if commands.iter().any(|c| c.label == label) {
+        format!("'{label}' has no menu")
+    } else {
+        format!(
+            "no command '{label}' in group '{group}' on tab '{}'",
+            tab.name
+        )
+    })
+}
+
+/// Where `menu-open` opens a menu: on the target's own probe when the last
+/// frame drew it (a cell's middle; a split button uses the pointer's own
+/// `split_menu_anchor`), else the middle of the window. The menu keeps
+/// itself inside the window.
+fn menu_point(
+    app: &crate::Docxy,
+    window: &Window,
+    probe: Option<&str>,
+    at: impl Fn(gpui::Bounds<Pixels>) -> Point<Pixels>,
+) -> Point<Pixels> {
+    probe
+        .and_then(|name| app.probes.borrow().get(name))
+        .map(at)
+        .unwrap_or_else(|| {
+            let size = window.viewport_size();
+            point(size.width / 2., size.height / 2.)
+        })
+}
+
+/// `menu-open`: open the menu on `target` through the opener its pointer
+/// gesture uses. Targets without a menu yet are refused by name, never
+/// mapped to another menu.
+fn menu_open(
+    app: &mut crate::Docxy,
+    target: &Json,
+    window: &mut Window,
+    cx: &mut Context<crate::Docxy>,
+) -> Result<(), String> {
+    match target {
+        Json::Str(name) if name == "document" => {
+            if app.active_is_project() {
+                return Err(
+                    r#"the document menu does not open on a Project tab; a task row's is {"row": uid}"#
+                        .into(),
+                );
+            }
+            let at = menu_point(app, window, None, |b| b.center());
+            app.open_document_menu(at, cx);
+            Ok(())
+        }
+        Json::Obj(fields) if fields.len() == 1 => match fields[0].0.as_str() {
+            "row" => {
+                let uid = match &fields[0].1 {
+                    Json::Null => None,
+                    other => Some(
+                        other
+                            .as_i64()
+                            .ok_or("'row' must be a task uid, or null for the entry row")?,
+                    ),
+                };
+                let Some(crate::Surface::Project(v)) = app.tabs.get(app.active).map(|t| &t.surface)
+                else {
+                    return Err("a row menu needs a Project tab".into());
+                };
+                let tasks = &v.ed.project().tasks;
+                // The entry row below the last task: a right-click there
+                // opens the same menu, for no task.
+                let Some(uid) = uid else {
+                    let probe = format!("project-cell:entry:{}", v.col);
+                    let row = tasks.len();
+                    let at = menu_point(app, window, Some(&probe), |b| b.center());
+                    return app.open_row_menu(row, None, at, window, cx);
+                };
+                let row = tasks
+                    .iter()
+                    .position(|t| i64::from(t.uid) == uid)
+                    .ok_or_else(|| format!("no task with uid {uid}"))?;
+                if !v.ed.visible_rows().contains(&row) {
+                    return Err(format!(
+                        "task {uid} is hidden under a collapsed summary; there is no row to right-click"
+                    ));
+                }
+                let probe = format!("project-cell:{}:{}", tasks[row].id, v.col);
+                let at = menu_point(app, window, Some(&probe), |b| b.center());
+                app.open_row_menu(row, None, at, window, cx)
+            }
+            "ribbon" => {
+                let path: Vec<&str> = fields[0]
+                    .1
+                    .as_array()
+                    .map(|a| a.iter().filter_map(Json::as_str).collect())
+                    .unwrap_or_default();
+                let [tab, group, label] = path.as_slice() else {
+                    return Err("'ribbon' must be [tab, group, command]".into());
+                };
+                ribbon_surface(app)?;
+                let def = ribbon_tab_def(app, tab)?;
+                let id = split_primary(&def, group, label)?;
+                app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), tab)?, window, cx);
+                // Where the pointer's press on the arrow opens it too.
+                let anchor = crate::split_menu_anchor(&app.probes.borrow(), id);
+                let at = anchor.unwrap_or_else(|| menu_point(app, window, None, |b| b.center()));
+                app.open_split_menu(id, at, cx)
+            }
+            other => Err(format!(
+                "menu target '{other}' is not supported yet (document, row and ribbon are)"
+            )),
+        },
+        _ => Err(r#"'target' must be "document" or one key such as {"row": uid}"#.into()),
+    }
+}
+
+/// Refuse a menu verb while the window draws no menu: the backstage covers
+/// the tab, and the more-tabs list hides an open menu.
+fn refuse_under_cover(app: &crate::Docxy) -> Result<(), String> {
+    cover_refusal(app.backstage, app.tab_more_open)
+}
+
+fn cover_refusal(backstage: bool, tab_more_open: bool) -> Result<(), String> {
+    if backstage {
+        return Err("File (backstage) is open; no menu shows".into());
+    }
+    if tab_more_open {
+        return Err("the more-tabs list is open; no menu shows".into());
+    }
+    Ok(())
+}
+
+/// Whether `verb` stands for a press outside an open menu, which closes it
+/// (#397). Reads leave it open, `key` and `type` reach the menu's own key
+/// gate, the `menu-*` verbs act on it, and a control-pipe verb closes it
+/// when it changes the plan or the focus (`dispatch_project`).
+fn closes_menu(verb: &str, args: &Json) -> bool {
+    // Reading the backstage is a read; opening or closing it is a press.
+    if verb == "backstage" {
+        return args.get_str("action") != Some("read");
+    }
+    matches!(
+        verb,
+        "click-cell"
+            | "drag"
+            | "select-chart"
+            | "focus-field"
+            | "ribbon-click"
+            | "title-tab"
+            | "close-tab"
+            | "selection-set"
+            | "open"
+            | "backstage-close"
+            | "theme-set"
+            | "ask-on-close"
+            | "dialog-set"
+            | "dialog-tab"
+            | "dialog-click"
+    )
+}
+
+/// `menu-click`'s `{label}` or `{path}`, as the labels to walk.
+fn menu_path(args: &Json) -> Result<Vec<&str>, String> {
+    match (args.get("label"), args.get("path")) {
+        (Some(label), None) => Ok(vec![label.as_str().ok_or("'label' must be a string")?]),
+        (None, Some(path)) => path
+            .as_array()
+            .ok_or("'path' must be an array of labels")?
+            .iter()
+            .map(|l| {
+                l.as_str()
+                    .ok_or_else(|| "'path' must be an array of labels".to_string())
+            })
+            .collect(),
+        _ => Err("menu-click takes 'label' or 'path'".into()),
+    }
 }
 
 /// Resolve by id first, then by label, then by screentip title, each tier
@@ -1467,6 +1690,13 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
                 .get(app.active)
                 .and_then(crate::tab_app_state)
                 .map_or(Json::Null, |s| Json::Str(s.label().into())),
+        ),
+        // The open menu's target, or null; `menu-read` has its items.
+        (
+            "menu",
+            app.menu.as_ref().map_or(Json::Null, |m| {
+                Json::obj(vec![("target", m.target.to_json())])
+            }),
         ),
         // The active tab's top dialog's id, or `none`; `dialog-read` has the rest.
         (
@@ -1603,6 +1833,11 @@ pub fn dispatch(
     // or not a frame ran in between. The verb that asks for one replies
     // before it runs, with `app_state` "Busy".
     app.flush_project_passes(cx);
+    // A verb that stands for a press outside an open menu closes it first,
+    // as that press would (the backdrop closes it, then the press goes on).
+    if closes_menu(verb, args) && app.close_menu() {
+        cx.notify();
+    }
     match verb {
         "window-zoom" => {
             window.zoom_window();
@@ -1837,6 +2072,33 @@ pub fn dispatch(
             let act = resolve_ribbon_command(app, &tab, &command)?;
             app.select_ribbon_tab(ribbon_tab_by_name(app.ribbon_kind(), &tab)?, window, cx);
             app.dispatch(act, window, cx);
+            Done::ok(state(app, window))
+        }
+        // Menus (#397): opened through the opener the right-click or the
+        // split button's arrow calls, clicked through the item's own handler.
+        "menu-open" => {
+            app.refuse_under_dialog()?;
+            refuse_under_cover(app)?;
+            let target = args.get("target").ok_or("menu-open needs a 'target'")?;
+            menu_open(app, target, window, cx)?;
+            Done::ok(crate::menu::read_json(app.menu.as_ref()))
+        }
+        "menu-read" => Done::ok(crate::menu::read_json(app.menu.as_ref())),
+        "menu-click" => {
+            app.refuse_under_dialog()?;
+            refuse_under_cover(app)?;
+            let labels = menu_path(args)?;
+            let menu = app.menu.as_ref().ok_or("no menu is open")?;
+            let path = crate::menu::resolve(&menu.items, &labels)?;
+            app.menu_activate(&path, window, cx)?;
+            Done::ok(state(app, window))
+        }
+        "menu-close" => {
+            app.refuse_under_dialog()?;
+            if !app.close_menu() {
+                return Err("no menu is open".into());
+            }
+            cx.notify();
             Done::ok(state(app, window))
         }
         "close-tab" => {
@@ -2827,6 +3089,7 @@ mod tests {
             key_tip: String::new(),
             act,
             gallery: false,
+            menu: None,
         };
         let commands = vec![
             cmd("one", "Move", "Move Task", Act::Bold),
@@ -2863,6 +3126,201 @@ mod tests {
         assert!(ribbon_tab_by_name(crate::Kind::Project, "Report").is_ok());
     }
 
+    /// #397: every command reports `enabled` from the predicate its button
+    /// draws with, and a split's menu items name the split they sit in.
+    #[test]
+    fn ribbon_read_reports_enabled_and_the_menu_a_command_sits_in() {
+        for kind in [crate::Kind::Docx, crate::Kind::Project] {
+            let json = ribbon_json_for(kind, true, true, |_| false);
+            let ribbon = crate::ribbon_for(kind);
+            let mut defs: Vec<RibbonCommand> = ribbon.tabs.iter().flat_map(tab_commands).collect();
+            if kind == crate::Kind::Docx {
+                defs.extend(tab_commands(&crate::table_tab()));
+            } else {
+                defs.extend(tab_commands(&crate::gantt_format_tab()));
+            }
+            let read: Vec<&Json> = json
+                .get("tabs")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|t| t.get("groups").unwrap().as_array().unwrap())
+                .flat_map(|g| g.get("commands").unwrap().as_array().unwrap())
+                .collect();
+            assert_eq!(read.len(), defs.len());
+            for (c, def) in read.iter().zip(&defs) {
+                assert_eq!(c.get_str("id"), Some(def.id.as_str()));
+                assert_eq!(
+                    c.get("enabled"),
+                    Some(&Json::Bool(crate::act_enabled(def.act))),
+                    "{}",
+                    def.id
+                );
+            }
+        }
+        let json = ribbon_json_for(crate::Kind::Project, false, false, |_| false);
+        let schedule = json
+            .get("tabs")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t.get_str("name") == Some("Project"))
+            .unwrap()
+            .get("groups")
+            .unwrap()
+            .as_array()
+            .unwrap()[0]
+            .get("commands")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| (c.get_str("label").unwrap(), c.get_str("menu")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            schedule,
+            [
+                ("Calculate Project", None),
+                ("Set Baseline", None),
+                ("Set Baseline...", Some("pr-baseline")),
+                ("Clear Baseline...", Some("pr-baseline")),
+            ]
+        );
+    }
+
+    /// #397: `ribbon-click` still finds the commands that moved into Set
+    /// Baseline's menu by the names a test already uses.
+    #[test]
+    fn ribbon_click_names_still_reach_set_and_clear_baseline() {
+        let ribbon = crate::ribbon_for(crate::Kind::Project);
+        let project = ribbon.tabs.iter().find(|t| t.name == "Project").unwrap();
+        let commands = tab_commands(project);
+        let act = |q| resolve_commands(&commands, "Project", q);
+        assert!(matches!(
+            act("Set Baseline"),
+            Ok(crate::Act::Project(crate::ProjectAct::Baseline))
+        ));
+        for q in ["Clear Baseline", "Clear Baseline...", "pr-baseline-clear"] {
+            assert!(
+                matches!(
+                    act(q),
+                    Ok(crate::Act::Project(crate::ProjectAct::ClearBaseline))
+                ),
+                "{q}"
+            );
+        }
+    }
+
+    /// #397: `menu-open {"ribbon": [...]}` finds a split button by its
+    /// primary's label, and says why when the named command has no menu.
+    #[test]
+    fn a_ribbon_menu_target_names_a_split_button() {
+        let ribbon = crate::ribbon_for(crate::Kind::Project);
+        let project = ribbon.tabs.iter().find(|t| t.name == "Project").unwrap();
+        assert_eq!(
+            split_primary(project, "Schedule", "Set Baseline"),
+            Ok("pr-baseline")
+        );
+        assert_eq!(
+            split_primary(project, "Schedule", "Calculate Project"),
+            Err("'Calculate Project' has no menu".into())
+        );
+        assert_eq!(
+            split_primary(project, "Schedule", "Nope"),
+            Err("no command 'Nope' in group 'Schedule' on tab 'Project'".into())
+        );
+        assert_eq!(
+            split_primary(project, "Nope", "Set Baseline"),
+            Err("no group 'Nope' on tab 'Project'".into())
+        );
+    }
+
+    /// #397: the verbs that stand for a press close an open menu; reads,
+    /// keys and the menu verbs do not.
+    #[test]
+    fn pointer_verbs_close_an_open_menu_and_reads_do_not() {
+        for verb in [
+            "click-cell",
+            "drag",
+            "ribbon-click",
+            "title-tab",
+            "close-tab",
+            "selection-set",
+            "open",
+            "select-chart",
+            "focus-field",
+        ] {
+            assert!(closes_menu(verb, &Json::obj(vec![])), "{verb}");
+        }
+        for verb in [
+            "menu-open",
+            "menu-read",
+            "menu-click",
+            "menu-close",
+            "key",
+            "type",
+            "ribbon-read",
+            "dialog-read",
+            "status-read",
+            "doc",
+            "rows",
+            "cell",
+            "selection",
+            "capture",
+            "rect",
+            "ping",
+            "task.set",
+        ] {
+            assert!(!closes_menu(verb, &Json::obj(vec![])), "{verb}");
+        }
+        let action = |a: &str| Json::obj(vec![("action", Json::Str(a.into()))]);
+        assert!(closes_menu("backstage", &action("open")));
+        assert!(closes_menu("backstage", &action("close")));
+        assert!(!closes_menu("backstage", &action("read")), "a read");
+    }
+
+    /// #397: no menu opens or runs while File or the more-tabs list covers
+    /// the tab, since the window draws none then.
+    #[test]
+    fn menus_are_refused_under_the_backstage_and_the_more_tabs_list() {
+        assert_eq!(cover_refusal(false, false), Ok(()));
+        assert!(
+            cover_refusal(true, false)
+                .unwrap_err()
+                .contains("backstage")
+        );
+        assert!(
+            cover_refusal(false, true)
+                .unwrap_err()
+                .contains("more-tabs list")
+        );
+    }
+
+    /// #397: `menu-click` takes a label or a path of labels, not both.
+    #[test]
+    fn menu_click_takes_a_label_or_a_path() {
+        let parse = |text: &str| Json::parse(text).unwrap();
+        assert_eq!(
+            menu_path(&parse(r#"{"label":"Insert Task"}"#)),
+            Ok(vec!["Insert Task"])
+        );
+        assert_eq!(
+            menu_path(&parse(r#"{"path":["Insert","Insert Task"]}"#)),
+            Ok(vec!["Insert", "Insert Task"])
+        );
+        for bad in [
+            r#"{}"#,
+            r#"{"label":"A","path":["A"]}"#,
+            r#"{"label":3}"#,
+            r#"{"path":"A"}"#,
+            r#"{"path":["A",1]}"#,
+        ] {
+            assert!(menu_path(&parse(bad)).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn ribbon_resolver_rejects_ambiguous_labels_and_status_is_live_text() {
         let commands = vec![
@@ -2874,6 +3332,7 @@ mod tests {
                 key_tip: String::new(),
                 act: crate::Act::Bold,
                 gallery: false,
+                menu: None,
             },
             RibbonCommand {
                 id: "two".into(),
@@ -2883,6 +3342,7 @@ mod tests {
                 key_tip: String::new(),
                 act: crate::Act::Italic,
                 gallery: false,
+                menu: None,
             },
         ];
         let err = resolve_commands(&commands, "Home", "Same").err().unwrap();

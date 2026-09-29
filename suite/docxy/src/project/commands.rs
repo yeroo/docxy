@@ -54,6 +54,9 @@ pub(crate) enum ProjectAct {
     /// Ctrl+Delete: clear the active cell, or reset it to its default; never
     /// deletes the task.
     ResetCell,
+    /// A task row's context menu › Delete Task: the selected task, whatever
+    /// column the cursor is on; a summary asks first, as Delete on its ID does.
+    DeleteTask,
     /// Ctrl+C / Ctrl+X / Ctrl+V on the cursor cell (see `clip.rs`).
     Copy,
     Cut,
@@ -322,24 +325,41 @@ pub(crate) fn project_ribbon() -> rs::Ribbon<Act> {
                         "Alt, P, E",
                         "E",
                     )),
-                    Control::Large(cmd(
-                        "pr-baseline",
-                        "save",
-                        "Set Baseline",
-                        Baseline,
-                        "Alt, P, B",
-                        "B",
-                    )),
-                    // Project has it under Set Baseline's menu, which the
-                    // suite ribbon cannot draw yet, so it sits beside it.
-                    rs::column(vec![cmd(
-                        "pr-baseline-clear",
-                        "table-delete-row",
-                        "Clear Baseline",
-                        ClearBaseline,
-                        "Alt, P, L",
-                        "L",
-                    )]),
+                    // A split button: the upper half sets the baseline at
+                    // once, the arrow opens Set Baseline... / Clear
+                    // Baseline... (#397). Project 2024 draws a menu button
+                    // here, with no one-press half; the one press is kept
+                    // so Alt, P, B still sets the baseline.
+                    Control::Split {
+                        primary: cmd(
+                            "pr-baseline",
+                            "save",
+                            "Set Baseline",
+                            Baseline,
+                            "Alt, P, B",
+                            "B",
+                        ),
+                        menu: vec![
+                            cmds(
+                                "pr-baseline-set",
+                                "save",
+                                "Set Baseline...",
+                                "Set Baseline",
+                                Baseline,
+                                "Alt, P, B",
+                                "B",
+                            ),
+                            cmds(
+                                "pr-baseline-clear",
+                                "table-delete-row",
+                                "Clear Baseline...",
+                                "Clear Baseline",
+                                ClearBaseline,
+                                "Alt, P, L",
+                                "L",
+                            ),
+                        ],
+                    },
                 ],
             )],
         ),
@@ -438,6 +458,92 @@ pub(crate) fn project_act_active(v: &ProjectView, act: ProjectAct) -> bool {
             .is_some_and(|t| !t.is_null && t.manual == (act == ProjectAct::ManuallySchedule)),
         _ => false,
     }
+}
+
+/// A task row's context menu, in the order Project's Gantt Chart table draws
+/// it (#397). An item with no command here is drawn disabled, so the order
+/// stays Project's. The rest follow the row the cursor is on: `task` is a
+/// real task (not a blank row), `row` any task row, blank ones included
+/// (not the entry row, which has no task to delete).
+pub(crate) fn project_row_menu(v: &ProjectView) -> Vec<crate::menu::MenuItem> {
+    use crate::menu::{
+        Entry,
+        MenuItem::{Item, Separator},
+    };
+    use ProjectAct::*;
+    let uid = v.selected_uid();
+    let row = uid.is_some();
+    let task = uid
+        .and_then(|uid| v.ed.project().task(uid))
+        .is_some_and(|t| !t.is_null);
+    let item = |id, label, icon, act: ProjectAct, enabled| {
+        Item(Entry::new(id, label, icon, Act::Project(act), enabled))
+    };
+    let toggle = |id, label, icon, act: ProjectAct| {
+        Item(
+            Entry::new(id, label, icon, Act::Project(act), task)
+                .checked(task && project_act_active(v, act)),
+        )
+    };
+    let none = |id, label| Item(Entry::unavailable(id, label));
+    vec![
+        item("rm-cut", "Cut", "cut", Cut, true),
+        item("rm-copy", "Copy", "copy", Copy, true),
+        item("rm-paste", "Paste", "paste", Paste, true),
+        none("rm-paste-special", "Paste Special..."),
+        Separator,
+        item(
+            "rm-scroll",
+            "Scroll to Task",
+            "align-left",
+            ScrollToTask,
+            task,
+        ),
+        Separator,
+        item(
+            "rm-insert",
+            "Insert Task",
+            "table-insert-row",
+            InsertBlankRow,
+            true,
+        ),
+        item(
+            "rm-delete",
+            "Delete Task",
+            "table-delete-row",
+            DeleteTask,
+            row,
+        ),
+        toggle(
+            "rm-inactivate",
+            "Inactivate Task",
+            "strikethrough",
+            Inactivate,
+        ),
+        Separator,
+        toggle("rm-manual", "Manually Schedule", "lock", ManuallySchedule),
+        toggle("rm-auto", "Auto Schedule", "redo", AutoSchedule),
+        Separator,
+        item("rm-assign", "Assign Resources...", "comment", Assign, task),
+        Separator,
+        none("rm-text-styles", "Text Styles..."),
+        none("rm-font", "Font..."),
+        Separator,
+        none("rm-fill-down", "Fill Down"),
+        none("rm-clear", "Clear Contents"),
+        Separator,
+        item(
+            "rm-info",
+            "Information...",
+            "print-layout",
+            Constraint,
+            task,
+        ),
+        none("rm-notes", "Notes..."),
+        none("rm-timeline", "Add to Timeline"),
+        Separator,
+        none("rm-hyperlink", "Hyperlink..."),
+    ]
 }
 
 fn selected_task_inactive(v: &ProjectView) -> bool {
@@ -984,6 +1090,10 @@ pub(crate) fn apply_project_act(tab: &mut DocTab, act: ProjectAct) {
                         _ => status = Some(format!("{} can't be cleared", COLUMNS[v.col])),
                     }
                 }
+            }
+            DeleteTask => {
+                dialog = delete_selected_task(v)?;
+                reveal_clear = true;
             }
             ResetCell => {
                 if let Some(uid) = v.selected_uid() {
