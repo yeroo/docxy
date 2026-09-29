@@ -12,6 +12,15 @@ pub(crate) struct Effect {
     pub focus: Option<usize>,
 }
 
+impl Effect {
+    /// Whether this effect flashes the agwinterm pane's activity dot. Never
+    /// for a harness instance (#697): it only inherited the pane of whatever
+    /// terminal launched it, and must not spawn `agwintermctl` against it.
+    pub(crate) fn signals_activity(&self, harness: bool) -> bool {
+        self.activity && !harness
+    }
+}
+
 /// Match a `tab` argument (an index, or a case-insensitive title/path
 /// substring) against the open tabs, Projects only when `project_only`. The
 /// one rule `proj.*` and the harness's `tab-select` share.
@@ -413,7 +422,7 @@ impl Docxy {
             if effect.repaint {
                 cx.notify();
             }
-            if effect.activity {
+            if effect.signals_activity(self.harness.is_some()) {
                 ctlcore::signal_activity();
             }
             if matches!(verb, "proj.save" | "proj.reload") {

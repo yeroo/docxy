@@ -24022,7 +24022,7 @@ fn main() {
                 std::process::exit(2);
             }
         };
-        match harness::start(&root) {
+        match harness::start(&root, true) {
             Ok(pair) => Some(pair),
             Err(e) => {
                 eprintln!("docxy: the harness could not start its control server: {e}");
@@ -24030,7 +24030,7 @@ fn main() {
             }
         }
     } else {
-        match harness::start(&config_root()) {
+        match harness::start(&config_root(), false) {
             Ok(pair) => Some(pair),
             Err(e) => {
                 eprintln!("docxy: Project control unavailable: {e}");
