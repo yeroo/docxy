@@ -1604,9 +1604,11 @@ impl SheetPackage {
         !vba_relationships(&self.parts).is_empty()
     }
 
-    /// Drop the VBA project in memory, exactly as [`save_xlsx_as`] does for a
-    /// macro-free kind: after a save without macros the open workbook matches
-    /// the file. Returns whether there was one.
+    /// Drop the VBA project in memory with the same removal [`save_xlsx_as`]
+    /// runs for a macro-free kind, so a later save cannot write the macros
+    /// back. The workbook part's content type is left alone: [`save_xlsx_as`]
+    /// and [`save_xlsx_for_path`] set it for the file they write. Returns
+    /// whether there was one.
     pub fn remove_vba_project(&mut self) -> bool {
         strip_vba_project(&mut self.parts)
     }
@@ -1633,19 +1635,22 @@ fn vba_relationships(parts: &[(String, Vec<u8>)]) -> Vec<(String, String, String
 /// that relationship, the part's own rels and the parts they name (the
 /// signatures), and their content-type Overrides. The `.bin` Default goes
 /// too, unless another `.bin` part (printer settings) still relies on it.
-/// Returns whether anything was removed.
+/// A part is deleted only once its relationship is, so a relationship that
+/// could not be found never dangles. Returns whether anything was removed.
 fn strip_vba_project(parts: &mut Vec<(String, Vec<u8>)>) -> bool {
     let rels = vba_relationships(parts);
-    if rels.is_empty() {
-        return false;
-    }
     let mut doomed: Vec<String> = Vec::new();
     for (rels_name, id, target) in &rels {
-        if let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_name) {
-            let xml = String::from_utf8_lossy(&p.1).into_owned();
-            p.1 = remove_element_containing(&xml, "<Relationship ", &format!(" Id=\"{id}\""))
-                .into_bytes();
-        }
+        let Some(p) = parts.iter_mut().find(|(n, _)| n == rels_name) else {
+            continue;
+        };
+        let mut xml = String::from_utf8_lossy(&p.1).into_owned();
+        let Some(el) = find_element_by_attr(&xml, "Relationship", "Id", |v| v == id) else {
+            continue;
+        };
+        xml.replace_range(el.start..el.end, "");
+        p.1 = xml.into_bytes();
+
         let own_rels = rels_part_name(target);
         let dir = target.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
         if let Some((_, xml)) = parts.iter().find(|(n, _)| *n == own_rels) {
@@ -1656,62 +1661,142 @@ fn strip_vba_project(parts: &mut Vec<(String, Vec<u8>)>) -> bool {
         doomed.push(target.clone());
         doomed.push(own_rels);
     }
+    if doomed.is_empty() {
+        return false;
+    }
     parts.retain(|(n, _)| !doomed.contains(n));
 
     if let Some(i) = parts.iter().position(|(n, _)| n == "[Content_Types].xml") {
         let mut xml = String::from_utf8_lossy(&parts[i].1).into_owned();
         for part in &doomed {
-            while let Some((start, end)) = override_span(&xml, &format!("/{part}")) {
-                xml.replace_range(start..end, "");
+            while let Some(el) = override_element(&xml, &format!("/{part}")) {
+                xml.replace_range(el.start..el.end, "");
             }
         }
         // A `.bin` part left without an Override of its own still needs it.
         let bin_needs_default = parts.iter().any(|(n, _)| {
             n.to_ascii_lowercase().ends_with(".bin")
-                && override_span(&xml, &format!("/{n}")).is_none()
+                && override_element(&xml, &format!("/{n}")).is_none()
         });
         if !bin_needs_default {
-            xml = remove_element_containing(&xml, "<Default ", VBA_PROJECT_CT);
+            while let Some(el) = find_element_by_attr(&xml, "Default", "ContentType", |v| {
+                v.eq_ignore_ascii_case(VBA_PROJECT_CT)
+            }) {
+                xml.replace_range(el.start..el.end, "");
+            }
         }
         parts[i].1 = xml.into_bytes();
     }
     true
 }
 
-/// The byte span of the `<Override>` whose PartName is `part_name` (OPC part
-/// names compare case-insensitively).
-fn override_span(xml: &str, part_name: &str) -> Option<(usize, usize)> {
+/// Where [`find_element_by_attr`] found an element: its whole span (start tag to
+/// end tag, or the self-closed tag) and the byte span of the matched
+/// attribute's value.
+struct ElementSpan {
+    start: usize,
+    end: usize,
+    value: (usize, usize),
+}
+
+/// The first element with local name `local` (any namespace prefix) whose
+/// attribute `attr` has a (decoded) value `want` accepts. Writers differ in quote
+/// style, whitespace, and `/>` versus `></X>`, so all of them are read.
+fn find_element_by_attr(
+    xml: &str,
+    local: &str,
+    attr: &str,
+    want: impl Fn(&str) -> bool,
+) -> Option<ElementSpan> {
+    let bytes = xml.as_bytes();
+    let local_of = |name: &str| name.rsplit(':').next().unwrap_or(name).to_string();
     let mut from = 0;
-    while let Some(rel) = xml[from..].find("<Override") {
+    while let Some(rel) = xml[from..].find('<') {
         let start = from + rel;
-        let gt = start + xml[start..].find('>')?;
-        let tag = &xml[start..=gt];
-        let end = if tag.ends_with("/>") {
-            gt + 1
-        } else {
-            xml[gt..]
-                .find("</Override>")
-                .map_or(gt + 1, |i| gt + i + "</Override>".len())
-        };
-        let name = attr_of_tag(tag, "<Override", "PartName");
-        if name.is_some_and(|n| n.eq_ignore_ascii_case(part_name)) {
-            return Some((start, end));
+        let name_end = start
+            + 1
+            + xml[start + 1..].find(|c: char| c.is_whitespace() || c == '/' || c == '>')?;
+        let qname = &xml[start + 1..name_end];
+        if qname.is_empty() || local_of(qname) != local {
+            from = start + 1;
+            continue;
         }
-        from = end;
+        // Walk the attributes, quote-aware, to the end of the start tag.
+        let mut i = name_end;
+        let mut hit = None;
+        let (tag_end, self_closed) = loop {
+            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            match bytes.get(i)? {
+                b'>' => break (i + 1, false),
+                b'/' if bytes.get(i + 1) == Some(&b'>') => break (i + 2, true),
+                _ => {
+                    let eq = i + xml[i..].find('=')?;
+                    let name = xml[i..eq].trim();
+                    let mut q = eq + 1;
+                    while bytes.get(q).is_some_and(u8::is_ascii_whitespace) {
+                        q += 1;
+                    }
+                    let quote = *bytes.get(q)?;
+                    if quote != b'"' && quote != b'\'' {
+                        return None;
+                    }
+                    let vs = q + 1;
+                    let ve = vs + xml[vs..].find(quote as char)?;
+                    if hit.is_none() && local_of(name) == attr && want(&decode(&xml[vs..ve])) {
+                        hit = Some((vs, ve));
+                    }
+                    i = ve + 1;
+                }
+            }
+        };
+        let end = if self_closed {
+            tag_end
+        } else {
+            let close = format!("</{qname}");
+            match xml[tag_end..].find(&close) {
+                Some(c) => {
+                    let c = tag_end + c;
+                    c + xml[c..].find('>')? + 1
+                }
+                None => tag_end,
+            }
+        };
+        if let Some(value) = hit {
+            return Some(ElementSpan { start, end, value });
+        }
+        from = tag_end;
     }
     None
 }
 
-/// Point `part_name`'s `<Override>` at `ct`, replacing whatever type it had,
-/// or add one. (`add_content_type_override` leaves an existing entry alone.)
+/// The `<Override>` whose PartName is `part_name` (OPC part names compare
+/// case-insensitively).
+fn override_element(xml: &str, part_name: &str) -> Option<ElementSpan> {
+    find_element_by_attr(xml, "Override", "PartName", |v| {
+        v.eq_ignore_ascii_case(part_name)
+    })
+}
+
+/// Point `part_name`'s `<Override>` at `ct`, replacing whatever type it had
+/// in place, or add one. (`add_content_type_override` leaves an existing
+/// entry alone.)
 fn set_content_type_override(parts: &mut [(String, Vec<u8>)], part_name: &str, ct: &str) {
     let Some(p) = parts.iter_mut().find(|(n, _)| n == "[Content_Types].xml") else {
         return;
     };
     let mut xml = String::from_utf8_lossy(&p.1).into_owned();
     let ov = format!("<Override PartName=\"{part_name}\" ContentType=\"{ct}\"/>");
-    match override_span(&xml, part_name) {
-        Some((start, end)) => xml.replace_range(start..end, &ov),
+    match override_element(&xml, part_name) {
+        Some(el) => {
+            let current =
+                find_element_by_attr(&xml[el.start..el.end], "Override", "ContentType", |_| true);
+            match current {
+                Some(c) => xml.replace_range(el.start + c.value.0..el.start + c.value.1, ct),
+                None => xml.replace_range(el.start..el.end, &ov),
+            }
+        }
         None => xml = xml.replacen("</Types>", &format!("{ov}</Types>"), 1),
     }
     p.1 = xml.into_bytes();
@@ -7153,8 +7238,10 @@ mod kind_tests {
 
     fn workbook_ct(pkg: &SheetPackage) -> String {
         let xml = content_types(pkg);
-        let (s, e) = override_span(&xml, "/xl/workbook.xml").expect("workbook Override");
-        attr_of_tag(&xml[s..e], "<Override", "ContentType").unwrap()
+        let el = override_element(&xml, "/xl/workbook.xml").expect("workbook Override");
+        let ct = find_element_by_attr(&xml[el.start..el.end], "Override", "ContentType", |_| true)
+            .unwrap();
+        xml[el.start + ct.value.0..el.start + ct.value.1].to_string()
     }
 
     fn retyped(pkg: &SheetPackage, from: &str, to: &str) -> SheetPackage {
@@ -7320,10 +7407,10 @@ mod kind_tests {
     fn a_workbook_without_an_override_gets_one() {
         let mut pkg = new_xlsx();
         let xml = content_types(&pkg);
-        let (s, e) = override_span(&xml, "/xl/workbook.xml").unwrap();
+        let el = override_element(&xml, "/xl/workbook.xml").unwrap();
         pkg.set_part(
             "[Content_Types].xml",
-            format!("{}{}", &xml[..s], &xml[e..]).into_bytes(),
+            format!("{}{}", &xml[..el.start], &xml[el.end..]).into_bytes(),
         );
         let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
         assert_eq!(workbook_ct(&out), XLSX_CT);
@@ -7342,6 +7429,53 @@ mod kind_tests {
             ct.to_ascii_lowercase().matches("/xl/workbook.xml").count(),
             1
         );
+    }
+
+    /// Other writers use single quotes and `></X>` closes. The workbook's
+    /// Override is still found (not duplicated beside the stale macro type),
+    /// and the VBA relationship goes without taking a neighbour with it.
+    #[test]
+    fn single_quotes_and_explicit_close_tags_are_read() {
+        let mut pkg = xlsm();
+        let ct = content_types(&pkg).replace('"', "'");
+        pkg.set_part("[Content_Types].xml", ct.into_bytes());
+        let rels = String::from_utf8_lossy(pkg.part("xl/_rels/workbook.xml.rels").unwrap())
+            .replace('"', "'")
+            .replace("/>", "></Relationship>");
+        pkg.set_part("xl/_rels/workbook.xml.rels", rels.into_bytes());
+        assert!(pkg.has_vba_project());
+
+        let out = roundtrip(&pkg, SpreadsheetKind::Workbook);
+        let ct = content_types(&out);
+        assert_eq!(ct.matches("/xl/workbook.xml").count(), 1, "{ct}");
+        assert_eq!(workbook_ct(&out), XLSX_CT);
+        assert!(
+            !ct.contains("macroEnabled") && !ct.contains("vbaProject"),
+            "{ct}"
+        );
+        assert!(ct.contains("<Default Extension='xml'"), "{ct}");
+        assert!(out.part("xl/vbaProject.bin").is_none());
+        let rels =
+            String::from_utf8_lossy(out.part("xl/_rels/workbook.xml.rels").unwrap()).into_owned();
+        assert!(!rels.contains("vbaProject"), "{rels}");
+        assert_eq!(rels.matches("<Relationship ").count(), 3, "{rels}");
+        assert_eq!(out.workbook.sheets.len(), 1);
+    }
+
+    /// The span is exactly the matched element: a neighbour closed with
+    /// `></X>` is not swallowed, and values compare decoded.
+    #[test]
+    fn the_element_span_is_exactly_the_match() {
+        let mut xml = String::from(
+            r#"<R><Relationship Id='a'></Relationship><Relationship Id="r&amp;9" Target="x"/></R>"#,
+        );
+        assert!(find_element_by_attr(&xml, "Relationship", "Id", |v| v == "r9").is_none());
+        let el = find_element_by_attr(&xml, "Relationship", "Id", |v| v == "r&9").unwrap();
+        xml.replace_range(el.start..el.end, "");
+        assert_eq!(xml, "<R><Relationship Id='a'></Relationship></R>");
+        let el = find_element_by_attr(&xml, "Relationship", "Id", |v| v == "a").unwrap();
+        xml.replace_range(el.start..el.end, "");
+        assert_eq!(xml, "<R></R>");
     }
 
     #[test]
