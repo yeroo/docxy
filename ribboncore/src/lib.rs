@@ -99,8 +99,10 @@ pub const EXPANDED_H: u16 = 7;
 pub struct Ribbon<A> {
     tabs: Vec<&'static str>,
     active: usize,
-    /// Groups per tab (aligned with `tabs`); a tab with no groups (e.g. File)
-    /// has no in-ribbon body — the app opens a backstage instead.
+    /// Groups per tab (aligned with `tabs`). A tab with no groups has no
+    /// in-ribbon body: `set_active` skips it as a backstage tab (File, which
+    /// the app opens as a backstage), while `show_tab` selects it and draws
+    /// an empty body (yppxy's Report).
     tab_groups: Vec<Vec<Group<A>>>,
     placed: Vec<Placed<A>>,
     tab_cols: Vec<(u16, u16)>, // (start, end_exclusive) of each tab header
@@ -189,7 +191,9 @@ impl<A: Copy + PartialEq> Ribbon<A> {
         }
     }
 
-    /// Whether tab `i` has an in-ribbon body (no body = a backstage tab).
+    /// Whether tab `i` has groups to draw. Apps whose only groupless tab is
+    /// File treat `false` as "open the backstage"; an app with an empty
+    /// ribbon tab tells File apart by its label instead.
     pub fn tab_has_body(&self, i: usize) -> bool {
         self.tab_groups.get(i).is_some_and(|g| !g.is_empty())
     }
