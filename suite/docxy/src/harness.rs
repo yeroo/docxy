@@ -1530,14 +1530,46 @@ fn state(app: &crate::Docxy, window: &Window) -> Json {
     Json::Obj(out)
 }
 
+/// The kind a tab is, as `tab-list` names it: the Backstage › New cards'.
+fn kind_name(kind: crate::Kind) -> &'static str {
+    match kind {
+        crate::Kind::Docx => "docx",
+        crate::Kind::Xlsx => "xlsx",
+        crate::Kind::Project => "project",
+        crate::Kind::Look => "mail",
+    }
+}
+
+/// `tab-list`: every open tab, in strip order, and which one is active.
+fn tab_list(tabs: &[crate::DocTab], active: usize) -> Json {
+    let tabs = tabs
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            Json::obj(vec![
+                ("index", Json::Num(i as f64)),
+                ("title", Json::Str(t.title.to_string())),
+                ("kind", Json::Str(kind_name(t.kind).into())),
+                (
+                    "path",
+                    str_or_null(t.path.as_ref().map(|p| p.to_string_lossy().into_owned())),
+                ),
+                ("dirty", Json::Bool(t.dirty)),
+                ("imported", Json::Bool(crate::is_imported(t))),
+            ])
+        })
+        .collect();
+    Json::obj(vec![
+        ("active", Json::Num(active as f64)),
+        ("tabs", Json::Arr(tabs)),
+    ])
+}
+
 /// Refuse a verb that stands for a pointer gesture while the active tab has a
 /// dialog open: the dialog's backdrop covers the whole window, title bar and
 /// ribbon included, so a person could not make that gesture either.
 fn refuse_under_dialog(app: &crate::Docxy) -> Result<(), String> {
-    match app.active_dialogs().and_then(|d| d.top()) {
-        Some(d) => Err(format!("a dialog is open: {}", d.title)),
-        None => Ok(()),
-    }
+    app.refuse_under_dialog()
 }
 
 /// The active tab's dialogs, for a verb that drives one.
@@ -1692,6 +1724,15 @@ pub fn dispatch(
                 }
                 _ => return Err("'action' must be prev, next, more or pick".into()),
             }
+            Done::ok(state(app, window))
+        }
+        "tab-list" => Done::ok(tab_list(&app.tabs, app.active)),
+        // The tab chip's click handler, by index or title/path substring.
+        "tab-select" => {
+            let tab = args.get("tab").ok_or("tab-select needs 'tab'")?;
+            refuse_under_dialog(app)?;
+            let i = crate::control::match_tab(&app.tabs, tab, false)?;
+            app.select_tab(i, window, cx);
             Done::ok(state(app, window))
         }
         "doc" => Done::ok(live_doc_state(app, window)?),
@@ -2256,6 +2297,85 @@ mod tests {
                 })],
             })],
         })
+    }
+
+    /// `tab-list` over one tab of every kind: a blank plan has no path, an
+    /// .mpp is imported, and `active` and `dirty` are each tab's own.
+    #[test]
+    fn tab_list_reports_every_tab_of_every_kind() {
+        let doc = |kind, title: &str| crate::DocTab {
+            kind,
+            title: title.to_owned().into(),
+            path: None,
+            surface: crate::Surface::Placeholder,
+            dirty: false,
+            status: "".into(),
+            comments: vec![],
+            pkg: None,
+            notes: vec![],
+            markdown: false,
+            hf_edit: None,
+            bundle_html: None,
+            load_failed: false,
+            dialogs: crate::dialog::DialogStack::default(),
+        };
+        let mut word = doc(crate::Kind::Docx, "a.docx");
+        word.path = Some("C:/work/a.docx".into());
+        word.dirty = true;
+        let book = doc(crate::Kind::Xlsx, "Untitled.xlsx");
+        let blank = crate::new_project_tab();
+        let mut mpp = doc(crate::Kind::Project, "plan.mpp");
+        mpp.path = Some("C:/work/plan.mpp".into());
+        let inbox = doc(crate::Kind::Look, "Inbox");
+        let list = tab_list(&[word, book, blank, mpp, inbox], 2);
+        assert_eq!(list.get("active"), Some(&Json::Num(2.)));
+        let tabs = list.get("tabs").and_then(Json::as_array).unwrap();
+        let row = |i: usize| {
+            let t = &tabs[i];
+            (
+                t.get("index").cloned(),
+                t.get_str("title").unwrap().to_string(),
+                t.get_str("kind").unwrap().to_string(),
+                t.get("path").cloned(),
+                t.get("dirty").cloned(),
+                t.get("imported").cloned(),
+            )
+        };
+        let expect = |i: usize, title: &str, kind: &str, path: Option<&str>, dirty, imported| {
+            (
+                Some(Json::Num(i as f64)),
+                title.to_string(),
+                kind.to_string(),
+                Some(path.map_or(Json::Null, |p| Json::Str(p.into()))),
+                Some(Json::Bool(dirty)),
+                Some(Json::Bool(imported)),
+            )
+        };
+        assert_eq!(tabs.len(), 5);
+        assert_eq!(
+            row(0),
+            expect(0, "a.docx", "docx", Some("C:/work/a.docx"), true, false)
+        );
+        assert_eq!(
+            row(1),
+            expect(1, "Untitled.xlsx", "xlsx", None, false, false)
+        );
+        assert_eq!(
+            row(2),
+            expect(2, "Untitled.yppx", "project", None, false, false)
+        );
+        assert_eq!(
+            row(3),
+            expect(
+                3,
+                "plan.mpp",
+                "project",
+                Some("C:/work/plan.mpp"),
+                false,
+                true
+            )
+        );
+        assert_eq!(row(4), expect(4, "Inbox", "mail", None, false, false));
     }
 
     #[test]
