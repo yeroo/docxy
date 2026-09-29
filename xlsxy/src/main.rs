@@ -2046,10 +2046,13 @@ impl App {
     }
 
     fn save(&mut self) {
-        self.save_current();
+        let _ = self.save_current();
     }
 
-    fn save_current(&mut self) -> bool {
+    /// Write the workbook to `self.path`. A failure's message is both the
+    /// status line and the `Err`, so a caller that reports it (the control
+    /// surface's `wb.save`) says exactly what the status bar says.
+    fn save_current(&mut self) -> Result<(), String> {
         let bytes = self.package_bytes();
         match export_atomic(
             self.import_source.as_deref().map(Path::new),
@@ -2059,18 +2062,19 @@ impl App {
             Ok(()) => {
                 self.modified = false;
                 self.status = Some(format!("Saved {} ({} bytes)", self.path, bytes.len()));
-                true
+                Ok(())
             }
             Err(e) => {
-                self.status = Some(format!("save failed: {e}"));
-                false
+                let msg = format!("save failed: {e}");
+                self.status = Some(msg.clone());
+                Err(msg)
             }
         }
     }
 
     fn save_as(&mut self, path: String) -> bool {
         let previous = std::mem::replace(&mut self.path, path);
-        if self.save_current() {
+        if self.save_current().is_ok() {
             self.import_source = None;
             true
         } else {
@@ -4176,10 +4180,9 @@ impl App {
                 self.save();
                 false
             }
-            "wq" | "x" => {
-                self.save();
-                true
-            }
+            // Quit only when the save landed: a failed save keeps the
+            // editor open with its edits and the failure on the status line.
+            "wq" | "x" => self.save_current().is_ok(),
             "q" => {
                 if self.modified {
                     self.status = Some("Unsaved changes (use :q! to discard)".to_string());
@@ -7684,6 +7687,31 @@ mod tests {
         app.vim_key(KeyCode::Char(':'), false, false);
         app.vim_key(KeyCode::Char('q'), false, false);
         assert!(app.vim_key(KeyCode::Enter, false, false));
+    }
+
+    #[test]
+    fn vim_wq_stays_open_when_the_save_fails() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-609-wq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The parent directory does not exist, so the save fails.
+        let book = dir.join("missing").join("book.xlsx");
+        let mut app = App::new(new_xlsx(), book.to_str().unwrap());
+        app.os_clip = None;
+        app.modified = true;
+        for cmd in ["wq", "x"] {
+            assert!(!app.vim_run_command(cmd), ":{cmd} quit after a failed save");
+            assert!(app.modified);
+            assert!(
+                app.status.as_deref().unwrap().starts_with("save failed: "),
+                "{:?}",
+                app.status
+            );
+        }
+        // Once the save can land, :wq quits.
+        std::fs::create_dir_all(book.parent().unwrap()).unwrap();
+        assert!(app.vim_run_command("wq"));
+        assert!(!app.modified);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

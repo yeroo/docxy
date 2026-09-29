@@ -762,7 +762,7 @@ name and defaults to the active sheet):
 | `col.width` | `{col, width, sheet?}` | `{col, width}` — `col` accepts a letter or a 0-based index; the reply always echoes the **numeric** index |
 | `find` | `{query, sheet?}` | `{query, count, matches:[…]}` |
 | `wb.recalc` | — | `{recalculated:true}` |
-| `wb.save` | — | `{path, …}` |
+| `wb.save` | — | `{path, …}`; a failed write answers `ok:false` with `save failed: …` (the status-bar text) and the workbook stays modified |
 | `wb.reload` | — | `{path, …}` (re-reads the file, dropping unsaved edits) |
 | `wb.open` | `{path}` | `{path, …}` |
 | `comment.list` | — | `{comments:[{sheet,ref,author,text}]}` (threads flattened in reply order) |

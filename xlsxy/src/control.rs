@@ -43,7 +43,7 @@
 //! | `cell.format` | `{range,patch,sheet?}` | `{formatted}` — one undo group; `patch` keys: `numFmt`/`bold`/`italic`/`fontColor`/`fillColor`/`align` (≥1 required) |
 //! | `col.width` | `{col,width,sheet?}` | `{col,width}` — NOT on the undo stack (mirrors the TUI's F7/F8, which mutate directly) |
 //! | `wb.recalc` | — | `{recalculated:true}` |
-//! | `wb.save` | — | `{path, …}` |
+//! | `wb.save` | — | `{path, …}`; a failed write errors with `save failed: …` (the status-bar text) and the workbook stays modified |
 //! | `wb.reload` | — | `{path, …}` |
 //! | `wb.open` | `{path}` | `{path, …}` |
 //!
@@ -112,7 +112,7 @@ pub fn dispatch(app: &mut App, verb: &str, args: &Json) -> Result<Json, String> 
             Ok(Json::obj(vec![("recalculated", Json::Bool(true))]))
         }
         "wb.save" => {
-            app.save();
+            app.save_current()?;
             Ok(path_info(app))
         }
         "wb.reload" => {
@@ -2938,5 +2938,66 @@ mod tests {
         .unwrap();
         let lst = dispatch(&mut a, "pivot.list", &Json::Null).unwrap();
         assert_eq!(lst.get("pivots").unwrap().as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn wb_save_reports_failure_and_keeps_modified() {
+        let dir = std::env::temp_dir().join(format!("xlsxy-609-save-fail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The parent directory does not exist, so the write fails.
+        let book = dir.join("missing").join("book.xlsx");
+        let mut a = App::new(new_xlsx(), book.to_str().unwrap());
+        a.os_clip = None;
+        set(&mut a, "A1", "changed");
+
+        let err = dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        assert!(err.starts_with("save failed: "), "{err}");
+        // The error is the status bar's text, word for word.
+        assert_eq!(a.status.as_deref(), Some(err.as_str()));
+        assert!(a.modified, "a failed save must leave the workbook modified");
+        assert_eq!(std::path::Path::new(&a.path), book);
+        assert!(!book.exists());
+
+        // Fixing the cause lets the next wb.save succeed.
+        std::fs::create_dir_all(book.parent().unwrap()).unwrap();
+        let r = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(r.get("modified").unwrap().as_bool(), Some(false));
+        assert!(book.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The issue's repro: another program holds the file open with no
+    /// sharing, so the atomic replace fails.
+    #[cfg(windows)]
+    #[test]
+    fn wb_save_reports_failure_while_file_is_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("xlsxy-609-save-locked-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let book = dir.join("book.xlsx");
+        let mut a = App::new(new_xlsx(), book.to_str().unwrap());
+        a.os_clip = None;
+        dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        let before = std::fs::read(&book).unwrap();
+
+        set(&mut a, "A1", "changed");
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(&book)
+            .unwrap();
+        let err = dispatch(&mut a, "wb.save", &Json::Null).unwrap_err();
+        assert!(err.starts_with("save failed: "), "{err}");
+        assert!(a.modified);
+        drop(lock);
+        assert_eq!(std::fs::read(&book).unwrap(), before, "old file intact");
+
+        let r = dispatch(&mut a, "wb.save", &Json::Null).unwrap();
+        assert_eq!(r.get("modified").unwrap().as_bool(), Some(false));
+        assert_ne!(std::fs::read(&book).unwrap(), before);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
