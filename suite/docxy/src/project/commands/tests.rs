@@ -153,17 +153,32 @@ fn ribbon_inventory_keys_tips_and_assets_are_complete() {
         for g in &t.groups {
             for control in &g.items {
                 let cmds: Vec<_> = match control {
-                    Control::Large(c) | Control::Toggle(c) => vec![c],
-                    Control::Column(c) => c.iter().collect(),
+                    Control::Large(c) | Control::Toggle(c) => vec![(c, false)],
+                    Control::Column(c) => c.iter().map(|c| (c, false)).collect(),
+                    // A split's menu may repeat its primary (Set Baseline...):
+                    // the same command under the same letter, not a second one.
+                    Control::Split { primary, menu } => [(primary, false)]
+                        .into_iter()
+                        .chain(menu.iter().map(|c| {
+                            let again = matches!(
+                                (c.act, primary.act),
+                                (Act::Project(a), Act::Project(b)) if a == b
+                            );
+                            assert!(!again || c.key_tip == primary.key_tip, "{}", c.id);
+                            (c, again)
+                        }))
+                        .collect(),
                     _ => panic!("unexpected control"),
                 };
-                for c in cmds {
+                for (c, again) in cmds {
                     let Act::Project(act) = c.act else {
                         panic!("wrong action")
                     };
-                    acts.push(act);
-                    assert!(!c.key_tip.is_empty() && !keys.contains(&c.key_tip));
-                    keys.push(c.key_tip);
+                    if !again {
+                        acts.push(act);
+                        assert!(!c.key_tip.is_empty() && !keys.contains(&c.key_tip));
+                        keys.push(c.key_tip);
+                    }
                     assert!(!c.tip.title.is_empty() && !c.tip.shortcut.is_empty());
                     assert!(
                         cmd_tip_text(c).ends_with(c.tip.shortcut),
@@ -258,6 +273,7 @@ fn project_instruction_paths_exist() {
                 let cmds: Vec<_> = match control {
                     Control::Large(c) | Control::Toggle(c) => vec![c],
                     Control::Column(c) => c.iter().collect(),
+                    Control::Split { primary, menu } => [primary].into_iter().chain(menu).collect(),
                     _ => panic!("unexpected control"),
                 };
                 for c in cmds {
@@ -354,10 +370,20 @@ fn project_instruction_paths_exist() {
             "Set Baseline",
             Baseline,
         ),
+        // Set Baseline's menu (#397); Project 2024's labels, with the
+        // screentips naming the commands, so `ribbon-click "Clear Baseline"`
+        // still finds it.
         (
             "Project",
             "Schedule",
-            "Clear Baseline",
+            "Set Baseline...",
+            "Set Baseline",
+            Baseline,
+        ),
+        (
+            "Project",
+            "Schedule",
+            "Clear Baseline...",
             "Clear Baseline",
             ClearBaseline,
         ),
@@ -430,6 +456,7 @@ fn docxy_only_commands_are_off_the_ribbon() {
         .flat_map(|item| match item {
             Control::Large(c) | Control::Toggle(c) => vec![c],
             Control::Column(commands) => commands.iter().collect(),
+            Control::Split { primary, menu } => [primary].into_iter().chain(menu).collect(),
             _ => vec![],
         })
         .collect();
@@ -445,7 +472,15 @@ fn docxy_only_commands_are_off_the_ribbon() {
     ] {
         assert!(!cmds.iter().any(|c| c.id == id), "{id} is on the ribbon");
     }
-    for gone in [Save, Level, ExportGantt, ScrollLeft, ScrollRight, GoToStart] {
+    for gone in [
+        Save,
+        Level,
+        ExportGantt,
+        ScrollLeft,
+        ScrollRight,
+        GoToStart,
+        DeleteTask,
+    ] {
         assert!(
             !cmds
                 .iter()
@@ -2818,4 +2853,216 @@ fn status_items_are_the_state_the_mode_and_the_message_in_order() {
     t.surface = Surface::Placeholder;
     t.status = "saved".into();
     assert_eq!(items(&t), [("message", "saved".to_string())]);
+}
+
+/// The row menu's items as (label, enabled, checked); separators as `-`.
+fn row_menu(t: &DocTab) -> Vec<(String, bool, bool)> {
+    use crate::menu::MenuItem;
+    project_row_menu(v(t))
+        .into_iter()
+        .map(|item| match item {
+            MenuItem::Item(e) => (e.label, e.enabled, e.checked),
+            MenuItem::Separator => ("-".into(), false, false),
+            MenuItem::Heading(h) => (format!("[{h}]"), false, false),
+        })
+        .collect()
+}
+
+fn enabled_items(t: &DocTab) -> Vec<String> {
+    row_menu(t)
+        .into_iter()
+        .filter(|(_, enabled, _)| *enabled)
+        .map(|(label, ..)| label)
+        .collect()
+}
+
+/// #397: a task row's context menu is Project's, in Project's order.
+#[test]
+fn the_row_menu_lists_projects_items_in_order() {
+    let t = tab();
+    let labels: Vec<_> = row_menu(&t).into_iter().map(|(l, ..)| l).collect();
+    assert_eq!(
+        labels,
+        [
+            "Cut",
+            "Copy",
+            "Paste",
+            "Paste Special...",
+            "-",
+            "Scroll to Task",
+            "-",
+            "Insert Task",
+            "Delete Task",
+            "Inactivate Task",
+            "-",
+            "Manually Schedule",
+            "Auto Schedule",
+            "-",
+            "Assign Resources...",
+            "-",
+            "Text Styles...",
+            "Font...",
+            "-",
+            "Fill Down",
+            "Clear Contents",
+            "-",
+            "Information...",
+            "Notes...",
+            "Add to Timeline",
+            "-",
+            "Hyperlink...",
+        ]
+    );
+    // Every drawn icon is one the window can load.
+    for item in project_row_menu(v(&t)) {
+        if let crate::menu::MenuItem::Item(e) = item {
+            assert!(
+                e.icon.is_empty()
+                    || Path::new(env!("CARGO_MANIFEST_DIR"))
+                        .join("assets/icons")
+                        .join(format!("{}.svg", e.icon))
+                        .exists(),
+                "{}",
+                e.icon
+            );
+            // An item with no command is never enabled.
+            assert!(e.act.is_some() || !e.enabled, "{}", e.label);
+        }
+    }
+}
+
+/// #397: which items a row enables — a real task, a blank row, the entry row.
+#[test]
+fn the_row_menu_enables_by_the_row_under_the_cursor() {
+    let mut t = tab();
+    let all_task = [
+        "Cut",
+        "Copy",
+        "Paste",
+        "Scroll to Task",
+        "Insert Task",
+        "Delete Task",
+        "Inactivate Task",
+        "Manually Schedule",
+        "Auto Schedule",
+        "Assign Resources...",
+        "Information...",
+    ];
+    assert_eq!(enabled_items(&t), all_task);
+    // A blank row can be inserted above and deleted, not scheduled.
+    let blank = v(&t).ed.project().tasks.len();
+    vm(&mut t).ed.insert_blank_row(None).unwrap();
+    vm(&mut t).ed.select(blank);
+    assert!(v(&t).selected_uid().is_some());
+    assert_eq!(
+        enabled_items(&t),
+        ["Cut", "Copy", "Paste", "Insert Task", "Delete Task"]
+    );
+    // The entry row has no task to delete.
+    vm(&mut t).enter_entry_row();
+    assert_eq!(v(&t).selected_uid(), None);
+    assert_eq!(enabled_items(&t), ["Cut", "Copy", "Paste", "Insert Task"]);
+    // No tick without a task.
+    assert!(row_menu(&t).iter().all(|(_, _, checked)| !checked));
+}
+
+/// #397: the ticks are the ribbon's (`project_act_active`).
+#[test]
+fn the_row_menu_ticks_the_task_mode_and_inactive_as_the_ribbon_does() {
+    let mut t = tab();
+    let ticked = |t: &DocTab| {
+        row_menu(t)
+            .into_iter()
+            .filter(|(_, _, checked)| *checked)
+            .map(|(label, ..)| label)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ticked(&t), ["Auto Schedule"]);
+    apply_project_act(&mut t, ProjectAct::ManuallySchedule);
+    apply_project_act(&mut t, ProjectAct::Inactivate);
+    assert_eq!(ticked(&t), ["Inactivate Task", "Manually Schedule"]);
+}
+
+/// #397: the row menu's Delete Task deletes the selected task whatever
+/// column the cursor is on; the Delete key does only on the ID column.
+#[test]
+fn delete_task_deletes_from_any_column_and_asks_for_a_summary() {
+    let mut t = tab();
+    assert_eq!(v(&t).col, COL_NAME);
+    let uid = v(&t).selected_uid().unwrap();
+    let count = v(&t).ed.project().tasks.len();
+    apply_project_act(&mut t, ProjectAct::ClearCell);
+    assert_eq!(
+        v(&t).ed.project().tasks.len(),
+        count,
+        "Delete on Name clears"
+    );
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    assert_eq!(v(&t).ed.project().tasks.len(), count - 1);
+    assert!(v(&t).ed.project().task(uid).is_none());
+    assert!(t.dialogs.top().is_none());
+    // One undo step brings it back.
+    apply_project_act(&mut t, ProjectAct::Undo);
+    assert!(v(&t).ed.project().task(uid).is_some());
+
+    // A summary asks first, as Delete on its ID does.
+    let mut t = summary_tab();
+    let before = v(&t).ed.project().clone();
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    assert_eq!(t.dialogs.top_id(), "delete-summary");
+    assert_eq!(v(&t).ed.project(), &before);
+    dialog_click(&mut t, "Yes").unwrap();
+    assert!(v(&t).ed.project().tasks.is_empty());
+
+    // On the entry row there is nothing to delete.
+    let mut t = tab();
+    vm(&mut t).enter_entry_row();
+    let before = v(&t).ed.project().clone();
+    apply_project_act(&mut t, ProjectAct::DeleteTask);
+    assert_eq!(v(&t).ed.project(), &before);
+}
+
+/// #397: Set Baseline is a split button: the primary sets the baseline, its
+/// menu offers Set Baseline... and Clear Baseline..., and the letters B and
+/// L still reach both from the keyboard.
+#[test]
+fn set_baseline_is_a_split_with_clear_baseline_in_its_menu() {
+    let r = project_ribbon();
+    let project = r.tabs.iter().find(|t| t.name == "Project").unwrap();
+    let schedule = &project.groups[0];
+    let (primary, menu) = schedule
+        .items
+        .iter()
+        .find_map(|c| match c {
+            Control::Split { primary, menu } => Some((primary, menu)),
+            _ => None,
+        })
+        .expect("Set Baseline is a split button");
+    assert_eq!(primary.label, "Set Baseline");
+    assert!(matches!(primary.act, Act::Project(ProjectAct::Baseline)));
+    let items = crate::menu::split_menu(menu, |_| true, |_| false);
+    let read: Vec<_> = items
+        .iter()
+        .map(|item| match item {
+            crate::menu::MenuItem::Item(e) => (e.label.as_str(), e.key_tip.as_str(), e.enabled),
+            _ => panic!("a split's menu is its commands"),
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            ("Set Baseline...", "B", true),
+            ("Clear Baseline...", "L", true)
+        ]
+    );
+    // Clear Baseline no longer sits beside it.
+    assert_eq!(schedule.items.len(), 2, "Calculate Project and the split");
+    assert!(matches!(
+        tab_keytip_cmd(project, "B"),
+        Some(Act::Project(ProjectAct::Baseline))
+    ));
+    assert!(matches!(
+        tab_keytip_cmd(project, "L"),
+        Some(Act::Project(ProjectAct::ClearBaseline))
+    ));
 }

@@ -28,6 +28,7 @@ mod dialog;
 mod dialog_host;
 mod harness;
 mod html_bundle;
+mod menu;
 mod project;
 #[cfg(test)]
 mod ribbon_export;
@@ -1373,8 +1374,9 @@ struct Docxy {
     range_pick: Option<((u32, u32), bool)>,
     // KeyTips (Alt access keys): Off, tab letters, or the active tab's commands.
     keytips: KeyTip,
-    // Right-click context menu position (window coords), if open.
-    context_menu: Option<Point<Pixels>>,
+    // The open menu (a right-click's context menu or a split button's
+    // drop-down), drawn from the same model the harness reads.
+    menu: Option<menu::Menu>,
     // Floating mini formatting toolbar shown after a drag-selection (window coords).
     mini_bar: Option<Point<Pixels>>,
     // Document zoom factor (1.0 = 100%), controlled from the status bar.
@@ -5691,7 +5693,7 @@ impl Docxy {
             drag_anchor: None,
             range_pick: None,
             keytips: KeyTip::Off,
-            context_menu: None,
+            menu: None,
             mini_bar: None,
             zoom: 1.0,
             ruler_guide: None,
@@ -11696,7 +11698,7 @@ impl Docxy {
         cx: &mut Context<Self>,
     ) {
         self.mini_bar = None;
-        self.context_menu = None;
+        self.menu = None;
         if let Some(ed) = self.edit_target() {
             if extend {
                 ed.extend_selection(true); // anchor at the current caret if none
@@ -13468,6 +13470,11 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // An open menu takes Tab as it takes every key; see `on_key`.
+        if menu::close_on_key(&mut self.menu) {
+            cx.notify();
+            return;
+        }
         if self.project_prompt_open() {
             return;
         }
@@ -13475,7 +13482,7 @@ impl Docxy {
         if self.active_is_project() {
             if self.keytips == KeyTip::Off && !self.backstage {
                 self.mini_bar = None;
-                self.context_menu = None;
+                self.menu = None;
                 self.project_tab_key(false, window, cx);
             }
             return;
@@ -13494,7 +13501,7 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
-        self.context_menu = None;
+        self.menu = None;
         // On a sheet, Tab commits the edit and advances one cell to the right.
         if self.active_is_sheet() {
             // A Chart-panel range field swallows Tab the same way it swallows
@@ -13535,6 +13542,11 @@ impl Docxy {
         if self.tab_more_open {
             return;
         }
+        // An open menu takes Tab as it takes every key; see `on_key`.
+        if menu::close_on_key(&mut self.menu) {
+            cx.notify();
+            return;
+        }
         if self.project_prompt_open() {
             return;
         }
@@ -13542,7 +13554,7 @@ impl Docxy {
         if self.active_is_project() {
             if self.keytips == KeyTip::Off && !self.backstage {
                 self.mini_bar = None;
-                self.context_menu = None;
+                self.menu = None;
                 self.project_tab_key(true, window, cx);
             }
             return;
@@ -13551,7 +13563,7 @@ impl Docxy {
             return;
         }
         self.mini_bar = None;
-        self.context_menu = None;
+        self.menu = None;
         // On a sheet, Shift+Tab commits and moves one cell to the left.
         if self.active_is_sheet() {
             // Same as Tab above: the field has the keyboard first, then
@@ -13578,6 +13590,13 @@ impl Docxy {
                 self.tab_more_close(cx);
             }
             return; // the modal list owns keys; do not edit the surface below
+        }
+        // An open menu takes the key: Esc closes it, and so, until menus
+        // take arrows and Enter, does any other key; none reaches the
+        // document or cell under it (#397).
+        if menu::close_on_key(&mut self.menu) {
+            cx.notify();
+            return;
         }
         if self.project_edit_open() && !self.backstage {
             return self.project_key(ev, window, cx);
@@ -13623,7 +13642,7 @@ impl Docxy {
         }
         // Any key dismisses the floating mini toolbar / context menu.
         self.mini_bar = None;
-        self.context_menu = None;
+        self.menu = None;
         // Spreadsheet surface: the grid has its own key handling (navigation,
         // cell editing, recalc) — nothing routes to a text editor.
         if self.active_is_sheet() {
@@ -15086,6 +15105,14 @@ fn ribbon_tab_name(tab: RibbonTab) -> &'static str {
     }
 }
 
+/// Whether a ribbon command can run now: its button draws greyed and takes
+/// no click when it cannot, a split button's menu greys the item, and
+/// `ribbon-read` reports the same. Every ribbon command can run today; a
+/// row menu's items have their own rules (`project_row_menu`).
+fn act_enabled(_act: Act) -> bool {
+    true
+}
+
 /// Find the command in a control whose KeyTip matches `key` (case-insensitive).
 fn control_keytip(c: &Control<Act>, key: &str) -> Option<Act> {
     let m = |cmd: &rs::Cmd<Act>| {
@@ -15094,6 +15121,9 @@ fn control_keytip(c: &Control<Act>, key: &str) -> Option<Act> {
     match c {
         Control::Large(cmd) | Control::Toggle(cmd) => m(cmd),
         Control::Column(cmds) => cmds.iter().find_map(m),
+        // The primary's letter, then its menu's: Office reaches a split's
+        // menu items through the menu, which has no keyboard yet (#397).
+        Control::Split { primary, menu } => m(primary).or_else(|| menu.iter().find_map(m)),
         Control::Rows(rows) => rows.iter().flatten().find_map(|cell| match cell {
             rs::Cell::Btn(cmd) => m(cmd),
             rs::Cell::Combo { cmd, .. } => m(cmd),
@@ -15229,7 +15259,7 @@ fn group_est(g: &rs::Group<Act>, icon_only: bool) -> f32 {
     for c in &g.items {
         w += match c {
             Control::Toggle(_) => 26.0,
-            Control::Large(_) => 58.0,
+            Control::Large(_) | Control::Split { .. } => 58.0,
             Control::Column(_) => {
                 if icon_only {
                     34.0
@@ -16511,67 +16541,211 @@ impl Docxy {
         self.refocus(window, cx);
     }
 
-    /// The right-click context menu (clipboard + quick formatting), anchored at the
-    /// click position, over a full-window backdrop that dismisses it.
-    fn context_menu_el(&self, at: Point<Pixels>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
-        let item = |cx: &mut Context<Self>,
-                    id: &'static str,
-                    label: &'static str,
-                    icon: &'static str,
-                    act: Act| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1()
-                .rounded_sm()
-                .cursor_pointer()
-                .text_size(px(12.))
-                .text_color(pal.fg)
-                .hover(|d| d.bg(pal.hover))
-                .when(!icon.is_empty(), |d| d.child(icon_svg(icon, 14., pal.fg)))
-                .when(icon.is_empty(), |d| d.child(div().w(px(14.))))
-                .child(SharedString::from(label))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.context_menu = None;
-                    this.dispatch(act, window, cx);
-                }))
+    /// Open `items` as the menu on `target`, anchored at `at` (window
+    /// coordinates). A second open replaces the first, as a second
+    /// right-click does.
+    fn open_menu(
+        &mut self,
+        target: menu::MenuTarget,
+        at: Point<Pixels>,
+        items: Vec<menu::MenuItem>,
+        cx: &mut Context<Self>,
+    ) {
+        self.mini_bar = None;
+        self.menu = Some(menu::Menu {
+            target,
+            at: (f32::from(at.x), f32::from(at.y)),
+            items,
+        });
+        cx.notify();
+    }
+
+    /// The document body's right-click, and `menu-open "document"`.
+    pub(crate) fn open_document_menu(&mut self, at: Point<Pixels>, cx: &mut Context<Self>) {
+        self.open_menu(menu::MenuTarget::Document, at, menu::document_menu(), cx);
+    }
+
+    /// A right-click on a Project row's table (row `row` in task order; past
+    /// the last task, the entry row), and `menu-open {"row"}`. The press
+    /// selects the row as a left click does, committing an open cell edit;
+    /// then the row's menu opens for it. A commit the plan refuses keeps the
+    /// edit and its status, and no menu opens.
+    pub(crate) fn open_row_menu(
+        &mut self,
+        row: usize,
+        col: Option<usize>,
+        at: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return Err("no tab is open".into());
         };
-        let sep = || div().h(px(1.)).mx_2().my_0p5().bg(pal.border);
-        let menu = v_flex()
-            .absolute()
-            .left(at.x)
-            .top(at.y)
-            .w(px(200.))
+        let Surface::Project(v) = &tab.surface else {
+            return Err("the active tab is not a Project".into());
+        };
+        if row < v.ed.project().tasks.len() {
+            project_cell_click(tab, row, col, false);
+        } else {
+            project_entry_click(tab, col, false);
+        }
+        let Surface::Project(v) = &tab.surface else {
+            return Err("the active tab is not a Project".into());
+        };
+        if v.cell.is_some() {
+            let status = tab.status.to_string();
+            self.refocus(window, cx);
+            return Err(format!("the open cell edit did not commit: {status}"));
+        }
+        let target = menu::MenuTarget::Row(v.selected_uid());
+        let items = project_row_menu(v);
+        self.refocus(window, cx);
+        self.open_menu(target, at, items, cx);
+        Ok(())
+    }
+
+    /// A split button's arrow half, and `menu-open {"ribbon"}`: its drop-down,
+    /// found by the primary command's id on the ribbon the active tab shows.
+    pub(crate) fn open_split_menu(
+        &mut self,
+        primary_id: &str,
+        at: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let (target, items) = self
+            .split_menu_for(primary_id)
+            .ok_or_else(|| format!("no split button '{primary_id}' on the ribbon"))?;
+        self.open_menu(target, at, items, cx);
+        Ok(())
+    }
+
+    /// The split button whose primary is `primary_id`: where it is, and its
+    /// menu with the live enabled and checked states.
+    fn split_menu_for(&self, primary_id: &str) -> Option<(menu::MenuTarget, Vec<menu::MenuItem>)> {
+        let kind = self.ribbon_kind();
+        let mut tabs = ribbon_for(kind).tabs;
+        if kind == Kind::Docx && self.caret_table().is_some() {
+            tabs.push(table_tab());
+        }
+        if kind == Kind::Project && self.project_gantt_showing() {
+            tabs.push(gantt_format_tab());
+        }
+        tabs.iter().find_map(|tab| {
+            tab.groups.iter().find_map(|group| {
+                group.items.iter().find_map(|control| match control {
+                    Control::Split { primary, menu } if primary.id == primary_id => Some((
+                        menu::MenuTarget::Ribbon {
+                            tab: tab.name.into(),
+                            group: group.title.into(),
+                            label: primary.label.into(),
+                        },
+                        menu::split_menu(menu, act_enabled, |a| self.act_active(a)),
+                    )),
+                    _ => None,
+                })
+            })
+        })
+    }
+
+    /// Click the open menu's item at `path` (indices through submenus): the
+    /// drawn item's click handler and `menu-click` both come here. The menu
+    /// closes, then the item's command runs.
+    pub(crate) fn menu_activate(
+        &mut self,
+        path: &[usize],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        let menu = self.menu.as_ref().ok_or("no menu is open")?;
+        let entry = menu::entry_at(&menu.items, path).ok_or("no such menu item")?;
+        if !entry.enabled {
+            return Err(format!("menu item '{}' is disabled", entry.label));
+        }
+        if !entry.submenu.is_empty() {
+            return Err(format!("menu item '{}' opens a submenu", entry.label));
+        }
+        let act = entry.act;
+        self.menu = None;
+        match act {
+            Some(act) => self.dispatch(act, window, cx),
+            None => self.refocus(window, cx),
+        }
+        Ok(())
+    }
+
+    /// The open menu, anchored where it was opened, over a full-window
+    /// backdrop that dismisses it. Disabled items are greyed and take no
+    /// click; a ticked item shows its tick where the icon goes.
+    fn menu_el(&self, menu: &menu::Menu, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        use menu::MenuItem;
+        let mut list = v_flex()
+            .min_w(px(200.))
             .py_1()
             .rounded_md()
             .bg(pal.panel)
             .border_1()
             .border_color(pal.border)
             .shadow_lg()
-            .child(item(cx, "cm-cut", "Cut", "cut", Act::Cut))
-            .child(item(cx, "cm-copy", "Copy", "copy", Act::Copy))
-            .child(item(cx, "cm-paste", "Paste", "paste", Act::Paste))
-            .child(sep())
-            .child(item(cx, "cm-bold", "Bold", "bold", Act::Bold))
-            .child(item(cx, "cm-italic", "Italic", "italic", Act::Italic))
-            .child(item(
-                cx,
-                "cm-underline",
-                "Underline",
-                "underline",
-                Act::Underline,
-            ))
-            .child(sep())
-            .child(item(
-                cx,
-                "cm-comment",
-                "New Comment",
-                "comment-add",
-                Act::NewComment,
-            ));
+            // A press on the menu itself is not a press outside it.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation());
+        for (i, item) in menu.items.iter().enumerate() {
+            list = list.child(match item {
+                MenuItem::Separator => div()
+                    .h(px(1.))
+                    .mx_2()
+                    .my_0p5()
+                    .bg(pal.border)
+                    .into_any_element(),
+                MenuItem::Heading(label) => div()
+                    .px_3()
+                    .py_1()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(pal.dim)
+                    .child(SharedString::from(label.clone()))
+                    .into_any_element(),
+                MenuItem::Item(e) => {
+                    let color = if e.enabled { pal.fg } else { pal.dim };
+                    let lead = if e.checked {
+                        div().w(px(14.)).child("✓").into_any_element()
+                    } else if e.icon.is_empty() {
+                        div().w(px(14.)).into_any_element()
+                    } else {
+                        icon_svg(e.icon, 14., color).into_any_element()
+                    };
+                    let clickable = e.enabled && e.submenu.is_empty();
+                    div()
+                        .id(SharedString::from(e.id.clone()))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_1()
+                        .rounded_sm()
+                        .text_size(px(12.))
+                        .text_color(color)
+                        .child(lead)
+                        .child(div().flex_1().child(SharedString::from(e.label.clone())))
+                        .when(!e.key_tip.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .text_color(pal.dim)
+                                    .child(SharedString::from(e.key_tip.clone())),
+                            )
+                        })
+                        .when(!e.submenu.is_empty(), |d| d.child("▸"))
+                        .when(clickable, |d| {
+                            d.cursor_pointer()
+                                .hover(|d| d.bg(pal.hover))
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    let _ = this.menu_activate(&[i], window, cx);
+                                }))
+                        })
+                        .into_any_element()
+                }
+            });
+        }
         // Full-window backdrop to catch outside clicks / right-clicks.
         div()
             .id("cm-backdrop")
@@ -16580,18 +16754,25 @@ impl Docxy {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _w, cx| {
-                    this.context_menu = None;
+                    this.menu = None;
                     cx.notify();
                 }),
             )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _w, cx| {
-                    this.context_menu = None;
+                    this.menu = None;
                     cx.notify();
                 }),
             )
-            .child(menu)
+            // Anchored where it was opened, flipped and nudged to stay inside
+            // the window, as a menu opened near an edge is.
+            .child(
+                anchored()
+                    .position(point(px(menu.at.0), px(menu.at.1)))
+                    .snap_to_window_with_margin(px(4.))
+                    .child(list),
+            )
             .into_any_element()
     }
 
@@ -18645,6 +18826,7 @@ impl Docxy {
         match c {
             Control::Toggle(cmd) => self.icon_btn(cmd, false, pal, cx),
             Control::Large(cmd) => self.large_btn(cmd, pal, cx),
+            Control::Split { primary, .. } => self.split_btn(primary, pal, cx),
             Control::Column(cmds) => {
                 // Office caps a button column at 3 rows; extra buttons wrap into
                 // the next column so nothing overflows the ribbon body height.
@@ -18881,6 +19063,11 @@ impl Docxy {
     fn large_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
         let act = cmd.act;
         let on = self.act_active(act);
+        let enabled = act_enabled(act);
+        let pal = Pal {
+            fg: if enabled { pal.fg } else { pal.dim },
+            ..pal
+        };
         let tip = cmd_tip_text(cmd);
         let keytip =
             (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
@@ -18918,7 +19105,82 @@ impl Docxy {
             .child(label)
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-            .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            .when(enabled, |d| {
+                d.on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            })
+            .into_any_element()
+    }
+
+    /// A large split button: the upper half (icon) runs the primary command,
+    /// the lower half (label and ▾) opens its menu, as in Office.
+    fn split_btn(&self, cmd: &rs::Cmd<Act>, pal: Pal, cx: &mut Context<Self>) -> AnyElement {
+        let act = cmd.act;
+        let enabled = act_enabled(act);
+        let fg = if enabled { pal.fg } else { pal.dim };
+        let tip = cmd_tip_text(cmd);
+        let keytip =
+            (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
+        let primary_id = cmd.id;
+        // The label with the drop-down mark on its last line, as Office
+        // draws a large split button's lower half.
+        let lines = label_lines(cmd.label);
+        let last = lines.len().saturating_sub(1);
+        let mut label = v_flex().items_center();
+        for (i, ln) in lines.into_iter().enumerate() {
+            let ln = if i == last {
+                format!("{ln} ▾")
+            } else {
+                ln.to_string()
+            };
+            label = label.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(fg)
+                    .child(SharedString::from(ln)),
+            );
+        }
+        let top = div()
+            .id(cmd.id)
+            .flex()
+            .justify_center()
+            .w_full()
+            .rounded_t(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .active(|d| d.bg(Hsla { a: 0.22, ..pal.fg }))
+            .child(icon_svg(cmd.icon.0, 26., fg))
+            .when(enabled, |d| {
+                d.on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            });
+        let arrow = div()
+            .id(SharedString::from(format!("{}-menu", cmd.id)))
+            .w_full()
+            .rounded_b(px(4.))
+            .cursor_pointer()
+            .hover(|d| d.bg(pal.hover))
+            .child(label)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    let _ = this.open_split_menu(primary_id, ev.position, cx);
+                }),
+            );
+        div()
+            .id(SharedString::from(format!("{}-split", cmd.id)))
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_0p5()
+            .px_1()
+            .h_full()
+            .child(probe(&self.probes, format!("ribbon-split:{}", cmd.id)))
+            .child(top)
+            .child(arrow)
+            .when_some(keytip, |d, k| d.child(keytip_badge(k)))
+            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
             .into_any_element()
     }
 
@@ -18969,6 +19231,11 @@ impl Docxy {
     ) -> AnyElement {
         let act = cmd.act;
         let on = self.act_active(act);
+        let enabled = act_enabled(act);
+        let pal = Pal {
+            fg: if enabled { pal.fg } else { pal.dim },
+            ..pal
+        };
         let tip_text = cmd_tip_text(cmd);
         let keytip =
             (self.keytips == KeyTip::Commands && !cmd.key_tip.is_empty()).then_some(cmd.key_tip);
@@ -19007,7 +19274,9 @@ impl Docxy {
             })
             .when_some(keytip, |d, k| d.child(keytip_badge(k)))
             .tooltip(move |window, cx| Tooltip::new(tip_text.clone()).build(window, cx))
-            .on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            .when(enabled, |d| {
+                d.on_click(cx.listener(move |this, _, window, cx| this.dispatch(act, window, cx)))
+            })
             .into_any_element()
     }
 
@@ -19284,7 +19553,7 @@ impl Docxy {
             } else {
                 self.sheet_fill = None;
                 self.grid_release(cx);
-                self.context_menu = None;
+                self.menu = None;
                 self.mini_bar = None;
                 self.tab_more_open = true;
                 cx.notify();
@@ -20370,12 +20639,16 @@ impl Render for Docxy {
             .flex_1()
             .min_h(px(0.))
             .overflow_hidden()
-            // Right-click anywhere in the document body opens the context menu.
+            // Right-click in a document or sheet body opens the document's
+            // context menu. A Project's task rows open their own (the table
+            // pane's handler); nothing else on a Project has a menu yet, so
+            // the document's never opens there (#397).
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, ev: &MouseDownEvent, _w, cx| {
-                    this.context_menu = Some(ev.position);
-                    cx.notify();
+                    if !this.active_is_project() {
+                        this.open_document_menu(ev.position, cx);
+                    }
                 }),
             )
             .when_some(nav_panel, |d, n| d.child(n))
@@ -20385,10 +20658,11 @@ impl Render for Docxy {
             .when_some(pivot_panel, |d, p| d.child(p))
             .when_some(chart_panel, |d, p| d.child(p));
         let context_menu = self
-            .context_menu
+            .menu
+            .as_ref()
             .filter(|_| !self.tab_more_open)
-            .map(|at| self.context_menu_el(at, pal, cx));
-        let mini_bar = (is_doc && self.context_menu.is_none())
+            .map(|m| self.menu_el(m, pal, cx));
+        let mini_bar = (is_doc && self.menu.is_none())
             .then_some(self.mini_bar)
             .flatten()
             .map(|at| self.mini_bar_el(at, pal, cx));
